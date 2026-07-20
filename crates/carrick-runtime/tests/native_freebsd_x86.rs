@@ -46,6 +46,72 @@ fn native_backend_enters_dynamic_interpreter_with_linux_auxv() {
 }
 
 #[test]
+fn sibling_exit_group_interrupts_indefinite_private_and_shared_futex_waits() {
+    let fixtures = [
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../carrick-dsr-x86/tests/fixtures/exitgroup-sibling-futex-x86_64-linux"
+        ),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../carrick-dsr-x86/tests/fixtures/exitgroup-sibling-shared-futex-x86_64-linux"
+        ),
+    ];
+
+    for fixture in fixtures {
+        assert!(
+            std::path::Path::new(fixture).exists(),
+            "fixture missing: {fixture}"
+        );
+        let start = std::time::Instant::now();
+        let result = carrick_runtime::runtime::run_elf_native_dispatch(fixture.as_ref())
+            .expect("a sibling exit_group must release the initial futex waiter");
+
+        assert_eq!(
+            result.exit_code, 37,
+            "the sibling's process-wide exit status must win for {fixture}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "exit_group must not wait for {fixture}'s infinite futex park"
+        );
+    }
+}
+
+#[test]
+fn immediate_child_exit_group_does_not_deadlock_clone_publication() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carrick-dsr-x86/tests/fixtures/exitgroup-sibling-immediate-x86_64-linux"
+    );
+    for iteration in 0..16 {
+        let result = carrick_runtime::runtime::run_elf_native_dispatch(fixture.as_ref())
+            .expect("an immediate child exit_group must not join its waiting parent");
+        assert_eq!(
+            result.exit_code, 37,
+            "child exit status on iteration {iteration}"
+        );
+    }
+}
+
+#[test]
+fn exit_group_asynchronously_kicks_a_sibling_spinning_in_jit_code() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../carrick-dsr-x86/tests/fixtures/exitgroup-sibling-busy-x86_64-linux"
+    );
+    let start = std::time::Instant::now();
+    let result = carrick_runtime::runtime::run_elf_native_dispatch(fixture.as_ref())
+        .expect("exit_group must kick a sibling with no syscall boundary");
+
+    assert_eq!(result.exit_code, 0);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "a chained JIT spin must not hide process exit"
+    );
+}
+
+#[test]
 fn native_backend_runs_a_static_x86_elf_through_the_real_dispatcher() {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),

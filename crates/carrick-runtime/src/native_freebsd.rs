@@ -31,7 +31,7 @@ use std::sync::Arc;
 use carrick_dsr::host::{JitRegion, NativeHostJit};
 use carrick_dsr_x86::block::{X86Block, X86Exit};
 use carrick_dsr_x86::decode::{X86InstClass, classify};
-use carrick_dsr_x86::gateway::{CTX_FAULT_RECORD, reg, signal_stub_addr};
+use carrick_dsr_x86::gateway::{CTX_FAULT_RECORD, kick_stub_addr, reg, signal_stub_addr};
 use carrick_dsr_x86::{
     X86DsrContext, X86ExitStatus, X86UcontextSnapshot, cflow,
     emit::{ScratchRestore, emit_block_linked},
@@ -390,6 +390,7 @@ mod identity_raw_range_tests {
                 waiter_key,
                 generation,
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+                &|| false,
             ),
             0
         );
@@ -2336,6 +2337,10 @@ impl Drop for ExitState {
     }
 }
 
+// FreeBSD's fixed SIGRTMIN. The libc crate does not expose it on this target;
+// unlike glibc, FreeBSD reserves no leading RT signals for pthread internals.
+const FREEBSD_NATIVE_EXIT_KICK_SIGNAL: i32 = 65;
+
 /// Everything a guest thread needs that is SHARED across the whole run: the
 /// interior-mutable dispatcher, the thread registry + futex table, the loaded
 /// image, the one contiguous JIT code cache, and the exit rendezvous. Cloned
@@ -2354,6 +2359,13 @@ struct SharedRun {
     free_slices: std::sync::Mutex<Vec<usize>>,
     /// Join handles of spawned guest-thread host threads.
     threads: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Host pthreads currently executing guest threads. Process exit repeatedly
+    /// sends the non-restarting native kick until every sibling unregisters,
+    /// interrupting host `ppoll`, `_umtx_op`, `fcntl(F_SETLKW)`, and shared-word
+    /// waits without polling or retaining raw guest addresses.
+    host_threads:
+        std::sync::Mutex<std::collections::HashMap<crate::thread::ThreadId, libc::pthread_t>>,
+    host_threads_cv: std::sync::Condvar,
     exit: ExitState,
 }
 
@@ -2387,12 +2399,113 @@ impl SharedRun {
             .push(off);
     }
 
-    fn any_threads_spawned(&self) -> bool {
-        !self
-            .threads
+    /// Join every spawned guest thread after process exit has been published.
+    /// The exit wake makes even indefinitely parked siblings leave their run
+    /// loops, so teardown no longer has to leak the JIT and guest arenas until
+    /// host-process termination.
+    fn join_threads(&self) {
+        let handles = std::mem::take(&mut *self.threads.lock().unwrap_or_else(|p| p.into_inner()));
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
+    fn register_host_thread(&self, tid: crate::thread::ThreadId) {
+        let pthread = unsafe { libc::pthread_self() };
+        self.host_threads
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .is_empty()
+            .insert(tid, pthread);
+    }
+
+    fn unregister_host_thread(&self, tid: crate::thread::ThreadId) {
+        self.host_threads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&tid);
+        self.host_threads_cv.notify_all();
+    }
+
+    /// Repeated non-restarting signals close the signal-before-host-park race:
+    /// the exit publisher waits on a condvar, not a polling/yield loop, and
+    /// retries only while a sibling remains registered.
+    fn interrupt_host_threads_for_exit(&self) {
+        let current = unsafe { libc::pthread_self() };
+        let mut threads = self.host_threads.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            let targets: Vec<libc::pthread_t> = threads
+                .values()
+                .copied()
+                .filter(|pthread| *pthread != current)
+                .collect();
+            if targets.is_empty() {
+                return;
+            }
+            drop(threads);
+            for pthread in targets {
+                unsafe {
+                    libc::pthread_kill(pthread, FREEBSD_NATIVE_EXIT_KICK_SIGNAL);
+                }
+            }
+            threads = self.host_threads.lock().unwrap_or_else(|p| p.into_inner());
+            let waited = self
+                .host_threads_cv
+                .wait_timeout(threads, std::time::Duration::from_millis(1));
+            let (next, _) = waited.unwrap_or_else(|p| p.into_inner());
+            threads = next;
+        }
+    }
+
+    /// Publish a process-wide exit and release every sibling from a blocking
+    /// wait. `exit_group(2)` may be issued by any guest thread while the
+    /// initial thread is indefinitely parked in a host syscall; recording the
+    /// flag alone leaves that thread asleep forever and prevents terminal state.
+    fn request_exit(&self, code: i32) {
+        self.exit.request(code);
+        self.futex.notify_signal_pending();
+        self.dispatcher.notify_inmem_epoll();
+        self.interrupt_host_threads_for_exit();
+    }
+}
+
+struct NativeHostThreadRegistration {
+    shared: Arc<SharedRun>,
+    tid: crate::thread::ThreadId,
+    registered: bool,
+}
+
+impl NativeHostThreadRegistration {
+    fn new(shared: &Arc<SharedRun>, tid: crate::thread::ThreadId) -> Self {
+        shared.register_host_thread(tid);
+        Self {
+            shared: Arc::clone(shared),
+            tid,
+            registered: true,
+        }
+    }
+
+    /// Stop Drop from locking the inherited parent registry in a fork child.
+    /// The old map is COW-private and discarded with the old SharedRun.
+    fn abandon_inherited_after_fork(&mut self) {
+        self.registered = false;
+    }
+
+    /// Rebind in a freshly-forked child without touching the inherited parent
+    /// registry mutex. Its owner may have been a sibling pthread that vanished
+    /// at fork, so locking it in the child can deadlock permanently.
+    fn rebind_after_fork(&mut self, shared: &Arc<SharedRun>, tid: crate::thread::ThreadId) {
+        shared.register_host_thread(tid);
+        self.shared = Arc::clone(shared);
+        self.tid = tid;
+        self.registered = true;
+    }
+}
+
+impl Drop for NativeHostThreadRegistration {
+    fn drop(&mut self) {
+        if self.registered {
+            self.shared.unregister_host_thread(self.tid);
+        }
     }
 }
 
@@ -2481,15 +2594,15 @@ fn spawn_clone_thread(
             );
             child_shared.free_slice(slice_off);
             match outcome {
-                ThreadRunOutcome::Exit { code, .. } => child_shared.exit.request(code),
-                ThreadRunOutcome::TrapLimit { .. } => child_shared.exit.request(125),
+                ThreadRunOutcome::Exit { code, .. } => child_shared.request_exit(code),
+                ThreadRunOutcome::TrapLimit { .. } => child_shared.request_exit(125),
                 ThreadRunOutcome::Fault { detail, .. } => {
                     let msg = format!("native x86 guest thread {}: {detail}\n", child_tid.raw());
                     // SAFETY: a straight write to host stderr.
                     unsafe {
                         libc::write(2, msg.as_ptr().cast(), msg.len());
                     }
-                    child_shared.exit.request(125);
+                    child_shared.request_exit(125);
                 }
                 // A plain thread exit (`exit(2)`, not last): nothing to do — the
                 // host thread just ends and its slice is already freed.
@@ -2509,12 +2622,18 @@ fn spawn_clone_thread(
     };
     // Wait until the child thread has started (it is already registered).
     let _ = ready_rx.recv();
-    shared
-        .threads
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push(handle);
-    Ok(child_tid)
+    let mut threads = shared.threads.lock().unwrap_or_else(|p| p.into_inner());
+    let exiting = shared.exit.requested();
+    threads.push(handle);
+    if exiting {
+        // Never join here: the child may be the exit_group publisher and be
+        // waiting for this parent thread to leave its run loop. Publishing the
+        // handle first lets the top-level teardown join it after every guest
+        // thread has unregistered.
+        Err(crate::linux_abi::LINUX_EAGAIN.guest_retval())
+    } else {
+        Ok(child_tid)
+    }
 }
 
 /// Build a fresh, PRIVATE `SharedRun` for a `fork()` child. The parent's code
@@ -2553,6 +2672,8 @@ fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String>
         max_traps: parent.max_traps,
         free_slices: std::sync::Mutex::new(free_slices),
         threads: std::sync::Mutex::new(Vec::new()),
+        host_threads: std::sync::Mutex::new(std::collections::HashMap::new()),
+        host_threads_cv: std::sync::Condvar::new(),
         exit: ExitState::new(),
     }))
 }
@@ -2640,6 +2761,8 @@ pub(crate) fn run_static_x86_elf_bytes(
 
     fault::install_fault_redirect(signal_stub_addr(), CTX_FAULT_RECORD)
         .map_err(|e| RuntimeError::Unsupported(format!("install fault redirect: {e}")))?;
+    fault::install_kick_redirect(FREEBSD_NATIVE_EXIT_KICK_SIGNAL, kick_stub_addr())
+        .map_err(|e| RuntimeError::Unsupported(format!("install kick redirect: {e}")))?;
     fault::register_code_region(region.exec_base.as_ptr() as u64, cache_len as u64);
 
     // Back the guest brk-heap and mmap arenas with real host pages at the
@@ -2730,6 +2853,8 @@ pub(crate) fn run_static_x86_elf_bytes(
         max_traps,
         free_slices: std::sync::Mutex::new(free_slices),
         threads: std::sync::Mutex::new(Vec::new()),
+        host_threads: std::sync::Mutex::new(std::collections::HashMap::new()),
+        host_threads_cv: std::sync::Condvar::new(),
         exit: ExitState::new(),
     });
 
@@ -2763,7 +2888,7 @@ pub(crate) fn run_static_x86_elf_bytes(
     // the process exit (the last thread to exit, or an `exit_group`).
     let (exit_code, traps, trap_limit_hit, fault) = match outcome {
         ThreadRunOutcome::Exit { code, traps } => {
-            shared.exit.request(code);
+            shared.request_exit(code);
             (code, traps, false, None)
         }
         ThreadRunOutcome::ThreadDone { traps } => {
@@ -2771,11 +2896,20 @@ pub(crate) fn run_static_x86_elf_bytes(
             (code, traps, false, None)
         }
         ThreadRunOutcome::TrapLimit { traps } => {
-            shared.exit.request(125);
+            shared.request_exit(125);
             (125, traps, true, None)
         }
-        ThreadRunOutcome::Fault { detail, traps } => (125, traps, false, Some(detail)),
+        ThreadRunOutcome::Fault { detail, traps } => {
+            shared.request_exit(125);
+            (125, traps, false, Some(detail))
+        }
     };
+
+    // Linux exit_group does not merely publish an exit code: every sibling is
+    // gone before the process is observable as terminal. The wake above makes
+    // all blocking paths leave, and joining here closes the lifetime before we
+    // read final output or retire shared mappings.
+    shared.join_threads();
 
     // Drain the guest's stdout/stderr from the SHARED dispatcher buffer (every
     // guest thread's writes accumulate here); surface them in the RunResult
@@ -2783,19 +2917,12 @@ pub(crate) fn run_static_x86_elf_bytes(
     let stdout = shared.dispatcher.stdout();
     let stderr = shared.dispatcher.stderr();
 
-    // Teardown only when this run never spawned a guest thread. With live
-    // siblings still executing from the shared code cache / guest arenas,
-    // unmapping either would fault them; a multi-threaded probe run terminates
-    // the whole process right after this returns (native_run `process::exit`),
-    // so the OS reclaims everything. The single-thread path (the in-process
-    // test harness, which reuses the process across runs) still tears down.
-    if !shared.any_threads_spawned() {
-        fault::unregister_code_region();
-        // SAFETY: nothing executes from the JIT region in the single-thread case.
-        unsafe { shared.jit.unmap(&shared.region) };
-        shared.current_image().teardown();
-        arenas.teardown();
-    }
+    fault::unregister_code_region();
+    // SAFETY: the initial thread returned and every spawned guest thread was
+    // joined above, so nothing can execute from the JIT region now.
+    unsafe { shared.jit.unmap(&shared.region) };
+    shared.current_image().teardown();
+    arenas.teardown();
 
     if let Some(detail) = fault {
         return Err(RuntimeError::Unsupported(format!(
@@ -2861,6 +2988,7 @@ fn run_x86_thread(
     // guest's code pages keep their VAs), so it stays borrowed from the caller.
     let mut active = Arc::clone(shared);
     let mut tid = tid;
+    let mut host_registration = NativeHostThreadRegistration::new(&active, tid);
     // Mutable so an in-place `execve` can retire this and swap in the new image;
     // every guest-code reader below re-borrows it, so the swap is picked up. All
     // guest-code reads go through the segment-aware `image.code_bytes`, which
@@ -3171,6 +3299,13 @@ fn run_x86_thread(
         // With chaining the EXITING block may differ from the entered one, so
         // dispatch on the exit STATUS + snapshot.rip, not the entered block.
         match X86ExitStatus::from_raw(raw) {
+            Some(X86ExitStatus::Kicked) => {
+                if active.exit.requested() {
+                    continue;
+                }
+                fault_detail = Some("native x86 received a kick without an exit request".into());
+                break 'run;
+            }
             Some(X86ExitStatus::Signal) => {
                 // A synchronous guest fault (SIGSEGV/SIGBUS/SIGFPE/SIGILL). The
                 // shim recorded the host JIT RIP and data address. Reverse-map
@@ -3303,10 +3438,12 @@ fn run_x86_thread(
                         // the per-tid signal state (mask + SA_ONSTACK alt stack)
                         // is orphaned under the parent's tid unless re-keyed.
                         let parent_tid = tid;
+                        host_registration.abandon_inherited_after_fork();
                         match fork_child_rebuild(&active) {
                             Ok(child) => {
                                 active = child;
                                 tid = active.registry.main_tid();
+                                host_registration.rebind_after_fork(&active, tid);
                                 cursor = 0;
                                 cursor_limit = JIT_SLICE_LEN;
                                 cache.clear();
@@ -3632,7 +3769,15 @@ fn service_syscall(
     let request = SyscallRequest::from_raw(raw).with_current_guest_sp(Some(snapshot.gpr[reg::RSP]));
     let syscall_nr = request.number.raw();
     let outcome = match service_syscall_threaded(
-        dispatcher, request, memory, reporter, waiter, tid, registry, futex,
+        dispatcher,
+        request,
+        memory,
+        reporter,
+        waiter,
+        tid,
+        registry,
+        futex,
+        &shared.exit,
     ) {
         Ok(o) => o,
         Err(e) => return Step::Fault(format!("dispatch error: {e:?}")),
@@ -3743,7 +3888,7 @@ fn service_syscall(
         // signal interrupts. The dispatcher could not block under its own lock,
         // so it handed the prepared wait token out here.
         DispatchOutcome::FutexWait { wait, timeout } => {
-            let value = wait_x86_futex(futex, tid, wait, timeout, 0);
+            let value = wait_x86_futex(futex, &shared.exit, tid, wait, timeout, 0);
             snapshot.gpr[reg::RAX] = value as u64;
             // A signal-interrupted futex (EINTR) delivers its handler here.
             if let Some(sig) = run_pending_signals(
@@ -3764,7 +3909,7 @@ fn service_syscall(
             index,
         } => {
             // On a wake, `futex_waitv` returns the INDEX of the woken futex.
-            let value = wait_x86_futex(futex, tid, wait, timeout, index);
+            let value = wait_x86_futex(futex, &shared.exit, tid, wait, timeout, index);
             snapshot.gpr[reg::RAX] = value as u64;
             if let Some(sig) = run_pending_signals(
                 shared,
@@ -3802,6 +3947,7 @@ fn service_syscall(
                 location.waiter_key(),
                 value,
                 timeout,
+                &|| shared.exit.requested(),
             );
             crate::thread::set_current_thread_state(tid, 'R');
             snapshot.gpr[reg::RAX] = retval as u64;
@@ -3832,6 +3978,7 @@ fn service_syscall(
                 location.waiter_key(),
                 value,
                 timeout,
+                &|| shared.exit.requested(),
             );
             crate::thread::set_current_thread_state(tid, 'R');
             let retval = if retval == 0 { index } else { retval };
@@ -4196,12 +4343,17 @@ fn wait_requeued_umtx(
     waiter_key: usize,
     mut generation: u32,
     deadline: Option<std::time::Instant>,
+    interrupted: &dyn Fn() -> bool,
 ) -> i64 {
     use std::sync::atomic::Ordering;
     let Some(slot) = shared_waiter_slot(waiter_key) else {
         return crate::linux_abi::LINUX_EAGAIN.guest_retval();
     };
     loop {
+        if interrupted() {
+            decrement_logical_requeued(slot);
+            return crate::linux_abi::LINUX_EINTR.guest_retval();
+        }
         if consume_waiter_assignment(&slot.logical_wake) {
             decrement_logical_requeued(slot);
             return 0;
@@ -4292,73 +4444,73 @@ fn shared_futex_wait_umtx(
     waiter_key: usize,
     value: u32,
     timeout: Option<std::time::Duration>,
+    interrupted: &dyn Fn() -> bool,
 ) -> i64 {
     use std::sync::atomic::Ordering;
+    if interrupted() {
+        return crate::linux_abi::LINUX_EINTR.guest_retval();
+    }
     let deadline = timeout.and_then(|duration| std::time::Instant::now().checked_add(duration));
-    let (word, waiter_key, value) = (word, waiter_key, value);
-    loop {
-        let remaining = match deadline {
-            Some(deadline) => {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    return crate::linux_abi::LINUX_ETIMEDOUT.guest_retval();
-                }
-                Some(remaining)
+    let remaining = match deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return crate::linux_abi::LINUX_ETIMEDOUT.guest_retval();
             }
-            None => None,
-        };
-        let ts = remaining.map(|duration| libc::timespec {
-            tv_sec: duration.as_secs() as libc::time_t,
-            tv_nsec: duration.subsec_nanos() as libc::c_long,
-        });
-        let (uaddr, uaddr2) = match &ts {
-            Some(ts) => (
-                UMTX_TIMESPEC_SIZE as *mut libc::c_void,
-                ts as *const libc::timespec as *mut libc::c_void,
-            ),
-            None => (std::ptr::null_mut(), std::ptr::null_mut()),
-        };
-        // Announce this parked waiter under its stable backing key so a peer's
-        // WAKE can report how many it woke even when it mapped the same file at
-        // another VA after exec. Increment before the park and decrement after
-        // every return path.
-        let slot = shared_waiter_slot(waiter_key);
-        if let Some(slot) = slot {
-            slot.count.fetch_add(1, Ordering::SeqCst);
+            Some(remaining)
         }
-        // SAFETY: `word` is an identity host VA of a guest-mapped,
-        // 4-byte-aligned shared futex word; `_umtx_op` only reads it.
-        let rc = unsafe {
-            libc::syscall(
-                SYS_UMTX_OP,
-                word as *mut u32 as *mut libc::c_void,
-                UMTX_OP_WAIT_UINT,
-                value as libc::c_ulong,
-                uaddr,
-                uaddr2,
-            )
-        } as libc::c_long;
-        if let Some(slot) = slot {
-            slot.count.fetch_sub(1, Ordering::SeqCst);
-        }
-        if rc == 0 {
-            match take_shared_wait_assignment(slot) {
-                SharedWaitAssignment::Direct => return 0,
-                SharedWaitAssignment::Requeue {
-                    waiter_key: next_key,
-                    generation,
-                } => return wait_requeued_umtx(next_key, generation, deadline),
-            }
-        }
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        return match errno {
-            libc::ETIMEDOUT => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
-            libc::EINTR => crate::linux_abi::LINUX_EINTR.guest_retval(),
-            // `*word != value` at entry (a peer already advanced it): Linux
-            // returns EAGAIN and the guest retry loop re-reads the word.
-            libc::EAGAIN => crate::linux_abi::LINUX_EAGAIN.guest_retval(),
-            _ => crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+        None => None,
+    };
+    let ts = remaining.map(|duration| libc::timespec {
+        tv_sec: duration.as_secs() as libc::time_t,
+        tv_nsec: duration.subsec_nanos() as libc::c_long,
+    });
+    let (uaddr, uaddr2) = match &ts {
+        Some(ts) => (
+            UMTX_TIMESPEC_SIZE as *mut libc::c_void,
+            ts as *const libc::timespec as *mut libc::c_void,
+        ),
+        None => (std::ptr::null_mut(), std::ptr::null_mut()),
+    };
+    // Announce this parked waiter under its stable backing key so a peer's
+    // WAKE can report how many it woke even when it mapped the same file at
+    // another VA after exec. Increment before the park and decrement after
+    // every return path.
+    let slot = shared_waiter_slot(waiter_key);
+    if let Some(slot) = slot {
+        slot.count.fetch_add(1, Ordering::SeqCst);
+    }
+    // SAFETY: `word` is an identity host VA of a guest-mapped,
+    // 4-byte-aligned shared futex word; `_umtx_op` only reads it.
+    let rc = unsafe {
+        libc::syscall(
+            SYS_UMTX_OP,
+            word as *mut u32 as *mut libc::c_void,
+            UMTX_OP_WAIT_UINT,
+            value as libc::c_ulong,
+            uaddr,
+            uaddr2,
+        )
+    } as libc::c_long;
+    if let Some(slot) = slot {
+        slot.count.fetch_sub(1, Ordering::SeqCst);
+    }
+    if rc == 0 {
+        return match take_shared_wait_assignment(slot) {
+            SharedWaitAssignment::Direct => 0,
+            SharedWaitAssignment::Requeue {
+                waiter_key: next_key,
+                generation,
+            } => wait_requeued_umtx(next_key, generation, deadline, interrupted),
         };
+    }
+    match std::io::Error::last_os_error().raw_os_error().unwrap_or(0) {
+        libc::ETIMEDOUT => crate::linux_abi::LINUX_ETIMEDOUT.guest_retval(),
+        libc::EINTR => crate::linux_abi::LINUX_EINTR.guest_retval(),
+        // `*word != value` at entry (a peer already advanced it): Linux returns
+        // EAGAIN and the guest retry loop re-reads the word.
+        libc::EAGAIN => crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+        _ => crate::linux_abi::LINUX_EAGAIN.guest_retval(),
     }
 }
 
@@ -4490,6 +4642,7 @@ fn shared_futex_wake_umtx(word: usize, waiter_key: usize, count: u32) -> i64 {
 /// the syscall boundary delivers the handler.
 fn wait_x86_futex(
     futex: &crate::thread::FutexTable,
+    exit: &ExitState,
     tid: crate::thread::ThreadId,
     wait: crate::thread::FutexWait,
     timeout: Option<std::time::Duration>,
@@ -4500,7 +4653,11 @@ fn wait_x86_futex(
     // back to 'R' (running) once it is woken.
     crate::thread::set_current_thread_state(tid, 'S');
     let interrupted = || {
-        crate::host_signal::has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
+        exit.requested()
+            || crate::host_signal::has_unblocked_pending_for(
+                tid.raw(),
+                carrick_abi::SigBlockMask::NONE,
+            )
     };
     let outcome = futex.wait_prepared_for_thread(wait, timeout, tid, &interrupted);
     crate::thread::set_current_thread_state(tid, 'R');
@@ -4533,6 +4690,7 @@ fn service_syscall_threaded(
     tid: crate::thread::ThreadId,
     registry: &crate::thread::ThreadRegistry,
     futex: &crate::thread::FutexTable,
+    exit: &ExitState,
 ) -> Result<DispatchOutcome, crate::dispatch::DispatchError> {
     use crate::io_wait::{WaitFd, WaitResult};
     const EINTR: crate::linux_abi::LinuxErrno = crate::linux_abi::LINUX_EINTR;
@@ -4554,6 +4712,9 @@ fn service_syscall_threaded(
     // raise lands there), matching the shared KVM servicer.
     let signal_pending = |mask: carrick_abi::WaitSigMask| {
         move || {
+            if exit.requested() {
+                return true;
+            }
             drain_native_child_exit_watches(false);
             dispatcher.drain_xsignals_process_directed();
             crate::host_signal::has_unblocked_pending_for(tid.raw(), mask.block_mask())
@@ -4683,10 +4844,11 @@ fn service_syscall_threaded(
                 match crate::dispatch::drive_blocking_host_write(&mut write) {
                     crate::dispatch::BlockingHostWriteStep::Done(o) => return Ok(o),
                     crate::dispatch::BlockingHostWriteStep::Wait => {
-                        match waiter.wait(
+                        match waiter.wait_with_dispatch_pending(
                             &[WaitFd::raw(write.host_fd(), libc::POLLOUT)],
                             None,
                             carrick_abi::SigBlockMask::NONE,
+                            || exit.requested(),
                         ) {
                             WaitResult::Ready => continue,
                             WaitResult::Interrupted | WaitResult::TimedOut => {
@@ -4707,6 +4869,9 @@ fn service_syscall_threaded(
                 }
             },
             DispatchOutcome::BlockingRecordLock(lock) => {
+                if exit.requested() {
+                    return Ok(DispatchOutcome::Errno { errno: EINTR });
+                }
                 return Ok(crate::dispatch::drive_blocking_record_lock(&lock));
             }
             DispatchOutcome::WaitOnSignals {
@@ -4726,6 +4891,9 @@ fn service_syscall_threaded(
                 // promptly and the re-dispatch's `take_pending_in_from` /
                 // `take_pending_in_for` returns the signum.
                 let pending = move || {
+                    if exit.requested() {
+                        return true;
+                    }
                     drain_native_child_exit_watches(false);
                     dispatcher.drain_xsignals_process_directed();
                     crate::host_signal::has_unblocked_pending_for(tid.raw(), block_mask)
@@ -4739,6 +4907,9 @@ fn service_syscall_threaded(
                 match waiter.wait_with_dispatch_pending(&[], timeout, block_mask, pending) {
                     WaitResult::Ready => continue,
                     WaitResult::Interrupted => {
+                        if exit.requested() {
+                            return Ok(DispatchOutcome::Errno { errno: EINTR });
+                        }
                         // A pending signal OUTSIDE the wait set completes with
                         // EINTR; a wait-set signal (or a spurious wake) re-dispatches
                         // so `rt_sigtimedwait` dequeues + returns it.
@@ -4777,8 +4948,9 @@ fn service_syscall_threaded(
                 }
             }
             DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
-                match waiter.wait_proc_state_with_dispatch_pending(sig_mask.block_mask(), || false)
-                {
+                match waiter.wait_proc_state_with_dispatch_pending(sig_mask.block_mask(), || {
+                    exit.requested()
+                }) {
                     WaitResult::Ready | WaitResult::TimedOut => continue,
                     WaitResult::Interrupted => {
                         return Ok(DispatchOutcome::Errno { errno: EINTR });
@@ -4794,6 +4966,9 @@ fn service_syscall_threaded(
                 // syscall result. Park through FreeBSD's cross-process umtx,
                 // then re-dispatch under fresh queue state. A value race before
                 // the park is EAGAIN and means the same thing: re-check now.
+                if exit.requested() {
+                    return Ok(DispatchOutcome::Errno { errno: EINTR });
+                }
                 let retval = carrick_host::shared_word::wait(location.wait_addr().raw(), value, 0);
                 if retval == 0 {
                     continue;

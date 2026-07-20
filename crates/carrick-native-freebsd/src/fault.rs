@@ -41,6 +41,7 @@ const GUEST_FAULT_SIGNALS: [libc::c_int; 4] =
 static CODE_BASE: AtomicU64 = AtomicU64::new(0);
 static CODE_LEN: AtomicU64 = AtomicU64::new(0);
 static SIGNAL_STUB: AtomicU64 = AtomicU64::new(0);
+static KICK_STUB: AtomicU64 = AtomicU64::new(0);
 static FAULT_RECORD_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 // The dispositions replaced at install time, restored when a fault is NOT
@@ -110,6 +111,50 @@ pub fn install_fault_redirect(signal_stub: u64, fault_record_offset: u32) -> io:
         }
     }
     Ok(())
+}
+
+/// Install a non-restarting asynchronous kick. Outside translated code the
+/// empty handler merely interrupts the current host syscall. Inside the JIT
+/// cache it rewrites RIP to `kick_stub`, giving the runtime the same typed
+/// boundary that a VMM backend gets when its vCPU run call is kicked.
+pub fn install_kick_redirect(signal: libc::c_int, kick_stub: u64) -> io::Result<()> {
+    KICK_STUB.store(kick_stub, Ordering::Release);
+    // SAFETY: well-formed SA_SIGINFO action; the handler is async-signal-safe.
+    unsafe {
+        let mut action: libc::sigaction = MaybeUninit::zeroed().assume_init();
+        action.sa_sigaction = native_kick_handler as unsafe extern "C" fn(_, _, _) as usize;
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Kick handler: no allocation, TLS, locks, or libc calls. A signal outside
+/// translated code returns normally, causing a blocking host syscall to report
+/// EINTR because the action intentionally omits SA_RESTART.
+unsafe extern "C" fn native_kick_handler(
+    _signal: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    ucontext: *mut libc::c_void,
+) {
+    // SAFETY: the kernel supplies a valid ucontext to SA_SIGINFO handlers.
+    unsafe {
+        let uc = ucontext.cast::<libc::ucontext_t>();
+        let mc = &mut (*uc).uc_mcontext;
+        let base = CODE_BASE.load(Ordering::Acquire);
+        let len = CODE_LEN.load(Ordering::Acquire);
+        let stub = KICK_STUB.load(Ordering::Acquire);
+        let rip = mc.mc_rip as u64;
+        if base != 0 && stub != 0 && rip >= base && rip < base.saturating_add(len) {
+            // Translated execution pins the gateway context in r15. Sigreturn
+            // restores all guest registers, then the kick stub captures them
+            // through the ordinary common exit path.
+            mc.mc_rip = stub as libc::register_t;
+        }
+    }
 }
 
 /// The signal handler. Signal-async discipline: NO TLS (the guest fs base

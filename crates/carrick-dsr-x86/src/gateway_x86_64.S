@@ -116,6 +116,15 @@ carrick_dsr_x86_exit_signal:
     movl $4, CTX_EXIT_STATUS(%r15)   // X86ExitStatus::Signal
     jmp carrick_dsr_x86_exit_common
 
+// Asynchronous runtime kick: the FreeBSD exit-group signal shim redirects a
+// translated thread here. No fault record is written; the runtime only needs
+// a safe gateway boundary so it can observe the process-exit rendezvous.
+.globl carrick_dsr_x86_exit_kicked
+.p2align 4
+carrick_dsr_x86_exit_kicked:
+    movl $7, CTX_EXIT_STATUS(%r15)   // X86ExitStatus::Kicked
+    jmp carrick_dsr_x86_exit_common
+
 .globl carrick_dsr_x86_exit_common
 carrick_dsr_x86_exit_common:
     // Save guest GPRs (movs preserve flags). Skip r15 (== ctx).

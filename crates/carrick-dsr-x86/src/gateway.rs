@@ -92,6 +92,8 @@ pub enum X86ExitStatus {
     Sensitive = 6,
     /// A host signal (guest fault) captured by the trap shim.
     Signal = 4,
+    /// An asynchronous host kick requesting a return to the run loop.
+    Kicked = 7,
 }
 
 impl X86ExitStatus {
@@ -101,6 +103,7 @@ impl X86ExitStatus {
             3 => Some(Self::Indirect),
             6 => Some(Self::Sensitive),
             4 => Some(Self::Signal),
+            7 => Some(Self::Kicked),
             _ => None,
         }
     }
@@ -315,6 +318,7 @@ mod native_gateway {
         fn carrick_dsr_x86_exit_indirect();
         fn carrick_dsr_x86_exit_sensitive();
         fn carrick_dsr_x86_exit_signal();
+        fn carrick_dsr_x86_exit_kicked();
     }
 
     /// Absolute address of the signal exit stub — what the host-OS seam's
@@ -322,6 +326,11 @@ mod native_gateway {
     /// fault (paired with [`super::CTX_FAULT_RECORD`]).
     pub fn signal_stub_addr() -> u64 {
         carrick_dsr_x86_exit_signal as *const () as u64
+    }
+
+    /// Absolute address of the asynchronous host-kick exit stub.
+    pub fn kick_stub_addr() -> u64 {
+        carrick_dsr_x86_exit_kicked as *const () as u64
     }
 
     /// Absolute addresses of the three exit stubs. Emitted code branches to
@@ -356,7 +365,7 @@ mod native_gateway {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use native_gateway::{enter_translated, exit_stub_addresses, signal_stub_addr};
+pub use native_gateway::{enter_translated, exit_stub_addresses, kick_stub_addr, signal_stub_addr};
 
 /// Off-x86 fail-closed complement: the gateway only exists on x86_64. This
 /// keeps the crate compiling (and unit-testable) on other host arches, where

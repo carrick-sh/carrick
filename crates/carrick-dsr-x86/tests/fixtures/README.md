@@ -45,3 +45,26 @@ clang --target=x86_64-linux-musl -nostdlib -fuse-ld=lld -pie \
   -Wl,--dynamic-linker,/lib/carrick-dynamic-interpreter -Wl,-e,_start \
   -o dynamic-main-x86_64-linux dynamic-main.S
 ```
+
+The `exitgroup-sibling-*-x86_64-linux` binaries come from one bare-static
+assembly fixture. Private/shared modes park the initial thread indefinitely in
+the corresponding `FUTEX_WAIT` while a sibling calls `exit_group(37)`; immediate
+mode makes that call directly after clone to race handle publication; busy mode
+has a sibling spin forever in chained JIT code while the initial thread calls
+`exit_group(0)`. Together they prove blocking-wait release, clone teardown, and
+asynchronous translated-code kicks before native arena teardown. Regenerate
+them with FreeBSD clang/lld:
+
+```sh
+clang --target=x86_64-linux-gnu -nostdlib -static -Wl,--build-id=none \
+  -o exitgroup-sibling-futex-x86_64-linux exitgroup-sibling-futex.S
+clang --target=x86_64-linux-gnu -DSHARED_FUTEX -nostdlib -static \
+  -Wl,--build-id=none -o exitgroup-sibling-shared-futex-x86_64-linux \
+  exitgroup-sibling-futex.S
+clang --target=x86_64-linux-gnu -DIMMEDIATE_CHILD -nostdlib -static \
+  -Wl,--build-id=none -o exitgroup-sibling-immediate-x86_64-linux \
+  exitgroup-sibling-futex.S
+clang --target=x86_64-linux-gnu -DBUSY_SIBLING -nostdlib -static \
+  -Wl,--build-id=none -o exitgroup-sibling-busy-x86_64-linux \
+  exitgroup-sibling-futex.S
+```
