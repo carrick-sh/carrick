@@ -124,20 +124,16 @@ mod commands;
 mod debug;
 mod fs_setup;
 mod lifecycle;
-// `perf_stats` + the bulk of `trace_profile` back the DTrace-based
-// `carrick trace --profile` pipeline, whose capture/summary arms are
-// macOS-only today (`commands.rs` imports them under `cfg(target_os =
-// "macos")`); the cross-platform residue is `TraceProfileKind` (arg
-// parsing). Dead-code is allowed rather than the modules gated so the
-// shared vocabulary stays in one place until the trace CLI grows a
-// FreeBSD capture backend.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// `perf_stats` + the bulk of `trace_profile` back the BSD libdtrace-based
+// `carrick trace --profile` pipeline. Other hosts retain only the shared
+// `TraceProfileKind` argument vocabulary.
+#[cfg_attr(not(any(target_os = "macos", target_os = "freebsd")), allow(dead_code))]
 mod perf_stats;
 mod runtime_util;
 mod serve;
 mod supervisor_perf;
 mod trace_cli;
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "freebsd")), allow(dead_code))]
 mod trace_profile;
 
 use clap::Parser;

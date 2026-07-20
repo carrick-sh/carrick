@@ -98,11 +98,11 @@ use crate::runtime_util::{
     block_on_oci, emit_raw, human_age, human_size, parse_env_file, parse_mount_flag,
     parse_publish_specs, parse_volume_mount, resolve_volumes_from_specs, truncate_str,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::trace_cli::{
     TraceSudoInvocation, current_supplementary_groups, trace_drop_credentials, trace_sudo_argv,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::trace_profile::{ProfileSummary, capture_provenance, write_summary_atomic};
 
 pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
@@ -1019,14 +1019,14 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             trace_groups,
             command,
         } => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
             {
                 crate::trace_cli::exec_trace_child(trace_uid, trace_gid, &trace_groups, &command)?;
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
             {
                 let _ = (trace_uid, trace_gid, trace_groups, command);
-                bail!("trace child execution is only available on macOS.");
+                bail!("trace child execution requires a host libdtrace implementation.");
             }
         }
         Commands::Trace {
@@ -1041,7 +1041,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             trace_gid,
             trace_groups,
         } => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
             {
                 // Apply env vars carried across the sudo re-exec as CLI args.
                 for kv in &forward_env {
@@ -1155,7 +1155,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     }
                 }
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
             {
                 let _ = (
                     flowindent,
@@ -1169,7 +1169,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     trace_gid,
                     trace_groups,
                 );
-                bail!("carrick trace is only available on macOS (libdtrace).");
+                bail!("carrick trace requires a host libdtrace implementation.");
             }
         }
         Commands::Volume { command } => run_volume_command(command)?,
