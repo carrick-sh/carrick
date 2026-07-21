@@ -37,7 +37,9 @@
 //! ## `brk` and the `/proc` views
 //!
 //! `brk` advances/retreats the program break (`brk_current`) within the heap
-//! region. `/proc/self/maps` is rendered from the boot-captured `AddressSpace`
+//! region. Shrinking scrubs the page-aligned released backing so a later growth
+//! re-exposes zero-filled memory, matching Linux's anonymous-memory contract.
+//! `/proc/self/maps` is rendered from the boot-captured `AddressSpace`
 //! snapshot (`address_space_regions`) with the heap end tracking `brk_current`
 //! and the mmap arena end tracking `mmap_next`; `/proc/self/auxv` echoes the
 //! exact serialized ELF auxiliary vector written to the guest stack at exec
@@ -1131,12 +1133,41 @@ impl SyscallDispatcher {
 
         fn brk(this, cx, requested: u64) {
             let mut mem = this.mem.lock();
+            let current = mem.brk_current;
             if requested == 0 {
                 return Ok(DispatchOutcome::Returned {
-                    value: mem.brk_current as i64,
+                    value: current as i64,
                 });
             }
             if range_within(requested, 0, mem.layout.heap_base, mem.layout.heap_size) {
+                if requested < current {
+                    let page_size = this.linux_page_size();
+                    let Some(clear_start) = align_up_u64(requested, page_size) else {
+                        return Ok(DispatchOutcome::Returned {
+                            value: current as i64,
+                        });
+                    };
+                    let Some(clear_end) = align_up_u64(current, page_size) else {
+                        return Ok(DispatchOutcome::Returned {
+                            value: current as i64,
+                        });
+                    };
+                    let Some(clear_len) = clear_end
+                        .checked_sub(clear_start)
+                        .and_then(|len| usize::try_from(len).ok())
+                    else {
+                        return Ok(DispatchOutcome::Returned {
+                            value: current as i64,
+                        });
+                    };
+                    if clear_len != 0
+                        && cx.memory.zero_backing(clear_start, clear_len).is_err()
+                    {
+                        return Ok(DispatchOutcome::Returned {
+                            value: current as i64,
+                        });
+                    }
+                }
                 mem.brk_current = requested;
             }
             Ok(DispatchOutcome::Returned {
@@ -4209,6 +4240,33 @@ mod tests {
         assert_eq!(
             dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0),
             Some((LINUX_MMAP_BASE, false))
+        );
+    }
+
+    #[test]
+    fn brk_shrink_scrubs_backing_before_regrowth() {
+        const SYS_BRK: u64 = 214;
+        const PAGES: u64 = 3;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let initial = dispatcher.mem.lock().layout.heap_base;
+        let grown = initial + PAGES * LINUX_PAGE_SIZE;
+        dispatcher.mem.lock().brk_current = grown;
+
+        let mut memory = CountingMmapMemory::new(initial, (PAGES * LINUX_PAGE_SIZE) as usize);
+        memory.bytes.fill(0xa5);
+        let reporter = CompatReporter::default();
+        let shrink = SyscallRequest::new(SYS_BRK, SyscallArgs([initial, 0, 0, 0, 0, 0]));
+
+        let outcome = dispatcher
+            .dispatch(shrink, &mut memory, &reporter)
+            .expect("brk shrink dispatch should succeed");
+
+        assert_eq!(returned(outcome), initial as i64);
+        assert_eq!(memory.zero_backing_calls.get(), 1);
+        assert!(
+            memory.bytes.iter().all(|byte| *byte == 0),
+            "a later brk growth must not re-expose stale heap bytes"
         );
     }
 

@@ -1,6 +1,7 @@
 //! brk heap-growth conformance: the program break must be growable far past its
-//! initial position, and every page of the grown range must be readable
-//! (zero-filled) and writable on FIRST touch. The bhyve/x86 backend eagerly
+//! initial position, and every page of the grown range must be readable,
+//! zero-filled (including after shrink/regrow), and writable on first touch.
+//! The bhyve/x86 backend eagerly
 //! GPA-backed only the first 4 MiB of the 128 MiB heap window (`M2_HEAP_CAP`)
 //! and left the tail with neither a window nor a demand-commit reservation, so
 //! the first guest store past `LINUX_HEAP_BASE + 4 MiB` took a #PF that
@@ -10,10 +11,9 @@
 //!
 //! This probe grows the break by 32 MiB, touches a byte every 64 KiB ascending
 //! (verifying zero-fill), writes + verifies a pattern, shrinks back to the
-//! initial break, regrows, and touches again. Regrown CONTENT is deliberately
-//! not compared (Linux zero-fills a shrink+regrow; carrick keeps the pages
-//! backed on every lane — a separate, pre-existing gap): the invariant here is
-//! grow/touch/readback, byte-exact and address-free.
+//! initial break, then regrows and verifies Linux's zero-fill guarantee before
+//! writing again. Stale bytes here corrupt glibc `calloc`: glibc may treat
+//! regrown `MORECORE` space as kernel-zeroed without clearing it itself.
 //!
 //! Raw `SYS_brk` is used directly: musl's `sbrk()` is a stub that fails with
 //! ENOMEM for any nonzero increment, and the glibc build's malloc owns the
@@ -97,6 +97,19 @@ fn main() {
     line("brk_shrink", shrunk == initial);
     let regrown = brk(target);
     line("brk_regrow", regrown == target);
+
+    let mut regrow_zero_ok = true;
+    off = 0;
+    while off < GROW {
+        if unsafe { base.add(off).read_volatile() } != 0 {
+            regrow_zero_ok = false;
+        }
+        off += STEP;
+    }
+    if unsafe { base.add(GROW - 1).read_volatile() } != 0 {
+        regrow_zero_ok = false;
+    }
+    line("regrow_zero_fill", regrow_zero_ok);
 
     off = 0;
     while off < GROW {
