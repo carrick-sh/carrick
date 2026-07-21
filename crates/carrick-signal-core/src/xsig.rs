@@ -52,6 +52,31 @@ struct XSigRing {
 static XSIG_RING: AtomicPtr<XSigRing> = AtomicPtr::new(std::ptr::null_mut());
 static XSIG_RING_FD: AtomicI32 = AtomicI32::new(-1);
 static XSIG_DIRTY: AtomicBool = AtomicBool::new(false);
+// `getpid(2)` is not a vDSO read on FreeBSD. Wait predicates inspect the ring
+// before and after every guest futex park, so resolving the unchanged process
+// identity there amplified a short Go scheduler sleep into two extra host
+// syscalls. Refreshed explicitly at every fork-child/reexec boundary below.
+static XSIG_SELF_HOST_PID: AtomicI32 = AtomicI32::new(0);
+
+fn xsig_self_host_pid() -> i32 {
+    let cached = XSIG_SELF_HOST_PID.load(Ordering::Acquire);
+    if cached > 0 {
+        cached
+    } else {
+        let pid = std::process::id() as i32;
+        XSIG_SELF_HOST_PID.store(pid, Ordering::Release);
+        pid
+    }
+}
+
+/// Refresh the cached host-process identity after `fork(2)` or host reexec.
+///
+/// The xsignal mapping is inherited across fork, but its target identity is not.
+/// Every backend fork-child reset must call this before inspecting or draining
+/// the inherited shared ring.
+pub fn xsig_refresh_self_host_pid() {
+    XSIG_SELF_HOST_PID.store(std::process::id() as i32, Ordering::Release);
+}
 
 /// Allocate the shared xsignal ring once. A deleted temporary file backs the
 /// mapping so native fork-children can carry its fd through a host self-reexec
@@ -59,6 +84,7 @@ static XSIG_DIRTY: AtomicBool = AtomicBool::new(false);
 /// fd. Best-effort — a failed allocation leaves the ring absent and senders
 /// fall back to a plain host `kill`.
 pub fn xsig_init() {
+    xsig_refresh_self_host_pid();
     if !XSIG_RING.load(Ordering::Acquire).is_null() {
         return;
     }
@@ -90,6 +116,7 @@ pub fn xsig_reexec_fd() -> Option<i32> {
 /// has no old ring mapping, while ordinary fork descendants hit the idempotent
 /// already-mapped path and keep their inherited fd.
 pub fn xsig_adopt_reexec_fd(fd: i32) -> bool {
+    xsig_refresh_self_host_pid();
     if fd < 0 {
         return false;
     }
@@ -220,7 +247,7 @@ pub fn xsig_has_unblocked_for_self(block_mask: carrick_abi::SigBlockMask) -> boo
     let Some(ring) = xsig_ring() else {
         return false;
     };
-    let me = std::process::id() as i32;
+    let me = xsig_self_host_pid();
     for slot in ring.slots.iter() {
         if slot.used.load(Ordering::Acquire) == 2
             && slot.target_host_pid.load(Ordering::Acquire) == me
@@ -241,7 +268,7 @@ pub fn xsig_drain_for_self() -> Vec<(i32, i32, i32, u32, i64, i32)> {
     let Some(ring) = xsig_ring() else {
         return out;
     };
-    let me = std::process::id() as i32;
+    let me = xsig_self_host_pid();
     for slot in ring.slots.iter() {
         // Only consider published entries (`== 2`) targeting THIS process. The
         // target check happens BEFORE the claim so a thread never claims a slot
@@ -304,6 +331,15 @@ mod tests {
     }
 
     #[test]
+    fn self_pid_cache_refreshes_at_process_boundaries() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        XSIG_SELF_HOST_PID.store(1, Ordering::Release);
+        assert_eq!(xsig_self_host_pid(), 1);
+        xsig_refresh_self_host_pid();
+        assert_eq!(xsig_self_host_pid(), std::process::id() as i32);
+    }
+
+    #[test]
     fn xsig_init_is_idempotent() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         xsig_init();
@@ -359,6 +395,17 @@ mod tests {
         mark_xsig_dirty();
         assert!(xsig_has_pending());
         reset_ring();
+    }
+
+    #[test]
+    fn empty_ring_rechecks_reuse_cached_self_pid() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_ring();
+        for _ in 0..10_000 {
+            assert!(!xsig_has_unblocked_for_self(
+                carrick_abi::SigBlockMask::NONE
+            ));
+        }
     }
 
     #[test]

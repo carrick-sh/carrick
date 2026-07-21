@@ -792,6 +792,7 @@ pub use carrick_host_bsd::{duplicate_internal_fd, relocate_internal_fd};
 /// with the parent (cross-process spurious wakes). Give the child a fresh
 /// self-pipe so its parked-thread wakes are its own.
 pub fn reinit_after_fork() {
+    carrick_signal_core::xsig::xsig_refresh_self_host_pid();
     open_pending_pipe();
     // The parent's pump kqueue fd is meaningless in the child; the child
     // re-spawns its own pump (which calls set_pump_kqueue). Until then, no
@@ -825,6 +826,7 @@ pub fn reinit_after_fork() {
 /// installs default handlers, so the child does not inherit stale pending
 /// signals, routed-handler bookkeeping, or the supervisor's self-pipe fds.
 pub fn reset_after_supervisor_fork() {
+    carrick_signal_core::xsig::xsig_refresh_self_host_pid();
     INSTALLED.store(0, Ordering::SeqCst);
     host_disposition::clear_all();
     clear_thread_pending();
