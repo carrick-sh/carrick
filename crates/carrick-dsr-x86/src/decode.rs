@@ -117,10 +117,11 @@ pub fn classify(bytes: &[u8], va: u64) -> Result<X86Classified, X86DecodeError> 
 /// so nothing FPU/vector escapes detection; the cost is paid once per block at
 /// translation time (cached thereafter).
 fn instruction_uses_fpu(inst: &Instruction) -> bool {
-    // Instructions that touch the SSE control/status word or the whole FPU
-    // area WITHOUT naming a vector register operand — they still mutate state
-    // inside the fxsave image, so a block containing one must not skip the
-    // save/restore.
+    // Instructions that touch control/status or whole extended-state areas
+    // WITHOUT naming a vector register operand still require the gateway's
+    // complete XSAVE/XRSTOR switch. PKRU is included: although it is not a
+    // vector register, letting guest WRPKRU leak into Rust changes host memory
+    // access rights.
     if matches!(
         inst.code(),
         Code::Ldmxcsr_m32
@@ -131,6 +132,20 @@ fn instruction_uses_fpu(inst: &Instruction) -> bool {
             | Code::Fxsave64_m512byte
             | Code::Fxrstor_m512byte
             | Code::Fxrstor64_m512byte
+            | Code::Xsave_mem
+            | Code::Xsave64_mem
+            | Code::Xrstor_mem
+            | Code::Xrstor64_mem
+            | Code::Xsaveopt_mem
+            | Code::Xsaveopt64_mem
+            | Code::Xsavec_mem
+            | Code::Xsavec64_mem
+            | Code::Xsaves_mem
+            | Code::Xsaves64_mem
+            | Code::Xrstors_mem
+            | Code::Xrstors64_mem
+            | Code::Rdpkru
+            | Code::Wrpkru
     ) {
         return true;
     }
@@ -315,9 +330,13 @@ mod tests {
         assert!(one(&[0x66, 0x0f, 0xfe, 0xc1]).uses_fpu);
         // x87: fld st(0) implicitly (d9 c0) touches st.
         assert!(one(&[0xd9, 0xc0]).uses_fpu);
-        // ldmxcsr [rax] (0f ae 10) touches the SSE control word with no xmm
-        // operand — still must be flagged.
-        assert!(one(&[0x0f, 0xae, 0x10]).uses_fpu);
+        // State-control instructions with no vector operand must still switch
+        // the full extended state, including process-affecting PKRU.
+        assert!(one(&[0x0f, 0xae, 0x10]).uses_fpu); // ldmxcsr [rax]
+        assert!(one(&[0x0f, 0xae, 0x20]).uses_fpu); // xsave [rax]
+        assert!(one(&[0x0f, 0xae, 0x28]).uses_fpu); // xrstor [rax]
+        assert!(one(&[0x0f, 0x01, 0xee]).uses_fpu); // rdpkru
+        assert!(one(&[0x0f, 0x01, 0xef]).uses_fpu); // wrpkru
     }
 
     #[test]

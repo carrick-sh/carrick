@@ -182,6 +182,94 @@ fn conditional_fpu_save_preserves_xmm_across_a_skipping_block() {
 }
 
 #[test]
+fn ymm_upper_half_survives_a_gateway_round_trip() {
+    if !std::arch::is_x86_feature_detected!("avx") {
+        return;
+    }
+
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+    let data = map_rw(4096);
+    let result = unsafe { data.add(64) };
+    let pattern: Vec<u8> = (0..32).map(|value| value ^ 0xa5).collect();
+    unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, pattern.len()) };
+    let stack = map_rw(64 * 1024);
+
+    const GUEST_CODE_BASE: u64 = 0x18_0000;
+    let mut program = vec![0x48, 0xb8]; // movabs rax, data
+    program.extend_from_slice(&(data as u64).to_le_bytes());
+    program.extend_from_slice(&[0xc5, 0xfe, 0x6f, 0x00]); // vmovdqu ymm0, [rax]
+    program.extend_from_slice(&[0xb8, 39, 0, 0, 0]); // getpid
+    program.extend_from_slice(&[0x0f, 0x05]);
+    program.extend_from_slice(&[0x48, 0xb8]); // movabs rax, result
+    program.extend_from_slice(&(result as u64).to_le_bytes());
+    program.extend_from_slice(&[0xc5, 0xfe, 0x7f, 0x00]); // vmovdqu [rax], ymm0
+    program.extend_from_slice(&[0xbf, 0, 0, 0, 0]);
+    program.extend_from_slice(&[0xb8]);
+    program.extend_from_slice(&(SYS_EXIT_GROUP as u32).to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]);
+
+    let read_guest = |va: u64| -> Vec<u8> {
+        let off = (va - GUEST_CODE_BASE) as usize;
+        program
+            .get(off..)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default()
+    };
+    let mut cursor = 0usize;
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack as u64 + 64 * 1024;
+    let mut next = GUEST_CODE_BASE;
+
+    for _ in 0..4 {
+        let block = plan_block(next, 256, 4096, read_guest).expect("plan");
+        let source = read_guest(block.start);
+        let body_len = (block.end - block.start) as usize;
+        let translated = emit_block(&source[..body_len], &block).expect("emit");
+        let exec = unsafe { region.exec_base.as_ptr().add(cursor) };
+        let write = region.write_ptr_for(exec).expect("write alias");
+        unsafe { std::ptr::copy_nonoverlapping(translated.as_ptr(), write, translated.len()) };
+        jit.flush_icache(exec, translated.len());
+        cursor += translated.len();
+
+        let resume = match block.exit {
+            X86Exit::Syscall { resume, .. } => resume,
+            other => panic!("expected syscall exit, got {other:?}"),
+        };
+        let mut ctx = X86DsrContext::new(snapshot, exec as u64, resume);
+        ctx.save_fpu = u32::from(block.uses_fpu);
+        let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
+        assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Syscall));
+        snapshot = ctx.snapshot;
+        match snapshot.gpr[reg::RAX] {
+            39 => {
+                // Host work is free to use every caller-saved vector register.
+                // Make that clobber deterministic instead of relying on Rust's
+                // code generation to happen to touch ymm0.
+                unsafe { std::arch::asm!("vzeroall") };
+                snapshot.gpr[reg::RAX] = 4242;
+                next = snapshot.rip;
+            }
+            SYS_EXIT_GROUP => break,
+            other => panic!("unexpected syscall {other}"),
+        }
+    }
+
+    let observed = unsafe { std::slice::from_raw_parts(result, pattern.len()) };
+    assert_eq!(
+        observed, pattern,
+        "the gateway must preserve all 256 bits of live YMM state"
+    );
+
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(data.cast(), 4096);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
+#[test]
 fn translated_x86_guest_writes_and_exits_natively() {
     let jit = FreebsdHostJit;
     jit.supported().expect("host JIT supported");
@@ -974,6 +1062,73 @@ fn translated_x86_guest_reads_tls_through_swapped_fsbase() {
     unsafe {
         jit.unmap(&region);
         libc::munmap(tls.cast(), 4096);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
+#[test]
+fn translated_signed_branch_stops_before_wrapped_index() {
+    use carrick_dsr_x86::cflow;
+
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+    let stack = map_rw(64 * 1024);
+
+    const GUEST_CODE_BASE: u64 = 0x1f_0000;
+    let mut program = vec![
+        0x31, 0xdb, // xor ebx, ebx
+        0x48, 0x83, 0xeb, 0x01, // sub rbx, 1 => u64::MAX
+        0x85, 0xdb, // test ebx, ebx => SF=1
+        0x78, 0x0c, // js +12, over the failure exit
+        0xbf, 0x63, 0x00, 0x00, 0x00, // mov edi, 99
+        0xb8,
+    ];
+    program.extend_from_slice(&(SYS_EXIT_GROUP as u32).to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]);
+    let signed_target = GUEST_CODE_BASE + program.len() as u64;
+    program.extend_from_slice(&[0xbf, 0x07, 0x00, 0x00, 0x00]);
+    program.extend_from_slice(&[0xb8]);
+    program.extend_from_slice(&(SYS_EXIT_GROUP as u32).to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]);
+
+    let read_guest = |va: u64| -> Vec<u8> {
+        let off = (va - GUEST_CODE_BASE) as usize;
+        program
+            .get(off..)
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default()
+    };
+    let block = plan_block(GUEST_CODE_BASE, 256, 4096, read_guest).expect("plan");
+    let branch_va = match block.exit {
+        X86Exit::ControlFlow { va, .. } => va,
+        other => panic!("expected signed conditional exit, got {other:?}"),
+    };
+    let source = read_guest(block.start);
+    let body_len = (block.end - block.start) as usize;
+    let translated = emit_block(&source[..body_len], &block).expect("emit");
+    let exec = region.exec_base.as_ptr();
+    let write = region.write_ptr_for(exec).expect("write alias");
+    unsafe { std::ptr::copy_nonoverlapping(translated.as_ptr(), write, translated.len()) };
+    jit.flush_icache(exec, translated.len());
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack as u64 + 64 * 1024;
+    let mut ctx = X86DsrContext::new(snapshot, exec as u64, branch_va);
+    let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
+    assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Indirect));
+    assert_eq!(ctx.snapshot.gpr[reg::RBX], u64::MAX);
+    assert_ne!(ctx.snapshot.rflags & (1 << 7), 0, "test ebx must set SF");
+
+    let next =
+        cflow::resolve(&read_guest(branch_va), branch_va, &mut ctx.snapshot).expect("resolve js");
+    assert_eq!(
+        next, signed_target,
+        "JS must stop before an index of -1 is used"
+    );
+
+    unsafe {
+        jit.unmap(&region);
         libc::munmap(stack.cast(), 64 * 1024);
     }
 }

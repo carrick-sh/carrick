@@ -15,15 +15,19 @@
 
 /// Guest register file. GPR order is the x86 encoding order
 /// (rax=0, rcx=1, rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7, r8..r15=8..15), so
-/// the gateway asm indexes it as `[r15 + SNAP_GPR + reg*8]`. `fxsave` is a
-/// 16-aligned 512-byte area for `fxsave`/`fxrstor` (SSE + x87 state).
-#[repr(C, align(16))]
+/// the gateway asm indexes it as `[r15 + SNAP_GPR + reg*8]`. `xsave` is a
+/// 64-aligned standard-format XSAVE area large enough for current x86_64
+/// extended state (including AVX-512 and AMX when enabled in XCR0).
+pub const XSAVE_AREA_LEN: usize = 16 * 1024;
+
+#[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
 pub struct X86UcontextSnapshot {
     pub gpr: [u64; 16],
     pub rip: u64,
     pub rflags: u64,
-    pub fxsave: [u8; 512],
+    xsave_align_pad: [u8; 48],
+    pub xsave: [u8; XSAVE_AREA_LEN],
 }
 
 /// Register-file index constants (into [`X86UcontextSnapshot::gpr`]).
@@ -50,24 +54,23 @@ impl X86UcontextSnapshot {
     /// A snapshot with Linux's initial register/FPU state. A caller sets `rip`,
     /// `gpr[RSP]`, and argument registers before entry.
     pub fn new() -> Self {
-        // The gateway `fxrstor`s this area on entry, so it must hold a VALID
-        // initial FXSAVE image, not zeros: a zeroed image sets `FCW=0` and
-        // `MXCSR=0`, which UNMASKS every x87/SSE exception and picks
-        // round-to-nearest-with-wrong-flags — a guest's first FP/SSE op would
-        // then trap or misbehave. Linux hands a fresh process `FCW=0x037F`
-        // (all exceptions masked, 64-bit precision, round-to-nearest) and
-        // `MXCSR=0x1F80` (all SSE exceptions masked). FXSAVE layout: FCW at
-        // byte 0, MXCSR at byte 24.
-        let mut fxsave = [0u8; 512];
-        fxsave[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
-        fxsave[24..28].copy_from_slice(&0x0000_1F80u32.to_le_bytes());
+        // XRSTOR requires a valid standard-format image. Linux starts x87/SSE
+        // in non-trapping defaults; AVX and newer components remain in their
+        // architectural initial state because XSTATE_BV names only x87/SSE.
+        // Standard XSAVE layout keeps the legacy FCW/MXCSR fields at 0/24 and
+        // XSTATE_BV at byte 512.
+        let mut xsave = [0u8; XSAVE_AREA_LEN];
+        xsave[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
+        xsave[24..28].copy_from_slice(&0x0000_1F80u32.to_le_bytes());
+        xsave[512..520].copy_from_slice(&0x3u64.to_le_bytes());
         Self {
             gpr: [0; 16],
             rip: 0,
             // EFLAGS bit 1 is always set; everything else clear (IF is not
             // meaningful at CPL 3 and the guest never observes it).
             rflags: 0x0000_0000_0000_0002,
-            fxsave,
+            xsave_align_pad: [0; 48],
+            xsave,
         }
     }
 }
@@ -154,12 +157,18 @@ impl X86IdentityStamp {
     }
 }
 
-/// The gateway context. `#[repr(C, align(16))]` with a fixed field order; the
+/// The gateway context has a fixed, 64-byte-aligned field order; the
 /// `gateway_x86_64.S` `.equ` offsets mirror the `offset_of!` asserts below.
-#[repr(C, align(16))]
+#[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
 pub struct X86DsrContext {
     pub snapshot: X86UcontextSnapshot,
+    /// Complete host extended state saved before installing guest state. This
+    /// includes process-affecting components such as PKRU, not just registers
+    /// covered by the SysV calling convention. XSAVE initializes every byte
+    /// XRSTOR may consume; `MaybeUninit` avoids pointlessly clearing 16 KiB on
+    /// every short gateway round trip.
+    pub host_xsave: [std::mem::MaybeUninit<u8>; XSAVE_AREA_LEN],
     /// Host `rsp` at trampoline entry (points at the return address into the
     /// Rust caller). The exit stub restores this and `ret`s through it.
     pub host_rsp: u64,
@@ -210,16 +219,14 @@ pub struct X86DsrContext {
     /// point — [`FaultRecord::host_rip`](carrick_dsr::fault::FaultRecord)
     /// is authoritative.
     pub fault: carrick_dsr::fault::FaultRecord,
-    /// Whether the enter/exit trampoline should `fxrstor`/`fxsave` the guest
-    /// FPU/vector state (the 512-byte `snapshot.fxsave` area) around this
-    /// block. Set per block from [`X86Block::uses_fpu`](crate::block::X86Block):
-    /// integer-only blocks (the majority) leave it 0 and skip the save/restore
-    /// entirely. Correctness across a non-saving block is preserved because the
-    /// `snapshot.fxsave` area still holds the last FPU-using block's guest
-    /// state, which the next FPU-using block's `fxrstor` reloads. Nonzero =
-    /// save/restore.
+    /// Whether the enter/exit trampoline should save/restore the guest and
+    /// host XSAVE areas around this block. Set per block from
+    /// [`X86Block::uses_fpu`](crate::block::X86Block); integer-only blocks skip
+    /// the extended-state work. Nonzero = save/restore.
     pub save_fpu: u32,
-    pub save_fpu_pad: u32,
+    /// Nonzero when the host supports XSAVEOPT for sparse, incremental guest
+    /// state saves; zero selects baseline XSAVE.
+    pub use_xsaveopt: u32,
     /// A CHAIN-MISS flag, set nonzero by a chainable branch's COLD stub (see
     /// `emit::emit_block_linked`). When nonzero after an `Indirect` exit the
     /// run loop is at a chain miss — `snapshot.rip` holds the already-resolved
@@ -240,46 +247,62 @@ pub struct X86DsrContext {
 /// Byte offset of [`X86DsrContext::exit_resume`] — the guest VA the exit stub
 /// copies to `snapshot.rip`. Emitted exits SELF-SET this (so a chained-into
 /// block does not depend on the driver pre-setting it).
-pub const CTX_EXIT_RESUME: i32 = 720;
+pub const CTX_EXIT_RESUME: i32 = 33_024;
 /// Byte offset of [`X86DsrContext::exit_syscall_addr`] for `jmp *disp(%r15)`.
-pub const CTX_EXIT_SYSCALL_ADDR: i32 = 736;
+pub const CTX_EXIT_SYSCALL_ADDR: i32 = 33_040;
 /// Byte offset of [`X86DsrContext::exit_indirect_addr`].
-pub const CTX_EXIT_INDIRECT_ADDR: i32 = 744;
+pub const CTX_EXIT_INDIRECT_ADDR: i32 = 33_048;
 /// Byte offset of [`X86DsrContext::exit_sensitive_addr`].
-pub const CTX_EXIT_SENSITIVE_ADDR: i32 = 752;
+pub const CTX_EXIT_SENSITIVE_ADDR: i32 = 33_056;
 /// Byte offset of [`X86DsrContext::scratch`] for the emitter's RIP-relative
 /// rewrite spill (`mov [r15+CTX_SCRATCH], reg` / restore).
-pub const CTX_SCRATCH: i32 = 760;
+pub const CTX_SCRATCH: i32 = 33_064;
 /// Byte offset of [`X86DsrContext::scratch2`] (second rewrite spill).
-pub const CTX_SCRATCH2: i32 = 768;
+pub const CTX_SCRATCH2: i32 = 33_072;
 /// Byte offset of [`X86DsrContext::guest_fsbase`] (mirrored in the `.S`).
-pub const CTX_GUEST_FSBASE: i32 = 776;
+pub const CTX_GUEST_FSBASE: i32 = 33_080;
 /// Byte offset of [`X86DsrContext::host_fsbase`] (mirrored in the `.S`).
-pub const CTX_HOST_FSBASE: i32 = 784;
+pub const CTX_HOST_FSBASE: i32 = 33_088;
 /// Byte offset of [`X86DsrContext::save_fpu`] (mirrored in the `.S`): the
 /// per-block flag gating the FPU save/restore.
-pub const CTX_SAVE_FPU: i32 = 816;
+pub const CTX_SAVE_FPU: i32 = 33_120;
 /// Byte offset of [`X86DsrContext::chain_patch_site`] — a chainable branch's
 /// cold stub writes the patch-site address here.
-pub const CTX_CHAIN_PATCH: i32 = 824;
+pub const CTX_CHAIN_PATCH: i32 = 33_128;
 /// Byte offsets of the x86 identity fast-path wire fields.
-pub const CTX_IDENTITY_LIVE_GATE: i32 = 832;
-pub const CTX_IDENTITY_PID: i32 = 840;
-pub const CTX_IDENTITY_TID: i32 = 848;
+pub const CTX_IDENTITY_LIVE_GATE: i32 = 33_136;
+pub const CTX_IDENTITY_PID: i32 = 33_144;
+pub const CTX_IDENTITY_TID: i32 = 33_152;
 /// Byte offset of the virtualized guest `%r15` slot inside the snapshot
 /// (`gpr[15]`): the emitter's r15-rename loads/stores it directly.
 pub const SNAP_GUEST_R15: i32 = 120;
 /// Byte offset of [`X86DsrContext::fault`] — handed to the host-OS seam's
 /// signal shim, which writes the record through `r15 + CTX_FAULT_RECORD`.
-pub const CTX_FAULT_RECORD: u32 = 792;
+pub const CTX_FAULT_RECORD: u32 = 33_096;
 /// Byte offset of [`X86DsrContext::entry`] (unused by emitted code — the
 /// trampoline reads it — but asserted for parity with the `.S`).
-pub const CTX_ENTRY: i32 = 712;
+pub const CTX_ENTRY: i32 = 33_016;
+
+#[cfg(target_arch = "x86_64")]
+fn host_supports_xsaveopt() -> u32 {
+    static SUPPORTED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| std::arch::x86_64::__cpuid_count(0x0d, 1).eax & 1)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn host_supports_xsaveopt() -> u32 {
+    0
+}
 
 impl X86DsrContext {
     pub fn new(snapshot: X86UcontextSnapshot, entry: u64, exit_resume: u64) -> Self {
+        let mut host_xsave = [std::mem::MaybeUninit::uninit(); XSAVE_AREA_LEN];
+        // XSAVE need not overwrite reserved header bytes, while XRSTOR requires
+        // them to be zero. Enabled component payloads are written by XSAVE.
+        host_xsave[512..576].fill(std::mem::MaybeUninit::new(0));
         Self {
             snapshot,
+            host_xsave,
             host_rsp: 0,
             host_callee: [0; 6],
             entry,
@@ -298,7 +321,7 @@ impl X86DsrContext {
             // The runtime driver sets it per block from `X86Block::uses_fpu`;
             // in-crate tests keep the conservative default.
             save_fpu: 1,
-            save_fpu_pad: 0,
+            use_xsaveopt: host_supports_xsaveopt(),
             chain_patch_site: 0,
             identity: X86IdentityStamp::default(),
         }
@@ -310,18 +333,19 @@ impl X86DsrContext {
 const _: () = assert!(std::mem::offset_of!(X86UcontextSnapshot, gpr) == 0);
 const _: () = assert!(std::mem::offset_of!(X86UcontextSnapshot, rip) == 128);
 const _: () = assert!(std::mem::offset_of!(X86UcontextSnapshot, rflags) == 136);
-const _: () = assert!(std::mem::offset_of!(X86UcontextSnapshot, fxsave) == 144);
-const _: () = assert!(std::mem::size_of::<X86UcontextSnapshot>() == 656);
+const _: () = assert!(std::mem::offset_of!(X86UcontextSnapshot, xsave) == 192);
+const _: () = assert!(std::mem::size_of::<X86UcontextSnapshot>() == 16_576);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, snapshot) == 0);
-const _: () = assert!(std::mem::offset_of!(X86DsrContext, host_rsp) == 656);
-const _: () = assert!(std::mem::offset_of!(X86DsrContext, host_callee) == 664);
-const _: () = assert!(std::mem::offset_of!(X86DsrContext, entry) == 712);
-const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_resume) == 720);
-const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_status) == 728);
-const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_syscall_addr) == 736);
-const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_indirect_addr) == 744);
-const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_sensitive_addr) == 752);
-const _: () = assert!(std::mem::offset_of!(X86DsrContext, scratch) == 760);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, host_xsave) == 16_576);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, host_rsp) == 32_960);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, host_callee) == 32_968);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, entry) == 33_016);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_resume) == 33_024);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_status) == 33_032);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_syscall_addr) == 33_040);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_indirect_addr) == 33_048);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_sensitive_addr) == 33_056);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, scratch) == 33_064);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, scratch) as i32 == CTX_SCRATCH);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, scratch2) as i32 == CTX_SCRATCH2);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, guest_fsbase) as i32 == CTX_GUEST_FSBASE);
@@ -332,6 +356,7 @@ const _: () = assert!(
 );
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, fault) as u32 == CTX_FAULT_RECORD);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, save_fpu) as i32 == CTX_SAVE_FPU);
+const _: () = assert!(std::mem::offset_of!(X86DsrContext, use_xsaveopt) == 33_124);
 const _: () =
     assert!(std::mem::offset_of!(X86DsrContext, chain_patch_site) as i32 == CTX_CHAIN_PATCH);
 const _: () = assert!(
@@ -376,7 +401,17 @@ pub fn fsgsbase_supported() -> bool {
 // SysV-ABI-portable). Everything that enters translated execution lives here.
 #[cfg(target_arch = "x86_64")]
 mod native_gateway {
-    use super::X86DsrContext;
+    use super::{X86DsrContext, XSAVE_AREA_LEN};
+
+    fn host_xsave_fits_snapshot() -> bool {
+        static FITS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FITS.get_or_init(|| {
+            let features = std::arch::x86_64::__cpuid(1).ecx;
+            let xsave_enabled = features & ((1 << 26) | (1 << 27)) == ((1 << 26) | (1 << 27));
+            xsave_enabled
+                && std::arch::x86_64::__cpuid_count(0x0d, 0).ebx as usize <= XSAVE_AREA_LEN
+        })
+    }
 
     unsafe extern "C" {
         fn carrick_dsr_x86_enter_raw(context: *mut X86DsrContext) -> i32;
@@ -420,6 +455,9 @@ mod native_gateway {
     /// `context.snapshot.gpr[RSP]` must point at a valid guest stack. The
     /// caller must keep the JIT region mapped for the duration.
     pub unsafe fn enter_translated(context: &mut X86DsrContext) -> i32 {
+        if !host_xsave_fits_snapshot() {
+            return -1;
+        }
         let (syscall, indirect, sensitive) = exit_stub_addresses();
         context.exit_syscall_addr = syscall;
         context.exit_indirect_addr = indirect;
@@ -447,21 +485,22 @@ mod tests {
 
     #[test]
     fn initial_snapshot_seeds_linux_fpu_control_words() {
-        // A fresh snapshot's fxsave image must carry Linux's initial FP control
-        // state, since the gateway fxrstors it before the guest's first FP/SSE
-        // op. FCW at byte 0 = 0x037F; MXCSR at byte 24 = 0x1F80.
+        // A fresh standard XSAVE image carries Linux's initial FP control
+        // state. FCW at byte 0 = 0x037F; MXCSR at byte 24 = 0x1F80; XSTATE_BV
+        // names the initialized x87/SSE legacy components.
         let s = X86UcontextSnapshot::new();
+        assert_eq!(u16::from_le_bytes([s.xsave[0], s.xsave[1]]), 0x037F, "FCW");
         assert_eq!(
-            u16::from_le_bytes([s.fxsave[0], s.fxsave[1]]),
-            0x037F,
-            "FCW"
-        );
-        assert_eq!(
-            u32::from_le_bytes([s.fxsave[24], s.fxsave[25], s.fxsave[26], s.fxsave[27]]),
+            u32::from_le_bytes([s.xsave[24], s.xsave[25], s.xsave[26], s.xsave[27]]),
             0x1F80,
             "MXCSR"
         );
-        // The rest of the image (FSW, tag word, ST/XMM regs) stays zeroed.
-        assert!(s.fxsave[28..].iter().all(|&b| b == 0));
+        assert_eq!(
+            u64::from_le_bytes(s.xsave[512..520].try_into().unwrap()),
+            0x3,
+            "XSTATE_BV"
+        );
+        assert!(s.xsave[28..512].iter().all(|&byte| byte == 0));
+        assert!(s.xsave[520..].iter().all(|&byte| byte == 0));
     }
 }

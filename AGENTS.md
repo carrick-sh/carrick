@@ -303,7 +303,7 @@ one pass, after hours of grep-guessing got nowhere.)
   `dtrace -Zq -c "…/native_run <elf>" -n 'carrick*:::syscall-return { @[copyinstr(arg1)] = count(); } tick-3s { exit(0); }'`.
   `syscall-entry` arg0 is the CANONICAL (asm-generic) number post-normalization.
 - **dtrace `profile` provider to read guest state during a spin.** Guest code runs
-  in the JIT with `%r15` = the DSR context; `exit_resume` at `r15+720` holds the
+  in the JIT with `%r15` = the DSR context; `exit_resume` at `r15+33024` holds the
   chain-entry guest VA:
   `dtrace -q -p PID -n 'profile-4999 { @[*(uint64_t*)copyin(uregs[R_R15]+720,8)] = count(); } tick-3s { printa(@); exit(0); }'`
   — the dominant address is the spinning block's guest VA.
