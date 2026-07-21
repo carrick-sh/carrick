@@ -2025,6 +2025,7 @@ pub mod host_signal {
     /// actually re-spawns a fresh pump instead of no-opping on the inherited
     /// `PUMP_STARTED == true` guard and leaving a dead pump.
     pub fn reset_after_supervisor_fork() {
+        carrick_signal_core::xsig::xsig_refresh_self_host_pid();
         // ---- NEUTRAL (shared with HVF): drop inherited pending / disposition /
         // child-watch state so the child does not act on the supervisor's. ----
         carrick_signal_core::clear_thread_pending();
@@ -2198,6 +2199,7 @@ pub mod host_signal {
         carrick_signal_core::child_watch::register(child_pid, parent_tid, exit_signal);
     }
     pub fn reinit_after_fork() {
+        carrick_signal_core::xsig::xsig_refresh_self_host_pid();
         // A forked child inherits the parent's process-global timer + signal-pending
         // state (these live in carrick-timer-core / carrick-signal-core statics, copied
         // across libc::fork), but POSIX gives a fork child NO inherited timers and an
