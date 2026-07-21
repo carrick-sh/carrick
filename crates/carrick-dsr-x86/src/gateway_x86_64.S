@@ -7,18 +7,20 @@
 // itself; an exit stub restores the host stack and `ret`s straight back to
 // `enter_raw`'s caller with the exit status in %eax.
 
-.equ SNAP_GPR,        0
-.equ SNAP_RIP,        128
-.equ SNAP_RFLAGS,     136
-.equ SNAP_FXSAVE,     144
-.equ HOST_RSP,        656
-.equ HOST_CALLEE,     664
-.equ CTX_ENTRY,       712
-.equ CTX_EXIT_RESUME, 720
-.equ CTX_EXIT_STATUS, 728
-.equ CTX_GUEST_FSBASE, 776
-.equ CTX_HOST_FSBASE,  784
-.equ CTX_SAVE_FPU,     816
+.equ SNAP_GPR,         0
+.equ SNAP_RIP,         128
+.equ SNAP_RFLAGS,      136
+.equ SNAP_XSAVE,       192
+.equ CTX_HOST_XSAVE,   16576
+.equ HOST_RSP,         32960
+.equ HOST_CALLEE,      32968
+.equ CTX_ENTRY,        33016
+.equ CTX_EXIT_RESUME,  33024
+.equ CTX_EXIT_STATUS,  33032
+.equ CTX_GUEST_FSBASE, 33080
+.equ CTX_HOST_FSBASE,  33088
+.equ CTX_SAVE_FPU,     33120
+.equ CTX_XSAVEOPT,     33124
 
 .text
 
@@ -48,13 +50,15 @@ carrick_dsr_x86_enter_raw:
     movq %rcx, CTX_HOST_FSBASE(%r15)
     wrfsbase %rax
 1:
-    // Restore guest SSE/x87 ONLY when this block touches FPU/vector state
-    // (save_fpu != 0). Integer-only blocks skip the 512-byte fxrstor; the
-    // snapshot area still holds the last FPU-using block's guest state for the
-    // next FPU-using block. Then restore guest rflags (host stack active).
+    // Preserve the complete host extended state, then install the complete
+    // guest state. This also protects process-affecting state such as PKRU;
+    // integer-only blocks skip this pair entirely.
     cmpl $0, CTX_SAVE_FPU(%r15)
     je 3f
-    fxrstor SNAP_FXSAVE(%r15)
+    xorl %ecx, %ecx
+    xgetbv
+    xsave64 CTX_HOST_XSAVE(%r15)
+    xrstor64 SNAP_XSAVE(%r15)
 3:
     pushq SNAP_RFLAGS(%r15)
     popfq
@@ -152,15 +156,25 @@ carrick_dsr_x86_exit_common:
     popq %rax
     movq %rax, SNAP_RFLAGS(%r15)
 
-    // Capture guest SSE/x87 only when this block used FPU/vector state; an
-    // integer-only block left the snapshot's fxsave area untouched, so its
-    // stored guest state stays valid. Guest xmm/x87 are still live here (only
-    // mov/pushfq/popq ran since the guest — none touch them); rflags are
-    // already saved, so the flag-clobbering `cmpl` is safe.
+    // Save every enabled guest xstate component and restore the complete host
+    // extended state before returning to Rust. GPRs and guest RFLAGS are safe in
+    // the snapshot, so XGETBV's clobbers are harmless here.
     cmpl $0, CTX_SAVE_FPU(%r15)
     je 4f
-    fxsave SNAP_FXSAVE(%r15)
+    xorl %ecx, %ecx
+    xgetbv
+    cmpl $0, CTX_XSAVEOPT(%r15)
+    je 5f
+    xsaveopt64 SNAP_XSAVE(%r15)
+    jmp 6f
+5:
+    xsave64 SNAP_XSAVE(%r15)
+6:
+    xrstor64 CTX_HOST_XSAVE(%r15)
 4:
+    // SysV requires DF clear on every host function boundary. Guest `std` is
+    // legal state and was captured above, but must never leak into Rust/libc.
+    cld
 
     // Resume RIP = pre-filled per-block resume target.
     movq CTX_EXIT_RESUME(%r15), %rax
