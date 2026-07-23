@@ -356,3 +356,22 @@ musl-record BIN:
     echo "musl-record: see the last UnsupportedPlatform / ENOSYS syscall above."
     echo "musl-record: this is informational only — recorded, never gating."
     exit 0
+
+# aarch64 BSD test VMs on this Mac (spec: docs/superpowers/specs/2026-07-22-aarch64-bsd-vm-lanes-design.md)
+bsdvm-fetch VM:
+    python3 scripts/bsdvm.py fetch {{VM}}
+
+bsdvm-provision VM *ARGS:
+    python3 scripts/bsdvm.py provision {{VM}} {{ARGS}}
+
+bsdvm-up VM:
+    python3 scripts/bsdvm.py up {{VM}}
+
+bsdvm-down VM:
+    python3 scripts/bsdvm.py down {{VM}}
+
+bsdvm-ps:
+    python3 scripts/bsdvm.py ps
+
+bsdvm-gate VM STAGE="stage0":
+    python3 scripts/bsdvm.py gate {{VM}} {{STAGE}}
