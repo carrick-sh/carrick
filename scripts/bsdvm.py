@@ -14,6 +14,7 @@ import lzma
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -800,7 +801,8 @@ def git_url(vm: VmConfig) -> str:
 def git_ssh_env(vm: VmConfig) -> dict[str, str]:
     base = ssh_base(vm)
     # GIT_SSH_COMMAND takes the options but not host/port (URL carries those).
-    opts = " ".join(base[3:-1])  # the three -o pairs
+    # Use shlex.join to properly quote option tokens (especially paths with spaces).
+    opts = shlex.join(base[3:-1])  # the three -o pairs
     env = dict(os.environ)
     env["GIT_SSH_COMMAND"] = f"ssh {opts}"
     return env
