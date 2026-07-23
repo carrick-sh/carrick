@@ -830,11 +830,15 @@ mod tests {
     /// crate's tests in parallel by default): the kernel is free to hand the
     /// just-closed number straight back out to a sibling test's `open()`
     /// before this test's probe runs, making `F_GETFD` unexpectedly succeed
-    /// (flaky under load). Serialize every test in this module that probes a
-    /// numeric fd after close so no sibling test's fd churn lands in the
-    /// window between close and probe. Poison-recovering, mirroring
-    /// `carrick-host`'s `host_mapping.rs::MMAP_TEST_LOCK`, so a panic in one
-    /// test doesn't cascade-fail the others.
+    /// (flaky under load). The recycling is CAUSED by the churners -- any
+    /// test that opens an fd (e.g. via `owned_dev_null()`) -- not by the
+    /// probing test itself, so every test in this module that either OPENS
+    /// an fd or probes a freed fd number must hold this lock; excluding
+    /// anything but the probing test excludes nothing, since a concurrent
+    /// opener outside the lock can still hand out the recycled number
+    /// mid-probe. Poison-recovering, mirroring `carrick-host`'s
+    /// `host_mapping.rs::MMAP_TEST_LOCK`, so a panic in one test doesn't
+    /// cascade-fail the others.
     static FD_PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn base() -> u64 {
@@ -888,6 +892,9 @@ mod tests {
 
     #[test]
     fn lookup_returns_backing_for_live_alloc() {
+        let _serialize = FD_PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut ap = SharedAperture::new();
         let fd = owned_dev_null();
         let raw_fd = fd.as_raw_fd();
@@ -928,6 +935,9 @@ mod tests {
 
     #[test]
     fn shrink_preserves_shared_file_fd_and_offset_metadata() {
+        let _serialize = FD_PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut ap = SharedAperture::new();
         let fd = owned_dev_null();
         let raw_fd = fd.as_raw_fd();
