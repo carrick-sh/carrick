@@ -1071,5 +1071,199 @@ class SshGitTests(unittest.TestCase):
         self.assertIn("ConnectTimeout=5", parsed)
 
 
+class GateTests(unittest.TestCase):
+    def test_stage_table_matches_spec_ladder(self) -> None:
+        self.assertEqual(list(BSDVM.STAGES), ["stage0", "stage1", "stage2", "stage3"])
+        s0 = BSDVM.STAGES["stage0"]
+        self.assertTrue(s0.available and not s0.report_only)
+        self.assertIn("carrick-portable", s0.cmds[0])
+        self.assertIn("carrick-hal", s0.cmds[0])
+        self.assertIn("carrick-host", s0.cmds[0])
+        self.assertIn("carrick-mem", s0.cmds[0])
+        s1 = BSDVM.STAGES["stage1"]
+        self.assertTrue(s1.available and s1.report_only)
+        self.assertFalse(BSDVM.STAGES["stage2"].available)
+        self.assertIn("NativeLane", BSDVM.STAGES["stage2"].note)
+        self.assertFalse(BSDVM.STAGES["stage3"].available)
+
+    def test_unavailable_stage_is_a_clear_error(self) -> None:
+        ns = mock.Mock(vm="freebsd-arm64", stage="stage2")
+        with self.assertRaises(SystemExit) as ctx:
+            BSDVM.cmd_gate(ns)
+        self.assertIn("NativeLane", str(ctx.exception))
+
+    def test_write_report_renders_json_and_text(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            report = {
+                "vm": "freebsd-arm64", "stage": "stage0", "head": "abc123",
+                "rustc": "rustc 1.96.0", "wall_s": 12.5, "report_only": False,
+                "steps": [{"cmd": "cargo test", "rc": 0, "tail": "ok"}],
+                "pass": True,
+            }
+            BSDVM.write_report(Path(td), report)
+            data = json.loads((Path(td) / "report.json").read_text())
+            self.assertTrue(data["pass"])
+            txt = (Path(td) / "report.txt").read_text()
+            self.assertIn("stage0", txt)
+            self.assertIn("PASS", txt)
+
+
+class GateReportGuaranteeTests(unittest.TestCase):
+    """cmd_gate must always emit report.json (even on a mid-flow exception or
+    a hung ssh command) and cleanup must never mask the exception that sent
+    it into the `finally` clause in the first place. All boundaries (boot,
+    ssh_wait, push_head, ssh_run, read_pid, stop_pid, create_overlay) are
+    mocked; only real filesystem operations run, against a tmpdir state root.
+    """
+
+    @staticmethod
+    def _fake_create_overlay(vm_name: str, name: str, backing: str) -> Path:
+        st = BSDVM.state_dir(vm_name)
+        overlay = st / name
+        if not overlay.exists():
+            overlay.write_bytes(b"gate-overlay")
+        return overlay
+
+    def _make_golden(self, vm_name: str) -> Path:
+        st = BSDVM.state_dir(vm_name)
+        st.mkdir(parents=True, exist_ok=True)
+        (st / "golden.qcow2").write_bytes(b"golden")
+        return st
+
+    def _report_dir(self, vm_name: str, stage: str) -> Path:
+        dirs = list((BSDVM.state_root() / "results").glob(f"*-{vm_name}-{stage}"))
+        self.assertEqual(len(dirs), 1, f"expected exactly one report dir, got {dirs}")
+        return dirs[0]
+
+    def test_ssh_wait_systemexit_still_writes_report_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm_name = "freebsd-arm64"
+                st = self._make_golden(vm_name)
+                (st / "qemu.pid").write_text("555")
+
+                ns = mock.Mock(vm=vm_name, stage="stage0")
+                stop_calls: list[int] = []
+                with (
+                    mock.patch.object(
+                        BSDVM, "create_overlay", side_effect=self._fake_create_overlay
+                    ),
+                    mock.patch.object(BSDVM, "boot", return_value=None),
+                    mock.patch.object(
+                        BSDVM, "ssh_wait",
+                        side_effect=SystemExit("freebsd-arm64: ssh not reachable after 300s"),
+                    ),
+                    # First call is cmd_gate's own not-already-running guard
+                    # (must be None so the run gets past it); second is the
+                    # cleanup lookup in `finally`, which should find the pid
+                    # this run's mocked `boot` would have started.
+                    mock.patch.object(BSDVM, "read_pid", side_effect=[None, 555]),
+                    mock.patch.object(
+                        BSDVM, "stop_pid", side_effect=lambda pid: stop_calls.append(pid)
+                    ),
+                ):
+                    with self.assertRaises(SystemExit) as ctx:
+                        BSDVM.cmd_gate(ns)
+                self.assertIn("ssh not reachable", str(ctx.exception))
+
+                self.assertEqual(stop_calls, [555])
+                self.assertFalse((st / "qemu.pid").exists())
+                self.assertEqual(list(st.glob("gate-*.qcow2")), [])
+
+                report = json.loads(
+                    (self._report_dir(vm_name, "stage0") / "report.json").read_text()
+                )
+                self.assertFalse(report["pass"])
+                self.assertIsNotNone(report["error"])
+                self.assertIn("ssh not reachable", report["error"])
+
+    def test_first_stage_cmd_timeout_skips_remaining_and_returns_1(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm_name = "freebsd-arm64"
+                self._make_golden(vm_name)
+
+                test_stage = BSDVM.Stage(
+                    cmds=["cmd-a", "cmd-b", "cmd-c"], report_only=False, available=True,
+                )
+                ns = mock.Mock(vm=vm_name, stage="stage0")
+                timeout_exc = subprocess.TimeoutExpired(
+                    cmd="cmd-a", timeout=7200, output=b"partial-out", stderr=b"partial-err"
+                )
+                with (
+                    mock.patch.dict(BSDVM.STAGES, {"stage0": test_stage}),
+                    mock.patch.object(
+                        BSDVM, "create_overlay", side_effect=self._fake_create_overlay
+                    ),
+                    mock.patch.object(BSDVM, "boot", return_value=None),
+                    mock.patch.object(BSDVM, "ssh_wait", return_value=None),
+                    mock.patch.object(BSDVM, "push_head", return_value="deadbeef"),
+                    mock.patch.object(
+                        BSDVM, "ssh_run",
+                        side_effect=[mock.Mock(stdout="rustc 1.99.0\n"), timeout_exc],
+                    ),
+                    mock.patch.object(BSDVM, "read_pid", return_value=None),
+                    mock.patch.object(BSDVM, "stop_pid") as stop_pid,
+                ):
+                    rc = BSDVM.cmd_gate(ns)
+
+                self.assertEqual(rc, 1)
+                stop_pid.assert_not_called()
+                self.assertEqual(list(BSDVM.state_dir(vm_name).glob("gate-*.qcow2")), [])
+
+                report = json.loads(
+                    (self._report_dir(vm_name, "stage0") / "report.json").read_text()
+                )
+                self.assertIsNone(report["error"])
+                self.assertFalse(report["pass"])
+                steps = report["steps"]
+                self.assertEqual(len(steps), 3)
+                self.assertIsNone(steps[0]["rc"])
+                self.assertIn("<timeout after 7200s>", steps[0]["tail"])
+                self.assertIn("partial-out", steps[0]["tail"])
+                self.assertIn("partial-err", steps[0]["tail"])
+                self.assertEqual(
+                    steps[1],
+                    {"cmd": "cmd-b", "rc": None, "tail": "<skipped: prior step timed out>"},
+                )
+                self.assertEqual(
+                    steps[2],
+                    {"cmd": "cmd-c", "rc": None, "tail": "<skipped: prior step timed out>"},
+                )
+
+    def test_cleanup_failure_does_not_mask_original_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm_name = "freebsd-arm64"
+                self._make_golden(vm_name)
+
+                ns = mock.Mock(vm=vm_name, stage="stage0")
+                stderr_buf = io.StringIO()
+                with (
+                    mock.patch.object(
+                        BSDVM, "create_overlay", side_effect=self._fake_create_overlay
+                    ),
+                    mock.patch.object(BSDVM, "boot", return_value=None),
+                    mock.patch.object(
+                        BSDVM, "ssh_wait",
+                        side_effect=SystemExit("root cause: ssh unreachable"),
+                    ),
+                    # See the parallel comment in the ssh_wait test above:
+                    # None for the not-already-running guard, then a real pid
+                    # for the `finally` cleanup lookup.
+                    mock.patch.object(BSDVM, "read_pid", side_effect=[None, 999]),
+                    mock.patch.object(
+                        BSDVM, "stop_pid", side_effect=SystemExit("kill failed")
+                    ),
+                    contextlib.redirect_stderr(stderr_buf),
+                ):
+                    with self.assertRaises(SystemExit) as ctx:
+                        BSDVM.cmd_gate(ns)
+
+                self.assertIn("root cause: ssh unreachable", str(ctx.exception))
+                self.assertIn("warning: cleanup failed", stderr_buf.getvalue())
+                self.assertIn("kill failed", stderr_buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

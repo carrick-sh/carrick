@@ -35,6 +35,14 @@ class VmConfig:
     pinned_sha512: str | None = None
 
 
+@dataclass(frozen=True)
+class Stage:
+    cmds: list[str]
+    report_only: bool
+    available: bool
+    note: str = ""
+
+
 _FB_BASE = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RELEASE/aarch64/Latest"
 _FB_RC_BASE = "https://download.freebsd.org/releases/VM-IMAGES/15.1-RC3/aarch64/Latest"
 _NB_BASE = "https://cdn.netbsd.org/pub/NetBSD/NetBSD-10.1/evbarm-aarch64/binary/gzimg"
@@ -68,6 +76,31 @@ VMS: dict[str, VmConfig] = {
             "9cd92b45c6efa43cc01ce6ecf6452ff71eda94f98458bcd0f0c16730eb48e86"
             "cabcddd96bbf91e8fcf10bd62c6a2eb2edc9cd79138761ea789ffd21426e531cb"
         ),
+    ),
+}
+
+
+_HOST_CRATES = "-p carrick-portable -p carrick-hal -p carrick-host -p carrick-mem"
+
+STAGES: dict[str, Stage] = {
+    "stage0": Stage(
+        cmds=[f"cd /root/carrick && cargo test {_HOST_CRATES}"],
+        report_only=False,
+        available=True,
+    ),
+    "stage1": Stage(
+        cmds=["cd /root/carrick && cargo build --workspace"],
+        report_only=True,  # red list IS the bring-up worklist (spec)
+        available=True,
+    ),
+    "stage2": Stage(
+        cmds=[], report_only=True, available=False,
+        note="requires NativeLane aarch64 host lanes (seam extraction) — "
+             "see 2026-07-17-native-backend-portability-seams-design.md",
+    ),
+    "stage3": Stage(
+        cmds=[], report_only=True, available=False,
+        note="requires stage2 + LTP gate tooling (native-x86-ltp-gate lineage)",
     ),
 }
 
@@ -872,6 +905,137 @@ def ensure_dev_remote(vm: VmConfig) -> None:
         print(f"added git remote {vm.remote} -> {git_url(vm)}")
 
 
+def write_report(out_dir: Path, report: dict) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    lines = [
+        f"bsdvm gate {report['stage']} on {report['vm']}: "
+        + ("PASS" if report["pass"] else "FAIL")
+        + (" (report-only)" if report["report_only"] else ""),
+        f"head={report['head']} rustc={report['rustc']} wall={report['wall_s']:.1f}s",
+    ]
+    for step in report["steps"]:
+        lines.append(f"  rc={step['rc']} :: {step['cmd']}")
+        for tail_line in step["tail"].splitlines()[-10:]:
+            lines.append(f"    | {tail_line}")
+    (out_dir / "report.txt").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+
+
+def _decode_partial(x: bytes | str | None) -> str:
+    """Decode a `subprocess.TimeoutExpired` partial-output attribute (its
+    `.stdout` or `.stderr`).
+
+    CPython's `subprocess.run(..., timeout=...)` re-raises the
+    `TimeoutExpired` straight out of `Popen.communicate()` on POSIX without a
+    second decode pass, so even when `subprocess.run` was called with
+    `text=True` these attributes carry raw bytes (confirmed empirically: a
+    killed process's captured-so-far output on the exception is `bytes`, not
+    `str`) -- and either may be `None` if nothing had been captured yet at
+    the point of the kill.
+    """
+    if x is None:
+        return ""
+    if isinstance(x, bytes):
+        return x.decode(errors="replace")
+    return x
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    vm = VMS[args.vm]
+    stage = STAGES.get(args.stage)
+    if stage is None:
+        raise SystemExit(f"unknown stage {args.stage} (known: {', '.join(STAGES)})")
+    if not stage.available:
+        raise SystemExit(f"{args.stage} not available yet: {stage.note}")
+    if not (state_dir(vm.name) / "golden.qcow2").exists():
+        raise SystemExit(f"no golden image; run: bsdvm.py provision {vm.name}")
+    if read_pid(vm.name) is not None:
+        raise SystemExit(f"{vm.name} is running; bsdvm.py down {vm.name} first")
+    overlay = create_overlay(vm.name, f"gate-{os.getpid()}.qcow2", "golden.qcow2")
+    started = time.monotonic()
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    out_dir = state_root() / "results" / f"{ts}-{vm.name}-{args.stage}"
+    steps: list[dict] = []
+    head = ""
+    rustc = ""
+    ok = True
+    error: str | None = None
+    try:
+        boot(vm, overlay)
+        ssh_wait(vm)
+        head = push_head(vm)
+        rustc = ssh_run(vm, "rustc --version", timeout_s=30).stdout.strip()
+        remaining = list(stage.cmds)
+        while remaining:
+            cmd = remaining.pop(0)
+            try:
+                proc = ssh_run(vm, cmd, timeout_s=7200)
+            except subprocess.TimeoutExpired as exc:
+                # The exact case the 7200s bound exists for: a hung cargo
+                # command. Record what we can (partial captured output, if
+                # any) and stop -- running further stage.cmds after one has
+                # already wedged the guest would just wait out their own
+                # timeouts for no benefit, so skip and record them instead.
+                partial = (_decode_partial(exc.stdout) + _decode_partial(exc.stderr))[-4000:]
+                steps.append(
+                    {"cmd": cmd, "rc": None, "tail": "<timeout after 7200s>" + partial}
+                )
+                ok = False
+                for skipped in remaining:
+                    steps.append(
+                        {"cmd": skipped, "rc": None, "tail": "<skipped: prior step timed out>"}
+                    )
+                break
+            tail = (proc.stdout + proc.stderr)[-4000:]
+            steps.append({"cmd": cmd, "rc": proc.returncode, "tail": tail})
+            ok = ok and proc.returncode == 0
+    except BaseException as exc:
+        # Whole-flow failure: boot, ssh_wait, push_head, the rustc probe, or
+        # anything else not already handled by the per-step TimeoutExpired
+        # catch above (e.g. ssh_wait's SystemExit after its own deadline).
+        # Remember it so the report below still gets written with the real
+        # cause, then re-raise once the finally clause has run -- callers and
+        # the exit code still see the original failure, unmasked.
+        error = repr(exc)
+        raise
+    finally:
+        report = {
+            "vm": vm.name, "stage": args.stage, "head": head, "rustc": rustc,
+            "wall_s": time.monotonic() - started,
+            "report_only": stage.report_only, "steps": steps,
+            "pass": ok and error is None, "error": error,
+        }
+        # Report write FIRST, before any cleanup: cleanup below can itself
+        # fail (stop_pid raising SystemExit on a SIGKILL survivor) and must
+        # not get a chance to prevent the report from landing.
+        try:
+            write_report(out_dir, report)
+        except Exception as report_exc:
+            # A broken report write (disk full, permissions, ...) must never
+            # mask whatever the gate run itself was doing.
+            print(f"warning: failed to write report: {report_exc}", file=sys.stderr)
+        # Cleanup: each action gets its own guard. stop_pid can itself raise
+        # SystemExit (SIGKILL survivor -- see stop_pid's docstring), and that
+        # must not eclipse the root cause of why cmd_gate is unwinding in the
+        # first place (e.g. the ssh_wait SystemExit above).
+        try:
+            pid = read_pid(vm.name)
+            if pid is not None:
+                stop_pid(pid)
+        except BaseException as cleanup_exc:
+            print(f"warning: cleanup failed: {cleanup_exc}", file=sys.stderr)
+        try:
+            pidfile_path(vm.name).unlink(missing_ok=True)
+        except BaseException as cleanup_exc:
+            print(f"warning: cleanup failed: {cleanup_exc}", file=sys.stderr)
+        try:
+            overlay.unlink(missing_ok=True)
+        except BaseException as cleanup_exc:
+            print(f"warning: cleanup failed: {cleanup_exc}", file=sys.stderr)
+    return 0 if (ok or stage.report_only) else 1
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     vm = VMS[args.vm]
     if not (state_dir(vm.name) / "golden.qcow2").exists():
@@ -933,6 +1097,10 @@ def main(argv: list[str]) -> int:
     refresh_golden = sub.add_parser("refresh-golden")
     refresh_golden.add_argument("vm")
     refresh_golden.set_defaults(func=cmd_refresh_golden)
+    gate = sub.add_parser("gate")
+    gate.add_argument("vm")
+    gate.add_argument("stage")
+    gate.set_defaults(func=cmd_gate)
     args = parser.parse_args(argv)
     if getattr(args, "vm", None) is not None and _resolve_vm(args.vm) is None:
         print(f"unknown vm: {args.vm} (known: {', '.join(sorted(VMS))})", file=sys.stderr)
