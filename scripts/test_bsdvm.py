@@ -122,6 +122,45 @@ class FetchLogicTests(unittest.TestCase):
                 self.assertFalse((st / "base.part.qcow2").exists())
                 self.assertEqual((st / "base.qcow2").read_bytes(), b"x")  # untouched
 
+    def test_fetch_force_refuses_when_golden_exists(self) -> None:
+        # A forced base refetch beneath a live golden chain reproduces the
+        # stale-backing corruption class: golden.qcow2 (and every overlay
+        # built against it) still points at base.qcow2's path, so rewriting
+        # that path's contents in place corrupts every descendant.
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                st = BSDVM.state_dir("netbsd-arm64")
+                st.mkdir(parents=True)
+                (st / "base.qcow2").write_bytes(b"x")
+                (st / "golden.qcow2").write_bytes(b"y")
+                ns = mock.Mock(vm="netbsd-arm64", force=True)
+                with mock.patch.object(BSDVM, "url_exists") as probe:
+                    with self.assertRaises(SystemExit) as ctx:
+                        BSDVM.cmd_fetch(ns)
+                    probe.assert_not_called()  # refused before any network activity
+                self.assertIn("golden.qcow2", str(ctx.exception))
+                self.assertIn("provision --force", str(ctx.exception))
+                # Neither file was touched by the refused refetch.
+                self.assertEqual((st / "base.qcow2").read_bytes(), b"x")
+                self.assertEqual((st / "golden.qcow2").read_bytes(), b"y")
+
+    def test_fetch_force_proceeds_when_only_base_exists(self) -> None:
+        # No golden chain yet -- a forced base refetch is safe and must still
+        # proceed exactly as it did before the golden-guard was added.
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                st = BSDVM.state_dir("netbsd-arm64")
+                st.mkdir(parents=True)
+                (st / "base.qcow2").write_bytes(b"x")
+                ns = mock.Mock(vm="netbsd-arm64", force=True)
+                with mock.patch.object(BSDVM, "url_exists", return_value=False):
+                    with self.assertRaises(SystemExit) as ctx:
+                        BSDVM.cmd_fetch(ns)
+                # Got past the golden guard and into the real fetch flow,
+                # which fails later for an unrelated reason (no live
+                # candidate URL) -- proof the golden-guard itself didn't fire.
+                self.assertNotIn("golden.qcow2", str(ctx.exception))
+
 
 class AtomicFinalizeTests(unittest.TestCase):
     """`_convert_and_finalize` must never leave a corrupt/partial file at the
@@ -1452,6 +1491,11 @@ class BootRetryTests(unittest.TestCase):
 
                 self.assertIsInstance(outcome["exc"], SystemExit)
                 self.assertEqual(outcome["report"]["boot_retries_used"], 2)
+                # rc hardening: a whole-flow exception (boot-retry exhaustion
+                # here) is never a pass, even though `ok` sits at its
+                # loop-top default of True (the exception fired in the boot
+                # phase, before any stage.cmds step could set it False).
+                self.assertEqual(outcome["rc"], 1)
                 # 3 total attempts (1 initial + 2 retries): 3 overlays created and
                 # cleaned up, none left behind.
                 self.assertEqual(list(st.glob("gate-*.qcow2")), [])
@@ -1579,15 +1623,20 @@ class CmdLadderTests(unittest.TestCase):
                 self.assertEqual(len(data["results"]), 2)
                 self.assertEqual(data["results"][0]["vm"], "freebsd-arm64")
                 self.assertEqual(data["results"][0]["stage"], "stage0")
-                self.assertTrue(data["results"][0]["pass"])
+                self.assertTrue(data["results"][0]["steps_ok"])
+                self.assertTrue(data["results"][0]["exit_ok"])
                 self.assertEqual(data["results"][1]["vm"], "netbsd-arm64")
 
     def test_exit_code_zero_when_report_only_stage_fails(self) -> None:
+        # report-only stage with failing steps: the per-gate summary must
+        # show the two signals split apart -- steps_ok:false (the report's
+        # own `pass` says the steps failed) but exit_ok:true (run_gate/
+        # cmd_gate's own contract already folds "failed but report-only"
+        # into rc=0) -- and the ladder's exit code follows exit_ok, not
+        # steps_ok.
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
                 def fake_run_gate(vm, stage_name, boot_retries=0):
-                    # report_only stage: run_gate/cmd_gate's own contract
-                    # already folds "failed but report-only" into rc=0.
                     return {
                         "report": {"boot_retries_used": 0, "pass": False},
                         "report_dir": BSDVM.state_root() / "results" / "fake",
@@ -1599,6 +1648,11 @@ class CmdLadderTests(unittest.TestCase):
                 with mock.patch.object(BSDVM, "run_gate", side_effect=fake_run_gate):
                     rc = BSDVM.cmd_ladder(ns)
                 self.assertEqual(rc, 0)
+
+                summaries = list((BSDVM.state_root() / "results").glob("ladder-*.json"))
+                data = json.loads(summaries[0].read_text())
+                self.assertFalse(data["results"][0]["steps_ok"])
+                self.assertTrue(data["results"][0]["exit_ok"])
 
     def test_exit_code_nonzero_when_stage0_gate_fails(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1641,10 +1695,12 @@ class CmdLadderTests(unittest.TestCase):
 
                 summaries = list((BSDVM.state_root() / "results").glob("ladder-*.json"))
                 data = json.loads(summaries[0].read_text())
-                self.assertFalse(data["results"][0]["pass"])
+                self.assertFalse(data["results"][0]["steps_ok"])
+                self.assertFalse(data["results"][0]["exit_ok"])
                 self.assertIsNotNone(data["results"][0]["error"])
                 self.assertIn("no golden image", data["results"][0]["error"])
-                self.assertTrue(data["results"][1]["pass"])
+                self.assertTrue(data["results"][1]["steps_ok"])
+                self.assertTrue(data["results"][1]["exit_ok"])
 
 
 if __name__ == "__main__":
