@@ -1508,6 +1508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn signal_xstate_roundtrip_is_complete_and_malformed_input_is_atomic() {
         let capabilities = signal_xstate_capabilities().expect("x86 test host exposes XSAVE");
         let mut original = X86UcontextSnapshot::new();
