@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 
 
@@ -304,16 +305,135 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 def cmd_ps(args: argparse.Namespace) -> int:
     names = [args.vm] if args.vm else sorted(VMS)
     for name in names:
-        pidfile = state_dir(name) / "qemu.pid"
+        pidfile = pidfile_path(name)
         status = "down"
         if pidfile.exists():
-            pid = int(pidfile.read_text().strip())
             try:
-                os.kill(pid, 0)
+                pid = int(pidfile.read_text().strip())
+            except ValueError:
+                pid = None
+            if pid is None:
+                status = "orphan-pidfile pid=?"
+            elif pid_alive(pid):
                 status = f"up pid={pid}"
-            except ProcessLookupError:
+            else:
                 status = f"orphan-pidfile pid={pid}"
         print(f"{name}\t{status}")
+    return 0
+
+
+def create_overlay(vm_name: str, name: str, backing: str) -> Path:
+    st = state_dir(vm_name)
+    overlay = st / name
+    if not overlay.exists():
+        subprocess.run(
+            ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
+             "-b", str(st / backing), str(overlay)],
+            check=True,
+        )
+    return overlay
+
+
+def pidfile_path(vm_name: str) -> Path:
+    return state_dir(vm_name) / "qemu.pid"
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # We spawned qemu as this user, so an unsignalable pid means the pid
+        # was recycled by a foreign process -- an accepted pidfile-scheme
+        # limitation. This cannot distinguish "our qemu now owned by someone
+        # else" from "a stale pid reused by an unrelated process"; treat both
+        # as not-ours-anymore (dead), same identity-check caveat as read_pid.
+        return False
+
+
+def read_pid(vm_name: str) -> int | None:
+    pidfile = pidfile_path(vm_name)
+    if not pidfile.exists():
+        return None
+    try:
+        pid = int(pidfile.read_text().strip())
+    except ValueError:
+        return None
+    return pid if pid_alive(pid) else None
+
+
+def boot(vm: VmConfig, overlay: Path, extra_drives: list[str] | None = None) -> None:
+    if read_pid(vm.name) is not None:
+        raise SystemExit(f"{vm.name} already running (bsdvm.py down {vm.name} first)")
+    subprocess.run(qemu_args(vm, overlay, extra_drives or []), check=True)
+    print(f"{vm.name}: booted {overlay.name} (ssh -p {vm.ssh_port} root@127.0.0.1)")
+
+
+def stop_pid(
+    pid: int,
+    term_wait_s: float = 10.0,
+    kill_wait_s: float = 5.0,
+    kill=os.kill,
+    sleep=time.sleep,
+) -> None:
+    try:
+        kill(pid, 15)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + term_wait_s
+    while time.monotonic() < deadline:
+        try:
+            kill(pid, 0)
+        except ProcessLookupError:
+            return
+        sleep(0.2)
+    try:
+        kill(pid, 9)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + kill_wait_s
+    while time.monotonic() < deadline:
+        try:
+            kill(pid, 0)
+        except ProcessLookupError:
+            return
+        sleep(0.1)
+    raise SystemExit(f"pid {pid} did not exit after SIGKILL; inspect manually")
+
+
+def cmd_up(args: argparse.Namespace) -> int:
+    vm = VMS[args.vm]
+    if not (state_dir(vm.name) / "golden.qcow2").exists():
+        raise SystemExit(f"no golden image; run: bsdvm.py provision {vm.name}")
+    boot(vm, create_overlay(vm.name, "dev.qcow2", "golden.qcow2"))
+    return 0
+
+
+def cmd_down(args: argparse.Namespace) -> int:
+    pid = read_pid(args.vm)
+    if pid is None:
+        print(f"{args.vm}: not running")
+    else:
+        stop_pid(pid)
+        print(f"{args.vm}: stopped")
+    pidfile_path(args.vm).unlink(missing_ok=True)
+    return 0
+
+
+PROTECTED = {"base.qcow2", "golden.qcow2", "golden.prev.qcow2"}
+
+
+def cmd_destroy(args: argparse.Namespace) -> int:
+    if read_pid(args.vm) is not None:
+        raise SystemExit(f"{args.vm} is running; bsdvm.py down {args.vm} first")
+    st = state_dir(args.vm)
+    for q in sorted(st.glob("*.qcow2")):
+        if q.name in PROTECTED and not args.all:
+            continue
+        q.unlink()
+        print(f"removed {q}")
     return 0
 
 
@@ -327,6 +447,16 @@ def main(argv: list[str]) -> int:
     fetch.add_argument("vm")
     fetch.add_argument("--force", action="store_true")
     fetch.set_defaults(func=cmd_fetch)
+    up = sub.add_parser("up")
+    up.add_argument("vm")
+    up.set_defaults(func=cmd_up)
+    down = sub.add_parser("down")
+    down.add_argument("vm")
+    down.set_defaults(func=cmd_down)
+    destroy = sub.add_parser("destroy")
+    destroy.add_argument("vm")
+    destroy.add_argument("--all", action="store_true")
+    destroy.set_defaults(func=cmd_destroy)
     args = parser.parse_args(argv)
     if getattr(args, "vm", None) is not None and _resolve_vm(args.vm) is None:
         print(f"unknown vm: {args.vm} (known: {', '.join(sorted(VMS))})", file=sys.stderr)
