@@ -5765,16 +5765,15 @@ fn native_poll_child_exit_watches() {
     }
 }
 
+/// Run the dispatcher + runtime fork-child resets in a fresh fork
+/// descendant, so the child starts with the POSIX-correct post-`fork` state
+/// instead of the parent's inherited process-global bookkeeping. Shared with
+/// `native_freebsd::native_after_fork_child` — see
+/// `crate::native::fork_child` for the ordered hook list and the Task 5
+/// Step 1 divergence note (Darwin has no lane-specific extra step; this is a
+/// bare call).
 fn native_after_fork_child(dispatcher: &SyscallDispatcher) {
-    dispatcher.clear_output_buffers();
-    crate::event_ring::reinit_after_fork();
-    crate::host_signal::reinit_after_fork();
-    crate::dispatch::reset_fifo_beacons_after_fork_child();
-    dispatcher.network_after_fork_child();
-    dispatcher.epoll_after_fork_child();
-    dispatcher.proc_after_fork_child();
-    dispatcher.mem_after_fork_child();
-    dispatcher.sysv_after_fork_child();
+    crate::native::fork_child::dispatcher_after_fork_child(dispatcher);
 }
 
 fn pipe_pair() -> Result<(RawFd, RawFd), RuntimeError> {

@@ -11424,26 +11424,25 @@ fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String>
 
 /// Run the dispatcher + runtime fork-child resets in a fresh fork descendant, so
 /// the child starts with the POSIX-correct post-`fork` state instead of the
-/// parent's inherited process-global bookkeeping. Mirrors
-/// `native_darwin::native_after_fork_child`: clear buffered stdout/stderr (the
-/// child must not re-flush the parent's pending bytes), reinit the event ring +
-/// host-signal (empty pending set, no inherited timers) + FIFO beacons, and run
-/// each dispatcher subsystem's fork-child hook — `proc_after_fork_child` resets
-/// timerslack to the default, re-seeds the subreaper ancestor to the child
-/// itself, and clears inherited itimers/membarrier registration
-/// (`procprctlview`, `childsubreaper`, `forkaltstack`, `forkexecpthread`);
-/// `mem`/`sysv`/`epoll` drop inherited mm/SysV/epoll fork state.
+/// parent's inherited process-global bookkeeping. Shared with
+/// `native_darwin::native_after_fork_child` via
+/// `crate::native::fork_child::dispatcher_after_fork_child` — clear buffered
+/// stdout/stderr (the child must not re-flush the parent's pending bytes),
+/// reinit the event ring + host-signal (empty pending set, no inherited
+/// timers) + FIFO beacons, and run each dispatcher subsystem's fork-child
+/// hook — `proc_after_fork_child` resets timerslack to the default, re-seeds
+/// the subreaper ancestor to the child itself, and clears inherited
+/// itimers/membarrier registration (`procprctlview`, `childsubreaper`,
+/// `forkaltstack`, `forkexecpthread`); `mem`/`sysv`/`epoll` drop inherited
+/// mm/SysV/epoll fork state.
 fn native_after_fork_child(dispatcher: &SyscallDispatcher) {
+    // FreeBSD-only lane-specific step, kept inline (Task 5 Step 1: this has
+    // no Darwin equivalent at all — Darwin's child-exit-watch mechanism is
+    // an entirely different poll over `child_watch::tracked_pids()`, not
+    // part of the shared fork-child reset). Clear this lane's SIGCHLD
+    // dirty-flag before the shared reset, matching the previous ordering.
     NATIVE_CHILD_EXIT_DIRTY.store(false, std::sync::atomic::Ordering::Release);
-    dispatcher.clear_output_buffers();
-    crate::event_ring::reinit_after_fork();
-    crate::host_signal::reinit_after_fork();
-    crate::dispatch::reset_fifo_beacons_after_fork_child();
-    dispatcher.network_after_fork_child();
-    dispatcher.epoll_after_fork_child();
-    dispatcher.proc_after_fork_child();
-    dispatcher.mem_after_fork_child();
-    dispatcher.sysv_after_fork_child();
+    crate::native::fork_child::dispatcher_after_fork_child(dispatcher);
 }
 
 /// Run a static x86_64 Linux ELF natively on FreeBSD/amd64 through the shared

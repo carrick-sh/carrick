@@ -72,6 +72,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub(crate) mod fork_child;
+
 use crate::dispatch::SyscallDispatcher;
 use crate::page_profile::ExecutionPlan;
 use crate::run_result::{RunResult, RuntimeError};
