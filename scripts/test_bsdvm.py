@@ -47,5 +47,44 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+class QemuArgsTests(unittest.TestCase):
+    def _args(self) -> list[str]:
+        vm = BSDVM.VMS["netbsd-arm64"]
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(
+                os.environ,
+                {"CARRICK_BSDVM_STATE": td, "CARRICK_BSDVM_FW_DIR": td},
+            ):
+                (Path(td) / "edk2-aarch64-code.fd").touch()
+                (Path(td) / "edk2-arm-vars.fd").write_bytes(b"vars")
+                return BSDVM.qemu_args(vm, Path(td) / "netbsd-arm64" / "dev.qcow2")
+
+    def test_qemu_args_core_shape(self) -> None:
+        args = self._args()
+        joined = " ".join(args)
+        self.assertEqual(args[0], "qemu-system-aarch64")
+        self.assertIn("virt,gic-version=3", joined)
+        self.assertIn("-accel hvf -cpu host", joined)
+        self.assertIn("-smp 4 -m 6144", joined)
+        self.assertIn("virtio-rng-pci", joined)  # NetBSD entropy: mandatory
+        self.assertIn("hostfwd=tcp:127.0.0.1:2202-:22", joined)
+        self.assertIn("logfile=", joined)
+        self.assertIn("-daemonize", joined)
+        self.assertIn("qemu.pid", joined)
+
+    def test_efivars_copied_once(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(
+                os.environ,
+                {"CARRICK_BSDVM_STATE": td, "CARRICK_BSDVM_FW_DIR": td},
+            ):
+                (Path(td) / "edk2-aarch64-code.fd").touch()
+                (Path(td) / "edk2-arm-vars.fd").write_bytes(b"vars")
+                p1 = BSDVM.ensure_efivars("freebsd-arm64")
+                p1.write_bytes(b"mutated")
+                p2 = BSDVM.ensure_efivars("freebsd-arm64")
+                self.assertEqual(p2.read_bytes(), b"mutated")  # no re-copy
+
+
 if __name__ == "__main__":
     unittest.main()
