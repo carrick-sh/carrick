@@ -4780,7 +4780,9 @@ mod tests {
     #[test]
     fn linux4k_partial_host_page_repoint_fails_clean_without_detaching_neighbours() {
         const HOST_PAGE: usize = 16 * 1024;
-        const LINUX_PAGE: usize = 4 * 1024;
+        // Function-local `LINUX_*` consts drift from the single ABI table
+        // (AGENTS.md / .semgrep/typed-domains.yml); use the canonical value.
+        let linux_page = carrick_abi::LINUX_PAGE_SIZE as usize;
         const RESERVATION: usize = 2 * HOST_PAGE;
 
         let raw = unsafe {
@@ -4801,9 +4803,9 @@ mod tests {
         for (index, byte) in expected.into_iter().enumerate() {
             unsafe {
                 std::ptr::write_bytes(
-                    (host_start + index * LINUX_PAGE) as *mut u8,
+                    (host_start + index * linux_page) as *mut u8,
                     byte,
-                    LINUX_PAGE,
+                    linux_page,
                 );
             }
         }
@@ -4830,16 +4832,16 @@ mod tests {
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
             host_page_size: HOST_PAGE as u64,
-            linux_page_size: LINUX_PAGE as u64,
+            linux_page_size: linux_page as u64,
             dsr_generations: dsr::cache::PageGenerationTable::new(HOST_PAGE as u64)
                 .expect("generation table"),
             dsr_translator: None,
             host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         let result = memory.remap_private(
-            (host_start + LINUX_PAGE) as u64,
-            LINUX_PAGE,
-            &vec![0xaa; LINUX_PAGE],
+            (host_start + linux_page) as u64,
+            linux_page,
+            &vec![0xaa; linux_page],
         );
         assert_eq!(
             result,
@@ -4849,8 +4851,8 @@ mod tests {
         for (index, byte) in expected.into_iter().enumerate() {
             let page = unsafe {
                 std::slice::from_raw_parts(
-                    (host_start + index * LINUX_PAGE) as *const u8,
-                    LINUX_PAGE,
+                    (host_start + index * linux_page) as *const u8,
+                    linux_page,
                 )
             };
             assert!(
