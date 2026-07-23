@@ -3818,6 +3818,13 @@ pub const LINUX_SOL_UDP: i32 = 17; // IPPROTO_UDP
 /// sockopts differ, accepted as no-ops).
 pub const LINUX_IPPROTO_UDPLITE: i32 = 136;
 pub const LINUX_SOL_IPV6: i32 = 41; // IPPROTO_IPV6
+/// Linux protocol number for ICMP (`IPPROTO_ICMP`), used by the raw-ICMP
+/// socket emulation (ping-style `SOCK_DGRAM`/`SOCK_RAW` with this protocol).
+pub const LINUX_IPPROTO_ICMP: i32 = 1;
+/// `struct icmphdr.type` value for an echo request (ICMP_ECHO).
+pub const LINUX_ICMP_ECHO_REQUEST: u8 = 8;
+/// `struct icmphdr.type` value for an echo reply (ICMP_ECHOREPLY).
+pub const LINUX_ICMP_ECHO_REPLY: u8 = 0;
 
 // IPPROTO_IP / IPPROTO_IPV6 option numbers differ from macOS, so they must be
 // translated (not passed through). Linux uapi values (include/uapi/linux/in.h,
