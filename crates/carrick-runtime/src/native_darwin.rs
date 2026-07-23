@@ -135,9 +135,10 @@ fn native_exited_leader_must_park(tid: crate::thread::ThreadId) -> bool {
 }
 
 // Moved verbatim to `carrick_dsr_aarch64::snapshot` as part of the staged
-// native-backend extraction (the C mirror in csrc/native_darwin.c and the
-// gateway offset asserts pin its layout); re-exported so the existing use
-// sites and the C-mirror contract stay unchanged.
+// native-backend extraction (the C mirror in carrick-native-darwin's
+// csrc/native_darwin.c and the gateway offset asserts pin its layout);
+// re-exported so the existing use sites and the C-mirror contract stay
+// unchanged.
 pub(crate) use carrick_dsr_aarch64::snapshot::NativeUcontextSnapshot;
 
 type DsrPrepareFn = fn(
@@ -530,9 +531,17 @@ impl carrick_hal::TimerDelivery for NativeTimerDelivery {
     }
 }
 
-// The C trap/kick shim (`csrc/native_darwin.c`) is genuinely Darwin+aarch64:
-// x18 guest-ABI switching, `__darwin_mcontext64` snapshots, and the MAP_JIT
-// cache bounds all live there, and build.rs only compiles it for that target.
+// The C trap/kick shim (`carrick-native-darwin/csrc/native_darwin.c`, moved
+// there from this crate as M0.6 of the seams design) is genuinely
+// Darwin+aarch64: x18 guest-ABI switching, `__darwin_mcontext64` snapshots,
+// and the MAP_JIT cache bounds all live there, and that crate's build.rs
+// only compiles it for that target. The static library it produces is
+// linked into this crate transitively through the `carrick-native-darwin`
+// dependency (Cargo propagates a dependency's build-script link directives
+// to every consumer), so these extern declarations still resolve unchanged.
+// (`carrick_native_clear_icache` is NOT declared here any more: `flush_icache`
+// moved to `carrick_native_darwin::jit::DarwinHostJit`, which binds it
+// directly — see that crate's `src/jit.rs`.)
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe extern "C" {
     fn carrick_native_install_dsr_signal_handlers() -> libc::c_int;
@@ -556,7 +565,6 @@ unsafe extern "C" {
     fn carrick_native_dsr_benchmark_signal_mask_pair() -> libc::c_int;
     #[cfg(test)]
     fn carrick_native_dsr_benchmark_custom_x18_pair() -> libc::c_int;
-    fn carrick_native_clear_icache(start: *mut libc::c_void, len: usize);
 }
 
 // FAIL-CLOSED complement of the Darwin C shim (M1 item: the per-host native
@@ -606,15 +614,6 @@ mod native_shim_fail_closed {
 
     pub(super) unsafe fn carrick_native_kick_state_unbind_current(_state: *mut libc::c_void) {
         unreachable!("native kick state cannot exist without a host shim");
-    }
-
-    /// Declaration parity with the Darwin extern block: the only caller
-    /// (`native_darwin::darwin_jit`) is itself Darwin-only, so this arm is
-    /// never referenced — kept so the stub surface stays byte-for-byte the
-    /// extern contract the M1 host shim crates will implement.
-    #[allow(dead_code)]
-    pub(super) unsafe fn carrick_native_clear_icache(_start: *mut libc::c_void, _len: usize) {
-        unreachable!("native JIT cache cannot exist without a host shim");
     }
 }
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

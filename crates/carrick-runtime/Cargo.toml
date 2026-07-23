@@ -133,13 +133,18 @@ carrick-spec = { path = "../carrick-spec" }
 [target.'cfg(target_os = "freebsd")'.dependencies]
 carrick-native-freebsd = { path = "../carrick-native-freebsd" }
 
+# The real Darwin native-lane host layer (MAP_JIT W^X JIT + the C trap/kick
+# shim, csrc/native_darwin.c); selected by target like the FreeBSD twin above.
+# Compiles to a real MAP_JIT impl on aarch64 and a fail-closed stub on any
+# other macOS arch (the crate's own internal gate), so it's always safe to
+# depend on here.
+[target.'cfg(target_os = "macos")'.dependencies]
+carrick-native-darwin = { path = "../carrick-native-darwin" }
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor.workspace = true
 applevisor-sys.workspace = true
 mach2.workspace = true
-
-[build-dependencies]
-cc = "1"
 
 [dev-dependencies]
 # bad64/dynasmrt dropped to DEV-dependencies with the extraction-completing
