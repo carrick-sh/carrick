@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 
+import hashlib
 import importlib.util
+import json
+import lzma
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -45,6 +49,251 @@ class ConfigTests(unittest.TestCase):
     def test_unknown_vm_is_an_error(self) -> None:
         rc = BSDVM.main(["ps", "no-such-vm"])
         self.assertEqual(rc, 2)
+
+
+class FetchLogicTests(unittest.TestCase):
+    def test_parse_checksum_bsd_format(self) -> None:
+        text = (
+            "SHA512 (FreeBSD-15.1-RELEASE-arm64-aarch64-ufs.qcow2.xz) = " + "ab" * 64 + "\n"
+            "SHA512 (other.img) = " + "cd" * 64 + "\n"
+        )
+        self.assertEqual(
+            BSDVM.parse_checksum(text, "FreeBSD-15.1-RELEASE-arm64-aarch64-ufs.qcow2.xz"),
+            "ab" * 64,
+        )
+        with self.assertRaises(KeyError):
+            BSDVM.parse_checksum(text, "missing.xz")
+
+    def test_pick_candidate_first_live_url(self) -> None:
+        cands = ["https://x/one", "https://x/two", "https://x/three"]
+        picked = BSDVM.pick_candidate(cands, probe=lambda u: u.endswith("two"))
+        self.assertEqual(picked, "https://x/two")
+        with self.assertRaises(SystemExit):
+            BSDVM.pick_candidate(cands, probe=lambda u: False)
+
+    def test_fetch_checksum_text_none_when_manifest_unreachable(self) -> None:
+        # NetBSD publishes no checksum manifest for gzimg images (verified against
+        # cdn.netbsd.org/ftp.netbsd.org across 9.4/10.0/10.1); the raw-text fetch
+        # must report None on an unreachable manifest, not raise. What happens
+        # next (pinned fallback vs fail-closed) is resolve_expected_sha512's job,
+        # covered by ChecksumPolicyTests below.
+        with mock.patch.object(BSDVM.urllib.request, "urlopen", side_effect=OSError("404")):
+            self.assertIsNone(BSDVM._fetch_checksum_text(BSDVM.VMS["netbsd-arm64"]))
+
+    def test_fetch_checksum_text_returns_raw_text_when_manifest_reachable(self) -> None:
+        text = "SHA512 (arm64.img.gz) = " + "ab" * 64 + "\n"
+        cm = mock.MagicMock()
+        cm.read.return_value = text.encode()
+        cm.__enter__.return_value = cm
+        with mock.patch.object(BSDVM.urllib.request, "urlopen", return_value=cm):
+            self.assertEqual(BSDVM._fetch_checksum_text(BSDVM.VMS["netbsd-arm64"]), text)
+
+    def test_fetch_is_idempotent_when_base_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                st = BSDVM.state_dir("netbsd-arm64")
+                st.mkdir(parents=True)
+                (st / "base.qcow2").write_bytes(b"x")
+                ns = mock.Mock(vm="netbsd-arm64", force=False)
+                with mock.patch.object(BSDVM, "url_exists") as probe:
+                    self.assertEqual(BSDVM.cmd_fetch(ns), 0)
+                    probe.assert_not_called()  # no network when base exists
+
+    def test_fetch_removes_stale_part_on_idempotent_skip(self) -> None:
+        # A prior interrupted --force refetch can leave base.part.qcow2 behind
+        # even though the old base.qcow2 is still intact and trusted. cmd_fetch
+        # must sweep the stale part at start regardless of which path it takes.
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                st = BSDVM.state_dir("netbsd-arm64")
+                st.mkdir(parents=True)
+                (st / "base.qcow2").write_bytes(b"x")
+                (st / "base.part.qcow2").write_bytes(b"stale-partial-from-interrupted-run")
+                ns = mock.Mock(vm="netbsd-arm64", force=False)
+                with mock.patch.object(BSDVM, "url_exists") as probe:
+                    self.assertEqual(BSDVM.cmd_fetch(ns), 0)
+                    probe.assert_not_called()
+                self.assertFalse((st / "base.part.qcow2").exists())
+                self.assertEqual((st / "base.qcow2").read_bytes(), b"x")  # untouched
+
+
+class AtomicFinalizeTests(unittest.TestCase):
+    """`_convert_and_finalize` must never leave a corrupt/partial file at the
+    `base.qcow2` name -- it only ever gets there via a rename of a fully
+    converted+resized `base.part.qcow2`.
+    """
+
+    def test_convert_failure_leaves_no_base_and_no_part(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            st = Path(td)
+            src = st / "image.raw"
+            src.write_bytes(b"fake-decompressed-bytes")
+            part = st / "base.part.qcow2"
+            base = st / "base.qcow2"
+            vm = BSDVM.VMS["netbsd-arm64"]
+            with mock.patch.object(
+                BSDVM.subprocess,
+                "run",
+                side_effect=subprocess.CalledProcessError(1, ["qemu-img", "convert"]),
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    BSDVM._convert_and_finalize(vm, src, part, base)
+            self.assertFalse(base.exists())
+            self.assertFalse(part.exists())  # qemu-img convert never ran for real
+
+    def test_resize_failure_leaves_no_base_even_though_part_was_written(self) -> None:
+        # convert "succeeds" (writes `part`), resize fails -> exception must
+        # propagate before the rename, so `base` must still not exist even
+        # though a (corrupt/partial) file sits at the `.part.qcow2` name.
+        with tempfile.TemporaryDirectory() as td:
+            st = Path(td)
+            src = st / "image.raw"
+            src.write_bytes(b"fake-decompressed-bytes")
+            part = st / "base.part.qcow2"
+            base = st / "base.qcow2"
+            vm = BSDVM.VMS["netbsd-arm64"]
+
+            def fake_run(cmd, check=True):
+                if cmd[1] == "convert":
+                    Path(cmd[-1]).write_bytes(b"partial-qcow2-from-convert")
+                    return mock.Mock(returncode=0)
+                raise subprocess.CalledProcessError(1, cmd)
+
+            with mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    BSDVM._convert_and_finalize(vm, src, part, base)
+            self.assertFalse(base.exists())
+            self.assertTrue(part.exists())  # partial file stranded at .part, never at base
+
+    def test_success_renames_part_onto_base(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            st = Path(td)
+            src = st / "image.raw"
+            src.write_bytes(b"fake-decompressed-bytes")
+            part = st / "base.part.qcow2"
+            base = st / "base.qcow2"
+            vm = BSDVM.VMS["freebsd-arm64"]
+
+            def fake_run(cmd, check=True):
+                if cmd[1] == "convert":
+                    Path(cmd[-1]).write_bytes(b"converted-qcow2")
+                elif cmd[1] == "resize":
+                    Path(cmd[-2]).write_bytes(b"resized-qcow2")
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run):
+                BSDVM._convert_and_finalize(vm, src, part, base)
+            self.assertTrue(base.exists())
+            self.assertFalse(part.exists())
+            self.assertEqual(base.read_bytes(), b"resized-qcow2")
+
+
+class FetchIntegrationTests(unittest.TestCase):
+    """Drives `cmd_fetch` fully end-to-end against mocked network/subprocess
+    boundaries, proving the checksum-policy wiring and the atomic finalize
+    actually compose correctly -- not just their unit-tested pieces in
+    isolation.
+    """
+
+    def test_cmd_fetch_happy_path_mocked(self) -> None:
+        vm_name = "freebsd-arm64"
+        vm = BSDVM.VMS[vm_name]
+        fname = vm.image_candidates[0].rsplit("/", 1)[1]
+        raw_bytes = b"pretend-decompressed-disk-image-bytes"
+        compressed_bytes = lzma.compress(raw_bytes)  # real xz so _decompress works
+        sha = hashlib.sha512(compressed_bytes).hexdigest()
+        checksum_text = f"SHA512 ({fname}) = {sha}\n"
+
+        def fake_download(url: str, dst: Path) -> None:
+            dst.write_bytes(compressed_bytes)
+
+        def fake_run(cmd: list[str], check: bool = True):
+            if cmd[1] == "convert":
+                Path(cmd[-1]).write_bytes(b"fake-converted-qcow2")
+            elif cmd[1] == "resize":
+                Path(cmd[-2]).write_bytes(b"fake-resized-qcow2")
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                st = BSDVM.state_dir(vm_name)
+                ns = mock.Mock(vm=vm_name, force=False)
+                with (
+                    mock.patch.object(BSDVM, "url_exists", return_value=True),
+                    mock.patch.object(BSDVM, "_download", side_effect=fake_download),
+                    mock.patch.object(
+                        BSDVM, "_fetch_checksum_text", return_value=checksum_text
+                    ),
+                    mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run),
+                ):
+                    rc = BSDVM.cmd_fetch(ns)
+                self.assertEqual(rc, 0)
+
+                base = st / "base.qcow2"
+                self.assertTrue(base.exists())
+                self.assertEqual(base.read_bytes(), b"fake-resized-qcow2")
+                self.assertFalse((st / "base.part.qcow2").exists())
+                # no leftover intermediates
+                self.assertFalse((st / fname).exists())
+                self.assertFalse((st / "image.raw").exists())
+                self.assertFalse((st / "image.qcow2").exists())
+
+                manifest = json.loads((st / "manifest.json").read_text())
+                self.assertEqual(manifest["checksum_method"], "upstream")
+                self.assertIs(manifest["checksum_verified"], True)
+                self.assertEqual(manifest["sha512"], sha)
+
+
+class ChecksumPolicyTests(unittest.TestCase):
+    """Pinned-hash + fail-closed verification policy (resolve_expected_sha512).
+
+    Project policy is fail-closed: an ever-unverified path is not acceptable.
+    NetBSD's gzimg tree publishes no checksum file, so netbsd-arm64 carries a
+    pinned_sha512 fallback; every other VM (and any future one without a pin)
+    must fail closed rather than proceed unverified.
+    """
+
+    def test_upstream_hit_wins_over_pinned(self) -> None:
+        vm = BSDVM.VMS["netbsd-arm64"]
+        text = "SHA512 (arm64.img.gz) = " + "ab" * 64 + "\n"
+        got, method = BSDVM.resolve_expected_sha512(vm, text, "arm64.img.gz")
+        self.assertEqual(got, "ab" * 64)
+        self.assertEqual(method, "upstream")
+
+    def test_falls_back_to_pinned_when_filename_missing_from_upstream(self) -> None:
+        vm = BSDVM.VMS["netbsd-arm64"]
+        text = "SHA512 (some-other-file.img) = " + "cd" * 64 + "\n"
+        got, method = BSDVM.resolve_expected_sha512(vm, text, "arm64.img.gz")
+        self.assertEqual(got, vm.pinned_sha512)
+        self.assertEqual(method, "pinned")
+
+    def test_falls_back_to_pinned_when_upstream_manifest_unreachable(self) -> None:
+        vm = BSDVM.VMS["netbsd-arm64"]
+        got, method = BSDVM.resolve_expected_sha512(vm, None, "arm64.img.gz")
+        self.assertEqual(got, vm.pinned_sha512)
+        self.assertEqual(method, "pinned")
+
+    def test_fails_closed_when_no_upstream_and_no_pin(self) -> None:
+        # freebsd-arm64 has a real upstream CHECKSUM.SHA512 and carries no pin;
+        # if that manifest is ever unreachable/missing the entry, there is no
+        # unverified fallback -- it must raise, not warn-and-proceed.
+        vm = BSDVM.VMS["freebsd-arm64"]
+        self.assertIsNone(vm.pinned_sha512)
+        with self.assertRaises(SystemExit):
+            BSDVM.resolve_expected_sha512(vm, None, "whatever.qcow2.xz")
+        with self.assertRaises(SystemExit):
+            BSDVM.resolve_expected_sha512(
+                vm, "SHA512 (other.qcow2.xz) = " + "ef" * 64, "whatever.qcow2.xz"
+            )
+
+    def test_pinned_sha512_is_well_formed(self) -> None:
+        # Coherence check on the constant itself: 128 lowercase hex chars
+        # (a SHA-512 digest), not a placeholder or truncated value.
+        nb = BSDVM.VMS["netbsd-arm64"]
+        self.assertIsNotNone(nb.pinned_sha512)
+        assert nb.pinned_sha512 is not None  # narrow for mypy/type-checkers
+        self.assertEqual(len(nb.pinned_sha512), 128)
+        self.assertRegex(nb.pinned_sha512, r"^[0-9a-f]{128}$")
 
 
 class QemuArgsTests(unittest.TestCase):
