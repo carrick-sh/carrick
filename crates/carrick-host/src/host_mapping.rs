@@ -230,10 +230,27 @@ mod tests {
         let len = mapping.len();
         assert_eq!(unsafe { libc::msync(ptr.cast(), len, libc::MS_ASYNC) }, 0);
         drop(mapping);
+        // The failed-msync return value itself (-1, i.e. "this range is not a
+        // live mapping") is reliable and platform-independent -- confirmed by
+        // a single-threaded (zero-concurrency) repro of exactly this
+        // mmap->msync->munmap->msync sequence on real NetBSD 10.1/aarch64:
+        // rc=-1 every time, no ambiguity, no address-reuse window.
         assert_eq!(unsafe { libc::msync(ptr.cast(), len, libc::MS_ASYNC) }, -1);
+        // The ERRNO that failure carries is where platforms diverge. NetBSD's
+        // own msync(2) man page documents ENOMEM for "one or more pages which
+        // are unmapped", but that same single-threaded repro shows NetBSD
+        // 10.1's actual kernel returns EFAULT (14) instead -- a real
+        // man-page-vs-kernel discrepancy, not a race (the MMAP_TEST_LOCK
+        // above already rules concurrency out, and the repro reproduced it
+        // with no other thread in the process at all). macOS and FreeBSD both
+        // give ENOMEM here, matching the BSD/POSIX msync man page text.
+        #[cfg(target_os = "netbsd")]
+        let expected_errno = libc::EFAULT;
+        #[cfg(not(target_os = "netbsd"))]
+        let expected_errno = libc::ENOMEM;
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ENOMEM)
+            Some(expected_errno)
         );
     }
 
