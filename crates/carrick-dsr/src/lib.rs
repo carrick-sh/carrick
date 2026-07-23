@@ -33,6 +33,7 @@ pub mod cache;
 pub mod fault;
 pub mod host;
 pub mod ids;
+pub mod lane;
 pub mod native_error;
 pub mod page_geometry;
 pub mod probes;
