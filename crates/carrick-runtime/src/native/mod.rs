@@ -20,7 +20,7 @@
 //!
 //! # This is strangler-interim, NOT the end-state
 //!
-//! [`HostNativeLane`] (plus [`DarwinAarch64Lane`]/[`FreebsdX8664Lane`] and
+//! [`HostNativeLane`] (plus [`DarwinAarch64Lane`]/`FreebsdX8664Lane` and
 //! their `carrick_dsr::lane::NativeLane` impls) is the compile-checked
 //! (guest ISA, host) pairing Phase 2 will dispatch through generically (a
 //! `ProcessTranslator<HostNativeLane>`-shaped call, replacing the per-lane
@@ -57,7 +57,7 @@
 //!   two unused params from the macOS-shaped signature discarded, not a
 //!   behavior change — `runtime.rs` itself is macOS-only today, so this arm
 //!   is presently unreached, staged for the day a unified caller reaches it).
-//! - [`run_dispatch_native`] / [`run_dispatch_native_bytes`] — the FreeBSD
+//! - `run_dispatch_native` / `run_dispatch_native_bytes` — the FreeBSD
 //!   standalone-workload/LTP-harness surface (`lib.rs`'s
 //!   `run_elf_native_dispatch_with_process` and the `run_oci_with_engine`
 //!   `ExecutionBackend::Native` early return). Both call shapes are
