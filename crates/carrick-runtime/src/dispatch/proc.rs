@@ -899,6 +899,14 @@ impl SyscallDispatcher {
     /// it as the fallback orphan-adoption target after acquiring host reaper
     /// status; syscall-facing code translates that implementation pid back to
     /// guest init PID 1 unless the guest explicitly selected a subreaper.
+    ///
+    /// Only that FreeBSD/x86_64 native lane (`native_freebsd.rs`) calls this
+    /// today, so it is otherwise unreachable — same target-gating rationale as
+    /// `carrick-dsr-x86`'s Cargo dependency edge.
+    #[cfg_attr(
+        not(all(target_os = "freebsd", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn bootstrap_host_pid(&self) -> u32 {
         self.proc.lock().bootstrap_host_pid
     }

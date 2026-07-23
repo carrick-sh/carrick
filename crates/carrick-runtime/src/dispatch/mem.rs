@@ -1017,6 +1017,15 @@ impl SyscallDispatcher {
     /// Private VMAs added after image construction. Native vfork backends use
     /// these ranges in addition to their fixed image/arena mappings so
     /// `CLONE_VM` also covers high aliases selected by `mmap(MAP_FIXED)`.
+    ///
+    /// Only the FreeBSD/x86_64 native lane (`native_freebsd.rs`) consumes this
+    /// (and its `shared_dynamic_mapping_ranges`/`dynamic_mapping_ranges`
+    /// helpers) today, so the cluster is otherwise unreachable — same
+    /// target-gating rationale as `carrick-dsr-x86`'s Cargo dependency edge.
+    #[cfg_attr(
+        not(all(target_os = "freebsd", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn private_dynamic_mapping_ranges(&self) -> Vec<(u64, usize)> {
         self.dynamic_mapping_ranges(ProcMapSharing::Private)
     }
@@ -1024,10 +1033,18 @@ impl SyscallDispatcher {
     /// Shared VMAs must be excluded from a temporary `INHERIT_SHARE`/COPY
     /// cycle: FreeBSD documents that changing a `MAP_SHARED` mapping to
     /// `INHERIT_COPY` permanently severs its backing-store sharing.
+    #[cfg_attr(
+        not(all(target_os = "freebsd", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn shared_dynamic_mapping_ranges(&self) -> Vec<(u64, usize)> {
         self.dynamic_mapping_ranges(ProcMapSharing::Shared)
     }
 
+    #[cfg_attr(
+        not(all(target_os = "freebsd", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     fn dynamic_mapping_ranges(&self, sharing: ProcMapSharing) -> Vec<(u64, usize)> {
         self.mem
             .lock()

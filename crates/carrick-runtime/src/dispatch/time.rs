@@ -943,14 +943,14 @@ fn raise_host_nofile_backing(guest_soft: u64) {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
         return;
     }
-    let cur_soft = rl.rlim_cur as u64;
+    let cur_soft = rl.rlim_cur;
     // The host hard limit ceilings any raise. A non-positive / INFINITY hard
     // value (rlim_max <= 0 when reinterpreted) means "no finite cap" → use the
     // desired target directly.
     let hard = rl.rlim_max;
     let desired = guest_soft.saturating_add(HOST_FD_HEADROOM);
-    let target = if hard > 0 && (hard as u64) < desired {
-        hard as u64
+    let target = if hard > 0 && hard < desired {
+        hard
     } else {
         desired
     };

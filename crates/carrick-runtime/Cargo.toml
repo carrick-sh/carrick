@@ -85,6 +85,12 @@ carrick-dsr = { path = "../carrick-dsr" }
 # host (bad64/dynasmrt are pure Rust); only its assembled gateway is
 # target-gated inside the crate itself.
 carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64" }
+# The x86_64 guest-ISA translator crate. Also UNCONDITIONAL, same rationale as
+# carrick-dsr-aarch64 above: its portable layout/decode surface (consumed
+# cross-host by `x86_dsr_profiler_layout` for diagnostic scripts) compiles
+# everywhere; only its assembled native gateway is target-gated inside the
+# crate itself.
+carrick-dsr-x86 = { path = "../carrick-dsr-x86" }
 carrick-host = { path = "../carrick-host" }
 carrick-kernel = { path = "../carrick-kernel" }
 carrick-mem = { path = "../carrick-mem" }
@@ -126,12 +132,6 @@ carrick-spec = { path = "../carrick-spec" }
 # compiles to nothing elsewhere.
 [target.'cfg(target_os = "freebsd")'.dependencies]
 carrick-native-freebsd = { path = "../carrick-native-freebsd" }
-
-# The x86_64 guest-ISA translator for the FreeBSD/amd64 native lane. Same
-# target-gating rationale as carrick-native-freebsd: the lane is a property of
-# the (host OS, host ISA) pair.
-[target.'cfg(all(target_os = "freebsd", target_arch = "x86_64"))'.dependencies]
-carrick-dsr-x86 = { path = "../carrick-dsr-x86" }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor.workspace = true

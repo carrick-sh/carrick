@@ -1372,6 +1372,17 @@ pub use native_gateway::{enter_translated, exit_stub_addresses, kick_stub_addr, 
 /// Off-x86 fail-closed complement: the gateway only exists on x86_64. This
 /// keeps the crate compiling (and unit-testable) on other host arches, where
 /// translated x86 execution is meaningless.
+///
+/// # Safety
+/// This stub is unreachable in practice: every real caller of
+/// `enter_translated` (e.g. `carrick-runtime`'s FreeBSD native lane) is
+/// itself `cfg`-gated to `target_arch = "x86_64"`, so on any other arch
+/// nothing in the tree names this function. The body never dereferences
+/// `context`, never runs translated code, and never reaches the raw gateway
+/// trampoline — it unconditionally fails closed and returns `-1`. It stays
+/// `unsafe fn` only to keep its signature identical to the live x86_64
+/// `enter_translated` above; there is no precondition on `context` for
+/// callers to uphold.
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn enter_translated(_context: &mut X86DsrContext) -> i32 {
     -1

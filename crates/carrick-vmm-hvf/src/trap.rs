@@ -7047,7 +7047,7 @@ mod thread_sibling_tests {
             let first_mapping = &self.mappings[first.mapping_idx];
             let first_physical = first_mapping.ipa + first.mapping_offset as u64;
             let mut copied = 0usize;
-            for chunk in plan {
+            for chunk in &plan {
                 let mapping = &self.mappings[chunk.mapping_idx];
                 let physical = mapping.ipa + chunk.mapping_offset as u64;
                 if chunk.mapping_idx != first.mapping_idx

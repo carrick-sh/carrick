@@ -1,3 +1,9 @@
+// This whole module is the `#[cfg(test)]` live-execution oracle (see the
+// `mod oracle;` gate in `dsr/mod.rs`): fixture/harness code that legitimately
+// fails fast on a broken test setup, same rationale as the live VMM
+// integration tests (e.g. `tests/live_bhyve_x86.rs`).
+#![allow(clippy::expect_used)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
