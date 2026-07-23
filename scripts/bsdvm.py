@@ -987,99 +987,246 @@ def _decode_partial(x: bytes | str | None) -> str:
     return x
 
 
-def cmd_gate(args: argparse.Namespace) -> int:
-    vm = VMS[args.vm]
-    stage = STAGES.get(args.stage)
+def run_gate(vm: VmConfig, stage_name: str, boot_retries: int = 0) -> dict:
+    """Runs one (vm, stage) gate, retrying the boot/ssh_wait phase (the part
+    of the flow before any stage cmd has run) up to `boot_retries` times,
+    each retry against a FRESH ephemeral overlay -- never a reused one, so a
+    flaky boot never inherits half-booted disk state from the attempt before
+    it.
+
+    Never raises for a whole-flow failure that a caller might want to
+    recover from (e.g. `cmd_ladder`, which must keep going to the next gate
+    spec): the exception, if any, is returned as `result["exc"]` rather than
+    propagated, so callers decide for themselves whether to re-raise
+    (`cmd_gate` does, to preserve its existing CLI contract) or record it and
+    move on (`cmd_ladder` does). Pre-flight validation errors (unknown stage,
+    no golden image, VM already running) are the one exception to this: they
+    happen before any attempt/overlay/report exists at all, so they still
+    raise directly, exactly as before this function existed.
+
+    Returns a dict: {"report": <the same dict write_report renders>,
+    "report_dir": Path, "rc": 0|1, "exc": BaseException | None}.
+    """
+    stage = STAGES.get(stage_name)
     if stage is None:
-        raise SystemExit(f"unknown stage {args.stage} (known: {', '.join(STAGES)})")
+        raise SystemExit(f"unknown stage {stage_name} (known: {', '.join(STAGES)})")
     if not stage.available:
-        raise SystemExit(f"{args.stage} not available yet: {stage.note}")
+        raise SystemExit(f"{stage_name} not available yet: {stage.note}")
     if not (state_dir(vm.name) / "golden.qcow2").exists():
         raise SystemExit(f"no golden image; run: bsdvm.py provision {vm.name}")
     if read_pid(vm.name) is not None:
         raise SystemExit(f"{vm.name} is running; bsdvm.py down {vm.name} first")
-    overlay = create_overlay(vm.name, f"gate-{os.getpid()}.qcow2", "golden.qcow2")
-    started = time.monotonic()
+
     ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-    out_dir = state_root() / "results" / f"{ts}-{vm.name}-{args.stage}"
-    steps: list[dict] = []
-    head = ""
-    rustc = ""
+    out_dir = state_root() / "results" / f"{ts}-{vm.name}-{stage_name}"
+
+    attempt = 0
+    final_exc: BaseException | None = None
+    report: dict = {}
     ok = True
-    error: str | None = None
-    try:
-        boot(vm, overlay)
-        ssh_wait(vm)
-        head = push_head(vm)
-        rustc = ssh_run(vm, "rustc --version", timeout_s=30).stdout.strip()
-        remaining = list(stage.cmds)
-        while remaining:
-            cmd = remaining.pop(0)
+    while True:
+        attempt += 1
+        overlay_path = state_dir(vm.name) / f"gate-{os.getpid()}-{attempt}.qcow2"
+        overlay_path.unlink(missing_ok=True)  # guarantee a genuinely fresh overlay
+        overlay = create_overlay(vm.name, overlay_path.name, "golden.qcow2")
+        started = time.monotonic()
+        steps: list[dict] = []
+        head = ""
+        rustc = ""
+        ok = True
+        error: str | None = None
+        boot_phase_failed = False
+        exc_caught: BaseException | None = None
+        try:
             try:
-                proc = ssh_run(vm, cmd, timeout_s=7200)
-            except subprocess.TimeoutExpired as exc:
-                # The exact case the 7200s bound exists for: a hung cargo
-                # command. Record what we can (partial captured output, if
-                # any) and stop -- running further stage.cmds after one has
-                # already wedged the guest would just wait out their own
-                # timeouts for no benefit, so skip and record them instead.
-                partial = (_decode_partial(exc.stdout) + _decode_partial(exc.stderr))[-4000:]
-                steps.append(
-                    {"cmd": cmd, "rc": None, "tail": "<timeout after 7200s>" + partial}
-                )
-                ok = False
-                for skipped in remaining:
+                boot(vm, overlay)
+                ssh_wait(vm)
+            except BaseException:
+                boot_phase_failed = True
+                raise
+            head = push_head(vm)
+            rustc = ssh_run(vm, "rustc --version", timeout_s=30).stdout.strip()
+            remaining = list(stage.cmds)
+            while remaining:
+                cmd = remaining.pop(0)
+                try:
+                    proc = ssh_run(vm, cmd, timeout_s=7200)
+                except subprocess.TimeoutExpired as exc:
+                    # The exact case the 7200s bound exists for: a hung cargo
+                    # command. Record what we can (partial captured output, if
+                    # any) and stop -- running further stage.cmds after one has
+                    # already wedged the guest would just wait out their own
+                    # timeouts for no benefit, so skip and record them instead.
+                    partial = (_decode_partial(exc.stdout) + _decode_partial(exc.stderr))[-4000:]
                     steps.append(
-                        {"cmd": skipped, "rc": None, "tail": "<skipped: prior step timed out>"}
+                        {"cmd": cmd, "rc": None, "tail": "<timeout after 7200s>" + partial}
                     )
-                break
-            tail = (proc.stdout + proc.stderr)[-4000:]
-            steps.append({"cmd": cmd, "rc": proc.returncode, "tail": tail})
-            ok = ok and proc.returncode == 0
-    except BaseException as exc:
-        # Whole-flow failure: boot, ssh_wait, push_head, the rustc probe, or
-        # anything else not already handled by the per-step TimeoutExpired
-        # catch above (e.g. ssh_wait's SystemExit after its own deadline).
-        # Remember it so the report below still gets written with the real
-        # cause, then re-raise once the finally clause has run -- callers and
-        # the exit code still see the original failure, unmasked.
-        error = repr(exc)
-        raise
-    finally:
-        report = {
-            "vm": vm.name, "stage": args.stage, "head": head, "rustc": rustc,
-            "wall_s": time.monotonic() - started,
-            "report_only": stage.report_only, "steps": steps,
-            "pass": ok and error is None, "error": error,
-        }
-        # Report write FIRST, before any cleanup: cleanup below can itself
-        # fail (stop_pid raising SystemExit on a SIGKILL survivor) and must
-        # not get a chance to prevent the report from landing.
+                    ok = False
+                    for skipped in remaining:
+                        steps.append(
+                            {"cmd": skipped, "rc": None, "tail": "<skipped: prior step timed out>"}
+                        )
+                    break
+                tail = (proc.stdout + proc.stderr)[-4000:]
+                steps.append({"cmd": cmd, "rc": proc.returncode, "tail": tail})
+                ok = ok and proc.returncode == 0
+        except BaseException as exc:
+            # Whole-flow failure: boot, ssh_wait, push_head, the rustc probe, or
+            # anything else not already handled by the per-step TimeoutExpired
+            # catch above (e.g. ssh_wait's SystemExit after its own deadline).
+            # Remember it so the report below still gets written with the real
+            # cause; whether it ultimately propagates is decided once the
+            # finally clause (and any retry) has run.
+            error = repr(exc)
+            exc_caught = exc
+        finally:
+            report = {
+                "vm": vm.name, "stage": stage_name, "head": head, "rustc": rustc,
+                "wall_s": time.monotonic() - started,
+                "report_only": stage.report_only, "steps": steps,
+                "pass": ok and error is None, "error": error,
+                "boot_retries_used": attempt - 1,
+            }
+            # Report write FIRST, before any cleanup: cleanup below can itself
+            # fail (stop_pid raising SystemExit on a SIGKILL survivor) and must
+            # not get a chance to prevent the report from landing.
+            try:
+                write_report(out_dir, report)
+            except Exception as report_exc:
+                # A broken report write (disk full, permissions, ...) must never
+                # mask whatever the gate run itself was doing.
+                print(f"warning: failed to write report: {report_exc}", file=sys.stderr)
+            # Archive this attempt's serial.log into the results dir BEFORE
+            # the next boot (a retry, or some unrelated later gate) overwrites
+            # it -- otherwise a boot-phase failure's only evidence is silently
+            # lost the moment anything reboots this VM again. Done for every
+            # boot-phase failure, independent of whether boot_retries > 0.
+            if boot_phase_failed:
+                serial_log = state_dir(vm.name) / "serial.log"
+                if serial_log.exists():
+                    try:
+                        shutil.copyfile(serial_log, out_dir / f"serial-attempt{attempt}.log")
+                    except OSError as copy_exc:
+                        print(f"warning: failed to archive serial log: {copy_exc}", file=sys.stderr)
+            # Cleanup: each action gets its own guard. stop_pid can itself raise
+            # SystemExit (SIGKILL survivor -- see stop_pid's docstring), and that
+            # must not eclipse the root cause of why this attempt is unwinding in
+            # the first place (e.g. the ssh_wait SystemExit above).
+            try:
+                pid = read_pid(vm.name)
+                if pid is not None:
+                    stop_pid(pid)
+            except BaseException as cleanup_exc:
+                print(f"warning: cleanup failed: {cleanup_exc}", file=sys.stderr)
+            try:
+                pidfile_path(vm.name).unlink(missing_ok=True)
+            except BaseException as cleanup_exc:
+                print(f"warning: cleanup failed: {cleanup_exc}", file=sys.stderr)
+            try:
+                overlay.unlink(missing_ok=True)
+            except BaseException as cleanup_exc:
+                print(f"warning: cleanup failed: {cleanup_exc}", file=sys.stderr)
+
+        if exc_caught is None:
+            break  # this attempt ran to completion (pass, or ok=False stage failure)
+        if boot_phase_failed and attempt <= boot_retries:
+            print(
+                f"{vm.name}: boot/ssh_wait attempt {attempt} failed ({error}); "
+                f"retrying with a fresh overlay ({attempt}/{boot_retries} retries used)"
+            )
+            continue
+        final_exc = exc_caught
+        break
+
+    return {
+        "report": report,
+        "report_dir": out_dir,
+        "rc": 0 if (ok or stage.report_only) else 1,
+        "exc": final_exc,
+    }
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    vm = VMS[args.vm]
+    outcome = run_gate(vm, args.stage, boot_retries=args.boot_retries)
+    if outcome["exc"] is not None:
+        # Preserve today's CLI contract exactly: cmd_gate propagates the
+        # original exception, unchanged, rather than reporting a bare rc.
+        raise outcome["exc"]
+    return outcome["rc"]
+
+
+def parse_gate_spec(spec: str) -> tuple[str, str]:
+    """Parse a `vm:stage` token used by `ladder`. Pure parsing/validation, no
+    I/O, so it is unit tested directly. Raises SystemExit (not ValueError)
+    for any malformed spec or unknown vm/stage, matching this module's
+    existing fail-fast CLI error convention.
+    """
+    if ":" not in spec:
+        raise SystemExit(f"invalid gate spec {spec!r} (expected vm:stage)")
+    vm_name, stage_name = spec.split(":", 1)
+    if vm_name not in VMS:
+        raise SystemExit(f"unknown vm: {vm_name} (known: {', '.join(sorted(VMS))})")
+    if stage_name not in STAGES:
+        raise SystemExit(f"unknown stage: {stage_name} (known: {', '.join(STAGES)})")
+    return vm_name, stage_name
+
+
+def cmd_ladder(args: argparse.Namespace) -> int:
+    """Runs each `vm:stage` gate spec sequentially, in this one process, with
+    boot-retries=1 -- the harness-tracked alternative to a human parking a
+    Monitor across a multi-hour multi-gate acceptance run. Reuses run_gate
+    for all orchestration (no duplicated boot/report/cleanup logic): a gate
+    spec whose precondition fails (no golden image, VM already running, ...)
+    or whose run_gate call raises for any other reason is recorded as a
+    failed entry and the ladder continues to the next spec rather than
+    aborting the whole run.
+    """
+    specs = [parse_gate_spec(g) for g in args.gates]  # validate all before running any
+    results: list[dict] = []
+    for vm_name, stage_name in specs:
+        vm = VMS[vm_name]
+        started = time.monotonic()
+        error: str | None = None
+        passed = False
+        report_dir: Path | None = None
+        boot_retries_used = 0
         try:
-            write_report(out_dir, report)
-        except Exception as report_exc:
-            # A broken report write (disk full, permissions, ...) must never
-            # mask whatever the gate run itself was doing.
-            print(f"warning: failed to write report: {report_exc}", file=sys.stderr)
-        # Cleanup: each action gets its own guard. stop_pid can itself raise
-        # SystemExit (SIGKILL survivor -- see stop_pid's docstring), and that
-        # must not eclipse the root cause of why cmd_gate is unwinding in the
-        # first place (e.g. the ssh_wait SystemExit above).
-        try:
-            pid = read_pid(vm.name)
-            if pid is not None:
-                stop_pid(pid)
-        except BaseException as cleanup_exc:
-            print(f"warning: cleanup failed: {cleanup_exc}", file=sys.stderr)
-        try:
-            pidfile_path(vm.name).unlink(missing_ok=True)
-        except BaseException as cleanup_exc:
-            print(f"warning: cleanup failed: {cleanup_exc}", file=sys.stderr)
-        try:
-            overlay.unlink(missing_ok=True)
-        except BaseException as cleanup_exc:
-            print(f"warning: cleanup failed: {cleanup_exc}", file=sys.stderr)
-    return 0 if (ok or stage.report_only) else 1
+            outcome = run_gate(vm, stage_name, boot_retries=1)
+            report_dir = outcome["report_dir"]
+            boot_retries_used = outcome["report"].get("boot_retries_used", 0)
+            if outcome["exc"] is not None:
+                error = repr(outcome["exc"])
+                passed = False
+            else:
+                passed = outcome["rc"] == 0
+        except BaseException as exc:
+            # Precondition failure (no golden, already running, ...) or any
+            # other exception run_gate itself couldn't recover from -- record
+            # it and keep going to the next gate spec instead of aborting the
+            # whole ladder.
+            error = repr(exc)
+            passed = False
+        wall_s = time.monotonic() - started
+        results.append({
+            "vm": vm_name, "stage": stage_name, "pass": passed,
+            "report_dir": str(report_dir) if report_dir is not None else None,
+            "wall_s": wall_s, "boot_retries_used": boot_retries_used, "error": error,
+        })
+        status = "PASS" if passed else "FAIL"
+        extra = f" error={error}" if error else ""
+        print(
+            f"ladder {vm_name}:{stage_name}: {status} wall={wall_s:.1f}s "
+            f"boot_retries_used={boot_retries_used}{extra}"
+        )
+
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    out = state_root() / "results" / f"ladder-{ts}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"results": results}, indent=2) + "\n")
+    print(f"ladder summary: {out}")
+
+    return 0 if all(r["pass"] for r in results) else 1
 
 
 def cmd_up(args: argparse.Namespace) -> int:
@@ -1146,7 +1293,11 @@ def main(argv: list[str]) -> int:
     gate = sub.add_parser("gate")
     gate.add_argument("vm")
     gate.add_argument("stage")
+    gate.add_argument("--boot-retries", type=int, default=0)
     gate.set_defaults(func=cmd_gate)
+    ladder = sub.add_parser("ladder")
+    ladder.add_argument("gates", nargs="+", metavar="vm:stage")
+    ladder.set_defaults(func=cmd_ladder)
     args = parser.parse_args(argv)
     if getattr(args, "vm", None) is not None and _resolve_vm(args.vm) is None:
         print(f"unknown vm: {args.vm} (known: {', '.join(sorted(VMS))})", file=sys.stderr)
