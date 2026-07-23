@@ -6,6 +6,7 @@
 //! `NativeMemoryConfig`) that lets hot-path readers avoid its `RwLock`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -23,7 +24,7 @@ use carrick_dsr::test_hooks::{
     take_native_prepared_mapping_failpoint,
 };
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_guest_mem::{GuestMemory, MemoryError};
+use carrick_guest_mem::{GuestMemory, MappingSharing, MemoryError, RepointPrivateError};
 use carrick_mem::memory::{AddressSpace, MemoryLayout, MemoryRegion};
 
 use crate::prepared_image::{
@@ -408,8 +409,7 @@ pub struct NativeMappedMemory {
     // now does the same via `exclusive_load`/`exclusive_store`. Only the shared
     // sequence bookkeeping below remains on the struct, behind its own interior
     // lock so it stays reachable through a shared `&self`.
-    pub exclusive_sequences:
-        parking_lot::Mutex<BTreeMap<NativeExclusiveLocation, NativeExclusiveSequence>>,
+    pub exclusive_sequences: parking_lot::Mutex<BTreeMap<u64, NativeExclusivePageState>>,
     pub host_page_size: u64,
     pub linux_page_size: u64,
     pub dsr_generations: dsr::cache::PageGenerationTable,
@@ -593,8 +593,38 @@ pub struct NativeExclusiveSequence(u64);
 impl NativeExclusiveSequence {
     pub const INITIAL: Self = Self(0);
 
+    /// Retire reservations while preserving the odd/even in-progress bit.
     pub fn next(self) -> Self {
+        Self(self.0.wrapping_add(2))
+    }
+
+    fn begin_host_write(self) -> Self {
+        debug_assert_eq!(self.0 & 1, 0);
         Self(self.0.wrapping_add(1))
+    }
+
+    fn finish_host_write(self) -> Self {
+        debug_assert_eq!(self.0 & 1, 1);
+        Self(self.0.wrapping_add(1))
+    }
+
+    fn write_in_progress(self) -> bool {
+        self.0 & 1 != 0
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct NativeExclusivePageState {
+    sequence: NativeExclusiveSequence,
+    host_writers: usize,
+}
+
+impl Default for NativeExclusivePageState {
+    fn default() -> Self {
+        Self {
+            sequence: NativeExclusiveSequence::INITIAL,
+            host_writers: 0,
+        }
     }
 }
 
@@ -1124,6 +1154,15 @@ impl NativeMappedMemory {
             shared_key_offset: 0,
         });
         let protections = MemoryProtections::default();
+        protections.set_mapping_sharing(
+            carrick_mem::memory::LINUX_SHARED_FILE_BASE,
+            usize::try_from(carrick_mem::memory::LINUX_SHARED_FILE_SIZE).map_err(|_| {
+                NativeMemoryError::Unsupported(
+                    "native shared aperture size is not host-representable".into(),
+                )
+            })?,
+            MappingSharing::Shared,
+        );
         for span in image.ro_spans() {
             let _span_end = checked_add_u64(span.start, span.len, "read-only ELF span end")?;
             let len = usize::try_from(span.len).map_err(|_| {
@@ -1174,8 +1213,7 @@ impl NativeMappedMemory {
             {
                 return Err(NativeMemoryError::Unsupported(
                     "prepared-map: injected vvar stamping failure".to_string(),
-                )
-                .into());
+                ));
             }
             memory.stamp_vdso_vvar()?;
             native_exec_map_detail(
@@ -1191,8 +1229,7 @@ impl NativeMappedMemory {
             {
                 return Err(NativeMemoryError::Unsupported(
                     "prepared-map: injected relocation failure".to_string(),
-                )
-                .into());
+                ));
             }
             apply_native_relative_relocations(&mut memory, relative_relocations)?;
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1202,7 +1239,7 @@ impl NativeMappedMemory {
                 return Err(NativeMemoryError::Unsupported(
                     "injected native exec failure after target mapping, vvar setup, and relocations"
                         .to_string(),
-                ).into());
+                ));
             }
             Ok(memory)
         })();
@@ -1884,50 +1921,90 @@ impl NativeMappedMemory {
         true
     }
 
-    /// Bumps the sequence for every tracked exclusive location that overlaps
-    /// `[address, address+len)`, or every tracked location if `address+len`
-    /// overflows. This is `invalidate_exclusive_range`'s entire job: every
-    /// exclusive reservation now lives in caller-owned state (per guest
-    /// thread), so bumping the shared sequence a reservation was captured
-    /// against is sufficient to invalidate it on the next CAS -- there is no
-    /// struct-embedded reservation left to null out here.
+    fn exclusive_page(&self, address: u64) -> u64 {
+        address & !(self.linux_page_size - 1)
+    }
+
+    /// Bump every already-tracked page intersecting a guest-memory write. Two
+    /// steps preserve parity so a concurrent host-write bracket remains odd.
     pub fn bump_exclusive_sequences_in_range(&self, address: u64, len: usize) {
+        if len == 0 {
+            return;
+        }
         let mut sequences = self.exclusive_sequences.lock();
-        let end = address.checked_add(len as u64);
-        if let Some(end) = end {
-            // DSR exclusive locations are scalar 1/2/4/8-byte accesses. An
-            // overlapping key can therefore start no earlier than address-7
-            // and strictly before the write end. Range the ordered map by that
-            // window rather than walking every exclusive location ever seen:
-            // Go's compiler issues DC ZVA continuously, and the old O(total
-            // locations) scan turned each 64-byte zero into a workload-wide
-            // traversal after a few thousand mutex addresses had accumulated.
-            let lower = NativeExclusiveLocation {
-                address: address.saturating_sub(7),
-                width: 0,
-            };
-            let upper = NativeExclusiveLocation {
-                address: end,
-                width: 0,
-            };
-            for (location, sequence) in sequences.range_mut(lower..upper) {
-                let location_end = location.address.saturating_add(location.width as u64);
-                if address < location_end {
-                    *sequence = sequence.next();
-                }
+        let Some(end) = address.checked_add(len as u64) else {
+            for state in sequences.values_mut() {
+                state.sequence = state.sequence.next();
             }
-        } else {
-            // An overflowing host-mediated write is rejected by its caller,
-            // but conservatively invalidate every tracked reservation before
-            // that error returns.
-            for sequence in sequences.values_mut() {
-                *sequence = sequence.next();
-            }
+            return;
+        };
+        let first = self.exclusive_page(address);
+        let last = self.exclusive_page(end.saturating_sub(1));
+        for (_, state) in sequences.range_mut(first..=last) {
+            state.sequence = state.sequence.next();
         }
     }
 
     pub fn invalidate_exclusive_range(&self, address: u64, len: usize) {
         self.bump_exclusive_sequences_in_range(address, len);
+    }
+
+    fn host_write_pages(&self, ranges: &[(u64, usize)]) -> Vec<u64> {
+        let mut pages = BTreeSet::new();
+        for &(address, len) in ranges {
+            if len == 0 {
+                continue;
+            }
+            let Some(end) = address.checked_add(len as u64) else {
+                pages.extend(self.exclusive_sequences.lock().keys().copied());
+                continue;
+            };
+            let mut page = self.exclusive_page(address);
+            let last = self.exclusive_page(end.saturating_sub(1));
+            loop {
+                pages.insert(page);
+                if page == last {
+                    break;
+                }
+                page = page.saturating_add(self.linux_page_size);
+            }
+        }
+        pages.into_iter().collect()
+    }
+
+    /// Enter an odd-generation host-write phase for every distinct page the
+    /// kernel will be allowed to mutate. A writer count keeps overlapping host
+    /// syscalls odd until the last guard closes.
+    pub fn begin_host_write_ranges(&self, ranges: &[(u64, usize)]) {
+        let pages = self.host_write_pages(ranges);
+        let mut sequences = self.exclusive_sequences.lock();
+        for &page in &pages {
+            let state = sequences.entry(page).or_default();
+            if state.host_writers == 0 {
+                state.sequence = state.sequence.begin_host_write();
+            }
+            state.host_writers = state.host_writers.saturating_add(1);
+        }
+    }
+
+    /// Close a host-write phase. The last writer advances odd→even, invalidating
+    /// reservations regardless of whether the kernel stored identical bytes,
+    /// returned a short count, or returned a no-write error.
+    pub fn finish_host_write_ranges(&self, ranges: &[(u64, usize)]) {
+        let pages = self.host_write_pages(ranges);
+        let mut sequences = self.exclusive_sequences.lock();
+        for page in pages {
+            let Some(state) = sequences.get_mut(&page) else {
+                continue;
+            };
+            if state.host_writers == 0 {
+                continue;
+            }
+            state.host_writers -= 1;
+            if state.host_writers == 0 {
+                state.sequence = state.sequence.finish_host_write();
+            }
+        }
     }
 
     /// Copy `bytes` into the host backing for `[address, address+bytes.len())`,
@@ -2201,11 +2278,11 @@ impl NativeMappedMemory {
         &self,
         location: NativeExclusiveLocation,
     ) -> NativeExclusiveSequence {
-        *self
-            .exclusive_sequences
+        self.exclusive_sequences
             .lock()
-            .entry(location)
-            .or_insert(NativeExclusiveSequence::INITIAL)
+            .entry(self.exclusive_page(location.address))
+            .or_default()
+            .sequence
     }
 
     /// Entry point for the single-threaded-gated linux4k guarded exclusive
@@ -2240,17 +2317,19 @@ impl NativeMappedMemory {
         acquire: bool,
         reservation: &mut Option<NativeExclusiveReservation>,
     ) -> Result<u64, MemoryError> {
-        if !address.is_multiple_of(width as u64) || !self.region_contains(address, width) {
+        if !matches!(width, 1 | 2 | 4 | 8)
+            || !address.is_multiple_of(width as u64)
+            || !self.region_contains(address, width)
+        {
             return Err(MemoryError::OutOfBounds {
                 address,
                 length: width,
             });
         }
+        *reservation = None;
         let changed = self.prepare_temporary_host_access(address, width, false)?;
-        // Balance the lift refcount even if `host_address` or the width
-        // match below returns early -- see `copy_bytes_to_host`. The success
-        // path DISARMS the guard and restores explicitly so a restore error
-        // still propagates; the guard only fires on early exit.
+        // Balance the lift refcount even if `host_address` returns early. The
+        // success path restores explicitly so a restore error still propagates.
         let mut restore_on_unwind = HostLiftRestoreGuard {
             memory: self,
             changed: &changed,
@@ -2266,24 +2345,35 @@ impl NativeMappedMemory {
         } else {
             std::sync::atomic::Ordering::Relaxed
         };
-        let observed = unsafe {
-            match width {
-                1 => u64::from((&*ptr.cast::<std::sync::atomic::AtomicU8>()).load(ordering)),
-                2 => u64::from((&*ptr.cast::<std::sync::atomic::AtomicU16>()).load(ordering)),
-                4 => u64::from((&*ptr.cast::<std::sync::atomic::AtomicU32>()).load(ordering)),
-                8 => (&*ptr.cast::<std::sync::atomic::AtomicU64>()).load(ordering),
-                _ => return Err(MemoryError::Unsupported),
-            }
+        let location = NativeExclusiveLocation { address, width };
+        let page = self.exclusive_page(address);
+        // Hold the page-generation lock across the atomic load and reservation
+        // capture. A kernel-write begin cannot publish odd between those steps;
+        // if the page is already odd the load still returns data but creates no
+        // reservation, matching the architectural monitor failure semantics.
+        let (observed, sequence) = {
+            let mut sequences = self.exclusive_sequences.lock();
+            let state = sequences.entry(page).or_default();
+            let sequence = (!state.sequence.write_in_progress()).then_some(state.sequence);
+            let observed = unsafe {
+                match width {
+                    1 => u64::from((&*ptr.cast::<std::sync::atomic::AtomicU8>()).load(ordering)),
+                    2 => u64::from((&*ptr.cast::<std::sync::atomic::AtomicU16>()).load(ordering)),
+                    4 => u64::from((&*ptr.cast::<std::sync::atomic::AtomicU32>()).load(ordering)),
+                    _ => (&*ptr.cast::<std::sync::atomic::AtomicU64>()).load(ordering),
+                }
+            };
+            (observed, sequence)
         };
         restore_on_unwind.armed = false;
         self.restore_temporary_host_access(&changed, address, width)?;
-        let location = NativeExclusiveLocation { address, width };
-        let sequence = self.exclusive_sequence_or_insert(location);
-        *reservation = Some(NativeExclusiveReservation {
-            location,
-            observed,
-            sequence,
-        });
+        if let Some(sequence) = sequence {
+            *reservation = Some(NativeExclusiveReservation {
+                location,
+                observed,
+                sequence,
+            });
+        }
         Ok(observed)
     }
 
@@ -2313,8 +2403,8 @@ impl NativeMappedMemory {
     ) -> NativeExclusiveSequence {
         self.exclusive_sequences
             .lock()
-            .get(&location)
-            .copied()
+            .get(&self.exclusive_page(location.address))
+            .map(|state| state.sequence)
             .unwrap_or(NativeExclusiveSequence::INITIAL)
     }
 
@@ -2328,7 +2418,9 @@ impl NativeMappedMemory {
     ) {
         self.exclusive_sequences
             .lock()
-            .insert(location, observed_sequence.next());
+            .entry(self.exclusive_page(location.address))
+            .or_default()
+            .sequence = observed_sequence.next();
     }
 
     /// `&self`: same reasoning as `exclusive_load_for` -- the CAS goes
@@ -2345,16 +2437,20 @@ impl NativeMappedMemory {
         let Some(reservation) = reservation.take() else {
             return Ok(false);
         };
+        if !matches!(width, 1 | 2 | 4 | 8)
+            || !address.is_multiple_of(width as u64)
+            || !self.region_contains(address, width)
+        {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: width,
+            });
+        }
         let location = NativeExclusiveLocation { address, width };
-        let sequence = self.exclusive_sequence_or_default(location);
-        if reservation.location != location || reservation.sequence != sequence {
+        if reservation.location != location {
             return Ok(false);
         }
         let changed = self.prepare_temporary_host_access(address, width, true)?;
-        // Balance the lift refcount even if `host_address` or the width
-        // match below returns early -- see `copy_bytes_to_host`. The success
-        // path DISARMS the guard and restores explicitly so a restore error
-        // still propagates; the guard only fires on early exit.
         let mut restore_on_unwind = HostLiftRestoreGuard {
             memory: self,
             changed: &changed,
@@ -2370,46 +2466,59 @@ impl NativeMappedMemory {
         } else {
             std::sync::atomic::Ordering::Relaxed
         };
-        let stored = unsafe {
-            match width {
-                1 => (&*ptr.cast::<std::sync::atomic::AtomicU8>())
-                    .compare_exchange(
-                        reservation.observed as u8,
-                        value as u8,
-                        success,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok(),
-                2 => (&*ptr.cast::<std::sync::atomic::AtomicU16>())
-                    .compare_exchange(
-                        reservation.observed as u16,
-                        value as u16,
-                        success,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok(),
-                4 => (&*ptr.cast::<std::sync::atomic::AtomicU32>())
-                    .compare_exchange(
-                        reservation.observed as u32,
-                        value as u32,
-                        success,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok(),
-                8 => (&*ptr.cast::<std::sync::atomic::AtomicU64>())
-                    .compare_exchange(
-                        reservation.observed,
-                        value,
-                        success,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok(),
-                _ => return Err(MemoryError::Unsupported),
+        let page = self.exclusive_page(address);
+        // The generation check and CAS are one critical section. A host-write
+        // begin cannot mark odd after the check but before STXR commits.
+        let stored = {
+            let mut sequences = self.exclusive_sequences.lock();
+            let Some(state) = sequences.get_mut(&page) else {
+                return Ok(false);
+            };
+            if state.sequence.write_in_progress() || reservation.sequence != state.sequence {
+                false
+            } else {
+                let stored = unsafe {
+                    match width {
+                        1 => (&*ptr.cast::<std::sync::atomic::AtomicU8>())
+                            .compare_exchange(
+                                reservation.observed as u8,
+                                value as u8,
+                                success,
+                                std::sync::atomic::Ordering::Relaxed,
+                            )
+                            .is_ok(),
+                        2 => (&*ptr.cast::<std::sync::atomic::AtomicU16>())
+                            .compare_exchange(
+                                reservation.observed as u16,
+                                value as u16,
+                                success,
+                                std::sync::atomic::Ordering::Relaxed,
+                            )
+                            .is_ok(),
+                        4 => (&*ptr.cast::<std::sync::atomic::AtomicU32>())
+                            .compare_exchange(
+                                reservation.observed as u32,
+                                value as u32,
+                                success,
+                                std::sync::atomic::Ordering::Relaxed,
+                            )
+                            .is_ok(),
+                        _ => (&*ptr.cast::<std::sync::atomic::AtomicU64>())
+                            .compare_exchange(
+                                reservation.observed,
+                                value,
+                                success,
+                                std::sync::atomic::Ordering::Relaxed,
+                            )
+                            .is_ok(),
+                    }
+                };
+                if stored {
+                    state.sequence = state.sequence.next();
+                }
+                stored
             }
         };
-        if stored {
-            self.bump_exclusive_sequence(location, sequence);
-        }
         restore_on_unwind.armed = false;
         self.restore_temporary_host_access(&changed, address, width)?;
         Ok(stored)
@@ -3011,31 +3120,49 @@ impl NativeMappedMemory {
         address: u64,
         len: usize,
         content: &[u8],
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), RepointPrivateError> {
         if content.len() != len || !self.region_contains(address, len) {
-            return Err(MemoryError::OutOfBounds {
+            return Err(RepointPrivateError::clean(MemoryError::OutOfBounds {
                 address,
                 length: len,
-            });
+            }));
         }
-        let end = address
-            .checked_add(len as u64)
-            .ok_or(MemoryError::OutOfBounds {
+        let end = address.checked_add(len as u64).ok_or_else(|| {
+            RepointPrivateError::clean(MemoryError::OutOfBounds {
                 address,
                 length: len,
-            })?;
-        let (page_start, page_len) = self.host_page_range(address, end)?;
-        let (host_start, flags) = self.fixed_mapping_target(
-            page_start,
-            page_len,
-            libc::MAP_ANON | MAP_NORESERVE | libc::MAP_PRIVATE,
-        )?;
-        let mut page = self.read_bytes_raw(page_start, page_len)?;
+            })
+        })?;
+        // Darwin cannot replace one 4 KiB logical linux4k subpage with a new
+        // VM object: mmap operates on the whole 16 KiB host page. Rounding this
+        // request detached the other three still-shared subpages and published
+        // false MAP_SHARED coherence. Reject before reading, mmaping, or
+        // changing any metadata; the dispatcher's CLEAN recovery then frees the
+        // candidate overlay and retains the old mapping intact.
+        if self.uses_linux4k_subpages()
+            && (!address.is_multiple_of(self.host_page_size)
+                || !(len as u64).is_multiple_of(self.host_page_size))
+        {
+            return Err(RepointPrivateError::clean(MemoryError::Unsupported));
+        }
+        let (page_start, page_len) = self
+            .host_page_range(address, end)
+            .map_err(RepointPrivateError::clean)?;
+        let (host_start, flags) = self
+            .fixed_mapping_target(
+                page_start,
+                page_len,
+                libc::MAP_ANON | MAP_NORESERVE | libc::MAP_PRIVATE,
+            )
+            .map_err(RepointPrivateError::clean)?;
+        let mut page = self
+            .read_bytes_raw(page_start, page_len)
+            .map_err(RepointPrivateError::clean)?;
         let offset = usize::try_from(address.saturating_sub(page_start)).map_err(|_| {
-            MemoryError::OutOfBounds {
+            RepointPrivateError::clean(MemoryError::OutOfBounds {
                 address,
                 length: len,
-            }
+            })
         })?;
         page[offset..offset + len].copy_from_slice(content);
 
@@ -3051,14 +3178,20 @@ impl NativeMappedMemory {
             )
         };
         if mapped == libc::MAP_FAILED || mapped != ptr {
-            return Err(MemoryError::OutOfBounds {
+            return Err(RepointPrivateError::clean(MemoryError::OutOfBounds {
                 address,
                 length: len,
-            });
+            }));
         }
         unsafe {
             std::ptr::copy_nonoverlapping(page.as_ptr(), mapped.cast::<u8>(), page.len());
         }
+        // The boot shared-aperture region remains in `regions`, so retire its
+        // classification in the authoritative current-VMA registry as part of
+        // the completed physical replacement. Otherwise an unflagged futex on
+        // this private overlay would still be given a cross-process key.
+        self.protections
+            .set_mapping_sharing(address, len, MappingSharing::Private);
         Ok(())
     }
 
@@ -3070,12 +3203,24 @@ impl NativeMappedMemory {
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
         prot_none: bool,
     ) -> Result<(), NativeMemoryError> {
+        // The dispatcher transfers this dup to the backend. Give every return
+        // and unwind path one owner instead of manually closing selected arms.
+        let file = file.map(|(fd, offset, prot)| {
+            // SAFETY: `MapHostAlias` transfers sole ownership of its dup'd fd.
+            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
+        });
         let map_len = align_up_u64(len, self.host_page_size, "native alias length")?;
         let map_len_usize = usize::try_from(map_len).map_err(|_| {
             NativeMemoryError::Unsupported(format!(
                 "native Darwin alias too large: 0x{address:x}+0x{len:x}"
             ))
         })?;
+        let len_usize = usize::try_from(len).map_err(|_| {
+            NativeMemoryError::Unsupported(format!(
+                "native Darwin alias guest length too large: 0x{address:x}+0x{len:x}"
+            ))
+        })?;
+        let region_end = checked_add_u64(address, len, "native alias end")?;
         if map_len_usize == 0 {
             return Ok(());
         }
@@ -3096,17 +3241,27 @@ impl NativeMappedMemory {
             ))
         })?;
         let guest_map_start = if page_delta == 0 { address } else { page_start };
+        let replaced_end = checked_add_u64(
+            guest_map_start,
+            host_map_len,
+            "native alias replaced host range",
+        )?;
 
-        let (mmap_prot, final_prot, flags, fd, offset, direct_file) = match file {
-            Some((fd, offset, prot)) if page_delta == 0 => {
-                (prot, prot, libc::MAP_SHARED, fd, offset, true)
-            }
+        let (mmap_prot, final_prot, flags, fd, offset, direct_file) = match file.as_ref() {
+            Some((fd, offset, prot)) if page_delta == 0 => (
+                *prot,
+                *prot,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                *offset,
+                true,
+            ),
             Some((fd, offset, prot)) => (
                 libc::PROT_READ | libc::PROT_WRITE,
-                prot,
+                *prot,
                 libc::MAP_ANON | libc::MAP_SHARED | MAP_NORESERVE,
-                fd,
-                offset,
+                fd.as_raw_fd(),
+                *offset,
                 false,
             ),
             None => (
@@ -3126,17 +3281,6 @@ impl NativeMappedMemory {
         };
         let mmap_fd = if direct_file { fd } else { -1 };
         let mmap_offset = if direct_file { offset } else { 0 };
-        let (host_start, flags) =
-            match self.fixed_mapping_target(guest_map_start, host_map_len_usize, flags) {
-                Ok(target) => target,
-                Err(error) => {
-                    if file.is_some() {
-                        unsafe { libc::close(fd) };
-                    }
-                    return Err(NativeMemoryError::Unsupported(error.to_string()));
-                }
-            };
-        let addr = host_start.raw() as *mut libc::c_void;
         // File-identity futex key material (see `NativeMappedRegion`): only a
         // DIRECT host MAP_SHARED file mapping is physically coherent with an
         // independent mapping of the same file, so only it earns a file key.
@@ -3150,6 +3294,63 @@ impl NativeMappedMemory {
         } else {
             (0, 0)
         };
+        let copy_offset = usize::try_from(page_delta).map_err(|_| {
+            NativeMemoryError::Unsupported(format!(
+                "native Darwin alias page delta too large: 0x{page_delta:x}"
+            ))
+        })?;
+        // An unaligned file mapping cannot be installed directly. Read it into
+        // staging storage BEFORE MAP_FIXED, so pread failure leaves the prior
+        // owner and its bytes untouched.
+        let mut staged_file = if file.is_some() && !direct_file {
+            vec![0u8; len_usize]
+        } else {
+            Vec::new()
+        };
+        if !staged_file.is_empty() {
+            let mut copied = 0usize;
+            while copied < staged_file.len() {
+                let copied_offset = libc::off_t::try_from(copied).map_err(|_| {
+                    NativeMemoryError::Unsupported(format!(
+                        "native Darwin alias file offset too large: {copied}"
+                    ))
+                })?;
+                let Some(read_offset) = offset.checked_add(copied_offset) else {
+                    return Err(NativeMemoryError::Unsupported(
+                        "native Darwin alias file offset overflow".to_string(),
+                    ));
+                };
+                let rc = unsafe {
+                    libc::pread(
+                        fd,
+                        staged_file[copied..].as_mut_ptr().cast::<libc::c_void>(),
+                        staged_file.len() - copied,
+                        read_offset,
+                    )
+                };
+                match rc {
+                    0 => break,
+                    n if n > 0 => copied = copied.saturating_add(n as usize),
+                    _ => {
+                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        if errno == libc::EINTR {
+                            continue;
+                        }
+                        return Err(NativeMemoryError::Unsupported(format!(
+                            "native Darwin alias pread failed with errno {errno}"
+                        )));
+                    }
+                }
+            }
+        }
+        let (host_start, flags) =
+            match self.fixed_mapping_target(guest_map_start, host_map_len_usize, flags) {
+                Ok(target) => target,
+                Err(error) => {
+                    return Err(NativeMemoryError::Unsupported(error.to_string()));
+                }
+            };
+        let addr = host_start.raw() as *mut libc::c_void;
         let mapped = unsafe {
             libc::mmap(
                 addr,
@@ -3160,60 +3361,6 @@ impl NativeMappedMemory {
                 mmap_offset,
             )
         };
-        if mapped != libc::MAP_FAILED && file.is_some() && !direct_file {
-            let copy_len = usize::try_from(len).map_err(|_| {
-                NativeMemoryError::Unsupported(format!(
-                    "native Darwin alias guest length too large: 0x{address:x}+0x{len:x}"
-                ))
-            })?;
-            let copy_offset = usize::try_from(page_delta).map_err(|_| {
-                NativeMemoryError::Unsupported(format!(
-                    "native Darwin alias page delta too large: 0x{page_delta:x}"
-                ))
-            })?;
-            let dst = unsafe { mapped.cast::<u8>().add(copy_offset) };
-            let mut copied = 0usize;
-            while copied < copy_len {
-                let rc = unsafe {
-                    libc::pread(
-                        fd,
-                        dst.add(copied).cast::<libc::c_void>(),
-                        copy_len - copied,
-                        offset.saturating_add(copied as libc::off_t),
-                    )
-                };
-                // Host-errno check (was `host_syscall_errno` + the Linux mapping
-                // while this lived in the runtime; EINTR is identical in both
-                // errno spaces, and the number below is now the HOST errno).
-                match rc {
-                    0 => break,
-                    n if n > 0 => copied = copied.saturating_add(n as usize),
-                    _ => {
-                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                        if errno == libc::EINTR {
-                            continue;
-                        }
-                        unsafe { libc::close(fd) };
-                        return Err(NativeMemoryError::Unsupported(format!(
-                            "native Darwin alias pread failed with errno {errno}"
-                        )));
-                    }
-                }
-            }
-            if host_final_prot != mmap_prot {
-                let rc = unsafe { libc::mprotect(mapped, host_map_len_usize, host_final_prot) };
-                if rc != 0 {
-                    unsafe { libc::close(fd) };
-                    return Err(last_io_error(&format!(
-                        "mprotect native Darwin alias 0x{page_start:x}..0x{:x}",
-                        page_start.saturating_add(host_map_len)
-                    )));
-                }
-            }
-        }
-        if file.is_some() {
-            unsafe { libc::close(fd) };
-        }
         if mapped == libc::MAP_FAILED {
             return Err(last_io_error(&format!(
                 "mmap native Darwin alias 0x{address:x}..0x{:x}",
@@ -3221,11 +3368,26 @@ impl NativeMappedMemory {
             )));
         }
         if mapped != addr {
+            if unsafe { libc::munmap(mapped, host_map_len_usize) } != 0 {
+                std::process::abort();
+            }
             return Err(NativeMemoryError::Unsupported(format!(
                 "native Darwin mmap did not honor MAP_FIXED for alias 0x{address:x}"
             )));
         }
-
+        if !staged_file.is_empty() {
+            let dst = unsafe { mapped.cast::<u8>().add(copy_offset) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(staged_file.as_ptr(), dst, staged_file.len());
+            }
+            if host_final_prot != mmap_prot
+                && unsafe { libc::mprotect(mapped, host_map_len_usize, host_final_prot) } != 0
+            {
+                // MAP_FIXED has already destroyed the prior owner. Returning a
+                // recoverable errno would preserve only stale metadata.
+                std::process::abort();
+            }
+        }
         // MAP_FIXED replaces the physical host pages, so none of the prior
         // mapping's protection overrides remain authoritative. Leaving a
         // stale PROT_NONE entry here lets a later temporary host access restore
@@ -3233,7 +3395,6 @@ impl NativeMappedMemory {
         // 8 MiB chunks this way). Clear whole host pages, matching mmap's
         // replacement granularity; Linux-4K subpage state is stale for the
         // same reason.
-        let replaced_end = guest_map_start.saturating_add(host_map_len);
         let mut replaced_page = guest_map_start;
         while replaced_page < replaced_end {
             self.native_page_protections.remove(&replaced_page);
@@ -3243,26 +3404,27 @@ impl NativeMappedMemory {
         }
 
         if file.is_none() && !payload.is_empty() {
-            let n = payload.len().min(map_len_usize);
+            let n = payload.len().min(len_usize);
+            let dst = unsafe { mapped.cast::<u8>().add(copy_offset) };
             unsafe {
-                std::ptr::copy_nonoverlapping(payload.as_ptr(), mapped.cast::<u8>(), n);
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), dst, n);
             }
         }
 
-        let len_usize = usize::try_from(len).map_err(|_| {
-            NativeMemoryError::Unsupported(format!(
-                "native Darwin alias guest length too large: 0x{address:x}+0x{len:x}"
-            ))
-        })?;
-        self.protections.set_mapping_protection(
+        self.protections.set_mapping_protection_and_sharing(
             address,
             len_usize,
             prot_none,
             !prot_none && final_prot & libc::PROT_WRITE == 0,
+            if file.is_some() {
+                MappingSharing::Shared
+            } else {
+                MappingSharing::Private
+            },
         );
         self.regions.push(NativeMappedRegion {
             start: address,
-            end: checked_add_u64(address, len, "native alias end")?,
+            end: region_end,
             host_protects: true,
             shared_futex: file.is_some(),
             guest_writable: final_prot & libc::PROT_WRITE != 0,
@@ -3523,6 +3685,22 @@ impl GuestMemory for NativeMappedMemory {
             .set_mapping_protection(address, len, no_access, no_write);
     }
 
+    fn set_mapping_sharing(&mut self, address: u64, len: usize, sharing: MappingSharing) {
+        self.protections.set_mapping_sharing(address, len, sharing);
+    }
+
+    fn set_mapping_protection_and_sharing(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+        sharing: MappingSharing,
+    ) {
+        self.protections
+            .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
+    }
+
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
         !self.protections.range_write_denied(address, length)
     }
@@ -3581,7 +3759,11 @@ impl GuestMemory for NativeMappedMemory {
         &self,
         guest_addr: u64,
     ) -> Option<carrick_guest_mem::SharedFutexLocation> {
-        if !guest_addr.is_multiple_of(std::mem::align_of::<u32>() as u64) {
+        if !guest_addr.is_multiple_of(std::mem::align_of::<u32>() as u64)
+            || !self
+                .protections
+                .range_mutable_shared_backing(guest_addr, std::mem::size_of::<u32>())
+        {
             return None;
         }
         let end = guest_addr.checked_add(std::mem::size_of::<u32>() as u64)?;
@@ -3623,7 +3805,7 @@ impl GuestMemory for NativeMappedMemory {
         _overlay_ipa: u64,
         len: usize,
         content: &[u8],
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), RepointPrivateError> {
         self.remap_private(va, len, content)
     }
 
@@ -3669,6 +3851,14 @@ impl GuestMemory for NativeMappedMemory {
     /// why it's sound to expose this through a shared borrow.
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
         self.host_ptr_for_write_shared(address, len)
+    }
+
+    fn begin_host_write(&mut self, ranges: &[(u64, usize)]) {
+        self.begin_host_write_ranges(ranges);
+    }
+
+    fn finish_host_write(&mut self, ranges: &[(u64, usize)]) {
+        self.finish_host_write_ranges(ranges);
     }
 }
 
@@ -4336,4 +4526,341 @@ pub fn relocate_vdso_vvar_loads(
         return Err(last_io_error("restore native Darwin vdso page protections"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn direct_test_memory(host_start: usize, len: usize, page_size: u64) -> NativeMappedMemory {
+        NativeMappedMemory {
+            address_mode: NativeAddressMode::Direct,
+            owned_host_ranges: Arc::new(vec![
+                carrick_guest_mem::HostVa(host_start)..carrick_guest_mem::HostVa(host_start + len),
+            ]),
+            regions: vec![NativeMappedRegion {
+                start: host_start as u64,
+                end: (host_start + len) as u64,
+                host_protects: true,
+                shared_futex: false,
+                guest_writable: true,
+                default_prot: carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+            }],
+            protections: MemoryProtections::default(),
+            native_page_protections: BTreeMap::new(),
+            native_write_exec_writable_pages: BTreeSet::new(),
+            linux4k_page_protections: BTreeMap::new(),
+            exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
+            host_page_size: page_size,
+            linux_page_size: page_size,
+            dsr_generations: dsr::cache::PageGenerationTable::new(page_size)
+                .expect("generation table"),
+            dsr_translator: None,
+            host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn inbound_same_value_and_aba_writes_invalidate_exclusive_reservations() {
+        const PAGE: usize = 4096;
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "map exclusive fixture");
+        let address = raw as u64;
+        unsafe { (raw as *mut u32).write(0x1122_3344) };
+        let mut memory = direct_test_memory(raw as usize, PAGE, PAGE as u64);
+
+        let mut same_value = None;
+        assert_eq!(
+            memory
+                .exclusive_load_for(address, 4, false, &mut same_value)
+                .expect("exclusive load"),
+            0x1122_3344
+        );
+        {
+            let ranges = [(address, 4)];
+            let _host_write = carrick_guest_mem::HostWriteGuard::new(&mut memory, &ranges);
+            unsafe { (raw as *mut u32).write_volatile(0x1122_3344) };
+        }
+        assert!(
+            !memory
+                .exclusive_store_for(address, 4, 0x5566_7788, false, &mut same_value)
+                .expect("same-value invalidated store")
+        );
+
+        let mut aba = None;
+        assert_eq!(
+            memory
+                .exclusive_load_for(address, 4, false, &mut aba)
+                .expect("ABA exclusive load"),
+            0x1122_3344
+        );
+        {
+            let ranges = [(address, 4)];
+            let _host_write = carrick_guest_mem::HostWriteGuard::new(&mut memory, &ranges);
+            unsafe {
+                (raw as *mut u32).write_volatile(0xaabb_ccdd);
+                (raw as *mut u32).write_volatile(0x1122_3344);
+            }
+        }
+        assert!(
+            !memory
+                .exclusive_store_for(address, 4, 0x99aa_bbcc, false, &mut aba)
+                .expect("ABA invalidated store")
+        );
+        assert_eq!(unsafe { (raw as *const u32).read_volatile() }, 0x1122_3344);
+
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, PAGE) }, 0);
+    }
+
+    #[test]
+    fn inbound_partial_write_invalidates_only_overlapping_page() {
+        const PAGE: usize = 4096;
+        const LEN: usize = 2 * PAGE;
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "map partial exclusive fixture");
+        let first = raw as u64 + PAGE as u64 - 4;
+        let second = raw as u64 + PAGE as u64;
+        unsafe {
+            (first as *mut u32).write(1);
+            (second as *mut u32).write(2);
+        }
+        let mut memory = direct_test_memory(raw as usize, LEN, PAGE as u64);
+        let mut first_reservation = None;
+        let mut second_reservation = None;
+        memory
+            .exclusive_load_for(first, 4, false, &mut first_reservation)
+            .expect("first reservation");
+        memory
+            .exclusive_load_for(second, 4, false, &mut second_reservation)
+            .expect("second reservation");
+
+        {
+            let ranges = [(first, 4)];
+            let _host_write = carrick_guest_mem::HostWriteGuard::new(&mut memory, &ranges);
+            unsafe { (first as *mut u32).write_volatile(1) };
+        }
+        assert!(
+            !memory
+                .exclusive_store_for(first, 4, 3, false, &mut first_reservation)
+                .expect("affected store")
+        );
+        assert!(
+            memory
+                .exclusive_store_for(second, 4, 4, false, &mut second_reservation)
+                .expect("unaffected store")
+        );
+
+        let mut zero_write = None;
+        memory
+            .exclusive_load_for(first, 4, false, &mut zero_write)
+            .expect("zero-write reservation");
+        {
+            let zero_ranges = [(first, 0)];
+            let _host_write = carrick_guest_mem::HostWriteGuard::new(&mut memory, &zero_ranges);
+        }
+        assert!(
+            memory
+                .exclusive_store_for(first, 4, 5, false, &mut zero_write)
+                .expect("zero-byte host exposure must not invalidate")
+        );
+
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, LEN) }, 0);
+    }
+
+    #[test]
+    fn exclusive_store_attempted_between_host_write_begin_and_end_fails() {
+        const PAGE: usize = 4096;
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "map in-progress fixture");
+        let address = raw as u64;
+        unsafe { (raw as *mut u32).write(7) };
+        let memory = direct_test_memory(raw as usize, PAGE, PAGE as u64);
+        let mut reservation = None;
+        memory
+            .exclusive_load_for(address, 4, false, &mut reservation)
+            .expect("create reservation before host write");
+
+        let ranges = [(address, 4)];
+        memory.begin_host_write_ranges(&ranges);
+        assert!(
+            !memory
+                .exclusive_store_for(address, 4, 9, false, &mut reservation)
+                .expect("STXR attempt while host write is in progress"),
+            "an odd in-progress generation must reject STXR"
+        );
+        assert_eq!(unsafe { (raw as *const u32).read_volatile() }, 7);
+        memory.finish_host_write_ranges(&ranges);
+
+        let mut after = None;
+        memory
+            .exclusive_load_for(address, 4, false, &mut after)
+            .expect("create reservation after host write");
+        assert!(
+            memory
+                .exclusive_store_for(address, 4, 11, false, &mut after)
+                .expect("STXR after host write"),
+            "a fresh reservation after the even close may commit"
+        );
+        assert_eq!(unsafe { (raw as *const u32).read_volatile() }, 11);
+
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, PAGE) }, 0);
+    }
+
+    #[test]
+    fn exclusive_load_during_host_write_captures_no_reservation() {
+        const PAGE: usize = 4096;
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "map odd-load fixture");
+        let address = raw as u64;
+        unsafe { (raw as *mut u32).write(13) };
+        let memory = direct_test_memory(raw as usize, PAGE, PAGE as u64);
+        let ranges = [(address, 4)];
+        memory.begin_host_write_ranges(&ranges);
+
+        let mut reservation = None;
+        assert_eq!(
+            memory
+                .exclusive_load_for(address, 4, false, &mut reservation)
+                .expect("LDXR while host write is in progress"),
+            13
+        );
+        assert!(reservation.is_none(), "odd generation must not arm LDXR");
+        memory.finish_host_write_ranges(&ranges);
+        assert!(
+            !memory
+                .exclusive_store_for(address, 4, 17, false, &mut reservation)
+                .expect("STXR without an armed reservation")
+        );
+
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, PAGE) }, 0);
+    }
+
+    #[test]
+    fn linux4k_partial_host_page_repoint_fails_clean_without_detaching_neighbours() {
+        const HOST_PAGE: usize = 16 * 1024;
+        const LINUX_PAGE: usize = 4 * 1024;
+        const RESERVATION: usize = 2 * HOST_PAGE;
+
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                RESERVATION,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "map physical repoint fixture");
+        let raw_start = raw as usize;
+        let host_start = (raw_start + (HOST_PAGE - 1)) & !(HOST_PAGE - 1);
+        assert!(host_start + HOST_PAGE <= raw_start + RESERVATION);
+        let expected = [0x11, 0x22, 0x33, 0x44];
+        for (index, byte) in expected.into_iter().enumerate() {
+            unsafe {
+                std::ptr::write_bytes(
+                    (host_start + index * LINUX_PAGE) as *mut u8,
+                    byte,
+                    LINUX_PAGE,
+                );
+            }
+        }
+
+        let mut memory = NativeMappedMemory {
+            address_mode: NativeAddressMode::Direct,
+            owned_host_ranges: Arc::new(vec![
+                carrick_guest_mem::HostVa(host_start)
+                    ..carrick_guest_mem::HostVa(host_start + HOST_PAGE),
+            ]),
+            regions: vec![NativeMappedRegion {
+                start: host_start as u64,
+                end: (host_start + HOST_PAGE) as u64,
+                host_protects: true,
+                shared_futex: false,
+                guest_writable: true,
+                default_prot: carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+            }],
+            protections: MemoryProtections::default(),
+            native_page_protections: BTreeMap::new(),
+            native_write_exec_writable_pages: BTreeSet::new(),
+            linux4k_page_protections: BTreeMap::new(),
+            exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
+            host_page_size: HOST_PAGE as u64,
+            linux_page_size: LINUX_PAGE as u64,
+            dsr_generations: dsr::cache::PageGenerationTable::new(HOST_PAGE as u64)
+                .expect("generation table"),
+            dsr_translator: None,
+            host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        };
+        let result = memory.remap_private(
+            (host_start + LINUX_PAGE) as u64,
+            LINUX_PAGE,
+            &vec![0xaa; LINUX_PAGE],
+        );
+        assert_eq!(
+            result,
+            Err(RepointPrivateError::Clean(MemoryError::Unsupported))
+        );
+
+        for (index, byte) in expected.into_iter().enumerate() {
+            let page = unsafe {
+                std::slice::from_raw_parts(
+                    (host_start + index * LINUX_PAGE) as *const u8,
+                    LINUX_PAGE,
+                )
+            };
+            assert!(
+                page.iter().all(|actual| *actual == byte),
+                "logical shared page {index} changed after clean rejection"
+            );
+        }
+        assert!(memory.linux4k_page_protections.is_empty());
+        assert!(memory.native_page_protections.is_empty());
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, RESERVATION) }, 0);
+    }
 }

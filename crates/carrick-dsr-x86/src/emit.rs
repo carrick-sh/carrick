@@ -33,15 +33,18 @@
 //! instruction's own flag effects are exactly the guest's.
 
 use iced_x86::{
-    Code, ConditionCode, Decoder, DecoderOptions, Encoder, FlowControl, Instruction,
+    Code, ConditionCode, CpuidFeature, Decoder, DecoderOptions, Encoder, FlowControl, Instruction,
     InstructionInfoFactory, MemoryOperand, Mnemonic, OpAccess, OpKind, Register,
 };
 
 use crate::block::{X86Block, X86Exit};
 use crate::gateway::{
-    CTX_CHAIN_PATCH, CTX_EXIT_INDIRECT_ADDR, CTX_EXIT_RESUME, CTX_EXIT_SENSITIVE_ADDR,
-    CTX_EXIT_SYSCALL_ADDR, CTX_IDENTITY_LIVE_GATE, CTX_IDENTITY_PID, CTX_IDENTITY_TID, CTX_SCRATCH,
-    CTX_SCRATCH2, SNAP_GUEST_R15, X86IdentitySyscall,
+    CTX_CHAIN_PATCH, CTX_EXECUTABLE_STOP_WORD, CTX_EXIT_INDIRECT_ADDR, CTX_EXIT_KICKED_ADDR,
+    CTX_EXIT_RESUME, CTX_EXIT_SENSITIVE_ADDR, CTX_EXIT_SYSCALL_ADDR, CTX_GUEST_FSBASE,
+    CTX_IDENTITY_LIVE_GATE, CTX_IDENTITY_PID, CTX_IDENTITY_TID, CTX_INDIRECT_ACTUAL_TARGET,
+    CTX_INDIRECT_CACHE_SITE, CTX_KICK_RESTORE_RCX, CTX_LAST_COPIED_X87_DATA_VALID,
+    CTX_LAST_COPIED_X87_GUEST_DATA_VA, CTX_LAST_COPIED_X87_GUEST_VA, CTX_SCRATCH, CTX_SCRATCH2,
+    SNAP_GUEST_R15, X86IdentitySyscall,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -88,6 +91,54 @@ fn mov_ctx_from_rcx(disp: i32) -> [u8; 7] {
 fn mov_rcx_from_ctx(disp: i32) -> [u8; 7] {
     let d = disp.to_le_bytes();
     [0x49, 0x8B, 0x8F, d[0], d[1], d[2], d[3]]
+}
+
+/// `mov dword ptr [r15+disp32], imm32`; preserves every guest register/flag.
+/// Returns the byte offset of the immediate so the runtime can publish a site
+/// id before the block becomes executable.
+fn emit_mov_ctx_imm32(disp: i32, immediate: u32, out: &mut Vec<u8>) -> usize {
+    let d = disp.to_le_bytes();
+    out.extend_from_slice(&[0x41, 0xC7, 0x87, d[0], d[1], d[2], d[3]]);
+    let immediate_off = out.len();
+    out.extend_from_slice(&immediate.to_le_bytes());
+    immediate_off
+}
+
+/// Publish a full guest VA without borrowing a guest GPR: two dword immediate
+/// stores preserve RFLAGS and are independently safe under an asynchronous
+/// kick. The gateway reads the value only after the following jump.
+fn emit_self_set_resume_immediates(resume_va: u64, out: &mut Vec<u8>) {
+    emit_mov_ctx_imm32(CTX_EXIT_RESUME, resume_va as u32, out);
+    emit_mov_ctx_imm32(CTX_EXIT_RESUME + 4, (resume_va >> 32) as u32, out);
+}
+
+/// Record a completed copied x87 stack instruction without borrowing a guest
+/// GPR or changing RFLAGS. The FreeBSD gateway uses this only when host XSAVE
+/// fails to materialize the corresponding JIT FIP.
+fn emit_copied_x87_guest_va(guest_va: u64, out: &mut Vec<u8>) {
+    emit_mov_ctx_imm32(CTX_LAST_COPIED_X87_GUEST_VA, guest_va as u32, out);
+    emit_mov_ctx_imm32(
+        CTX_LAST_COPIED_X87_GUEST_VA + 4,
+        (guest_va >> 32) as u32,
+        out,
+    );
+}
+
+/// Publish the data-address witness after its full 64-bit value. The valid
+/// flag is the commit record: an asynchronous exit can never mistake a partly
+/// written address for a guest FDP, and guest address zero remains representable.
+fn emit_copied_x87_data_address(
+    address: Register,
+    va: u64,
+    out: &mut Vec<u8>,
+) -> Result<(), EmitError> {
+    let destination =
+        MemoryOperand::with_base_displ(Register::R15, i64::from(CTX_LAST_COPIED_X87_GUEST_DATA_VA));
+    let store = Instruction::with2(Code::Mov_rm64_r64, destination, address)
+        .map_err(|_| EmitError::Reencode { va })?;
+    encode_into(&store, va, out)?;
+    emit_mov_ctx_imm32(CTX_LAST_COPIED_X87_DATA_VALID, 1, out);
+    Ok(())
 }
 
 /// Emit `jrcxz rel8`. Unlike cmp/test + jcc, this does not alter guest RFLAGS.
@@ -188,11 +239,26 @@ pub fn emit_block(source: &[u8], block: &X86Block) -> Result<Vec<u8>, EmitError>
 pub struct ChainEdge {
     /// Guest VA of the successor block this edge branches to.
     pub target_va: u64,
-    /// Byte offset within the emitted block of the 4-byte `rel32` of this
-    /// edge's patchable `jmp` slot. The runtime patches it to
-    /// `target_exec - (block_exec + rel32_off + 4)` once the target is
-    /// translated; until then the slot jumps to a cold stub that exits to Rust.
-    pub rel32_off: usize,
+    /// Byte offset within the emitted block of the original branch's 4-byte
+    /// `rel32`. It initially targets the cold stub. Publication patches this
+    /// last so the edge becomes hot only after its guard target is ready.
+    pub entry_rel32_off: usize,
+    /// Byte offset of the edge's executable stop-word guard.
+    pub guard_off: usize,
+    /// Byte offset of the guard's final `jmp rel32` target field. Publication
+    /// patches this to the translated successor before redirecting the entry
+    /// branch to [`Self::guard_off`].
+    pub guard_target_rel32_off: usize,
+}
+
+/// One emitted return site whose monomorphic cache id is assigned by the
+/// runtime before publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndirectCacheSite {
+    /// Byte offset of the four-byte, initially-zero one-based site id.
+    pub site_id_imm_off: usize,
+    /// Architectural stack advance performed by a cache hit (`8 + imm16`).
+    pub stack_adjust: u64,
 }
 
 /// A translated block plus its chainable edges (empty ⇒ the terminator exits
@@ -201,6 +267,8 @@ pub struct ChainEdge {
 pub struct LinkedBlock {
     pub bytes: Vec<u8>,
     pub edges: Vec<ChainEdge>,
+    /// Optional return-cache site. Other indirect forms remain cold.
+    pub indirect_cache: Option<IndirectCacheSite>,
     /// Reverse map for synchronous host faults in emitted guest instructions.
     pub fault_map: Vec<FaultMapEntry>,
 }
@@ -216,6 +284,10 @@ pub struct FaultMapEntry {
     pub emitted_start: usize,
     pub emitted_end: usize,
     pub guest_va: u64,
+    /// The exact emitted instruction is a copied x87 instruction whose host
+    /// FIP must be reverse-mapped at the next full gateway exit. MMX and SIMD
+    /// instructions are deliberately false even though they share xstate.
+    pub is_copied_x87: bool,
     pub restores: Vec<ScratchRestore>,
 }
 
@@ -253,6 +325,50 @@ fn emit_cold_stub(slot_rel32_off: usize, target_va: u64, cold_off: usize, out: &
 
 /// Byte length of one [`emit_cold_stub`].
 const COLD_STUB_LEN: usize = 52;
+
+/// Emit one hot-edge executable stop guard. The original edge remains pointed
+/// at its cold stub until the runtime first patches `guard_target_rel32_off` to
+/// the translated successor and only then patches the original branch to
+/// `guard_off`.
+///
+/// RCX is the sole temporary. Every instruction before the successor is a
+/// `mov`, `jrcxz`, or `jmp`, so guest RFLAGS are bit-for-bit unchanged. The
+/// active spill flag gives the existing asynchronous-kick shim enough state to
+/// recover guest RCX at any point after the stop-word pointer replaces it.
+fn emit_chain_guard(target_va: u64, cold_off: usize, out: &mut Vec<u8>) -> (usize, usize) {
+    let guard_off = out.len();
+    out.extend_from_slice(&mov_ctx_from_rcx(CTX_SCRATCH2));
+    emit_mov_ctx_imm32(CTX_KICK_RESTORE_RCX, 1, out);
+    out.extend_from_slice(&mov_rcx_from_ctx(CTX_EXECUTABLE_STOP_WORD));
+    let null_to_successor = emit_jrcxz(out);
+    out.extend_from_slice(&[0x8B, 0x09]); // mov ecx, dword ptr [rcx]
+    let zero_to_successor = emit_jrcxz(out);
+
+    // Nonzero: the successor has not executed. Restore the complete guest RCX,
+    // publish that successor as the exact resume boundary, and leave through
+    // the gateway's kicked stub without borrowing another guest register.
+    out.extend_from_slice(&mov_rcx_from_ctx(CTX_SCRATCH2));
+    emit_mov_ctx_imm32(CTX_KICK_RESTORE_RCX, 0, out);
+    emit_self_set_resume_immediates(target_va, out);
+    out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_KICKED_ADDR));
+
+    let successor_path = out.len();
+    out.extend_from_slice(&mov_rcx_from_ctx(CTX_SCRATCH2));
+    emit_mov_ctx_imm32(CTX_KICK_RESTORE_RCX, 0, out);
+    let guard_target_rel32_off = emit_jmp_rel32(out);
+
+    patch_local_rel8(out, null_to_successor, successor_path);
+    patch_local_rel8(out, zero_to_successor, successor_path);
+    // Defensive initial destination: even if an entry is redirected too early,
+    // the existing cold behavior remains intact. Ordered publication replaces
+    // this target before making the guard reachable.
+    patch_local_rel32(out, guard_target_rel32_off, cold_off);
+    debug_assert_eq!(out.len() - guard_off, CHAIN_GUARD_LEN);
+    (guard_off, guard_target_rel32_off)
+}
+
+/// Byte length of one [`emit_chain_guard`].
+const CHAIN_GUARD_LEN: usize = 101;
 
 fn statically_known_identity_syscall(
     source: &[u8],
@@ -310,6 +426,7 @@ fn emit_identity_syscall_or_fallback(
     out.push(0xE9);
     out.extend_from_slice(&0_i32.to_le_bytes());
     emit_cold_stub(slot_off + 1, resume, cold_off, out);
+    let (guard_off, guard_target_rel32_off) = emit_chain_guard(resume, cold_off, out);
 
     patch_local_rel8(out, null_to_fallback, fallback);
     patch_local_rel8(out, disabled_to_fallback, fallback);
@@ -317,7 +434,9 @@ fn emit_identity_syscall_or_fallback(
 
     ChainEdge {
         target_va: resume,
-        rel32_off: slot_off + 1,
+        entry_rel32_off: slot_off + 1,
+        guard_off,
+        guard_target_rel32_off,
     }
 }
 
@@ -344,6 +463,45 @@ fn jcc_rel32_opcode(cc: ConditionCode) -> Option<u8> {
     })
 }
 
+/// Emit a return-target capture that preserves guest RFLAGS and every GPR at
+/// the gateway boundary. RCX is transiently spilled while reading `[rsp]`;
+/// synchronous faults reverse-map the spill, and the FreeBSD kick shim uses
+/// `CTX_KICK_RESTORE_RCX` to repair an asynchronous interruption.
+fn emit_return_cache_site(
+    guest_va: u64,
+    stack_adjust: u64,
+    out: &mut Vec<u8>,
+    fault_map: &mut Vec<FaultMapEntry>,
+) -> IndirectCacheSite {
+    out.extend_from_slice(&mov_ctx_from_rcx(CTX_SCRATCH2));
+    emit_mov_ctx_imm32(CTX_KICK_RESTORE_RCX, 1, out);
+
+    let load_start = out.len();
+    out.extend_from_slice(&[0x48, 0x8B, 0x0C, 0x24]); // mov rcx, [rsp]
+    let load_end = out.len();
+    fault_map.push(FaultMapEntry {
+        emitted_start: load_start,
+        emitted_end: load_end,
+        guest_va,
+        is_copied_x87: false,
+        restores: vec![ScratchRestore {
+            snapshot_gpr: crate::gateway::reg::RCX,
+            scratch_index: 1,
+        }],
+    });
+
+    out.extend_from_slice(&mov_ctx_from_rcx(CTX_INDIRECT_ACTUAL_TARGET));
+    out.extend_from_slice(&mov_rcx_from_ctx(CTX_SCRATCH2));
+    emit_mov_ctx_imm32(CTX_KICK_RESTORE_RCX, 0, out);
+    emit_self_set_resume_immediates(guest_va, out);
+    let site_id_imm_off = emit_mov_ctx_imm32(CTX_INDIRECT_CACHE_SITE, 0, out);
+    out.extend_from_slice(&jmp_indirect_r15(CTX_EXIT_INDIRECT_ADDR));
+    IndirectCacheSite {
+        site_id_imm_off,
+        stack_adjust,
+    }
+}
+
 /// How a block's terminating branch chains.
 enum BranchChain {
     /// `jmp rel` — one successor.
@@ -354,7 +512,10 @@ enum BranchChain {
         taken: u64,
         fallthrough: u64,
     },
-    /// `call`/`ret`/indirect — not chained; resolved in Rust from the snapshot.
+    /// `ret`/`ret imm16` — capture the live stack target for a gateway-owned
+    /// monomorphic cache; misses remain resolved in Rust.
+    Return { stack_adjust: u64 },
+    /// `call`/other indirect — not chained; resolved in Rust from the snapshot.
     Resolve,
 }
 
@@ -381,6 +542,12 @@ fn classify_branch(bytes: &[u8], va: u64) -> BranchChain {
                 None => BranchChain::Resolve,
             }
         }
+        FlowControl::Return if inst.code() == Code::Retnq => {
+            BranchChain::Return { stack_adjust: 8 }
+        }
+        FlowControl::Return if inst.code() == Code::Retnq_imm16 => BranchChain::Return {
+            stack_adjust: 8 + u64::from(inst.immediate16()),
+        },
         _ => BranchChain::Resolve,
     }
 }
@@ -388,8 +555,9 @@ fn classify_branch(bytes: &[u8], va: u64) -> BranchChain {
 /// Emit a block with direct-branch CHAINING. Identical to [`emit_block`] except
 /// that a block ending in a direct `jmp`/`jcc` gets patchable jump slots (one
 /// per successor) that initially target cold stubs and are later patched by the
-/// runtime to jump straight to the successor's translated code — so a hot loop
-/// runs without a gateway round-trip per branch. Every exit SELF-SETS its
+/// runtime to enter a per-edge stop-word guard. A zero word continues through
+/// the guard's separately published successor jump without a gateway round
+/// trip; a nonzero word exits at that successor boundary. Every exit SELF-SETS its
 /// resume VA (a chained-into block was not entered with the driver's per-block
 /// `exit_resume`). `call`/`ret`/indirect branches, syscalls, sensitive
 /// instructions, and continues keep the resolve-in-Rust exit.
@@ -397,6 +565,7 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
     let no_edges = |bytes, fault_map| LinkedBlock {
         bytes,
         edges: Vec::new(),
+        indirect_cache: None,
         fault_map,
     };
     match block.exit {
@@ -410,6 +579,7 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
                 Ok(LinkedBlock {
                     bytes: out,
                     edges: vec![edge],
+                    indirect_cache: None,
                     fault_map,
                 })
             } else {
@@ -437,12 +607,16 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
             out.push(0xE9);
             out.extend_from_slice(&(rel as i32).to_le_bytes());
             emit_cold_stub(slot_off + 1, target, cold_off, &mut out);
+            let (guard_off, guard_target_rel32_off) = emit_chain_guard(target, cold_off, &mut out);
             Ok(LinkedBlock {
                 bytes: out,
                 edges: vec![ChainEdge {
                     target_va: target,
-                    rel32_off: slot_off + 1,
+                    entry_rel32_off: slot_off + 1,
+                    guard_off,
+                    guard_target_rel32_off,
                 }],
+                indirect_cache: None,
                 fault_map,
             })
         }
@@ -456,6 +630,17 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
                     got: source.len(),
                 })?;
             match classify_branch(branch, va) {
+                BranchChain::Return { stack_adjust } => {
+                    let (mut out, mut fault_map) = emit_copy_body(source, block, va)?;
+                    let indirect_cache =
+                        emit_return_cache_site(va, stack_adjust, &mut out, &mut fault_map);
+                    Ok(LinkedBlock {
+                        bytes: out,
+                        edges: Vec::new(),
+                        indirect_cache: Some(indirect_cache),
+                        fault_map,
+                    })
+                }
                 BranchChain::Resolve => {
                     // call/ret/indirect: exit to Rust; the run loop re-decodes
                     // the branch at the resume VA and resolves it.
@@ -473,12 +658,17 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
                     out.push(0xE9);
                     out.extend_from_slice(&(rel as i32).to_le_bytes());
                     emit_cold_stub(slot_off + 1, target, cold_off, &mut out);
+                    let (guard_off, guard_target_rel32_off) =
+                        emit_chain_guard(target, cold_off, &mut out);
                     Ok(LinkedBlock {
                         bytes: out,
                         edges: vec![ChainEdge {
                             target_va: target,
-                            rel32_off: slot_off + 1,
+                            entry_rel32_off: slot_off + 1,
+                            guard_off,
+                            guard_target_rel32_off,
                         }],
+                        indirect_cache: None,
                         fault_map,
                     })
                 }
@@ -507,21 +697,31 @@ pub fn emit_block_linked(source: &[u8], block: &X86Block) -> Result<LinkedBlock,
                     let taken_rel = cold_t_off as i64 - (taken_slot_off + 5) as i64;
                     out.push(0xE9);
                     out.extend_from_slice(&(taken_rel as i32).to_le_bytes());
-                    // cold stubs
+                    // Cold stubs retain the initial behavior; unreachable guards
+                    // follow them and are published target-first by the runtime.
                     emit_cold_stub(fall_slot_off + 1, fallthrough, cold_f_off, &mut out);
                     emit_cold_stub(taken_slot_off + 1, taken, cold_t_off, &mut out);
+                    let (fall_guard_off, fall_guard_target_rel32_off) =
+                        emit_chain_guard(fallthrough, cold_f_off, &mut out);
+                    let (taken_guard_off, taken_guard_target_rel32_off) =
+                        emit_chain_guard(taken, cold_t_off, &mut out);
                     Ok(LinkedBlock {
                         bytes: out,
                         edges: vec![
                             ChainEdge {
                                 target_va: taken,
-                                rel32_off: taken_slot_off + 1,
+                                entry_rel32_off: taken_slot_off + 1,
+                                guard_off: taken_guard_off,
+                                guard_target_rel32_off: taken_guard_target_rel32_off,
                             },
                             ChainEdge {
                                 target_va: fallthrough,
-                                rel32_off: fall_slot_off + 1,
+                                entry_rel32_off: fall_slot_off + 1,
+                                guard_off: fall_guard_off,
+                                guard_target_rel32_off: fall_guard_target_rel32_off,
                             },
                         ],
+                        indirect_cache: None,
                         fault_map,
                     })
                 }
@@ -571,15 +771,51 @@ fn emit_one(bytes: &[u8], va: u64, out: &mut Vec<u8>) -> Result<Option<FaultMapE
     if inst.is_invalid() {
         return Err(EmitError::Undecodable { va });
     }
+    let is_copied_x87 = inst.cpuid_features().iter().any(|feature| {
+        matches!(
+            feature,
+            CpuidFeature::FPU
+                | CpuidFeature::FPU287
+                | CpuidFeature::FPU287XL_ONLY
+                | CpuidFeature::FPU387
+                | CpuidFeature::FPU387SL_ONLY
+        )
+    });
+    // FIP names every completed non-control x87 instruction. Iced's
+    // used-register view omits the implicit ST-stack write for some memory
+    // loads (notably FLD m80), so it cannot be the authority here. The small
+    // architectural control family below is the complete set that leaves FIP
+    // unchanged; state-transfer forms never reach Copy emission.
+    let records_x87_fip = is_copied_x87
+        && !matches!(
+            inst.mnemonic(),
+            Mnemonic::Fldcw
+                | Mnemonic::Fnstcw
+                | Mnemonic::Fstcw
+                | Mnemonic::Fnstsw
+                | Mnemonic::Fstsw
+                | Mnemonic::Fnclex
+                | Mnemonic::Fclex
+                | Mnemonic::Fninit
+                | Mnemonic::Finit
+                | Mnemonic::Fnop
+                | Mnemonic::Wait
+        );
+    let records_x87_data_address = records_x87_fip && has_memory_operand(&inst);
     let ip_rel = inst.is_ip_rel_memory_operand();
     let r15_use = r15_usage(&inst);
-    if !ip_rel && r15_use.is_none() {
+    if !ip_rel && r15_use.is_none() && !records_x87_data_address {
         let emitted_start = out.len();
         out.extend_from_slice(bytes);
+        let emitted_end = out.len();
+        if records_x87_fip {
+            emit_copied_x87_guest_va(va, out);
+        }
         return Ok(Some(FaultMapEntry {
             emitted_start,
-            emitted_end: out.len(),
+            emitted_end,
             guest_va: va,
+            is_copied_x87,
             restores: Vec::new(),
         }));
     }
@@ -635,6 +871,34 @@ fn emit_one(bytes: &[u8], va: u64, out: &mut Vec<u8>) -> Result<Option<FaultMapE
     } else {
         None
     };
+    // A copied x87 memory instruction needs an exact FDP even when XSAVEOPT
+    // omits it. Reuse the already-materialized RIP target or the r15 rename
+    // where possible; only then borrow another spilled register.
+    let data_address = if records_x87_data_address {
+        if let Some(base) = base {
+            Some(base)
+        } else if let Some(rename) = rename {
+            Some(rename)
+        } else {
+            let s = scratches.take().ok_or(EmitError::NoScratch { va })?;
+            let slot = spill_slots[spilled.len()];
+            spilled.push((s, slot));
+            Some(s)
+        }
+    } else {
+        None
+    };
+    // LEA ignores segment bases. FS is live guest TLS during translated
+    // execution, so add its virtual base explicitly after calculating the
+    // architecturally sized offset. GS never reaches copy emission.
+    let fs_address = if records_x87_data_address && inst.segment_prefix() == Register::FS {
+        let s = scratches.take().ok_or(EmitError::NoScratch { va })?;
+        let slot = spill_slots[spilled.len()];
+        spilled.push((s, slot));
+        Some(s)
+    } else {
+        None
+    };
 
     // Saves (and loads) in allocation order.
     for &(reg, slot) in &spilled {
@@ -663,6 +927,13 @@ fn emit_one(bytes: &[u8], va: u64, out: &mut Vec<u8>) -> Result<Option<FaultMapE
     let emitted_start = out.len();
     encode_into(&rewritten, va, out)?;
     let emitted_end = out.len();
+    if let Some(data_address) = data_address {
+        emit_x87_memory_data_address(&inst, bytes, va, rename, data_address, fs_address, out)?;
+        emit_copied_x87_data_address(data_address, va, out)?;
+    }
+    if records_x87_fip {
+        emit_copied_x87_guest_va(va, out);
+    }
 
     if let (Some(rename), Some(R15Use { written: true })) = (rename, &r15_use) {
         let snap = MemoryOperand::with_base_displ(Register::R15, i64::from(SNAP_GUEST_R15));
@@ -691,8 +962,99 @@ fn emit_one(bytes: &[u8], va: u64, out: &mut Vec<u8>) -> Result<Option<FaultMapE
         emitted_start,
         emitted_end,
         guest_va: va,
+        is_copied_x87,
         restores,
     }))
+}
+
+/// Whether the decoded instruction has an explicit ModRM/SIB memory operand.
+/// All copied x87 data forms use this representation; register-only forms
+/// retain the entry FDP and therefore publish no data-address sideband.
+fn has_memory_operand(inst: &Instruction) -> bool {
+    (0..inst.op_count()).any(|operand| inst.op_kind(operand) == OpKind::Memory)
+}
+
+/// The legacy prefixes before an x87 opcode. For no-base/no-index addressing,
+/// iced's operand fields do not retain whether the source used 32-bit address
+/// size; preserve that one bit explicitly when re-encoding the witness LEA.
+fn has_address_size_override(bytes: &[u8]) -> bool {
+    let mut address_size = false;
+    for &byte in bytes {
+        match byte {
+            0x67 => address_size = true,
+            0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 | 0x66 => {}
+            0x40..=0x4F => {}
+            _ => break,
+        }
+    }
+    address_size
+}
+
+fn x87_memory_operand(inst: &Instruction, rename: Option<Register>) -> MemoryOperand {
+    let remap = |register: Register| {
+        if register.full_register() == Register::R15 {
+            // The copied instruction uses the renamed physical scratch. The
+            // post-instruction LEA must use that same value, not the pinned
+            // context pointer.
+            sized_gpr(rename.unwrap_or(Register::R15), register.size())
+        } else {
+            register
+        }
+    };
+    MemoryOperand::new(
+        remap(inst.memory_base()),
+        remap(inst.memory_index()),
+        inst.memory_index_scale(),
+        inst.memory_displacement64() as i64,
+        inst.memory_displ_size(),
+        false,
+        Register::None,
+    )
+}
+
+/// Calculate and publish the exact linear address used by a completed copied
+/// x87 memory instruction. The source operand's address-size semantics live in
+/// the LEA; the guest FS base is added separately because LEA deliberately
+/// ignores segmentation. GS forms are rejected by the planner.
+fn emit_x87_memory_data_address(
+    inst: &Instruction,
+    bytes: &[u8],
+    va: u64,
+    rename: Option<Register>,
+    data_address: Register,
+    fs_address: Option<Register>,
+    out: &mut Vec<u8>,
+) -> Result<(), EmitError> {
+    let memory = x87_memory_operand(inst, rename);
+    // RIP-relative operands were rewritten through `data_address` before the
+    // copied instruction and retain their compile-time guest target. Other
+    // forms need a post-instruction LEA over the original effective-address
+    // expression, including 32-bit address-size zero extension.
+    if !inst.is_ip_rel_memory_operand() {
+        if memory.base == Register::None
+            && memory.index == Register::None
+            && has_address_size_override(bytes)
+        {
+            // `lea r64,[disp32]` normally uses long-mode's sign-extended
+            // absolute displacement. The source's 67 prefix makes it the
+            // zero-extended 32-bit absolute form instead.
+            out.push(0x67);
+        }
+        let lea = Instruction::with2(Code::Lea_r64_m, data_address, memory)
+            .map_err(|_| EmitError::Reencode { va })?;
+        encode_into(&lea, va, out)?;
+    }
+    if let Some(fs_address) = fs_address {
+        let fsbase = MemoryOperand::with_base_displ(Register::R15, i64::from(CTX_GUEST_FSBASE));
+        let load = Instruction::with2(Code::Mov_r64_rm64, fs_address, fsbase)
+            .map_err(|_| EmitError::Reencode { va })?;
+        encode_into(&load, va, out)?;
+        let add = MemoryOperand::with_base_index_scale(data_address, fs_address, 1);
+        let lea = Instruction::with2(Code::Lea_r64_m, data_address, add)
+            .map_err(|_| EmitError::Reencode { va })?;
+        encode_into(&lea, va, out)?;
+    }
+    Ok(())
 }
 
 fn snapshot_gpr_index(register: Register) -> Option<usize> {
@@ -887,6 +1249,60 @@ mod tests {
         (next as i64 + rel as i64) as usize
     }
 
+    fn assert_guarded_publication(
+        bytes: &[u8],
+        edge: ChainEdge,
+        expected_cold: usize,
+        successor: usize,
+    ) {
+        assert_eq!(
+            follow_rel32(bytes, edge.entry_rel32_off - 1, edge.entry_rel32_off),
+            expected_cold,
+            "the unpublished entry must retain cold behavior"
+        );
+        assert_eq!(
+            follow_rel32(
+                bytes,
+                edge.guard_target_rel32_off - 1,
+                edge.guard_target_rel32_off,
+            ),
+            expected_cold,
+            "the unpublished guard target is defensively cold"
+        );
+
+        let mut published = bytes.to_vec();
+        patch_local_rel32(&mut published, edge.guard_target_rel32_off, successor);
+        assert_eq!(
+            follow_rel32(&published, edge.entry_rel32_off - 1, edge.entry_rel32_off,),
+            expected_cold,
+            "publishing the guard target alone must not make the edge hot"
+        );
+        patch_local_rel32(&mut published, edge.entry_rel32_off, edge.guard_off);
+        assert_eq!(
+            follow_rel32(&published, edge.entry_rel32_off - 1, edge.entry_rel32_off,),
+            edge.guard_off,
+            "the published entry must target the guard, never the successor"
+        );
+        assert_eq!(
+            follow_rel32(
+                &published,
+                edge.guard_target_rel32_off - 1,
+                edge.guard_target_rel32_off,
+            ),
+            successor,
+            "the guard owns the separately published successor target"
+        );
+        assert_eq!(
+            published[edge.guard_off], 0x49,
+            "guard starts by spilling rcx"
+        );
+        assert_eq!(
+            published[edge.guard_target_rel32_off - 1],
+            0xE9,
+            "guard target metadata names its final jmp rel32"
+        );
+    }
+
     #[test]
     fn linked_unconditional_jmp_slot_targets_cold_stub_then_edge_patchable() {
         // nop (90); jmp +0 (eb 00) — one copy byte then an unconditional jmp.
@@ -898,7 +1314,7 @@ mod tests {
         // The one edge's rel32 is at offset 2, and initially targets the cold
         // stub which begins right after the 5-byte slot (offset 6).
         assert_eq!(lb.edges.len(), 1);
-        assert_eq!(lb.edges[0].rel32_off, 2);
+        assert_eq!(lb.edges[0].entry_rel32_off, 2);
         assert_eq!(lb.edges[0].target_va, BASE + 3, "jmp +0 target = VA after");
         let cold = follow_rel32(&lb.bytes, 1, 2);
         assert_eq!(cold, 6, "slot initially jumps to the cold stub at +6");
@@ -912,6 +1328,7 @@ mod tests {
             2,
             "cold stub's lea resolves to the slot rel32 address"
         );
+        assert_guarded_publication(&lb.bytes, lb.edges[0], cold, lb.bytes.len() + 0x80);
     }
 
     #[test]
@@ -930,9 +1347,9 @@ mod tests {
         // fallSlot+1=7.
         assert_eq!(lb.edges.len(), 2);
         assert_eq!(lb.edges[0].target_va, BASE + 4);
-        assert_eq!(lb.edges[0].rel32_off, 12);
+        assert_eq!(lb.edges[0].entry_rel32_off, 12);
         assert_eq!(lb.edges[1].target_va, BASE + 2);
-        assert_eq!(lb.edges[1].rel32_off, 7);
+        assert_eq!(lb.edges[1].entry_rel32_off, 7);
         // Slots initially target their cold stubs.
         let cold_f = follow_rel32(&lb.bytes, 6, 7);
         let cold_t = follow_rel32(&lb.bytes, 11, 12);
@@ -943,6 +1360,10 @@ mod tests {
         assert_eq!(f_imm, BASE + 2, "coldF resume = fallthrough");
         let t_imm = u64::from_le_bytes(lb.bytes[cold_t + 23..cold_t + 31].try_into().unwrap());
         assert_eq!(t_imm, BASE + 4, "coldT resume = taken");
+
+        let successor = lb.bytes.len() + 0x80;
+        assert_guarded_publication(&lb.bytes, lb.edges[0], cold_t, successor);
+        assert_guarded_publication(&lb.bytes, lb.edges[1], cold_f, successor + 0x40);
     }
 
     #[test]
@@ -973,6 +1394,18 @@ mod tests {
         let getpid = plan_and_emit_linked(GETPID);
         assert_eq!(getpid.edges.len(), 1);
         assert_eq!(getpid.edges[0].target_va, BASE + 7);
+        let identity_edge = getpid.edges[0];
+        let identity_cold = follow_rel32(
+            &getpid.bytes,
+            identity_edge.entry_rel32_off - 1,
+            identity_edge.entry_rel32_off,
+        );
+        assert_guarded_publication(
+            &getpid.bytes,
+            identity_edge,
+            identity_cold,
+            getpid.bytes.len() + 0x80,
+        );
 
         // int 0x80 uses the i386 syscall table: ordinal 39 is not getpid.
         static INT80_39: &[u8] = &[0xb8, 0x27, 0x00, 0x00, 0x00, 0xcd, 0x80];
@@ -989,6 +1422,73 @@ mod tests {
         assert_eq!(out.len(), 5 + 7);
         assert_eq!(out[5], 0x41, "REX.B prefix of the exit jmp");
         assert_eq!(out[6], 0xFF, "jmp near indirect opcode");
+    }
+
+    #[test]
+    fn all_xsave_forms_are_never_physically_emitted() {
+        for image in [
+            &[0x0f, 0xae, 0x64, 0x24, 0x40][..],
+            &[0x48, 0x0f, 0xae, 0x64, 0x24, 0x40][..],
+            &[0x0f, 0xae, 0x74, 0x24, 0x40][..],
+            &[0x48, 0x0f, 0xae, 0x74, 0x24, 0x40][..],
+            &[0x0f, 0xc7, 0x64, 0x24, 0x40][..],
+            &[0x48, 0x0f, 0xc7, 0x64, 0x24, 0x40][..],
+        ] {
+            let out = plan_and_emit(image);
+            assert_eq!(out.len(), 7, "only the sensitive-exit jump is emitted");
+            assert_eq!(out, jmp_indirect_r15(CTX_EXIT_SENSITIVE_ADDR));
+            assert!(
+                !out.windows(image.len()).any(|window| window == image),
+                "guest XSAVE bytes must never reach executable JIT memory"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_xrstor_forms_are_never_physically_emitted() {
+        for image in [
+            &[0x0f, 0xae, 0x6c, 0x24, 0x40][..],
+            &[0x48, 0x0f, 0xae, 0x6c, 0x24, 0x40][..],
+        ] {
+            let out = plan_and_emit(image);
+            assert_eq!(out.len(), 7, "only the sensitive-exit jump is emitted");
+            assert_eq!(out, jmp_indirect_r15(CTX_EXIT_SENSITIVE_ADDR));
+            assert!(
+                !out.windows(image.len()).any(|window| window == image),
+                "guest XRSTOR bytes must never reach executable JIT memory"
+            );
+        }
+    }
+
+    #[test]
+    fn linked_return_emits_a_cold_monomorphic_cache_site() {
+        let linked = plan_and_emit_linked(&[0xC3]); // ret
+        let site = linked
+            .indirect_cache
+            .expect("a return should publish one indirect-cache site");
+        assert_eq!(site.stack_adjust, 8);
+        assert_eq!(
+            &linked.bytes[site.site_id_imm_off..site.site_id_imm_off + 4],
+            &[0; 4],
+            "the runtime assigns a one-based site id before publication"
+        );
+        assert!(
+            linked.fault_map.iter().any(|entry| entry.guest_va == BASE
+                && entry.restores.contains(&ScratchRestore {
+                    snapshot_gpr: crate::gateway::reg::RCX,
+                    scratch_index: 1,
+                })),
+            "a return-stack fault must restore the temporary rcx spill"
+        );
+    }
+
+    #[test]
+    fn linked_return_immediate_records_the_exact_stack_advance() {
+        let linked = plan_and_emit_linked(&[0xC2, 0x34, 0x12]); // ret $0x1234
+        assert_eq!(
+            linked.indirect_cache.map(|site| site.stack_adjust),
+            Some(8 + 0x1234)
+        );
     }
 
     #[test]
@@ -1071,9 +1571,61 @@ mod tests {
                 emitted_start: 0,
                 emitted_end: 3,
                 guest_va: BASE,
+                is_copied_x87: false,
                 restores: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn linked_fault_map_marks_only_copied_x87_instructions_for_fip_recovery() {
+        let x87 = plan_and_emit_linked(&[0xdb, 0x28, 0x0f, 0x05]); // fld tbyte ptr [rax]
+        assert_eq!(x87.fault_map.len(), 1);
+        assert!(x87.fault_map[0].is_copied_x87);
+        let rip_x87 = plan_and_emit_linked(&[0xdb, 0x2d, 0, 0, 0, 0, 0x0f, 0x05]);
+        assert!(rip_x87.fault_map[0].is_copied_x87);
+        let mut expected_fip_witness = Vec::new();
+        emit_copied_x87_guest_va(BASE, &mut expected_fip_witness);
+        assert!(
+            x87.bytes
+                .windows(expected_fip_witness.len())
+                .any(|bytes| bytes == expected_fip_witness),
+            "completed copied x87 instructions must publish their exact guest VA"
+        );
+        assert!(
+            rip_x87
+                .bytes
+                .windows(expected_fip_witness.len())
+                .any(|bytes| bytes == expected_fip_witness),
+            "rewritten RIP-relative x87 instructions must publish their exact guest VA"
+        );
+        let data_slot = (CTX_LAST_COPIED_X87_GUEST_DATA_VA as u32).to_le_bytes();
+        assert!(
+            x87.bytes
+                .windows(7)
+                .any(|bytes| bytes[..3] == [0x49, 0x89, 0x8f] && bytes[3..] == data_slot),
+            "base/index copied x87 form must spill-compute and publish FDP"
+        );
+        assert!(
+            rip_x87
+                .bytes
+                .windows(7)
+                .any(|bytes| bytes[..3] == [0x49, 0x89, 0x87] && bytes[3..] == data_slot),
+            "RIP-relative copied x87 form must publish its compile-time FDP"
+        );
+        let valid_slot = (CTX_LAST_COPIED_X87_DATA_VALID as u32).to_le_bytes();
+        assert!(
+            rip_x87.bytes.windows(11).any(|bytes| {
+                bytes[..3] == [0x41, 0xc7, 0x87]
+                    && bytes[3..7] == valid_slot
+                    && bytes[7..] == 1_u32.to_le_bytes()
+            }),
+            "FDP validity must commit after the full address, including zero"
+        );
+
+        let mmx = plan_and_emit_linked(&[0x0f, 0x77, 0x0f, 0x05]); // emms
+        assert_eq!(mmx.fault_map.len(), 1);
+        assert!(!mmx.fault_map[0].is_copied_x87);
     }
 
     #[test]
@@ -1135,6 +1687,17 @@ mod tests {
         assert_eq!(&out[..2], &[0x90, 0x90], "both capped instructions emit");
         assert_eq!(out.len(), 2 + 7);
         assert_eq!(out[2], 0x41, "REX.B prefix of the indirect exit jmp");
+
+        let linked = emit_block_linked(IMG, &block).expect("emit linked continue");
+        assert_eq!(linked.edges.len(), 1);
+        assert_eq!(linked.edges[0].target_va, BASE + 2);
+        let edge = linked.edges[0];
+        let cold = follow_rel32(
+            &linked.bytes,
+            edge.entry_rel32_off - 1,
+            edge.entry_rel32_off,
+        );
+        assert_guarded_publication(&linked.bytes, edge, cold, linked.bytes.len() + 0x80);
     }
 
     #[test]

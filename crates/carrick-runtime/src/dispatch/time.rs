@@ -109,6 +109,33 @@ impl SyscallDispatcher {
         effective_rlimit(resource, nofile_soft, &self.proc.lock().rlimit_overrides)
     }
 
+    /// A host fork discards the parent's unregistered enforcement pthread.
+    /// Re-read the inherited override only after `proc_after_fork_child` has
+    /// reset child process state, then arm exactly one child-local helper for a
+    /// finite limit. `arm_rlimit_cpu` advances the child COW generation first,
+    /// so no inherited generation can be mistaken for a live helper.
+    pub(crate) fn begin_rlimit_cpu_fork_guard_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<RlimitCpuForkGuard> {
+        try_hold_rlimit_cpu_for_fork_until(deadline)
+    }
+
+    pub(crate) fn rlimit_cpu_after_fork_child(
+        &self,
+    ) -> Result<RlimitCpuChildRearm, std::io::Error> {
+        let inherited = self.proc.lock().rlimit_overrides[LINUX_RLIMIT_CPU as usize];
+        let limit = inherited.unwrap_or_else(|| {
+            rlimit_for_resource(
+                LINUX_RLIMIT_CPU,
+                self.io
+                    .nofile_soft
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
+        arm_rlimit_cpu(limit, self.async_signal_wake_owner())
+    }
+
     define_syscall! {
         fn timerfd_create(this, cx, clock_id: u64, flags: u64) {
             if linux_clock_duration(clock_id).is_none()
@@ -888,7 +915,7 @@ impl SyscallDispatcher {
                         let limit = LinuxRlimit::new(rlim_cur, rlim_max);
                         *slot = Some(limit);
                         if resource == LINUX_RLIMIT_CPU {
-                            arm_rlimit_cpu(limit, this.async_signal_wake_owner());
+                            let _ = arm_rlimit_cpu(limit, this.async_signal_wake_owner());
                         }
                     }
                 }
@@ -941,20 +968,83 @@ fn raise_host_nofile_backing(guest_soft: u64) {
 }
 
 static RLIMIT_CPU_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Outer exclusion for the unregistered RLIMIT_CPU helper. Every iteration
+/// owns it from the guest CPU clock read through any signal/timer publication;
+/// host fork takes the same gate only after registered guest threads drain.
+static RLIMIT_CPU_FORK_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const RLIMIT_CPU_RECHECK_NS: u64 = 1_000_000;
 const RLIMIT_CPU_REPEAT_NS: u64 = 1_000_000_000;
 
-fn arm_rlimit_cpu(limit: LinuxRlimit, wake_owner: crate::dispatch::AsyncSignalWakeOwner) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RlimitCpuChildRearm {
+    InfiniteNoHelper,
+    FiniteHelperSpawned,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_RLIMIT_CPU_SPAWN: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+pub(crate) struct RlimitCpuForkGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+pub(crate) fn try_hold_rlimit_cpu_for_fork_until(
+    deadline: std::time::Instant,
+) -> Option<RlimitCpuForkGuard> {
+    loop {
+        match RLIMIT_CPU_FORK_GATE.try_lock() {
+            Ok(guard) => return Some(RlimitCpuForkGuard { _guard: guard }),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                return Some(RlimitCpuForkGuard {
+                    _guard: poisoned.into_inner(),
+                });
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn hold_rlimit_cpu_iteration_for_test(
+    on_locked: impl FnOnce(),
+    wait_for_release: impl FnOnce(),
+) {
+    let _gate = RLIMIT_CPU_FORK_GATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    on_locked();
+    wait_for_release();
+}
+
+fn arm_rlimit_cpu(
+    limit: LinuxRlimit,
+    wake_owner: crate::dispatch::AsyncSignalWakeOwner,
+) -> Result<RlimitCpuChildRearm, std::io::Error> {
     let generation = RLIMIT_CPU_GENERATION
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
     let (soft, hard) = (limit.rlim_cur, limit.rlim_max);
     if soft == LINUX_RLIM_INFINITY && hard == LINUX_RLIM_INFINITY {
-        return;
+        return Ok(RlimitCpuChildRearm::InfiniteNoHelper);
     }
-    let _ = std::thread::Builder::new()
+    #[cfg(test)]
+    if FAIL_NEXT_RLIMIT_CPU_SPAWN.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other(
+            "injected RLIMIT_CPU helper spawn failure",
+        ));
+    }
+    std::thread::Builder::new()
         .name("carrick-rlimit-cpu".to_owned())
-        .spawn(move || enforce_rlimit_cpu(generation, soft, hard, wake_owner));
+        .spawn(move || enforce_rlimit_cpu(generation, soft, hard, wake_owner))?;
+    Ok(RlimitCpuChildRearm::FiniteHelperSpawned)
 }
 
 fn enforce_rlimit_cpu(
@@ -970,28 +1060,40 @@ fn enforce_rlimit_cpu(
         if RLIMIT_CPU_GENERATION.load(Ordering::SeqCst) != generation {
             return;
         }
-        let now = crate::guest_cpu::total_ns_including_active();
-        if let Some(hard) = hard_ns
-            && now >= hard
-        {
-            publish_rlimit_cpu_signal(wake_owner, crate::linux_abi::LINUX_SIGKILL);
-            return;
-        }
-        if let Some(soft) = next_sigxcpu_ns
-            && now >= soft
-        {
-            publish_rlimit_cpu_signal(wake_owner, crate::linux_abi::LINUX_SIGXCPU);
-            next_sigxcpu_ns = now.checked_add(RLIMIT_CPU_REPEAT_NS);
-        }
-        let next = [next_sigxcpu_ns, hard_ns]
-            .into_iter()
-            .flatten()
-            .filter(|deadline| *deadline > now)
-            .min();
-        let delay_ns = next
-            .map(|deadline| deadline.saturating_sub(now))
-            .unwrap_or(RLIMIT_CPU_REPEAT_NS)
-            .clamp(1, RLIMIT_CPU_RECHECK_NS);
+        let delay_ns = {
+            let _fork_gate = RLIMIT_CPU_FORK_GATE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            // A newer setrlimit may have raced while this helper waited for a
+            // fork owner. Re-check under the outer gate before reading clocks
+            // or publishing into timer/signal state.
+            if RLIMIT_CPU_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let now = crate::guest_cpu::total_ns_including_active();
+            if let Some(hard) = hard_ns
+                && now >= hard
+            {
+                publish_rlimit_cpu_signal(wake_owner, crate::linux_abi::LINUX_SIGKILL);
+                return;
+            }
+            if let Some(soft) = next_sigxcpu_ns
+                && now >= soft
+            {
+                publish_rlimit_cpu_signal(wake_owner, crate::linux_abi::LINUX_SIGXCPU);
+                next_sigxcpu_ns = now.checked_add(RLIMIT_CPU_REPEAT_NS);
+            }
+            let next = [next_sigxcpu_ns, hard_ns]
+                .into_iter()
+                .flatten()
+                .filter(|deadline| *deadline > now)
+                .min();
+            next.map(|deadline| deadline.saturating_sub(now))
+                .unwrap_or(RLIMIT_CPU_REPEAT_NS)
+                .clamp(1, RLIMIT_CPU_RECHECK_NS)
+        };
+        // Never sleep while holding the fork gate: a healthy enforcement
+        // helper adds no fork-path latency beyond its short publication step.
         std::thread::sleep(Duration::from_nanos(delay_ns));
     }
 }
@@ -1157,6 +1259,8 @@ fn x86_alarm_remaining_seconds(state: Option<crate::dispatch::proc::ItimerState>
 #[cfg(test)]
 mod rlimit_tests {
     use super::*;
+
+    static RLIMIT_CPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
     fn nofile_uses_dynamic_soft_cap() {
         let r = rlimit_for_resource(7, 2048); // RLIMIT_NOFILE
@@ -1171,5 +1275,84 @@ mod rlimit_tests {
         let r = rlimit_for_resource(99, 1024);
         let cur = r.rlim_cur;
         assert_eq!(cur, LINUX_RLIM_INFINITY);
+    }
+
+    #[test]
+    fn fork_gate_waits_for_real_enforcement_iteration() {
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let helper = std::thread::spawn(move || {
+            hold_rlimit_cpu_iteration_for_test(
+                || {
+                    locked_tx
+                        .send(())
+                        .expect("report locked RLIMIT_CPU iteration")
+                },
+                || release_rx.recv().expect("release RLIMIT_CPU iteration"),
+            );
+        });
+        locked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("enforcement iteration holds actual fork gate");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            release_tx.send(()).expect("release enforcement iteration");
+        });
+        let guard =
+            try_hold_rlimit_cpu_for_fork_until(std::time::Instant::now() + Duration::from_secs(1))
+                .expect("bounded fork acquisition waits for iteration");
+        drop(guard);
+        releaser.join().expect("join gate releaser");
+        helper.join().expect("join gate holder");
+    }
+
+    #[test]
+    fn fork_child_rearms_only_finite_inherited_cpu_limit() {
+        let _test_lock = RLIMIT_CPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.proc.lock().rlimit_overrides[LINUX_RLIMIT_CPU as usize] =
+            Some(LinuxRlimit::new(u64::MAX - 1, LINUX_RLIM_INFINITY));
+        let before = RLIMIT_CPU_GENERATION.load(Ordering::SeqCst);
+        assert_eq!(
+            dispatcher
+                .rlimit_cpu_after_fork_child()
+                .expect("finite rearm"),
+            RlimitCpuChildRearm::FiniteHelperSpawned,
+            "finite inherited CPU limit must spawn a fresh child helper"
+        );
+        assert_eq!(
+            RLIMIT_CPU_GENERATION.load(Ordering::SeqCst),
+            before.wrapping_add(1),
+            "child hook must arm exactly once"
+        );
+
+        dispatcher.proc.lock().rlimit_overrides[LINUX_RLIMIT_CPU as usize] =
+            Some(LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY));
+        assert_eq!(
+            dispatcher
+                .rlimit_cpu_after_fork_child()
+                .expect("infinite rearm"),
+            RlimitCpuChildRearm::InfiniteNoHelper,
+            "infinite inherited CPU limit must not spawn a helper"
+        );
+    }
+
+    #[test]
+    fn fork_child_finite_cpu_limit_reports_injected_spawn_failure() {
+        let _test_lock = RLIMIT_CPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.proc.lock().rlimit_overrides[LINUX_RLIMIT_CPU as usize] =
+            Some(LinuxRlimit::new(1, 2));
+        FAIL_NEXT_RLIMIT_CPU_SPAWN.with(|fail| fail.set(true));
+
+        let error = dispatcher
+            .rlimit_cpu_after_fork_child()
+            .expect_err("finite child limit must surface helper spawn failure");
+
+        assert!(error.to_string().contains("injected RLIMIT_CPU"));
     }
 }

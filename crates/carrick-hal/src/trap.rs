@@ -111,7 +111,9 @@ pub trait SyscallTrap {
     /// bhyve: the VM is a NAME-bound `/dev/vmm/<name>` node that persists until
     /// `vm_destroy`, so a forked child that `_exit`s without this would LEAK its
     /// node — the bhyve engine overrides this to `vm_destroy` the child VM.
-    fn process_exit_cleanup(&mut self) {}
+    fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
     /// Inject a guest signal frame for `signum`. Writes a `CarrickSigframe` to
     /// SP_EL0, points the guest's x30 at `sa_restorer`, sets x0 to `signum`,
     /// and redirects the vCPU's next resumed PC to the user handler. The
@@ -159,6 +161,13 @@ pub trait SyscallTrap {
     /// Back a dynamic high-VA mmap (`DispatchOutcome::MapHostAlias`): map host
     /// memory at `ipa` and build the VA→IPA stage-1 path.
     ///
+    /// Ownership/failure contract: `file`, when present, is an owned dup that
+    /// the implementation must close on every success, error, and unwind path.
+    /// Until backends can prove that `Err` means no mutation occurred, the
+    /// generic runtime fail-stops on every claimed installation failure; it does
+    /// not attempt a recoverable cleanup and resume. If a host `MAP_FIXED` has
+    /// already replaced a prior owner, process teardown is the ownership backstop.
+    ///
     /// The dispatcher only emits `DispatchOutcome::MapHostAlias` for engines that
     /// can back a high-VA alias, so reaching this default is a carrick coverage
     /// bug — an engine received an outcome it cannot service — never a recoverable
@@ -175,7 +184,10 @@ pub trait SyscallTrap {
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        let _ = (payload, file);
+        let _ = payload;
+        if let Some((fd, _, _)) = file {
+            unsafe { libc::close(fd) };
+        }
         let (va, ipa) = (va.raw(), ipa.raw());
         // A genuine, immediate abort (SIGABRT) — the codebase's deterministic
         // failure mechanism (see the panic-backstop note in the workspace

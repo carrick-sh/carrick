@@ -46,11 +46,12 @@
 #![cfg(target_arch = "x86_64")]
 
 use std::ffi::c_int;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
 use carrick_abi::LinuxProtFlags;
-use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError};
+use carrick_guest_mem::{Gpa, GuestVa, HostVa, MappingSharing, MemoryError, RepointPrivateError};
 use carrick_hal::GuestVmBackend;
 use carrick_hal::OsError;
 use carrick_hal::SharedFutexLocation;
@@ -66,10 +67,11 @@ use crate::bhyve_kicker::{BhyveKickHandle, BhyveKicker};
 use crate::guest_setup_x86::{
     ACCESS_RING3_CS64, ACCESS_RING3_SS, BhyveGuestRam, BroughtUpX86, CommitOutcome,
     FAULT_DOORBELL_PORT, FP_STUB_DOORBELL_PORT, FaultScratchRecord, PROT_RWX,
-    SYSCALL_DOORBELL_PORT, USER_CS64_SEL, USER_SS_SEL, VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA,
-    X86_FP_STUB_GPA, X86_GDT_GPA, X86_MEM_SIZE, X86_PML4_CAPACITY, X86_PML4_GPA, bring_up_x86_elf,
-    fault_scratch_gpa, fault_scratch_record_from_bytes, fault_stack_frame_len,
-    fault_user_context_from_bytes, program_x86_vcpu_longmode_entry, program_x86_vcpu_reclaim_entry,
+    SYSCALL_DOORBELL_PORT, SharedFutexMirrorKey, SharedFutexMirrorWireKey, USER_CS64_SEL,
+    USER_SS_SEL, VM_SEGID_SYSMEM, X86_FP_SCRATCH_GPA, X86_FP_STUB_GPA, X86_GDT_GPA, X86_MEM_SIZE,
+    X86_PML4_CAPACITY, X86_PML4_GPA, bring_up_x86_elf, fault_scratch_gpa,
+    fault_scratch_record_from_bytes, fault_stack_frame_len, fault_user_context_from_bytes,
+    file_object_id, program_x86_vcpu_longmode_entry, program_x86_vcpu_reclaim_entry,
     snapshot_x86_bhyve,
 };
 use crate::vmm::{BhyveSharedVm, BhyveVcpu, BhyveVm, Vcpu};
@@ -970,7 +972,172 @@ pub struct BhyveSiblingBuilder {
 // materialized engine touches single-threaded.
 unsafe impl Send for BhyveSiblingBuilder {}
 
+#[derive(Debug)]
+enum SharedAliasIoError {
+    Snapshot(std::io::Error),
+    UnmappedGpa {
+        operation: &'static str,
+        gpa: u64,
+        len: usize,
+    },
+    HostIo {
+        operation: &'static str,
+        offset: libc::off_t,
+        len: usize,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for SharedAliasIoError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Snapshot(error) => write!(formatter, "alias fd snapshot failed: {error}"),
+            Self::UnmappedGpa {
+                operation,
+                gpa,
+                len,
+            } => write!(
+                formatter,
+                "alias {operation} GPA 0x{gpa:x} len 0x{len:x} is unmapped"
+            ),
+            Self::HostIo {
+                operation,
+                offset,
+                len,
+                source,
+            } => write!(
+                formatter,
+                "alias {operation} offset {offset} len 0x{len:x} failed: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SharedAliasIoError {}
+
+fn checked_next_offset(offset: libc::off_t, progress: usize) -> std::io::Result<libc::off_t> {
+    let progress = libc::off_t::try_from(progress)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    offset
+        .checked_add(progress)
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EOVERFLOW))
+}
+
+fn exact_pwrite_at_with<F>(
+    mut bytes: &[u8],
+    mut offset: libc::off_t,
+    mut write: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&[u8], libc::off_t) -> std::io::Result<usize>,
+{
+    while !bytes.is_empty() {
+        match write(bytes, offset) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(progress) if progress <= bytes.len() => {
+                offset = checked_next_offset(offset, progress)?;
+                bytes = &bytes[progress..];
+            }
+            Ok(_) => return Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn exact_pread_at_with<F>(
+    bytes: &mut [u8],
+    mut offset: libc::off_t,
+    mut read: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&mut [u8], libc::off_t) -> std::io::Result<usize>,
+{
+    let mut filled = 0usize;
+    while filled < bytes.len() {
+        match read(&mut bytes[filled..], offset) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Ok(progress) if progress <= bytes.len() - filled => {
+                offset = checked_next_offset(offset, progress)?;
+                filled += progress;
+            }
+            Ok(_) => return Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn exact_pwrite_at(fd: &OwnedFd, bytes: &[u8], offset: libc::off_t) -> std::io::Result<()> {
+    exact_pwrite_at_with(bytes, offset, |remaining, at| {
+        // SAFETY: remaining is readable and fd stays owned for the call.
+        let result = unsafe {
+            libc::pwrite(
+                fd.as_raw_fd(),
+                remaining.as_ptr().cast::<libc::c_void>(),
+                remaining.len(),
+                at,
+            )
+        };
+        if result < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    })
+}
+
+fn exact_pread_at(fd: &OwnedFd, bytes: &mut [u8], offset: libc::off_t) -> std::io::Result<()> {
+    exact_pread_at_with(bytes, offset, |remaining, at| {
+        // SAFETY: remaining is writable and fd stays owned for the call.
+        let result = unsafe {
+            libc::pread(
+                fd.as_raw_fd(),
+                remaining.as_mut_ptr().cast::<libc::c_void>(),
+                remaining.len(),
+                at,
+            )
+        };
+        if result < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    })
+}
+
+#[cfg(test)]
+fn staged_pread_at_with<F>(
+    destination: &mut [u8],
+    offset: libc::off_t,
+    read: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&mut [u8], libc::off_t) -> std::io::Result<usize>,
+{
+    let mut staged = vec![0u8; destination.len()];
+    exact_pread_at_with(&mut staged, offset, read)?;
+    destination.copy_from_slice(&staged);
+    Ok(())
+}
+
 impl BhyveVmm {
+    /// Walk the authoritative live guest page tables. This deliberately reads
+    /// the VM's PML4 sysmem, not the unrelated per-vCPU fault-frame helper: all
+    /// sibling vCPUs share these tables and private-aperture repoints edit them
+    /// in place. Any missing table mapping or non-present leaf is a typed
+    /// translation miss (`None`).
+    fn translate_live_guest_va(&self, va: u64) -> Option<u64> {
+        let _pml4 = self.pml4_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let host = self.vm.map_gpa(X86_PML4_GPA, X86_PML4_CAPACITY)?;
+        let mut tables = vec![0u8; X86_PML4_CAPACITY];
+        // SAFETY: map_gpa proved the complete live page-table window exists.
+        unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
+        Pml4Manager::new(tables, X86_PML4_GPA).translate(va)
+    }
+
     /// Read the live guest PML4 into a scratch buffer, let `edit` mutate it via a
     /// `Pml4Manager`, write it back, and reload CR3 (the single-vCPU TLB flush) —
     /// the copy-edit-copy idiom shared by the demand-paging commit (and a future
@@ -1006,6 +1173,49 @@ impl BhyveVmm {
             .as_bhyve()
             .set_reg_raw_shared(VM_REG_GUEST_CR3, X86_PML4_GPA)
             .map_err(|e| MemoryError::HostMap(format!("bhyve-x86: reload CR3: {e}")))
+    }
+
+    /// Publish one live VA→compact-GPA leaf with explicit failure phase. Errors
+    /// while reading/editing the scratch PML4 are clean; once the table bytes are
+    /// copied into live sysmem, a CR3 reload error is indeterminate and the
+    /// dispatcher must fail stopped.
+    fn publish_live_pml4_mapping(
+        &mut self,
+        va: u64,
+        gpa: u64,
+        span: usize,
+    ) -> Result<(), RepointPrivateError> {
+        let _pml4 = self.pml4_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let host = self
+            .vm
+            .map_gpa(X86_PML4_GPA, X86_PML4_CAPACITY)
+            .ok_or_else(|| {
+                RepointPrivateError::clean(MemoryError::HostMap(format!(
+                    "bhyve-x86: PML4 map_gpa 0x{X86_PML4_GPA:x} unmapped"
+                )))
+            })?;
+        let mut tables = vec![0u8; X86_PML4_CAPACITY];
+        // SAFETY: map_gpa proved the live PML4 window is mapped.
+        unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
+        let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
+        mgr.map_aliased(GuestVa(va & !0xFFF), Gpa(gpa), span as u64, true, true)
+            .map_err(|_| {
+                RepointPrivateError::clean(MemoryError::OutOfBounds {
+                    address: va,
+                    length: span,
+                })
+            })?;
+        // SAFETY: both windows are X86_PML4_CAPACITY bytes. This is the
+        // guest-visible publication point.
+        unsafe { std::ptr::copy_nonoverlapping(mgr.bytes().as_ptr(), host, X86_PML4_CAPACITY) };
+        let reload = self
+            .h
+            .as_bhyve()
+            .set_reg_raw_shared(VM_REG_GUEST_CR3, X86_PML4_GPA)
+            .map_err(|error| {
+                MemoryError::HostMap(format!("bhyve live PML4 publication reload CR3: {error}"))
+            });
+        classify_private_repoint_cr3_reload(reload)
     }
 
     /// Back a lazily-reserved VA range NOW: allocate a compact GPA span,
@@ -1071,30 +1281,86 @@ impl BhyveVmm {
         Ok(())
     }
 
-    /// Flush every registered writable file-backed shm alias's live sysmem back
-    /// to its backing FILE. Called at the fork barrier (`freeze_ram`, parent vCPU
-    /// suspended) so a forked child that re-`shmat`s the same segment reads the
-    /// parent's stores via map_host_alias's file→sysmem copy. Best-effort: a
-    /// transient `map_gpa`/`pwrite` failure is skipped (the worst case is the
-    /// pre-fix stale-file behaviour for that one alias, never a crash). The write
-    /// is bounded by the file's real size, so it never grows the file.
-    fn flush_shm_aliases(&self) {
-        for (gpa, fd, offset, write_len) in self.ram.shm_aliases_for_flush() {
-            if write_len == 0 {
+    /// Flush every writable copied file alias exactly. Fork freeze and child
+    /// exit treat an incomplete writeback as a hard boundary failure: proceeding
+    /// would publish a child/exit status whose shared-file state is stale.
+    fn flush_shm_aliases(&self) -> Result<(), SharedAliasIoError> {
+        let aliases = self
+            .ram
+            .shm_aliases_for_flush()
+            .map_err(SharedAliasIoError::Snapshot)?;
+        for alias in aliases {
+            if alias.len == 0 {
                 continue;
             }
-            let Some(host) = self.vm.map_gpa(gpa, write_len) else {
-                continue;
-            };
-            // SAFETY: map_gpa proved `[gpa, gpa+write_len)` is live sysmem; we read
-            // it into the kernel via pwrite. The parent vCPU is suspended, so the
-            // bytes are a consistent snapshot.
-            let n = unsafe { libc::pwrite(fd, host as *const libc::c_void, write_len, offset) };
-            // A short/failed write only leaves the file as stale as before the fix
-            // for this alias — never fatal; nothing to recover.
-            let _ = n;
+            let host =
+                self.vm
+                    .map_gpa(alias.gpa, alias.len)
+                    .ok_or(SharedAliasIoError::UnmappedGpa {
+                        operation: "writeback",
+                        gpa: alias.gpa,
+                        len: alias.len,
+                    })?;
+            // SAFETY: map_gpa proved the complete source range live and the vCPU
+            // is stopped at every caller's coherence boundary.
+            let bytes = unsafe { std::slice::from_raw_parts(host.cast_const(), alias.len) };
+            exact_pwrite_at(&alias.fd, bytes, alias.offset).map_err(|source| {
+                SharedAliasIoError::HostIo {
+                    operation: "pwrite",
+                    offset: alias.offset,
+                    len: alias.len,
+                    source,
+                }
+            })?;
         }
+        Ok(())
     }
+
+    fn refresh_shm_aliases(&self) -> Result<(), SharedAliasIoError> {
+        let aliases = self
+            .ram
+            .shm_aliases_for_refresh()
+            .map_err(SharedAliasIoError::Snapshot)?;
+        // Stage every file read and every destination pointer first. Nothing is
+        // copied into guest sysmem until ALL reads complete, so one short read,
+        // EOF, EINTR exhaustion, or hard error cannot publish a mixed refresh.
+        let mut staged = Vec::with_capacity(aliases.len());
+        for alias in aliases {
+            if alias.len == 0 {
+                continue;
+            }
+            let host =
+                self.vm
+                    .map_gpa(alias.gpa, alias.len)
+                    .ok_or(SharedAliasIoError::UnmappedGpa {
+                        operation: "refresh",
+                        gpa: alias.gpa,
+                        len: alias.len,
+                    })?;
+            let mut bytes = vec![0u8; alias.len];
+            exact_pread_at(&alias.fd, &mut bytes, alias.offset).map_err(|source| {
+                SharedAliasIoError::HostIo {
+                    operation: "pread",
+                    offset: alias.offset,
+                    len: alias.len,
+                    source,
+                }
+            })?;
+            staged.push((host, bytes));
+        }
+        for (host, bytes) in staged {
+            // SAFETY: each pointer was validated for bytes.len() above; the
+            // staging vectors are disjoint host allocations.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, bytes.len()) };
+        }
+        Ok(())
+    }
+}
+
+fn classify_private_repoint_cr3_reload(
+    result: Result<(), MemoryError>,
+) -> Result<(), RepointPrivateError> {
+    result.map_err(RepointPrivateError::indeterminate)
 }
 
 impl GuestVmBackend for BhyveVmm {
@@ -1167,7 +1433,7 @@ impl GuestVmBackend for BhyveVmm {
         true
     }
 
-    fn process_exit_cleanup(&mut self) {
+    fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
         // Push this process's writable file-backed `MAP_SHARED` alias stores back
         // to their backing files BEFORE the VM node is torn down. bhyve can't share
         // guest physical RAM across the fork, so the shared inode is the only
@@ -1178,48 +1444,44 @@ impl GuestVmBackend for BhyveVmm {
         // the write is bounded by file size, and a read-only alias is skipped (no
         // dirty data). Done for a borrowed (vfork-shared) VM too — the writes are
         // owed regardless of who destroys the node.
-        self.flush_shm_aliases();
+        self.flush_shm_aliases()
+            .map_err(|error| TrapError::Hypervisor(format!("bhyve exit writeback: {error}")))?;
         // Tear down the bhyve VM node on a forked-child `_exit` (which skips
         // Drop). A vfork-shared (borrowed) VM must NOT be destroyed — the parent
         // owns the node and resumes on it (§2.5c). Carried verbatim from the old
         // engine. The generic engine's `process_exit_cleanup` delegates here.
-        if self.vm_borrowed {
-            return;
+        if !self.vm_borrowed {
+            self.vm.destroy_in_place();
         }
-        self.vm.destroy_in_place();
+        Ok(())
     }
 }
 
-/// Number of slots in the fork-coherent futex mirror (open-addressed by futex-word VA).
+/// Number of typed-key slots in the fork-coherent futex mirror.
 const FUTEX_MIRROR_SLOTS: usize = 8192;
+const MIRROR_EMPTY: u32 = 0;
+const MIRROR_CLAIMING: u32 = 1;
+const MIRROR_OCCUPIED: u32 = 2;
 
-/// One fork-coherent futex-mirror slot: the guest futex-word VA (the open-addressing
-/// key; 0 = empty), the cross-process mirror of that word's value, and a parked-waiter
-/// count. The waiter count exists because FreeBSD `_umtx_op(UMTX_OP_WAKE)` returns 0 on
-/// success — NOT the number of waiters woken, which Linux `FUTEX_WAKE` returns and which
-/// `tst_checkpoint_wake` loops on. The umtx wait/wake path (carrick-host) bumps/reads it
-/// at `value`+4 so a shared WAKE can report a Linux-faithful woken count. LAYOUT IS
-/// LOAD-BEARING: `value` at offset 8, `waiters` at offset 12 (== the wake addr + 4).
-#[repr(C, align(16))]
+/// One fork-coherent futex-mirror slot. The typed key is stored field-for-field;
+/// its hash only selects the first probe index. `state` publishes the key as one
+/// transaction, and full-field comparison resolves hash collisions.
+#[repr(C, align(64))]
 struct FutexMirrorSlot {
-    key: std::sync::atomic::AtomicU64,
+    state: std::sync::atomic::AtomicU32,
+    kind: std::sync::atomic::AtomicU64,
+    domain_0: std::sync::atomic::AtomicU64,
+    domain_1: std::sync::atomic::AtomicU64,
+    backing_0: std::sync::atomic::AtomicU64,
+    backing_1: std::sync::atomic::AtomicU64,
+    backing_2: std::sync::atomic::AtomicU64,
+    byte_offset: std::sync::atomic::AtomicU64,
     value: std::sync::atomic::AtomicU32,
     waiters: std::sync::atomic::AtomicU32,
 }
 
-/// Fork-coherent "futex mirror" for the bhyve cross-process futex. bhyve cannot share
-/// guest sysmem across a fork (the vmmapi memseg model can't back a guest segment with
-/// a host fd from userspace — see `map_host_alias`), so each forked process holds a
-/// PRIVATE copy of every guest MAP_SHARED word; a cross-process futex keyed on the
-/// per-VM word never rendezvouses. This ONE host `MAP_SHARED|MAP_ANON` slot array,
-/// allocated before the guest's first fork (so every child inherits the SAME physical
-/// pages), holds the shared word the umtx waits/wakes on, open-addressed by the
-/// futex-word VA — which is stable across the fork (the child inherits the page tables)
-/// and so resolves to the same slot in parent and child. (Indexing by GPA would need a
-/// per-VA→GPA translation the engine doesn't expose here; the VA is the natural key.)
 static SHARED_FUTEX_MIRROR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Base of the futex-mirror slot array; `None` if the mmap failed.
 fn shared_futex_mirror_base() -> Option<usize> {
     let base = *SHARED_FUTEX_MIRROR.get_or_init(|| {
         let len = FUTEX_MIRROR_SLOTS * std::mem::size_of::<FutexMirrorSlot>();
@@ -1239,45 +1501,78 @@ fn shared_futex_mirror_base() -> Option<usize> {
     (base != 0).then_some(base)
 }
 
-/// Resolve a guest futex-word VA to the host address of its fork-coherent mirror word,
-/// claiming an open-addressed slot on first sight. `None` if the mmap failed or the
-/// table is full (the cross-process futex then degrades to the old per-VM behaviour).
-fn shared_futex_mirror_slot(key: u64) -> Option<SharedFutexLocation> {
-    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+fn mirror_key_hash(key: &SharedFutexMirrorWireKey) -> usize {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish() as usize
+}
+
+fn mirror_slot_key(slot: &FutexMirrorSlot) -> SharedFutexMirrorWireKey {
+    use std::sync::atomic::Ordering::Relaxed;
+    SharedFutexMirrorWireKey {
+        kind: slot.kind.load(Relaxed),
+        domain: [slot.domain_0.load(Relaxed), slot.domain_1.load(Relaxed)],
+        backing: [
+            slot.backing_0.load(Relaxed),
+            slot.backing_1.load(Relaxed),
+            slot.backing_2.load(Relaxed),
+        ],
+        byte_offset: slot.byte_offset.load(Relaxed),
+    }
+}
+
+fn write_mirror_slot_key(slot: &FutexMirrorSlot, key: SharedFutexMirrorWireKey) {
+    use std::sync::atomic::Ordering::Relaxed;
+    slot.kind.store(key.kind, Relaxed);
+    slot.domain_0.store(key.domain[0], Relaxed);
+    slot.domain_1.store(key.domain[1], Relaxed);
+    slot.backing_0.store(key.backing[0], Relaxed);
+    slot.backing_1.store(key.backing[1], Relaxed);
+    slot.backing_2.store(key.backing[2], Relaxed);
+    slot.byte_offset.store(key.byte_offset, Relaxed);
+}
+
+fn mirror_location(slot: &FutexMirrorSlot) -> SharedFutexLocation {
+    SharedFutexLocation::Mirror {
+        word: HostVa(&slot.value as *const _ as usize),
+        waiter_count: HostVa(&slot.waiters as *const _ as usize),
+        waiter_key: &slot.value as *const _ as usize,
+    }
+}
+
+fn shared_futex_mirror_slot(key: SharedFutexMirrorKey) -> Option<SharedFutexLocation> {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let key = key.wire();
     let base = shared_futex_mirror_base()?;
     let slots = base as *const FutexMirrorSlot;
-    let mut idx = ((key >> 2) as usize) % FUTEX_MIRROR_SLOTS;
+    let mut idx = mirror_key_hash(&key) % FUTEX_MIRROR_SLOTS;
     for _ in 0..FUTEX_MIRROR_SLOTS {
-        // SAFETY: idx < FUTEX_MIRROR_SLOTS and `base` is a live array of that many slots.
+        // SAFETY: idx is bounded by FUTEX_MIRROR_SLOTS and the shared mmap owns
+        // a zero-initialized array of exactly that many slots.
         let slot = unsafe { &*slots.add(idx) };
-        let cur = slot.key.load(Acquire);
-        if cur == key {
-            return Some(SharedFutexLocation::Mirror {
-                word: HostVa(&slot.value as *const _ as usize),
-                waiter_count: HostVa(&slot.waiters as *const _ as usize),
-                waiter_key: &slot.value as *const _ as usize,
-            });
+        let mut state = slot.state.load(Acquire);
+        while state == MIRROR_CLAIMING {
+            std::hint::spin_loop();
+            state = slot.state.load(Acquire);
         }
-        if cur == 0 {
-            match slot.key.compare_exchange(0, key, AcqRel, Acquire) {
-                Ok(_) => {
-                    return Some(SharedFutexLocation::Mirror {
-                        word: HostVa(&slot.value as *const _ as usize),
-                        waiter_count: HostVa(&slot.waiters as *const _ as usize),
-                        waiter_key: &slot.value as *const _ as usize,
-                    });
-                }
-                // Lost the race to a peer claiming the SAME key — still ours to use.
-                Err(actual) if actual == key => {
-                    return Some(SharedFutexLocation::Mirror {
-                        word: HostVa(&slot.value as *const _ as usize),
-                        waiter_count: HostVa(&slot.waiters as *const _ as usize),
-                        waiter_key: &slot.value as *const _ as usize,
-                    });
-                }
-                // Claimed by a different key — keep probing.
-                Err(_) => {}
-            }
+        if state == MIRROR_OCCUPIED && mirror_slot_key(slot) == key {
+            return Some(mirror_location(slot));
+        }
+        if state == MIRROR_EMPTY
+            && slot
+                .state
+                .compare_exchange(
+                    MIRROR_EMPTY,
+                    MIRROR_CLAIMING,
+                    std::sync::atomic::Ordering::AcqRel,
+                    Acquire,
+                )
+                .is_ok()
+        {
+            write_mirror_slot_key(slot, key);
+            slot.state.store(MIRROR_OCCUPIED, Release);
+            return Some(mirror_location(slot));
         }
         idx = (idx + 1) % FUTEX_MIRROR_SLOTS;
     }
@@ -1298,22 +1593,44 @@ impl X86Vmm for BhyveVmm {
         Ok(())
     }
 
-    fn shared_futex_location(&self, key: Gpa, _len: usize) -> Option<SharedFutexLocation> {
-        // Cross-process futex coherence on bhyve: the per-VM guest word is NOT shared
-        // across the fork (vmmapi limitation, see SHARED_FUTEX_MIRROR). `key` is the
-        // futex-word VA (syscall_buffer_gpa is identity on bhyve) — stable across the
-        // fork — so resolve it to its fork-coherent mirror slot. The dispatch syncs the
-        // per-VM guest word <-> the mirror at the WAIT/WAKE boundaries (proc.rs).
-        //
-        // NOTE: the ONE non-PRIVATE futex that must NOT use this mirror is a thread
-        // descriptor's `pd->tid` (glibc's `pthread_join` waits on it non-PRIVATE), whose
-        // waker is carrick's IN-PROCESS `CLONE_CHILD_CLEARTID` (`handle_thread_exit` →
-        // `futex.wake`), not a guest `FUTEX_WAKE` — a mirror `__ulock` WAIT would never be
-        // woken and the join would HANG. The host-neutral dispatch routes that word to the
-        // in-process table BEFORE reaching here (it recognises a live thread's
-        // `clear_child_tid` address); see `dispatch/proc.rs`. Everything else — every
-        // genuine `MAP_SHARED` (file or anon) cross-process futex — keeps the mirror.
-        shared_futex_mirror_slot(key.raw())
+    fn translate_va(&self, va: u64) -> Option<u64> {
+        self.translate_live_guest_va(va)
+    }
+
+    fn syscall_buffer_host_ptr(&self, va: GuestVa, gpa: Gpa, len: usize) -> Option<*mut u8> {
+        if carrick_mem::memory::needs_stage1_translation(va.raw(), len as u64) {
+            return self
+                .ram
+                .contains_gpa(gpa.raw(), len)
+                .then(|| self.vm.map_gpa(gpa.raw(), len))
+                .flatten();
+        }
+        self.host_ptr(va.raw(), len)
+    }
+
+    fn syscall_buffer_host_ptr_mut(
+        &mut self,
+        va: GuestVa,
+        gpa: Gpa,
+        len: usize,
+    ) -> Option<*mut u8> {
+        if carrick_mem::memory::needs_stage1_translation(va.raw(), len as u64) {
+            return self.syscall_buffer_host_ptr(va, gpa, len);
+        }
+        self.host_ptr_mut(va.raw(), len)
+    }
+
+    fn shared_futex_location(&self, gpa: Gpa, len: usize) -> Option<SharedFutexLocation> {
+        // Compact GPA is only a translation coordinate, never object identity:
+        // parent and child can allocate unrelated post-fork objects at the same
+        // bump position. Resolve through the RAM metadata to the stored logical
+        // object + byte offset, then use the typed collision-checked mirror key.
+        let key = self.ram.shared_futex_key(gpa.raw(), len)?;
+        shared_futex_mirror_slot(key)
+    }
+
+    fn publish_mapping_sharing(&mut self, va: GuestVa, len: usize, sharing: MappingSharing) {
+        self.ram.publish_mapping_sharing(va.raw(), len, sharing);
     }
 
     fn is_guest_reserved(&self, va: u64) -> bool {
@@ -1456,12 +1773,17 @@ impl X86Vmm for BhyveVmm {
         } else {
             Ok(())
         };
-        // THEN prune the window, so a later mmap that reuses this VA re-commits a
-        // FRESH GPA instead of resolving this now-dead one. Leaving the window
-        // behind diverges host_ptr (syscall copies) from the guest's live leaf and
-        // mis-targets zero_backing — the bhyve large-alloc heap corruption. Done
-        // after protect_range so the leaf-clear above can still resolve the VA.
-        self.ram.remove_windows(address, len);
+        // THEN prune ordinary windows, so a later mmap that reuses such a VA
+        // re-commits a FRESH GPA instead of resolving dead storage. The shared
+        // aperture is different: its compact-GPA window is the retained physical
+        // identity backing. PrivateReservation teardown invalidates only the leaf;
+        // a later MAP_SHARED reuse resolves this retained window, zeroes fresh
+        // bytes, and restores VA→that exact compact GPA. Removing it here made
+        // `restore_shared_identity` either fail or map the impossible GPA==VA.
+        // On backend failure retain every window and fork-flush owner.
+        if result.is_ok() && !carrick_mem::memory::needs_stage1_translation(address, len as u64) {
+            self.ram.remove_windows(address, len);
+        }
         result
     }
 
@@ -1474,6 +1796,10 @@ impl X86Vmm for BhyveVmm {
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
         let va = va.raw();
+        let file = file.map(|(fd, offset, prot)| {
+            // SAFETY: the dispatcher transfers sole ownership of this dup.
+            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
+        });
         // bhyve IGNORES the dispatcher's `ipa` (it bumps its own GPA in the single
         // sysmem segment, which is already kernel-backed and host-visible via
         // map_gpa). The alias content is COPIED into that backing RAM: an anon
@@ -1485,8 +1811,8 @@ impl X86Vmm for BhyveVmm {
         // guest segment with a host fd from userspace, so durable/shared-aperture
         // coherence on bhyve is a known follow-up. Enough for a guest that READS
         // its initial aperture content (the common startup case).
-        let writable = match file {
-            Some((_, _, prot)) => prot & libc::PROT_WRITE != 0,
+        let writable = match file.as_ref() {
+            Some((_, _, prot)) => *prot & libc::PROT_WRITE != 0,
             None => true,
         };
         let gpa = self
@@ -1496,8 +1822,10 @@ impl X86Vmm for BhyveVmm {
         let host = self.vm.map_gpa(gpa, len as usize).ok_or_else(|| {
             TrapError::Hypervisor(format!("bhyve map_host_alias: map_gpa 0x{gpa:x} unmapped"))
         })?;
+        let mut retained_file = None;
         match file {
             Some((fd, offset, _prot)) => {
+                let raw_fd = fd.as_raw_fd();
                 // The dispatcher's alias `len` is page-aligned to the alias-IPA
                 // arena granularity (`HVF_PAGE_SIZE` = 16 KiB), but the backing
                 // file (e.g. a SysV-shm segment ftruncated to its requested size)
@@ -1511,11 +1839,16 @@ impl X86Vmm for BhyveVmm {
                 // segment's partial last page. (KVM never hits this: it registers
                 // the mmap as a guest memslot WITHOUT host-reading it, so an
                 // out-of-bounds touch would fault inside the guest, not the host.)
+                let file_id = file_object_id(raw_fd).map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "bhyve map_host_alias: fstat identity fd={raw_fd}: {error}"
+                    ))
+                })?;
                 let file_size = {
                     let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                    if unsafe { libc::fstat(raw_fd, &mut st) } != 0 {
                         return Err(TrapError::Hypervisor(format!(
-                            "bhyve map_host_alias: fstat fd={fd}: {}",
+                            "bhyve map_host_alias: fstat size fd={raw_fd}: {}",
                             std::io::Error::last_os_error()
                         )));
                     }
@@ -1533,13 +1866,13 @@ impl X86Vmm for BhyveVmm {
                             copy_len,
                             libc::PROT_READ,
                             libc::MAP_SHARED,
-                            fd,
+                            raw_fd,
                             offset,
                         )
                     };
                     if src == libc::MAP_FAILED {
                         return Err(TrapError::Hypervisor(format!(
-                            "bhyve map_host_alias: mmap file fd={fd} off={offset} \
+                            "bhyve map_host_alias: mmap file fd={raw_fd} off={offset} \
                              copy_len=0x{copy_len:x}: {}",
                             std::io::Error::last_os_error()
                         )));
@@ -1551,29 +1884,12 @@ impl X86Vmm for BhyveVmm {
                     // SAFETY: drop the transient host view of the file.
                     unsafe { libc::munmap(src, copy_len) };
                 }
-                // SysV-shm cross-process coherence: bhyve cannot back the guest
-                // segment with the host fd, so a guest store lands in private
-                // sysmem, invisible to a forked child that re-attaches the same
-                // file. For a WRITABLE alias, retain the fd and register the alias
-                // so `freeze_ram` flushes this GPA back to the file at the fork
-                // barrier — the child's re-`shmat` then reads the parent's stores
-                // (matching KVM/HVF, whose MAP_SHARED file alias is coherent for
-                // free). A READ-ONLY alias has no dirty data to push back, so just
-                // close its fd. (The dispatcher transferred fd ownership to us;
-                // KVM closes it after mmap — bhyve previously LEAKED it here.)
-                if writable {
-                    self.ram.register_shm_alias(
-                        va,
-                        gpa,
-                        len as usize,
-                        fd,
-                        offset,
-                        file_size as usize,
-                    );
-                } else {
-                    // SAFETY: we own `fd`; nothing to flush for a read-only alias.
-                    unsafe { libc::close(fd) };
-                }
+                // Retain every file alias. Writable views participate in
+                // fork/exit writeback; read-only views still need a stable
+                // `(domain, dev, ino, file-offset)` object identity and refresh
+                // after another process updates the file. Snapshot I/O duplicates
+                // this owned fd before dropping the RAM lock.
+                retained_file = Some((fd, offset, file_size as usize, file_id));
             }
             None => {
                 let n = payload.len().min(len as usize);
@@ -1584,32 +1900,44 @@ impl X86Vmm for BhyveVmm {
         // Install the VA→GPA path in the live PML4 (the same copy-edit-copy +
         // CR3 reload as `protect_range`; map_aliased uses bounded 2 MiB block
         // leaves for large spans).
-        let host = self
-            .vm
-            .map_gpa(X86_PML4_GPA, X86_PML4_CAPACITY)
-            .ok_or_else(|| {
-                TrapError::Hypervisor(format!(
-                    "bhyve map_host_alias: PML4 map_gpa 0x{X86_PML4_GPA:x} unmapped"
-                ))
-            })?;
-        let mut tables = vec![0u8; X86_PML4_CAPACITY];
-        // SAFETY: map_gpa proved the live PML4 window is mapped.
-        unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
-        let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
-        // exec=true: a MAP_SHARED file/anon host alias maps executable (the
-        // historical alias behaviour; shared-object text needs to execute).
-        mgr.map_aliased(GuestVa(va), Gpa(gpa), len, writable, true)
-            .map_err(|_| {
-                TrapError::Hypervisor(format!(
-                    "bhyve map_host_alias: map_aliased va=0x{va:x} gpa=0x{gpa:x} len=0x{len:x}"
-                ))
-            })?;
-        // SAFETY: both windows are X86_PML4_CAPACITY bytes.
-        unsafe { std::ptr::copy_nonoverlapping(mgr.bytes().as_ptr(), host, X86_PML4_CAPACITY) };
-        self.h
-            .as_bhyve()
-            .set_reg_raw_shared(VM_REG_GUEST_CR3, X86_PML4_GPA)
-            .map_err(|e| TrapError::Hypervisor(format!("bhyve map_host_alias: reload CR3: {e}")))?;
+        {
+            // Serialize this whole-table publication with demand faults,
+            // protection edits, private repoints, and sibling translations.
+            let _pml4 = self.pml4_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let host = self
+                .vm
+                .map_gpa(X86_PML4_GPA, X86_PML4_CAPACITY)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "bhyve map_host_alias: PML4 map_gpa 0x{X86_PML4_GPA:x} unmapped"
+                    ))
+                })?;
+            let mut tables = vec![0u8; X86_PML4_CAPACITY];
+            // SAFETY: map_gpa proved the live PML4 window is mapped.
+            unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
+            let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
+            // exec=true: a MAP_SHARED file/anon host alias maps executable (the
+            // historical alias behaviour; shared-object text needs to execute).
+            mgr.map_aliased(GuestVa(va), Gpa(gpa), len, writable, true)
+                .map_err(|_| {
+                    TrapError::Hypervisor(format!(
+                        "bhyve map_host_alias: map_aliased va=0x{va:x} gpa=0x{gpa:x} len=0x{len:x}"
+                    ))
+                })?;
+            // SAFETY: both windows are X86_PML4_CAPACITY bytes.
+            unsafe { std::ptr::copy_nonoverlapping(mgr.bytes().as_ptr(), host, X86_PML4_CAPACITY) };
+            self.h
+                .as_bhyve()
+                .set_reg_raw_shared(VM_REG_GUEST_CR3, X86_PML4_GPA)
+                .map_err(|e| {
+                    TrapError::Hypervisor(format!("bhyve map_host_alias: reload CR3: {e}"))
+                })?;
+        }
+        // The backing and live PML4 are now installed. Publish VA lookup and
+        // fork-flush fd ownership together, trimming any fixed-replacement
+        // owner (including a partially overlapping alias) in one RAM lock.
+        self.ram
+            .replace_alias_window(va, gpa, len as usize, writable, retained_file);
         Ok(())
     }
 
@@ -1619,9 +1947,15 @@ impl X86Vmm for BhyveVmm {
         overlay_va: u64,
         len: usize,
         content: &[u8],
-    ) -> Result<(), MemoryError> {
-        // Guest `mmap(MAP_FIXED|MAP_PRIVATE|MAP_ANON)` over a shared-aperture VA.
-        // The dispatcher already carved an overlay slot (`overlay_va`, in the
+    ) -> Result<(), RepointPrivateError> {
+        if content.len() != len {
+            return Err(RepointPrivateError::clean(MemoryError::OutOfBounds {
+                address: va,
+                length: content.len(),
+            }));
+        }
+        // Guest file or anonymous `mmap(MAP_FIXED|MAP_PRIVATE)` over a
+        // shared-aperture VA. The dispatcher already carved an overlay slot (`overlay_va`, in the
         // per-process private overlay aperture) and asks the backend to make `va`
         // resolve there so the guest's "private" stores stay private. On bhyve the
         // overlay aperture is demand-paged (capped to 1 page at bring-up — see
@@ -1633,46 +1967,78 @@ impl X86Vmm for BhyveVmm {
         // re-MAP_FIXED free path) resolves consistently; the leaf for `va` is what
         // the guest's own EL0 access and carrick's syscall-buffer translation
         // (`needs_stage1_translation`) both target.
-        let span = (len + 0xFFF) & !0xFFF;
+        let span = len
+            .checked_add(0xFFF)
+            .map(|rounded| rounded & !0xFFF)
+            .ok_or_else(|| {
+                RepointPrivateError::clean(MemoryError::OutOfBounds {
+                    address: va,
+                    length: len,
+                })
+            })?;
         if span == 0 {
             return Ok(());
         }
-        // Reuse an existing overlay-VA window if a prior repoint already backed it
-        // (the dispatcher frees the old overlay slot on re-MAP_FIXED, but the bhyve
-        // GPA window persists; resolve it so we seed/repoint in place rather than
-        // leaking a fresh GPA each time).
+        // Reuse an existing overlay-VA window if a prior repoint already backed it.
+        // The bhyve GPA window persists after dispatcher bookkeeping releases an
+        // old slot; resolve it so we seed/repoint in place rather than leaking a
+        // fresh GPA each time.
         let gpa = match self.ram.resolve(overlay_va, span) {
             Some(gpa) => gpa,
             None => self
                 .ram
                 .add_bump(overlay_va, span, true, true, false)
                 .map_err(|e| {
-                    MemoryError::HostMap(format!("bhyve repoint_private: GPA alloc: {e}"))
+                    RepointPrivateError::clean(MemoryError::HostMap(format!(
+                        "bhyve repoint_private: GPA alloc: {e}"
+                    )))
                 })?,
         };
         let host = self.vm.map_gpa(gpa, span).ok_or_else(|| {
-            MemoryError::HostMap(format!("bhyve repoint_private: map_gpa 0x{gpa:x} unmapped"))
+            RepointPrivateError::clean(MemoryError::HostMap(format!(
+                "bhyve repoint_private: map_gpa 0x{gpa:x} unmapped"
+            )))
         })?;
         // Seed: zero the whole slot (Linux anon zero-fill), then copy `content`
         // (the dispatcher passes zeros for an anon MAP_FIXED, but honour any seed).
         // SAFETY: `host` is live sysmem of `span` bytes (>= len).
         unsafe { std::ptr::write_bytes(host, 0, span) };
         if !content.is_empty() {
-            let n = content.len().min(span);
-            // SAFETY: `host` spans `span` >= n bytes; `content[..n]` is a distinct
-            // valid source slice.
-            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), host, n) };
+            // SAFETY: `host` spans `span >= len == content.len()` bytes and the
+            // snapshot is a distinct valid source slice.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), host, len) };
         }
         // Repoint the live PML4 leaf for `va` at the fresh private GPA (4 KiB
         // precise; the engine reloads CR3 after this returns).
-        self.with_live_pml4(|mgr| {
-            mgr.map_aliased(GuestVa(va & !0xFFF), Gpa(gpa), span as u64, true, true)
-                .map_err(|_| MemoryError::OutOfBounds {
-                    address: va,
-                    length: span,
-                })?;
-            Ok(true)
-        })
+        self.publish_live_pml4_mapping(va, gpa, span)
+    }
+
+    fn restore_shared_identity(&mut self, va: u64, len: usize) -> Result<(), RepointPrivateError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let _ = va.checked_add(len as u64).ok_or_else(|| {
+            RepointPrivateError::clean(MemoryError::OutOfBounds {
+                address: va,
+                length: len,
+            })
+        })?;
+        // bhyve's shared aperture is VA-identity only in the guest. Its physical
+        // sysmem is compact, so the retained shared window is the authoritative
+        // source of the exact GPA that must replace the stale private-overlay
+        // leaf. Mapping VA→GPA(va) points far outside the bhyve RAM segment.
+        let gpa = self.ram.resolve(va, len).ok_or_else(|| {
+            RepointPrivateError::clean(MemoryError::OutOfBounds {
+                address: va,
+                length: len,
+            })
+        })?;
+        if !self.ram.contains_gpa(gpa, len) || self.vm.map_gpa(gpa, len).is_none() {
+            return Err(RepointPrivateError::clean(MemoryError::HostMap(format!(
+                "bhyve shared identity restore compact GPA 0x{gpa:x} for VA 0x{va:x} len 0x{len:x} is not backed"
+            ))));
+        }
+        self.publish_live_pml4_mapping(va, gpa, len)
     }
 
     fn back_fixed_anon(&mut self, va: u64, len: usize, writable: bool) -> Result<(), MemoryError> {
@@ -1754,7 +2120,8 @@ impl X86Vmm for BhyveVmm {
         // so the sysmem read is a consistent snapshot. KVM/HVF don't need this (their
         // alias IS a MAP_SHARED file mapping, coherent for free); bhyve copies
         // file→sysmem, so the file is stale until we push the dirty bytes back here.
-        self.flush_shm_aliases();
+        self.flush_shm_aliases()
+            .map_err(|error| TrapError::Hypervisor(format!("bhyve fork writeback: {error}")))?;
 
         let live = self.ram.total_size().min(X86_MEM_SIZE);
         debug_assert!(live <= X86_MEM_SIZE);
@@ -2066,7 +2433,7 @@ impl X86Vmm for BhyveVmm {
         Arc::new(BhyveKicker::new())
     }
 
-    fn refresh_shared_after_wait(&mut self) {
+    fn refresh_shared_after_wait(&mut self) -> Result<(), TrapError> {
         // The parent just reaped a child (`wait4`/`waitid`). The child flushed its
         // writable file-backed `MAP_SHARED` aliases to their files on exit
         // (`process_exit_cleanup`); re-read those files INTO this (parent's) sysmem
@@ -2074,30 +2441,19 @@ impl X86Vmm for BhyveVmm {
         // bhyve copies file→private sysmem (it can't back a guest segment with a
         // host fd), so without this re-read the parent reads its own stale private
         // copy. A `waitpid` return is a process-exit happens-before barrier, so the
-        // file read is a consistent snapshot. KVM/HVF need nothing (their alias IS
-        // a host `MAP_SHARED` of the file). Best-effort: a transient map_gpa/pread
-        // failure leaves that one alias as stale as before — never fatal.
-        for (gpa, fd, offset, read_len) in self.ram.shm_aliases_for_refresh() {
-            if read_len == 0 {
-                continue;
-            }
-            let Some(host) = self.vm.map_gpa(gpa, read_len) else {
-                continue;
-            };
-            // SAFETY: map_gpa proved `[gpa, gpa+read_len)` is live sysmem; we read
-            // the file into it via pread. The reaped child has exited, so the file
-            // holds its final stores.
-            let n = unsafe { libc::pread(fd, host as *mut libc::c_void, read_len, offset) };
-            let _ = n;
-        }
+        // file read is a consistent snapshot. Stage every alias first; a short
+        // read/EOF/error publishes no guest bytes and fails the wait boundary.
+        self.refresh_shm_aliases()
+            .map_err(|error| TrapError::Hypervisor(format!("bhyve wait refresh: {error}")))
     }
 
-    fn sync_shared_file_aliases(&mut self) {
+    fn sync_shared_file_aliases(&mut self) -> Result<(), TrapError> {
         // bhyve backs guest file aliases with copied sysmem, not a live host
         // MAP_SHARED mapping. Flush before every syscall so a following read,
         // pread, stat-ish file operation, or fsync observes guest stores the way
         // Linux's page cache-backed mapping would.
-        self.flush_shm_aliases();
+        self.flush_shm_aliases()
+            .map_err(|error| TrapError::Hypervisor(format!("bhyve syscall writeback: {error}")))
     }
 
     fn needs_shared_file_alias_sync(&self) -> bool {
@@ -2194,6 +2550,243 @@ pub fn engine_from_brought_up(bux: BroughtUpX86) -> X86EngineCore<BhyveVmm> {
 mod tests {
     use super::*;
     use crate::guest_setup_x86::X86_INIT_BLOB_GPA;
+    use carrick_guest_mem::{GuestMemory as _, MappingSharing};
+    use carrick_hal::SyscallTrap as _;
+    use carrick_mem::shared_aperture::{BackingObject, SharedAperture};
+
+    #[test]
+    fn exact_alias_write_retries_eintr_and_short_progress() {
+        let source = b"abcdefgh";
+        let mut calls = 0usize;
+        let mut offsets = Vec::new();
+        let mut written = Vec::new();
+        exact_pwrite_at_with(source, 17, |remaining, offset| {
+            calls += 1;
+            offsets.push(offset);
+            if calls == 1 {
+                return Err(std::io::Error::from_raw_os_error(libc::EINTR));
+            }
+            let progress = remaining.len().min(3);
+            written.extend_from_slice(&remaining[..progress]);
+            Ok(progress)
+        })
+        .expect("exact short write");
+
+        assert_eq!(written, source);
+        assert_eq!(offsets, [17, 17, 20, 23]);
+    }
+
+    #[test]
+    fn exact_alias_write_reports_zero_and_hard_errors() {
+        let zero = exact_pwrite_at_with(b"x", 0, |_, _| Ok(0)).expect_err("zero progress");
+        assert_eq!(zero.kind(), std::io::ErrorKind::WriteZero);
+        let hard = exact_pwrite_at_with(b"x", 0, |_, _| {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        })
+        .expect_err("hard error");
+        assert_eq!(hard.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn exact_alias_read_retries_and_staged_failure_does_not_publish() {
+        let source = b"abcdefgh";
+        let mut source_offset = 0usize;
+        let mut calls = 0usize;
+        let mut destination = [0u8; 8];
+        exact_pread_at_with(&mut destination, 9, |remaining, _| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::Error::from_raw_os_error(libc::EINTR));
+            }
+            let progress = remaining.len().min(2);
+            remaining[..progress].copy_from_slice(&source[source_offset..source_offset + progress]);
+            source_offset += progress;
+            Ok(progress)
+        })
+        .expect("exact short read");
+        assert_eq!(&destination, source);
+
+        let mut unchanged = [0x5au8; 8];
+        let mut partial = true;
+        let error = staged_pread_at_with(&mut unchanged, 0, |remaining, _| {
+            if partial {
+                partial = false;
+                remaining[..2].copy_from_slice(b"xx");
+                Ok(2)
+            } else {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+        })
+        .expect_err("injected refresh failure");
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(
+            unchanged, [0x5a; 8],
+            "staged partial bytes stay unpublished"
+        );
+    }
+
+    #[test]
+    fn exact_alias_read_rejects_eof() {
+        let mut destination = [0u8; 4];
+        let error =
+            exact_pread_at_with(&mut destination, 0, |_, _| Ok(0)).expect_err("unexpected eof");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    fn live_vmm_available() -> bool {
+        std::path::Path::new("/dev/vmm").exists()
+            || std::process::Command::new("kldstat")
+                .args(["-q", "-m", "vmm"])
+                .status()
+                .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn live_bhyve_trait_translates_fragmented_buffers_and_restores_compact_shared_gpa() {
+        if !live_vmm_available() {
+            eprintln!("SKIP: bhyve vmm is unavailable");
+            return;
+        }
+
+        const PAGE: usize = 0x1000;
+        const GRANULE: usize = 0x4000;
+        let bux = crate::guest_setup_x86::bring_up_x86().expect("live bhyve bring-up");
+        let mut engine = engine_from_brought_up(bux);
+        let shared = carrick_mem::memory::LINUX_SHARED_FILE_BASE;
+        let overlay = carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE;
+
+        let mut initial = vec![0x44; 2 * GRANULE];
+        initial[..PAGE].fill(0x11);
+        initial[2 * PAGE..3 * PAGE].fill(0x33);
+        engine
+            .map_host_alias(
+                GuestVa(shared),
+                Gpa(0),
+                initial.len() as u64,
+                &initial,
+                None,
+            )
+            .expect("install compact shared window");
+        engine
+            .repoint_private(shared + PAGE as u64, overlay, PAGE, &[0x22; PAGE])
+            .expect("repoint middle page private");
+
+        let middle_gpa = <BhyveVmm as X86Vmm>::translate_va(engine.vm(), shared + PAGE as u64)
+            .expect("middle live translation");
+        assert_eq!(
+            middle_gpa,
+            engine.vm().ram.resolve(overlay, 1).expect("overlay GPA")
+        );
+        assert_eq!(
+            <BhyveVmm as X86Vmm>::translate_va(engine.vm(), shared + 0x20_0000),
+            None,
+            "an absent live leaf is a typed translation miss"
+        );
+
+        let start = shared + PAGE as u64 - 0x10;
+        let bytes = engine
+            .read_bytes(start, PAGE + 0x20)
+            .expect("cross-fragment shared/private/shared read");
+        assert!(bytes[..0x10].iter().all(|byte| *byte == 0x11));
+        assert!(bytes[0x10..PAGE + 0x10].iter().all(|byte| *byte == 0x22));
+        assert!(bytes[PAGE + 0x10..].iter().all(|byte| *byte == 0x33));
+
+        let replacement: Vec<u8> = (0..bytes.len()).map(|index| (index % 251) as u8).collect();
+        engine
+            .write_bytes(start, &replacement)
+            .expect("cross-fragment shared/private/shared write");
+        assert_eq!(
+            engine
+                .read_bytes(start, replacement.len())
+                .expect("round trip"),
+            replacement
+        );
+
+        // Drive the allocator state that the dispatcher uses for a partial
+        // PrivateReservation teardown. The released tail is reused as shared
+        // anonymous storage while its non-present leaf still names private
+        // overlay GPA storage.
+        let source = shared + 0x10_000;
+        let overlay_source = overlay + 0x10_000;
+        let mut aperture = SharedAperture::with_window(source, 8 * GRANULE as u64);
+        assert_eq!(
+            aperture.alloc(2 * GRANULE as u64, BackingObject::SharedAnon),
+            Some(source)
+        );
+        aperture
+            .reserve_private_range(source, 2 * GRANULE as u64)
+            .expect("private reservation");
+        let shared_stale = vec![0x55; 2 * GRANULE];
+        engine
+            .map_host_alias(
+                GuestVa(source),
+                Gpa(0),
+                (2 * GRANULE) as u64,
+                &shared_stale,
+                None,
+            )
+            .expect("install reusable compact shared window");
+        let private_bytes = vec![0x99; 2 * GRANULE];
+        engine
+            .repoint_private(source, overlay_source, 2 * GRANULE, &private_bytes)
+            .expect("publish private reservation overlay");
+
+        aperture
+            .shrink(source, GRANULE as u64)
+            .expect("shrink reservation");
+        let tail = source + GRANULE as u64;
+        engine
+            .unmap_range(tail, GRANULE)
+            .expect("invalidate released tail");
+        assert!(aperture.range_needs_identity_restore(tail, GRANULE as u64));
+        assert_eq!(
+            aperture.alloc_sourced_with_reuse(GRANULE as u64, BackingObject::SharedAnon, None,),
+            Some((tail, true))
+        );
+        engine
+            .zero_anonymous_reuse(tail, GRANULE, MappingSharing::Shared)
+            .expect("scrub retained compact shared backing");
+        engine
+            .restore_shared_identity(tail, GRANULE)
+            .expect("restore compact shared GPA");
+        aperture
+            .mark_identity_restored(tail, GRANULE as u64)
+            .expect("publish allocator restore");
+        engine.set_mapping_protection(tail, GRANULE, false, false);
+
+        let compact_gpa = engine
+            .vm()
+            .ram
+            .resolve(tail, GRANULE)
+            .expect("retained shared GPA");
+        assert_ne!(
+            compact_gpa, tail,
+            "bhyve shared backing is not GPA-identity"
+        );
+        assert_eq!(
+            <BhyveVmm as X86Vmm>::translate_va(engine.vm(), tail),
+            Some(compact_gpa)
+        );
+        assert!(
+            engine
+                .read_bytes(tail, GRANULE)
+                .expect("fresh shared bytes")
+                .iter()
+                .all(|byte| *byte == 0),
+            "reuse must expose scrubbed shared bytes, not retired overlay bytes"
+        );
+    }
+
+    #[test]
+    fn private_repoint_cr3_reload_failure_is_indeterminate() {
+        let result = classify_private_repoint_cr3_reload(Err(MemoryError::HostMap(
+            "injected post-publication CR3 failure".into(),
+        )));
+        assert!(matches!(
+            result,
+            Err(RepointPrivateError::Indeterminate(MemoryError::HostMap(_)))
+        ));
+    }
 
     #[test]
     fn bhyve_ring0_kicks_are_swallowed_except_sysret() {
@@ -2210,7 +2803,7 @@ mod tests {
             "SYSRET kicks surface so the shared engine can synthesize user context"
         );
         assert!(
-            should_surface_bhyve_kick(0x1000_1b25b, u64::from(USER_CS64_SEL)),
+            should_surface_bhyve_kick(0x1000_1b25b, USER_CS64_SEL),
             "ordinary ring-3 kicks surface for async signal delivery"
         );
     }

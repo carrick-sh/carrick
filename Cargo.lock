@@ -465,6 +465,7 @@ dependencies = [
 name = "carrick-dsr-x86"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-dsr",
  "carrick-guest-mem",
  "carrick-native-freebsd",
@@ -664,6 +665,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "signal-hook",
+ "socket2",
+ "static_assertions",
  "tar",
  "tempfile",
  "thiserror",

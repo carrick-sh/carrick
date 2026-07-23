@@ -15,15 +15,114 @@
 
 use carrick_dsr::host::NativeHostJit;
 use carrick_dsr_x86::block::X86Exit;
-use carrick_dsr_x86::gateway::reg;
+use carrick_dsr_x86::gateway::{XSAVE_AREA_LEN, reg};
 use carrick_dsr_x86::{
-    X86DsrContext, X86ExitStatus, X86UcontextSnapshot, emit::emit_block, plan_block,
+    X86DsrContext, X86ExitStatus, X86GuestGsBase, X86IndirectCacheEntry, X86UcontextSnapshot,
+    X86XstateMemoryReader, X86XstateRestorePlan,
+    emit::{emit_block, emit_block_linked},
+    plan_block,
 };
 use carrick_native_freebsd::FreebsdHostJit;
 
 // Linux x86_64 syscall numbers used by the guest.
 const SYS_WRITE: u64 = 1;
 const SYS_EXIT_GROUP: u64 = 231;
+
+static FAULT_REDIRECT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+core::arch::global_asm!(
+    r#"
+.text
+.globl carrick_test_private_xsaveopt_after_switch
+.type carrick_test_private_xsaveopt_after_switch,@function
+carrick_test_private_xsaveopt_after_switch:
+    // rdi=private image, rsi=pattern A, rdx=pattern B, rcx=timespec,
+    // r8=expected-state output. Preserve three callee-saved registers; after
+    // the pushes rsp is correctly aligned for the host libc call.
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    movq %rdi, %r12
+    movq %r8, %r13
+    movq %rcx, %r14
+    movq %rdx, %r11
+    vmovdqu64 (%rsi), %zmm0
+    movq (%rsi), %rax
+    kmovq %rax, %k1
+    fldcw .Lhost_fcw_a(%rip)
+    ldmxcsr .Lhost_mxcsr_a(%rip)
+    xorl %eax, %eax
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    wrpkru
+    xgetbv
+    xsave64 (%r12)
+    vmovdqu64 (%r11), %zmm0
+    movq (%r11), %rax
+    kmovq %rax, %k1
+    fldcw .Lhost_fcw_b(%rip)
+    ldmxcsr .Lhost_mxcsr_b(%rip)
+    movl $0xc0000000, %eax
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    wrpkru
+    movq %r14, %rdi
+    xorl %esi, %esi
+    callq nanosleep@PLT
+
+    // Capture the exact post-context-switch host state before XSAVEOPT so the
+    // test remains valid even if libc legally clobbers caller-saved xstate.
+    vmovdqu64 %zmm0, 0(%r13)
+    kmovq %k1, %rax
+    movq %rax, 64(%r13)
+    fnstcw 72(%r13)
+    stmxcsr 76(%r13)
+    xorl %ecx, %ecx
+    rdpkru
+    movl %eax, 80(%r13)
+    xgetbv
+    xsaveopt64 (%r12)
+    fldcw .Lhost_fcw_a(%rip)
+    ldmxcsr .Lhost_mxcsr_a(%rip)
+    xorl %eax, %eax
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    wrpkru
+    vzeroupper
+    popq %r14
+    popq %r13
+    popq %r12
+    ret
+.size carrick_test_private_xsaveopt_after_switch, .-carrick_test_private_xsaveopt_after_switch
+
+.section .rodata
+.p2align 2
+.Lhost_fcw_a:
+    .short 0x037f
+.Lhost_fcw_b:
+    .short 0x0b7f
+.p2align 2
+.Lhost_mxcsr_a:
+    .long 0x1f80
+.Lhost_mxcsr_b:
+    .long 0x3f80
+.text
+"#,
+    options(att_syntax)
+);
+
+unsafe extern "C" {
+    fn carrick_test_private_xsaveopt_after_switch(
+        image: *mut u8,
+        pattern_a: *const u8,
+        pattern_b: *const u8,
+        pause: *const libc::timespec,
+        expected: *mut u8,
+    );
+}
+
+#[repr(C, align(64))]
+struct AlignedXsave([u8; XSAVE_AREA_LEN]);
 
 /// Assemble the guest program. `data_va` is the absolute address of the "hi\n"
 /// bytes (the guest reaches it via `movabs`, so no RIP-relative fixup is
@@ -61,6 +160,122 @@ fn map_rw(len: usize) -> *mut u8 {
     };
     assert_ne!(p, libc::MAP_FAILED, "guest data/stack mmap");
     p.cast()
+}
+
+/// FreeBSD must make XSAVEOPT safe for a persistent user-space destination
+/// after both blocking context switches and forced CPU migration. The first
+/// full XSAVE seeds pattern A; pattern B is installed, the thread sleeps in the
+/// kernel, and XSAVEOPT must update the same image to B rather than retaining A
+/// under stale modified-state tracking.
+#[test]
+fn private_host_xsaveopt_survives_context_switch_and_cpu_migration() {
+    if std::arch::x86_64::__cpuid_count(0x0d, 1).eax & 1 == 0
+        || !std::arch::is_x86_feature_detected!("avx512f")
+        || std::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 3) == 0
+        || unsafe { std::arch::x86_64::_xgetbv(0) } & 0x2e0 != 0x2e0
+    {
+        return;
+    }
+    let component = |index| {
+        let leaf = std::arch::x86_64::__cpuid_count(0x0d, index);
+        (leaf.ebx as usize, leaf.eax as usize)
+    };
+    let (ymm_hi, ymm_hi_len) = component(2);
+    let (opmask, opmask_len) = component(5);
+    let (zmm_hi, zmm_hi_len) = component(6);
+    let (pkru, pkru_len) = component(9);
+    assert!(ymm_hi_len >= 16 && opmask_len >= 16 && zmm_hi_len >= 32 && pkru_len >= 4);
+
+    let mut original: libc::cpuset_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::cpuset_getaffinity(
+                libc::CPU_LEVEL_WHICH,
+                libc::CPU_WHICH_TID,
+                -1,
+                std::mem::size_of::<libc::cpuset_t>(),
+                &mut original,
+            )
+        },
+        0,
+        "read current thread affinity"
+    );
+    let allowed = (0..libc::CPU_SETSIZE as usize)
+        // SAFETY: `original` was initialized by successful cpuset_getaffinity.
+        .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &original) })
+        .collect::<Vec<_>>();
+    assert!(!allowed.is_empty(), "thread must have one allowed CPU");
+
+    let pattern_a = [0x17u8; 64];
+    let pattern_b = [0xa9u8; 64];
+    let pause = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    let mut image = AlignedXsave([0; XSAVE_AREA_LEN]);
+    let mut expected = [0u8; 84];
+    let mut stale = 0usize;
+    let mut observed_cpus = std::collections::BTreeSet::new();
+
+    for iteration in 0..64 {
+        let cpu = allowed[iteration % allowed.len().min(2)];
+        let mut selected: libc::cpuset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: cpu came from the kernel-populated original set.
+        unsafe { libc::CPU_SET(cpu, &mut selected) };
+        assert_eq!(
+            unsafe {
+                libc::cpuset_setaffinity(
+                    libc::CPU_LEVEL_WHICH,
+                    libc::CPU_WHICH_TID,
+                    -1,
+                    std::mem::size_of::<libc::cpuset_t>(),
+                    &selected,
+                )
+            },
+            0,
+            "force test-thread CPU"
+        );
+        image.0.fill(0);
+        expected.fill(0);
+        unsafe {
+            carrick_test_private_xsaveopt_after_switch(
+                image.0.as_mut_ptr(),
+                pattern_a.as_ptr(),
+                pattern_b.as_ptr(),
+                &pause,
+                expected.as_mut_ptr(),
+            );
+        }
+        observed_cpus.insert(unsafe { libc::sched_getcpu() });
+        let xstate_bv =
+            u64::from_le_bytes(image.0[512..520].try_into().expect("standard XSAVE header"));
+        let stale_components = (xstate_bv & (1 << 0) != 0 && image.0[..2] != expected[72..74])
+            || (xstate_bv & (1 << 1) != 0
+                && (image.0[160..176] != expected[..16] || image.0[24..28] != expected[76..80]))
+            || (xstate_bv & (1 << 2) != 0 && image.0[ymm_hi..ymm_hi + 16] != expected[16..32])
+            || (xstate_bv & (1 << 5) != 0 && image.0[opmask + 8..opmask + 16] != expected[64..72])
+            || (xstate_bv & (1 << 6) != 0 && image.0[zmm_hi..zmm_hi + 32] != expected[32..64])
+            || (xstate_bv & (1 << 9) != 0 && image.0[pkru..pkru + 4] != expected[80..84]);
+        stale += usize::from(stale_components);
+    }
+
+    let restore_rc = unsafe {
+        libc::cpuset_setaffinity(
+            libc::CPU_LEVEL_WHICH,
+            libc::CPU_WHICH_TID,
+            -1,
+            std::mem::size_of::<libc::cpuset_t>(),
+            &original,
+        )
+    };
+    assert_eq!(restore_rc, 0, "restore test-thread affinity");
+    assert_eq!(stale, 0, "private XSAVEOPT image retained stale host XMM0");
+    if allowed.len() >= 2 {
+        assert!(
+            observed_cpus.len() >= 2,
+            "the migration half of the host XSAVEOPT contract did not run"
+        );
+    }
 }
 
 /// Conditional FPU save/restore correctness: a value placed in `xmm0` must
@@ -121,6 +336,8 @@ fn conditional_fpu_save_preserves_xmm_across_a_skipping_block() {
 
     let mut snapshot = X86UcontextSnapshot::new();
     snapshot.gpr[reg::RSP] = stack_top;
+    let mut context = X86DsrContext::new(snapshot, 0, 0);
+    let context_addr = std::ptr::addr_of!(context);
     let mut next_guest_va = GUEST_CODE_BASE;
     let mut exit_code: Option<i32> = None;
     let mut saw_integer_skip = false;
@@ -134,15 +351,15 @@ fn conditional_fpu_save_preserves_xmm_across_a_skipping_block() {
             X86Exit::Syscall { resume, .. } => resume,
             other => panic!("fpu guest produced non-syscall exit: {other:?}"),
         };
-        let mut ctx = X86DsrContext::new(snapshot, exec, resume);
-        // Mirror the driver: skip the FPU save/restore for integer blocks.
-        ctx.save_fpu = u32::from(uses_fpu);
+        // Mirror the driver: mutate only scalar per-entry state and preserve
+        // one stable context (including both 16 KiB XSAVE areas).
+        context.prepare_entry(exec, resume, uses_fpu, None, None);
+        assert_eq!(std::ptr::addr_of!(context), context_addr);
         // SAFETY: freshly translated block ending in an exit stub; valid rsp.
-        let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
+        let raw = unsafe { carrick_dsr_x86::enter_translated(&mut context) };
         assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Syscall));
-        snapshot = ctx.snapshot;
 
-        match snapshot.gpr[reg::RAX] {
+        match context.snapshot.gpr[reg::RAX] {
             39 => {
                 // Service getpid: return a pid AND deliberately clobber the
                 // physical xmm registers (as real host syscall servicing does)
@@ -154,11 +371,11 @@ fn conditional_fpu_save_preserves_xmm_across_a_skipping_block() {
                         out("xmm0") _,
                     );
                 }
-                snapshot.gpr[reg::RAX] = 4242;
-                next_guest_va = snapshot.rip;
+                context.snapshot.gpr[reg::RAX] = 4242;
+                next_guest_va = context.snapshot.rip;
             }
             SYS_EXIT_GROUP => {
-                exit_code = Some(snapshot.gpr[reg::RDI] as i32);
+                exit_code = Some(context.snapshot.gpr[reg::RDI] as i32);
                 break;
             }
             other => panic!("unexpected syscall {other}"),
@@ -173,6 +390,130 @@ fn conditional_fpu_save_preserves_xmm_across_a_skipping_block() {
         exit_code,
         Some(MAGIC as i32),
         "xmm0 must survive the syscall round-trips and the skipping block"
+    );
+    if context.use_xsaveopt != 0 {
+        assert_eq!(
+            context.host_xsave_initialized, 1,
+            "the first host save must initialize the persistent XSAVEOPT image"
+        );
+    }
+
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
+#[test]
+fn xrstor_sensitive_exit_captures_live_guest_xstate_before_rust_emulation() {
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+    let stack = map_rw(64 * 1024);
+
+    const SOURCE_VA: u64 = 0x17_0000;
+    const MAGIC: u64 = 0x8877_6655_4433_2211;
+    let mut source = vec![0x48, 0xb8]; // movabs rax, MAGIC
+    source.extend_from_slice(&MAGIC.to_le_bytes());
+    source.extend_from_slice(&[0x66, 0x48, 0x0f, 0x6e, 0xc0]); // movq xmm0, rax
+    source.extend_from_slice(&[0xeb, 0x00]); // jmp to adjacent XRSTOR block
+    let target_va = SOURCE_VA + source.len() as u64;
+    let source_block = plan_block(SOURCE_VA, 256, 4096, |va| {
+        let offset = usize::try_from(va - SOURCE_VA).expect("source offset");
+        source.get(offset..).map(<[u8]>::to_vec).unwrap_or_default()
+    })
+    .expect("plan xstate-producing source");
+    let mut linked_source =
+        emit_block_linked(&source, &source_block).expect("emit xstate-producing source");
+    let edge = linked_source.edges[0];
+    assert_eq!(edge.target_va, target_va);
+
+    let target = [0x0f, 0xae, 0x6c, 0x24, 0x40];
+    let target_block = plan_block(target_va, 256, 4096, |va| {
+        let offset = usize::try_from(va - target_va).expect("target offset");
+        target.get(offset..).map(<[u8]>::to_vec).unwrap_or_default()
+    })
+    .expect("plan exact XRSTOR target");
+    assert!(
+        target_block.uses_fpu,
+        "an omitted XRSTOR terminator must request an authoritative gateway save"
+    );
+    let linked_target =
+        emit_block_linked(&target, &target_block).expect("emit exact XRSTOR target");
+
+    let target_offset = linked_source.bytes.len();
+    let displacement = target_offset as i64 - (edge.entry_rel32_off + 4) as i64;
+    linked_source.bytes[edge.entry_rel32_off..edge.entry_rel32_off + 4]
+        .copy_from_slice(&(displacement as i32).to_le_bytes());
+    let source_exec = region.exec_base.as_ptr();
+    let target_exec = unsafe { source_exec.add(target_offset) };
+    let source_write = region
+        .write_ptr_for(source_exec)
+        .expect("source write alias");
+    let target_write = region
+        .write_ptr_for(target_exec)
+        .expect("target write alias");
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            linked_source.bytes.as_ptr(),
+            source_write,
+            linked_source.bytes.len(),
+        );
+        std::ptr::copy_nonoverlapping(
+            linked_target.bytes.as_ptr(),
+            target_write,
+            linked_target.bytes.len(),
+        );
+    }
+    jit.flush_icache(source_exec, linked_source.bytes.len());
+    jit.flush_icache(target_exec, linked_target.bytes.len());
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack as u64 + 32 * 1024;
+    let mut context = X86DsrContext::new(snapshot, source_exec as u64, SOURCE_VA);
+    context.prepare_entry(
+        source_exec as u64,
+        SOURCE_VA,
+        target_block.uses_fpu,
+        None,
+        None,
+    );
+    let raw = unsafe { carrick_dsr_x86::enter_translated(&mut context) };
+    assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Sensitive));
+    assert_eq!(context.snapshot.rip, target_va);
+    assert_eq!(
+        &context.snapshot.xsave[160..168],
+        &MAGIC.to_le_bytes(),
+        "the sensitive exit must capture physical xmm0 before Rust observes the snapshot"
+    );
+
+    struct ZeroHeaderReader;
+    impl X86XstateMemoryReader for ZeroHeaderReader {
+        type Error = std::convert::Infallible;
+
+        fn read_exact(
+            &mut self,
+            _address: carrick_guest_mem::GuestVa,
+            destination: &mut [u8],
+        ) -> Result<(), Self::Error> {
+            destination.fill(0);
+            Ok(())
+        }
+    }
+
+    context.snapshot.gpr[reg::RAX] = 1; // request absent x87 only
+    context.snapshot.gpr[reg::RDX] = 0;
+    let plan = X86XstateRestorePlan::decode(&target, &context.snapshot, 0, X86GuestGsBase::Zero)
+        .expect("decode exact target for Rust emulation");
+    let layout = carrick_dsr_x86::signal_xstate_layout().expect("validated host xstate layout");
+    context
+        .snapshot
+        .emulate_xrstor_with_reader(plan, &layout, &mut ZeroHeaderReader)
+        .expect("emulate partial XRSTOR");
+    assert_eq!(
+        &context.snapshot.xsave[160..168],
+        &MAGIC.to_le_bytes(),
+        "unrequested SSE must preserve the pre-XRSTOR state captured by the gateway"
     );
 
     unsafe {
@@ -400,6 +741,135 @@ fn translated_x86_guest_writes_and_exits_natively() {
     }
 }
 
+/// Guest AC and DF are architectural state but hostile host execution state.
+/// The gateway must snapshot both bits exactly and clear them before any cache
+/// comparison or Rust return.
+#[test]
+fn guest_ac_and_df_are_contained_at_a_syscall_exit() {
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+    let stack = map_rw(64 * 1024);
+
+    const GUEST_CODE_BASE: u64 = 0x5e_0000;
+    let program = [
+        0xfd, // std
+        0x9c, // pushfq
+        0x58, // pop rax
+        0x48, 0x0d, 0x00, 0x00, 0x04, 0x00, // or rax, 1 << 18 (AC)
+        0x50, // push rax
+        0x9d, // popfq
+        0x0f, 0x05, // syscall (gateway exit; not copied)
+    ];
+    let read_guest = |va: u64| -> Vec<u8> {
+        let offset = (va - GUEST_CODE_BASE) as usize;
+        program
+            .get(offset..)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default()
+    };
+    let block = plan_block(GUEST_CODE_BASE, 256, 4096, read_guest).expect("plan");
+    let source = read_guest(block.start);
+    let translated = emit_block(&source[..(block.end - block.start) as usize], &block)
+        .expect("emit AC+DF guest");
+    let exec = region.exec_base.as_ptr();
+    let write = region.write_ptr_for(exec).expect("write alias");
+    unsafe { std::ptr::copy_nonoverlapping(translated.as_ptr(), write, translated.len()) };
+    jit.flush_icache(exec, translated.len());
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack as u64 + 64 * 1024;
+    let resume = match block.exit {
+        X86Exit::Syscall { resume, .. } => resume,
+        other => panic!("expected syscall exit, got {other:?}"),
+    };
+    let mut context = X86DsrContext::new(snapshot, exec as u64, resume);
+    let raw = unsafe { carrick_dsr_x86::enter_translated(&mut context) };
+    assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Syscall));
+
+    const DF: u64 = 1 << 10;
+    const AC: u64 = 1 << 18;
+    assert_eq!(
+        context.snapshot.rflags & (DF | AC),
+        DF | AC,
+        "snapshot must retain the guest's exact AC+DF state"
+    );
+    let host_flags: u64;
+    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) host_flags) };
+    assert_eq!(
+        host_flags & (DF | AC),
+        0,
+        "gateway must clear AC+DF before returning to Rust"
+    );
+
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
+/// A zero guest FS base is real state (for example after ARCH_SET_FS(0)), not
+/// a sentinel for retaining the host's TLS base. A copied `fs:` access must
+/// fault at address zero rather than disclose a word from host TLS.
+#[test]
+fn zero_guest_fsbase_cannot_read_host_tls() {
+    use carrick_dsr_x86::gateway::{CTX_FAULT_RECORD, signal_stub_addr};
+    use carrick_native_freebsd::fault;
+
+    let _fault_redirect_guard = FAULT_REDIRECT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+    fault::install_fault_redirect(signal_stub_addr(), CTX_FAULT_RECORD)
+        .expect("install fault redirect");
+    fault::register_code_region(region.exec_base.as_ptr() as u64, 64 * 1024);
+    let stack = map_rw(64 * 1024);
+
+    const GUEST_CODE_BASE: u64 = 0x5f_0000;
+    let program = [
+        0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov rax, fs:[0]
+        0x0f, 0x05, // syscall, reached only if host FS leaked
+    ];
+    let read_guest = |va: u64| -> Vec<u8> {
+        let offset = (va - GUEST_CODE_BASE) as usize;
+        program
+            .get(offset..)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default()
+    };
+    let block = plan_block(GUEST_CODE_BASE, 256, 4096, read_guest).expect("plan");
+    let source = read_guest(block.start);
+    let translated = emit_block(&source[..(block.end - block.start) as usize], &block)
+        .expect("emit zero-FS guest");
+    let exec = region.exec_base.as_ptr();
+    let write = region.write_ptr_for(exec).expect("write alias");
+    unsafe { std::ptr::copy_nonoverlapping(translated.as_ptr(), write, translated.len()) };
+    jit.flush_icache(exec, translated.len());
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = stack as u64 + 64 * 1024;
+    let resume = match block.exit {
+        X86Exit::Syscall { resume, .. } => resume,
+        other => panic!("expected syscall-terminated block, got {other:?}"),
+    };
+    let mut context = X86DsrContext::new(snapshot, exec as u64, resume);
+    context.guest_fsbase = 0;
+    let raw = unsafe { carrick_dsr_x86::enter_translated(&mut context) };
+    assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Signal));
+    assert_eq!(context.fault.signal, libc::SIGSEGV);
+    assert_eq!(context.fault.addr, 0, "zero FS must resolve fs:[0] to zero");
+
+    fault::unregister_code_region();
+    let host_tls_still_works = [7u8; 32];
+    assert_eq!(host_tls_still_works[17], 7);
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
 /// A guest that FAULTS: it dereferences an unmapped address mid-block. The
 /// FreeBSD fault shim must surface this as a typed `Signal` gateway exit
 /// with an accurate fault record — not kill the process — and the host must
@@ -409,6 +879,9 @@ fn translated_x86_guest_fault_becomes_a_signal_exit() {
     use carrick_dsr_x86::gateway::{CTX_FAULT_RECORD, signal_stub_addr};
     use carrick_native_freebsd::fault;
 
+    let _fault_redirect_guard = FAULT_REDIRECT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let jit = FreebsdHostJit;
     jit.supported().expect("host JIT supported");
     let region = jit.map_code_cache(64 * 1024).expect("map code cache");
@@ -635,6 +1108,267 @@ fn translated_x86_guest_calls_through_a_function_pointer_table() {
     unsafe {
         jit.unmap(&region);
         libc::munmap(data.cast(), 4096);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
+#[test]
+fn monomorphic_return_cache_resumes_without_a_rust_round_trip() {
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+    let stack = map_rw(64 * 1024);
+    let guest_rsp = stack as u64 + 64 * 1024 - 8;
+
+    const RET_VA: u64 = 0x51_0000;
+    const TARGET_VA: u64 = 0x52_0000;
+    let ret_source = [0xC3];
+    let ret_block = plan_block(RET_VA, 256, 4096, |va| {
+        let off = (va - RET_VA) as usize;
+        ret_source
+            .get(off..)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default()
+    })
+    .expect("plan ret");
+    let mut linked_ret = emit_block_linked(&ret_source, &ret_block).expect("emit ret cache");
+    let site = linked_ret.indirect_cache.expect("return cache metadata");
+    linked_ret.bytes[site.site_id_imm_off..site.site_id_imm_off + 4]
+        .copy_from_slice(&1_u32.to_le_bytes());
+
+    let target_source = [
+        0xB8,
+        SYS_EXIT_GROUP as u8,
+        0x00,
+        0x00,
+        0x00, // mov eax, exit_group
+        0x0F,
+        0x05, // syscall
+    ];
+    let target_block = plan_block(TARGET_VA, 256, 4096, |va| {
+        let off = (va - TARGET_VA) as usize;
+        target_source
+            .get(off..)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default()
+    })
+    .expect("plan target");
+    let linked_target =
+        emit_block_linked(&target_source, &target_block).expect("emit target syscall");
+
+    let ret_exec = region.exec_base.as_ptr();
+    let target_exec = unsafe { ret_exec.add(linked_ret.bytes.len()) };
+    let ret_write = region.write_ptr_for(ret_exec).expect("ret write alias");
+    let target_write = region
+        .write_ptr_for(target_exec)
+        .expect("target write alias");
+    unsafe {
+        std::ptr::copy_nonoverlapping(linked_ret.bytes.as_ptr(), ret_write, linked_ret.bytes.len());
+        std::ptr::copy_nonoverlapping(
+            linked_target.bytes.as_ptr(),
+            target_write,
+            linked_target.bytes.len(),
+        );
+        std::ptr::write(guest_rsp as *mut u64, TARGET_VA);
+    }
+    jit.flush_icache(ret_exec, linked_ret.bytes.len());
+    jit.flush_icache(target_exec, linked_target.bytes.len());
+
+    let mut entries = [X86IndirectCacheEntry::return_site(site.stack_adjust)];
+    entries[0].arm(TARGET_VA, target_exec as u64);
+
+    // A host-resident neutral interval must stay cold even when its target
+    // matches: otherwise the target would inherit arbitrary host xstate.
+    const HOSTILE_RFLAGS: u64 = 0x4_0CD7; // arithmetic status + DF + AC
+    let mut cold_snapshot = X86UcontextSnapshot::new();
+    cold_snapshot.gpr[reg::RSP] = guest_rsp;
+    cold_snapshot.gpr[reg::RCX] = 0x1122_3344_5566_7788;
+    cold_snapshot.rflags = HOSTILE_RFLAGS;
+    let mut cold = X86DsrContext::new(cold_snapshot, ret_exec as u64, RET_VA);
+    cold.prepare_entry(ret_exec as u64, RET_VA, false, None, None);
+    // SAFETY: the fixed array remains live and immutable through this entry.
+    unsafe { cold.publish_indirect_cache(&entries) };
+    let cold_raw = unsafe { carrick_dsr_x86::enter_translated(&mut cold) };
+    assert_eq!(
+        X86ExitStatus::from_raw(cold_raw),
+        Some(X86ExitStatus::Indirect)
+    );
+    assert_eq!(cold.snapshot.rip, RET_VA);
+    assert_eq!(cold.snapshot.gpr[reg::RSP], guest_rsp);
+    assert_eq!(cold.snapshot.gpr[reg::RCX], 0x1122_3344_5566_7788);
+    assert_eq!(cold.snapshot.rflags & HOSTILE_RFLAGS, HOSTILE_RFLAGS);
+
+    let mut snapshot = X86UcontextSnapshot::new();
+    snapshot.gpr[reg::RSP] = guest_rsp;
+    snapshot.gpr[reg::RCX] = 0x1122_3344_5566_7788;
+    snapshot.rflags = HOSTILE_RFLAGS;
+    let mut context = X86DsrContext::new(snapshot, ret_exec as u64, RET_VA);
+
+    // A guest-resident but mismatched target also stays cold and leaves the
+    // architectural return side effects unapplied for the Rust resolver.
+    entries[0].arm(TARGET_VA + 1, target_exec as u64);
+    context.prepare_entry(ret_exec as u64, RET_VA, true, None, None);
+    // SAFETY: the fixed array remains live and immutable through this entry.
+    unsafe { context.publish_indirect_cache(&entries) };
+    // SAFETY: the emitted return block and guest stack are valid; the cache
+    // key deliberately does not match the live target.
+    let mismatch_raw = unsafe { carrick_dsr_x86::enter_translated(&mut context) };
+    assert_eq!(
+        X86ExitStatus::from_raw(mismatch_raw),
+        Some(X86ExitStatus::Indirect)
+    );
+    assert_eq!(context.snapshot.rip, RET_VA);
+    assert_eq!(context.snapshot.gpr[reg::RSP], guest_rsp);
+    assert_eq!(context.snapshot.gpr[reg::RCX], 0x1122_3344_5566_7788);
+    assert_eq!(context.snapshot.rflags & HOSTILE_RFLAGS, HOSTILE_RFLAGS);
+
+    entries[0].arm(TARGET_VA, target_exec as u64);
+    let stop_word = std::sync::atomic::AtomicU32::new(1);
+    context.prepare_entry(ret_exec as u64, RET_VA, true, None, Some(&stop_word));
+    // SAFETY: the fixed array remains live and immutable through this entry.
+    unsafe { context.publish_indirect_cache(&entries) };
+    let kicked_gprs = context.snapshot.gpr;
+    let kicked_rflags = context.snapshot.rflags;
+
+    // The cache key matches, but a nonzero stop word observes the exact
+    // unexecuted-ret boundary before the gateway applies RIP/RSP mutation.
+    let kicked_raw = unsafe { carrick_dsr_x86::enter_translated(&mut context) };
+    assert_eq!(
+        X86ExitStatus::from_raw(kicked_raw),
+        Some(X86ExitStatus::Kicked)
+    );
+    assert_eq!(context.snapshot.rip, RET_VA);
+    assert_eq!(context.snapshot.gpr, kicked_gprs);
+    assert_eq!(context.snapshot.gpr[reg::RSP], guest_rsp);
+    assert_eq!(context.snapshot.rflags, kicked_rflags);
+
+    stop_word.store(0, std::sync::atomic::Ordering::Release);
+    context.prepare_entry(ret_exec as u64, RET_VA, true, None, Some(&stop_word));
+    // SAFETY: the fixed array remains live and immutable through this entry.
+    unsafe { context.publish_indirect_cache(&entries) };
+
+    // SAFETY: both emitted blocks are executable, the zero stop word permits
+    // the matching return-cache hit, and the guest stack is valid.
+    let raw = unsafe { carrick_dsr_x86::enter_translated(&mut context) };
+    assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Syscall));
+    assert_eq!(context.snapshot.rip, TARGET_VA + target_source.len() as u64);
+    assert_eq!(context.snapshot.gpr[reg::RSP], guest_rsp + 8);
+    assert_eq!(context.snapshot.gpr[reg::RCX], 0x1122_3344_5566_7788);
+    assert_eq!(context.snapshot.rflags & HOSTILE_RFLAGS, HOSTILE_RFLAGS);
+
+    unsafe {
+        jit.unmap(&region);
+        libc::munmap(stack.cast(), 64 * 1024);
+    }
+}
+
+#[test]
+fn guarded_direct_edge_polls_stop_word_without_changing_guest_state() {
+    let jit = FreebsdHostJit;
+    jit.supported().expect("host JIT supported");
+    let region = jit.map_code_cache(64 * 1024).expect("map code cache");
+    let stack = map_rw(64 * 1024);
+
+    const SOURCE_VA: u64 = 0x53_0000;
+    const TARGET_VA: u64 = SOURCE_VA + 2;
+    let source = [0xEB, 0x00]; // jmp TARGET_VA
+    let source_block = plan_block(SOURCE_VA, 256, 4096, |va| {
+        let off = (va - SOURCE_VA) as usize;
+        source.get(off..).map(<[u8]>::to_vec).unwrap_or_default()
+    })
+    .expect("plan source jmp");
+    let mut linked_source = emit_block_linked(&source, &source_block).expect("emit source jmp");
+    let edge = linked_source.edges[0];
+    assert_eq!(edge.target_va, TARGET_VA);
+
+    let target = [0x0F, 0x05]; // syscall: no body GPR/flag changes
+    let target_block = plan_block(TARGET_VA, 256, 4096, |va| {
+        let off = (va - TARGET_VA) as usize;
+        target.get(off..).map(<[u8]>::to_vec).unwrap_or_default()
+    })
+    .expect("plan target syscall");
+    let linked_target = emit_block_linked(&target, &target_block).expect("emit target syscall");
+
+    let target_off = linked_source.bytes.len();
+    let patch_rel32 = |bytes: &mut [u8], rel32_off: usize, target: usize| {
+        let displacement = target as i64 - (rel32_off + 4) as i64;
+        bytes[rel32_off..rel32_off + 4].copy_from_slice(&(displacement as i32).to_le_bytes());
+    };
+    // Mirror runtime publication: guarded successor first, entry branch last.
+    patch_rel32(
+        &mut linked_source.bytes,
+        edge.guard_target_rel32_off,
+        target_off,
+    );
+    patch_rel32(
+        &mut linked_source.bytes,
+        edge.entry_rel32_off,
+        edge.guard_off,
+    );
+
+    let source_exec = region.exec_base.as_ptr();
+    let target_exec = unsafe { source_exec.add(target_off) };
+    let source_write = region
+        .write_ptr_for(source_exec)
+        .expect("source write alias");
+    let target_write = region
+        .write_ptr_for(target_exec)
+        .expect("target write alias");
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            linked_source.bytes.as_ptr(),
+            source_write,
+            linked_source.bytes.len(),
+        );
+        std::ptr::copy_nonoverlapping(
+            linked_target.bytes.as_ptr(),
+            target_write,
+            linked_target.bytes.len(),
+        );
+    }
+    jit.flush_icache(source_exec, linked_source.bytes.len());
+    jit.flush_icache(target_exec, linked_target.bytes.len());
+
+    let guest_rsp = stack as u64 + 64 * 1024;
+    let mut snapshot = X86UcontextSnapshot::new();
+    for (index, value) in snapshot.gpr.iter_mut().enumerate() {
+        *value = 0x1111_0000_0000_0000 | index as u64;
+    }
+    snapshot.gpr[reg::RSP] = guest_rsp;
+    // IF is immutable at CPL3, so include its live value while exercising the
+    // arithmetic flags and DF that the guard must preserve exactly.
+    snapshot.rflags = 0xED7;
+    let expected_gprs = snapshot.gpr;
+    let expected_rflags = snapshot.rflags;
+    let stop_word = std::sync::atomic::AtomicU32::new(1);
+    let mut context = X86DsrContext::new(snapshot, source_exec as u64, SOURCE_VA);
+    context.prepare_entry(source_exec as u64, SOURCE_VA, true, None, Some(&stop_word));
+
+    // SAFETY: the source edge and target syscall blocks are live executable
+    // mappings; the nonzero guard leaves before touching the target.
+    let kicked_raw = unsafe { carrick_dsr_x86::enter_translated(&mut context) };
+    assert_eq!(
+        X86ExitStatus::from_raw(kicked_raw),
+        Some(X86ExitStatus::Kicked)
+    );
+    assert_eq!(context.snapshot.rip, TARGET_VA);
+    assert_eq!(context.snapshot.gpr, expected_gprs);
+    assert_eq!(context.snapshot.gpr[reg::RSP], guest_rsp);
+    assert_eq!(context.snapshot.rflags, expected_rflags);
+
+    stop_word.store(0, std::sync::atomic::Ordering::Release);
+    context.prepare_entry(source_exec as u64, SOURCE_VA, true, None, Some(&stop_word));
+    // SAFETY: the zero stop word permits the guarded edge to reach the live
+    // target syscall block.
+    let raw = unsafe { carrick_dsr_x86::enter_translated(&mut context) };
+    assert_eq!(X86ExitStatus::from_raw(raw), Some(X86ExitStatus::Syscall));
+    assert_eq!(context.snapshot.rip, TARGET_VA + target.len() as u64);
+    assert_eq!(context.snapshot.gpr, expected_gprs);
+    assert_eq!(context.snapshot.gpr[reg::RSP], guest_rsp);
+    assert_eq!(context.snapshot.rflags, expected_rflags);
+
+    unsafe {
+        jit.unmap(&region);
         libc::munmap(stack.cast(), 64 * 1024);
     }
 }

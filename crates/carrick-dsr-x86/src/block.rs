@@ -8,6 +8,8 @@
 //! variable-length. Like the AArch64 planner this is a PURE function over a
 //! byte reader, so it is fully unit-testable with no guest memory or JIT.
 
+use std::convert::Infallible;
+
 use crate::decode::{X86DecodeError, X86InstClass, X86SensitiveKind, classify};
 
 /// One planned guest instruction: its VA, byte length, and class. The
@@ -68,6 +70,10 @@ impl X86Exit {
 pub enum BlockLimit {
     PageBoundary,
     InstructionLimit,
+    /// The next instruction could not be fetched. A nonempty prefix remains
+    /// executable; replanning at `target` will surface the typed fetch fault at
+    /// the architecturally correct instruction boundary.
+    FetchBoundary,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,8 +87,9 @@ pub struct X86Block {
     /// Whether any emitted (copy-through) instruction in this block touches
     /// SSE/AVX/x87/MMX state. When false the gateway can skip the
     /// `fxsave`/`fxrstor` of the 512-byte FPU area around the block — the
-    /// common case in integer code. The terminator (syscall/branch/sensitive)
-    /// never touches FPU, so only the body matters.
+    /// common case in integer code. Most terminators do not touch xstate, but
+    /// an omitted XRSTOR terminator must force a save so Rust emulation sees
+    /// the authoritative pre-instruction guest state.
     pub uses_fpu: bool,
 }
 
@@ -95,6 +102,36 @@ pub enum X86BlockError {
     #[error("x86 block planner: decode failed: {0}")]
     Decode(#[from] X86DecodeError),
 }
+
+/// A planner failure that retains a typed instruction-fetch error instead of
+/// collapsing an inaccessible guest address into an empty byte vector.
+#[derive(Debug, PartialEq, Eq)]
+pub enum X86BlockPlanError<E> {
+    Block(X86BlockError),
+    Read { va: u64, error: E },
+}
+
+impl<E> From<X86BlockError> for X86BlockPlanError<E> {
+    fn from(error: X86BlockError) -> Self {
+        Self::Block(error)
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for X86BlockPlanError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Block(error) => error.fmt(formatter),
+            Self::Read { va, error } => {
+                write!(
+                    formatter,
+                    "x86 block planner: instruction fetch at 0x{va:x} failed: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for X86BlockPlanError<E> {}
 
 fn page_end(start: u64, page_size: u64) -> Result<u64, X86BlockError> {
     if page_size == 0 || !page_size.is_power_of_two() {
@@ -118,6 +155,25 @@ pub fn plan_block(
     page_size: u64,
     mut read: impl FnMut(u64) -> Vec<u8>,
 ) -> Result<X86Block, X86BlockError> {
+    match plan_block_with_reader(start, max_instructions, page_size, |va| {
+        Ok::<_, Infallible>(read(va))
+    }) {
+        Ok(block) => Ok(block),
+        Err(X86BlockPlanError::Block(error)) => Err(error),
+        Err(X86BlockPlanError::Read { error, .. }) => match error {},
+    }
+}
+
+/// Typed-reader form of [`plan_block`]. A fetch failure at the first
+/// instruction is returned to the caller. If a block already has an executable
+/// prefix, the planner ends that prefix at a [`BlockLimit::FetchBoundary`]; the
+/// caller executes it before replanning the faulting instruction.
+pub fn plan_block_with_reader<E>(
+    start: u64,
+    max_instructions: usize,
+    page_size: u64,
+    mut read: impl FnMut(u64) -> Result<Vec<u8>, E>,
+) -> Result<X86Block, X86BlockPlanError<E>> {
     let limit = page_end(start, page_size)?;
     let mut va = start;
     let mut instructions = Vec::new();
@@ -140,7 +196,20 @@ pub fn plan_block(
             ));
         }
 
-        let bytes = read(va);
+        let bytes = match read(va) {
+            Ok(bytes) => bytes,
+            Err(error) if instructions.is_empty() => {
+                return Err(X86BlockPlanError::Read { va, error });
+            }
+            Err(_) => {
+                return Ok(continue_block(
+                    start,
+                    va,
+                    BlockLimit::FetchBoundary,
+                    instructions,
+                ));
+            }
+        };
         match classify(&bytes, va) {
             Ok(c) => {
                 let next = va
@@ -238,13 +307,24 @@ pub fn plan_block(
                     instructions,
                 ));
             }
-            Err(e) => return Err(e.into()),
+            Err(error) => return Err(X86BlockError::from(error).into()),
         }
     }
 }
 
 fn terminate(start: u64, end: u64, instructions: Vec<PlannedInst>, exit: X86Exit) -> X86Block {
-    let uses_fpu = instructions.iter().any(|i| i.uses_fpu);
+    let uses_fpu = instructions.iter().any(|i| i.uses_fpu)
+        || matches!(
+            exit,
+            X86Exit::Sensitive {
+                kind: X86SensitiveKind::XstateSave(_)
+                    | X86SensitiveKind::XstateRestore(_)
+                    | X86SensitiveKind::FxState(_)
+                    | X86SensitiveKind::LegacyX87(_)
+                    | X86SensitiveKind::X87Wait,
+                ..
+            }
+        );
     X86Block {
         start,
         end,
@@ -362,6 +442,103 @@ mod tests {
                 },
             }
         );
+        assert!(
+            !block.uses_fpu,
+            "non-XRSTOR sensitive instructions retain the existing save policy"
+        );
+    }
+
+    #[test]
+    fn all_xsave_forms_end_as_typed_sensitive_blocks_with_authoritative_state() {
+        for (image, len, kind) in [
+            (
+                &[0x0f, 0xae, 0x64, 0x24, 0x40][..],
+                5,
+                crate::decode::X86XstateSaveKind::Xsave,
+            ),
+            (
+                &[0x48, 0x0f, 0xae, 0x64, 0x24, 0x40][..],
+                6,
+                crate::decode::X86XstateSaveKind::Xsave64,
+            ),
+            (
+                &[0x0f, 0xae, 0x74, 0x24, 0x40][..],
+                5,
+                crate::decode::X86XstateSaveKind::Xsaveopt,
+            ),
+            (
+                &[0x48, 0x0f, 0xae, 0x74, 0x24, 0x40][..],
+                6,
+                crate::decode::X86XstateSaveKind::Xsaveopt64,
+            ),
+            (
+                &[0x0f, 0xc7, 0x64, 0x24, 0x40][..],
+                5,
+                crate::decode::X86XstateSaveKind::Xsavec,
+            ),
+            (
+                &[0x48, 0x0f, 0xc7, 0x64, 0x24, 0x40][..],
+                6,
+                crate::decode::X86XstateSaveKind::Xsavec64,
+            ),
+        ] {
+            let block = plan_block(BASE, 256, PAGE, |va| {
+                usize::try_from(va - BASE)
+                    .ok()
+                    .and_then(|offset| image.get(offset..))
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default()
+            })
+            .expect("plan XSAVE");
+            assert!(block.instructions.is_empty());
+            assert!(block.uses_fpu, "XSAVE needs the authoritative guest image");
+            assert_eq!(
+                block.exit,
+                X86Exit::Sensitive {
+                    va: BASE,
+                    len,
+                    kind: X86SensitiveKind::XstateSave(kind),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn exact_rsp_xrstor_and_xrstor64_end_as_typed_sensitive_blocks() {
+        for (image, len, kind) in [
+            (
+                &[0x0f, 0xae, 0x6c, 0x24, 0x40][..],
+                5,
+                crate::decode::X86XstateRestoreKind::Xrstor,
+            ),
+            (
+                &[0x48, 0x0f, 0xae, 0x6c, 0x24, 0x40][..],
+                6,
+                crate::decode::X86XstateRestoreKind::Xrstor64,
+            ),
+        ] {
+            let block = plan_block(BASE, 256, PAGE, |va| {
+                usize::try_from(va - BASE)
+                    .ok()
+                    .and_then(|offset| image.get(offset..))
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default()
+            })
+            .expect("plan XRSTOR");
+            assert!(block.instructions.is_empty());
+            assert!(
+                block.uses_fpu,
+                "the gateway must capture authoritative pre-XRSTOR guest xstate"
+            );
+            assert_eq!(
+                block.exit,
+                X86Exit::Sensitive {
+                    va: BASE,
+                    len,
+                    kind: X86SensitiveKind::XstateRestore(kind),
+                }
+            );
+        }
     }
 
     #[test]
@@ -436,6 +613,41 @@ mod tests {
             X86Exit::Continue {
                 target: BASE + 11,
                 limit: BlockLimit::PageBoundary,
+            }
+        );
+    }
+
+    #[test]
+    fn typed_reader_retains_first_instruction_fetch_fault() {
+        let error = plan_block_with_reader(BASE, 256, PAGE, |_va| {
+            Err::<Vec<u8>, _>("mapped executable backing fault")
+        })
+        .expect_err("first instruction fetch must remain typed");
+        assert_eq!(
+            error,
+            X86BlockPlanError::Read {
+                va: BASE,
+                error: "mapped executable backing fault",
+            }
+        );
+    }
+
+    #[test]
+    fn typed_reader_executes_prefix_before_replanning_fault_boundary() {
+        let block = plan_block_with_reader(BASE, 256, PAGE, |va| {
+            if va == BASE {
+                Ok(vec![0x90])
+            } else {
+                Err("next instruction is inaccessible")
+            }
+        })
+        .expect("a valid prefix remains executable");
+        assert_eq!(block.instructions.len(), 1);
+        assert_eq!(
+            block.exit,
+            X86Exit::Continue {
+                target: BASE + 1,
+                limit: BlockLimit::FetchBoundary,
             }
         );
     }

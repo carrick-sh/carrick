@@ -501,34 +501,44 @@ impl SyscallDispatcher {
 
     /// Re-key a thread's per-thread signal state from `old` to `new` across
     /// fork(2): the child gets a NEW tid (its own pid) but INHERITS the
-    /// parent's blocked mask and alternate signal stack (POSIX). The pending
-    /// set is NOT migrated — fork clears the child's pending signals. Without
-    /// this, the child's per-tid lookups miss (the state stays orphaned under
-    /// the parent's tid) and an inherited SA_ONSTACK alt stack is silently lost.
+    /// parent's blocked mask, alternate signal stack, and any active
+    /// signal-frame bookkeeping (POSIX fork clones the forking thread's user
+    /// state exactly). The pending set is NOT migrated — fork clears the
+    /// child's pending signals. Without this, the child's per-tid lookups miss
+    /// (the state stays orphaned under the parent's tid) and an inherited
+    /// SA_ONSTACK alt stack or in-handler SS_ONSTACK state is silently lost.
     /// (audit M2; probe forkaltstack)
     pub fn migrate_thread_signal_state(
         &self,
         old: crate::thread::ThreadId,
         new: crate::thread::ThreadId,
     ) {
-        if old == new {
-            return;
-        }
         let mut s = self.signal.lock();
-        if let Some(mask) = s.masks.remove(&old) {
-            s.masks.insert(new, mask);
+        if old != new {
+            if let Some(mask) = s.masks.remove(&old) {
+                s.masks.insert(new, mask);
+            }
+            if let Some(alt) = s.altstack.remove(&old) {
+                s.altstack.insert(new, alt);
+            }
+            if let Some(frames) = s.handler_frames.remove(&old) {
+                s.handler_frames.insert(new, frames);
+            }
+            if let Some(rm) = s.restore_masks.remove(&old) {
+                s.restore_masks.insert(new, rm);
+            }
         }
-        if let Some(alt) = s.altstack.remove(&old) {
-            s.altstack.insert(new, alt);
-        }
-        if let Some(rm) = s.restore_masks.remove(&old) {
-            s.restore_masks.insert(new, rm);
-        }
-        // fork clears the child's pending set; drop any stale entries keyed
-        // under the new tid so the child starts clean.
-        s.pendings.remove(&new);
-        s.rt_pending_counts.retain(|(t, _), _| *t != new);
-        s.pending_actions.clear();
+        // fork clears the child's pending set copied under the OLD forking tid
+        // as well as any stale entry already keyed by the child's NEW tid. The
+        // tids can be equal on host-pid-stable lanes, so pending clearing must
+        // not be hidden behind the state-rekey fast path.
+        s.pendings.retain(|tid, _| *tid != old && *tid != new);
+        s.rt_pending_counts
+            .retain(|(tid, _), _| *tid != old && *tid != new);
+        s.pending_actions
+            .retain(|(tid, _), _| *tid != old && *tid != new);
+        s.pending_siginfos
+            .retain(|(tid, _), _| *tid != old && *tid != new);
         // fork ALSO clears the inherited (copied) shared process pending set —
         // a process-directed signal pending in the parent is not pending in the
         // new child (POSIX). This runs only in the post-fork child (a separate
@@ -588,6 +598,64 @@ impl SyscallDispatcher {
         s.altstack.remove(&child);
         s.handler_frames.remove(&child);
         s.restore_masks.remove(&child);
+        self.refresh_signal_pending_hints(&s);
+    }
+
+    /// Rekey the sole surviving exec caller from a nonleader tid to the
+    /// process-leader tid. The survivor keeps its blocked mask and pending
+    /// signals, including queued RT payload/action state. Every retired sibling
+    /// record is discarded, while old-image altstack/frame/temporary-mask state
+    /// is reset as required by exec.
+    pub fn rekey_thread_signal_state_after_exec(
+        &self,
+        old: crate::thread::ThreadId,
+        new: crate::thread::ThreadId,
+    ) {
+        let mut s = self.signal.lock();
+        let mask = s.masks.remove(&old);
+        let pending = s.pendings.remove(&old);
+        let mut rt_pending = Vec::new();
+        let mut pending_actions = Vec::new();
+        let mut pending_siginfos = Vec::new();
+        for signum in 1..=64 {
+            if let Some(count) = s.rt_pending_counts.remove(&(old, signum)) {
+                rt_pending.push((signum, count));
+            }
+            if let Some(actions) = s.pending_actions.remove(&(old, signum)) {
+                pending_actions.push((signum, actions));
+            }
+            if let Some(infos) = s.pending_siginfos.remove(&(old, signum)) {
+                pending_siginfos.push((signum, infos));
+            }
+        }
+
+        s.masks.clear();
+        s.pendings.clear();
+        s.rt_pending_counts.clear();
+        s.pending_actions.clear();
+        s.pending_siginfos.clear();
+        s.altstack.clear();
+        s.handler_frames.clear();
+        s.restore_masks.clear();
+        if let Some(mask) = mask
+            && !mask.is_empty()
+        {
+            s.masks.insert(new, mask);
+        }
+        if let Some(pending) = pending
+            && !pending.is_empty()
+        {
+            s.pendings.insert(new, pending);
+        }
+        for (signum, count) in rt_pending {
+            s.rt_pending_counts.insert((new, signum), count);
+        }
+        for (signum, actions) in pending_actions {
+            s.pending_actions.insert((new, signum), actions);
+        }
+        for (signum, infos) in pending_siginfos {
+            s.pending_siginfos.insert((new, signum), infos);
+        }
         self.refresh_signal_pending_hints(&s);
     }
 
@@ -2670,6 +2738,90 @@ mod tests {
     }
 
     #[test]
+    fn fork_child_clears_old_and_new_pending_signal_state() {
+        let d = SyscallDispatcher::new();
+        let old = crate::thread::ThreadId::synthetic_for_tests(90);
+        let new = crate::thread::ThreadId::synthetic_for_tests(91);
+        let mask = SigSet::EMPTY.with(12);
+        let restore = SigSet::EMPTY.with(14);
+        let altstack = carrick_abi::LinuxSigaltstack::empty();
+        let handler_frames = vec![true, false, true];
+        {
+            let mut s = d.signal.lock();
+            s.masks.insert(old, mask);
+            s.altstack.insert(old, altstack);
+            s.handler_frames.insert(old, handler_frames.clone());
+            s.restore_masks.insert(old, restore);
+            for tid in [old, new] {
+                s.pendings.insert(tid, SigSet::EMPTY.with(10).with(34));
+                s.rt_pending_counts.insert((tid, 34), 2);
+                s.pending_actions.insert((tid, 10), VecDeque::new());
+                s.pending_actions.insert((tid, 34), VecDeque::new());
+                s.pending_siginfos
+                    .entry((tid, 10))
+                    .or_default()
+                    .push_back(LinuxSiginfo::kill(
+                        10,
+                        crate::linux_abi::LINUX_SI_USER,
+                        1,
+                        0,
+                    ));
+                s.pending_siginfos
+                    .entry((tid, 34))
+                    .or_default()
+                    .push_back(LinuxSiginfo::rt_queue(34, 1, 0, 7));
+            }
+            s.process_pending = SigSet::EMPTY.with(10).with(34);
+            s.process_rt_pending_counts.insert(34, 2);
+            s.process_pending_siginfos
+                .entry(34)
+                .or_default()
+                .push_back(LinuxSiginfo::rt_queue(34, 1, 0, 9));
+        }
+
+        d.migrate_thread_signal_state(old, new);
+
+        let s = d.signal.lock();
+        assert!(!s.masks.contains_key(&old));
+        assert_eq!(s.mask_for(new), mask);
+        assert_eq!(s.altstack.get(&new), Some(&altstack));
+        assert_eq!(s.handler_frames.get(&new), Some(&handler_frames));
+        assert_eq!(s.restore_masks.get(&new), Some(&restore));
+        for tid in [old, new] {
+            assert!(!s.pendings.contains_key(&tid));
+            assert!(!s.rt_pending_counts.keys().any(|(t, _)| *t == tid));
+            assert!(!s.pending_actions.keys().any(|(t, _)| *t == tid));
+            assert!(!s.pending_siginfos.keys().any(|(t, _)| *t == tid));
+        }
+        assert!(s.process_pending.is_empty());
+        assert!(s.process_rt_pending_counts.is_empty());
+        assert!(s.process_pending_siginfos.is_empty());
+        drop(s);
+
+        // A lane whose namespace tid remains stable must still clear copied
+        // standard and RT pending state while preserving inherited state.
+        {
+            let mut s = d.signal.lock();
+            s.pendings.insert(new, SigSet::EMPTY.with(10).with(34));
+            s.rt_pending_counts.insert((new, 34), 1);
+            s.pending_actions.insert((new, 34), VecDeque::new());
+            s.pending_siginfos.insert((new, 34), VecDeque::new());
+            s.process_pending = SigSet::EMPTY.with(10);
+        }
+        d.migrate_thread_signal_state(new, new);
+        let s = d.signal.lock();
+        assert_eq!(s.mask_for(new), mask);
+        assert_eq!(s.altstack.get(&new), Some(&altstack));
+        assert_eq!(s.handler_frames.get(&new), Some(&handler_frames));
+        assert_eq!(s.restore_masks.get(&new), Some(&restore));
+        assert!(!s.pendings.contains_key(&new));
+        assert!(!s.rt_pending_counts.keys().any(|(t, _)| *t == new));
+        assert!(!s.pending_actions.keys().any(|(t, _)| *t == new));
+        assert!(!s.pending_siginfos.keys().any(|(t, _)| *t == new));
+        assert!(s.process_pending.is_empty());
+    }
+
+    #[test]
     fn fork_child_retires_sibling_thread_signal_state() {
         // MT fork: the child inherits the parent's per-tid signal maps, but
         // only the forking thread survives. Sibling entries must be retired
@@ -3820,6 +3972,47 @@ mod tests {
     }
 
     #[test]
+    fn exec_rekey_preserves_survivor_mask_and_pending_but_retires_siblings() {
+        let d = SyscallDispatcher::new();
+        let old = crate::thread::ThreadId::synthetic_for_tests(10);
+        let new = crate::thread::ThreadId::synthetic_for_tests(1);
+        let sibling = crate::thread::ThreadId::synthetic_for_tests(11);
+        let blocked = SigSet::EMPTY.with(10).with(34);
+        d.restore_signal_mask(old, blocked);
+        d.restore_signal_mask(sibling, SigSet::EMPTY.with(12));
+        d.mark_signal_pending(old, 10);
+        d.mark_signal_pending(old, 34);
+        d.mark_signal_pending(old, 34);
+        {
+            let mut signal = d.signal.lock();
+            signal.altstack.insert(
+                old,
+                LinuxSigaltstack {
+                    ss_sp: 0x4000,
+                    ss_flags: 0,
+                    __pad: 0,
+                    ss_size: 0x2000,
+                },
+            );
+            signal.restore_masks.insert(old, SigSet::EMPTY.with(2));
+        }
+
+        d.rekey_thread_signal_state_after_exec(old, new);
+
+        let signal = d.signal.lock();
+        assert_eq!(signal.mask_for(new), blocked);
+        let pending = signal.pendings.get(&new).copied().unwrap_or(SigSet::EMPTY);
+        assert!(pending.contains(10));
+        assert!(pending.contains(34));
+        assert_eq!(signal.rt_pending_counts.get(&(new, 34)), Some(&2));
+        assert!(!signal.masks.contains_key(&old));
+        assert!(!signal.masks.contains_key(&sibling));
+        assert!(signal.altstack.is_empty());
+        assert!(signal.handler_frames.is_empty());
+        assert!(signal.restore_masks.is_empty());
+    }
+
+    #[test]
     fn sigaltstack_reports_ss_onstack_and_rejects_reconfigure_while_on_stack() {
         let d = SyscallDispatcher::new();
         let tid = crate::thread::ThreadId::synthetic_for_tests(1);
@@ -3860,6 +4053,41 @@ mod tests {
             "a non-SA_ONSTACK handler is not on the alt stack"
         );
         d.pop_handler_frame(tid);
+    }
+
+    #[test]
+    fn fork_child_rekeys_active_handler_frames_for_ss_onstack() {
+        let d = SyscallDispatcher::new();
+        let old = crate::thread::ThreadId::synthetic_for_tests(1);
+        let new = crate::thread::ThreadId::synthetic_for_tests(2);
+
+        d.signal.lock().altstack.insert(
+            old,
+            LinuxSigaltstack {
+                ss_sp: 0x4000,
+                ss_flags: 0,
+                __pad: 0,
+                ss_size: 0x4000,
+            },
+        );
+        let mut on = LinuxSigaction::empty();
+        on.sa_handler = 0x9000;
+        on.sa_flags = crate::linux_abi::LINUX_SA_ONSTACK;
+        d.enter_signal_handler(old, 10, on);
+
+        d.migrate_thread_signal_state(old, new);
+
+        assert!(
+            !d.is_on_altstack(old, None),
+            "the parent tid must not retain fork-child handler bookkeeping"
+        );
+        assert!(
+            d.is_on_altstack(new, None),
+            "the child tid must keep SS_ONSTACK state for an active handler"
+        );
+
+        d.pop_handler_frame(new);
+        assert!(!d.is_on_altstack(new, None));
     }
 
     #[test]

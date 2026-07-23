@@ -64,8 +64,38 @@ pub enum ConnectTarget {
     Denied(LinuxErrno),
 }
 
+/// Provider-owned exclusion held across a host `fork()`. Host/none providers
+/// return a no-op guard; bridge providers pin auxiliary publication helpers
+/// outside their registry critical section so the child never inherits it
+/// locked by a vanished helper thread.
+pub struct NetworkForkGuard<'a> {
+    _guard: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl NetworkForkGuard<'_> {
+    fn no_op() -> Self {
+        Self { _guard: None }
+    }
+
+    pub(super) fn real(guard: std::sync::MutexGuard<'_, ()>) -> NetworkForkGuard<'_> {
+        NetworkForkGuard {
+            _guard: Some(guard),
+        }
+    }
+}
+
 pub trait NetworkProvider: Send + Sync {
     fn capabilities(&self) -> NetworkCapabilities;
+    /// Nonblocking provider fork exclusion. Returning `None` means the caller
+    /// must retry until its absolute fork deadline; the default has no helper
+    /// state and therefore succeeds with a no-op guard.
+    fn try_fork_guard(&self) -> Option<NetworkForkGuard<'_>> {
+        Some(NetworkForkGuard::no_op())
+    }
+    /// Repair process-local provider state after a host fork. Implementations
+    /// must not join vanished inherited helper threads or remove durable files
+    /// still owned by the parent process.
+    fn after_fork_child(&self) {}
     fn create_namespace(&self, spec: &NetworkNamespaceSpec) -> Result<NetworkLease, String>;
     fn destroy_namespace(&self, lease_id: NetworkLeaseId) -> Result<(), String>;
     fn publish_port(&self, lease_id: NetworkLeaseId, mapping: PortMapping) -> Result<(), String>;
@@ -298,6 +328,25 @@ impl RuntimeNetwork {
 
     pub fn resolve_dns_name(&self, name: &str) -> Result<Vec<Ipv4Addr>, String> {
         self.provider.resolve_dns_name(&self.spec, name)
+    }
+
+    pub(crate) fn fork_guard_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<NetworkForkGuard<'_>> {
+        loop {
+            if let Some(guard) = self.provider.try_fork_guard() {
+                return Some(guard);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    pub(crate) fn after_fork_child(&self) {
+        self.provider.after_fork_child();
     }
 }
 

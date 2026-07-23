@@ -88,9 +88,17 @@ use carrick_runtime::syscall::lookup_aarch64;
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::trap::hvf_capabilities;
 
-use crate::args::{Cli, Commands, NetworkCommand, RootfsCommand, SystemCommand, VolumeCommand};
+use crate::args::{
+    Cli, Commands, DebugCommand, NetworkCommand, RootfsCommand, SystemCommand, VolumeCommand,
+};
 #[cfg(feature = "platform-macos")]
 use crate::debug::run_debug;
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
+use crate::debug_layout::native_x86_layout_json;
 // Used only by the macOS-only `run-elf` arm.
 #[cfg(feature = "platform-macos")]
 use crate::fs_setup::install_fs_backend;
@@ -504,11 +512,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             cache,
             cache_repo,
             platform,
+            output,
             push,
             context,
         } => {
             run_build(
-                &store, tag, file, build_arg, no_cache, cache, cache_repo, platform, push, context,
+                &store, tag, file, build_arg, no_cache, cache, cache_repo, platform, output, push,
+                context,
             )?;
         }
         Commands::Run {
@@ -1009,10 +1019,15 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             feature = "platform-freebsd",
             feature = "platform-netbsd"
         ))]
-        Commands::Debug { command } => {
-            let _ = command;
-            bail!("debug (guest address-space inspection) is HVF-only on this build");
-        }
+        Commands::Debug { command } => match command {
+            DebugCommand::NativeX86Layout => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&native_x86_layout_json())?
+                );
+            }
+            _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
+        },
         Commands::TraceChild {
             trace_uid,
             trace_gid,
@@ -1753,9 +1768,17 @@ fn run_build(
     cache: bool,
     cache_repo: Option<String>,
     platform: Option<String>,
+    output: Option<std::path::PathBuf>,
     push: bool,
     context: std::path::PathBuf,
 ) -> anyhow::Result<()> {
+    if push && output.is_some() {
+        bail!("--output cannot be combined with --push");
+    }
+    if let Some(output) = output.as_deref() {
+        validate_build_output_destination(output)?;
+    }
+
     // The build context must exist and be a directory. Canonicalise it so the
     // `-v` bind mount gets an absolute host path (carrick run resolves the mount
     // source against its launch dir otherwise).
@@ -1857,6 +1880,10 @@ fn run_build(
         .as_ref()
         .context("internal error: missing output tar path for --no-push build")?
         .join("image.tar");
+    if let Some(output) = output.as_deref() {
+        preserve_build_archive(&tar, output)?;
+        println!("Successfully exported {}", output.display());
+    }
     let summaries = store
         .load_docker_archive(&tar)
         .with_context(|| format!("failed to load built image from {}", tar.display()))?;
@@ -1866,6 +1893,68 @@ fn run_build(
         println!("Successfully tagged {}", summary.image);
     }
     Ok(())
+}
+
+/// Preserve the exact kaniko tar without silently replacing an existing
+/// artifact. A same-filesystem destination is a hard link, so exporting a
+/// large image adds no copy before the store ingests the original path. Other
+/// filesystems fall back to a create-new byte copy.
+fn validate_build_output_destination(destination: &std::path::Path) -> anyhow::Result<()> {
+    if destination.exists() {
+        bail!("build output already exists: {}", destination.display());
+    }
+    if let Some(parent) = destination.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        bail!(
+            "build output directory does not exist: {}",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
+fn preserve_build_archive(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> anyhow::Result<()> {
+    std::fs::metadata(source)
+        .with_context(|| format!("built image archive is missing: {}", source.display()))?;
+    validate_build_output_destination(destination)?;
+
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("build output already exists: {}", destination.display());
+        }
+        Err(_) => {}
+    }
+
+    let copy_result = (|| -> anyhow::Result<()> {
+        let mut input = std::fs::File::open(source)
+            .with_context(|| format!("failed to open built archive {}", source.display()))?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .with_context(|| format!("failed to create build output {}", destination.display()))?;
+        std::io::copy(&mut input, &mut output).with_context(|| {
+            format!(
+                "failed to copy built archive {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        output
+            .sync_all()
+            .with_context(|| format!("failed to sync build output {}", destination.display()))?;
+        Ok(())
+    })();
+    if copy_result.is_err() {
+        let _ = std::fs::remove_file(destination);
+    }
+    copy_result
 }
 
 /// Recursively copy `src` (a directory) to `dst` (which must not yet exist).
@@ -2131,6 +2220,22 @@ mod build_tests {
                 "LinkLocalIPs": ["169.254.44.11"],
             })
         );
+    }
+
+    #[test]
+    fn preserve_build_archive_keeps_exact_bytes_and_rejects_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("kaniko.tar");
+        let destination = directory.path().join("exported.tar");
+        std::fs::write(&source, b"exact kaniko bytes").unwrap();
+
+        preserve_build_archive(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"exact kaniko bytes");
+        assert!(source.exists(), "the store still ingests the original path");
+
+        let error = preserve_build_archive(&source, &destination).unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"exact kaniko bytes");
     }
 
     #[test]

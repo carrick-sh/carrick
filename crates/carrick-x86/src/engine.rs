@@ -18,12 +18,15 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 
-use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, MemoryError, SharedFutexLocation};
+use carrick_guest_mem::{
+    Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
+    SharedFutexLocation,
+};
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::x8664_arch::{SegmentBaseRegs, SyscallNorm, X8664GuestArch, service_arch_prctl};
 use carrick_hal::{
     ForkOutcome, GuestEntryRegs, OsError, RawSyscall, Reg, SysReg, SyscallTrap, ThreadedEngine,
-    TrapError,
+    TrapError, X86SignalXstate, X86XstateCapabilities,
 };
 use carrick_mem::memory::{AddressSpace, LINUX_NULL_GUARD_END};
 
@@ -302,15 +305,45 @@ impl<V: X86Vmm> X86EngineCore<V> {
     /// accesses hit (the identity GPA still resolves to the STALE shared
     /// aperture). High VAs (the alias arena) are EXCLUDED by
     /// `needs_stage1_translation`: their window is keyed at the VA, so identity
-    /// is correct there. A walk miss falls back to `address` (identity),
-    /// preserving prior behaviour for an unmapped VA. Mirrors the aarch64
-    /// engine's `syscall_buffer_ipa`.
-    fn syscall_buffer_gpa(&self, address: GuestVa, len: usize) -> Gpa {
+    /// is correct there. A shared-aperture walk miss is an unmapped guest buffer,
+    /// never permission to fall back to the stale identity backing. Mirrors the
+    /// aarch64 engine's `syscall_buffer_ipa`.
+    fn syscall_buffer_gpa(&self, address: GuestVa, len: usize) -> Option<Gpa> {
         let raw = address.raw();
         if !carrick_mem::memory::needs_stage1_translation(raw, len as u64) {
-            return Gpa(raw);
+            return Some(Gpa(raw));
         }
-        Gpa(self.vm.translate_va(raw).unwrap_or(raw))
+        self.vm.translate_va(raw).map(Gpa)
+    }
+
+    /// Return one 4 KiB-bounded VA→GPA segment. A private overlay can repoint a
+    /// prefix/middle/suffix independently, so translating only the first VA and
+    /// adding the total offset is never valid across a page boundary.
+    fn syscall_buffer_chunk(
+        &self,
+        address: u64,
+        offset: usize,
+        total_len: usize,
+    ) -> Result<(u64, Gpa, usize), MemoryError> {
+        let offset_u64 = u64::try_from(offset).map_err(|_| MemoryError::OutOfBounds {
+            address,
+            length: total_len,
+        })?;
+        let va = address
+            .checked_add(offset_u64)
+            .ok_or(MemoryError::OutOfBounds {
+                address,
+                length: total_len,
+            })?;
+        let page_left = (0x1000 - (va & 0xfff)) as usize;
+        let len = (total_len - offset).min(page_left);
+        let gpa = self
+            .syscall_buffer_gpa(GuestVa(va), len)
+            .ok_or(MemoryError::OutOfBounds {
+                address,
+                length: total_len,
+            })?;
+        Ok((va, gpa, len))
     }
 
     fn flush_current_tlb(&mut self) -> Result<(), MemoryError> {
@@ -363,20 +396,20 @@ impl<V: X86Vmm> SegmentBaseRegs for X86EngineCore<V> {
 /// pieces, each backed by an independent host alias window, so a bulk syscall
 /// copy (e.g. a 40 MiB `getrandom`) crossing a window boundary cannot be served
 /// by one `host_ptr`. Callers copy window-by-window using this run length.
-fn host_run_len<V: X86Vmm>(vm: &V, addr: u64, max: usize) -> usize {
+fn host_run_len<V: X86Vmm>(vm: &V, va: GuestVa, gpa: Gpa, max: usize) -> usize {
     if max == 0 {
         return 0;
     }
-    if vm.host_ptr(addr, max).is_some() {
+    if vm.syscall_buffer_host_ptr(va, gpa, max).is_some() {
         return max; // fast path: whole span in one window
     }
-    if vm.host_ptr(addr, 1).is_none() {
+    if vm.syscall_buffer_host_ptr(va, gpa, 1).is_none() {
         return 0; // first byte unmapped
     }
     let (mut lo, mut hi) = (1usize, max); // lo maps, hi does not
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if vm.host_ptr(addr, mid).is_some() {
+        if vm.syscall_buffer_host_ptr(va, gpa, mid).is_some() {
             lo = mid;
         } else {
             hi = mid;
@@ -419,6 +452,29 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             .set_mapping_protection(address, len, no_access, no_write);
     }
 
+    fn set_mapping_sharing(&mut self, address: u64, len: usize, sharing: MappingSharing) {
+        // Prepare backend identity first. Publishing `Shared` in the protection
+        // registry is the point at which sibling dispatch can request a
+        // cross-process futex key, so it must never lead the backing metadata.
+        self.vm
+            .publish_mapping_sharing(GuestVa(address), len, sharing);
+        self.protections.set_mapping_sharing(address, len, sharing);
+    }
+
+    fn set_mapping_protection_and_sharing(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+        sharing: MappingSharing,
+    ) {
+        self.vm
+            .publish_mapping_sharing(GuestVa(address), len, sharing);
+        self.protections
+            .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
+    }
+
     /// Resolve a guest futex VA to the host address of its `MAP_SHARED` backing
     /// (the boot aperture OR a runtime file-backed alias), so a cross-process
     /// futex routes through the bare-`SYS_futex` shared path instead of the
@@ -431,9 +487,22 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     /// lot — a forked child's `FUTEX_WAKE` never reached a parent parked in
     /// `FUTEX_WAIT` on the same `/dev/shm` page (`ltpcheckpoint` reverse direction).
     fn shared_futex_location(&self, guest_addr: u64) -> Option<SharedFutexLocation> {
+        // FUTEX_PRIVATE_FLAG is only an optimization hint: an unflagged futex in
+        // a MAP_PRIVATE VMA must still use the process/mm key. The process-wide
+        // mapping registry is authoritative across fixed overlays and unmap/reuse;
+        // physical aperture membership alone is not sharing provenance.
+        if !self
+            .protections
+            .range_mutable_shared_backing(guest_addr, std::mem::size_of::<u32>())
+        {
+            return None;
+        }
         // A futex word is a 4-byte u32. (The `GuestMemory` trait method itself
         // stays raw — stage-9 scope — but the VA→GPA→host chain below is typed.)
-        let gpa = self.syscall_buffer_gpa(GuestVa(guest_addr), 4);
+        let (_va, gpa, chunk_len) = self.syscall_buffer_chunk(guest_addr, 0, 4).ok()?;
+        if chunk_len != 4 {
+            return None;
+        }
         self.vm.shared_futex_location(gpa, 4)
     }
 
@@ -465,26 +534,22 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             trace_x86_efault("read", address, length);
             return Err(MemoryError::OutOfBounds { address, length });
         }
-        // Resolve the GPA the guest's OWN access hits: identity for ordinary
-        // pointers, the per-process overlay GPA for a `repoint_private` VA over
-        // the shared aperture (the identity GPA still backs the STALE shared
-        // page). The overlay slot is contiguous, so translating the base and
-        // adding the offset addresses the whole buffer.
-        let gpa_base = self.syscall_buffer_gpa(GuestVa(address), length).raw();
+        // Resolve each page independently: private overlay fragments can make
+        // adjacent guest pages physically unrelated.
         let mut out = vec![0u8; length];
         let mut off = 0usize;
         while off < length {
-            let addr = gpa_base + off as u64;
-            let run = host_run_len(&self.vm, addr, length - off);
+            let (va, gpa, page_len) = self.syscall_buffer_chunk(address, off, length)?;
+            let addr = gpa.raw();
+            let run = host_run_len(&self.vm, GuestVa(va), gpa, page_len);
             if run == 0 {
                 // A reserved-but-uncommitted page (a lazily-zeroed anonymous
                 // mmap/brk page the guest never touched — e.g. a calloc/
                 // alloc_zeroed buffer): the kernel reads it as zeros, so skip it
                 // (`out` is already zero-filled) instead of faulting. Only a VA
                 // that is NOT a reservation is a genuine EFAULT.
-                if self.vm.is_guest_reserved(addr) {
-                    let page_rem = (0x1000 - (addr as usize & 0xfff)).min(length - off);
-                    off += page_rem;
+                if self.vm.is_guest_reserved(va) {
+                    off += page_len;
                     continue;
                 }
                 trace_x86_efault("read", addr, length - off);
@@ -492,7 +557,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             }
             let host = self
                 .vm
-                .host_ptr(addr, run)
+                .syscall_buffer_host_ptr(GuestVa(va), gpa, run)
                 .ok_or(MemoryError::OutOfBounds { address, length })?;
             // SAFETY: `host_run_len`/`host_ptr` proved [host, host+run) is within
             // a live window; the destination slice is disjoint.
@@ -500,6 +565,47 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             off += run;
         }
         Ok(out)
+    }
+
+    fn zero_anonymous_reuse(
+        &mut self,
+        address: u64,
+        len: usize,
+        sharing: MappingSharing,
+    ) -> Result<(), MemoryError> {
+        if sharing != MappingSharing::Shared
+            || !carrick_mem::memory::needs_stage1_translation(address, len as u64)
+        {
+            return self.zero_backing(address, len);
+        }
+        // A released PrivateReservation still has a non-present leaf whose GPA
+        // records private overlay storage. Shared reuse is scrubbed BEFORE that
+        // leaf is restored, so following live translation here would zero the
+        // retired overlay and later expose stale shared bytes. Address the
+        // retained shared window directly; bhyve resolves this VA to its compact
+        // GPA and KVM resolves the identity GPA.
+        const ZEROES: [u8; 4096] = [0; 4096];
+        let mut offset = 0usize;
+        while offset < len {
+            let chunk_len = (len - offset).min(ZEROES.len());
+            let chunk_va = address
+                .checked_add(offset as u64)
+                .ok_or(MemoryError::OutOfBounds {
+                    address,
+                    length: len,
+                })?;
+            let host =
+                self.vm
+                    .host_ptr_mut(chunk_va, chunk_len)
+                    .ok_or(MemoryError::OutOfBounds {
+                        address,
+                        length: len,
+                    })?;
+            // SAFETY: the backend proved a complete retained shared-window chunk.
+            unsafe { std::ptr::copy_nonoverlapping(ZEROES.as_ptr(), host, chunk_len) };
+            offset += chunk_len;
+        }
+        Ok(())
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
@@ -511,27 +617,26 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             trace_x86_efault("write", address, length);
             return Err(MemoryError::OutOfBounds { address, length });
         }
-        // Resolve the GPA the guest's OWN access hits (see `read_bytes_raw`): for
-        // a `repoint_private` overlay VA this lands the syscall write in the
-        // PRIVATE overlay backing the guest reads, not the stale shared aperture.
-        let gpa_base = self.syscall_buffer_gpa(GuestVa(address), length).raw();
+        // Resolve each page independently (see `read_bytes_raw`).
         let mut off = 0usize;
         while off < length {
-            let addr = gpa_base + off as u64;
+            let (va, gpa, page_len) = self.syscall_buffer_chunk(address, off, length)?;
+            let addr = gpa.raw();
             // Let a lazy/sparse backend materialize the range before we probe
-            // run lengths: `host_run_len` uses the immutable `host_ptr`, which
-            // reads 0 for a not-yet-backed reservation, so a host-side write into
-            // one (file-backed mmap content, stack/auxv) would wrongly EFAULT.
-            // On eager backends `host_ptr_mut` defaults to `host_ptr` → no-op.
-            let _ = self.vm.host_ptr_mut(addr, length - off);
-            let run = host_run_len(&self.vm, addr, length - off);
+            // run lengths. The typed VA+GPA seam keeps compact-GPA backends from
+            // feeding a translated physical address back through their VA window
+            // resolver.
+            let _ = self
+                .vm
+                .syscall_buffer_host_ptr_mut(GuestVa(va), gpa, page_len);
+            let run = host_run_len(&self.vm, GuestVa(va), gpa, page_len);
             if run == 0 {
                 trace_x86_efault("write", addr, length - off);
                 return Err(MemoryError::OutOfBounds { address, length });
             }
             let host = self
                 .vm
-                .host_ptr_mut(addr, run)
+                .syscall_buffer_host_ptr_mut(GuestVa(va), gpa, run)
                 .ok_or(MemoryError::OutOfBounds { address, length })?;
             // SAFETY: `host_run_len`/`host_ptr_mut` proved [host, host+run) is
             // within a live window; the source slice is disjoint.
@@ -589,14 +694,36 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         overlay_gpa: u64,
         len: usize,
         content: &[u8],
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), RepointPrivateError> {
         // Seed the overlay backing + repoint the leaf on the backend (it seeds
         // `host_ptr(overlay_gpa)` FIRST, while `va` still maps to the stale shared
         // aperture, then edits the live PML4 leaf), then flush the current vCPU's
         // TLB so an already-touched overlay VA picks up the new mapping. Mirrors
         // the aarch64 engine's `repoint_private` (pt edit + EL1-maintenance TLBI).
         self.vm.repoint_private(va, overlay_gpa, len, content)?;
-        self.flush_current_tlb()
+        self.flush_current_tlb().map_err(|error| {
+            RepointPrivateError::indeterminate(MemoryError::HostMap(format!(
+                "x86 TLB flush after private repoint failed: {error}"
+            )))
+        })?;
+        self.vm
+            .publish_mapping_sharing(GuestVa(va), len, MappingSharing::Private);
+        self.protections
+            .set_mapping_sharing(va, len, MappingSharing::Private);
+        Ok(())
+    }
+
+    fn restore_shared_identity(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
+        let result = self.vm.restore_shared_identity(va, len).and_then(|()| {
+            self.flush_current_tlb().map_err(|error| {
+                RepointPrivateError::indeterminate(MemoryError::HostMap(format!(
+                    "x86 TLB flush after shared identity restore failed: {error}"
+                )))
+            })
+        });
+        result.map_err(|error| match error {
+            RepointPrivateError::Clean(error) | RepointPrivateError::Indeterminate(error) => error,
+        })
     }
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
@@ -752,6 +879,57 @@ impl<V: X86Vmm> carrick_hal::RegAccess for X86EngineCore<V> {
         // Advertise AVX in xstate_bv (bit 2) so the setter restores the YMM_Hi
         // component rather than treating it as "in init state" (zeroed).
         xs[512] |= 0x04;
+        self.vcpu
+            .set_xsave(&xs)
+            .map(|_| ())
+            .map_err(|_| OsError::from_raw(libc::EIO))
+    }
+
+    fn x86_xstate_capabilities(&self) -> Result<X86XstateCapabilities, OsError> {
+        Ok(X86XstateCapabilities::legacy_avx())
+    }
+
+    fn save_x86_signal_xstate(&mut self) -> Result<X86SignalXstate, OsError> {
+        let xs = self
+            .vcpu
+            .get_xsave()
+            .map_err(|_| OsError::from_raw(libc::EIO))?
+            .ok_or_else(|| OsError::from_raw(libc::EIO))?;
+        let mut bytes = xs.to_vec();
+        // A standard signal frame owns the Linux software descriptor at
+        // 464..512 and requires an uncompacted, zero-reserved XSAVE header.
+        bytes[464..512].fill(0);
+        bytes[520..576].fill(0);
+        bytes[28..32].copy_from_slice(&0x0000_ffbfu32.to_le_bytes());
+        Ok(X86SignalXstate {
+            bytes,
+            xfeatures: 0x7,
+            virtual_pkru: 0,
+            virtual_x87_fcs: carrick_abi::LINUX_X8664_USER_CS,
+            virtual_x87_fds: carrick_abi::LINUX_X8664_USER_DS,
+        })
+    }
+
+    fn restore_x86_signal_xstate(&mut self, state: &X86SignalXstate) -> Result<(), OsError> {
+        if state.bytes.len() != crate::vmm::XSAVE_LEN
+            || state.xfeatures != 0x7
+            || state.virtual_pkru != 0
+            || state.virtual_x87_fcs != carrick_abi::LINUX_X8664_USER_CS
+            || state.virtual_x87_fds != carrick_abi::LINUX_X8664_USER_DS
+        {
+            return Err(OsError::from_raw(libc::EINVAL));
+        }
+        let mut xstate_bv_bytes = [0u8; 8];
+        xstate_bv_bytes.copy_from_slice(&state.bytes[512..520]);
+        if u64::from_le_bytes(xstate_bv_bytes) & !0x7 != 0
+            || state.bytes[520..576].iter().any(|byte| *byte != 0)
+        {
+            return Err(OsError::from_raw(libc::EINVAL));
+        }
+        let mut xs = [0u8; crate::vmm::XSAVE_LEN];
+        xs[..464].copy_from_slice(&state.bytes[..464]);
+        xs[512..520].copy_from_slice(&state.bytes[512..520]);
+        xs[576..].copy_from_slice(&state.bytes[576..]);
         self.vcpu
             .set_xsave(&xs)
             .map(|_| ())
@@ -1017,13 +1195,13 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         self.last_syscall_canonical
     }
 
-    fn process_exit_cleanup(&mut self) {
+    fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
         // Delegate to the backend (§2.5c): a HOOK, not Drop — the forked child
         // `_exit`s skipping Drops. Default is a no-op (KVM/NVMM RAM is released by
         // the OS on `_exit`); bhyve overrides it to tear down its `/dev/vmm` node
         // (and skip a vfork-shared/borrowed VM).
         print_x86_syscall_stats_once("process-exit");
-        self.vm.process_exit_cleanup();
+        self.vm.process_exit_cleanup()
     }
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
@@ -1035,7 +1213,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         // stores. No-op on KVM/HVF (their alias IS a fork-coherent host
         // `MAP_SHARED` of the file). Canonical wait4=260, waitid=95.
         if matches!(self.last_syscall_canonical, Some(260) | Some(95)) && return_value >= 0 {
-            self.vm.refresh_shared_after_wait();
+            self.vm.refresh_shared_after_wait()?;
         }
         // Write RAX = return value and resume inside the stashed syscall
         // trampoline. KVM reports the native current RIP (observed as the OUT
@@ -1098,20 +1276,12 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        // The third element of `file` is the HOST libc::PROT_* mask the dispatcher
-        // computed for this file-backed alias. A PROT_READ-only alias is backed by
-        // a host mmap WITHOUT PROT_WRITE, so a syscall-path write into it would take
-        // a fatal host SIGBUS (the guest-reachable crash the `rosharedbus` probe
-        // catches). Register the range in the syscall WRITE gate so such a write
-        // surfaces as a clean EFAULT instead — mirroring HVF's
-        // validate_guest_write_range. Reads stay allowed; a writable alias clears it.
-        let read_only = file.is_some_and(|(_, _, prot)| prot & libc::PROT_WRITE == 0);
-        self.vm.map_host_alias(va, ipa, len, payload, file)?;
-        if let Ok(len_usize) = usize::try_from(len) {
-            self.protections
-                .set_no_write(va.raw(), len_usize, read_only);
-        }
-        Ok(())
+        // Mapping provenance is published by the runtime only after this
+        // backend install and every requested leaf protection succeed. Do not
+        // infer it from `file` here: anonymous MAP_SHARED aliases and private
+        // file snapshots are both valid, and the dispatch outcome is the
+        // authoritative source of protection + sharing.
+        self.vm.map_host_alias(va, ipa, len, payload, file)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1329,8 +1499,8 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         self.vm.needs_shared_file_alias_sync()
     }
 
-    fn sync_shared_file_aliases(&mut self) {
-        self.vm.sync_shared_file_aliases();
+    fn sync_shared_file_aliases(&mut self) -> Result<(), TrapError> {
+        self.vm.sync_shared_file_aliases()
     }
 
     fn build_sibling_spec(&self, entry: GuestEntryRegs) -> Result<Self::SiblingSpec, TrapError> {
@@ -1413,6 +1583,7 @@ mod tests {
         prepared_sysret: bool,
         get_gprs_calls: std::cell::Cell<u32>,
         set_gprs_calls: u32,
+        fail_cr3_write: bool,
         /// Scripted `run()` exits, consumed front-to-back; empty ⇒ `Halt`.
         exits: std::collections::VecDeque<X86Exit>,
     }
@@ -1465,6 +1636,115 @@ mod tests {
         fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry> {
             Arc::new(GenericVcpuRegistry::default())
         }
+
+        fn repoint_private(
+            &mut self,
+            _va: u64,
+            _overlay_gpa: u64,
+            _len: usize,
+            _content: &[u8],
+        ) -> Result<(), RepointPrivateError> {
+            Ok(())
+        }
+    }
+
+    struct FragmentVmm {
+        pages: std::collections::BTreeMap<u64, Box<[u8; 0x1000]>>,
+        translations: std::collections::BTreeMap<u64, u64>,
+    }
+
+    impl FragmentVmm {
+        fn new(shared_base: u64, overlay_gpa: u64) -> Self {
+            let mut pages = std::collections::BTreeMap::new();
+            pages.insert(shared_base, Box::new([0x11; 0x1000]));
+            pages.insert(overlay_gpa, Box::new([0x22; 0x1000]));
+            pages.insert(shared_base + 0x2000, Box::new([0x33; 0x1000]));
+            let translations = [
+                (shared_base, shared_base),
+                (shared_base + 0x1000, overlay_gpa),
+                (shared_base + 0x2000, shared_base + 0x2000),
+            ]
+            .into_iter()
+            .collect();
+            Self {
+                pages,
+                translations,
+            }
+        }
+
+        fn page(&self, gpa: u64) -> &[u8; 0x1000] {
+            self.pages.get(&gpa).expect("test page")
+        }
+    }
+
+    impl GuestVmBackend for FragmentVmm {
+        fn write_gpa(&self, _gpa: u64, _bytes: &[u8]) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
+            let base = gpa & !0xfff;
+            let offset = usize::try_from(gpa - base).ok()?;
+            (offset.checked_add(len)? <= 0x1000).then(|| {
+                let page = self.pages.get(&base)?;
+                Some(unsafe { page.as_ptr().add(offset) as *mut u8 })
+            })?
+        }
+
+        fn fork_ram_strategy(&self) -> ForkRamStrategy {
+            ForkRamStrategy::Cow
+        }
+    }
+
+    impl X86Vmm for FragmentVmm {
+        type KickHandle = TestKick;
+        type SiblingBuilder = ();
+        type Vcpu = TestVcpu;
+
+        fn setup_memory(&mut self, _plan: &WindowPlan) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn translate_va(&self, va: u64) -> Option<u64> {
+            let page = va & !0xfff;
+            self.translations
+                .get(&page)
+                .and_then(|gpa| gpa.checked_add(va - page))
+        }
+
+        fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
+            Ok(TestVcpu::default())
+        }
+
+        fn kick_handle(&self) -> Self::KickHandle {
+            TestKick
+        }
+
+        fn build_sibling_builder(&self) -> Result<Self::SiblingBuilder, TrapError> {
+            Ok(())
+        }
+
+        fn materialize_sibling(
+            _builder: Self::SiblingBuilder,
+        ) -> Result<(Self, Self::Vcpu), TrapError> {
+            Err(TrapError::Hypervisor("unused fragment sibling".into()))
+        }
+
+        fn set_guest_sp(&self, _vcpu: &Self::Vcpu, _sp: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry> {
+            Arc::new(GenericVcpuRegistry::default())
+        }
+
+        fn shared_futex_location(&self, gpa: Gpa, len: usize) -> Option<SharedFutexLocation> {
+            let word = self.host_ptr(gpa.raw(), len)?;
+            Some(SharedFutexLocation::Direct {
+                word: carrick_guest_mem::HostVa(word as usize),
+                waiter_key: word as usize,
+            })
+        }
     }
 
     impl X86Vcpu for TestVcpu {
@@ -1479,6 +1759,11 @@ mod tests {
         }
 
         fn set_gpr(&mut self, reg: X86Reg, v: u64) -> Result<(), TrapError> {
+            if reg == X86Reg::Cr3 && self.fail_cr3_write {
+                return Err(TrapError::Hypervisor(
+                    "injected post-publication CR3 write failure".into(),
+                ));
+            }
             match reg {
                 X86Reg::Rcx => self.rcx = v,
                 X86Reg::R11 => self.r11 = v,
@@ -1664,6 +1949,32 @@ mod tests {
         assert!(
             !engine.protections().unwrap().range_no_access(addr, 0x10),
             "set_no_access(false) clears the range"
+        );
+    }
+
+    #[test]
+    fn syscall_copies_cross_shared_private_shared_fragments_page_by_page() {
+        let shared = carrick_mem::memory::LINUX_SHARED_FILE_BASE;
+        let overlay = carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE;
+        let vm = FragmentVmm::new(shared, overlay);
+        let mut engine = X86EngineCore::from_parts(vm, TestVcpu::default(), test_layout());
+        let address = shared + 0xff0;
+        let length = 0x1020;
+
+        let bytes = engine.read_bytes(address, length).expect("fragmented read");
+        assert!(bytes[..0x10].iter().all(|byte| *byte == 0x11));
+        assert!(bytes[0x10..0x1010].iter().all(|byte| *byte == 0x22));
+        assert!(bytes[0x1010..].iter().all(|byte| *byte == 0x33));
+
+        let replacement: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+        engine
+            .write_bytes(address, &replacement)
+            .expect("fragmented write");
+        assert_eq!(&engine.vm.page(shared)[0xff0..], &replacement[..0x10]);
+        assert_eq!(&engine.vm.page(overlay)[..], &replacement[0x10..0x1010]);
+        assert_eq!(
+            &engine.vm.page(shared + 0x2000)[..0x10],
+            &replacement[0x1010..]
         );
     }
 
@@ -1936,6 +2247,23 @@ mod tests {
         assert!(trapped.is_none());
         assert_eq!(engine.current_pc().expect("pc"), 0x0040_5000);
         assert!(engine.vcpu.exits.is_empty());
+    }
+
+    #[test]
+    fn private_repoint_cr3_flush_failure_is_indeterminate() {
+        let layout = test_layout();
+        let vcpu = TestVcpu {
+            fail_cr3_write: true,
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+
+        let result = engine.repoint_private(0x4000, 0x8000, 0x1000, &[0; 0x1000]);
+
+        assert!(matches!(
+            result,
+            Err(RepointPrivateError::Indeterminate(MemoryError::HostMap(_)))
+        ));
     }
 
     #[test]

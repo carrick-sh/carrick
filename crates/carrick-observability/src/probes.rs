@@ -620,6 +620,31 @@ mod real {
         /// RAX, RDX, RDI, RSI, R8. Split because the USDT backend supports six
         /// arguments per probe.
         fn native__x86__fault__regs(_: u32, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Guest stack values at a native x86 fault. Args: host pid, qwords at
+        /// RSP+0x18, RSP+0x20, RSP+0x30, and RSP+0x38, plus RBP. These offsets
+        /// expose common saved-register/frame layouts without asking DTrace to
+        /// dereference an identity-mapped guest VA after process teardown.
+        fn native__x86__fault__stack(_: u32, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Last five gateway-entered guest PCs before a native x86 fault.
+        /// Chained interior blocks do not appear; the sequence identifies the
+        /// indirect/syscall boundaries that led into the failing chain.
+        fn native__x86__fault__history(_: u32, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Opt-in native x86 guest-PC observation. Args: host pid, guest PC,
+        /// RSP, RDI, RBP, and the qword at RSP. Enabled only when the
+        /// runtime's targeted-PC diagnostic is configured.
+        fn native__x86__pc(_: u32, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Opt-in native x86 indirect-control resolution. Args: host pid,
+        /// source guest PC, resolved target PC, RSP, RDI, and RBP.
+        fn native__x86__resolve(_: u32, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Selected native-x86 xstate transition. Args: host pid, source guest
+        /// PC, target guest PC, event kind, decision flags, and XSTATE_BV.
+        fn native__x86__xstate__edge(_: u32, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Control fields for the selected xstate transition. Args: host pid,
+        /// source PC, FCW, MXCSR, PKRU, and the full extended-state hash.
+        fn native__x86__xstate__controls(_: u32, _: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Component hashes for the selected xstate transition. Args: host pid,
+        /// source PC, legacy, YMM, opmask/ZMM, and full extended-state hashes.
+        fn native__x86__xstate__hashes(_: u32, _: u64, _: u64, _: u64, _: u64, _: u64) {}
         /// Fires from `map_host_alias` (the post-boot high-VA hv_vm_map path) with
         /// the MANAGER's L0..L3 stage-1 descriptors for the alias VA + whether this
         /// is a forked child and whether the page-table build succeeded (rc: 0 ok,
@@ -1685,6 +1710,85 @@ mod real {
         let pid = std::process::id();
         carrick_usdt::native__x86__fault!(|| (pid, pc, fault_address, rsp, rcx, rflags));
         carrick_usdt::native__x86__fault__regs!(|| (pid, rax, rdx, rdi, rsi, r8));
+    }
+
+    pub fn native_x86_fault_stack(rbp: u64, stack_words: [u64; 4]) {
+        let pid = std::process::id();
+        carrick_usdt::native__x86__fault__stack!(|| (
+            pid,
+            stack_words[0],
+            stack_words[1],
+            stack_words[2],
+            stack_words[3],
+            rbp
+        ));
+    }
+
+    pub fn native_x86_fault_history(pcs: [u64; 5]) {
+        let pid = std::process::id();
+        carrick_usdt::native__x86__fault__history!(|| (
+            pid, pcs[0], pcs[1], pcs[2], pcs[3], pcs[4]
+        ));
+    }
+
+    pub fn native_x86_pc(pc: u64, rsp: u64, rdi: u64, rbp: u64, stack_word: u64) {
+        let pid = std::process::id();
+        carrick_usdt::native__x86__pc!(|| (pid, pc, rsp, rdi, rbp, stack_word));
+    }
+
+    pub fn native_x86_resolve(source: u64, target: u64, rsp: u64, rdi: u64, rbp: u64) {
+        let pid = std::process::id();
+        carrick_usdt::native__x86__resolve!(|| (pid, source, target, rsp, rdi, rbp));
+    }
+
+    /// Scalar payload for the opt-in native-x86 xstate transition probes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct NativeX86XstateProbe {
+        pub source: u64,
+        pub target: u64,
+        pub event: u64,
+        pub flags: u64,
+        pub xstate_bv: u64,
+        pub fcw: u16,
+        pub mxcsr: u32,
+        pub pkru: u32,
+        pub legacy_hash: u64,
+        pub ymm_hash: u64,
+        pub opmask_zmm_hash: u64,
+        pub extended_hash: u64,
+    }
+
+    pub fn native_x86_xstate_edge(probe: NativeX86XstateProbe) {
+        let pid = std::process::id();
+        carrick_usdt::native__x86__xstate__edge!(|| (
+            pid,
+            probe.source,
+            probe.target,
+            probe.event,
+            probe.flags,
+            probe.xstate_bv
+        ));
+    }
+
+    pub fn native_x86_xstate(probe: NativeX86XstateProbe) {
+        let pid = std::process::id();
+        native_x86_xstate_edge(probe);
+        carrick_usdt::native__x86__xstate__controls!(|| (
+            pid,
+            probe.source,
+            u64::from(probe.fcw),
+            u64::from(probe.mxcsr),
+            u64::from(probe.pkru),
+            probe.extended_hash
+        ));
+        carrick_usdt::native__x86__xstate__hashes!(|| (
+            pid,
+            probe.source,
+            probe.legacy_hash,
+            probe.ymm_hash,
+            probe.opmask_zmm_hash,
+            probe.extended_hash
+        ));
     }
 
     /// Emit a high-VA alias page-table walk. See `pt__alias__walk`. `flag` bit0 =

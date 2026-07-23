@@ -81,6 +81,12 @@ syscall_table! {
     283 => sys_membarrier,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivateRepointRecovery {
+    RecoveredCleanly,
+    FailStopRetainingOwners,
+}
+
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
 #[derive(Clone)]
 pub(super) struct MemState {
@@ -133,7 +139,9 @@ pub(super) struct MemState {
     /// image instead of from already-rearranged bytes.
     pub remap_snapshots: std::collections::HashMap<u64, Vec<u8>>,
     /// Ranges inside mapped files where Linux delivers SIGBUS on access: pages
-    /// wholly beyond the backing file's EOF for a MAP_SHARED file mapping.
+    /// wholly beyond the backing file's EOF. Live MAP_SHARED aliases inherit
+    /// later vnode truncation from the host; materialized MAP_PRIVATE mappings
+    /// publish the exact page-rounded tail observed at map time.
     pub bus_fault_ranges: Vec<(u64, u64)>,
     /// Page-rounded guest virtual ranges currently counted as mlocked. Stored as
     /// typed guest-VA ranges so `/proc` accounting cannot mix them with host or
@@ -439,6 +447,49 @@ fn dynamic_mapping_overlaps_sorted(maps: &[ProcMapsEntry], start: u64, len: u64)
     maps.get(idx).is_some_and(|map| map.start < end)
 }
 
+fn boot_region_is_hidden_mmap_backing(map: &ProcMapsEntry, layout: MemoryLayout) -> bool {
+    map.start == layout.mmap_base && map.end == layout.mmap_base.saturating_add(layout.mmap_size)
+}
+
+fn boot_region_is_hidden_heap_backing(map: &ProcMapsEntry, layout: MemoryLayout) -> bool {
+    map.start == layout.heap_base && map.end == layout.heap_base.saturating_add(layout.heap_size)
+}
+
+fn boot_region_is_hidden_shared_aperture(map: &ProcMapsEntry) -> bool {
+    map.start == crate::memory::LINUX_SHARED_FILE_BASE
+        && map.end
+            == crate::memory::LINUX_SHARED_FILE_BASE
+                .saturating_add(crate::memory::LINUX_SHARED_FILE_SIZE)
+}
+
+fn boot_region_is_hidden_private_overlay(map: &ProcMapsEntry) -> bool {
+    map.start == crate::memory::LINUX_PRIVATE_OVERLAY_BASE
+        && map.end
+            == crate::memory::LINUX_PRIVATE_OVERLAY_BASE
+                .saturating_add(crate::memory::LINUX_PRIVATE_OVERLAY_SIZE)
+}
+
+fn boot_region_is_hidden_reservation(map: &ProcMapsEntry, layout: MemoryLayout) -> bool {
+    boot_region_is_hidden_mmap_backing(map, layout)
+        || boot_region_is_hidden_heap_backing(map, layout)
+        || boot_region_is_hidden_shared_aperture(map)
+        || boot_region_is_hidden_private_overlay(map)
+}
+
+fn boot_region_source_intersects_hidden_backing(
+    map: &ProcMapsEntry,
+    mem: &MemState,
+    end: u64,
+) -> bool {
+    if boot_region_is_hidden_mmap_backing(map, mem.layout)
+        || boot_region_is_hidden_shared_aperture(map)
+        || boot_region_is_hidden_private_overlay(map)
+    {
+        return true;
+    }
+    boot_region_is_hidden_heap_backing(map, mem.layout) && end > mem.brk_current
+}
+
 fn trim_dynamic_maps_for_range(maps: &mut Vec<ProcMapsEntry>, start: u64, len: u64) {
     let Some(end) = start.checked_add(len) else {
         maps.clear();
@@ -477,6 +528,66 @@ impl MmapSharing {
             Self::Shared => ProcMapSharing::Shared,
         }
     }
+
+    fn guest_mapping_sharing(self) -> carrick_guest_mem::MappingSharing {
+        match self {
+            Self::Private => carrick_guest_mem::MappingSharing::Private,
+            Self::Shared => carrick_guest_mem::MappingSharing::Shared,
+        }
+    }
+}
+
+fn proc_mapping_sharing(sharing: ProcMapSharing) -> carrick_guest_mem::MappingSharing {
+    match sharing {
+        ProcMapSharing::Private => carrick_guest_mem::MappingSharing::Private,
+        ProcMapSharing::Shared => carrick_guest_mem::MappingSharing::Shared,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MremapMappingMetadata {
+    start: u64,
+    end: u64,
+    prot: LinuxProtFlags,
+    sharing: ProcMapSharing,
+    path: String,
+}
+
+fn proc_maps_entry_mremap_metadata(map: &ProcMapsEntry) -> MremapMappingMetadata {
+    let mut prot = LinuxProtFlags::empty();
+    if map.read {
+        prot |= LinuxProtFlags::READ;
+    }
+    if map.write {
+        prot |= LinuxProtFlags::WRITE;
+    }
+    if map.execute {
+        prot |= LinuxProtFlags::EXEC;
+    }
+    MremapMappingMetadata {
+        start: map.start,
+        end: map.end,
+        prot,
+        sharing: map.sharing,
+        path: map.path.clone(),
+    }
+}
+
+/// Dispatcher metadata published only after a runtime `MapHostAlias` install
+/// succeeds. Keeping the complete commit record out of `MemState` until then
+/// makes an mmap/protection failure a no-op for the prior VMA and every
+/// range-derived classification.
+pub(crate) struct HostAliasMmapCommit {
+    pub(super) start: u64,
+    pub(super) len: u64,
+    pub(super) prot: LinuxProtFlags,
+    pub(super) sharing: ProcMapSharing,
+    pub(super) path: String,
+    pub(super) locked: Option<crate::vfs::GuestMemoryRange>,
+    pub(super) resident: bool,
+    pub(super) bus_fault: Option<(u64, u64)>,
+    pub(super) write_sealed_shared: bool,
+    pub(super) writable_memfd: Option<OpenDescriptionRef>,
 }
 
 fn prot_to_proc_perms(prot: LinuxProtFlags) -> (bool, bool, bool) {
@@ -485,6 +596,41 @@ fn prot_to_proc_perms(prot: LinuxProtFlags) -> (bool, bool, bool) {
         prot.contains(LinuxProtFlags::WRITE),
         prot.contains(LinuxProtFlags::EXEC),
     )
+}
+
+fn trim_writable_memfd_maps_for_range(
+    maps: &mut Vec<(crate::vfs::GuestMemoryRange, OpenDescriptionRef)>,
+    start: u64,
+    len: u64,
+) {
+    let Some(end) = start.checked_add(len) else {
+        maps.clear();
+        return;
+    };
+    let mut retained = Vec::with_capacity(maps.len() + 1);
+    for (range, description) in maps.drain(..) {
+        let range_start = range.start().raw();
+        let range_end = range.end().raw();
+        if range_start >= end || start >= range_end {
+            retained.push((range, description));
+            continue;
+        }
+        if range_start < start
+            && let Some(prefix) = crate::vfs::GuestMemoryRange::new(
+                GuestVa(range_start),
+                GuestVa(start.min(range_end)),
+            )
+        {
+            retained.push((prefix, std::sync::Arc::clone(&description)));
+        }
+        if end < range_end
+            && let Some(suffix) =
+                crate::vfs::GuestMemoryRange::new(GuestVa(end.max(range_start)), GuestVa(range_end))
+        {
+            retained.push((suffix, description));
+        }
+    }
+    *maps = retained;
 }
 
 fn trim_ranges_for_range(ranges: &mut Vec<(u64, u64)>, start: u64, len: u64) {
@@ -511,6 +657,60 @@ fn trim_ranges_for_range(ranges: &mut Vec<(u64, u64)>, start: u64, len: u64) {
     *ranges = next;
 }
 
+fn trim_remap_snapshots_for_range(
+    snapshots: &mut std::collections::HashMap<u64, Vec<u8>>,
+    start: u64,
+    len: u64,
+) {
+    let Some(end) = start.checked_add(len) else {
+        snapshots.clear();
+        return;
+    };
+    let mut retained = std::collections::HashMap::with_capacity(snapshots.len() + 1);
+    for (snapshot_start, bytes) in std::mem::take(snapshots) {
+        let Some(snapshot_len) = u64::try_from(bytes.len()).ok() else {
+            continue;
+        };
+        let Some(snapshot_end) = snapshot_start.checked_add(snapshot_len) else {
+            continue;
+        };
+        if snapshot_start >= end || start >= snapshot_end {
+            retained.insert(snapshot_start, bytes);
+            continue;
+        }
+        if snapshot_start < start {
+            let prefix_len = usize::try_from(start - snapshot_start)
+                .unwrap_or(bytes.len())
+                .min(bytes.len());
+            retained.insert(snapshot_start, bytes[..prefix_len].to_vec());
+        }
+        if end < snapshot_end {
+            let suffix_offset = usize::try_from(end - snapshot_start)
+                .unwrap_or(bytes.len())
+                .min(bytes.len());
+            retained.insert(end, bytes[suffix_offset..].to_vec());
+        }
+    }
+    *snapshots = retained;
+}
+
+fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
+    trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
+    trim_ranges_for_range(&mut mem.bus_fault_ranges, start, len);
+    trim_writable_memfd_maps_for_range(&mut mem.writable_memfd_maps, start, len);
+    trim_remap_snapshots_for_range(&mut mem.remap_snapshots, start, len);
+    let Some(remove) =
+        crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+    else {
+        return;
+    };
+    locked_ranges_remove(&mut mem.locked_ranges, remove);
+    locked_ranges_remove(&mut mem.resident_ranges, remove);
+    locked_ranges_remove(&mut mem.resident_tracked_ranges, remove);
+    remove_fault_range(&mut mem.resident_fault_ranges, remove);
+    locked_ranges_remove(&mut mem.write_sealed_shared_maps, remove);
+}
+
 fn shared_file_bus_offset(file_len: u64, offset: u64, length: u64, page_size: u64) -> Option<u64> {
     let bytes_available = file_len.saturating_sub(offset).min(length);
     let bus_start = align_up_u64(bytes_available, page_size)?;
@@ -524,6 +724,54 @@ fn host_fd_file_len(fd: i32) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// Eager MAP_PRIVATE materialization plus its map-time Linux EOF contract.
+/// Bytes through the last partially backed page are snapshotted and its EOF
+/// remainder stays zero-filled; pages wholly beyond that boundary are published
+/// as BUS_ADRERR. Carrick's existing private-file approximation is detached from
+/// the vnode, so a later external truncate is deliberately not tracked.
+struct PrivateMmapSnapshot {
+    bytes: Vec<u8>,
+    bus_fault_offset: Option<u64>,
+}
+
+fn snapshot_private_host_file(
+    host_fd: i32,
+    offset: u64,
+    bytes: &mut [u8],
+) -> Result<(), LinuxErrno> {
+    let mut copied = 0usize;
+    while copied < bytes.len() {
+        let copied_offset = u64::try_from(copied).map_err(|_| linux_errno::EOVERFLOW)?;
+        let file_offset = offset
+            .checked_add(copied_offset)
+            .and_then(|value| libc::off_t::try_from(value).ok())
+            .ok_or(linux_errno::EOVERFLOW)?;
+        let read = unsafe {
+            libc::pread(
+                host_fd,
+                bytes[copied..].as_mut_ptr().cast::<libc::c_void>(),
+                bytes.len() - copied,
+                file_offset,
+            )
+        };
+        if read == 0 {
+            break;
+        }
+        if read < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(linux_errno::EIO);
+        }
+        let read = usize::try_from(read).map_err(|_| linux_errno::EIO)?;
+        if read > bytes.len() - copied {
+            return Err(linux_errno::EIO);
+        }
+        copied += read;
+    }
+    Ok(())
 }
 
 fn mark_range_unmapped(memory: &mut impl GuestMemory, address: u64, len: usize) {
@@ -544,7 +792,163 @@ struct MadviseRangeMeta {
     locked: bool,
 }
 
+/// Owns alias exclusion from grow-down fault lookup through backend protection
+/// and dispatcher metadata publication.
+pub(crate) struct MmapGrowdownFaultPlan {
+    start: u64,
+    len: usize,
+    exclusion: super::HostAliasDispatchGuard,
+}
+
+impl MmapGrowdownFaultPlan {
+    pub(crate) fn start(&self) -> u64 {
+        self.start
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// Owns alias exclusion from resident-fault lookup through backend protection
+/// and residency publication.
+pub(crate) struct ResidentFaultPlan {
+    page: u64,
+    prot: u64,
+    exclusion: super::HostAliasDispatchGuard,
+}
+
+impl ResidentFaultPlan {
+    pub(crate) fn page(&self) -> u64 {
+        self.page
+    }
+
+    pub(crate) fn prot(&self) -> u64 {
+        self.prot
+    }
+}
+
 impl SyscallDispatcher {
+    fn recover_private_repoint_failure(
+        &self,
+        candidate: u64,
+        failure: carrick_guest_mem::RepointPrivateError,
+    ) -> PrivateRepointRecovery {
+        match failure {
+            carrick_guest_mem::RepointPrivateError::Clean(_) => {
+                if self.mem.lock().overlay.free(candidate).is_none() {
+                    std::process::abort();
+                }
+                PrivateRepointRecovery::RecoveredCleanly
+            }
+            carrick_guest_mem::RepointPrivateError::Indeterminate(_) => {
+                PrivateRepointRecovery::FailStopRetainingOwners
+            }
+        }
+    }
+
+    pub(super) fn commit_host_alias_mmap(&self, commit: HostAliasMmapCommit) {
+        let Some(end) = commit.start.checked_add(commit.len) else {
+            std::process::abort();
+        };
+        let Some(replacement) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(commit.start), GuestVa(end))
+        else {
+            std::process::abort();
+        };
+        let (read, write, execute) = prot_to_proc_perms(commit.prot);
+        let mut mem = self.mem.lock();
+
+        // Remove only the replaced range from every classification. This is
+        // the same cleanup used by munmap/shmdt; range-aware trimming preserves
+        // disjoint sibling changes and both fragments of a partial replacement.
+        remove_mapping_metadata_locked(&mut mem, commit.start, commit.len);
+
+        if let Some((start, len)) = commit.bus_fault {
+            mem.bus_fault_ranges.push((start, len));
+        }
+        if commit.resident {
+            locked_ranges_insert(&mut mem.resident_ranges, replacement);
+        }
+        if let Some(locked) = commit.locked {
+            locked_ranges_insert(&mut mem.resident_ranges, locked);
+            locked_ranges_insert(&mut mem.locked_ranges, locked);
+        }
+        if commit.write_sealed_shared {
+            locked_ranges_insert(&mut mem.write_sealed_shared_maps, replacement);
+        }
+        if let Some(description) = commit.writable_memfd {
+            mem.writable_memfd_maps.push((replacement, description));
+        }
+        let entry = ProcMapsEntry {
+            start: commit.start,
+            end,
+            read,
+            write,
+            execute,
+            sharing: commit.sharing,
+            path: commit.path,
+        };
+        let idx = mem
+            .dynamic_maps
+            .partition_point(|map| map.start < commit.start);
+        mem.dynamic_maps.insert(idx, entry);
+    }
+
+    /// Snapshot one MAP_PRIVATE file payload into anonymous materialization
+    /// bytes. The destination starts zeroed, so EOF supplies the Linux mapping's
+    /// zero tail. Every fallible file/device operation completes before a fixed
+    /// replacement can touch the prior VMA.
+    fn snapshot_private_mmap_file(
+        &self,
+        fd: Fd,
+        offset: u64,
+        length: usize,
+    ) -> Result<PrivateMmapSnapshot, LinuxErrno> {
+        let mut bytes = vec![0; length];
+        let length_u64 = u64::try_from(length).map_err(|_| linux_errno::EOVERFLOW)?;
+        let page_size = self.linux_page_size();
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Err(LINUX_EBADF);
+        };
+        let open = open_file.description.read();
+        let offset_usize = usize::try_from(offset).map_err(|_| linux_errno::EOVERFLOW)?;
+        let bus_fault_offset = match &*open {
+            OpenDescription::File { contents, .. } => {
+                let available = contents.read_at(offset_usize, length);
+                bytes[..available.len()].copy_from_slice(&available);
+                shared_file_bus_offset(contents.len() as u64, offset, length_u64, page_size)
+            }
+            OpenDescription::SyntheticFile { contents, .. } => {
+                if offset_usize < contents.len() {
+                    let available = &contents[offset_usize..];
+                    let copy_len = available.len().min(length);
+                    bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+                }
+                shared_file_bus_offset(contents.len() as u64, offset, length_u64, page_size)
+            }
+            OpenDescription::HostFile { host_fd, .. } => {
+                let file_len = host_fd_file_len(host_fd.raw()).ok_or(linux_errno::EIO)?;
+                snapshot_private_host_file(host_fd.raw(), offset, &mut bytes)?;
+                shared_file_bus_offset(file_len, offset, length_u64, page_size)
+            }
+            OpenDescription::HostPipe { host_fd, .. } => {
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                let is_chardev = unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
+                    && (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFCHR as u32;
+                if !is_chardev {
+                    return Err(linux_errno::ENODEV);
+                }
+                None
+            }
+            _ => return Err(LINUX_EBADF),
+        };
+        Ok(PrivateMmapSnapshot {
+            bytes,
+            bus_fault_offset,
+        })
+    }
+
     /// Derive `madvise` range validity + properties from carrick's mapping
     /// metadata (`dynamic_maps` plus the boot address-space regions), never by
     /// probing a page. Coverage unions both sources so an advise on an
@@ -642,6 +1046,33 @@ impl SyscallDispatcher {
         dynamic_mapping_overlaps_sorted(&self.mem.lock().dynamic_maps, start, len)
     }
 
+    /// Whether `[start, start + len)` overlaps a Linux-visible guest VMA.
+    ///
+    /// The boot snapshot includes Carrick's hidden heap and mmap backing arenas;
+    /// those reservations are not VMAs by themselves. Dynamic mappings inside
+    /// either arena and the live `[heap_base, brk_current)` span are real VMAs and
+    /// are checked separately before the hidden boot reservations are filtered.
+    pub(super) fn guest_vma_overlaps(&self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return true;
+        };
+        let mem = self.mem.lock();
+        if dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len) {
+            return true;
+        }
+        if mem.brk_current > mem.layout.heap_base
+            && start < mem.brk_current
+            && mem.layout.heap_base < end
+        {
+            return true;
+        }
+        mem.address_space_regions.iter().flatten().any(|map| {
+            map.start < end
+                && start < map.end
+                && !boot_region_is_hidden_reservation(map, mem.layout)
+        })
+    }
+
     fn range_intersects_shared_mapping(&self, start: u64, len: u64) -> bool {
         let Some(end) = start.checked_add(len) else {
             return false;
@@ -710,14 +1141,6 @@ impl SyscallDispatcher {
             .any(|r| ranges_overlap(start, len, r.start().raw(), r.end().raw()))
     }
 
-    fn remove_write_sealed_shared_map(&self, start: u64, len: u64) {
-        if let Some(range) =
-            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
-        {
-            locked_ranges_remove(&mut self.mem.lock().write_sealed_shared_maps, range);
-        }
-    }
-
     fn record_writable_memfd_map(&self, start: u64, len: u64, description: OpenDescriptionRef) {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
@@ -729,14 +1152,15 @@ impl SyscallDispatcher {
         }
     }
 
-    fn remove_writable_memfd_map(&self, start: u64, len: u64) {
-        let Some(end) = start.checked_add(len) else {
-            return;
-        };
-        self.mem
-            .lock()
-            .writable_memfd_maps
-            .retain(|(range, _)| !(range.start().raw() < end && start < range.end().raw()));
+    /// Remove every dispatcher-owned mmap classification for a committed range.
+    /// Call only after the backend unmap has succeeded: metadata is the commit
+    /// record, not a prediction of a fallible page-table/host operation.
+    ///
+    /// `pub(super)` is intentional: SysV `shmdt` owns an mmap-classified host
+    /// alias too and must retire the same VMA/residency/lock/fault/bus/seal/memfd
+    /// state before it removes the attachment and decrements `nattch`.
+    pub(super) fn remove_mapping_metadata(&self, start: u64, len: u64) {
+        remove_mapping_metadata_locked(&mut self.mem.lock(), start, len);
     }
 
     /// True iff a live MAP_SHARED, PROT_WRITE mapping backed by `description`
@@ -787,19 +1211,64 @@ impl SyscallDispatcher {
         mem.dynamic_maps.insert(idx, entry);
     }
 
-    fn remove_dynamic_mapping(&self, start: u64, len: u64) {
-        let mut mem = self.mem.lock();
-        trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
-        if start.checked_add(len).is_none() {
-            mem.remap_snapshots.clear();
-            return;
+    /// Recover the one source VMA `mremap` is allowed to transform. Combining
+    /// adjacent VMAs by OR-ing their permission bits can manufacture broader
+    /// access than either source had (for example RX + R becoming one RX move),
+    /// and a byte-copy cannot preserve mixed backing identities. Reject a gap or
+    /// any range spanning more than one VMA before touching allocator/backing
+    /// state, matching Linux's `EFAULT` for an invalid old mapping range.
+    fn mremap_mapping_metadata(
+        &self,
+        memory: &impl GuestMemory,
+        start: u64,
+        len: u64,
+    ) -> Result<MremapMappingMetadata, LinuxErrno> {
+        let end = start.checked_add(len).ok_or(LINUX_EFAULT)?;
+        let mem = self.mem.lock();
+        let mut overlapping_dynamic = mem
+            .dynamic_maps
+            .iter()
+            .filter(|map| map.start < end && map.end > start);
+        if let Some(first) = overlapping_dynamic.next() {
+            if first.start > start || first.end < end || overlapping_dynamic.next().is_some() {
+                return Err(LINUX_EFAULT);
+            }
+            return Ok(proc_maps_entry_mremap_metadata(first));
         }
-        mem.remap_snapshots.retain(|snapshot_start, bytes| {
-            let snapshot_end = snapshot_start
-                .checked_add(bytes.len() as u64)
-                .unwrap_or(u64::MAX);
-            !ranges_overlap(start, len, *snapshot_start, snapshot_end)
-        });
+
+        // Complete mapping metadata is authoritative over the retained boot
+        // backing. A prior munmap leaves the arena bytes addressable to some VMM
+        // backends, but it must not let the boot snapshot recreate a source VMA.
+        let len_usize = usize::try_from(len).map_err(|_| LINUX_EFAULT)?;
+        if memory.has_complete_mapping_metadata()
+            && memory.protections().is_some_and(|protections| {
+                !protections
+                    .unmapped_intersections(start, len_usize)
+                    .is_empty()
+            })
+        {
+            return Err(LINUX_EFAULT);
+        }
+        let mut covering_regions = mem
+            .address_space_regions
+            .iter()
+            .flatten()
+            .filter(|map| map.start <= start && map.end >= end);
+        let Some(region) = covering_regions.next() else {
+            return Err(LINUX_EFAULT);
+        };
+        if covering_regions.next().is_some() {
+            return Err(LINUX_EFAULT);
+        }
+        // The real boot snapshot includes full heap/mmap backing reservations.
+        // Identify those by their exact layout extent rather than by address:
+        // an ELF/test VMA may legitimately live at the same VA as a synthetic
+        // arena in a custom layout. The mmap reservation is never a source VMA;
+        // only the live brk prefix of the heap reservation is.
+        if boot_region_source_intersects_hidden_backing(region, &mem, end) {
+            return Err(LINUX_EFAULT);
+        }
+        Ok(proc_maps_entry_mremap_metadata(region))
     }
 
     pub(in crate::dispatch) fn record_mmap_bus_fault_range(&self, start: u64, len: u64) {
@@ -810,6 +1279,7 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn mmap_fault_is_sigbus(&self, addr: u64) -> bool {
+        let _host_alias_dispatch = self.begin_host_alias_dispatch();
         self.mem
             .lock()
             .bus_fault_ranges
@@ -831,7 +1301,8 @@ impl SyscallDispatcher {
         self.mem.lock().growdown_ranges.push((low, start, end));
     }
 
-    pub(crate) fn mmap_growdown_fault_plan(&self, addr: u64) -> Option<(u64, usize)> {
+    pub(crate) fn mmap_growdown_fault_plan(&self, addr: u64) -> Option<MmapGrowdownFaultPlan> {
+        let exclusion = self.begin_host_alias_dispatch();
         let page = page_floor(addr, self.linux_page_size());
         let mem = self.mem.lock();
         for &(low, current, _end) in &mem.growdown_ranges {
@@ -844,17 +1315,24 @@ impl SyscallDispatcher {
                     return None;
                 }
                 let len = usize::try_from(current - page).ok()?;
-                return Some((page, len));
+                return Some(MmapGrowdownFaultPlan {
+                    start: page,
+                    len,
+                    exclusion,
+                });
             }
         }
         None
     }
 
-    pub(crate) fn commit_mmap_growdown(&self, new_start: u64) {
+    pub(crate) fn commit_mmap_growdown(&self, plan: MmapGrowdownFaultPlan) {
+        if !self.owns_host_alias_dispatch(&plan.exclusion) {
+            std::process::abort();
+        }
         let mut mem = self.mem.lock();
         for (_low, current, _end) in &mut mem.growdown_ranges {
-            if new_start < *current {
-                *current = new_start;
+            if plan.start < *current {
+                *current = plan.start;
                 break;
             }
         }
@@ -975,33 +1453,69 @@ impl SyscallDispatcher {
         Some((address, stale))
     }
 
-    /// Write a freed `SharedFile` allocation's bytes back to its host fd and
-    /// close the owned dup. `SharedAnon` frees need no writeback. Called from
-    /// `munmap` (close_fd=true) and `msync` (close_fd=false, no free).
+    /// Snapshot one `SharedFile` fragment while its old guest translation is
+    /// still live. The snapshot is committed only after backend mutation
+    /// succeeds, so a clean failure cannot produce duplicate writeback.
+    fn snapshot_shared_writeback<M: GuestMemory>(
+        &self,
+        memory: &mut M,
+        alloc: &crate::shared_aperture::SharedAlloc,
+    ) -> Option<Vec<u8>> {
+        alloc.backing.shared_file_parts()?;
+        let len = usize::try_from(alloc.live_len).ok()?;
+        if len == 0 {
+            return None;
+        }
+        memory.read_bytes(alloc.guest_addr, len).ok()
+    }
+
+    /// Commit bytes captured by [`Self::snapshot_shared_writeback`]. Descriptor
+    /// ownership lives in the backing's shared RAII owner: carving clones that
+    /// owner into survivors, so fragment retirement never double-closes.
+    fn writeback_shared_snapshot(&self, alloc: &crate::shared_aperture::SharedAlloc, bytes: &[u8]) {
+        let Some((host_fd, offset)) = alloc.backing.shared_file_parts() else {
+            return;
+        };
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let Ok(written_offset) = u64::try_from(written) else {
+                break;
+            };
+            let Some(file_offset) = offset
+                .checked_add(written_offset)
+                .and_then(|value| libc::off_t::try_from(value).ok())
+            else {
+                break;
+            };
+            let result = unsafe {
+                libc::pwrite(
+                    host_fd,
+                    bytes[written..].as_ptr().cast(),
+                    bytes.len() - written,
+                    file_offset,
+                )
+            };
+            if result > 0 {
+                let Ok(count) = usize::try_from(result) else {
+                    break;
+                };
+                written = written.saturating_add(count);
+                continue;
+            }
+            if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+    }
+
     fn writeback_shared<M: GuestMemory>(
         &self,
-        cx: &mut SyscallCtx<'_, M>,
+        memory: &mut M,
         alloc: &crate::shared_aperture::SharedAlloc,
-        close_fd: bool,
     ) {
-        if let crate::shared_aperture::BackingObject::SharedFile { host_fd, offset } = alloc.backing
-        {
-            let len = usize::try_from(alloc.len).unwrap_or(0);
-            if len > 0
-                && let Ok(bytes) = cx.memory.read_bytes(alloc.guest_addr, len)
-            {
-                unsafe {
-                    libc::pwrite(
-                        host_fd,
-                        bytes.as_ptr() as *const _,
-                        bytes.len(),
-                        offset as libc::off_t,
-                    );
-                }
-            }
-            if close_fd {
-                unsafe { libc::close(host_fd) };
-            }
+        if let Some(bytes) = self.snapshot_shared_writeback(memory, alloc) {
+            self.writeback_shared_snapshot(alloc, &bytes);
         }
     }
 
@@ -1132,6 +1646,7 @@ impl SyscallDispatcher {
         }
 
         fn brk(this, cx, requested: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let mut mem = this.mem.lock();
             let current = mem.brk_current;
             if requested == 0 {
@@ -1176,6 +1691,7 @@ impl SyscallDispatcher {
         }
 
         fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
+            let host_alias_dispatch = this.begin_host_alias_dispatch();
             let mut flags = flags;
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
@@ -1337,73 +1853,172 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
 
-            // MAP_FIXED|MAP_PRIVATE|ANON landing on a shared-aperture VA: the
-            // guest wants a genuinely PRIVATE page at exactly this (currently
-            // shared) address. Writing through to the shared backing would leak
-            // the guest's "private" stores to every other mapper and across
-            // fork (the mapfixed privacy bug). Instead carve a slot in the
-            // per-process private overlay aperture and repoint this VA's stage-1
-            // leaf to it — stage-1 ONLY, since the overlay window is boot-mapped
-            // (no post-vCPU hv_vm_map, per the durable-memory rule). requested.0
-            // and length are already validated page-aligned/non-zero above.
-            // (MAP_FIXED|MAP_PRIVATE of a FILE over a shared-aperture VA is a
-            // tracked remainder — the probe and common case are anon.)
+            // MAP_FIXED|MAP_PRIVATE landing on a shared-aperture VA needs a
+            // genuine per-process backing object before any Private provenance or
+            // executable cacheability is published. File mappings are eagerly
+            // snapshotted into a complete zero-tailed payload first; anonymous
+            // mappings use the same transaction with an all-zero snapshot. Then
+            // repoint stage-1 into a fresh private-overlay slot. The boot-mapped
+            // overlay avoids post-vCPU stage-2 mutation, and native identity
+            // backends atomically replace the host mapping with MAP_PRIVATE anon.
             if map_flags.contains(LinuxMmapFlags::FIXED)
                 && map_sharing == MmapSharing::Private
-                && map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && crate::memory::va_in_shared_aperture(requested.0, length)
             {
+                let snapshot = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+                    PrivateMmapSnapshot {
+                        bytes: vec![0u8; length_usize],
+                        bus_fault_offset: None,
+                    }
+                } else {
+                    match this.snapshot_private_mmap_file(fd, offset, length_usize) {
+                        Ok(snapshot) => snapshot,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    }
+                };
+                let bus_fault = snapshot.bus_fault_offset.and_then(|bus_offset| {
+                    Some((
+                        requested.0.checked_add(bus_offset)?,
+                        length.checked_sub(bus_offset)?,
+                    ))
+                });
                 let locked_range =
                     this.prepare_mmap_locked_range(map_flags, requested.0, length)?;
-                if let Some(range) = locked_range {
-                    this.populate_resident_range(memory, range)?;
-                }
-                let overlay_va = {
+                // Keep every prior overlay fragment live until the fresh
+                // replacement is installed. A clean repoint failure can then free
+                // only the candidate and leave old translation/ownership exact.
+                // Exact sub-granule fragments stay quarantined in the aperture
+                // free list until they coalesce into an aligned allocation.
+                let (overlay_va, displaced_shared_preview) = {
                     let mut mem = this.mem.lock();
-                    // Re-MAP_FIXED over the same VA: free the prior overlay slot.
-                    if let Some(old) = mem.overlay.find_by_source(requested.0) {
-                        mem.overlay.free(old);
+                    if !mem
+                        .overlay
+                        .source_range_is_carvable(requested.0, length, None)
+                        || !mem.shared.guest_range_is_carvable(requested.0, length)
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
-                    mem.overlay.alloc_sourced(
+                    let Some(displaced) = mem.shared.guest_range_fragments(requested.0, length)
+                    else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    let overlay = mem.overlay.alloc_sourced(
                         length,
                         crate::shared_aperture::BackingObject::PrivateAnon,
                         Some(requested.0),
-                    )
+                    );
+                    (overlay, displaced)
                 };
                 let Some(overlay_va) = overlay_va else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                // Anonymous => fresh zero page. Seed + stage-1 repoint atomically
-                // on the engine; on failure roll the slot back so it's reusable.
-                let zeros = vec![0u8; length_usize];
-                if memory
-                    .repoint_private(requested.0, overlay_va, length_usize, &zeros)
-                    .is_err()
-                {
-                    this.mem.lock().overlay.free(overlay_va);
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                // Capture exact SharedFile fragments while the old translation
+                // is live, but defer pwrite until repoint succeeds. A clean
+                // backend failure therefore leaves ownership and writeback both
+                // uncommitted.
+                let displaced_shared_snapshots = displaced_shared_preview
+                    .iter()
+                    .map(|alloc| this.snapshot_shared_writeback(memory, alloc))
+                    .collect::<Vec<_>>();
+                if let Err(failure) = memory.repoint_private(
+                    requested.0,
+                    overlay_va,
+                    length_usize,
+                    &snapshot.bytes,
+                ) {
+                    match this.recover_private_repoint_failure(overlay_va, failure) {
+                        PrivateRepointRecovery::RecoveredCleanly => {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        }
+                        PrivateRepointRecovery::FailStopRetainingOwners => {
+                            // Live translation state is unknown. Retain BOTH the
+                            // fresh candidate and prior owners; recycling either
+                            // could hand active guest leaves to another mapping.
+                            std::process::abort();
+                        }
+                    }
                 }
+                for (alloc, bytes) in displaced_shared_preview
+                    .iter()
+                    .zip(&displaced_shared_snapshots)
+                {
+                    if let Some(bytes) = bytes {
+                        this.writeback_shared_snapshot(alloc, bytes);
+                    }
+                }
+                let displaced_shared = {
+                    let mut mem = this.mem.lock();
+                    if mem
+                        .overlay
+                        .carve_source_range(requested.0, length, Some(overlay_va))
+                        .is_none()
+                    {
+                        // Backend publication succeeded, so ownership cannot be
+                        // recovered if the validated carve transaction disappeared.
+                        std::process::abort();
+                    }
+                    let Some(displaced) = mem
+                        .shared
+                        .reserve_private_range(requested.0, length)
+                    else {
+                        std::process::abort();
+                    };
+                    displaced
+                };
+                drop(displaced_shared);
+                drop(displaced_shared_preview);
                 let prot_none = prot_flags.is_empty();
-                memory.set_mapping_protection(
+                memory.set_mapping_protection_and_sharing(
                     requested.0,
                     length_usize,
                     prot_none,
                     !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
+                    carrick_guest_mem::MappingSharing::Private,
                 );
                 if memory
                     .protect_range(requested.0, length_usize, prot)
                     .is_err()
                 {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    // Repoint succeeded, so the prior mapping cannot be restored.
+                    // Match the runtime alias transaction: do not return to the
+                    // guest with split backing/metadata ownership after a
+                    // post-replacement failure.
+                    mark_range_unmapped(memory, requested.0, length_usize);
+                    std::process::abort();
                 }
-                this.commit_eager_locked_range(locked_range);
-                this.record_dynamic_mapping(
-                    requested.0,
-                    length,
-                    prot_flags,
-                    ProcMapSharing::Private,
-                    String::new(),
-                );
+                if let Some((bus_start, bus_len)) = bus_fault {
+                    let Ok(bus_len_usize) = usize::try_from(bus_len) else {
+                        std::process::abort();
+                    };
+                    if memory
+                        .protect_range(bus_start, bus_len_usize, 0)
+                        .is_err()
+                    {
+                        mark_range_unmapped(memory, requested.0, length_usize);
+                        std::process::abort();
+                    }
+                    memory.set_mapping_protection(bus_start, bus_len_usize, true, false);
+                    if let Some(protections) = memory.protections() {
+                        protections.set_bus_fault(bus_start, bus_len_usize, true);
+                    }
+                }
+                // The physical replacement and every required protection are
+                // now infallible history. Retire the exact predecessor range from
+                // all dispatcher classifications, then publish the new EOF tail,
+                // residency/lock state, and VMA as one ordered metadata commit.
+                this.commit_host_alias_mmap(HostAliasMmapCommit {
+                    start: requested.0,
+                    len: length,
+                    prot: prot_flags,
+                    sharing: ProcMapSharing::Private,
+                    path: String::new(),
+                    locked: locked_range,
+                    resident: !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                        || map_flags.contains(LinuxMmapFlags::POPULATE),
+                    bus_fault,
+                    write_sealed_shared: false,
+                    writable_memfd: None,
+                });
                 return Ok(DispatchOutcome::Returned {
                     value: requested.0 as i64,
                 });
@@ -1510,33 +2125,39 @@ impl SyscallDispatcher {
                     if pf.contains(LinuxProtFlags::WRITE) {
                         host_prot |= libc::PROT_WRITE;
                     }
-                    // Host-side EFAULT gate for a PROT_NONE file mapping: a
-                    // syscall buffer here must fault (the host backing is
-                    // itself PROT_NONE — touching it would crash carrick).
+                    // Host-side EFAULT gate for a PROT_NONE file mapping. The
+                    // runtime publishes permission + Shared metadata only after
+                    // the live host file mapping succeeds; publishing here would
+                    // expose a transient private/cacheable executable view.
                     let prot_none = pf.is_empty();
-                    if let Ok(l) = usize::try_from(length) {
-                        memory.set_mapping_protection(
-                            va,
-                            l,
-                            prot_none,
-                            !prot_none && !pf.contains(LinuxProtFlags::WRITE),
-                        );
-                    }
-                    this.mark_range_resident(va, length);
-                    this.commit_eager_locked_range(locked_range);
-                    this.record_dynamic_mapping(
-                        va,
-                        length,
-                        prot_flags,
-                        ProcMapSharing::Shared,
-                        String::new(),
-                    );
+                    let transaction = host_alias_dispatch.publish(HostAliasCommit::mmap(
+                        HostAliasMmapCommit {
+                            start: va,
+                            len: length,
+                            prot: prot_flags,
+                            sharing: ProcMapSharing::Shared,
+                            path: String::new(),
+                            locked: locked_range,
+                            resident: true,
+                            bus_fault: None,
+                            write_sealed_shared: false,
+                            writable_memfd: None,
+                        },
+                    ));
                     return Ok(DispatchOutcome::MapHostAlias {
+                        transaction,
                         va: GuestVa(va),
                         ipa: Gpa(ipa),
                         len: length,
                         payload: Vec::new(),
-                        file: Some((dup_fd, offset as libc::off_t, host_prot)),
+                        file: Some((
+                            // SAFETY: `dup_fd` is the successful, uniquely-owned
+                            // descriptor created above and is transferred into
+                            // the non-cloneable outcome exactly once.
+                            unsafe { HostAliasOwnedFd::from_raw_fd(dup_fd) },
+                            offset as libc::off_t,
+                            host_prot,
+                        )),
                         shared: true,
                         prot,
                         prot_none,
@@ -1554,19 +2175,49 @@ impl SyscallDispatcher {
                 let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
                 let alloc = {
                     let mut mem = this.mem.lock();
-                    mem.shared
-                        .alloc_sourced_with_reuse(
-                            map_len,
-                            crate::shared_aperture::BackingObject::SharedAnon,
-                            None,
-                        )
+                    mem.shared.alloc_sourced_with_reuse(
+                        length,
+                        crate::shared_aperture::BackingObject::SharedAnon,
+                        None,
+                    )
                 };
                 if let Some((addr, reused)) = alloc {
                     let map_len_usize = usize::try_from(map_len)
                         .map_err(|_| DispatchError::LengthTooLarge(map_len))?;
                     let locked_range = this.prepare_mmap_locked_range(map_flags, addr, length)?;
-                    if reused {
-                        let _ = memory.zero_backing(addr, map_len_usize);
+                    if reused
+                        && memory
+                            .zero_anonymous_reuse(
+                                addr,
+                                map_len_usize,
+                                carrick_guest_mem::MappingSharing::Shared,
+                            )
+                            .is_err()
+                    {
+                        this.mem.lock().shared.free(addr);
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
+                    let needs_identity_restore = this
+                        .mem
+                        .lock()
+                        .shared
+                        .range_needs_identity_restore(addr, map_len);
+                    if needs_identity_restore {
+                        if memory.restore_shared_identity(addr, map_len_usize).is_err() {
+                            // The page-table edit may already be live even when
+                            // its required TLB flush reports failure. Recycling
+                            // this VA would publish unowned translation state.
+                            std::process::abort();
+                        }
+                        if this
+                            .mem
+                            .lock()
+                            .shared
+                            .mark_identity_restored(addr, map_len)
+                            .is_none()
+                        {
+                            std::process::abort();
+                        }
                     }
                     // Make the REQUESTED protection guest-visible: the
                     // aperture is boot-mapped RW, so without this a store
@@ -1577,46 +2228,57 @@ impl SyscallDispatcher {
                     // the eager arena (mirrors the file-mmap arm); the
                     // host-side no_access gate is kept in sync for EFAULT.
                     let prot_none = prot_flags.is_empty();
-                    memory.set_mapping_protection(
+                    memory.set_mapping_protection_and_sharing(
                         addr,
                         map_len_usize,
                         prot_none,
                         !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
+                        carrick_guest_mem::MappingSharing::Shared,
                     );
-                    if prot_none {
-                        let _ = memory.protect_range(addr, map_len_usize, 0);
+                    let protection = if prot_none {
+                        memory.protect_range(addr, map_len_usize, 0)
                     } else if memory
-                        .resident_pages(
-                            GuestVa(addr),
-                            1,
-                            this.linux_page_size(),
-                        )
+                        .resident_pages(GuestVa(addr), 1, this.linux_page_size())
                         .is_none()
                     {
                         // Backends without live host residency use a temporary
                         // inaccessible mapping to observe the first touch.
-                        let _ = memory.protect_range(addr, map_len_usize, 0);
-                        this.track_resident_fault_range(addr, length, prot_flags);
-                        // The temporary backing state is not the guest VMA
-                        // permission. Preserve the requested Linux metadata.
-                        memory.set_mapping_protection(
-                            addr,
-                            map_len_usize,
-                            false,
-                            !prot_flags.contains(LinuxProtFlags::WRITE),
-                        );
-                        if let Some(protections) = memory.protections() {
-                            protections.set_executable(
+                        let protected = memory.protect_range(addr, map_len_usize, 0);
+                        if protected.is_ok() {
+                            this.track_resident_fault_range(addr, length, prot_flags);
+                            // The temporary backing state is not the guest VMA
+                            // permission. Preserve the requested Linux metadata.
+                            memory.set_mapping_protection(
                                 addr,
                                 map_len_usize,
-                                prot_flags.contains(LinuxProtFlags::EXEC),
+                                false,
+                                !prot_flags.contains(LinuxProtFlags::WRITE),
                             );
+                            if let Some(protections) = memory.protections() {
+                                protections.set_executable(
+                                    addr,
+                                    map_len_usize,
+                                    prot_flags.contains(LinuxProtFlags::EXEC),
+                                );
+                            }
                         }
+                        protected
                     } else {
                         // Native identity mappings expose real host residency;
                         // apply the requested guest permission directly without
-                        // manufacturing a demand fault.
-                        let _ = memory.protect_range(addr, map_len_usize, prot);
+                        // manufacturing a demand fault. This call also consumes
+                        // a failure recorded by the preceding void metadata
+                        // setter; an error must roll the allocation back.
+                        memory.protect_range(addr, map_len_usize, prot)
+                    };
+                    if protection.is_err() && memory.supports_concurrent_exec_protection() {
+                        this.rollback_shared_anon_mapping(
+                            memory,
+                            addr,
+                            length,
+                            map_len_usize,
+                        )?;
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                     if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
                         memory.set_mapping_protection(addr, map_len_usize, false, false);
@@ -1626,7 +2288,12 @@ impl SyscallDispatcher {
                             crate::linux_abi::LINUX_PROT_READ
                                 | crate::linux_abi::LINUX_PROT_WRITE,
                         );
-                        this.rollback_shared_anon_mapping(addr, length);
+                        this.rollback_shared_anon_mapping(
+                            memory,
+                            addr,
+                            length,
+                            map_len_usize,
+                        )?;
                         return Ok(DispatchOutcome::errno(errno));
                     }
                     this.record_dynamic_mapping(
@@ -1663,7 +2330,16 @@ impl SyscallDispatcher {
                 // Pool built on a freed 16 MiB b'X' buffer → 0x58.. ptr → SIGSEGV).
                 // MAP_FIXED|ANON also overwrites a caller-selected range, so it
                 // cannot rely on the bump allocator's pristine-tail invariant.
-                let _ = memory.zero_backing(address, length_usize);
+                if memory
+                    .zero_anonymous_reuse(
+                        address,
+                        length_usize,
+                        map_sharing.guest_mapping_sharing(),
+                    )
+                    .is_err()
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
             }
 
             // Restore guest-visible stage-1 validity for arena allocations: a
@@ -1675,7 +2351,13 @@ impl SyscallDispatcher {
             let prot_none = prot_flags.is_empty();
             if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
-                memory.set_mapping_protection(address, length_usize, true, false);
+                memory.set_mapping_protection_and_sharing(
+                    address,
+                    length_usize,
+                    true,
+                    false,
+                    map_sharing.guest_mapping_sharing(),
+                );
                 // protect_range runs UNCONDITIONALLY so a demand-paged backend
                 // (bhyve) records a reservation across the WHOLE mmap arena,
                 // not just the first `mmap_arena_size()` bytes — Go's page
@@ -1683,7 +2365,10 @@ impl SyscallDispatcher {
                 // is fatal only inside the eager arena (where eager backends
                 // must succeed); an out-of-arena protect_range failure is
                 // benign (KVM/NVMM host-map lazily, HVF maps the arena eagerly).
-                if memory.protect_range(address, length_usize, 0).is_err() && in_arena {
+                if memory.protect_range(address, length_usize, 0).is_err()
+                    && (in_arena || memory.supports_concurrent_exec_protection())
+                {
+                    mark_range_unmapped(memory, address, length_usize);
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 this.commit_mmap_locked_range(memory, locked_range)?;
@@ -1706,15 +2391,19 @@ impl SyscallDispatcher {
                 && !mmap_address_uses_alias(address, length, layout)
             {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
-                memory.set_mapping_protection(
+                memory.set_mapping_protection_and_sharing(
                     address,
                     length_usize,
                     false,
                     !prot_flags.contains(LinuxProtFlags::WRITE),
+                    map_sharing.guest_mapping_sharing(),
                 );
                 // Unconditional (see the PROT_NONE arm above): reserve across
                 // the whole arena for demand-paged backends; fatal only in-arena.
-                if memory.protect_range(address, length_usize, prot).is_err() && in_arena {
+                if memory.protect_range(address, length_usize, prot).is_err()
+                    && (in_arena || memory.supports_concurrent_exec_protection())
+                {
+                    mark_range_unmapped(memory, address, length_usize);
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 this.commit_mmap_locked_range(memory, locked_range)?;
@@ -1843,12 +2532,10 @@ impl SyscallDispatcher {
                 bytes
             };
 
-            if mmap_write_sealed_shared {
-                this.record_write_sealed_shared_map(address, length);
-            }
-            if let Some(description) = writable_memfd_desc {
-                this.record_writable_memfd_map(address, length, description);
-            }
+            // Auxiliary memfd/seal state is published only after every
+            // fallible backing/protection operation below succeeds. Recording
+            // it here would leave a ghost live mapping when an identity-host
+            // mprotect fails before dynamic VMA publication.
 
             // Guest-chosen mmap addresses outside Carrick's low identity arenas
             // use alias backing. VAs >= 1 TiB need this because HVF's IPA is
@@ -1893,43 +2580,32 @@ impl SyscallDispatcher {
                 let Some(ipa) = crate::memory::alloc_alias_ipa(length) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                // Alias mappings frequently overlay an earlier PROT_NONE
-                // reservation (Rosetta reserves the x86 stack/binary span anon
-                // PROT_NONE, then MAP_FIXEDs RW/file segments in; Go probes its
-                // arena with PROT_NONE before mapping usable pages). The guest's
-                // own accesses translate via the page tables map_aliased installs,
-                // but carrick's syscall-path EFAULT check consults `no_access` —
-                // clear it here, or reads/writes of guest buffers in this range
-                // wrongly EFAULT.
-                memory.set_mapping_protection(
-                    address,
-                    length_usize,
-                    prot_none,
-                    !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
-                );
-                if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
-                    || map_flags.contains(LinuxMmapFlags::POPULATE)
-                {
-                    this.mark_range_resident(address, length);
-                }
-                this.commit_eager_locked_range(locked_range);
-                this.record_dynamic_mapping(
-                    address,
-                    length,
-                    prot_flags,
-                    map_sharing.proc_map_sharing(),
-                    String::new(),
-                );
-                if let Some(bus_offset) = bus_fault_offset
-                    && let Some(bus_start) = address.checked_add(bus_offset)
-                    && let Some(bus_len) = length.checked_sub(bus_offset)
-                    && let Ok(bus_len_usize) = usize::try_from(bus_len)
-                {
-                    memory.set_no_access(bus_start, bus_len_usize, true);
-                    let _ = memory.protect_range(bus_start, bus_len_usize, 0);
-                    this.record_mmap_bus_fault_range(bus_start, bus_len);
-                }
+                // Alias VMA/lock/residency/bus/seal state is a pending commit:
+                // no dispatcher metadata changes until the runtime reports the
+                // host mapping and every subrange protection successful.
+                let bus_fault = bus_fault_offset.and_then(|bus_offset| {
+                    Some((
+                        address.checked_add(bus_offset)?,
+                        length.checked_sub(bus_offset)?,
+                    ))
+                });
+                let transaction = host_alias_dispatch.publish(HostAliasCommit::mmap(
+                    HostAliasMmapCommit {
+                        start: address,
+                        len: length,
+                        prot: prot_flags,
+                        sharing: map_sharing.proc_map_sharing(),
+                        path: String::new(),
+                        locked: locked_range,
+                        resident: !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                            || map_flags.contains(LinuxMmapFlags::POPULATE),
+                        bus_fault,
+                        write_sealed_shared: mmap_write_sealed_shared,
+                        writable_memfd: writable_memfd_desc,
+                    },
+                ));
                 return Ok(DispatchOutcome::MapHostAlias {
+                    transaction,
                     va: GuestVa(address),
                     ipa: Gpa(ipa),
                     len: length,
@@ -1950,23 +2626,31 @@ impl SyscallDispatcher {
             // requested Linux permission immediately afterward.
             if !bytes.is_empty() {
                 let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
-                if memory.protect_range(address, length_usize, rw).is_err() && in_arena {
+                if memory.protect_range(address, length_usize, rw).is_err()
+                    && (in_arena || memory.supports_concurrent_exec_protection())
+                {
+                    mark_range_unmapped(memory, address, length_usize);
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 if memory.write_bytes_unchecked(address, &bytes).is_err() {
+                    mark_range_unmapped(memory, address, length_usize);
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
             }
-            memory.set_mapping_protection(
+            memory.set_mapping_protection_and_sharing(
                 address,
                 length_usize,
                 prot_none,
                 !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
+                map_sharing.guest_mapping_sharing(),
             );
             // Make the requested protection guest-visible (also restores RW for
             // a reused range). prot==0 here means file-backed PROT_NONE.
             // Unconditional: reserve across the whole arena; fatal only in-arena.
-            if memory.protect_range(address, length_usize, prot).is_err() && in_arena {
+            if memory.protect_range(address, length_usize, prot).is_err()
+                && (in_arena || memory.supports_concurrent_exec_protection())
+            {
+                mark_range_unmapped(memory, address, length_usize);
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             if let Some(bus_offset) = bus_fault_offset
@@ -1975,7 +2659,11 @@ impl SyscallDispatcher {
                 && let Ok(bus_len_usize) = usize::try_from(bus_len)
             {
                 memory.set_no_access(bus_start, bus_len_usize, true);
-                let _ = memory.protect_range(bus_start, bus_len_usize, 0);
+                if memory.protect_range(bus_start, bus_len_usize, 0).is_err()
+                    && memory.supports_concurrent_exec_protection()
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
                 this.record_mmap_bus_fault_range(bus_start, bus_len);
             }
             // A file-backed mapping's content is loaded eagerly (above), and
@@ -1988,6 +2676,12 @@ impl SyscallDispatcher {
                 this.mark_range_resident(address, length);
             }
             this.commit_mmap_locked_range(memory, locked_range)?;
+            if mmap_write_sealed_shared {
+                this.record_write_sealed_shared_map(address, length);
+            }
+            if let Some(description) = writable_memfd_desc {
+                this.record_writable_memfd_map(address, length, description);
+            }
             this.record_dynamic_mapping(
                 address,
                 length,
@@ -2001,6 +2695,7 @@ impl SyscallDispatcher {
         }
 
         fn munmap(this, cx, address: GuestPtr, length: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let page_size = this.linux_page_size();
             // Linux munmap EINVAL edges (__vm_munmap): the address must be
             // page-aligned and the length non-zero. LTP munmap03 munmaps the
@@ -2012,44 +2707,91 @@ impl SyscallDispatcher {
             if length == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if let Some(len) = align_up_u64(length, page_size) {
-                this.remove_dynamic_mapping(address.0, len);
-                this.remove_write_sealed_shared_map(address.0, len);
-                this.remove_writable_memfd_map(address.0, len);
-                trim_ranges_for_range(&mut this.mem.lock().bus_fault_ranges, address.0, len);
-                if let Some(remove) = crate::vfs::GuestMemoryRange::new(
-                    GuestVa(address.0),
-                    GuestVa(address.0.saturating_add(len)),
-                ) {
-                    let mut mem = this.mem.lock();
-                    locked_ranges_remove(&mut mem.locked_ranges, remove);
-                    locked_ranges_remove(&mut mem.resident_ranges, remove);
-                    locked_ranges_remove(&mut mem.resident_tracked_ranges, remove);
-                    remove_fault_range(&mut mem.resident_fault_ranges, remove);
-                }
-            }
-            let freed = {
-                let mut mem = this.mem.lock();
-                // Release any private-overlay slot repointed at this VA (a
-                // MAP_FIXED|MAP_PRIVATE over a shared-aperture VA carved one via
-                // alloc_sourced + repoint_private); without this it leaks a slot
-                // in the bounded overlay window. Mirrors the re-MAP_FIXED path.
-                // (audit M11)
-                if let Some(slot) = mem.overlay.find_by_source(address.0) {
-                    mem.overlay.free(slot);
-                }
-                mem.shared.free(address.0)
+            let Some(aligned_len) = align_up_u64(length, page_size) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
-            if let Some(alloc) = freed {
-                // SharedFile backings write dirty bytes back and close the dup;
-                // SharedAnon frees are pure bookkeeping. The aperture stays
-                // stage-2 mapped — no hv_vm_unmap.
-                if let Some(len) = align_up_u64(length, page_size)
-                    && let Ok(len_usize) = usize::try_from(len)
-                {
-                    mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
+            let (
+                shared_owned,
+                shared_carvable,
+                shared_preview,
+                overlay_owned,
+                overlay_carvable,
+            ) = {
+                let mem = this.mem.lock();
+                (
+                    mem.shared.guest_range_has_owner(address.0, aligned_len),
+                    mem.shared.guest_range_is_carvable(address.0, aligned_len),
+                    mem.shared.guest_range_fragments(address.0, aligned_len),
+                    mem.overlay.source_range_has_owner(address.0, aligned_len),
+                    mem.overlay
+                        .source_range_is_carvable(address.0, aligned_len, None),
+                )
+            };
+            if shared_owned && !shared_carvable || overlay_owned && !overlay_carvable {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            }
+            if !shared_owned && overlay_owned {
+                let Ok(len_usize) = usize::try_from(aligned_len) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                if cx.memory.unmap_range(address.0, len_usize).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
-                this.writeback_shared(cx, &alloc, true);
+                mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
+                this.remove_mapping_metadata(address.0, aligned_len);
+                if this
+                    .mem
+                    .lock()
+                    .overlay
+                    .carve_source_range(address.0, aligned_len, None)
+                    .is_none()
+                {
+                    std::process::abort();
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            if shared_owned {
+                // SharedFile fragments write their exact dirty intervals back;
+                // SharedAnon removes are pure bookkeeping. The aperture stays
+                // stage-2 mapped — no hv_vm_unmap.
+                let Ok(len_usize) = usize::try_from(aligned_len) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                let Some(shared_preview) = shared_preview else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                // Capture while the shared guest translation is still live;
+                // commit pwrite only after backend unmap succeeds.
+                let shared_snapshots = shared_preview
+                    .iter()
+                    .map(|alloc| this.snapshot_shared_writeback(&mut *cx.memory, alloc))
+                    .collect::<Vec<_>>();
+                if cx.memory.unmap_range(address.0, len_usize).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
+                mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
+                this.remove_mapping_metadata(address.0, aligned_len);
+                let displaced_shared = {
+                    let mut mem = this.mem.lock();
+                    if mem
+                        .overlay
+                        .carve_source_range(address.0, aligned_len, None)
+                        .is_none()
+                    {
+                        std::process::abort();
+                    }
+                    let Some(displaced) = mem.shared.carve_guest_range(address.0, aligned_len) else {
+                        std::process::abort();
+                    };
+                    displaced
+                };
+                for (alloc, bytes) in shared_preview.iter().zip(&shared_snapshots) {
+                    if let Some(bytes) = bytes {
+                        this.writeback_shared_snapshot(alloc, bytes);
+                    }
+                }
+                drop(displaced_shared);
+                drop(shared_preview);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             // A canonical alias-window guest VA is a dynamic alias mapping:
@@ -2067,53 +2809,63 @@ impl SyscallDispatcher {
             // addresses >= 2^48 stay EINVAL via the range check below.
             let layout = this.mem.lock().layout;
             if mmap_address_uses_alias(address.0, length, layout) {
-                if let Some(len) = align_up_u64(length, page_size)
-                    && let Ok(len_usize) = usize::try_from(len)
+                let Ok(len_usize) = usize::try_from(aligned_len) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                // Alias teardown: invalidate AND reclaim the now-empty per-
+                // alias stage-1 sub-table (each MAP_SHARED file mapping took
+                // its own 2 MiB block + L3 table) — else the spare pool leaks
+                // one table per alias and a churning guest hits OutOfTables.
+                if cx
+                    .memory
+                    .unmap_alias_range(address.0, len_usize)
+                    .is_err()
                 {
-                    // Alias teardown: invalidate AND reclaim the now-empty per-
-                    // alias stage-1 sub-table (each MAP_SHARED file mapping took
-                    // its own 2 MiB block + L3 table) — else the spare pool leaks
-                    // one table per alias and a churning guest hits OutOfTables.
-                    let _ = cx.memory.unmap_alias_range(address.0, len_usize);
-                    mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
+                mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
+                this.remove_mapping_metadata(address.0, aligned_len);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if !range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if let Some(len) = align_up_u64(length, page_size) {
-                let mut mem = this.mem.lock();
-                // Invalidate the freed range in stage-1 (use-after-munmap faults
-                // in-guest) BEFORE returning it to the allocator, holding `mem`
-                // across the edit. A concurrent mmap that reuses this address
-                // must re-acquire `mem` to allocate it, so its validity-restore
-                // is strictly ordered AFTER this invalidate — otherwise a late
-                // invalidate could clobber the new owner's mapping and fault it.
-                // Best-effort: a failure leaves it accessible (pre-existing
-                // behavior).
-                if let Ok(len_usize) = usize::try_from(len) {
-                    let _ = cx.memory.unmap_range(address.0, len_usize);
-                    mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
+            let Ok(len_usize) = usize::try_from(aligned_len) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
+            // Invalidate the freed range before removing any dispatcher VMA
+            // metadata or returning it to the allocator.
+            if cx.memory.unmap_range(address.0, len_usize).is_err() {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            }
+            mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
+            this.remove_mapping_metadata(address.0, aligned_len);
+            let mut mem = this.mem.lock();
+            if mem
+                .overlay
+                .carve_source_range(address.0, aligned_len, None)
+                .is_none()
+            {
+                std::process::abort();
+            }
+            if address.0.checked_add(aligned_len) == Some(mem.mmap_next) {
+                mem.mmap_next = address.0;
+                while let Some(pos) = mem
+                    .free_regions
+                    .iter()
+                    .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                {
+                    let (s, _l) = mem.free_regions.remove(pos);
+                    mem.mmap_next = s;
                 }
-                if address.0.checked_add(len) == Some(mem.mmap_next) {
-                    mem.mmap_next = address.0;
-                    while let Some(pos) = mem
-                        .free_regions
-                        .iter()
-                        .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
-                    {
-                        let (s, _l) = mem.free_regions.remove(pos);
-                        mem.mmap_next = s;
-                    }
-                } else {
-                    free_regions_insert(&mut mem.free_regions, address.0, len);
-                }
+            } else {
+                free_regions_insert(&mut mem.free_regions, address.0, aligned_len);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn msync(this, cx, address: GuestPtr, length: u64, flags: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -2136,11 +2888,11 @@ impl SyscallDispatcher {
                     .live()
                     .iter()
                     .find(|a| a.guest_addr == address.0)
-                    .copied()
+                    .cloned()
             };
             if let Some(alloc) = alloc {
                 // Write a SharedFile backing's dirty bytes back without freeing.
-                this.writeback_shared(cx, &alloc, false);
+                this.writeback_shared(&mut *cx.memory, &alloc);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if cx.memory.read_bytes(address.0, 1).is_err() {
@@ -2150,6 +2902,7 @@ impl SyscallDispatcher {
         }
 
         fn mlock(this, cx, address: GuestPtr, length: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let page_size = this.linux_page_size();
             let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -2161,6 +2914,7 @@ impl SyscallDispatcher {
         }
 
         fn munlock(this, cx, address: GuestPtr, length: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let page_size = this.linux_page_size();
             let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -2171,6 +2925,7 @@ impl SyscallDispatcher {
         }
 
         fn mlockall(this, cx, flags: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let Some(flags) = LinuxMlockallFlags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
@@ -2192,11 +2947,13 @@ impl SyscallDispatcher {
         }
 
         fn munlockall(this, cx) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             this.mem.lock().locked_ranges.clear();
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn mlock2(this, cx, address: GuestPtr, length: u64, flags: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let Some(flags) = LinuxMlock2Flags::from_bits(flags) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
@@ -2218,6 +2975,7 @@ impl SyscallDispatcher {
         }
 
         fn mincore(this, cx, address: GuestPtr, length: u64, vec: GuestPtr) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
             // Linux requires a page-aligned start address, else EINVAL (this is
@@ -2263,9 +3021,18 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, _new_address: GuestPtr) {
+        fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, new_address: GuestPtr) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
+            if flags & (LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
+                // Carrick cannot yet preserve Linux's exact fixed replacement
+                // or DONTUNMAP zero-fill/fault contract on every backend. Refuse
+                // these shapes before even validating size/source/other flag
+                // bits: no unsupported request may reach allocator, backing, or
+                // VMA mutation.
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+            }
             if new_size_req == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -2278,8 +3045,76 @@ impl SyscallDispatcher {
             let Some(new_size) = align_up_u64(new_size_req, page_size) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
+            let move_fixed = flags & LINUX_MREMAP_FIXED != 0;
+            let dontunmap = flags & LINUX_MREMAP_DONTUNMAP != 0;
+            if (move_fixed || dontunmap) && flags & LINUX_MREMAP_MAYMOVE == 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if dontunmap && new_size != old_size {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let layout = this.mem.lock().layout;
-            if !range_within(old_address.0, old_size, layout.mmap_base, layout.mmap_size) {
+            let fixed_new_address = if move_fixed {
+                if new_address.0 == 0 || !new_address.0.is_multiple_of(page_size) {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if !range_within(new_address.0, new_size, layout.mmap_base, layout.mmap_size) {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
+                Some(new_address.0)
+            } else {
+                None
+            };
+            if let Some(new_address) = fixed_new_address {
+                let Some(new_end) = new_address.checked_add(new_size) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                if ranges_overlap(old_address.0, old_size, new_address, new_end) {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+            }
+            let move_requested = move_fixed || dontunmap;
+            let source_in_arena =
+                range_within(old_address.0, old_size, layout.mmap_base, layout.mmap_size);
+            if !source_in_arena && memory.read_bytes(old_address.0, 1).is_err() {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let source_metadata = match this.mremap_mapping_metadata(memory, old_address.0, old_size) {
+                Ok(metadata) => metadata,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            if source_metadata.sharing == ProcMapSharing::Shared
+                && (move_requested || new_size > old_size)
+            {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            }
+            let shared_aperture_alloc = this
+                .mem
+                .lock()
+                .shared
+                .live()
+                .iter()
+                .find(|alloc| {
+                    ranges_overlap(
+                        old_address.0,
+                        old_size,
+                        alloc.guest_addr,
+                        alloc.guest_addr.saturating_add(alloc.live_len),
+                    )
+                })
+                .cloned();
+            if let Some(ref alloc) = shared_aperture_alloc
+                && (alloc.guest_addr != old_address.0
+                    || old_size != alloc.live_len
+                    || source_metadata.start != old_address.0
+                    || source_metadata.end != old_address.0.saturating_add(old_size))
+            {
+                // Carrick cannot split one shared-aperture backing owner during
+                // mremap. Reject prefix/suffix shrink before touching page tables,
+                // residency, VMA metadata, or the aperture free list.
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            if !source_in_arena {
                 // The mapping is not in the mmap arena: it's a MAP_SHARED file
                 // alias (high VA) or a MAP_SHARED anonymous shared-aperture
                 // region. CPython's mmap.resize() shrinks both of these
@@ -2291,22 +3126,88 @@ impl SyscallDispatcher {
                 // smaller logical size. CPython already ftruncate'd a file
                 // backing to the new size; the freed tail is not accessed (Python
                 // tracks the new size/position), so we return the unchanged base.
-                // (Unlike the arena shrink below we do NOT eagerly unmap the tail
-                // here — invalidating a high-VA alias tail needs trap-engine
-                // coordination; no caller reads it. A grow without MAYMOVE cannot
-                // be placed in situ, which Linux reports as ENOMEM. Musl relies on
-                // that distinction while probing the main stack VMA.)
+                // Shrink revokes the tail in both backend and sharing metadata;
+                // retaining a logically removed shared executable tail would let
+                // native translation classify replacement bytes from stale VMA
+                // state. A grow without MAYMOVE cannot be placed in situ, which
+                // Linux reports as ENOMEM. Musl relies on that distinction while
+                // probing the main stack VMA.
                 if memory.read_bytes(old_address.0, 1).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                if new_size <= old_size {
+                if !move_requested && new_size <= old_size {
+                    let tail_start = old_address.0.saturating_add(new_size);
+                    let tail_len = old_size.saturating_sub(new_size);
+                    if tail_len != 0 {
+                        let Ok(tail_len_usize) = usize::try_from(tail_len) else {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        };
+                        let tracked_shared = shared_aperture_alloc.is_some();
+                        let (tracked_overlay, overlay_tail_carvable) = {
+                            let mem = this.mem.lock();
+                            (
+                                mem.overlay.source_range_has_owner(tail_start, tail_len),
+                                mem.overlay
+                                    .source_range_is_carvable(tail_start, tail_len, None),
+                            )
+                        };
+                        if tracked_overlay && !overlay_tail_carvable {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        }
+                        let unmap_result = if !tracked_shared
+                            && !tracked_overlay
+                            && mmap_address_uses_alias(old_address.0, old_size, layout)
+                        {
+                            memory.unmap_alias_range(tail_start, tail_len_usize)
+                        } else {
+                            memory.unmap_range(tail_start, tail_len_usize)
+                        };
+                        if unmap_result.is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        }
+                        mark_range_unmapped(memory, tail_start, tail_len_usize);
+                        this.remove_mapping_metadata(tail_start, tail_len);
+                        if tracked_shared
+                            && this
+                                .mem
+                                .lock()
+                                .shared
+                                .shrink(old_address.0, new_size)
+                                .is_none()
+                        {
+                            // The backend tail is already gone. Preflight above
+                            // proved this exact shrink valid, so failure here is
+                            // an internal ownership/accounting violation.
+                            std::process::abort();
+                        }
+                        if tracked_overlay
+                            && this
+                                .mem
+                                .lock()
+                                .overlay
+                                .carve_source_range(tail_start, tail_len, None)
+                                .is_none()
+                        {
+                            // The SOURCE tail is no longer reachable after the
+                            // backend unmap. Losing the preflighted overlay carve
+                            // would leave reusable storage with stale ownership.
+                            std::process::abort();
+                        }
+                    }
+                    this.record_dynamic_mapping(
+                        old_address.0,
+                        new_size,
+                        source_metadata.prot,
+                        source_metadata.sharing,
+                        source_metadata.path.clone(),
+                    );
                     return Ok(DispatchOutcome::Returned {
                         value: old_address.0 as i64,
                     });
                 }
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
-            if new_size <= old_size {
+            if !move_requested && new_size <= old_size {
                 // Linux mremap shrink unmaps the freed tail [old+new_size,
                 // old+old_size); carrick used to leave it mapped (a leak, and
                 // the stale bytes there could later be misread). Reclaim the
@@ -2322,13 +3223,17 @@ impl SyscallDispatcher {
                     && tail_end > tail_start
                 {
                     let tail_len = tail_end - tail_start;
-                    if let Ok(tl) = usize::try_from(tail_len) {
-                        // Invalidate guest translation first, then publish the
-                        // post-unmap VMA state last so backend protection hooks
-                        // cannot overwrite it with live PROT_NONE metadata.
-                        let _ = memory.unmap_range(tail_start, tl);
-                        mark_range_unmapped(memory, tail_start, tl);
+                    let Ok(tl) = usize::try_from(tail_len) else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    // Invalidate guest translation first, then publish the
+                    // post-unmap VMA state last so backend protection hooks
+                    // cannot overwrite it with live PROT_NONE metadata.
+                    if memory.unmap_range(tail_start, tl).is_err() {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
+                    mark_range_unmapped(memory, tail_start, tl);
+                    this.remove_mapping_metadata(tail_start, tail_len);
                     let mut mem = this.mem.lock();
                     if tail_end == mem.mmap_next {
                         mem.mmap_next = tail_start;
@@ -2344,12 +3249,19 @@ impl SyscallDispatcher {
                         free_regions_insert(&mut mem.free_regions, tail_start, tail_len);
                     }
                 }
+                this.record_dynamic_mapping(
+                    old_address.0,
+                    new_size,
+                    source_metadata.prot,
+                    source_metadata.sharing,
+                    source_metadata.path.clone(),
+                );
                 return Ok(DispatchOutcome::Returned {
                     value: old_address.0 as i64,
                 });
             }
 
-            if old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
+            if !move_requested && old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
                 let Some(old_end) = old_address.0.checked_add(old_size) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
@@ -2357,38 +3269,43 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
                 if range_within(old_address.0, new_size, layout.mmap_base, layout.mmap_size) {
+                    // Re-validate the freshly-grown tail with the source VMA's
+                    // exact protection and sharing. Sharing is published before
+                    // execute permission, so an RX shared grow can never appear
+                    // transiently private/cacheable to native translation.
+                    let grow_len_u64 = new_size - old_size;
+                    let Ok(grow_len) = usize::try_from(grow_len_u64) else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    let prot_none = source_metadata.prot.is_empty();
+                    memory.set_mapping_protection_and_sharing(
+                        old_end,
+                        grow_len,
+                        prot_none,
+                        !prot_none && !source_metadata.prot.contains(LinuxProtFlags::WRITE),
+                        proc_mapping_sharing(source_metadata.sharing),
+                    );
+                    if memory
+                        .protect_range(old_end, grow_len, source_metadata.prot.bits())
+                        .is_err()
+                    {
+                        mark_range_unmapped(memory, old_end, grow_len);
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
                     {
                         let mut mem = this.mem.lock();
                         mem.mmap_next = new_end;
-                        // Advance the dirty high-water to cover the grown tail.
-                        // The guest dirties [old_end, new_end); without this, a
-                        // later munmap+rebump into that range sees addr >=
-                        // mmap_dirty_high, assumes it pristine, SKIPS the
-                        // zero-fill, and hands back STALE bytes — read as a
-                        // pointer (far=0x5858…='X'*8) → SIGSEGV in multiprocessing
-                        // Pool (test_async_timeout). Same stale-memory class as
-                        // the mmap-bump zero-fill fix; the in-place-grow path was
-                        // the missed sibling.
+                        // The dirty high-water stays monotonic so a later
+                        // munmap+rebump cannot expose bytes dirtied in this tail.
                         mem.mmap_dirty_high = mem.mmap_dirty_high.max(new_end);
                     }
-                    // Re-validate the freshly-grown tail [old_end, new_end). Those
-                    // pages can be a range reclaimed from a prior munmap (which
-                    // invalidated their stage-1 leaves and rolled mmap_next back),
-                    // so without restoring RW validity here the guest FAULTS on
-                    // first access to the grown region — exactly as the move path
-                    // below and the regular mmap path do. (CPython's obmalloc/
-                    // realloc grows an arena buffer in place; the tail landed on
-                    // invalidated pages → a level-3 translation fault.)
-                    let grow_len_u64 = new_size - old_size;
-                    if let Ok(grow_len) = usize::try_from(grow_len_u64) {
-                        memory.set_mapping_protection(old_end, grow_len, false, false);
-                        if memory
-                            .protect_range(old_end, grow_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
-                            .is_err()
-                        {
-                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                        }
-                    }
+                    this.record_dynamic_mapping(
+                        old_address.0,
+                        new_size,
+                        source_metadata.prot,
+                        source_metadata.sharing,
+                        source_metadata.path.clone(),
+                    );
                     return Ok(DispatchOutcome::Returned {
                         value: old_address.0 as i64,
                     });
@@ -2398,48 +3315,114 @@ impl SyscallDispatcher {
             if flags & LINUX_MREMAP_MAYMOVE == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
-            let Some((new_addr, reused)) =
-                this.next_mmap_address(0, new_size, LINUX_PROT_READ | LINUX_PROT_WRITE, 0)
-            else {
+            let Some((new_addr, reused)) = this.next_mmap_address(
+                fixed_new_address.unwrap_or(0),
+                new_size,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                if move_fixed { LINUX_MAP_FIXED } else { 0 },
+            ) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
             let new_len = match usize::try_from(new_size) {
                 Ok(n) => n,
                 Err(_) => return Ok(DispatchOutcome::errno(LINUX_ENOMEM)),
             };
-            // Clear stale no-access tracking on the destination — it may be a
-            // range reclaimed from a prior munmap (which marked it no-access).
-            memory.set_mapping_protection(new_addr, new_len, false, false);
-            if reused {
-                let _ = memory.zero_guest_range(new_addr, new_len);
-            }
-            let copy_len = match usize::try_from(old_size) {
+            let copy_len = match usize::try_from(old_size.min(new_size)) {
                 Ok(len) => len,
                 Err(_) => {
+                    if !move_fixed {
+                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                    }
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
             };
-            if copy_len > 0 {
-                match memory.read_bytes(old_address.0, copy_len) {
-                    Ok(bytes) => {
-                        let _ = memory.write_bytes(new_addr, &bytes);
-                    }
+            let copied = if copy_len == 0 {
+                Vec::new()
+            } else {
+                match memory.read_bytes_raw(old_address.0, copy_len) {
+                    Ok(bytes) => bytes,
                     Err(_) => {
+                        if !move_fixed {
+                            this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                        }
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 }
+            };
+            if (reused || move_fixed) && memory.zero_backing(new_addr, new_len).is_err() {
+                if move_fixed {
+                    // A fixed destination may have been partially overwritten;
+                    // its prior backing/content cannot be reconstructed.
+                    std::process::abort();
+                }
+                this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
-            // Re-validate the destination's guest stage-1 entries, exactly as
-            // mmap does. A range reused from a munmap'd region was invalidated;
-            // without this the guest FAULTS reading the freshly-mremap'd memory
-            // (carrick wrote the copy host-side, so no guest write-fault ever
-            // re-established the page). new_addr is always in the arena here.
+            // Publish the destination as non-executable RW while copying, but
+            // with its final sharing already installed. This is restrictive for
+            // RX sources and prevents a stale executable replacement from being
+            // observed as private/cacheable during the move.
+            memory.set_mapping_protection_and_sharing(
+                new_addr,
+                new_len,
+                false,
+                false,
+                proc_mapping_sharing(source_metadata.sharing),
+            );
             if memory
                 .protect_range(new_addr, new_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
                 .is_err()
             {
+                if move_fixed {
+                    std::process::abort();
+                }
+                this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
+            if !copied.is_empty()
+                && memory
+                    .write_bytes_unchecked(new_addr, &copied)
+                    .is_err()
+            {
+                if move_fixed {
+                    std::process::abort();
+                }
+                this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            let prot_none = source_metadata.prot.is_empty();
+            memory.set_mapping_protection(
+                new_addr,
+                new_len,
+                prot_none,
+                !prot_none && !source_metadata.prot.contains(LinuxProtFlags::WRITE),
+            );
+            if memory
+                .protect_range(new_addr, new_len, source_metadata.prot.bits())
+                .is_err()
+            {
+                if move_fixed {
+                    std::process::abort();
+                }
+                this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            }
+            if move_fixed {
+                let Some(new_end) = new_addr.checked_add(new_size) else {
+                    std::process::abort();
+                };
+                let mut mem = this.mem.lock();
+                trim_ranges_for_range(&mut mem.free_regions, new_addr, new_size);
+                mem.mmap_next = mem.mmap_next.max(new_end);
+                mem.mmap_dirty_high = mem.mmap_dirty_high.max(new_end);
+            }
+            this.record_dynamic_mapping(
+                new_addr,
+                new_size,
+                source_metadata.prot,
+                source_metadata.sharing,
+                source_metadata.path.clone(),
+            );
             // mremap MOVE on Linux UNMAPS the source [old, old+old_size) (unless
             // MREMAP_DONTUNMAP). carrick previously LEAKED it: the source VA
             // stayed mapped with its stale bytes and was never returned to the
@@ -2459,9 +3442,18 @@ impl SyscallDispatcher {
                 && let Ok(old_len) = usize::try_from(old_size)
                     && old_len > 0
                 {
-                    let mut mem = this.mem.lock();
-                    let _ = memory.unmap_range(old_address.0, old_len);
+                    if let Err(first) = memory.unmap_range(old_address.0, old_len)
+                        && let Err(retry) = memory.unmap_range(old_address.0, old_len)
+                    {
+                        let _ = (first, retry);
+                        // The destination is already published; returning would
+                        // expose two owners while reporting failure. Retain
+                        // fail-stop semantics so host teardown reclaims both.
+                        std::process::abort();
+                    }
                     mark_range_unmapped(memory, old_address.0, old_len);
+                    this.remove_mapping_metadata(old_address.0, old_size);
+                    let mut mem = this.mem.lock();
                     if old_address.0.checked_add(old_size) == Some(mem.mmap_next) {
                         mem.mmap_next = old_address.0;
                         while let Some(pos) = mem
@@ -2482,6 +3474,7 @@ impl SyscallDispatcher {
         }
 
         fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let page_size = this.linux_page_size();
             if prot & !LinuxProtFlags::SUPPORTED_MASK != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -2557,6 +3550,17 @@ impl SyscallDispatcher {
                 ));
                 return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
             }
+            // Preserve file-hole identity across the permission transition.
+            // Linux mprotect changes VMA permissions but never turns a page
+            // wholly beyond the mapped file's map-time EOF into zero backing.
+            // Snapshot before any backend edit; the protection registry keeps
+            // this backing classification independent of R/W/X permission.
+            let bus_faults = cx
+                .memory
+                .protections()
+                .map(|protections| protections.bus_fault_intersections(address.0, len))
+                .unwrap_or_default();
+
             // Make the new protection guest-VISIBLE (a violating access
             // faults during EL0 execution) by editing the stage-1/PML4
             // page tables. In the private mmap arena a failed edit is
@@ -2595,6 +3599,18 @@ impl SyscallDispatcher {
                 // legacy VMM aliases retain their host-side-only behavior.
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
+            // A backend protection call above may have made the whole VMA
+            // accessible. Re-apply the physical hole before publishing the new
+            // permission metadata, including on legacy shared/overlay aliases
+            // whose ordinary mprotect path is host-side-only.
+            for (bus_start, bus_end) in bus_faults {
+                let Ok(bus_len) = usize::try_from(bus_end - bus_start) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                if cx.memory.protect_range(bus_start, bus_len, 0).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                }
+            }
             let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
             cx.memory.set_mapping_protection(
                 address.0,
@@ -2611,6 +3627,7 @@ impl SyscallDispatcher {
         }
 
         fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let page_size = this.linux_page_size();
             if !address.0.is_multiple_of(page_size) || !linux_madvise_advice_is_supported(advice) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -2677,6 +3694,7 @@ impl SyscallDispatcher {
         }
 
         fn remap_file_pages(this, cx, addr: u64, size: u64, prot: u64, pgoff: u64, _flags: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             if addr == 0 || size == 0 || prot != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -2826,6 +3844,46 @@ impl SyscallDispatcher {
     /// Record a range as populated (resident) — used when carrick eagerly loads
     /// a file-backed or MAP_POPULATE mapping's content, so a later `mincore`
     /// reports those pages resident.
+    #[cfg(test)]
+    pub(crate) fn dynamic_mapping_for_test(&self, start: u64) -> Option<ProcMapsEntry> {
+        self.mem
+            .lock()
+            .dynamic_maps
+            .iter()
+            .find(|map| map.start == start)
+            .cloned()
+    }
+
+    #[cfg(test)]
+    pub(super) fn range_has_mapping_metadata_for_test(&self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return true;
+        };
+        let mem = self.mem.lock();
+        let overlaps = |range: &crate::vfs::GuestMemoryRange| {
+            range.start().raw() < end && start < range.end().raw()
+        };
+        dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len)
+            || mem.remap_snapshots.iter().any(|(snapshot_start, bytes)| {
+                *snapshot_start < end && start < snapshot_start.saturating_add(bytes.len() as u64)
+            })
+            || mem.bus_fault_ranges.iter().any(|(range_start, range_len)| {
+                *range_start < end && start < range_start.saturating_add(*range_len)
+            })
+            || mem.locked_ranges.iter().any(overlaps)
+            || mem.resident_ranges.iter().any(overlaps)
+            || mem.resident_tracked_ranges.iter().any(overlaps)
+            || mem
+                .resident_fault_ranges
+                .iter()
+                .any(|fault| overlaps(&fault.range))
+            || mem.write_sealed_shared_maps.iter().any(overlaps)
+            || mem
+                .writable_memfd_maps
+                .iter()
+                .any(|(range, _)| overlaps(range))
+    }
+
     fn mark_range_resident(&self, start: u64, len: u64) {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
@@ -2834,20 +3892,32 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(crate) fn resident_fault_plan(&self, address: u64) -> Option<(u64, u64)> {
+    pub(crate) fn resident_fault_plan(&self, address: u64) -> Option<ResidentFaultPlan> {
+        let exclusion = self.begin_host_alias_dispatch();
         let page = page_floor(address, self.linux_page_size());
         let mem = self.mem.lock();
-        mem.resident_fault_ranges
+        let prot = mem
+            .resident_fault_ranges
             .iter()
-            .find(|fault| page >= fault.range.start().raw() && page < fault.range.end().raw())
-            .map(|fault| (page, fault.prot.bits()))
+            .find(|fault| page >= fault.range.start().raw() && page < fault.range.end().raw())?
+            .prot
+            .bits();
+        Some(ResidentFaultPlan {
+            page,
+            prot,
+            exclusion,
+        })
     }
 
-    pub(crate) fn commit_resident_fault(&self, page: u64) {
-        let Some(end) = page.checked_add(self.linux_page_size()) else {
+    pub(crate) fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
+        if !self.owns_host_alias_dispatch(&plan.exclusion) {
+            std::process::abort();
+        }
+        let Some(end) = plan.page.checked_add(self.linux_page_size()) else {
             return;
         };
-        let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(page), GuestVa(end)) else {
+        let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(plan.page), GuestVa(end))
+        else {
             return;
         };
         let mut mem = self.mem.lock();
@@ -2960,6 +4030,8 @@ impl SyscallDispatcher {
         Ok(())
     }
 
+    #[cfg(test)]
+    #[cfg(test)]
     fn commit_eager_locked_range(&self, range: Option<crate::vfs::GuestMemoryRange>) {
         let Some(range) = range else {
             return;
@@ -2969,19 +4041,80 @@ impl SyscallDispatcher {
         locked_ranges_insert(&mut mem.locked_ranges, range);
     }
 
-    fn rollback_shared_anon_mapping(&self, address: u64, length: u64) {
-        let Some(end) = address.checked_add(length) else {
-            return;
+    fn rollback_shared_anon_mapping(
+        &self,
+        memory: &mut impl GuestMemory,
+        address: u64,
+        guest_length: u64,
+        mapped_length: usize,
+    ) -> Result<(), MemoryError> {
+        let Some(end) = address.checked_add(guest_length) else {
+            return Err(MemoryError::HostMap(format!(
+                "shared-anon rollback range overflows at 0x{address:x} for {guest_length} bytes"
+            )));
         };
         let Some(range) = crate::vfs::GuestMemoryRange::new(GuestVa(address), GuestVa(end)) else {
-            return;
+            return Err(MemoryError::HostMap(format!(
+                "shared-anon rollback range is empty at 0x{address:x}"
+            )));
         };
+        if let Err(first) = memory.unmap_range(address, mapped_length)
+            && let Err(retry) = memory.unmap_range(address, mapped_length)
+        {
+            // A concurrent-exec backend maps guest bytes into this host
+            // process. Returning would destroy the only rollback authority
+            // while a live host mapping remains outside the VMA allocator.
+            // Fail-stop so the host kernel reclaims it with the process.
+            if memory.supports_concurrent_exec_protection() {
+                std::process::abort();
+            }
+            return Err(MemoryError::HostMap(format!(
+                "shared-anon rollback unmap at 0x{address:x} for {mapped_length} bytes failed: \
+                 {first}; retry failed: {retry}"
+            )));
+        }
+        memory.set_unmapped(address, mapped_length, true);
         let mut mem = self.mem.lock();
         mem.shared.free(address);
         locked_ranges_remove(&mut mem.locked_ranges, range);
         locked_ranges_remove(&mut mem.resident_ranges, range);
         locked_ranges_remove(&mut mem.resident_tracked_ranges, range);
         remove_fault_range(&mut mem.resident_fault_ranges, range);
+        Ok(())
+    }
+
+    /// Roll back a freshly allocated private-arena mapping. Native direct
+    /// execution cannot return while a failed publication remains host-mapped:
+    /// retry once, then retain Task 51's fail-stop behavior so process teardown
+    /// is the final ownership backstop.
+    fn rollback_fresh_arena_mapping(
+        &self,
+        memory: &mut impl GuestMemory,
+        address: u64,
+        len: u64,
+    ) -> Result<(), MemoryError> {
+        let len_usize = usize::try_from(len).map_err(|_| {
+            MemoryError::HostMap(format!("arena rollback length does not fit usize: {len}"))
+        })?;
+        if let Err(first) = memory.unmap_range(address, len_usize)
+            && let Err(retry) = memory.unmap_range(address, len_usize)
+        {
+            if memory.supports_concurrent_exec_protection() {
+                std::process::abort();
+            }
+            return Err(MemoryError::HostMap(format!(
+                "arena rollback unmap at 0x{address:x} for {len} bytes failed: \
+                 {first}; retry failed: {retry}"
+            )));
+        }
+        mark_range_unmapped(memory, address, len_usize);
+        let mut mem = self.mem.lock();
+        if address.checked_add(len) == Some(mem.mmap_next) {
+            mem.mmap_next = address;
+        } else {
+            free_regions_insert(&mut mem.free_regions, address, len);
+        }
+        Ok(())
     }
 
     fn remove_locked_range(&self, range: crate::vfs::GuestMemoryRange) {
@@ -3123,6 +4256,7 @@ fn mmap_address_uses_alias(address: u64, length: u64, layout: MemoryLayout) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux_abi::LINUX_PROT_EXEC;
     use crate::memory::{LINUX_HEAP_BASE, LINUX_MMAP_BASE};
     use std::cell::Cell;
 
@@ -3247,10 +4381,110 @@ mod tests {
     struct ProtectionTrackingMemory {
         inner: CountingMmapMemory,
         protections: carrick_guest_mem::protections::MemoryProtections,
+        repoint_calls: usize,
+        repoint_payload: Vec<u8>,
+        repoint_observed_shared: Vec<bool>,
+        restored_shared_identity: Vec<(u64, usize)>,
+        fail_repoint: bool,
+        fail_repoint_indeterminate: bool,
+        fail_protect: bool,
     }
 
     struct FailingProtectMemory {
         inner: CountingMmapMemory,
+    }
+
+    struct DeferredSetterFailureMemory {
+        inner: CountingMmapMemory,
+        pending_failure: bool,
+        protect_calls: usize,
+        unmap_calls: usize,
+        unmap_failures_remaining: usize,
+        concurrent_exec: bool,
+        unmapped: carrick_guest_mem::protections::MemoryProtections,
+    }
+
+    impl DeferredSetterFailureMemory {
+        fn new(base: u64, len: usize) -> Self {
+            Self {
+                inner: CountingMmapMemory::new(base, len),
+                pending_failure: false,
+                protect_calls: 0,
+                unmap_calls: 0,
+                unmap_failures_remaining: 0,
+                concurrent_exec: true,
+                unmapped: carrick_guest_mem::protections::MemoryProtections::default(),
+            }
+        }
+
+        fn fail_unmaps(mut self, count: usize) -> Self {
+            self.unmap_failures_remaining = count;
+            self
+        }
+
+        fn demand_paged(mut self) -> Self {
+            self.concurrent_exec = false;
+            self
+        }
+    }
+
+    impl GuestMemory for DeferredSetterFailureMemory {
+        fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+            Some(&self.unmapped)
+        }
+
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.inner.read_bytes_raw(address, length)
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.inner.write_bytes_raw(address, bytes)
+        }
+
+        fn set_mapping_protection(
+            &mut self,
+            _address: u64,
+            _len: usize,
+            _no_access: bool,
+            _no_write: bool,
+        ) {
+            self.pending_failure = true;
+        }
+
+        fn protect_range(
+            &mut self,
+            _address: u64,
+            _len: usize,
+            _prot: u64,
+        ) -> Result<(), MemoryError> {
+            self.protect_calls += 1;
+            if std::mem::take(&mut self.pending_failure) {
+                Err(MemoryError::HostMap(
+                    "deferred eager mapping failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unmap_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+            self.unmap_calls += 1;
+            if self.unmap_failures_remaining != 0 {
+                self.unmap_failures_remaining -= 1;
+                return Err(MemoryError::HostMap(
+                    "injected persistent unmap failure".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+            self.unmapped.set_unmapped(address, len, unmapped);
+        }
+
+        fn supports_concurrent_exec_protection(&self) -> bool {
+            self.concurrent_exec
+        }
     }
 
     impl GuestMemory for FailingProtectMemory {
@@ -3277,6 +4511,13 @@ mod tests {
             Self {
                 inner: CountingMmapMemory::new(base, len),
                 protections: carrick_guest_mem::protections::MemoryProtections::default(),
+                repoint_calls: 0,
+                repoint_payload: Vec::new(),
+                repoint_observed_shared: Vec::new(),
+                restored_shared_identity: Vec::new(),
+                fail_repoint: false,
+                fail_repoint_indeterminate: false,
+                fail_protect: false,
             }
         }
     }
@@ -3284,6 +4525,10 @@ mod tests {
     impl GuestMemory for ProtectionTrackingMemory {
         fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
             Some(&self.protections)
+        }
+
+        fn has_complete_mapping_metadata(&self) -> bool {
+            true
         }
 
         fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
@@ -3296,6 +4541,49 @@ mod tests {
 
         fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
             self.inner.zero_backing(address, len)
+        }
+
+        fn restore_shared_identity(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+            self.restored_shared_identity.push((address, len));
+            Ok(())
+        }
+
+        fn repoint_private(
+            &mut self,
+            address: u64,
+            _overlay_ipa: u64,
+            len: usize,
+            content: &[u8],
+        ) -> Result<(), carrick_guest_mem::RepointPrivateError> {
+            if content.len() != len {
+                return Err(carrick_guest_mem::RepointPrivateError::clean(
+                    MemoryError::OutOfBounds {
+                        address,
+                        length: content.len(),
+                    },
+                ));
+            }
+            let offset = self
+                .inner
+                .range_offset(address, len)
+                .map_err(carrick_guest_mem::RepointPrivateError::clean)?;
+            self.repoint_observed_shared
+                .push(self.protections.range_mutable_shared_backing(address, len));
+            self.repoint_calls += 1;
+            if self.fail_repoint {
+                return Err(carrick_guest_mem::RepointPrivateError::clean(
+                    MemoryError::HostMap("injected private repoint failure".into()),
+                ));
+            }
+            if self.fail_repoint_indeterminate {
+                return Err(carrick_guest_mem::RepointPrivateError::indeterminate(
+                    MemoryError::HostMap("injected post-publication repoint failure".into()),
+                ));
+            }
+            self.repoint_payload.clear();
+            self.repoint_payload.extend_from_slice(content);
+            self.inner.bytes[offset..offset + len].copy_from_slice(content);
+            Ok(())
         }
 
         fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
@@ -3321,12 +4609,40 @@ mod tests {
                 .set_mapping_protection(address, len, no_access, no_write);
         }
 
+        fn set_mapping_sharing(
+            &mut self,
+            address: u64,
+            len: usize,
+            sharing: carrick_guest_mem::MappingSharing,
+        ) {
+            self.protections.set_mapping_sharing(address, len, sharing);
+        }
+
+        fn set_mapping_protection_and_sharing(
+            &mut self,
+            address: u64,
+            len: usize,
+            no_access: bool,
+            no_write: bool,
+            sharing: carrick_guest_mem::MappingSharing,
+        ) {
+            self.protections
+                .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
+        }
+
         fn protect_range(
             &mut self,
             address: u64,
             len: usize,
             prot: u64,
         ) -> Result<(), MemoryError> {
+            if self.fail_protect {
+                return Err(MemoryError::HostMap(
+                    "injected private protection failure".into(),
+                ));
+            }
+            self.protections
+                .set_executable(address, len, prot & LINUX_PROT_EXEC != 0);
             self.inner.protect_range(address, len, prot)
         }
     }
@@ -3376,6 +4692,46 @@ mod tests {
         );
     }
 
+    fn assert_operation_waits_for_host_alias_idle<F>(label: &'static str, operation: F)
+    where
+        F: FnOnce(std::sync::Arc<SyscallDispatcher>) + Send + 'static,
+    {
+        let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
+        let guard = dispatcher.begin_host_alias_dispatch();
+        let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+            len: LINUX_PAGE_SIZE,
+            prot: LinuxProtFlags::READ,
+            sharing: ProcMapSharing::Private,
+            path: String::new(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        }));
+        let install = transaction
+            .claim()
+            .expect("claim pending host alias install");
+        let sibling = std::sync::Arc::clone(&dispatcher);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            operation(sibling);
+            entered_tx.send(()).expect("report blocked operation");
+        });
+        assert!(
+            entered_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "{label} raced an installing host alias"
+        );
+        drop(install);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("operation admitted after abort");
+        thread.join().expect("join blocked operation thread");
+    }
+
     #[test]
     fn native16k_rejects_shared_write_exec_mmap() {
         const SYS_MMAP: u64 = 222;
@@ -3406,6 +4762,2636 @@ mod tests {
 
         assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
         assert_partial_reason(&reporter, "mmap", "shared write-exec");
+    }
+
+    #[test]
+    fn shared_anon_deferred_setter_failure_rolls_back_before_commit() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = 4096;
+        const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1050));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            DeferredSetterFailureMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
+        assert_eq!(memory.protect_calls, 1, "setter failure consumed once");
+        assert_eq!(memory.unmap_calls, 1, "candidate backing rolled back");
+        assert!(
+            memory
+                .unmapped
+                .range_unmapped(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH)
+        );
+        let mem = dispatcher.mem.lock();
+        assert!(mem.shared.live().is_empty(), "allocation must not commit");
+        assert!(mem.dynamic_maps.is_empty(), "VMA metadata must not commit");
+    }
+
+    #[test]
+    fn mmap_publishes_shared_rx_and_private_fixed_replacement() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = 4096;
+        const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1060));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH);
+        let mapped = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_EXEC,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert!(memory.protections.range_executable(mapped, LENGTH as usize));
+        assert!(
+            memory
+                .protections
+                .range_mutable_shared_backing(mapped, LENGTH as usize)
+        );
+        assert!(
+            memory
+                .protections
+                .range_translation_requires_ephemeral(mapped, LENGTH as usize)
+        );
+
+        let replaced = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    mapped,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_EXEC,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert_eq!(replaced, mapped);
+        assert!(memory.protections.range_executable(mapped, LENGTH as usize));
+        assert!(
+            !memory
+                .protections
+                .range_mutable_shared_backing(mapped, LENGTH as usize)
+        );
+        assert!(
+            !memory
+                .protections
+                .range_translation_requires_ephemeral(mapped, LENGTH as usize)
+        );
+    }
+
+    #[test]
+    fn file_private_fixed_shared_aperture_repoints_snapshot_and_publishes_map_time_bus_tail() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MPROTECT: u64 = 226;
+        const LENGTH: u64 = 3 * LINUX_PAGE_SIZE;
+        const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+        const FD: i32 = 9;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1061));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH);
+        let mapped = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_EXEC,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert!(
+            memory
+                .protections
+                .range_mutable_shared_backing(mapped, LENGTH as usize)
+        );
+
+        let mut file_bytes = vec![0x7d; LINUX_PAGE_SIZE as usize];
+        file_bytes.extend_from_slice(&[0x90, 0xc3, 0x4a]);
+        dispatcher.io.open_files.write().insert(
+            FD,
+            OpenFile::new(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    path: "private-replacement".into(),
+                    contents: file_bytes,
+                    offset: 0,
+                })),
+                0,
+            ),
+        );
+
+        let replaced = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    mapped,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_EXEC,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+                    FD as u64,
+                    LINUX_PAGE_SIZE,
+                ]),
+            ),
+        )) as u64;
+
+        assert_eq!(replaced, mapped);
+        assert_eq!(memory.repoint_calls, 1);
+        assert_eq!(memory.repoint_observed_shared, [true]);
+        assert_eq!(memory.repoint_payload.len(), LENGTH as usize);
+        assert_eq!(&memory.repoint_payload[..3], &[0x90, 0xc3, 0x4a]);
+        assert!(
+            memory.repoint_payload[3..LINUX_PAGE_SIZE as usize]
+                .iter()
+                .all(|byte| *byte == 0),
+            "the remainder of the partially backed last page is readable zero-fill"
+        );
+        assert!(
+            memory.repoint_payload[LINUX_PAGE_SIZE as usize..]
+                .iter()
+                .all(|byte| *byte == 0),
+            "materialization bytes stay zeroed even though full pages past EOF fault"
+        );
+        assert_eq!(
+            memory
+                .read_bytes(mapped, 3)
+                .expect("within-file private snapshot bytes"),
+            vec![0x90, 0xc3, 0x4a]
+        );
+        assert_eq!(
+            memory
+                .read_bytes(mapped + LINUX_PAGE_SIZE - 1, 1)
+                .expect("partial-page EOF zero tail"),
+            vec![0]
+        );
+        assert!(
+            memory.read_bytes(mapped + LINUX_PAGE_SIZE, 1).is_err(),
+            "the first page wholly beyond map-time EOF is inaccessible"
+        );
+        assert!(
+            !memory.protections.range_bus_fault(mapped, 1)
+                && memory
+                    .protections
+                    .range_bus_fault(mapped + LINUX_PAGE_SIZE, 1)
+        );
+        assert!(dispatcher.mmap_fault_is_sigbus(mapped + LINUX_PAGE_SIZE));
+        assert!(!dispatcher.mmap_fault_is_sigbus(mapped + LINUX_PAGE_SIZE - 1));
+
+        assert_eq!(
+            returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MPROTECT,
+                    SyscallArgs([mapped, LENGTH, LINUX_PROT_READ | LINUX_PROT_EXEC, 0, 0, 0,]),
+                ),
+            )),
+            0
+        );
+        assert!(
+            memory.read_bytes(mapped + LINUX_PAGE_SIZE - 1, 1).is_ok(),
+            "mprotect preserves the readable partial-page zero tail"
+        );
+        assert!(
+            memory.read_bytes(mapped + LINUX_PAGE_SIZE, 1).is_err(),
+            "mprotect cannot reopen a full page beyond map-time EOF"
+        );
+        assert!(
+            memory
+                .protections
+                .range_bus_fault(mapped + LINUX_PAGE_SIZE, 1)
+                && memory
+                    .protections
+                    .range_no_access(mapped + LINUX_PAGE_SIZE, 1)
+        );
+        assert_eq!(
+            memory.inner.write_calls.get(),
+            0,
+            "file payload must not be copied through the still-shared VA"
+        );
+        assert!(
+            memory
+                .protections
+                .range_executable(mapped, LINUX_PAGE_SIZE as usize),
+            "the partially backed page remains executable"
+        );
+        assert!(
+            !memory
+                .protections
+                .range_executable(mapped + LINUX_PAGE_SIZE, 1),
+            "the BUS_ADRERR tail cannot remain executable"
+        );
+        assert!(
+            !memory
+                .protections
+                .range_mutable_shared_backing(mapped, LENGTH as usize)
+        );
+        assert!(
+            !memory
+                .protections
+                .range_translation_requires_ephemeral(mapped, LENGTH as usize)
+        );
+        let replacement = dispatcher
+            .dynamic_mapping_for_test(mapped)
+            .expect("private fixed replacement VMA");
+        assert_eq!(replacement.sharing, ProcMapSharing::Private);
+        assert!(replacement.execute);
+        assert!(dispatcher.mem.lock().resident_ranges.iter().any(|range| {
+            range.start().raw() == mapped && range.end().raw() == mapped + LENGTH
+        }));
+    }
+
+    #[test]
+    fn private_file_snapshot_computes_identical_bus_tail_for_memfd_synthetic_and_host_sources() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        const LENGTH: usize = 3 * LINUX_PAGE_SIZE as usize;
+        const FILE_LENGTH: usize = LINUX_PAGE_SIZE as usize + 3;
+        let dispatcher = SyscallDispatcher::new();
+        let payload = {
+            let mut bytes = vec![0x7d; LINUX_PAGE_SIZE as usize];
+            bytes.extend_from_slice(&[0x90, 0xc3, 0x4a]);
+            bytes
+        };
+        let metadata = RootFsMetadata {
+            path: std::path::PathBuf::from("/memfd:private-eof"),
+            kind: RootFsEntryKind::File,
+            mode: 0o600,
+            size: FILE_LENGTH,
+        };
+        let mut memfd_base = OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR);
+        memfd_base.set_seals(Some(0));
+        dispatcher.io.open_files.write().insert(
+            20,
+            OpenFile::new(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
+                    base: memfd_base,
+                    path: "/memfd:private-eof".into(),
+                    metadata: metadata.clone(),
+                    contents: FileContents::dense(payload.clone()),
+                    offset: 0,
+                    writable: true,
+                })),
+                0,
+            ),
+        );
+        dispatcher.io.open_files.write().insert(
+            21,
+            OpenFile::new(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    path: "/synthetic-private-eof".into(),
+                    contents: payload.clone(),
+                    offset: 0,
+                })),
+                0,
+            ),
+        );
+        let host_file = tempfile::tempfile().expect("temporary host private-map source");
+        assert_eq!(
+            unsafe {
+                libc::pwrite(
+                    host_file.as_raw_fd(),
+                    payload.as_ptr().cast(),
+                    payload.len(),
+                    0,
+                )
+            },
+            payload.len() as isize
+        );
+        dispatcher.io.open_files.write().insert(
+            22,
+            OpenFile::new(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    host_fd: HostFdRef::new(host_file.into_raw_fd()),
+                    metadata,
+                    writable: false,
+                })),
+                0,
+            ),
+        );
+
+        for (fd, source) in [(20, "memfd"), (21, "synthetic"), (22, "host")] {
+            let snapshot = dispatcher
+                .snapshot_private_mmap_file(Fd(fd), LINUX_PAGE_SIZE, LENGTH)
+                .unwrap_or_else(|error| panic!("snapshot {source} source: {error:?}"));
+            assert_eq!(
+                snapshot.bus_fault_offset,
+                Some(LINUX_PAGE_SIZE),
+                "{source} first full page beyond EOF"
+            );
+            assert_eq!(&snapshot.bytes[..3], &[0x90, 0xc3, 0x4a]);
+            assert!(
+                snapshot.bytes[3..LINUX_PAGE_SIZE as usize]
+                    .iter()
+                    .all(|byte| *byte == 0),
+                "{source} partial-page tail must be zero-filled"
+            );
+        }
+    }
+
+    #[test]
+    fn private_repoint_failure_preserves_prior_overlay_owner_and_vma() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = 4096;
+        const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1062));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH);
+        let shared = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        let first = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    shared,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert_eq!(first, shared);
+        let prior_overlay = dispatcher
+            .mem
+            .lock()
+            .overlay
+            .find_by_source(shared)
+            .expect("first private overlay owner");
+        memory.inner.bytes[0] = 0x5a;
+        let prior_map = dispatcher
+            .dynamic_mapping_for_test(shared)
+            .expect("first private VMA");
+        memory.fail_repoint = true;
+
+        let failed = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    shared,
+                    LENGTH,
+                    LINUX_PROT_READ,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(failed, DispatchOutcome::errno(LINUX_ENOMEM));
+        assert_eq!(memory.inner.bytes[0], 0x5a);
+        assert_eq!(dispatcher.dynamic_mapping_for_test(shared), Some(prior_map));
+        let mut mem = dispatcher.mem.lock();
+        assert_eq!(mem.overlay.find_by_source(shared), Some(prior_overlay));
+        assert_eq!(
+            mem.overlay
+                .live()
+                .iter()
+                .filter(|slot| slot.source == Some(shared))
+                .count(),
+            1,
+            "failed candidate must be returned without retiring the prior owner"
+        );
+        let reused = mem
+            .overlay
+            .alloc(
+                crate::trap::HVF_PAGE_SIZE,
+                crate::shared_aperture::BackingObject::PrivateAnon,
+            )
+            .expect("clean failure candidate is reusable");
+        assert_eq!(reused, prior_overlay + crate::trap::HVF_PAGE_SIZE);
+    }
+
+    #[test]
+    fn indeterminate_repoint_policy_retains_old_and_candidate_storage() {
+        const GRANULE: u64 = crate::trap::HVF_PAGE_SIZE;
+        let dispatcher = SyscallDispatcher::new();
+        let source = crate::memory::LINUX_SHARED_FILE_BASE;
+        let (old, candidate) = {
+            let mut mem = dispatcher.mem.lock();
+            let old = mem
+                .overlay
+                .alloc_sourced(
+                    GRANULE,
+                    crate::shared_aperture::BackingObject::PrivateAnon,
+                    Some(source),
+                )
+                .expect("old overlay");
+            let candidate = mem
+                .overlay
+                .alloc_sourced(
+                    GRANULE,
+                    crate::shared_aperture::BackingObject::PrivateAnon,
+                    Some(source),
+                )
+                .expect("candidate overlay");
+            (old, candidate)
+        };
+
+        let action = dispatcher.recover_private_repoint_failure(
+            candidate,
+            carrick_guest_mem::RepointPrivateError::indeterminate(MemoryError::HostMap(
+                "injected post-publication failure".into(),
+            )),
+        );
+        assert_eq!(action, PrivateRepointRecovery::FailStopRetainingOwners);
+        let mut mem = dispatcher.mem.lock();
+        assert!(mem.overlay.live().iter().any(|slot| slot.guest_addr == old));
+        assert!(
+            mem.overlay
+                .live()
+                .iter()
+                .any(|slot| slot.guest_addr == candidate)
+        );
+        let next = mem
+            .overlay
+            .alloc(GRANULE, crate::shared_aperture::BackingObject::PrivateAnon)
+            .expect("retained owners force fresh allocation");
+        assert_eq!(next, candidate + GRANULE);
+    }
+
+    #[test]
+    fn indeterminate_private_repoint_failure_fails_stopped() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = crate::trap::HVF_PAGE_SIZE;
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork indeterminate-repoint child failed");
+        if child == 0 {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+            let dispatcher = SyscallDispatcher::new();
+            let registry = crate::thread::ThreadRegistry::new(
+                crate::thread::ThreadId::synthetic_for_tests(1165),
+            );
+            let reporter = CompatReporter::default();
+            let mut memory = ProtectionTrackingMemory::new(
+                crate::memory::LINUX_SHARED_FILE_BASE,
+                LENGTH as usize,
+            );
+            let source = returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        0,
+                        LENGTH,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            )) as u64;
+            let _ = returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        source,
+                        LENGTH,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            ));
+            memory.fail_repoint_indeterminate = true;
+            let _ = threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        source,
+                        LENGTH,
+                        LINUX_PROT_READ,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            );
+            unsafe { libc::_exit(93) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFSIGNALED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+    }
+
+    fn assert_partial_private_overlay_replacement(replace_offset: u64) {
+        const SYS_MMAP: u64 = 222;
+        const GRANULE: u64 = crate::trap::HVF_PAGE_SIZE;
+        const LENGTH: u64 = 3 * GRANULE;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(
+                1160 + i32::try_from(replace_offset / GRANULE).unwrap(),
+            ));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, LENGTH as usize);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        let first = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    source,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert_eq!(first, source);
+        let old_overlay = dispatcher
+            .mem
+            .lock()
+            .overlay
+            .translate_source_range(source, LENGTH)
+            .expect("whole initial overlay");
+
+        memory.inner.bytes[..GRANULE as usize].fill(0x11);
+        memory.inner.bytes[GRANULE as usize..(2 * GRANULE) as usize].fill(0x22);
+        memory.inner.bytes[(2 * GRANULE) as usize..].fill(0x33);
+        let replaced = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    source + replace_offset,
+                    GRANULE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert_eq!(replaced, source + replace_offset);
+
+        let replaced_index = usize::try_from(replace_offset).unwrap();
+        assert!(
+            memory.inner.bytes[replaced_index..replaced_index + GRANULE as usize]
+                .iter()
+                .all(|byte| *byte == 0),
+            "replacement payload must touch only the replaced source interval"
+        );
+        if replace_offset != 0 {
+            assert!(
+                memory.inner.bytes[..replaced_index]
+                    .iter()
+                    .all(|byte| *byte != 0)
+            );
+        }
+        let replacement_end = replaced_index + GRANULE as usize;
+        if replacement_end < LENGTH as usize {
+            assert!(
+                memory.inner.bytes[replacement_end..]
+                    .iter()
+                    .all(|byte| *byte != 0)
+            );
+        }
+
+        let mut mem = dispatcher.mem.lock();
+        let replacement_overlay = mem
+            .overlay
+            .translate_source_range(source + replace_offset, GRANULE)
+            .expect("replacement overlay translation");
+        assert_ne!(replacement_overlay, old_overlay + replace_offset);
+        if replace_offset != 0 {
+            assert_eq!(
+                mem.overlay.translate_source_range(source, replace_offset),
+                Some(old_overlay)
+            );
+        }
+        let suffix_start = replace_offset + GRANULE;
+        if suffix_start < LENGTH {
+            assert_eq!(
+                mem.overlay
+                    .translate_source_range(source + suffix_start, LENGTH - suffix_start),
+                Some(old_overlay + suffix_start)
+            );
+        }
+        let reused = mem
+            .overlay
+            .alloc(GRANULE, crate::shared_aperture::BackingObject::PrivateAnon)
+            .expect("only overwritten overlay storage is reusable");
+        assert_eq!(reused, old_overlay + replace_offset);
+        let after_reuse = mem
+            .overlay
+            .alloc(GRANULE, crate::shared_aperture::BackingObject::PrivateAnon)
+            .expect("preserved storage remains unavailable");
+        assert!(
+            after_reuse >= replacement_overlay + GRANULE,
+            "preserved prefix/suffix must not be reallocated"
+        );
+        drop(mem);
+
+        // The mapped bytes survive a real fork snapshot. Child mutations to the
+        // private replacement model cannot bleed back into the parent, while the
+        // parent retains every preserved prefix/suffix byte.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork partial-overlay snapshot failed");
+        if child == 0 {
+            if memory.inner.bytes[replaced_index] != 0 {
+                unsafe { libc::_exit(81) };
+            }
+            memory.inner.bytes.fill(0x7e);
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert_eq!(memory.inner.bytes[replaced_index], 0);
+        if replace_offset != 0 {
+            assert_ne!(memory.inner.bytes[0], 0x7e);
+        }
+        if replacement_end < LENGTH as usize {
+            assert_ne!(memory.inner.bytes[replacement_end], 0x7e);
+        }
+    }
+
+    fn assert_shared_owner_survives_partial_private_replacement(replace_offset: u64) {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MUNMAP: u64 = 215;
+        const GRANULE: u64 = crate::trap::HVF_PAGE_SIZE;
+        const LENGTH: u64 = 3 * GRANULE;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(
+                1180 + i32::try_from(replace_offset / GRANULE).unwrap(),
+            ));
+        let reporter = CompatReporter::default();
+        let mut memory = ProtectionTrackingMemory::new(
+            crate::memory::LINUX_SHARED_FILE_BASE,
+            (5 * GRANULE) as usize,
+        );
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        memory.inner.bytes[..GRANULE as usize].fill(0x11);
+        memory.inner.bytes[GRANULE as usize..(2 * GRANULE) as usize].fill(0x22);
+        memory.inner.bytes[(2 * GRANULE) as usize..(3 * GRANULE) as usize].fill(0x33);
+
+        assert_eq!(
+            returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        source + replace_offset,
+                        GRANULE,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            )),
+            (source + replace_offset) as i64
+        );
+        {
+            let mem = dispatcher.mem.lock();
+            if replace_offset != 0 {
+                assert!(mem.shared.guest_range_has_owner(source, replace_offset));
+            }
+            let suffix_start = replace_offset + GRANULE;
+            if suffix_start < LENGTH {
+                assert!(
+                    mem.shared
+                        .guest_range_has_owner(source + suffix_start, LENGTH - suffix_start)
+                );
+            }
+            assert!(
+                mem.shared
+                    .guest_range_is_private_reservation(source + replace_offset, GRANULE)
+            );
+        }
+
+        let blocked = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    GRANULE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert!(
+            blocked >= source + LENGTH,
+            "live private reservation must keep nonfixed MAP_SHARED away from its source VA"
+        );
+
+        assert_eq!(
+            threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MUNMAP,
+                    SyscallArgs([source + replace_offset, GRANULE, 0, 0, 0, 0]),
+                ),
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let reused = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    GRANULE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert_eq!(reused, source + replace_offset);
+        assert_eq!(
+            memory.restored_shared_identity.last(),
+            Some(&(source + replace_offset, GRANULE as usize)),
+            "reusing the exact private source must restore VA to shared identity backing"
+        );
+
+        for (index, expected) in [0x11, 0x22, 0x33].into_iter().enumerate() {
+            let offset = (index as u64) * GRANULE;
+            if offset != replace_offset {
+                let start = usize::try_from(offset).unwrap();
+                assert!(
+                    memory.inner.bytes[start..start + GRANULE as usize]
+                        .iter()
+                        .all(|byte| *byte == expected),
+                    "reusing the displaced interval overwrote a live shared fragment"
+                );
+            }
+        }
+        let next = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    GRANULE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert!(
+            next >= source + LENGTH,
+            "a preserved prefix/suffix was returned to the shared allocator"
+        );
+    }
+
+    #[test]
+    fn shared_owner_prefix_replacement_then_unmap_reuses_only_prefix() {
+        assert_shared_owner_survives_partial_private_replacement(0);
+    }
+
+    #[test]
+    fn shared_owner_middle_replacement_then_unmap_reuses_only_middle() {
+        assert_shared_owner_survives_partial_private_replacement(crate::trap::HVF_PAGE_SIZE);
+    }
+
+    #[test]
+    fn shared_owner_suffix_replacement_then_unmap_reuses_only_suffix() {
+        assert_shared_owner_survives_partial_private_replacement(2 * crate::trap::HVF_PAGE_SIZE);
+    }
+
+    #[test]
+    fn partial_shared_file_munmaps_write_exact_fragments_and_close_once() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        const SYS_MUNMAP: u64 = 215;
+        const GRANULE: u64 = crate::trap::HVF_PAGE_SIZE;
+        const LENGTH: u64 = 3 * GRANULE;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1190));
+        let reporter = CompatReporter::default();
+        let file = tempfile::tempfile().expect("temporary shared backing");
+        file.set_len(LENGTH).expect("size shared backing");
+        let dup = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(
+            dup >= 0,
+            "dup shared backing: {}",
+            std::io::Error::last_os_error()
+        );
+        let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+        let owned_raw = owned.as_raw_fd();
+        let source = dispatcher
+            .mem
+            .lock()
+            .shared
+            .alloc(
+                LENGTH,
+                crate::shared_aperture::BackingObject::shared_file(owned, 0),
+            )
+            .expect("shared file aperture allocation");
+        dispatcher.record_dynamic_mapping(
+            source,
+            LENGTH,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            "shared-file".into(),
+        );
+        let mut memory = ProtectionTrackingMemory::new(source, LENGTH as usize);
+        memory.inner.bytes[..GRANULE as usize].fill(0x11);
+        memory.inner.bytes[GRANULE as usize..(2 * GRANULE) as usize].fill(0x22);
+        memory.inner.bytes[(2 * GRANULE) as usize..].fill(0x33);
+
+        for offset in [GRANULE, 0, 2 * GRANULE] {
+            assert_eq!(
+                threaded_memory_call(
+                    &dispatcher,
+                    &mut memory,
+                    &registry,
+                    &reporter,
+                    SyscallRequest::new(
+                        SYS_MUNMAP,
+                        SyscallArgs([source + offset, GRANULE, 0, 0, 0, 0]),
+                    ),
+                ),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            if offset != 2 * GRANULE {
+                assert_ne!(
+                    unsafe { libc::fcntl(owned_raw, libc::F_GETFD) },
+                    -1,
+                    "a surviving fragment must retain the one fd owner"
+                );
+            }
+        }
+        assert_eq!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+
+        let mut actual = vec![0_u8; LENGTH as usize];
+        assert_eq!(
+            unsafe {
+                libc::pread(
+                    file.as_raw_fd(),
+                    actual.as_mut_ptr().cast(),
+                    actual.len(),
+                    0,
+                )
+            },
+            LENGTH as isize
+        );
+        assert!(actual[..GRANULE as usize].iter().all(|byte| *byte == 0x11));
+        assert!(
+            actual[GRANULE as usize..(2 * GRANULE) as usize]
+                .iter()
+                .all(|byte| *byte == 0x22)
+        );
+        assert!(
+            actual[(2 * GRANULE) as usize..]
+                .iter()
+                .all(|byte| *byte == 0x33)
+        );
+    }
+
+    #[test]
+    fn clean_private_repoint_failure_does_not_commit_shared_file_writeback() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        const SYS_MMAP: u64 = 222;
+        const SYS_MUNMAP: u64 = 215;
+        const LENGTH: u64 = crate::trap::HVF_PAGE_SIZE;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1191));
+        let reporter = CompatReporter::default();
+        let file = tempfile::tempfile().expect("temporary repoint backing");
+        file.set_len(LENGTH).expect("size repoint backing");
+        let dup = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(dup >= 0, "dup repoint backing");
+        let owned = unsafe { OwnedFd::from_raw_fd(dup) };
+        let owned_raw = owned.as_raw_fd();
+        let source = dispatcher
+            .mem
+            .lock()
+            .shared
+            .alloc(
+                LENGTH,
+                crate::shared_aperture::BackingObject::shared_file(owned, 0),
+            )
+            .expect("shared file source");
+        dispatcher.record_dynamic_mapping(
+            source,
+            LENGTH,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            "shared-file".into(),
+        );
+        let mut memory = ProtectionTrackingMemory::new(source, LENGTH as usize);
+        memory.inner.bytes.fill(0x61);
+        memory.fail_repoint = true;
+
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    source,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        );
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
+        let mut byte = [0xff_u8; 1];
+        assert_eq!(
+            unsafe { libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+            1
+        );
+        assert_eq!(byte, [0], "clean failure must not commit writeback");
+        assert!(
+            dispatcher
+                .mem
+                .lock()
+                .shared
+                .guest_range_has_owner(source, LENGTH)
+        );
+        assert_ne!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
+
+        assert_eq!(
+            threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(SYS_MUNMAP, SyscallArgs([source, LENGTH, 0, 0, 0, 0]),),
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
+        assert_eq!(
+            unsafe { libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+            1
+        );
+        assert_eq!(byte, [0x61]);
+    }
+
+    #[test]
+    fn private_overlay_prefix_replacement_carves_exact_storage() {
+        assert_partial_private_overlay_replacement(0);
+    }
+
+    #[test]
+    fn private_overlay_middle_replacement_carves_exact_storage() {
+        assert_partial_private_overlay_replacement(crate::trap::HVF_PAGE_SIZE);
+    }
+
+    #[test]
+    fn private_overlay_suffix_replacement_carves_exact_storage() {
+        assert_partial_private_overlay_replacement(2 * crate::trap::HVF_PAGE_SIZE);
+    }
+
+    #[test]
+    fn exact_partial_granule_replacement_splits_owner_without_reusing_live_storage() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = 2 * crate::trap::HVF_PAGE_SIZE;
+        const PARTIAL: u64 = LINUX_PAGE_SIZE;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1164));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, LENGTH as usize);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        let _ = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    source,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        ));
+        let prior_calls = memory.repoint_calls;
+        let prior_overlay = dispatcher
+            .mem
+            .lock()
+            .overlay
+            .translate_source_range(source, LENGTH)
+            .expect("prior overlay");
+
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    source,
+                    PARTIAL,
+                    LINUX_PROT_READ,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: source as i64
+            }
+        );
+        assert_eq!(memory.repoint_calls, prior_calls + 1);
+        let mut mem = dispatcher.mem.lock();
+        let replacement = mem
+            .overlay
+            .translate_source_range(source, PARTIAL)
+            .expect("exact partial replacement owner");
+        assert_ne!(replacement, prior_overlay);
+        assert_eq!(
+            mem.overlay
+                .translate_source_range(source + PARTIAL, LENGTH - PARTIAL),
+            Some(prior_overlay + PARTIAL)
+        );
+        let fresh = mem
+            .overlay
+            .alloc(
+                crate::trap::HVF_PAGE_SIZE,
+                crate::shared_aperture::BackingObject::PrivateAnon,
+            )
+            .expect("partial physical hole is not independently reusable");
+        assert!(fresh >= replacement + crate::trap::HVF_PAGE_SIZE);
+    }
+
+    #[test]
+    fn post_repoint_protection_failure_aborts_instead_of_publishing_split_ownership() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = 4096;
+        const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork protection-failure child failed");
+        if child == 0 {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+            let dispatcher = SyscallDispatcher::new();
+            let registry = crate::thread::ThreadRegistry::new(
+                crate::thread::ThreadId::synthetic_for_tests(1063),
+            );
+            let reporter = CompatReporter::default();
+            let mut memory =
+                ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH);
+            let shared = returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        0,
+                        LENGTH,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            )) as u64;
+            memory.fail_protect = true;
+            let _ = threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        shared,
+                        LENGTH,
+                        LINUX_PROT_READ,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            );
+            unsafe { libc::_exit(92) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFSIGNALED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+    }
+
+    #[test]
+    fn moving_shared_mremap_fails_before_private_copy_or_metadata_mutation() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MREMAP: u64 = 216;
+        const LENGTH: u64 = LINUX_PAGE_SIZE;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1065));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (8 * LINUX_PAGE_SIZE) as usize);
+        let old = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_EXEC,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        let _blocker = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        ));
+        memory.protections.set_mapping_sharing(
+            old,
+            LENGTH as usize,
+            carrick_guest_mem::MappingSharing::Shared,
+        );
+        dispatcher.record_dynamic_mapping(
+            old,
+            LENGTH,
+            LinuxProtFlags::READ | LinuxProtFlags::EXEC,
+            ProcMapSharing::Shared,
+            "shared-code".into(),
+        );
+
+        let mmap_next_before = dispatcher.mem.lock().mmap_next;
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([old, LENGTH, 2 * LENGTH, LINUX_MREMAP_MAYMOVE, 0, 0]),
+            ),
+        );
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
+        assert_eq!(dispatcher.mem.lock().mmap_next, mmap_next_before);
+        assert!(
+            memory
+                .protections
+                .range_mutable_shared_backing(old, LENGTH as usize)
+        );
+        assert!(!memory.protections.range_unmapped(old, LENGTH as usize));
+        let mem = dispatcher.mem.lock();
+        assert!(mem.dynamic_maps.iter().any(|map| {
+            map.start == old
+                && map.end == old + LENGTH
+                && map.execute
+                && map.sharing == ProcMapSharing::Shared
+                && map.path == "shared-code"
+        }));
+        assert_eq!(mem.dynamic_maps.len(), 2, "source plus blocker only");
+    }
+
+    #[test]
+    fn mixed_rx_and_r_mremap_source_is_rejected_without_broadening_permissions() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MPROTECT: u64 = 226;
+        const SYS_MREMAP: u64 = 216;
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1066));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (8 * LINUX_PAGE_SIZE) as usize);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    2 * LINUX_PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_EXEC,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert_eq!(
+            threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MPROTECT,
+                    SyscallArgs([
+                        source + LINUX_PAGE_SIZE,
+                        LINUX_PAGE_SIZE,
+                        LINUX_PROT_READ,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let maps_before = dispatcher.mem.lock().dynamic_maps.clone();
+        let mmap_next_before = dispatcher.mem.lock().mmap_next;
+
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([
+                    source,
+                    2 * LINUX_PAGE_SIZE,
+                    3 * LINUX_PAGE_SIZE,
+                    LINUX_MREMAP_MAYMOVE,
+                    0,
+                    0,
+                ]),
+            ),
+        );
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
+        assert_eq!(dispatcher.mem.lock().dynamic_maps, maps_before);
+        assert_eq!(dispatcher.mem.lock().mmap_next, mmap_next_before);
+    }
+
+    #[test]
+    fn mremap_shrink_unmap_failure_keeps_source_metadata_and_allocator() {
+        const SYS_MREMAP: u64 = 216;
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1067));
+        let reporter = CompatReporter::default();
+        let source = LINUX_MMAP_BASE;
+        dispatcher.record_dynamic_mapping(
+            source,
+            2 * LINUX_PAGE_SIZE,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Private,
+            "source".into(),
+        );
+        dispatcher.mem.lock().mmap_next = source + 2 * LINUX_PAGE_SIZE;
+        let mut memory =
+            DeferredSetterFailureMemory::new(source, (2 * LINUX_PAGE_SIZE) as usize).fail_unmaps(1);
+        let maps_before = dispatcher.mem.lock().dynamic_maps.clone();
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([source, 2 * LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
+            ),
+        );
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
+        assert_eq!(dispatcher.mem.lock().dynamic_maps, maps_before);
+        assert_eq!(
+            dispatcher.mem.lock().mmap_next,
+            source + 2 * LINUX_PAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn shared_anonymous_mremap_shrink_retains_shared_prefix_metadata() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MREMAP: u64 = 216;
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1068));
+        let reporter = CompatReporter::default();
+        let base = crate::memory::LINUX_SHARED_FILE_BASE;
+        let map_len = crate::trap::HVF_PAGE_SIZE * 2;
+        let mut memory = CountingMmapMemory::new(base, map_len as usize);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    map_len,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        let shrunk = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([source, map_len, crate::trap::HVF_PAGE_SIZE, 0, 0, 0]),
+            ),
+        );
+        assert_eq!(
+            shrunk,
+            DispatchOutcome::Returned {
+                value: source as i64
+            }
+        );
+        let mem = dispatcher.mem.lock();
+        assert!(mem.dynamic_maps.iter().any(|map| {
+            map.start == source
+                && map.end == source + crate::trap::HVF_PAGE_SIZE
+                && map.sharing == ProcMapSharing::Shared
+        }));
+    }
+
+    #[test]
+    fn private_overlay_mremap_shrink_carves_source_tail_and_reuses_only_storage() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MREMAP: u64 = 216;
+        const GRANULE: u64 = crate::trap::HVF_PAGE_SIZE;
+        const LENGTH: u64 = 2 * GRANULE;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1174));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, LENGTH as usize);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        assert_eq!(
+            returned(threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        source,
+                        LENGTH,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            )),
+            source as i64
+        );
+        let old_overlay = dispatcher
+            .mem
+            .lock()
+            .overlay
+            .translate_source_range(source, LENGTH)
+            .expect("whole private overlay before shrink");
+        memory.inner.bytes[..GRANULE as usize].fill(0x41);
+        memory.inner.bytes[GRANULE as usize..].fill(0x52);
+
+        assert_eq!(
+            threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(SYS_MREMAP, SyscallArgs([source, LENGTH, GRANULE, 0, 0, 0]),),
+            ),
+            DispatchOutcome::Returned {
+                value: source as i64
+            }
+        );
+
+        let mut mem = dispatcher.mem.lock();
+        assert_eq!(
+            mem.overlay.translate_source_range(source, GRANULE),
+            Some(old_overlay),
+            "retained source prefix must keep its physical overlay translation"
+        );
+        assert_eq!(
+            mem.overlay
+                .translate_source_range(source + GRANULE, GRANULE),
+            None,
+            "removed source tail must not retain stale overlay ownership"
+        );
+        assert!(
+            mem.shared
+                .guest_range_is_private_reservation(source, GRANULE)
+        );
+        assert!(!mem.shared.guest_range_has_owner(source + GRANULE, GRANULE));
+        assert!(
+            mem.shared
+                .range_needs_identity_restore(source + GRANULE, GRANULE)
+        );
+        let reused = mem
+            .overlay
+            .alloc_sourced(
+                GRANULE,
+                crate::shared_aperture::BackingObject::PrivateAnon,
+                Some(source + (8 * GRANULE)),
+            )
+            .expect("reuse removed overlay tail for a distinct source");
+        assert_eq!(reused, old_overlay + GRANULE);
+        assert_eq!(
+            mem.overlay
+                .translate_source_range(source + (8 * GRANULE), GRANULE),
+            Some(old_overlay + GRANULE)
+        );
+        drop(mem);
+
+        assert!(
+            memory
+                .protections
+                .range_unmapped(source + GRANULE, GRANULE as usize),
+            "VMM/identity guest metadata must keep the removed VA inaccessible"
+        );
+        assert!(
+            memory.inner.bytes[..GRANULE as usize]
+                .iter()
+                .all(|byte| *byte == 0x41)
+        );
+        let map = dispatcher
+            .dynamic_mapping_for_test(source)
+            .expect("retained private prefix VMA");
+        assert_eq!(map.end, source + GRANULE);
+        assert_eq!(map.sharing, ProcMapSharing::Private);
+        assert!(
+            dispatcher
+                .dynamic_mapping_for_test(source + GRANULE)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mremap_fixed_is_rejected_before_source_or_destination_mutation() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MREMAP: u64 = 216;
+        const MREMAP_MAYMOVE: u64 = 0x01;
+        const MREMAP_FIXED: u64 = 0x02;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1069));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (8 * LINUX_PAGE_SIZE) as usize);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LINUX_PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        let destination = source + (2 * LINUX_PAGE_SIZE);
+        memory
+            .write_bytes(source, b"move")
+            .expect("seed source bytes before fixed move");
+
+        let zero_size = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([u64::MAX, LINUX_PAGE_SIZE, 0, MREMAP_FIXED, 1, 0]),
+            ),
+        );
+        assert_eq!(zero_size, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        let invalid_combo = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([u64::MAX, u64::MAX, u64::MAX, MREMAP_FIXED | (1 << 63), 3, 0]),
+            ),
+        );
+        assert_eq!(invalid_combo, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([
+                    source,
+                    LINUX_PAGE_SIZE,
+                    LINUX_PAGE_SIZE,
+                    MREMAP_MAYMOVE | MREMAP_FIXED,
+                    destination,
+                    0,
+                ]),
+            ),
+        );
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_eq!(memory.read_bytes(source, 4).unwrap(), b"move");
+        assert_eq!(memory.read_bytes(destination, 4).unwrap(), &[0; 4]);
+        assert!(
+            !memory
+                .protections
+                .range_unmapped(source, LINUX_PAGE_SIZE as usize)
+        );
+        let mem = dispatcher.mem.lock();
+        assert!(mem.dynamic_maps.iter().any(|map| map.start == source));
+        assert!(!mem.dynamic_maps.iter().any(|map| map.start == destination));
+    }
+
+    #[test]
+    fn mremap_dontunmap_is_rejected_before_source_or_allocator_mutation() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MREMAP: u64 = 216;
+        const MREMAP_MAYMOVE: u64 = 0x01;
+        const MREMAP_DONTUNMAP: u64 = 0x04;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1070));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (8 * LINUX_PAGE_SIZE) as usize);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LINUX_PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        memory
+            .write_bytes(source, b"keep")
+            .expect("seed source bytes before dontunmap move");
+
+        let invalid_precedence = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([u64::MAX, 0, 0, MREMAP_DONTUNMAP | (1 << 63), 0, 0]),
+            ),
+        );
+        assert_eq!(invalid_precedence, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([
+                    source,
+                    LINUX_PAGE_SIZE,
+                    LINUX_PAGE_SIZE,
+                    MREMAP_MAYMOVE | MREMAP_DONTUNMAP,
+                    0,
+                    0,
+                ]),
+            ),
+        );
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_eq!(memory.read_bytes(source, 4).unwrap(), b"keep");
+        let mem = dispatcher.mem.lock();
+        assert_eq!(mem.dynamic_maps.len(), 1);
+        assert_eq!(mem.dynamic_maps[0].start, source);
+    }
+
+    #[test]
+    fn shared_fixed_mremap_move_fails_before_source_mutation() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MREMAP: u64 = 216;
+        const MREMAP_MAYMOVE: u64 = 0x01;
+        const MREMAP_FIXED: u64 = 0x02;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1071));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (8 * LINUX_PAGE_SIZE) as usize);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LINUX_PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_EXEC,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        memory.protections.set_mapping_sharing(
+            source,
+            LINUX_PAGE_SIZE as usize,
+            carrick_guest_mem::MappingSharing::Shared,
+        );
+        dispatcher.record_dynamic_mapping(
+            source,
+            LINUX_PAGE_SIZE,
+            LinuxProtFlags::READ | LinuxProtFlags::EXEC,
+            ProcMapSharing::Shared,
+            "shared-fixed".into(),
+        );
+        let before = dispatcher.mem.lock().dynamic_maps.clone();
+
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([
+                    source,
+                    LINUX_PAGE_SIZE,
+                    LINUX_PAGE_SIZE,
+                    MREMAP_MAYMOVE | MREMAP_FIXED,
+                    source + (2 * LINUX_PAGE_SIZE),
+                    0,
+                ]),
+            ),
+        );
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_eq!(dispatcher.mem.lock().dynamic_maps, before);
+        assert!(
+            !memory
+                .protections
+                .range_unmapped(source, LINUX_PAGE_SIZE as usize)
+        );
+    }
+
+    #[test]
+    fn shared_fixed_mremap_shrink_fails_before_source_tail_mutation() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MREMAP: u64 = 216;
+        const MREMAP_MAYMOVE: u64 = 0x01;
+        const MREMAP_FIXED: u64 = 0x02;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1073));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (8 * LINUX_PAGE_SIZE) as usize);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    2 * LINUX_PAGE_SIZE,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        memory.protections.set_mapping_sharing(
+            source,
+            (2 * LINUX_PAGE_SIZE) as usize,
+            carrick_guest_mem::MappingSharing::Shared,
+        );
+        dispatcher.record_dynamic_mapping(
+            source,
+            2 * LINUX_PAGE_SIZE,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            "shared-fixed-shrink".into(),
+        );
+        let before = dispatcher.mem.lock().dynamic_maps.clone();
+
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([
+                    source,
+                    2 * LINUX_PAGE_SIZE,
+                    LINUX_PAGE_SIZE,
+                    MREMAP_MAYMOVE | MREMAP_FIXED,
+                    source + (3 * LINUX_PAGE_SIZE),
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_eq!(dispatcher.mem.lock().dynamic_maps, before);
+        assert!(
+            !memory
+                .protections
+                .range_unmapped(source + LINUX_PAGE_SIZE, LINUX_PAGE_SIZE as usize),
+            "fixed shared shrink must not unmap the source tail before rejection"
+        );
+    }
+
+    #[test]
+    fn mremap_boot_region_metadata_fallback_preserves_exact_properties() {
+        const SYS_MREMAP: u64 = 216;
+        const BOOT_VMA: u64 = LINUX_MMAP_BASE - (8 * LINUX_PAGE_SIZE);
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_address_space_regions(vec![ProcMapsEntry {
+            start: BOOT_VMA,
+            end: BOOT_VMA + (2 * LINUX_PAGE_SIZE),
+            read: true,
+            write: true,
+            execute: false,
+            sharing: ProcMapSharing::Private,
+            path: "boot-region".into(),
+        }]);
+        let reporter = CompatReporter::default();
+        let mut memory = ProtectionTrackingMemory::new(BOOT_VMA, (4 * LINUX_PAGE_SIZE) as usize);
+
+        let outcome = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    SYS_MREMAP,
+                    SyscallArgs([BOOT_VMA, 2 * LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("boot-region shrink dispatch");
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: BOOT_VMA as i64
+            }
+        );
+        let map = dispatcher
+            .dynamic_mapping_for_test(BOOT_VMA)
+            .expect("fallback should publish exact boot-region metadata");
+        assert_eq!(map.end, BOOT_VMA + LINUX_PAGE_SIZE);
+        assert!((map.read, map.write, map.execute) == (true, true, false));
+        assert_eq!(map.sharing, ProcMapSharing::Private);
+        assert_eq!(map.path, "boot-region");
+    }
+
+    #[test]
+    fn mremap_rejects_boot_region_source_spanning_multiple_regions() {
+        const SYS_MREMAP: u64 = 216;
+        const BOOT_VMA: u64 = LINUX_MMAP_BASE - (8 * LINUX_PAGE_SIZE);
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_address_space_regions(vec![
+            ProcMapsEntry {
+                start: BOOT_VMA,
+                end: BOOT_VMA + LINUX_PAGE_SIZE,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: "boot-left".into(),
+            },
+            ProcMapsEntry {
+                start: BOOT_VMA + LINUX_PAGE_SIZE,
+                end: BOOT_VMA + (2 * LINUX_PAGE_SIZE),
+                read: true,
+                write: false,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: "boot-right".into(),
+            },
+        ]);
+        let reporter = CompatReporter::default();
+        let mut memory = ProtectionTrackingMemory::new(BOOT_VMA, (4 * LINUX_PAGE_SIZE) as usize);
+
+        let outcome = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    SYS_MREMAP,
+                    SyscallArgs([
+                        BOOT_VMA,
+                        2 * LINUX_PAGE_SIZE,
+                        3 * LINUX_PAGE_SIZE,
+                        LINUX_MREMAP_MAYMOVE,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("mixed boot-span shrink dispatch");
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
+        assert!(dispatcher.mem.lock().dynamic_maps.is_empty());
+    }
+
+    #[test]
+    fn mremap_rejects_hidden_mmap_backing_boot_region() {
+        const SYS_MREMAP: u64 = 216;
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_address_space_regions(vec![ProcMapsEntry {
+            start: LINUX_MMAP_BASE,
+            end: LINUX_MMAP_BASE + crate::memory::LINUX_MMAP_SIZE,
+            read: true,
+            write: true,
+            execute: false,
+            sharing: ProcMapSharing::Private,
+            path: "hidden-mmap-backing".into(),
+        }]);
+        let mut memory =
+            ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (2 * LINUX_PAGE_SIZE) as usize);
+        let outcome = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    SYS_MREMAP,
+                    SyscallArgs([LINUX_MMAP_BASE, LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .expect("hidden backing mremap dispatch");
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
+        assert!(dispatcher.mem.lock().dynamic_maps.is_empty());
+    }
+
+    #[test]
+    fn mremap_rejects_hidden_shared_and_private_aperture_boot_regions() {
+        const SYS_MREMAP: u64 = 216;
+        for (base, size, label) in [
+            (
+                crate::memory::LINUX_SHARED_FILE_BASE,
+                crate::memory::LINUX_SHARED_FILE_SIZE,
+                "hidden-shared-aperture",
+            ),
+            (
+                crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
+                crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
+                "hidden-private-overlay",
+            ),
+        ] {
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.set_address_space_regions(vec![ProcMapsEntry {
+                start: base,
+                end: base + size,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: label.into(),
+            }]);
+            let mut memory = ProtectionTrackingMemory::new(base, LINUX_PAGE_SIZE as usize);
+            let outcome = dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        SYS_MREMAP,
+                        SyscallArgs([base, LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &CompatReporter::default(),
+                )
+                .expect("hidden aperture mremap dispatch");
+            assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT), "{label}");
+            assert!(dispatcher.mem.lock().dynamic_maps.is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn mremap_boot_heap_fallback_accepts_live_prefix_and_rejects_hidden_suffix() {
+        const SYS_MREMAP: u64 = 216;
+        let mut dispatcher = SyscallDispatcher::new();
+        let layout = dispatcher.mem.lock().layout;
+        dispatcher.set_address_space_regions(vec![ProcMapsEntry {
+            start: layout.heap_base,
+            end: layout.heap_base + layout.heap_size,
+            read: true,
+            write: true,
+            execute: false,
+            sharing: ProcMapSharing::Private,
+            path: "hidden-heap-backing".into(),
+        }]);
+        dispatcher.mem.lock().brk_current = layout.heap_base + (2 * LINUX_PAGE_SIZE);
+        let mut memory =
+            ProtectionTrackingMemory::new(layout.heap_base, (4 * LINUX_PAGE_SIZE) as usize);
+        let reporter = CompatReporter::default();
+
+        let live = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    SYS_MREMAP,
+                    SyscallArgs([layout.heap_base, LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("live heap-prefix mremap");
+        assert_eq!(
+            live,
+            DispatchOutcome::Returned {
+                value: layout.heap_base as i64
+            }
+        );
+
+        let hidden = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    SYS_MREMAP,
+                    SyscallArgs([
+                        layout.heap_base + (2 * LINUX_PAGE_SIZE),
+                        LINUX_PAGE_SIZE,
+                        LINUX_PAGE_SIZE,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("hidden heap-suffix mremap");
+        assert_eq!(hidden, DispatchOutcome::errno(LINUX_EFAULT));
+        assert!(
+            dispatcher
+                .dynamic_mapping_for_test(layout.heap_base)
+                .is_some()
+        );
+        assert!(
+            dispatcher
+                .dynamic_mapping_for_test(layout.heap_base + (2 * LINUX_PAGE_SIZE))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn munmap_hole_cannot_fall_back_to_boot_metadata_during_mremap() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MUNMAP: u64 = 215;
+        const SYS_MREMAP: u64 = 216;
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_address_space_regions(vec![ProcMapsEntry {
+            start: LINUX_MMAP_BASE,
+            end: LINUX_MMAP_BASE + (4 * LINUX_PAGE_SIZE),
+            read: true,
+            write: true,
+            execute: false,
+            sharing: ProcMapSharing::Private,
+            path: "hidden-mmap-backing".into(),
+        }]);
+        let mut memory =
+            ProtectionTrackingMemory::new(LINUX_MMAP_BASE, (4 * LINUX_PAGE_SIZE) as usize);
+        let reporter = CompatReporter::default();
+        let mapped = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        0,
+                        LINUX_PAGE_SIZE,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("mmap before hole regression");
+        assert_eq!(returned(mapped), LINUX_MMAP_BASE as i64);
+        let unmapped = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    SYS_MUNMAP,
+                    SyscallArgs([LINUX_MMAP_BASE, LINUX_PAGE_SIZE, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("munmap before hole regression");
+        assert_eq!(unmapped, DispatchOutcome::Returned { value: 0 });
+
+        let remapped = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    SYS_MREMAP,
+                    SyscallArgs([LINUX_MMAP_BASE, LINUX_PAGE_SIZE, LINUX_PAGE_SIZE, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("mremap of munmap hole");
+        assert_eq!(remapped, DispatchOutcome::errno(LINUX_EFAULT));
+        assert!(dispatcher.mem.lock().dynamic_maps.is_empty());
+        assert!(
+            memory
+                .protections
+                .range_unmapped(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+        );
+    }
+
+    #[test]
+    fn shared_aperture_partial_and_shifted_sources_reject_before_backend_mutation() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MREMAP: u64 = 216;
+        const OLD_LEN: u64 = 32 * 1024;
+        const PREFIX_LEN: u64 = 16 * 1024;
+        const NEW_LEN: u64 = 8 * 1024;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1073));
+        let reporter = CompatReporter::default();
+        let mut memory = ProtectionTrackingMemory::new(
+            crate::memory::LINUX_SHARED_FILE_BASE,
+            (OLD_LEN + LINUX_PAGE_SIZE) as usize,
+        );
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    OLD_LEN,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([source, PREFIX_LEN, NEW_LEN, 0, 0, 0]),
+            ),
+        );
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
+        let suffix_outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([source + PREFIX_LEN, PREFIX_LEN, NEW_LEN, 0, 0, 0]),
+            ),
+        );
+        assert_eq!(suffix_outcome, DispatchOutcome::errno(LINUX_EFAULT));
+
+        // Fabricate an exact VMA that starts inside the allocation and has the
+        // same length as its owner. Without an explicit allocation-start check,
+        // this shape passed the live_len test and released pages it did not own.
+        dispatcher.remove_mapping_metadata(source, OLD_LEN);
+        dispatcher.record_dynamic_mapping(
+            source + LINUX_PAGE_SIZE,
+            OLD_LEN,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            "shifted-shared-vma".into(),
+        );
+        let shifted_outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([source + LINUX_PAGE_SIZE, OLD_LEN, PREFIX_LEN, 0, 0, 0]),
+            ),
+        );
+        assert_eq!(shifted_outcome, DispatchOutcome::errno(LINUX_EFAULT));
+        let mem = dispatcher.mem.lock();
+        let alloc = mem
+            .shared
+            .live()
+            .iter()
+            .find(|alloc| alloc.guest_addr == source)
+            .expect("whole shared allocation retained");
+        assert_eq!(alloc.live_len, OLD_LEN);
+        assert_eq!(alloc.len, OLD_LEN);
+        assert!(!memory.protections.range_unmapped(source + NEW_LEN, 1));
+    }
+
+    #[test]
+    fn odd_shared_mmap_tracks_logical_length_and_granule_reservation() {
+        const SYS_MMAP: u64 = 222;
+        const REQUESTED: u64 = 4097;
+        const LOGICAL: u64 = 8192;
+        const RESERVED: u64 = 16 * 1024;
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1074));
+        let mut memory =
+            ProtectionTrackingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, RESERVED as usize);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &CompatReporter::default(),
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    REQUESTED,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+        let mem = dispatcher.mem.lock();
+        let alloc = mem
+            .shared
+            .live()
+            .iter()
+            .find(|alloc| alloc.guest_addr == source)
+            .expect("odd shared allocation");
+        assert_eq!(alloc.live_len, LOGICAL);
+        assert_eq!(alloc.len, RESERVED);
+        let map = mem
+            .dynamic_maps
+            .iter()
+            .find(|map| map.start == source)
+            .expect("odd logical VMA");
+        assert_eq!(map.end - map.start, LOGICAL);
+    }
+
+    #[test]
+    fn shared_mremap_shrink_unmap_failure_keeps_live_length_and_tail_accounting() {
+        const SYS_MMAP: u64 = 222;
+        const SYS_MREMAP: u64 = 216;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1072));
+        let reporter = CompatReporter::default();
+        let map_len = crate::trap::HVF_PAGE_SIZE * 2;
+        let mut memory = DeferredSetterFailureMemory::new(
+            crate::memory::LINUX_SHARED_FILE_BASE,
+            map_len as usize,
+        )
+        .demand_paged()
+        .fail_unmaps(1);
+        let source = returned(threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    map_len,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        )) as u64;
+
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MREMAP,
+                SyscallArgs([source, map_len, crate::trap::HVF_PAGE_SIZE, 0, 0, 0]),
+            ),
+        );
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
+        {
+            let mem = dispatcher.mem.lock();
+            let alloc = mem
+                .shared
+                .live()
+                .iter()
+                .find(|alloc| alloc.guest_addr == source)
+                .unwrap();
+            assert_eq!(alloc.live_len, map_len);
+            assert_eq!(alloc.len, map_len);
+        }
+        let next = {
+            let mut mem = dispatcher.mem.lock();
+            mem.shared
+                .alloc(
+                    crate::trap::HVF_PAGE_SIZE,
+                    crate::shared_aperture::BackingObject::SharedAnon,
+                )
+                .expect("failed shrink must not free the tail for reuse")
+        };
+        assert_eq!(next, source + map_len);
+    }
+
+    #[test]
+    fn demand_paged_shared_anon_keeps_best_effort_mapping_on_protection_failure() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = 4096;
+        const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1070));
+        let reporter = CompatReporter::default();
+        let mut memory =
+            DeferredSetterFailureMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, MAPPED_LENGTH)
+                .demand_paged();
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    0,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        );
+
+        assert!(matches!(outcome, DispatchOutcome::Returned { .. }));
+        assert_eq!(memory.protect_calls, 1);
+        assert_eq!(
+            memory.unmap_calls, 0,
+            "demand-paged backend keeps reservation"
+        );
+        assert_eq!(dispatcher.mem.lock().dynamic_maps.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_exec_mmap_does_not_commit_consumed_protection_failure_outside_arena() {
+        const SYS_MMAP: u64 = 222;
+        const ADDRESS: u64 = 0x2000_0000;
+        const LENGTH: u64 = 4096;
+
+        let dispatcher = SyscallDispatcher::new();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1075));
+        let reporter = CompatReporter::default();
+        let mut memory = DeferredSetterFailureMemory::new(ADDRESS, LENGTH as usize);
+        let outcome = threaded_memory_call(
+            &dispatcher,
+            &mut memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    ADDRESS,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                    u64::MAX,
+                    0,
+                ]),
+            ),
+        );
+
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_ENOMEM));
+        assert_eq!(
+            memory.protect_calls, 1,
+            "deferred failure consumed exactly once"
+        );
+        assert!(dispatcher.mem.lock().dynamic_maps.is_empty());
+    }
+
+    #[test]
+    fn shared_anon_persistent_rollback_failure_aborts_concurrent_exec_backend() {
+        const SYS_MMAP: u64 = 222;
+        const LENGTH: u64 = 4096;
+        const MAPPED_LENGTH: usize = crate::trap::HVF_PAGE_SIZE as usize;
+
+        // SAFETY: the child owns an isolated dispatcher and intentionally takes
+        // the fail-stop abort after two injected host-unmap failures.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+            let dispatcher = SyscallDispatcher::new();
+            let registry = crate::thread::ThreadRegistry::new(
+                crate::thread::ThreadId::synthetic_for_tests(1080),
+            );
+            let reporter = CompatReporter::default();
+            let mut memory = DeferredSetterFailureMemory::new(
+                crate::memory::LINUX_SHARED_FILE_BASE,
+                MAPPED_LENGTH,
+            )
+            .fail_unmaps(2);
+            let _ = threaded_memory_call(
+                &dispatcher,
+                &mut memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(
+                    SYS_MMAP,
+                    SyscallArgs([
+                        0,
+                        LENGTH,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+            );
+            unsafe { libc::_exit(92) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFSIGNALED(status));
+        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
     }
 
     #[test]
@@ -3937,6 +7923,61 @@ mod tests {
     }
 
     #[test]
+    fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
+        let dispatcher = SyscallDispatcher::new();
+        let layout = dispatcher.mem.lock().layout;
+        const BOOT: u64 = 0x20_0000_0000;
+        dispatcher.set_address_space_regions(vec![
+            ProcMapsEntry {
+                start: layout.heap_base,
+                end: layout.heap_base + layout.heap_size,
+                read: true,
+                write: true,
+                execute: false,
+                sharing: ProcMapSharing::Private,
+                path: "heap-backing".into(),
+            },
+            ProcMapsEntry {
+                start: layout.mmap_base,
+                end: layout.mmap_base + layout.mmap_size,
+                read: true,
+                write: true,
+                execute: true,
+                sharing: ProcMapSharing::Private,
+                path: "mmap-backing".into(),
+            },
+            ProcMapsEntry {
+                start: BOOT,
+                end: BOOT + LINUX_PAGE_SIZE,
+                read: true,
+                write: false,
+                execute: true,
+                sharing: ProcMapSharing::Private,
+                path: "boot-text".into(),
+            },
+        ]);
+        dispatcher.mem.lock().brk_current = layout.heap_base + LINUX_PAGE_SIZE;
+        dispatcher.record_dynamic_mapping(
+            layout.mmap_base + (2 * LINUX_PAGE_SIZE),
+            LINUX_PAGE_SIZE,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Private,
+            String::new(),
+        );
+
+        assert!(dispatcher.guest_vma_overlaps(layout.heap_base, LINUX_PAGE_SIZE));
+        assert!(
+            !dispatcher.guest_vma_overlaps(layout.heap_base + LINUX_PAGE_SIZE, LINUX_PAGE_SIZE)
+        );
+        assert!(
+            dispatcher
+                .guest_vma_overlaps(layout.mmap_base + (2 * LINUX_PAGE_SIZE), LINUX_PAGE_SIZE)
+        );
+        assert!(!dispatcher.guest_vma_overlaps(layout.mmap_base, LINUX_PAGE_SIZE));
+        assert!(dispatcher.guest_vma_overlaps(BOOT, LINUX_PAGE_SIZE));
+    }
+
+    #[test]
     fn dynamic_mapping_overlap_uses_sorted_boundaries() {
         let maps = vec![
             ProcMapsEntry {
@@ -4360,6 +8401,449 @@ mod tests {
             1,
             "reused mapping should still install the requested guest protection"
         );
+    }
+
+    #[test]
+    fn range_owned_metadata_removal_clears_every_mmap_classification() {
+        let dispatcher = SyscallDispatcher::new();
+        let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let len = 2 * LINUX_PAGE_SIZE;
+        let range = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
+            .expect("metadata range");
+        let writable_memfd =
+            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(0),
+                path: "memfd:metadata-remove".into(),
+                contents: Vec::new(),
+                offset: 0,
+            }));
+        dispatcher.record_dynamic_mapping(
+            start,
+            len,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            String::new(),
+        );
+        {
+            let mut mem = dispatcher.mem.lock();
+            mem.remap_snapshots.insert(start, vec![0; len as usize]);
+            mem.bus_fault_ranges.push((start, len));
+            locked_ranges_insert(&mut mem.locked_ranges, range);
+            locked_ranges_insert(&mut mem.resident_ranges, range);
+            locked_ranges_insert(&mut mem.resident_tracked_ranges, range);
+            mem.resident_fault_ranges.push(ResidentFaultRange {
+                range,
+                prot: LinuxProtFlags::READ,
+            });
+            locked_ranges_insert(&mut mem.write_sealed_shared_maps, range);
+            mem.writable_memfd_maps.push((range, writable_memfd));
+        }
+        assert!(dispatcher.range_has_mapping_metadata_for_test(start, len));
+
+        dispatcher.remove_mapping_metadata(start, len);
+
+        assert!(!dispatcher.range_has_mapping_metadata_for_test(start, len));
+    }
+
+    #[test]
+    fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffix() {
+        let dispatcher = SyscallDispatcher::new();
+        let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let page = LINUX_PAGE_SIZE;
+        let len = 3 * page;
+        let middle = start + page;
+        let whole = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
+            .expect("whole predecessor range");
+        let writable_memfd =
+            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(0),
+                path: "memfd:split-predecessor".into(),
+                contents: Vec::new(),
+                offset: 0,
+            }));
+        dispatcher.record_dynamic_mapping(
+            start,
+            len,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            "predecessor".into(),
+        );
+        {
+            let mut mem = dispatcher.mem.lock();
+            let mut snapshot = vec![0x11; page as usize];
+            snapshot.extend(std::iter::repeat_n(0x22, page as usize));
+            snapshot.extend(std::iter::repeat_n(0x33, page as usize));
+            mem.remap_snapshots.insert(start, snapshot);
+            mem.bus_fault_ranges.push((start, len));
+            locked_ranges_insert(&mut mem.locked_ranges, whole);
+            locked_ranges_insert(&mut mem.resident_ranges, whole);
+            locked_ranges_insert(&mut mem.resident_tracked_ranges, whole);
+            mem.resident_fault_ranges.push(ResidentFaultRange {
+                range: whole,
+                prot: LinuxProtFlags::READ,
+            });
+            locked_ranges_insert(&mut mem.write_sealed_shared_maps, whole);
+            mem.writable_memfd_maps
+                .push((whole, std::sync::Arc::clone(&writable_memfd)));
+        }
+
+        dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+            start: middle,
+            len: page,
+            prot: LinuxProtFlags::READ | LinuxProtFlags::EXEC,
+            sharing: ProcMapSharing::Private,
+            path: "replacement".into(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        });
+
+        let mem = dispatcher.mem.lock();
+        assert_eq!(mem.dynamic_maps.len(), 3);
+        assert_eq!(
+            mem.dynamic_maps
+                .iter()
+                .map(|map| (map.start, map.end, map.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (start, middle, "predecessor"),
+                (middle, middle + page, "replacement"),
+                (middle + page, start + len, "predecessor"),
+            ]
+        );
+        assert_eq!(
+            mem.bus_fault_ranges,
+            vec![(start, page), (middle + page, page)]
+        );
+        let expected_ranges = vec![
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(middle)).expect("prefix"),
+            crate::vfs::GuestMemoryRange::new(GuestVa(middle + page), GuestVa(start + len))
+                .expect("suffix"),
+        ];
+        assert_eq!(mem.locked_ranges, expected_ranges);
+        assert_eq!(mem.resident_ranges, expected_ranges);
+        assert_eq!(mem.resident_tracked_ranges, expected_ranges);
+        assert_eq!(mem.write_sealed_shared_maps, expected_ranges);
+        assert_eq!(mem.resident_fault_ranges.len(), 2);
+        assert_eq!(mem.resident_fault_ranges[0].range, expected_ranges[0]);
+        assert_eq!(mem.resident_fault_ranges[1].range, expected_ranges[1]);
+        assert!(
+            mem.resident_fault_ranges
+                .iter()
+                .all(|fault| fault.prot == LinuxProtFlags::READ)
+        );
+        assert_eq!(mem.writable_memfd_maps.len(), 2);
+        assert_eq!(mem.writable_memfd_maps[0].0, expected_ranges[0]);
+        assert_eq!(mem.writable_memfd_maps[1].0, expected_ranges[1]);
+        assert!(
+            mem.writable_memfd_maps
+                .iter()
+                .all(|(_, description)| std::sync::Arc::ptr_eq(description, &writable_memfd))
+        );
+        assert_eq!(mem.remap_snapshots.len(), 2);
+        assert_eq!(
+            mem.remap_snapshots.get(&start).map(Vec::as_slice),
+            Some(vec![0x11; page as usize].as_slice())
+        );
+        assert_eq!(
+            mem.remap_snapshots.get(&(middle + page)).map(Vec::as_slice),
+            Some(vec![0x33; page as usize].as_slice())
+        );
+    }
+
+    #[test]
+    fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata() {
+        let dispatcher = SyscallDispatcher::new();
+        let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let len = LINUX_PAGE_SIZE * 2;
+        let replacement = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start + len))
+            .expect("replacement range");
+        dispatcher.record_dynamic_mapping(
+            start,
+            len,
+            LinuxProtFlags::READ | LinuxProtFlags::EXEC,
+            ProcMapSharing::Private,
+            "prior".to_string(),
+        );
+        let writable_memfd =
+            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(0),
+                path: "memfd:test".into(),
+                contents: Vec::new(),
+                offset: 0,
+            }));
+        {
+            let mut mem = dispatcher.mem.lock();
+            locked_ranges_insert(&mut mem.locked_ranges, replacement);
+            locked_ranges_insert(&mut mem.resident_ranges, replacement);
+            locked_ranges_insert(&mut mem.write_sealed_shared_maps, replacement);
+            mem.writable_memfd_maps
+                .push((replacement, std::sync::Arc::clone(&writable_memfd)));
+            mem.bus_fault_ranges
+                .push((start + LINUX_PAGE_SIZE, LINUX_PAGE_SIZE));
+        }
+        let before = dispatcher.mem.lock().clone();
+        let guard = dispatcher.begin_host_alias_dispatch();
+        let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+            start,
+            len,
+            prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            sharing: ProcMapSharing::Shared,
+            path: "replacement".to_string(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        }));
+
+        let pending = dispatcher.mem.lock().clone();
+        assert_eq!(pending.dynamic_maps, before.dynamic_maps);
+        assert_eq!(pending.locked_ranges, before.locked_ranges);
+        assert_eq!(pending.resident_ranges, before.resident_ranges);
+        assert_eq!(pending.bus_fault_ranges, before.bus_fault_ranges);
+        assert_eq!(
+            pending.write_sealed_shared_maps,
+            before.write_sealed_shared_maps
+        );
+        assert_eq!(pending.writable_memfd_maps.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(
+            &pending.writable_memfd_maps[0].1,
+            &writable_memfd
+        ));
+        let install = transaction
+            .claim()
+            .expect("claim pending host alias install");
+        drop(install);
+
+        let after = dispatcher.mem.lock().clone();
+        assert_eq!(after.dynamic_maps, before.dynamic_maps);
+        assert_eq!(after.locked_ranges, before.locked_ranges);
+        assert_eq!(after.resident_ranges, before.resident_ranges);
+        assert_eq!(after.bus_fault_ranges, before.bus_fault_ranges);
+        assert_eq!(
+            after.write_sealed_shared_maps,
+            before.write_sealed_shared_maps
+        );
+        assert_eq!(after.writable_memfd_maps.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(
+            &after.writable_memfd_maps[0].1,
+            &writable_memfd
+        ));
+    }
+
+    #[test]
+    fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
+        let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
+        let guard = dispatcher.begin_host_alias_dispatch();
+        let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+            len: LINUX_PAGE_SIZE,
+            prot: LinuxProtFlags::READ,
+            sharing: ProcMapSharing::Private,
+            path: String::new(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        }));
+        let sibling = std::sync::Arc::clone(&dispatcher);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).expect("report pending waiter start");
+            let _guard = sibling.begin_host_alias_dispatch();
+            entered_tx
+                .send(())
+                .expect("report pending waiter admission");
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("pending waiter reached exclusion");
+        assert!(
+            entered_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "pending transaction did not exclude a sibling"
+        );
+        drop(transaction);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("pending transaction Drop notified sibling");
+        thread.join().expect("join pending transaction waiter");
+    }
+
+    #[test]
+    fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
+        let dispatcher = SyscallDispatcher::new();
+        let guard = dispatcher.begin_host_alias_dispatch();
+        let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+            len: LINUX_PAGE_SIZE,
+            prot: LinuxProtFlags::READ,
+            sharing: ProcMapSharing::Shared,
+            path: String::new(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        }));
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let read_fd = pipe[0];
+        let outcome = DispatchOutcome::MapHostAlias {
+            transaction,
+            va: GuestVa(crate::memory::LINUX_HIGH_VA_THRESHOLD),
+            ipa: Gpa(crate::memory::LINUX_ALIAS_IPA_BASE),
+            len: LINUX_PAGE_SIZE,
+            payload: Vec::new(),
+            file: Some((
+                // SAFETY: the successful pipe read end is uniquely transferred.
+                unsafe { HostAliasOwnedFd::from_raw_fd(read_fd) },
+                0,
+                libc::PROT_READ,
+            )),
+            shared: true,
+            prot: crate::linux_abi::LINUX_PROT_READ,
+            prot_none: false,
+        };
+
+        drop(outcome);
+        assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(unsafe { libc::close(pipe[1]) }, 0);
+        // Drop of the transaction handle also returned the exclusion to Idle.
+        drop(dispatcher.begin_host_alias_dispatch());
+    }
+
+    #[test]
+    fn installing_host_alias_blocks_sibling_mapping_dispatch_until_resolution() {
+        let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
+        let guard = dispatcher.begin_host_alias_dispatch();
+        let transaction = guard.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+            len: LINUX_PAGE_SIZE,
+            prot: LinuxProtFlags::READ,
+            sharing: ProcMapSharing::Private,
+            path: String::new(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        }));
+        let install = transaction
+            .claim()
+            .expect("claim pending host alias install");
+        let sibling = std::sync::Arc::clone(&dispatcher);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).expect("report install waiter start");
+            let _guard = sibling.begin_host_alias_dispatch();
+            entered_tx.send(()).expect("report mapping admission");
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("install waiter reached exclusion");
+        assert!(
+            entered_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "sibling mapping dispatch raced an installing host alias"
+        );
+        drop(install);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("sibling admitted after abort");
+        thread.join().expect("join sibling mapping dispatch");
+    }
+
+    #[test]
+    fn brk_waits_for_host_alias_idle() {
+        const SYS_BRK: u64 = 214;
+        assert_operation_waits_for_host_alias_idle("brk", move |dispatcher| {
+            let reporter = CompatReporter::default();
+            let registry = crate::thread::ThreadRegistry::new(
+                crate::thread::ThreadId::synthetic_for_tests(1300),
+            );
+            let mut memory = LinearMemory::new(LINUX_HEAP_BASE, vec![0; LINUX_PAGE_SIZE as usize]);
+            dispatcher
+                .dispatch_threaded(
+                    SyscallRequest::new(SYS_BRK, SyscallArgs([0, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                    registry.main_tid(),
+                    &registry,
+                    &crate::thread::FutexTable::new(),
+                )
+                .expect("brk dispatch while alias install is pending");
+        });
+    }
+
+    #[test]
+    fn msync_waits_for_host_alias_idle() {
+        const SYS_MSYNC: u64 = 227;
+        assert_operation_waits_for_host_alias_idle("msync", move |dispatcher| {
+            let reporter = CompatReporter::default();
+            let registry = crate::thread::ThreadRegistry::new(
+                crate::thread::ThreadId::synthetic_for_tests(1301),
+            );
+            let mut memory = LinearMemory::new(LINUX_MMAP_BASE, vec![0; LINUX_PAGE_SIZE as usize]);
+            dispatcher
+                .dispatch_threaded(
+                    SyscallRequest::new(
+                        SYS_MSYNC,
+                        SyscallArgs([LINUX_MMAP_BASE, LINUX_PAGE_SIZE, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                    registry.main_tid(),
+                    &registry,
+                    &crate::thread::FutexTable::new(),
+                )
+                .expect("msync dispatch while alias install is pending");
+        });
+    }
+
+    #[test]
+    fn mincore_waits_for_host_alias_idle() {
+        const SYS_MINCORE: u64 = 232;
+        assert_operation_waits_for_host_alias_idle("mincore", move |dispatcher| {
+            let reporter = CompatReporter::default();
+            let registry = crate::thread::ThreadRegistry::new(
+                crate::thread::ThreadId::synthetic_for_tests(1302),
+            );
+            let mut memory =
+                LinearMemory::new(LINUX_MMAP_BASE, vec![0; (2 * LINUX_PAGE_SIZE) as usize]);
+            dispatcher
+                .dispatch_threaded(
+                    SyscallRequest::new(
+                        SYS_MINCORE,
+                        SyscallArgs([
+                            LINUX_MMAP_BASE,
+                            LINUX_PAGE_SIZE,
+                            LINUX_MMAP_BASE + LINUX_PAGE_SIZE,
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                    registry.main_tid(),
+                    &registry,
+                    &crate::thread::FutexTable::new(),
+                )
+                .expect("mincore dispatch while alias install is pending");
+        });
     }
 
     #[test]

@@ -270,6 +270,7 @@ pub const LINUX_SIGXFSZ: i32 = 25;
 pub const LINUX_SEGV_MAPERR: i32 = 1;
 pub const LINUX_SEGV_ACCERR: i32 = 2;
 pub const LINUX_BUS_ADRALN: i32 = 1;
+pub const LINUX_BUS_ADRERR: i32 = 2;
 pub const LINUX_SIGVTALRM: i32 = 26;
 pub const LINUX_SIGPROF: i32 = 27;
 pub const LINUX_SIGWINCH: i32 = 28; // default action = Ignore
@@ -1502,6 +1503,10 @@ pub const LINUX_UCONTEXT_SIGMASK_PAD_BYTES: usize = 120;
 pub const LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES: usize = 4096;
 
 pub const LINUX_SI_USER: i32 = 0;
+/// Kernel-generated signal without a more specific positive `si_code`.
+/// Carrick uses this for architecturally synchronous faults such as user-mode
+/// x86 `#GP(0)`/`#SS(0)`, matching Linux's guest ABI value.
+pub const LINUX_SI_KERNEL: i32 = 128;
 /// `si_code` for a `sigqueue(3)`/`rt_sigqueueinfo(2)`-delivered signal — the
 /// handler's `si_value` carries the sender's payload.
 pub const LINUX_SI_QUEUE: i32 = -1;
@@ -1774,9 +1779,64 @@ impl CarrickSigframe {
 // `packed` (for unaligned zerocopy access at the guest SP) yields the identical
 // byte layout the kernel produces. The running 104 fixture is the oracle.
 
-/// x86-64 FXSAVE area (`struct _fpstate`, 512 bytes; Intel SDM Vol.1 §10.5.1).
-/// carrick fills `mxcsr` + `xmm_space` (XMM0–15) from `KVM_GET_FPU`; the x87
-/// `st_space` is zeroed (revisit if a fixture needs x87).
+/// Standard-format XSAVE legacy area size (Intel SDM Vol. 1, XSAVE area).
+pub const X8664_XSAVE_LEGACY_LEN: usize = 512;
+/// Standard-format XSAVE header size, immediately after the legacy area.
+pub const X8664_XSAVE_HEADER_LEN: usize = 64;
+/// Smallest standard-format XSAVE image: legacy area plus XSAVE header.
+pub const X8664_XSAVE_MIN_LEN: usize = X8664_XSAVE_LEGACY_LEN + X8664_XSAVE_HEADER_LEN;
+/// Carrick's hard upper bound for a guest signal XSAVE image. Component ranges
+/// derived from CPUID leaf 0xD must fit this bound before a frame is emitted.
+pub const X8664_XSAVE_AREA_MAX_LEN: usize = 16 * 1024;
+/// Offset of Linux's software-reserved xstate descriptor in the legacy area.
+pub const X8664_FP_XSTATE_SW_BYTES_OFFSET: usize = 464;
+/// Linux-described marker identifying an extended x86 FP state frame (`FPXS`).
+pub const X8664_FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+/// Final marker at the end of the Linux-advertised extended fpstate (`FPXE`).
+pub const X8664_FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+/// Size of the trailing `FP_XSTATE_MAGIC2` word.
+pub const X8664_FP_XSTATE_MAGIC2_SIZE: usize = core::mem::size_of::<u32>();
+/// XSAVE component number for PKRU. Native x86 virtualizes it outside the
+/// hardware image so guest key-0 restrictions can never revoke gateway access.
+pub const X8664_XFEATURE_PKRU: u32 = 9;
+/// Ring-3 code selector installed by Carrick's Linux/x86_64 guest ABI.
+pub const LINUX_X8664_USER_CS: u16 = 0x23;
+/// Ring-3 data/stack selector installed by Carrick's Linux/x86_64 guest ABI.
+pub const LINUX_X8664_USER_DS: u16 = 0x1b;
+
+/// Linux's 48-byte software descriptor in the final bytes of the legacy FXSAVE
+/// area. `xstate_size` covers only the standard XSAVE image; `extended_size`
+/// reaches through final MAGIC2. Carrick frames place their private trailer in
+/// that advertised interval between `xstate_size` and MAGIC2, so an exact Linux-
+/// compatible extent copy retains it. Layout and semantics are verified against
+/// clean-room signal-frame probes; component offsets come from CPUID leaf 0xD.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct X8664FpxSwBytes {
+    pub magic1: u32,
+    pub extended_size: u32,
+    pub xfeatures: u64,
+    pub xstate_size: u32,
+    pub reserved: [u32; 7],
+}
+
+impl X8664FpxSwBytes {
+    pub const fn empty() -> Self {
+        Self {
+            magic1: 0,
+            extended_size: 0,
+            xfeatures: 0,
+            xstate_size: 0,
+            reserved: [0; 7],
+        }
+    }
+}
+
+/// x86-64 512-byte XSAVE legacy area (Intel SDM Vol. 1, XSAVE). Unlike the old
+/// XMM/YMM approximation this models the complete x87/SSE legacy payload and
+/// the Linux software descriptor occupying its final 48 bytes.
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -1790,9 +1850,10 @@ pub struct X8664Fpstate {
     pub rdp: u64,
     pub mxcsr: u32,
     pub mxcr_mask: u32,
-    pub st_space: [u32; 32],  // x87 registers (128 bytes)
-    pub xmm_space: [u32; 64], // XMM0–15 (256 bytes)
-    pub padding: [u32; 24],   // reserved (96 bytes)
+    pub st_space: [u32; 32],
+    pub xmm_space: [u32; 64],
+    pub padding: [u32; 12],
+    pub sw_reserved: X8664FpxSwBytes,
 }
 
 impl X8664Fpstate {
@@ -1808,7 +1869,71 @@ impl X8664Fpstate {
             mxcr_mask: 0,
             st_space: [0; 32],
             xmm_space: [0; 64],
-            padding: [0; 24],
+            padding: [0; 12],
+            sw_reserved: X8664FpxSwBytes::empty(),
+        }
+    }
+}
+
+/// XSAVE header at standard-image byte 512. Compact format is forbidden in a
+/// Linux signal frame: `xcomp_bv` must be zero and all reserved words zero.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct X8664XsaveHeader {
+    pub xstate_bv: u64,
+    pub xcomp_bv: u64,
+    pub reserved: [u64; 6],
+}
+
+impl X8664XsaveHeader {
+    pub const fn empty() -> Self {
+        Self {
+            xstate_bv: 0,
+            xcomp_bv: 0,
+            reserved: [0; 6],
+        }
+    }
+}
+
+/// Carrick-private virtual-state trailer. Version 3 places it after the
+/// standard-format XSAVE image and before final MAGIC2, inside Linux's
+/// advertised `extended_size`. A handler that copies or relocates exactly that
+/// extent therefore retains virtual PKRU and non-REX x87 selectors. Keeping the
+/// state in the guest frame also makes nested delivery self-contained without a
+/// host-side frame map.
+pub const CARRICK_X8664_XSTATE_TRAILER_MAGIC: u64 = 0x3154_5358_4b52_4143;
+pub const CARRICK_X8664_XSTATE_TRAILER_VERSION: u16 = 3;
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct CarrickX8664XstateTrailer {
+    pub magic: u64,
+    pub version: u16,
+    pub size: u16,
+    pub virtual_pkru: u32,
+    /// Virtual non-REX x87 instruction-pointer selector. This is kept outside
+    /// the hardware FXSAVE64 image so a host selector can never enter a guest
+    /// signal frame.
+    pub virtual_x87_fcs: u16,
+    /// Virtual non-REX x87 data-pointer selector.
+    pub virtual_x87_fds: u16,
+    pub reserved: [u32; 3],
+}
+
+impl CarrickX8664XstateTrailer {
+    pub const fn new(virtual_pkru: u32, virtual_x87_fcs: u16, virtual_x87_fds: u16) -> Self {
+        Self {
+            magic: CARRICK_X8664_XSTATE_TRAILER_MAGIC,
+            version: CARRICK_X8664_XSTATE_TRAILER_VERSION,
+            size: core::mem::size_of::<Self>() as u16,
+            virtual_pkru,
+            virtual_x87_fcs,
+            virtual_x87_fds,
+            reserved: [0; 3],
         }
     }
 }
@@ -1916,11 +2041,12 @@ impl X8664Ucontext {
     }
 }
 
-/// The Linux x86-64 `struct rt_sigframe` written to the guest stack at the new
-/// RSP. `pretcode` is the address the handler RETs to (the restorer →
-/// rt_sigreturn). Live Linux/amd64 places `siginfo` at `ucontext+304`, and the
-/// 16-byte-aligned FXSAVE area at `ucontext+448`; `uc.uc_mcontext.fpstate`
-/// points to that FXSAVE area.
+/// Fixed prefix of the Linux x86-64 `rt_sigframe`. The standard-format XSAVE
+/// image starts at the zero-sized `fpstate` marker (byte 456) and has a runtime
+/// CPUID-derived length, followed by Carrick's private trailer and final MAGIC2;
+/// all three are covered by `extended_size`. Keeping only the invariant prefix
+/// in the Rust type prevents `size_of` from being mistaken for the dynamic
+/// frame extent.
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -1930,15 +2056,7 @@ pub struct X8664Rtsigframe {
     pub uc: X8664Ucontext,
     pub info: LinuxSiginfo,
     pub fpstate_pad: [u8; 16],
-    pub fpstate: X8664Fpstate,
-    /// Carrick-internal AVX `YMM_Hi` (NOT part of the Linux ABI frame the guest
-    /// reads — trailing bytes beyond `fpstate`, which `uc.uc_mcontext.fpstate`
-    /// never points at). Preserves the interrupted thread's AVX upper halves
-    /// across a signal+sigreturn; the FXSAVE `fpstate` carries only XMM (the low
-    /// 128 bits). 16 × 16 bytes = YMM0_Hi..YMM15_Hi, little-endian. Travelling
-    /// WITH the frame keeps it correct under siglongjmp (no separate bookkeeping
-    /// to leak). Zero on a backend without AVX.
-    pub ymm_hi: [u8; 256],
+    pub fpstate: [u8; 0],
 }
 
 impl X8664Rtsigframe {
@@ -1948,20 +2066,24 @@ impl X8664Rtsigframe {
             uc: X8664Ucontext::empty(),
             info: LinuxSiginfo::empty(),
             fpstate_pad: [0; 16],
-            fpstate: X8664Fpstate::empty(),
-            ymm_hi: [0; 256],
+            fpstate: [],
         }
     }
 }
 
+pub const X8664_RTSIGFRAME_FPSTATE_OFFSET: usize = core::mem::offset_of!(X8664Rtsigframe, fpstate);
+
 // Compile-time ABI size guards (x86-64 psABI / Intel SDM). A layout drift fails
 // the BUILD rather than producing a silently-wrong guest signal frame.
-const _: () = assert!(core::mem::size_of::<X8664Fpstate>() == 512);
+const _: () = assert!(core::mem::size_of::<X8664FpxSwBytes>() == 48);
+const _: () = assert!(core::mem::size_of::<X8664Fpstate>() == X8664_XSAVE_LEGACY_LEN);
+const _: () = assert!(core::mem::offset_of!(X8664Fpstate, sw_reserved) == 464);
+const _: () = assert!(core::mem::size_of::<X8664XsaveHeader>() == X8664_XSAVE_HEADER_LEN);
+const _: () = assert!(core::mem::size_of::<CarrickX8664XstateTrailer>() == 32);
 const _: () = assert!(core::mem::size_of::<X8664Sigcontext>() == 256);
 const _: () = assert!(core::mem::size_of::<X8664Ucontext>() == 304);
-// 968-byte Linux ABI frame (pretcode/uc/info/fpstate) + 256-byte carrick-internal
-// trailing YMM_Hi (see the field doc) = 1224.
-const _: () = assert!(core::mem::size_of::<X8664Rtsigframe>() == 1224);
+const _: () = assert!(X8664_RTSIGFRAME_FPSTATE_OFFSET == 456);
+const _: () = assert!(core::mem::size_of::<X8664Rtsigframe>() == 456);
 
 #[cfg(test)]
 mod x8664_sigframe_tests {

@@ -277,6 +277,43 @@ where
     Ok(())
 }
 
+/// Backing-sharing classification for a newly published guest VMA.
+///
+/// This is deliberately typed rather than a boolean: confusing guest-visible
+/// permissions with backing sharing can make a translation backend persist code
+/// whose bytes remain mutable through another view or process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingSharing {
+    Private,
+    Shared,
+}
+
+/// Transactional failure from [`GuestMemory::repoint_private`].
+///
+/// A clean failure proves the guest-visible translation was not published, so
+/// the dispatcher may release the fresh overlay candidate and retain the old
+/// mapping. An indeterminate failure happened after publication began (for
+/// example, after writing live page tables but before a TLB flush completed);
+/// returning to the guest or recycling either backing would risk use-after-free
+/// through an unknown live translation, so the process must fail stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RepointPrivateError {
+    #[error("private repoint failed before publication: {0}")]
+    Clean(#[source] MemoryError),
+    #[error("private repoint may have been published: {0}")]
+    Indeterminate(#[source] MemoryError),
+}
+
+impl RepointPrivateError {
+    pub fn clean(error: MemoryError) -> Self {
+        Self::Clean(error)
+    }
+
+    pub fn indeterminate(error: MemoryError) -> Self {
+        Self::Indeterminate(error)
+    }
+}
+
 /// The guest physical/virtual memory a syscall handler reads and writes. The
 /// backend may be the real HVF-backed address space or the in-memory
 /// `LinearMemory` used by unit tests.
@@ -301,8 +338,11 @@ pub trait GuestMemory {
 
     /// PERMISSION-CHECKED guest read. DEFAULT: run the inaccessible-range gate
     /// (`protections()`), then delegate to [`read_bytes_raw`](Self::read_bytes_raw).
-    /// Backends must NOT override this — implement `read_bytes_raw` instead so the
-    /// one shared gate always runs.
+    /// Backends normally implement only `read_bytes_raw` so this shared gate
+    /// always runs. An identity-mapped backend may override the checked method
+    /// only when permission metadata and fault-intolerant host copying must be
+    /// covered by one backend mapping lock; that override must reproduce this
+    /// gate under the same guard as the copy.
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         if length > 0
             && self
@@ -406,6 +446,22 @@ pub trait GuestMemory {
         })
     }
 
+    /// Re-establish zero-filled anonymous backing for a reused mapping without
+    /// changing its physical sharing contract. Identity-native backends may
+    /// implement [`zero_backing`](Self::zero_backing) by replacing a hole with a
+    /// host anonymous mapping; this typed seam prevents that replacement from
+    /// silently choosing `MAP_PRIVATE` for a guest `MAP_SHARED` range. VMM and
+    /// byte-backed implementations can use the default because their raw scrub
+    /// does not replace the underlying mapping object.
+    fn zero_anonymous_reuse(
+        &mut self,
+        address: u64,
+        len: usize,
+        _sharing: MappingSharing,
+    ) -> Result<(), MemoryError> {
+        self.zero_backing(address, len)
+    }
+
     /// PERMISSION-CHECKED zeroing of a guest range, the counterpart to
     /// [`zero_backing`](Self::zero_backing): use this when the guest legitimately
     /// OWNS the bytes and a PROT_NONE / read-only overlap must EFAULT — e.g.
@@ -472,6 +528,33 @@ pub trait GuestMemory {
         self.set_no_write(address, len, no_write);
     }
 
+    /// Publish whether a live mapping has private or mutable shared backing.
+    ///
+    /// The default is intentionally a no-op: VMM backends execute guest bytes
+    /// directly and remain coherent with their own stage-1 mappings without a
+    /// host translation cache. Native translation backends override this seam
+    /// and use it to refuse persistent translations of every executable shared
+    /// span. A caller must publish `Shared` only after the backing and requested
+    /// host protection are installed successfully.
+    fn set_mapping_sharing(&mut self, _address: u64, _len: usize, _sharing: MappingSharing) {}
+
+    /// Atomically publish protection plus backing sharing for a replacement
+    /// mapping where the backend has a unified metadata registry. The default
+    /// preserves existing VMM behavior while still invoking the typed sharing
+    /// seam. Native identity memory overrides this to use one protection-lock
+    /// transition after successful host backing/protection.
+    fn set_mapping_protection_and_sharing(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+        sharing: MappingSharing,
+    ) {
+        self.set_mapping_protection(address, len, no_access, no_write);
+        self.set_mapping_sharing(address, len, sharing);
+    }
+
     /// Change the guest-VISIBLE protection of `[address, address+len)` by
     /// editing the EL1 stage-1 page descriptors and flushing the stage-1 TLB,
     /// so a guest access that violates `prot` faults during EL0 execution
@@ -507,19 +590,37 @@ pub trait GuestMemory {
 
     /// Repoint guest VA `[va, va+len)` to a slot in the boot-mapped PRIVATE
     /// overlay aperture (`overlay_ipa`, identity IPA==VA), seeding the slot with
-    /// `content` first. Used for `MAP_FIXED|MAP_PRIVATE` over a shared-aperture
-    /// VA: after this, the guest's stores to `va` hit the per-process overlay
-    /// page, not the shared backing. The repoint is a stage-1 page-table edit +
-    /// TLB flush only — the overlay window was `hv_vm_map`'d at boot, so no
-    /// post-vCPU stage-2 mutation happens. Default: no-op (the in-memory backend
-    /// and unit tests have no stage-1 tables and don't model the overlay).
+    /// the exact `len`-byte `content` snapshot first. Used for file-backed or
+    /// anonymous `MAP_FIXED|MAP_PRIVATE` over a shared-aperture VA: after this,
+    /// the guest's stores to `va` hit the per-process materialized overlay, not
+    /// the shared backing. Implementations must classify a failure as
+    /// [`RepointPrivateError::Clean`] only when the old guest-visible translation
+    /// is certainly intact. Any error after live page-table/host-mapping
+    /// publication begins is [`RepointPrivateError::Indeterminate`]; the caller
+    /// will fail stopped without recycling the candidate. The caller publishes
+    /// Private sharing and executable eligibility only after success. The repoint is a stage-1
+    /// page-table edit + TLB flush only — the overlay window was `hv_vm_map`'d at
+    /// boot, so no post-vCPU stage-2 mutation happens. Identity-native backends
+    /// instead perform an exact anonymous MAP_PRIVATE replacement at `va`.
+    /// Default: no-op (the in-memory backend and unit tests have no stage-1
+    /// tables and don't model the overlay).
     fn repoint_private(
         &mut self,
         _va: u64,
         _overlay_ipa: u64,
         _len: usize,
         _content: &[u8],
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), RepointPrivateError> {
+        Ok(())
+    }
+
+    /// Restore `[va, va+len)` to the boot shared aperture's identity backing
+    /// after a private overlay was unmapped. This is distinct from
+    /// `protect_range`: protection edits must preserve an existing non-identity
+    /// output address, so making an invalid stale overlay leaf valid would
+    /// otherwise resurrect private storage as a shared mapping. Backends without
+    /// stage-1 translation keep the default no-op.
+    fn restore_shared_identity(&mut self, _va: u64, _len: usize) -> Result<(), MemoryError> {
         Ok(())
     }
 
@@ -563,6 +664,35 @@ pub trait GuestMemory {
     }
     fn host_ptr_for_write(&mut self, _address: u64, _len: usize) -> Option<*mut u8> {
         None
+    }
+
+    /// Begin/end a kernel-write bracket for mutable guest ranges whose raw host
+    /// pointers are about to be passed to one host syscall. Native translation
+    /// backends use an odd/even generation protocol so an exclusive reservation
+    /// cannot be created or committed while the kernel may be mutating memory.
+    /// Callers must use [`HostWriteGuard`] rather than pairing these manually.
+    fn begin_host_write(&mut self, _ranges: &[(u64, usize)]) {}
+    fn finish_host_write(&mut self, _ranges: &[(u64, usize)]) {}
+}
+
+/// Panic-safe lifetime bracket for a host syscall that may write through raw
+/// guest-memory pointers. Construction marks every exposed range in progress;
+/// Drop always closes the bracket, including `?`, early return, and unwind paths.
+pub struct HostWriteGuard<'a, M: GuestMemory + ?Sized> {
+    memory: &'a mut M,
+    ranges: &'a [(u64, usize)],
+}
+
+impl<'a, M: GuestMemory + ?Sized> HostWriteGuard<'a, M> {
+    pub fn new(memory: &'a mut M, ranges: &'a [(u64, usize)]) -> Self {
+        memory.begin_host_write(ranges);
+        Self { memory, ranges }
+    }
+}
+
+impl<M: GuestMemory + ?Sized> Drop for HostWriteGuard<'_, M> {
+    fn drop(&mut self) {
+        self.memory.finish_host_write(self.ranges);
     }
 }
 

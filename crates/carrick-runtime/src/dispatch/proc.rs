@@ -908,9 +908,20 @@ impl SyscallDispatcher {
         self.proc.lock().ptrace_traceme
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn set_ptrace_traceme_for_test(&self) {
         self.proc.lock().ptrace_traceme = true;
+    }
+
+    #[cfg(all(test, target_os = "freebsd", target_arch = "x86_64"))]
+    pub(crate) fn hold_proc_mutex_for_native_fork_test(
+        &self,
+        on_locked: impl FnOnce(),
+        wait_for_release: impl FnOnce(),
+    ) {
+        let _proc = self.proc.lock();
+        on_locked();
+        wait_for_release();
     }
 
     pub(crate) fn proc_after_fork_child(&self) {
@@ -1078,6 +1089,24 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Roll back one freshly installed CLONE_PIDFD descriptor before its gated
+    /// child is released. The native fork path retains exact thread exclusion,
+    /// so this fd cannot have been observed, closed, or reused by guest code.
+    pub fn remove_installed_child_pidfd(&self, fd: i32, child_pid: i32) -> bool {
+        if self.pidfd_host_pid(fd) != Some(child_pid) {
+            return false;
+        }
+        self.detach_fd_from_epolls(fd);
+        let removed = self.io.open_files.write().remove(&fd);
+        if let Some(open_file) = removed {
+            self.close_open_file_and_free_pty(&open_file);
+            self.note_fd_closed(fd);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Resolve a pidfd to its backing host pid, or `None` if `fd` isn't a pidfd.
     pub(super) fn pidfd_host_pid(&self, fd: i32) -> Option<i32> {
         let open = self.open_file(fd)?;
@@ -1211,10 +1240,7 @@ impl SyscallDispatcher {
         }
 
         let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
-            if memory
-                .read_bytes(args.pidfd, core::mem::size_of::<i32>())
-                .is_err()
-            {
+            if !memory.guest_range_is_writable(args.pidfd, core::mem::size_of::<i32>()) {
                 return DispatchOutcome::errno(LINUX_EFAULT);
             }
             Some(args.pidfd)

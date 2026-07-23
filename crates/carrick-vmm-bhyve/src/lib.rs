@@ -59,4 +59,4 @@ pub use bhyve_threaded_glue::{BhyveForkCoordinator, BhyveTimerDelivery};
 pub use bhyve_x86_engine::{BhyveVmm, BhyveX86Vcpu, bring_up as bring_up_x86_engine};
 pub use vmm::{BhyveSharedVm, BhyveVcpu, BhyveVm};
 #[cfg(target_arch = "x86_64")]
-pub use vmm_x86::BhyveVmExit;
+pub use vmm_x86::{BhyveVmExit, BhyveVmExit as X86Exit};

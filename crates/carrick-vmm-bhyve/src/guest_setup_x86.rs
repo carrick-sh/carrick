@@ -85,6 +85,10 @@
 //! SCE the SYSCALL instruction raises #UD → triple-fault → VM_EXITCODE_SUSPENDED.
 
 use std::ffi::c_int;
+#[cfg(test)]
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
+use std::sync::Arc;
 
 use carrick_hal::OsError;
 use carrick_hal::guest_arch::GuestArch;
@@ -928,6 +932,128 @@ pub fn complete_inout(_vcpu: &mut BhyveVcpu, _rip: u64, _inst_length: u8) -> Res
 /// for GPAs outside lowmem/highmem), GPAs are allocated compactly from a bump
 /// cursor rather than identity-placed. The PML4 decouples guest VA from GPA,
 /// so carrick's guest-virtual layout is unaffected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ForkDomainId([u64; 2]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct AllocationNonce([u64; 2]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct AllocationHostPid(libc::pid_t);
+
+/// Stable host-file identity while the inode is held open. The enclosing fork
+/// domain prevents a later exec/new address space from inheriting stale mirror
+/// state even if the host eventually recycles `(device, inode)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FileObjectId {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SharedObjectBacking {
+    Anonymous {
+        allocation_host: AllocationHostPid,
+        nonce: AllocationNonce,
+    },
+    File(FileObjectId),
+}
+
+/// Identity of one logical shared backing object. Stored in RAM metadata, so a
+/// pre-fork allocation is copied unchanged into the child. A post-fork
+/// allocation embeds the allocating host PID plus fresh entropy and therefore
+/// cannot collide merely because the parent's bump/counter state was cloned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SharedObjectId {
+    domain: ForkDomainId,
+    backing: SharedObjectBacking,
+}
+
+/// Typed mirror-table key: logical shared object plus byte offset. Hashes only
+/// choose an open-addressing start slot; slots retain and compare every field,
+/// so a hash collision cannot alias unrelated futex words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SharedFutexMirrorKey {
+    object: SharedObjectId,
+    byte_offset: u64,
+}
+
+/// Field-preserving representation stored atomically in the shared mirror
+/// table. This is not a packed scalar: kind/domain/object/offset remain separate
+/// and every field is compared after a hash hit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SharedFutexMirrorWireKey {
+    pub(crate) kind: u64,
+    pub(crate) domain: [u64; 2],
+    pub(crate) backing: [u64; 3],
+    pub(crate) byte_offset: u64,
+}
+
+impl SharedFutexMirrorKey {
+    pub(crate) fn wire(self) -> SharedFutexMirrorWireKey {
+        let (kind, backing) = match self.object.backing {
+            SharedObjectBacking::Anonymous {
+                allocation_host,
+                nonce,
+            } => (1, [allocation_host.0 as i64 as u64, nonce.0[0], nonce.0[1]]),
+            SharedObjectBacking::File(file) => (2, [file.device, file.inode, 0]),
+        };
+        SharedFutexMirrorWireKey {
+            kind,
+            domain: self.object.domain.0,
+            backing,
+            byte_offset: self.byte_offset,
+        }
+    }
+}
+
+fn random_identity_words() -> [u64; 2] {
+    let mut words = [0u64; 2];
+    // SAFETY: `words` is a writable 16-byte buffer. FreeBSD's arc4random_buf
+    // cannot fail and is fork-safe; fresh entropy avoids cloned counter state.
+    unsafe {
+        libc::arc4random_buf(
+            words.as_mut_ptr().cast::<libc::c_void>(),
+            std::mem::size_of_val(&words),
+        )
+    };
+    words
+}
+
+pub(crate) fn file_object_id(raw_fd: libc::c_int) -> std::io::Result<FileObjectId> {
+    // SAFETY: `stat` is initialized and `raw_fd` is borrowed for the call.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(raw_fd, &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileObjectId {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    })
+}
+
+fn fresh_anonymous_object(domain: ForkDomainId) -> SharedObjectId {
+    SharedObjectId {
+        domain,
+        backing: SharedObjectBacking::Anonymous {
+            // SAFETY: getpid has no preconditions.
+            allocation_host: AllocationHostPid(unsafe { libc::getpid() }),
+            nonce: AllocationNonce(random_identity_words()),
+        },
+    }
+}
+
+/// One shared-object interval in guest VA space. `object_offset` is the byte
+/// offset corresponding to `va`: zero for a fresh anonymous allocation and the
+/// host file offset for a file alias. Splits advance it, preserving identity.
+#[derive(Clone, Debug)]
+struct SharedBackingRange {
+    va: u64,
+    len: usize,
+    object: SharedObjectId,
+    object_offset: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct BhyveWindow {
     /// Guest virtual address this window is mapped at.
@@ -983,6 +1109,7 @@ pub struct BhyveWindow {
 /// barrier (parent suspended in `freeze_ram`), flushes the alias's live sysmem
 /// back to the file; the child's `shmat`→`map_host_alias` then re-reads the
 /// up-to-date file. `fd` is OWNED (closed when the alias is dropped).
+#[derive(Clone)]
 struct ShmAlias {
     /// Guest VA the alias is mapped at (the `host_ptr`/GPA lookup key).
     va: u64,
@@ -990,18 +1117,40 @@ struct ShmAlias {
     gpa: u64,
     /// Page-aligned alias length (>= file_size).
     len: usize,
-    /// Owned host fd of the backing file (write side; closed on drop).
-    fd: libc::c_int,
+    /// Shared ownership permits a middle unmap to split one live alias into
+    /// two flush extents without a fallible `dup(2)` after backend mutation.
+    fd: Arc<OwnedFd>,
     /// File offset the alias starts at.
     offset: libc::off_t,
-    /// The file's size in bytes — bounds the write-back so it never grows the
-    /// file or reads/writes past the segment's real content.
+    /// The file's size in bytes — bounds I/O so it never grows the file or
+    /// reads/writes past the segment's real content.
     file_size: usize,
+    /// Read-only aliases retain their descriptor for stable object identity but
+    /// never participate in dirty writeback.
+    writable: bool,
+    file_id: FileObjectId,
 }
 
+/// Ownership-preserving fork/file-coherence I/O snapshot. Each snapshot owns a
+/// duplicated descriptor, so dropping/replacing the RAM-table alias can close
+/// and even recycle its original numeric fd without redirecting in-flight I/O.
+#[derive(Debug)]
+pub(crate) struct ShmAliasIo {
+    pub(crate) gpa: u64,
+    pub(crate) fd: OwnedFd,
+    pub(crate) offset: libc::off_t,
+    pub(crate) len: usize,
+}
+
+#[derive(Clone)]
 struct RamInner {
     windows: Vec<BhyveWindow>,
     cursor: u64,
+    /// Unique per address-space root, inherited across host fork but replaced by
+    /// exec/new `BhyveGuestRam`. Namespaces file identities and anonymous IDs so
+    /// stale slots from an old image cannot be reused by a fresh object.
+    fork_domain: ForkDomainId,
+    shared_backings: Vec<SharedBackingRange>,
     // Each reservation is `(start, end, prot)`. `prot` carries the guest
     // protection bits so demand-commit can distinguish PROT_NONE from PROT_READ:
     // a PROT_NONE first touch must fault, not commit as a readable page.
@@ -1142,6 +1291,99 @@ impl RamInner {
         self.reservations = out;
     }
 
+    fn remove_shared_backings(&mut self, start: u64, end: u64) {
+        let mut kept = Vec::with_capacity(self.shared_backings.len() + 1);
+        for range in self.shared_backings.drain(..) {
+            let Some(range_end) = range.va.checked_add(range.len as u64) else {
+                continue;
+            };
+            if end <= range.va || start >= range_end {
+                kept.push(range);
+                continue;
+            }
+            if range.va < start {
+                kept.push(SharedBackingRange {
+                    va: range.va,
+                    len: usize::try_from(start - range.va)
+                        .unwrap_or_else(|_| std::process::abort()),
+                    object: range.object,
+                    object_offset: range.object_offset,
+                });
+            }
+            if end < range_end {
+                let delta = end - range.va;
+                kept.push(SharedBackingRange {
+                    va: end,
+                    len: usize::try_from(range_end - end).unwrap_or_else(|_| std::process::abort()),
+                    object: range.object,
+                    object_offset: range
+                        .object_offset
+                        .checked_add(delta)
+                        .unwrap_or_else(|| std::process::abort()),
+                });
+            }
+        }
+        self.shared_backings = kept;
+    }
+
+    fn publish_mapping_sharing(
+        &mut self,
+        va: u64,
+        len: usize,
+        sharing: carrick_guest_mem::MappingSharing,
+    ) {
+        let Some(end) = va.checked_add(len as u64) else {
+            std::process::abort();
+        };
+        if len == 0 {
+            return;
+        }
+        if sharing == carrick_guest_mem::MappingSharing::Shared
+            && self.shared_backings.iter().any(|range| {
+                range.va <= va
+                    && range
+                        .va
+                        .checked_add(range.len as u64)
+                        .is_some_and(|range_end| end <= range_end)
+            })
+        {
+            // `map_host_alias` installs file identity together with its window;
+            // preserve it when the runtime publishes the authoritative Shared
+            // protection/sharing classification.
+            return;
+        }
+        self.remove_shared_backings(va, end);
+        if sharing == carrick_guest_mem::MappingSharing::Shared {
+            self.shared_backings.push(SharedBackingRange {
+                va,
+                len,
+                object: fresh_anonymous_object(self.fork_domain),
+                object_offset: 0,
+            });
+        }
+    }
+
+    fn shared_futex_key(&self, gpa: u64, len: usize) -> Option<SharedFutexMirrorKey> {
+        let window = self.windows.iter().find(|window| {
+            gpa.checked_sub(window.gpa)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .is_some_and(|offset| window.len.saturating_sub(offset) >= len)
+        })?;
+        let va = window.va.checked_add(gpa.checked_sub(window.gpa)?)?;
+        let end = va.checked_add(len as u64)?;
+        let range = self.shared_backings.iter().find(|range| {
+            range.va <= va
+                && range
+                    .va
+                    .checked_add(range.len as u64)
+                    .is_some_and(|range_end| end <= range_end)
+        })?;
+        Some(SharedFutexMirrorKey {
+            object: range.object,
+            byte_offset: range.object_offset.checked_add(va - range.va)?,
+        })
+    }
+
     /// Remove (or trim) any window overlapping `[va, va+len)`. Called from
     /// `unmap_range` so a `munmap`'d VA stops resolving to its now-dead GPA.
     ///
@@ -1168,6 +1410,75 @@ impl RamInner {
         if end <= start {
             return;
         }
+
+        self.remove_shared_backings(start, end);
+
+        // Keep fork-flush ownership identical to the live VA→GPA windows. A
+        // full detach drops the fd; prefix/tail removal trims the extent; a
+        // middle punch shares the one owned fd across both surviving extents.
+        let mut aliases = Vec::with_capacity(self.shm_aliases.len() + 1);
+        for mut alias in self.shm_aliases.drain(..) {
+            let alias_start = alias.va;
+            let alias_end = alias.va.saturating_add(alias.len as u64);
+            if end <= alias_start || start >= alias_end {
+                aliases.push(alias);
+                continue;
+            }
+            let left_len = start
+                .min(alias_end)
+                .saturating_sub(alias_start)
+                .try_into()
+                .unwrap_or_else(|_| std::process::abort());
+            let right_start = end.max(alias_start).min(alias_end);
+            let right_len: usize = alias_end
+                .saturating_sub(right_start)
+                .try_into()
+                .unwrap_or_else(|_| std::process::abort());
+            match (left_len, right_len) {
+                (0, 0) => {}
+                (left, 0) => {
+                    alias.len = left;
+                    aliases.push(alias);
+                }
+                (0, right) => {
+                    let delta = right_start.saturating_sub(alias_start);
+                    alias.va = right_start;
+                    alias.gpa = alias.gpa.saturating_add(delta);
+                    alias.offset = alias
+                        .offset
+                        .checked_add(
+                            libc::off_t::try_from(delta).unwrap_or_else(|_| std::process::abort()),
+                        )
+                        .unwrap_or_else(|| std::process::abort());
+                    alias.len = right;
+                    aliases.push(alias);
+                }
+                (left, right) => {
+                    let delta = right_start.saturating_sub(alias_start);
+                    let right_alias = ShmAlias {
+                        va: right_start,
+                        gpa: alias.gpa.saturating_add(delta),
+                        len: right,
+                        fd: Arc::clone(&alias.fd),
+                        offset: alias
+                            .offset
+                            .checked_add(
+                                libc::off_t::try_from(delta)
+                                    .unwrap_or_else(|_| std::process::abort()),
+                            )
+                            .unwrap_or_else(|| std::process::abort()),
+                        file_size: alias.file_size,
+                        writable: alias.writable,
+                        file_id: alias.file_id,
+                    };
+                    alias.len = left;
+                    aliases.push(alias);
+                    aliases.push(right_alias);
+                }
+            }
+        }
+        self.shm_aliases = aliases;
+
         let mut out: Vec<BhyveWindow> = Vec::with_capacity(self.windows.len());
         for w in self.windows.drain(..) {
             let w_start = w.va;
@@ -1254,6 +1565,21 @@ impl RamInner {
         }
         None
     }
+
+    /// Validate that one exact guest-physical interval belongs to a published
+    /// RAM window. Live page-table translation returns compact GPAs, which must
+    /// not be fed back through the VA resolver or accepted merely because they
+    /// fall inside the oversized bhyve sysmem segment.
+    fn contains_gpa(&self, gpa: u64, len: usize) -> bool {
+        self.windows.iter().any(|window| {
+            let Some(offset) = gpa.checked_sub(window.gpa) else {
+                return false;
+            };
+            usize::try_from(offset)
+                .ok()
+                .is_some_and(|offset| window.len.saturating_sub(offset) >= len)
+        })
+    }
 }
 
 impl BhyveGuestRam {
@@ -1263,6 +1589,8 @@ impl BhyveGuestRam {
             inner: std::sync::Arc::new(std::sync::Mutex::new(RamInner {
                 windows: Vec::new(),
                 cursor: X86_GPA_CURSOR_START,
+                fork_domain: ForkDomainId(random_identity_words()),
+                shared_backings: Vec::new(),
                 reservations: Vec::new(),
                 shm_aliases: Vec::new(),
             })),
@@ -1271,6 +1599,13 @@ impl BhyveGuestRam {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RamInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    fn fork_snapshot_for_test(&self) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(self.lock().clone())),
+        }
     }
 
     /// Record a lazily-reserved VA range — backed on demand by the `#PF` path,
@@ -1307,6 +1642,71 @@ impl BhyveGuestRam {
         self.lock().remove_windows(va, len);
     }
 
+    /// Atomically replace every overlapping VA window and fork-flush alias with
+    /// the successfully installed alias. `map_host_alias` stages its backing and
+    /// page tables first; publishing both lookup and fd ownership under this one
+    /// lock prevents sibling syscall copies/fork snapshots from observing a
+    /// missing window or stale fixed-replacement owner.
+    pub(crate) fn replace_alias_window(
+        &self,
+        va: u64,
+        gpa: u64,
+        len: usize,
+        writable: bool,
+        file: Option<(OwnedFd, libc::off_t, usize, FileObjectId)>,
+    ) {
+        let mut inner = self.lock();
+        inner.remove_windows(va, len);
+        inner.windows.push(BhyveWindow {
+            va,
+            gpa,
+            len,
+            user: true,
+            write: writable,
+            exec: true,
+        });
+        if let Some((fd, offset, file_size, file_id)) = file {
+            let object_offset = u64::try_from(offset).unwrap_or_else(|_| std::process::abort());
+            let fork_domain = inner.fork_domain;
+            inner.shared_backings.push(SharedBackingRange {
+                va,
+                len,
+                object: SharedObjectId {
+                    domain: fork_domain,
+                    backing: SharedObjectBacking::File(file_id),
+                },
+                object_offset,
+            });
+            inner.shm_aliases.push(ShmAlias {
+                va,
+                gpa,
+                len,
+                fd: Arc::new(fd),
+                offset,
+                file_size,
+                writable,
+                file_id,
+            });
+        }
+    }
+
+    /// Publish logical sharing after the backend has installed a mapping. File
+    /// aliases already have stable identity from `replace_alias_window`; shared
+    /// anonymous/boot-aperture allocations receive a fresh stored object ID.
+    pub fn publish_mapping_sharing(
+        &self,
+        va: u64,
+        len: usize,
+        sharing: carrick_guest_mem::MappingSharing,
+    ) {
+        self.lock().publish_mapping_sharing(va, len, sharing);
+    }
+
+    /// Derive the logical shared-object+offset key for a compact GPA.
+    pub(crate) fn shared_futex_key(&self, gpa: u64, len: usize) -> Option<SharedFutexMirrorKey> {
+        self.lock().shared_futex_key(gpa, len)
+    }
+
     /// Allocate a compact GPA for a window of `len` bytes (page-aligned).
     pub fn plan_gpa(&self, len: usize) -> Result<u64, OsError> {
         self.lock().plan_gpa(len)
@@ -1340,6 +1740,11 @@ impl BhyveGuestRam {
     /// Resolve a guest VA → backing GPA (used by the engine's host_ptr).
     pub fn resolve(&self, va: u64, len: usize) -> Option<u64> {
         self.lock().resolve(va, len)
+    }
+
+    /// True when one exact compact-GPA interval is owned by a published window.
+    pub fn contains_gpa(&self, gpa: u64, len: usize) -> bool {
+        self.lock().contains_gpa(gpa, len)
     }
 
     /// Snapshot the window table (boot-time PML4 build + tests read it).
@@ -1383,75 +1788,53 @@ impl BhyveGuestRam {
         })
     }
 
-    /// Record a host-file-backed shm alias whose sysmem must be flushed back to
-    /// its file at the fork barrier (SysV-shm cross-process coherence). Takes
-    /// OWNERSHIP of `fd` (closed when the alias is later dropped). If `va` is
-    /// already registered (a re-attach at the same VA), the prior alias's fd is
-    /// closed and replaced so the table never grows unbounded or leaks fds.
-    pub fn register_shm_alias(
+    #[cfg(test)]
+    fn register_shm_alias_for_test(
         &self,
         va: u64,
         gpa: u64,
         len: usize,
-        fd: libc::c_int,
+        fd: OwnedFd,
         offset: libc::off_t,
         file_size: usize,
     ) {
-        let mut inner = self.lock();
-        if let Some(old) = inner.shm_aliases.iter_mut().find(|a| a.va == va) {
-            // SAFETY: we own the prior fd; replace it with the fresh one.
-            unsafe { libc::close(old.fd) };
-            old.gpa = gpa;
-            old.len = len;
-            old.fd = fd;
-            old.offset = offset;
-            old.file_size = file_size;
-            return;
+        let file_id = file_object_id(fd.as_raw_fd()).expect("test alias fstat");
+        self.replace_alias_window(va, gpa, len, true, Some((fd, offset, file_size, file_id)));
+    }
+
+    fn snapshot_aliases(&self, writable_only: bool) -> std::io::Result<Vec<ShmAliasIo>> {
+        let inner = self.lock();
+        let mut snapshots = Vec::with_capacity(inner.shm_aliases.len());
+        for alias in &inner.shm_aliases {
+            if writable_only && !alias.writable {
+                continue;
+            }
+            let io_len = alias
+                .file_size
+                .saturating_sub(alias.offset.max(0) as usize)
+                .min(alias.len);
+            snapshots.push(ShmAliasIo {
+                gpa: alias.gpa,
+                fd: alias.fd.try_clone()?,
+                offset: alias.offset,
+                len: io_len,
+            });
         }
-        inner.shm_aliases.push(ShmAlias {
-            va,
-            gpa,
-            len,
-            fd,
-            offset,
-            file_size,
-        });
+        Ok(snapshots)
     }
 
-    /// Snapshot the registered shm aliases as `(gpa, fd, offset, write_len)` for
-    /// a fork-barrier flush. `write_len` is bounded by the file's real size so a
-    /// write-back never grows the file or writes past the segment's content.
-    pub fn shm_aliases_for_flush(&self) -> Vec<(u64, libc::c_int, libc::off_t, usize)> {
-        self.lock()
-            .shm_aliases
-            .iter()
-            .map(|a| {
-                let write_len = a
-                    .file_size
-                    .saturating_sub(a.offset.max(0) as usize)
-                    .min(a.len);
-                (a.gpa, a.fd, a.offset, write_len)
-            })
-            .collect()
+    /// Snapshot writable aliases for fork/exit writeback. Every result owns a
+    /// dup, so the RAM lock can drop and concurrent munmap/replacement can retire
+    /// the table's descriptor without closing or redirecting this I/O operation.
+    pub(crate) fn shm_aliases_for_flush(&self) -> std::io::Result<Vec<ShmAliasIo>> {
+        self.snapshot_aliases(true)
     }
 
-    /// Snapshot the registered shm aliases as `(gpa, fd, offset, read_len)` for a
-    /// REFRESH — re-read the backing file INTO sysmem (the inverse of
-    /// `shm_aliases_for_flush`). Used after the parent reaps a child (`wait4`/
-    /// `waitid`): the child flushed its stores to the file on exit, so the parent
-    /// must re-read the file to see them (the child wrote a different process's
-    /// private sysmem; bhyve's only cross-process medium is the shared inode).
-    /// `read_len` is bounded by the file size so it never reads past the content.
-    pub fn shm_aliases_for_refresh(&self) -> Vec<(u64, libc::c_int, libc::off_t, usize)> {
-        self.shm_aliases_for_flush()
-    }
-}
-
-impl Drop for ShmAlias {
-    fn drop(&mut self) {
-        // SAFETY: `fd` is the owned host fd of the backing file (a dispatcher fd
-        // map_host_alias took ownership of, or a re-attach replacement).
-        unsafe { libc::close(self.fd) };
+    /// Snapshot all file aliases for refresh. A read-only view can still need to
+    /// observe stores written through another mapping/process, so it retains a
+    /// stable descriptor even though it never participates in writeback.
+    pub(crate) fn shm_aliases_for_refresh(&self) -> std::io::Result<Vec<ShmAliasIo>> {
+        self.snapshot_aliases(false)
     }
 }
 
@@ -2818,6 +3201,26 @@ pub fn seed_entry_snapshot_bhyve(
 mod tests {
     use super::*;
     use carrick_mem::pml4::{PML4_NX, PML4_P, PML4_PS, PML4_US, walk_descriptors};
+    use std::io::Write as _;
+    use std::os::fd::IntoRawFd as _;
+
+    fn temp_file(contents: &[u8]) -> (OwnedFd, std::path::PathBuf) {
+        let nonce = random_identity_words();
+        let path = std::env::temp_dir().join(format!(
+            "carrick-bhyve-alias-{}-{:016x}{:016x}",
+            std::process::id(),
+            nonce[0],
+            nonce[1]
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create temp alias file");
+        file.write_all(contents).expect("seed temp alias file");
+        (file.into(), path)
+    }
 
     /// Byte-pin the M0 blob (the `el1_vectors_sentinel_bytes` pattern):
     /// `mov $N, %al` = B0 ib; `out %al, imm8` = E6 ib; `hlt` = F4
@@ -3129,6 +3532,266 @@ mod tests {
             Some(gpa + 3 * 4096),
             "tail page kept at its original offset"
         );
+    }
+
+    #[test]
+    fn remove_windows_splits_and_releases_shm_alias_fd_ownership() {
+        use std::os::fd::FromRawFd as _;
+
+        let ram = BhyveGuestRam::new();
+        let va = 0x60_0000_0000u64;
+        let gpa = 0x20_0000u64;
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        unsafe { libc::close(pipe[1]) };
+        let raw = pipe[0];
+        // SAFETY: the read end is newly owned and transferred to the alias.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        ram.register_shm_alias_for_test(va, gpa, 4 * 4096, fd, 0, 4 * 4096);
+
+        ram.remove_windows(va + 4096, 2 * 4096);
+        let split = ram.shm_aliases_for_flush().expect("snapshot split aliases");
+        assert_eq!(split.len(), 2);
+        assert_eq!(
+            (split[0].gpa, split[0].offset, split[0].len),
+            (gpa, 0, 4096)
+        );
+        assert_eq!(
+            (split[1].gpa, split[1].offset, split[1].len),
+            (gpa + 3 * 4096, 3 * 4096, 4096),
+        );
+        assert_ne!(split[0].fd.as_raw_fd(), raw, "snapshot owns a dup");
+        assert_ne!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+
+        ram.remove_windows(va, 4096);
+        assert_ne!(
+            unsafe { libc::fcntl(raw, libc::F_GETFD) },
+            -1,
+            "the surviving tail still owns the shared fd"
+        );
+        ram.remove_windows(va + 3 * 4096, 4096);
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn replace_alias_window_discards_fixed_prior_lookup_and_fd_owner() {
+        use std::os::fd::FromRawFd as _;
+
+        let ram = BhyveGuestRam::new();
+        let va = 0x60_0000_0000u64;
+        let old_gpa = ram
+            .add_bump(va, 4096, true, true, true)
+            .expect("old alias gpa");
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        unsafe { libc::close(pipe[1]) };
+        let old_fd = pipe[0];
+        // SAFETY: the read end is newly owned and transferred to the old alias.
+        ram.register_shm_alias_for_test(
+            va,
+            old_gpa,
+            4096,
+            unsafe { OwnedFd::from_raw_fd(old_fd) },
+            0,
+            4096,
+        );
+        let new_gpa = ram
+            .add_bump(va, 4096, true, true, true)
+            .expect("staged replacement gpa");
+
+        ram.replace_alias_window(va, new_gpa, 4096, true, None);
+
+        assert_eq!(ram.resolve(va, 1), Some(new_gpa));
+        assert_eq!(
+            ram.windows_snapshot().iter().filter(|w| w.va == va).count(),
+            1
+        );
+        assert!(
+            ram.shm_aliases_for_flush()
+                .expect("snapshot aliases")
+                .is_empty()
+        );
+        assert_eq!(unsafe { libc::fcntl(old_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn alias_io_snapshot_survives_original_close_and_numeric_fd_reuse() {
+        let ram = BhyveGuestRam::new();
+        let va = 0x60_0000_0000u64;
+        let gpa = 0x20_0000u64;
+        let original_bytes = b"original-alias";
+        let (original, original_path) = temp_file(original_bytes);
+        let original_raw = original.as_raw_fd();
+        ram.register_shm_alias_for_test(va, gpa, 4096, original, 0, original_bytes.len());
+
+        let mut snapshots = ram
+            .shm_aliases_for_refresh()
+            .expect("ownership-preserving snapshot");
+        let snapshot = snapshots.pop().expect("one alias snapshot");
+        assert_ne!(snapshot.fd.as_raw_fd(), original_raw);
+        ram.remove_windows(va, 4096);
+        assert_eq!(unsafe { libc::fcntl(original_raw, libc::F_GETFD) }, -1);
+
+        let replacement_bytes = b"replacement!!!";
+        let (replacement, replacement_path) = temp_file(replacement_bytes);
+        let replacement_raw = replacement.into_raw_fd();
+        let reused = if replacement_raw == original_raw {
+            replacement_raw
+        } else {
+            assert_eq!(
+                unsafe { libc::dup2(replacement_raw, original_raw) },
+                original_raw
+            );
+            unsafe { libc::close(replacement_raw) };
+            original_raw
+        };
+        assert_eq!(
+            reused, original_raw,
+            "test must recycle the original fd number"
+        );
+
+        let mut via_reused = vec![0u8; replacement_bytes.len()];
+        assert_eq!(
+            unsafe { libc::pread(reused, via_reused.as_mut_ptr().cast(), via_reused.len(), 0,) },
+            replacement_bytes.len() as isize
+        );
+        assert_eq!(via_reused, replacement_bytes);
+
+        let mut via_snapshot = vec![0u8; original_bytes.len()];
+        assert_eq!(
+            unsafe {
+                libc::pread(
+                    snapshot.fd.as_raw_fd(),
+                    via_snapshot.as_mut_ptr().cast(),
+                    via_snapshot.len(),
+                    0,
+                )
+            },
+            original_bytes.len() as isize
+        );
+        assert_eq!(
+            via_snapshot, original_bytes,
+            "snapshot still names original inode"
+        );
+
+        unsafe { libc::close(reused) };
+        std::fs::remove_file(original_path).expect("remove original temp file");
+        std::fs::remove_file(replacement_path).expect("remove replacement temp file");
+    }
+
+    #[test]
+    fn pre_fork_anonymous_object_key_is_preserved() {
+        let ram = BhyveGuestRam::new();
+        let va = 0x60_0000_0000u64;
+        let gpa = ram.add_bump(va, 4096, true, true, false).expect("anon gpa");
+        ram.publish_mapping_sharing(va, 4096, carrick_guest_mem::MappingSharing::Shared);
+        let child = ram.fork_snapshot_for_test();
+
+        assert_eq!(
+            ram.shared_futex_key(gpa, 4),
+            child.shared_futex_key(gpa, 4),
+            "a pre-fork allocation stores one identity copied into both branches"
+        );
+    }
+
+    #[test]
+    fn divergent_post_fork_anonymous_allocations_at_same_gpa_do_not_alias() {
+        let parent = BhyveGuestRam::new();
+        let child = parent.fork_snapshot_for_test();
+        let va = 0x60_0000_0000u64;
+        let parent_gpa = parent
+            .add_bump(va, 4096, true, true, false)
+            .expect("parent gpa");
+        let child_gpa = child
+            .add_bump(va, 4096, true, true, false)
+            .expect("child gpa");
+        assert_eq!(parent_gpa, child_gpa, "fork cloned the compact GPA cursor");
+        parent.publish_mapping_sharing(va, 4096, carrick_guest_mem::MappingSharing::Shared);
+        child.publish_mapping_sharing(va, 4096, carrick_guest_mem::MappingSharing::Shared);
+
+        assert_ne!(
+            parent.shared_futex_key(parent_gpa, 4),
+            child.shared_futex_key(child_gpa, 4),
+            "fresh per-allocation entropy prevents cloned-counter collisions"
+        );
+    }
+
+    #[test]
+    fn shared_file_identity_uses_inode_and_file_offset_not_gpa() {
+        let ram = BhyveGuestRam::new();
+        let (file, path) = temp_file(&[0u8; 4096]);
+        let same_file = file.try_clone().expect("dup shared file");
+        let file_id = file_object_id(file.as_raw_fd()).expect("file identity");
+        let va_a = 0x60_0000_0000u64;
+        let va_b = va_a + 0x20_0000;
+        let gpa_a = ram.add_bump(va_a, 4096, true, true, false).expect("gpa a");
+        let gpa_b = ram.add_bump(va_b, 4096, true, true, false).expect("gpa b");
+        assert_ne!(gpa_a, gpa_b);
+        ram.replace_alias_window(va_a, gpa_a, 4096, true, Some((file, 0, 4096, file_id)));
+        ram.replace_alias_window(va_b, gpa_b, 4096, true, Some((same_file, 0, 4096, file_id)));
+
+        assert_eq!(
+            ram.shared_futex_key(gpa_a + 64, 4),
+            ram.shared_futex_key(gpa_b + 64, 4),
+            "same inode + file byte offset shares despite different compact GPA"
+        );
+        std::fs::remove_file(path).expect("remove temp file");
+    }
+
+    #[test]
+    fn unrelated_files_and_fresh_exec_domain_do_not_reuse_mirror_keys() {
+        let ram = BhyveGuestRam::new();
+        let exec_ram = BhyveGuestRam::new();
+        let (file_a, path_a) = temp_file(&[0u8; 4096]);
+        let same_a_after_exec = file_a.try_clone().expect("dup file a");
+        let (file_b, path_b) = temp_file(&[0u8; 4096]);
+        let id_a = file_object_id(file_a.as_raw_fd()).expect("id a");
+        let id_b = file_object_id(file_b.as_raw_fd()).expect("id b");
+        let va = 0x60_0000_0000u64;
+        let gpa = ram.add_bump(va, 4096, true, true, false).expect("gpa a");
+        let other_va = va + 0x20_0000;
+        let other_gpa = ram
+            .add_bump(other_va, 4096, true, true, false)
+            .expect("gpa b");
+        ram.replace_alias_window(va, gpa, 4096, true, Some((file_a, 0, 4096, id_a)));
+        ram.replace_alias_window(
+            other_va,
+            other_gpa,
+            4096,
+            true,
+            Some((file_b, 0, 4096, id_b)),
+        );
+        assert_ne!(
+            ram.shared_futex_key(gpa, 4),
+            ram.shared_futex_key(other_gpa, 4)
+        );
+
+        let exec_gpa = exec_ram
+            .add_bump(va, 4096, true, true, false)
+            .expect("exec gpa");
+        exec_ram.replace_alias_window(
+            va,
+            exec_gpa,
+            4096,
+            true,
+            Some((same_a_after_exec, 0, 4096, id_a)),
+        );
+        assert_ne!(
+            ram.shared_futex_key(gpa, 4),
+            exec_ram.shared_futex_key(exec_gpa, 4),
+            "new address-space fork domain cannot bind an old mirror slot"
+        );
+
+        std::fs::remove_file(path_a).expect("remove file a");
+        std::fs::remove_file(path_b).expect("remove file b");
     }
 
     /// BhyveGuestRam: overflow guard returns an error before exceeding the

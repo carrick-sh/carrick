@@ -42,6 +42,8 @@ static CODE_BASE: AtomicU64 = AtomicU64::new(0);
 static CODE_LEN: AtomicU64 = AtomicU64::new(0);
 static SIGNAL_STUB: AtomicU64 = AtomicU64::new(0);
 static KICK_STUB: AtomicU64 = AtomicU64::new(0);
+static KICK_RESTORE_RCX_OFFSET: AtomicU64 = AtomicU64::new(0);
+static KICK_SCRATCH_RCX_OFFSET: AtomicU64 = AtomicU64::new(0);
 static FAULT_RECORD_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 // The dispositions replaced at install time, restored when a fault is NOT
@@ -113,12 +115,27 @@ pub fn install_fault_redirect(signal_stub: u64, fault_record_offset: u32) -> io:
     Ok(())
 }
 
+/// Signal-safe description of one transient guest-RCX spill used by emitted
+/// control-flow probes. Both offsets are relative to the context pinned in
+/// `%r15`; zero disables recovery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KickRcxRecovery {
+    pub active_offset: u32,
+    pub scratch_offset: u32,
+}
+
 /// Install a non-restarting asynchronous kick. Outside translated code the
 /// empty handler merely interrupts the current host syscall. Inside the JIT
 /// cache it rewrites RIP to `kick_stub`, giving the runtime the same typed
 /// boundary that a VMM backend gets when its vCPU run call is kicked.
-pub fn install_kick_redirect(signal: libc::c_int, kick_stub: u64) -> io::Result<()> {
+pub fn install_kick_redirect(
+    signal: libc::c_int,
+    kick_stub: u64,
+    rcx_recovery: KickRcxRecovery,
+) -> io::Result<()> {
     KICK_STUB.store(kick_stub, Ordering::Release);
+    KICK_SCRATCH_RCX_OFFSET.store(u64::from(rcx_recovery.scratch_offset), Ordering::Release);
+    KICK_RESTORE_RCX_OFFSET.store(u64::from(rcx_recovery.active_offset), Ordering::Release);
     // SAFETY: well-formed SA_SIGINFO action; the handler is async-signal-safe.
     unsafe {
         let mut action: libc::sigaction = MaybeUninit::zeroed().assume_init();
@@ -149,6 +166,22 @@ unsafe extern "C" fn native_kick_handler(
         let stub = KICK_STUB.load(Ordering::Acquire);
         let rip = mc.mc_rip as u64;
         if base != 0 && stub != 0 && rip >= base && rip < base.saturating_add(len) {
+            // A return-cache probe may be interrupted after spilling and then
+            // borrowing guest RCX. Repair the kernel's saved register before
+            // sigreturn reaches the ordinary kick stub. Volatile accesses are
+            // required because emitted code, not Rust, owns these fields while
+            // translated execution is live.
+            let restore_offset = KICK_RESTORE_RCX_OFFSET.load(Ordering::Acquire);
+            let scratch_offset = KICK_SCRATCH_RCX_OFFSET.load(Ordering::Acquire);
+            if restore_offset != 0 && scratch_offset != 0 {
+                let ctx = mc.mc_r15 as u64;
+                let active = (ctx + restore_offset) as *mut u32;
+                if active.read_volatile() != 0 {
+                    mc.mc_rcx =
+                        ((ctx + scratch_offset) as *const u64).read_volatile() as libc::register_t;
+                    active.write_volatile(0);
+                }
+            }
             // Translated execution pins the gateway context in r15. Sigreturn
             // restores all guest registers, then the kick stub captures them
             // through the ordinary common exit path.
@@ -209,5 +242,60 @@ unsafe extern "C" fn native_fault_handler(
             };
         libc::sigemptyset(&mut action.sa_mask);
         libc::sigaction(signal, &action, std::ptr::null_mut());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(C)]
+    struct RecoveryContext {
+        pad: u64,
+        scratch_rcx: u64,
+        active: u32,
+    }
+
+    #[test]
+    fn kick_repairs_an_active_emitter_rcx_spill() {
+        let mut context = RecoveryContext {
+            pad: 0,
+            scratch_rcx: 0x1122_3344_5566_7788,
+            active: 1,
+        };
+        let mut ucontext: libc::ucontext_t = unsafe { std::mem::zeroed() };
+        ucontext.uc_mcontext.mc_rip = 0x1010;
+        ucontext.uc_mcontext.mc_r15 = std::ptr::addr_of_mut!(context) as libc::register_t;
+        ucontext.uc_mcontext.mc_rcx = 0xDEAD;
+
+        CODE_LEN.store(0x100, Ordering::Release);
+        CODE_BASE.store(0x1000, Ordering::Release);
+        KICK_STUB.store(0x2000, Ordering::Release);
+        KICK_SCRATCH_RCX_OFFSET.store(
+            std::mem::offset_of!(RecoveryContext, scratch_rcx) as u64,
+            Ordering::Release,
+        );
+        KICK_RESTORE_RCX_OFFSET.store(
+            std::mem::offset_of!(RecoveryContext, active) as u64,
+            Ordering::Release,
+        );
+
+        unsafe {
+            native_kick_handler(
+                0,
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(ucontext).cast(),
+            )
+        };
+
+        assert_eq!(ucontext.uc_mcontext.mc_rcx as u64, context.scratch_rcx);
+        assert_eq!(ucontext.uc_mcontext.mc_rip as u64, 0x2000);
+        assert_eq!(context.active, 0);
+
+        CODE_BASE.store(0, Ordering::Release);
+        CODE_LEN.store(0, Ordering::Release);
+        KICK_STUB.store(0, Ordering::Release);
+        KICK_SCRATCH_RCX_OFFSET.store(0, Ordering::Release);
+        KICK_RESTORE_RCX_OFFSET.store(0, Ordering::Release);
     }
 }

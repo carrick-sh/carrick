@@ -155,6 +155,18 @@ fn lock_thread_pending() -> std::sync::MutexGuard<'static, Option<HashMap<i32, u
     guard
 }
 
+fn try_lock_thread_pending() -> Option<std::sync::MutexGuard<'static, Option<HashMap<i32, u64>>>> {
+    let mut guard = match THREAD_PENDING.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    Some(guard)
+}
+
 /// ATFORK-PREPARE guard over the thread-pending table (see
 /// [`hold_thread_pending_for_fork`]): held by the FORKING thread across
 /// `fork()` so a fork child can never inherit `THREAD_PENDING`'s mutex in a
@@ -170,6 +182,13 @@ pub struct ThreadPendingForkGuard(
 /// processes, before any pending-table use (the mutex is not reentrant).
 pub fn hold_thread_pending_for_fork() -> ThreadPendingForkGuard {
     ThreadPendingForkGuard(lock_thread_pending())
+}
+
+/// Non-blocking fork-prepare acquisition used by bounded native host-fork
+/// coordinators. `None` means a publisher currently owns the table; callers
+/// retry only until their explicit fork deadline.
+pub fn try_hold_thread_pending_for_fork() -> Option<ThreadPendingForkGuard> {
+    try_lock_thread_pending().map(ThreadPendingForkGuard)
 }
 
 /// Set the thread-directed pending `signum` bit for `tid`. This is the pure

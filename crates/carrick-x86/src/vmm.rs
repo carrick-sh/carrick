@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use carrick_guest_mem::{Gpa, GuestVa, MemoryError, X8664SyscallFrame};
+use carrick_guest_mem::{
+    Gpa, GuestVa, MappingSharing, MemoryError, RepointPrivateError, X8664SyscallFrame,
+};
 use carrick_hal::{GuestVmBackend, SharedFutexLocation, TrapError, VcpuKick, VcpuRegistry};
 
 use crate::bringup_fns::{self, BringupLayout, X86VcpuSnapshot};
@@ -294,6 +296,10 @@ pub trait X86Vmm: Sized + GuestVmBackend {
 
     /// Back a dynamic high-VA mapping and install the VA→GPA page-table path.
     /// Backends that can receive `DispatchOutcome::MapHostAlias` override this.
+    /// `file` transfers ownership of a dup and must be closed on every
+    /// return/unwind path. Until `Err` certifies that no backend/page-table
+    /// mutation occurred, the generic runtime fail-stops every claimed install
+    /// failure instead of returning recoverably to the guest.
     fn map_host_alias(
         &mut self,
         va: GuestVa,
@@ -302,12 +308,23 @@ pub trait X86Vmm: Sized + GuestVmBackend {
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        let _ = (ipa, payload, file);
+        let _ = (ipa, payload);
+        if let Some((fd, _, _)) = file {
+            unsafe { libc::close(fd) };
+        }
         Err(TrapError::Hypervisor(format!(
             "carrick-x86: map_host_alias not implemented for this backend (va=0x{:x} len=0x{len:x})",
             va.raw()
         )))
     }
+
+    /// Publish or retire backend-specific identity for a logical mapping.
+    /// `X86EngineCore` calls this immediately before it publishes the same
+    /// sharing classification in its syscall-access protection registry, so a
+    /// backend can prepare a durable shared-object futex key without a transient
+    /// `Shared` classification pointing at missing identity. Most VMMs key
+    /// directly on their shared host mapping and need no extra metadata.
+    fn publish_mapping_sharing(&mut self, _va: GuestVa, _len: usize, _sharing: MappingSharing) {}
 
     /// Handle a backend memory exit. Return `true` when the VMM resolved the
     /// missing backing and the engine should retry the same guest instruction.
@@ -327,12 +344,35 @@ pub trait X86Vmm: Sized + GuestVmBackend {
         None
     }
 
+    /// Resolve one already-segmented syscall-buffer fragment to host memory.
+    /// `va` is the guest virtual address and `gpa` is the live page-table
+    /// translation selected by the engine. Most backends key their host slots by
+    /// GPA and keep the default. A compact-GPA backend may override this seam to
+    /// distinguish an ordinary VA-keyed identity fast path from a translated
+    /// shared-aperture fragment without reinterpreting one integer domain as the
+    /// other.
+    fn syscall_buffer_host_ptr(&self, _va: GuestVa, gpa: Gpa, len: usize) -> Option<*mut u8> {
+        self.host_ptr(gpa.raw(), len)
+    }
+
+    /// Mutable counterpart of [`Self::syscall_buffer_host_ptr`]. Sparse
+    /// backends may materialize an ordinary VA here before resolving its host
+    /// pointer; a translated fragment must retain the exact GPA selected above.
+    fn syscall_buffer_host_ptr_mut(
+        &mut self,
+        _va: GuestVa,
+        gpa: Gpa,
+        len: usize,
+    ) -> Option<*mut u8> {
+        self.host_ptr_mut(gpa.raw(), len)
+    }
+
     /// Repoint guest VA `[va, va+len)` at the per-process PRIVATE overlay
     /// aperture GPA `overlay_gpa` (identity GPA==VA, boot-mapped), seeding the
     /// overlay backing with `content` FIRST (while `va` still translates to the
     /// stale shared-aperture GPA, so no torn read during the flip). Backs a guest
-    /// `mmap(MAP_FIXED|MAP_PRIVATE|MAP_ANON)` over a shared-aperture VA: carrick's
-    /// shared aperture is host-`MAP_SHARED`, so a write through `va` would leak a
+    /// file or anonymous `mmap(MAP_FIXED|MAP_PRIVATE)` over a shared-aperture VA:
+    /// carrick's shared aperture is host-`MAP_SHARED`, so a write through `va` would leak a
     /// guest's "private" stores to every other mapper and across fork — the
     /// overlay is `MAP_SHARED`-free (fork-snapshotted), so the repointed VA's
     /// stores stay private. The backend seeds `host_ptr(overlay_gpa)`, then edits
@@ -346,10 +386,19 @@ pub trait X86Vmm: Sized + GuestVmBackend {
         _overlay_gpa: u64,
         _len: usize,
         _content: &[u8],
-    ) -> Result<(), MemoryError> {
-        Err(MemoryError::HostMap(format!(
+    ) -> Result<(), RepointPrivateError> {
+        Err(RepointPrivateError::clean(MemoryError::HostMap(format!(
             "carrick-x86: repoint_private not implemented for this backend (va=0x{va:x})"
-        )))
+        ))))
+    }
+
+    /// Restore a shared-aperture VA to its identity GPA after a private-overlay
+    /// leaf was invalidated. Protection edits deliberately preserve the leaf's
+    /// GPA and therefore cannot perform this ownership transition themselves.
+    fn restore_shared_identity(&mut self, va: u64, _len: usize) -> Result<(), RepointPrivateError> {
+        Err(RepointPrivateError::clean(MemoryError::HostMap(format!(
+            "carrick-x86: restore_shared_identity not implemented for this backend (va=0x{va:x})"
+        ))))
     }
 
     /// Back and map a guest `mmap(MAP_FIXED|MAP_PRIVATE|MAP_ANON)` at an
@@ -457,14 +506,18 @@ pub trait X86Vmm: Sized + GuestVmBackend {
     /// the parent must re-read the file into its own sysmem HERE (a `waitpid`
     /// return is a process-exit happens-before barrier, so the read is a
     /// consistent snapshot of the reaped child's writes).
-    fn refresh_shared_after_wait(&mut self) {}
+    fn refresh_shared_after_wait(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
 
     /// Publish any copied file-backed `MAP_SHARED` alias stores before a guest
     /// syscall observes the backing file. No-op for direct shared-memory backends.
     fn needs_shared_file_alias_sync(&self) -> bool {
         false
     }
-    fn sync_shared_file_aliases(&mut self) {}
+    fn sync_shared_file_aliases(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
 
     /// Restore a generic x86 vCPU snapshot onto a backend vCPU. The default
     /// uses the shared trait-level register writers; backends with stricter

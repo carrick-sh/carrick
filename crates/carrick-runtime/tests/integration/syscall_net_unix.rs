@@ -10,12 +10,14 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
+#[cfg(target_os = "macos")]
 use carrick_runtime::linux_abi::{
     LINUX_AT_FDCWD, LINUX_EADDRINUSE, LINUX_ECONNREFUSED, LINUX_ENOENT, LINUX_ENXIO, LINUX_O_CREAT,
     LINUX_O_RDWR, LINUX_SOCK_STREAM,
 };
 #[cfg(target_os = "macos")]
 use carrick_runtime::vfs::BindVfs;
+#[cfg(target_os = "macos")]
 use support::*;
 
 /// Regression for the Go `net` unix-socket hang: carrick translates a guest

@@ -122,6 +122,7 @@ mod commands;
 // `runtime::DebugStateSnapshot`; HVF-only.
 #[cfg(feature = "platform-macos")]
 mod debug;
+mod debug_layout;
 mod fs_setup;
 mod lifecycle;
 // `perf_stats` + the bulk of `trace_profile` back the BSD libdtrace-based

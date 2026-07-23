@@ -56,10 +56,25 @@ fn stage1(exe: &str) {
 
 fn stage2() {
     let threads = status_thread_count();
+    // Keep a fresh stage-2 clone alive while the exec survivor asks gettid.
+    // A presentation-only "live_count == 1" alias passes the first query but
+    // regresses to the worker's old tid as soon as this child registers.
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let child = std::thread::spawn(move || {
+        ready_tx.send(()).expect("publish stage2 child");
+        release_rx.recv().expect("release stage2 child");
+    });
+    ready_rx.recv().expect("stage2 child registered");
+    let survivor_pid = unsafe { libc::getpid() } as i64;
+    let survivor_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
     report!(
         exec_from_thread_stage2_reached = true,
         exec_from_thread_count_is_one = threads == Some(1),
+        exec_from_thread_survivor_gettid_is_getpid = survivor_tid == survivor_pid,
     );
+    release_tx.send(()).expect("release stage2 child");
+    child.join().expect("join stage2 child");
 }
 
 fn main() {

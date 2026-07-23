@@ -382,6 +382,49 @@ pub fn entry_trampoline_bytes() -> Vec<u8> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct X8664GuestArch;
 
+fn x8664_is_canonical(address: u64) -> bool {
+    let top = address >> 47;
+    top == 0 || top == 0x1_ffff
+}
+
+/// Linux's downward-growing alt-stack membership rule. The low boundary is
+/// outside while the top is inside; using a half-open Rust range reverses both
+/// endpoint decisions and can make a nested frame overwrite its parent.
+fn x8664_altstack_contains(ss_sp: u64, ss_size: u64, sp: u64) -> bool {
+    ss_sp
+        .checked_add(ss_size)
+        .is_some_and(|top| sp > ss_sp && sp <= top)
+}
+
+fn x8664_standard_xstate_is_valid(
+    capabilities: crate::X86XstateCapabilities,
+    state: &crate::X86SignalXstate,
+) -> bool {
+    let Some(expected_size) = capabilities.standard_size_for(state.xfeatures) else {
+        return false;
+    };
+    if state.bytes.len() != expected_size
+        || state.bytes.len() < carrick_abi::X8664_XSAVE_MIN_LEN
+        || state.bytes.len() > carrick_abi::X8664_XSAVE_AREA_MAX_LEN
+        || state.xfeatures & (1u64 << carrick_abi::X8664_XFEATURE_PKRU) != 0
+    {
+        return false;
+    }
+    let mut xstate_bytes = [0u8; 8];
+    xstate_bytes.copy_from_slice(&state.bytes[512..520]);
+    if u64::from_le_bytes(xstate_bytes) & !state.xfeatures != 0 {
+        return false;
+    }
+    let mut xcomp_bytes = [0u8; 8];
+    xcomp_bytes.copy_from_slice(&state.bytes[520..528]);
+    if u64::from_le_bytes(xcomp_bytes) != 0 || state.bytes[528..576].iter().any(|byte| *byte != 0) {
+        return false;
+    }
+    let mut mxcsr_bytes = [0u8; 4];
+    mxcsr_bytes.copy_from_slice(&state.bytes[24..28]);
+    u32::from_le_bytes(mxcsr_bytes) & !capabilities.mxcsr_mask == 0
+}
+
 impl GuestArch for X8664GuestArch {
     type Frame = X8664SyscallFrame;
     type Mmu = X8664Mmu;
@@ -428,7 +471,12 @@ impl GuestArch for X8664GuestArch {
         params: crate::sigframe::InjectParams,
     ) -> Result<crate::sigframe::SigframeInject, TrapError> {
         use crate::Reg;
-        use carrick_abi::{X8664Fpstate, X8664Rtsigframe, X8664Sigcontext, X8664Ucontext};
+        use carrick_abi::{
+            CarrickX8664XstateTrailer, X8664_FP_XSTATE_MAGIC1, X8664_FP_XSTATE_MAGIC2,
+            X8664_FP_XSTATE_MAGIC2_SIZE, X8664_FP_XSTATE_SW_BYTES_OFFSET,
+            X8664_RTSIGFRAME_FPSTATE_OFFSET, X8664FpxSwBytes, X8664Rtsigframe, X8664Sigcontext,
+            X8664Ucontext,
+        };
         use zerocopy::IntoBytes;
 
         let p = params;
@@ -474,51 +522,88 @@ impl GuestArch for X8664GuestArch {
             mc.rax = p.orig_x0;
         }
         // Ring-3 selectors (informational; rt_sigreturn restores GPRs, not segs).
-        mc.cs = 0x23;
-        mc.ss = 0x1b;
+        mc.cs = carrick_abi::LINUX_X8664_USER_CS;
+        mc.ss = carrick_abi::LINUX_X8664_USER_DS;
         mc.cr2 = p.fault_siginfo.map(|(_, addr)| addr).unwrap_or(0);
 
-        // ── Compute the new RSP: skip the 128-byte red zone (or the alt-stack
-        //    top for SA_ONSTACK), reserve the frame, and align so &pretcode ≡ 8
-        //    (mod 16) at handler entry (x86-64 psABI: RSP+8 is 16-aligned at a
-        //    function entry; the handler is entered as-if-CALLed). ──
-        let frame_size = core::mem::size_of::<X8664Rtsigframe>() as u64;
-        let base = match p.altstack {
-            // SA_ONSTACK: switch to the alt-stack TOP — but ONLY when we are not
-            // already executing on it. A nested SA_NODEFER|SA_ONSTACK handler is
-            // already on the alt stack; resetting to the top would rebuild the
-            // depth-2 frame ON TOP of the live depth-1 frame → no clean unwind →
-            // the `sigreenter` trap-loop runaway (spins to the 1M-trap ceiling).
-            // When already on the sigstack, continue DOWNWARD past the red zone
-            // exactly like the main-stack path. (Matches Linux `get_sigframe`,
-            // which uses the alt-stack top only when `!on_sig_stack(sp)`.)
-            Some((ss_sp, ss_size))
-                if !(ss_sp..ss_sp.wrapping_add(ss_size)).contains(&saved_rsp) =>
-            {
-                ss_sp.wrapping_add(ss_size)
-            }
-            // No SA_ONSTACK, OR already on the alt stack: reserve below the live
-            // RSP, skipping the 128-byte red zone.
-            _ => saved_rsp.wrapping_sub(128),
-        };
-        let new_sp = (base.wrapping_sub(frame_size) & !0xf).wrapping_sub(8);
-        // fpstate pointer = the FXSAVE area's address within the frame.
-        mc.fpstate = new_sp + core::mem::offset_of!(X8664Rtsigframe, fpstate) as u64;
-
-        // ── FXSAVE area: MXCSR + XMM0–15, plus the AVX YMM_Hi (carrick-internal,
-        //    trailing the frame) so the interrupted thread's AVX upper halves
-        //    survive the handler+sigreturn — FXSAVE holds only the low 128 bits. ──
-        let mut fp = X8664Fpstate::empty();
-        let mut ymm_hi = [0u8; 256];
-        if p.fpsimd_enabled {
-            // ONE KVM_GET_XSAVE (x86 override of save_fpsimd_frame) carries MXCSR
-            // + XMM0–15 + the AVX YMM_Hi — replacing 1 + 16 + 16 per-register
-            // ioctls (the signal-storm throughput cliff).
-            let (mxcsr, xmm, hi) = engine.save_fpsimd_frame()?;
-            fp.mxcsr = mxcsr;
-            fp.xmm_space = xmm;
-            ymm_hi = hi;
+        // Capture the complete x86 state through one architecture-specific
+        // seam. This is authoritative even when an older caller passed the
+        // AArch64-shaped `fpsimd_enabled` flag as false.
+        let capabilities = engine.x86_xstate_capabilities()?;
+        let mut xstate = engine.save_x86_signal_xstate()?;
+        if !x8664_standard_xstate_is_valid(capabilities, &xstate) {
+            return Err(TrapError::Hypervisor(
+                "x86 signal-state exporter returned invalid standard XSAVE geometry".into(),
+            ));
         }
+        let xstate_size = u32::try_from(xstate.bytes.len()).map_err(|_| {
+            TrapError::Hypervisor("x86 signal XSAVE extent does not fit u32".into())
+        })?;
+        let trailer = CarrickX8664XstateTrailer::new(
+            xstate.virtual_pkru,
+            xstate.virtual_x87_fcs,
+            xstate.virtual_x87_fds,
+        );
+        let trailer_size = u32::try_from(core::mem::size_of::<CarrickX8664XstateTrailer>())
+            .map_err(|_| {
+                TrapError::Hypervisor("x86 signal trailer size does not fit u32".into())
+            })?;
+        let extended_size = xstate_size
+            .checked_add(trailer_size)
+            .and_then(|size| size.checked_add(X8664_FP_XSTATE_MAGIC2_SIZE as u32))
+            .ok_or_else(|| TrapError::Hypervisor("x86 signal XSAVE extent overflow".into()))?;
+        let sw = X8664FpxSwBytes {
+            magic1: X8664_FP_XSTATE_MAGIC1,
+            extended_size,
+            xfeatures: xstate.xfeatures,
+            xstate_size,
+            reserved: [0; 7],
+        };
+        xstate.bytes[X8664_FP_XSTATE_SW_BYTES_OFFSET
+            ..X8664_FP_XSTATE_SW_BYTES_OFFSET + core::mem::size_of::<X8664FpxSwBytes>()]
+            .copy_from_slice(sw.as_bytes());
+        let dynamic_size = usize::try_from(extended_size)
+            .map_err(|_| TrapError::Hypervisor("x86 signal frame size overflow".into()))?;
+
+        // Reserve below the normal-stack red zone or from the alt-stack top.
+        // Align the dynamic fpstate itself to 64 bytes; because its fixed offset
+        // is 456 (8 mod 16), the resulting handler RSP is 8 mod 16 as required
+        // by the x86-64 psABI function-entry rule.
+        let already_on_altstack = p
+            .altstack
+            .is_some_and(|(ss_sp, ss_size)| x8664_altstack_contains(ss_sp, ss_size, saved_rsp));
+        let base = match p.altstack {
+            Some((ss_sp, ss_size)) if !already_on_altstack => ss_sp
+                .checked_add(ss_size)
+                .ok_or(TrapError::SignalDeliveryFault)?,
+            _ => saved_rsp
+                .checked_sub(128)
+                .ok_or(TrapError::SignalDeliveryFault)?,
+        };
+        let dynamic_size_u64 =
+            u64::try_from(dynamic_size).map_err(|_| TrapError::SignalDeliveryFault)?;
+        let fpstate_addr = base
+            .checked_sub(dynamic_size_u64)
+            .map(|address| address & !63u64)
+            .ok_or(TrapError::SignalDeliveryFault)?;
+        let new_sp = fpstate_addr
+            .checked_sub(X8664_RTSIGFRAME_FPSTATE_OFFSET as u64)
+            .ok_or(TrapError::SignalDeliveryFault)?;
+        if !x8664_is_canonical(new_sp) || !x8664_is_canonical(fpstate_addr) {
+            return Err(TrapError::SignalDeliveryFault);
+        }
+        if let Some((ss_sp, ss_size)) = p.altstack {
+            let ss_end = ss_sp
+                .checked_add(ss_size)
+                .ok_or(TrapError::SignalDeliveryFault)?;
+            let frame_end = fpstate_addr
+                .checked_add(dynamic_size_u64)
+                .ok_or(TrapError::SignalDeliveryFault)?;
+            if new_sp < ss_sp || frame_end > ss_end {
+                return Err(TrapError::SignalDeliveryFault);
+            }
+        }
+        mc.fpstate = fpstate_addr;
 
         // ── siginfo: queued > fault > SI_USER; re-stamp si_signo. ──
         let mut siginfo = match (p.queued_siginfo, p.fault_siginfo) {
@@ -550,10 +635,11 @@ impl GuestArch for X8664GuestArch {
         }
         uc.uc_mcontext = mc;
 
-        // ── Assemble + write the frame. ──
+        // Assemble the fixed prefix plus the complete Linux-advertised extent:
+        // standard XSAVE image, Carrick's versioned virtual-state trailer, then
+        // the final MAGIC2 word. One checked guest write prevents register
+        // mutation after only part of a frame reached memory.
         let mut frame = X8664Rtsigframe::empty();
-        // pretcode: the restorer the handler RETs to (→ rt_sigreturn). musl/glibc
-        // pass an explicit sa_restorer; fall back to the fixed trampoline.
         frame.pretcode = if p.sa_restorer != 0 {
             p.sa_restorer
         } else {
@@ -561,10 +647,21 @@ impl GuestArch for X8664GuestArch {
         };
         frame.uc = uc;
         frame.info = siginfo;
-        frame.fpstate = fp;
-        frame.ymm_hi = ymm_hi;
+        let total_size = X8664_RTSIGFRAME_FPSTATE_OFFSET
+            .checked_add(dynamic_size)
+            .ok_or_else(|| TrapError::Hypervisor("x86 signal frame size overflow".into()))?;
+        let mut bytes = Vec::with_capacity(total_size);
+        bytes.extend_from_slice(frame.as_bytes());
+        bytes.extend_from_slice(&xstate.bytes);
+        bytes.extend_from_slice(trailer.as_bytes());
+        bytes.extend_from_slice(&X8664_FP_XSTATE_MAGIC2.to_le_bytes());
+        if bytes.len() != total_size {
+            return Err(TrapError::Hypervisor(
+                "x86 signal frame assembly size mismatch".into(),
+            ));
+        }
         engine
-            .write_bytes(new_sp, frame.as_bytes())
+            .write_bytes(new_sp, &bytes)
             .map_err(|_| TrapError::SignalDeliveryFault)?;
 
         // ── Handler entry register state (x86-64 psABI handler ABI). ──
@@ -592,46 +689,148 @@ impl GuestArch for X8664GuestArch {
 
     fn restore_sigframe<E: RegAccess + GuestMemory>(
         engine: &mut E,
-        fpsimd_enabled: bool,
+        _fpsimd_enabled: bool,
     ) -> Result<crate::sigframe::SigframeRestore, TrapError> {
-        use crate::Reg;
-        use carrick_abi::X8664Rtsigframe;
+        use crate::{Reg, X86SignalXstate};
+        use carrick_abi::{
+            CARRICK_X8664_XSTATE_TRAILER_MAGIC, CARRICK_X8664_XSTATE_TRAILER_VERSION,
+            CarrickX8664XstateTrailer, X8664_FP_XSTATE_MAGIC1, X8664_FP_XSTATE_MAGIC2,
+            X8664_FP_XSTATE_MAGIC2_SIZE, X8664_FP_XSTATE_SW_BYTES_OFFSET, X8664_XSAVE_AREA_MAX_LEN,
+            X8664_XSAVE_LEGACY_LEN, X8664_XSAVE_MIN_LEN, X8664FpxSwBytes, X8664Rtsigframe,
+        };
         use zerocopy::FromBytes;
 
-        // At rt_sigreturn the handler's `ret` already popped the 8-byte pretcode,
-        // so RSP points just past it (at uc); the frame starts at RSP - 8 (the
-        // x86-64 kernel does the identical `regs->sp - sizeof(long)`).
+        // The handler's RET popped pretcode, so RSP points at `uc`. Every guest-
+        // controlled pointer and size is checked before any register or xstate
+        // mutation.
         let rsp = engine.get_reg(Reg::Rsp)?;
-        let frame_sp = rsp.wrapping_sub(8);
-        let size = core::mem::size_of::<X8664Rtsigframe>();
-        let bytes = engine
-            .read_bytes(frame_sp, size)
-            // A bad guest RSP at rt_sigreturn makes this frame read fault — it is
-            // guest-reachable, so deliver a guest SIGSEGV (Linux force_sigsegv),
-            // never a fatal runtime abort. Mirrors inject_sigframe's write arm.
+        let frame_sp = rsp
+            .checked_sub(core::mem::size_of::<u64>() as u64)
+            .ok_or(TrapError::SignalDeliveryFault)?;
+        if !x8664_is_canonical(frame_sp) {
+            return Err(TrapError::SignalDeliveryFault);
+        }
+        let prefix_bytes = engine
+            .read_bytes(frame_sp, core::mem::size_of::<X8664Rtsigframe>())
             .map_err(|_| TrapError::SignalDeliveryFault)?;
-        let frame = X8664Rtsigframe::read_from_bytes(&bytes)
-            .map_err(|_| TrapError::Hypervisor("x86 sigframe decode failed".into()))?;
-
-        // Copy nested packed fields OUT into standalone locals (cannot borrow
-        // fields of a #[repr(C, packed)] value).
+        let frame = X8664Rtsigframe::read_from_bytes(&prefix_bytes)
+            .map_err(|_| TrapError::SignalDeliveryFault)?;
         let uc = frame.uc;
         let mc = uc.uc_mcontext;
         let sigmask = uc.uc_sigmask;
-        let fp = frame.fpstate;
+        let fpstate = mc.fpstate;
+        let mc_reserved = mc.reserved;
+        let fpstate_pad = frame.fpstate_pad;
 
-        // Validate the resume RIP is canonical (bits 47..63 sign-extended) — a
-        // corrupt frame / rt_sigreturn outside a handler would otherwise resume
-        // the vCPU at garbage. Replaces the aarch64 EL0-PSTATE gate.
-        let rip = mc.rip;
-        let top = rip >> 47;
-        if top != 0 && top != 0x1_ffff {
-            // Guest-controlled frame contents: a corrupt/forged rt_sigreturn
-            // frame is a guest fault (force_sigsegv), not a runtime abort.
+        if !x8664_is_canonical(mc.rip)
+            || !x8664_is_canonical(mc.rsp)
+            || !x8664_is_canonical(fpstate)
+            || fpstate == 0
+            || fpstate & 63 != 0
+            || mc_reserved.iter().any(|word| *word != 0)
+            || fpstate_pad.iter().any(|byte| *byte != 0)
+        {
             return Err(TrapError::SignalDeliveryFault);
         }
 
-        // Restore GPRs + RIP + RSP.
+        let legacy = engine
+            .read_bytes(fpstate, X8664_XSAVE_LEGACY_LEN)
+            .map_err(|_| TrapError::SignalDeliveryFault)?;
+        let sw_end = X8664_FP_XSTATE_SW_BYTES_OFFSET
+            .checked_add(core::mem::size_of::<X8664FpxSwBytes>())
+            .ok_or(TrapError::SignalDeliveryFault)?;
+        let sw = X8664FpxSwBytes::read_from_bytes(
+            legacy
+                .get(X8664_FP_XSTATE_SW_BYTES_OFFSET..sw_end)
+                .ok_or(TrapError::SignalDeliveryFault)?,
+        )
+        .map_err(|_| TrapError::SignalDeliveryFault)?;
+        let magic1 = sw.magic1;
+        let extended_size = sw.extended_size;
+        let xfeatures = sw.xfeatures;
+        let xstate_size = sw.xstate_size;
+        let sw_reserved = sw.reserved;
+        let xstate_size_usize =
+            usize::try_from(xstate_size).map_err(|_| TrapError::SignalDeliveryFault)?;
+        let trailer_size = core::mem::size_of::<CarrickX8664XstateTrailer>();
+        let expected_extended_size = xstate_size
+            .checked_add(u32::try_from(trailer_size).map_err(|_| TrapError::SignalDeliveryFault)?)
+            .and_then(|size| size.checked_add(X8664_FP_XSTATE_MAGIC2_SIZE as u32))
+            .ok_or(TrapError::SignalDeliveryFault)?;
+        if magic1 != X8664_FP_XSTATE_MAGIC1
+            || extended_size != expected_extended_size
+            || !(X8664_XSAVE_MIN_LEN..=X8664_XSAVE_AREA_MAX_LEN).contains(&xstate_size_usize)
+            || sw_reserved.iter().any(|word| *word != 0)
+        {
+            return Err(TrapError::SignalDeliveryFault);
+        }
+
+        // Read exactly the extent advertised to Linux-compatible handlers.
+        // The private trailer is inside it, immediately before final MAGIC2.
+        let dynamic_size =
+            usize::try_from(extended_size).map_err(|_| TrapError::SignalDeliveryFault)?;
+        let dynamic_end = fpstate
+            .checked_add(u64::try_from(dynamic_size).map_err(|_| TrapError::SignalDeliveryFault)?)
+            .ok_or(TrapError::SignalDeliveryFault)?;
+        if !x8664_is_canonical(dynamic_end.saturating_sub(1)) {
+            return Err(TrapError::SignalDeliveryFault);
+        }
+        let dynamic = engine
+            .read_bytes(fpstate, dynamic_size)
+            .map_err(|_| TrapError::SignalDeliveryFault)?;
+        let trailer_start = xstate_size_usize;
+        let trailer_end = trailer_start
+            .checked_add(trailer_size)
+            .ok_or(TrapError::SignalDeliveryFault)?;
+        let trailer = CarrickX8664XstateTrailer::read_from_bytes(
+            dynamic
+                .get(trailer_start..trailer_end)
+                .ok_or(TrapError::SignalDeliveryFault)?,
+        )
+        .map_err(|_| TrapError::SignalDeliveryFault)?;
+        let trailer_magic = trailer.magic;
+        let trailer_version = trailer.version;
+        let encoded_trailer_size = trailer.size;
+        let virtual_pkru = trailer.virtual_pkru;
+        let virtual_x87_fcs = trailer.virtual_x87_fcs;
+        let virtual_x87_fds = trailer.virtual_x87_fds;
+        let trailer_reserved = trailer.reserved;
+        if trailer_magic != CARRICK_X8664_XSTATE_TRAILER_MAGIC
+            || trailer_version != CARRICK_X8664_XSTATE_TRAILER_VERSION
+            || usize::from(encoded_trailer_size) != trailer_size
+            || trailer_reserved.iter().any(|word| *word != 0)
+        {
+            return Err(TrapError::SignalDeliveryFault);
+        }
+        let magic2_end = trailer_end
+            .checked_add(X8664_FP_XSTATE_MAGIC2_SIZE)
+            .ok_or(TrapError::SignalDeliveryFault)?;
+        let mut magic2_bytes = [0u8; X8664_FP_XSTATE_MAGIC2_SIZE];
+        magic2_bytes.copy_from_slice(
+            dynamic
+                .get(trailer_end..magic2_end)
+                .ok_or(TrapError::SignalDeliveryFault)?,
+        );
+        if magic2_end != dynamic_size || u32::from_le_bytes(magic2_bytes) != X8664_FP_XSTATE_MAGIC2
+        {
+            return Err(TrapError::SignalDeliveryFault);
+        }
+
+        let capabilities = engine.x86_xstate_capabilities()?;
+        let state = X86SignalXstate {
+            bytes: dynamic[..xstate_size_usize].to_vec(),
+            xfeatures,
+            virtual_pkru,
+            virtual_x87_fcs,
+            virtual_x87_fds,
+        };
+        if !x8664_standard_xstate_is_valid(capabilities, &state) {
+            return Err(TrapError::SignalDeliveryFault);
+        }
+
+        // All guest-controlled fields are now validated. The backend's batch
+        // importer validates into temporary state again before its one commit.
+        engine.restore_x86_signal_xstate(&state)?;
         engine.set_reg(Reg::R8, mc.r8)?;
         engine.set_reg(Reg::R9, mc.r9)?;
         engine.set_reg(Reg::R10, mc.r10)?;
@@ -649,26 +848,14 @@ impl GuestArch for X8664GuestArch {
         engine.set_reg(Reg::Rcx, mc.rcx)?;
         engine.set_reg(Reg::Rsp, mc.rsp)?;
         engine.set_reg(Reg::Rip, mc.rip)?;
-        // RFLAGS: restore, force reserved bit 1 = 1, keep IF (bit 9), clear TF.
         let ef = (mc.eflags | 0x2) & !(1u64 << 8);
         engine.set_reg(Reg::Rflags, ef)?;
-
-        // Restore MXCSR + XMM0–15 + AVX YMM_Hi from the frame's FXSAVE area.
-        if fpsimd_enabled {
-            // Copy the values out of the (packed) frame structs first, then hand
-            // them to the engine's batched restore — ONE KVM_GET_XSAVE + ONE
-            // KVM_SET_XSAVE (x86 override) instead of ~80 per-register ioctls.
-            let mxcsr = { fp }.mxcsr;
-            let xmm = fp.xmm_space;
-            let ymm_hi = frame.ymm_hi;
-            engine.restore_fpsimd_frame(mxcsr, &xmm, &ymm_hi)?;
-        }
 
         Ok(crate::sigframe::SigframeRestore {
             sigmask,
             saved_pc: mc.rip,
             frame_sp,
-            magic: 0,
+            magic: u64::from(magic1),
         })
     }
 }
@@ -1953,9 +2140,6 @@ mod normalize_tests {
         // Reserved / never-implemented numbers (STREAMS & misc): getpmsg(181),
         // putpmsg(182), afs_syscall(183), tuxcall(184), security(185).
         181, 182, 183, 184, 185,
-        // time(201): legacy x86_64-only; asm-generic reads the clock via
-        // clock_gettime / gettimeofday instead.
-        201,
         // epoll_ctl_old(214)/epoll_wait_old(215): obsolete, never implemented.
         214, 215,
         // The large unassigned gap in the x86_64 number space between
@@ -2351,6 +2535,15 @@ mod tests {
     }
 
     #[test]
+    fn altstack_membership_matches_downward_linux_endpoints() {
+        assert!(!x8664_altstack_contains(0x1000, 0x1000, 0x1000));
+        assert!(x8664_altstack_contains(0x1000, 0x1000, 0x1001));
+        assert!(x8664_altstack_contains(0x1000, 0x1000, 0x2000));
+        assert!(!x8664_altstack_contains(0x1000, 0x1000, 0x2001));
+        assert!(!x8664_altstack_contains(u64::MAX - 1, 4, u64::MAX));
+    }
+
+    #[test]
     fn build_sigframe_runs_codec_and_faults_only_at_guest_memory() {
         // The codec IS implemented: it builds the frame and only fails when the
         // stub's `write_bytes` (Unsupported) refuses the guest-stack write. The
@@ -2391,6 +2584,9 @@ mod tests {
         mem: std::collections::HashMap<u64, u8>,
         rsp: u64,
         ymm: [u128; 16],
+        virtual_pkru: u32,
+        virtual_x87_fcs: u16,
+        virtual_x87_fds: u16,
     }
 
     impl carrick_guest_mem::GuestMemory for SigframeRoundtrip {
@@ -2448,6 +2644,50 @@ mod tests {
             self.ymm[n as usize] = v;
             Ok(())
         }
+        fn save_x86_signal_xstate(&mut self) -> Result<crate::X86SignalXstate, crate::OsError> {
+            let capabilities = crate::X86XstateCapabilities::legacy_avx();
+            let (mxcsr, xmm, ymm_hi) = self.save_fpsimd_frame()?;
+            let mut bytes = vec![0u8; capabilities.standard_size as usize];
+            bytes[0..2].copy_from_slice(&0x037fu16.to_le_bytes());
+            bytes[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+            bytes[28..32].copy_from_slice(&capabilities.mxcsr_mask.to_le_bytes());
+            for (index, word) in xmm.iter().enumerate() {
+                let offset = 160 + index * 4;
+                bytes[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            bytes[512..520].copy_from_slice(&0x7u64.to_le_bytes());
+            bytes[576..832].copy_from_slice(&ymm_hi);
+            Ok(crate::X86SignalXstate {
+                bytes,
+                xfeatures: 0x7,
+                virtual_pkru: self.virtual_pkru,
+                virtual_x87_fcs: self.virtual_x87_fcs,
+                virtual_x87_fds: self.virtual_x87_fds,
+            })
+        }
+        fn restore_x86_signal_xstate(
+            &mut self,
+            state: &crate::X86SignalXstate,
+        ) -> Result<(), crate::OsError> {
+            let mut mxcsr = [0u8; 4];
+            mxcsr.copy_from_slice(&state.bytes[24..28]);
+            let mut xmm = [0u32; 64];
+            for (index, word) in xmm.iter_mut().enumerate() {
+                let offset = 160 + index * 4;
+                *word = u32::from_le_bytes(
+                    state.bytes[offset..offset + 4]
+                        .try_into()
+                        .map_err(|_| crate::OsError::from_raw(libc::EINVAL))?,
+                );
+            }
+            let mut ymm_hi = [0u8; 256];
+            ymm_hi.copy_from_slice(&state.bytes[576..832]);
+            self.restore_fpsimd_frame(u32::from_le_bytes(mxcsr), &xmm, &ymm_hi)?;
+            self.virtual_pkru = state.virtual_pkru;
+            self.virtual_x87_fcs = state.virtual_x87_fcs;
+            self.virtual_x87_fds = state.virtual_x87_fds;
+            Ok(())
+        }
         fn get_fpcr(&self) -> Result<u64, crate::OsError> {
             Ok(0)
         }
@@ -2473,6 +2713,9 @@ mod tests {
             mem: std::collections::HashMap::new(),
             rsp: 0x10_0000,
             ymm: [0; 16],
+            virtual_pkru: 0,
+            virtual_x87_fcs: carrick_abi::LINUX_X8664_USER_CS,
+            virtual_x87_fds: carrick_abi::LINUX_X8664_USER_DS,
         };
         for n in 0..16u32 {
             m.ymm[n as usize] = ((n as u128) << 96) | 0xCAFE_F00D_0000_0001;
@@ -2495,6 +2738,145 @@ mod tests {
             m.ymm, saved,
             "AVX YMM_Hi must round-trip through the signal frame"
         );
+    }
+
+    #[test]
+    fn sigframe_preserves_virtual_pkru_and_x87_selectors() {
+        let mut m = SigframeRoundtrip {
+            mem: std::collections::HashMap::new(),
+            rsp: 0x10_0000,
+            ymm: [0; 16],
+            virtual_pkru: 0xa5a5_5a5a,
+            virtual_x87_fcs: 0x1357,
+            virtual_x87_fds: 0x2468,
+        };
+        let built = X8664GuestArch::build_sigframe(&mut m, make_inject_params())
+            .expect("build signal frame with virtual x87 selector trailer");
+
+        m.rsp = built.new_sp + 8;
+        m.virtual_pkru = 0;
+        m.virtual_x87_fcs = 0;
+        m.virtual_x87_fds = 0;
+        X8664GuestArch::restore_sigframe(&mut m, true)
+            .expect("restore virtual x87 selector trailer");
+
+        assert_eq!(m.virtual_pkru, 0xa5a5_5a5a);
+        assert_eq!(m.virtual_x87_fcs, 0x1357);
+        assert_eq!(m.virtual_x87_fds, 0x2468);
+    }
+
+    #[test]
+    fn copying_exact_advertised_xstate_extent_retains_virtual_state() {
+        let mut m = SigframeRoundtrip {
+            mem: std::collections::HashMap::new(),
+            rsp: 0x10_0000,
+            ymm: [0; 16],
+            virtual_pkru: 0xa5a5_5a5a,
+            virtual_x87_fcs: 0x1357,
+            virtual_x87_fds: 0x2468,
+        };
+        let built = X8664GuestArch::build_sigframe(&mut m, make_inject_params())
+            .expect("build Linux-advertised xstate extent");
+        let fpstate = built.new_sp + carrick_abi::X8664_RTSIGFRAME_FPSTATE_OFFSET as u64;
+        let extended_size_field = fpstate
+            + carrick_abi::X8664_FP_XSTATE_SW_BYTES_OFFSET as u64
+            + core::mem::offset_of!(carrick_abi::X8664FpxSwBytes, extended_size) as u64;
+        let mut extended_size_bytes = [0u8; 4];
+        for (offset, byte) in extended_size_bytes.iter_mut().enumerate() {
+            *byte = *m
+                .mem
+                .get(&(extended_size_field + offset as u64))
+                .unwrap_or(&0);
+        }
+        let extended_size = u32::from_le_bytes(extended_size_bytes) as usize;
+        let expected_size = crate::X86XstateCapabilities::legacy_avx().standard_size as usize
+            + core::mem::size_of::<carrick_abi::CarrickX8664XstateTrailer>()
+            + carrick_abi::X8664_FP_XSTATE_MAGIC2_SIZE;
+        assert_eq!(
+            extended_size, expected_size,
+            "Linux extended_size must cover standard state, private trailer, and MAGIC2"
+        );
+
+        let relocated_fpstate = 0x20_0000u64;
+        let advertised_extent: Vec<u8> = (0..extended_size)
+            .map(|offset| *m.mem.get(&(fpstate + offset as u64)).unwrap_or(&0))
+            .collect();
+        for (offset, byte) in advertised_extent.into_iter().enumerate() {
+            m.mem.insert(relocated_fpstate + offset as u64, byte);
+        }
+        let fpstate_pointer_field = built.new_sp
+            + core::mem::offset_of!(carrick_abi::X8664Rtsigframe, uc) as u64
+            + core::mem::offset_of!(carrick_abi::X8664Ucontext, uc_mcontext) as u64
+            + core::mem::offset_of!(carrick_abi::X8664Sigcontext, fpstate) as u64;
+        for (offset, byte) in relocated_fpstate.to_le_bytes().into_iter().enumerate() {
+            m.mem.insert(fpstate_pointer_field + offset as u64, byte);
+        }
+
+        m.rsp = built.new_sp + 8;
+        m.virtual_pkru = 0;
+        m.virtual_x87_fcs = 0;
+        m.virtual_x87_fds = 0;
+        X8664GuestArch::restore_sigframe(&mut m, true)
+            .expect("restore from exactly copied advertised extent");
+        assert_eq!(m.virtual_pkru, 0xa5a5_5a5a);
+        assert_eq!(m.virtual_x87_fcs, 0x1357);
+        assert_eq!(m.virtual_x87_fds, 0x2468);
+    }
+
+    #[test]
+    fn malformed_private_xstate_trailer_is_rejected_before_state_mutation() {
+        let mut m = SigframeRoundtrip {
+            mem: std::collections::HashMap::new(),
+            rsp: 0x10_0000,
+            ymm: [0x1111; 16],
+            virtual_pkru: 0x1234_5678,
+            virtual_x87_fcs: 0x1357,
+            virtual_x87_fds: 0x2468,
+        };
+        let built = X8664GuestArch::build_sigframe(&mut m, make_inject_params())
+            .expect("build valid signal frame");
+        let fpstate = built.new_sp + carrick_abi::X8664_RTSIGFRAME_FPSTATE_OFFSET as u64;
+        let trailer = fpstate + crate::X86XstateCapabilities::legacy_avx().standard_size as u64;
+        m.mem.insert(trailer, 0);
+        m.rsp = built.new_sp + 8;
+        m.ymm = [0x2222; 16];
+        m.virtual_pkru = 0x8765_4321;
+
+        assert!(matches!(
+            X8664GuestArch::restore_sigframe(&mut m, true),
+            Err(TrapError::SignalDeliveryFault)
+        ));
+        assert_eq!(m.ymm, [0x2222; 16], "restore must be all-or-nothing");
+        assert_eq!(m.virtual_pkru, 0x8765_4321);
+        assert_eq!(m.rsp, built.new_sp + 8, "GPRs must remain untouched");
+    }
+
+    #[test]
+    fn malformed_extended_sigframe_is_rejected_before_state_mutation() {
+        let mut m = SigframeRoundtrip {
+            mem: std::collections::HashMap::new(),
+            rsp: 0x10_0000,
+            ymm: [0x1111; 16],
+            virtual_pkru: 0,
+            virtual_x87_fcs: carrick_abi::LINUX_X8664_USER_CS,
+            virtual_x87_fds: carrick_abi::LINUX_X8664_USER_DS,
+        };
+        let built = X8664GuestArch::build_sigframe(&mut m, make_inject_params())
+            .expect("build valid signal frame");
+        let fpstate = built.new_sp + carrick_abi::X8664_RTSIGFRAME_FPSTATE_OFFSET as u64;
+        let magic2 = fpstate
+            + crate::X86XstateCapabilities::legacy_avx().standard_size as u64
+            + core::mem::size_of::<carrick_abi::CarrickX8664XstateTrailer>() as u64;
+        m.mem.insert(magic2, 0);
+        m.rsp = built.new_sp + 8;
+        m.ymm = [0x2222; 16];
+
+        assert!(matches!(
+            X8664GuestArch::restore_sigframe(&mut m, true),
+            Err(TrapError::SignalDeliveryFault)
+        ));
+        assert_eq!(m.ymm, [0x2222; 16], "restore must be all-or-nothing");
+        assert_eq!(m.rsp, built.new_sp + 8, "GPRs must remain untouched");
     }
 
     // ── LSTAR value matches the trampoline slot ───────────────────────────

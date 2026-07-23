@@ -169,6 +169,31 @@ pub struct ThreadRegistry {
     inner: ParkingMutex<RegistryInner>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecSurvivorRekeyError {
+    UnknownSurvivor(ThreadId),
+    SiblingsRemain(usize),
+    MainTidOccupied(ThreadId),
+}
+
+/// Proof that the sole exec survivor was atomically moved onto the permanent
+/// process-leader registry key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecSurvivorRekey {
+    previous: ThreadId,
+    current: ThreadId,
+}
+
+impl ExecSurvivorRekey {
+    pub fn previous(self) -> ThreadId {
+        self.previous
+    }
+
+    pub fn current(self) -> ThreadId {
+        self.current
+    }
+}
+
 /// Process-global handle to THIS process's live thread registry, so the
 /// `/proc/<tid>/stat` and `/proc/<pid>/task/` synthesis (which runs on the
 /// fs/open path, where the per-syscall registry isn't threaded through) can
@@ -361,6 +386,42 @@ impl ThreadRegistry {
             inner.map.remove(tid);
         }
         removed
+    }
+
+    /// Permanently re-thread the exact sole survivor of `execve(2)` onto the
+    /// process leader's registry key. Linux changes a nonleader exec caller's
+    /// tid to the tgid; this cannot be a presentation-only `gettid` alias because
+    /// every future clone, signal, futex, and `/proc` lookup keys through this
+    /// table. The move and exec-invalid field reset happen under one lock.
+    pub fn rekey_exec_survivor(
+        &self,
+        survivor: ThreadId,
+    ) -> Result<ExecSurvivorRekey, ExecSurvivorRekeyError> {
+        let mut inner = self.inner.lock();
+        if inner.map.len() != 1 {
+            return Err(ExecSurvivorRekeyError::SiblingsRemain(inner.map.len()));
+        }
+        if !inner.map.contains_key(&survivor) {
+            return Err(ExecSurvivorRekeyError::UnknownSurvivor(survivor));
+        }
+        if survivor != self.main_tid && inner.map.contains_key(&self.main_tid) {
+            return Err(ExecSurvivorRekeyError::MainTidOccupied(self.main_tid));
+        }
+        let mut entry = inner
+            .map
+            .remove(&survivor)
+            .ok_or(ExecSurvivorRekeyError::UnknownSurvivor(survivor))?;
+        // Kernel-owned clone-exit and old-image presentation state do not
+        // survive exec. The backing host pthread/port does, so preserve it.
+        entry.clear_child_tid = 0;
+        entry.name = None;
+        entry.proc_state = 'R';
+        entry.vcpu_parked = None;
+        inner.map.insert(self.main_tid, entry);
+        Ok(ExecSurvivorRekey {
+            previous: survivor,
+            current: self.main_tid,
+        })
     }
 
     /// Every live thread id of this process. Unlike `thread_states`, this does
@@ -1149,6 +1210,47 @@ mod tests {
         assert!(reg.is_live(a));
         assert!(!reg.is_live(b));
         assert_eq!(reg.live_count(), 1);
+    }
+
+    #[test]
+    fn exec_rekeys_worker_survivor_permanently_to_main_tid() {
+        let main = ThreadId::synthetic_for_tests(1000);
+        let reg = ThreadRegistry::new(main);
+        let worker = reg.register_child(0x4000);
+        reg.set_thread_name(worker, b"old-worker");
+        reg.set_thread_state(worker, 'S');
+        reg.remove_all_except(worker);
+
+        let rekey = reg
+            .rekey_exec_survivor(worker)
+            .expect("rekey sole exec survivor");
+        assert_eq!(rekey.previous(), worker);
+        assert_eq!(rekey.current(), main);
+        assert!(!reg.is_live(worker));
+        assert!(reg.is_live(main));
+        assert_eq!(reg.clear_child_tid(main), Some(0));
+        assert_eq!(reg.thread_name(main), None);
+        assert_eq!(reg.thread_state_chars(), vec![(main, 'R')]);
+
+        let future = reg.register_child(0);
+        assert!(
+            reg.is_live(main),
+            "future clone must not restore worker key"
+        );
+        assert_ne!(future, main);
+    }
+
+    #[test]
+    fn exec_rekey_rejects_nonterminal_thread_group() {
+        let main = ThreadId::synthetic_for_tests(1100);
+        let reg = ThreadRegistry::new(main);
+        let worker = reg.register_child(0);
+        assert_eq!(
+            reg.rekey_exec_survivor(worker),
+            Err(ExecSurvivorRekeyError::SiblingsRemain(2))
+        );
+        assert!(reg.is_live(main));
+        assert!(reg.is_live(worker));
     }
 
     #[test]

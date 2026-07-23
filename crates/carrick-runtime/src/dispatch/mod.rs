@@ -129,6 +129,7 @@
 //! lowest-free-descriptor, capped at the guest's soft `RLIMIT_NOFILE`.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -1164,7 +1165,163 @@ pub(crate) fn drive_blocking_record_lock(lock: &BlockingRecordLock) -> DispatchO
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Typed handle for one dispatcher-to-runtime host-alias installation. The
+/// payload is intentionally opaque: exact VMA/SysV commit data stays owned by
+/// the dispatcher and is published only after the runtime reports success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+struct HostAliasTransactionId(u64);
+
+/// Owned dispatcher-to-runtime alias transaction. Dropping an unclaimed
+/// transaction aborts the matching pending/installing phase, if any, and wakes
+/// blocked sibling mapping syscalls.
+pub struct HostAliasTransaction {
+    transactions: Arc<HostAliasTransactions>,
+    id: HostAliasTransactionId,
+    armed: bool,
+}
+
+impl std::fmt::Debug for HostAliasTransaction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("HostAliasTransaction")
+            .field(&self.id)
+            .finish()
+    }
+}
+
+impl PartialEq for HostAliasTransaction {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.transactions, &other.transactions)
+    }
+}
+
+impl Eq for HostAliasTransaction {}
+
+impl Serialize for HostAliasTransaction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.id.serialize(serializer)
+    }
+}
+
+impl HostAliasTransaction {
+    pub(crate) fn claim(mut self) -> Option<HostAliasInstallGuard> {
+        let mut phase = self.transactions.phase.lock();
+        let HostAliasPhase::Pending { id, commit } = &mut *phase else {
+            return None;
+        };
+        if *id != self.id {
+            return None;
+        }
+        let installing = commit.take();
+        *phase = HostAliasPhase::Installing {
+            id: self.id,
+            commit: installing,
+        };
+        self.armed = false;
+        Some(HostAliasInstallGuard {
+            transactions: Arc::clone(&self.transactions),
+            id: self.id,
+            armed: true,
+        })
+    }
+}
+
+impl Drop for HostAliasTransaction {
+    fn drop(&mut self) {
+        if self.armed {
+            self.transactions.abort_matching(self.id);
+        }
+    }
+}
+
+pub(crate) struct HostAliasInstallGuard {
+    transactions: Arc<HostAliasTransactions>,
+    id: HostAliasTransactionId,
+    armed: bool,
+}
+
+impl HostAliasInstallGuard {
+    pub(crate) fn bus_fault_range(&self) -> Option<(u64, u64)> {
+        let phase = self.transactions.phase.lock();
+        match &*phase {
+            HostAliasPhase::Installing { id, commit } if *id == self.id => commit
+                .as_ref()
+                .and_then(|commit| commit.mmap.as_ref())
+                .and_then(|mmap| mmap.bus_fault),
+            _ => None,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HostAliasInstallGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.transactions.abort_matching(self.id);
+        }
+    }
+}
+
+/// Owned host fd transferred with a [`DispatchOutcome::MapHostAlias`].
+///
+/// Keeping ownership in the non-cloneable outcome closes the dispatch/runtime
+/// gap: dropping an unconsumed outcome now closes the dup as well as aborting
+/// its alias transaction. Consumers move the [`OwnedFd`] out exactly once.
+pub struct HostAliasOwnedFd(OwnedFd);
+
+impl HostAliasOwnedFd {
+    /// Take ownership of a successful `dup(2)`/open result.
+    ///
+    /// # Safety
+    /// `fd` must be a live, uniquely owned host descriptor.
+    pub(crate) unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        // SAFETY: forwarded caller contract.
+        Self(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+
+    pub fn into_owned_fd(self) -> OwnedFd {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for HostAliasOwnedFd {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("HostAliasOwnedFd")
+            .field(&self.as_raw_fd())
+            .finish()
+    }
+}
+
+impl PartialEq for HostAliasOwnedFd {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_raw_fd() == other.as_raw_fd()
+    }
+}
+
+impl Eq for HostAliasOwnedFd {}
+
+impl Serialize for HostAliasOwnedFd {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_i32(self.as_raw_fd())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
     Returned {
@@ -1255,6 +1412,10 @@ pub enum DispatchOutcome {
     /// completes the `mmap` with `va`. The dispatcher has already reserved `ipa`
     /// from the low alias arena (`crate::memory::LINUX_ALIAS_IPA_BASE`).
     MapHostAlias {
+        /// Opaque pending metadata commit. Every runtime consumer must claim it
+        /// immediately before host mapping, then commit exactly once on full
+        /// success or abort on any map/protection failure.
+        transaction: HostAliasTransaction,
         va: GuestVa,
         ipa: Gpa,
         len: u64,
@@ -1271,7 +1432,7 @@ pub enum DispatchOutcome {
         /// `PROT_WRITE` MAP_SHARED of a read-only fd is EACCES). The fd is a dup
         /// the runtime owns and closes after mapping. `None` → anonymous (the
         /// high-VA / `payload`-snapshot path).
-        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+        file: Option<(HostAliasOwnedFd, libc::off_t, libc::c_int)>,
         /// Whether an anonymous alias must remain coherent across host `fork`.
         /// Ignored for a file mapping (its `MAP_SHARED` backing is explicit).
         shared: bool,
@@ -1731,6 +1892,153 @@ impl AsyncSignalWakeOwner {
     }
 }
 
+pub(crate) struct HostAliasCommit {
+    mmap: Option<mem::HostAliasMmapCommit>,
+    shmat: Option<sysv::HostAliasShmatCommit>,
+}
+
+impl HostAliasCommit {
+    pub(crate) fn mmap(mmap: mem::HostAliasMmapCommit) -> Self {
+        Self {
+            mmap: Some(mmap),
+            shmat: None,
+        }
+    }
+
+    pub(crate) fn shmat(mmap: mem::HostAliasMmapCommit, shmat: sysv::HostAliasShmatCommit) -> Self {
+        Self {
+            mmap: Some(mmap),
+            shmat: Some(shmat),
+        }
+    }
+}
+
+enum HostAliasPhase {
+    Idle,
+    Dispatching,
+    Pending {
+        id: HostAliasTransactionId,
+        commit: Option<HostAliasCommit>,
+    },
+    Installing {
+        id: HostAliasTransactionId,
+        commit: Option<HostAliasCommit>,
+    },
+}
+
+struct HostAliasTransactions {
+    phase: parking_lot::Mutex<HostAliasPhase>,
+    idle: parking_lot::Condvar,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+impl HostAliasTransactions {
+    fn new() -> Self {
+        Self {
+            phase: parking_lot::Mutex::new(HostAliasPhase::Idle),
+            idle: parking_lot::Condvar::new(),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    fn begin_dispatch(self: &Arc<Self>) -> HostAliasDispatchGuard {
+        let mut phase = self.phase.lock();
+        while !matches!(*phase, HostAliasPhase::Idle) {
+            self.idle.wait(&mut phase);
+        }
+        *phase = HostAliasPhase::Dispatching;
+        HostAliasDispatchGuard {
+            transactions: Arc::clone(self),
+            active: true,
+        }
+    }
+
+    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    fn begin_dispatch_until(
+        self: &Arc<Self>,
+        deadline: std::time::Instant,
+    ) -> Option<HostAliasDispatchGuard> {
+        let mut phase = self.phase.lock();
+        while !matches!(*phase, HostAliasPhase::Idle) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            if self
+                .idle
+                .wait_for(&mut phase, deadline.saturating_duration_since(now))
+                .timed_out()
+                && !matches!(*phase, HostAliasPhase::Idle)
+            {
+                return None;
+            }
+        }
+        *phase = HostAliasPhase::Dispatching;
+        Some(HostAliasDispatchGuard {
+            transactions: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    fn abort_matching(&self, id: HostAliasTransactionId) {
+        let mut phase = self.phase.lock();
+        let matches = match &*phase {
+            HostAliasPhase::Pending { id: found, .. }
+            | HostAliasPhase::Installing { id: found, .. } => *found == id,
+            HostAliasPhase::Idle | HostAliasPhase::Dispatching => false,
+        };
+        if matches {
+            *phase = HostAliasPhase::Idle;
+            self.idle.notify_all();
+        }
+    }
+}
+
+pub(crate) struct HostAliasDispatchGuard {
+    transactions: Arc<HostAliasTransactions>,
+    active: bool,
+}
+
+impl HostAliasDispatchGuard {
+    pub(crate) fn publish(mut self, commit: HostAliasCommit) -> HostAliasTransaction {
+        let raw = self
+            .transactions
+            .next_id
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let id = HostAliasTransactionId(raw);
+        let mut phase = self.transactions.phase.lock();
+        debug_assert!(matches!(*phase, HostAliasPhase::Dispatching));
+        *phase = HostAliasPhase::Pending {
+            id,
+            commit: Some(commit),
+        };
+        self.active = false;
+        HostAliasTransaction {
+            transactions: Arc::clone(&self.transactions),
+            id,
+            armed: true,
+        }
+    }
+}
+
+impl Drop for HostAliasDispatchGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut phase = self.transactions.phase.lock();
+        if matches!(*phase, HostAliasPhase::Dispatching) {
+            *phase = HostAliasPhase::Idle;
+            self.transactions.idle.notify_all();
+        }
+    }
+}
+
 pub struct SyscallDispatcher {
     /// Owned I/O subsystem state (buffered stdout/stderr, stream toggle,
     /// the open-fd table, next-fd cursor, and cwd). See [`fs::IoState`].
@@ -1740,6 +2048,12 @@ pub struct SyscallDispatcher {
     /// window + live maps, and the captured address-space regions for
     /// `/proc/self/maps`). See [`mem::MemState`].
     mem: Mutex<mem::MemState>,
+    /// Serializes mapping syscalls across the dispatcher/runtime split. A
+    /// `MapHostAlias` remains `Pending` until its runtime consumer claims it,
+    /// then `Installing` until exact metadata commit or abort. Later mapping
+    /// operations wait without holding a subsystem lock, so no sibling can race
+    /// a host `MAP_FIXED` install or have its unrelated state erased by rollback.
+    host_alias_transactions: Arc<HostAliasTransactions>,
     /// Owned process subsystem state (executable path, personality,
     /// dumpable flag, task comm name). See [`proc::ProcState`].
     proc: Mutex<proc::ProcState>,
@@ -2076,6 +2390,7 @@ impl SyscallDispatcher {
         Self {
             io: fs::IoState::new(),
             mem: Mutex::new(mem::MemState::new()),
+            host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             proc: Mutex::new(proc::ProcState::new()),
             creds: Mutex::new(creds::CredState::new()),
             signal: Mutex::new(signal::SignalState::new()),
@@ -2101,6 +2416,69 @@ impl SyscallDispatcher {
             // `sandbox_exec_to_container`).
             exec_host_fs_fallback: true,
         }
+    }
+
+    pub(crate) fn begin_host_alias_dispatch(&self) -> HostAliasDispatchGuard {
+        self.host_alias_transactions.begin_dispatch()
+    }
+
+    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    pub(crate) fn begin_host_alias_dispatch_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<HostAliasDispatchGuard> {
+        self.host_alias_transactions.begin_dispatch_until(deadline)
+    }
+
+    pub(crate) fn begin_network_fork_guard_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<crate::network::NetworkForkGuard<'_>> {
+        self.network.fork_guard_until(deadline)
+    }
+
+    pub(crate) fn network_after_fork_child(&self) {
+        self.network.after_fork_child();
+    }
+
+    pub(super) fn owns_host_alias_dispatch(&self, guard: &HostAliasDispatchGuard) -> bool {
+        Arc::ptr_eq(&self.host_alias_transactions, &guard.transactions)
+    }
+
+    /// Publish exact range-owned metadata after the host alias and every
+    /// required subrange protection are installed successfully.
+    pub(crate) fn commit_host_alias_install(
+        &self,
+        mut install: HostAliasInstallGuard,
+    ) -> Result<(), LinuxErrno> {
+        if !Arc::ptr_eq(&self.host_alias_transactions, &install.transactions) {
+            return Err(LINUX_ENOMEM);
+        }
+        let mut phase = self.host_alias_transactions.phase.lock();
+        let HostAliasPhase::Installing {
+            id: installing,
+            commit,
+        } = &mut *phase
+        else {
+            return Err(LINUX_ENOMEM);
+        };
+        if *installing != install.id {
+            return Err(LINUX_ENOMEM);
+        }
+        let Some(commit) = commit.take() else {
+            return Err(LINUX_ENOMEM);
+        };
+
+        if let Some(mmap) = commit.mmap {
+            self.commit_host_alias_mmap(mmap);
+        }
+        if let Some(shmat) = commit.shmat {
+            self.commit_host_alias_shmat(shmat);
+        }
+        *phase = HostAliasPhase::Idle;
+        self.host_alias_transactions.idle.notify_all();
+        install.disarm();
+        Ok(())
     }
 
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
@@ -5147,6 +5525,10 @@ impl SyscallDispatcher {
     }
 
     fn synthetic_proc_context(&self) -> crate::vfs::SyntheticProcContext {
+        // Acquire before signal/proc/sysv/memory locks: callers may need to wait
+        // for an installing alias, and `/proc/*maps` must snapshot one coherent
+        // host+dispatcher address-space generation.
+        let _host_alias_dispatch = self.begin_host_alias_dispatch();
         // /proc/<pid>/status renders hex words; escape the typed sets at the
         // render boundary.
         let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks();
@@ -6104,7 +6486,7 @@ impl HostSyscallError {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn raw_errno(self) -> i32 {
         self.raw_errno
     }
@@ -7500,6 +7882,42 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn host_alias_transaction_id_overflow_aborts() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+            let dispatcher = SyscallDispatcher::new();
+            dispatcher
+                .host_alias_transactions
+                .next_id
+                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            let guard = dispatcher.begin_host_alias_dispatch();
+            let _ = guard.publish(HostAliasCommit::mmap(mem::HostAliasMmapCommit {
+                start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
+                len: LINUX_PAGE_SIZE,
+                prot: LinuxProtFlags::READ,
+                sharing: ProcMapSharing::Private,
+                path: String::new(),
+                locked: None,
+                resident: false,
+                bus_fault: None,
+                write_sealed_shared: false,
+                writable_memfd: None,
+            }));
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFSIGNALED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+    }
+
+    #[test]
     fn epoll_et_repolls_host_level_when_mux_misses_wake() {
         let mut h = Harness::new();
         let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
@@ -7698,7 +8116,10 @@ mod overlay_dispatch_tests {
             .dispatcher
             .dispatch(read_request, &mut h.memory, &h.reporter)
             .expect("read dispatch");
-        assert_eq!(returned(read_outcome.clone()), 1);
+        assert!(matches!(
+            read_outcome,
+            DispatchOutcome::Returned { value: 1 }
+        ));
         assert!(
             h.dispatcher.io.epoll_fds.read().contains(&(epfd as i32)),
             "epoll fd should be tracked for rearm"

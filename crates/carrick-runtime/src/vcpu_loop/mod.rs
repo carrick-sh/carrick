@@ -36,6 +36,7 @@
 //! handshake (SeqCst on both sides) is preserved verbatim in
 //! [`run_vcpu_until_exit`].
 
+use std::os::fd::IntoRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1003,7 +1004,15 @@ where
         // With sibling vCPUs live, Pause-Modify-Resume them so none walks a
         // half-edited descriptor tree.
         let _pt_pause = match frame.number.raw() {
-            215 | 216 | 222 | 226 if self.kicker.count() > 1 => Some(self.pt_pause()),
+            215 | 216 | 222 | 226 if self.kicker.count() > 1 => match self.pt_pause() {
+                Ok(guard) => Some(guard),
+                Err(quiesce::PtPauseError::TimedOut) => {
+                    // No dispatcher/backend mapping call has started yet. Return
+                    // a clean Linux allocation failure after pt_pause rolled the
+                    // request back and resumed already-parked siblings.
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOMEM));
+                }
+            },
             _ => None,
         };
         let mut signal_wait_deadline = None;
@@ -1034,7 +1043,7 @@ where
         let sync_shared_file_aliases = engine.needs_shared_file_alias_sync();
         loop {
             if sync_shared_file_aliases && !matches!(frame.number.raw(), 260 | 95) {
-                engine.sync_shared_file_aliases();
+                engine.sync_shared_file_aliases()?;
             }
             let request = SyscallRequest::from_raw(frame)
                 .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
@@ -2043,8 +2052,10 @@ where
                     if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
                         crate::probes::guest_exit(code);
                         // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
-                        // is a no-op (fd-lifetime-bound VM). _exit skips every Drop.
-                        engine.process_exit_cleanup();
+                        // is a no-op (fd-lifetime-bound VM). A copied shared-file
+                        // writeback failure is propagated instead of reporting a
+                        // successful child exit with stale data.
+                        engine.process_exit_cleanup()?;
                         kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         forked_child_exit(
                             code,
@@ -2074,8 +2085,9 @@ where
                     crate::trap::dump_kick_stats();
                     if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
                         // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
-                        // is a no-op (fd-lifetime-bound VM). _exit skips every Drop.
-                        engine.process_exit_cleanup();
+                        // is a no-op (fd-lifetime-bound VM). Writeback failures
+                        // propagate before the terminal signal is reported.
+                        engine.process_exit_cleanup()?;
                         kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
                         forked_child_die_by_signal(
                             signum,
@@ -2310,29 +2322,76 @@ where
                     last_syscall_retval = Some(state.complete_returned(&mut engine, 0)?);
                 }
                 DispatchOutcome::MapHostAlias {
+                    transaction,
                     va,
                     ipa,
                     len,
                     payload,
                     file,
+                    shared,
+                    prot,
                     prot_none,
-                    ..
                 } => {
-                    engine.map_host_alias(va, ipa, len, &payload, file)?;
-                    if prot_none && let Ok(l) = usize::try_from(len) {
-                        // A PROT_NONE alias must be guest-INACCESSIBLE: clear
-                        // the fresh leaves' validity so the guest's own access
-                        // faults (SIGSEGV/SEGV_ACCERR via the no-access set)
-                        // instead of reaching the host backing — which for a
-                        // PROT_NONE MAP_SHARED file is itself unmapped-for-
-                        // access and crashes the vCPU (KVM_RUN EFAULT /
-                        // stage-2 abort: LTP mmap05 TBROK). Best-effort: on
-                        // failure the host-side no_access gate still EFAULTs
-                        // syscall buffers (the historical behaviour).
-                        let _ = engine.protect_range(va.raw(), l, 0);
-                    }
-                    last_syscall_retval =
-                        Some(state.complete_returned(&mut engine, va.raw() as i64)?);
+                    let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
+                    let retval = match transaction.claim() {
+                        None => {
+                            drop(file);
+                            crate::linux_abi::LINUX_ENOMEM.guest_retval()
+                        }
+                        Some(install) => {
+                            if engine
+                                .map_host_alias(
+                                    va,
+                                    ipa,
+                                    len,
+                                    &payload,
+                                    file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                                )
+                                .is_err()
+                            {
+                                std::process::abort();
+                            }
+                            let Ok(len) = usize::try_from(len) else {
+                                std::process::abort();
+                            };
+                            if prot_none && engine.protect_range(va.raw(), len, 0).is_err() {
+                                std::process::abort();
+                            }
+                            // The backend install and requested leaf protection
+                            // are live. Atomically publish the dispatcher's full
+                            // Linux protection + sharing classification before
+                            // any sibling or the current vCPU can resume.
+                            engine.set_mapping_protection_and_sharing(
+                                va.raw(),
+                                len,
+                                prot_none,
+                                prot & crate::linux_abi::LINUX_PROT_WRITE == 0,
+                                if shared {
+                                    carrick_guest_mem::MappingSharing::Shared
+                                } else {
+                                    carrick_guest_mem::MappingSharing::Private
+                                },
+                            );
+                            if let Some((bus_start, bus_len)) = install.bus_fault_range() {
+                                let Ok(bus_len) = usize::try_from(bus_len) else {
+                                    std::process::abort();
+                                };
+                                if engine.protect_range(bus_start, bus_len, 0).is_err() {
+                                    std::process::abort();
+                                }
+                                engine.set_no_access(bus_start, bus_len, true);
+                            }
+                            if kernel
+                                .dispatcher
+                                .commit_host_alias_install(install)
+                                .is_err()
+                            {
+                                std::process::abort();
+                            }
+                            va.raw() as i64
+                        }
+                    };
+                    last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
                 }
             }
 
@@ -2469,8 +2528,9 @@ fn service_signals_threaded<E: ThreadedEngine>(
             if let Some(signum) = action.term_signal {
                 if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
                     // Destroy a name-bound child VM (bhyve) before _exit — KVM/HVF
-                    // is a no-op (fd-lifetime-bound VM). _exit skips every Drop.
-                    engine.process_exit_cleanup();
+                    // is a no-op (fd-lifetime-bound VM). Fail before terminal
+                    // publication if copied shared-file writeback is incomplete.
+                    engine.process_exit_cleanup()?;
                     let out = kernel.dispatcher.stdout();
                     let err = kernel.dispatcher.stderr();
                     forked_child_die_by_signal(signum, &out, &err);

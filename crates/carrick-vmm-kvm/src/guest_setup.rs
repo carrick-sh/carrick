@@ -7,6 +7,7 @@
 // program_sysregs, BroughtUp) are cfg-gated.  Suppress dead_code/unused-import
 // warnings on x86_64 to keep `cargo clippy -- -D warnings` clean.
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, RwLock};
 
 use carrick_hal::{HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg};
@@ -547,6 +548,7 @@ impl GuestRam {
         }
         let (host, kind) = match backing {
             AliasBacking::File { fd, offset, prot } => {
+                let raw_fd = fd.as_raw_fd();
                 // MAP_SHARED of the dup'd fd: writes hit the page cache (coherent
                 // with other openers + across fork). We own the dup; mmap takes its
                 // own reference, so close it once mapped.
@@ -556,14 +558,13 @@ impl GuestRam {
                         size,
                         prot,
                         libc::MAP_SHARED,
-                        fd,
+                        raw_fd,
                         offset,
                     )
                 };
-                unsafe { libc::close(fd) };
                 if h == libc::MAP_FAILED {
                     return Err(OsError::new(format!(
-                        "kvm: alias MAP_SHARED file (fd={fd} off={offset} size={size} prot={prot}) failed"
+                        "kvm: alias MAP_SHARED file (fd={raw_fd} off={offset} size={size} prot={prot}) failed"
                     )));
                 }
                 (h.cast::<u8>(), WindowKind::Shared)
@@ -1008,8 +1009,9 @@ impl GuestRam {
     /// target for a bare host `SYS_futex` cross-process rendezvous (see
     /// `crate::kvm_futex::KvmFutex::shared_wait`). Returns `None` for a word in
     /// a `Private` (COW) window — those futexes stay in-process via the parking-
-    /// lot [`carrick_thread::thread::FutexTable`]. The guest is identity-mapped
-    /// (VA == GPA), so the dispatcher passes the guest futex VA straight in.
+    /// lot [`carrick_thread::thread::FutexTable`]. The engine passes the exact
+    /// stage-1-translated backing GPA: a private overlay therefore resolves
+    /// outside this shared window instead of aliasing the stale aperture page.
     pub fn shared_futex_host_addr(&self, gpa: u64, len: usize) -> Option<usize> {
         let (w, off) = self.locate(gpa, len)?;
         if w.kind != WindowKind::Shared {
@@ -1263,7 +1265,7 @@ pub(crate) enum AliasBacking<'a> {
     /// other openers and inherited across `fork(2)`). `GuestRam::add_alias` owns
     /// the dup and closes it after the mmap takes its own reference.
     File {
-        fd: libc::c_int,
+        fd: OwnedFd,
         offset: libc::off_t,
         prot: libc::c_int,
     },

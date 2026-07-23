@@ -1372,6 +1372,30 @@ mod tests {
     }
 
     #[test]
+    fn private_overlay_protection_preserves_gpa_and_identity_restore_repoints() {
+        let va = 0x90_0000_4000;
+        let overlay_gpa = 0x98_0000_8000;
+        let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), LARGE_2M)]);
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+        mgr.map_aliased(GuestVa(va), Gpa(overlay_gpa), 0x1000, true, false)
+            .expect("private overlay");
+        mgr.set_readonly(va, 0x1000, false)
+            .expect("protect overlay readonly");
+        assert_eq!(mgr.translate(va), Some(overlay_gpa));
+
+        mgr.set_prot_none(va, 0x1000).expect("unmap overlay");
+        mgr.map_aliased(GuestVa(va), Gpa(va), 0x1000, true, false)
+            .expect("restore shared identity");
+        mgr.set_rw(va, 0x1000, false)
+            .expect("protect restored shared mapping");
+        assert_eq!(
+            mgr.translate(va),
+            Some(va),
+            "protect_range must not resurrect the stale private-overlay GPA"
+        );
+    }
+
+    #[test]
     fn set_rw_exec_toggles_nx() {
         let va = 0x40_0000;
         let bytes = build(&[user_rw_nx(GuestVa(va), Gpa(va), 0x1000)]); // built NX

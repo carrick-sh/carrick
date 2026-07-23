@@ -100,6 +100,7 @@ mod tests {
     use super::*;
     use crate::FutexOutcome;
     use crate::threaded::HostForkCoordinator;
+    use carrick_guest_mem::SharedFutexLocation;
     use std::time::Duration;
 
     /// Inert backend glue: real signum identity + a no-op kick install, so the

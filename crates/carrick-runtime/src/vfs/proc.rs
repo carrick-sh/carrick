@@ -2142,7 +2142,7 @@ fpu\t\t: yes\n\
 fpu_exception\t: yes\n\
 cpuid level\t: 22\n\
 wp\t\t: yes\n\
-flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch fsgsbase bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves\n\
+flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch fsgsbase bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec\n\
 bugs\t\t:\n\
 bogomips\t: 5000.00\n\
 clflush size\t: 64\n\
@@ -4182,6 +4182,11 @@ mod tests {
         assert!(
             x86.contains(" lm "),
             "x86 cpuinfo missing long-mode flag: {x86}"
+        );
+        assert!(x86.contains(" xsavec"), "x86 cpuinfo lost XSAVEC: {x86}");
+        assert!(
+            !x86.contains(" xgetbv1") && !x86.contains(" xsaves"),
+            "x86 cpuinfo advertised unsupported XGETBV1/XSAVES: {x86}"
         );
         assert!(
             !x86.contains("CPU architecture: 8") && !x86.contains("CPU implementer"),

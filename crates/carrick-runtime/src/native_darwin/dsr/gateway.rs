@@ -17,9 +17,9 @@
 #[allow(unused_imports)]
 pub(in crate::native_darwin) use carrick_dsr_aarch64::gateway::*;
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "aarch64"))]
 use super::super::NativeUcontextSnapshot;
-#[cfg(test)]
+#[cfg(all(test, target_arch = "aarch64"))]
 use super::types::{CacheVa, CodeGeneration, NativeDsrExit};
 
 #[cfg(test)]
@@ -273,20 +273,6 @@ fn measure_closure_subcomponents() -> (
     }
 }
 
-#[cfg(all(test, not(target_arch = "aarch64")))]
-fn measure_closure_subcomponents() -> (
-    GatewayComponentSummary,
-    GatewayComponentSummary,
-    GatewayComponentSummary,
-) {
-    panic!("native DSR closure component benchmark requires AArch64")
-}
-
-#[cfg(all(test, not(target_arch = "aarch64")))]
-fn measure_gateway_components() -> (GatewayComponentSummary, GatewayComponentSummary) {
-    panic!("native DSR gateway component benchmark requires AArch64")
-}
-
 #[cfg(test)]
 mod component_benchmark_tests {
     use super::*;
@@ -314,6 +300,7 @@ mod component_benchmark_tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
     #[ignore = "explicit opt-in native DSR component microbenchmark"]
     fn dsr_gateway_component_benchmark() {
         let (closure, wrapper) = measure_gateway_components();
@@ -329,6 +316,7 @@ mod component_benchmark_tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
     #[ignore = "explicit opt-in native DSR closure decomposition"]
     fn dsr_gateway_closure_component_benchmark() {
         let (signal_mask, signal_mask_prebuilt, custom_x18) = measure_closure_subcomponents();

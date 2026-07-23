@@ -5694,6 +5694,10 @@ impl SyscallDispatcher {
             let recv_protocol = this.socket_port_protocol(fd);
             let received_source = std::cell::RefCell::new(None::<Vec<u8>>);
             let outcome = this.blocking_io(host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
+                let host_write_ranges = [(buf_addr, len)];
+                let host_write = zero_copy.then(|| {
+                    carrick_guest_mem::HostWriteGuard::new(memory, &host_write_ranges)
+                });
                 let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
                 let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
                 let (n, used_addr) = if src_addr == 0 {
@@ -5725,9 +5729,10 @@ impl SyscallDispatcher {
                         true,
                     )
                 };
+                // Close the odd-generation bracket before interpreting any
+                // result or touching `memory` again. Drop also runs on unwind.
+                drop(host_write);
                 let n = n.host_syscall_errno()?;
-                // Copy path: flush the bounce into guest. Zero-copy: the kernel
-                // already wrote straight into guest memory, nothing to copy.
                 if !zero_copy
                     && n > 0
                     && let Some(b) = recv_copy.as_ref()

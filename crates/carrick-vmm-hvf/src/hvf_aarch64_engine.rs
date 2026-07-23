@@ -33,7 +33,7 @@ use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
 };
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_guest_mem::{GuestVa, MemoryError, SharedFutexLocation};
+use carrick_guest_mem::{Gpa, GuestVa, MemoryError, SharedFutexLocation};
 use carrick_hal::{GuestEntryRegs, GuestVmBackend, Reg, SlotId, SysReg, TrapError, VcpuRegistry};
 use carrick_mem::memory::AddressSpace;
 
@@ -346,7 +346,7 @@ impl GuestVmBackend for HvfAarch64Vmm {
         ForkRamStrategy::EagerCopy
     }
 
-    fn process_exit_cleanup(&mut self) {
+    fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
         // Called on the exiting fork-child's OWN thread (vcpu_loop/mod.rs:1469/
         // 1500/1884 — the child-exit / signal-death paths, gated by
         // `is_forked_child() || is_forked_guest_process()`, so it NEVER runs on
@@ -365,6 +365,7 @@ impl GuestVmBackend for HvfAarch64Vmm {
         // (ManuallyDrop discipline), so there is nothing to release on a
         // forked-child `_exit`. Matches the historical no-op byte-for-byte.
         let _ = crate::trap::cooperative_release_atomic_permit();
+        Ok(())
     }
 
     fn wait_for_vcpu_slot() {
@@ -470,13 +471,14 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.zero_guest_backing(address, len)
     }
 
-    fn shared_futex_location(&self, guest_addr: GuestVa) -> Option<SharedFutexLocation> {
-        self.state.shared_futex_location(guest_addr.raw())
+    fn shared_futex_location(&self, backing_gpa: Gpa) -> Option<SharedFutexLocation> {
+        self.state.shared_futex_location(backing_gpa.raw())
     }
 
     fn on_unmap(&mut self, va: u64, len: usize) {
-        // Drop the process-shared alias index entry for this VA range before the
-        // stage-1 invalidate (high-VA aliases only; low-VA arena is a no-op).
+        // The shared engine calls this only after checked stage-1 teardown and
+        // TLBI succeed. A failed edit therefore retains this process-shared alias
+        // owner; successful teardown removes the high-VA lookup (low VA no-op).
         crate::trap::unregister_alias(va, len);
     }
 

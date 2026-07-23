@@ -29,9 +29,15 @@
 //! sibling; a `fork(2)` child gets an INDEPENDENT copy (the Linux COW of the
 //! whole process duplicates the underlying `Vec`, or `MemoryProtections::snapshot`
 //! plus `MemoryProtections::from_snapshot`); `execve` starts fresh
-//! (`MemoryProtections::default`).
+//! (`MemoryProtections::default`). Mutable `MAP_SHARED` backing is VMA-local
+//! metadata, not a process-local write epoch: a second view, `pwrite(2)`, or a
+//! forked/external writer can change an RX view without entering this process's
+//! mutation hooks. Native translation backends therefore keep every executable
+//! shared span permanently ephemeral in each process.
 //!
 //! [`GuestMemory`]: crate::GuestMemory
+
+use crate::MappingSharing;
 
 /// Sorted, merged, non-overlapping `[start, end)` guest-address ranges with an
 /// O(log n) overlap query. The shared building block for the PROT_NONE,
@@ -62,6 +68,45 @@ impl RangeSet {
             .is_some_and(|&(s, e)| address < e && s < end)
     }
 
+    /// Address of the first byte in this set intersecting the query.
+    fn first_intersection(&self, address: u64, length: usize) -> Option<u64> {
+        let end = address.saturating_add(length as u64);
+        if end <= address {
+            return None;
+        }
+        let index = self.ranges.partition_point(|&(_, e)| e <= address);
+        self.ranges.get(index).and_then(|&(start, range_end)| {
+            let first = start.max(address);
+            (first < range_end.min(end)).then_some(first)
+        })
+    }
+
+    /// Return the exact intersections between `[address,address+length)` and
+    /// this set. Native identity backends use this snapshot to restore only
+    /// tracked holes without MAP_FIXED-replacing adjacent live bytes.
+    fn intersections(&self, address: u64, length: usize) -> Vec<(u64, u64)> {
+        let end = address.saturating_add(length as u64);
+        if end <= address {
+            return Vec::new();
+        }
+        let mut intersections = Vec::new();
+        let mut index = self
+            .ranges
+            .partition_point(|&(_, range_end)| range_end <= address);
+        while let Some(&(start, range_end)) = self.ranges.get(index) {
+            if start >= end {
+                break;
+            }
+            let intersection_start = start.max(address);
+            let intersection_end = range_end.min(end);
+            if intersection_start < intersection_end {
+                intersections.push((intersection_start, intersection_end));
+            }
+            index += 1;
+        }
+        intersections
+    }
+
     /// True if one merged interval fully covers `[address,address+length)`.
     fn covers(&self, address: u64, length: usize) -> bool {
         let end = address.saturating_add(length as u64);
@@ -72,6 +117,34 @@ impl RangeSet {
         self.ranges
             .get(idx)
             .is_some_and(|&(s, e)| s <= address && e >= end)
+    }
+
+    /// True when this set and `other` both contain at least one byte inside the
+    /// queried span. Both sets are sorted, so a two-cursor walk is linear only
+    /// in the intersecting range count (normally one VMA).
+    fn intersects_set(&self, other: &Self, address: u64, length: usize) -> bool {
+        let end = address.saturating_add(length as u64);
+        if end <= address {
+            return false;
+        }
+        let mut left = self.ranges.partition_point(|&(_, e)| e <= address);
+        let mut right = other.ranges.partition_point(|&(_, e)| e <= address);
+        while let (Some(&(left_start, left_end)), Some(&(right_start, right_end))) =
+            (self.ranges.get(left), other.ranges.get(right))
+        {
+            if left_start >= end || right_start >= end {
+                return false;
+            }
+            if left_start.max(right_start) < left_end.min(right_end).min(end) {
+                return true;
+            }
+            if left_end <= right_end {
+                left += 1;
+            } else {
+                right += 1;
+            }
+        }
+        false
     }
 
     /// Add (`present=true`, merging adjacent/overlapping) or remove
@@ -130,6 +203,36 @@ struct ProtectionState {
     unmapped: RangeSet,
     no_write: RangeSet,
     executable: RangeSet,
+    /// Page-rounded mapped-file tails that Linux reports as `SIGBUS/BUS_ADRERR`.
+    /// These bytes are also in `no_access`; the separate classification lets a
+    /// backend distinguish them from an ordinary live `PROT_NONE` VMA.
+    bus_fault: RangeSet,
+    /// Live VMAs whose bytes may change through another `MAP_SHARED` view,
+    /// positional I/O, or another process. This classification intentionally
+    /// survives `mprotect`: sharing is a backing fact, not a permission bit.
+    mutable_shared_backing: RangeSet,
+}
+
+/// Direction of one guest-memory access sampled against VMA protections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestMemoryAccess {
+    Read,
+    Write,
+}
+
+/// Linux-visible reason one guest-memory access cannot reach its first denied
+/// byte. Backends translate this neutral classification to their guest ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestMemoryFaultKind {
+    Unmapped,
+    AccessDenied,
+}
+
+/// Immutable fault descriptor captured under the protection registry lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestMemoryFault {
+    pub address: crate::GuestVa,
+    pub kind: GuestMemoryFaultKind,
 }
 
 /// The process-wide host-side protection sets a backend enforces on the syscall
@@ -142,7 +245,104 @@ pub struct MemoryProtections {
     state: parking_lot::RwLock<ProtectionState>,
 }
 
+/// Exact, range-local protection/sharing image used by a fallible host mapping
+/// transaction. Restoring it clears and rebuilds only the captured span, never a
+/// whole-process snapshot that could erase unrelated sibling changes.
+pub struct MappingProtectionSnapshot {
+    address: u64,
+    len: usize,
+    no_access: Vec<(u64, u64)>,
+    unmapped: Vec<(u64, u64)>,
+    no_write: Vec<(u64, u64)>,
+    executable: Vec<(u64, u64)>,
+    bus_fault: Vec<(u64, u64)>,
+    mutable_shared_backing: Vec<(u64, u64)>,
+}
+
+/// Opaque exclusive lease over a [`MemoryProtections`] instance.
+///
+/// Native backends acquire this after their executable epoch and host-mapping
+/// lock and hold it across `fork(2)`. The child can then drop the inherited
+/// lease before touching guest memory, proving that no vanished sibling owned
+/// the internal protection lock at the fork boundary without exposing
+/// [`ProtectionState`] outside this module.
+pub struct MemoryProtectionsExclusiveGuard<'a> {
+    _state: parking_lot::RwLockWriteGuard<'a, ProtectionState>,
+}
+
 impl MemoryProtections {
+    /// Capture every classification intersecting one exact mapping range.
+    pub fn snapshot_mapping_range(&self, address: u64, len: usize) -> MappingProtectionSnapshot {
+        let state = self.state.read();
+        MappingProtectionSnapshot {
+            address,
+            len,
+            no_access: state.no_access.intersections(address, len),
+            unmapped: state.unmapped.intersections(address, len),
+            no_write: state.no_write.intersections(address, len),
+            executable: state.executable.intersections(address, len),
+            bus_fault: state.bus_fault.intersections(address, len),
+            mutable_shared_backing: state.mutable_shared_backing.intersections(address, len),
+        }
+    }
+
+    /// Restore a range-local mapping snapshot atomically. Changes outside the
+    /// captured span survive, so rollback cannot erase a sibling's disjoint VMA.
+    pub fn restore_mapping_range(&self, snapshot: MappingProtectionSnapshot) {
+        fn restore(
+            set: &mut RangeSet,
+            snapshot: &MappingProtectionSnapshot,
+            ranges: &[(u64, u64)],
+        ) {
+            set.set(snapshot.address, snapshot.len, false);
+            for &(start, end) in ranges {
+                if let Ok(len) = usize::try_from(end - start) {
+                    set.set(start, len, true);
+                }
+            }
+        }
+
+        let mut state = self.state.write();
+        restore(&mut state.no_access, &snapshot, &snapshot.no_access);
+        restore(&mut state.unmapped, &snapshot, &snapshot.unmapped);
+        restore(&mut state.no_write, &snapshot, &snapshot.no_write);
+        restore(&mut state.executable, &snapshot, &snapshot.executable);
+        restore(&mut state.bus_fault, &snapshot, &snapshot.bus_fault);
+        restore(
+            &mut state.mutable_shared_backing,
+            &snapshot,
+            &snapshot.mutable_shared_backing,
+        );
+    }
+
+    /// Hold the complete protection registry exclusively across a host fork.
+    ///
+    /// Callers must acquire any executable-quiescence and host-mapping locks
+    /// first. Both parent and child must explicitly drop the returned guard as
+    /// soon as `fork(2)` returns.
+    pub fn exclusive_for_fork(&self) -> MemoryProtectionsExclusiveGuard<'_> {
+        MemoryProtectionsExclusiveGuard {
+            _state: self.state.write(),
+        }
+    }
+
+    /// Bounded variant for native host-fork protocols. Retry work exists only
+    /// on the rare fork path; ordinary protection reads/writes are unchanged.
+    pub fn exclusive_for_fork_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Option<MemoryProtectionsExclusiveGuard<'_>> {
+        loop {
+            if let Some(state) = self.state.try_write() {
+                return Some(MemoryProtectionsExclusiveGuard { _state: state });
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    }
+
     /// Replace all protection state with one initially-unmapped address range.
     /// Native identity backends use this at process-image start so every raw
     /// syscall pointer is fail-closed until the loader or mmap path publishes a
@@ -178,6 +378,8 @@ impl MemoryProtections {
             unmapped: state.unmapped.snapshot(),
             no_write: state.no_write.snapshot(),
             executable: state.executable.snapshot(),
+            bus_fault: state.bus_fault.snapshot(),
+            mutable_shared_backing: state.mutable_shared_backing.snapshot(),
         }
     }
 
@@ -189,6 +391,8 @@ impl MemoryProtections {
                 unmapped: RangeSet::from_ranges(snapshot.unmapped),
                 no_write: RangeSet::from_ranges(snapshot.no_write),
                 executable: RangeSet::from_ranges(snapshot.executable),
+                bus_fault: RangeSet::from_ranges(snapshot.bus_fault),
+                mutable_shared_backing: RangeSet::from_ranges(snapshot.mutable_shared_backing),
             }),
         }
     }
@@ -212,6 +416,52 @@ impl MemoryProtections {
         self.state.read().unmapped.contains(address, length)
     }
 
+    /// Snapshot the exact tracked-hole intervals intersecting a query range.
+    /// The returned ranges are sorted, disjoint, and clipped to the query.
+    pub fn unmapped_intersections(&self, address: u64, length: usize) -> Vec<(u64, u64)> {
+        self.state.read().unmapped.intersections(address, length)
+    }
+
+    /// Capture the first inaccessible byte and its stable reason under one
+    /// registry read. Read-only spans deny writes but never reads; an unmapped
+    /// byte wins ties because it is not part of a live VMA.
+    pub fn first_access_fault(
+        &self,
+        address: crate::GuestVa,
+        length: usize,
+        access: GuestMemoryAccess,
+    ) -> Option<GuestMemoryFault> {
+        let state = self.state.read();
+        let address = address.raw();
+        let unmapped = state.unmapped.first_intersection(address, length);
+        let denied = match access {
+            GuestMemoryAccess::Read => state.no_access.first_intersection(address, length),
+            GuestMemoryAccess::Write => {
+                let no_access = state.no_access.first_intersection(address, length);
+                let no_write = state.no_write.first_intersection(address, length);
+                match (no_access, no_write) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (left, right) => left.or(right),
+                }
+            }
+        };
+        match (unmapped, denied) {
+            (Some(unmapped), Some(denied)) if denied < unmapped => Some(GuestMemoryFault {
+                address: crate::GuestVa(denied),
+                kind: GuestMemoryFaultKind::AccessDenied,
+            }),
+            (Some(unmapped), _) => Some(GuestMemoryFault {
+                address: crate::GuestVa(unmapped),
+                kind: GuestMemoryFaultKind::Unmapped,
+            }),
+            (None, Some(denied)) => Some(GuestMemoryFault {
+                address: crate::GuestVa(denied),
+                kind: GuestMemoryFaultKind::AccessDenied,
+            }),
+            (None, None) => None,
+        }
+    }
+
     /// True when a syscall write must fail: PROT_NONE, post-unmap, or a live
     /// read-only mapping. All three sets are sampled under one read lock.
     pub fn range_write_denied(&self, address: u64, length: usize) -> bool {
@@ -226,6 +476,28 @@ impl MemoryProtections {
     pub fn range_fault_is_access_error(&self, address: u64, length: usize) -> bool {
         let state = self.state.read();
         state.no_access.contains(address, length) || state.no_write.contains(address, length)
+    }
+
+    /// True when an inaccessible byte belongs to the page-rounded mapped-file
+    /// EOF tail that Linux reports as `SIGBUS/BUS_ADRERR`, rather than to an
+    /// ordinary `PROT_NONE` mapping (`SIGSEGV/SEGV_ACCERR`).
+    pub fn range_bus_fault(&self, address: u64, length: usize) -> bool {
+        self.state.read().bus_fault.contains(address, length)
+    }
+
+    /// Snapshot the exact page-rounded EOF-tail intervals intersecting a query.
+    /// Native identity mprotect uses this to change ordinary pages without ever
+    /// reopening a materialized file hole between permission and metadata steps.
+    pub fn bus_fault_intersections(&self, address: u64, length: usize) -> Vec<(u64, u64)> {
+        self.state.read().bus_fault.intersections(address, length)
+    }
+
+    /// Publish or clear an exact mapped-file EOF tail. The caller owns the
+    /// corresponding physical `PROT_NONE` transition and dispatcher VMA record;
+    /// this registry bit only preserves the guest-visible fault reason for
+    /// checked native memory paths.
+    pub fn set_bus_fault(&self, address: u64, len: usize, bus_fault: bool) {
+        self.state.write().bus_fault.set(address, len, bus_fault);
     }
 
     /// Record (`no_access=true`) or clear (`false`) a live PROT_NONE range.
@@ -245,6 +517,8 @@ impl MemoryProtections {
             state.no_access.set(address, len, false);
             state.no_write.set(address, len, false);
             state.executable.set(address, len, false);
+            state.bus_fault.set(address, len, false);
+            state.mutable_shared_backing.set(address, len, false);
         }
         state.unmapped.set(address, len, unmapped);
     }
@@ -286,6 +560,75 @@ impl MemoryProtections {
         self.state.read().executable.contains(address, length)
     }
 
+    /// True when the complete live range is both writable and executable.
+    ///
+    /// All protection dimensions are sampled under the same state lock. Native
+    /// DSR backends use this at translation boundaries: separately querying
+    /// execute and write permission could otherwise classify a transitioning
+    /// page as ordinary immutable text and retain a stale translation.
+    pub fn range_writable_executable(&self, address: u64, length: usize) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let state = self.state.read();
+        state.executable.covers(address, length)
+            && !state.no_access.contains(address, length)
+            && !state.unmapped.contains(address, length)
+            && !state.no_write.contains(address, length)
+    }
+
+    /// Conservatively report whether any byte in the range may be both writable
+    /// and executable.
+    ///
+    /// The complete classification is sampled under one read lock. Returning a
+    /// false positive only makes a native DSR block ephemeral; returning a false
+    /// negative could retain stale translated code. We therefore prove a range
+    /// safe only when one denial set covers the whole query. This deliberately
+    /// treats mixed RX/W+X spans, and ambiguous mixtures of disjoint denial
+    /// sets, as possibly W+X.
+    pub fn range_may_have_writable_executable(&self, address: u64, length: usize) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let state = self.state.read();
+        state.executable.contains(address, length)
+            && !state.no_access.covers(address, length)
+            && !state.unmapped.covers(address, length)
+            && !state.no_write.covers(address, length)
+    }
+
+    /// True when any byte in the range belongs to a mutable `MAP_SHARED`
+    /// backing. This is intentionally independent of current R/W/X permission.
+    pub fn range_mutable_shared_backing(&self, address: u64, length: usize) -> bool {
+        self.state
+            .read()
+            .mutable_shared_backing
+            .contains(address, length)
+    }
+
+    /// Conservatively classify a complete planned translation span.
+    ///
+    /// A span is ephemeral when any byte may be W+X, or when executable bytes
+    /// overlap mutable shared backing. The latter remains true for read-only RX
+    /// views because writers need not use this VMA or even this process. All
+    /// dimensions are sampled under one lock so a mapping transition cannot be
+    /// misclassified from independently observed states.
+    pub fn range_translation_requires_ephemeral(&self, address: u64, length: usize) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let state = self.state.read();
+        let may_be_writable_executable = state.executable.contains(address, length)
+            && !state.no_access.covers(address, length)
+            && !state.unmapped.covers(address, length)
+            && !state.no_write.covers(address, length);
+        let mutable_shared_executable =
+            state
+                .executable
+                .intersects_set(&state.mutable_shared_backing, address, length);
+        may_be_writable_executable || mutable_shared_executable
+    }
+
     /// Publish or revoke executable permission for a live VMA.
     pub fn set_executable(&self, address: u64, len: usize, executable: bool) {
         let mut state = self.state.write();
@@ -295,9 +638,22 @@ impl MemoryProtections {
         state.executable.set(address, len, executable);
     }
 
+    /// Publish or clear the backing-sharing classification without changing
+    /// protection. `mprotect` uses this property: R/W/X changes must not turn a
+    /// shared VMA private. New mapping publication should prefer
+    /// [`Self::set_mapping_protection_and_sharing`] so replacement is atomic.
+    pub fn set_mapping_sharing(&self, address: u64, len: usize, sharing: MappingSharing) {
+        let mut state = self.state.write();
+        state
+            .mutable_shared_backing
+            .set(address, len, matches!(sharing, MappingSharing::Shared));
+    }
+
     /// Publish the complete protection state of a live mapping atomically.
     /// This prevents sibling vCPUs from observing a transient accessible gap
     /// while an unmapped range becomes PROT_NONE/read-only or vice versa.
+    /// Mapped-file EOF tails remain inaccessible across `mprotect`: changing
+    /// VMA permissions cannot turn a Linux `BUS_ADRERR` page into zero backing.
     pub fn set_mapping_protection(
         &self,
         address: u64,
@@ -306,9 +662,40 @@ impl MemoryProtections {
         no_write: bool,
     ) {
         let mut state = self.state.write();
+        let bus_faults = state.bus_fault.intersections(address, len);
+        state.unmapped.set(address, len, false);
+        state.no_access.set(address, len, no_access);
+        for (bus_start, bus_end) in bus_faults {
+            if let Ok(bus_len) = usize::try_from(bus_end - bus_start) {
+                state.no_access.set(bus_start, bus_len, true);
+            }
+        }
+        state.no_write.set(address, len, no_write);
+    }
+
+    /// Publish a replacement mapping's protection and backing-sharing state in
+    /// one transition. Replacement revokes stale execute metadata; the caller
+    /// publishes the new executable permission only after the backing and host
+    /// protection succeed. This makes the transition temporarily restrictive,
+    /// never permissive, and clears a prior shared classification for a private
+    /// `MAP_FIXED` replacement.
+    pub fn set_mapping_protection_and_sharing(
+        &self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+        sharing: MappingSharing,
+    ) {
+        let mut state = self.state.write();
         state.unmapped.set(address, len, false);
         state.no_access.set(address, len, no_access);
         state.no_write.set(address, len, no_write);
+        state.executable.set(address, len, false);
+        state.bus_fault.set(address, len, false);
+        state
+            .mutable_shared_backing
+            .set(address, len, matches!(sharing, MappingSharing::Shared));
     }
 }
 
@@ -319,6 +706,8 @@ pub struct ProtectionSnapshot {
     pub unmapped: Vec<(u64, u64)>,
     pub no_write: Vec<(u64, u64)>,
     pub executable: Vec<(u64, u64)>,
+    pub bus_fault: Vec<(u64, u64)>,
+    pub mutable_shared_backing: Vec<(u64, u64)>,
 }
 
 #[cfg(test)]
@@ -344,6 +733,19 @@ mod tests {
     }
 
     #[test]
+    fn unmapped_intersections_are_clipped_and_preserve_live_gaps() {
+        let p = MemoryProtections::default();
+        p.set_unmapped(0x2000, 0x1000, true);
+        p.set_unmapped(0x5000, 0x2000, true);
+
+        assert_eq!(
+            p.unmapped_intersections(0x2800, 0x3800),
+            vec![(0x2800, 0x3000), (0x5000, 0x6000)]
+        );
+        assert!(p.unmapped_intersections(0x3000, 0x2000).is_empty());
+    }
+
+    #[test]
     fn executable_ranges_require_full_live_coverage() {
         let p = MemoryProtections::default();
         p.set_executable(0x1000, 0x2000, true);
@@ -353,9 +755,51 @@ mod tests {
         assert!(!p.range_executable(0x2000, 0x2000));
         assert!(p.range_has_executable(0x0800, 0x1000));
         assert!(!p.range_has_executable(0x4000, 0x1000));
+        assert!(p.range_writable_executable(0x1000, 0x1000));
+        p.set_no_write(0x1000, 0x1000, true);
+        assert!(!p.range_writable_executable(0x1000, 0x1000));
+        p.set_no_write(0x1000, 0x1000, false);
         p.set_unmapped(0x2000, 0x1000, true);
         assert!(!p.range_executable(0x1000, 0x2000));
         assert!(p.range_executable(0x1000, 0x1000));
+        assert!(!p.range_writable_executable(0x1800, 0x1000));
+    }
+
+    #[test]
+    fn possible_writable_executable_query_catches_mixed_span() {
+        let p = MemoryProtections::default();
+        p.set_executable(0x1fff, 2, true);
+        p.set_no_write(0x1fff, 1, true);
+
+        assert!(!p.range_may_have_writable_executable(0x1fff, 1));
+        assert!(
+            p.range_may_have_writable_executable(0x1fff, 2),
+            "the writable executable suffix makes the complete span ephemeral"
+        );
+    }
+
+    #[test]
+    fn exclusive_fork_guard_blocks_protection_updates() {
+        let p = std::sync::Arc::new(MemoryProtections::default());
+        let guard = p.exclusive_for_fork();
+        let sibling = std::sync::Arc::clone(&p);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let updater = std::thread::spawn(move || {
+            sibling.set_executable(0x4000, 0x1000, true);
+            done_tx.send(()).expect("report protection update");
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "exclusive guard allowed a concurrent protection update"
+        );
+        drop(guard);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("protection update resumed after exclusive guard");
+        updater.join().expect("join protection updater");
     }
 
     #[test]
@@ -389,6 +833,81 @@ mod tests {
         assert!(
             !p.range_no_write(0x5500, 0x10),
             "writable again clears no_write"
+        );
+    }
+
+    #[test]
+    fn first_access_fault_is_directional_and_byte_exact() {
+        let p = MemoryProtections::default();
+        p.set_no_write(0x2000, 0x1000, true);
+        p.set_unmapped(0x3000, 0x1000, true);
+        p.set_no_access(0x5000, 0x1000, true);
+
+        assert_eq!(
+            p.first_access_fault(crate::GuestVa(0x2ffc), 8, GuestMemoryAccess::Read),
+            Some(GuestMemoryFault {
+                address: crate::GuestVa(0x3000),
+                kind: GuestMemoryFaultKind::Unmapped,
+            }),
+            "read-only bytes must not turn a later read hole into ACCERR"
+        );
+        assert_eq!(
+            p.first_access_fault(crate::GuestVa(0x2ffc), 8, GuestMemoryAccess::Write),
+            Some(GuestMemoryFault {
+                address: crate::GuestVa(0x2ffc),
+                kind: GuestMemoryFaultKind::AccessDenied,
+            })
+        );
+        assert_eq!(
+            p.first_access_fault(crate::GuestVa(0x4ffc), 8, GuestMemoryAccess::Read),
+            Some(GuestMemoryFault {
+                address: crate::GuestVa(0x5000),
+                kind: GuestMemoryFaultKind::AccessDenied,
+            })
+        );
+        assert_eq!(
+            p.first_access_fault(crate::GuestVa(0x1000), 8, GuestMemoryAccess::Write),
+            None
+        );
+    }
+
+    #[test]
+    fn bus_fault_classification_is_exact_forked_and_cleared_by_replacement() {
+        let p = MemoryProtections::default();
+        p.set_no_access(0x1000, 0x1000, true);
+        p.set_no_access(0x4000, 0x1000, true);
+        p.set_bus_fault(0x4000, 0x1000, true);
+
+        assert!(
+            !p.range_bus_fault(0x1000, 1),
+            "ordinary PROT_NONE is ACCERR"
+        );
+        assert!(p.range_bus_fault(0x4000, 1));
+        assert_eq!(
+            p.bus_fault_intersections(0x3000, 0x3000),
+            vec![(0x4000, 0x5000)]
+        );
+
+        let forked = MemoryProtections::from_snapshot(p.snapshot_all());
+        assert!(forked.range_bus_fault(0x4fff, 1));
+        forked.set_mapping_protection(0x3000, 0x3000, false, false);
+        assert!(
+            forked.range_no_access(0x4000, 1),
+            "mprotect cannot reopen a mapped-file EOF tail"
+        );
+        assert!(!forked.range_no_access(0x3000, 1));
+        assert!(!forked.range_no_access(0x5000, 1));
+        forked.set_mapping_protection_and_sharing(
+            0x4000,
+            0x1000,
+            false,
+            false,
+            MappingSharing::Private,
+        );
+        assert!(!forked.range_bus_fault(0x4000, 1));
+        assert!(
+            p.range_bus_fault(0x4000, 1),
+            "fork snapshots are independent"
         );
     }
 
@@ -447,5 +966,122 @@ mod tests {
         assert!(!p.range_no_access(0x1800, 1));
         assert!(p.range_no_write(0x1800, 1));
         assert!(!p.range_unmapped(0x1800, 1));
+    }
+
+    #[test]
+    fn mapping_range_restore_is_exact_and_preserves_disjoint_sibling_changes() {
+        let protections = MemoryProtections::default();
+        protections.set_mapping_protection_and_sharing(
+            0x1000,
+            0x1000,
+            false,
+            true,
+            MappingSharing::Shared,
+        );
+        protections.set_executable(0x1000, 0x1000, true);
+        let snapshot = protections.snapshot_mapping_range(0x1000, 0x1000);
+
+        protections.set_mapping_protection_and_sharing(
+            0x1000,
+            0x1000,
+            true,
+            false,
+            MappingSharing::Private,
+        );
+        protections.set_mapping_protection_and_sharing(
+            0x4000,
+            0x1000,
+            false,
+            false,
+            MappingSharing::Private,
+        );
+        protections.restore_mapping_range(snapshot);
+
+        assert!(!protections.range_no_access(0x1000, 0x1000));
+        assert!(protections.range_no_write(0x1000, 0x1000));
+        assert!(protections.range_executable(0x1000, 0x1000));
+        assert!(protections.range_mutable_shared_backing(0x1000, 0x1000));
+        assert!(!protections.range_no_write(0x4000, 0x1000));
+        assert!(!protections.range_mutable_shared_backing(0x4000, 0x1000));
+    }
+
+    #[test]
+    fn shared_rx_is_ephemeral_while_private_rx_is_cacheable() {
+        let shared = MemoryProtections::default();
+        shared.set_mapping_protection_and_sharing(
+            0x1000,
+            0x1000,
+            false,
+            true,
+            MappingSharing::Shared,
+        );
+        shared.set_executable(0x1000, 0x1000, true);
+        assert!(shared.range_mutable_shared_backing(0x1000, 1));
+        assert!(shared.range_translation_requires_ephemeral(0x1000, 0x1000));
+
+        // mprotect changes only permission. A shared RX view cannot become
+        // persistently cacheable merely because it toggles through RW then RX.
+        shared.set_mapping_protection(0x1000, 0x1000, false, false);
+        shared.set_mapping_protection(0x1000, 0x1000, false, true);
+        assert!(shared.range_translation_requires_ephemeral(0x1000, 0x1000));
+
+        let private = MemoryProtections::default();
+        private.set_mapping_protection_and_sharing(
+            0x1000,
+            0x1000,
+            false,
+            true,
+            MappingSharing::Private,
+        );
+        private.set_executable(0x1000, 0x1000, true);
+        assert!(!private.range_mutable_shared_backing(0x1000, 1));
+        assert!(!private.range_translation_requires_ephemeral(0x1000, 0x1000));
+    }
+
+    #[test]
+    fn unmap_and_private_replacement_clear_shared_backing() {
+        let p = MemoryProtections::default();
+        p.set_mapping_protection_and_sharing(0x2000, 0x1000, false, true, MappingSharing::Shared);
+        p.set_executable(0x2000, 0x1000, true);
+        p.set_unmapped(0x2000, 0x1000, true);
+        assert!(!p.range_mutable_shared_backing(0x2000, 1));
+        assert!(!p.range_translation_requires_ephemeral(0x2000, 1));
+
+        p.set_mapping_protection_and_sharing(0x2000, 0x1000, false, true, MappingSharing::Shared);
+        p.set_executable(0x2000, 0x1000, true);
+        p.set_mapping_protection_and_sharing(0x2000, 0x1000, false, true, MappingSharing::Private);
+        assert!(
+            !p.range_executable(0x2000, 1),
+            "replacement revokes stale X"
+        );
+        assert!(!p.range_mutable_shared_backing(0x2000, 1));
+        p.set_executable(0x2000, 0x1000, true);
+        assert!(!p.range_translation_requires_ephemeral(0x2000, 0x1000));
+    }
+
+    #[test]
+    fn fork_snapshot_preserves_mutable_shared_backing() {
+        let p = MemoryProtections::default();
+        p.set_mapping_protection_and_sharing(0x3000, 0x1000, false, true, MappingSharing::Shared);
+        p.set_executable(0x3000, 0x1000, true);
+
+        let child = MemoryProtections::from_snapshot(p.snapshot_all());
+        assert!(child.range_mutable_shared_backing(0x3000, 0x1000));
+        assert!(child.range_translation_requires_ephemeral(0x3000, 0x1000));
+
+        child.set_unmapped(0x3000, 0x1000, true);
+        assert!(p.range_mutable_shared_backing(0x3000, 0x1000));
+        assert!(!child.range_mutable_shared_backing(0x3000, 0x1000));
+    }
+
+    #[test]
+    fn mixed_private_and_shared_rx_span_is_ephemeral() {
+        let p = MemoryProtections::default();
+        p.set_mapping_protection_and_sharing(0x4fff, 1, false, true, MappingSharing::Private);
+        p.set_mapping_protection_and_sharing(0x5000, 1, false, true, MappingSharing::Shared);
+        p.set_executable(0x4fff, 2, true);
+
+        assert!(!p.range_translation_requires_ephemeral(0x4fff, 1));
+        assert!(p.range_translation_requires_ephemeral(0x4fff, 2));
     }
 }

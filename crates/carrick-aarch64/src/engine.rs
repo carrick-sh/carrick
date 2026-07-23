@@ -25,7 +25,10 @@ use std::sync::{Arc, Mutex};
 
 use carrick_abi::LinuxSiginfo;
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_guest_mem::{Gpa, GuestMemory, GuestVa, MemoryError, SharedFutexLocation};
+use carrick_guest_mem::{
+    Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
+    SharedFutexLocation,
+};
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::{
     ForkOutcome, GuestEntryRegs, OsError, RawSyscall, Reg, SlotId, SysReg, SyscallTrap,
@@ -476,13 +479,43 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// identity is correct and re-basing on the IPA would miss the window. A walk
     /// miss falls back to `va` (identity), preserving prior behaviour for an
     /// unmapped VA.
-    fn syscall_buffer_ipa(&self, va: GuestVa, len: usize) -> Gpa {
+    fn syscall_buffer_ipa(&self, va: GuestVa, len: usize) -> Option<Gpa> {
         let raw = va.raw();
         if !carrick_mem::memory::needs_stage1_translation(raw, len as u64) {
-            return Gpa(raw);
+            return Some(Gpa(raw));
         }
         let guard = self.page_tables.lock().unwrap_or_else(|e| e.into_inner());
-        Gpa(guard.as_ref().and_then(|m| m.translate(raw)).unwrap_or(raw))
+        guard.as_ref()?.translate(raw).map(Gpa)
+    }
+
+    /// One page-bounded VA→IPA segment of a syscall buffer. Page bounding is
+    /// mandatory: a private prefix/middle/suffix overlay can make numerically
+    /// adjacent guest VAs resolve to unrelated physical pages.
+    fn syscall_buffer_chunk(
+        &self,
+        address: u64,
+        offset: usize,
+        total_len: usize,
+    ) -> Result<(u64, Gpa, usize), MemoryError> {
+        let offset_u64 = u64::try_from(offset).map_err(|_| MemoryError::OutOfBounds {
+            address,
+            length: total_len,
+        })?;
+        let va = address
+            .checked_add(offset_u64)
+            .ok_or(MemoryError::OutOfBounds {
+                address,
+                length: total_len,
+            })?;
+        let page_left = (0x1000 - (va & 0xfff)) as usize;
+        let len = (total_len - offset).min(page_left);
+        let ipa = self
+            .syscall_buffer_ipa(GuestVa(va), len)
+            .ok_or(MemoryError::OutOfBounds {
+                address,
+                length: total_len,
+            })?;
+        Ok((va, ipa, len))
     }
 }
 
@@ -539,21 +572,35 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        // PROT_NONE was gated on the guest VA in the default `read_bytes`; here we
-        // do the IPA-translated single-region lookup so a `repoint_private` overlay
-        // / high-VA alias resolves to the page the guest's OWN EL0 accesses hit —
-        // NOT the stale shared-aperture backing the VA still covers. Identity VAs:
-        // ipa==address (skips the walk). The copy stays glue (in the backend).
-        let ipa = self.syscall_buffer_ipa(GuestVa(address), length).raw();
-        self.vm.translated_read(address, ipa, length)
+        // PROT_NONE was gated on the guest VA in the default `read_bytes`. Walk
+        // every page independently so a buffer spanning shared identity and a
+        // private overlay never assumes one physically-contiguous base IPA.
+        let mut out = vec![0u8; length];
+        let mut copied = 0usize;
+        while copied < length {
+            let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
+            let bytes = self.vm.translated_read(va, ipa.raw(), chunk_len)?;
+            if bytes.len() != chunk_len {
+                return Err(MemoryError::OutOfBounds { address, length });
+            }
+            out[copied..copied + chunk_len].copy_from_slice(&bytes);
+            copied += chunk_len;
+        }
+        Ok(out)
     }
 
     fn read_into_raw(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
-        // No-alloc fixed-size read (`read_u32`/`read_u64`/struct headers). The
-        // backend may `volatile`-copy straight into `dst` (HVF); the default copies
-        // through a `Vec`. PROT_NONE was already gated in `read_into`.
-        let ipa = self.syscall_buffer_ipa(GuestVa(address), dst.len()).raw();
-        self.vm.translated_read_into(address, ipa, dst)
+        // No-alloc fixed-size read (`read_u32`/`read_u64`/struct headers), still
+        // page-segmented for fragmented overlays.
+        let length = dst.len();
+        let mut copied = 0usize;
+        while copied < length {
+            let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
+            self.vm
+                .translated_read_into(va, ipa.raw(), &mut dst[copied..copied + chunk_len])?;
+            copied += chunk_len;
+        }
+        Ok(())
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
@@ -577,8 +624,15 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 length: bytes.len(),
             });
         }
-        let ipa = self.syscall_buffer_ipa(GuestVa(address), bytes.len()).raw();
-        self.vm.translated_write(address, ipa, bytes)
+        let length = bytes.len();
+        let mut copied = 0usize;
+        while copied < length {
+            let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
+            self.vm
+                .translated_write(va, ipa.raw(), &bytes[copied..copied + chunk_len])?;
+            copied += chunk_len;
+        }
+        Ok(())
     }
 
     fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
@@ -587,8 +641,18 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // permission (the host page is writable). PROT_NONE is NOT re-gated (the
         // default `write_bytes_unchecked` doesn't gate either). The translated IPA
         // resolves a `repoint_private` overlay to the private backing.
-        let ipa = self.syscall_buffer_ipa(GuestVa(address), bytes.len()).raw();
-        self.vm.translated_write_unchecked(address, ipa, bytes)
+        let length = bytes.len();
+        let mut copied = 0usize;
+        while copied < length {
+            let (va, ipa, chunk_len) = self.syscall_buffer_chunk(address, copied, length)?;
+            self.vm.translated_write_unchecked(
+                va,
+                ipa.raw(),
+                &bytes[copied..copied + chunk_len],
+            )?;
+            copied += chunk_len;
+        }
+        Ok(())
     }
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
@@ -640,6 +704,26 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         }
     }
 
+    fn set_mapping_sharing(&mut self, address: u64, len: usize, sharing: MappingSharing) {
+        if let Some(protections) = self.vm.protections() {
+            protections.set_mapping_sharing(address, len, sharing);
+        }
+    }
+
+    fn set_mapping_protection_and_sharing(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+        sharing: MappingSharing,
+    ) {
+        if let Some(protections) = self.vm.protections() {
+            protections
+                .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
+        }
+    }
+
     /// Scrub the physical backing of `[address, address+len)`, BYPASSING the
     /// PROT_NONE check — used to clear a reused/`munmap`'d region whose stale bytes
     /// must never resurface after a later `mprotect` makes it readable.
@@ -652,9 +736,21 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// host-`SYS_futex` path on the same physical page. `None` for a private/COW
     /// word (those stay in-process via the parking-lot `FutexTable`).
     fn shared_futex_location(&self, guest_addr: u64) -> Option<SharedFutexLocation> {
-        // The backend seam below is typed GuestVa -> HostVa. Aarch64 backends
-        // expose only direct shared-aperture words; bhyve-style mirrors are x86.
-        self.vm.shared_futex_location(GuestVa(guest_addr))
+        if !self.vm.protections().is_some_and(|protections| {
+            protections.range_mutable_shared_backing(guest_addr, std::mem::size_of::<u32>())
+        }) {
+            return None;
+        }
+        // A futex word must resolve through one physically-contiguous page-table
+        // segment. Passing the original shared-aperture VA here would alias the
+        // stale identity page after `repoint_private`; the exact backing GPA makes
+        // an overlay word private while preserving real MAP_SHARED keys.
+        let (_va, backing_gpa, chunk_len) = self
+            .syscall_buffer_chunk(guest_addr, 0, std::mem::size_of::<u32>())
+            .ok()?;
+        (chunk_len == std::mem::size_of::<u32>())
+            .then(|| self.vm.shared_futex_location(backing_gpa))
+            .flatten()
     }
 
     /// Make a guest `mprotect`/`mmap`'s protection GUEST-visible by editing the
@@ -683,12 +779,21 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// `munmap`: invalidate the stage-1 descriptors for `[address, address+len)` so
     /// the guest's own access faults (vs the host-side `no_access` check). The
     /// unmapped range is typically ALREADY-TOUCHED, so flush the stale TLB entry.
+    fn restore_shared_identity(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
+        let len = u64::try_from(len).map_err(|_| MemoryError::OutOfBounds {
+            address: va,
+            length: len,
+        })?;
+        self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, va, len, true))
+    }
+
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        // Drop any process-shared alias index entry for this VA range BEFORE the
-        // stage-1 invalidate (no-op for the common low-VA arena; HVF's
-        // `alias_registry` for a high-VA alias routed here). KVM no-op.
-        self.vm.on_unmap(address, len);
+        // Teardown the checked stage-1 path and flush stale translations first.
+        // Only then retire process-shared backend lookup metadata. If the page-
+        // table/TLBI operation fails, the alias registry remains an exact owner
+        // of the still-published backing instead of becoming a dangling absence.
         self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))?;
+        self.vm.on_unmap(address, len);
         self.set_unmapped(address, len, true);
         Ok(())
     }
@@ -697,18 +802,20 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// sub-table(s) (vs `unmap_range`, which keeps the table for the low-VA arena's
     /// in-place reuse). Flush the stale TLB entry. Mirrors HVF.
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        // The alias backing is freed here; drop the process-shared index entry first
-        // so a cross-thread fallback never resolves a now-munmap'd `host_addr` (HVF).
-        self.vm.on_unmap(address, len);
+        // Reclaim the alias leaves/table and complete TLBI before unregistering
+        // backend lookup metadata. An Err therefore leaves the alias registry
+        // intact and consistent with the still-owned host/stage-2 backing.
         self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))?;
+        self.vm.on_unmap(address, len);
         self.set_unmapped(address, len, true);
         Ok(())
     }
 
     /// Repoint guest VA `[va, va+len)` to a slot in the boot-mapped PRIVATE overlay
-    /// aperture (`overlay_ipa`, identity IPA==VA), seeding the slot with `content`
-    /// first. Backs a guest `mmap(MAP_FIXED|MAP_PRIVATE|MAP_ANON)` over a
-    /// SHARED-aperture VA: carrick's shared aperture is host-`MAP_SHARED`, so it is
+    /// aperture (`overlay_ipa`, identity IPA==VA), seeding the slot with the exact
+    /// file or zero `content` snapshot first. Backs a guest
+    /// `mmap(MAP_FIXED|MAP_PRIVATE)` over a SHARED-aperture VA: carrick's shared
+    /// aperture is host-`MAP_SHARED`, so it is
     /// inherited across `fork(2)` AND visible to sibling carrick processes —
     /// leaving the VA pointed there would make a guest's "private" stores leak.
     ///
@@ -724,35 +831,57 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         overlay_ipa: u64,
         len: usize,
         content: &[u8],
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), RepointPrivateError> {
+        if content.len() != len {
+            return Err(RepointPrivateError::clean(MemoryError::OutOfBounds {
+                address: va,
+                length: content.len(),
+            }));
+        }
         // 1. Resolve the overlay slot's host backing pointer (the same resolver the
         //    live page-table editor's `sync_to_host` uses). `len.max(1)` so a
         //    zero-length repoint still resolves the start page.
-        let dst = self
-            .vm
-            .host_ptr(overlay_ipa, len.max(1))
-            .ok_or(MemoryError::OutOfBounds {
+        let dst = self.vm.host_ptr(overlay_ipa, len.max(1)).ok_or_else(|| {
+            RepointPrivateError::clean(MemoryError::OutOfBounds {
                 address: overlay_ipa,
                 length: len,
-            })?;
+            })
+        })?;
         // 2. Seed `content` into the overlay backing FIRST, while `va` still
         //    translates to the OLD (shared) IPA — no torn read through `va` during
-        //    the flip. Copy at most `len` bytes.
+        //    the flip.
         if !content.is_empty() {
-            let n = content.len().min(len);
             // SAFETY: `host_ptr` proved `[overlay_ipa, overlay_ipa+len)` lies wholly
-            // within the overlay slot's backing, so `dst[..n]` (n <= len) is valid
-            // and writable; `content[..n]` is a distinct, valid source slice.
+            // within the overlay slot's backing, and `content` is exactly `len`
+            // distinct, valid source bytes.
             unsafe {
-                std::ptr::copy_nonoverlapping(content.as_ptr(), dst, n);
+                std::ptr::copy_nonoverlapping(content.as_ptr(), dst, len);
             }
         }
         // 3. Stage-1 repoint + TLB flush. `map_aliased` splits the covering boot
         //    block to a page leaf so a single page within the shared aperture is
         //    repointed without disturbing its neighbours; the flush invalidates any
         //    stale stage-1 entry for an already-touched overlay VA.
-        self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, overlay_ipa, len as u64, true))
+        // The cached manager is process-persistent. Even when an edit error
+        // prevents `sync_to_host`, a multi-leaf operation may have changed its
+        // scratch image; fail stopped so a later successful edit cannot publish
+        // partial leaves after this candidate was recycled.
+        let changed = self
+            .pt_edit_locked(|mgr| mgr.map_aliased(va, overlay_ipa, len as u64, true))
+            .map_err(RepointPrivateError::indeterminate)?;
+        if !changed {
+            return Ok(());
+        }
+        classify_private_repoint_tlbi(self.run_el1_maintenance())
     }
+}
+
+fn classify_private_repoint_tlbi(result: Result<(), TrapError>) -> Result<(), RepointPrivateError> {
+    result.map_err(|error| {
+        RepointPrivateError::indeterminate(MemoryError::HostMap(format!(
+            "stage-1 TLBI after private repoint failed: {error}"
+        )))
+    })
 }
 
 fn emit_fork_footprint(phase: i32, arena_high_water: u64) {
@@ -926,8 +1055,8 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         self.vcpu.get_reg(Reg::Pc)
     }
 
-    fn process_exit_cleanup(&mut self) {
-        self.vm.process_exit_cleanup();
+    fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
+        self.vm.process_exit_cleanup()
     }
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
@@ -1107,8 +1236,18 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // VA is brand-new (no stale TLB entry), so the guest's first access walks the
         // just-written tables — the same fresh-page argument as `protect_range`.
         let (gpa, writable) = self.vm.add_alias(va.raw(), ipa.raw(), len, payload, file)?;
-        self.pt_edit(|mgr| mgr.map_aliased(va.raw(), gpa, len, writable))
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+        if let Err(error) = self.pt_edit(|mgr| mgr.map_aliased(va.raw(), gpa, len, writable)) {
+            // `map_aliased` may allocate/edit several leaves before reporting
+            // exhaustion. Run the backend/page-table teardown even though the
+            // public install returns Err; if teardown itself cannot complete,
+            // continuing would expose a partially owned alias.
+            let cleanup_len = usize::try_from(len).unwrap_or_else(|_| std::process::abort());
+            if self.unmap_alias_range(va.raw(), cleanup_len).is_err() {
+                std::process::abort();
+            }
+            return Err(TrapError::Hypervisor(error.to_string()));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1640,6 +1779,17 @@ mod tests {
             child.fpcr, parent.fpcr,
             "fpcr must NOT be swapped with fpsr"
         );
+    }
+
+    #[test]
+    fn private_repoint_tlbi_failure_is_indeterminate() {
+        let result = classify_private_repoint_tlbi(Err(TrapError::Hypervisor(
+            "injected post-publication TLBI failure".into(),
+        )));
+        assert!(matches!(
+            result,
+            Err(RepointPrivateError::Indeterminate(MemoryError::HostMap(_)))
+        ));
     }
 
     /// The reclaim snapshot (de)serialization round-trips every field bit-exact

@@ -55,6 +55,20 @@ fn shm_anon_fd(capacity: usize) -> io::Result<libc::c_int> {
     Ok(fd)
 }
 
+fn unmap_candidate_or_abort(address: *mut libc::c_void, capacity: usize) -> Option<io::Error> {
+    // SAFETY: callers pass an unpublished alias they exclusively own.
+    if unsafe { libc::munmap(address, capacity) } == 0 {
+        return None;
+    }
+    let first = io::Error::last_os_error();
+    // Preserve ownership through one reportable transient. A persistent failure
+    // cannot return without losing the only alias record, so fail-stop.
+    if unsafe { libc::munmap(address, capacity) } != 0 {
+        std::process::abort();
+    }
+    Some(first)
+}
+
 fn map_shared(fd: libc::c_int, capacity: usize, prot: libc::c_int) -> io::Result<NonNull<u8>> {
     // SAFETY: fd is a valid SHM object of at least `capacity` bytes; a
     // kernel-chosen placement with MAP_SHARED aliases the object.
@@ -71,8 +85,17 @@ fn map_shared(fd: libc::c_int, capacity: usize, prot: libc::c_int) -> io::Result
     if mapped == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    NonNull::new(mapped.cast::<u8>())
-        .ok_or_else(|| io::Error::other("mmap returned a null mapping"))
+    let Some(mapping) = NonNull::new(mapped.cast::<u8>()) else {
+        // A successful address-zero map is still owned. Do not turn it into an
+        // error until that ownership has been explicitly discharged.
+        if let Some(cleanup_error) = unmap_candidate_or_abort(mapped, capacity) {
+            return Err(io::Error::other(format!(
+                "mmap returned a null mapping; cleanup initially failed: {cleanup_error}"
+            )));
+        }
+        return Err(io::Error::other("mmap returned a null mapping"));
+    };
+    Ok(mapping)
 }
 
 impl NativeHostJit for FreebsdHostJit {
@@ -85,23 +108,34 @@ impl NativeHostJit for FreebsdHostJit {
 
     fn map_code_cache(&self, capacity: usize) -> io::Result<JitRegion> {
         let fd = shm_anon_fd(capacity)?;
-        let exec = map_shared(fd, capacity, libc::PROT_READ | libc::PROT_EXEC);
-        let write = exec.and_then(|exec_base| {
-            map_shared(fd, capacity, libc::PROT_READ | libc::PROT_WRITE)
-                .map(|write_base| (exec_base, write_base))
-                .inspect_err(|_| {
-                    // SAFETY: exec_base is the mapping we just created; on
-                    // alias failure nothing else references it yet.
-                    unsafe {
-                        libc::munmap(exec_base.as_ptr().cast(), capacity);
-                    }
-                })
-        });
+        let exec_base = match map_shared(fd, capacity, libc::PROT_READ | libc::PROT_EXEC) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                // SAFETY: `fd` is the still-private SHM descriptor.
+                unsafe { libc::close(fd) };
+                return Err(error);
+            }
+        };
+        let write_base = match map_shared(fd, capacity, libc::PROT_READ | libc::PROT_WRITE) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                // exec_base is the only acquired alias and nothing can execute
+                // from it before this function returns a JitRegion.
+                let cleanup_error = unmap_candidate_or_abort(exec_base.as_ptr().cast(), capacity);
+                // SAFETY: `fd` remains ours on both success and error paths.
+                unsafe { libc::close(fd) };
+                return Err(match cleanup_error {
+                    Some(cleanup_error) => io::Error::other(format!(
+                        "map writable JIT alias failed: {error}; executable-alias rollback failed: {cleanup_error}"
+                    )),
+                    None => error,
+                });
+            }
+        };
         // The object lives as long as its mappings; the fd is not needed
         // after both views exist (and must not leak into guests).
         // SAFETY: fd is ours; mappings keep the SHM object alive.
         unsafe { libc::close(fd) };
-        let (exec_base, write_base) = write?;
         Ok(JitRegion {
             exec_base,
             write_base,
