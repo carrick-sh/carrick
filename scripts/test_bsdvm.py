@@ -8,9 +8,11 @@ import json
 import lzma
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -432,6 +434,150 @@ class PsDisplayTests(unittest.TestCase):
                     rc = BSDVM.cmd_ps(ns)
                 self.assertEqual(rc, 0)
                 self.assertIn("orphan-pidfile", out.getvalue())
+
+
+class SerialConsoleTests(unittest.TestCase):
+    def test_expect_and_sendline_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sock_path = Path(td) / "serial.sock"
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(str(sock_path))
+            srv.listen(1)
+            got: list[bytes] = []
+
+            def server() -> None:
+                conn, _ = srv.accept()
+                conn.sendall(b"NetBSD/evbarm (netbsd) (constty)\n\nlogin: ")
+                got.append(conn.recv(64))
+                conn.sendall(b"# ")
+                conn.close()
+
+            t = threading.Thread(target=server)
+            t.daemon = True
+            t.start()
+            try:
+                con = BSDVM.SerialConsole(sock_path)
+                pre = con.expect(b"login: ", timeout_s=5)
+                self.assertIn(b"NetBSD", pre)
+                con.sendline("root")
+                con.expect(b"# ", timeout_s=5)
+                con._sock.close()
+                t.join(timeout=5)
+                self.assertEqual(got[0], b"root\n")
+            finally:
+                srv.close()
+
+    def test_expect_timeout_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sock_path = Path(td) / "serial.sock"
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(str(sock_path))
+            srv.listen(1)
+            accepted: list[socket.socket] = []
+
+            def server() -> None:
+                conn, _ = srv.accept()
+                accepted.append(conn)
+
+            t = threading.Thread(target=server)
+            t.daemon = True
+            t.start()
+            try:
+                con = BSDVM.SerialConsole(sock_path)
+                with self.assertRaises(TimeoutError):
+                    con.expect(b"never", timeout_s=0.2)
+                con._sock.close()
+                t.join(timeout=5)
+            finally:
+                for conn in accepted:
+                    conn.close()
+                srv.close()
+
+
+class ProvisionDataTests(unittest.TestCase):
+    def test_freebsd_commands_cover_spec_steps(self) -> None:
+        cmds = " && ".join(
+            c for c, _ in BSDVM.provision_commands(BSDVM.VMS["freebsd-arm64"], "ssh-ed25519 KEY x")
+        )
+        for needle in (
+            "authorized_keys", "sshd_enable=YES", "pkg install",
+            "git", "rust", "receive.denyCurrentBranch updateInstead",
+            "shutdown -p now",
+        ):
+            self.assertIn(needle, cmds)
+
+    def test_netbsd_commands_cover_spec_steps(self) -> None:
+        cmds = " && ".join(
+            c for c, _ in BSDVM.provision_commands(BSDVM.VMS["netbsd-arm64"], "ssh-ed25519 KEY x")
+        )
+        for needle in (
+            "authorized_keys", "sshd=YES", "pkg_add",
+            "receive.denyCurrentBranch updateInstead", "shutdown -p now",
+        ):
+            self.assertIn(needle, cmds)
+
+
+# A pubkey whose trailing user@host comment embeds a literal `'`; this is
+# exactly the shape that broke naive `echo '{pubkey}'` interpolation.
+_TRICKY_PUBKEY = "ssh-ed25519 AAAA test's-mac"
+
+
+class ShQuoteTests(unittest.TestCase):
+    """`_sh_squote` must produce a POSIX single-quoted token that a real
+    `/bin/sh` hands back byte-for-byte -- proven by actually invoking the
+    shell (a safe, local, instant call), not just by inspecting the string.
+    """
+
+    def _round_trip(self, escaped: str, original: str) -> None:
+        result = subprocess.run(
+            ["/bin/sh", "-c", f"printf %s {escaped}"],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(result.stdout, original)
+
+    def test_sh_squote_escapes_embedded_quote_and_round_trips(self) -> None:
+        escaped = BSDVM._sh_squote(_TRICKY_PUBKEY)
+        self.assertIn("'\\''", escaped)  # POSIX-escaped form present
+        self._round_trip(escaped, _TRICKY_PUBKEY)
+
+    def test_provision_commands_key_cmd_is_squoted_and_round_trips(self) -> None:
+        # Exercise the actual call site, not just the helper in isolation.
+        key_cmd = BSDVM.provision_commands(BSDVM.VMS["freebsd-arm64"], _TRICKY_PUBKEY)[0][0]
+        escaped = BSDVM._sh_squote(_TRICKY_PUBKEY)
+        self.assertIn(escaped, key_cmd)
+        self._round_trip(escaped, _TRICKY_PUBKEY)
+
+
+class CloudInitSeedTests(unittest.TestCase):
+    """`write_cloudinit_seed` must derive its `runcmd` list from
+    `provision_commands` (the single source of truth) rather than
+    hand-duplicating commands that can drift out of sync.
+    """
+
+    def test_netbsd_name_raises_systemexit(self) -> None:
+        with self.assertRaises(SystemExit):
+            BSDVM.write_cloudinit_seed("netbsd-arm64", _TRICKY_PUBKEY)
+
+    def test_freebsd_seed_user_data_matches_provision_commands_no_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                with mock.patch.object(
+                    BSDVM.subprocess, "run", return_value=mock.Mock(returncode=0)
+                ) as run_mock:
+                    BSDVM.write_cloudinit_seed("freebsd-arm64", _TRICKY_PUBKEY)
+                run_mock.assert_called_once()  # only the hdiutil packing call
+                st = BSDVM.state_dir("freebsd-arm64")
+                user_data = (st / "seed" / "user-data").read_text()
+
+                cmds = BSDVM.provision_commands(BSDVM.VMS["freebsd-arm64"], _TRICKY_PUBKEY)
+                key_cmd, pkg_install_cmd = cmds[0][0], cmds[3][0]
+                self.assertIn("pkg install", pkg_install_cmd)  # sanity on the index
+
+                expected_line = f"  - {BSDVM._yaml_dquote(pkg_install_cmd)}\n"
+                self.assertIn(expected_line, user_data)  # exact-equality derivation, no drift
+
+                self.assertNotIn(key_cmd, user_data)  # authorized_keys step not re-run via runcmd
+                self.assertIn(BSDVM._yaml_dquote(_TRICKY_PUBKEY), user_data)  # ssh_authorized_keys
 
 
 if __name__ == "__main__":

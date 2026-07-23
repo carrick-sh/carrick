@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -401,6 +402,138 @@ def stop_pid(
             return
         sleep(0.1)
     raise SystemExit(f"pid {pid} did not exit after SIGKILL; inspect manually")
+
+
+class SerialConsole:
+    """Line-oriented expect over the qemu chardev unix socket."""
+
+    def __init__(self, sock_path: Path):
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.connect(str(sock_path))
+        self._sock.settimeout(0.25)
+        self._buf = b""
+        self._log_hint = sock_path.with_name("serial.log")
+
+    def expect(self, pattern: bytes, timeout_s: float) -> bytes:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            idx = self._buf.find(pattern)
+            if idx >= 0:
+                out, self._buf = self._buf[: idx + len(pattern)], self._buf[idx + len(pattern):]
+                return out
+            try:
+                chunk = self._sock.recv(4096)
+                if chunk:
+                    self._buf += chunk
+            except socket.timeout:
+                pass
+        raise TimeoutError(
+            f"serial expect timed out waiting for {pattern!r} "
+            f"(see {self._log_hint})"
+        )
+
+    def sendline(self, s: str) -> None:
+        self._sock.sendall(s.encode() + b"\n")
+
+
+def read_pubkey() -> str:
+    override = os.environ.get("CARRICK_BSDVM_PUBKEY")
+    candidates = [Path(override)] if override else [
+        Path.home() / ".ssh" / "id_ed25519.pub",
+        Path.home() / ".ssh" / "id_rsa.pub",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c.read_text().strip()
+    raise SystemExit("no ssh public key found (set CARRICK_BSDVM_PUBKEY)")
+
+
+def _sh_squote(s: str) -> str:
+    """POSIX single-quoted shell escaping for a value embedded verbatim in a
+    shell command string built by this module (e.g. the ssh pubkey, whose
+    trailing user@host comment can contain a literal `'`). The standard
+    close-quote/escaped-quote/reopen-quote trick: `'\\''`.
+    """
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _yaml_dquote(s: str) -> str:
+    """Double-quoted YAML scalar escaping (no yaml lib): backslash must be
+    escaped before double-quote, or an embedded `\\` would be re-escaped by
+    the `"` substitution.
+    """
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+_GIT_SETUP = (
+    "git init /root/carrick && "
+    "git -C /root/carrick config receive.denyCurrentBranch updateInstead"
+)
+
+
+def provision_commands(vm: VmConfig, pubkey: str) -> list[tuple[str, float]]:
+    key_cmd = (
+        "mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
+        f"echo {_sh_squote(pubkey)} >> /root/.ssh/authorized_keys && "
+        "chmod 600 /root/.ssh/authorized_keys"
+    )
+    if vm.name == "freebsd-arm64":
+        return [
+            (key_cmd, 30),
+            ("sysrc sshd_enable=YES && "
+             "echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config && "
+             "service sshd restart", 120),
+            ("env ASSUME_ALWAYS_YES=yes pkg bootstrap -f", 600),
+            ("env ASSUME_ALWAYS_YES=yes pkg install -y git just rust python3", 3600),
+            (_GIT_SETUP, 30),
+            ("shutdown -p now", 120),
+        ]
+    return [  # netbsd-arm64
+        (key_cmd, 30),
+        ("printf 'sshd=YES\\ndhcpcd=YES\\n' >> /etc/rc.conf && "
+         "echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config && "
+         "/etc/rc.d/sshd start", 300),
+        ("export PKG_PATH=https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/aarch64/10.1/All; "
+         "/usr/sbin/pkg_add -U git rust || /usr/sbin/pkg_add -U git rust", 3600),
+        # `just` may be absent from pkgsrc aarch64; gates call cargo directly.
+        ("export PKG_PATH=https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/aarch64/10.1/All; "
+         "/usr/sbin/pkg_add -U just || echo 'just unavailable (ok)'", 600),
+        (f"PATH=/usr/pkg/bin:$PATH {_GIT_SETUP}", 30),
+        ("shutdown -p now", 120),
+    ]
+
+
+def write_cloudinit_seed(vm_name: str, pubkey: str) -> Path:
+    """Write the FreeBSD NoCloud seed (meta-data + user-data) and pack it into
+    seed.iso. `provision_commands` is the single source of truth for what
+    gets run: the `runcmd` list here is derived from it directly (minus the
+    first entry, which `ssh_authorized_keys` already covers) rather than
+    hand-duplicated, so the two provisioning paths cannot drift apart.
+    """
+    if vm_name != "freebsd-arm64":
+        raise SystemExit("cloud-init seed is only used for the FreeBSD lane")
+    st = state_dir(vm_name)
+    cmds = provision_commands(VMS[vm_name], pubkey)[1:]  # drop authorized_keys step
+    seed_dir = st / "seed"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    (seed_dir / "meta-data").write_text(f"instance-id: {vm_name}\nlocal-hostname: {vm_name}\n")
+    runcmd_lines = "".join(f"  - {_yaml_dquote(cmd)}\n" for cmd, _ in cmds)
+    (seed_dir / "user-data").write_text(
+        "#cloud-config\n"
+        "disable_root: false\n"
+        "ssh_authorized_keys:\n"
+        f"  - {_yaml_dquote(pubkey)}\n"
+        "runcmd:\n"
+        f"{runcmd_lines}"
+    )
+    iso = st / "seed.iso"
+    iso.unlink(missing_ok=True)
+    subprocess.run(
+        ["hdiutil", "makehybrid", "-iso", "-joliet",
+         "-default-volume-name", "cidata", "-o", str(iso), str(seed_dir)],
+        check=True,
+    )
+    return iso
 
 
 def cmd_up(args: argparse.Namespace) -> int:
