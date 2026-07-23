@@ -9,6 +9,7 @@ import lzma
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -1031,6 +1032,43 @@ class SshGitTests(unittest.TestCase):
         with mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run):
             BSDVM.ensure_dev_remote(vm)
         self.assertIn(["git", "remote", "add", vm.remote, BSDVM.git_url(vm)], calls)
+
+    def test_git_ssh_env_shell_quotes_options_with_spaces(self) -> None:
+        """GIT_SSH_COMMAND must be shell-parseable even with spaces in known_hosts path.
+
+        When CARRICK_BSDVM_STATE contains a space, the known_hosts path will too.
+        The GIT_SSH_COMMAND string is later shell-parsed (by git's ssh wrapper logic),
+        so shlex.join must quote tokens that contain special characters.
+        """
+        vm = BSDVM.VMS["freebsd-arm64"]
+        with tempfile.TemporaryDirectory() as root_td:
+            # Create a state dir with a space in its path.
+            space_dir = Path(root_td) / "with space"
+            space_dir.mkdir()
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": str(space_dir)}):
+                env = BSDVM.git_ssh_env(vm)
+
+        self.assertIn("GIT_SSH_COMMAND", env)
+        git_ssh_cmd = env["GIT_SSH_COMMAND"]
+
+        # Parse the GIT_SSH_COMMAND string with shlex to verify it yields correct tokens.
+        # This is exactly what the shell will do when git invokes the command.
+        parsed = shlex.split(git_ssh_cmd)
+
+        # First token must be "ssh"
+        self.assertEqual(parsed[0], "ssh")
+
+        # The known_hosts path must be embedded in the UserKnownHostsFile option.
+        # After shlex.split, it should appear as a single option value that contains the space.
+        known_hosts_path = str(space_dir / vm.name / "known_hosts")
+        known_hosts_opt = f"UserKnownHostsFile={known_hosts_path}"
+        self.assertIn(known_hosts_opt, parsed)
+
+        # Verify the three -o pairs are present and intact.
+        # After shlex.split, we should have: ["ssh", "-o", "opt1=val1", "-o", "opt2=val2", "-o", "opt3=val3"]
+        self.assertIn("-o", parsed)
+        self.assertIn("StrictHostKeyChecking=accept-new", parsed)
+        self.assertIn("ConnectTimeout=5", parsed)
 
 
 if __name__ == "__main__":
