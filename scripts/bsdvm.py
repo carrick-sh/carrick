@@ -868,31 +868,77 @@ def push_head(vm: VmConfig) -> str:
     sha = subprocess.run(
         ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
     ).stdout.strip()
-    ls_remote = subprocess.run(
-        ["git", "ls-remote", "--symref", git_url(vm), "HEAD"],
-        capture_output=True,
-        text=True,
-        env=git_ssh_env(vm),
-        check=True,
-    )
+
+    # Guest-side truth first: `git symbolic-ref --short HEAD` reports the
+    # branch name a checked-out HEAD points to whether or not that branch has
+    # any commits yet (an *unborn* HEAD, e.g. a golden provisioned by a plain
+    # `git init` before `_GIT_SETUP` pinned `-b main`, still resolves this to
+    # e.g. "master"). `git ls-remote --symref` cannot make that distinction --
+    # for an unborn HEAD it prints nothing at all -- so it previously caused
+    # push_head to default to "main" even when the guest's actual checked-out
+    # branch was "master", pushing an orphan `main` ref that
+    # receive.denyCurrentBranch=updateInstead never applied to the (still
+    # empty) worktree.
+    branch: str | None = None
     try:
-        branch = parse_symref_head(ls_remote.stdout)
-    except SystemExit:
-        # Empty guest repo, no HEAD yet (see parse_symref_head's docstring):
-        # this push is the one that establishes the branch. Guests are
-        # provisioned via `git init -b main` (_GIT_SETUP), so "main" is what
-        # the guest's checked-out branch will actually be once this push
-        # creates its first commit.
-        branch = "main"
-        print(
-            f"{vm.name}: no symref HEAD from ls-remote (empty repo); "
-            "defaulting first push to refs/heads/main"
+        probe = ssh_run(vm, "git -C /root/carrick symbolic-ref --short HEAD", timeout_s=30)
+        if probe.returncode == 0 and probe.stdout.strip():
+            branch = probe.stdout.strip()
+    except subprocess.TimeoutExpired:
+        branch = None
+
+    if branch is None:
+        # ssh probe unreachable or inconclusive: fall back to the
+        # ls-remote --symref based detection.
+        ls_remote = subprocess.run(
+            ["git", "ls-remote", "--symref", git_url(vm), "HEAD"],
+            capture_output=True,
+            text=True,
+            env=git_ssh_env(vm),
+            check=True,
         )
+        try:
+            branch = parse_symref_head(ls_remote.stdout)
+        except SystemExit:
+            # Empty guest repo, no HEAD yet (see parse_symref_head's
+            # docstring), AND the ssh symbolic-ref probe was also
+            # inconclusive: this push is the one that establishes the
+            # branch. Guests are provisioned via `git init -b main`
+            # (_GIT_SETUP), so "main" is what the guest's checked-out branch
+            # will actually be once this push creates its first commit.
+            branch = "main"
+            print(
+                f"{vm.name}: no symref HEAD from ls-remote (empty repo); "
+                "defaulting first push to refs/heads/main"
+            )
+
     subprocess.run(
         ["git", "push", "--force", git_url(vm), f"HEAD:refs/heads/{branch}"],
         env=git_ssh_env(vm),
         check=True,
     )
+
+    # Verify the push actually materialized into the guest's worktree (this
+    # is exactly the check that would have caught the bug above): a push to
+    # the wrong ref, or a guest with denyCurrentBranch misconfigured, leaves
+    # /root/carrick looking pushed-to but empty. One forced checkout retry
+    # before giving up -- if the branch name is right this always succeeds.
+    materialized = ssh_run(vm, "test -f /root/carrick/Cargo.toml", timeout_s=30)
+    if materialized.returncode != 0:
+        ssh_run(
+            vm,
+            f"git -C /root/carrick checkout -f {branch} -- . || "
+            f"git -C /root/carrick checkout -f {branch}",
+            timeout_s=60,
+        )
+        recheck = ssh_run(vm, "test -f /root/carrick/Cargo.toml", timeout_s=30)
+        if recheck.returncode != 0:
+            raise SystemExit(
+                f"{vm.name}: pushed HEAD to refs/heads/{branch} but "
+                "/root/carrick/Cargo.toml is still missing after a forced "
+                f"checkout -- inspect the guest repo (branch={branch!r})"
+            )
+
     return sha
 
 

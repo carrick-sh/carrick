@@ -917,48 +917,17 @@ class SshGitTests(unittest.TestCase):
         self.assertNotIn("root@127.0.0.1", env["GIT_SSH_COMMAND"])
         self.assertNotIn(f"-p {vm.ssh_port}", env["GIT_SSH_COMMAND"])
 
-    def test_push_head_returns_local_head_sha_and_pushes_via_git_url(self) -> None:
-        # Guest's checked-out branch (per ls-remote --symref) is "main" here --
-        # what a freshly `_GIT_SETUP`-provisioned (`git init -b main`) guest
-        # reports once it has at least one commit.
-        vm = BSDVM.VMS["freebsd-arm64"]
-        rev_parse = mock.Mock(returncode=0, stdout="deadbeef1234\n")
-        ls_remote = mock.Mock(
-            returncode=0, stdout="ref: refs/heads/main\tHEAD\n" + "a" * 40 + "\tHEAD\n"
-        )
-        push = mock.Mock(returncode=0)
-        push_calls: list[tuple[list[str], dict]] = []
-
-        def fake_run(cmd, **kwargs):
-            if cmd[:2] == ["git", "rev-parse"]:
-                return rev_parse
-            if cmd[:3] == ["git", "ls-remote", "--symref"]:
-                return ls_remote
-            if cmd[:2] == ["git", "push"]:
-                push_calls.append((cmd, kwargs))
-                return push
-            raise AssertionError(f"unexpected command: {cmd}")
-
-        with mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run):
-            sha = BSDVM.push_head(vm)
-        self.assertEqual(sha, "deadbeef1234")
-        self.assertEqual(len(push_calls), 1)
-        push_cmd, push_kwargs = push_calls[0]
-        self.assertEqual(push_cmd[:2], ["git", "push"])
-        self.assertIn(BSDVM.git_url(vm), push_cmd)
-        self.assertIn("HEAD:refs/heads/main", push_cmd)
-        self.assertIn("GIT_SSH_COMMAND", push_kwargs.get("env", {}))
-
-    def test_push_head_targets_checked_out_branch_from_ls_remote(self) -> None:
-        # Reviewer finding: guest repos provisioned by plain `git init` (the
-        # pre-fix _GIT_SETUP) default to `master`; updateInstead only updates
-        # the working tree when the push targets the CHECKED-OUT branch, so
-        # push_head must ask ls-remote what that branch actually is rather
-        # than hardcoding "main".
-        vm = BSDVM.VMS["freebsd-arm64"]
-        rev_parse = mock.Mock(returncode=0, stdout="deadbeef1234\n")
-        ls_remote = mock.Mock(
-            returncode=0, stdout="ref: refs/heads/master\tHEAD\n" + "a" * 40 + "\tHEAD\n"
+    def _push_head_fake_run(self, rev_parse_sha="deadbeef1234\n", ls_remote_stdout=None):
+        """Build a `subprocess.run` side_effect covering push_head's
+        non-ssh_run calls (`git rev-parse`, the `ls-remote --symref`
+        fallback, and `git push`), plus the list `push_calls` it appends to.
+        `ls_remote_stdout=None` means the ls-remote fallback must NOT be
+        reached at all (any call raises AssertionError) -- used by tests
+        where the ssh_run symbolic-ref probe alone must resolve the branch.
+        """
+        rev_parse = mock.Mock(returncode=0, stdout=rev_parse_sha)
+        ls_remote = (
+            None if ls_remote_stdout is None else mock.Mock(returncode=0, stdout=ls_remote_stdout)
         )
         push = mock.Mock(returncode=0)
         push_calls: list[list[str]] = []
@@ -967,44 +936,165 @@ class SshGitTests(unittest.TestCase):
             if cmd[:2] == ["git", "rev-parse"]:
                 return rev_parse
             if cmd[:3] == ["git", "ls-remote", "--symref"]:
+                if ls_remote is None:
+                    raise AssertionError(
+                        "ls-remote fallback must not run when the ssh "
+                        "symbolic-ref probe already resolved the branch"
+                    )
                 return ls_remote
             if cmd[:2] == ["git", "push"]:
                 push_calls.append(cmd)
                 return push
             raise AssertionError(f"unexpected command: {cmd}")
 
-        with mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run):
+        return fake_run, push_calls
+
+    @staticmethod
+    def _push_head_fake_ssh_run(probe_result, materialized_ok=True, checkout_fixes_it=True):
+        """Build an `ssh_run` side_effect covering push_head's guest-side
+        calls: the `symbolic-ref --short HEAD` branch probe, the post-push
+        `test -f Cargo.toml` materialization check, and (if that check fails)
+        the forced-checkout recovery attempt.
+
+        `probe_result` is either a str (the branch the probe reports, rc=0),
+        a `subprocess.TimeoutExpired` instance to raise, or `None`/anything
+        falsy meaning the probe returns rc=1 with empty stdout (inconclusive,
+        e.g. not a git worktree yet).
+        """
+        checkout_calls: list[str] = []
+
+        def fake_ssh_run(vm_arg, cmd, timeout_s):
+            if "symbolic-ref" in cmd:
+                if isinstance(probe_result, BaseException):
+                    raise probe_result
+                if probe_result:
+                    return mock.Mock(returncode=0, stdout=f"{probe_result}\n")
+                return mock.Mock(returncode=1, stdout="")
+            if cmd == "test -f /root/carrick/Cargo.toml":
+                if not checkout_calls:
+                    return mock.Mock(returncode=0 if materialized_ok else 1)
+                # This is the post-checkout recheck.
+                return mock.Mock(returncode=0 if checkout_fixes_it else 1)
+            if "checkout -f" in cmd:
+                checkout_calls.append(cmd)
+                return mock.Mock(returncode=0)
+            raise AssertionError(f"unexpected ssh_run command: {cmd!r}")
+
+        return fake_ssh_run, checkout_calls
+
+    def test_push_head_resolves_branch_via_ssh_symbolic_ref_probe(self) -> None:
+        # Primary path: `git symbolic-ref --short HEAD` over ssh resolves the
+        # guest's checked-out branch directly, without ever needing
+        # `ls-remote --symref` (which cannot distinguish an unborn HEAD from
+        # no repo at all -- see push_head's docstring comment).
+        vm = BSDVM.VMS["freebsd-arm64"]
+        fake_run, push_calls = self._push_head_fake_run(ls_remote_stdout=None)
+        fake_ssh_run, _ = self._push_head_fake_ssh_run("main")
+
+        with (
+            mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(BSDVM, "ssh_run", side_effect=fake_ssh_run),
+        ):
+            sha = BSDVM.push_head(vm)
+        self.assertEqual(sha, "deadbeef1234")
+        self.assertEqual(len(push_calls), 1)
+        self.assertIn(BSDVM.git_url(vm), push_calls[0])
+        self.assertIn("HEAD:refs/heads/main", push_calls[0])
+
+    def test_push_head_targets_unborn_master_via_ssh_symbolic_ref_probe(self) -> None:
+        # The exact bug this fixup addresses: a golden provisioned before
+        # `_GIT_SETUP` pinned `-b main` has an UNBORN `master` HEAD. Plain
+        # `git ls-remote --symref` prints nothing at all for that (so the old
+        # code defaulted to "main", pushing an orphan branch the checked-out
+        # `master` worktree never saw). `git symbolic-ref --short HEAD` over
+        # ssh resolves an unborn HEAD just fine -- it reports "master" here.
+        vm = BSDVM.VMS["freebsd-arm64"]
+        fake_run, push_calls = self._push_head_fake_run(ls_remote_stdout=None)
+        fake_ssh_run, _ = self._push_head_fake_ssh_run("master")
+
+        with (
+            mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(BSDVM, "ssh_run", side_effect=fake_ssh_run),
+        ):
             BSDVM.push_head(vm)
         self.assertEqual(len(push_calls), 1)
         self.assertIn("HEAD:refs/heads/master", push_calls[0])
         self.assertNotIn("HEAD:refs/heads/main", push_calls[0])
 
-    def test_push_head_falls_back_to_main_when_remote_repo_is_empty(self) -> None:
-        # A brand-new guest repo (`git init`, zero commits) has an unborn HEAD:
-        # `ls-remote --symref ... HEAD` reports nothing at all (confirmed
-        # empirically -- see parse_symref_head's docstring). The very first
-        # push is the one that establishes the branch, so push_head must fall
-        # back to "main" rather than raising.
+    def test_push_head_falls_back_to_ls_remote_when_ssh_probe_fails(self) -> None:
+        # The ssh symbolic-ref probe can itself be inconclusive (e.g. ssh
+        # flaked, or `/root/carrick` isn't a git worktree yet); push_head
+        # must still work by falling back to `ls-remote --symref`.
         vm = BSDVM.VMS["freebsd-arm64"]
-        rev_parse = mock.Mock(returncode=0, stdout="deadbeef1234\n")
-        ls_remote = mock.Mock(returncode=0, stdout="")
-        push = mock.Mock(returncode=0)
-        push_calls: list[list[str]] = []
+        fake_run, push_calls = self._push_head_fake_run(
+            ls_remote_stdout="ref: refs/heads/master\tHEAD\n" + "a" * 40 + "\tHEAD\n"
+        )
+        fake_ssh_run, _ = self._push_head_fake_ssh_run(None)
 
-        def fake_run(cmd, **kwargs):
-            if cmd[:2] == ["git", "rev-parse"]:
-                return rev_parse
-            if cmd[:3] == ["git", "ls-remote", "--symref"]:
-                return ls_remote
-            if cmd[:2] == ["git", "push"]:
-                push_calls.append(cmd)
-                return push
-            raise AssertionError(f"unexpected command: {cmd}")
+        with (
+            mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(BSDVM, "ssh_run", side_effect=fake_ssh_run),
+        ):
+            BSDVM.push_head(vm)
+        self.assertEqual(len(push_calls), 1)
+        self.assertIn("HEAD:refs/heads/master", push_calls[0])
 
-        with mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run):
+    def test_push_head_falls_back_to_main_when_probe_and_ls_remote_both_empty(self) -> None:
+        # A brand-new guest repo (`git init`, zero commits) with the ssh
+        # probe ALSO inconclusive: `ls-remote --symref ... HEAD` reports
+        # nothing at all (confirmed empirically -- see parse_symref_head's
+        # docstring). The very first push is the one that establishes the
+        # branch, so push_head must fall back to "main" rather than raising.
+        vm = BSDVM.VMS["freebsd-arm64"]
+        fake_run, push_calls = self._push_head_fake_run(ls_remote_stdout="")
+        fake_ssh_run, _ = self._push_head_fake_ssh_run(None)
+
+        with (
+            mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(BSDVM, "ssh_run", side_effect=fake_ssh_run),
+        ):
             BSDVM.push_head(vm)
         self.assertEqual(len(push_calls), 1)
         self.assertIn("HEAD:refs/heads/main", push_calls[0])
+
+    def test_push_head_recovers_via_forced_checkout_when_worktree_still_empty(self) -> None:
+        # Materialization guard: even with the right branch name, a stale or
+        # oddly-configured guest worktree can stay empty after the push.
+        # push_head must retry with a forced checkout and succeed if that
+        # fixes it.
+        vm = BSDVM.VMS["freebsd-arm64"]
+        fake_run, push_calls = self._push_head_fake_run(ls_remote_stdout=None)
+        fake_ssh_run, checkout_calls = self._push_head_fake_ssh_run(
+            "main", materialized_ok=False, checkout_fixes_it=True
+        )
+
+        with (
+            mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(BSDVM, "ssh_run", side_effect=fake_ssh_run),
+        ):
+            sha = BSDVM.push_head(vm)
+        self.assertEqual(sha, "deadbeef1234")
+        self.assertEqual(len(push_calls), 1)
+        self.assertEqual(len(checkout_calls), 1)
+        self.assertIn("checkout -f main", checkout_calls[0])
+
+    def test_push_head_raises_when_worktree_stays_empty_after_forced_checkout(self) -> None:
+        # If the forced checkout doesn't fix it either, push_head must raise
+        # rather than silently reporting a pushed-but-empty guest as success.
+        vm = BSDVM.VMS["freebsd-arm64"]
+        fake_run, push_calls = self._push_head_fake_run(ls_remote_stdout=None)
+        fake_ssh_run, checkout_calls = self._push_head_fake_ssh_run(
+            "main", materialized_ok=False, checkout_fixes_it=False
+        )
+
+        with (
+            mock.patch.object(BSDVM.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(BSDVM, "ssh_run", side_effect=fake_ssh_run),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                BSDVM.push_head(vm)
+        self.assertEqual(len(checkout_calls), 1)
+        self.assertIn("main", str(ctx.exception))
 
     def test_ensure_dev_remote_is_idempotent(self) -> None:
         vm = BSDVM.VMS["freebsd-arm64"]
