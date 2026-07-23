@@ -375,13 +375,14 @@ fn identity_raw_range_valid(address: u64, length: usize) -> bool {
 mod identity_raw_range_tests {
     use super::{
         IDENTITY_PROTECTIONS, IdentityGuestMemory, PublishedFaultEntry, SharedWaitAssignment,
-        calibrate_x86_vvar_clock, cflow_guest_memory_fault, cflow_memory_backend_error,
-        cflow_raw_memory_fault, exclude_vfork_shared_ranges, freebsd_shared_waiter_key,
-        host_clock_ns, identity_checked_fetch_x86_instruction, identity_checked_read_exact,
-        identity_checked_write_exact, identity_kernel_copy_pipe_census,
-        identity_kernel_copyin_operation_census, identity_kernel_copyout_operation_census,
-        identity_raw_range_valid, init_shared_waiter_table, normalize_x86_gateway_x87_fip,
-        parse_loadable_elf, recover_x86_fault_snapshot, reset_identity_kernel_copy_pipe_census,
+        X86GatewayX87Witness, calibrate_x86_vvar_clock, cflow_guest_memory_fault,
+        cflow_memory_backend_error, cflow_raw_memory_fault, exclude_vfork_shared_ranges,
+        freebsd_shared_waiter_key, host_clock_ns, identity_checked_fetch_x86_instruction,
+        identity_checked_read_exact, identity_checked_write_exact,
+        identity_kernel_copy_pipe_census, identity_kernel_copyin_operation_census,
+        identity_kernel_copyout_operation_census, identity_raw_range_valid,
+        init_shared_waiter_table, normalize_x86_gateway_x87_fip, parse_loadable_elf,
+        recover_x86_fault_snapshot, reset_identity_kernel_copy_pipe_census,
         reset_identity_kernel_copyin_operation_census,
         reset_identity_kernel_copyout_operation_census, shared_futex_requeue_umtx,
         shared_futex_wait_umtx, shared_futex_wake_umtx, shared_waiter_slot,
@@ -1659,11 +1660,13 @@ mod identity_raw_range_tests {
         normalize_x86_gateway_x87_fip(
             &entries,
             0x8000..0x9000,
-            0x1234,
-            0,
-            0,
-            0,
-            false,
+            X86GatewayX87Witness {
+                entry_fip: 0x1234,
+                entry_fdp: 0,
+                completed_guest_va: 0,
+                completed_guest_data_va: 0,
+                completed_data_valid: false,
+            },
             &mut snapshot,
         )
         .expect("unique copied x87 instruction must reverse-map");
@@ -1684,8 +1687,19 @@ mod identity_raw_range_tests {
         // though the copied FLD completed in the JIT.
         snapshot.xsave[8..16].fill(0);
 
-        normalize_x86_gateway_x87_fip(&[], 0x8000..0x9000, 0, 0, 0x4010, 0, false, &mut snapshot)
-            .expect("the completed x87 instruction witness must normalize FIP");
+        normalize_x86_gateway_x87_fip(
+            &[],
+            0x8000..0x9000,
+            X86GatewayX87Witness {
+                entry_fip: 0,
+                entry_fdp: 0,
+                completed_guest_va: 0x4010,
+                completed_guest_data_va: 0,
+                completed_data_valid: false,
+            },
+            &mut snapshot,
+        )
+        .expect("the completed x87 instruction witness must normalize FIP");
         assert_eq!(snapshot.x87_instruction_pointer(), 0x4010);
         assert_eq!(snapshot.x87_fcs(), carrick_abi::LINUX_X8664_USER_CS);
         assert_eq!(snapshot.x87_fds(), carrick_abi::LINUX_X8664_USER_DS);
@@ -1698,11 +1712,13 @@ mod identity_raw_range_tests {
         normalize_x86_gateway_x87_fip(
             &[],
             0x8000..0x9000,
-            0,
-            0x55_000,
-            0x4010,
-            0,
-            true,
+            X86GatewayX87Witness {
+                entry_fip: 0,
+                entry_fdp: 0x55_000,
+                completed_guest_va: 0x4010,
+                completed_guest_data_va: 0,
+                completed_data_valid: true,
+            },
             &mut snapshot,
         )
         .expect("a valid zero data witness is an architectural address");
@@ -1714,11 +1730,13 @@ mod identity_raw_range_tests {
         normalize_x86_gateway_x87_fip(
             &[],
             0x8000..0x9000,
-            0,
-            0x55_000,
-            0x4020,
-            0,
-            false,
+            X86GatewayX87Witness {
+                entry_fip: 0,
+                entry_fdp: 0x55_000,
+                completed_guest_va: 0x4020,
+                completed_guest_data_va: 0,
+                completed_data_valid: false,
+            },
             &mut register_only,
         )
         .expect("a register-only x87 instruction must retain entry FDP");
@@ -1750,11 +1768,13 @@ mod identity_raw_range_tests {
             normalize_x86_gateway_x87_fip(
                 &entries,
                 0x8000..0x9000,
-                0x1234,
-                0,
-                0,
-                0,
-                false,
+                X86GatewayX87Witness {
+                    entry_fip: 0x1234,
+                    entry_fdp: 0,
+                    completed_guest_va: 0,
+                    completed_guest_data_va: 0,
+                    completed_data_valid: false,
+                },
                 &mut snapshot,
             ),
             Err(super::X86X87FipNormalizationError::AmbiguousInstruction { host_fip: 0x8012 })
@@ -12051,16 +12071,28 @@ enum X86X87FipNormalizationError {
     NonX87Instruction { host_fip: u64 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct X86GatewayX87Witness {
+    entry_fip: u64,
+    entry_fdp: u64,
+    completed_guest_va: u64,
+    completed_guest_data_va: u64,
+    completed_data_valid: bool,
+}
+
 fn normalize_x86_gateway_x87_fip(
     entries: &[PublishedFaultEntry],
     jit_range: std::ops::Range<u64>,
-    entry_fip: u64,
-    entry_fdp: u64,
-    last_copied_x87_guest_va: u64,
-    last_copied_x87_guest_data_va: u64,
-    last_copied_x87_data_valid: bool,
+    witness: X86GatewayX87Witness,
     snapshot: &mut X86UcontextSnapshot,
 ) -> Result<(), X86X87FipNormalizationError> {
+    let X86GatewayX87Witness {
+        entry_fip,
+        entry_fdp,
+        completed_guest_va: last_copied_x87_guest_va,
+        completed_guest_data_va: last_copied_x87_guest_data_va,
+        completed_data_valid: last_copied_x87_data_valid,
+    } = witness;
     const X87_FEATURE: u64 = 1;
 
     if last_copied_x87_guest_va != 0 {
@@ -12921,11 +12953,13 @@ fn run_x86_thread(
                 normalize_x86_gateway_x87_fip(
                     &fault_entries,
                     jit_start..jit_end,
-                    entry_x87_fip,
-                    entry_x87_fdp,
-                    context.last_copied_x87_guest_va,
-                    context.last_copied_x87_guest_data_va,
-                    context.last_copied_x87_data_valid != 0,
+                    X86GatewayX87Witness {
+                        entry_fip: entry_x87_fip,
+                        entry_fdp: entry_x87_fdp,
+                        completed_guest_va: context.last_copied_x87_guest_va,
+                        completed_guest_data_va: context.last_copied_x87_guest_data_va,
+                        completed_data_valid: context.last_copied_x87_data_valid != 0,
+                    },
                     &mut context.snapshot,
                 )
             });
