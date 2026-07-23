@@ -105,11 +105,15 @@ per-VMM and per-host implementations so KVM/bhyve/NVMM can share the runtime
 without pulling in HVF/applevisor. Use the `carrick-vmm-*` names for VMM crates
 (`carrick-vmm-hvf`, not the historical `carrick-hvf`).
 
-**Native (DSR) backend** (no-VMM same-ISA translation; extraction staged per
+**Native (DSR) backend** (no-VMM same-ISA translation; seams landed per
 [`docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md`](docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md))
-- `carrick-dsr` — platform-neutral DSR core: translation cache + publication index behind the `NativeHostJit` host seam, profiling census, page-geometry vocabulary, probe-sink seam, test hooks. Kept `ring`/`usdt`-free so a non-mac rig can darwin-cross-check it.
-- `carrick-dsr-aarch64` — the AArch64 guest-ISA lane: bad64/dynasmrt decode/emit, block planner + exclusive fusion, gateway (`gateway_aarch64.S`), counter virtualization, artifact store, mapped memory + translator. Compiles on every host; only the gateway's assembled surface is macos/aarch64-gated.
-- Integration glue (thread loop, dispatch adapter, signal lowering, exec capsule) still lives in `carrick-runtime/src/native_darwin*` pending the lane seam; a `carrick-dsr-x86` + `carrick-native-{darwin,freebsd}` split is the planned FreeBSD/amd64 bring-up path.
+- `carrick-dsr` — platform-neutral DSR core: the `NativeLane`/`GuestIsa`/`NativeHost` seam traits (`lane.rs`), translation cache + publication index behind the `NativeHostJit` host seam, `prepared_image`, profiling census, page-geometry vocabulary, probe-sink seam, test hooks. Kept `ring`/`usdt`-free so a non-mac rig can darwin-cross-check it.
+- `carrick-dsr-aarch64` — AArch64 guest-ISA lane: bad64/dynasmrt decode/emit, block planner + exclusive fusion, gateway (`gateway_aarch64.S`), counter virtualization, artifact store, mapped memory + translator.
+- `carrick-dsr-x86` — x86_64 guest-ISA lane: `iced-x86` decode/classify, block planning + control-flow lowering, a hand-rolled byte-level block emitter (no dynasmrt — ahead of this spec's fixed decision), gateway (`gateway_x86_64.S`) + full x87/SSE/AVX state transfer; already runs real Linux/x86_64 ELF binaries through `native_freebsd.rs`.
+- `carrick-native-darwin` — Darwin `NativeHost` impl (`DarwinHost`): `MAP_JIT`/`pthread_jit_write_protect_np` JIT cache, the byte-for-byte-moved `csrc/native_darwin.c` trap/kick shim.
+- `carrick-native-freebsd` — FreeBSD `NativeHost` impl (`FreebsdHost`): SHM_ANON dual-mapped W^X JIT cache (no process-wide `mprotect` flip), amd64 `mcontext_t` trap shim.
+- `carrick-runtime/src/native_darwin.rs` (~13.0k lines, ~7.1k of it `mod tests`) and `src/native_freebsd.rs` (~19.7k lines) are the two lanes' thread-loop/dispatch-adapter/signal-lowering/fork-exec drivers; both route exclusively through the one wiring point, `carrick-runtime/src/native/mod.rs` (`type HostNativeLane` resolves to `DarwinAarch64Lane` or `FreebsdX8664Lane`), plus its `native/fork_child.rs` shared post-fork dispatcher reset.
+- Plan: [`docs/superpowers/plans/2026-07-23-native-lane-seam-phase1.md`](docs/superpowers/plans/2026-07-23-native-lane-seam-phase1.md); Phase 2 (separate plan) merges the two drivers' thread loops behind `NativeLane` and neutralizes `IdentityGuestMemory`/`NativeMapping` into an ISA-keyed identity-memory module.
 
 **VMM backends** (hypervisor implementations over `carrick-hal`)
 - `carrick-vmm-hvf` — macOS Hypervisor.framework backend; the mature one (trap loop, vCPU cluster).

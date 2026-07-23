@@ -179,3 +179,78 @@ Naming note: `carrick-dsr*` for the translation engine (the ISA axis),
 - **`usdt` probe relocation:** DSR probes move crates; probe names must stay
   stable so `carrick trace` scripts keep working — assert via the existing
   trace smoke path on macOS.
+
+## Implementation drift (2026-07-23)
+
+Recorded after Phase 1 (`docs/superpowers/plans/2026-07-23-native-lane-seam-phase1.md`,
+Tasks 1-6) landed on `feat/native-lane-seam-phase1`. This section notes where
+the landed shape differs from the fixed decisions and crate graph above; it
+does not revise them.
+
+- **FreeBSD JIT cache: an SHM_ANON dual map, not the `mprotect` RW↔RX flip the
+  M1 milestone assumed.** `crates/carrick-native-freebsd/src/jit.rs` gives the
+  reason:
+
+  > FreeBSD has no Darwin `MAP_JIT`/per-thread write-protect toggle, and
+  > `mprotect` RW↔RX flips would be PROCESS-wide — a writer would yank X from
+  > under concurrently-executing guest threads.
+
+  The cache is instead one `shm_open(SHM_ANON)` object mapped twice —
+  `PROT_READ|PROT_EXEC` at `JitRegion.exec_base`, `PROT_READ|PROT_WRITE` at
+  `JitRegion.write_base` — so `begin_thread_write`/`end_thread_write` are
+  no-ops and no protection ever flips.
+
+- **`carrick-native-darwin` now exists** (`crates/carrick-native-darwin`,
+  commit `ee1d63ba`), as the crate graph above already named it: the Darwin
+  host layer's `csrc/native_darwin.c` trap/kick shim moved byte-identical
+  (git-mv'd; that file shows 0 added/removed lines in the extraction commit)
+  out of `carrick-runtime`, alongside the real `DarwinHostJit` (MAP_JIT /
+  `pthread_jit_write_protect_np`) and a `DarwinHost` impl of
+  `carrick_dsr::lane::NativeHost`.
+
+- **Fork repair landed as `NativeHostJit::remap_for_fork_child`**
+  (`crates/carrick-dsr/src/host.rs`), fulfilling the "fork repair" line in the
+  `NativeHost` trait sketch above with this exact named shape: every native
+  host answers it, and a fork child never keeps executing against the
+  parent's JIT region. `FreebsdHostJit::remap_for_fork_child` always returns a
+  brand-new SHM_ANON object (`ForkChildJit::Fresh`) — its `MAP_SHARED` dual
+  map would otherwise still be shared with the child. Darwin's `MAP_JIT`
+  region is `MAP_PRIVATE` and survives fork as a COW copy already, so
+  `DarwinHostJit::remap_for_fork_child` answers `ForkChildJit::Inherited` and
+  leaves the real repair to `after_fork_child` (resetting the per-thread
+  write-protect bit).
+
+- **M0.8 wiring is a facade module, not a bare `#[cfg]` pair inline at call
+  sites.** `crates/carrick-runtime/src/native/mod.rs` is the single place
+  `execute.rs`/`runtime.rs`/`lib.rs` reach into a native backend (enforced by
+  a drift-guard test reading the three files' committed source); it defines
+  `type HostNativeLane` under exactly one
+  `#[cfg(all(target_os = ..., target_arch = ...))]` pair per lane
+  (`DarwinAarch64Lane` / `FreebsdX8664Lane`), matching this design's "ONE
+  wiring point" decision. Per the module's own doc comment this is
+  **strangler-interim**: the facade's function bodies still branch on target
+  `#[cfg]` and call straight into `native_darwin`/`native_freebsd`; Phase 2 is
+  what collapses them into one generic call through `HostNativeLane`.
+
+- **`prepared_image` now lives in `carrick-dsr`**
+  (`crates/carrick-dsr/src/prepared_image.rs`), closing the "What moves
+  where" table's mapped-memory/address row for that piece; `carrick-dsr-aarch64`
+  re-exports it under its old path (`pub use carrick_dsr::prepared_image;`) so
+  existing `carrick_dsr_aarch64::prepared_image::…` call sites are unaffected.
+
+- **x86_64 emission is hand-rolled, not `dynasmrt`** — a drift in the "Fixed
+  decisions" section above, predating Phase 1 (the seams design's own M2
+  milestone, landed 2026-07-17 through 2026-07-20 per `git log --
+  crates/carrick-dsr-x86`, tracked by the separate
+  `docs/superpowers/specs/2026-07-17-x86-dsr-execution-design.md`). `carrick-dsr-x86/src/emit.rs`
+  hand-encodes x86_64 bytes directly (`iced-x86` is used for decode only);
+  there is no `dynasmrt` dependency in that crate's `Cargo.toml`. The crate
+  now also has a real `gateway.rs`/`gateway_x86_64.S`, block planner
+  (`block.rs`), control-flow lowering (`cflow.rs`), and full x87/SSE/AVX
+  state transfer (`fxstate.rs`/`legacy_x87.rs`/`xstate_{save,restore}.rs`) —
+  well past the crate graph's "M0: typed Unsupported stubs" note above (that
+  crate's own `lib.rs` doc comment is itself stale on this point and is a
+  separate follow-up, not fixed here).
+
+Not this file's business: the `bsdvm` acceptance-harness campaign's own
+`ladder` subcommand addition is tracked in its own plan, not here.
