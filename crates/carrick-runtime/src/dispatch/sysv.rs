@@ -11,10 +11,9 @@
 //!   - shmget(key, size, IPC_CREAT|IPC_EXCL|perms) → fail with EEXIST if present.
 //!   - shmat(shmid, addr_hint=0, flags=0) → MAP_SHARED into guest VA via
 //!     the same MapHostAlias path mmap(MAP_SHARED, fd) uses.
-//!   - shmdt(addr) → record the detach; the guest's mmap arena keeps the
-//!     reservation but the host munmap happens at runtime exit. (Linux
-//!     semantics: shmdt unmaps, but for carrick a release that doesn't
-//!     reclaim the guest VA still passes every LTP test we've audited.)
+//!   - shmdt(addr) → invalidate the alias mapping, retire its complete VMA
+//!     metadata, and then remove the attachment/decrement `nattch`. Ambiguous
+//!     backend teardown failure is fail-stop rather than exposing split ownership.
 //!   - shmctl(shmid, IPC_RMID, NULL) → unlink the backing file. Existing
 //!     mmaps remain valid (Linux mmap+unlink semantics).
 //!   - shmctl(shmid, IPC_STAT, buf) → fill an `shmid_ds` from carrick's
@@ -214,6 +213,7 @@ bitflags::bitflags! {
     struct ShmAttachFlags: u64 {
         const RDONLY = 0o10000;
         const RND = 0o20000;
+        const REMAP = 0o40000;
     }
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -544,6 +544,13 @@ impl SemSet {
                 self.mode.other_writable()
             }
     }
+}
+
+pub(crate) struct HostAliasShmatCommit {
+    pub(super) va: u64,
+    pub(super) shmid: i32,
+    pub(super) atime: u64,
+    pub(super) lpid: i32,
 }
 
 #[derive(Default, Debug)]
@@ -1977,6 +1984,24 @@ fn sysvipc_msg_table_from_files() -> String {
 // ===================================================================
 
 impl SyscallDispatcher {
+    pub(super) fn commit_host_alias_shmat(&self, commit: HostAliasShmatCommit) {
+        let mut state = self.sysv.lock();
+        if state.attachments.contains_key(&commit.va) || !state.segments.contains_key(&commit.shmid)
+        {
+            // The host mapping is already installed. Alias exclusion proves no
+            // legitimate shmat/shmdt/shmctl mutation can intervene here, so an
+            // occupied VA or vanished segment is irrecoverable corruption.
+            std::process::abort();
+        }
+        state.attachments.insert(commit.va, commit.shmid);
+        let Some(segment) = state.segments.get_mut(&commit.shmid) else {
+            std::process::abort();
+        };
+        segment.nattch = adjust_shm_nattch(segment, 1);
+        segment.atime = commit.atime;
+        segment.lpid = commit.lpid;
+    }
+
     pub(crate) fn init_sysv_run_scope(&self) {
         init_sysv_run_scope();
     }
@@ -2140,9 +2165,15 @@ impl SyscallDispatcher {
         /// SHM_RND rounds an unaligned requested address down to a page
         /// boundary. SHM_REMAP remains unsupported.
         fn shmat(this, cx, shmid: u64, addr: u64, flag: u64) {
+            let host_alias_dispatch = this.begin_host_alias_dispatch();
             let shmid = shmid as i32;
             let attach_flags = ShmAttachFlags::from_bits_retain(flag);
             let linux_page_size = this.linux_page_size();
+            if attach_flags.contains(ShmAttachFlags::REMAP) {
+                // SHM_REMAP is not implemented. Never start a fixed replacement
+                // while the transaction is deliberately non-destructive.
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let (host_fd, size) = {
                 let mut state = this.sysv.lock();
                 match shmat_open_fd(&mut state, shmid) {
@@ -2197,13 +2228,6 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: va as i64 });
                 }
             }
-            // Fresh, process-tree-global, never-reused alias IPA (see
-            // crate::memory::alloc_alias_ipa — the shared hv_vm's stage-2 TLB can't
-            // be flushed on arm64, so an alias IPA must never be reused).
-            let Some(ipa) = crate::memory::alloc_alias_ipa(map_len) else {
-                unsafe { libc::close(host_fd) };
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            };
             if addr != 0
                 && !addr.is_multiple_of(linux_page_size)
                 && !attach_flags.contains(ShmAttachFlags::RND)
@@ -2211,15 +2235,29 @@ impl SyscallDispatcher {
                 unsafe { libc::close(host_fd) };
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let va = if addr != 0 {
-                addr & !(linux_page_size - 1)
-            } else {
+            let requested_va = (addr != 0).then_some(addr & !(linux_page_size - 1));
+            if let Some(va) = requested_va
+                && (this.guest_vma_overlaps(va, map_len)
+                    || this.sysv.lock().attachments.contains_key(&va))
+            {
+                // Without SHM_REMAP Linux refuses to replace any existing VMA.
+                // Check before consuming a monotonic alias IPA or touching a host
+                // mapping; the unsupported replacement is never destructive.
+                unsafe { libc::close(host_fd) };
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            // Fresh, process-tree-global, never-reused alias IPA (see
+            // crate::memory::alloc_alias_ipa — the shared hv_vm's stage-2 TLB can't
+            // be flushed on arm64, so an alias IPA must never be reused).
+            let Some(ipa) = crate::memory::alloc_alias_ipa(map_len) else {
+                unsafe { libc::close(host_fd) };
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
+            let va = requested_va.unwrap_or_else(|| {
                 crate::memory::LINUX_HIGH_VA_THRESHOLD
                     + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE)
-            };
-            if !attach_flags.contains(ShmAttachFlags::RND)
-                && this.sysv.lock().attachments.contains_key(&va)
-            {
+            });
+            if this.sysv.lock().attachments.contains_key(&va) {
                 unsafe { libc::close(host_fd) };
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -2233,28 +2271,49 @@ impl SyscallDispatcher {
                 libc::PROT_READ | libc::PROT_WRITE
             };
 
-            // Track the attach so shmdt can find the shmid and the
-            // shm_nattch counter (read by LTP shmat01 via IPC_STAT) is
-            // accurate.
-            {
-                let mut state = this.sysv.lock();
-                state.attachments.insert(va, shmid);
-                if let Some(seg) = state.segments.get_mut(&shmid) {
-                    seg.nattch = adjust_shm_nattch(seg, 1);
-                    seg.atime = std::time::SystemTime::now()
+            let guest_prot = if attach_flags.contains(ShmAttachFlags::RDONLY) {
+                crate::linux_abi::LinuxProtFlags::READ
+            } else {
+                crate::linux_abi::LinuxProtFlags::READ
+                    | crate::linux_abi::LinuxProtFlags::WRITE
+            };
+            let transaction = host_alias_dispatch.publish(HostAliasCommit::shmat(
+                crate::dispatch::mem::HostAliasMmapCommit {
+                    start: va,
+                    len: map_len,
+                    prot: guest_prot,
+                    sharing: ProcMapSharing::Shared,
+                    path: String::new(),
+                    locked: None,
+                    resident: true,
+                    bus_fault: None,
+                    write_sealed_shared: false,
+                    writable_memfd: None,
+                },
+                HostAliasShmatCommit {
+                    va,
+                    shmid,
+                    atime: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    seg.lpid = crate::namespace::pid::self_ns_pid() as i32;
-                }
-            }
+                        .unwrap_or(0),
+                    lpid: crate::namespace::pid::self_ns_pid() as i32,
+                },
+            ));
 
             Ok(DispatchOutcome::MapHostAlias {
+                transaction,
                 va: GuestVa(va),
                 ipa: Gpa(ipa),
                 len: map_len,
                 payload: Vec::new(),
-                file: Some((host_fd, 0, host_prot)),
+                file: Some((
+                    // SAFETY: `shmat_open_fd` returned a fresh descriptor whose
+                    // ownership transfers into this non-cloneable outcome.
+                    unsafe { HostAliasOwnedFd::from_raw_fd(host_fd) },
+                    0,
+                    host_prot,
+                )),
                 shared: true,
                 prot: if attach_flags.contains(ShmAttachFlags::RDONLY) {
                     crate::linux_abi::LINUX_PROT_READ
@@ -2270,30 +2329,60 @@ impl SyscallDispatcher {
         /// mapping, and tear down the dynamic alias leaves so repeated SysV shm
         /// attach/detach cycles reclaim the backend's per-alias page-table pool.
         fn shmdt(this, cx, addr: u64) {
-            let mut state = this.sysv.lock();
-            if state.remapped_attachments.contains(&addr) {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            let shmid = match state.attachments.remove(&addr) {
-                Some(id) => id,
-                None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
+            let (shmid, len) = {
+                let state = this.sysv.lock();
+                if state.remapped_attachments.contains(&addr) {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                let Some(shmid) = state.attachments.get(&addr).copied() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                let Some(segment) = state.segments.get(&shmid) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                let Some(aligned_len) =
+                    align_up_u64(segment.size as u64, crate::trap::HVF_PAGE_SIZE)
+                else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                let Ok(len) = usize::try_from(aligned_len) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                (shmid, len)
             };
-            let size = state.segments.get(&shmid).map(|seg| seg.size);
-            if let Some(seg) = state.segments.get_mut(&shmid) {
-                seg.nattch = adjust_shm_nattch(seg, -1);
-                seg.dtime = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                seg.lpid = crate::namespace::pid::self_ns_pid() as i32;
+            if cx.memory.unmap_alias_range(addr, len).is_err() {
+                // A backend error may follow a partial page-table/stage-2
+                // mutation. Returning ENOMEM would let the guest continue with
+                // attachment and backend ownership in an unknowable split state.
+                std::process::abort();
             }
-            if let Some(size) = size
-                && let Some(len) = align_up_u64(size as u64, crate::trap::HVF_PAGE_SIZE)
-                    .and_then(|len| usize::try_from(len).ok())
+            cx.memory.set_unmapped(addr, len, true);
+            this.remove_mapping_metadata(addr, len as u64);
+            let dtime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let lpid = crate::namespace::pid::self_ns_pid() as i32;
+            let mut state = this.sysv.lock();
+            if state.remapped_attachments.contains(&addr)
+                || state.attachments.get(&addr).copied() != Some(shmid)
             {
-                let _ = cx.memory.unmap_alias_range(addr, len);
-                cx.memory.set_unmapped(addr, len, true);
+                // Alias exclusion makes this impossible unless bookkeeping was
+                // mutated outside the contract. The backend unmap has already
+                // succeeded, so continuing with stale attachment metadata would
+                // leave two irreconcilable owners.
+                std::process::abort();
             }
+            let Some(seg) = state.segments.get_mut(&shmid) else {
+                // The backend alias is gone and the attachment still names this
+                // segment, so there is no recoverable bookkeeping state.
+                std::process::abort();
+            };
+            seg.nattch = adjust_shm_nattch(seg, -1);
+            seg.dtime = dtime;
+            seg.lpid = lpid;
+            state.attachments.remove(&addr);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -2304,6 +2393,7 @@ impl SyscallDispatcher {
         ///              shm_ctime) in carrick's owned segment bookkeeping so a
         ///              following IPC_STAT reads them back.
         fn shmctl(this, cx, shmid: u64, cmd: u64, buf: u64) {
+            let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let shmid = shmid as i32;
             let creds = this.cred_snapshot();
             match cmd {
@@ -3890,6 +3980,71 @@ mod ipc_set_tests {
     use super::*;
     use std::path::PathBuf;
 
+    struct FailingUnmapMemory {
+        inner: LinearMemory,
+        set_unmapped_calls: Vec<(u64, usize, bool)>,
+    }
+
+    impl FailingUnmapMemory {
+        fn new(base: u64, len: usize) -> Self {
+            Self {
+                inner: LinearMemory::new(base, vec![0; len]),
+                set_unmapped_calls: Vec::new(),
+            }
+        }
+    }
+
+    impl GuestMemory for FailingUnmapMemory {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.inner.read_bytes_raw(address, length)
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.inner.write_bytes_raw(address, bytes)
+        }
+
+        fn unmap_alias_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+            Err(MemoryError::HostMap(
+                "injected alias unmap failure".to_string(),
+            ))
+        }
+
+        fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
+            self.set_unmapped_calls.push((address, len, unmapped));
+        }
+    }
+
+    fn insert_test_shm_segment(
+        dispatcher: &SyscallDispatcher,
+        shmid: i32,
+        size: usize,
+    ) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("temporary shm backing");
+        file.as_file()
+            .set_len(size as u64)
+            .expect("size temporary shm backing");
+        dispatcher.sysv.lock().segments.insert(
+            shmid,
+            ShmSegment {
+                path: file.path().to_path_buf(),
+                key: 0,
+                size,
+                mode: ShmPermMode::requested(0o600),
+                uid: 0,
+                gid: 0,
+                cuid: 0,
+                cgid: 0,
+                nattch: 0,
+                ctime: 1,
+                atime: 0,
+                dtime: 0,
+                cpid: 1,
+                lpid: 0,
+            },
+        );
+        file
+    }
+
     #[test]
     fn scoped_host_sem_key_separates_run_scopes() {
         let key = 0x1234_5678u32 as i32;
@@ -3910,6 +4065,251 @@ mod ipc_set_tests {
             LINUX_IPC_PRIVATE as libc::key_t,
             "IPC_PRIVATE must stay host-private"
         );
+    }
+
+    #[test]
+    fn shmdt_ambiguous_backend_unmap_failure_aborts_with_sigabrt() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork shmdt failure child");
+        if pid == 0 {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+            let dispatcher = SyscallDispatcher::new();
+            let shmid = 4240;
+            let addr = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+            dispatcher.sysv.lock().segments.insert(
+                shmid,
+                ShmSegment {
+                    path: PathBuf::from("/tmp/carrick-shm/test-failing-shmdt"),
+                    key: 0,
+                    size: LINUX_PAGE_SIZE as usize,
+                    mode: ShmPermMode::requested(0o600),
+                    uid: 0,
+                    gid: 0,
+                    cuid: 0,
+                    cgid: 0,
+                    nattch: 7,
+                    ctime: 1,
+                    atime: 2,
+                    dtime: 3,
+                    cpid: 4,
+                    lpid: 5,
+                },
+            );
+            dispatcher.sysv.lock().attachments.insert(addr, shmid);
+            let mut memory = FailingUnmapMemory::new(0x1000, 0x1000);
+            let _ = dispatcher.dispatch_normalized(
+                SyscallRequest::new(197, SyscallArgs::from([addr, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &CompatReporter::default(),
+                None,
+            );
+            unsafe { libc::_exit(111) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFSIGNALED(status));
+        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+    }
+
+    #[test]
+    fn shmdt_success_retires_all_committed_mmap_metadata_before_attachment() {
+        let dispatcher = SyscallDispatcher::new();
+        let shmid = 4245;
+        let addr = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let len = crate::trap::HVF_PAGE_SIZE;
+        dispatcher.sysv.lock().segments.insert(
+            shmid,
+            ShmSegment {
+                path: PathBuf::from("/tmp/carrick-shm/test-successful-shmdt"),
+                key: 0,
+                size: LINUX_PAGE_SIZE as usize,
+                mode: ShmPermMode::requested(0o600),
+                uid: 0,
+                gid: 0,
+                cuid: 0,
+                cgid: 0,
+                nattch: 1,
+                ctime: 1,
+                atime: 2,
+                dtime: 0,
+                cpid: 4,
+                lpid: 5,
+            },
+        );
+        dispatcher.sysv.lock().attachments.insert(addr, shmid);
+        let range = crate::vfs::GuestMemoryRange::new(GuestVa(addr), GuestVa(addr + len))
+            .expect("shmat metadata range");
+        let writable_memfd =
+            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                base: OpenDescriptionBase::new(0),
+                path: "memfd:shmdt-test".into(),
+                contents: Vec::new(),
+                offset: 0,
+            }));
+        dispatcher.commit_host_alias_mmap(crate::dispatch::mem::HostAliasMmapCommit {
+            start: addr,
+            len,
+            prot: crate::linux_abi::LinuxProtFlags::READ | crate::linux_abi::LinuxProtFlags::WRITE,
+            sharing: ProcMapSharing::Shared,
+            path: String::new(),
+            locked: Some(range),
+            resident: true,
+            bus_fault: Some((addr, len)),
+            write_sealed_shared: true,
+            writable_memfd: Some(writable_memfd),
+        });
+        assert!(dispatcher.range_has_mapping_metadata_for_test(addr, len));
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+
+        let outcome = dispatcher
+            .dispatch_normalized(
+                SyscallRequest::new(197, SyscallArgs::from([addr, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &CompatReporter::default(),
+                None,
+            )
+            .expect("shmdt is claimed")
+            .expect("successful shmdt dispatch");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert!(!dispatcher.range_has_mapping_metadata_for_test(addr, len));
+        let state = dispatcher.sysv.lock();
+        assert!(!state.attachments.contains_key(&addr));
+        let segment = state.segments.get(&shmid).expect("detached segment");
+        assert_eq!(segment.nattch, 0);
+        assert_ne!(segment.dtime, 0);
+    }
+
+    #[test]
+    fn explicit_shmat_rejects_dynamic_vma_overlap_before_alias_install() {
+        const REQUESTED: u64 = 0x20_0000_0000;
+        let dispatcher = SyscallDispatcher::new();
+        let shmid = 4246;
+        let _file = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
+        dispatcher.commit_host_alias_mmap(crate::dispatch::mem::HostAliasMmapCommit {
+            start: REQUESTED,
+            len: crate::trap::HVF_PAGE_SIZE,
+            prot: crate::linux_abi::LinuxProtFlags::READ,
+            sharing: ProcMapSharing::Private,
+            path: "occupied-dynamic".into(),
+            locked: None,
+            resident: false,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        });
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let outcome = dispatcher
+            .dispatch_normalized(
+                SyscallRequest::new(
+                    196,
+                    SyscallArgs::from([shmid as u64, REQUESTED, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+                None,
+            )
+            .expect("shmat is claimed")
+            .expect("overlap rejection dispatch");
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+        assert!(dispatcher.sysv.lock().attachments.is_empty());
+    }
+
+    #[test]
+    fn explicit_shmat_rejects_real_boot_vma_overlap_before_alias_install() {
+        const REQUESTED: u64 = 0x20_0000_0000;
+        let dispatcher = SyscallDispatcher::new();
+        let shmid = 4247;
+        let _file = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
+        dispatcher.set_address_space_regions(vec![ProcMapsEntry {
+            start: REQUESTED,
+            end: REQUESTED + crate::trap::HVF_PAGE_SIZE,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: ProcMapSharing::Private,
+            path: "boot-text".into(),
+        }]);
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let outcome = dispatcher
+            .dispatch_normalized(
+                SyscallRequest::new(
+                    196,
+                    SyscallArgs::from([shmid as u64, REQUESTED, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+                None,
+            )
+            .expect("shmat is claimed")
+            .expect("boot overlap rejection dispatch");
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+        assert!(dispatcher.sysv.lock().attachments.is_empty());
+    }
+
+    #[test]
+    fn aborted_host_alias_leaves_sysv_attachment_and_nattch_exact() {
+        let dispatcher = SyscallDispatcher::new();
+        let shmid = 4241;
+        dispatcher.sysv.lock().segments.insert(
+            shmid,
+            ShmSegment {
+                path: PathBuf::from("/tmp/carrick-shm/test-pending-shmat"),
+                key: 0,
+                size: LINUX_PAGE_SIZE as usize,
+                mode: ShmPermMode::requested(0o600),
+                uid: 0,
+                gid: 0,
+                cuid: 0,
+                cgid: 0,
+                nattch: 7,
+                ctime: 1,
+                atime: 2,
+                dtime: 3,
+                cpid: 4,
+                lpid: 5,
+            },
+        );
+        let va = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let guard = dispatcher.begin_host_alias_dispatch();
+        let transaction = guard.publish(HostAliasCommit::shmat(
+            crate::dispatch::mem::HostAliasMmapCommit {
+                start: va,
+                len: LINUX_PAGE_SIZE,
+                prot: crate::linux_abi::LinuxProtFlags::READ
+                    | crate::linux_abi::LinuxProtFlags::WRITE,
+                sharing: ProcMapSharing::Shared,
+                path: String::new(),
+                locked: None,
+                resident: true,
+                bus_fault: None,
+                write_sealed_shared: false,
+                writable_memfd: None,
+            },
+            HostAliasShmatCommit {
+                va,
+                shmid,
+                atime: 99,
+                lpid: 100,
+            },
+        ));
+        {
+            let state = dispatcher.sysv.lock();
+            assert!(!state.attachments.contains_key(&va));
+            let segment = state.segments.get(&shmid).expect("pending segment");
+            assert_eq!((segment.nattch, segment.atime, segment.lpid), (7, 2, 5));
+        }
+        let install = transaction
+            .claim()
+            .expect("claim pending host alias install");
+        drop(install);
+        let state = dispatcher.sysv.lock();
+        assert!(!state.attachments.contains_key(&va));
+        let segment = state.segments.get(&shmid).expect("aborted segment");
+        assert_eq!((segment.nattch, segment.atime, segment.lpid), (7, 2, 5));
     }
 
     /// `shmctl(IPC_SET)` must APPLY the requested permission bits to carrick's

@@ -36,7 +36,7 @@ pub(super) fn fallback_counter_ticks() -> Option<u64> {
     counter::fallback_counter_ticks()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn host_counter_plan_is_inline_for_test() -> bool {
     matches!(
         counter::host_counter_plan(),
@@ -74,7 +74,7 @@ pub(super) fn test_thread_translator(capacity: usize) -> Result<ThreadTranslator
     ThreadTranslator::new(capacity)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn execute_virtual_counter_for_test() -> Result<u64, types::DsrError> {
     let guest = carrick_guest_mem::GuestVa(0x19_000);
     let plan = block::BlockPlan {

@@ -903,7 +903,7 @@ mod tests {
     use super::*;
     use crate::memory::{
         LINUX_ALIAS_IPA_BASE, LINUX_HIGH_VA_THRESHOLD, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE,
-        stage1_identity_page_tables,
+        LINUX_PRIVATE_OVERLAY_BASE, LINUX_SHARED_FILE_BASE, stage1_identity_page_tables,
     };
 
     fn manager() -> PageTableManager {
@@ -988,6 +988,29 @@ mod tests {
         mgr.set_rw(va, 0x2000, true).expect("rw");
         assert!(mgr.is_valid(va));
         assert!(mgr.is_valid(va + 0x1000));
+    }
+
+    #[test]
+    fn private_overlay_protection_preserves_backing_and_identity_restore_repoints() {
+        let mut mgr = manager();
+        let va = LINUX_SHARED_FILE_BASE + 0x4000;
+        let overlay = LINUX_PRIVATE_OVERLAY_BASE + 0x8000;
+        mgr.map_aliased(va, overlay, 0x1000, true)
+            .expect("private overlay");
+        mgr.set_readonly(va, 0x1000, false)
+            .expect("protect overlay readonly");
+        assert_eq!(mgr.translate(va), Some(overlay));
+
+        mgr.invalidate(va, 0x1000).expect("unmap overlay");
+        mgr.map_aliased(va, va, 0x1000, true)
+            .expect("restore shared identity");
+        mgr.set_rw(va, 0x1000, false)
+            .expect("protect restored shared mapping");
+        assert_eq!(
+            mgr.translate(va),
+            Some(va),
+            "protect_range must not resurrect the stale private-overlay IPA"
+        );
     }
 
     #[test]

@@ -273,6 +273,11 @@ pub(crate) enum Commands {
         /// `--customPlatform`).
         #[arg(long, value_name = "OS/ARCH")]
         platform: Option<String>,
+        /// Preserve the exact kaniko Docker archive at PATH in addition to
+        /// ingesting it into Carrick's local store. The destination must not
+        /// already exist. Incompatible with `--push`.
+        #[arg(long = "output", value_name = "PATH", conflicts_with = "push")]
+        output: Option<PathBuf>,
         /// Push the built image to the registry instead of loading it into the
         /// local store. When set kaniko pushes to `--tag`'s registry; otherwise
         /// the image is built to a tar and ingested locally.
@@ -843,6 +848,10 @@ pub(crate) enum VolumeCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum DebugCommand {
+    /// Print the versioned native-x86 DSR context layout consumed by
+    /// `scripts/native-x86-profile.py`. The running process's matching Carrick
+    /// binary is authoritative; do not hardcode these offsets in D scripts.
+    NativeX86Layout,
     /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
     /// (with DFSC for data aborts) so the operator doesn't have to hand-
     /// parse syndromes during an interactive session.
@@ -1015,6 +1024,24 @@ mod tests {
         assert!(
             Cli::try_parse_from(["carrick", "volume", "inspect", "vol1", "vol2"]).is_ok(),
             "volume inspect should accept multiple names"
+        );
+    }
+
+    #[test]
+    fn build_output_conflicts_with_push() {
+        assert!(
+            Cli::try_parse_from([
+                "carrick",
+                "build",
+                "--output",
+                "/tmp/image.tar",
+                "--push",
+                ".",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["carrick", "build", "--output", "/tmp/image.tar", ".",]).is_ok()
         );
     }
 }

@@ -48,7 +48,7 @@ use address::NativeLayout;
 use std::collections::{BTreeMap, BTreeSet};
 
 use std::io::Read;
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -63,6 +63,7 @@ use crate::memory::{AddressSpace, AddressSpaceError};
 use crate::native_prepared_image::{NativeRelativeRelocation, ValidatedPreparedImage};
 use crate::page_profile::ExecutionPlan;
 use crate::runtime::{RunResult, RuntimeError, maybe_dump_debug_state};
+use carrick_guest_mem::RepointPrivateError;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_hal::{
     ForkOutcome, RawSyscall, Reg, RegAccess, SysReg, SyscallTrap, TrapError, VcpuRegistry,
@@ -2785,6 +2786,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 }
             }
             DispatchOutcome::MapHostAlias {
+                transaction,
                 va,
                 ipa: _,
                 len,
@@ -2793,16 +2795,49 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 prot_none,
                 ..
             } => {
-                memory
-                    .write()
-                    .map_host_alias(va.raw(), len, &payload, file, prot_none)?;
+                let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
+                let retval = match transaction.claim() {
+                    None => {
+                        drop(file);
+                        crate::linux_abi::LINUX_ENOMEM.guest_retval()
+                    }
+                    Some(install) => {
+                        let mut mapped_memory = memory.write();
+                        if mapped_memory
+                            .map_host_alias(
+                                va.raw(),
+                                len,
+                                &payload,
+                                file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                                prot_none,
+                            )
+                            .is_err()
+                        {
+                            std::process::abort();
+                        }
+                        if let Some((bus_start, bus_len)) = install.bus_fault_range() {
+                            let Ok(bus_len) = usize::try_from(bus_len) else {
+                                std::process::abort();
+                            };
+                            if mapped_memory.protect_range(bus_start, bus_len, 0).is_err() {
+                                std::process::abort();
+                            }
+                            mapped_memory.set_no_access(bus_start, bus_len, true);
+                        }
+                        if dispatcher.commit_host_alias_install(install).is_err() {
+                            std::process::abort();
+                        }
+                        drop(mapped_memory);
+                        va.raw() as i64
+                    }
+                };
                 snapshot = complete_dsr_syscall(
                     &dispatcher,
                     &memory,
                     snapshot,
                     thread_runtime.tid(),
                     request.number.raw(),
-                    va.raw() as i64,
+                    retval,
                     resume,
                     &mut translator,
                 )?;
@@ -2972,13 +3007,16 @@ fn lower_dsr_fault(
         }
     }
     if matches!(fault, dsr::ThreadFault::Host { .. })
-        && let Some((page, prot)) = dispatcher.resident_fault_plan(fault_address)
+        && let Some(plan) = dispatcher.resident_fault_plan(fault_address)
     {
         let mut memory = memory.write();
         let linux_page_size = memory.linux_page_size as usize;
-        if memory.protect_range(page, linux_page_size, prot).is_ok() {
+        if memory
+            .protect_range(plan.page(), linux_page_size, plan.prot())
+            .is_ok()
+        {
             drop(memory);
-            dispatcher.commit_resident_fault(page);
+            dispatcher.commit_resident_fault(plan);
             return Ok(snapshot);
         }
     }
@@ -3020,18 +3058,18 @@ fn lower_dsr_fault(
         crate::vcpu_loop::upgrade_protection_si_code(&*memory, signum, si_code, si_addr)
     };
     if signum == crate::linux_abi::LINUX_SIGSEGV
-        && let Some((grow_start, grow_len)) = dispatcher.mmap_growdown_fault_plan(si_addr)
+        && let Some(plan) = dispatcher.mmap_growdown_fault_plan(si_addr)
     {
         let grew = memory
             .write()
             .protect_range(
-                grow_start,
-                grow_len,
+                plan.start(),
+                plan.len(),
                 crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
             )
             .is_ok();
         if grew {
-            dispatcher.commit_mmap_growdown(grow_start);
+            dispatcher.commit_mmap_growdown(plan);
             return Ok(snapshot);
         }
     }
@@ -4016,6 +4054,14 @@ impl GuestMemory for NativeDispatchMemory<'_> {
         self.inner().host_ptr_for_write_shared(address, len)
     }
 
+    fn begin_host_write(&mut self, ranges: &[(u64, usize)]) {
+        self.inner().begin_host_write_ranges(ranges);
+    }
+
+    fn finish_host_write(&mut self, ranges: &[(u64, usize)]) {
+        self.inner().finish_host_write_ranges(ranges);
+    }
+
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         // Mirrors `NativeMappedMemory::write_bytes`'s gate exactly (the
         // trait default's `range_no_access`-only gate is less precise: this
@@ -4103,6 +4149,33 @@ impl GuestMemory for NativeDispatchMemory<'_> {
         );
     }
 
+    fn set_mapping_sharing(
+        &mut self,
+        _address: u64,
+        _len: usize,
+        _sharing: carrick_guest_mem::MappingSharing,
+    ) {
+        unreachable!(
+            "native_syscall_mutates_mappings classified this syscall read-only, \
+             but its handler called set_mapping_sharing (a mapping-table mutator)"
+        );
+    }
+
+    fn set_mapping_protection_and_sharing(
+        &mut self,
+        _address: u64,
+        _len: usize,
+        _no_access: bool,
+        _no_write: bool,
+        _sharing: carrick_guest_mem::MappingSharing,
+    ) {
+        unreachable!(
+            "native_syscall_mutates_mappings classified this syscall read-only, \
+             but its handler called set_mapping_protection_and_sharing \
+             (a mapping-table mutator)"
+        );
+    }
+
     fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
         unreachable!(
             "native_syscall_mutates_mappings classified this syscall read-only, \
@@ -4123,7 +4196,7 @@ impl GuestMemory for NativeDispatchMemory<'_> {
         _overlay_ipa: u64,
         _len: usize,
         _content: &[u8],
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), RepointPrivateError> {
         unreachable!(
             "native_syscall_mutates_mappings classified this syscall read-only, \
              but its handler called repoint_private (a mapping-table mutator)"
@@ -5175,6 +5248,30 @@ fn handle_native_fork(
         }
         barrier.end_fork();
     };
+    // Publication and RLIMIT_CPU helpers are not guest registrations. Once the
+    // guest drain is complete, pin their outer gates before any fork-shared
+    // provider/timer mutex, using one absolute deadline and rolling back without
+    // calling fork if either helper fails to leave its short iteration.
+    let helper_deadline = Instant::now() + Duration::from_secs(10);
+    let Some(network_fork_guard) = dispatcher.begin_network_fork_guard_until(helper_deadline)
+    else {
+        end_fork_state(quiesced);
+        return Ok(NativeForkFlow::Resume {
+            value: crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+            fork_child: false,
+            child_stack: 0,
+        });
+    };
+    let Some(rlimit_cpu_fork_guard) = dispatcher.begin_rlimit_cpu_fork_guard_until(helper_deadline)
+    else {
+        drop(network_fork_guard);
+        end_fork_state(quiesced);
+        return Ok(NativeForkFlow::Resume {
+            value: crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+            fork_child: false,
+            child_stack: 0,
+        });
+    };
     let vfork_pipe = if request.vfork.is_some() {
         memory.read().set_fork_inheritance(true);
         match vfork_pipe_pair() {
@@ -5242,6 +5339,8 @@ fn handle_native_fork(
     // The parent releases its guards normally; the child publishes a fresh
     // waiter backing instead of unlocking a copied contended parking queue.
     drop(fork_signal_locks);
+    drop(rlimit_cpu_fork_guard);
+    drop(network_fork_guard);
     drop(paused_guard);
     if child < 0 {
         crate::guest_cpu::abort_prepared_child_record();
@@ -5295,6 +5394,11 @@ fn handle_native_fork(
         native_trace_fork_phase("child-thread-runtime-reset");
         crate::guest_cpu::reset();
         crate::guest_cpu::complete_child_record_post_fork_child();
+        dispatcher.rlimit_cpu_after_fork_child().map_err(|error| {
+            RuntimeError::Unsupported(format!(
+                "native fork child could not rearm finite RLIMIT_CPU helper: {error}"
+            ))
+        })?;
         // P2 getrandom fork-safety: give the child its own vvar RNG generation
         // (its PID) so the COW-inherited userspace getrandom state reseeds
         // instead of replaying the parent's keystream — the native counterpart
@@ -5667,6 +5771,7 @@ fn native_after_fork_child(dispatcher: &SyscallDispatcher) {
     crate::event_ring::reinit_after_fork();
     crate::host_signal::reinit_after_fork();
     crate::dispatch::reset_fifo_beacons_after_fork_child();
+    dispatcher.network_after_fork_child();
     dispatcher.epoll_after_fork_child();
     dispatcher.proc_after_fork_child();
     dispatcher.mem_after_fork_child();
@@ -8606,6 +8711,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn wait_for_test_kick(kicks: &std::sync::atomic::AtomicUsize) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while kicks.load(std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -8617,6 +8723,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn counting_wake_pump(
         tid: crate::thread::ThreadId,
     ) -> (
@@ -11608,14 +11715,56 @@ mod tests {
             if memory.unmap_range(va, 16 * 1024).is_err() {
                 unsafe { libc::_exit(4) };
             }
-            // After munmap the reused VA is an arena word again: it must key
-            // by VA like every other process, never by the dead file.
+            memory.set_mapping_protection_and_sharing(
+                va,
+                16 * 1024,
+                false,
+                false,
+                carrick_guest_mem::MappingSharing::Shared,
+            );
+            // After shared-anon reuse is published, the VA is an arena word
+            // again: it must key by VA like every other process, never by the
+            // dead file.
             let va_keyed_after = key(&memory) == Some(word as usize);
             unsafe { libc::_exit(i32::from(!(file_keyed && va_keyed_after))) };
         }
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
         let _ = std::fs::remove_file(&path);
+        assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn native_private_overlay_retires_boot_shared_futex_provenance_after_fork() {
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            let layout = native_memory_layout();
+            let image = AddressSpace::from_regions(0, Vec::new())
+                .expect("empty native test image should be valid");
+            let mut memory = NativeMappedMemory::map(&image, layout, 16 * 1024, 16 * 1024)
+                .expect("native mapping set should map");
+            let word = crate::memory::LINUX_SHARED_FILE_BASE + 0x4c;
+            let shared_before = memory.shared_futex_location(word).is_some();
+            let private = vec![0u8; 16 * 1024];
+            let repointed = memory
+                .repoint_private(
+                    crate::memory::LINUX_SHARED_FILE_BASE,
+                    0,
+                    private.len(),
+                    &private,
+                )
+                .is_ok();
+            let private_after = memory.shared_futex_location(word).is_none();
+            unsafe { libc::_exit(i32::from(!(shared_before && repointed && private_after))) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
         assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
         assert_eq!(libc::WEXITSTATUS(status), 0);
     }
@@ -11972,6 +12121,11 @@ mod tests {
     fn assert_native_ranges_vacant(
         ranges: impl IntoIterator<Item = (impl AsRef<str>, std::ops::Range<carrick_guest_mem::HostVa>)>,
     ) {
+        #[cfg(target_os = "macos")]
+        const VACANCY_MAP_FLAGS: i32 = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE;
+        #[cfg(not(target_os = "macos"))]
+        const VACANCY_MAP_FLAGS: i32 = libc::MAP_ANON | libc::MAP_PRIVATE;
+
         for (name, range) in ranges {
             let length = range
                 .end
@@ -11982,7 +12136,7 @@ mod tests {
                 range.start,
                 length,
                 libc::PROT_NONE,
-                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                VACANCY_MAP_FLAGS,
             )
             .unwrap_or_else(|error| {
                 panic!(

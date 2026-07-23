@@ -21,6 +21,7 @@
 //! `gpa == SENTINEL_GPA` → `Syscall`, `FAULT_SENTINEL_GPA` → `EL0Fault`,
 //! `MAINT_SENTINEL_GPA` → `MaintenanceDone`, and `KVM_RUN` EINTR → `Kicked`.
 
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Arc, RwLock};
 
 use carrick_aarch64::{
@@ -28,7 +29,7 @@ use carrick_aarch64::{
 };
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::zero_range_chunked;
-use carrick_guest_mem::{GuestVa, HostVa, MemoryError, SharedFutexLocation};
+use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError, SharedFutexLocation};
 use carrick_hal::{
     GuestEntryRegs, GuestVmBackend, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg, TrapError,
     VcpuExit, VcpuRegistry,
@@ -360,9 +361,9 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         })
     }
 
-    fn shared_futex_location(&self, guest_addr: GuestVa) -> Option<SharedFutexLocation> {
+    fn shared_futex_location(&self, backing_gpa: Gpa) -> Option<SharedFutexLocation> {
         self.ram
-            .shared_futex_host_addr(guest_addr.raw(), 4)
+            .shared_futex_host_addr(backing_gpa.raw(), 4)
             .map(|word| SharedFutexLocation::Direct {
                 word: HostVa(word),
                 waiter_key: word,
@@ -378,6 +379,10 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(u64, bool), TrapError> {
         use crate::guest_setup::{AliasBacking, KVM_ALIAS_GPA_BASE, KVM_ALIAS_GPA_SIZE};
+        let file = file.map(|(fd, offset, prot)| {
+            // SAFETY: dispatcher-to-backend alias setup transfers this dup.
+            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
+        });
         use carrick_mem::memory::LINUX_HIGH_VA_THRESHOLD;
         // KVM IGNORES the dispatcher's `ipa` (HVF-shaped: a low IPA at 96 GiB that
         // sits INSIDE KVM's single low-window slot, so it can't be a fresh slot).
@@ -397,8 +402,8 @@ impl Aarch64Vmm for KvmAarch64Vmm {
                 ))
             })?;
         let gpa = KVM_ALIAS_GPA_BASE + off;
-        let writable = match file {
-            Some((_, _, prot)) => prot & libc::PROT_WRITE != 0,
+        let writable = match file.as_ref() {
+            Some((_, _, prot)) => *prot & libc::PROT_WRITE != 0,
             None => true,
         };
         let backing = match file {

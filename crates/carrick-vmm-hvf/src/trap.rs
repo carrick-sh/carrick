@@ -177,6 +177,7 @@ use carrick_aarch64::Aarch64VcpuSnapshot;
 use carrick_guest_mem::MemoryError;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 mod sysreg;
 use sysreg::*;
@@ -3221,6 +3222,10 @@ impl HvfVmState {
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(u64, bool), TrapError> {
+        let file = file.map(|(fd, offset, prot)| {
+            // SAFETY: dispatcher-to-backend alias setup transfers this dup.
+            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
+        });
         // Use the IPA the DISPATCHER already allocated from the global alias arena
         // (`crate::memory::alloc_alias_ipa`) and passed through `MapHostAlias` — do
         // NOT re-allocate here (that double-consumed the arena and desynced the
@@ -3239,33 +3244,34 @@ impl HvfVmState {
         // so a PROT_READ file alias has a read-only host backing. Track the
         // guest-intended writability so the syscall write-path returns EFAULT
         // instead of SIGBUS-ing the host. Anon aliases are RW-backed.
-        let alias_guest_writable = match file {
-            Some((_, _, prot)) => prot & libc::PROT_WRITE != 0,
+        let alias_guest_writable = match file.as_ref() {
+            Some((_, _, prot)) => *prot & libc::PROT_WRITE != 0,
             None => true,
         };
-        let (shared_key_base, shared_key_offset) = match file {
+        let (shared_key_base, shared_key_offset) = match file.as_ref() {
             Some((fd, offset, _)) => (
-                shared_file_key_base(fd),
-                u64::try_from(offset).unwrap_or_default(),
+                shared_file_key_base(fd.as_raw_fd()),
+                u64::try_from(*offset).unwrap_or_default(),
             ),
             None => (0, 0),
         };
-        let host_mapping = match file {
+        let host_mapping = match file.as_ref() {
             // Live MAP_SHARED file: back the guest region with the file's page
             // cache directly, so writes are coherent with other openers and
             // survive fork. The dispatcher handed us a dup'd fd it owns; mmap
             // takes its own reference, so close the dup once mapped.
-            Some((fd, offset, prot)) => {
-                let m = crate::host_mapping::OwnedHostMapping::map_shared_file(fd, offset, size, prot)
-                    .map_err(|e| {
-                        unsafe { libc::close(fd) };
-                        TrapError::Hypervisor(format!(
-                            "alias MAP_SHARED file (fd={fd} off={offset} size={size} prot={prot}) failed: {e}"
-                        ))
-                    })?;
-                unsafe { libc::close(fd) };
-                m
-            }
+            Some((fd, offset, prot)) => crate::host_mapping::OwnedHostMapping::map_shared_file(
+                fd.as_raw_fd(),
+                *offset,
+                size,
+                *prot,
+            )
+            .map_err(|e| {
+                TrapError::Hypervisor(format!(
+                    "alias MAP_SHARED file (fd={} off={offset} size={size} prot={prot}) failed: {e}",
+                    fd.as_raw_fd()
+                ))
+            })?,
             None => crate::host_mapping::OwnedHostMapping::map_shared_anon(
                 size,
                 crate::host_mapping::HostMappingKind::PrivateAnon,
@@ -3550,22 +3556,57 @@ impl HvfVmState {
         Ok(())
     }
 
+    /// Resolve a zero-copy pointer only when every page-bounded fragment belongs
+    /// to the same backing region and both its GPA and host pointer advance
+    /// linearly. Otherwise the caller must use the already-segmented copy path.
+    fn contiguous_guest_host_ptr(&self, address: u64, length: usize) -> Option<*mut u8> {
+        let stripped = strip_pointer_tag(address);
+        let mut checked = 0usize;
+        let mut first: Option<(u64, u64, u64, usize, u64, *mut u8)> = None;
+        while checked < length {
+            let (chunk_va, chunk_len) = Self::guest_copy_chunk(stripped, checked, length).ok()?;
+            let lookup = self.syscall_buffer_lookup_addr(chunk_va, chunk_len);
+            let mapping = self.mapping_for_range(lookup, chunk_len)?;
+            let mapping_offset = lookup.checked_sub(mapping.start)?;
+            let physical = mapping.ipa.checked_add(mapping_offset)?;
+            let host = unsafe { mapping.host_addr.add(mapping_offset as usize) };
+            match first {
+                None => {
+                    first = Some((
+                        mapping.start,
+                        mapping.end,
+                        mapping.ipa,
+                        mapping.host_addr as usize,
+                        physical,
+                        host,
+                    ));
+                }
+                Some((start, end, ipa, host_base, first_physical, first_host)) => {
+                    if mapping.start != start
+                        || mapping.end != end
+                        || mapping.ipa != ipa
+                        || mapping.host_addr as usize != host_base
+                        || physical != first_physical.checked_add(checked as u64)?
+                        || host as usize != (first_host as usize).checked_add(checked)?
+                    {
+                        return None;
+                    }
+                }
+            }
+            checked += chunk_len;
+        }
+        first.map(|(_, _, _, _, _, host)| host)
+    }
+
     /// Host pointer for a contiguous guest range (zero-copy send source), or
-    /// `None` if the whole range isn't within one mapped region. Mirrors
-    /// `read_guest_bytes`'s address handling (raw no-access guard, tag strip)
-    /// but returns the backing pointer instead of copying. See
+    /// `None` if any page resolves to another physical fragment. See
     /// `GuestMemory::host_ptr_for_read`.
     pub(crate) fn host_ptr_for_read(&self, address: u64, length: usize) -> Option<*const u8> {
         if length == 0 || self.range_no_access(address, length) {
             return None;
         }
-        let stripped = strip_pointer_tag(address);
-        // `repoint_private` overlay VAs look up + offset via the translated overlay
-        // IPA (see `syscall_buffer_lookup_addr`); identity otherwise (no walk).
-        let lookup = self.syscall_buffer_lookup_addr(stripped, length);
-        let mapping = self.mapping_for_range(lookup, length)?;
-        let offset = (lookup - mapping.start) as usize;
-        Some(unsafe { mapping.host_addr.add(offset) } as *const u8)
+        self.contiguous_guest_host_ptr(address, length)
+            .map(|ptr| ptr as *const u8)
     }
 
     /// Host pointer for a contiguous guest range as a zero-copy recv DESTINATION,
@@ -3585,12 +3626,7 @@ impl HvfVmState {
         {
             return None;
         }
-        // `repoint_private` overlay VAs look up + offset via the translated overlay
-        // IPA (see `syscall_buffer_lookup_addr`); identity otherwise (no walk).
-        let lookup = self.syscall_buffer_lookup_addr(stripped, length);
-        let mapping = self.mapping_for_range(lookup, length)?;
-        let offset = (lookup - mapping.start) as usize;
-        Some(unsafe { mapping.host_addr.add(offset) })
+        self.contiguous_guest_host_ptr(stripped, length)
     }
 
     /// Zero the PHYSICAL backing of `[address, address+length)`, bypassing BOTH
@@ -7001,6 +7037,29 @@ mod thread_sibling_tests {
             &self.backing[idx]
         }
 
+        fn zero_copy_eligible(&self, address: u64, length: usize) -> bool {
+            let Ok(plan) = self.plan(address, length) else {
+                return false;
+            };
+            let Some(first) = plan.first() else {
+                return false;
+            };
+            let first_mapping = &self.mappings[first.mapping_idx];
+            let first_physical = first_mapping.ipa + first.mapping_offset as u64;
+            let mut copied = 0usize;
+            for chunk in plan {
+                let mapping = &self.mappings[chunk.mapping_idx];
+                let physical = mapping.ipa + chunk.mapping_offset as u64;
+                if chunk.mapping_idx != first.mapping_idx
+                    || physical != first_physical + copied as u64
+                {
+                    return false;
+                }
+                copied += chunk.len;
+            }
+            true
+        }
+
         fn plan(&self, address: u64, length: usize) -> Result<Vec<FakeCopyChunk>, MemoryError> {
             let mut copied = 0usize;
             let mut plan = Vec::new();
@@ -7150,6 +7209,27 @@ mod thread_sibling_tests {
             &harness.mapping_bytes(1)[..length - boundary_prefix],
             &source[boundary_prefix..]
         );
+    }
+
+    #[test]
+    fn zero_copy_declines_cross_fragment_stage1_range() {
+        let old_start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let old_ipa = crate::memory::LINUX_ALIAS_IPA_BASE;
+        let new_start = old_start + 0x3000;
+        let new_ipa = old_ipa + 0x20_0000;
+        let harness = FakeStageCopyHarness::new(
+            vec![
+                mapped_region(old_start, old_start + 0x9000, old_ipa),
+                mapped_region(new_start, new_start + 0x6000, new_ipa),
+            ],
+            vec![
+                FakeStageSegment::new(old_start, new_start, old_ipa),
+                FakeStageSegment::new(new_start, new_start + 0x6000, new_ipa),
+            ],
+        );
+
+        assert!(harness.zero_copy_eligible(old_start + 0x1000, 0x1000));
+        assert!(!harness.zero_copy_eligible(old_start + 0x2ff0, 0x1020));
     }
 
     #[test]

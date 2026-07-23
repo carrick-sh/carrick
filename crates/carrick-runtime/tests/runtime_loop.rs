@@ -17,7 +17,7 @@ use std::process::Command;
 // `Aarch64SyscallFrame` comes from the leaf crate directly: the dispatch
 // re-export is gone (the dispatcher is ISA-neutral; this harness scripts
 // aarch64 frames and decodes them the way a backend's `GuestArch` would).
-use carrick_guest_mem::Aarch64SyscallFrame;
+use carrick_guest_mem::{Aarch64SyscallFrame, MappingSharing, MemoryError, RepointPrivateError};
 use carrick_runtime::dispatch::{GuestMemory, LinearMemory, SyscallDispatcher};
 use carrick_runtime::memory::AddressSpace;
 use carrick_runtime::rootfs::{LayerSource, RootFs};
@@ -84,6 +84,270 @@ fn runtime_loop_stops_when_guest_never_exits() {
     assert!(result.trap_limit_hit);
     assert_eq!(result.exit_code, -1);
     assert_eq!(result.traps, 0);
+}
+
+struct SplitForwardMemory {
+    base: u64,
+    bytes: Vec<u8>,
+    repoints: Vec<(u64, u64, usize)>,
+    sharing_publications: Vec<(u64, usize, MappingSharing)>,
+    combined_publications: usize,
+}
+
+impl SplitForwardMemory {
+    fn new(base: u64, len: usize) -> Self {
+        Self {
+            base,
+            bytes: vec![0; len],
+            repoints: Vec::new(),
+            sharing_publications: Vec::new(),
+            combined_publications: 0,
+        }
+    }
+
+    fn offset(&self, address: u64, len: usize) -> Result<usize, MemoryError> {
+        let offset = address
+            .checked_sub(self.base)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or(MemoryError::OutOfBounds {
+                address,
+                length: len,
+            })?;
+        if offset
+            .checked_add(len)
+            .is_some_and(|end| end <= self.bytes.len())
+        {
+            Ok(offset)
+        } else {
+            Err(MemoryError::OutOfBounds {
+                address,
+                length: len,
+            })
+        }
+    }
+}
+
+impl GuestMemory for SplitForwardMemory {
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        let offset = self.offset(address, length)?;
+        Ok(self.bytes[offset..offset + length].to_vec())
+    }
+
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let offset = self.offset(address, bytes.len())?;
+        self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn repoint_private(
+        &mut self,
+        va: u64,
+        overlay_ipa: u64,
+        len: usize,
+        content: &[u8],
+    ) -> Result<(), RepointPrivateError> {
+        let offset = self.offset(va, len).map_err(RepointPrivateError::clean)?;
+        self.bytes[offset..offset + len].copy_from_slice(content);
+        self.repoints.push((va, overlay_ipa, len));
+        Ok(())
+    }
+
+    fn set_mapping_sharing(&mut self, address: u64, len: usize, sharing: MappingSharing) {
+        self.sharing_publications.push((address, len, sharing));
+    }
+
+    fn set_mapping_protection_and_sharing(
+        &mut self,
+        address: u64,
+        len: usize,
+        _no_access: bool,
+        _no_write: bool,
+        sharing: MappingSharing,
+    ) {
+        self.combined_publications += 1;
+        self.set_mapping_sharing(address, len, sharing);
+    }
+}
+
+#[test]
+fn split_runtime_loop_forwards_private_repoint_and_provenance_publication() {
+    const LENGTH: u64 = 0x4000;
+    let shared = carrick_runtime::memory::LINUX_SHARED_FILE_BASE;
+    let mut memory = SplitForwardMemory::new(shared, LENGTH as usize);
+    let mut trap = ScriptedTrap::new([
+        Aarch64SyscallFrame {
+            x0: 0,
+            x1: LENGTH,
+            x2: carrick_runtime::linux_abi::LINUX_PROT_READ
+                | carrick_runtime::linux_abi::LINUX_PROT_WRITE,
+            x3: carrick_runtime::linux_abi::LINUX_MAP_SHARED
+                | carrick_runtime::linux_abi::LINUX_MAP_ANONYMOUS,
+            x4: u64::MAX,
+            x5: 0,
+            x8: 222,
+        },
+        Aarch64SyscallFrame {
+            x0: shared,
+            x1: LENGTH,
+            x2: carrick_runtime::linux_abi::LINUX_PROT_READ
+                | carrick_runtime::linux_abi::LINUX_PROT_WRITE,
+            x3: carrick_runtime::linux_abi::LINUX_MAP_PRIVATE
+                | carrick_runtime::linux_abi::LINUX_MAP_ANONYMOUS
+                | carrick_runtime::linux_abi::LINUX_MAP_FIXED,
+            x4: u64::MAX,
+            x5: 0,
+            x8: 222,
+        },
+        Aarch64SyscallFrame {
+            x0: 0,
+            x1: 0,
+            x2: 0,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x8: 93,
+        },
+    ]);
+
+    let result = run_syscall_loop(&mut memory, &mut trap, 8).unwrap();
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(trap.return_values, [shared as i64, shared as i64]);
+    assert_eq!(
+        memory.repoints.len(),
+        1,
+        "SplitView must not use no-op default"
+    );
+    assert_eq!(memory.repoints[0].0, shared);
+    assert_eq!(memory.repoints[0].2, LENGTH as usize);
+    assert!(
+        memory
+            .sharing_publications
+            .iter()
+            .any(|&(address, len, sharing)| {
+                address == shared && len == LENGTH as usize && sharing == MappingSharing::Shared
+            })
+    );
+    assert!(
+        memory
+            .sharing_publications
+            .iter()
+            .any(|&(address, len, sharing)| {
+                address == shared && len == LENGTH as usize && sharing == MappingSharing::Private
+            })
+    );
+    assert!(memory.combined_publications >= 2);
+}
+
+#[test]
+fn runtime_loop_publishes_shared_file_alias_provenance_after_install() {
+    use carrick_runtime::fs_backend::{FsBackend as _, HostFsBackend};
+
+    let scratch = std::env::temp_dir().join(format!(
+        "carrick-runtime-alias-provenance-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let mut host = HostFsBackend::new_in(&scratch).expect("host fs backend");
+    host.set_file_contents("/shared.bin", vec![0x41; 4096])
+        .expect("seed shared file");
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(host));
+
+    let mut memory = SplitForwardMemory::new(0x4000, 0x1000);
+    memory.write_bytes(0x4000, b"/shared.bin\0").unwrap();
+    let mut trap = ScriptedTrap::new([
+        Aarch64SyscallFrame {
+            x0: (-100_i64) as u64,
+            x1: 0x4000,
+            x2: 2, // O_RDWR
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x8: 56,
+        },
+        Aarch64SyscallFrame {
+            x0: 0,
+            x1: 4096,
+            x2: carrick_runtime::linux_abi::LINUX_PROT_READ
+                | carrick_runtime::linux_abi::LINUX_PROT_WRITE,
+            x3: carrick_runtime::linux_abi::LINUX_MAP_SHARED,
+            x4: 3,
+            x5: 0,
+            x8: 222,
+        },
+        Aarch64SyscallFrame {
+            x0: 0,
+            x1: 0,
+            x2: 0,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x8: 93,
+        },
+    ]);
+
+    let result = run_syscall_loop_with_dispatcher(&mut memory, &mut trap, dispatcher, 8).unwrap();
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(trap.alias_installs, 1);
+    let mapped = trap.return_values[1] as u64;
+    assert!(
+        memory
+            .sharing_publications
+            .iter()
+            .any(|entry| { *entry == (mapped, 4096, MappingSharing::Shared) })
+    );
+    assert_eq!(memory.combined_publications, 1);
+    std::fs::remove_dir_all(scratch).expect("remove scratch root");
+}
+
+#[test]
+fn runtime_loop_publishes_sysv_alias_provenance_after_install() {
+    let mut memory = SplitForwardMemory::new(0x4000, 1);
+    let mut trap = ScriptedTrap::new([
+        Aarch64SyscallFrame {
+            x0: 0, // IPC_PRIVATE
+            x1: 4096,
+            x2: 0o600,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x8: 194, // shmget
+        },
+        Aarch64SyscallFrame {
+            x0: u64::MAX, // patched from shmget return by ScriptedTrap
+            x1: 0,
+            x2: 0,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x8: 196, // shmat
+        },
+        Aarch64SyscallFrame {
+            x0: 0,
+            x1: 0,
+            x2: 0,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x8: 93,
+        },
+    ]);
+
+    let result =
+        run_syscall_loop_with_dispatcher(&mut memory, &mut trap, SyscallDispatcher::new(), 8)
+            .unwrap();
+    assert_eq!(result.exit_code, 0);
+    assert!(trap.return_values[0] > 0, "shmget returned a live shmid");
+    assert_eq!(trap.alias_installs, 1);
+    let attached = trap.return_values[1] as u64;
+    assert!(
+        memory
+            .sharing_publications
+            .iter()
+            .any(|entry| { *entry == (attached, 0x4000, MappingSharing::Shared) })
+    );
+    assert_eq!(memory.combined_publications, 1);
 }
 
 #[test]
@@ -231,6 +495,7 @@ fn runtime_loop_can_list_a_rootfs_directory() {
 struct ScriptedTrap {
     frames: VecDeque<Aarch64SyscallFrame>,
     return_values: Vec<i64>,
+    alias_installs: usize,
 }
 
 impl ScriptedTrap {
@@ -238,6 +503,7 @@ impl ScriptedTrap {
         Self {
             frames: frames.into_iter().collect(),
             return_values: Vec::new(),
+            alias_installs: 0,
         }
     }
 }
@@ -265,6 +531,15 @@ impl SyscallTrap for ScriptedTrap {
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
         self.return_values.push(return_value);
+        // Runtime-path SysV test: feed shmget's dynamic inode-based shmid into
+        // the immediately following scripted shmat without fabricating backend
+        // provenance or bypassing either dispatch/install transaction.
+        if let Some(next) = self.frames.front_mut()
+            && next.x8 == 196
+            && next.x0 == u64::MAX
+        {
+            next.x0 = return_value as u64;
+        }
         Ok(())
     }
 
@@ -302,6 +577,23 @@ impl SyscallTrap for ScriptedTrap {
         Err(TrapError::Hypervisor(
             "scripted trap does not implement restore_from_sigframe".to_owned(),
         ))
+    }
+
+    fn map_host_alias(
+        &mut self,
+        _va: carrick_guest_mem::GuestVa,
+        _ipa: carrick_guest_mem::Gpa,
+        _len: u64,
+        _payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
+    ) -> Result<(), TrapError> {
+        if let Some((fd, _, _)) = file {
+            // Ownership is transferred by the trait contract; the scripted
+            // backend installs no host mapping, so close it here.
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        }
+        self.alias_installs += 1;
+        Ok(())
     }
 }
 

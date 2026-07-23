@@ -247,25 +247,29 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     const SIGBUS: i32 = 7;
     const BUS_ADRERR: i32 = 2;
     if signum == SIGSEGV
-        && let Some((page, prot)) = dispatcher.resident_fault_plan(si_addr)
+        && let Some(plan) = dispatcher.resident_fault_plan(si_addr)
         && engine
-            .protect_range(page, crate::linux_abi::LINUX_PAGE_SIZE as usize, prot)
+            .protect_range(
+                plan.page(),
+                crate::linux_abi::LINUX_PAGE_SIZE as usize,
+                plan.prot(),
+            )
             .is_ok()
     {
-        dispatcher.commit_resident_fault(page);
+        dispatcher.commit_resident_fault(plan);
         return Ok(None);
     }
     if signum == SIGSEGV
-        && let Some((grow_start, grow_len)) = dispatcher.mmap_growdown_fault_plan(si_addr)
+        && let Some(plan) = dispatcher.mmap_growdown_fault_plan(si_addr)
         && engine
             .protect_range(
-                grow_start,
-                grow_len,
+                plan.start(),
+                plan.len(),
                 crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,
             )
             .is_ok()
     {
-        dispatcher.commit_mmap_growdown(grow_start);
+        dispatcher.commit_mmap_growdown(plan);
         return Ok(None);
     }
     if signum == SIGSEGV && dispatcher.mmap_fault_is_sigbus(si_addr) {

@@ -229,6 +229,10 @@ pub use carrick_abi as linux_abi;
 // `crate::memory::…` / `crate::elf::…` / `crate::page_table::…` / `crate::vdso::…`
 // site (and the `carrick_runtime::*` ones) is unchanged.
 pub use carrick_mem::{elf, memory, page_table, vdso};
+// Versioned native-x86 context layout consumed by the live profiler. The
+// matching carrick binary is the authority; scripts must never duplicate the
+// offset because gateway state (notably XSAVE) changes its size.
+pub use carrick_dsr_x86::{X86DsrProfilerLayout, x86_dsr_profiler_layout};
 // guest_cpu/host_facts/host_mapping/host_proc/ulock were lifted into the leaf
 // crate `carrick-host` (Darwin host primitives — machine facts, __ulock, host
 // shared mappings, CPU accounting, libproc introspection; no dispatch/trap/VFS
@@ -1931,25 +1935,78 @@ pub mod host_signal {
     /// `SignalForkLocks`): every fork-shared signal-static mutex a NON-forking
     /// auxiliary thread can hold while publishing — the child-watch tables and
     /// the THREAD_PENDING store. Both guards are the platform-NEUTRAL
-    /// `carrick-signal-core` ones, i.e. the REAL locks these lanes use; the
-    /// only HVF member with no analogue here is its `THREAD_WAITERS` self-pipe
-    /// registry (the waiter on these lanes is a stateless `ppoll` woken by the
-    /// kick's EINTR — see the `reset_after_supervisor_fork` note), so there is
-    /// no third guard to hold.
+    /// `carrick-signal-core` ones, i.e. the REAL locks these lanes use. Native
+    /// FreeBSD also includes the timer-delivery mutex because its unregistered
+    /// helper nests pending publication and kicker/futex registry access under
+    /// that mutex. The HVF `THREAD_WAITERS` self-pipe registry has no analogue
+    /// here (these lanes use a stateless `ppoll` waiter).
     pub struct SignalForkLocks {
         _child_watch: carrick_signal_core::child_watch::ChildWatchForkGuard,
         _thread_pending: carrick_signal_core::ThreadPendingForkGuard,
+        /// Freezes the unregistered timer helper across its complete
+        /// publish+kicker+futex critical section on the native FreeBSD lane.
+        #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+        _timer_delivery: crate::timer_delivery::TimerForkGuard,
     }
 
     /// Acquire the atfork-prepare bundle (see [`SignalForkLocks`]). Call
     /// immediately before `libc::fork()`; drop immediately after in both
     /// processes, strictly before any child-side signal reinit.
     pub fn hold_signal_locks_for_fork() -> SignalForkLocks {
-        let child_watch = carrick_signal_core::child_watch::hold_for_fork();
-        let thread_pending = carrick_signal_core::hold_thread_pending_for_fork();
-        SignalForkLocks {
-            _child_watch: child_watch,
-            _thread_pending: thread_pending,
+        #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+        loop {
+            // Match the helper's real nesting: timer delivery owns its mutex
+            // before pending publication and kicker/futex registry access.
+            if let Some(timer_delivery) = crate::timer_delivery::try_hold_for_fork()
+                && let Some(child_watch) = carrick_signal_core::child_watch::try_hold_for_fork()
+                && let Some(thread_pending) =
+                    carrick_signal_core::try_hold_thread_pending_for_fork()
+            {
+                return SignalForkLocks {
+                    _child_watch: child_watch,
+                    _thread_pending: thread_pending,
+                    _timer_delivery: timer_delivery,
+                };
+            }
+            std::thread::yield_now();
+        }
+
+        #[cfg(not(all(target_os = "freebsd", target_arch = "x86_64")))]
+        {
+            let child_watch = carrick_signal_core::child_watch::hold_for_fork();
+            let thread_pending = carrick_signal_core::hold_thread_pending_for_fork();
+            SignalForkLocks {
+                _child_watch: child_watch,
+                _thread_pending: thread_pending,
+            }
+        }
+    }
+
+    /// Acquire the complete signal-static fork bundle without an unbounded
+    /// mutex wait. This is fork-path-only retry work; ordinary signal and
+    /// syscall paths retain their existing single-lock fast path.
+    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    pub fn try_hold_signal_locks_for_fork_until(
+        deadline: std::time::Instant,
+    ) -> Option<SignalForkLocks> {
+        loop {
+            // All acquisitions are nonblocking so a failed inner lock drops
+            // the timer guard before retrying, preserving timer->signal order.
+            if let Some(timer_delivery) = crate::timer_delivery::try_hold_for_fork()
+                && let Some(child_watch) = carrick_signal_core::child_watch::try_hold_for_fork()
+                && let Some(thread_pending) =
+                    carrick_signal_core::try_hold_thread_pending_for_fork()
+            {
+                return Some(SignalForkLocks {
+                    _child_watch: child_watch,
+                    _thread_pending: thread_pending,
+                    _timer_delivery: timer_delivery,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -2317,6 +2374,13 @@ pub mod io_wait {
         /// The guest tid this waiter parks on behalf of.
         pub fn tid(&self) -> crate::thread::ThreadId {
             self.tid
+        }
+
+        /// Permanently follow a nonleader exec survivor onto the process main
+        /// tid. All subsequent pending-signal checks must use the rekeyed
+        /// registry identity, including after the replacement image clones.
+        pub fn rekey_after_exec(&mut self, tid: crate::thread::ThreadId) {
+            self.tid = tid;
         }
 
         pub fn wait(
@@ -2901,6 +2965,48 @@ pub mod timer_delivery {
         cell()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Opaque atfork guard for the real timer-delivery helper mutex. Holding it
+    /// proves no unregistered timer thread can be inside the pending-signal,
+    /// kicker-registry, or current-futex operations nested under `deliver`.
+    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    pub struct TimerForkGuard {
+        _delivery: std::sync::MutexGuard<'static, Option<Delivery>>,
+    }
+
+    /// Try-acquire the timer helper's complete critical section. The fork
+    /// bundle acquires this outer guard first, then try-acquires signal guards;
+    /// any miss drops everything before retrying, matching `deliver`'s
+    /// timer->pending lock order without an unbounded wait.
+    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    pub fn try_hold_for_fork() -> Option<TimerForkGuard> {
+        match cell().try_lock() {
+            Ok(delivery) => Some(TimerForkGuard {
+                _delivery: delivery,
+            }),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(TimerForkGuard {
+                _delivery: poisoned.into_inner(),
+            }),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Replace the inherited parent kicker after a native fork child installs
+    /// its fresh current registry and futex table.
+    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    pub fn reset_after_fork_child(kicker: Arc<dyn carrick_hal::VcpuRegistry>, main_tid: ThreadId) {
+        *lock() = Some(Delivery { kicker, main_tid });
+    }
+
+    #[cfg(all(test, target_os = "freebsd", target_arch = "x86_64"))]
+    pub(crate) fn hold_critical_section_for_native_fork_test(
+        on_locked: impl FnOnce(),
+        release: impl FnOnce(),
+    ) {
+        let _delivery = lock();
+        on_locked();
+        release();
     }
 
     /// Install the kicker + target tid. Called once at run-loop startup.

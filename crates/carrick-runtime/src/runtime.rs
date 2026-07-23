@@ -111,6 +111,7 @@
 //!
 //! [`AddressSpace`]: crate::memory::AddressSpace
 
+use std::os::fd::IntoRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1201,22 +1202,81 @@ where
                 last_syscall_retval = Some(0);
             }
             DispatchOutcome::MapHostAlias {
+                transaction,
                 va,
                 ipa,
                 len,
                 payload,
                 file,
+                shared,
+                prot,
                 prot_none,
             } => {
-                // Back a dynamic high-VA mmap; complete with the VA.
-                runtime.map_host_alias(va, ipa, len, &payload, file)?;
-                if prot_none && let Ok(l) = usize::try_from(len) {
-                    // Guest-inaccessible PROT_NONE alias (see the threaded
-                    // loop's arm): invalidate the fresh leaves best-effort.
-                    let _ = runtime.protect_range(va.raw(), l, 0);
-                }
-                runtime.complete_syscall(va.raw() as i64)?;
-                last_syscall_retval = Some(va.raw() as i64);
+                let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
+                let retval = match transaction.claim() {
+                    None => {
+                        // No backend mutation started; dropping `file` closes the
+                        // owned dup and this pre-install claim failure is recoverable.
+                        drop(file);
+                        crate::linux_abi::LINUX_ENOMEM.guest_retval()
+                    }
+                    Some(install) => {
+                        if runtime
+                            .map_host_alias(
+                                va,
+                                ipa,
+                                len,
+                                &payload,
+                                file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                            )
+                            .is_err()
+                        {
+                            // Backend `Err` does not prove that stage-2/page-table
+                            // mutation never began. Process teardown is the only
+                            // sound rollback until the backend Result is stronger.
+                            std::process::abort();
+                        }
+                        let Ok(len) = usize::try_from(len) else {
+                            std::process::abort();
+                        };
+                        if prot_none && runtime.protect_range(va.raw(), len, 0).is_err() {
+                            std::process::abort();
+                        }
+                        // Publish the dispatcher's authoritative Linux VMA
+                        // protection + sharing only after the backend mapping and
+                        // requested leaf protection are both live. This is the
+                        // final infallible half of the alias transaction: a
+                        // sibling can never observe MAP_SHARED provenance for a
+                        // backing that failed to install, nor resume with a live
+                        // shared mapping classified as process-private.
+                        runtime.set_mapping_protection_and_sharing(
+                            va.raw(),
+                            len,
+                            prot_none,
+                            prot & crate::linux_abi::LINUX_PROT_WRITE == 0,
+                            if shared {
+                                carrick_guest_mem::MappingSharing::Shared
+                            } else {
+                                carrick_guest_mem::MappingSharing::Private
+                            },
+                        );
+                        if let Some((bus_start, bus_len)) = install.bus_fault_range() {
+                            let Ok(bus_len) = usize::try_from(bus_len) else {
+                                std::process::abort();
+                            };
+                            if runtime.protect_range(bus_start, bus_len, 0).is_err() {
+                                std::process::abort();
+                            }
+                            runtime.set_no_access(bus_start, bus_len, true);
+                        }
+                        if dispatcher.commit_host_alias_install(install).is_err() {
+                            std::process::abort();
+                        }
+                        va.raw() as i64
+                    }
+                };
+                runtime.complete_syscall(retval)?;
+                last_syscall_retval = Some(retval);
             }
             DispatchOutcome::SharedFutexWait {
                 location,
@@ -2042,11 +2102,20 @@ struct SplitView<'a, M: GuestMemory, T: SyscallTrap> {
 }
 
 impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
-    // Inherit the gated default `read_bytes`/`write_bytes`; forward the gate's
-    // inputs (`protections()` + the raw copy) to the inner memory so the PROT_NONE
-    // EFAULT check is NOT lost through the wrapper.
+    // This adapter must be transparent. In particular, inheriting a modelless
+    // default here silently bypasses the wrapped backend's physical repoint and
+    // provenance publication while `run_syscall_loop` uses this split shape.
     fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
         self.mem.protections()
+    }
+    fn has_complete_mapping_metadata(&self) -> bool {
+        self.mem.has_complete_mapping_metadata()
+    }
+    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.mem.read_bytes(address, length)
+    }
+    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.mem.write_bytes(address, bytes)
     }
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         self.mem.read_bytes_raw(address, length)
@@ -2054,14 +2123,43 @@ impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.mem.write_bytes_raw(address, bytes)
     }
+    fn read_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+        self.mem.read_into(address, dst)
+    }
+    fn read_into_raw(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+        self.mem.read_into_raw(address, dst)
+    }
+    fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.mem.write_bytes_unchecked(address, bytes)
+    }
     fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
         self.mem.host_ptr_for_read(address, len)
     }
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
         self.mem.host_ptr_for_write(address, len)
     }
+    fn begin_host_write(&mut self, ranges: &[(u64, usize)]) {
+        self.mem.begin_host_write(ranges);
+    }
+    fn finish_host_write(&mut self, ranges: &[(u64, usize)]) {
+        self.mem.finish_host_write(ranges);
+    }
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.mem.zero_backing(address, len)
+    }
+    fn zero_anonymous_reuse(
+        &mut self,
+        address: u64,
+        len: usize,
+        sharing: carrick_guest_mem::MappingSharing,
+    ) -> Result<(), MemoryError> {
+        self.mem.zero_anonymous_reuse(address, len, sharing)
+    }
+    fn zero_guest_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.mem.zero_guest_range(address, len)
+    }
+    fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
+        self.mem.guest_range_is_writable(address, length)
     }
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.mem.set_no_access(address, len, no_access);
@@ -2082,14 +2180,53 @@ impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
         self.mem
             .set_mapping_protection(address, len, no_access, no_write);
     }
+    fn set_mapping_sharing(
+        &mut self,
+        address: u64,
+        len: usize,
+        sharing: carrick_guest_mem::MappingSharing,
+    ) {
+        self.mem.set_mapping_sharing(address, len, sharing);
+    }
+    fn set_mapping_protection_and_sharing(
+        &mut self,
+        address: u64,
+        len: usize,
+        no_access: bool,
+        no_write: bool,
+        sharing: carrick_guest_mem::MappingSharing,
+    ) {
+        self.mem
+            .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
+    }
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         self.mem.protect_range(address, len, prot)
+    }
+    fn supports_concurrent_exec_protection(&self) -> bool {
+        self.mem.supports_concurrent_exec_protection()
     }
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.mem.unmap_range(address, len)
     }
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.mem.unmap_alias_range(address, len)
+    }
+    fn repoint_private(
+        &mut self,
+        va: u64,
+        overlay_ipa: u64,
+        len: usize,
+        content: &[u8],
+    ) -> Result<(), carrick_guest_mem::RepointPrivateError> {
+        self.mem.repoint_private(va, overlay_ipa, len, content)
+    }
+    fn resident_pages(
+        &self,
+        start: carrick_guest_mem::GuestVa,
+        page_count: u64,
+        page_size: u64,
+    ) -> Option<Vec<u8>> {
+        self.mem.resident_pages(start, page_count, page_size)
     }
     fn shared_futex_location(
         &self,
@@ -2122,6 +2259,9 @@ impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     }
     fn is_forked_child(&self) -> bool {
         self.trap.is_forked_child()
+    }
+    fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
+        self.trap.process_exit_cleanup()
     }
     #[allow(clippy::too_many_arguments)]
     fn inject_signal(

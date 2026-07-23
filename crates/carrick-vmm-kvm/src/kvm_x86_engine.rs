@@ -29,10 +29,11 @@
 //! the sigframe carries). `KERNEL_GS_BASE` (the SWAPGS shadow) is not used by
 //! the ring-3-only guest, so `get/set_gs_base` operate on `sregs.gs.base`.
 
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, RwLock};
 
 use carrick_abi::LinuxProtFlags;
-use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError};
+use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError, RepointPrivateError};
 use carrick_hal::{GuestVmBackend, SharedFutexLocation, TrapError};
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::pml4::{Pml4Manager, walk_descriptors};
@@ -193,8 +194,9 @@ impl GuestVmBackend for KvmVmm {
         ForkRamStrategy::Cow
     }
 
-    fn process_exit_cleanup(&mut self) {
+    fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
         crate::kvm::print_kvm_stats_once("process-exit");
+        Ok(())
     }
 
     fn wait_for_vcpu_slot() {
@@ -298,6 +300,10 @@ impl X86Vmm for KvmVmm {
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
         use crate::guest_setup::AliasBacking;
+        let file = file.map(|(fd, offset, prot)| {
+            // SAFETY: dispatcher-to-backend alias setup transfers this dup.
+            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
+        });
         use carrick_mem::memory::{LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE};
 
         let (va, ipa) = (va.raw(), ipa.raw());
@@ -313,8 +319,8 @@ impl X86Vmm for KvmVmm {
             )));
         }
         let gpa = ipa;
-        let writable = match file {
-            Some((_, _, prot)) => prot & libc::PROT_WRITE != 0,
+        let writable = match file.as_ref() {
+            Some((_, _, prot)) => *prot & libc::PROT_WRITE != 0,
             None => true,
         };
         let backing = match file {
@@ -355,38 +361,63 @@ impl X86Vmm for KvmVmm {
         overlay_gpa: u64,
         len: usize,
         content: &[u8],
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), RepointPrivateError> {
+        if content.len() != len {
+            return Err(RepointPrivateError::clean(MemoryError::OutOfBounds {
+                address: va,
+                length: content.len(),
+            }));
+        }
         // The overlay aperture (608 GiB) is identity GPA==VA and boot-mapped as a
         // normal KVM slot, so `host_ptr(overlay_gpa)` resolves its private (NOT
         // MAP_SHARED) backing. Seed `content` into that backing FIRST — while `va`
         // still maps to the stale shared-aperture GPA, so no torn read through
         // `va` during the flip.
-        let dst = self
-            .ram
-            .host_ptr(overlay_gpa, len.max(1))
-            .ok_or(MemoryError::OutOfBounds {
+        let dst = self.ram.host_ptr(overlay_gpa, len.max(1)).ok_or_else(|| {
+            RepointPrivateError::clean(MemoryError::OutOfBounds {
                 address: overlay_gpa,
                 length: len,
-            })?;
+            })
+        })?;
         if !content.is_empty() {
-            let n = content.len().min(len);
             // SAFETY: `host_ptr` proved `[overlay_gpa, overlay_gpa+len)` lies wholly
-            // within the overlay slot's backing, so `dst[..n]` (n <= len) is valid
-            // and writable; `content[..n]` is a distinct, valid source slice.
-            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), dst, n) };
+            // within the overlay slot's backing, and `content` is exactly `len`
+            // distinct, valid source bytes.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), dst, len) };
         }
         // Repoint the live PML4 leaf for `va` at the overlay GPA (`map_aliased`
         // splits any covering 2 MiB block to a 4 KiB leaf so a single page is
         // repointed without disturbing neighbours), then copy the table image back
         // over the live PML4 backing. The engine reloads CR3 afterwards.
-        let len_u64 = u64::try_from(len).map_err(|_| MemoryError::OutOfBounds {
-            address: va,
-            length: len,
+        let len_u64 = u64::try_from(len).map_err(|_| {
+            RepointPrivateError::clean(MemoryError::OutOfBounds {
+                address: va,
+                length: len,
+            })
         })?;
         self.edit_page_tables(va, len, |mgr| {
             mgr.map_aliased(GuestVa(va), Gpa(overlay_gpa), len_u64, true, true)
                 .map(|()| true)
         })
+        // `Pml4Manager` is process-persistent. A failed multi-leaf edit may have
+        // changed its scratch image even when the live table copy was skipped;
+        // conservatively fail stopped so a later successful edit cannot publish
+        // those partial leaves after the dispatcher recycled this candidate.
+        .map_err(RepointPrivateError::indeterminate)
+    }
+
+    fn restore_shared_identity(&mut self, va: u64, len: usize) -> Result<(), RepointPrivateError> {
+        let len_u64 = u64::try_from(len).map_err(|_| {
+            RepointPrivateError::clean(MemoryError::OutOfBounds {
+                address: va,
+                length: len,
+            })
+        })?;
+        self.edit_page_tables(va, len, |mgr| {
+            mgr.map_aliased(GuestVa(va), Gpa(va), len_u64, true, true)
+                .map(|()| true)
+        })
+        .map_err(RepointPrivateError::indeterminate)
     }
 
     fn back_fixed_anon(&mut self, va: u64, len: usize, writable: bool) -> Result<(), MemoryError> {

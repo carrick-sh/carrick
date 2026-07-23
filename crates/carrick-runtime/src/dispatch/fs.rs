@@ -348,11 +348,17 @@ fn prepare_pwritev_payloads(
     Ok(PwritevPayloads::Staged(staged_iovecs))
 }
 
+struct PreparedReadvTargets {
+    host_iovecs: Vec<libc::iovec>,
+    guest_ranges: Vec<(u64, usize)>,
+}
+
 fn prepare_readv_targets(
     memory: &mut impl GuestMemory,
     iovecs: &[LinuxIovec],
-) -> Result<Option<Vec<libc::iovec>>, LinuxErrno> {
+) -> Result<Option<PreparedReadvTargets>, LinuxErrno> {
     let mut borrowed_iovecs = Vec::with_capacity(iovecs.len());
+    let mut guest_ranges = Vec::with_capacity(iovecs.len());
     for iovec in iovecs {
         let iov_len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
         if iov_len == 0 {
@@ -365,8 +371,12 @@ fn prepare_readv_targets(
             iov_base: ptr as *mut libc::c_void,
             iov_len,
         });
+        guest_ranges.push((iovec.iov_base, iov_len));
     }
-    Ok(Some(borrowed_iovecs))
+    Ok(Some(PreparedReadvTargets {
+        host_iovecs: borrowed_iovecs,
+        guest_ranges,
+    }))
 }
 
 /// If `path` is a `/proc/{self,thread-self,curproc,this}/fd/N` magic symlink,
@@ -2362,6 +2372,10 @@ impl SyscallDispatcher {
         let Some(m) = self.fs.vfs_mounts.resolve(path) else {
             return VfsOpenAttempt::FallThrough;
         };
+        // `/proc` and other synthetic mounts render address-space state. Hold
+        // alias exclusion across the complete snapshot so it cannot describe
+        // stale VMA metadata while a host replacement is installing.
+        let _host_alias_dispatch = self.begin_host_alias_dispatch();
 
         // Build the OpenContext only after a mount claims the path. Rootfs and
         // overlay fallthrough opens are the hot path and do not need proc, fd,
@@ -5745,15 +5759,20 @@ impl SyscallDispatcher {
                     }
                 }
                 LINUX_F_ADD_SEALS => {
-                    let Some(open_file) = this.open_file(fd.0) else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
                     let new_seals = arg as u32;
                     // Unknown seal bits → EINVAL (before the sealable check, as
                     // Linux validates the arg first).
                     if u64::from(new_seals) != arg || new_seals & !LINUX_F_SEAL_ALL != 0 {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
+                    // Hold the SAME alias-dispatch exclusion mmap/shmat use for
+                    // publication, so a sibling cannot race between the seal
+                    // check and the new seal becoming visible. Acquire it before
+                    // any subsystem locks so we never wait while holding them.
+                    let _host_alias_dispatch = this.begin_host_alias_dispatch();
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
                     let mut open = open_file.description.write();
                     let Some(current) = open.seals() else {
                         // Not a sealable fd (regular file, socket, …).
@@ -7628,13 +7647,19 @@ impl SyscallDispatcher {
             // offset). Fill each iovec sequentially.
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
                 let hfd = host_fd.raw();
-                if let Some(borrowed_iovecs) = prepare_readv_targets(memory, &iovecs)? {
-                    if borrowed_iovecs.is_empty() {
+                if let Some(targets) = prepare_readv_targets(memory, &iovecs)? {
+                    if targets.host_iovecs.is_empty() {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     let iovcnt =
-                        i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
-                    let n = unsafe { libc::readv(hfd, borrowed_iovecs.as_ptr(), iovcnt) };
+                        i32::try_from(targets.host_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
+                    let n = {
+                        let _host_write = carrick_guest_mem::HostWriteGuard::new(
+                            memory,
+                            &targets.guest_ranges,
+                        );
+                        unsafe { libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt) }
+                    };
                     let n = n.host_syscall_errno()?;
                     return Ok(DispatchOutcome::Returned { value: n as i64 });
                 }
@@ -7871,22 +7896,28 @@ impl SyscallDispatcher {
             // (kernel offset untouched).
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
                 let hfd = host_fd.raw();
-                if let Some(borrowed_iovecs) = prepare_readv_targets(memory, &iovecs)? {
-                    if borrowed_iovecs.is_empty() {
+                if let Some(targets) = prepare_readv_targets(memory, &iovecs)? {
+                    if targets.host_iovecs.is_empty() {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     let iovcnt =
-                        i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
-                    let n = unsafe {
-                        if read_at_current {
-                            libc::readv(hfd, borrowed_iovecs.as_ptr(), iovcnt)
-                        } else {
-                            libc::preadv(
-                                hfd,
-                                borrowed_iovecs.as_ptr(),
-                                iovcnt,
-                                offset as libc::off_t,
-                            )
+                        i32::try_from(targets.host_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
+                    let n = {
+                        let _host_write = carrick_guest_mem::HostWriteGuard::new(
+                            memory,
+                            &targets.guest_ranges,
+                        );
+                        unsafe {
+                            if read_at_current {
+                                libc::readv(hfd, targets.host_iovecs.as_ptr(), iovcnt)
+                            } else {
+                                libc::preadv(
+                                    hfd,
+                                    targets.host_iovecs.as_ptr(),
+                                    iovcnt,
+                                    offset as libc::off_t,
+                                )
+                            }
                         }
                     };
                     let n = n.host_syscall_errno()?;
@@ -11416,6 +11447,53 @@ impl SyscallDispatcher {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct HostWriteEvents {
+        begins: Vec<Vec<(u64, usize)>>,
+        finishes: Vec<Vec<(u64, usize)>>,
+    }
+
+    impl GuestMemory for HostWriteEvents {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OutOfBounds { address, length })
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            })
+        }
+
+        fn begin_host_write(&mut self, ranges: &[(u64, usize)]) {
+            self.begins.push(ranges.to_vec());
+        }
+
+        fn finish_host_write(&mut self, ranges: &[(u64, usize)]) {
+            self.finishes.push(ranges.to_vec());
+        }
+    }
+
+    fn fail_with_readv_host_write_guard(memory: &mut HostWriteEvents) -> Result<(), LinuxErrno> {
+        let ranges = [(0x1000, 0x1000), (0x5000, 0x1000)];
+        let _guard = carrick_guest_mem::HostWriteGuard::new(memory, &ranges);
+        Err(LINUX_EINVAL)
+    }
+
+    #[test]
+    fn readv_host_write_guard_finishes_every_exposed_range_on_error() {
+        let mut events = HostWriteEvents::default();
+
+        assert_eq!(
+            fail_with_readv_host_write_guard(&mut events),
+            Err(LINUX_EINVAL)
+        );
+
+        let expected = vec![(0x1000, 0x1000), (0x5000, 0x1000)];
+        assert_eq!(events.begins.as_slice(), std::slice::from_ref(&expected));
+        assert_eq!(events.finishes.as_slice(), std::slice::from_ref(&expected));
+    }
+
     #[test]
     fn inet4_ioctl_view_uses_linux_interface_names() {
         let ifaces = vec![
@@ -11847,6 +11925,76 @@ mod tests {
                 .unwrap(),
             DispatchOutcome::Returned { .. }
         ));
+    }
+
+    #[test]
+    fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
+        let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
+        let mut base = OpenDescriptionBase::new(LINUX_O_RDWR);
+        base.set_seals(Some(0));
+        let description = std::sync::Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+            base,
+            path: "/memfd:test".to_string(),
+            contents: Vec::new(),
+            offset: 0,
+        }));
+        let fd = dispatcher
+            .install_fd_at_or_above(3, OpenFile::new(std::sync::Arc::clone(&description), 0))
+            .expect("install sealable fd");
+
+        let guard = dispatcher.begin_host_alias_dispatch();
+        let sibling = std::sync::Arc::clone(&dispatcher);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let reporter = CompatReporter::default();
+            let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+            started_tx.send(()).expect("report F_ADD_SEALS start");
+            let outcome = sibling
+                .dispatch_normalized(
+                    SyscallRequest::new(
+                        25,
+                        SyscallArgs::from([
+                            fd as u64,
+                            LINUX_F_ADD_SEALS,
+                            u64::from(LINUX_F_SEAL_SHRINK),
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                    None,
+                )
+                .expect("fcntl is a claimed syscall")
+                .expect("F_ADD_SEALS must not be a fatal DispatchError");
+            outcome_tx
+                .send(outcome)
+                .expect("report F_ADD_SEALS outcome");
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("F_ADD_SEALS thread reached dispatch");
+        assert!(
+            outcome_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "F_ADD_SEALS raced an in-flight alias dispatch"
+        );
+        assert_eq!(description.read().seals(), Some(0));
+
+        drop(guard);
+
+        assert_eq!(
+            outcome_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("F_ADD_SEALS resumes after alias dispatch exits"),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(description.read().seals(), Some(LINUX_F_SEAL_SHRINK));
+        thread.join().expect("join F_ADD_SEALS thread");
     }
 
     #[test]

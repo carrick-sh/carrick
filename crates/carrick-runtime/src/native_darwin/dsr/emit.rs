@@ -22,15 +22,16 @@ mod tests {
     use super::super::block::{BlockLimit, BlockPlan, PlannedExit, PlannedInst};
     use super::super::cache::TranslationCache;
     use super::super::types::{
-        CacheOffset, CodeGeneration, CounterDestination, CounterRead, DirectExit, DirectKind,
-        DsrError, IndirectExit, IndirectKind, InstAction, MemoryAccess, MemoryBase, MemoryClass,
-        MemoryWriteback, PcRelativeInst, PcRelativeKind, SensitiveExit, SensitiveKind,
+        CacheOffset, CodeGeneration, DirectExit, DirectKind, DsrError, IndirectExit, IndirectKind,
+        InstAction, MemoryAccess, MemoryBase, MemoryClass, MemoryWriteback, PcRelativeInst,
+        PcRelativeKind, SensitiveExit, SensitiveKind,
     };
     use super::*;
     // These were ambient through the emitter's own file-level imports before
     // the extraction; the shim's glob re-export only carries the emitter's
     // PUB items, so the test module imports them directly.
     use carrick_guest_mem::GuestVa;
+    #[cfg(target_arch = "aarch64")]
     use dynasmrt::{DynasmApi, VecAssembler, aarch64::Aarch64Relocation};
 
     #[derive(Clone, Copy)]

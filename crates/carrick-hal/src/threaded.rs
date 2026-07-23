@@ -342,6 +342,86 @@ pub trait PlatformFutex: Send + Sync {
     fn notify_signal_pending_for(&self, tid: ThreadId);
 }
 
+/// One standard-format XSAVE component range reported by CPUID leaf 0xD.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct X86XstateComponent {
+    pub offset: u32,
+    pub size: u32,
+}
+
+impl X86XstateComponent {
+    pub const fn new(offset: u32, size: u32) -> Self {
+        Self { offset, size }
+    }
+
+    pub fn end(self) -> Option<usize> {
+        usize::try_from(self.offset)
+            .ok()?
+            .checked_add(usize::try_from(self.size).ok()?)
+    }
+}
+
+/// Cached x86 user-xstate geometry used by the signal-frame codec. Component 9
+/// (PKRU) is deliberately absent for the native lane: its guest value is a
+/// Carrick virtual scalar and must never reach hardware XRSTOR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct X86XstateCapabilities {
+    pub supported_features: u64,
+    pub standard_size: u32,
+    pub mxcsr_mask: u32,
+    pub components: [X86XstateComponent; 64],
+}
+
+impl X86XstateCapabilities {
+    /// Compatibility geometry for x86 VMM backends whose existing batch seam
+    /// carries the legacy area and AVX YMM_Hi component.
+    pub const fn legacy_avx() -> Self {
+        let mut components = [X86XstateComponent { offset: 0, size: 0 }; 64];
+        components[2] = X86XstateComponent::new(576, 256);
+        Self {
+            supported_features: 0x7,
+            standard_size: 832,
+            mxcsr_mask: 0x0000_ffbf,
+            components,
+        }
+    }
+
+    pub fn component(self, number: u32) -> Option<X86XstateComponent> {
+        let index = usize::try_from(number).ok()?;
+        let component = *self.components.get(index)?;
+        (component.size != 0).then_some(component)
+    }
+
+    /// Exact standard-format extent required by a supported feature subset.
+    pub fn standard_size_for(self, features: u64) -> Option<usize> {
+        if features & !self.supported_features != 0 || features & 0x3 != 0x3 {
+            return None;
+        }
+        let mut end = carrick_abi::X8664_XSAVE_MIN_LEN;
+        for number in 2..64u32 {
+            if features & (1u64 << number) == 0 {
+                continue;
+            }
+            end = end.max(self.component(number)?.end()?);
+        }
+        (end <= carrick_abi::X8664_XSAVE_AREA_MAX_LEN).then_some(end)
+    }
+}
+
+/// Complete standard-format x86 signal state passed through one architecture-
+/// specific batch seam. The byte vector begins with the 512-byte legacy area
+/// and includes the 64-byte standard XSAVE header and every advertised
+/// component at its CPUID leaf 0xD offset. Linux magic words and Carrick's PKRU
+/// trailer are frame metadata and are not part of this image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct X86SignalXstate {
+    pub bytes: Vec<u8>,
+    pub xfeatures: u64,
+    pub virtual_pkru: u32,
+    pub virtual_x87_fcs: u16,
+    pub virtual_x87_fds: u16,
+}
+
 /// Get/set the registers + FP/SIMD state the shared sigframe builders need.
 ///
 /// This is a sigframe/trap-loop adapter, not a claim that every guest ISA has
@@ -371,14 +451,69 @@ pub trait RegAccess {
     fn get_fpsr(&self) -> Result<u64, OsError>;
     fn set_fpsr(&mut self, v: u64) -> Result<(), OsError>;
 
-    /// Save the FP/SIMD state for an x86 signal frame in one shot: MXCSR, the 16
-    /// XMM low halves (`[u32; 64]`, the FXSAVE `xmm_space` layout), and the 16
-    /// AVX `YMM_Hi` upper halves (256 bytes). The DEFAULT loops the per-register
-    /// getters (correct for any backend, e.g. aarch64); the x86 engine overrides
-    /// it with a SINGLE `KVM_GET_XSAVE` — the XSAVE area carries MXCSR + XMM in
-    /// its legacy FXSAVE region AND `YMM_Hi` in its AVX region. The per-register
-    /// path costs ~33 host ioctls per signal DELIVERY, a throughput cliff under a
-    /// signal flood (CPython `test_stress_delivery_simultaneous`).
+    /// Capabilities for the x86 batch signal-state seam. Non-x86 callers never
+    /// invoke this default; legacy x86 VMMs retain their AVX-era geometry.
+    fn x86_xstate_capabilities(&self) -> Result<X86XstateCapabilities, OsError> {
+        Ok(X86XstateCapabilities::legacy_avx())
+    }
+
+    /// Export all authoritative guest xstate in standard format. Native x86
+    /// overrides this with a direct snapshot copy using cached CPUID geometry.
+    fn save_x86_signal_xstate(&mut self) -> Result<X86SignalXstate, OsError> {
+        let (mxcsr, xmm, ymm_hi) = self.save_fpsimd_frame()?;
+        let caps = self.x86_xstate_capabilities()?;
+        let size = usize::try_from(caps.standard_size).map_err(|_| OsError::from_raw(libc::EIO))?;
+        if !(832..=carrick_abi::X8664_XSAVE_AREA_MAX_LEN).contains(&size) {
+            return Err(OsError::from_raw(libc::EIO));
+        }
+        let mut bytes = vec![0u8; size];
+        bytes[0..2].copy_from_slice(&0x037fu16.to_le_bytes());
+        bytes[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+        bytes[28..32].copy_from_slice(&caps.mxcsr_mask.to_le_bytes());
+        for (index, word) in xmm.iter().enumerate() {
+            let offset = 160 + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        bytes[512..520].copy_from_slice(&0x7u64.to_le_bytes());
+        bytes[576..832].copy_from_slice(&ymm_hi);
+        Ok(X86SignalXstate {
+            bytes,
+            xfeatures: 0x7,
+            virtual_pkru: 0,
+            virtual_x87_fcs: carrick_abi::LINUX_X8664_USER_CS,
+            virtual_x87_fds: carrick_abi::LINUX_X8664_USER_DS,
+        })
+    }
+
+    /// Import a fully validated standard-format image. Native x86 overrides
+    /// this to commit one temporary complete snapshot plus virtual PKRU.
+    fn restore_x86_signal_xstate(&mut self, state: &X86SignalXstate) -> Result<(), OsError> {
+        if state.bytes.len() < carrick_abi::X8664_XSAVE_MIN_LEN {
+            return Err(OsError::from_raw(libc::EINVAL));
+        }
+        let mut mxcsr_bytes = [0u8; 4];
+        mxcsr_bytes.copy_from_slice(&state.bytes[24..28]);
+        let mxcsr = u32::from_le_bytes(mxcsr_bytes);
+        let mut xmm = [0u32; 64];
+        for (index, word) in xmm.iter_mut().enumerate() {
+            let offset = 160 + index * 4;
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&state.bytes[offset..offset + 4]);
+            *word = u32::from_le_bytes(bytes);
+        }
+        let mut ymm_hi = [0u8; 256];
+        if state.xfeatures & (1 << 2) != 0 {
+            let end = 832usize;
+            if state.bytes.len() < end {
+                return Err(OsError::from_raw(libc::EINVAL));
+            }
+            ymm_hi.copy_from_slice(&state.bytes[576..end]);
+        }
+        self.restore_fpsimd_frame(mxcsr, &xmm, &ymm_hi)
+    }
+
+    /// Save the legacy x86 FP/SIMD subset. Kept for existing VMM adapters; new
+    /// signal codecs use [`RegAccess::save_x86_signal_xstate`].
     fn save_fpsimd_frame(&mut self) -> Result<(u32, [u32; 64], [u8; 256]), OsError> {
         let mxcsr = self.get_fpcr()? as u32;
         let mut xmm = [0u32; 64];
@@ -630,7 +765,9 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     fn needs_shared_file_alias_sync(&self) -> bool {
         false
     }
-    fn sync_shared_file_aliases(&mut self) {}
+    fn sync_shared_file_aliases(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
     fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
         Ok(())
     }

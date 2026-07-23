@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_guest_mem::{Aarch64SyscallFrame, GuestVa, MemoryError, SharedFutexLocation};
+use carrick_guest_mem::{Aarch64SyscallFrame, Gpa, MemoryError, SharedFutexLocation};
 use carrick_hal::{
     GuestEntryRegs, GuestVmBackend, MemPerms, Reg, SlotId, SysReg, TrapError, VcpuKick,
     VcpuRegistry,
@@ -369,7 +369,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// Host wait address plus Linux-visible waiter-count key for a guest futex
     /// word IFF it lives in a `MAP_SHARED` region. `None` for private/COW words,
     /// which stay in-process via the parking-lot `FutexTable`.
-    fn shared_futex_location(&self, _guest_addr: GuestVa) -> Option<SharedFutexLocation> {
+    fn shared_futex_location(&self, _backing_gpa: Gpa) -> Option<SharedFutexLocation> {
         None
     }
 
@@ -378,6 +378,9 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// `(gpa, writable)` the engine then threads into the SHARED stage-1
     /// `map_aliased` edit. KVM derives the alias GPA from the VA inside its <1 TiB
     /// arena; HVF maps at a low alias IPA. The STAGE-1 path stays in the engine.
+    /// `file` transfers ownership of a dup: every backend must close it on every
+    /// return/unwind path. Until a returned error certifies zero mutation, the
+    /// generic runtime fail-stops rather than resuming the guest after cleanup.
     fn add_alias(
         &mut self,
         va: u64,
@@ -387,11 +390,11 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(u64, bool), TrapError>;
 
-    /// Called by the engine's `unmap_range`/`unmap_alias_range` BEFORE the stage-1
-    /// invalidate, so a backend with a process-shared alias index (HVF's
-    /// `alias_registry`) can drop the entry for a high-VA alias whose backing is
-    /// about to be freed — a stale `host_addr` must never resolve after the
-    /// `OwnedHostMapping` unmaps it. KVM has no such index; default no-op.
+    /// Called by the engine's `unmap_range`/`unmap_alias_range` only AFTER the
+    /// checked stage-1 edit and TLBI complete, so an edit failure leaves a
+    /// backend's process-shared alias index (HVF's `alias_registry`) intact and
+    /// consistent with its still-owned backing. KVM has no such index; default
+    /// no-op.
     fn on_unmap(&mut self, _va: u64, _len: usize) {}
 
     /// Whether the engine saves/restores guest FP/SIMD across signal delivery (the

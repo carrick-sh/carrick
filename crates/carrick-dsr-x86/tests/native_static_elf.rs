@@ -229,6 +229,8 @@ fn runs_a_real_static_pie_linux_elf_natively() {
 
     let mut snapshot = X86UcontextSnapshot::new();
     snapshot.gpr[reg::RSP] = rsp;
+    let mut context = X86DsrContext::new(snapshot, 0, 0);
+    context.guest_fsbase = snapshot_fsbase(&context.snapshot);
     let mut next = loaded.entry;
     let mut exit_code: Option<i32> = None;
     let mut wrote = Vec::new();
@@ -250,42 +252,40 @@ fn runs_a_real_static_pie_linux_elf_natively() {
             X86Exit::Unsupported { .. } => unreachable!(),
         };
 
-        let mut ctx = X86DsrContext::new(snapshot, exec, resume);
-        ctx.guest_fsbase = snapshot_fsbase(&snapshot);
+        context.prepare_entry(exec, resume, true, None, None);
         // SAFETY: freshly translated block ending in an exit stub; valid rsp.
-        let raw = unsafe { carrick_dsr_x86::enter_translated(&mut ctx) };
+        let raw = unsafe { carrick_dsr_x86::enter_translated(&mut context) };
         let status = X86ExitStatus::from_raw(raw);
         assert_eq!(
             status,
             Some(expect_status),
             "exit status mismatch at guest 0x{next:x} (fault={:?})",
-            ctx.fault
+            context.fault
         );
-        snapshot = ctx.snapshot;
 
         match exit {
-            X86Exit::Syscall { .. } => match snapshot.gpr[reg::RAX] {
+            X86Exit::Syscall { .. } => match context.snapshot.gpr[reg::RAX] {
                 SYS_WRITE => {
-                    let fd = snapshot.gpr[reg::RDI] as i32;
-                    let buf = snapshot.gpr[reg::RSI] as *const u8;
-                    let len = snapshot.gpr[reg::RDX] as usize;
+                    let fd = context.snapshot.gpr[reg::RDI] as i32;
+                    let buf = context.snapshot.gpr[reg::RSI] as *const u8;
+                    let len = context.snapshot.gpr[reg::RDX] as usize;
                     // Mirror the guest's write to our capture pipe (fd 1 -> pipe).
                     let target = if fd == 1 { write_fd } else { fd };
                     let slice = unsafe { std::slice::from_raw_parts(buf, len) };
                     wrote.extend_from_slice(slice);
                     let n = unsafe { libc::write(target, slice.as_ptr().cast(), len) };
-                    snapshot.gpr[reg::RAX] = n as u64;
-                    next = snapshot.rip;
+                    context.snapshot.gpr[reg::RAX] = n as u64;
+                    next = context.snapshot.rip;
                 }
                 SYS_EXIT_GROUP => {
-                    exit_code = Some(snapshot.gpr[reg::RDI] as i32);
+                    exit_code = Some(context.snapshot.gpr[reg::RDI] as i32);
                     break;
                 }
                 other => panic!("unsupported syscall {other} at guest 0x{next:x}"),
             },
             X86Exit::ControlFlow { va, .. } => {
                 let branch = read_guest(va);
-                next = cflow::resolve(&branch, va, &mut snapshot).expect("resolve branch");
+                next = cflow::resolve(&branch, va, &mut context.snapshot).expect("resolve branch");
             }
             X86Exit::Continue { target, .. } => {
                 next = target;
@@ -320,8 +320,9 @@ fn runs_a_real_static_pie_linux_elf_natively() {
 }
 
 /// This harness never services `arch_prctl(ARCH_SET_FS)` (the no_std guest
-/// sets no TLS), so the guest fs base is always 0 — the gateway skips the
-/// swap. Kept as a named seam for when a libc guest lands.
+/// sets no TLS), so the guest fs base is always 0. The gateway still installs
+/// that zero state to keep host TLS isolated. Kept as a named seam for when a
+/// libc guest lands.
 fn snapshot_fsbase(_snapshot: &X86UcontextSnapshot) -> u64 {
     0
 }

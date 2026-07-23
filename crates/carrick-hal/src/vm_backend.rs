@@ -85,7 +85,9 @@ pub trait GuestVmBackend {
     /// Forked-child / process `_exit` cleanup (a HOOK, not `Drop` — the forked
     /// child `_exit`s skipping Rust Drops). Default no-op; backends with a
     /// per-process VM node (bhyve) override it.
-    fn process_exit_cleanup(&mut self) {}
+    fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
 
     /// Backend admission gate before a new vCPU thread runs (HVF's concurrent-vCPU
     /// cap; a no-op on KVM/bhyve/NVMM).

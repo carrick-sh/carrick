@@ -19,6 +19,7 @@
 //! The IO doorbell exit returns `io.npc` (the next-PC; the kernel does NOT
 //! advance RIP — proven in M0), so `run()` fills `resume_pc = exit.io.npc`.
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, RwLock};
 
 use carrick_guest_mem::{Gpa, GuestVa};
@@ -605,8 +606,9 @@ impl GuestVmBackend for NvmmVmm {
         ForkRamStrategy::EagerCopy
     }
 
-    fn process_exit_cleanup(&mut self) {
+    fn process_exit_cleanup(&mut self) -> Result<(), TrapError> {
         self.mach.destroy_in_place();
+        Ok(())
     }
 }
 
@@ -642,6 +644,10 @@ impl X86Vmm for NvmmVmm {
     ) -> Result<(), TrapError> {
         use carrick_mem::memory::{LINUX_ALIAS_IPA_BASE, LINUX_ALIAS_IPA_SIZE};
 
+        let file = file.map(|(fd, offset, prot)| {
+            // SAFETY: dispatcher-to-backend alias setup transfers this dup.
+            (unsafe { OwnedFd::from_raw_fd(fd) }, offset, prot)
+        });
         let (va, ipa) = (va.raw(), ipa.raw());
 
         let aligned_len = len
@@ -667,6 +673,7 @@ impl X86Vmm for NvmmVmm {
         let (mapped_ipa, hva, prot, backing, writable, register_existing, record_region) =
             match file {
                 Some((fd, offset, host_prot)) => {
+                    let raw_fd = fd.as_raw_fd();
                     let mut prot = 0;
                     if host_prot & libc::PROT_READ != 0 {
                         prot |= NVMM_PROT_READ;
@@ -695,14 +702,9 @@ impl X86Vmm for NvmmVmm {
                             ))
                         })?
                         };
-                        if let Err(e) = copy_file_mapping_payload(hva, aligned_len, fd, offset) {
-                            unsafe {
-                                libc::close(fd);
-                            }
+                        if let Err(e) = copy_file_mapping_payload(hva, aligned_len, raw_fd, offset)
+                        {
                             return Err(e);
-                        }
-                        unsafe {
-                            libc::close(fd);
                         }
                         (
                             mapped_ipa,
@@ -720,20 +722,14 @@ impl X86Vmm for NvmmVmm {
                                 aligned_len,
                                 host_prot,
                                 libc::MAP_SHARED,
-                                fd,
+                                raw_fd,
                                 offset,
                             )
                         };
                         if h == libc::MAP_FAILED {
-                            unsafe {
-                                libc::close(fd);
-                            }
                             return Err(TrapError::Hypervisor(format!(
-                                "nvmm-x86: alias MAP_SHARED file fd={fd} off={offset} size={aligned_len} prot={host_prot} failed"
+                                "nvmm-x86: alias MAP_SHARED file fd={raw_fd} off={offset} size={aligned_len} prot={host_prot} failed"
                             )));
-                        }
-                        unsafe {
-                            libc::close(fd);
                         }
                         (
                             ipa,

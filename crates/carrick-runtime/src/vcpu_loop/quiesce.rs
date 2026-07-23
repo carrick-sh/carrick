@@ -1,7 +1,8 @@
 //! MEM concern: fork / page-table quiesce of the vCPU run loop.
 //!
-//! Split out of `vcpu_loop/mod.rs` (Task A2). Pure relocation — no logic
-//! changes; only `mod`/`use`/visibility wiring differs.
+//! Split out of `vcpu_loop/mod.rs` (Task A2). The page-table pause is a
+//! transactional typed gate: timeout rolls the request back before dispatch;
+//! fork quiesce remains the separate process-topology protocol below.
 
 use super::*;
 
@@ -14,6 +15,57 @@ pub(crate) fn fork_barrier() -> &'static crate::fork_quiesce::QuiesceBarrier {
 /// Process-wide page-table-edit Pause-Modify-Resume barrier.
 pub(crate) fn pt_barrier() -> &'static crate::fork_quiesce::PtQuiesce {
     crate::fork_quiesce::pt_barrier()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PtPauseError {
+    TimedOut,
+}
+
+fn acquire_pt_pause(
+    barrier: &'static crate::fork_quiesce::PtQuiesce,
+    kicker: &dyn carrick_hal::VcpuRegistry,
+    tid: ThreadId,
+    timeout: Duration,
+) -> Result<crate::fork_quiesce::PtPauseGuard, PtPauseError> {
+    // Serialize editors: at most one stop-the-world at a time. A loser parks
+    // (if the winner has raised quiescing) or yields (tiny pre-flag window),
+    // then retries. This stays independent of the fork/topology lock.
+    loop {
+        if barrier.try_become_coordinator() {
+            break;
+        }
+        if barrier.is_quiescing() {
+            barrier.park();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    barrier.set_quiescing();
+    crate::probes::pt_pause_begin(
+        tid.raw(),
+        i32::from(kicker.any_other_in_guest(tid)),
+        kicker.count() as i32,
+    );
+
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut spins: i32 = 0;
+    while kicker.any_other_in_guest(tid) {
+        kicker.kick_all_except(tid);
+        if Instant::now() >= deadline {
+            crate::probes::pt_pause_timeout(tid.raw(), start.elapsed().as_micros() as i64);
+            // Roll back BOTH persistent request bits and wake every sibling that
+            // already parked. Returning a guard while the predicate is still
+            // true would let the caller edit live page tables.
+            barrier.end();
+            return Err(PtPauseError::TimedOut);
+        }
+        spins = spins.saturating_add(1);
+        std::thread::yield_now();
+    }
+    crate::probes::pt_pause_ready(tid.raw(), spins, start.elapsed().as_micros() as i64);
+    Ok(barrier.pause_guard(tid))
 }
 
 pub(super) struct ForkRequest {
@@ -31,46 +83,15 @@ where
     E::SiblingSpec: 'static,
 {
     /// Pause sibling vCPUs for a stage-1 page-table edit (mmap/mprotect/munmap),
-    /// returning an RAII guard that resumes them on drop.
-    pub(super) fn pt_pause(&self) -> crate::fork_quiesce::PtPauseGuard {
-        let b = pt_barrier();
-        // Serialize editors: at most one stop-the-world at a time. A loser parks
-        // (if the winner has raised quiescing) or yields (tiny pre-flag window),
-        // then retries.
-        loop {
-            if b.try_become_coordinator() {
-                break;
-            }
-            if b.is_quiescing() {
-                b.park();
-            } else {
-                std::thread::yield_now();
-            }
-        }
-        b.set_quiescing();
-        let tid = self.this_tid;
-        crate::probes::pt_pause_begin(
-            tid.raw(),
-            i32::from(self.kicker.any_other_in_guest(self.this_tid)),
-            self.kicker.count() as i32,
-        );
-        // Force in-guest siblings out so they reach the run-loop-top park, then
-        // wait until none is walking the tables. Re-kick each spin in case a
-        // vCPU was between runs when the first kick landed.
-        let start = std::time::Instant::now();
-        let deadline = start + std::time::Duration::from_millis(500);
-        let mut spins: i32 = 0;
-        while self.kicker.any_other_in_guest(self.this_tid) {
-            self.kicker.kick_all_except(self.this_tid);
-            if std::time::Instant::now() >= deadline {
-                crate::probes::pt_pause_timeout(tid.raw(), start.elapsed().as_micros() as i64);
-                break;
-            }
-            spins = spins.saturating_add(1);
-            std::thread::yield_now();
-        }
-        crate::probes::pt_pause_ready(tid.raw(), spins, start.elapsed().as_micros() as i64);
-        b.pause_guard(tid)
+    /// returning an RAII guard that resumes them on drop. A timeout is a typed
+    /// clean failure: the barrier request is rolled back and no edit may begin.
+    pub(super) fn pt_pause(&self) -> Result<crate::fork_quiesce::PtPauseGuard, PtPauseError> {
+        acquire_pt_pause(
+            pt_barrier(),
+            &*self.kicker,
+            self.this_tid,
+            Duration::from_millis(500),
+        )
     }
 
     pub(super) fn release_and_park_vcpu_for_fork(
@@ -785,5 +806,96 @@ where
             }
         };
         Ok(Some(retval))
+    }
+}
+
+#[cfg(test)]
+mod pt_pause_tests {
+    use super::*;
+    use carrick_hal::{GenericVcpuRegistry, VcpuKickDyn, VcpuRegistry};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct NoopKick;
+
+    impl VcpuKickDyn for NoopKick {
+        fn kick(&self) {}
+    }
+
+    struct LeaveGuestOnKick(Arc<AtomicBool>);
+
+    impl VcpuKickDyn for LeaveGuestOnKick {
+        fn kick(&self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn tid(raw: i32) -> ThreadId {
+        ThreadId::synthetic_for_tests(raw)
+    }
+
+    #[test]
+    fn pt_pause_timeout_skips_backend_and_resumes_parked_sibling() {
+        let barrier: &'static crate::fork_quiesce::PtQuiesce =
+            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let registry = Arc::new(GenericVcpuRegistry::new());
+        let coordinator = tid(1501);
+        let sibling = tid(1502);
+        registry.register_in_guest(coordinator);
+        let sibling_in_guest = registry.register_in_guest(sibling);
+        sibling_in_guest.store(true, Ordering::SeqCst);
+        registry.register(coordinator, Box::new(NoopKick));
+        registry.register(sibling, Box::new(NoopKick));
+
+        let resumed = Arc::new(AtomicBool::new(false));
+        let sibling_resumed = Arc::clone(&resumed);
+        let sibling_thread = std::thread::spawn(move || {
+            while !barrier.is_quiescing() {
+                std::thread::yield_now();
+            }
+            barrier.park();
+            sibling_resumed.store(true, Ordering::SeqCst);
+        });
+        let backend_repoint_calls = AtomicUsize::new(0);
+        let result = acquire_pt_pause(barrier, &*registry, coordinator, Duration::from_millis(20));
+        if result.is_ok() {
+            backend_repoint_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        assert_eq!(result.err(), Some(PtPauseError::TimedOut));
+        assert_eq!(backend_repoint_calls.load(Ordering::SeqCst), 0);
+        sibling_thread.join().expect("join rolled-back sibling");
+        assert!(resumed.load(Ordering::SeqCst));
+        assert!(!barrier.is_quiescing());
+        assert!(
+            barrier.try_become_coordinator(),
+            "timeout must release coordinator ownership"
+        );
+        barrier.end();
+    }
+
+    #[test]
+    fn pt_pause_exact_drain_returns_guard_and_allows_backend() {
+        let barrier: &'static crate::fork_quiesce::PtQuiesce =
+            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let registry = Arc::new(GenericVcpuRegistry::new());
+        let coordinator = tid(1511);
+        let sibling = tid(1512);
+        registry.register_in_guest(coordinator);
+        let sibling_in_guest = registry.register_in_guest(sibling);
+        sibling_in_guest.store(true, Ordering::SeqCst);
+        registry.register(coordinator, Box::new(NoopKick));
+        registry.register(
+            sibling,
+            Box::new(LeaveGuestOnKick(Arc::clone(&sibling_in_guest))),
+        );
+
+        let guard = acquire_pt_pause(barrier, &*registry, coordinator, Duration::from_secs(1))
+            .expect("sibling drains exactly after kick");
+        let backend_repoint_calls = AtomicUsize::new(0);
+        backend_repoint_calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(backend_repoint_calls.load(Ordering::SeqCst), 1);
+        assert!(barrier.is_quiescing());
+        drop(guard);
+        assert!(!barrier.is_quiescing());
     }
 }

@@ -752,6 +752,7 @@ fn run_bridge_publish_probe(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_native_service_pair(
     bin: &PathBuf,
     lane: Lane,
@@ -2880,6 +2881,7 @@ fn run_carrick_probe_with_deadline(
     run_carrick_probe_with_backend_env(bin, lane, stdin_bytes, deadline, None)
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_carrick_probe_with_backend(
     bin: &PathBuf,
     lane: Lane,

@@ -33,9 +33,16 @@ use anyhow::{Context, bail};
 use carrick_runtime::runtime::DebugStateSnapshot;
 
 use crate::args::DebugCommand;
+use crate::debug_layout::native_x86_layout_json;
 
 pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
     match command {
+        DebugCommand::NativeX86Layout => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&native_x86_layout_json())?
+            );
+        }
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
             let value = if let Some(hex) = stripped

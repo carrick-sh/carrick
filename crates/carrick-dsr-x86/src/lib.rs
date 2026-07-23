@@ -27,10 +27,43 @@ pub mod block;
 pub mod cflow;
 pub mod decode;
 pub mod emit;
+pub mod fxstate;
+#[cfg(test)]
+mod fxstate_tests;
 pub mod gateway;
+pub mod legacy_x87;
+mod xstate_address;
+pub mod xstate_restore;
+pub mod xstate_save;
 
-pub use block::{BlockLimit, PlannedInst, X86Block, X86BlockError, X86Exit, plan_block};
-pub use decode::{X86Classified, X86DecodeError, X86InstClass, X86SensitiveKind, classify};
+pub use block::{
+    BlockLimit, PlannedInst, X86Block, X86BlockError, X86BlockPlanError, X86Exit, plan_block,
+    plan_block_with_reader,
+};
+pub use decode::{
+    X86Classified, X86DecodeError, X86FxStateKind, X86InstClass, X86LegacyX87Kind,
+    X86SensitiveKind, X86XstateRestoreKind, X86XstateSaveKind, classify,
+};
+pub use fxstate::{
+    X86FxStateError, X86FxStateGpReason, X86FxStateInternalReason, X86FxStatePlan,
+    X86FxStateSsReason,
+};
 pub use gateway::{
-    X86DsrContext, X86ExitStatus, X86IdentityStamp, X86UcontextSnapshot, enter_translated,
+    X86_SIGNAL_SAFE_XFEATURES, X86DsrContext, X86DsrProfilerLayout, X86ExitStatus,
+    X86IdentityStamp, X86IndirectCacheEntry, X86SnapshotXstateCapabilities,
+    X86SnapshotXstateComponent, X86SnapshotXstateError, X86SnapshotXstateLayout,
+    X86UcontextSnapshot, enter_translated, signal_xstate_capabilities, signal_xstate_layout,
+    x86_dsr_profiler_layout,
+};
+pub use legacy_x87::{
+    X86LegacyX87Error, X86LegacyX87GpReason, X86LegacyX87InternalReason, X86LegacyX87Plan,
+    X86LegacyX87SsReason, X86X87ExceptionKind,
+};
+pub use xstate_restore::{
+    X86GuestGsBase, X86XstateMemoryReader, X86XstateRestoreError, X86XstateRestoreGpReason,
+    X86XstateRestoreInternalReason, X86XstateRestorePlan, X86XstateRestoreSsReason,
+};
+pub use xstate_save::{
+    X86XstateMemoryWriter, X86XstateSaveError, X86XstateSaveGpReason, X86XstateSaveInternalReason,
+    X86XstateSavePlan, X86XstateSaveSsReason,
 };

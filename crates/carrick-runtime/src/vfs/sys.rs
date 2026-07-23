@@ -182,7 +182,7 @@ fn net_interfaces_from_model(model: &crate::network::model::LinuxNetworkModel) -
 
 /// Render `/sys/class/net/<if>/<attr>` for a live interface, or `None` if the
 /// path isn't a recognized attribute of a present interface.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn synthetic_net_file(path: &str) -> Option<Vec<u8>> {
     synthetic_net_file_from_interfaces(path, host_net_interfaces())
 }

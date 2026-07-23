@@ -43,7 +43,9 @@ const LINUX_SIGCHLD: i32 = 17;
 /// backend glue publishes nothing in that case). A `Mutex<Option<HashMap>>` so
 /// the static is const-initialisable in this edition (matching the crate idiom in
 /// `lib.rs`'s `THREAD_PENDING`); lazily filled on first `register`.
-static CHILD_WATCHES: Mutex<Option<HashMap<i32, (i32, i32)>>> = Mutex::new(None);
+type ChildWatchTable = HashMap<i32, (i32, i32)>;
+
+static CHILD_WATCHES: Mutex<Option<ChildWatchTable>> = Mutex::new(None);
 
 /// Raw host-observed child-exit payload, captured by backend glue from
 /// `waitid(WNOWAIT|WNOHANG)` and consumed by runtime delivery to build the
@@ -68,7 +70,7 @@ static CHILD_SIGINFOS: Mutex<Option<ChildSiginfoQueue>> = Mutex::new(None);
 /// panicking thread poisoned the mutex (the contents are a plain map of small
 /// integers, never left half-updated — and a poisoned watch table must not crash
 /// child-exit delivery).
-fn lock() -> std::sync::MutexGuard<'static, Option<HashMap<i32, (i32, i32)>>> {
+fn lock() -> std::sync::MutexGuard<'static, Option<ChildWatchTable>> {
     let mut guard = CHILD_WATCHES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -86,6 +88,30 @@ fn lock_siginfos() -> std::sync::MutexGuard<'static, Option<ChildSiginfoQueue>> 
         *guard = Some(HashMap::new());
     }
     guard
+}
+
+fn try_lock() -> Option<std::sync::MutexGuard<'static, Option<ChildWatchTable>>> {
+    let mut guard = match CHILD_WATCHES.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    Some(guard)
+}
+
+fn try_lock_siginfos() -> Option<std::sync::MutexGuard<'static, Option<ChildSiginfoQueue>>> {
+    let mut guard = match CHILD_SIGINFOS.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    Some(guard)
 }
 
 /// Record that guest tid `parent_tid` forked child `child_pid`, which should
@@ -185,7 +211,7 @@ pub fn clear() {
 /// and would otherwise park forever on a COW lock copy that no surviving
 /// thread will ever release.
 pub struct ChildWatchForkGuard {
-    _watches: std::sync::MutexGuard<'static, Option<HashMap<i32, (i32, i32)>>>,
+    _watches: std::sync::MutexGuard<'static, Option<ChildWatchTable>>,
     _siginfos: std::sync::MutexGuard<'static, Option<ChildSiginfoQueue>>,
 }
 
@@ -198,6 +224,18 @@ pub fn hold_for_fork() -> ChildWatchForkGuard {
         _watches: lock(),
         _siginfos: lock_siginfos(),
     }
+}
+
+/// Non-blocking fork-prepare acquisition for a bounded native fork. The first
+/// guard is released immediately when the second table is busy, so callers can
+/// retry the complete bundle without lock-order inversion.
+pub fn try_hold_for_fork() -> Option<ChildWatchForkGuard> {
+    let watches = try_lock()?;
+    let siginfos = try_lock_siginfos()?;
+    Some(ChildWatchForkGuard {
+        _watches: watches,
+        _siginfos: siginfos,
+    })
 }
 
 #[cfg(test)]

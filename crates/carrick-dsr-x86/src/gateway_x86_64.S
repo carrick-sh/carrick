@@ -21,6 +21,15 @@
 .equ CTX_HOST_FSBASE,  33088
 .equ CTX_SAVE_FPU,     33120
 .equ CTX_XSAVEOPT,     33124
+.equ CTX_DIAGNOSTIC,   33160
+.equ CTX_HOST_XSAVE_INIT, 33164
+.equ CTX_INDIRECT_CACHE_TABLE, 33168
+.equ CTX_INDIRECT_CACHE_LEN, 33176
+.equ CTX_INDIRECT_CACHE_SITE, 33180
+.equ CTX_INDIRECT_ACTUAL, 33184
+.equ CTX_KICK_RESTORE_RCX, 33192
+.equ CTX_EXIT_KICKED_ADDR, 33200
+.equ CTX_EXECUTABLE_STOP_WORD, 33208
 
 .text
 
@@ -39,26 +48,47 @@ carrick_dsr_x86_enter_raw:
     // Pin r15 = ctx for the duration of translated execution.
     movq %rdi, %r15
 
-    // Install the guest fs base (Linux thread pointer) when the guest has
-    // one; fs:-prefixed guest TLS accesses then copy through verbatim.
-    // guest_fsbase == 0 means "no guest TLS yet" — skip the swap entirely.
+    // Save the host fs base and install the guest's Linux thread pointer for
+    // every full entry. Zero is a real guest FS base, not a sentinel: skipping
+    // that write would expose host TLS to a guest after ARCH_SET_FS(0).
     // (rax/rcx are dead here: guest GPRs load below.)
     movq CTX_GUEST_FSBASE(%r15), %rax
-    testq %rax, %rax
-    jz 1f
     rdfsbase %rcx
     movq %rcx, CTX_HOST_FSBASE(%r15)
     wrfsbase %rax
-1:
-    // Preserve the complete host extended state, then install the complete
-    // guest state. This also protects process-affecting state such as PKRU;
-    // integer-only blocks skip this pair entirely.
+    // Preserve the complete host extended state, then install the guest's
+    // hardware-safe state. Host PKRU is included; guest PKRU is virtualized
+    // outside this XSAVE payload so it cannot revoke gateway/context access.
+    // Integer-only blocks skip this pair entirely.
     cmpl $0, CTX_SAVE_FPU(%r15)
-    je 3f
+    je 7f
     xorl %ecx, %ecx
     xgetbv
+    // XSAVEOPT's modified-state optimization is valid only after this stable
+    // destination contains one complete baseline image. Keep the first host
+    // save full; later entries use the same buffer and full XCR0 mask.
+    cmpl $0, CTX_XSAVEOPT(%r15)
+    je .Lhost_xsave_full
+    cmpl $0, CTX_HOST_XSAVE_INIT(%r15)
+    je .Lhost_xsave_first
+    xsaveopt64 CTX_HOST_XSAVE(%r15)
+    jmp .Lhost_xsave_done
+.Lhost_xsave_first:
     xsave64 CTX_HOST_XSAVE(%r15)
+    movl $1, CTX_HOST_XSAVE_INIT(%r15)
+    jmp .Lhost_xsave_done
+.Lhost_xsave_full:
+    xsave64 CTX_HOST_XSAVE(%r15)
+.Lhost_xsave_done:
     xrstor64 SNAP_XSAVE(%r15)
+    jmp 3f
+7:
+    // Diagnostic-only deterministic negative control: model arbitrary host
+    // vector use at a skipped transfer boundary. PCMPEQD changes no flags; the
+    // guest RFLAGS image is restored below regardless.
+    testl $1, CTX_DIAGNOSTIC(%r15)
+    jz 3f
+    pcmpeqd %xmm0, %xmm0
 3:
     pushq SNAP_RFLAGS(%r15)
     popfq
@@ -156,6 +186,63 @@ carrick_dsr_x86_exit_common:
     popq %rax
     movq %rax, SNAP_RFLAGS(%r15)
 
+    // Guest AC and DF are both legal state, but neither may leak into gateway
+    // comparisons or the SysV/Rust host. Preserve the exact guest image above,
+    // then clear both bits through a user-legal RFLAGS restore immediately.
+    // -263169 == ~((1 << 18) | (1 << 10)) as a sign-extended imm32.
+    andq $-263169, %rax
+    pushq %rax
+    popfq
+
+    // A translated return may publish a one-based monomorphic cache site and
+    // its live stack target without changing guest flags or registers. Resolve
+    // a hit here, after the full GPR/RFLAGS snapshot but BEFORE transferring
+    // xstate back to the host. This keeps G resident across the return while a
+    // cold/mismatched/host-resident site follows the ordinary Rust path.
+    cmpl $3, CTX_EXIT_STATUS(%r15)
+    jne .Lfull_exit
+    movl CTX_INDIRECT_CACHE_SITE(%r15), %eax
+    testl %eax, %eax
+    jz .Lfull_exit
+    // The ret is still unapplied here: guest RSP and RIP remain at the exact
+    // return-instruction boundary. Poll the per-run stop word before any cache
+    // validation or architectural stack/RIP mutation. Ordinary x86 loads have
+    // acquire semantics; all guest GPRs/RFLAGS are already in the snapshot.
+    movq CTX_EXECUTABLE_STOP_WORD(%r15), %rcx
+    testq %rcx, %rcx
+    jz .Lreturn_cache_validate
+    movl 0(%rcx), %ecx
+    testl %ecx, %ecx
+    jz .Lreturn_cache_validate
+    movl $7, CTX_EXIT_STATUS(%r15)   // X86ExitStatus::Kicked
+    jmp .Lfull_exit
+.Lreturn_cache_validate:
+    cmpl CTX_INDIRECT_CACHE_LEN(%r15), %eax
+    ja .Lfull_exit
+    movq CTX_INDIRECT_CACHE_TABLE(%r15), %rcx
+    testq %rcx, %rcx
+    jz .Lfull_exit
+    decl %eax
+    shlq $5, %rax                 // sizeof(X86IndirectCacheEntry) == 32
+    addq %rcx, %rax
+    movq 0(%rax), %rdx            // expected guest target (zero = cold)
+    testq %rdx, %rdx
+    jz .Lfull_exit
+    cmpq CTX_INDIRECT_ACTUAL(%r15), %rdx
+    jne .Lfull_exit
+    cmpl $0, CTX_SAVE_FPU(%r15)   // only G-resident intervals may stay in JIT
+    je .Lfull_exit
+    movq 8(%rax), %rcx            // translated target
+    testq %rcx, %rcx
+    jz .Lfull_exit
+    movq %rcx, CTX_ENTRY(%r15)
+    movq 16(%rax), %rcx           // ret's 8 + optional imm16 stack advance
+    addq %rcx, SNAP_GPR+32(%r15)
+    movq %rdx, SNAP_RIP(%r15)
+    movl $0, CTX_INDIRECT_CACHE_SITE(%r15)
+    jmp .Lresume_guest
+
+.Lfull_exit:
     // Save every enabled guest xstate component and restore the complete host
     // extended state before returning to Rust. GPRs and guest RFLAGS are safe in
     // the snapshot, so XGETBV's clobbers are harmless here.
@@ -163,13 +250,12 @@ carrick_dsr_x86_exit_common:
     je 4f
     xorl %ecx, %ecx
     xgetbv
-    cmpl $0, CTX_XSAVEOPT(%r15)
-    je 5f
-    xsaveopt64 SNAP_XSAVE(%r15)
-    jmp 6f
-5:
+    // Guest state must be a complete authoritative snapshot at every native
+    // boundary. In particular, FreeBSD XSAVEOPT can omit x87 legacy bytes
+    // after a copied FLD, leaving an unusable FIP/TOP payload for FXSAVE and
+    // the legacy environment codecs. Keep the host-side persistent save
+    // optimized, but use full XSAVE for guest publication.
     xsave64 SNAP_XSAVE(%r15)
-6:
     xrstor64 CTX_HOST_XSAVE(%r15)
 4:
     // SysV requires DF clear on every host function boundary. Guest `std` is
@@ -180,16 +266,11 @@ carrick_dsr_x86_exit_common:
     movq CTX_EXIT_RESUME(%r15), %rax
     movq %rax, SNAP_RIP(%r15)
 
-    // Restore the host fs base if the guest's was installed at entry. The
-    // guest cannot have CHANGED fsbase inside a block (wrfsbase/arch_prctl
-    // classify Sensitive and exit), so guest_fsbase needs no re-read. Guest
-    // rflags are already captured — test/jz are safe here.
-    movq CTX_GUEST_FSBASE(%r15), %rax
-    testq %rax, %rax
-    jz 2f
+    // Every full entry installed the guest fs base, including zero. Restore
+    // the saved host base on every full exit before any Rust/libc code runs.
+    // Return-cache hits bypass this full-exit path and remain guest-resident.
     movq CTX_HOST_FSBASE(%r15), %rax
     wrfsbase %rax
-2:
 
     // Restore host callee-saved; return status in %eax. Restore host r15 last.
     movl CTX_EXIT_STATUS(%r15), %eax
@@ -200,6 +281,30 @@ carrick_dsr_x86_exit_common:
     movq HOST_CALLEE+32(%r15), %r14
     movq HOST_CALLEE+40(%r15), %r15
     ret
+
+// Resume a monomorphic indirect-cache hit without touching either xstate
+// image or the FS bases: the same guest-resident interval is continuing.
+// GPRs/RFLAGS were captured before cache lookup, so host-side comparisons and
+// stack arithmetic cannot leak into guest architectural state.
+.Lresume_guest:
+    pushq SNAP_RFLAGS(%r15)
+    popfq
+    movq SNAP_GPR+0(%r15),   %rax
+    movq SNAP_GPR+8(%r15),   %rcx
+    movq SNAP_GPR+16(%r15),  %rdx
+    movq SNAP_GPR+24(%r15),  %rbx
+    movq SNAP_GPR+40(%r15),  %rbp
+    movq SNAP_GPR+48(%r15),  %rsi
+    movq SNAP_GPR+56(%r15),  %rdi
+    movq SNAP_GPR+64(%r15),  %r8
+    movq SNAP_GPR+72(%r15),  %r9
+    movq SNAP_GPR+80(%r15),  %r10
+    movq SNAP_GPR+88(%r15),  %r11
+    movq SNAP_GPR+96(%r15),  %r12
+    movq SNAP_GPR+104(%r15), %r13
+    movq SNAP_GPR+112(%r15), %r14
+    movq SNAP_GPR+32(%r15),  %rsp
+    jmpq *CTX_ENTRY(%r15)
 
 #if defined(__ELF__)
 .section .note.GNU-stack,"",%progbits

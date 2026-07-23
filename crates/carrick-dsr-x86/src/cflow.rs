@@ -8,10 +8,11 @@
 //! captures `rflags`, so conditional branches evaluate against real guest
 //! flags here.
 //!
-//! Stack effect for `call`/`ret` writes/reads the guest stack directly: in the
-//! native model a guest VA IS a host VA (guest memory is mapped into the host
-//! address space), so `snapshot.gpr[RSP]` is a live host pointer. A guest with
-//! an unmapped stack faults through the (M2-runtime) signal shim, not here.
+//! Production stack and memory-indirect accesses flow through one neutral
+//! [`ControlFlowMemory`] callback. This lets an identity-mapped runtime hold its
+//! executable epoch and mapping guards for the complete access rather than
+//! creating unchecked host pointers. [`ControlFlowPlan::resolve`] retains the
+//! direct identity-memory behavior only as a native test convenience.
 
 use iced_x86::{
     Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register,
@@ -19,12 +20,66 @@ use iced_x86::{
 
 use crate::gateway::{X86UcontextSnapshot, reg};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CflowMemoryAccess {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CflowMemoryFaultKind {
+    Unmapped,
+    AccessDenied,
+    BusAddress,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CflowError {
     #[error("control-flow resolve: could not decode branch at 0x{va:x}")]
     Undecodable { va: u64 },
     #[error("control-flow resolve: branch form at 0x{va:x} is not lowered yet")]
     Unsupported { va: u64 },
+    #[error("control-flow resolve: guest memory read {kind:?} at 0x{address:x}")]
+    MemoryRead {
+        address: u64,
+        kind: CflowMemoryFaultKind,
+    },
+    #[error("control-flow resolve: guest memory write {kind:?} at 0x{address:x}")]
+    MemoryWrite {
+        address: u64,
+        kind: CflowMemoryFaultKind,
+    },
+    #[error("control-flow resolve: {access:?} memory backend failed at 0x{address:x}: {detail}")]
+    MemoryBackend {
+        access: CflowMemoryAccess,
+        address: u64,
+        detail: String,
+    },
+}
+
+/// Neutral memory seam for resolving call, return, and memory-indirect exits.
+///
+/// A single mutable object owns both operations so production runtimes do not
+/// need two closures that simultaneously borrow their guest-memory backend.
+pub trait ControlFlowMemory {
+    fn read_u64(&mut self, address: u64) -> Result<u64, CflowError>;
+    fn write_u64(&mut self, address: u64, value: u64) -> Result<(), CflowError>;
+}
+
+struct IdentityTestMemory;
+
+impl ControlFlowMemory for IdentityTestMemory {
+    fn read_u64(&mut self, address: u64) -> Result<u64, CflowError> {
+        // SAFETY: this adapter is used only by the native test convenience
+        // wrapper, whose callers provide live identity-mapped addresses.
+        Ok(unsafe { (address as *const u64).read_unaligned() })
+    }
+
+    fn write_u64(&mut self, address: u64, value: u64) -> Result<(), CflowError> {
+        // SAFETY: same native-test-only identity-memory contract as `read_u64`.
+        unsafe { (address as *mut u64).write_unaligned(value) };
+        Ok(())
+    }
 }
 
 /// Predecoded control-flow instruction. Hot indirect sites (especially `ret`)
@@ -51,7 +106,17 @@ impl ControlFlowPlan {
         })
     }
 
+    /// Native-test convenience wrapper over direct identity-mapped memory.
+    /// Production runtimes must use [`Self::resolve_with_memory`].
     pub fn resolve(&self, snapshot: &mut X86UcontextSnapshot) -> Result<u64, CflowError> {
+        self.resolve_with_memory(snapshot, &mut IdentityTestMemory)
+    }
+
+    pub fn resolve_with_memory<M: ControlFlowMemory + ?Sized>(
+        &self,
+        snapshot: &mut X86UcontextSnapshot,
+        memory: &mut M,
+    ) -> Result<u64, CflowError> {
         let inst = &self.instruction;
         let va = self.va;
         let fallthrough = self.fallthrough;
@@ -70,25 +135,28 @@ impl ControlFlowPlan {
             }
             FlowControl::Call => {
                 let target = rel_target(inst, va)?;
-                push64(snapshot, fallthrough);
+                push64(snapshot, fallthrough, memory)?;
                 Ok(target)
             }
-            FlowControl::IndirectBranch => indirect_target(inst, va, snapshot),
+            FlowControl::IndirectBranch => indirect_target(inst, va, snapshot, memory),
             FlowControl::IndirectCall => {
                 // Read the target BEFORE the push (an rsp-based memory operand
                 // must see the pre-call rsp, exactly like hardware).
-                let target = indirect_target(inst, va, snapshot)?;
-                push64(snapshot, fallthrough);
+                let target = indirect_target(inst, va, snapshot, memory)?;
+                push64(snapshot, fallthrough, memory)?;
                 Ok(target)
             }
             FlowControl::Return => {
-                let target = pop64(snapshot);
-                // `ret imm16` additionally releases the callee-popped argument
-                // bytes after the return address.
-                if inst.code() == Code::Retnq_imm16 {
-                    snapshot.gpr[reg::RSP] =
-                        snapshot.gpr[reg::RSP].wrapping_add(u64::from(inst.immediate16()));
-                }
+                let rsp = snapshot.gpr[reg::RSP];
+                let target = memory.read_u64(rsp)?;
+                let stack_adjust = 8 + if inst.code() == Code::Retnq_imm16 {
+                    u64::from(inst.immediate16())
+                } else {
+                    0
+                };
+                // Architectural stack state changes only after the read
+                // succeeds. A failed access leaves the snapshot retryable.
+                snapshot.gpr[reg::RSP] = rsp.wrapping_add(stack_adjust);
                 Ok(target)
             }
             _ => Err(CflowError::Unsupported { va }),
@@ -119,10 +187,11 @@ fn rel_target(inst: &Instruction, va: u64) -> Result<u64, CflowError> {
 /// load from the resolved effective address (guest VA == host VA natively).
 /// Far forms and segment-prefixed operands (the base would need the swapped
 /// fs/gs base, which is not live here on the host side) stay unsupported.
-fn indirect_target(
+fn indirect_target<M: ControlFlowMemory + ?Sized>(
     inst: &Instruction,
     va: u64,
     snapshot: &X86UcontextSnapshot,
+    memory: &mut M,
 ) -> Result<u64, CflowError> {
     match inst.op0_kind() {
         OpKind::Register => gpr_value(inst.op0_register(), snapshot, va),
@@ -143,9 +212,7 @@ fn indirect_target(
                     .wrapping_mul(u64::from(inst.memory_index_scale()));
                 addr = addr.wrapping_add(scaled);
             }
-            // SAFETY: addr is a guest VA == host VA in the native mapping
-            // model; a bad guest pointer faults through the signal shim.
-            Ok(unsafe { (addr as *const u64).read_unaligned() })
+            memory.read_u64(addr)
         }
         _ => Err(CflowError::Unsupported { va }),
     }
@@ -166,19 +233,16 @@ fn gpr_value(
     Ok(snapshot.gpr[index])
 }
 
-fn push64(snapshot: &mut X86UcontextSnapshot, value: u64) {
+fn push64<M: ControlFlowMemory + ?Sized>(
+    snapshot: &mut X86UcontextSnapshot,
+    value: u64,
+    memory: &mut M,
+) -> Result<(), CflowError> {
     let rsp = snapshot.gpr[reg::RSP].wrapping_sub(8);
+    memory.write_u64(rsp, value)?;
+    // Architectural stack state changes only after the write succeeds.
     snapshot.gpr[reg::RSP] = rsp;
-    // SAFETY: rsp is a guest VA == host VA in the native mapping model.
-    unsafe { (rsp as *mut u64).write_unaligned(value) };
-}
-
-fn pop64(snapshot: &mut X86UcontextSnapshot) -> u64 {
-    let rsp = snapshot.gpr[reg::RSP];
-    // SAFETY: as above; a bad guest rsp faults through the signal shim.
-    let value = unsafe { (rsp as *const u64).read_unaligned() };
-    snapshot.gpr[reg::RSP] = rsp.wrapping_add(8);
-    value
+    Ok(())
 }
 
 // rflags bit positions.
@@ -309,6 +373,119 @@ mod tests {
 
     fn snap() -> X86UcontextSnapshot {
         X86UcontextSnapshot::new()
+    }
+
+    #[derive(Default)]
+    struct RecordingMemory {
+        read_value: u64,
+        reads: Vec<u64>,
+        writes: Vec<(u64, u64)>,
+        fail_read: bool,
+        fail_write: bool,
+    }
+
+    impl ControlFlowMemory for RecordingMemory {
+        fn read_u64(&mut self, address: u64) -> Result<u64, CflowError> {
+            self.reads.push(address);
+            if self.fail_read {
+                Err(CflowError::MemoryRead {
+                    address,
+                    kind: CflowMemoryFaultKind::Unmapped,
+                })
+            } else {
+                Ok(self.read_value)
+            }
+        }
+
+        fn write_u64(&mut self, address: u64, value: u64) -> Result<(), CflowError> {
+            self.writes.push((address, value));
+            if self.fail_write {
+                Err(CflowError::MemoryWrite {
+                    address,
+                    kind: CflowMemoryFaultKind::Unmapped,
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn callback_services_indirect_call_read_then_stack_write_once() {
+        let plan = ControlFlowPlan::decode(&[0xff, 0x14, 0x24], VA).expect("decode call [rsp]");
+        let mut s = snap();
+        s.gpr[reg::RSP] = 0x8000;
+        let mut memory = RecordingMemory {
+            read_value: 0x55_0000,
+            ..RecordingMemory::default()
+        };
+
+        let target = plan
+            .resolve_with_memory(&mut s, &mut memory)
+            .expect("resolve indirect call");
+
+        assert_eq!(target, 0x55_0000);
+        assert_eq!(memory.reads, vec![0x8000], "target read exactly once");
+        assert_eq!(memory.writes, vec![(0x7ff8, VA + 3)]);
+        assert_eq!(s.gpr[reg::RSP], 0x7ff8);
+    }
+
+    #[test]
+    fn failed_indirect_call_reads_target_once_without_pushing() {
+        let plan = ControlFlowPlan::decode(&[0xff, 0x14, 0x24], VA).expect("decode call [rsp]");
+        let mut snapshot = snap();
+        snapshot.gpr[reg::RSP] = 0x8000;
+        let mut memory = RecordingMemory {
+            fail_read: true,
+            ..RecordingMemory::default()
+        };
+
+        assert_eq!(
+            plan.resolve_with_memory(&mut snapshot, &mut memory),
+            Err(CflowError::MemoryRead {
+                address: 0x8000,
+                kind: CflowMemoryFaultKind::Unmapped,
+            })
+        );
+        assert_eq!(memory.reads, vec![0x8000], "target read exactly once");
+        assert!(memory.writes.is_empty(), "failed target read cannot push");
+        assert_eq!(snapshot.gpr[reg::RSP], 0x8000);
+    }
+
+    #[test]
+    fn callback_memory_failure_leaves_stack_state_unchanged() {
+        let call = ControlFlowPlan::decode(&[0xe8, 0, 0, 0, 0], VA).expect("decode call");
+        let mut call_snapshot = snap();
+        call_snapshot.gpr[reg::RSP] = 0x9000;
+        let mut write_fails = RecordingMemory {
+            fail_write: true,
+            ..RecordingMemory::default()
+        };
+        assert_eq!(
+            call.resolve_with_memory(&mut call_snapshot, &mut write_fails),
+            Err(CflowError::MemoryWrite {
+                address: 0x8ff8,
+                kind: CflowMemoryFaultKind::Unmapped,
+            })
+        );
+        assert_eq!(call_snapshot.gpr[reg::RSP], 0x9000);
+
+        let ret = ControlFlowPlan::decode(&[0xc3], VA).expect("decode ret");
+        let mut ret_snapshot = snap();
+        ret_snapshot.gpr[reg::RSP] = 0xa000;
+        let mut read_fails = RecordingMemory {
+            fail_read: true,
+            ..RecordingMemory::default()
+        };
+        assert_eq!(
+            ret.resolve_with_memory(&mut ret_snapshot, &mut read_fails),
+            Err(CflowError::MemoryRead {
+                address: 0xa000,
+                kind: CflowMemoryFaultKind::Unmapped,
+            })
+        );
+        assert_eq!(read_fails.reads, vec![0xa000], "return read exactly once");
+        assert_eq!(ret_snapshot.gpr[reg::RSP], 0xa000);
     }
 
     #[test]

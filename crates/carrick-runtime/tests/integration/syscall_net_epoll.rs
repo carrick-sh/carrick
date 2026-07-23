@@ -15,9 +15,12 @@ use carrick_runtime::dispatch::WaitFds;
 #[cfg(target_os = "macos")]
 use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
 use carrick_runtime::linux_abi::{
-    LINUX_AF_INET, LINUX_EINTR, LINUX_EMFILE, LINUX_EPOLLOUT, LINUX_SIOCGIFINDEX,
-    LINUX_SIOCGIFNAME, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_TCP,
+    LINUX_AF_INET, LINUX_EMFILE, LINUX_SIOCGIFINDEX, LINUX_SIOCGIFNAME, LINUX_SOCK_STREAM,
     LinuxGuestAbi, LinuxX8664EpollEvent,
+};
+#[cfg(target_os = "macos")]
+use carrick_runtime::linux_abi::{
+    LINUX_EINTR, LINUX_EPOLLOUT, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK, LINUX_SOL_TCP,
 };
 #[cfg(target_os = "macos")]
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
