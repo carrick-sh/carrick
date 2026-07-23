@@ -85,6 +85,78 @@ measurements. The supported commands, schema, measured overhead, current long
 poles, and interruption behavior are recorded in the
 [native DSR profile report](native-dsr-dtrace-profile.md).
 
+### Profiling a running FreeBSD native-x86 process
+
+Launch-time `carrick trace --profile dsr` owns its target and may use Carrick
+USDT probes. An already-running FreeBSD native process has a different safety
+contract: **never attach with `dtrace -p`, `pid$PID`, or USDT fasttrap probes**.
+Fasttrap teardown delivered a leaked `SIGTRAP` and killed a continuing Kaniko
+build. Use the bounded kernel-provider profiler instead:
+
+```sh
+sudo scripts/native-x86-profile.py PID --seconds 5
+sudo scripts/native-x86-profile.py PID --guest-elf /path/to/guest --json
+```
+
+The tool discovers the current host process tree and follows later forks through
+`proc:::create`; discovers Carrick, libc, and executable POSIX-SHM JIT mappings
+with `procstat`; and obtains `%r15` plus the `exit_resume` offset from the
+matching binary's versioned `carrick debug native-x86-layout` contract. It
+reports host syscall counts, PIE-normalized/`addr2line`-symbolicated host PCs,
+guest-PC samples, and sampled `memcpy` callers and sizes. It rechecks executable mappings and tracee liveness after
+capture and fails closed when DTrace reports drops or action errors.
+
+For an unexplained signal death in a long-running process tree, start the
+kernel-provider lifecycle trace while the root still runs:
+
+```sh
+sudo dtrace -q -s scripts/dtrace/native-x86-signal-lifecycle.d ROOT_PID \
+  > /tmp/native-x86-signals.out
+```
+
+It records the sender PID/name, target PID, and signum for signals delivered to
+the root or descendants created after tracing starts, then exits with the root.
+It enables only the kernel `proc` provider: no `-p`, pid provider, USDT, or
+fasttrap attachment. Start it before the child of interest is created; the
+initial PID set contains only `ROOT_PID`.
+
+Do not use `ustack()` as ground truth while the JIT runs: DSR has installed the
+guest RSP, so host unwinding either stops or follows guest data. Do not copy a
+numeric context offset into a D script; XSAVE expansion already moved
+`exit_resume` from 720 to 33024. Raw guest PCs remain authoritative when a
+stripped Go ELF retains no symbol table; `--guest-elf` symbolizes ordinary ELF
+symbols when available.
+
+For a controlled xstate-ownership investigation, launch the target under trace
+(the tracer must own its whole lifetime) and select only the relevant guest PCs:
+
+```sh
+CARRICK_NATIVE_X86_TRACE_PC=0x20114d,0x201138 \
+  target/release/carrick trace \
+  --script scripts/dtrace/native-x86-pc.d -- run ...
+```
+
+The trace emits edge event/decision flags plus FCW, MXCSR, XSTATE_BV, PKRU and
+bounded legacy/YMM/opmask-ZMM/extended hashes. To bisect a transitive chain,
+`CARRICK_NATIVE_X86_EDGE_BARRIER` accepts `all`, a source PC, or
+`source->target`; selected edges stay on their cold gateway stub. The exact
+value `CARRICK_NATIVE_X86_XSTATE_POLICY=unsafe-local-diagnostic` deliberately
+clobbers skipped entries for a red-first diagnostic. The experimental
+`neutral-domains` policy keeps locally classified state-user targets cold and
+uses host-resident physical state only for neutral entries; nonzero virtual
+guest PKRU forces guest residency. RDPKRU/WRPKRU are sensitive-emulated outside
+the hardware XSAVE image so guest key-0 rights cannot revoke gateway access;
+guest-memory pkey enforcement is not implemented yet. The legacy
+`unsafe-target-barrier-diagnostic` spelling
+is an alias retained for reproducing the original experiment. Only
+`unsafe-local-diagnostic` is intentionally corrupting. Combine diagnostic modes
+with selected PCs and a bounded launch-time trace. To discover candidate PCs on an
+exact workload, set `CARRICK_NATIVE_X86_TRACE_XSTATE_GRAPH=1` and launch with
+`scripts/dtrace/native-x86-xstate-graph.d`; it aggregates translation and patch
+lifecycle edges without gateway-entry events or component hashing. These are
+USDT probes, so the prohibition on attaching them to an already-running FreeBSD
+native process still applies.
+
 ### USDT probe families
 
 The probes are static USDT, wired at the translation boundaries via the `usdt`

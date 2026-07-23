@@ -15,9 +15,10 @@ description: >-
   eprintln!/printf to a carrick guest; reach for this on any carrick guest
   debugging, hang, wedge, ENOSYS, or "why did the guest do that" question.
 compatibility: >-
-  Requires the carrick project + a release build codesigned with the HVF
-  entitlement, macOS on Apple silicon, and root (carrick trace auto-sudos for
-  /dev/dtrace).
+  Requires the carrick project and root DTrace access. The macOS/HVF lane needs
+  a codesigned release binary; FreeBSD/amd64 also supports launch-time
+  `carrick trace`. Profiling an already-running FreeBSD native process uses
+  `scripts/native-x86-profile.py`, not a live USDT/fasttrap attach.
 metadata:
   version: "1.0"
   upstream-scripts: carrick repo scripts/*.d and src/probes.rs
@@ -47,6 +48,15 @@ carrick trace [--script <file.d>] [--trace-out <file>] [--flowindent] -- <run-ar
 `$target` inside the script binds to the spawned carrick pid.
 
 ## Operating rules (learned the hard way)
+
+0. **Never attach USDT/fasttrap DTrace to a continuing FreeBSD native process.**
+   A bounded `dtrace -p`/USDT capture can leave a breakpoint and deliver
+   `SIGTRAP` when it detaches; this killed a live Kaniko build. For an existing
+   native x86 PID use `sudo scripts/native-x86-profile.py <pid> --seconds 5`.
+   It uses kernel-only `profile`/`syscall`/`proc` providers, discovers the DSR
+   layout from the matching Carrick binary, follows descendants, and verifies
+   that the tracee survived. Use `carrick trace --profile dsr -- ...` only when
+   the tracer launches and owns the target for its complete lifetime.
 
 1. **Always follow the whole process tree with `progenyof($target)`.** A guest
    `fork`/`clone` becomes a real macOS child carrick process that re-registers
