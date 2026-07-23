@@ -2,7 +2,7 @@
 """bsdvm: QEMU/HVF FreeBSD+NetBSD aarch64 test VMs on the Mac.
 
 Spec: docs/superpowers/specs/2026-07-22-aarch64-bsd-vm-lanes-design.md
-Subcommands: fetch provision up down destroy ps gate refresh-golden
+Subcommands: fetch provision up down destroy ps gate ladder refresh-golden
 """
 
 import argparse
@@ -291,6 +291,19 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     st = state_dir(vm.name)
     base = st / "base.qcow2"
     part = st / "base.part.qcow2"
+    golden = st / "golden.qcow2"
+    if getattr(args, "force", False) and golden.exists():
+        # A forced base refetch out from under a live golden chain reproduces
+        # the stale-backing corruption class: golden.qcow2 (and every overlay
+        # created against it) still points at the OLD base.qcow2 by path, so
+        # rewriting that path's contents in place corrupts every descendant
+        # the moment it next reads a not-yet-COW'd cluster.
+        raise SystemExit(
+            f"{golden} exists; refusing --force (would refetch the base image "
+            "backing a live golden chain). Run `provision --force` to rebuild "
+            f"the golden on top of a fresh base first, or `destroy {vm.name} "
+            "--all` to clear this VM's state entirely."
+        )
     part.unlink(missing_ok=True)  # stale partial finalize from an interrupted prior run
     if base.exists() and not getattr(args, "force", False):
         print(f"{base} exists; skipping (use --force to refetch)")
@@ -1138,10 +1151,18 @@ def run_gate(vm: VmConfig, stage_name: str, boot_retries: int = 0) -> dict:
         final_exc = exc_caught
         break
 
+    rc = 0 if (ok or stage.report_only) else 1
+    if final_exc is not None:
+        # A whole-flow exception (boot-retry exhaustion, ssh_wait's own
+        # SystemExit, ...) is never a pass, no matter what `ok` and
+        # `report_only` say -- `ok` still holds its loop-top default of True
+        # when the exception fires before any stage.cmds step ran, which
+        # previously produced rc=0 alongside a non-None `exc`.
+        rc = 1
     return {
         "report": report,
         "report_dir": out_dir,
-        "rc": 0 if (ok or stage.report_only) else 1,
+        "rc": rc,
         "exc": final_exc,
     }
 
@@ -1188,32 +1209,40 @@ def cmd_ladder(args: argparse.Namespace) -> int:
         vm = VMS[vm_name]
         started = time.monotonic()
         error: str | None = None
-        passed = False
+        # Two distinct signals, kept separate rather than conflated into one
+        # `pass`: `steps_ok` is the gate report's own `pass` (did every
+        # stage.cmds step return 0, with no whole-flow exception?);
+        # `exit_ok` is run_gate's rc (0 iff steps_ok, OR the stage is
+        # report-only and never gates on step failure -- see run_gate's rc
+        # hardening above for the exc-not-None case). A report-only stage
+        # with failing steps is exactly `steps_ok=False, exit_ok=True`.
+        steps_ok = False
+        exit_ok = False
         report_dir: Path | None = None
         boot_retries_used = 0
         try:
             outcome = run_gate(vm, stage_name, boot_retries=1)
             report_dir = outcome["report_dir"]
             boot_retries_used = outcome["report"].get("boot_retries_used", 0)
+            steps_ok = bool(outcome["report"].get("pass"))
+            exit_ok = outcome["rc"] == 0
             if outcome["exc"] is not None:
                 error = repr(outcome["exc"])
-                passed = False
-            else:
-                passed = outcome["rc"] == 0
         except BaseException as exc:
             # Precondition failure (no golden, already running, ...) or any
             # other exception run_gate itself couldn't recover from -- record
             # it and keep going to the next gate spec instead of aborting the
-            # whole ladder.
+            # whole ladder. No report/rc exists in this path, so both fields
+            # stay at their False default.
             error = repr(exc)
-            passed = False
         wall_s = time.monotonic() - started
         results.append({
-            "vm": vm_name, "stage": stage_name, "pass": passed,
+            "vm": vm_name, "stage": stage_name,
+            "steps_ok": steps_ok, "exit_ok": exit_ok,
             "report_dir": str(report_dir) if report_dir is not None else None,
             "wall_s": wall_s, "boot_retries_used": boot_retries_used, "error": error,
         })
-        status = "PASS" if passed else "FAIL"
+        status = "PASS" if exit_ok else "FAIL"
         extra = f" error={error}" if error else ""
         print(
             f"ladder {vm_name}:{stage_name}: {status} wall={wall_s:.1f}s "
@@ -1226,7 +1255,7 @@ def cmd_ladder(args: argparse.Namespace) -> int:
     out.write_text(json.dumps({"results": results}, indent=2) + "\n")
     print(f"ladder summary: {out}")
 
-    return 0 if all(r["pass"] for r in results) else 1
+    return 0 if all(r["exit_ok"] for r in results) else 1
 
 
 def cmd_up(args: argparse.Namespace) -> int:
