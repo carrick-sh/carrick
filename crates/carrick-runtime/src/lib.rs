@@ -134,6 +134,13 @@ pub(crate) mod inotify;
 pub mod interactive_supervisor;
 pub mod layer_cache;
 pub mod namespace;
+// The single native-lane wiring point (M0.8): the ONE place execute.rs /
+// runtime.rs / lib.rs reach into a native backend. See
+// `native/mod.rs`'s module doc for the strangler-interim rationale — its
+// facade bodies still branch per-target and call straight into
+// `native_darwin`/`native_freebsd` below; Phase 2 replaces those bodies with
+// a single generic `NativeLane`-parameterized call apiece.
+pub(crate) mod native;
 pub(crate) mod native_darwin;
 // The FreeBSD/amd64 native (DSR) driver: executes a static x86_64 Linux ELF
 // through the carrick-dsr-x86 gateway and services its syscalls via the shared
@@ -914,7 +921,7 @@ pub mod runtime {
         env: impl IntoIterator<Item = String>,
     ) -> Result<RunResult, RuntimeError> {
         let dispatcher = make_native_dispatcher(path);
-        crate::native_freebsd::run_static_x86_elf(path, dispatcher, argv, env, DEFAULT_MAX_TRAPS)
+        crate::native::run_dispatch_native(path, dispatcher, argv, env, DEFAULT_MAX_TRAPS)
     }
 
     /// Dispatcher for the NATIVE (DSR) ELF runner with Docker-stable container
@@ -1781,7 +1788,7 @@ pub mod runtime {
         if plan.backend == crate::page_profile::ExecutionBackend::Native {
             dispatcher.set_native_x86_64(true);
             let env = spec.envp.iter().map(|s| s.as_bytes().to_vec()).collect();
-            return crate::native_freebsd::run_static_x86_elf_bytes(
+            return crate::native::run_dispatch_native_bytes(
                 &bytes,
                 dispatcher,
                 argv,

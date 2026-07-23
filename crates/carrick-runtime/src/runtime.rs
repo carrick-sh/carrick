@@ -293,7 +293,7 @@ where
                 options.debug_state_path,
             )
         }
-        crate::page_profile::ExecutionBackend::Native => crate::native_darwin::run_static_elf(
+        crate::page_profile::ExecutionBackend::Native => crate::native::run_static_native(
             path.as_ref(),
             dispatcher,
             argv,

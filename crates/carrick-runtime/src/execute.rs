@@ -341,7 +341,7 @@ impl Runtime {
                     .map(|p| PathBuf::from(p.as_std_path()));
                 let run_result =
                     if execution_plan.backend == crate::page_profile::ExecutionBackend::Native {
-                        crate::native_darwin::run_elf_from_dispatcher_debug(
+                        crate::native::run_oci_native(
                             &spec.executable,
                             dispatcher,
                             spec.argv.clone(),
@@ -454,7 +454,7 @@ impl Runtime {
                     .map(|p| PathBuf::from(p.as_std_path()));
                 let run_result =
                     if execution_plan.backend == crate::page_profile::ExecutionBackend::Native {
-                        crate::native_darwin::run_elf_from_dispatcher_debug(
+                        crate::native::run_oci_native(
                             &spec.executable,
                             dispatcher,
                             spec.argv.clone(),
