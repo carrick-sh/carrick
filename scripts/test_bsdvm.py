@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import lzma
 import os
@@ -333,6 +335,103 @@ class QemuArgsTests(unittest.TestCase):
                 p1.write_bytes(b"mutated")
                 p2 = BSDVM.ensure_efivars("freebsd-arm64")
                 self.assertEqual(p2.read_bytes(), b"mutated")  # no re-copy
+
+
+class LifecycleTests(unittest.TestCase):
+    def test_stop_pid_escalates_to_kill(self) -> None:
+        calls: list[tuple[int, int]] = []
+
+        def fake_kill(pid: int, sig: int) -> None:
+            calls.append((pid, sig))
+            if sig == 0:  # "still alive" while probing until KILL sent
+                if any(s == 9 for _, s in calls):
+                    raise ProcessLookupError
+                return
+
+        BSDVM.stop_pid(42, term_wait_s=0.05, kill=fake_kill, sleep=lambda s: None)
+        sigs = [s for _, s in calls]
+        self.assertIn(15, sigs)
+        self.assertIn(9, sigs)
+
+    def test_stop_pid_no_kill_if_term_works(self) -> None:
+        state = {"alive": True}
+
+        def fake_kill(pid: int, sig: int) -> None:
+            if sig == 15:
+                state["alive"] = False
+                return
+            if sig == 0:
+                if not state["alive"]:
+                    raise ProcessLookupError
+                return
+            self.fail(f"unexpected signal {sig}")
+
+        BSDVM.stop_pid(42, term_wait_s=1.0, kill=fake_kill, sleep=lambda s: None)
+
+    def test_stop_pid_bounded_when_sigkill_never_kills(self) -> None:
+        # If SIGKILL itself never manages to kill the process (kill(pid, 0)
+        # always succeeds), the post-KILL wait must still be bounded -- it
+        # must raise SystemExit rather than loop forever.
+        def fake_kill(pid: int, sig: int) -> None:
+            return  # every signal "succeeds"; process never looks dead
+
+        with self.assertRaises(SystemExit):
+            BSDVM.stop_pid(
+                42,
+                term_wait_s=0.05,
+                kill_wait_s=0.05,
+                kill=fake_kill,
+                sleep=lambda s: None,
+            )
+
+    def test_destroy_protects_base_and_golden(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                st = BSDVM.state_dir("freebsd-arm64")
+                st.mkdir(parents=True)
+                for n in ("base.qcow2", "golden.qcow2", "dev.qcow2", "gate-1.qcow2"):
+                    (st / n).write_bytes(b"x")
+                ns = mock.Mock(vm="freebsd-arm64", all=False)
+                with mock.patch.object(BSDVM, "read_pid", return_value=None):
+                    BSDVM.cmd_destroy(ns)
+                self.assertTrue((st / "base.qcow2").exists())
+                self.assertTrue((st / "golden.qcow2").exists())
+                self.assertFalse((st / "dev.qcow2").exists())
+                self.assertFalse((st / "gate-1.qcow2").exists())
+
+
+class PidAliveTests(unittest.TestCase):
+    """`pid_alive` is the single probe read_pid/cmd_ps both centralize on."""
+
+    def test_permission_error_is_treated_as_dead(self) -> None:
+        # We spawned qemu as this user; an unsignalable pid means the pid
+        # was recycled by a foreign process -- accepted pidfile-scheme
+        # limitation (see pid_alive's docstring/comment for the caveat).
+        with mock.patch.object(BSDVM.os, "kill", side_effect=PermissionError):
+            self.assertFalse(BSDVM.pid_alive(42))
+
+    def test_process_lookup_error_is_dead(self) -> None:
+        with mock.patch.object(BSDVM.os, "kill", side_effect=ProcessLookupError):
+            self.assertFalse(BSDVM.pid_alive(42))
+
+    def test_successful_probe_is_alive(self) -> None:
+        with mock.patch.object(BSDVM.os, "kill", return_value=None):
+            self.assertTrue(BSDVM.pid_alive(42))
+
+
+class PsDisplayTests(unittest.TestCase):
+    def test_cmd_ps_malformed_pidfile_reports_orphan_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                st = BSDVM.state_dir("freebsd-arm64")
+                st.mkdir(parents=True)
+                (st / "qemu.pid").write_text("garbage")
+                ns = mock.Mock(vm="freebsd-arm64")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = BSDVM.cmd_ps(ns)
+                self.assertEqual(rc, 0)
+                self.assertIn("orphan-pidfile", out.getvalue())
 
 
 if __name__ == "__main__":
