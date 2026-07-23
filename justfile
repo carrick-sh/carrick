@@ -375,3 +375,6 @@ bsdvm-ps:
 
 bsdvm-gate VM STAGE="stage0":
     python3 scripts/bsdvm.py gate {{VM}} {{STAGE}}
+
+bsdvm-acceptance:
+    python3 scripts/bsdvm.py ladder freebsd-arm64:stage0 netbsd-arm64:stage0 freebsd-arm64:stage1 netbsd-arm64:stage1

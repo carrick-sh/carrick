@@ -1177,7 +1177,7 @@ class GateTests(unittest.TestCase):
         self.assertFalse(BSDVM.STAGES["stage3"].available)
 
     def test_unavailable_stage_is_a_clear_error(self) -> None:
-        ns = mock.Mock(vm="freebsd-arm64", stage="stage2")
+        ns = mock.Mock(vm="freebsd-arm64", stage="stage2", boot_retries=0)
         with self.assertRaises(SystemExit) as ctx:
             BSDVM.cmd_gate(ns)
         self.assertIn("NativeLane", str(ctx.exception))
@@ -1232,7 +1232,7 @@ class GateReportGuaranteeTests(unittest.TestCase):
                 st = self._make_golden(vm_name)
                 (st / "qemu.pid").write_text("555")
 
-                ns = mock.Mock(vm=vm_name, stage="stage0")
+                ns = mock.Mock(vm=vm_name, stage="stage0", boot_retries=0)
                 stop_calls: list[int] = []
                 with (
                     mock.patch.object(
@@ -1276,7 +1276,7 @@ class GateReportGuaranteeTests(unittest.TestCase):
                 test_stage = BSDVM.Stage(
                     cmds=["cmd-a", "cmd-b", "cmd-c"], report_only=False, available=True,
                 )
-                ns = mock.Mock(vm=vm_name, stage="stage0")
+                ns = mock.Mock(vm=vm_name, stage="stage0", boot_retries=0)
                 timeout_exc = subprocess.TimeoutExpired(
                     cmd="cmd-a", timeout=7200, output=b"partial-out", stderr=b"partial-err"
                 )
@@ -1327,7 +1327,7 @@ class GateReportGuaranteeTests(unittest.TestCase):
                 vm_name = "freebsd-arm64"
                 self._make_golden(vm_name)
 
-                ns = mock.Mock(vm=vm_name, stage="stage0")
+                ns = mock.Mock(vm=vm_name, stage="stage0", boot_retries=0)
                 stderr_buf = io.StringIO()
                 with (
                     mock.patch.object(
@@ -1353,6 +1353,298 @@ class GateReportGuaranteeTests(unittest.TestCase):
                 self.assertIn("root cause: ssh unreachable", str(ctx.exception))
                 self.assertIn("warning: cleanup failed", stderr_buf.getvalue())
                 self.assertIn("kill failed", stderr_buf.getvalue())
+
+
+class BootRetryTests(unittest.TestCase):
+    """`run_gate`'s boot-retry loop: the boot/ssh_wait phase (before any stage
+    cmd has run) gets torn down and retried with a FRESH ephemeral overlay,
+    up to `boot_retries` times. Boundaries (create_overlay, boot, ssh_wait,
+    push_head, ssh_run, read_pid, stop_pid) are mocked; only real filesystem
+    operations run, against a tmpdir state root.
+    """
+
+    @staticmethod
+    def _fake_create_overlay(vm_name: str, name: str, backing: str) -> Path:
+        st = BSDVM.state_dir(vm_name)
+        overlay = st / name
+        if not overlay.exists():
+            overlay.write_bytes(b"gate-overlay")
+        return overlay
+
+    def _make_golden(self, vm_name: str) -> Path:
+        st = BSDVM.state_dir(vm_name)
+        st.mkdir(parents=True, exist_ok=True)
+        (st / "golden.qcow2").write_bytes(b"golden")
+        return st
+
+    def test_boot_retry_succeeds_on_second_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm_name = "freebsd-arm64"
+                st = self._make_golden(vm_name)
+                vm = BSDVM.VMS[vm_name]
+
+                boot_calls: list[str] = []
+
+                def fake_boot(vm_arg, overlay, extra_drives=None) -> None:
+                    boot_calls.append(overlay.name)
+
+                ssh_wait_calls = {"n": 0}
+
+                def fake_ssh_wait(vm_arg, timeout_s=300) -> None:
+                    ssh_wait_calls["n"] += 1
+                    if ssh_wait_calls["n"] == 1:
+                        (st / "serial.log").write_text("attempt-1 boot output\n")
+                        raise SystemExit(f"{vm_name}: ssh not reachable after 300s")
+                    (st / "serial.log").write_text("attempt-2 boot output\n")
+
+                with (
+                    mock.patch.object(
+                        BSDVM, "create_overlay", side_effect=self._fake_create_overlay
+                    ),
+                    mock.patch.object(BSDVM, "boot", side_effect=fake_boot),
+                    mock.patch.object(BSDVM, "ssh_wait", side_effect=fake_ssh_wait),
+                    mock.patch.object(BSDVM, "push_head", return_value="deadbeef"),
+                    mock.patch.object(
+                        BSDVM, "ssh_run",
+                        return_value=mock.Mock(returncode=0, stdout="rustc 1.99.0\n", stderr=""),
+                    ),
+                    mock.patch.object(BSDVM, "read_pid", return_value=None),
+                    mock.patch.object(BSDVM, "stop_pid"),
+                ):
+                    outcome = BSDVM.run_gate(vm, "stage0", boot_retries=1)
+
+                self.assertIsNone(outcome["exc"])
+                self.assertEqual(outcome["rc"], 0)
+                self.assertEqual(outcome["report"]["boot_retries_used"], 1)
+                self.assertEqual(len(boot_calls), 2)
+                self.assertNotEqual(
+                    boot_calls[0], boot_calls[1], "each attempt must use a fresh overlay name"
+                )
+
+                out_dir = outcome["report_dir"]
+                archived = out_dir / "serial-attempt1.log"
+                self.assertTrue(archived.exists())
+                self.assertIn("attempt-1 boot output", archived.read_text())
+                # attempt 2 succeeded: no serial-attempt2.log archived for it.
+                self.assertFalse((out_dir / "serial-attempt2.log").exists())
+
+    def test_boot_retry_exhausted_raises_and_reports_retries_used(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm_name = "freebsd-arm64"
+                st = self._make_golden(vm_name)
+                vm = BSDVM.VMS[vm_name]
+
+                with (
+                    mock.patch.object(
+                        BSDVM, "create_overlay", side_effect=self._fake_create_overlay
+                    ),
+                    mock.patch.object(BSDVM, "boot", return_value=None),
+                    mock.patch.object(
+                        BSDVM, "ssh_wait",
+                        side_effect=SystemExit(f"{vm_name}: ssh not reachable after 300s"),
+                    ),
+                    mock.patch.object(BSDVM, "read_pid", return_value=None),
+                    mock.patch.object(BSDVM, "stop_pid"),
+                ):
+                    outcome = BSDVM.run_gate(vm, "stage0", boot_retries=2)
+
+                self.assertIsInstance(outcome["exc"], SystemExit)
+                self.assertEqual(outcome["report"]["boot_retries_used"], 2)
+                # 3 total attempts (1 initial + 2 retries): 3 overlays created and
+                # cleaned up, none left behind.
+                self.assertEqual(list(st.glob("gate-*.qcow2")), [])
+
+    def test_archives_serial_log_on_boot_failure_even_without_retries(self) -> None:
+        # This is the general evidence-loss fix: archiving must happen on ANY
+        # boot-phase failure, not only when boot_retries > 0 -- otherwise the
+        # next gate's boot silently overwrites the only evidence of why this
+        # one failed.
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm_name = "freebsd-arm64"
+                st = self._make_golden(vm_name)
+                (st / "serial.log").write_text("boot output before failure\n")
+                vm = BSDVM.VMS[vm_name]
+
+                with (
+                    mock.patch.object(
+                        BSDVM, "create_overlay", side_effect=self._fake_create_overlay
+                    ),
+                    mock.patch.object(BSDVM, "boot", return_value=None),
+                    mock.patch.object(
+                        BSDVM, "ssh_wait",
+                        side_effect=SystemExit(f"{vm_name}: ssh not reachable after 300s"),
+                    ),
+                    mock.patch.object(BSDVM, "read_pid", return_value=None),
+                    mock.patch.object(BSDVM, "stop_pid"),
+                ):
+                    outcome = BSDVM.run_gate(vm, "stage0", boot_retries=0)
+
+                self.assertIsInstance(outcome["exc"], SystemExit)
+                out_dir = outcome["report_dir"]
+                archived = out_dir / "serial-attempt1.log"
+                self.assertTrue(archived.exists())
+                self.assertIn("boot output before failure", archived.read_text())
+
+    def test_cmd_gate_reraises_run_gate_exception_unchanged(self) -> None:
+        # cmd_gate must remain a thin CLI wrapper: on an unrecoverable
+        # boot-phase failure it re-raises the exact same exception run_gate
+        # saw, preserving today's external cmd_gate contract.
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm_name = "freebsd-arm64"
+                self._make_golden(vm_name)
+
+                ns = mock.Mock(vm=vm_name, stage="stage0", boot_retries=0)
+                with (
+                    mock.patch.object(
+                        BSDVM, "create_overlay", side_effect=self._fake_create_overlay
+                    ),
+                    mock.patch.object(BSDVM, "boot", return_value=None),
+                    mock.patch.object(
+                        BSDVM, "ssh_wait",
+                        side_effect=SystemExit("freebsd-arm64: ssh not reachable after 300s"),
+                    ),
+                    mock.patch.object(BSDVM, "read_pid", return_value=None),
+                    mock.patch.object(BSDVM, "stop_pid"),
+                ):
+                    with self.assertRaises(SystemExit) as ctx:
+                        BSDVM.cmd_gate(ns)
+                self.assertIn("ssh not reachable", str(ctx.exception))
+
+
+class ParseGateSpecTests(unittest.TestCase):
+    """`parse_gate_spec` is pure `vm:stage` parsing/validation used by
+    `ladder` -- unit tested directly, no subprocess/network.
+    """
+
+    def test_splits_vm_and_stage(self) -> None:
+        self.assertEqual(
+            BSDVM.parse_gate_spec("freebsd-arm64:stage0"), ("freebsd-arm64", "stage0")
+        )
+
+    def test_unknown_vm_raises_systemexit(self) -> None:
+        with self.assertRaises(SystemExit):
+            BSDVM.parse_gate_spec("bogus-vm:stage0")
+
+    def test_unknown_stage_raises_systemexit(self) -> None:
+        with self.assertRaises(SystemExit):
+            BSDVM.parse_gate_spec("freebsd-arm64:stageX")
+
+    def test_missing_colon_raises_systemexit(self) -> None:
+        with self.assertRaises(SystemExit):
+            BSDVM.parse_gate_spec("freebsd-arm64")
+
+
+class CmdLadderTests(unittest.TestCase):
+    """`cmd_ladder` reuses `run_gate` (no duplicated orchestration), runs
+    every gate spec sequentially in this one process with boot-retries=1,
+    writes a ladder-<ts>.json summary, and exits 0 iff every gate
+    passed-or-report-only.
+    """
+
+    def test_validates_all_specs_before_running_any(self) -> None:
+        ns = mock.Mock(gates=["freebsd-arm64:stage0", "bogus-vm:stage0"])
+        with mock.patch.object(BSDVM, "run_gate") as run_gate:
+            with self.assertRaises(SystemExit):
+                BSDVM.cmd_ladder(ns)
+            run_gate.assert_not_called()
+
+    def test_writes_summary_and_uses_boot_retries_one(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                boot_retries_seen: list[int] = []
+
+                def fake_run_gate(vm, stage_name, boot_retries=0):
+                    boot_retries_seen.append(boot_retries)
+                    out_dir = BSDVM.state_root() / "results" / f"fake-{vm.name}-{stage_name}"
+                    return {
+                        "report": {"boot_retries_used": 0, "pass": True},
+                        "report_dir": out_dir,
+                        "rc": 0,
+                        "exc": None,
+                    }
+
+                ns = mock.Mock(gates=["freebsd-arm64:stage0", "netbsd-arm64:stage0"])
+                with mock.patch.object(BSDVM, "run_gate", side_effect=fake_run_gate):
+                    rc = BSDVM.cmd_ladder(ns)
+                self.assertEqual(rc, 0)
+                self.assertEqual(boot_retries_seen, [1, 1])
+
+                summaries = list((BSDVM.state_root() / "results").glob("ladder-*.json"))
+                self.assertEqual(len(summaries), 1)
+                data = json.loads(summaries[0].read_text())
+                self.assertEqual(len(data["results"]), 2)
+                self.assertEqual(data["results"][0]["vm"], "freebsd-arm64")
+                self.assertEqual(data["results"][0]["stage"], "stage0")
+                self.assertTrue(data["results"][0]["pass"])
+                self.assertEqual(data["results"][1]["vm"], "netbsd-arm64")
+
+    def test_exit_code_zero_when_report_only_stage_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                def fake_run_gate(vm, stage_name, boot_retries=0):
+                    # report_only stage: run_gate/cmd_gate's own contract
+                    # already folds "failed but report-only" into rc=0.
+                    return {
+                        "report": {"boot_retries_used": 0, "pass": False},
+                        "report_dir": BSDVM.state_root() / "results" / "fake",
+                        "rc": 0,
+                        "exc": None,
+                    }
+
+                ns = mock.Mock(gates=["freebsd-arm64:stage1"])
+                with mock.patch.object(BSDVM, "run_gate", side_effect=fake_run_gate):
+                    rc = BSDVM.cmd_ladder(ns)
+                self.assertEqual(rc, 0)
+
+    def test_exit_code_nonzero_when_stage0_gate_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                def fake_run_gate(vm, stage_name, boot_retries=0):
+                    return {
+                        "report": {"boot_retries_used": 0, "pass": False},
+                        "report_dir": BSDVM.state_root() / "results" / "fake",
+                        "rc": 1,
+                        "exc": None,
+                    }
+
+                ns = mock.Mock(gates=["freebsd-arm64:stage0"])
+                with mock.patch.object(BSDVM, "run_gate", side_effect=fake_run_gate):
+                    rc = BSDVM.cmd_ladder(ns)
+                self.assertEqual(rc, 1)
+
+    def test_continues_past_a_gate_whose_run_gate_call_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                calls: list[tuple[str, str]] = []
+
+                def fake_run_gate(vm, stage_name, boot_retries=0):
+                    calls.append((vm.name, stage_name))
+                    if vm.name == "freebsd-arm64":
+                        raise SystemExit("no golden image; run: bsdvm.py provision freebsd-arm64")
+                    return {
+                        "report": {"boot_retries_used": 0, "pass": True},
+                        "report_dir": BSDVM.state_root() / "results" / "fake",
+                        "rc": 0,
+                        "exc": None,
+                    }
+
+                ns = mock.Mock(gates=["freebsd-arm64:stage0", "netbsd-arm64:stage0"])
+                with mock.patch.object(BSDVM, "run_gate", side_effect=fake_run_gate):
+                    rc = BSDVM.cmd_ladder(ns)
+                # Both gates attempted despite the first one raising.
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(rc, 1)
+
+                summaries = list((BSDVM.state_root() / "results").glob("ladder-*.json"))
+                data = json.loads(summaries[0].read_text())
+                self.assertFalse(data["results"][0]["pass"])
+                self.assertIsNotNone(data["results"][0]["error"])
+                self.assertIn("no golden image", data["results"][0]["error"])
+                self.assertTrue(data["results"][1]["pass"])
 
 
 if __name__ == "__main__":
