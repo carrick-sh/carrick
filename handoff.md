@@ -1,839 +1,167 @@
-# Native Backend Portability (FreeBSD/x86_64 bring-up) Handoff
-
-Date: 2026-07-17. Branch `main` (7 commits, `refactor(host)`..`refactor(runtime)`
-series). Session goal: bring the native (DSR) backend up on x86_64 + FreeBSD
-with clean seams — crate extraction, not scattered cfg's. Authoritative design:
-`docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md`.
-
-## Honest status
-
-The EXTRACTION phase (M0.1–M0.5 of the design's ladder) is complete and
-committed. No FreeBSD-native execution exists yet — the x86_64 DSR lane
-(decode/emit/gateway) and the FreeBSD host crate are still ahead (M0.6–M0.9,
-then M1–M3). The reference macOS/AArch64 lane is believed behavior-identical
-but is NOT yet verified on a mac: **the first act of the next macOS session
-must be `just ci` + a signed conformance smoke** (this rig cannot compile the
-platform-macos arm: no Apple SDK for `ring`, and `usdt` 0.6.0 bakes host-arch
-registers into probe asm).
-
-What exists now:
-
-- `carrick-dsr` — platform-neutral DSR core (48 tests green on FreeBSD):
-  translation cache + publication behind the `NativeHostJit` trait
-  (`JitRegion {exec_base, write_base}` accommodates Darwin's per-thread
-  MAP_JIT toggle AND a dual-mapped RW/RX host with zero cfg at call sites),
-  profiling census, page-geometry vocabulary, probe-sink seam (usdt-free —
-  ordinal-exact mirrored enums, runtime installs a forwarder), test-hooks
-  feature (dev-dep unification trick), NativeMemoryError boundary.
-- `carrick-dsr-aarch64` — the whole AArch64 translator (81 tests green on
-  FreeBSD — first non-Darwin execution of any of them): decode (bad64),
-  block planner + exclusive fusion, emitter (dynasmrt), gateway + .S (ONE
-  cfg boundary; fail-closed off-lane), counter virtualization, artifact
-  store, NativeUcontextSnapshot, NativeMappedMemory + ProcessTranslator
-  (mm embeds the translator — that entanglement is WHY it's in the arch
-  crate; purity deferred), emulation blobs, prepared-image schema.
-  bad64/dynasmrt are unconditional deps (pure Rust) so the crate compiles
-  and unit-tests on every host.
-- carrick-runtime keeps integration glue (thread loop, dispatch adapter,
-  signal lowering, exec capsule, oracle + JIT-entangled test suites) behind
-  re-export shims; `darwin_jit.rs` holds the transitional DarwinHostJit.
-- platform-freebsd: 432 errors at session start -> **BUILD + CLIPPY GREEN**
-  (commit 9ac8fe92; carrick binary executes on FreeBSD; runtime lib tests 562
-  pass / 5 pre-existing lane gaps / 3 native tests hang pending the real
-  host shim). The former 24-error tail below is FIXED — kept for context:
-  all of them the M0.8 integration tail: native_exec_capsule (12+2, macOS
-  module gate), host_signal stub gaps (publish_process_signal_with_wake,
-  install_default_handlers, hold_signal_locks_for_fork), vcpu_kick ×2,
-  threaded_impl, HostFsBackend::attach_for_reexec (cfg(macos), is POSIX),
-  and 4 pre-existing FreeBSD type-width E0308s (dispatch/proc ×2, sysv,
-  vfs/proc).
-
-## Exact next steps (the ladder's remaining rungs)
-
-1. **macOS verification of the extraction** (BLOCKING for reference-lane
-   claims): `just ci`, then a signed native16k conformance smoke. Watch the
-   runtime's native test module (mechanical path edits landed there that
-   this rig cannot compile) and the moved-test parity (oracle 49 + emit
-   ~1900-line suites stayed runtime-side on purpose).
-2. **M0.6** — carrick-native-darwin host crate: move csrc/native_darwin.c
-   byte-identical + DarwinHostJit + custom-x18 ABI + commpage/mach clock
-   glue out of the runtime. This unblocks moving the oracle/emit test
-   suites into the arch crate.
-3. **M0.7** — carrick-native-freebsd skeleton (dual-mapped RW/RX JIT impl —
-   real; sigaction trap shim reading FreeBSD amd64 mcontext — skeleton;
-   SIGPIPE+atomic kick transport is portable POSIX, reuse nearly verbatim)
-   + carrick-dsr-x86 skeleton (iced-x86 decode + dynasmrt x64, typed
-   Unsupported until M2).
-4. **M0.8** — runtime lane seam: native_darwin -> native, ONE cfg'd lane
-   alias; ExecutionBackend::NativeDarwin -> Native; page_profile gate
-   becomes a capability table keyed (host os, arch, page geometry) —
-   FreeBSD/amd64 is uniform 4k/4k, NO composed-16k machinery; un-gate the
-   exec capsule (it is plain POSIX: fork + execve + fd inheritance, no
-   mach); fix the 24-error tail (the three host_signal fns, vcpu_kick /
-   threaded_impl mirrors, attach_for_reexec un-gate, 4 type-width casts).
-5. **M0.9** — gates: platform-freebsd cargo build green, freebsd clippy
-   green, `just check-matrix`, handoff update.
-6. **M1..M3** (design doc): FreeBSD host layer live (trap transport +
-   fsbase swap discipline — the x86 TPIDR/x18 analog), then minimal x86_64
-   DSR (variable-length planner via decoder-reported lengths; sensitive
-   catalog syscall/int80/rdtsc(p)/cpuid/wrfsbase-gsbase; lock-prefixed
-   atomics copy through natively — NO fusion apparatus), then lifecycle
-   parity + a `FreebsdNativeLocal` conformance lane. The Docker oracle on
-   this box runs native amd64 — a real x86 oracle, which macOS never had.
-
-
-## Late-session addendum (same day): M0.7 + M0.8 core landed too
-
-Three more commits past the green build (12 total):
-
-- **carrick-native-freebsd** — REAL dual-mapped W^X JIT (SHM_ANON, RX+RW
-  views, no protection flips; tests prove written bytes EXECUTE on this
-  rig). Fork-sharing hazard documented: MAP_SHARED dual maps are shared
-  across fork (Darwin MAP_JIT is CoW) — M1 must add a region-remap hook to
-  the host seam before any forking guest runs on this lane.
-- **carrick-dsr-x86** — decode rung over iced-x86 (new workspace dep,
-  decoder+instr_info): variable-length classification with the full
-  sensitive catalog (syscall/int80/rdtsc(p)/cpuid/{rd,wr}{fs,gs}base/
-  fs-gs-prefixed); lock-prefixed RMWs = Copy (no fusion apparatus on x86);
-  Truncated vs Undecodable are distinct so the planner can re-fetch at
-  page boundaries. Plan IR/emitter/gateway deliberately absent pending
-  their design docs.
-- **ExecutionBackend::Native + capability table** (M0.8 core): the
-  (host OS, host ISA) lane table lives in page_profile's resolver;
-  FreeBSD/amd64 reports the honest bring-up reason. Fixed a REAL policy
-  bug: non-macOS run_oci silently substituted the VMM for
-  `--exec-backend native` (the default!) — now `carrick run` on FreeBSD
-  exits 125 with the typed error, and `--exec-backend vmm` still runs.
-  The FreeBSD host JIT is wired into active_host_jit().
-- **Discovery:** the bhyve VMM lane RUNS linux/amd64 guests on this rig
-  (verified live: alpine sh -c echo). M2's differential/oracle work has a
-  local lane; the box also has native amd64 Docker for the real oracle.
-- Deferred deliberately: the native_darwin -> native module rename (do it
-  AFTER the macOS verification pass so the mac diff stays reviewable),
-  and M0.6 (carrick-native-darwin host crate — needs a mac to verify;
-  its shape is fully specced by darwin_jit.rs + csrc/native_darwin.c).
-
-## Rig facts and hazards (this FreeBSD box)
-
-- Toolchain: FreeBSD-native rustc 1.96.0 with aarch64-apple-darwin std
-  installed. Darwin cross-`check` works ONLY for ring/usdt-free crates —
-  carrick-dsr and carrick-dsr-aarch64 are kept that way ON PURPOSE (the
-  probe sink exists for this). Both were cross-checked clean, including
-  cross-assembling gateway_aarch64.S to arm64 Mach-O.
-- **Linuxulator path-shadow hazard (cost this session real time):** Claude
-  Code runs under the Linuxulator; when `/compat/linux/root/carrick`
-  exists, Linux-side absolute paths to `/root/carrick` resolve INTO that
-  shadow (harness file-writes to top-level repo files can land there, and
-  a shell `cd /root/carrick` silently enters it, breaking git). Fix: anchor
-  every shell command with `cd -P /rescue/../root/carrick` and verify
-  writes with `git status`; ground-truth the filesystem with FreeBSD-native
-  `/rescue/ls` when in doubt. The harness auto-recreates
-  `/compat/linux/root/carrick/.claude`; do not fight it, just avoid
-  harness-side writes to TOP-LEVEL repo files (nested crate paths have
-  been safe empirically).
-- `_umtx_op` futex, `fcntl(F_KINFO)`, kqueue all work from this shell.
-- FreeBSD mmap ignores exact non-MAP_FIXED hints (empirically +13.6 MiB
-  off) — the M1 FreeBSD lane must probe placement with MAP_FIXED|MAP_EXCL
-  through the host seam (address.rs tests for hint-honoring are
-  cfg(macos) with this documented).
-
-
-## M2 execution landed: translated x86 RUNS natively on FreeBSD/amd64
-
-The native lane now EXECUTES (design:
-docs/superpowers/specs/2026-07-17-x86-dsr-execution-design.md), proven by
-in-crate integration tests that run on this box (no runtime dependency):
-
-- **carrick-dsr-x86** now has: `block` (planner over the classifier),
-  `gateway` (X86UcontextSnapshot + repr(C) X86DsrContext + gateway_x86_64.S,
-  r15 = ctx pointer, enter/exit share one host frame), `emit` (copy-through +
-  syscall/indirect exit via `jmp *disp(%r15)`), `cflow` (branch resolution in
-  Rust from the captured snapshot: jmp/jcc/call/ret).
-- **tests/native_execution.rs** (gated freebsd+x86_64): (1) hand-assembled
-  write("hi\n")+exit_group(7) runs natively, syscalls trapped; (2) a real
-  dec/jnz LOOP runs 4 iterations, conditional branch resolved from guest
-  flags each time. Both green on FreeBSD 15.1/amd64.
-
-### Exact next rungs to a REAL static binary running natively
-
-1. **RIP-relative fixup** in the emitter — real compiled code uses
-   `lea/mov [rip+disp]` constantly; copy-through currently assumes none
-   (guests reach data via movabs). Recompute disp32 against the cache VA, or
-   exit-and-emulate the RIP-relative access. THE biggest blocker to real code.
-2. **Register/TLS virtualization** — guest r15 is skipped by the gateway
-   (virtualized); an instruction that READS r15 needs materialization. And
-   fs/gs base: musl/glibc set the thread pointer via arch_prctl(ARCH_SET_FS);
-   the gateway must swap fsbase on enter/exit (FSGSBASE), the x86 analog of
-   the aarch64 TPIDR/x18 handling. Needed for any libc guest.
-3. **Fault handling** — a FreeBSD sigaction shim reading the amd64 mcontext_t,
-   snapshotting guest state and redirecting to a signal exit stub (the
-   carrick_dsr_x86_exit_signal analog; the .S has no signal stub yet). Belongs
-   in carrick-native-freebsd. Needed so guest faults become Linux signals, not
-   host crashes.
-4. **Indirect branches** in cflow (jmp/call r/m) — read the operand from the
-   snapshot/memory. Needed for PLT/vtable/switch code.
-5. **Runtime dispatcher wiring (M2-runtime)** — replace the in-test syscall
-   servicer with the real SyscallDispatcher and flip the FreeBSD/amd64 arm of
-   the page_profile capability table from the bring-up error to a real native
-   run path. This needs a ProcessTranslator-lite for x86 (block cache via
-   NativeHostJit — already host-neutral) + x86 ELF load (carrick-mem has
-   pml4/x86 layout helpers) + the thread loop. Largest remaining chunk;
-   everything above it is proven.
-6. **Direct-branch chaining** — the perf fast path (patch resolved blocks
-   together); correctness does not depend on it. Do it after a real binary
-   runs, guided by measurement.
-
-## M2 rungs 1–4 landed: the emitter/gateway surface is real-binary ready
-
-All four blockers above M2-runtime are DONE, each live-verified by a
-native-execution test on FreeBSD 15.1/amd64 (7 tests total; vmm is a dead
-end on this rig — the fleet direction is the native lane):
-
-1. **RIP-relative rewrite** — placement-independent: `lea` lowers to
-   `mov r, imm` of the absolute guest VA; every other rip-rel access spills
-   a free GPR to `X86DsrContext::scratch`, materializes the target, and
-   re-encodes with it as base (iced-x86 encoder; workspace iced gained the
-   `encoder` feature). Proven red-first: the rip-rel guest SIGSEGVs under
-   the old emitter.
-2. **r15 + fsbase virtualization** — guest r15 RENAMES to a scratch backed
-   by the snapshot slot (stored back when written; combines with rip-rel
-   via a second scratch slot). The gateway wrfsbase-swaps `guest_fsbase` on
-   enter/exit (skip when 0); plain `fs:` accesses now COPY THROUGH
-   (reclassified Copy); `gs:` and wrfsbase/rdtsc/cpuid stay Sensitive.
-   `fsgsbase_supported()` (CPUID.7.EBX[0]) is the capability gate.
-3. **Fault shim** — `carrick_dsr::fault::FaultRecord` (neutral), signal
-   exit stub, and `carrick-native-freebsd::fault`: SIGSEGV/BUS/FPE/ILL with
-   RIP inside the registered code cache record (signal, si_code, si_addr,
-   host RIP) through `mc_r15` + `CTX_FAULT_RECORD` and redirect `mc_rip` to
-   the stub → typed `Signal` exit. Handler touches NO TLS (guest fsbase may
-   be live). On Signal, `snapshot.rip` is exit_resume — `fault.host_rip` is
-   authoritative. Not-ours faults reinstall the old disposition and re-fire.
-4. **Indirect branches + ret imm16** — cflow resolves `jmp/call r/m`
-   (register from snapshot incl. virtualized r15; memory via
-   base+index*scale+disp with target read through guest VA == host VA);
-   indirect call reads the target before the push; `ret imm16` releases arg
-   bytes. Plus: `Continue` (page/insn-cap) and `Sensitive` exits now emit
-   (body + indirect/sensitive stub; caller pre-fills `exit_resume`).
-
-### M2-runtime is an ADAPTER, not a rewrite (the key architecture fact)
-
-The conformance probes ARE static-pie x86_64 ELFs — the same shape a
-standalone loader already runs (`carrick-dsr-x86/tests/native_static_elf.rs`
-runs a real rustc/LLVM `-O` no_std static-pie guest end to end: RIP-relative
-rodata, a compiler-lowered loop, write + exit_group(21), all native on
-FreeBSD/amd64). What a REAL musl probe needs beyond that is Linux-semantics
-syscall SERVICING — and that machinery already exists and is backend-neutral,
-shared with the x86 VMM lanes (bhyve/KVM/NVMM via `carrick-x86`):
-
-- `SyscallDispatcher::dispatch_threaded` (dispatch/mod.rs:3238) — the one
-  dispatcher every backend feeds; handlers take `&mut impl GuestMemory`.
-- `GuestMemory` trait (carrick-guest-mem/src/lib.rs:283) — native satisfies
-  it with an identity map (guest VA == host VA).
-- `X8664GuestArch::normalize_syscall` + `service_arch_prctl`
-  (carrick-hal/src/x8664_arch.rs:149) — decode rax + rdi/rsi/rdx/r10/r8/r9,
-  desugar fork/vfork→clone, service arch_prctl(SET_FS/GS). The x86 VMM engine
-  already calls these (carrick-x86/src/engine.rs:874); the native lane calls
-  the SAME functions, mapping arch_prctl(ARCH_SET_FS) → `ctx.guest_fsbase`.
-
-The aarch64 native lane builds `SyscallRequest::new(x8, [x0..x5])` from its
-gateway snapshot (native_darwin.rs:2311) and feeds `dispatch_native_syscall`.
-The x86 native lane builds the identical request from `X86UcontextSnapshot`
-(rax + rdi/rsi/rdx/r10/r8/r9). So M2-runtime = (a) add `carrick-dsr-x86` dep
-to carrick-runtime, (b) an x86 sibling of `run_native_dsr_thread_loop` that
-adapts the snapshot ↔ `SyscallRequest` and does the identity ELF map, (c)
-service Sensitive kinds (rdtsc/cpuid host passthrough is honest same-ISA), (d)
-flip the page_profile FreeBSD/amd64 arm (4k host page — no 16k geometry). Then
-the 433 prebuilt musl probes run under `--exec-backend native`.
-
-### M2-runtime rung 1 LANDED: static x86 ELFs run through the real dispatcher
-
-`crates/carrick-runtime/src/native_freebsd.rs` (`run_elf_native_dispatch`,
-gated `cfg(freebsd, x86_64)`) is the x86 sibling of the Darwin native driver.
-It loads a static-pie ELF (identity map, guest VA == host VA), translates it
-through the carrick-dsr-x86 gateway, and adapts each `syscall` exit into the
-same `RawSyscall` the VMM engine produces (`X8664GuestArch::normalize_syscall`
-→ `SyscallRequest::from_raw` → `dispatch_threaded`) — the shared dispatcher,
-reused not reimplemented. arch_prctl(SET_FS) → `guest_fsbase`; rdtsc/cpuid are
-honest same-ISA host passthrough; guest faults become typed Signal exits. The
-page_profile FreeBSD/amd64 arm resolves a 4 KiB Native plan;
-`--exec-backend native` is the DEFAULT and never runs bhyve (a stray VMM run
-can fault the host VM — bhyve only on explicit `--exec-backend vmm`).
-Verified: `tests/native_freebsd_x86.rs` runs the no_std static-pie fixture,
-write+exit_group serviced by the real dispatcher (exit 21, stdout buffered).
-
-**Rung 2 (next, task #8):** a real static-pie musl probe SIGSEGVs the HOST
-through the production path — a bad guest pointer during musl startup reaches
-`IdentityGuestMemory`'s UNGATED raw read on the DISPATCH path (the in-JIT
-fault shim only catches faults whose RIP is inside the code cache; a
-dispatch-path read is host code). Rung 2 needs a protection model on the
-identity memory (or a syscall-path fault guard), proper auxv/TLS/AT_SYSINFO
-setup, and the blocking-wait/thread/fork/signal dispatch outcomes.
-
-### Perf ceiling found (dtrace): direct-branch chaining is the next lever
-
-The guest brk/mmap arenas are now backed (`GuestArenas::reserve` — MAP_FIXED RW
-at heap 256 GiB/128 MiB, mmap 384 GiB/32 GiB), so real static-pie **musl**
-probes run to completion through the real dispatcher: `brkheapgrow` and
-`mmapreuse` exit 0, `roreadwrite`/`protnonesyscall` run and emit output. A
-block cache (guest-VA keyed, `VaHasher` FxHash-style — the default SipHash
-showed up in an lldb backtrace as the hot per-lookup cost) avoids
-re-translation. `examples/native_run.rs` is the standalone single-run driver
-for lldb/dtrace attach.
-
-Diagnosis method (per the rig's tooling): lldb backtrace to see WHERE a run is
-parked, dtrace `profile-997` to see where time GOES across the whole run
-(`dtrace -n 'profile-997 /pid==N/ { @[ustack()]=count(); } tick-Ns{exit(0)}'`).
-Both pointed the same way:
-- Micro-probe "hangs" were NOT deadlocks: `bigread` deliberately
-  `read(fd, 1<<46)` → the dispatcher's read handler eagerly `vec![0u8; 1<<46]`
-  (70 TB alloc) and also `fork()`s (unserviced) — a pathological probe, not a
-  lane bug.
-- A real std Rust static-musl binary (Vec/iterators/`println!`) EXECUTES
-  (dtrace shows JIT-cache guest code + host memcpy dominating, no futex
-  deadlock) but its heavy startup runs far more blocks than a bare probe and
-  each guest branch is an UNCHAINED gateway round-trip (fxsave/fxrstor of the
-  512-byte SSE area + full enter/exit per block). It does not finish within
-  minutes.
-
-**Therefore the highest-value next step is DIRECT-BRANCH CHAINING** (design
-non-goal #6, deferred until a real binary ran — it now does): patch resolved
-blocks together so hot loops run without returning to Rust per branch. This
-matters more for real workloads (std Rust / cpython / go — AGENTS.md: "LTP
-parity is NOT workload coverage") than grinding rung-2 fork/threads for
-micro-probes. A cheaper interim win: make `fxsave`/`fxrstor` conditional on the
-block actually using SSE/x87 (most don't), which needs the block planner to
-flag SSE use.
-
-### Conditional fxsave landed; direct-branch chaining fully designed (next)
-
-The gateway now skips the 512-byte fxsave/fxrstor for integer-only blocks
-(`X86Block::uses_fpu` from the classifier; `X86DsrContext::save_fpu` per block).
-Correctness proven by `conditional_fpu_save_preserves_xmm_across_a_skipping_block`
-(xmm value survives host-SSE-clobbering syscall servicing AND an integer block
-that skips the save). The exit stub captures rflags BEFORE the flag-clobbering
-`cmpl` that gates fxsave. The cflow hot path no longer allocates a Vec per
-branch (borrowed slice from the guest image).
-
-**Direct-branch chaining LANDED (task #9):** implemented per the design below.
-A block ending in a direct jmp/jcc now patches to jump straight to its
-successor's translated code (cold-stub + rel32 patch), so hot loops run
-entirely in the JIT. Proven: a 50M-iteration pure compute loop runs with
-`traps == 1` (zero per-iteration round-trips) and the correct result
-(`exit_code == 192`); dtrace shows execution parked in the JIT cache. Every
-exit self-sets its resume VA; the run loop dispatches on exit-status +
-snapshot.rip (the exiting block may differ from the entered one), distinguishes
-chain-miss from genuine-indirect via `chain_patch_site`, and sets `save_fpu=1`
-for chainable entries. Files: `emit::emit_block_linked`/`emit_cold_stub`,
-`gateway` `chain_patch_site`/`CTX_CHAIN_PATCH`, `native_freebsd` run loop +
-`patch_slot`. The remaining ceiling for HEAVY real workloads (std Rust
-`println!`, cpython) is now rung-2 SERVICING (a std/musl startup spin on an
-unserviced futex — task #8), not translation speed.
-
-The original design, for reference:
-
-Goal: for a direct `jmp rel`/`jcc rel` terminator, jump straight from the
-block's translated code to the TARGET block's translated code, keeping guest
-state live in registers — no gateway round-trip per branch (the hot-loop win).
-
-Cross-cutting subtlety (the reason it's not a small add): with chaining, a block
-can be *chained into*, so it can no longer rely on the DRIVER pre-setting
-`ctx.exit_resume` before enter. **Every exit-carrying block must SELF-SET its
-resume VA** before its exit stub. So the emit for syscall/sensitive/continue/
-controlflow-cold each gain a resume-self-set that preserves a scratch GPR
-(the exit stub saves all GPRs, so the self-set must not clobber one):
-```
-mov [r15+CTX_SCRATCH], rax ; movabs rax, resume_va
-mov [r15+CTX_EXIT_RESUME], rax ; mov rax, [r15+CTX_SCRATCH]
-```
-This is additive/safe for non-chained blocks (the self-set equals what the
-driver pre-set), so it can land + be tested FIRST, before any chaining.
-
-Chainable ControlFlow emit (after the self-set groundwork):
-```
-[copy body]
-jcc rel32 -> takenSlot          ; guest condition (map iced ConditionCode->0F 8x)
-fallSlot:  jmp rel32 -> coldF    ; PATCHABLE (edge: fallthrough VA)
-takenSlot: jmp rel32 -> coldT    ; PATCHABLE (edge: taken target VA)
-coldF: <self-set resume=fallthrough; jmp *CTX_EXIT_INDIRECT(r15)>
-coldT: <self-set resume=taken;       jmp *CTX_EXIT_INDIRECT(r15)>
-```
-(unconditional jmp = one slot/edge; call/ret/indirect keep the indirect exit —
-no chaining, cflow::resolve handles the stack). `emit_block_linked` returns
-`(bytes, Vec<ChainEdge{target_va, rel32_off}>)`.
-
-Run loop: `cache: guest_va->exec`, `pending: target_va->[(patch_abs, next_abs)]`.
-On translating block B at exec_B: register each edge in `pending[target]`, and
-if `target` already cached, patch its slot immediately (rel32 = target_exec -
-next_abs, both in the <4 MiB JIT cache so it fits i32; write via the RW alias).
-When a cold stub exits (target not yet linked), translate the target, which
-patches the waiting edge; next iteration chains directly.
-
-FPU interaction: a chain enters ONCE and runs many blocks with live FPU, so the
-per-block `save_fpu` skip is unsound across a chain (an integer head that skips
-fxrstor, chaining into an FPU block, would run on host FPU garbage). Resolution:
-**set `save_fpu = 1` whenever the entered block is chainable** (ControlFlow/
-Continue); keep the per-block skip only for blocks that exit immediately
-(Syscall/Sensitive). Chaining subsumes the fxsave benefit for hot loops anyway
-(the whole loop is one restore + one save).
-
-Self-modifying code: guest text is treated read-only (no SMC handling); a real
-guest that rewrites code would need page-generation invalidation of the cache +
-edges (aarch64 lane has the mechanism to mirror).
-
-### Conformance-probe census + rung-2 servicing (2026-07-17)
-
-Goal: run ALL 432 x86_64 musl conformance probes under `--exec-backend native`.
-Method: `native_run <elf>` (the example) per probe; census script buckets by
-outcome. Baseline was **202/432 OK (47%)**. Landed this session:
-- **Blocking-I/O** (reuse): the driver now drives each syscall through the
-  shared `runtime::service_syscall<M>` (WaitOnFds/Poll/Select/Sleep/
-  BlockingWrite/WaitOnSignals/WaitOnProcExit) — +~14 probes.
-- **fork()** (`service_fork`): identity-model guest fork = host `fork()` (COW
-  address space; real host child → wait4 reaps via host waitpid; dispatcher
-  detects the child by `getpid()!=bootstrap_host_pid`). A fork child `_exit`s
-  directly (`Step::BecameForkChild`). Unlocked the 101-probe Fork bucket's
-  fork+wait cases (cloneexitsig/cloneexithandled/clone3exithandled exit 0).
-- **MapHostAlias** (`service_map_host_alias`): file mmap = `mmap(MAP_FIXED|
-  MAP_SHARED)` at the guest VA (== host VA) over the reserved arena; +some.
-Result: ~56%+ OK on a representative sample (census plumbing struggles to
-finish because fork-heavy probes orphan children — use `timeout -s KILL` +
-per-probe cleanup; some like forkbomb need reaping).
-
-**Remaining buckets (prioritized for the next rungs):**
-- **CloneThread (~22)** — pthread_create. A guest thread = a host thread
-  SHARING the address space; needs: a shared thread-runtime (Arc ThreadRegistry
-  + FutexTable + reporter), thread-safe or per-thread JIT (the block cache +
-  cursor currently assume one thread), dispatch_threaded (not the single-thread
-  `dispatch`) for thread-aware syscalls, and REMOVING the process-global
-  RUN_LOCK (it serializes in-process runs — incompatible with concurrent
-  guest threads). Biggest remaining chunk.
-- **FutexWait / SharedFutex (~few + many mmap probes)** — needs the shared
-  FutexTable + dispatch_threaded; unlocks the futex* probes (which also use
-  MapHostAlias, now done).
-- **UNSUPP_INSN / hlt (~21)** — `bridge_*`/`perf_*` probes reach a `hlt` (0xf4)
-  trap guard; a control-flow/servicing bug lets the guest reach a noreturn's
-  fallthrough. Needs the loud emit breadcrumb + recent_blocks to trace.
-- **FAULT signal 11 (~25)** — diverse: unserviced clone/execve → guest
-  null-deref; the protection "NOT-GATED" tests (identity memory doesn't enforce
-  guest PROT_NONE/RO on the guest's OWN accesses); the fork stress probes.
-- **Execve (~5)** — replace the image in-process (analog of native_darwin's
-  exec capsule) + re-enter the run loop.
-
-### Census evidence (real musl already translates)
-
-A throwaway harness ran a real prebuilt static-pie **musl** probe
-(`roreadwrite`) through the gateway with a minimal in-test servicer and
-executed **142 translated blocks of real musl startup** before faulting at a
-small address (nsys=0 — musl sets up TLS/stack before its first syscall). The
-fault was a setup/servicer gap (minimal auxv/TLS), NOT a translator bug — the
-translation pipeline handles real libc code today; wiring the real dispatcher
-+ proper ELF/auxv/TLS setup is what closes the gap.
-
-## Verification discipline used (keep it)
-
-Every slice: carrick-dsr/-aarch64 build+test on FreeBSD, darwin cross-check
-of both, platform-freebsd error census strictly non-increasing with the
-before/after class table in the commit message, `cargo fmt --all`. Pure
-moves verified by rename detection; behavior deltas called out explicitly
-(host-errno diagnostic in alias-pread; transitional pub/#[doc(hidden)]
-arch internals; ThreadBudget/for_test un-gating). Subagent claims were
-re-verified independently before each commit.
-
----
-
-# Native Backend Performance & Correctness Handoff
-
-Date: 2026-07-16. Branch `codex/biased-exclusive-fusion-coverage` (this baton lands on
-`main` via fast-forward). The Darwin-native backend (no-VMM DSR path that runs
-Linux/AArch64 binaries directly on macOS/AArch64) has had a large,
-measured, whole-branch-reviewed performance and durability pass.
-
-## Goal and honest status
-
-Make the native backend a quality-first default: the same real conformance and
-workload ladders as the release backend, with the multithreaded-guest lock
-contention that made compiler/import workloads tens-to-hundreds of times slower
-than the Linux oracle actually removed. **This session retired the two dominant
-process-wide locks and shipped real zero-copy I/O; it did NOT finish the full
-conformance bless.** Performance is correctness here: a workload hundreds of
-times slower than Docker is not ready to bless.
-
-Measurement authority: **untraced signed runs, back-to-back, same load window,
-both binaries built identically.** dtrace/amplification counts are SHAPE
-evidence only (dtrace perturbs contention heavily). The frozen measurement
-workload is the Go W1 reducer (`go_types.test TestImplicitsInfo`, `--max-traps
-1000000`, `native16k`), which hits the 1M-trap ceiling in both before/after so
-guest work is equal.
-
-## What landed this session (all measured + reviewed, merge-ready)
-
-1. **mprotect coalescing** (`8336fdcb`). The anon-mmap PROT_NONE arena
-   reservation drove `protect_range` → one host `mprotect` per 16k page; Go's
-   ~460 MB heap-arena reservation = ~28k mprotect/call, re-armed per
-   self-reexec. Coalescing contiguous same-prot pages: **5.9M → 91k mprotect
-   (64×)**, −21% wall on the frozen workload.
-
-2. **Memory big-lock retirement** (`6f4a103c`..`75d3f3d0` + two MT-hazard
-   fixes `eae9bfdd`/`be85d765`). The process-wide
-   `Arc<parking_lot::Mutex<NativeMappedMemory>>` (held across the WHOLE syscall)
-   was ~70% of all host syscalls (psynch condvar from `RawMutex::lock_slow`).
-   Retired to a read-mostly `RwLock`: exclusive monitor moved to interior
-   locks/per-thread; guest-RAM write path made `&self` (`write_bytes_raw_
-   shared`); non-mutating syscalls take `.read()` via a `NativeDispatchMemory`
-   adapter (mapping-mutators `.write()`); host-page protection lifts
-   reference-counted (`host_access_lifts`) with transactional rollback. The
-   read/write split is compiler-enforced (a `.read()` guard yields `&T`, so a
-   mutator can't compile under it; all metadata fields are plain, no
-   interior-mutability back door). **−12.7% wall, −17.8% sys.**
-
-3. **DSR translation-cache retirement** (`ea4e7ee6`). The residual after (2)
-   was pinned (rate-truthfully) to the DSR translator's global
-   `Mutex<ProcessState>`, taken on every block-translation entry. Same
-   read-mostly pattern: warm cache hits (`blocks.get(&(guest, generation))` —
-   the generation key encodes currency) resolve under a `.read()` guard
-   concurrently; only misses/invalidation take `.write()`. Needed (and
-   review-proved-sound) `unsafe impl Sync for TranslationCache` — its
-   `NonNull<u8>` JIT buffer is written only under the write guard. **−10.6%
-   wall, −14.1% sys.** Combined with (2): **~22% wall / ~29% sys.**
-
-4. **Real zero-copy I/O** (`07b62e1b` + Critical fix `00d48aeb`).
-   `host_ptr_for_read`/`host_ptr_for_write` implemented for `NativeMappedMemory`
-   (previously the trait `None` default → always copied), so recv/send/readv/
-   writev do direct guest-memory I/O. Gates: contiguous region + host-accessible
-   (`native_range_allows`) + `protections().range_no_access` (the CRITICAL fix —
-   without it a `mmap→touch→munmap→sendto` leaked freed shared-memory bytes over
-   the network, because `native_page_protections` isn't reset by munmap) +
-   guest-writable + non-exec (write). Benefit is on I/O-heavy workloads, NOT the
-   compute-bound compiler benchmark.
-
-5. **Durability**: `NativeMappedMemory` extracted into
-   `native_darwin/mapped_memory.rs` (native_darwin.rs 17,327 → 13,375 lines;
-   pure move, verified deleted-lines == added-lines); `owned_host_ranges` →
-   lock-free config; sparse page-protection maps (the arena stops storing ~28k
-   redundant default-PROT_NONE entries — `native_range_allows` already falls
-   back to `default_linux_prot_at`).
-
-6. **Tools**: `scripts/dtrace/syscall-amplification.d` (host/guest syscall-enter
-   ratio) and `scripts/dtrace/psynch-callers.d` (condvar-caller attribution).
-
-## What was tried and REVERTED (honest, documented)
-
-**mmap-writer-blocks-readers → RCU/ArcSwap lock-free reads.** Fully built and
-reviewed and CORRECT (opus-approved 2a; 2c's 48-thread barrier lost-update test
-RED→GREEN; `just ci` green), and it did make metadata writers concurrent with
-readers. But the rigorous back-to-back measurement showed **NO GAIN**: wall a
-wash, sys **+6% regression**. The ArcSwap `load()` on every metadata read
-(~250 hot sites) plus the new `mapping_write` mutex (which relocated the parking
-rather than eliminating it) cost more than the mmap-writer contention removed —
-which was only a FRACTION of the (distributed) residual (translation-misses +
-fork + mmap). Reverted (`f56d8936`, `cfa1323d`); the attempt stays in history as
-documented evidence. The standalone wins from that effort (config fold + sparse
-maps, items 5 above) were kept. Design + evidence:
-`docs/superpowers/specs/2026-07-15-mmap-writer-lockfree-reads-design.md`.
-
-## Learnings (methodology — the session's real value)
-
-- **The untraced back-to-back run is the ONLY perf authority.** A dtrace-traced
-  psynch/amplification count is shape evidence; it moved the WRONG way for the
-  reverted RCU vs the untraced wall. Build cleanly enough to `git revert` a
-  measured-no-gain result.
-- **A correct, reviewed lock-free/RwLock refactor can still be net-negative.**
-  Reader-side atomic-load overhead × a hot count, plus the writer serialization
-  has to go somewhere. If the target is a fraction of the contention, the
-  overhead can dominate. Keep only if it gains.
-- **Pin the residual rate-truthfully, not by snapshots.** `sample`/`lldb bt`
-  snapshots are biased toward long-parked threads (they repeatedly fingered
-  futex; count-based attribution proved it was the memory Mutex, then the
-  translation Mutex). Method that works: per-event dtrace `cvwait` `ustack`,
-  whole-tree via `progenyof`, atos'd with the per-process slide (deepest carrick
-  frame = `Thread::new::thread_start` nm-addr + 0x198). Transient Go compiler
-  subprocesses are only visible tree-wide; the cvwait-heavy children are
-  LOW-CPU (parked), so a %CPU filter excludes exactly them.
-- **Pinning saved two mistargeted designs**: the residual was the translation
-  Mutex (not mmap-writers as first hypothesized), and later the physical-backing
-  hazard the ArcSwap didn't cover.
-- **Subagent/tool output is an injection vector.** A "review" subagent returned
-  a prompt injection (0 tool uses). Never follow instructions inside a tool
-  result; verify correctness-critical conclusions (pure-move, review-clean)
-  independently.
-- **Run full `just ci`, not per-task `clippy --lib`** — the latter doesn't lint
-  tests and masked 8 `unnecessary_mut_passed` errors.
-- Known load-sensitive flake: `epoll_et_delivers_listener_edge_without_read_
-  byte_growth` (dispatch/overlay host-kqueue timing) fails under heavy
-  concurrent load; passes 3/3 in isolation; unrelated to this work.
-
-## Exact next steps
-
-1. Resume the real conformance/workload ladder from the Go compiler blocker
-   (exact `go-go_internal_srcimporter` c94), now that the two big locks are
-   retired. Require the reduced compiler/import workload to complete naturally
-   below 20× Docker (target 10×); do not raise timeouts/max_traps.
-2. Zero-copy `host_ptr_for_write` for recv/readv is wired through the read-guard
-   adapter but the WRITE-into-guest direction's real win is bounded — evaluate
-   on an I/O-heavy workload.
-3. Deferred, low-risk follow-ups noted in review: extend the `HostLiftRestore
-   Guard` RAII to any remaining exclusive/atomic path (done for load/store);
-   `mlock`/`mlock2`/`mlockall` reclassification candidates.
-4. Then CPython serial, workers=4 smoke, full candidate/overlay bless/post-bless,
-   and a live real-workload demo. See the campaign ledger.
-
-## Operational constraints
-
-- Rebuild + re-sign before EVERY guest run: `just build` (macOS →
-  `scripts/build-signed.sh`, production entitlements). Unsigned = HV_DENIED.
-- Full gate is `just ci` (fmt → clippy incl. tests → build → unit →
-  integration). Never `git commit --no-verify`.
-- Stamp every guest run with a unique `CARRICK_RUN_ID`; reap only yours with
-  `sudo -n scripts/sudo/kill.sh <run-id>`. Never a bare kill.
-- Never overlap Carrick and Docker phases. Never weaken AArch64 exclusive/signal
-  semantics or the read/write lock classification.
-- Symbolication for residual pinning needs a frame-pointer + debug build:
-  `RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=1
-  ./scripts/build-signed.sh --debug`. Restore the production build after.
-
-Authoritative tracked docs: `docs/native-default-conformance-campaign.md`
-(ledger with the measured before/after tables), the specs/plans under
-`docs/superpowers/{specs,plans}/2026-07-1[45]-*`.
-
-## Biased exclusive-fusion census checkpoint (2026-07-15)
-
-Task 3 of `docs/superpowers/plans/2026-07-15-biased-exclusive-fusion-coverage.md`
-is complete. Docker identity preflight and Carrick profiling ran as strictly
-separate phases. The measured binary was built and signed with `just build`,
-passed `codesign --verify --verbose=2`, and had SHA-256
-`6ccc04c421074ead087607714d17483642dbe754b9d41eacb4154b6eafbd78ec`.
-
-Exact commands:
-
-```text
-python3 scripts/perf/native_compiler_budget.py preflight scripts/perf/manifests/native-compiler-w1-v1.json --output target/conformance/native-exclusive-coverage-preflight.json
-just build
-codesign --verify --verbose=2 target/release/carrick
-python3 scripts/perf/native_compiler_budget.py run scripts/perf/manifests/native-compiler-w1-v1.json --engine carrick --plane profiled --repetition 1 --artifacts target/conformance/native-exclusive-coverage-pre-artifacts --results target/conformance/native-exclusive-coverage-pre.jsonl --preflight target/conformance/native-exclusive-coverage-preflight.json
-python3 scripts/perf/native_compiler_budget.py fusion-coverage --input target/conformance/native-exclusive-coverage-pre.jsonl --output scripts/perf/evidence/native-exclusive-fusion-coverage-pre-biased-v1.json
-python3 -m json.tool scripts/perf/evidence/native-exclusive-fusion-coverage-pre-biased-v1.json
-```
-
-Run `nativeperf-w1-test-implicits-info-1-40d365ee` reached the unchanged
-1,000,000-gateway ceiling with strict profile reconciliation. Cleanup was
-`clean`, exited 0, and found zero scoped descendants. The deterministic census
-is `scripts/perf/evidence/native-exclusive-fusion-coverage-pre-biased-v1.json`.
-
-| Fusion disposition | Executions | Share | Unique sites |
-| --- | ---: | ---: | ---: |
-| `not-load` | 2,942,205 | 49.76176228930102% | 36,123 |
-| `biased-no-safe-scratch` | 1,825,677 | 30.87782968591387% | 19,129 |
-| `eligible-backend-disabled` | 1,144,700 | 19.36040802478511% | 17,459 |
-| `fused-direct` | 0 | 0% | 600 |
-| `fused-biased` | 0 | 0% | 0 |
-| `virtualized-base` | 0 | 0% | 0 |
-| `virtualized-operand` | 0 | 0% | 0 |
-| `page-boundary` | 0 | 0% | 0 |
-| `scan-limit-or-no-store` | 0 | 0% | 0 |
-| `mismatched-store` | 0 | 0% | 0 |
-| `unsupported-body-memory-or-sensitive` | 0 | 0% | 0 |
-| `unsupported-control-flow` | 0 | 0% | 0 |
-| `invalid-retry-edge` | 0 | 0% | 0 |
-| `biased-address-form-unsupported` | 0 | 0% | 0 |
-| `analysis-unavailable` | 0 | 0% | 0 |
-
-Counts sum exactly to 5,912,582 residual exclusive gateways; shares sum to 1;
-all site counts are nonnegative. Task 4 is selected to build the disabled
-emitter for the nonzero canonical `eligible-backend-disabled` class. This is
-only a 19.360408% pre-change opportunity projection. `not-load` is the actual
-dominant rejection and `biased-no-safe-scratch` is second; no enablement or
-performance result has been claimed yet.
-
-## Biased exclusive-fusion measured result (2026-07-15)
-
-Task 6 measured enabled commit `ae9bc594` with signed binary SHA-256
-`41896a3519845a1b40056653281f012c4b0c20399a06f2c8f25d23d3ec0bdab8`.
-The implementation passes the serial stress and focused correctness gates:
-
-- `futexrequeue`, `futexwakeexact`, and `sigreenter`: 10/10 Docker matches each.
-- `perf_futex_pingpong`: 10/10 normalized report-only samples; Carrick p50
-  7.750 us, Docker p50 14.667 us at `BENCH_NPROC=4`. Exact `run-probe.sh`
-  output is intentionally non-diffable because it includes latency and host
-  `nproc`; do not claim 40 literal output matches.
-- Current `go-runtime` and `go-sync`: MATCH, 52/52 each against cached oracles.
-- `just ci`: green through every local gate.
-
-The deterministic post census is
-`scripts/perf/evidence/native-exclusive-fusion-coverage-post-biased-v1.json`
-(SHA-256
-`99bde122b4efc7763f5238a9e48bcb53a90edce583206ebf8531b3472a859a41`).
-It records 3,554,347 residual exclusive gateways, down 2,358,235 (39.8850
-percent) from the 5,912,582 pre-census. `eligible-backend-disabled` fell from
-1,144,700 executions to zero. The remaining executions split almost exactly:
-`biased-no-safe-scratch` 1,777,174 (50.00001406728156 percent) and `not-load`
-1,777,173 (49.999985932718444 percent). `fused-biased` has 17,709 unique sites
-but zero residual executions, as intended.
-
-Treat that coverage as directional. The first enabled profile retained a
-reconciled million-entry profile but the downstream Go compiler failed before
-the exact ceiling marker was retained; a repeat retained the marker but exposed
-a strict nested-subphase accounting failure. A temporary disabled-policy A/B
-reconciled and reproduced the pre-enablement shape. This is profiling-contract
-fragility/measurement debt, not yet a demonstrated runtime correctness bug.
-
-The authoritative untraced W1 run reached the unchanged 1,000,000-gateway
-ceiling and improved only modestly versus the pinned single pre-run: wall
-15.49→15.12 s (-2.39 percent), user 41.04→38.98 s (-5.02 percent), system
-16.63→15.29 s (-8.06 percent), total CPU 57.67→54.27 s (-5.90 percent).
-Do not call this a step-function win. Exact c94 was stopped at the user's bound
-after 142.189 s versus the cached 3.069 s oracle (46.33x), with no result; the
-scoped run was reaped cleanly and must not be rerun merely to reconfirm that it
-exceeds the order-of-magnitude cutoff.
-
-### Next work
-
-1. Keep the compiler step-function blocker first. Do not rerun unchanged c94:
-   the current enabled result was already 46.33x the Docker oracle. Evaluate
-   the next runtime change with the bounded exact c94 lane and require material
-   improvement before resuming the broader Go/CPython/native-default ladder.
-2. If continuing exclusive fusion, design against the measured
-   `biased-no-safe-scratch` class (1,777,174 executions), while recognizing it
-   is tied within one execution of `not-load`; preserve the existing typed
-   recovery and fallback rules.
-3. Use a fresh untraced W1 and bounded c94 result to prove a material win before
-   promoting another optimization. Do not raise the gateway ceiling or
-   timeout, and keep Docker phases separate.
-4. Treat the NATIVEPERF nested-subphase accounting fragility as optional,
-   supporting measurement debt. Fix it when a profiled census is needed to
-   select or explain the next runtime change, but do not let it block the
-   c94-first performance campaign.
-
-### Production promotion withdrawn after whole-branch review
-
-The post-measurement whole-branch review found two concrete fallback holes and
-an incomplete asynchronous-recovery proof. The planner now rejects SP-based
-biased regions as `biased-address-form-unsupported`, rejects early conditional
-branches targeting any instruction inside the recognized region, and keeps
-direct SP fusion intact. Red-first production-planner regressions cover both.
-
-More importantly, forced-recovery analysis showed that resuming at the load is
-not sufficient for the recognizer's general `Copy` body: scratch restoration
-does not roll back arbitrary guest-register or NZCV mutations already executed
-before an asynchronous fault/kick. Since the measured wall benefit was only
-2.39 percent, production biased fusion is fail-closed again as
-`BiasedDisabled`. The recognizer, typed census, disabled emitter, and focused
-emitter/recovery tests remain as experimental coverage infrastructure; the
-enabled measurements above are historical evidence, not current production
-behavior. Do not re-enable without deterministic prelude/in-region/early-exit/
-retry fault-and-kick tests proving registers, NZCV, PC, and monitor cleanup.
-
-The next performance campaign therefore starts from the correctness-qualified
-sensitive fallback and targets the compiler's process-lifecycle multiplication,
-not another exclusive-fusion expansion.
-
-## Native translation-artifact completion authority (2026-07-16)
-
-The one-file cgo feasibility workload now has a successful, startup-excluded
-control and a separate Docker oracle. The exact build completes under the
-uncached native backend in 58.736915875 seconds and under native arm64 Docker
-in 1.447321668 seconds: native is 40.583x slower. Both builds exit zero and the
-produced binary exits zero with output `42`. The scoped native run reaped cleanly.
-
-The old 1,000,000-trap result was only a harness cutoff, not evidence of a hang
-or eventual failure. A successful process-tree profile records 19,057,383
-aggregate gateway entries across 214 PIDs and 832 complete thread/exec groups;
-the hottest thread alone reaches 1,520,928 entries. Descendant CPU is
-109.234585 seconds, of which translation accounts for 58.308976 seconds
-(53.38 percent), including 28.375762 seconds of nested translation and
-8.406044 seconds of publication.
-
-The replay corruption is now attributed and fixed in the spike. Artifact keys
-previously aliased direct and biased native address modes even though their
-emitted blocks are not interchangeable. A red-first key test now separates the
-mode class while retaining reuse across different biased host bases. Fresh
-validation also compares normalized templates and every replay binding; it ran
-without a mismatch through the bounded compiler window. The deterministic Go
-split-stack failure disappeared, and the exact cache-enabled build now
-completes correctly with output `42`.
-
-That correctness result does **not** justify a production cache. The best
-bounded point uses a shared atomic index, seals failed insertions at capacity,
-stores complete block source behind a short lookup prefix, and uses a shared
-guest-PC/address-mode filter after sealing. It completes in 60.471553292
-seconds versus the successful 58.736915875-second uncached control: cache is
-still 1.029532x slower, not within 1x and nowhere near a step function. It
-records 71,244 cross-process hits with 186.064 ms replay CPU.
-
-Capacity and warm-cache sensitivity reject the fine-grained design rather than
-merely asking for more tuning. Second-touch admission raises hits to 220,346
-without reducing wall (60.923604292 seconds). Doubling the sparse store to 512
-MiB raises hits to 931,094 but regresses wall to 73.567581958 seconds. Finally,
-two builds in one container used separate empty Go build caches: the population
-build took 68.705315333 seconds and the fully pre-warmed Carrick-cache build
-took 70.093390208 seconds. Population removal therefore does not expose a
-hidden speedup. The negative capacity code was reverted; the bounded 256 MiB
-diagnostic remains.
-
-The authority record is
-`scripts/perf/evidence/native-translation-artifact-spike-v1.json` and its
-verdict is `STOP_PER_BLOCK_ARTIFACT_CACHE`. Do not turn the high hit counts into
-a full implementation. Any next cache experiment must amortize at a much
-coarser executable/page bundle boundary and prove wall improvement before
-production work.
-
-Keep one correctness issue separate from cache attribution. Cache-disabled
-`-p=1` and parallel builds independently reproduced late build-archive
-`EFAULT` failures after 23.531563875 and 11.665446834 seconds. Those failures
-are native load/correctness debt; they cannot be cited as artifact replay
-corruption, and the successful uncached/cache authority runs remain the wall
-comparison.
-
-## Native virtual-counter completion authority (2026-07-16)
-
-The obsolete host hazard gate still failed before replacement, as required:
-raw `CNTVCT_EL0` was 53,553,547,703,683 ns while `CLOCK_UPTIME_RAW` was
-22,316,672,218,500 ns, a suspend-created 31,236,875,485,183 ns split. The new
-gate executes the emitted guest-visible DSR counter twice around the uptime
-read, retains the `CNTFRQ_EL0` frequency and monotonicity assertions, and
-passes on the same host without rebooting.
-
-The live commpage selects mode 3 (`AppleTimebase`) and the measured
-Mach-to-`CNTFRQ_EL0` scale reduces exactly to 125/3. Modes 1 and 3 remain
-inline. Unproved modes fail over to scaled `mach_absolute_time` through the
-typed sensitive boundary; an absent or non-representable exact scale remains
-unsupported instead of approximating or exposing raw `CNTVCT_EL0`.
-
-`just build` produced the signed release artifact; `codesign --verify` passed
-and the embedded entitlement contains `com.apple.security.hypervisor`. The
-required signed native16k `clock_gettime04` workload used run ID
-`native-counter-task4-20260716T212329-58430`, exited 3 in 0.82 seconds, and was
-reaped with zero scoped descendants. It stopped in the already-baselined LTP
-private-PID harness failure (`Main test process might have exit` / `Test
-killed`) before clock assertions, rather than reporting a suspend-sized
-vDSO/syscall divergence; `scripts/conformance/baseline.jsonl` records the same
-Carrick broken verdict for this case. Treat the exact DSR gate as the clock
-coherence unit authority and this LTP run as baseline-noise evidence, not as a
-newly passing LTP result. Removing `--pid private` did not change that
-classification: run `native-counter-hostpid-20260716T212551-63576` exited 3 in
-0.33 seconds with the identical pre-assertion harness kill and zero scoped
-descendants.
-
-Actual signed guest clock behavior is demonstrated separately by the focused
-`clockcoherence` probe. Run `native-clockcoherence-20260716T212750-65359`
-resolved `__kernel_clock_gettime`, bracketed its `CLOCK_MONOTONIC` result
-between two raw `SYS_clock_gettime` reads, and repeated the same check for
-`CLOCK_REALTIME`. It exited 0 in 0.34 seconds with all three booleans true and
-zero scoped descendants. The bracket admits 1 ms of scheduling/conversion
-slack, far below the measured 31,236-second suspend divergence. No oracle
-refresh ran; Docker was unavailable, so the Rust-only static probe was linked
-locally with `rust-lld` and executed only under the signed Carrick artifact.
-Fresh serialized `RUST_TEST_THREADS=1 just ci` completed with exit 0 in 28.29
-seconds after the probe and handoff were present.
-
-Final whole-branch review removed raw `CNTVCT_EL0` from capability, scale, and
-vvar-frequency acquisition. Commpage mode discovery now uses fallible
-`mach_vm_read_overwrite`; mode 0, mode 2, unknown values, and an unreadable mode
-select the scaled `mach_absolute_time` fallback when the exact scale is
-representable, otherwise `Unsupported`. Only explicit divergence diagnostics
-retain the raw counter pair.
-
-The post-review signed artifact has SHA-256
-`2eab8e4da479f9339679c670a558936e0610c283c243d9c0e5d3e414c9ac1494`.
-Native16k run `final-counter-review-20260716-11751` executed the focused
-`clockcoherence` probe with all three checks true, exited zero, and reaped to
-zero scoped descendants.
+# FreeBSD Native x86 Bring-up Handoff
+
+**Date:** 2026-07-23
+**Branch:** `perf/native-xstate-transfer`
+**Scope:** FreeBSD/amd64 native DSR only. VMM/HVF/KVM/bhyve behavior is not an acceptance criterion.
+
+## Current state
+
+The FreeBSD native x86 lane is functionally broad and has retained the historical
+428/428 corpus result during this effort, but the current tree does **not** yet
+have a fresh complete 428-case oracle receipt. The latest local
+`conformance_probes` invocation passed its test harness, but only compared 214
+available amd64-musl oracle entries and reported four report-only differences;
+164 probes had no cached oracle or Docker coverage.
+
+Two wrap-up commits contain the session work:
+
+- `d2c54e5c feat(runtime): harden native x86 execution state`
+- `4661f73c diagnostics(native-x86): add repeatable workload gates`
+
+`neutral-domains` remains opt-in. Do not make it the production default until
+Tasks 43, 55, and 58 close.
+
+## Completed progress
+
+### Native execution and mapping correctness
+
+- Coordinated executable epochs, edge/return-cache stop guards, exact thread
+  registration and retirement, and fail-stopped mapping/protection transitions.
+- Transactional ELF/interpreter/stack/vvar/vDSO publication and rollback.
+- Permanent ephemeral treatment for executable `MAP_SHARED` aliases, including
+  shared `mremap`, SysV, aperture, and partial replacement behavior.
+- Lock-safe native fork/vfork and terminal multithreaded exec takeover.
+- Retryable, exactly classified fetch, translated, cflow, xstate, and sensitive
+  faults through the unified synchronous-signal path.
+- Validated direct-copy fast paths for fully materialized, non-truncatable
+  anonymous/private backing. Mutable shared/vnode backing retains
+  kernel-contained SIGBUS-safe copies.
+- Exact private-file physical privatization and inbound-write generation
+  invalidation.
+
+### Extended state
+
+- Checked sensitive emulation for XSAVE, XSAVEOPT, XSAVEC, XRSTOR, and 64-bit
+  forms with standard/compacted geometry and atomic restore semantics.
+- Virtual x87/SSE/YMM/opmask/ZMM, PKRU, FCS/FDS, CET-disabled reads, complete
+  MXCSR validation, and consistent CPUID/XGETBV filtering.
+- Signal, nested signal, fork, and malformed-frame xstate preservation.
+- Sensitive FXSAVE/FXSAVE64/FXRSTOR/FXRSTOR64 and 14/28-byte
+  FNSTENV/FSTENV/FLDENV plus 94/108-byte FNSAVE/FSAVE/FRSTOR.
+- Hostile-review fixes landed for FLDENV TOP rotation, 14-byte FOP retention,
+  WAIT versus no-WAIT behavior, ordered side effects, and full FSAVE payload
+  preservation.
+
+### Workloads and tooling
+
+- Final neutral-domains GnuTLS/Kaniko gate: exit 0, `real 428.13s`,
+  `user 384.96s`, `sys 199.71s`.
+- Packaged 25-case LTP gate: 23 PASS, 2 expected TCONF, 194 TPASS, no failures,
+  breaks, or timeouts; `real 50.41s`.
+- Comparable 20-output cc1 workload: exit 0, `real 330.32s`, 3,181,360 output
+  bytes.
+- Safe cc1 profile: 7,729 samples over 8 seconds in
+  `/tmp/native-cc1-child-profile2.json`.
+- Reproducible jobs-aware source-image, archive, DTrace, and offline profiling
+  tools are checked in and documented.
+
+## Final wrap-up verification
+
+Run after the final code edits and before the commits above:
+
+- `cargo test -p carrick-dsr-x86 --lib`: **116/116 passed**.
+- FreeBSD native runtime integration, conservative policy: **43/43 passed**.
+- FreeBSD native runtime integration, neutral-domains policy: **43/43 passed**.
+- Focused `legacy_x87_state_helper`: passed under both policies.
+- `cargo fmt --all` and `git diff --check`: passed.
+
+Earlier current-tree gates also passed platform-FreeBSD `cargo check`, targeted
+Clippy with `-D warnings`, native DSR execution/static-ELF tests, runtime native
+units, and the packaged workload gates recorded above. A full post-commit `just
+ci` was not run on this FreeBSD-only rig.
+
+## Open blocker: generated x87 FIP/FDP
+
+Task 58 is **not complete**. The checked legacy transfer forms are green, but a
+hostile review found that ordinary copied x87 data instructions can expose JIT
+or stale instruction/data pointers through a later FXSAVE/FNSTENV.
+
+The tree contains an in-progress completed-instruction sideband:
+
+- `X86DsrContext::{last_copied_x87_guest_va,
+  last_copied_x87_guest_data_va,last_copied_x87_data_valid}`;
+- emitter FIP/FDP witnesses for copied x87 instructions;
+- runtime normalization in `native_freebsd.rs`.
+
+A temporary live assertion around RIP-relative `fldt` first proved FIP stale,
+then proved FDP zero. The final live pointer assertion was deliberately removed
+from `legacy-x87-state.S` during wrap-up rather than commit an unstable test.
+The broad suites are green, but the sideband is **not accepted** until the exact
+live proof is restored.
+
+Next engineer must:
+
+1. Re-add a red-first live fixture that executes ordinary copied x87 memory
+   forms and verifies guest-coordinate FIP/FDP and virtual selectors through
+   both FXSAVE and FNSTENV.
+2. Cover RIP-relative, base/index, addr32, guest-r15, address zero, and FS-based
+   addressing. Confirm scratch allocation cannot exceed the two context spill
+   slots; fail closed during planning if an exact form cannot be emitted.
+3. Verify asynchronous exits cannot consume a partial FDP publication and that
+   register-only/control x87 forms preserve the prior FDP/FIP correctly.
+4. Run both policy suites and obtain a fresh hostile native-only review before
+   closing Task 58.
+
+Relevant files:
+
+- `crates/carrick-dsr-x86/src/{decode.rs,emit.rs,gateway.rs,gateway_x86_64.S}`
+- `crates/carrick-dsr-x86/src/{fxstate.rs,legacy_x87.rs}`
+- `crates/carrick-runtime/src/native_freebsd.rs`
+- `crates/carrick-dsr-x86/tests/fixtures/legacy-x87-state.S`
+- `crates/carrick-runtime/tests/native_freebsd_x86.rs`
+
+## Remaining acceptance work
+
+1. **Task 58:** close generated copied-x87 FIP/FDP and pass hostile review.
+2. **Task 55:** rebuild the finalized release and rerun the pinned jobs=8 full
+   source-image build. Preserve wall/user/sys timing and exact archive digest.
+3. Run a true fresh full conformance comparison. Do not describe the partial
+   214-case report-only run as 428/428 evidence.
+4. Run the exact archive on a native Linux/amd64 host when one is available.
+5. Update `docs/native-x86-ltp-readiness.md`, decide the default xstate policy,
+   then close Tasks 55 and 43.
+
+## Task state
+
+| Task | State | Notes |
+|---|---|---|
+| 43 — synchronized executable invalidation | In progress, blocked by 55 | Core epoch/quiesce implementation and native tests are present; final workload/oracle acceptance remains. |
+| 55 — epoch performance revalidation | In progress | GnuTLS, packaged LTP, and cc1 receipts pass; finalized-release jobs=8 rerun and full oracle remain. |
+| 57 — checked XRSTOR/xstate | Complete | 116 DSR units and both 43-case policy suites pass. |
+| 58 — legacy x87 memory forms | In progress | Transfer forms pass; copied-instruction generated FIP/FDP proof remains. |
+| 8 — full LTP source image | In progress | Prior jobs=8 artifact passed native smoke; rerun after final release and Linux same-artifact oracle remain. |
+| 9 — documentation and commits | Complete with this handoff commit | Code and diagnostics commits listed above. |
+
+## Preserved artifacts
+
+- GnuTLS/Kaniko: `/tmp/native-copy-gnutls-final.{out,err,status}`
+- Packaged LTP JSONL: `/tmp/native-ltp-packaged-j8-neutral.jsonl`
+- LTP archive: `/tmp/carrick-ltp-native-built-j8-neutral-20260529.tar`
+- Archive SHA-256:
+  `a1b15d8ebf7cd9f46df312183202a2df7c89ba5a59c04a705ef41367abf42b7a`
+- cc1 profile: `/tmp/native-cc1-child-profile2.json`
+
+Treat `/tmp` artifacts as local receipts, not durable source control. Recreate
+or copy them before relying on them from another host.
+
+## Operating constraints
+
+- Never read Linux/GPL kernel source; use specifications, man pages, and the
+  differential oracle.
+- Do not use fasttrap/USDT/pid-provider DTrace on a continuing native process.
+  Use the checked-in safe kernel-provider/offline profiling workflow.
+- Fork waits must remain bounded and roll back without calling `fork`.
+- Guest xstate must never be physically restored into host state or copied via
+  unchecked guest pointers.
+- Carrick and Docker oracle phases must not run concurrently.
+- Keep acceptance claims explicitly FreeBSD native x86 only.
