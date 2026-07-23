@@ -83,12 +83,9 @@
 //! dispatcher struct and the normalized dispatch table. Socket/netlink/fd-set
 //! helper routines and the AF_UNIX registry live in the `support` submodule.
 use super::*;
+use crate::linux_abi::{LINUX_ICMP_ECHO_REPLY, LINUX_ICMP_ECHO_REQUEST, LINUX_IPPROTO_ICMP};
 use crate::network::{BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr};
 use carrick_spec::PortProtocol;
-
-const LINUX_IPPROTO_ICMP: i32 = 1;
-const LINUX_ICMP_ECHO_REQUEST: u8 = 8;
-const LINUX_ICMP_ECHO_REPLY: u8 = 0;
 
 const EPOLL_REBIND_REASON_IO_REARM: u32 = 1;
 const EPOLL_REBIND_REASON_CLOSE_DETACH: u32 = 2;
