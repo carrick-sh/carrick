@@ -697,7 +697,7 @@ pub(crate) mod test_host {
 
     use std::ptr::NonNull;
 
-    use crate::host::{JitRegion, NativeHostJit};
+    use crate::host::{ForkChildJit, JitRegion, NativeHostJit};
 
     pub(crate) struct TestHostJit;
 
@@ -760,6 +760,12 @@ pub(crate) mod test_host {
         fn after_fork_child(&self) {
             unsafe { libc::pthread_jit_write_protect_np(1) };
         }
+
+        fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
+            // Mirror of `DarwinHostJit`: MAP_JIT is MAP_PRIVATE, so the
+            // inherited mapping is already the child's own CoW copy.
+            Ok(ForkChildJit::Inherited)
+        }
     }
 
     // Non-Darwin test hosts: a plain RWX private anonymous mapping with
@@ -807,6 +813,13 @@ pub(crate) mod test_host {
         fn flush_icache(&self, _exec_ptr: *const u8, _len: usize) {}
 
         fn after_fork_child(&self) {}
+
+        fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
+            // MAP_PRIVATE anonymous mapping: the inherited pages are
+            // already this child's own CoW copy, same reasoning as Darwin's
+            // MAP_JIT arm above.
+            Ok(ForkChildJit::Inherited)
+        }
     }
 }
 

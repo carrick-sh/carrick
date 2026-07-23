@@ -25,3 +25,28 @@ pub fn active_host_jit() -> &'static dyn carrick_dsr::host::NativeHostJit {
     static JIT: FreebsdHostJit = FreebsdHostJit;
     &JIT
 }
+
+/// The FreeBSD half of a native lane (`carrick_dsr::lane::NativeHost`):
+/// hands the lane wiring this crate's JIT authority. Mirrors
+/// `carrick-native-darwin`'s `DarwinHost`.
+pub struct FreebsdHost;
+
+impl carrick_dsr::lane::NativeHost for FreebsdHost {
+    const NAME: &'static str = "freebsd";
+
+    fn active_jit() -> &'static dyn carrick_dsr::host::NativeHostJit {
+        active_host_jit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carrick_dsr::lane::NativeHost;
+
+    #[test]
+    fn freebsd_host_name_and_jit_are_wired() {
+        assert_eq!(FreebsdHost::NAME, "freebsd");
+        FreebsdHost::active_jit().supported().expect("supported");
+    }
+}

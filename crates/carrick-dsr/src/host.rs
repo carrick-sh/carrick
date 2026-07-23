@@ -52,6 +52,22 @@ impl JitRegion {
     }
 }
 
+/// Outcome of [`NativeHostJit::remap_for_fork_child`]: what the fork CHILD
+/// must do with its inherited [`JitRegion`] before any guest thread runs.
+///
+/// * `Inherited` — the inherited mapping is safe for the child to keep
+///   executing from as-is (e.g. Darwin's `MAP_JIT` is `MAP_PRIVATE`, so the
+///   child already holds its own copy-on-write pages; nothing to replace).
+/// * `Fresh(region)` — the inherited mapping is UNSAFE to share (e.g. a
+///   `MAP_SHARED` dual map: a child that appended translations into it would
+///   clobber the parent's live code through the same physical pages) and the
+///   child must adopt `region` instead of the one it inherited.
+#[derive(Debug)]
+pub enum ForkChildJit {
+    Inherited,
+    Fresh(JitRegion),
+}
+
 /// Host W^X JIT plumbing for the translation cache. Implementations are
 /// stateless (all state lives in the [`JitRegion`]); every method is safe to
 /// call from any guest thread — hence the `Send + Sync` supertraits, which
@@ -86,7 +102,20 @@ pub trait NativeHostJit: Send + Sync {
     fn flush_icache(&self, exec_ptr: *const u8, len: usize);
 
     /// Repair per-thread protection state inherited by the sole surviving
-    /// thread after `fork(2)` (Darwin: re-assert the write-protect bit; the
-    /// child reuses the inherited mapping and must NOT re-map).
+    /// thread after `fork(2)`, IN PLACE, for lanes whose region SURVIVES
+    /// fork unchanged (Darwin: re-assert the write-protect bit; the child
+    /// reuses the inherited mapping and must NOT re-map). Region
+    /// REPLACEMENT — for lanes where the inherited region is unsafe to
+    /// keep using — is [`Self::remap_for_fork_child`], not this method.
     fn after_fork_child(&self);
+
+    /// Fork-repair contract. Called in the CHILD immediately after
+    /// `fork(2)`, before any guest thread runs. `prior` is the region the
+    /// child inherited (the parent's, byte-for-byte, at fork). `Inherited`
+    /// means the child may keep executing from it as-is; `Fresh(region)`
+    /// means the inherited region is unsafe to share and the child must
+    /// adopt `region` — of the same capacity as `prior`, mapped fresh for
+    /// this child — instead. No default impl: every host answers
+    /// explicitly (see [`ForkChildJit`] for the per-shape rationale).
+    fn remap_for_fork_child(&self, prior: &JitRegion) -> std::io::Result<ForkChildJit>;
 }

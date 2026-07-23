@@ -30,7 +30,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 
-use carrick_dsr::host::{JitRegion, NativeHostJit};
+use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
 use carrick_dsr_x86::block::{X86BlockPlanError, X86Exit};
 use carrick_dsr_x86::decode::{X86InstClass, classify};
 use carrick_dsr_x86::gateway::{
@@ -11355,19 +11355,40 @@ fn spawn_clone_thread(
 /// Build a fresh, PRIVATE `SharedRun` for a `fork()` child. The parent's code
 /// cache is a `SHM_ANON` `MAP_SHARED` dual-map, so it survives fork as the SAME
 /// physical pages — a child that re-JITs into it at its own cursor clobbers the
-/// parent's live code. Map a brand-new SHM_ANON cache (private to this child),
-/// register it with the fault shim (re-registration replaces the parent-
-/// inherited region in this child process), and give the child its own thread
-/// registry + futex table (fork copied only the calling thread, so the child's
-/// thread group is just itself). The dispatcher (its COW copy), reporter,
-/// image (COW-identical VAs), and max_traps carry over. Slice 0 is reserved for
-/// the child's main thread; guest threads it spawns take slices 1..N.
+/// parent's live code. Repair this through the enforced host-seam contract
+/// (`NativeHostJit::remap_for_fork_child`) rather than mapping a fresh cache
+/// directly: on this lane it always answers `Fresh` (see
+/// `carrick-native-freebsd/src/jit.rs`'s fork-hazard doc), so the child gets a
+/// brand-new SHM_ANON cache private to itself. Register it with the fault shim
+/// (re-registration replaces the parent-inherited region in this child
+/// process), and give the child its own thread registry + futex table (fork
+/// copied only the calling thread, so the child's thread group is just
+/// itself). The dispatcher (its COW copy), reporter, image (COW-identical
+/// VAs), and max_traps carry over. Slice 0 is reserved for the child's main
+/// thread; guest threads it spawns take slices 1..N.
 fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String> {
     let cache_len = JIT_SLICE_LEN * JIT_SLICE_COUNT;
-    let region = parent
+    let region = match parent
         .jit
-        .map_code_cache(cache_len)
-        .map_err(|e| format!("fork child: map fresh code cache: {e:?}"))?;
+        .remap_for_fork_child(&parent.region)
+        .map_err(|e| format!("fork child: remap code cache: {e:?}"))?
+    {
+        ForkChildJit::Fresh(region) => region,
+        // Unreachable on this lane: `FreebsdHostJit::remap_for_fork_child`
+        // always maps a fresh SHM_ANON object (the dual map is MAP_SHARED
+        // and never safe to keep sharing with a fork child — see the
+        // fork-hazard doc in `carrick-native-freebsd/src/jit.rs`). Fail
+        // closed rather than silently keep executing against the parent's
+        // live code cache if this contract is ever violated.
+        ForkChildJit::Inherited => {
+            return Err(
+                "fork child: FreeBSD dual-map JIT lane reported Inherited from \
+                 remap_for_fork_child; the SHM_ANON MAP_SHARED cache is never safe to \
+                 share with a fork child"
+                    .to_string(),
+            );
+        }
+    };
     fault::register_code_region(region.exec_base.as_ptr() as u64, cache_len as u64);
 
     let tid = crate::thread::ThreadId::main_from_host_pid();
