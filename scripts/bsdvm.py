@@ -9,6 +9,7 @@ import argparse
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import shutil
 import sys
 
 
@@ -61,6 +62,60 @@ def state_root() -> Path:
 
 def state_dir(vm_name: str) -> Path:
     return state_root() / vm_name
+
+
+def firmware_paths() -> tuple[Path, Path]:
+    override = os.environ.get("CARRICK_BSDVM_FW_DIR")
+    if override:
+        base = Path(override)
+    else:
+        qemu = shutil.which("qemu-system-aarch64")
+        if qemu is None:
+            raise SystemExit("qemu-system-aarch64 not found (brew install qemu)")
+        base = Path(qemu).resolve().parent.parent / "share" / "qemu"
+    code = base / "edk2-aarch64-code.fd"
+    vars_tpl = base / "edk2-arm-vars.fd"
+    for p in (code, vars_tpl):
+        if not p.exists():
+            raise SystemExit(f"missing firmware file: {p}")
+    return code, vars_tpl
+
+
+def ensure_efivars(vm_name: str) -> Path:
+    _, vars_tpl = firmware_paths()
+    dst = state_dir(vm_name) / "efivars.fd"
+    if not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(vars_tpl, dst)
+    return dst
+
+
+def qemu_args(vm: VmConfig, overlay: Path, extra_drives: list[str] | None = None) -> list[str]:
+    code, _ = firmware_paths()
+    st = state_dir(vm.name)
+    args = [
+        "qemu-system-aarch64",
+        "-M", "virt,gic-version=3",
+        "-accel", "hvf",
+        "-cpu", "host",
+        "-smp", "4",
+        "-m", "6144",
+        "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
+        "-drive", f"if=pflash,format=raw,file={ensure_efivars(vm.name)}",
+        "-drive", f"if=virtio,format=qcow2,file={overlay}",
+        "-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{vm.ssh_port}-:22",
+        "-device", "virtio-net-pci,netdev=n0",
+        "-device", "virtio-rng-pci",
+        "-chardev",
+        f"socket,id=ser0,path={st / 'serial.sock'},server=on,wait=off,logfile={st / 'serial.log'}",
+        "-serial", "chardev:ser0",
+        "-display", "none",
+        "-daemonize",
+        "-pidfile", str(st / "qemu.pid"),
+    ]
+    for d in extra_drives or []:
+        args += ["-drive", d]
+    return args
 
 
 def _resolve_vm(name: str) -> VmConfig | None:
