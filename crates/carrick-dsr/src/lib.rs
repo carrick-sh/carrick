@@ -36,6 +36,7 @@ pub mod ids;
 pub mod lane;
 pub mod native_error;
 pub mod page_geometry;
+pub mod prepared_image;
 pub mod probes;
 pub mod profile;
 #[cfg(any(test, feature = "test-hooks"))]

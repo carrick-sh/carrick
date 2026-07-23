@@ -28,7 +28,15 @@ carrick-mem = { path = "../carrick-mem" }
 libc.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
+# Pulled in by `prepared_image` (the artifact digest + the scratch-file the
+# copy-in path materializes); both are ISA-free, matching the module's own
+# "compiles on every target" contract.
+sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# `prepared_image`'s own unit tests round-trip the schema through JSON
+# (moved with the module; production code never touches serde_json).
+serde_json.workspace = true

@@ -27,7 +27,13 @@ pub mod emulate;
 pub mod esr;
 pub mod gateway;
 pub mod mapped_memory;
-pub mod prepared_image;
+// The prepared-image schema moved to `carrick-dsr` (the platform-neutral
+// crate) as part of the staged native-backend extraction: it is ISA-free
+// (Task 6, docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md).
+// Re-exported under its old path so every `carrick_dsr_aarch64::prepared_image::…`
+// call site (notably `carrick-runtime`'s `native_prepared_image.rs` shim) is
+// unchanged.
+pub use carrick_dsr::prepared_image;
 pub mod snapshot;
 pub mod translator;
 pub mod types;
