@@ -8179,6 +8179,26 @@ mod overlay_dispatch_tests {
         assert_eq!(data, registered_reader as u64);
     }
 
+    // The host TCP handshake that completes a listening socket's accept queue
+    // is asynchronous relative to `connect()` returning on the client side: the
+    // client-side call can return before the LISTENER side's kernel state (and
+    // thus carrick's epoll/kqueue bridge) has observed the new connection. A
+    // single immediate `epoll_wait` can therefore race a real, still-in-flight
+    // host completion (a time-assumption, not a dispatcher correctness issue —
+    // once the edge is observed it is never re-delivered, so retrying only
+    // gives the async completion a bounded, unhurried chance to land before
+    // failing the assertion for real).
+    fn epoll_wait_ready(h: &mut Harness, epfd: u64, out_addr: u64) -> i64 {
+        let start = std::time::Instant::now();
+        loop {
+            let n = returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0]));
+            if n != 0 || start.elapsed() >= std::time::Duration::from_millis(200) {
+                return n;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn epoll_et_delivers_listener_edge_without_read_byte_growth() {
         let mut h = Harness::new();
@@ -8259,7 +8279,7 @@ mod overlay_dispatch_tests {
 
         let out_addr = h.reserve(16);
         let client1 = connect_client();
-        assert_eq!(returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])), 1);
+        assert_eq!(epoll_wait_ready(&mut h, epfd, out_addr), 1);
         assert_eq!(
             returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])),
             0,
@@ -8267,7 +8287,7 @@ mod overlay_dispatch_tests {
         );
 
         let client2 = connect_client();
-        let n = returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0]));
+        let n = epoll_wait_ready(&mut h, epfd, out_addr);
         unsafe {
             libc::close(client1);
             libc::close(client2);
