@@ -19650,4 +19650,18 @@ mod tests {
             assert_eq!(actual, expected);
         }
     }
+
+    /// Drift-pin test: ensure carrick_dsr_x86::X8664Isa::USER_VA_END_EXCLUSIVE
+    /// never diverges from the local X86_64_USER_END_EXCLUSIVE constant.
+    /// Both must be kept in sync; Phase 2 will delete the local one.
+    #[test]
+    fn x86_64_user_va_end_exclusive_constant_matches_dsr_x86() {
+        use carrick_dsr::lane::GuestIsa;
+        use carrick_dsr_x86::X8664Isa;
+        assert_eq!(
+            X8664Isa::USER_VA_END_EXCLUSIVE,
+            X86_64_USER_END_EXCLUSIVE,
+            "X8664Isa::USER_VA_END_EXCLUSIVE must match native_freebsd.rs X86_64_USER_END_EXCLUSIVE"
+        );
+    }
 }

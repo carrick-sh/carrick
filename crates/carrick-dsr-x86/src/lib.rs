@@ -67,3 +67,25 @@ pub use xstate_save::{
     X86XstateMemoryWriter, X86XstateSaveError, X86XstateSaveGpReason, X86XstateSaveInternalReason,
     X86XstateSavePlan, X86XstateSaveSsReason,
 };
+
+/// x86_64 guest ISA implementation for the DSR lane seam.
+pub struct X8664Isa;
+
+impl carrick_dsr::lane::GuestIsa for X8664Isa {
+    const NAME: &'static str = "x86_64";
+    const USER_VA_END_EXCLUSIVE: u64 = 1u64 << 47;
+    const GUEST_PAGE_SIZE: usize = 4096;
+}
+
+#[cfg(test)]
+mod isa_tests {
+    use super::*;
+    use carrick_dsr::lane::GuestIsa;
+
+    #[test]
+    fn x8664_isa_constants() {
+        assert_eq!(X8664Isa::NAME, "x86_64");
+        assert_eq!(X8664Isa::USER_VA_END_EXCLUSIVE, 1u64 << 47);
+        assert_eq!(X8664Isa::GUEST_PAGE_SIZE, 4096);
+    }
+}
