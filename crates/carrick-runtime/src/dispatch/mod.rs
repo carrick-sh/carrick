@@ -3621,6 +3621,14 @@ impl SyscallDispatcher {
     /// Live gate consumed by native JIT contexts. The launch-time policy is
     /// immutable once execution starts; guest seccomp transitions flip the
     /// returned atomic word from 1 to 0 before publishing their filter.
+    ///
+    /// Only the FreeBSD/x86_64 native lane (`native_freebsd.rs`) consumes this
+    /// today, so it is otherwise unreachable — same target-gating rationale as
+    /// `carrick-dsr-x86`'s Cargo dependency edge.
+    #[cfg_attr(
+        not(all(target_os = "freebsd", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn identity_fast_path_word(&self) -> Option<&std::sync::atomic::AtomicU32> {
         if self.container_policy.as_ref().is_some_and(|policy| {
             policy.denies_any(crate::container_policy::IDENTITY_FAST_PATH_SYSCALLS)

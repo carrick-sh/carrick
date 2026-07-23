@@ -248,7 +248,7 @@ fn runtime_loop_publishes_shared_file_alias_provenance_after_install() {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&scratch);
-    let mut host = HostFsBackend::new_in(&scratch).expect("host fs backend");
+    let host = HostFsBackend::new_in(&scratch).expect("host fs backend");
     host.set_file_contents("/shared.bin", vec![0x41; 4096])
         .expect("seed shared file");
     let mut dispatcher = SyscallDispatcher::new();

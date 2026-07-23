@@ -33,7 +33,7 @@ use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
 };
 use carrick_guest_mem::protections::MemoryProtections;
-use carrick_guest_mem::{Gpa, GuestVa, MemoryError, SharedFutexLocation};
+use carrick_guest_mem::{Gpa, MemoryError, SharedFutexLocation};
 use carrick_hal::{GuestEntryRegs, GuestVmBackend, Reg, SlotId, SysReg, TrapError, VcpuRegistry};
 use carrick_mem::memory::AddressSpace;
 

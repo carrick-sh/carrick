@@ -548,8 +548,10 @@ const HOST_STREAM_BUF_TARGET: libc::c_int = 16 * 1024 * 1024;
 const HOST_STREAM_BUF_REQUIRED: libc::c_int = 8 * 1024 * 1024;
 
 // Only referenced from the macOS-gated widening test now that widening reads
-// back nothing in the hot path (best-effort). Keep it for that coverage.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// back nothing in the hot path (best-effort). Keep it for that coverage. The
+// only real caller is `#[cfg(test)]`-gated, so a plain (non-test) lib build
+// on macOS is ALSO callerless — gate on `not(test)` too, not just non-macOS.
+#[cfg_attr(not(all(test, target_os = "macos")), allow(dead_code))]
 fn host_socket_buffer_size(host_fd: i32, opt: libc::c_int) -> Result<libc::c_int, LinuxErrno> {
     let mut size: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;

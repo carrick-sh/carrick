@@ -88,9 +88,15 @@ use carrick_runtime::syscall::lookup_aarch64;
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::trap::hvf_capabilities;
 
-use crate::args::{
-    Cli, Commands, DebugCommand, NetworkCommand, RootfsCommand, SystemCommand, VolumeCommand,
-};
+use crate::args::{Cli, Commands, NetworkCommand, RootfsCommand, SystemCommand, VolumeCommand};
+// Only the non-HVF `Commands::Debug` arm below matches on `DebugCommand`
+// variants directly; the macOS arm just forwards `command` into `run_debug`.
+#[cfg(any(
+    feature = "platform-linux",
+    feature = "platform-freebsd",
+    feature = "platform-netbsd"
+))]
+use crate::args::DebugCommand;
 #[cfg(feature = "platform-macos")]
 use crate::debug::run_debug;
 #[cfg(any(
