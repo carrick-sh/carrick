@@ -59,6 +59,13 @@ mod tests {
         fn flush_icache(&self, _exec_ptr: *const u8, _len: usize) {}
 
         fn after_fork_child(&self) {}
+
+        fn remap_for_fork_child(
+            &self,
+            _prior: &crate::host::JitRegion,
+        ) -> std::io::Result<crate::host::ForkChildJit> {
+            Err(std::io::Error::other("test stub"))
+        }
     }
 
     static TEST_HOST_JIT: TestHostJit = TestHostJit;

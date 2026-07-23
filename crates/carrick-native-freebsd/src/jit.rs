@@ -18,22 +18,28 @@
 //! sites is the x86 arch crate's contract at its patch encodings, not a
 //! flush).
 //!
-//! ## Fork hazard (M1 item — documented, not yet closed)
+//! ## Fork hazard — CLOSED, enforced by `remap_for_fork_child`
 //!
 //! Unlike Darwin's `MAP_PRIVATE` MAP_JIT (fork child gets a CoW copy), a
 //! `MAP_SHARED` dual map is SHARED with a fork child: a child that APPENDS
 //! translations would write the same physical pages the parent executes.
-//! Today no guest runs on this lane (plan resolution fails closed until the
-//! x86 translator exists), so `after_fork_child` is a documented no-op; the
-//! M1 bring-up must extend the host seam with a region-remap hook
-//! (fresh SHM object + cleared block index in the child) BEFORE the first
-//! forking guest workload. Do not enable guest execution on this lane
-//! without closing this.
+//! This was a standing review finding (M1 item, previously "documented, not
+//! yet closed"). It is now CLOSED and ENFORCED through the host seam:
+//! [`NativeHostJit::remap_for_fork_child`] is the contract every native
+//! host must answer, and `FreebsdHostJit`'s answer is always
+//! `Ok(ForkChildJit::Fresh(..))` — a brand-new SHM_ANON object of the same
+//! capacity, never the inherited one. The runtime's `fork_child_rebuild`
+//! (`carrick-runtime/src/native_freebsd.rs`) calls this instead of
+//! `map_code_cache` directly, so a fork child NEVER keeps executing against
+//! the parent's SHM object. `after_fork_child` stays a no-op here: it is the
+//! IN-PLACE repair hook for lanes whose region SURVIVES fork (Darwin); this
+//! lane's fork repair is entirely REGION REPLACEMENT, done by
+//! `remap_for_fork_child` before the child's first guest thread runs.
 
 use std::io;
 use std::ptr::NonNull;
 
-use carrick_dsr::host::{JitRegion, NativeHostJit};
+use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
 
 /// Stateless dual-map JIT backend (all state lives in the [`JitRegion`]).
 pub struct FreebsdHostJit;
@@ -164,8 +170,19 @@ impl NativeHostJit for FreebsdHostJit {
     }
 
     fn after_fork_child(&self) {
-        // See the module doc's fork hazard: no-op is safe ONLY while no
-        // guest executes on this lane; M1 must add region remapping here.
+        // No per-thread protection state to repair on this lane (no MAP_JIT
+        // toggle). This lane's fork repair is REGION REPLACEMENT, not
+        // in-place repair — see `remap_for_fork_child` and the module doc's
+        // fork-hazard section.
+    }
+
+    fn remap_for_fork_child(&self, prior: &JitRegion) -> io::Result<ForkChildJit> {
+        // The SHM_ANON dual map is MAP_SHARED: a fork child inherits the
+        // SAME physical pages the parent (still) executes from. Never
+        // report `Inherited` on this lane — map a brand-new SHM object of
+        // the same capacity so the child can never append translations
+        // into pages the parent is running.
+        self.map_code_cache(prior.capacity).map(ForkChildJit::Fresh)
     }
 }
 
@@ -245,5 +262,41 @@ mod tests {
         let jit = FreebsdHostJit;
         let err = jit.map_code_cache(usize::MAX & !0xfff);
         assert!(err.is_err(), "absurd capacity must fail closed");
+    }
+
+    #[test]
+    fn remap_for_fork_child_returns_a_fresh_distinct_region() {
+        // The fork hazard from the module doc, enforced: this lane must
+        // NEVER report `Inherited` (the SHM_ANON dual map is MAP_SHARED and
+        // unsafe to keep sharing with a fork child), and the region it
+        // hands back must be a genuinely distinct mapping of the same
+        // capacity, not the parent's.
+        let jit = FreebsdHostJit;
+        let prior = jit.map_code_cache(CAPACITY).expect("map prior region");
+        let remapped = jit
+            .remap_for_fork_child(&prior)
+            .expect("remap_for_fork_child must succeed");
+        let fresh = match remapped {
+            ForkChildJit::Fresh(region) => region,
+            ForkChildJit::Inherited => {
+                panic!("FreeBSD dual-map lane must never report Inherited across fork")
+            }
+        };
+        assert_eq!(
+            fresh.capacity, prior.capacity,
+            "fork-child region must match the prior region's capacity"
+        );
+        assert_ne!(
+            fresh.exec_base, prior.exec_base,
+            "fork-child region must be a distinct mapping, not the parent's"
+        );
+        assert_ne!(
+            fresh.write_base, prior.write_base,
+            "fork-child region's write alias must also be distinct"
+        );
+        unsafe {
+            jit.unmap(&fresh);
+            jit.unmap(&prior);
+        }
     }
 }

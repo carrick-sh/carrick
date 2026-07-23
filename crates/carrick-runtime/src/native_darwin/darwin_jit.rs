@@ -23,7 +23,7 @@ pub(crate) use carrick_native_freebsd::active_host_jit;
 /// ever mapping code.
 #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
 mod unsupported {
-    use carrick_dsr::host::{JitRegion, NativeHostJit};
+    use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
 
     pub(crate) struct UnsupportedHostJit;
 
@@ -47,6 +47,12 @@ mod unsupported {
         fn flush_icache(&self, _exec_ptr: *const u8, _len: usize) {}
 
         fn after_fork_child(&self) {}
+
+        fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
+            Err(std::io::Error::other(
+                "no native host JIT implementation for this target yet",
+            ))
+        }
     }
 
     static UNSUPPORTED_HOST_JIT: UnsupportedHostJit = UnsupportedHostJit;
