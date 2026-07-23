@@ -97,7 +97,7 @@ sync with `rustup update stable`.
 
 ## Repository map
 
-27-crate Cargo workspace under [`crates/`](crates/) (see
+31-crate Cargo workspace under [`crates/`](crates/) (see
 [`crates/README.md`](crates/README.md)). Dependency direction:
 `cli → engine → {image, runtime} → spec`. The HAL/platform split
 ([`docs/hal.md`](docs/hal.md)) separates platform-neutral contracts from

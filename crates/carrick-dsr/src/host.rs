@@ -110,12 +110,13 @@ pub trait NativeHostJit: Send + Sync {
     fn after_fork_child(&self);
 
     /// Fork-repair contract. Called in the CHILD immediately after
-    /// `fork(2)`, before any guest thread runs. `prior` is the region the
-    /// child inherited (the parent's, byte-for-byte, at fork). `Inherited`
-    /// means the child may keep executing from it as-is; `Fresh(region)`
-    /// means the inherited region is unsafe to share and the child must
-    /// adopt `region` — of the same capacity as `prior`, mapped fresh for
-    /// this child — instead. No default impl: every host answers
-    /// explicitly (see [`ForkChildJit`] for the per-shape rationale).
+    /// `fork(2)` by lanes whose fork path routes region repair through this seam
+    /// (currently: FreeBSD's `fork_child_rebuild`); Darwin's CoW lane does not
+    /// consult it. `prior` is the region the child inherited (the parent's,
+    /// byte-for-byte, at fork). `Inherited` means the child may keep executing
+    /// from it as-is; `Fresh(region)` means the inherited region is unsafe to
+    /// share and the child must adopt `region` — of the same capacity as
+    /// `prior`, mapped fresh for this child — instead. No default impl: every
+    /// host answers explicitly (see [`ForkChildJit`] for the per-shape rationale).
     fn remap_for_fork_child(&self, prior: &JitRegion) -> std::io::Result<ForkChildJit>;
 }

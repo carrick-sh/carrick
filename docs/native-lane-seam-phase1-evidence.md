@@ -125,7 +125,7 @@ test-order/timing flake, not a regression, consistent with this
 project's documented load-sensitivity of its test suite). The total-test-
 count difference (792 vs 788) is fully explained by the 4 new tests
 Phase-1 itself added (`native::tests::*`, `native::fork_child::tests::*`,
-`native_cfg_topology_tests::*`).
+`native_freebsd::tests::x86_64_user_va_end_exclusive_constant_matches_dsr_x86`).
 
 **Net: zero test failures traced to the Phase-1 diff on FreeBSD.**
 

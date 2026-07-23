@@ -242,7 +242,7 @@ tables. See [docs/conformance-testing.md](docs/conformance-testing.md).
 
 ## Directory Map
 
-Carrick is a 25-crate Cargo workspace under [`crates/`](crates/). The high-level
+Carrick is a 31-crate Cargo workspace under [`crates/`](crates/). The high-level
 dependency direction is:
 
 ```text

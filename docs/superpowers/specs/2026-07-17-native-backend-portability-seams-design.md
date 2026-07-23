@@ -216,9 +216,9 @@ does not revise them.
   brand-new SHM_ANON object (`ForkChildJit::Fresh`) — its `MAP_SHARED` dual
   map would otherwise still be shared with the child. Darwin's `MAP_JIT`
   region is `MAP_PRIVATE` and survives fork as a COW copy already, so
-  `DarwinHostJit::remap_for_fork_child` answers `ForkChildJit::Inherited` and
-  leaves the real repair to `after_fork_child` (resetting the per-thread
-  write-protect bit).
+  `DarwinHostJit::remap_for_fork_child` answers `ForkChildJit::Inherited`;
+  the actual post-fork write-protect repair path is `TranslationCache::after_fork_child`
+  calling `host.end_thread_write()` (crates/carrick-dsr/src/cache.rs ~513).
 
 - **M0.8 wiring is a facade module, not a bare `#[cfg]` pair inline at call
   sites.** `crates/carrick-runtime/src/native/mod.rs` is the single place

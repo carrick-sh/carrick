@@ -172,11 +172,10 @@ const _: fn(
 mod native_cfg_topology_tests {
     // INTENT (unchanged from the pre-extraction assertion on the inline
     // module): the prepared-image SCHEMA must compile on every target. The
-    // schema now lives in `carrick-dsr-aarch64` (which compiles
-    // unconditionally on every host by construction); what this crate owns
-    // is the re-export shim, so the assertion pins the shim's topology
-    // instead: both the module declaration and the shim's re-export line
-    // must be cfg-free.
+    // schema now lives in `carrick-dsr` (re-exported via carrick-dsr-aarch64);
+    // what this crate owns is the re-export shim, so the assertion pins the
+    // shim's topology instead: both the module declaration and the shim's
+    // re-export line must be cfg-free.
     #[test]
     fn native_darwin_unconditional_import_has_unconditional_schema_module() {
         let source = include_str!("lib.rs");
