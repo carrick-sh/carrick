@@ -1,0 +1,19 @@
+[package]
+name = "carrick-native-darwin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_native_darwin"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-dsr = { path = "../carrick-dsr" }
+libc.workspace = true
+
+[build-dependencies]
+cc = "1"

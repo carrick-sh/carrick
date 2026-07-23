@@ -584,6 +584,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-native-darwin"
+version = "0.1.0"
+dependencies = [
+ "carrick-dsr",
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "carrick-native-freebsd"
 version = "0.1.0"
 dependencies = [
@@ -635,6 +644,7 @@ dependencies = [
  "carrick-image",
  "carrick-kernel",
  "carrick-mem",
+ "carrick-native-darwin",
  "carrick-native-freebsd",
  "carrick-observability",
  "carrick-portable",
@@ -647,7 +657,6 @@ dependencies = [
  "carrick-vmm-hvf",
  "carrick-vmm-kvm",
  "carrick-vmm-nvmm",
- "cc",
  "clap",
  "dynasmrt",
  "fd-lock",
