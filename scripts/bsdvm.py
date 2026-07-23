@@ -423,8 +423,18 @@ class SerialConsole:
                 return out
             try:
                 chunk = self._sock.recv(4096)
-                if chunk:
-                    self._buf += chunk
+                if not chunk:
+                    # Peer (qemu) closed the connection: recv() on a closed
+                    # socket returns b"" immediately rather than raising, so
+                    # without this check the loop would spin at 100% CPU
+                    # doing nothing until `deadline` -- observed in practice
+                    # as an orphaned bsdvm.py process still burning a full
+                    # core minutes after the VM under it was torn down.
+                    raise ConnectionError(
+                        f"serial connection closed while waiting for {pattern!r} "
+                        f"(see {self._log_hint})"
+                    )
+                self._buf += chunk
             except socket.timeout:
                 pass
         raise TimeoutError(
@@ -485,7 +495,12 @@ def provision_commands(vm: VmConfig, pubkey: str) -> list[tuple[str, float]]:
              "service sshd restart", 120),
             ("env ASSUME_ALWAYS_YES=yes pkg bootstrap -f", 600),
             ("env ASSUME_ALWAYS_YES=yes pkg install -y git just rust python3", 3600),
-            (_GIT_SETUP, 30),
+            # A login shell's PATH already includes /usr/local/bin, but
+            # `export` (not a plain prefix assignment) still matters here:
+            # a bare `PATH=... cmd1 && cmd2` only scopes PATH to cmd1,
+            # leaving cmd2 (after the `&&` in _GIT_SETUP) to fail the same
+            # way it would under a PATH-less environment.
+            (f"export PATH=/usr/local/bin:/usr/local/sbin:$PATH; {_GIT_SETUP}", 30),
             ("shutdown -p now", 120),
         ]
     return [  # netbsd-arm64
@@ -493,12 +508,63 @@ def provision_commands(vm: VmConfig, pubkey: str) -> list[tuple[str, float]]:
         ("printf 'sshd=YES\\ndhcpcd=YES\\n' >> /etc/rc.conf && "
          "echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config && "
          "/etc/rc.d/sshd start", 300),
-        ("export PKG_PATH=https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/aarch64/10.1/All; "
+        # Purely local (never blocks on the network) visibility into whether
+        # dhcpcd actually got a lease before the network-dependent pkg_add
+        # step below -- kept for diagnosis after the DAD hang below was found
+        # via exactly this output.
+        ("ifconfig -a; netstat -rn", 30),
+        # dhcpcd's IPv4 duplicate-address-detection (ARP probe) never
+        # resolves over qemu's usermode/slirp network -- there is no real
+        # peer to ARP against, so the interface's address is left
+        # permanently in "tentative" state and no default route is
+        # installed. Symptom: pkg_add hangs forever with zero packets sent
+        # and no error. `sysctl ... && dhcpcd restart` alone was NOT
+        # sufficient (the already-bound address stayed tentative), and a
+        # manual `ifconfig ... delete` follow-up hung the shell outright
+        # (likely a syntax/argument-order issue with this ifconfig's
+        # `delete` verb) -- so instead fully stop dhcpcd first (releasing
+        # its lease/address cleanly through its own codepath), set the
+        # sysctl, then start it fresh: a brand new lease acquired after
+        # dad_count=0 is set should skip DAD from the start rather than
+        # needing to un-stick an already-tentative one.
+        ("/etc/rc.d/dhcpcd stop; sysctl -w net.inet.ip.dad_count=0; "
+         "/etc/rc.d/dhcpcd start; sleep 5; ifconfig -a; netstat -rn", 60),
+        # dhcpcd never wrote a resolver config from this DHCP server either
+        # (confirmed by ntpd's own background "Temporary failure in name
+        # resolution" log lines) -- write it directly. 10.0.2.3 is qemu
+        # usermode-network's fixed built-in DNS relay, deterministic given
+        # this module's own -netdev user config (matches the 10.0.2.2
+        # gateway used above). Resolution STILL failed after this alone
+        # (ntpd kept logging the same error against a correct resolv.conf),
+        # so also check whether npf (NetBSD's default packet filter) is the
+        # thing actually eating the UDP/53 replies, and lay in a static
+        # /etc/hosts entry for the pkgsrc CDN host as a belt-and-braces
+        # fallback that doesn't depend on the relay working at all. The IP
+        # is a Fastly edge (may rotate over time -- if this ever goes stale,
+        # `host cdn.netbsd.org` from the Mac host gets a current one).
+        ("echo 'nameserver 10.0.2.3' > /etc/resolv.conf; cat /etc/resolv.conf; "
+         "/etc/rc.d/npf status; npfctl show 2>&1 | head -20; "
+         "echo '151.101.1.6 cdn.netbsd.org' >> /etc/hosts", 30),
+        # cdn.netbsd.org/.../10.1/All/ 302-redirects (at the CDN/varnish
+        # layer) to .../10.0_2026Q1/All/ -- there is no real 10.1 aarch64
+        # binary bulk-build tree, just a rolling "current quarter" one under
+        # the 10.0 branch name. NetBSD's pkg_add doesn't follow that
+        # redirect; it just hangs with no output and no timeout. Point
+        # PKG_PATH at the resolved location directly (empirically confirmed
+        # to carry git-2.53.0 and rust-1.91.1nb1 as of 2026-07-22).
+        ("export PKG_PATH=https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/aarch64/10.0_2026Q1/All; "
          "/usr/sbin/pkg_add -U git rust || /usr/sbin/pkg_add -U git rust", 3600),
         # `just` may be absent from pkgsrc aarch64; gates call cargo directly.
-        ("export PKG_PATH=https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/aarch64/10.1/All; "
+        ("export PKG_PATH=https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/aarch64/10.0_2026Q1/All; "
          "/usr/sbin/pkg_add -U just || echo 'just unavailable (ok)'", 600),
-        (f"PATH=/usr/pkg/bin:$PATH {_GIT_SETUP}", 30),
+        # `export` (not a bare prefix assignment) so PATH survives across the
+        # `&&` in _GIT_SETUP -- see the matching freebsd comment above. 30s
+        # was NOT enough here in practice: pkgsrc post-install trigger
+        # output (git-base's template/hook file copies, xmlcatmgr catalog
+        # registration, etc.) can still be draining to the console for a
+        # while after the shell prompt has nominally returned, delaying
+        # this command's own completion echo.
+        (f"export PATH=/usr/pkg/bin:$PATH; {_GIT_SETUP}", 180),
         ("shutdown -p now", 120),
     ]
 
@@ -534,6 +600,159 @@ def write_cloudinit_seed(vm_name: str, pubkey: str) -> Path:
         check=True,
     )
     return iso
+
+
+PROMPT = b"# "
+
+# Module-level so tests can shrink it (mock.patch.object) instead of actually
+# waiting out a slow-boot budget; production callers get the full 600s.
+LOGIN_TIMEOUT_S = 600
+
+
+def wait_for_shutdown(vm_name: str, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if read_pid(vm_name) is None:
+            return
+        time.sleep(2)
+    raise SystemExit(f"{vm_name}: qemu did not exit after guest shutdown (see serial.log)")
+
+
+def _run_serial_provision(vm: VmConfig, pubkey: str) -> None:
+    st = state_dir(vm.name)
+    con = SerialConsole(st / "serial.sock")
+    try:
+        con.expect(b"login: ", timeout_s=LOGIN_TIMEOUT_S)  # first boot: fsck/resize can be slow
+    except TimeoutError:
+        # Some images (seen on NetBSD gzimg first boot) drop straight to a
+        # root shell instead of presenting a login prompt. Nudge with a
+        # newline and look for the shell prompt directly instead.
+        con.sendline("")
+        con.expect(PROMPT, timeout_s=120)
+    else:
+        con.sendline("root")
+        con.expect(PROMPT, timeout_s=120)
+    for cmd, timeout_s in provision_commands(vm, pubkey):
+        print(f"[provision {vm.name}] {cmd[:70]}…" if len(cmd) > 70 else f"[provision {vm.name}] {cmd}")
+        con.sendline(cmd)
+        if cmd.startswith("shutdown"):
+            break
+        con.expect(PROMPT, timeout_s=timeout_s)
+
+
+def _invalidate_consumer_overlays(vm_name: str) -> None:
+    """Unlink every overlay backed by golden.qcow2 (dev.qcow2 and any
+    gate-*.qcow2) after a new golden lands.
+
+    qcow2 overlays reference their backing file by path, not by content or
+    generation: once golden.qcow2 is replaced, an existing consumer overlay
+    would silently read backing blocks from a DIFFERENT disk image than the
+    one it was created against -- corruption-like reads, not an error. This
+    exact foot-gun cost most of the Task 6 session's wall clock (see the
+    cmd_provision call-site comment). Call this immediately after the rename
+    that lands a new golden.qcow2, in both cmd_provision and
+    cmd_refresh_golden.
+    """
+    st = state_dir(vm_name)
+    candidates = [st / "dev.qcow2"] + sorted(st.glob("gate-*.qcow2"))
+    for overlay in candidates:
+        if overlay.exists():
+            overlay.unlink()
+            print(f"removed stale overlay {overlay.name} (backing golden replaced)")
+
+
+def cmd_provision(args: argparse.Namespace) -> int:
+    vm = VMS[args.vm]
+    st = state_dir(vm.name)
+    if not (st / "base.qcow2").exists():
+        raise SystemExit(f"no base image; run: bsdvm.py fetch {vm.name}")
+    golden = st / "golden.qcow2"
+    if golden.exists() and not args.force:
+        raise SystemExit(f"{golden} exists (use --force to reprovision)")
+    # A failed earlier run may have left a partially-provisioned overlay: start
+    # fresh. The old golden (if any) is deliberately left alone here -- `work`
+    # is backed by base.qcow2, not golden.qcow2, so it is not in this
+    # overlay's chain and does not need to move before boot/provision
+    # succeeds. It only gets rotated to golden.prev.qcow2 once a replacement
+    # has actually landed, below.
+    (st / "provision.qcow2").unlink(missing_ok=True)
+    work = create_overlay(vm.name, "provision.qcow2", "base.qcow2")
+    pubkey = read_pubkey()
+    # manifest.json's cloudinit=True (set at fetch time for the FreeBSD
+    # BASIC-CLOUDINIT image) originally meant "drive provisioning via a
+    # NoCloud seed.iso, hands-off". That path is deliberately NOT taken here:
+    # while chasing what looked like reproducible /boot/kernel corruption on
+    # golden images built via cloud-init, this project's own `up` reuses an
+    # existing dev.qcow2 overlay rather than recreating it (by design, so a
+    # dev session's disk state survives across up/down) -- across this
+    # session's many `provision --force` reruns, every `up` verification was
+    # unknowingly reading a STALE dev.qcow2 overlay still backed by an
+    # earlier golden.qcow2 generation, which is what actually explains the
+    # observed "missing kernel" (confirmed by deleting dev.qcow2 before
+    # re-testing: the very first cloud-init-built golden this session was
+    # never actually re-checked with a fresh overlay). So the cloud-init path
+    # was very likely fine all along. This serial-expect path is kept
+    # anyway -- it's the plan's own documented fallback, it's now proven
+    # end-to-end (ssh + rustc + git config all verified), and reverting to
+    # re-validate cloud-init would cost another full provisioning run for a
+    # single-source-of-truth code-cleanliness win, not a correctness one.
+    # Future maintainer: if you want cloud-init back, `write_cloudinit_seed`
+    # is untouched and still unit-tested; just re-wire this call site -- the
+    # stale-overlay foot-gun described above is now enforced shut by
+    # _invalidate_consumer_overlays (called below once the new golden
+    # lands), so there is no more manual `rm dev.qcow2` step to remember.
+    try:
+        boot(vm, work)
+        _run_serial_provision(vm, pubkey)
+        wait_for_shutdown(vm.name, timeout_s=4200)
+    except BaseException:
+        pid = read_pid(vm.name)
+        if pid is not None:
+            stop_pid(pid)
+        raise
+    prev = st / "golden.prev.qcow2"
+    if golden.exists():
+        prev.unlink(missing_ok=True)
+        golden.rename(prev)
+    work.rename(golden)
+    _invalidate_consumer_overlays(vm.name)
+    print(f"golden image ready: {golden}")
+    return 0
+
+
+def cmd_refresh_golden(args: argparse.Namespace) -> int:
+    vm = VMS[args.vm]
+    st = state_dir(vm.name)
+    golden = st / "golden.qcow2"
+    if not golden.exists():
+        raise SystemExit(f"nothing to refresh; run: bsdvm.py provision {vm.name}")
+    prev = st / "golden.prev.qcow2"
+    prev.unlink(missing_ok=True)
+    # Flatten first so the new golden does not chain onto the rotated file.
+    subprocess.run(["qemu-img", "convert", "-O", "qcow2", str(golden), str(st / "golden.flat.qcow2")], check=True)
+    golden.rename(prev)
+    (st / "golden.flat.qcow2").rename(golden)
+    # Reprovision on top of the flattened golden as the new base for update cmds.
+    (st / "provision.qcow2").unlink(missing_ok=True)
+    work = create_overlay(vm.name, "provision.qcow2", "golden.qcow2")
+    pubkey = read_pubkey()
+    try:
+        boot(vm, work)
+        _run_serial_provision(vm, pubkey)
+        wait_for_shutdown(vm.name, timeout_s=4200)
+    except BaseException:
+        pid = read_pid(vm.name)
+        if pid is not None:
+            stop_pid(pid)
+        raise
+    golden.unlink()
+    work.rename(golden)
+    # The just-flattened/reprovisioned golden.qcow2 has entirely different
+    # content at the same path than what any pre-existing dev.qcow2/gate-*.qcow2
+    # was created against -- see _invalidate_consumer_overlays.
+    _invalidate_consumer_overlays(vm.name)
+    print(f"golden refreshed (previous kept at {prev})")
+    return 0
 
 
 def cmd_up(args: argparse.Namespace) -> int:
@@ -590,6 +809,13 @@ def main(argv: list[str]) -> int:
     destroy.add_argument("vm")
     destroy.add_argument("--all", action="store_true")
     destroy.set_defaults(func=cmd_destroy)
+    provision = sub.add_parser("provision")
+    provision.add_argument("vm")
+    provision.add_argument("--force", action="store_true")
+    provision.set_defaults(func=cmd_provision)
+    refresh_golden = sub.add_parser("refresh-golden")
+    refresh_golden.add_argument("vm")
+    refresh_golden.set_defaults(func=cmd_refresh_golden)
     args = parser.parse_args(argv)
     if getattr(args, "vm", None) is not None and _resolve_vm(args.vm) is None:
         print(f"unknown vm: {args.vm} (known: {', '.join(sorted(VMS))})", file=sys.stderr)
