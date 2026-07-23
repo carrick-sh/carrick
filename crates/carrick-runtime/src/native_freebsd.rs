@@ -13323,7 +13323,7 @@ fn run_x86_thread(
                             Err(errno) => {
                                 // Exec failed with the old image intact: return
                                 // the errno to the guest and resume.
-                                context.snapshot.gpr[reg::RAX] = (-(errno.get() as i64)) as u64;
+                                context.snapshot.gpr[reg::RAX] = errno.guest_retval() as u64;
                                 next = context.snapshot.rip;
                             }
                             Ok((bytes, interpreter, resolved, argv)) => {
@@ -14107,7 +14107,7 @@ fn service_syscall(
             Step::Continue(snapshot.rip)
         }
         DispatchOutcome::Errno { errno } => {
-            let retval = -(errno.get() as i64);
+            let retval = errno.guest_retval();
             snapshot.gpr[reg::RAX] = retval as u64;
             if let Some(sig) = run_pending_signals(
                 shared,
@@ -16063,7 +16063,7 @@ fn service_fork(
             let errno = std::io::Error::last_os_error()
                 .raw_os_error()
                 .unwrap_or(libc::EMFILE);
-            snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
+            snapshot.gpr[reg::RAX] = carrick_abi::LinuxErrno::new(errno).guest_retval() as u64;
             return Step::Continue(resume);
         }
         Some(fds)
@@ -16198,7 +16198,7 @@ fn service_fork(
                     ));
                 }
                 let errno = error.source.raw_os_error().unwrap_or(libc::EAGAIN);
-                snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
+                snapshot.gpr[reg::RAX] = carrick_abi::LinuxErrno::new(errno).guest_retval() as u64;
                 return Step::Continue(resume);
             }
         }
@@ -16321,7 +16321,7 @@ fn service_fork(
         let errno = fork_error
             .and_then(|error| error.raw_os_error())
             .unwrap_or(libc::EAGAIN);
-        snapshot.gpr[reg::RAX] = (-(errno as i64)) as u64;
+        snapshot.gpr[reg::RAX] = carrick_abi::LinuxErrno::new(errno).guest_retval() as u64;
         return Step::Continue(resume);
     }
     if pid == 0 {
