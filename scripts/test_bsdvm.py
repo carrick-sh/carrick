@@ -8,6 +8,7 @@ import json
 import lzma
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -467,6 +468,34 @@ class SerialConsoleTests(unittest.TestCase):
             finally:
                 srv.close()
 
+    def test_expect_raises_connectionerror_not_timeout_on_eof(self) -> None:
+        # The peer (qemu) closing the connection before the pattern arrives
+        # must surface as ConnectionError, distinct from a real TimeoutError
+        # (and must not silently return) -- see expect()'s EOF-vs-timeout
+        # comment: recv() on a closed socket returns b"" immediately rather
+        # than raising, so this is the busy-loop bug's regression coverage.
+        with tempfile.TemporaryDirectory() as td:
+            sock_path = Path(td) / "serial.sock"
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(str(sock_path))
+            srv.listen(1)
+
+            def server() -> None:
+                conn, _ = srv.accept()
+                conn.close()  # EOF before the pattern ever arrives
+
+            t = threading.Thread(target=server)
+            t.daemon = True
+            t.start()
+            try:
+                con = BSDVM.SerialConsole(sock_path)
+                with self.assertRaises(ConnectionError):
+                    con.expect(b"login: ", timeout_s=5)
+            finally:
+                con._sock.close()
+                t.join(timeout=5)
+                srv.close()
+
     def test_expect_timeout_raises(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             sock_path = Path(td) / "serial.sock"
@@ -515,6 +544,44 @@ class ProvisionDataTests(unittest.TestCase):
             "receive.denyCurrentBranch updateInstead", "shutdown -p now",
         ):
             self.assertIn(needle, cmds)
+
+
+class PathExportShapeTests(unittest.TestCase):
+    """Regression coverage for the `PATH=... cmd1 && cmd2` footgun (Task 6
+    report bug #2): a bare prefix assignment only scopes PATH to the single
+    command immediately following it, so anything after a `&&` on the same
+    line silently runs without it. Behavior assertion over every actual
+    provisioning command for both VMs, not a snapshot of specific strings.
+    """
+
+    _BARE_PREFIX_WITH_AND = re.compile(r"^PATH=\S+ .*&&")
+
+    def _all_commands(self) -> list[str]:
+        pubkey = "ssh-ed25519 AAAA test"
+        cmds: list[str] = []
+        for vm_name in ("freebsd-arm64", "netbsd-arm64"):
+            cmds += [c for c, _ in BSDVM.provision_commands(BSDVM.VMS[vm_name], pubkey)]
+        return cmds
+
+    def test_no_command_uses_broken_bare_prefix_with_compound_shape(self) -> None:
+        for cmd in self._all_commands():
+            self.assertNotRegex(
+                cmd,
+                self._BARE_PREFIX_WITH_AND,
+                msg=(
+                    "a bare `PATH=... ` prefix combined with `&&` only scopes "
+                    f"PATH to the first command: {cmd!r}"
+                ),
+            )
+
+    def test_git_setup_command_uses_export_path(self) -> None:
+        for vm_name in ("freebsd-arm64", "netbsd-arm64"):
+            cmds = [
+                c for c, _ in BSDVM.provision_commands(BSDVM.VMS[vm_name], "ssh-ed25519 AAAA test")
+            ]
+            git_setup_cmds = [c for c in cmds if "receive.denyCurrentBranch" in c]
+            self.assertEqual(len(git_setup_cmds), 1, f"{vm_name}: expected exactly one git-setup command")
+            self.assertRegex(git_setup_cmds[0], r"^export PATH=[^;]+;")
 
 
 # A pubkey whose trailing user@host comment embeds a literal `'`; this is
@@ -578,6 +645,162 @@ class CloudInitSeedTests(unittest.TestCase):
 
                 self.assertNotIn(key_cmd, user_data)  # authorized_keys step not re-run via runcmd
                 self.assertIn(BSDVM._yaml_dquote(_TRICKY_PUBKEY), user_data)  # ssh_authorized_keys
+
+
+class ProvisionOrchestrationTests(unittest.TestCase):
+    """cmd_provision's replace-then-invalidate orchestration around --force:
+    the previous golden must survive untouched until a replacement fully
+    lands (boot/provision/shutdown all succeed), and any stale consumer
+    overlay (dev.qcow2, gate-*.qcow2) must not survive a golden replacement.
+    All boundaries (boot, serial console, subprocess) are mocked; only real
+    filesystem operations run, against a tmpdir state root.
+    """
+
+    @staticmethod
+    def _fake_create_overlay(vm_name: str, name: str, backing: str) -> Path:
+        # Simpler than mocking subprocess.run's qemu-img argv shape: just
+        # materialize the overlay file the real create_overlay would have
+        # produced, so the real rename/unlink calls downstream have
+        # something real to operate on.
+        st = BSDVM.state_dir(vm_name)
+        overlay = st / name
+        if not overlay.exists():
+            overlay.write_bytes(b"work-product")
+        return overlay
+
+    def test_provision_force_success_rotates_golden_and_invalidates_overlays(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm_name = "freebsd-arm64"
+                st = BSDVM.state_dir(vm_name)
+                st.mkdir(parents=True)
+                (st / "base.qcow2").write_bytes(b"base")
+                (st / "golden.qcow2").write_bytes(b"old")
+                (st / "dev.qcow2").write_bytes(b"stale-dev")
+                (st / "gate-9.qcow2").write_bytes(b"stale-gate")
+
+                ns = mock.Mock(vm=vm_name, force=True)
+                with (
+                    mock.patch.object(BSDVM, "boot", return_value=None),
+                    mock.patch.object(BSDVM, "_run_serial_provision", return_value=None),
+                    mock.patch.object(BSDVM, "wait_for_shutdown", return_value=None),
+                    mock.patch.object(BSDVM, "read_pubkey", return_value="ssh-ed25519 AAAA test"),
+                    mock.patch.object(BSDVM, "create_overlay", side_effect=self._fake_create_overlay),
+                ):
+                    rc = BSDVM.cmd_provision(ns)
+                self.assertEqual(rc, 0)
+
+                self.assertEqual((st / "golden.prev.qcow2").read_bytes(), b"old")
+                self.assertTrue((st / "golden.qcow2").exists())
+                self.assertEqual((st / "golden.qcow2").read_bytes(), b"work-product")
+                self.assertFalse((st / "dev.qcow2").exists())
+                self.assertFalse((st / "gate-9.qcow2").exists())
+
+    def test_provision_failure_leaves_old_golden_untouched_and_stops_vm(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm_name = "freebsd-arm64"
+                st = BSDVM.state_dir(vm_name)
+                st.mkdir(parents=True)
+                (st / "base.qcow2").write_bytes(b"base")
+                (st / "golden.qcow2").write_bytes(b"old")
+
+                stop_calls: list[int] = []
+                ns = mock.Mock(vm=vm_name, force=True)
+                with (
+                    mock.patch.object(BSDVM, "boot", return_value=None),
+                    mock.patch.object(
+                        BSDVM, "_run_serial_provision",
+                        side_effect=RuntimeError("serial boom"),
+                    ),
+                    mock.patch.object(BSDVM, "wait_for_shutdown", return_value=None),
+                    mock.patch.object(BSDVM, "read_pubkey", return_value="ssh-ed25519 AAAA test"),
+                    mock.patch.object(BSDVM, "create_overlay", side_effect=self._fake_create_overlay),
+                    mock.patch.object(BSDVM, "read_pid", return_value=12345),
+                    mock.patch.object(
+                        BSDVM, "stop_pid", side_effect=lambda pid: stop_calls.append(pid)
+                    ),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        BSDVM.cmd_provision(ns)
+
+                self.assertEqual(stop_calls, [12345])
+                self.assertEqual((st / "golden.qcow2").read_bytes(), b"old")
+                self.assertFalse((st / "golden.prev.qcow2").exists())
+                # The work overlay was created but never renamed onto golden.
+                self.assertTrue((st / "provision.qcow2").exists())
+                self.assertEqual((st / "provision.qcow2").read_bytes(), b"work-product")
+
+
+class RunSerialProvisionLoginFallbackTests(unittest.TestCase):
+    """`_run_serial_provision`'s login-fallback branch: some images (seen on
+    NetBSD gzimg first boot per the Task 6 report) drop straight to a bare
+    shell prompt and never present a `login: ` prompt at all. `LOGIN_TIMEOUT_S`
+    is patched small so this test doesn't wait out the production 600s
+    budget.
+    """
+
+    def test_falls_back_to_bare_prompt_and_sends_first_command(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm = BSDVM.VMS["netbsd-arm64"]
+                st = BSDVM.state_dir(vm.name)
+                st.mkdir(parents=True)
+                sock_path = st / "serial.sock"
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv.bind(str(sock_path))
+                srv.listen(1)
+                received: list[bytes] = []
+                pubkey = "ssh-ed25519 AAAA test"
+                real_first_cmd = BSDVM.provision_commands(vm, pubkey)[0]
+
+                def server() -> None:
+                    conn, _ = srv.accept()
+                    # Never send "login: " at all -- only respond once the
+                    # client's post-timeout nudge newline (the fallback
+                    # branch) arrives, with a bare shell prompt.
+                    received.append(conn.recv(64))  # sendline("") nudge
+                    conn.sendall(b"# ")
+                    # The function should now proceed into the provisioning
+                    # loop and send its first real command.
+                    received.append(conn.recv(4096))
+                    conn.sendall(b"# ")
+                    conn.close()
+
+                t = threading.Thread(target=server)
+                t.daemon = True
+                t.start()
+                # Capture the SerialConsole _run_serial_provision creates
+                # internally, purely so this test can close its client
+                # socket explicitly afterward instead of leaving cleanup to
+                # the GC.
+                created: list[BSDVM.SerialConsole] = []
+                real_serial_console = BSDVM.SerialConsole
+
+                def capturing_serial_console(sock_path_arg):
+                    con = real_serial_console(sock_path_arg)
+                    created.append(con)
+                    return con
+
+                try:
+                    with (
+                        mock.patch.object(BSDVM, "LOGIN_TIMEOUT_S", 0.4),
+                        mock.patch.object(
+                            BSDVM, "provision_commands", return_value=[real_first_cmd]
+                        ),
+                        mock.patch.object(
+                            BSDVM, "SerialConsole", side_effect=capturing_serial_console
+                        ),
+                    ):
+                        BSDVM._run_serial_provision(vm, pubkey)
+                finally:
+                    for con in created:
+                        con._sock.close()
+                    t.join(timeout=5)
+                    srv.close()
+
+                self.assertEqual(received[0], b"\n")  # sendline("") nudge
+                self.assertEqual(received[1], real_first_cmd[0].encode() + b"\n")
 
 
 if __name__ == "__main__":
