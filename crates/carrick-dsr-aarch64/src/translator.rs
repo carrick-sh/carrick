@@ -922,7 +922,7 @@ impl ThreadTranslator {
     /// Never resurrects a `Drained` tombstone: once a foreign drain has
     /// emitted this thread's record, re-registering would let a later
     /// self-flush win a claim on the freshly re-created slot and emit the same
-    /// `(pid, tid, era)` a second time (see [`SiblingSlot`]).
+    /// `(pid, tid, era)` a second time (see `SiblingSlot`).
     pub fn publish_sibling_snapshot(&self) {
         if !self.budget.enabled() {
             return;

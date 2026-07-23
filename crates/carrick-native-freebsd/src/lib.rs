@@ -4,9 +4,15 @@
 //! Two rungs of the seams design
 //! (docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md)
 //! live here: the dual-mapped W^X JIT backend (M0.7) and the guest-fault
-//! shim ([`fault`]) that turns SIGSEGV/SIGBUS/SIGFPE/SIGILL inside the code
+//! shim (`fault`) that turns SIGSEGV/SIGBUS/SIGFPE/SIGILL inside the code
 //! cache into typed gateway `Signal` exits. The SIGPIPE kick plumbing lands
 //! with the runtime thread loop.
+//!
+//! `fault` (like every other item below) only exists when this crate's whole
+//! body is compiled in on `target_os = "freebsd"`; the module doc above uses
+//! a plain code span rather than an intra-doc link so `cargo doc` does not
+//! try (and fail) to resolve it on other hosts, where the `#![cfg]` below
+//! leaves this crate empty.
 //!
 //! The whole crate is FreeBSD-only by construction; other targets compile it
 //! to nothing (same `#![cfg]` pattern as `carrick-host-bsd`).

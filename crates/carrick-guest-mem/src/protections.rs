@@ -265,7 +265,7 @@ pub struct MappingProtectionSnapshot {
 /// lock and hold it across `fork(2)`. The child can then drop the inherited
 /// lease before touching guest memory, proving that no vanished sibling owned
 /// the internal protection lock at the fork boundary without exposing
-/// [`ProtectionState`] outside this module.
+/// `ProtectionState` outside this module.
 pub struct MemoryProtectionsExclusiveGuard<'a> {
     _state: parking_lot::RwLockWriteGuard<'a, ProtectionState>,
 }
