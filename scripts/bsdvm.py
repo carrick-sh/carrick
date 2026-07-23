@@ -476,7 +476,7 @@ def _yaml_dquote(s: str) -> str:
 
 
 _GIT_SETUP = (
-    "git init /root/carrick && "
+    "git init -b main /root/carrick && "
     "git -C /root/carrick config receive.denyCurrentBranch updateInstead"
 )
 
@@ -716,6 +716,7 @@ def cmd_provision(args: argparse.Namespace) -> int:
         golden.rename(prev)
     work.rename(golden)
     _invalidate_consumer_overlays(vm.name)
+    ensure_dev_remote(vm)
     print(f"golden image ready: {golden}")
     return 0
 
@@ -753,6 +754,120 @@ def cmd_refresh_golden(args: argparse.Namespace) -> int:
     _invalidate_consumer_overlays(vm.name)
     print(f"golden refreshed (previous kept at {prev})")
     return 0
+
+
+def ssh_base(vm: VmConfig) -> list[str]:
+    st = state_dir(vm.name)
+    st.mkdir(parents=True, exist_ok=True)
+    return [
+        "ssh",
+        "-p", str(vm.ssh_port),
+        "-o", f"UserKnownHostsFile={st / 'known_hosts'}",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=5",
+        "root@127.0.0.1",
+    ]
+
+
+def ssh_run(vm: VmConfig, cmd: str, timeout_s: float) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ssh_base(vm) + [vm.remote_path_prefix + cmd],
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+
+
+def ssh_wait(vm: VmConfig, timeout_s: float = 300) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            if ssh_run(vm, "true", timeout_s=10).returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(5)
+    raise SystemExit(
+        f"{vm.name}: ssh not reachable after {timeout_s}s "
+        f"(see {state_dir(vm.name) / 'serial.log'})"
+    )
+
+
+def git_url(vm: VmConfig) -> str:
+    return f"ssh://root@127.0.0.1:{vm.ssh_port}/root/carrick"
+
+
+def git_ssh_env(vm: VmConfig) -> dict[str, str]:
+    base = ssh_base(vm)
+    # GIT_SSH_COMMAND takes the options but not host/port (URL carries those).
+    opts = " ".join(base[3:-1])  # the three -o pairs
+    env = dict(os.environ)
+    env["GIT_SSH_COMMAND"] = f"ssh {opts}"
+    return env
+
+
+def parse_symref_head(text: str) -> str:
+    """Parse `git ls-remote --symref <url> HEAD` output and return the branch
+    name the remote's HEAD is a symref to (e.g. "main" from the line
+    `ref: refs/heads/main\tHEAD`).
+
+    Pure string parsing, no I/O, so it can be unit tested directly. Raises
+    SystemExit if no symref line is present -- this happens for a genuinely
+    empty repo (`git init`, zero commits): HEAD is an unborn symref and git's
+    ref-advertisement protocol emits nothing at all for `ls-remote --symref`
+    against it (confirmed empirically against a real `git init -b main` repo
+    with no commits: exit 0, empty stdout). Callers that have a sensible
+    default for that specific case (the very first push, which establishes
+    the branch) should catch SystemExit themselves -- this function has no
+    opinion on what a missing symref should fall back to.
+    """
+    m = re.search(r"^ref: refs/heads/(\S+)\tHEAD$", text, re.M)
+    if not m:
+        raise SystemExit(
+            f"no symref HEAD line found in ls-remote --symref output: {text!r}"
+        )
+    return m.group(1)
+
+
+def push_head(vm: VmConfig) -> str:
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    ls_remote = subprocess.run(
+        ["git", "ls-remote", "--symref", git_url(vm), "HEAD"],
+        capture_output=True,
+        text=True,
+        env=git_ssh_env(vm),
+        check=True,
+    )
+    try:
+        branch = parse_symref_head(ls_remote.stdout)
+    except SystemExit:
+        # Empty guest repo, no HEAD yet (see parse_symref_head's docstring):
+        # this push is the one that establishes the branch. Guests are
+        # provisioned via `git init -b main` (_GIT_SETUP), so "main" is what
+        # the guest's checked-out branch will actually be once this push
+        # creates its first commit.
+        branch = "main"
+        print(
+            f"{vm.name}: no symref HEAD from ls-remote (empty repo); "
+            "defaulting first push to refs/heads/main"
+        )
+    subprocess.run(
+        ["git", "push", "--force", git_url(vm), f"HEAD:refs/heads/{branch}"],
+        env=git_ssh_env(vm),
+        check=True,
+    )
+    return sha
+
+
+def ensure_dev_remote(vm: VmConfig) -> None:
+    have = subprocess.run(
+        ["git", "remote"], capture_output=True, text=True, check=True
+    ).stdout.split()
+    if vm.remote not in have:
+        subprocess.run(["git", "remote", "add", vm.remote, git_url(vm)], check=True)
+        print(f"added git remote {vm.remote} -> {git_url(vm)}")
 
 
 def cmd_up(args: argparse.Namespace) -> int:
