@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 27-crate Cargo workspace. The product path is:
+Carrick is a 31-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-spec
@@ -57,8 +57,11 @@ Platform code is selected by Cargo features. The default feature is
 
 | Crate | Role |
 | --- | --- |
-| `carrick-dsr` | Platform-neutral DSR core: translation cache + publication behind the `NativeHostJit` seam, profiling census, page-geometry vocabulary, probe-sink seam, test hooks. Deliberately `ring`/`usdt`-free (darwin-cross-checkable from a non-mac rig). |
+| `carrick-dsr` | Platform-neutral DSR core: the `NativeLane`/`GuestIsa`/`NativeHost` seam traits, translation cache + publication behind the `NativeHostJit` seam, `prepared_image`, profiling census, page-geometry vocabulary, probe-sink seam, test hooks. Deliberately `ring`/`usdt`-free (darwin-cross-checkable from a non-mac rig). |
 | `carrick-dsr-aarch64` | AArch64 guest-ISA lane: bad64/dynasmrt decode + emit, block planner + exclusive fusion, gateway (`gateway_aarch64.S`), counter virtualization, artifact store, mapped memory + translator. Compiles on every host; only the gateway's assembled surface is macos/aarch64-gated. |
+| `carrick-dsr-x86` | x86_64 guest-ISA lane: `iced-x86` decode/classify, block planning + control-flow lowering, a hand-rolled byte-level block emitter (no dynasmrt dependency), gateway (`gateway_x86_64.S`) + x87/SSE/AVX state transfer; already runs real Linux/x86_64 ELF binaries on FreeBSD/amd64 through `native_freebsd.rs`. |
+| `carrick-native-darwin` | Darwin `NativeHost` impl: `MAP_JIT`/`pthread_jit_write_protect_np` JIT cache (`DarwinHost`), the byte-for-byte-moved `csrc/native_darwin.c` trap/kick shim. |
+| `carrick-native-freebsd` | FreeBSD `NativeHost` impl: SHM_ANON dual-mapped W^X JIT cache with no process-wide `mprotect` flip (`FreebsdHost`), amd64 `mcontext_t` trap shim. |
 
 ## Test and Harness Support
 
