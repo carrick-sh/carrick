@@ -1,10 +1,11 @@
 /*
- * Native FreeBSD/x86 exec and fatal-fault state.
+ * Native FreeBSD/x86 exec and guest-visible fault state.
  *
  * Usage:
  *   carrick trace --script scripts/dtrace/native-x86-fault.d -- run ...
  *
- * Pair the two fault lines by host pid. Payloads are scalar so the record
+ * Pair the fault, register, stack, and history lines by host pid. Payloads
+ * are scalar so the record
  * survives a fork child exiting immediately after the probe fires.
  */
 #pragma D option quiet
@@ -43,4 +44,30 @@ carrick*:::native-x86-fault-regs
 {
     printf("%Y [%d REGS ] hostpid=%d rax=%#x rdx=%#x rdi=%#x rsi=%#x r8=%#x\n",
         walltimestamp, pid, (int)arg0, arg1, arg2, arg3, arg4, arg5);
+}
+
+carrick*:::native-x86-fault-stack
+/pid == $target || progenyof($target)/
+{
+    printf("%Y [%d STACK] hostpid=%d q3=%#x q4=%#x q6=%#x q7=%#x rbp=%#x\n",
+        walltimestamp, pid, (int)arg0, arg1, arg2, arg3, arg4, arg5);
+}
+
+carrick*:::native-x86-fault-history
+/pid == $target || progenyof($target)/
+{
+    printf("%Y [%d HIST ] hostpid=%d pcs=%#x,%#x,%#x,%#x,%#x\n",
+        walltimestamp, pid, (int)arg0, arg1, arg2, arg3, arg4, arg5);
+}
+
+tick-1s
+{
+    seconds++;
+}
+
+tick-1s
+/seconds >= 180/
+{
+    printf("native x86 exec/fault trace reached 180-second bound\n");
+    exit(0);
 }

@@ -296,17 +296,33 @@ one pass, after hours of grep-guessing got nowhere.)
   standalone single-run driver to attach a debugger/tracer to (build with
   `--no-default-features --features platform-freebsd`). It registers the carrick
   USDT provider so probes are live.
-- **dtrace USDT (the real observability path — no env logging).** Probe names use
-  HYPHENS: `carrick<PID>:::syscall-return` (not `syscall__return`). USDT probes
-  register *after* the process starts, so use **`-Z`** (bind late) and `-c` to
-  launch under trace. Guest syscall census:
+- **Launch-time dtrace USDT (the event observability path — no env logging).**
+  Probe names use HYPHENS: `carrick<PID>:::syscall-return` (not
+  `syscall__return`). USDT probes register after process start, so use `-Z` and
+  `-c` to launch and own the target for its whole lifetime. Guest syscall census:
   `dtrace -Zq -c "…/native_run <elf>" -n 'carrick*:::syscall-return { @[copyinstr(arg1)] = count(); } tick-3s { exit(0); }'`.
-  `syscall-entry` arg0 is the CANONICAL (asm-generic) number post-normalization.
-- **dtrace `profile` provider to read guest state during a spin.** Guest code runs
-  in the JIT with `%r15` = the DSR context; `exit_resume` at `r15+33024` holds the
-  chain-entry guest VA:
-  `dtrace -q -p PID -n 'profile-4999 { @[*(uint64_t*)copyin(uregs[R_R15]+720,8)] = count(); } tick-3s { printa(@); exit(0); }'`
-  — the dominant address is the spinning block's guest VA.
+  `syscall-entry` arg0 is the CANONICAL number post-normalization. **Never use
+  `dtrace -p`, pid-provider probes, or USDT fasttrap probes on a continuing
+  native process**: detach leaked `SIGTRAP` and killed a live Kaniko build.
+- **Profile an already-running process with the supported kernel-only tool:**
+  `sudo scripts/native-x86-profile.py PID --seconds 5` (add `--guest-elf PATH`
+  or `--json` as needed). It discovers the existing process tree and follows new
+  forks; discovers ASLR, JIT, Carrick, and libc mappings; reports syscall mix,
+  symbolicated host RIPs, guest-PC census, and sampled memcpy callers/sizes; and
+  verifies that the process survived with stable executable mappings. It uses
+  only the kernel `profile`/`syscall`/`proc` providers — no process grab or
+  breakpoint patching. DSR owns guest RSP, so `ustack()` is not authoritative;
+  the tool reads `exit_resume` through `%r15` using the matching binary's
+  versioned `carrick debug native-x86-layout` contract. **Never hardcode the
+  context offset** (XSAVE expansion moved it from 720 to 33024).
+- **The native-x86 gateway is zero-copy by contract.** One persistent
+  `X86DsrContext` owns each host guest thread's register/XSAVE state; hot
+  entries call `prepare_entry()` and mutate only scalars. Do not reconstruct
+  the 33 KiB context or copy its 16 KiB snapshot around a block loop. The large
+  types deliberately are not `Copy`; an explicit snapshot clone is reserved
+  for Linux task creation. Profile regressions with
+  `scripts/native-x86-profile.py`: 16,384/16,576-byte `memcpy` samples that
+  scale with gateway entries are a correctness-of-performance failure.
 - **gcore + disassemble the JIT.** `gcore -c core PID`, then
   `lldb …/native_run -c core -o "register read rip r15" -o "disassemble -b -s \$rip"`.
   lldb can't unwind the JIT frame yet, BUT the core holds the guest's **live

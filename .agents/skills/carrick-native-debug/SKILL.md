@@ -1,21 +1,97 @@
 ---
 name: carrick-native-debug
 description: >-
-  Bring up and debug Carrick's no-VMM Darwin-native arm64 backend. Use when
-  `--exec-backend native`, `CARRICK_EXEC_BACKEND=native`, `native16k`, or
-  `linux4k` crashes, exits early, returns wrong process status, faults in a
-  dynamic loader, or diverges from HVF. Covers the HVF contract audit, signed
-  live repros, `carrick debug`, native trap records, Darwin fixed-address
-  collisions, fork/exec lifecycle, and 4K-on-16K protection triage.
+  Bring up and debug Carrick's no-VMM native backends on Darwin/arm64 and
+  FreeBSD/amd64. Use when `--exec-backend native`, `CARRICK_EXEC_BACKEND=native`,
+  `native16k`, or `linux4k` crashes, exits early, hangs, runs slowly, returns a
+  wrong process status, faults in a dynamic loader, or diverges from a VMM lane.
+  Covers safe live FreeBSD DSR profiling, fork/exec lifecycle, native trap
+  records, Darwin fixed-address collisions, and 4K-on-16K protection triage.
 ---
 
-# Debugging the Darwin-native backend
+# Debugging Carrick native backends
 
-Treat HVF as Carrick's executable specification for Linux process behavior, not
-as the native mechanism. Audit the relevant HVF lifecycle before inventing a
-native path, then prove the Darwin-specific mechanism independently.
+Treat the mature VMM path as Carrick's executable specification for Linux
+process behavior, not as the native mechanism. Audit the relevant lifecycle
+before inventing a native path, then prove the host-native mechanism
+independently.
 
-## First pass
+## FreeBSD/amd64: profile a running DSR process
+
+Use the supported profiler; do not recreate its DTrace program by hand:
+
+```sh
+sudo scripts/native-x86-profile.py <carrick-pid> --seconds 5
+sudo scripts/native-x86-profile.py <pid> --guest-elf /path/to/guest --json
+```
+
+It discovers the existing process tree, follows new forks through the kernel
+`proc` provider, discovers ASLR/JIT mappings with `procstat`, asks the matching
+Carrick binary for its versioned `X86DsrContext` layout, and reports syscall
+mix, symbolicated host PCs, raw/symbolicated guest PCs, and sampled `memcpy`
+callers/sizes. A successful capture must end with `tracee_alive=true`,
+`executable_mappings_stable=true`, and `dtrace_clean=true`.
+
+**HARD GATE — never run `dtrace -p`, `pid$PID`, or Carrick USDT probes against a
+continuing native FreeBSD process.** Fasttrap detach killed a live Kaniko build
+with leaked `SIGTRAP`. The profiler deliberately uses only kernel `profile`,
+`syscall`, and `proc` providers filtered through a numeric PID set.
+
+For an unexplained fatal signal in a long build, start the reusable
+kernel-provider trace before the relevant descendants are created:
+
+```sh
+sudo dtrace -q -s scripts/dtrace/native-x86-signal-lifecycle.d ROOT_PID \
+  > /tmp/native-x86-signals.out
+```
+
+It follows future children, records sender/target/signum for `proc:::signal-send`,
+and exits with the root. It is safe for a continuing tracee because it enables
+no pid provider, USDT, or fasttrap probes. It initially knows only `ROOT_PID`,
+so starting after the child of interest already exists will miss that child.
+
+`ustack()` is not authoritative while guest code runs: DSR installs the guest
+RSP, so host unwinding stops or follows guest data. The profiler samples host
+RIP directly and reads the current guest PC through R15 using the layout from
+`carrick debug native-x86-layout`; never hardcode the offset (XSAVE expansion
+moved it from 720 to 33024). For a spin, use the reported guest-PC census; for a
+host hotspot, use its PIE-normalized `addr2line` result.
+
+The profiler is for an already-running process. `carrick trace --profile dsr`
+is the separate launch-time USDT phase profiler and must own the target for its
+whole lifetime.
+
+For xstate-chain corruption, use the launch-time targeted edge trace only:
+
+```sh
+CARRICK_NATIVE_X86_TRACE_PC=0xSOURCE,0xTARGET \
+  target/release/carrick trace \
+  --script scripts/dtrace/native-x86-pc.d -- run ...
+```
+
+It records selected edge/patch decisions and FCW/MXCSR/XSTATE_BV/PKRU plus
+bounded component hashes. `CARRICK_NATIVE_X86_EDGE_BARRIER` accepts `all`, a
+source PC, or `source->target` and leaves that edge cold for a transition
+bisect. `CARRICK_NATIVE_X86_XSTATE_POLICY=unsafe-local-diagnostic` deliberately
+clobbers skipped local entries for a deterministic red control. The experimental
+`neutral-domains` policy keeps state-user targets cold and guards neutral entry
+on virtual guest PKRU. RDPKRU/WRPKRU are sensitive-emulated outside the hardware
+XSAVE image so key-0 rights cannot revoke gateway access; guest-memory pkey
+enforcement remains incomplete. `unsafe-target-barrier-diagnostic` remains an alias for replaying
+the rejected experiment. Only the unsafe-local mode deliberately corrupts
+state. To discover candidate edges first, set
+`CARRICK_NATIVE_X86_TRACE_XSTATE_GRAPH=1` and launch with
+`scripts/dtrace/native-x86-xstate-graph.d`; it aggregates patch lifecycle events
+without per-entry probes or component hashing. Do not attach these USDT probes
+to a continuing process—the launch-time tracer must own the target.
+
+Treat repeated 16,384/16,576-byte copies as a gateway regression. Native x86
+keeps one persistent `X86DsrContext` per host guest thread; the block loop calls
+`prepare_entry()` and updates only scalar inputs. Never reconstruct the 33 KiB
+context or move its embedded snapshot per entry. Snapshot cloning is reserved
+for the semantic Linux `clone` boundary, not ordinary translated execution.
+
+## Darwin/arm64 first pass
 
 1. Build and sign with `just build`; verify with
    `codesign --verify --verbose=2 target/release/carrick`.
