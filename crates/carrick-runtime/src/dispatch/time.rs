@@ -931,6 +931,11 @@ impl SyscallDispatcher {
 /// plus headroom for carrick's internal fds, clamped to the host's hard limit.
 /// Only ever raises — never lowers the host soft limit (which could starve
 /// carrick's own descriptors) — and is a no-op if the host already covers it.
+// `rlim_t` is `u64` on macOS/Linux/NetBSD but `i64` on FreeBSD — the `as u64`
+// casts below are load-bearing for portability (comparing/assigning against
+// the `u64` guest limit) even though clippy sees them as redundant on
+// targets where `rlim_t` already is `u64`.
+#[allow(clippy::unnecessary_cast)]
 fn raise_host_nofile_backing(guest_soft: u64) {
     // Headroom for native_run's own descriptors: event ring, epoll/kqueue,
     // host stdio, per-thread waiters, and the dispatcher's transient host fds.
@@ -943,14 +948,14 @@ fn raise_host_nofile_backing(guest_soft: u64) {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
         return;
     }
-    let cur_soft = rl.rlim_cur;
+    let cur_soft = rl.rlim_cur as u64;
     // The host hard limit ceilings any raise. A non-positive / INFINITY hard
     // value (rlim_max <= 0 when reinterpreted) means "no finite cap" → use the
     // desired target directly.
     let hard = rl.rlim_max;
     let desired = guest_soft.saturating_add(HOST_FD_HEADROOM);
-    let target = if hard > 0 && hard < desired {
-        hard
+    let target = if hard > 0 && (hard as u64) < desired {
+        hard as u64
     } else {
         desired
     };
