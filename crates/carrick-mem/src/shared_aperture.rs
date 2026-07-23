@@ -823,6 +823,20 @@ fn free_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
 mod tests {
     use super::*;
 
+    /// `shared_file_fragments_adjust_offsets_and_close_once_after_last_owner`
+    /// asserts that a just-FREED numeric fd is dead (`fcntl(F_GETFD) == -1`,
+    /// `errno == EBADF`) -- which races any concurrent test in this same
+    /// binary that opens its own fd around the same moment (cargo runs a
+    /// crate's tests in parallel by default): the kernel is free to hand the
+    /// just-closed number straight back out to a sibling test's `open()`
+    /// before this test's probe runs, making `F_GETFD` unexpectedly succeed
+    /// (flaky under load). Serialize every test in this module that probes a
+    /// numeric fd after close so no sibling test's fd churn lands in the
+    /// window between close and probe. Poison-recovering, mirroring
+    /// `carrick-host`'s `host_mapping.rs::MMAP_TEST_LOCK`, so a panic in one
+    /// test doesn't cascade-fail the others.
+    static FD_PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn base() -> u64 {
         LINUX_SHARED_FILE_BASE
     }
@@ -1016,6 +1030,9 @@ mod tests {
 
     #[test]
     fn shared_file_fragments_adjust_offsets_and_close_once_after_last_owner() {
+        let _serialize = FD_PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut ap = SharedAperture::with_window(0x0900_0000, 0x10_0000);
         let fd = owned_dev_null();
         let raw_fd = fd.as_raw_fd();
