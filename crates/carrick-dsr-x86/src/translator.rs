@@ -38,9 +38,12 @@
 
 use carrick_dsr::cache::{CacheError, TranslationCache};
 use carrick_dsr::host::{JitRegion, NativeHostJit};
+use carrick_dsr::identity_memory::IdentityCheckedReadError;
 use carrick_guest_mem::GuestVa;
+use carrick_guest_mem::protections::MemoryProtections;
 
-use crate::emit::ScratchRestore;
+use crate::block::{X86BlockPlanError, X86Exit, plan_block_with_reader};
+use crate::emit::{ChainEdge, ScratchRestore, emit_block_linked};
 
 /// A minimal multiply-based hasher for the guest-VA block cache. The default
 /// `HashMap` uses SipHash (DoS-resistant but slow), and an lldb backtrace of a
@@ -212,6 +215,368 @@ pub struct PendingChainEdge {
     pub source: GuestVa,
     pub source_uses_fpu: bool,
     pub source_requires_guest_pkru: bool,
+}
+
+/// The bounded outcome of [`X86ThreadTranslator::translate`]. x86's
+/// fetch/translate fault path is RETRYABLE (`SynchronousFaultDelivery::RetryAt`
+/// / `Fatal`), unlike aarch64's hard abort, so the engine returns this outcome
+/// instead of aborting inside a `translate` that owns the loop's control flow.
+/// The run loop matches it at the SINGLE translate call site and, on the fault
+/// arm, still calls the loop-resident `deliver_x86_instruction_fetch_error`
+/// itself — that helper plus the xstate/edge-registration and gateway
+/// admission/entry machinery deliberately stay in the loop (they are
+/// xstate-entangled). This return enum, consumed at one call site, is the sized
+/// shape for that seam; no callback trait is introduced.
+pub enum X86TranslateOutcome {
+    /// The block was translated (or recycled-then-translated) and its cache /
+    /// cflow-plan / return-cache / fault-index entries are published. The loop
+    /// then runs the still-resident xstate edge registration for this block.
+    Translated(X86TranslatedBlock),
+    /// A guest instruction fetch or executable read faulted. The loop delivers
+    /// the synchronous signal via
+    /// `deliver_x86_instruction_fetch_error(report_va, error)` and retries or
+    /// terminates exactly as before. `report_va` is the failing VA the planner
+    /// surfaced (a `plan_block_with_reader` read miss) or the block entry VA (a
+    /// whole-block executable read miss), matching the two pre-extraction call
+    /// sites.
+    InstructionFetchFault {
+        report_va: u64,
+        error: IdentityCheckedReadError,
+    },
+    /// An unrecoverable translation error. The loop records it as `fault_detail`
+    /// and breaks, byte-for-byte as the pre-extraction `break` arms did.
+    Fatal(String),
+}
+
+/// The published block plus the loop-owned decisions the still-resident xstate
+/// edge-registration logic consumes. `edges` is this block's outgoing chain
+/// edges, moved out of the (now consumed) `LinkedBlock`; the run loop iterates
+/// them under `xstate_policy`. The three `ephemeral_*` fields carry exactly the
+/// loop-locals the pre-extraction translate-miss branch used to set inline
+/// (`ephemeral_return_adjust`, `ephemeral_cflow_plan`,
+/// `current_ephemeral_fault_range`), so the loop's later resolve/normalization
+/// paths are unchanged.
+pub struct X86TranslatedBlock {
+    pub entry: CachedBlock,
+    pub edges: Vec<ChainEdge>,
+    pub source_translation_ephemeral: bool,
+    pub ephemeral_return_adjust: Option<u64>,
+    pub ephemeral_cflow_plan: Option<(u64, crate::cflow::ControlFlowPlan)>,
+    pub current_ephemeral_fault_range: Option<(u64, u64)>,
+}
+
+/// One guest OS thread's private DSR translate/cache/chain engine: the owned
+/// translation state the run loop used to hold as loop-locals — the
+/// guest-VA block index (`cache`), the predecoded indirect-exit plans
+/// (`cflow_plans`), the monomorphic return-site table (`indirect_cache_entries`),
+/// the not-yet-resolved chain edges (`pending`), the published fault-recovery
+/// index (`fault_entries`), and the bump-allocator handle they all write
+/// through (`translation_cache`).
+///
+/// Mirrors aarch64's `ProcessTranslator` owning its cache + publication index,
+/// but stays PER-THREAD-PRIVATE (no `Arc`, no lock) per the KEEP-LANE cache
+/// boundary the module header documents: x86 identity-maps guest memory so the
+/// translated bytes for a VA are the same across threads, yet each thread owns a
+/// non-overlapping JIT slice and its own block index. Unifying that into a
+/// shared, locked process cache is an out-of-scope cross-ISA merge.
+pub struct X86ThreadTranslator {
+    /// This thread's private slice of the shared JIT code cache, wrapped in the
+    /// shared bump-allocator. Borrows nothing — `TranslationCache::from_region`
+    /// copies the region's raw pointers — so this engine needs no lifetime.
+    pub translation_cache: TranslationCache,
+    /// Generation-scoped translations keyed by guest VA. Each `CachedBlock`
+    /// retains its full planned guest span so reuse, incoming edges, and return
+    /// targets atomically re-check mixed immutable/mutable executable spans.
+    pub cache: std::collections::HashMap<u64, CachedBlock, VaBuildHasher>,
+    /// Predecoded plans for genuine indirect exits, keyed by the exit VA.
+    pub cflow_plans: std::collections::HashMap<u64, crate::cflow::ControlFlowPlan, VaBuildHasher>,
+    /// One thread-local, generation-scoped monomorphic entry per emitted return
+    /// site. Emitted code publishes a one-based index into this vector.
+    pub indirect_cache_entries: Vec<crate::X86IndirectCacheEntry>,
+    /// Chain edges awaiting their target's translation, indexed by target VA.
+    pub pending: std::collections::HashMap<u64, Vec<PendingChainEdge>, VaBuildHasher>,
+    /// Fault-recovery metadata for the currently live translated blocks.
+    pub fault_entries: Vec<PublishedFaultEntry>,
+}
+
+impl X86ThreadTranslator {
+    /// Adopt a freshly borrowed JIT slice (`TranslationCache::from_region`) and
+    /// start with empty translation maps.
+    pub fn new(translation_cache: TranslationCache) -> Self {
+        Self {
+            translation_cache,
+            cache: std::collections::HashMap::default(),
+            cflow_plans: std::collections::HashMap::default(),
+            indirect_cache_entries: Vec::new(),
+            pending: std::collections::HashMap::default(),
+            fault_entries: Vec::new(),
+        }
+    }
+
+    /// Drop every generation-scoped translation map: the block index, the
+    /// predecoded cflow plans, the return-site table, the pending chain edges,
+    /// and the fault-recovery index. The bump-allocator (`translation_cache`)
+    /// is reset or rebuilt by the caller because its reset shape differs by site
+    /// (in-place `reset_after_fork_for_exec` recycle vs a fresh fork-child
+    /// slice). Verbatim of the five `.clear()` calls the run loop repeated at
+    /// each cache-refresh boundary (capacity recycle, admission refresh, fork
+    /// child, in-place exec).
+    pub fn clear_translation_state(&mut self) {
+        self.cache.clear();
+        self.cflow_plans.clear();
+        self.indirect_cache_entries.clear();
+        self.pending.clear();
+        self.fault_entries.clear();
+    }
+
+    /// Translate the block at `next` on a cache miss: plan → classify
+    /// ephemeral → read the guest bytes → decode any control-flow plan → emit &
+    /// link → assign a return-cache site → publish the padded bytes (recycling
+    /// the whole slice on capacity exhaustion) → record the fault-recovery
+    /// index → construct the `CachedBlock` → insert it (and any cflow plan) into
+    /// the owned maps. Returns the block plus the loop-owned decisions the
+    /// still-resident xstate edge-registration logic needs.
+    ///
+    /// Moved verbatim from `run_x86_thread`'s translate-miss branch (Phase-3
+    /// Task 2b); the only necessary adaptations are: control flow that was
+    /// `continue 'run`/`break 'run`/inline-`deliver` becomes a returned
+    /// [`X86TranslateOutcome`] variant; the runtime-side guest readers arrive as
+    /// the `fetch`/`read_exact` closures (`plan_block_with_reader` already took a
+    /// reader closure); the one-line runtime helper
+    /// `native_x86_translation_is_ephemeral` is inlined to its
+    /// `MemoryProtections::range_translation_requires_ephemeral` body; and the
+    /// no-progress breadcrumb reads the `segments`/`history` slices the loop
+    /// passes rather than closing over `image`/`history` directly.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the miss orchestration consumes the guest readers, protections, and diagnostic context the loop owned inline"
+    )]
+    pub fn translate(
+        &mut self,
+        next: u64,
+        slice_len: usize,
+        page: u64,
+        protections: &MemoryProtections,
+        segments: &[(u64, u64)],
+        history: &[u64],
+        mut fetch: impl FnMut(u64) -> Result<Vec<u8>, IdentityCheckedReadError>,
+        mut read_exact: impl FnMut(GuestVa, &mut [u8]) -> Result<(), IdentityCheckedReadError>,
+    ) -> X86TranslateOutcome {
+        let mut ephemeral_return_adjust: Option<u64> = None;
+        let mut ephemeral_cflow_plan: Option<(u64, crate::cflow::ControlFlowPlan)> = None;
+        let mut current_ephemeral_fault_range: Option<(u64, u64)> = None;
+
+        // Plan bounded to the 4 KiB guest page so a block stays within one
+        // mapped PT_LOAD segment (a larger span could read across an unmapped
+        // gap between them). `plan_block` always includes its first instruction
+        // even if it spans the page boundary, so it never returns an empty
+        // `Continue{target: start}` — which the chainer would turn into an
+        // infinite self-jump.
+        let block = match plan_block_with_reader(next, 256, page, &mut fetch) {
+            Ok(block) => block,
+            Err(X86BlockPlanError::Read { va, error }) => {
+                return X86TranslateOutcome::InstructionFetchFault {
+                    report_va: va,
+                    error,
+                };
+            }
+            Err(X86BlockPlanError::Block(error)) => {
+                return X86TranslateOutcome::Fatal(format!("plan_block at 0x{next:x}: {error}"));
+            }
+        };
+        // Defensive: a block that plans zero instructions AND only CONTINUES at
+        // its own start makes no progress (a page-spanning instruction that
+        // could not be planned, or the guest ran off mapped code). A block whose
+        // first instruction is a TERMINATOR also has zero copy-instructions and
+        // `exit.va() == start` — normal — so match only the `Continue` shape.
+        let empty_self_continue = block.instructions.is_empty()
+            && matches!(block.exit, X86Exit::Continue { target, .. } if target == next);
+        if empty_self_continue {
+            let bytes = fetch(next)
+                .map(|bytes| format!("{bytes:02x?}"))
+                .unwrap_or_else(|error| format!("fetch-error={error:?}"));
+            let in_seg = segments.iter().any(|&(s, e)| next >= s && next < e);
+            let recent: Vec<String> = history
+                .iter()
+                .rev()
+                .take(8)
+                .map(|v| format!("0x{v:x}"))
+                .collect();
+            return X86TranslateOutcome::Fatal(format!(
+                "no-progress block at 0x{next:x}: exit={:?} in_segment={in_seg} \
+                 bytes={bytes} segments={segments:x?} recent_blocks={recent:?}",
+                block.exit,
+            ));
+        }
+        let guest_len = match block
+            .end
+            .checked_sub(block.start)
+            .and_then(|len| usize::try_from(len).ok())
+        {
+            Some(len) if len != 0 => len,
+            _ => {
+                return X86TranslateOutcome::Fatal(format!(
+                    "invalid native x86 guest block span 0x{:x}..0x{:x}",
+                    block.start, block.end
+                ));
+            }
+        };
+        // Classify the complete planned instruction span before publishing cache
+        // metadata, edges, or a return-cache site — the planner may include its
+        // first instruction across a page boundary.
+        let source_translation_ephemeral =
+            protections.range_translation_requires_ephemeral(block.start, guest_len);
+        let mut body = vec![0u8; guest_len];
+        if let Err(error) = read_exact(GuestVa(block.start), &mut body) {
+            return X86TranslateOutcome::InstructionFetchFault {
+                report_va: next,
+                error,
+            };
+        }
+        let control_flow_plan = match block.exit {
+            X86Exit::ControlFlow { va, .. } => {
+                let offset = va
+                    .checked_sub(block.start)
+                    .and_then(|offset| usize::try_from(offset).ok());
+                let Some(bytes) = offset.and_then(|offset| body.get(offset..)) else {
+                    return X86TranslateOutcome::Fatal(format!(
+                        "cflow plan at 0x{va:x} is outside block 0x{:x}..0x{:x}",
+                        block.start, block.end
+                    ));
+                };
+                match crate::cflow::ControlFlowPlan::decode(bytes, va) {
+                    Ok(plan) => Some((va, plan)),
+                    Err(error) => {
+                        return X86TranslateOutcome::Fatal(format!(
+                            "cflow plan at 0x{va:x}: {error}"
+                        ));
+                    }
+                }
+            }
+            _ => None,
+        };
+        let mut linked = match emit_block_linked(&body, &block) {
+            Ok(t) => t,
+            Err(e) => {
+                // Loud: include the already checked terminator bytes so an
+                // unsupported instruction is identifiable without another
+                // uncontained guest-memory read.
+                let at = block.exit.va();
+                let terminator_bytes = at
+                    .checked_sub(block.start)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .and_then(|offset| body.get(offset..))
+                    .unwrap_or(&[]);
+                return X86TranslateOutcome::Fatal(format!(
+                    "emit_block at 0x{next:x} ({:?}): {e} — insn bytes at 0x{at:x} = {terminator_bytes:02x?}",
+                    block.exit,
+                ));
+            }
+        };
+        if linked.bytes.len() > slice_len {
+            return X86TranslateOutcome::Fatal(format!(
+                "single translated block exceeds the {slice_len}-byte JIT slice at 0x{next:x}"
+            ));
+        }
+        if let Some(site) = linked.indirect_cache {
+            if source_translation_ephemeral {
+                // Site id zero keeps the gateway cache cold, while the emitted
+                // probe still captures `[rsp]` exactly once for the Rust
+                // resolver. No persistent cache entry is created.
+                ephemeral_return_adjust = Some(site.stack_adjust);
+            } else {
+                let Some(site_id) = self
+                    .indirect_cache_entries
+                    .len()
+                    .checked_add(1)
+                    .and_then(|id| u32::try_from(id).ok())
+                else {
+                    return X86TranslateOutcome::Fatal(
+                        "native x86 indirect-cache site id overflow".into(),
+                    );
+                };
+                linked.bytes[site.site_id_imm_off..site.site_id_imm_off + 4]
+                    .copy_from_slice(&site_id.to_le_bytes());
+                self.indirect_cache_entries
+                    .push(crate::X86IndirectCacheEntry::return_site(site.stack_adjust));
+            }
+        }
+        let published = match publish_x86_translated_bytes(
+            &mut self.translation_cache,
+            &linked.bytes,
+        ) {
+            Ok(published) => published,
+            Err(CacheError::Capacity { .. }) => {
+                // The guest is back at a gateway boundary, so no code in this
+                // thread's private slice is executing. Recycle the whole slice
+                // instead of imposing a lifetime translation-volume limit: large
+                // static Go programs execute far more than 4 MiB of distinct
+                // emitted code during startup. Guest return addresses remain
+                // guest VAs, so dropping every block/edge map and re-translating
+                // `next` at the slice base is safe.
+                self.translation_cache.reset_after_fork_for_exec();
+                self.clear_translation_state();
+                match publish_x86_translated_bytes(&mut self.translation_cache, &linked.bytes) {
+                    Ok(published) => published,
+                    Err(error) => {
+                        return X86TranslateOutcome::Fatal(format!(
+                            "native x86 JIT publish at 0x{next:x} failed just after slice recycle: {error}"
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                return X86TranslateOutcome::Fatal(format!(
+                    "native x86 JIT publish at 0x{next:x} failed: {error}"
+                ));
+            }
+        };
+        let exec_u64 = published.entry().host().raw() as u64;
+        self.fault_entries
+            .extend(linked.fault_map.iter().map(|entry| PublishedFaultEntry {
+                host_start: exec_u64 + entry.emitted_start as u64,
+                host_end: exec_u64 + entry.emitted_end as u64,
+                guest_va: entry.guest_va,
+                is_copied_x87: entry.is_copied_x87,
+                restores: entry.restores.clone(),
+            }));
+        let entry = if source_translation_ephemeral {
+            current_ephemeral_fault_range = Some((exec_u64, exec_u64 + linked.bytes.len() as u64));
+            CachedBlock {
+                exec: exec_u64,
+                has_edges: false,
+                uses_fpu: block.uses_fpu,
+                has_indirect_cache: false,
+                guest_len,
+            }
+        } else {
+            CachedBlock {
+                exec: exec_u64,
+                has_edges: !linked.edges.is_empty() || linked.indirect_cache.is_some(),
+                uses_fpu: block.uses_fpu,
+                has_indirect_cache: linked.indirect_cache.is_some(),
+                guest_len,
+            }
+        };
+        if !source_translation_ephemeral {
+            self.cache.insert(next, entry);
+        }
+        if let Some((va, plan)) = control_flow_plan {
+            if source_translation_ephemeral {
+                ephemeral_cflow_plan = Some((va, plan));
+            } else {
+                self.cflow_plans.insert(va, plan);
+            }
+        }
+        X86TranslateOutcome::Translated(X86TranslatedBlock {
+            entry,
+            edges: linked.edges,
+            source_translation_ephemeral,
+            ephemeral_return_adjust,
+            ephemeral_cflow_plan,
+            current_ephemeral_fault_range,
+        })
+    }
 }
 
 #[cfg(test)]

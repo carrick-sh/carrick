@@ -30,11 +30,10 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 
-use carrick_dsr::cache::{CacheError, TranslationCache};
+use carrick_dsr::cache::TranslationCache;
 use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
 use carrick_dsr::identity_memory::*;
 use carrick_dsr::lane::NativeHost;
-use carrick_dsr_x86::block::{X86BlockPlanError, X86Exit};
 use carrick_dsr_x86::decode::{X86InstClass, classify};
 use carrick_dsr_x86::gateway::{
     CTX_FAULT_RECORD, CTX_KICK_RESTORE_RCX, CTX_SCRATCH2, kick_stub_addr, reg, signal_stub_addr,
@@ -42,15 +41,14 @@ use carrick_dsr_x86::gateway::{
 #[cfg(test)]
 use carrick_dsr_x86::plan_block;
 use carrick_dsr_x86::translator::{
-    CachedBlock, GuardedChainPatch, PendingChainEdge, PublishedFaultEntry, VaBuildHasher,
-    publish_guarded_chain_edge, publish_x86_translated_bytes,
+    GuardedChainPatch, PendingChainEdge, PublishedFaultEntry, X86ThreadTranslator,
+    X86TranslateOutcome, publish_guarded_chain_edge,
 };
 use carrick_dsr_x86::{
     X86DsrContext, X86ExitStatus, X86FxStateError, X86FxStatePlan, X86GuestGsBase,
-    X86IdentityStamp, X86IndirectCacheEntry, X86LegacyX87Error, X86LegacyX87Plan,
-    X86UcontextSnapshot, X86X87ExceptionKind, X86XstateMemoryReader, X86XstateMemoryWriter,
-    X86XstateRestoreError, X86XstateRestorePlan, X86XstateSaveError, X86XstateSavePlan, cflow,
-    emit::emit_block_linked, plan_block_with_reader,
+    X86IdentityStamp, X86LegacyX87Error, X86LegacyX87Plan, X86UcontextSnapshot,
+    X86X87ExceptionKind, X86XstateMemoryReader, X86XstateMemoryWriter, X86XstateRestoreError,
+    X86XstateRestorePlan, X86XstateSaveError, X86XstateSavePlan, cflow, plan_block_with_reader,
 };
 #[cfg(test)]
 use carrick_guest_mem::RepointPrivateError;
@@ -8960,7 +8958,7 @@ fn run_x86_thread(
     // through its free-list (`alloc_slice`/`free_slice`), so this cache's
     // `Drop` must never unmap the memory out from under a future slice
     // occupant (see `TranslationCache::from_region`'s doc comment).
-    let mut translation_cache = match active.region.sub_region(slice_off, slice_len) {
+    let translation_cache = match active.region.sub_region(slice_off, slice_len) {
         Some(sub) => TranslationCache::from_region(sub, active_host_jit()),
         None => {
             return ThreadRunOutcome::Fault {
@@ -8983,28 +8981,17 @@ fn run_x86_thread(
     // EOF; successful in-process exec explicitly writes then closes it.
     let mut vfork_completion_fd: Option<i32> = None;
 
-    // Generation-scoped translations keyed by guest VA. Each `CachedBlock`
-    // retains its full planned guest span so reuse, incoming edges, and return
-    // targets atomically re-check mixed immutable/mutable executable spans
-    // rather than sampling only the first byte. Cursor is monotonic.
-    let mut cache: std::collections::HashMap<u64, CachedBlock, VaBuildHasher> =
-        std::collections::HashMap::default();
-    // Predecoded plans for genuine indirect exits. Perl/m4 execute millions of
-    // returns; decoding the same `ret` with iced-x86 on every trip dominated
-    // their runtime even though the translated block itself was cached.
-    let mut cflow_plans: std::collections::HashMap<u64, cflow::ControlFlowPlan, VaBuildHasher> =
-        std::collections::HashMap::default();
-    // One thread-local, generation-scoped monomorphic entry per emitted return
-    // site. Emitted code publishes a one-based index; the gateway consumes the
-    // slice only while this loop is inside `enter_translated`, so growth and
-    // replacement happen solely at gateway boundaries.
-    let mut indirect_cache_entries: Vec<X86IndirectCacheEntry> = Vec::new();
-    // Chain edges awaiting their target's translation. When `target_va` is
-    // translated, each guard target is published first and its original branch
-    // is redirected from the cold stub to that guard last.
-    let mut pending: std::collections::HashMap<u64, Vec<PendingChainEdge>, VaBuildHasher> =
-        std::collections::HashMap::default();
-    let mut fault_entries: Vec<PublishedFaultEntry> = Vec::new();
+    // This thread's private DSR translate/cache/chain engine. It OWNS the
+    // generation-scoped block index (keyed by guest VA, each `CachedBlock`
+    // retaining its full planned guest span so reuse/incoming edges/return
+    // targets re-check mixed immutable/mutable spans), the predecoded
+    // indirect-exit plans, the monomorphic return-site table, the
+    // not-yet-resolved chain edges, and the fault-recovery index — plus the
+    // `translation_cache` bump-allocator slice they all write through.
+    // Per-thread-private (no lock); mirrors aarch64's owned-state translator.
+    // The run loop calls `engine.translate(...)` on a miss and drives the
+    // still-resident xstate edge-registration and gateway machinery around it.
+    let mut engine = X86ThreadTranslator::new(translation_cache);
     let mut code_generation = active
         .executable_epoch
         .current_generation()
@@ -9081,7 +9068,9 @@ fn run_x86_thread(
             return ThreadRunOutcome::RetiredForExec { traps };
         }
         if let Some((start, end)) = retired_ephemeral_fault_range.take() {
-            fault_entries.retain(|entry| entry.host_start < start || entry.host_start >= end);
+            engine
+                .fault_entries
+                .retain(|entry| entry.host_start < start || entry.host_start >= end);
         }
         history.push(next);
         if history.len() > 64 {
@@ -9136,478 +9125,274 @@ fn run_x86_thread(
                 }
             }
         }
-        let cached_block = cache.get(&next).copied();
+        let cached_block = engine.cache.get(&next).copied();
         let mut source_translation_ephemeral = false;
         let guest_pkru_requires_residency = context.snapshot.pkru().requires_guest_residency();
         let mut cache_hit = false;
         let mut ephemeral_cflow_plan: Option<(u64, cflow::ControlFlowPlan)> = None;
         let mut ephemeral_return_adjust: Option<u64> = None;
         let mut current_ephemeral_fault_range: Option<(u64, u64)> = None;
-        let (exec, has_edges, uses_fpu, has_indirect_cache) = if let Some(hit) = cached_block
-            .filter(|hit| {
+        let (exec, has_edges, uses_fpu, has_indirect_cache) =
+            if let Some(hit) = cached_block.filter(|hit| {
                 native_x86_edge_target_is_cacheable(
                     &IDENTITY_PROTECTIONS,
                     GuestVa(next),
                     hit.guest_len,
                 )
             }) {
-            cache_hit = true;
-            (
-                hit.exec,
-                hit.has_edges,
-                hit.uses_fpu,
-                hit.has_indirect_cache,
-            )
-        } else {
-            // This thread's JIT region (the fork child swapped `active` to its
-            // own private cache). Re-borrowed each translation so a mid-run swap
-            // is picked up; the borrow never outlives this branch.
-            let region = &active.region;
-            // Plan bounded to the 4 KiB guest page so a block stays within one
-            // mapped PT_LOAD segment (segments are page-aligned; a larger span
-            // could read across an unmapped gap between them). `plan_block`
-            // always includes its first instruction even if it spans the page
-            // boundary (an internal, in-segment boundary), so it never returns
-            // an empty `Continue{target: start}` — which the chainer would turn
-            // into an infinite self-jump.
-            let block = match plan_block_with_reader(next, 256, PAGE, |va| {
-                identity_checked_fetch_x86_instruction(GuestVa(va))
-            }) {
-                Ok(block) => block,
-                Err(X86BlockPlanError::Read { va, error }) => {
-                    match deliver_x86_instruction_fetch_error(
-                        &active,
-                        tid,
-                        &mut context.snapshot,
-                        va,
-                        error,
-                    ) {
-                        Ok(SynchronousFaultDelivery::RetryAt(rip)) => {
-                            next = rip;
-                            continue 'run;
-                        }
-                        Ok(SynchronousFaultDelivery::Fatal(final_signum)) => {
-                            if forked {
-                                crate::exec_helpers::forked_child_die_by_signal(
-                                    final_signum,
-                                    active.dispatcher.stdout(),
-                                    active.dispatcher.stderr(),
-                                );
-                            }
-                            exit_code = Some(128 + final_signum);
-                            break 'run;
-                        }
-                        Err(detail) => {
-                            fault_detail = Some(detail);
-                            break 'run;
-                        }
-                    }
-                }
-                Err(X86BlockPlanError::Block(error)) => {
-                    fault_detail = Some(format!("plan_block at 0x{next:x}: {error}"));
-                    break 'run;
-                }
-            };
-            // Defensive: a block that plans zero instructions AND only
-            // CONTINUES at its own start makes no progress (a page-spanning
-            // instruction that could not be planned, or the guest ran off
-            // mapped code). A block whose first instruction is a TERMINATOR
-            // (call/jmp/jcc/syscall/sensitive) also has zero copy-instructions
-            // and `exit.va() == start` — that is normal, so match only the
-            // `Continue` shape. Emit a LOUD breadcrumb on the real no-progress
-            // case so an unhandled scenario is debuggable without guessing.
-            let empty_self_continue = block.instructions.is_empty()
-                && matches!(block.exit, X86Exit::Continue { target, .. } if target == next);
-            if empty_self_continue {
-                let fetch = identity_checked_fetch_x86_instruction(GuestVa(next))
-                    .map(|bytes| format!("{bytes:02x?}"))
-                    .unwrap_or_else(|error| format!("fetch-error={error:?}"));
-                let in_seg = image.segments.iter().any(|&(s, e)| next >= s && next < e);
-                let recent: Vec<String> = history
-                    .iter()
-                    .rev()
-                    .take(8)
-                    .map(|v| format!("0x{v:x}"))
-                    .collect();
-                fault_detail = Some(format!(
-                    "no-progress block at 0x{next:x}: exit={:?} in_segment={in_seg} \
-                     bytes={fetch} segments={:x?} recent_blocks={:?}",
-                    block.exit, image.segments, recent,
-                ));
-                break;
-            }
-            let guest_len = match block
-                .end
-                .checked_sub(block.start)
-                .and_then(|len| usize::try_from(len).ok())
-            {
-                Some(len) if len != 0 => len,
-                _ => {
-                    fault_detail = Some(format!(
-                        "invalid native x86 guest block span 0x{:x}..0x{:x}",
-                        block.start, block.end
-                    ));
-                    break;
-                }
-            };
-            // Classify the complete planned instruction span before publishing
-            // cache metadata, edges, or a return-cache site. In particular, the
-            // planner may include its first instruction across a page boundary.
-            source_translation_ephemeral =
-                native_x86_translation_is_ephemeral(&IDENTITY_PROTECTIONS, block.start, guest_len);
-            let mut body = vec![0u8; guest_len];
-            if let Err(error) =
-                identity_checked_read_executable_exact(GuestVa(block.start), &mut body)
-            {
-                match deliver_x86_instruction_fetch_error(
-                    &active,
-                    tid,
-                    &mut context.snapshot,
+                cache_hit = true;
+                (
+                    hit.exec,
+                    hit.has_edges,
+                    hit.uses_fpu,
+                    hit.has_indirect_cache,
+                )
+            } else {
+                // This thread's JIT region (the fork child swapped `active` to its
+                // own private cache). Re-borrowed each translation so a mid-run swap
+                // is picked up; the borrow never outlives this branch.
+                let region = &active.region;
+                // Translate on a cache miss. The engine OWNS the block index, the
+                // JIT slice, and the chain/return/fault maps; it returns a bounded
+                // outcome so this loop keeps the RETRYABLE fetch-fault delivery and
+                // the xstate-entangled edge registration below. On a fetch fault the
+                // loop still calls the unmoved `deliver_x86_instruction_fetch_error`
+                // itself — the single site that consumes this outcome enum.
+                let translated = match engine.translate(
                     next,
-                    error,
+                    slice_len,
+                    PAGE,
+                    &IDENTITY_PROTECTIONS,
+                    &image.segments,
+                    &history,
+                    |va| identity_checked_fetch_x86_instruction(GuestVa(va)),
+                    identity_checked_read_executable_exact,
                 ) {
-                    Ok(SynchronousFaultDelivery::RetryAt(rip)) => {
-                        next = rip;
-                        continue 'run;
-                    }
-                    Ok(SynchronousFaultDelivery::Fatal(final_signum)) => {
-                        if forked {
-                            crate::exec_helpers::forked_child_die_by_signal(
-                                final_signum,
-                                active.dispatcher.stdout(),
-                                active.dispatcher.stderr(),
-                            );
+                    X86TranslateOutcome::Translated(translated) => translated,
+                    X86TranslateOutcome::InstructionFetchFault { report_va, error } => {
+                        match deliver_x86_instruction_fetch_error(
+                            &active,
+                            tid,
+                            &mut context.snapshot,
+                            report_va,
+                            error,
+                        ) {
+                            Ok(SynchronousFaultDelivery::RetryAt(rip)) => {
+                                next = rip;
+                                continue 'run;
+                            }
+                            Ok(SynchronousFaultDelivery::Fatal(final_signum)) => {
+                                if forked {
+                                    crate::exec_helpers::forked_child_die_by_signal(
+                                        final_signum,
+                                        active.dispatcher.stdout(),
+                                        active.dispatcher.stderr(),
+                                    );
+                                }
+                                exit_code = Some(128 + final_signum);
+                                break 'run;
+                            }
+                            Err(detail) => {
+                                fault_detail = Some(detail);
+                                break 'run;
+                            }
                         }
-                        exit_code = Some(128 + final_signum);
-                        break 'run;
                     }
-                    Err(detail) => {
+                    X86TranslateOutcome::Fatal(detail) => {
                         fault_detail = Some(detail);
                         break 'run;
                     }
-                }
-            }
-            let control_flow_plan = match block.exit {
-                X86Exit::ControlFlow { va, .. } => {
-                    let offset = va
-                        .checked_sub(block.start)
-                        .and_then(|offset| usize::try_from(offset).ok());
-                    let Some(bytes) = offset.and_then(|offset| body.get(offset..)) else {
-                        fault_detail = Some(format!(
-                            "cflow plan at 0x{va:x} is outside block 0x{:x}..0x{:x}",
-                            block.start, block.end
-                        ));
-                        break 'run;
-                    };
-                    match cflow::ControlFlowPlan::decode(bytes, va) {
-                        Ok(plan) => Some((va, plan)),
-                        Err(error) => {
-                            fault_detail = Some(format!("cflow plan at 0x{va:x}: {error}"));
-                            break 'run;
-                        }
-                    }
-                }
-                _ => None,
-            };
-            let mut linked = match emit_block_linked(&body, &block) {
-                Ok(t) => t,
-                Err(e) => {
-                    // Loud: include the already checked terminator bytes so an
-                    // unsupported instruction is identifiable without another
-                    // uncontained guest-memory read.
-                    let at = block.exit.va();
-                    let terminator_bytes = at
-                        .checked_sub(block.start)
-                        .and_then(|offset| usize::try_from(offset).ok())
-                        .and_then(|offset| body.get(offset..))
-                        .unwrap_or(&[]);
-                    fault_detail = Some(format!(
-                        "emit_block at 0x{next:x} ({:?}): {e} — insn bytes at 0x{at:x} = {terminator_bytes:02x?}",
-                        block.exit,
-                    ));
-                    break;
-                }
-            };
-            if linked.bytes.len() > slice_len {
-                fault_detail = Some(format!(
-                    "single translated block exceeds the {slice_len}-byte JIT slice at 0x{next:x}"
-                ));
-                break;
-            }
-            if let Some(site) = linked.indirect_cache {
+                };
+                // The engine already inserted the block (and any cflow plan) into
+                // the owned maps and recorded the fault-recovery index. Carry the
+                // loop-owned decisions the still-resident xstate edge logic needs;
+                // `entry.exec`/`entry.uses_fpu` are the pre-extraction `exec_u64` /
+                // `block.uses_fpu` by construction.
+                let entry = translated.entry;
+                source_translation_ephemeral = translated.source_translation_ephemeral;
+                ephemeral_return_adjust = translated.ephemeral_return_adjust;
+                ephemeral_cflow_plan = translated.ephemeral_cflow_plan;
+                current_ephemeral_fault_range = translated.current_ephemeral_fault_range;
+                let edges = translated.edges;
+                // Mutable executable blocks are one-entry translations: discard
+                // incoming waiters and publish neither outgoing edges nor return-
+                // cache state. Only private immutable RX text retains the normal
+                // guarded chaining path.
                 if source_translation_ephemeral {
-                    // Site id zero keeps the gateway cache cold, while the
-                    // emitted probe still captures `[rsp]` exactly once for the
-                    // Rust resolver below. No persistent cache entry is created.
-                    ephemeral_return_adjust = Some(site.stack_adjust);
+                    engine.pending.remove(&next);
                 } else {
-                    let Some(site_id) = indirect_cache_entries
-                        .len()
-                        .checked_add(1)
-                        .and_then(|id| u32::try_from(id).ok())
-                    else {
-                        fault_detail = Some("native x86 indirect-cache site id overflow".into());
-                        break;
-                    };
-                    linked.bytes[site.site_id_imm_off..site.site_id_imm_off + 4]
-                        .copy_from_slice(&site_id.to_le_bytes());
-                    indirect_cache_entries
-                        .push(X86IndirectCacheEntry::return_site(site.stack_adjust));
-                }
-            }
-            let published = match publish_x86_translated_bytes(
-                &mut translation_cache,
-                &linked.bytes,
-            ) {
-                Ok(published) => published,
-                Err(CacheError::Capacity { .. }) => {
-                    // The guest is back at a gateway boundary, so no code in
-                    // this thread's private slice is executing. Recycle the
-                    // whole slice instead of imposing a lifetime
-                    // translation-volume limit: large static Go programs such
-                    // as Kaniko execute far more than 4 MiB of distinct
-                    // emitted code during startup. Guest return addresses
-                    // remain guest VAs, so dropping every block/edge map and
-                    // re-translating `next` at the slice base is safe.
-                    translation_cache.reset_after_fork_for_exec();
-                    cache.clear();
-                    cflow_plans.clear();
-                    indirect_cache_entries.clear();
-                    pending.clear();
-                    fault_entries.clear();
-                    match publish_x86_translated_bytes(&mut translation_cache, &linked.bytes) {
-                        Ok(published) => published,
-                        Err(error) => {
-                            fault_detail = Some(format!(
-                                "native x86 JIT publish at 0x{next:x} failed just after slice recycle: {error}"
-                            ));
-                            break;
-                        }
-                    }
-                }
-                Err(error) => {
-                    fault_detail = Some(format!(
-                        "native x86 JIT publish at 0x{next:x} failed: {error}"
-                    ));
-                    break;
-                }
-            };
-            let exec_u64 = published.entry().host().raw() as u64;
-            fault_entries.extend(linked.fault_map.iter().map(|entry| PublishedFaultEntry {
-                host_start: exec_u64 + entry.emitted_start as u64,
-                host_end: exec_u64 + entry.emitted_end as u64,
-                guest_va: entry.guest_va,
-                is_copied_x87: entry.is_copied_x87,
-                restores: entry.restores.clone(),
-            }));
-            let entry = if source_translation_ephemeral {
-                current_ephemeral_fault_range =
-                    Some((exec_u64, exec_u64 + linked.bytes.len() as u64));
-                CachedBlock {
-                    exec: exec_u64,
-                    has_edges: false,
-                    uses_fpu: block.uses_fpu,
-                    has_indirect_cache: false,
-                    guest_len,
-                }
-            } else {
-                CachedBlock {
-                    exec: exec_u64,
-                    has_edges: !linked.edges.is_empty() || linked.indirect_cache.is_some(),
-                    uses_fpu: block.uses_fpu,
-                    has_indirect_cache: linked.indirect_cache.is_some(),
-                    guest_len,
-                }
-            };
-            if !source_translation_ephemeral {
-                cache.insert(next, entry);
-            }
-            if let Some((va, plan)) = control_flow_plan {
-                if source_translation_ephemeral {
-                    ephemeral_cflow_plan = Some((va, plan));
-                } else {
-                    cflow_plans.insert(va, plan);
-                }
-            }
-            // Mutable executable blocks are one-entry translations: discard
-            // incoming waiters and publish neither outgoing edges nor return-
-            // cache state. Only private immutable RX text retains the normal
-            // guarded chaining path.
-            if source_translation_ephemeral {
-                pending.remove(&next);
-            } else {
-                // Register this block's outgoing edges; patch any whose target is
-                // already translated (a self-edge sees this block, now cached).
-                for edge in &linked.edges {
-                    let source = GuestVa(next);
-                    let target = GuestVa(edge.target_va);
-                    let entry_patch_abs = exec_u64 + edge.entry_rel32_off as u64;
-                    let entry_next_abs = entry_patch_abs + 4;
-                    let guard_exec = exec_u64 + edge.guard_off as u64;
-                    let guard_target_patch_abs = exec_u64 + edge.guard_target_rel32_off as u64;
-                    let guard_target_next_abs = guard_target_patch_abs + 4;
-                    let source_save = xstate_policy.save_required(
-                        true,
-                        block.uses_fpu,
-                        guest_pkru_requires_residency,
-                    );
-                    let unsafe_local_policy =
-                        xstate_policy == NativeX86XstatePolicy::UnsafeLocalDiagnostic;
-                    let target_barrier_policy = xstate_policy.keeps_state_targets_cold();
-                    let cached_target = cache.get(&edge.target_va).copied();
-                    let target_uses_fpu = cached_target.is_some_and(|block| block.uses_fpu);
-                    let target_guest_len =
-                        cached_target.map(|block| block.guest_len).or_else(|| {
-                            native_x86_uncached_target_guest_len(target, |va| {
-                                identity_checked_fetch_x86_instruction(GuestVa(va))
-                            })
-                        });
-                    if target_guest_len.is_none_or(|guest_len| {
-                        !native_x86_edge_target_is_cacheable(
-                            &IDENTITY_PROTECTIONS,
-                            target,
-                            guest_len,
-                        )
-                    }) || edge_barriers.contains(source, target)
-                        || (target_barrier_policy && target_uses_fpu)
-                    {
-                        native_x86_trace_xstate(
-                            &trace_pcs,
-                            trace_xstate_graph,
-                            source,
-                            target,
-                            NativeX86XstateEvent::BarrierEdge,
-                            NativeX86XstateDecision {
-                                source_uses_fpu: block.uses_fpu,
-                                target_uses_fpu,
-                                has_edges: true,
-                                save_required: source_save,
-                                cache_hit: cached_target.is_some(),
-                                unsafe_local_policy,
-                                target_barrier_policy,
-                            },
-                            &context.snapshot,
-                        );
-                        continue;
-                    }
-                    if let Some(target_block) = cached_target {
-                        native_x86_trace_xstate(
-                            &trace_pcs,
-                            trace_xstate_graph,
-                            source,
-                            target,
-                            NativeX86XstateEvent::PatchCachedTarget,
-                            NativeX86XstateDecision {
-                                source_uses_fpu: block.uses_fpu,
-                                target_uses_fpu,
-                                has_edges: true,
-                                save_required: source_save,
-                                unsafe_local_policy,
-                                target_barrier_policy,
-                                ..NativeX86XstateDecision::default()
-                            },
-                            &context.snapshot,
-                        );
-                        publish_guarded_chain_edge(
-                            region,
-                            &jit,
-                            GuardedChainPatch {
-                                entry_patch_abs,
-                                entry_next_abs,
-                                guard_exec,
-                                guard_target_patch_abs,
-                                guard_target_next_abs,
-                            },
-                            target_block.exec,
-                        );
-                    } else {
-                        native_x86_trace_xstate(
-                            &trace_pcs,
-                            trace_xstate_graph,
-                            source,
-                            target,
-                            NativeX86XstateEvent::RegisterPendingEdge,
-                            NativeX86XstateDecision {
-                                source_uses_fpu: block.uses_fpu,
-                                has_edges: true,
-                                save_required: source_save,
-                                unsafe_local_policy,
-                                target_barrier_policy,
-                                ..NativeX86XstateDecision::default()
-                            },
-                            &context.snapshot,
-                        );
-                        pending
-                            .entry(edge.target_va)
-                            .or_default()
-                            .push(PendingChainEdge {
-                                entry_patch_abs,
-                                entry_next_abs,
-                                guard_exec,
-                                guard_target_patch_abs,
-                                guard_target_next_abs,
-                                source,
-                                source_uses_fpu: block.uses_fpu,
-                                source_requires_guest_pkru: guest_pkru_requires_residency,
-                            });
-                    }
-                }
-                // Patch any earlier-translated blocks that were waiting for THIS VA.
-                if let Some(waiters) = pending.remove(&next) {
-                    for waiter in waiters {
+                    // Register this block's outgoing edges; patch any whose target is
+                    // already translated (a self-edge sees this block, now cached).
+                    for edge in &edges {
+                        let source = GuestVa(next);
+                        let target = GuestVa(edge.target_va);
+                        let entry_patch_abs = entry.exec + edge.entry_rel32_off as u64;
+                        let entry_next_abs = entry_patch_abs + 4;
+                        let guard_exec = entry.exec + edge.guard_off as u64;
+                        let guard_target_patch_abs =
+                            entry.exec + edge.guard_target_rel32_off as u64;
+                        let guard_target_next_abs = guard_target_patch_abs + 4;
                         let source_save = xstate_policy.save_required(
                             true,
-                            waiter.source_uses_fpu,
-                            waiter.source_requires_guest_pkru,
+                            entry.uses_fpu,
+                            guest_pkru_requires_residency,
                         );
+                        let unsafe_local_policy =
+                            xstate_policy == NativeX86XstatePolicy::UnsafeLocalDiagnostic;
                         let target_barrier_policy = xstate_policy.keeps_state_targets_cold();
-                        let keep_cold = target_barrier_policy && block.uses_fpu;
-                        native_x86_trace_xstate(
-                            &trace_pcs,
-                            trace_xstate_graph,
-                            waiter.source,
-                            GuestVa(next),
-                            if keep_cold {
-                                NativeX86XstateEvent::BarrierEdge
-                            } else {
-                                NativeX86XstateEvent::PatchPendingEdge
-                            },
-                            NativeX86XstateDecision {
-                                source_uses_fpu: waiter.source_uses_fpu,
-                                target_uses_fpu: block.uses_fpu,
-                                has_edges: true,
-                                save_required: source_save,
-                                unsafe_local_policy: xstate_policy
-                                    == NativeX86XstatePolicy::UnsafeLocalDiagnostic,
-                                target_barrier_policy,
-                                ..NativeX86XstateDecision::default()
-                            },
-                            &context.snapshot,
-                        );
-                        if !keep_cold {
+                        let cached_target = engine.cache.get(&edge.target_va).copied();
+                        let target_uses_fpu = cached_target.is_some_and(|block| block.uses_fpu);
+                        let target_guest_len =
+                            cached_target.map(|block| block.guest_len).or_else(|| {
+                                native_x86_uncached_target_guest_len(target, |va| {
+                                    identity_checked_fetch_x86_instruction(GuestVa(va))
+                                })
+                            });
+                        if target_guest_len.is_none_or(|guest_len| {
+                            !native_x86_edge_target_is_cacheable(
+                                &IDENTITY_PROTECTIONS,
+                                target,
+                                guest_len,
+                            )
+                        }) || edge_barriers.contains(source, target)
+                            || (target_barrier_policy && target_uses_fpu)
+                        {
+                            native_x86_trace_xstate(
+                                &trace_pcs,
+                                trace_xstate_graph,
+                                source,
+                                target,
+                                NativeX86XstateEvent::BarrierEdge,
+                                NativeX86XstateDecision {
+                                    source_uses_fpu: entry.uses_fpu,
+                                    target_uses_fpu,
+                                    has_edges: true,
+                                    save_required: source_save,
+                                    cache_hit: cached_target.is_some(),
+                                    unsafe_local_policy,
+                                    target_barrier_policy,
+                                },
+                                &context.snapshot,
+                            );
+                            continue;
+                        }
+                        if let Some(target_block) = cached_target {
+                            native_x86_trace_xstate(
+                                &trace_pcs,
+                                trace_xstate_graph,
+                                source,
+                                target,
+                                NativeX86XstateEvent::PatchCachedTarget,
+                                NativeX86XstateDecision {
+                                    source_uses_fpu: entry.uses_fpu,
+                                    target_uses_fpu,
+                                    has_edges: true,
+                                    save_required: source_save,
+                                    unsafe_local_policy,
+                                    target_barrier_policy,
+                                    ..NativeX86XstateDecision::default()
+                                },
+                                &context.snapshot,
+                            );
                             publish_guarded_chain_edge(
                                 region,
                                 &jit,
                                 GuardedChainPatch {
-                                    entry_patch_abs: waiter.entry_patch_abs,
-                                    entry_next_abs: waiter.entry_next_abs,
-                                    guard_exec: waiter.guard_exec,
-                                    guard_target_patch_abs: waiter.guard_target_patch_abs,
-                                    guard_target_next_abs: waiter.guard_target_next_abs,
+                                    entry_patch_abs,
+                                    entry_next_abs,
+                                    guard_exec,
+                                    guard_target_patch_abs,
+                                    guard_target_next_abs,
                                 },
-                                exec_u64,
+                                target_block.exec,
+                            );
+                        } else {
+                            native_x86_trace_xstate(
+                                &trace_pcs,
+                                trace_xstate_graph,
+                                source,
+                                target,
+                                NativeX86XstateEvent::RegisterPendingEdge,
+                                NativeX86XstateDecision {
+                                    source_uses_fpu: entry.uses_fpu,
+                                    has_edges: true,
+                                    save_required: source_save,
+                                    unsafe_local_policy,
+                                    target_barrier_policy,
+                                    ..NativeX86XstateDecision::default()
+                                },
+                                &context.snapshot,
+                            );
+                            engine.pending.entry(edge.target_va).or_default().push(
+                                PendingChainEdge {
+                                    entry_patch_abs,
+                                    entry_next_abs,
+                                    guard_exec,
+                                    guard_target_patch_abs,
+                                    guard_target_next_abs,
+                                    source,
+                                    source_uses_fpu: entry.uses_fpu,
+                                    source_requires_guest_pkru: guest_pkru_requires_residency,
+                                },
                             );
                         }
                     }
+                    // Patch any earlier-translated blocks that were waiting for THIS VA.
+                    if let Some(waiters) = engine.pending.remove(&next) {
+                        for waiter in waiters {
+                            let source_save = xstate_policy.save_required(
+                                true,
+                                waiter.source_uses_fpu,
+                                waiter.source_requires_guest_pkru,
+                            );
+                            let target_barrier_policy = xstate_policy.keeps_state_targets_cold();
+                            let keep_cold = target_barrier_policy && entry.uses_fpu;
+                            native_x86_trace_xstate(
+                                &trace_pcs,
+                                trace_xstate_graph,
+                                waiter.source,
+                                GuestVa(next),
+                                if keep_cold {
+                                    NativeX86XstateEvent::BarrierEdge
+                                } else {
+                                    NativeX86XstateEvent::PatchPendingEdge
+                                },
+                                NativeX86XstateDecision {
+                                    source_uses_fpu: waiter.source_uses_fpu,
+                                    target_uses_fpu: entry.uses_fpu,
+                                    has_edges: true,
+                                    save_required: source_save,
+                                    unsafe_local_policy: xstate_policy
+                                        == NativeX86XstatePolicy::UnsafeLocalDiagnostic,
+                                    target_barrier_policy,
+                                    ..NativeX86XstateDecision::default()
+                                },
+                                &context.snapshot,
+                            );
+                            if !keep_cold {
+                                publish_guarded_chain_edge(
+                                    region,
+                                    &jit,
+                                    GuardedChainPatch {
+                                        entry_patch_abs: waiter.entry_patch_abs,
+                                        entry_next_abs: waiter.entry_next_abs,
+                                        guard_exec: waiter.guard_exec,
+                                        guard_target_patch_abs: waiter.guard_target_patch_abs,
+                                        guard_target_next_abs: waiter.guard_target_next_abs,
+                                    },
+                                    entry.exec,
+                                );
+                            }
+                        }
+                    }
                 }
-            }
-            (
-                entry.exec,
-                entry.has_edges,
-                entry.uses_fpu,
-                entry.has_indirect_cache,
-            )
-        };
+                (
+                    entry.exec,
+                    entry.has_edges,
+                    entry.uses_fpu,
+                    entry.has_indirect_cache,
+                )
+            };
 
         // A chainable block runs many blocks with live FPU state, so production
         // execution restores/saves around every chainable entry. The explicitly
@@ -9642,11 +9427,7 @@ fn run_x86_thread(
         {
             Ok(JitAdmission::Entered(guard)) => guard,
             Ok(JitAdmission::Refresh(generation)) => {
-                cache.clear();
-                cflow_plans.clear();
-                indirect_cache_entries.clear();
-                pending.clear();
-                fault_entries.clear();
+                engine.clear_translation_state();
                 retired_ephemeral_fault_range = None;
                 code_generation = generation;
                 continue 'run;
@@ -9678,7 +9459,7 @@ fn run_x86_thread(
         xstate_policy.configure_stress(save_required, &mut context);
         // SAFETY: the thread-local vector is mutated only at gateway
         // boundaries. It remains stable for the complete translated interval.
-        unsafe { context.publish_indirect_cache(&indirect_cache_entries) };
+        unsafe { context.publish_indirect_cache(&engine.indirect_cache_entries) };
         // SAFETY: exec holds a freshly translated block ending in an exit stub
         // (or chaining to one); rsp is a valid guest stack.
         let admitted = in_jit.admission();
@@ -9695,7 +9476,7 @@ fn run_x86_thread(
             .ok_or(X86X87FipNormalizationError::JitRangeOverflow)
             .and_then(|jit_end| {
                 normalize_x86_gateway_x87_fip(
-                    &fault_entries,
+                    &engine.fault_entries,
                     jit_start..jit_end,
                     X86GatewayX87Witness {
                         entry_fip: entry_x87_fip,
@@ -9769,7 +9550,7 @@ fn run_x86_thread(
                 let scratch = [context.scratch, context.scratch2];
                 let mut linux_sig = crate::host_signal::host_to_linux_signum(fault.signal);
                 let Some(fault_pc) = recover_x86_fault_snapshot(
-                    &fault_entries,
+                    &engine.fault_entries,
                     fault.host_rip,
                     scratch,
                     &mut context.snapshot,
@@ -9959,24 +9740,22 @@ fn run_x86_thread(
                                 // `fork_child_rebuild` reserves for the
                                 // forking thread itself; siblings never exist
                                 // in the child).
-                                translation_cache = match active.region.sub_region(0, JIT_SLICE_LEN)
+                                engine.translation_cache = match active
+                                    .region
+                                    .sub_region(0, JIT_SLICE_LEN)
                                 {
                                     Some(sub) => {
                                         TranslationCache::from_region(sub, active_host_jit())
                                     }
                                     None => {
                                         fault_detail = Some(
-                                            "fork child: JIT slice 0 is outside the fresh code cache"
-                                                .to_string(),
-                                        );
+                                                "fork child: JIT slice 0 is outside the fresh code cache"
+                                                    .to_string(),
+                                            );
                                         break;
                                     }
                                 };
-                                cache.clear();
-                                cflow_plans.clear();
-                                indirect_cache_entries.clear();
-                                pending.clear();
-                                fault_entries.clear();
+                                engine.clear_translation_state();
                                 // XSAVEOPT's destination-init guarantee is
                                 // process-local. Seed the fork child's COW copy
                                 // with one full host XSAVE before optimized
@@ -10263,11 +10042,7 @@ fn run_x86_thread(
                                 // `slice_off`, so re-seeding from `slice_off`
                                 // would be wrong) — the old blocks become dead
                                 // space, harmless for the probe's single exec.
-                                cache.clear();
-                                cflow_plans.clear();
-                                indirect_cache_entries.clear();
-                                pending.clear();
-                                fault_entries.clear();
+                                engine.clear_translation_state();
                                 retired_ephemeral_fault_range = None;
                                 context.guest_fsbase = 0;
                                 context.snapshot = X86UcontextSnapshot::new();
@@ -10308,7 +10083,7 @@ fn run_x86_thread(
                         .as_ref()
                         .filter(|(plan_va, _)| *plan_va == va)
                         .map(|(_, plan)| plan)
-                        .or_else(|| cflow_plans.get(&va));
+                        .or_else(|| engine.cflow_plans.get(&va));
                     let Some(plan) = plan else {
                         fault_detail = Some(format!("missing cflow plan at 0x{va:x}"));
                         break;
@@ -10333,7 +10108,7 @@ fn run_x86_thread(
                             stack_adjust,
                         ))
                     } else if let Some(index) = indirect_cache_index {
-                        let Some(entry) = indirect_cache_entries.get(index) else {
+                        let Some(entry) = engine.indirect_cache_entries.get(index) else {
                             fault_detail = Some(format!(
                                 "invalid indirect-cache site {} at 0x{va:x}",
                                 context.indirect_cache_site
@@ -10357,8 +10132,8 @@ fn run_x86_thread(
                     match resolved {
                         Ok(target) => {
                             if let Some(entry) = indirect_cache_index
-                                .and_then(|index| indirect_cache_entries.get_mut(index))
-                                && let Some(target_block) = cache.get(&target).copied()
+                                .and_then(|index| engine.indirect_cache_entries.get_mut(index))
+                                && let Some(target_block) = engine.cache.get(&target).copied()
                                 && native_x86_return_cache_is_armable(
                                     &IDENTITY_PROTECTIONS,
                                     source_translation_ephemeral,
