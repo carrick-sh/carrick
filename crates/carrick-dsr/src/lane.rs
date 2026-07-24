@@ -11,14 +11,20 @@ use crate::host::NativeHostJit;
 
 /// Guest-ISA half of a native lane. Phase 1 carries only what the shared
 /// slices consume; gateway/emit surfaces join in Phase 2 (spec §traits).
+///
+/// Deliberately NOT here: a single static "native guest page size" constant.
+/// `page_profile.rs`'s capability table (`PageGeometry`/`NativePageProfile`)
+/// is the real page-geometry authority — the linux4k-on-16k lane runs a 4
+/// KiB Linux guest page size over a 16 KiB Darwin host page, a fact a
+/// per-ISA constant cannot express. A `GUEST_PAGE_SIZE` associated const
+/// used to live here; it had zero production consumers (only its own
+/// definitions and a same-value assertion test apiece) and was removed
+/// rather than kept as an inert, misleading source of truth.
 pub trait GuestIsa: 'static + Send + Sync {
     const NAME: &'static str; // "aarch64" | "x86_64"
 
     /// Exclusive end of canonical user VA (x86_64: 1<<47; aarch64: 1<<48).
     const USER_VA_END_EXCLUSIVE: u64;
-
-    /// Native guest page size the ISA lane translates for.
-    const GUEST_PAGE_SIZE: usize;
 }
 
 /// Host-OS half of a native lane. Phase 1: JIT authority only. Phase 2 adds
@@ -111,7 +117,6 @@ mod tests {
     impl GuestIsa for TestIsa {
         const NAME: &'static str = "test";
         const USER_VA_END_EXCLUSIVE: u64 = 1u64 << 48;
-        const GUEST_PAGE_SIZE: usize = 4096;
     }
 
     // Dummy test lane for trait composition
