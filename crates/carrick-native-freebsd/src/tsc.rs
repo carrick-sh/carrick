@@ -110,3 +110,22 @@ pub fn calibrate() -> Option<(u64, u64, u64)> {
         tsc_clock_offset(libc::CLOCK_MONOTONIC, frequency)?,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    // Unit test lives with its unit: `tsc_vdso_is_safe` is a private helper of
+    // this FreeBSD-only crate, so the test reaches it via `super::` rather than
+    // a cross-crate reference from the runtime's run loop (where it used to sit
+    // before the host-ops seam moved the TSC block here). NetBSD never builds
+    // this crate, so the gate is the crate's own `cfg(target_os = "freebsd")`
+    // dependency selection — no per-test `cfg` needed.
+    use super::tsc_vdso_is_safe;
+
+    #[test]
+    fn tsc_vdso_requires_invariant_and_smp_safe_host_counter() {
+        assert!(tsc_vdso_is_safe(1, 1));
+        assert!(!tsc_vdso_is_safe(0, 1));
+        assert!(!tsc_vdso_is_safe(1, 0));
+        assert!(!tsc_vdso_is_safe(0, 0));
+    }
+}
