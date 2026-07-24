@@ -76,11 +76,45 @@ per-thread-private — the shared-cache incompatibility was about `carrick-dsr`'
 - [ ] **Step 3:** macOS `cargo test -p carrick-dsr-x86 --lib` + `cargo test -p carrick-runtime --lib dsr` (aarch64 untouched pin — the aarch64 translator must be byte-unaffected); clippy. FreeBSD box: full native_freebsd_x86 suite + LTP == baseline (programmatic diff). == baseline or STOP.
 - [ ] **Step 4:** Metrics: native_freebsd.rs delta; carrick-dsr-x86 growth; the x86/aarch64 crate-structure symmetry now achieved. Commit `refactor(dsr-x86): extract the x86 translate/cache engine (mirror aarch64)`. (Box wip-commits OK; squash to one.)
 
-## Task 3: FreeBSD adopts exec-capsule + prepared_image
+## Task 3: FreeBSD loader adopts carrick_mem::AddressSpace (RE-SCOPED)
 
-**Files:** `native_freebsd.rs` (replace `parse_loadable_elf`/`load_static_pie` with `native_prepared_image::prepare` + `native_exec_capsule` calls — the same ones Darwin uses), delete the duplication.
+**CORRECTION (2026-07-24):** The original Task 3 ("adopt exec-capsule + prepared_image")
+was a CATEGORY ERROR in this plan and the design spec, caught by the Task-3 scout and
+verified: `native_prepared_image::prepare` + `native_exec_capsule` are the DARWIN execve
+*self-reexec transport* (hard-gated `cfg(macos,aarch64)`), NOT a shared ELF loader —
+`native_freebsd.rs` never duplicated them (0 refs). The REAL dedup, maintainer-approved
+on the scout's finding: FreeBSD's loader hand-rolls ELF loading (`Elf::parse` +
+`map_one_elf` + hand-mmap in `parse_loadable_elf`/`load_static_pie`/`map_one_elf`),
+while Darwin uses the shared `carrick_mem::AddressSpace` API
+(`load_elf_bytes_with_reader_at_pie_base_without_runtime_regions` + `with_native_vdso` +
+`with_linux_initial_stack_page_size` — native_darwin.rs:663/681/740/875). Make FreeBSD
+adopt AddressSpace, deleting `map_one_elf` and the hand-rolled loading.
 
-- [ ] Baseline (box suite + LTP). Adopt; iterate on box. macOS + box green; LTP == baseline. Metrics: native_freebsd.rs delta. Commit `refactor(runtime): adopt shared prepared-image + exec-capsule on freebsd`.
+**Files:** `native_freebsd.rs` (`parse_loadable_elf`/`load_static_pie`/`map_one_elf`/
+`load_execve_image` → `AddressSpace::load_elf_bytes...` + `with_native_vdso` +
+`with_linux_initial_stack*`, mirroring native_darwin.rs's usage), delete the hand-rolled
+loader.
+
+**Behavior-adjacent — the risk:** the guest's initial stack/auxv/vDSO/vvar layout and the
+PIE base must be BYTE-identical after adoption (a shifted auxv or stack breaks the guest
+silently). LTP-equivalence is the guard; the initial-stack/entry-state must match exactly.
+
+- [ ] **Step 1 (SCOUT + STOP GATE):** Inventory FreeBSD's hand-rolled loader
+  (`map_one_elf`/`load_static_pie`/`parse_loadable_elf`/`build_initial_stack`) vs the
+  AddressSpace API Darwin uses. Confirm x86-vs-aarch64 differences (R_X86_64_RELATIVE
+  relocs, x86 vDSO/vvar/sigreturn-trampoline, identity-mapping model) are all expressible
+  through the SHARED AddressSpace API (which already serves x86 elsewhere? check
+  native_freebsd.rs:10371's `with_linux_initial_stack` use). If AddressSpace can't express
+  a FreeBSD-x86-specific loader step without an aarch64-affecting change → STOP/BLOCKED with
+  the specific step. Small additive AddressSpace extension is OK only with aarch64-unaffected
+  proof. Capture box baseline (native_freebsd_x86 suite + LTP).
+- [ ] **Step 2:** Adopt per the scout; iterate on box (native_freebsd.rs box-only compile).
+- [ ] **Step 3:** macOS `cargo test -p carrick-runtime --lib` (+ `--lib dsr` aarch64 pin if
+  AddressSpace/carrick-mem touched — identical) + clippy; FreeBSD box full suite + LTP ==
+  baseline (programmatic diff — a stack/auxv shift shows here). Box leg before commit; restore
+  box; STOP/BLOCKED if box dirty.
+- [ ] **Step 4:** Metrics: native_freebsd.rs delta (deleting map_one_elf + hand-rolled load).
+  Commit `refactor(runtime): freebsd loader adopts carrick_mem::AddressSpace`. (Box wip OK; squash to one.)
 
 ## Task 4: Cross-process futex host seam
 
