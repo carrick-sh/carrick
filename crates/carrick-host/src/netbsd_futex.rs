@@ -1,10 +1,20 @@
 //! NetBSD cross-process futex via `__futex(2)`.
 //!
-//! NetBSD keys cross-process futexes through shared objects: file-backed
-//! `MAP_SHARED` mappings wake across `fork`, while `MAP_SHARED|MAP_ANON` stores
-//! are coherent but `FUTEX_WAKE` finds no waiter in the child. A NetBSD runtime
-//! shared aperture must therefore use a file-backed shared mapping if it wants
-//! this primitive for guest shared futexes.
+//! NetBSD keys cross-process futexes by the backing uvm object, so a
+//! `FUTEX_WAKE` reaches a waiter parked in a forked peer whenever both processes
+//! share that object. This holds for BOTH file-backed `MAP_SHARED` mappings AND
+//! `MAP_SHARED|MAP_ANON` mappings: an anonymous `MAP_SHARED` page shares its uvm
+//! object across `fork`, so a cross-process wake on it works. This was verified
+//! by a box probe on NetBSD 10.1 (both directions, 3/3 iterations, wake returned
+//! the woken count) — see
+//! `docs/superpowers/specs/2026-07-25-netbsd-primitives-grounding.md` §3 and the
+//! passing cross-process test in `carrick-native-netbsd/src/futex.rs`.
+//!
+//! (An earlier revision of this comment asserted that anon `MAP_SHARED` stores
+//! are coherent but that `FUTEX_WAKE` "finds no waiter in the child"; the §3
+//! probe refuted that on NetBSD 10.1. The code below takes a bare `host_addr`
+//! and is agnostic to how the word is backed, so nothing here ever depended on
+//! the retracted claim.)
 //!
 //! Mirrors `ulock.rs`/`umtx.rs`'s `-errno` contract so BSD-family callers can
 //! select the host primitive without learning the raw syscall ABI.
