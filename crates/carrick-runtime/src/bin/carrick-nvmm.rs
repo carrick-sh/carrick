@@ -72,6 +72,11 @@ fn main() {
                 // run-oci is a container-shaped dev driver: model docker's
                 // launch-time default seccomp policy like `carrick run`.
                 seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
+                // This bin drives the NVMM VMM backend, so it selects the VMM
+                // exec path; the native page profile is irrelevant to the VMM
+                // dispatcher and takes the default.
+                exec_backend: carrick_spec::ExecBackendRequest::Vmm,
+                native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             };
             match carrick_runtime::runtime::run_oci(&spec) {
                 Ok(result) => {
