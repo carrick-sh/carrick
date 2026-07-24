@@ -423,10 +423,13 @@ unsafe impl Send for TranslationCache {}
 // hold no shared mutable state; write windows are per-thread) -- so it
 // cannot race another thread on this struct's memory. So concurrent
 // `&self` reads across threads never race a writer, and never race each
-// other (plain reads of the same memory are data-race-free). Direct-link
-// patches into the JIT buffer's *contents* (as opposed to these struct
-// fields) still go through `AtomicU32` stores with `Release` ordering plus
-// an icache flush, unchanged by this impl and only ever issued under the
+// other (plain reads of the same memory are data-race-free). A second
+// consumer, x86's `TranslationCache::from_region` caches, are not behind an
+// RwLock; their soundness rests on exclusive per-thread ownership (one
+// thread owns each slice, enforced by the platform's thread architecture).
+// Direct-link patches into the JIT buffer's *contents* (as opposed to these
+// struct fields) still go through `AtomicU32` stores with `Release` ordering
+// plus an icache flush, unchanged by this impl and only ever issued under the
 // same write lock.
 unsafe impl Sync for TranslationCache {}
 

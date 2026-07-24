@@ -26,8 +26,8 @@
 //! Two small host-specific behaviors remain: a fork-coherent shared-futex
 //! waiter key (FreeBSD `kern.proc.vmmap`; Darwin has no equivalent) and the
 //! extra `mmap(2)` flag bit that makes a `MAP_FIXED` request atomically fail
-//! on collision instead of silently replacing bytes (FreeBSD/NetBSD
-//! `MAP_EXCL`; Darwin has none). Both are passed in by value via
+//! on collision instead of silently replacing bytes (FreeBSD `MAP_EXCL`;
+//! Darwin/NetBSD have no such flag). Both are passed in by value via
 //! [`IdentityHostSeam`] rather than threaded as a second generic parameter —
 //! `IdentityGuestMemory<A>` needing two unrelated generic axes (mutation
 //! authority AND host behavior) for no shared reason would be needless

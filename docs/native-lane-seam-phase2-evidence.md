@@ -146,18 +146,20 @@ action; `git status --short` empty, confirmed after the restore.
 | after Task 4 (`2cf1eba4`, carry-ins, final HEAD) | **16,593** | −1 |
 | **Phase-2 net** | | **−3,094 (−15.7%)** |
 
-Target was ≤16.5K (16,500). Actual final: **16,593 — 93 lines over the
-target (0.56%).** Not hit exactly, but the substance target (shrink the
-monolith by the identity-memory + cache moves) was: Task 2 alone removed
-3,174 lines by moving `IdentityGuestMemory` + its whole closure to a shared
-crate. Task 3's cache adoption added back +81 net (a deliberate trade —
-typed `CacheError`/recycle-retry handling and doc comments explaining the
-KEEP-LANE boundary are more verbose than the ~15-line hand-rolled
+Target was ≤16,000 (and −3.5K line reduction or better per the File Structure
+section). Actual final: **16,593 — 593 lines over ≤16K.** Achieved −3,094
+lines vs −3,500 chartered (406 short). Not hit exactly, but the substance
+target (shrink the monolith by the identity-memory + cache moves) was: Task 2
+alone removed 3,174 lines by moving `IdentityGuestMemory` + its whole closure
+to a shared crate. Task 3's cache adoption added back +81 net (a deliberate
+trade — typed `CacheError`/recycle-retry handling and doc comments explaining
+the KEEP-LANE boundary are more verbose than the ~15-line hand-rolled
 bump-pointer check + raw write they replaced; see Task 3's report §Metrics).
 Task 4 was net −1 (small correctness fixes + the mremap dead-code removal
-roughly offset the cfg-gating additions elsewhere). The 93-line miss is
-attributable almost entirely to that one deliberate Task-3 trade, not scope
-creep.
+roughly offset the cfg-gating additions elsewhere). The 593-line miss is
+attributable to Task 3's deliberate +81-line trade, the 9 deferred trailing
+tests (would have reduced the count further), and plan-estimate optimism, not
+scope creep.
 
 ### `native_darwin.rs` — confirmed untouched (the aarch64-lane-stability pin)
 
@@ -350,9 +352,11 @@ plan's own Phase-3 pointer and this task's own findings:
   the crate boundary (part of the box's 777-pass run), satisfying the
   brief's "runtime consumers pin behavior" bar, but represent unclaimed
   additional cleanup for a future pass.
-- **The `≤16.5K` line-count target was missed by 93 lines** (16,593 actual)
-  — see §3 above; attributable to Task 3's deliberate typed-error-handling
-  trade, not scope creep or an incomplete move.
+- **The `≤16K` line-count target was missed by 593 lines** (16,593 actual)
+  — see §3 above; achieved −3,094 vs −3,500 chartered; attributable to Task
+  3's deliberate typed-error-handling trade (+81 lines), the 9 deferred
+  trailing tests, and plan-estimate optimism, not scope creep or an incomplete
+  move.
 - **The Intel-mac cfg-proxy minor.** Task 4d's `vdso_enabled_for_debug`
   re-export gate is `cfg(any(feature = "platform-macos", all(target_os =
   "macos", target_arch = "aarch64")))` — a deliberate "union of both real

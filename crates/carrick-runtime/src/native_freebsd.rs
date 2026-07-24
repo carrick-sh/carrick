@@ -16577,9 +16577,11 @@ mod tests {
         }
     }
 
-    /// Drift-pin test: ensure carrick_dsr_x86::X8664Isa::USER_VA_END_EXCLUSIVE
-    /// never diverges from the local X86_64_USER_END_EXCLUSIVE constant.
-    /// Both must be kept in sync; Phase 2 will delete the local one.
+    /// Drift-pin test: ensure native_freebsd's use of
+    /// carrick_dsr::identity_memory::X86_64_USER_END_EXCLUSIVE (the x86-64
+    /// canonical-VA boundary) remains synchronized with
+    /// carrick_dsr_x86::X8664Isa::USER_VA_END_EXCLUSIVE. Both are kept as a
+    /// shared plain const in carrick_dsr::identity_memory per Phase 2's ruling.
     #[test]
     fn x86_64_user_va_end_exclusive_constant_matches_dsr_x86() {
         use carrick_dsr::lane::GuestIsa;
