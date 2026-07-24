@@ -90,6 +90,9 @@ pub(crate) type HostNativeLane = DarwinAarch64Lane;
 #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 #[allow(dead_code)]
 pub(crate) type HostNativeLane = FreebsdX8664Lane;
+#[cfg(all(target_os = "netbsd", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub(crate) type HostNativeLane = NetbsdX8664Lane;
 
 /// The Darwin/aarch64 native lane: AArch64 guest ISA, Darwin host JIT
 /// authority (`carrick-native-darwin`).
@@ -115,6 +118,21 @@ impl carrick_dsr::lane::NativeLane for FreebsdX8664Lane {
     type Host = carrick_native_freebsd::FreebsdHost;
 }
 
+/// The NetBSD/x86_64 native lane: x86_64 guest ISA, NetBSD host JIT
+/// authority (`carrick-native-netbsd`). Same guest ISA as the FreeBSD lane —
+/// the two share the `native_freebsd` run loop over a bounded host-ops seam;
+/// only the [`carrick_dsr::lane::NativeHost`] impl (JIT + fault + `__futex`)
+/// differs.
+#[cfg(all(target_os = "netbsd", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub(crate) struct NetbsdX8664Lane;
+
+#[cfg(all(target_os = "netbsd", target_arch = "x86_64"))]
+impl carrick_dsr::lane::NativeLane for NetbsdX8664Lane {
+    type Isa = carrick_dsr_x86::X8664Isa;
+    type Host = carrick_native_netbsd::NetbsdHost;
+}
+
 /// Fallback message for a build where neither known native lane's `cfg`
 /// matches (e.g. Linux/KVM). Nothing calls the native facade from such a
 /// build today — `execute.rs`/`runtime.rs` are macOS-only files and the
@@ -124,7 +142,7 @@ impl carrick_dsr::lane::NativeLane for FreebsdX8664Lane {
 fn no_native_lane_wired() -> RuntimeError {
     RuntimeError::Unsupported(
         "native execution requested on a host with no wired NativeLane \
-         (only macOS/aarch64 and FreeBSD/x86_64 are wired)"
+         (only macOS/aarch64, FreeBSD/x86_64, and NetBSD/x86_64 are wired)"
             .to_string(),
     )
 }
@@ -158,7 +176,10 @@ where
         plan,
     );
 
-    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_os = "freebsd", target_os = "netbsd"),
+        target_arch = "x86_64"
+    ))]
     {
         let _ = (
             path,
@@ -221,7 +242,10 @@ where
     // or a resolved `ExecutionPlan` (it is the same function
     // `run_dispatch_native` below forwards to); drop the two macOS-shaped
     // params rather than inventing FreeBSD-side plumbing for them.
-    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_os = "freebsd", target_os = "netbsd"),
+        target_arch = "x86_64"
+    ))]
     {
         let _ = (debug_state_path, plan);
         return crate::native_freebsd::run_static_x86_elf(path, dispatcher, argv, env, max_traps);
@@ -246,7 +270,10 @@ where
 /// `lib.rs`'s `run_elf_native_dispatch_with_process` reaches into the native
 /// backend. FreeBSD/x86_64-only: see the module doc for why this does not
 /// carry a Darwin arm.
-#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_os = "freebsd", target_os = "netbsd"),
+    target_arch = "x86_64"
+))]
 pub(crate) fn run_dispatch_native<A, E>(
     path: &Path,
     dispatcher: SyscallDispatcher,
@@ -265,7 +292,10 @@ where
 /// `lib.rs`'s `run_oci_with_engine` reaches into the native backend for its
 /// `ExecutionBackend::Native` early return. FreeBSD/x86_64-only: see the
 /// module doc for why this does not carry a Darwin arm.
-#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_os = "freebsd", target_os = "netbsd"),
+    target_arch = "x86_64"
+))]
 pub(crate) fn run_dispatch_native_bytes(
     bytes: &[u8],
     dispatcher: SyscallDispatcher,
@@ -286,7 +316,8 @@ mod tests {
     /// type, and it either resolves on a lane host or does not exist at all.
     #[cfg(any(
         all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "freebsd", target_arch = "x86_64")
+        all(target_os = "freebsd", target_arch = "x86_64"),
+        all(target_os = "netbsd", target_arch = "x86_64")
     ))]
     #[allow(dead_code)]
     fn _assert_host_native_lane_resolves() {
@@ -302,6 +333,14 @@ mod tests {
     /// source text of the three files and fails the moment any of them
     /// reintroduces a direct call, reopening the M0.8 gap this facade
     /// exists to close.
+    ///
+    /// This covers the NetBSD/x86_64 wiring too: `native_freebsd.rs` is the
+    /// SHARED BSD run loop (FreeBSD + NetBSD run through the same file over the
+    /// host-ops seam — see `native_freebsd`'s `#[cfg(any(freebsd, netbsd))]`),
+    /// so the `native_freebsd::run_` check already forbids a direct NetBSD-lane
+    /// call. There is no separate `native_netbsd` run module — NetBSD's host
+    /// glue is the external `carrick_native_netbsd` crate (JIT/fault/futex), not
+    /// a run-loop entry — so the two prefixes below are the complete set.
     #[test]
     fn native_entry_points_route_only_through_the_facade() {
         let sources: [(&str, &str); 3] = [

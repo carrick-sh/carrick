@@ -128,6 +128,12 @@ fn resolve_execution_plan_for_request_for_host(
                 (HostOs::FreeBsd, Platform::Amd64) => {
                     x86_native_plan(native_page_profile, host_page_size)
                 }
+                // NetBSD/x86_64 is the same-ISA native lane as FreeBSD/x86_64:
+                // x86_64 is natively 4 KiB (== the Linux page size) so it shares
+                // the exact identity-map plan with no page-profile knob.
+                (HostOs::NetBsd, Platform::Amd64) => {
+                    x86_native_plan(native_page_profile, host_page_size)
+                }
                 (os, isa) => Err(RuntimeError::Unsupported(format!(
                     "no native execution lane for {os:?}/{isa:?} host; pass --exec-backend vmm to request the platform VMM"
                 ))),
@@ -391,6 +397,49 @@ mod tests {
                 NativePageProfileRequest::Native16k,
             ),
             caps(HostOs::FreeBsd, Platform::Amd64),
+            DEFAULT_LINUX_PAGE_SIZE,
+        )
+        .expect_err("no page-profile knob on the x86 lane");
+        assert!(matches!(
+            err,
+            RuntimeError::Unsupported(message) if message.contains("no page-profile knob")
+        ));
+    }
+
+    #[test]
+    fn netbsd_amd64_lane_resolves_the_native_identity_plan() {
+        // NetBSD/amd64 is the same-ISA native lane as FreeBSD/amd64:
+        // `--exec-backend native` resolves the identical 4 KiB identity plan
+        // (no page-profile knob), never the VMM.
+        let plan = resolve_execution_plan_for_host(
+            &spec_with_platform(
+                Platform::Amd64,
+                ExecBackendRequest::Native,
+                NativePageProfileRequest::Auto,
+            ),
+            caps(HostOs::NetBsd, Platform::Amd64),
+            DEFAULT_LINUX_PAGE_SIZE,
+        )
+        .expect("netbsd/amd64 native lane resolves a plan");
+
+        assert_eq!(plan.backend, ExecutionBackend::Native);
+        assert_eq!(plan.page_geometry.host_page_size, DEFAULT_LINUX_PAGE_SIZE);
+        assert_eq!(plan.page_geometry.linux_page_size, DEFAULT_LINUX_PAGE_SIZE);
+        // The identity driver needs no native page geometry.
+        assert_eq!(plan.page_geometry.native_geometry(), None);
+    }
+
+    #[test]
+    fn netbsd_amd64_native_rejects_a_page_profile_knob() {
+        // Same as the FreeBSD twin: x86_64 is natively 4 KiB, so a non-Auto
+        // native page-profile request is refused, not ignored.
+        let err = resolve_execution_plan_for_host(
+            &spec_with_platform(
+                Platform::Amd64,
+                ExecBackendRequest::Native,
+                NativePageProfileRequest::Native16k,
+            ),
+            caps(HostOs::NetBsd, Platform::Amd64),
             DEFAULT_LINUX_PAGE_SIZE,
         )
         .expect_err("no page-profile knob on the x86 lane");
