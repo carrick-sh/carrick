@@ -1963,7 +1963,10 @@ impl HostAliasTransactions {
         }
     }
 
-    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_os = "freebsd", target_os = "netbsd"),
+        target_arch = "x86_64"
+    ))]
     fn begin_dispatch_until(
         self: &Arc<Self>,
         deadline: std::time::Instant,
@@ -2432,7 +2435,10 @@ impl SyscallDispatcher {
         self.host_alias_transactions.begin_dispatch()
     }
 
-    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_os = "freebsd", target_os = "netbsd"),
+        target_arch = "x86_64"
+    ))]
     pub(crate) fn begin_host_alias_dispatch_until(
         &self,
         deadline: std::time::Instant,
@@ -3654,7 +3660,10 @@ impl SyscallDispatcher {
     /// today, so it is otherwise unreachable — same target-gating rationale as
     /// `carrick-dsr-x86`'s Cargo dependency edge.
     #[cfg_attr(
-        not(all(target_os = "freebsd", target_arch = "x86_64")),
+        not(all(
+            any(target_os = "freebsd", target_os = "netbsd"),
+            target_arch = "x86_64"
+        )),
         allow(dead_code)
     )]
     pub(crate) fn identity_fast_path_word(&self) -> Option<&std::sync::atomic::AtomicU32> {

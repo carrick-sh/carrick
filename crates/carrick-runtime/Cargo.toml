@@ -133,6 +133,11 @@ carrick-spec = { path = "../carrick-spec" }
 [target.'cfg(target_os = "freebsd")'.dependencies]
 carrick-native-freebsd = { path = "../carrick-native-freebsd" }
 
+# The real NetBSD native-lane host layer (dual-mapped W^X JIT + fault shim +
+# __futex(2) cross-process futex); target-selected like the FreeBSD twin above.
+[target.'cfg(target_os = "netbsd")'.dependencies]
+carrick-native-netbsd = { path = "../carrick-native-netbsd" }
+
 # The real Darwin native-lane host layer (MAP_JIT W^X JIT + the C trap/kick
 # shim, csrc/native_darwin.c); selected by target like the FreeBSD twin above.
 # Compiles to a real MAP_JIT impl on aarch64 and a fail-closed stub on any
