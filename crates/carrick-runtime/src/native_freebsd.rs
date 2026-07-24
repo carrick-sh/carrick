@@ -55,7 +55,16 @@ use carrick_guest_mem::RepointPrivateError;
 use carrick_guest_mem::{GuestMemory, GuestVa, MemoryError, X8664SyscallFrame};
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_hal::{GuestArch, Reg, RegAccess};
-use carrick_native_freebsd::{FreebsdHost, FreebsdHostJit, active_host_jit, fault};
+// The native-lane host layer, selected by target so the run loop below is one
+// shared body over a bounded host-ops seam (`LaneHost`/`LaneHostJit` + the
+// `fault` shim + `active_host_jit`). FreeBSD and NetBSD (added at the re-gate)
+// each supply their own crate; every host primitive the loop needs is reached
+// through this alias, `LaneHost`'s `NativeHost` methods, or the `futex` module
+// alias below.
+#[cfg(target_os = "freebsd")]
+use carrick_native_freebsd::{
+    FreebsdHost as LaneHost, FreebsdHostJit as LaneHostJit, active_host_jit, fault,
+};
 use goblin::elf::Elf;
 use goblin::elf::header::{EM_X86_64, ET_DYN, ET_EXEC};
 use goblin::elf::program_header::PT_LOAD;
@@ -163,7 +172,7 @@ fn reserve_fixed_rw(
         libc::PROT_READ | libc::PROT_WRITE,
         Some(base),
         reservation,
-        FreebsdHost::exclusive_fixed_map_flag(),
+        LaneHost::exclusive_fixed_map_flag(),
     );
     if p == libc::MAP_FAILED.cast() {
         return Err(RuntimeError::Unsupported(format!(
@@ -214,18 +223,28 @@ const ARCH_GET_GS: u64 = 0x1004;
 /// `EINVAL`, as a negated Linux errno return.
 const NEG_EINVAL: i64 = -22;
 
-#[cfg(test)]
+// FreeBSD-welded (Task 3a, run-path review F1): this module reaches into
+// `carrick_native_freebsd::futex` internals (`SYS_UMTX_OP`/`UMTX_OP_WAKE`/
+// `waiter_parked_count`) and the FreeBSD TSC helpers, so it is gated to the
+// FreeBSD lane. On FreeBSD `all(test, freebsd)` == `test` (byte-identical run);
+// on NetBSD it is absent, keeping the shared run loop's `cargo test`/
+// `--all-targets` compilable. Porting the OS-agnostic tests to NetBSD is a
+// red-listed follow-on.
+#[cfg(all(test, target_os = "freebsd"))]
 mod identity_raw_range_tests {
     use super::{
         NativeIdentityMemory, PublishedFaultEntry, X86GatewayX87Witness, calibrate_x86_vvar_clock,
-        exclude_vfork_shared_ranges, host_clock_ns, identity_checked_fetch_x86_instruction,
-        identity_host_seam, normalize_x86_gateway_x87_fip, parse_loadable_elf,
-        recover_x86_fault_snapshot, tsc_ns,
+        exclude_vfork_shared_ranges, identity_checked_fetch_x86_instruction, identity_host_seam,
+        normalize_x86_gateway_x87_fip, parse_loadable_elf, recover_x86_fault_snapshot,
     };
+    // `host_clock_ns`/`tsc_ns` moved to `carrick_native_freebsd::tsc` with the
+    // TSC sysctl block (the host-ops seam); `calibrate_x86_vvar_clock` stays a
+    // thin `super` wrapper over `NativeHost::vdso_tsc_calibration`.
     use carrick_native_freebsd::futex::{
         SYS_UMTX_OP, UMTX_OP_WAKE, init_shared_waiter_table, shared_wait, shared_wake,
         waiter_parked_count,
     };
+    use carrick_native_freebsd::tsc::{host_clock_ns, tsc_ns};
     // These moved to `carrick-dsr::identity_memory` (Phase 2 of the native-lane
     // seam plan); the census/reset pair is `test-hooks`-gated there, reachable
     // here via carrick-runtime's own `[dev-dependencies]` re-declaration of
@@ -1248,8 +1267,8 @@ type NativeIdentityMemory = IdentityGuestMemory<ExecutableEpoch>;
 /// itself (see that module's doc for why).
 fn identity_host_seam() -> IdentityHostSeam {
     IdentityHostSeam {
-        shared_futex_waiter_key: FreebsdHost::shared_futex_waiter_key,
-        exclusive_fixed_map_flag: FreebsdHost::exclusive_fixed_map_flag(),
+        shared_futex_waiter_key: LaneHost::shared_futex_waiter_key,
+        exclusive_fixed_map_flag: LaneHost::exclusive_fixed_map_flag(),
     }
 }
 
@@ -6375,93 +6394,17 @@ struct X86VvarClock {
     monotonic_off_ns: u64,
 }
 
-fn freebsd_sysctl_i32(name: &std::ffi::CStr) -> Option<i32> {
-    let mut value = 0i32;
-    let mut len = std::mem::size_of::<i32>();
-    // SAFETY: `name` is NUL-terminated; output points to a writable i32 and
-    // `len` advertises its exact size.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            (&mut value as *mut i32).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (rc == 0 && len == std::mem::size_of::<i32>()).then_some(value)
-}
-
-fn tsc_vdso_is_safe(invariant_tsc: i32, smp_tsc: i32) -> bool {
-    invariant_tsc != 0 && smp_tsc != 0
-}
-
-fn freebsd_tsc_vdso_is_safe() -> bool {
-    let invariant = freebsd_sysctl_i32(c"kern.timecounter.invariant_tsc").unwrap_or(0);
-    let smp = freebsd_sysctl_i32(c"kern.timecounter.smp_tsc").unwrap_or(0);
-    tsc_vdso_is_safe(invariant, smp)
-}
-
-fn freebsd_tsc_frequency() -> Option<u64> {
-    let mut frequency = 0u64;
-    let mut len = std::mem::size_of::<u64>();
-    // SAFETY: the name is NUL-terminated; output points to a writable u64 and
-    // `len` advertises its exact size. FreeBSD exports this on amd64 when TSC
-    // is available, independently of the selected host timecounter.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"machdep.tsc_freq".as_ptr(),
-            (&mut frequency as *mut u64).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (rc == 0 && len == std::mem::size_of::<u64>() && frequency != 0).then_some(frequency)
-}
-
-fn host_clock_ns(clock: libc::clockid_t) -> Option<u64> {
-    let mut value = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `value` is a valid output timespec.
-    (unsafe { libc::clock_gettime(clock, &mut value) } == 0).then(|| {
-        (value.tv_sec as u64)
-            .wrapping_mul(1_000_000_000)
-            .wrapping_add(value.tv_nsec as u64)
-    })
-}
-
-fn tsc_ns(tsc: u64, frequency: u64) -> u64 {
-    ((tsc as u128 * 1_000_000_000u128) / frequency as u128) as u64
-}
-
-fn tsc_clock_offset(clock: libc::clockid_t, frequency: u64) -> Option<u64> {
-    // Bracket clock_gettime with TSC reads and use their midpoint. This bounds
-    // calibration error to half the host call latency while retaining the exact
-    // frequency FreeBSD reports for this virtual/physical CPU.
-    let before = unsafe { std::arch::x86_64::_rdtsc() };
-    let clock_ns = host_clock_ns(clock)?;
-    let after = unsafe { std::arch::x86_64::_rdtsc() };
-    let midpoint = before.wrapping_add(after.wrapping_sub(before) / 2);
-    Some(clock_ns.wrapping_sub(tsc_ns(midpoint, frequency)))
-}
-
 fn calibrate_x86_vvar_clock() -> Option<X86VvarClock> {
-    // A frequency alone does not make TSC a valid clocksource. FreeBSD guests
-    // commonly expose `machdep.tsc_freq` while selecting kvmclock and marking
-    // TSC non-invariant/non-SMP-safe; those counters can move backwards after
-    // a host-vCPU migration. Leave frequency zero in that case so the vDSO's
-    // built-in Linux syscall fallback supplies coherent host-clock semantics.
-    if !freebsd_tsc_vdso_is_safe() {
-        return None;
-    }
-    let frequency = freebsd_tsc_frequency()?;
+    // The FreeBSD-welded TSC-safety sysctls + clock_gettime bracketing moved to
+    // `carrick_native_freebsd::tsc` behind the `NativeHost::vdso_tsc_calibration`
+    // host-ops seam (NetBSD lacks those sysctls and returns `None`, selecting the
+    // vDSO's syscall fallback). This reconstructs the lane-neutral tuple into the
+    // run loop's `X86VvarClock`.
+    let (frequency, realtime_off_ns, monotonic_off_ns) = LaneHost::vdso_tsc_calibration()?;
     Some(X86VvarClock {
         frequency,
-        realtime_off_ns: tsc_clock_offset(libc::CLOCK_REALTIME, frequency)?,
-        monotonic_off_ns: tsc_clock_offset(libc::CLOCK_MONOTONIC, frequency)?,
+        realtime_off_ns,
+        monotonic_off_ns,
     })
 }
 
@@ -6559,7 +6502,7 @@ fn map_one_elf(
                 libc::PROT_NONE,
                 None,
                 "ELF reservation",
-                FreebsdHost::exclusive_fixed_map_flag(),
+                LaneHost::exclusive_fixed_map_flag(),
             )?;
             let bias = candidate.mapping(index).base - lo;
             (index, bias)
@@ -6571,7 +6514,7 @@ fn map_one_elf(
                 libc::PROT_NONE,
                 Some(lo),
                 "fixed ELF reservation",
-                FreebsdHost::exclusive_fixed_map_flag(),
+                LaneHost::exclusive_fixed_map_flag(),
             )?,
             0,
         ),
@@ -6684,7 +6627,7 @@ fn load_static_pie(
             libc::PROT_READ | libc::PROT_WRITE,
             None,
             "guest stack",
-            FreebsdHost::exclusive_fixed_map_flag(),
+            LaneHost::exclusive_fixed_map_flag(),
         )?;
         let stack = candidate.mapping(stack_index).base;
         let scratch_index = candidate.map_anonymous(
@@ -6693,7 +6636,7 @@ fn load_static_pie(
             libc::PROT_READ | libc::PROT_WRITE,
             None,
             "signal scratch",
-            FreebsdHost::exclusive_fixed_map_flag(),
+            LaneHost::exclusive_fixed_map_flag(),
         )?;
         let scratch = candidate.mapping(scratch_index).base;
 
@@ -6717,7 +6660,7 @@ fn load_static_pie(
                 libc::PROT_READ | libc::PROT_WRITE,
                 vvar_base,
                 "vvar",
-                FreebsdHost::exclusive_fixed_map_flag(),
+                LaneHost::exclusive_fixed_map_flag(),
             )? {
                 Some(vvar_index) => match candidate.map_optional_fixed(
                     NativeMappingOperation::Vdso,
@@ -6725,7 +6668,7 @@ fn load_static_pie(
                     libc::PROT_READ | libc::PROT_WRITE,
                     vdso_base,
                     "vDSO",
-                    FreebsdHost::exclusive_fixed_map_flag(),
+                    LaneHost::exclusive_fixed_map_flag(),
                 )? {
                     Some(vdso_index) => {
                         let vvar_address = candidate.mapping(vvar_index).base;
@@ -7506,7 +7449,7 @@ struct SharedRun {
     reporter: Arc<CompatReporter>,
     image: std::sync::RwLock<Arc<LoadedImage>>,
     region: JitRegion,
-    jit: FreebsdHostJit,
+    jit: LaneHostJit,
     max_traps: usize,
     /// Free JIT-slice offsets (`i * JIT_SLICE_LEN`). Popped on spawn, pushed
     /// back on thread exit.
@@ -8172,7 +8115,7 @@ fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String>
         reporter: Arc::clone(&parent.reporter),
         image: std::sync::RwLock::new(parent.current_image()),
         region,
-        jit: FreebsdHostJit,
+        jit: LaneHostJit,
         max_traps: parent.max_traps,
         free_slices: std::sync::Mutex::new(free_slices),
         threads: std::sync::Mutex::new(Vec::new()),
@@ -8272,7 +8215,7 @@ pub(crate) fn run_static_x86_elf_bytes(
         ));
     }
 
-    let jit = FreebsdHostJit;
+    let jit = LaneHostJit;
     if let Err(error) = jit.supported() {
         let primary = RuntimeError::Unsupported(format!("host JIT unsupported: {error:?}"));
         return Err(rollback_initial_native_resources(
@@ -8377,21 +8320,16 @@ pub(crate) fn run_static_x86_elf_bytes(
     // can report how many waiters it woke (Linux semantics; native _umtx_op does
     // not). Pre-fork so every descendant maps the same physical pages.
     carrick_native_freebsd::futex::init_shared_waiter_table();
-    // Act as the guest's PID-namespace init: become a FreeBSD reaper so an
-    // orphaned guest grandchild (its middle parent exited) REPARENTS to this
-    // process instead of host init, letting the guest's wait4(-1) reap it —
-    // pid_namespaces(7) "pid 1 reaps orphans" (`pidnsorphanreap`), and the
-    // reparent target for PR_SET_CHILD_SUBREAPER (`childsubreaper`). Idempotent:
-    // a second acquire returns EBUSY, ignored.
-    // SAFETY: procctl with a valid cmd + NULL data.
-    unsafe {
-        libc::procctl(
-            libc::P_PID,
-            0,
-            libc::PROC_REAP_ACQUIRE,
-            std::ptr::null_mut(),
-        );
-    }
+    // Act as the guest's PID-namespace init so an orphaned guest grandchild (its
+    // middle parent exited) REPARENTS to this process instead of host init,
+    // letting the guest's wait4(-1) reap it — pid_namespaces(7) "pid 1 reaps
+    // orphans" (`pidnsorphanreap`), and the reparent target for
+    // PR_SET_CHILD_SUBREAPER (`childsubreaper`). Host-glue behind the seam:
+    // FreeBSD acquires a `procctl(PROC_REAP_ACQUIRE)` subreaper; NetBSD has no
+    // equivalent, so its default no-op leaves orphans reparenting to host init
+    // (guest wait4 of a grandchild then returns ECHILD — a scoped, red-listed
+    // capability gap, not a crash).
+    LaneHost::become_guest_reaper();
 
     let free_slices: Vec<usize> = (0..JIT_SLICE_COUNT).map(|i| i * JIT_SLICE_LEN).collect();
     // Normal SharedRun cleanup takes ownership only after every pre-run setup
@@ -8963,7 +8901,7 @@ fn run_x86_thread(
     let mut host_registration = NativeHostThreadRegistration::new(&active, tid);
     // Mutable so an in-place `execve` can retire this and swap in the new image.
     let mut image = shared.current_image();
-    let jit = FreebsdHostJit;
+    let jit = LaneHostJit;
     let max_traps = shared.max_traps;
 
     let (snapshot, guest_fsbase, mut next) = match start {
@@ -11648,7 +11586,11 @@ thread_local! {
 }
 
 fn native_fork_gate_write(fd: i32, byte: &u8) -> libc::ssize_t {
-    #[cfg(test)]
+    // FreeBSD-welded test failpoint (Task 3a, F1): the errno injection uses
+    // `libc::__error()` (NetBSD's accessor is `libc::__errno()`), so this block
+    // is gated to the FreeBSD lane. `all(test, freebsd)` == `test` on FreeBSD
+    // (byte-identical); absent on NetBSD so the shared loop stays compilable.
+    #[cfg(all(test, target_os = "freebsd"))]
     if NATIVE_FORK_GATE_WRITE_FAILURES.with(|failures| {
         let remaining = failures.get();
         if remaining == 0 {
@@ -14482,7 +14424,7 @@ mod tests {
                 address,
                 PAGE as usize,
                 &protections,
-                FreebsdHost::exclusive_fixed_map_flag()
+                LaneHost::exclusive_fixed_map_flag()
             ),
             Err(MemoryError::HostMap(_))
         ));
@@ -14527,7 +14469,7 @@ mod tests {
                 address,
                 PAGE as usize,
                 &protections,
-                FreebsdHost::exclusive_fixed_map_flag()
+                LaneHost::exclusive_fixed_map_flag()
             ),
             Err(MemoryError::HostMap(_))
         ));
@@ -14603,7 +14545,7 @@ mod tests {
             address,
             len,
             &protections,
-            FreebsdHost::exclusive_fixed_map_flag(),
+            LaneHost::exclusive_fixed_map_flag(),
         )
         .expect("restore exact middle hole");
 
@@ -14628,7 +14570,7 @@ mod tests {
             libc::PROT_READ | libc::PROT_WRITE,
             None,
             "reset test image",
-            FreebsdHost::exclusive_fixed_map_flag(),
+            LaneHost::exclusive_fixed_map_flag(),
         )
         .expect("map reset test image");
         let base = mapping.base;
@@ -14896,7 +14838,7 @@ mod tests {
             libc::PROT_READ | libc::PROT_WRITE,
             Some(start),
             "fixed collision occupant",
-            FreebsdHost::exclusive_fixed_map_flag(),
+            LaneHost::exclusive_fixed_map_flag(),
         )
         .expect("occupy ET_EXEC range exclusively");
         // SAFETY: the occupant owns a writable byte at `start`.
@@ -14923,7 +14865,7 @@ mod tests {
             libc::PROT_READ | libc::PROT_WRITE,
             Some(crate::vdso::LINUX_VVAR_BASE),
             "vvar collision occupant",
-            FreebsdHost::exclusive_fixed_map_flag(),
+            LaneHost::exclusive_fixed_map_flag(),
         )
         .expect("occupy fixed vvar range exclusively");
         // SAFETY: the test owner holds the writable vvar-range mapping.
@@ -15001,7 +14943,7 @@ mod tests {
                 libc::PROT_READ | libc::PROT_WRITE,
                 None,
                 "drop fail-stop test",
-                FreebsdHost::exclusive_fixed_map_flag(),
+                LaneHost::exclusive_fixed_map_flag(),
             )
             .unwrap_or_else(|_| unsafe { libc::_exit(91) });
             faults.fail_next_munmap();
@@ -15025,7 +14967,7 @@ mod tests {
             libc::PROT_READ | libc::PROT_WRITE,
             None,
             "terminal teardown test",
-            FreebsdHost::exclusive_fixed_map_flag(),
+            LaneHost::exclusive_fixed_map_flag(),
         )
         .expect("map terminal teardown test image");
         let epoch = ExecutableEpoch::new();

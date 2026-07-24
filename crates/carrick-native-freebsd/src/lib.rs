@@ -22,6 +22,7 @@
 pub mod fault;
 pub mod futex;
 pub mod jit;
+pub mod tsc;
 mod waiter_key;
 
 pub use jit::FreebsdHostJit;
@@ -52,6 +53,28 @@ impl carrick_dsr::lane::NativeHost for FreebsdHost {
 
     fn exclusive_fixed_map_flag() -> i32 {
         libc::MAP_EXCL
+    }
+
+    fn become_guest_reaper() {
+        // Act as the guest's PID-namespace init: become a FreeBSD reaper so an
+        // orphaned guest grandchild (its middle parent exited) REPARENTS to this
+        // process instead of host init, letting the guest's wait4(-1) reap it —
+        // pid_namespaces(7) "pid 1 reaps orphans" (`pidnsorphanreap`), and the
+        // reparent target for PR_SET_CHILD_SUBREAPER (`childsubreaper`).
+        // Idempotent: a second acquire returns EBUSY, ignored.
+        // SAFETY: procctl with a valid cmd + NULL data.
+        unsafe {
+            libc::procctl(
+                libc::P_PID,
+                0,
+                libc::PROC_REAP_ACQUIRE,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    fn vdso_tsc_calibration() -> Option<(u64, u64, u64)> {
+        tsc::calibrate()
     }
 }
 
