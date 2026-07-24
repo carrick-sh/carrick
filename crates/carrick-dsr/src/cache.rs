@@ -388,6 +388,14 @@ pub struct TranslationCache {
     host: &'static dyn NativeHostJit,
     region: JitRegion,
     cursor: usize,
+    /// `true` for a cache built by [`Self::new`], which mapped `region`
+    /// itself and must unmap it on `Drop`. `false` for one built by
+    /// [`Self::from_region`], which BORROWS an already-mapped region owned
+    /// by some other, longer-lived reservation (e.g. one private slice of a
+    /// process-wide code cache the caller carves into several
+    /// independently-cursored regions) -- unmapping `region` on drop there
+    /// would tear down memory a sibling still owns.
+    owns_mapping: bool,
 }
 
 // SAFETY: the mapping is process-wide and contains no thread-affine pointer
@@ -457,7 +465,32 @@ impl TranslationCache {
             host,
             region,
             cursor: 0,
+            owns_mapping: true,
         })
+    }
+
+    /// Build a translation cache over a region that is ALREADY mapped and
+    /// owned elsewhere -- skips [`NativeHostJit::map_code_cache`] entirely
+    /// (no page-rounding, no fresh allocation) and starts empty (`cursor =
+    /// 0`). A new sibling to [`Self::new`], not a replacement: existing
+    /// callers of `new` are completely unaffected.
+    ///
+    /// This is the seam a lane whose guest threads do NOT yet share one
+    /// cache uses to get typed capacity/publish machinery per thread without
+    /// asking the host to map a fresh region per thread: carve one big
+    /// reservation into per-thread slices with [`JitRegion::sub_region`] and
+    /// wrap each slice in its own `TranslationCache::from_region`. Because
+    /// `region` is borrowed, NOT owned, dropping the returned cache never
+    /// unmaps it -- the caller that produced `region` keeps sole unmap
+    /// responsibility for the reservation it carved it from.
+    pub fn from_region(region: JitRegion, host: &'static dyn NativeHostJit) -> Self {
+        host.end_thread_write();
+        Self {
+            host,
+            region,
+            cursor: 0,
+            owns_mapping: false,
+        }
     }
 
     pub fn reset_after_fork_for_exec(&mut self) {
@@ -606,6 +639,14 @@ impl TranslationCache {
 impl Drop for TranslationCache {
     fn drop(&mut self) {
         self.host.end_thread_write();
+        if !self.owns_mapping {
+            // Built via `from_region`: `self.region` is a borrowed slice of
+            // someone else's longer-lived reservation. That owner (not this
+            // cache) is responsible for unmapping it, on its own schedule --
+            // typically well after this cache has been dropped and its slice
+            // recycled for a new occupant.
+            return;
+        }
         // SAFETY: dropping the cache is the single teardown point; the
         // runtime guarantees no thread still executes from or holds pointers
         // into the region (the `NativeHostJit::unmap` contract).
@@ -1133,5 +1174,117 @@ mod generation_tests {
 
     fn page_range() -> Range<GuestVa> {
         PAGE..GuestVa(PAGE.raw() + PAGE_SIZE)
+    }
+}
+
+#[cfg(test)]
+mod from_region_tests {
+    //! `TranslationCache::from_region` / `JitRegion::sub_region`: the seam a
+    //! lane whose guest threads each carve a private slice out of ONE big
+    //! process-wide reservation (the x86 native lane's per-thread JIT cache)
+    //! uses to get the same typed capacity/publish machinery `Self::new`
+    //! gives a process-wide cache, without asking the host to map a fresh
+    //! region per slice. `Self::new`'s own construction path (used
+    //! unconditionally by the aarch64 lane) is untouched by any of this --
+    //! these tests are the aarch64-non-regression pin for that claim.
+
+    use super::test_host::TEST_HOST;
+    use crate::host::NativeHostJit;
+
+    const SLICE_LEN: usize = 4096;
+    const SLICE_COUNT: usize = 3;
+
+    #[test]
+    fn from_region_reports_the_slice_capacity_not_the_parent_region() {
+        let region = TEST_HOST
+            .map_code_cache(SLICE_LEN * SLICE_COUNT)
+            .expect("map process-wide region");
+        let slice = region.sub_region(SLICE_LEN, SLICE_LEN).expect("slice 1");
+        let cache = super::TranslationCache::from_region(slice, &TEST_HOST);
+
+        assert_eq!(cache.capacity_bytes(), SLICE_LEN);
+        assert_eq!(cache.used_bytes(), 0);
+
+        // The cache never mapped anything itself and does not own `region`;
+        // dropping it here must not unmap the parent's memory (proven below,
+        // in `from_region_drop_never_unmaps_the_borrowed_region`).
+        drop(cache);
+        unsafe { TEST_HOST.unmap(&region) };
+    }
+
+    #[test]
+    fn from_region_writes_land_at_the_slices_own_offset() {
+        let region = TEST_HOST
+            .map_code_cache(SLICE_LEN * SLICE_COUNT)
+            .expect("map process-wide region");
+        let slice1 = region.sub_region(SLICE_LEN, SLICE_LEN).expect("slice 1");
+        let mut cache1 = super::TranslationCache::from_region(slice1, &TEST_HOST);
+
+        let published = cache1
+            .publish_words(&[0xd503_201f])
+            .expect("publish one word into slice 1");
+        let expected_entry = region.exec_base.as_ptr() as usize + SLICE_LEN;
+        assert_eq!(published.entry().host().raw(), expected_entry);
+        assert_eq!(cache1.used_bytes(), 4);
+
+        drop(cache1);
+        unsafe { TEST_HOST.unmap(&region) };
+    }
+
+    #[test]
+    fn from_region_drop_never_unmaps_the_borrowed_region() {
+        let region = TEST_HOST
+            .map_code_cache(SLICE_LEN * SLICE_COUNT)
+            .expect("map process-wide region");
+        let slice0 = region.sub_region(0, SLICE_LEN).expect("slice 0");
+        let mut cache0 = super::TranslationCache::from_region(slice0, &TEST_HOST);
+        let published = cache0
+            .publish_words(&[0x1234_5678, 0x9abc_def0])
+            .expect("publish two words into slice 0");
+        let entry_addr = published.entry().host().raw();
+
+        // Dropping a `from_region` cache must be a no-op on the underlying
+        // mapping -- a live sibling slice (or a future occupant of this same
+        // slice, recycled from a free-list the way the x86 native lane
+        // reuses JIT slices across guest threads) must still see valid,
+        // readable memory afterward.
+        drop(cache0);
+
+        let survived = unsafe { std::slice::from_raw_parts(entry_addr as *const u32, 2) };
+        assert_eq!(
+            survived,
+            &[0x1234_5678, 0x9abc_def0],
+            "the published bytes must survive the from_region cache's Drop"
+        );
+
+        // And a FRESH cache over the very same slice must still get a valid,
+        // writable region -- proof the memory was never unmapped out from
+        // under it.
+        let slice0_again = region.sub_region(0, SLICE_LEN).expect("re-slice slot 0");
+        let mut reused = super::TranslationCache::from_region(slice0_again, &TEST_HOST);
+        reused
+            .publish_words(&[0x1111_1111])
+            .expect("publish into the recycled slice");
+
+        unsafe { TEST_HOST.unmap(&region) };
+    }
+
+    #[test]
+    fn sub_region_rejects_a_range_that_does_not_fit() {
+        let region = TEST_HOST
+            .map_code_cache(SLICE_LEN * SLICE_COUNT)
+            .expect("map process-wide region");
+
+        assert!(region.sub_region(SLICE_LEN * SLICE_COUNT, 1).is_none());
+        assert!(region.sub_region(1, SLICE_LEN * SLICE_COUNT).is_none());
+        assert!(region.sub_region(usize::MAX, 1).is_none());
+        assert!(
+            region
+                .sub_region(SLICE_LEN * (SLICE_COUNT - 1), SLICE_LEN)
+                .is_some(),
+            "the last slice exactly fills the remaining capacity"
+        );
+
+        unsafe { TEST_HOST.unmap(&region) };
     }
 }
