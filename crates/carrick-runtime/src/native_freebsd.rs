@@ -428,25 +428,55 @@ mod identity_raw_range_tests {
                 location.wait_addr().raw(),
                 location.waiter_key(),
                 0,
-                Some(std::time::Duration::from_secs(2)),
+                // Backstop only: the re-issued parent wake below lands within a
+                // few ms of enrollment, so a healthy run never approaches this.
+                Some(std::time::Duration::from_secs(5)),
                 &|| false,
             );
             unsafe { libc::_exit(i32::from(result != 0)) };
         }
         wait_until_parked(shared_location.waiter_key());
+        // `wait_until_parked` releases on the child's waiter-count announce
+        // (`count.fetch_add`), which happens an instant BEFORE the child enrolls
+        // in the kernel umtxq. A single `_umtx_op(WAKE)` issued at that moment can
+        // race ahead of the enrollment and be physically lost, leaving the child
+        // to sleep out its whole timeout. A REAL `FUTEX_WAKE` waker is immune:
+        // the guest advances the futex word before waking, so a waiter that
+        // enrolls late re-checks `*word != value` in-kernel, returns EAGAIN, and
+        // its retry loop re-reads the word. This raw test wakes WITHOUT advancing
+        // the word — a shape real guests never produce — so it must re-issue the
+        // wake until the woken child is reaped. The first wake still snapshots and
+        // reports the one announced waiter (1).
+        let first_woken = shared_wake(
+            shared_location.wait_addr().raw(),
+            shared_location.waiter_key(),
+            1,
+        );
         assert_eq!(
+            first_woken, 1,
+            "shared wake must report the one parked waiter"
+        );
+        let mut status = 0;
+        let wake_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let reaped = unsafe { libc::waitpid(shared_child, &mut status, libc::WNOHANG) };
+            assert!(reaped >= 0, "waitpid(shared_child) failed");
+            if reaped == shared_child {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < wake_deadline,
+                "shared cross-process waiter never woke"
+            );
+            // Re-issue once the child has enrolled in the umtxq; a wake on a word
+            // nothing is parked on is a harmless no-op.
             shared_wake(
                 shared_location.wait_addr().raw(),
                 shared_location.waiter_key(),
                 1,
-            ),
-            1
-        );
-        let mut status = 0;
-        assert_eq!(
-            unsafe { libc::waitpid(shared_child, &mut status, 0) },
-            shared_child
-        );
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
 
         let private_address = address + PAGE as u64;
