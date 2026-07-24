@@ -451,9 +451,10 @@ pub fn host_mmap(
     }) {
         return match injected {
             InjectedMmapResult::Failed => {
-                // SAFETY: FreeBSD exposes the calling thread's errno through
-                // `__error`; injected host failures must carry a real errno.
-                unsafe { *libc::__error() = libc::ENOMEM };
+                // Injected host failures must carry a real errno; route through
+                // the portable errno accessor (Darwin/FreeBSD `__error`, NetBSD
+                // `__errno`, Linux `__errno_location`) rather than a per-OS deref.
+                carrick_portable::set_errno(libc::ENOMEM);
                 libc::MAP_FAILED
             }
             // Allocate a real, separately-owned mapping so exact-address
@@ -524,8 +525,9 @@ pub fn host_mprotect(
     prot: i32,
 ) -> i32 {
     if take_injected_mprotect_failure(operation) {
-        // SAFETY: FreeBSD exposes the calling thread's errno through __error.
-        unsafe { *libc::__error() = libc::EIO };
+        // Route the injected errno through the portable accessor (per-OS
+        // errno location handled by carrick-portable).
+        carrick_portable::set_errno(libc::EIO);
         return -1;
     }
     // SAFETY: callers hold the identity mapping writer for owned guest ranges.
@@ -550,11 +552,10 @@ pub fn host_munmap(address: *mut libc::c_void, len: usize) -> i32 {
     let injected_failure = false;
     // SAFETY: callers invoke this only for mappings whose ownership they hold.
     let result = if injected_failure {
+        // Route the injected errno through the portable accessor (per-OS
+        // errno location handled by carrick-portable).
         #[cfg(any(test, feature = "test-hooks"))]
-        // SAFETY: FreeBSD exposes the calling thread's errno through __error.
-        unsafe {
-            *libc::__error() = libc::EIO;
-        }
+        carrick_portable::set_errno(libc::EIO);
         -1
     } else {
         unsafe { libc::munmap(address, len) }

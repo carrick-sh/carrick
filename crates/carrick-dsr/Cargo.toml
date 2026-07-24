@@ -25,6 +25,7 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }
+carrick-portable = { path = "../carrick-portable" }
 libc.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
