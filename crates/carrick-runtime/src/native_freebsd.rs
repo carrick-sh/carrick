@@ -8212,7 +8212,6 @@ fn spawn_clone_thread(
 /// VAs), and max_traps carry over. Slice 0 is reserved for the child's main
 /// thread; guest threads it spawns take slices 1..N.
 fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String> {
-    let cache_len = JIT_SLICE_LEN * JIT_SLICE_COUNT;
     let region = match parent
         .jit
         .remap_for_fork_child(&parent.region)
@@ -8234,7 +8233,7 @@ fn fork_child_rebuild(parent: &Arc<SharedRun>) -> Result<Arc<SharedRun>, String>
             );
         }
     };
-    fault::register_code_region(region.exec_base.as_ptr() as u64, cache_len as u64);
+    fault::register_code_region(region.exec_base.as_ptr() as u64, region.capacity as u64);
 
     let tid = crate::thread::ThreadId::main_from_host_pid();
     let registry = Arc::new(crate::thread::ThreadRegistry::new(tid));
