@@ -74,39 +74,46 @@ paradigm, just one generic parameter deeper.
 **Propagation.** Genericity threads through every item that touches
 `&IdentityGuestMemory`/its epoch: `identity_checked_write_exact`,
 `identity_checked_write_sigframe` (both take `memory: &IdentityGuestMemory`),
-and — because they move to `carrick-dsr-x86`, see §0b — `IdentityXstateMemoryWriter<'a>`
-and the `ControlFlowMemory` impl. All become `<A: ExecutableMutationAuthority>`.
+and — because only the `ControlFlowMemory` impl moves to `carrick-dsr-x86` (see §0b),
+while `IdentityXstateMemoryReader`/`IdentityXstateMemoryWriter` stay in
+native_freebsd.rs — the `ControlFlowMemory` impl only. The write helpers become
+`<A: ExecutableMutationAuthority>`.
 Everything on the **read** path (`identity_checked_read_exact` and friends) is
 already epoch-free (reads only ever take `IDENTITY_HOST_MAPPING_LOCK.read()`
 directly — confirmed by grep, no `&IdentityGuestMemory` param) and needs no
 generic parameter at all.
 
-### 0b. Orphan-rule routing: two impls do NOT go to `carrick-dsr`
+### 0b. Orphan-rule routing: `ControlFlowMemory` goes to `carrick-dsr-x86`; xstate impls STAY
 
 `carrick-dsr-x86` depends on `carrick-dsr`; **`carrick-dsr` does not depend on
-`carrick-dsr-x86`** (confirmed via both crates' `Cargo.toml`). Two trait impls
-in the closure implement a `carrick-dsr-x86`-defined trait for
+`carrick-dsr-x86`** (confirmed via both crates' `Cargo.toml`). One trait impl
+in the closure implements a `carrick-dsr-x86`-defined trait for
 `IdentityGuestMemory`:
 
 - `impl cflow::ControlFlowMemory for IdentityGuestMemory` (native_freebsd.rs:8298-8339) — `cflow::ControlFlowMemory` is defined in `carrick-dsr-x86/src/cflow.rs:64`.
-- `impl X86XstateMemoryReader for IdentityXstateMemoryReader` / `impl X86XstateMemoryWriter for IdentityXstateMemoryWriter<'_>` (native_freebsd.rs:8241-8259) — both traits live in `carrick-dsr-x86`.
 
-Today these compile because `IdentityGuestMemory` is *local* to
+Today this compiles because `IdentityGuestMemory` is *local* to
 `carrick-runtime` (the orphan rule needs only one of {trait, type} local to
-the impl's crate). Once the type moves to `carrick-dsr`, **both the trait and
-the type become foreign to any crate that isn't `carrick-dsr-x86` itself** —
-`carrick-runtime` could no longer host this impl (neither type nor trait
-would be local to it), and `carrick-dsr` can't host it either (trait foreign,
-and no dependency edge to see it). The only legal home is **`carrick-dsr-x86`**,
-which already depends on `carrick-dsr` and already owns both traits. Concretely:
-`cflow_guest_memory_fault`/`cflow_raw_memory_fault`/`cflow_memory_backend_error`
-(8261-8296) and `IdentityXstateMemoryReader`/`IdentityXstateMemoryWriter`
-(8239-8259) and the `ControlFlowMemory` impl (8298-8339) all move to
-**`crates/carrick-dsr-x86/src/cflow.rs`** (or a new sibling file there), not to
-`carrick-dsr::identity_memory`. This is a missing row in the parent plan's
-Task-2 file list — add it. Zero aarch64 impact: `carrick-dsr-aarch64` has no
-`cflow` module and no `ControlFlowMemory`/`X86XstateMemory*` usage at all
-(grepped, no hits).
+the impl's crate). Once the type moves to `carrick-dsr`, **the trait becomes
+foreign while the type becomes foreign to `carrick-runtime`** — `carrick-runtime`
+could no longer host this impl (neither type nor trait local), and `carrick-dsr`
+can't host it either (trait foreign, and no dependency edge to see it). The only
+legal home is **`carrick-dsr-x86`**, which already depends on `carrick-dsr` and
+already owns the trait. Concretely: `cflow_guest_memory_fault`/
+`cflow_raw_memory_fault`/`cflow_memory_backend_error` (8261-8296) and the
+`ControlFlowMemory` impl (8298-8339) move to **`crates/carrick-dsr-x86/src/cflow.rs`**
+(or a new sibling file there), not to `carrick-dsr::identity_memory`. This is a
+missing row in the parent plan's Task-2 file list — add it.
+
+**CONTROLLER RULING (2026-07-23):** `IdentityXstateMemoryReader` and
+`IdentityXstateMemoryWriter<'_>` (native_freebsd.rs:8239-8259) are *local wrapper
+types* — the orphan rule does NOT force them anywhere because `IdentityGuestMemory`
+is their only type, and they reference concrete `IdentityGuestMemory<ExecutableEpoch>`
+directly (not genericized). **These impls STAY in native_freebsd.rs**, avoiding
+the need to thread `A: ExecutableMutationAuthority` genericity through
+`carrick-dsr-x86` for a type it does not need to own. Zero aarch64 impact:
+`carrick-dsr-aarch64` has no `cflow` module and no `ControlFlowMemory`/
+`X86XstateMemory*` usage at all (grepped, no hits).
 
 ---
 
@@ -162,9 +169,10 @@ modulo the ~120 lines (cflow/xstate-reader glue) that land in
 |---|---|---|
 | `ExecutableEpoch` + its entire admission/quiescence/host-fork-lease cluster (`ExecutableGeneration`, `ExecutableStopSequence`, `ExecutableAdmission`, `ExecutableThreadId/State/Record`, `ExecutableMutationOwner`, `ExecutableHostForkOwner/State`, `ExecutableTerminalPhase/Owner/State/Stop`, `ExecutableEpochError`, `ExecutableThreadRegistration`, `ExecutableHostWaitGuard`, `ExecutableHostForkLease`, `ExecutableTerminalRetirement/Reservation/Lease`, `JitAdmission`, `InJitGuard`, `ExecutableMutationLease`) + `mod executable_epoch_tests` | 2150-6378 (~4.2K lines) | The x86 thread-loop's own JIT-admission/quiescence coordinator. `IdentityGuestMemory` only *references* it (one Arc field, one method call — §0); the coordinator itself is deeply wired to `SharedRun`/host-fork/thread-registration machinery that is explicitly Phase-3 territory (the loop merge). Made reachable to the moved module only through `ExecutableMutationAuthority` (§0). |
 | `identity_contiguous_executable_span_under_mapping_lock`, `identity_execute_fault_under_mapping_lock`, `identity_checked_read_executable_exact`, `identity_checked_fetch_x86_instruction_mutable_shared_under_mapping_lock`, `identity_checked_fetch_x86_instruction`, `X86_MAX_INSTRUCTION_LENGTH` | 7840-8070 | This is x86 **instruction-decode**-coupled: `identity_checked_fetch_x86_instruction[_mutable_shared_...]` calls `carrick_dsr_x86::decode::classify(...)` directly to find the true instruction length. `identity_execute_fault_under_mapping_lock`/`identity_contiguous_executable_span_under_mapping_lock` are technically ISA-neutral in their own bodies, but their only consumer is this x86-fetch cluster — splitting them out for zero present reuse just fragments one cohesive unit. A future NetBSD/aarch64-native-lane's equivalent instruction-fetch helper would be its own ISA-appropriate thing anyway (aarch64 has fixed 4-byte instructions and no "find the executable prefix up to N bytes" concept at all). |
-| `cflow_guest_memory_fault`, `cflow_raw_memory_fault`, `cflow_memory_backend_error`, `impl cflow::ControlFlowMemory for IdentityGuestMemory`, `IdentityXstateMemoryReader`/`IdentityXstateMemoryWriter` + their trait impls | 7221-7231, 8239-8339 | **Not "stay" — "move elsewhere."** See §0b: orphan rule forces these into `carrick-dsr-x86`, not `carrick-dsr`. Listed here only so the inventory is exhaustive; do not leave them in `native_freebsd.rs`. |
+| `cflow_guest_memory_fault`, `cflow_raw_memory_fault`, `cflow_memory_backend_error`, `impl cflow::ControlFlowMemory for IdentityGuestMemory` | 7221-7231, 8298-8339 | **MOVE to `carrick-dsr-x86`** (§0b). Orphan rule forces `ControlFlowMemory` there; the cflow helpers move with it. |
+| `IdentityXstateMemoryReader`/`IdentityXstateMemoryWriter` + their `X86XstateMemory*` trait impls | 8239-8259 | **STAY in native_freebsd.rs** (§0b). Local wrapper types over concrete `IdentityGuestMemory<ExecutableEpoch>`; orphan rule does not force relocation. Avoids threading `ExecutableMutationAuthority` genericity through carrick-dsr-x86 unnecessarily. |
 | `SigframeEngine` struct + `RegAccess`/`GuestMemory` impls, `deliver_x86_signal`, `synchronous_fault_*`, `deliver_synchronous_x86_fault`, `deliver_x86_instruction_fetch_error`, `restore_x86_sigreturn`, `NativeX86Trap` | 8348-8858ish | A *different* `GuestMemory` impl (over live register/xstate snapshot, not identity host memory) for x86 signal delivery. It **consumes** the moved `identity_checked_read_sigframe`/`identity_checked_write_sigframe` (cross-crate call after the move) but is not itself part of `IdentityGuestMemory`'s closure. |
-| `native_minherit`, `NativeMinheritFailureGuard`, `exclude_vfork_shared_ranges`, `native_private_inheritance_ranges`, `NativeVforkShare`, `wait_native_vfork_completion` | 15669-15833 | vfork-inheritance machinery (`minherit(2)`/`FREEBSD_INHERIT_{SHARE,COPY}`, already portably wrapped in `carrick-portable::freebsd_minherit`, `crates/carrick-portable/src/lib.rs:1170-1182`). Operates on host memory ranges but has nothing to do with the `GuestMemory` trait or `IdentityGuestMemory` — it's `service_fork`'s vfork-sharing policy. Matches the parent plan's own text ("minherit vfork machinery stays"). |
+| `native_minherit`, `NativeMinheritFailureGuard`, `exclude_vfork_shared_ranges`, `native_private_inheritance_ranges`, `NativeVforkShare`, `wait_native_vfork_completion` | 15568-15833 | vfork-inheritance machinery (`minherit(2)`/`FREEBSD_INHERIT_{SHARE,COPY}`, already portably wrapped in `carrick-portable::freebsd_minherit`, `crates/carrick-portable/src/lib.rs:1170-1182`). Operates on host memory ranges but has nothing to do with the `GuestMemory` trait or `IdentityGuestMemory` — it's `service_fork`'s vfork-sharing policy. Matches the parent plan's own text ("minherit vfork machinery stays"). |
 | `GuestArenas`, `FixedRwReservation`, `reserve_fixed_rw`, `remap_exec_arenas` | 76-189 | Consumers of `NativeMapping`/`map_prot_at` (arena reservation at loader/exec time), not part of the type's own closure. See §2. |
 | `LoadedImage`, `protect_existing_identity_range`, `reset_identity_vmas_with_registry`, `reset_identity_vmas` | 9067-9190 | Consumers (loader/exec-image lifecycle), not closure members. `protect_existing_identity_range` duplicates a local `USER_END_EXCLUSIVE: u64 = 1 << 47` const — a drift nit, not fixed here, but Task 2 should have it reference the same ISA-VA-end source once that's parameterized (§1c). |
 | `freebsd_shared_waiter_key` — the FUNCTION itself | 270-342 | **Moves, but not to `identity_memory.rs`** — see §1c. Listed here to be explicit about the distinction between "the seam call site" (moves to identity_memory) and "the concrete FreeBSD implementation" (moves to `carrick-native-freebsd`). |
@@ -341,7 +349,7 @@ Task 2's sketch says `identity_raw_range_tests` (~1.5K lines) "moves with it."
 import list (native_freebsd.rs:376-379: it pulls in `PublishedFaultEntry`,
 `SharedWaitAssignment`, `X86GatewayX87Witness`, `calibrate_x86_vvar_clock`,
 `exclude_vfork_shared_ranges` alongside `IdentityGuestMemory`) and then
-classified all 23 test fns by which non-identity subsystem, if any, each body
+classified all 24 test fns by which non-identity subsystem, if any, each body
 touches:
 
 | Test fn (line) | Touches | Disposition |
@@ -368,13 +376,13 @@ touches:
 | `elf_preflight_rejects_wrong_machine_and_non_executable_type` (1805) | `parse_loadable_elf` | STAY |
 | `vfork_inheritance_excludes_existing_shared_vmas` (1820) | `exclude_vfork_shared_ranges` | STAY |
 
-Net: **8 of 23** move to `identity_memory.rs`, **2 of 23** move to
-`carrick-dsr-x86`, **1 of 23** moves to `carrick-native-freebsd`, **12 of 23**
+Net: **8 of 24** move to `identity_memory.rs`, **2 of 24** move to
+`carrick-dsr-x86`, **1 of 24** moves to `carrick-native-freebsd`, **13 of 24**
 stay in `native_freebsd.rs` as integration/consumer-pinning tests. The module
 must be **split at Task-2 time**, not moved wholesale — the parent plan's
 "~1.5K lines move with it" line is superseded by this table.
 
-The trailing `mod tests` (17562-end, 55 test fns) was never claimed by the
+The trailing `mod tests` (17562-end, 53 test fns) was never claimed by the
 parent plan to move wholesale, so no correction is owed there, but for
 Task 2's estimating purposes: marker-based classification (verified by direct
 read for the unambiguous cases) finds **9 clean move candidates** with no
