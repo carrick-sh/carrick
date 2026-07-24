@@ -3042,14 +3042,21 @@ impl SyscallDispatcher {
             let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
-            if flags & (LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
-                // Carrick cannot yet preserve Linux's exact fixed replacement
-                // or DONTUNMAP zero-fill/fault contract on every backend. Refuse
-                // these shapes before even validating size/source/other flag
-                // bits: no unsupported request may reach allocator, backing, or
-                // VMA mutation.
-                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
-            }
+            // Errno precedence below is oracle-derived (real Linux 6.12.76,
+            // docker gcc:latest, 2026-07-23 — see
+            // .superpowers/sdd/mremap-ruling-report.md) and follows man 2 mremap's
+            // documented EINVAL conditions: no unrecognized flag bits,
+            // new_size != 0, MREMAP_FIXED/MREMAP_DONTUNMAP only paired with
+            // MREMAP_MAYMOVE, and MREMAP_DONTUNMAP only with old_size ==
+            // new_size. Real Linux validates ALL of these — even for
+            // requests that use MREMAP_FIXED or MREMAP_DONTUNMAP, since real
+            // Linux actually implements both flags — before it would ever
+            // attempt the remap. So every one of these well-formedness
+            // checks must run BEFORE carrick's own "not yet implemented"
+            // refusal just below: a malformed request (e.g. an unrelated
+            // garbage bit ORed onto MREMAP_FIXED) must surface the EINVAL
+            // real Linux would give, not carrick's EOPNOTSUPP stand-in for a
+            // shape real Linux would have actually performed.
             if new_size_req == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -3069,6 +3076,15 @@ impl SyscallDispatcher {
             }
             if dontunmap && new_size != old_size {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if move_fixed || dontunmap {
+                // Only now — once the request has passed every
+                // well-formedness check real Linux performs first — refuse
+                // the FIXED/DONTUNMAP shapes carrick cannot yet faithfully
+                // emulate (exact fixed-replacement or DONTUNMAP zero-fill/
+                // fault contract on every backend). No allocator, backing,
+                // or VMA mutation has happened yet.
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
             }
             let layout = this.mem.lock().layout;
             let fixed_new_address = if move_fixed {
@@ -6521,6 +6537,11 @@ mod tests {
             .write_bytes(source, b"move")
             .expect("seed source bytes before fixed move");
 
+        // new_size == 0 is EINVAL on real Linux regardless of any other
+        // flag bit (confirmed against a real-Linux oracle, 2026-07-23,
+        // Linux 6.12.76 — see .superpowers/sdd/mremap-ruling-report.md): it must win
+        // over carrick's MREMAP_FIXED-not-yet-implemented refusal, not be
+        // masked by it.
         let zero_size = threaded_memory_call(
             &dispatcher,
             &mut memory,
@@ -6531,7 +6552,14 @@ mod tests {
                 SyscallArgs([u64::MAX, LINUX_PAGE_SIZE, 0, MREMAP_FIXED, 1, 0]),
             ),
         );
-        assert_eq!(zero_size, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_eq!(zero_size, DispatchOutcome::errno(LINUX_EINVAL));
+        // An unrecognized flag bit (1 << 63) ORed onto an otherwise-valid
+        // MREMAP_FIXED request is EINVAL on real Linux, not EOPNOTSUPP:
+        // real Linux actually implements MREMAP_FIXED (confirmed by the
+        // same oracle run — MREMAP_FIXED|MREMAP_MAYMOVE with the garbage
+        // bit removed succeeds), so an unknown bit is what makes this
+        // request invalid, and that check must run before carrick's
+        // "not yet implemented" refusal for the FIXED shape itself.
         let invalid_combo = threaded_memory_call(
             &dispatcher,
             &mut memory,
@@ -6542,7 +6570,7 @@ mod tests {
                 SyscallArgs([u64::MAX, u64::MAX, u64::MAX, MREMAP_FIXED | (1 << 63), 3, 0]),
             ),
         );
-        assert_eq!(invalid_combo, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_eq!(invalid_combo, DispatchOutcome::errno(LINUX_EINVAL));
 
         let outcome = threaded_memory_call(
             &dispatcher,
@@ -6608,6 +6636,11 @@ mod tests {
             .write_bytes(source, b"keep")
             .expect("seed source bytes before dontunmap move");
 
+        // new_size == 0 (and, independently, the unrecognized 1 << 63 bit)
+        // is EINVAL on real Linux, not EOPNOTSUPP: confirmed against a
+        // real-Linux oracle, 2026-07-23, Linux 6.12.76 — see
+        // .superpowers/sdd/mremap-ruling-report.md. Either well-formedness check must
+        // win over carrick's MREMAP_DONTUNMAP-not-yet-implemented refusal.
         let invalid_precedence = threaded_memory_call(
             &dispatcher,
             &mut memory,
@@ -6618,7 +6651,7 @@ mod tests {
                 SyscallArgs([u64::MAX, 0, 0, MREMAP_DONTUNMAP | (1 << 63), 0, 0]),
             ),
         );
-        assert_eq!(invalid_precedence, DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+        assert_eq!(invalid_precedence, DispatchOutcome::errno(LINUX_EINVAL));
 
         let outcome = threaded_memory_call(
             &dispatcher,
