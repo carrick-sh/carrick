@@ -50,6 +50,35 @@ impl JitRegion {
         // SAFETY: offset < capacity, so the add stays inside the write alias.
         Some(unsafe { self.write_base.as_ptr().add(offset) })
     }
+
+    /// Slice out a `len`-byte sub-region starting at byte `offset` within
+    /// this region: both aliases shifted by the same `offset`, `capacity`
+    /// replaced by `len`. `None` if `offset..offset+len` does not fit inside
+    /// `self` (caller bug -- bounds must come from the same allocator that
+    /// produced `self.capacity`, e.g. a fixed-size per-thread slice carved
+    /// out of one big process-wide reservation).
+    ///
+    /// The returned `JitRegion` aliases the SAME memory as `self` -- it does
+    /// not map or own anything new. Combine with
+    /// [`crate::cache::TranslationCache::from_region`] to give each slice its
+    /// own typed bump-allocator without asking the host to map a fresh
+    /// region per slice.
+    pub fn sub_region(&self, offset: usize, len: usize) -> Option<JitRegion> {
+        let end = offset.checked_add(len)?;
+        if end > self.capacity {
+            return None;
+        }
+        // SAFETY: `offset + len <= self.capacity`, so both shifted bases
+        // stay within the bounds of the original mapping (one-past-the-end
+        // is the worst case, when `len == 0`).
+        let exec_base = unsafe { self.exec_base.as_ptr().add(offset) };
+        let write_base = unsafe { self.write_base.as_ptr().add(offset) };
+        Some(JitRegion {
+            exec_base: NonNull::new(exec_base)?,
+            write_base: NonNull::new(write_base)?,
+            capacity: len,
+        })
+    }
 }
 
 /// Outcome of [`NativeHostJit::remap_for_fork_child`]: what the fork CHILD
@@ -119,4 +148,55 @@ pub trait NativeHostJit: Send + Sync {
     /// `prior`, mapped fresh for this child — instead. No default impl: every
     /// host answers explicitly (see [`ForkChildJit`] for the per-shape rationale).
     fn remap_for_fork_child(&self, prior: &JitRegion) -> std::io::Result<ForkChildJit>;
+}
+
+#[cfg(test)]
+mod sub_region_tests {
+    //! Pure pointer-arithmetic proof for `JitRegion::sub_region`, independent
+    //! of any real mapping (the pointers below are never dereferenced --
+    //! `cache.rs`'s `from_region_tests` cover the mapped, end-to-end case).
+
+    use super::JitRegion;
+    use std::ptr::NonNull;
+
+    fn fake_region(exec: usize, write: usize, capacity: usize) -> JitRegion {
+        JitRegion {
+            exec_base: NonNull::new(exec as *mut u8).expect("nonzero exec base"),
+            write_base: NonNull::new(write as *mut u8).expect("nonzero write base"),
+            capacity,
+        }
+    }
+
+    #[test]
+    fn sub_region_shifts_both_aliases_by_the_same_offset() {
+        let region = fake_region(0x1000, 0x9000, 0x10000);
+        let slice = region.sub_region(0x100, 0x200).expect("in-bounds slice");
+        assert_eq!(slice.exec_base.as_ptr() as usize, 0x1100);
+        assert_eq!(slice.write_base.as_ptr() as usize, 0x9100);
+        assert_eq!(slice.capacity, 0x200);
+    }
+
+    #[test]
+    fn sub_region_accepts_a_range_that_exactly_fills_the_remainder() {
+        let region = fake_region(0x1000, 0x9000, 0x10000);
+        let slice = region.sub_region(0xff00, 0x100).expect("exact-fit slice");
+        assert_eq!(slice.exec_base.as_ptr() as usize, 0x1000 + 0xff00);
+        assert_eq!(slice.capacity, 0x100);
+
+        // A zero-length slice at the very end (offset == capacity) is a
+        // degenerate but valid "no bytes" view, not an error.
+        let empty_tail = region
+            .sub_region(0x10000, 0)
+            .expect("zero-length tail slice");
+        assert_eq!(empty_tail.capacity, 0);
+    }
+
+    #[test]
+    fn sub_region_rejects_ranges_that_overrun_the_parent() {
+        let region = fake_region(0x1000, 0x9000, 0x10000);
+        assert!(region.sub_region(0x10000, 1).is_none());
+        assert!(region.sub_region(1, 0x10000).is_none());
+        assert!(region.sub_region(usize::MAX, 1).is_none());
+        assert!(region.sub_region(usize::MAX, usize::MAX).is_none());
+    }
 }

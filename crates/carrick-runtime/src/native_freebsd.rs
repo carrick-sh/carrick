@@ -30,6 +30,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 
+use carrick_dsr::cache::{CacheError, TranslationCache};
 use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
 use carrick_dsr::identity_memory::*;
 use carrick_dsr::lane::NativeHost;
@@ -53,7 +54,7 @@ use carrick_guest_mem::RepointPrivateError;
 use carrick_guest_mem::{GuestMemory, GuestVa, MemoryError, X8664SyscallFrame};
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_hal::{GuestArch, Reg, RegAccess};
-use carrick_native_freebsd::{FreebsdHost, FreebsdHostJit, fault};
+use carrick_native_freebsd::{FreebsdHost, FreebsdHostJit, active_host_jit, fault};
 use goblin::elf::Elf;
 use goblin::elf::header::{EM_X86_64, ET_DYN, ET_EXEC};
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
@@ -7173,6 +7174,44 @@ impl std::hash::Hasher for VaHasher {
 
 type VaBuildHasher = std::hash::BuildHasherDefault<VaHasher>;
 
+/// Reserve, write, and publish `bytes` into the calling thread's private JIT
+/// slice through the shared bump-allocator
+/// (`carrick_dsr::cache::TranslationCache`, adopted here per the Phase-2
+/// cache-adoption precision map: the block index and the chain-edge patch
+/// protocol below stay lane-local, but the raw byte-cache allocation now
+/// routes through the same typed capacity/publish machinery the aarch64 lane
+/// uses). `TranslationCache::begin_write`/`CacheWriter::write_words` are
+/// ISA-neutral in principle but were authored against aarch64's fixed 4-byte
+/// instructions -- `begin_write` rejects any length that is not a `u32`
+/// multiple. x86 translated blocks are an arbitrary byte length, so pad up
+/// to the next `u32` boundary with `0xCC` (`int3`) filler before handing the
+/// bytes over. The filler is never reached: every emitted block ends in an
+/// unconditional jump (to its chain guard, cold stub, or a gateway-exit
+/// trampoline), so control flow never falls through into the padding.
+/// Reassembling the padded buffer into `u32` words via `from_ne_bytes`
+/// (rather than a pointer cast) keeps this alignment-safe regardless of the
+/// `Vec<u8>` allocator's actual alignment.
+fn publish_x86_translated_bytes(
+    cache: &mut TranslationCache,
+    bytes: &[u8],
+) -> Result<carrick_dsr::cache::PublishedCode, CacheError> {
+    let padded_len = bytes
+        .len()
+        .checked_add(3)
+        .map(|rounded| rounded & !3)
+        .ok_or_else(|| CacheError::Policy("translated block length overflow".to_string()))?;
+    let mut padded = Vec::with_capacity(padded_len);
+    padded.extend_from_slice(bytes);
+    padded.resize(padded_len, 0xCC);
+    let words: Vec<u32> = padded
+        .chunks_exact(4)
+        .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
+        .collect();
+    let mut writer = cache.begin_write(padded_len)?;
+    writer.write_words(&words)?;
+    writer.publish()
+}
+
 /// Patch a chainable branch's 5-byte `jmp` slot to jump straight to a
 /// translated successor block. `patch_abs` is the exec-alias address of the
 /// slot's 4-byte `rel32` field; `next_abs` is the address just after it (the
@@ -9058,8 +9097,25 @@ fn run_x86_thread(
     // 33 KiB value per block made GCC spend most host samples in `memcpy`.
     let mut context = X86DsrContext::new(snapshot, 0, next);
     context.guest_fsbase = guest_fsbase;
-    let mut cursor = slice_off;
-    let mut cursor_limit = slice_off + slice_len;
+    // This thread's private slice of the shared JIT code cache, wrapped in
+    // the shared bump-allocator (`carrick_dsr::cache::TranslationCache`)
+    // instead of hand-rolled cursor arithmetic. `from_region` borrows the
+    // slice without mapping or unmapping anything -- `SharedRun` owns the one
+    // big reservation for the run's whole lifetime and recycles slices
+    // through its free-list (`alloc_slice`/`free_slice`), so this cache's
+    // `Drop` must never unmap the memory out from under a future slice
+    // occupant (see `TranslationCache::from_region`'s doc comment).
+    let mut translation_cache = match active.region.sub_region(slice_off, slice_len) {
+        Some(sub) => TranslationCache::from_region(sub, active_host_jit()),
+        None => {
+            return ThreadRunOutcome::Fault {
+                detail: format!(
+                    "native x86 JIT slice 0x{slice_off:x}+0x{slice_len:x} is outside the code cache"
+                ),
+                traps: 0,
+            };
+        }
+    };
     let mut traps = 0usize;
     let mut exit_code: Option<i32> = None;
     let mut fault_detail: Option<String> = None;
@@ -9423,21 +9479,6 @@ fn run_x86_thread(
                 ));
                 break;
             }
-            if cursor + linked.bytes.len() > cursor_limit {
-                // The guest is back at a gateway boundary, so no code in this
-                // thread's private slice is executing. Recycle the whole slice
-                // instead of imposing a lifetime translation-volume limit:
-                // large static Go programs such as Kaniko execute far more than
-                // 4 MiB of distinct emitted code during startup. Guest return
-                // addresses remain guest VAs, so dropping every block/edge map
-                // and translating `next` at the slice base is safe.
-                cursor = cursor_limit - slice_len;
-                cache.clear();
-                cflow_plans.clear();
-                indirect_cache_entries.clear();
-                pending.clear();
-                fault_entries.clear();
-            }
             if let Some(site) = linked.indirect_cache {
                 if source_translation_ephemeral {
                     // Site id zero keeps the gateway cache cold, while the
@@ -9459,21 +9500,44 @@ fn run_x86_thread(
                         .push(X86IndirectCacheEntry::return_site(site.stack_adjust));
                 }
             }
-            // SAFETY: the JIT region is mapped for the run; cursor is in range.
-            let exec = unsafe { region.exec_base.as_ptr().add(cursor) };
-            let wptr = match region.write_ptr_for(exec) {
-                Some(p) => p,
-                None => {
-                    fault_detail = Some("JIT write alias out of range".to_string());
+            let published = match publish_x86_translated_bytes(
+                &mut translation_cache,
+                &linked.bytes,
+            ) {
+                Ok(published) => published,
+                Err(CacheError::Capacity { .. }) => {
+                    // The guest is back at a gateway boundary, so no code in
+                    // this thread's private slice is executing. Recycle the
+                    // whole slice instead of imposing a lifetime
+                    // translation-volume limit: large static Go programs such
+                    // as Kaniko execute far more than 4 MiB of distinct
+                    // emitted code during startup. Guest return addresses
+                    // remain guest VAs, so dropping every block/edge map and
+                    // re-translating `next` at the slice base is safe.
+                    translation_cache.reset_after_fork_for_exec();
+                    cache.clear();
+                    cflow_plans.clear();
+                    indirect_cache_entries.clear();
+                    pending.clear();
+                    fault_entries.clear();
+                    match publish_x86_translated_bytes(&mut translation_cache, &linked.bytes) {
+                        Ok(published) => published,
+                        Err(error) => {
+                            fault_detail = Some(format!(
+                                "native x86 JIT publish at 0x{next:x} failed just after slice recycle: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    fault_detail = Some(format!(
+                        "native x86 JIT publish at 0x{next:x} failed: {error}"
+                    ));
                     break;
                 }
             };
-            // SAFETY: wptr is the RW alias of exec; linked.bytes fits.
-            unsafe {
-                std::ptr::copy_nonoverlapping(linked.bytes.as_ptr(), wptr, linked.bytes.len())
-            };
-            jit.flush_icache(exec, linked.bytes.len());
-            let exec_u64 = exec as u64;
+            let exec_u64 = published.entry().host().raw() as u64;
             fault_entries.extend(linked.fault_map.iter().map(|entry| PublishedFaultEntry {
                 host_start: exec_u64 + entry.emitted_start as u64,
                 host_end: exec_u64 + entry.emitted_end as u64,
@@ -9481,7 +9545,6 @@ fn run_x86_thread(
                 is_copied_x87: entry.is_copied_x87,
                 restores: entry.restores.clone(),
             }));
-            cursor += linked.bytes.len();
             let entry = if source_translation_ephemeral {
                 current_ephemeral_fault_range =
                     Some((exec_u64, exec_u64 + linked.bytes.len() as u64));
@@ -10034,8 +10097,26 @@ fn run_x86_thread(
                                     break;
                                 }
                                 memory.rebind_after_fork(&active.executable_epoch);
-                                cursor = 0;
-                                cursor_limit = JIT_SLICE_LEN;
+                                // Every prior translation pointed into the old
+                                // (now-abandoned) shared region: rebuild this
+                                // thread's private cache over slot 0 of the
+                                // fork child's fresh one (the only slot
+                                // `fork_child_rebuild` reserves for the
+                                // forking thread itself; siblings never exist
+                                // in the child).
+                                translation_cache = match active.region.sub_region(0, JIT_SLICE_LEN)
+                                {
+                                    Some(sub) => {
+                                        TranslationCache::from_region(sub, active_host_jit())
+                                    }
+                                    None => {
+                                        fault_detail = Some(
+                                            "fork child: JIT slice 0 is outside the fresh code cache"
+                                                .to_string(),
+                                        );
+                                        break;
+                                    }
+                                };
                                 cache.clear();
                                 cflow_plans.clear();
                                 indirect_cache_entries.clear();
