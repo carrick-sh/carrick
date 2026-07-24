@@ -429,6 +429,7 @@ dependencies = [
  "carrick-guest-mem",
  "carrick-host",
  "carrick-mem",
+ "carrick-portable",
  "libc",
  "parking_lot",
  "proptest",
