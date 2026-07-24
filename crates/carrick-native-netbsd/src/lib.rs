@@ -6,8 +6,10 @@
 //! (docs/superpowers/specs/2026-07-25-netbsd-primitives-grounding.md): NetBSD
 //! has no `SHM_ANON`, so the anonymous backing object is a uniquely-named
 //! `shm_open` that is `shm_unlink`ed immediately, then mapped twice (RX + RW).
-//! The guest-fault shim (`fault`) and cross-process futex (`futex`/
-//! `waiter_key`) join in Tasks 2 and 3.
+//! Task 2 adds the guest-fault shim (`fault`) that turns SIGSEGV/SIGBUS/SIGFPE/
+//! SIGILL inside the code cache into typed gateway `Signal` exits (reading the
+//! NetBSD `mcontext_t.__gregs[_REG_*]` array) plus the RCX-recovery kick. The
+//! cross-process futex (`futex`/`waiter_key`) joins in Task 3.
 //!
 //! The whole crate is NetBSD-only by construction (same `#![cfg]` pattern as
 //! `carrick-native-freebsd`); other targets compile it to nothing, so the
@@ -16,8 +18,10 @@
 
 #![cfg(target_os = "netbsd")]
 
+pub mod fault;
 pub mod jit;
 
+pub use fault::NATIVE_EXIT_KICK_SIGNAL;
 pub use jit::NetbsdHostJit;
 
 /// The process-wide host-JIT instance handed to the runtime's lane wiring
