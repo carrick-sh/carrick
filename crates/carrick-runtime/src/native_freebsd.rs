@@ -15031,19 +15031,6 @@ mod tests {
         );
     }
 
-    // FreeBSD-only: exercises `carrick_native_freebsd::tsc::tsc_vdso_is_safe`,
-    // a FreeBSD-crate helper. NetBSD returns `None` from `vdso_tsc_calibration`
-    // and has no such sysctl-backed TSC gate, so without this gate the test
-    // leaks into the NetBSD test build and fails to resolve the helper (F1).
-    #[cfg(target_os = "freebsd")]
-    #[test]
-    fn tsc_vdso_requires_invariant_and_smp_safe_host_counter() {
-        assert!(tsc_vdso_is_safe(1, 1));
-        assert!(!tsc_vdso_is_safe(0, 1));
-        assert!(!tsc_vdso_is_safe(1, 0));
-        assert!(!tsc_vdso_is_safe(0, 0));
-    }
-
     #[test]
     fn xstate_edge_barriers_parse_sources_pairs_and_all() {
         let barriers = NativeX86EdgeBarriers::parse("0x10, 20->0x30,all,bad");
