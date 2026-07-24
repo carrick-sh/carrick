@@ -44,7 +44,6 @@ pub struct Aarch64Isa;
 impl carrick_dsr::lane::GuestIsa for Aarch64Isa {
     const NAME: &'static str = "aarch64";
     const USER_VA_END_EXCLUSIVE: u64 = 1u64 << 48;
-    const GUEST_PAGE_SIZE: usize = 16384; // Darwin lane value today
 }
 
 #[cfg(test)]
@@ -56,6 +55,5 @@ mod tests {
     fn aarch64_isa_constants() {
         assert_eq!(Aarch64Isa::NAME, "aarch64");
         assert_eq!(Aarch64Isa::USER_VA_END_EXCLUSIVE, 1u64 << 48);
-        assert_eq!(Aarch64Isa::GUEST_PAGE_SIZE, 16384);
     }
 }
