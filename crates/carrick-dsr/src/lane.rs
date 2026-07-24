@@ -50,8 +50,8 @@ pub trait NativeHost: 'static + Send + Sync {
 
     /// Extra `mmap(2)` flag bits a host adds to a `MAP_FIXED` request to make
     /// it atomically fail rather than silently replace existing bytes when
-    /// the target range is already occupied (FreeBSD/NetBSD: `MAP_EXCL`;
-    /// Darwin has no such flag — a `MAP_FIXED` there always replaces, so the
+    /// the target range is already occupied (FreeBSD: `MAP_EXCL`; Darwin/
+    /// NetBSD: no such flag — a `MAP_FIXED` there always replaces, so the
     /// identity-memory model's own overlap bookkeeping —
     /// `NativeMappingTransaction`'s disjoint-range check — is the only
     /// protection on hosts where this returns 0).
