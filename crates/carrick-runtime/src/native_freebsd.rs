@@ -4202,6 +4202,10 @@ mod executable_epoch_tests {
         sibling.join().expect("join alias sibling");
     }
 
+    // FreeBSD-only: exercises `SyscallDispatcher::hold_proc_mutex_for_native_fork_test`,
+    // itself gated to `target_os = "freebsd"`. Without this gate the test leaks
+    // into the NetBSD test build and fails to resolve the helper (F1).
+    #[cfg(target_os = "freebsd")]
     #[test]
     fn real_fork_child_can_reset_dispatcher_after_proc_mutex_holder_parks() {
         let epoch = ExecutableEpoch::new();
@@ -4287,6 +4291,10 @@ mod executable_epoch_tests {
         assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
+    // FreeBSD-only: exercises `timer_delivery::hold_critical_section_for_native_fork_test`,
+    // itself gated to `target_os = "freebsd"`. Without this gate the test leaks
+    // into the NetBSD test build and fails to resolve the helper (F1).
+    #[cfg(target_os = "freebsd")]
     #[test]
     fn real_fork_freezes_timer_helper_before_child_registry_reset() {
         let epoch = ExecutableEpoch::new();
@@ -15023,6 +15031,11 @@ mod tests {
         );
     }
 
+    // FreeBSD-only: exercises `carrick_native_freebsd::tsc::tsc_vdso_is_safe`,
+    // a FreeBSD-crate helper. NetBSD returns `None` from `vdso_tsc_calibration`
+    // and has no such sysctl-backed TSC gate, so without this gate the test
+    // leaks into the NetBSD test build and fails to resolve the helper (F1).
+    #[cfg(target_os = "freebsd")]
     #[test]
     fn tsc_vdso_requires_invariant_and_smp_safe_host_counter() {
         assert!(tsc_vdso_is_safe(1, 1));

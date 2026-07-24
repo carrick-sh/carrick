@@ -162,16 +162,28 @@ pub fn shared_wake(word: usize, _waiter_key: usize, count: u32) -> i64 {
 /// destination host word address, usable directly as `uaddr2`. `from_key` is
 /// unused for the same reason.
 ///
-/// **Compare value.** The dispatcher already performed the guest's
-/// `FUTEX_CMP_REQUEUE` `*uaddr == val3` gate before emitting this outcome
-/// (`dispatch`: `word != val3 -> EAGAIN`), so re-reading the current word for
-/// `val3` here all but always matches; on the rare intervening write the kernel
-/// returns `EAGAIN` and we fall back to the compare-free `FUTEX_REQUEUE`, so a
-/// `pthread_cond_broadcast` never loses a waiter to a value race.
+/// **Compare value (deliberately biased toward `FUTEX_REQUEUE`).** The
+/// dispatcher already performed the guest's `FUTEX_CMP_REQUEUE` `*uaddr == val3`
+/// gate before emitting this outcome (`dispatch`: `word != val3 -> EAGAIN`).
+/// This impl then RE-READS `*from_word` and passes that as `val3`, so the
+/// kernel's `CMP_REQUEUE` compare becomes `*uaddr == *uaddr` (`word == word`) —
+/// which degrades `FUTEX_CMP_REQUEUE` toward the compare-free `FUTEX_REQUEUE`.
+/// That is intentional: a `pthread_cond_broadcast` must never lose a waiter to a
+/// value race, so the lane prefers to never spuriously `EAGAIN` over preserving
+/// the exact atomic compare. True `FUTEX_CMP_REQUEUE` compare fidelity is
+/// RED-LISTED as a Task-5 follow-on. (On the rare intervening write the kernel
+/// still returns `EAGAIN` and we fall back to an explicit `FUTEX_REQUEUE`.)
 ///
-/// Returns `(total, 0)`: NetBSD's requeue is atomic and reports the Linux total
-/// (woken + requeued) in one value; the run loop reports `woken + moved` to the
-/// guest, so the split is not observable and the second element is 0.
+/// Returns `(woken, 0)`. NetBSD's `FUTEX_(CMP_)REQUEUE` reports the WOKEN count
+/// ONLY — NOT Linux's woken+requeued total. Grounding doc §3 probe D
+/// (`FUTEX_REQUEUE(wake=0, requeue=MAX)` with two parked waiters) returned 0,
+/// i.e. the woken count, not 2; the `cross_process_requeue_*` test below
+/// likewise observes `(0, 0)` for `wake_count == 0` with one waiter (a
+/// Linux-total impl would report 1). The kernel does not report how many were
+/// moved, so the second element is hard-coded 0; exact `(woken, moved)` count
+/// fidelity is RED-LISTED as a Task-5 follow-on. This divergence is benign for
+/// the workloads the lane targets: glibc `pthread_cond_*` ignores the requeue
+/// return value.
 pub fn shared_requeue(
     from_word: usize,
     _from_key: usize,
@@ -333,6 +345,108 @@ mod tests {
         assert!(
             woken,
             "parent must be released by the child's cross-process wake"
+        );
+
+        unsafe { libc::munmap(page.cast(), 4096) };
+    }
+
+    /// Cross-process `shared_requeue`: a fork child parks a waiter on a `from`
+    /// word; the parent `shared_requeue`s it onto a `to` word (`wake_count == 0`,
+    /// `requeue_count == 1`), then a `shared_wake` on the DESTINATION `to` word
+    /// releases the physically-moved waiter. This empirically resolves two
+    /// review CANNOT-CONFIRMs: (a) an anonymous `MAP_SHARED` word supports
+    /// cross-process REQUEUE on NetBSD 10.1, and (b) what `FUTEX_CMP_REQUEUE`
+    /// actually returns — with `wake_count == 0` and one waiter, NetBSD reports
+    /// the WOKEN count (`0`), not the Linux woken+requeued total (which would be
+    /// `1`). Mirrors the fork/sync idioms of
+    /// `cross_process_wait_wake_reports_woken_count`.
+    ///
+    /// Three words share one anonymous `MAP_SHARED` page: `ready` (the child
+    /// announces it is about to park), `from` (the source wait word), and `to`
+    /// (the requeue destination). Neither `from` nor `to` is mutated after
+    /// setup, so a `shared_wait`/`shared_wake` return of `0`/`1` is a genuine
+    /// cross-process wake of a requeued waiter, not a value-mismatch `EAGAIN`.
+    #[test]
+    fn cross_process_requeue_moves_waiter_and_reports_woken_only() {
+        let page = map_shared_word();
+        // `ready` at offset 0, `from` at offset 1, `to` at offset 2 (all 4-byte,
+        // non-overlapping within the 4096-byte page).
+        let ready = page;
+        // SAFETY: `page` is a 4096-byte shared mapping; offsets 1 and 2 are in
+        // bounds.
+        let from = unsafe { page.add(1) };
+        let to = unsafe { page.add(2) };
+        // SAFETY: the test owns this writable shared page.
+        unsafe {
+            ready.write_volatile(0);
+            from.write_volatile(0);
+            to.write_volatile(0);
+        }
+        let ready_addr = ready as usize;
+        let from_addr = from as usize;
+        let to_addr = to as usize;
+
+        // SAFETY: the child does only async-signal-safe work (a shared store, a
+        // raw futex syscall) before `_exit`; it never unwinds or allocates.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // Announce readiness, then park ONCE on `from` with a wall-bounded
+            // timeout that comfortably outlasts the parent's requeue+wake. A
+            // return of 0 means the parent's wake on the DESTINATION word reached
+            // us after the physical requeue relinked our waiter there.
+            unsafe { from.write_volatile(0) };
+            unsafe { ready.write_volatile(1) };
+            let ret = shared_wait(from_addr, 0, 0, Some(Duration::from_secs(10)), &|| false);
+            unsafe { libc::_exit(if ret == 0 { 0 } else { 22 }) };
+        }
+
+        // Wait for the child to publish readiness, give it a moment to reach
+        // FUTEX_WAIT on `from`, then requeue its waiter from `from` onto `to`.
+        while unsafe { (ready_addr as *const u32).read_volatile() } == 0 {
+            unsafe { libc::usleep(1_000) };
+        }
+        unsafe { libc::usleep(50_000) };
+
+        let requeue_ret = shared_requeue(from_addr, from_addr, to_addr, 0, 1);
+
+        // Wake the physically-moved waiter on the DESTINATION word, retrying
+        // while the child's park settles. A non-zero return proves the requeue
+        // actually relinked the waiter onto `to` (a wake on `from` after the
+        // move would find nothing).
+        let mut woken = 0i64;
+        for _ in 0..200 {
+            woken = shared_wake(to_addr, to_addr, 1);
+            if woken >= 1 {
+                break;
+            }
+            unsafe { libc::usleep(10_000) };
+        }
+
+        let mut status: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "reap child");
+        assert!(
+            libc::WIFEXITED(status),
+            "child exited normally: {status:#x}"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "requeued waiter must be woken by a wake on the DESTINATION word (exit 22 = it was not)"
+        );
+        assert_eq!(
+            woken, 1,
+            "a wake on the destination word must release exactly the one requeued waiter"
+        );
+        // NetBSD `FUTEX_CMP_REQUEUE` reports the WOKEN count only (grounding §3
+        // probe D). With `wake_count == 0` the woken count is 0; a Linux-total
+        // impl would instead report 1 (the single requeued waiter). The second
+        // element is the always-0 moved count the kernel does not report.
+        assert_eq!(
+            requeue_ret,
+            (0, 0),
+            "NetBSD requeue reports woken-only: expected (0, 0), observed {requeue_ret:?}"
         );
 
         unsafe { libc::munmap(page.cast(), 4096) };
