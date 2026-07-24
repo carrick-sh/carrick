@@ -37,14 +37,44 @@ The two loops: `native_darwin.rs::run_native_dsr_thread_loop_profiled` (~855 ln)
 - [ ] **Step 3:** The DANGER ZONES — fault lowering (`lower_dsr_fault` vs `deliver_synchronous_x86_fault`) and xstate (x86 XSAVE/XRSTOR service vs aarch64 FP snapshot): characterize whether these can sit behind trait callbacks without semantic entanglement, or must stay lane-specific with the shared loop calling out. Be concrete: a wrong call here corrupts signal delivery or FP state.
 - [ ] **Step 4: STOP ASSESSMENT** — is a genuine merge (meaningful shared body) achievable, or does the honest outcome tell us the loops share too little to justify the risk? If the latter, SAY SO — the controller escalates and Phase 3 may reshape Task 2 to a thinner skeleton or skip the loop merge. Commit the notes: `docs(native): loop-merge precision map`.
 
-## Task 2: The loop merge (gated on Task 1's verdict)
+## Task 2: Extract the x86 translate/cache/chain engine into carrick-dsr-x86 (REDIRECTED)
 
-**Files:** `crates/carrick-dsr/src/lane.rs` (GuestIsa growth), `carrick-dsr-{aarch64,x86}/src/lib.rs` (ISA impls of the new surface), a new `crates/carrick-runtime/src/native/thread_loop.rs` (the generic `run_native_thread_loop<L>`), both lane files (delete the merged bodies, call the generic). Dispositions per Task-1 notes GOVERN.
+**Redirect (2026-07-24, maintainer-approved on the Task-1 SKIP verdict):** The loop
+merge is SKIPPED — the two loops share only ~10% and the gap is an *asymmetry*, not
+ISA semantics: aarch64's translate/cache/JIT orchestration already lives in
+`carrick-dsr-aarch64::translator` (2,643 ln) while x86's equivalent (~543 ln:
+`run_x86_thread`'s block-plan → emit → JIT-cache → chain-edge orchestration, the
+`CachedBlock`/`VaHasher` index, `PublishedFaultEntry`/`PendingChainEdge`) is still
+inline in `native_freebsd.rs`. This task removes that asymmetry — the higher-leverage,
+lower-risk move (an extraction like Phase-2 identity_memory, not a cross-ISA merge) —
+and it serves NetBSD directly (NetBSD reuses the extracted engine, not inline code).
 
-- [ ] **Step 1:** BASELINE on the box (native_freebsd_x86 suite + LTP pass-set → save). Also capture the aarch64 side's proving evidence: macOS DSR oracle suite as the aarch64-untouched pin.
-- [ ] **Step 2:** Grow `GuestIsa` (additive), impl on both ISA crates (thin re-fronts). Build the generic loop from the SHARED regions; lane-specific regions become trait callbacks or stay inline at the two thin call sites per Task-1's DIVERGED/LANE-ONLY dispositions.
-- [ ] **Step 3:** macOS: DSR oracle + gateway suites IDENTICAL to baseline (aarch64 loop behavior unchanged — this is the aarch64 pin); clippy. FreeBSD box: full suite + LTP == baseline. Both == baseline or STOP.
-- [ ] **Step 4:** Metrics: combined loop LoC before/after; twin-fn delta. Commit `refactor(runtime): merge native thread loop behind NativeLane`. (Box wip-commits for compiler feedback OK; squash to one.)
+**Files:** new `crates/carrick-dsr-x86/src/translator.rs` (mirror the aarch64 translator's
+shape as the target), `native_freebsd.rs` (delete the moved orchestration, call the
+extracted engine), tests move with the code.
+
+**Boundaries (from Phase-2 Task-3, HONOR):** the unaligned target-first chain-edge patch
+protocol (`patch_slot`/`publish_guarded_chain_edge`) was KEPT lane-local because it's
+incompatible with the shared aligned-atomic contract — decide during Step 1 whether it
+moves into `carrick-dsr-x86::translator` (it can, since that crate is x86-specific and
+per-thread-private — the shared-cache incompatibility was about `carrick-dsr`'s
+`ConcurrentPublicationIndex`, not the x86 crate) or stays. The bump-allocator adoption
+(TranslationCache::from_region) stays as-is.
+
+- [ ] **Step 1 (INVENTORY + STOP GATE):** Map the x86 engine closure in `native_freebsd.rs`
+  (run_x86_thread's translate/cache/chain regions + CachedBlock/VaHasher/PublishedFaultEntry/
+  PendingChainEdge/patch_slot/publish_guarded_chain_edge + the SharedRun slice accounting it
+  touches). For each: MOVE / STAY, mapped against the aarch64 translator's shape. Identify
+  couplings that resist extraction (SharedRun, identity_memory, the run-loop's own signal/
+  fault handling — those STAY in the loop; only the translate/cache/chain ENGINE moves). If a
+  coupling can't be cleanly severed (as ExecutableEpoch was for identity_memory — needed a
+  trait), design the minimal seam OR STOP and report. Also capture the box baseline
+  (native_freebsd_x86 suite + LTP pass-set).
+- [ ] **Step 2:** Extract per the inventory. aarch64 translator is the target shape (a
+  `X86ProcessTranslator`/`X86ThreadTranslator` or equivalent). Move bodies verbatim (use-path
+  edits only); color-moved evidence in the report.
+- [ ] **Step 3:** macOS `cargo test -p carrick-dsr-x86 --lib` + `cargo test -p carrick-runtime --lib dsr` (aarch64 untouched pin — the aarch64 translator must be byte-unaffected); clippy. FreeBSD box: full native_freebsd_x86 suite + LTP == baseline (programmatic diff). == baseline or STOP.
+- [ ] **Step 4:** Metrics: native_freebsd.rs delta; carrick-dsr-x86 growth; the x86/aarch64 crate-structure symmetry now achieved. Commit `refactor(dsr-x86): extract the x86 translate/cache engine (mirror aarch64)`. (Box wip-commits OK; squash to one.)
 
 ## Task 3: FreeBSD adopts exec-capsule + prepared_image
 
