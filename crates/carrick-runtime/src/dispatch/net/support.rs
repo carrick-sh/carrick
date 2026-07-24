@@ -1450,6 +1450,25 @@ pub(super) fn is_known_sockopt_optname(level: i32, optname: i32) -> bool {
     }
 }
 
+/// Socket-option constants the NetBSD kernel defines but the `libc` crate does
+/// NOT bind for the NetBSD target. Transcribed clean-room from the NetBSD 10.1
+/// headers on the build host (each value cites its `/usr/include/...` line).
+/// These are the host's NATIVE numbers and are consumed at exactly the sites
+/// where the other BSD/Linux arms reference the corresponding `libc::` constant.
+#[cfg(target_os = "netbsd")]
+mod netbsd_sockopt {
+    /// `/usr/include/netinet/in.h:276`   `#define IP_OPTIONS 1`
+    pub const IP_OPTIONS: i32 = 1;
+    /// `/usr/include/netinet/in.h:295`   `#define IP_RECVTTL 23`
+    pub const IP_RECVTTL: i32 = 23;
+    /// `/usr/include/netinet6/in6.h:415` `#define IPV6_RECVHOPLIMIT 37`
+    pub const IPV6_RECVHOPLIMIT: i32 = 37;
+    /// `/usr/include/netinet6/in6.h:429` `#define IPV6_HOPLIMIT 47`
+    pub const IPV6_HOPLIMIT: i32 = 47;
+    // NOTE: NetBSD has no IP_RECVTOS equivalent (netinet/in.h defines only
+    // IP_TOS=3), so there is deliberately no constant for it here.
+}
+
 pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i32)> {
     match level {
         LINUX_SOL_SOCKET => {
@@ -1519,10 +1538,25 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
                 a::LINUX_IP_MULTICAST_LOOP => libc::IP_MULTICAST_LOOP,
                 a::LINUX_IP_ADD_MEMBERSHIP => libc::IP_ADD_MEMBERSHIP,
                 a::LINUX_IP_DROP_MEMBERSHIP => libc::IP_DROP_MEMBERSHIP,
+                // NetBSD defines IP_RECVTTL (=23) but the `libc` crate omits it,
+                // so use the clean-room NetBSD value there; every other host keeps
+                // its `libc::IP_RECVTTL`.
+                #[cfg(target_os = "netbsd")]
+                a::LINUX_IP_RECVTTL => netbsd_sockopt::IP_RECVTTL,
+                #[cfg(not(target_os = "netbsd"))]
                 a::LINUX_IP_RECVTTL => libc::IP_RECVTTL,
+                // NetBSD has no IP_RECVTOS equivalent (netinet/in.h defines only
+                // IP_TOS=3), so gate the arm out on NetBSD; it then falls through
+                // to the best-effort pass-through, like any unmodelled option.
+                #[cfg(not(target_os = "netbsd"))]
                 a::LINUX_IP_RECVTOS => libc::IP_RECVTOS,
-                #[cfg(not(target_os = "freebsd"))]
+                // IP_OPTIONS is absent from `libc` on both FreeBSD and NetBSD.
+                // Linux keeps `libc::IP_OPTIONS`; NetBSD supplies the clean-room
+                // value (=1); FreeBSD falls through to the pass-through default.
+                #[cfg(all(not(target_os = "freebsd"), not(target_os = "netbsd")))]
                 a::LINUX_IP_OPTIONS => libc::IP_OPTIONS,
+                #[cfg(target_os = "netbsd")]
+                a::LINUX_IP_OPTIONS => netbsd_sockopt::IP_OPTIONS,
                 #[cfg(not(target_os = "freebsd"))]
                 a::LINUX_IP_PKTINFO => libc::IP_PKTINFO,
                 other => other,
@@ -1596,8 +1630,17 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
                 a::LINUX_IPV6_V6ONLY => libc::IPV6_V6ONLY,
                 a::LINUX_IPV6_RECVTCLASS => libc::IPV6_RECVTCLASS,
                 a::LINUX_IPV6_TCLASS => libc::IPV6_TCLASS,
+                // NetBSD defines IPV6_RECVHOPLIMIT (=37) and IPV6_HOPLIMIT (=47)
+                // but the `libc` crate omits both, so use the clean-room NetBSD
+                // values there; every other host keeps its `libc::` constant.
+                #[cfg(target_os = "netbsd")]
+                a::LINUX_IPV6_RECVHOPLIMIT => netbsd_sockopt::IPV6_RECVHOPLIMIT,
+                #[cfg(not(target_os = "netbsd"))]
                 a::LINUX_IPV6_RECVHOPLIMIT => libc::IPV6_RECVHOPLIMIT,
                 a::LINUX_IPV6_PKTINFO => libc::IPV6_PKTINFO,
+                #[cfg(target_os = "netbsd")]
+                a::LINUX_IPV6_HOPLIMIT => netbsd_sockopt::IPV6_HOPLIMIT,
+                #[cfg(not(target_os = "netbsd"))]
                 a::LINUX_IPV6_HOPLIMIT => libc::IPV6_HOPLIMIT,
                 a::LINUX_IPV6_RECVPKTINFO => libc::IPV6_RECVPKTINFO,
                 other => other,
@@ -2230,9 +2273,21 @@ const IPV6_CMSG_MAP: &[(i32, i32)] = &[
 /// FreeBSD/NetBSD they resolve to that host's native numbers — faithful by
 /// construction. The Linux-side keys come from `carrick-abi`'s guest-Linux
 /// constants so the wire value the guest sees is exact.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "netbsd")))]
 const IPV6_CMSG_MAP: &[(i32, i32)] = &[
     (crate::linux_abi::LINUX_IPV6_HOPLIMIT, libc::IPV6_HOPLIMIT),
+    (crate::linux_abi::LINUX_IPV6_TCLASS, libc::IPV6_TCLASS),
+    (crate::linux_abi::LINUX_IPV6_PKTINFO, libc::IPV6_PKTINFO),
+];
+// NetBSD binds IPV6_TCLASS/IPV6_PKTINFO in `libc` but omits IPV6_HOPLIMIT, so
+// supply the clean-room NetBSD cmsg-type number (=47, netinet6/in6.h:429) for
+// that one entry; the other two stay on their `libc::` bindings.
+#[cfg(target_os = "netbsd")]
+const IPV6_CMSG_MAP: &[(i32, i32)] = &[
+    (
+        crate::linux_abi::LINUX_IPV6_HOPLIMIT,
+        netbsd_sockopt::IPV6_HOPLIMIT,
+    ),
     (crate::linux_abi::LINUX_IPV6_TCLASS, libc::IPV6_TCLASS),
     (crate::linux_abi::LINUX_IPV6_PKTINFO, libc::IPV6_PKTINFO),
 ];
