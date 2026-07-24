@@ -41,13 +41,16 @@ use carrick_dsr_x86::gateway::{
 };
 #[cfg(test)]
 use carrick_dsr_x86::plan_block;
+use carrick_dsr_x86::translator::{
+    CachedBlock, GuardedChainPatch, PendingChainEdge, PublishedFaultEntry, VaBuildHasher,
+    publish_guarded_chain_edge, publish_x86_translated_bytes,
+};
 use carrick_dsr_x86::{
     X86DsrContext, X86ExitStatus, X86FxStateError, X86FxStatePlan, X86GuestGsBase,
     X86IdentityStamp, X86IndirectCacheEntry, X86LegacyX87Error, X86LegacyX87Plan,
     X86UcontextSnapshot, X86X87ExceptionKind, X86XstateMemoryReader, X86XstateMemoryWriter,
     X86XstateRestoreError, X86XstateRestorePlan, X86XstateSaveError, X86XstateSavePlan, cflow,
-    emit::{ScratchRestore, emit_block_linked},
-    plan_block_with_reader,
+    emit::emit_block_linked, plan_block_with_reader,
 };
 #[cfg(test)]
 use carrick_guest_mem::RepointPrivateError;
@@ -7146,132 +7149,15 @@ enum Step {
     },
 }
 
-/// A minimal multiply-based hasher for the guest-VA block cache. The default
-/// `HashMap` uses SipHash (DoS-resistant but slow), and an lldb backtrace of a
-/// hot guest loop showed SipHash dominating — the cache is looked up once per
-/// block per iteration, millions of times. The keys are our OWN guest VAs (no
-/// adversarial input), so a single FxHash-style multiply is both correct and
-/// far cheaper. Only `write_u64` is exercised (u64 keys); other inputs fold in
-/// byte-wise so the impl is still a valid `Hasher`.
-#[derive(Default)]
-struct VaHasher(u64);
-
-impl std::hash::Hasher for VaHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64(u64::from(b));
-        }
-    }
-    fn write_u64(&mut self, value: u64) {
-        // FxHash's rotate-xor-multiply step (rustc's `rustc-hash`).
-        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(K);
-    }
-}
-
-type VaBuildHasher = std::hash::BuildHasherDefault<VaHasher>;
-
-/// Reserve, write, and publish `bytes` into the calling thread's private JIT
-/// slice through the shared bump-allocator
-/// (`carrick_dsr::cache::TranslationCache`, adopted here per the Phase-2
-/// cache-adoption precision map: the block index and the chain-edge patch
-/// protocol below stay lane-local, but the raw byte-cache allocation now
-/// routes through the same typed capacity/publish machinery the aarch64 lane
-/// uses). `TranslationCache::begin_write`/`CacheWriter::write_words` are
-/// ISA-neutral in principle but were authored against aarch64's fixed 4-byte
-/// instructions -- `begin_write` rejects any length that is not a `u32`
-/// multiple. x86 translated blocks are an arbitrary byte length, so pad up
-/// to the next `u32` boundary with `0xCC` (`int3`) filler before handing the
-/// bytes over. The filler is never reached: every emitted block ends in an
-/// unconditional jump (to its chain guard, cold stub, or a gateway-exit
-/// trampoline), so control flow never falls through into the padding.
-/// Reassembling the padded buffer into `u32` words via `from_ne_bytes`
-/// (rather than a pointer cast) keeps this alignment-safe regardless of the
-/// `Vec<u8>` allocator's actual alignment.
-fn publish_x86_translated_bytes(
-    cache: &mut TranslationCache,
-    bytes: &[u8],
-) -> Result<carrick_dsr::cache::PublishedCode, CacheError> {
-    let padded_len = bytes
-        .len()
-        .checked_add(3)
-        .map(|rounded| rounded & !3)
-        .ok_or_else(|| CacheError::Policy("translated block length overflow".to_string()))?;
-    let mut padded = Vec::with_capacity(padded_len);
-    padded.extend_from_slice(bytes);
-    padded.resize(padded_len, 0xCC);
-    let words: Vec<u32> = padded
-        .chunks_exact(4)
-        .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
-        .collect();
-    let mut writer = cache.begin_write(padded_len)?;
-    writer.write_words(&words)?;
-    writer.publish()
-}
-
-/// Patch a chainable branch's 5-byte `jmp` slot to jump straight to a
-/// translated successor block. `patch_abs` is the exec-alias address of the
-/// slot's 4-byte `rel32` field; `next_abs` is the address just after it (the
-/// jmp's own next-instruction address the rel32 is relative to); `target_exec`
-/// is the successor's exec VA. Both endpoints live in the <4 MiB JIT cache, so
-/// the displacement always fits `i32`. The write goes through the region's RW
-/// alias (the exec alias is not writable).
-fn patch_slot(
-    region: &JitRegion,
-    jit: &FreebsdHostJit,
-    patch_abs: u64,
-    next_abs: u64,
-    target_exec: u64,
-) -> bool {
-    let rel = (target_exec as i64 - next_abs as i64) as i32;
-    let Some(w) = region.write_ptr_for(patch_abs as *mut u8) else {
-        return false;
-    };
-    // SAFETY: `w` is the RW alias of the 4-byte rel32 field inside the JIT.
-    unsafe { std::ptr::copy_nonoverlapping(rel.to_le_bytes().as_ptr(), w, 4) };
-    jit.flush_icache(patch_abs as *mut u8, 4);
-    true
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GuardedChainPatch {
-    entry_patch_abs: u64,
-    entry_next_abs: u64,
-    guard_exec: u64,
-    guard_target_patch_abs: u64,
-    guard_target_next_abs: u64,
-}
-
-/// Publish one hot direct edge target-first. Until the final entry displacement
-/// is written, the original branch still reaches its cold Rust-exit stub. Once
-/// the entry points at the guard, its separately-published target is complete.
-fn publish_guarded_chain_edge(
-    region: &JitRegion,
-    jit: &FreebsdHostJit,
-    patch: GuardedChainPatch,
-    target_exec: u64,
-) {
-    if !patch_slot(
-        region,
-        jit,
-        patch.guard_target_patch_abs,
-        patch.guard_target_next_abs,
-        target_exec,
-    ) {
-        return;
-    }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    let _ = patch_slot(
-        region,
-        jit,
-        patch.entry_patch_abs,
-        patch.entry_next_abs,
-        patch.guard_exec,
-    );
-}
+// `VaHasher`/`VaBuildHasher`, `publish_x86_translated_bytes`, `patch_slot`,
+// `GuardedChainPatch`, and `publish_guarded_chain_edge` moved verbatim to
+// `carrick_dsr_x86::translator` (Phase 3 Task 2 of the native-lane seam
+// campaign, the x86 translate/cache/chain engine extraction mirroring
+// aarch64's `carrick_dsr_aarch64::translator`). The only change made in the
+// move: `patch_slot`/`publish_guarded_chain_edge` take `&dyn NativeHostJit`
+// instead of the concrete `FreebsdHostJit` (a thin re-front over the
+// existing trait, not new capability) — this call site is unaffected by
+// that change (`&jit` unsize-coerces automatically).
 
 /// Serializes in-process runs. This driver mutates PROCESS-GLOBAL state — the
 /// fixed guest arenas (MAP_FIXED at the layout addresses) and the process-wide
@@ -8621,27 +8507,9 @@ pub(crate) fn run_static_x86_elf_bytes(
     })
 }
 
-#[derive(Clone, Debug)]
-struct PublishedFaultEntry {
-    host_start: u64,
-    host_end: u64,
-    guest_va: u64,
-    is_copied_x87: bool,
-    restores: Vec<ScratchRestore>,
-}
-
-/// One generation-scoped translated block and the complete guest instruction
-/// span that produced it. The span is reclassified atomically on every reuse so
-/// an RX prefix with mutable W+X or shared backing can never reuse or receive a
-/// stale edge.
-#[derive(Clone, Copy, Debug)]
-struct CachedBlock {
-    exec: u64,
-    has_edges: bool,
-    uses_fpu: bool,
-    has_indirect_cache: bool,
-    guest_len: usize,
-}
+// `PublishedFaultEntry`, `CachedBlock`, and `PendingChainEdge` moved
+// verbatim to `carrick_dsr_x86::translator` alongside the patch/publish
+// primitives above (same Phase-3 Task-2 move).
 
 fn apply_captured_return(
     snapshot: &mut X86UcontextSnapshot,
@@ -8650,18 +8518,6 @@ fn apply_captured_return(
 ) -> u64 {
     snapshot.gpr[reg::RSP] = snapshot.gpr[reg::RSP].wrapping_add(stack_adjust);
     target
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PendingChainEdge {
-    entry_patch_abs: u64,
-    entry_next_abs: u64,
-    guard_exec: u64,
-    guard_target_patch_abs: u64,
-    guard_target_next_abs: u64,
-    source: GuestVa,
-    source_uses_fpu: bool,
-    source_requires_guest_pkru: bool,
 }
 
 fn parse_native_x86_guest_va(value: &str) -> Option<GuestVa> {

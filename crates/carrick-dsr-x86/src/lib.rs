@@ -32,6 +32,7 @@ pub mod fxstate;
 mod fxstate_tests;
 pub mod gateway;
 pub mod legacy_x87;
+pub mod translator;
 mod xstate_address;
 pub mod xstate_restore;
 pub mod xstate_save;
