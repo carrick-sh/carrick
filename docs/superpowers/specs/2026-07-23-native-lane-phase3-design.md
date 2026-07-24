@@ -103,3 +103,39 @@ dedup (maintainer-approved re-scope) is adopting `carrick_mem::AddressSpace`
 (`load_elf_bytes...` + `with_native_vdso` + `with_linux_initial_stack`) — which
 Darwin already uses and FreeBSD hand-rolls via `map_one_elf`. See the plan's
 re-scoped Task 3.
+
+## Correction (2026-07-24): loop merge SKIPPED — Task 2 became the x86 engine extraction
+
+The Task-1 loop-merge precision map (scout, `f902c26e`) found — and the
+maintainer accepted — that the **loop merge described as this document's headline
+scope did NOT happen**, and the framing throughout should be read against that:
+
+- **§Scope, §"The four pieces" item 1, §"Fixed decisions" ("The loop merge grows
+  `GuestIsa`"), and the title "(loop merge → NetBSD bring-up)" are all superseded.**
+  The two run loops share only ~10% (100–180 of ~2,635 lines); the gap is an
+  *asymmetry*, not shared ISA semantics — and the danger-zone regions (fault
+  lowering, x86 XSAVE/XRSTOR vs aarch64 FP xstate) are NOT callback-able without
+  semantic entanglement. Only 3 `GuestIsa` methods cleared the thin-re-front bar.
+  A forced merge was not worth the risk.
+- **Task 2 was redirected to the x86 ENGINE EXTRACTION** (redirect commit
+  `6a854b04`; impl `9dfcbc50` + `5d35725a`). The real asymmetry was that
+  aarch64's translate/cache/JIT orchestration already lived in
+  `carrick-dsr-aarch64::translator` (2,643 ln) while x86's equivalent was still
+  inline in `native_freebsd.rs`. That equivalent now lives in
+  `carrick-dsr-x86::translator` as an `X86ThreadTranslator` with owned state and
+  a `translate()` engine mirroring aarch64's `ProcessTranslator` —
+  **engine-level symmetry achieved**. Note the scope: the symmetry is the
+  translate/cache engine only; the cross-ISA loop merge itself was NOT done, and
+  gateway-admission + xstate stay loop-resident (lane-specific, by design).
+
+**§3 (Cross-process futex host trait) is also superseded.** No shared cross-lane
+`NativeHost` futex trait was built, because there is no shared caller — the loop
+merge that would have named the operation from shared code was skipped. What
+landed (Task 4, `3739c3f7`) is an **EXTRACTION for symmetry**: FreeBSD's
+`_umtx_op` + waiter-table body moved into `carrick-native-freebsd::futex`
+(`shared_wait`/`shared_wake`/`shared_requeue`), mirroring Darwin's already-extracted
+`carrick-host::ulock` split. Darwin is already factored behind
+`carrick_hal::PlatformFutex` (which also backs the HVF runtime), so a unified
+static trait would regress it. NetBSD's `SYS___futex` does NOT slot into a trait:
+it will MIRROR the module and its lane-side dispatch at the FreeBSD call sites,
+not slot into a shared abstraction.

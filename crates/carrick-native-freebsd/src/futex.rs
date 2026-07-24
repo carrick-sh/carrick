@@ -2,12 +2,14 @@
 //! backend.
 //!
 //! Moved verbatim from `carrick-runtime/src/native_freebsd.rs` as the Phase-3
-//! futex seam: the FreeBSD half of the "shared code names the operation, not
-//! the syscall" contract. The Darwin lane already names its shared futex
-//! behind `carrick_hal::PlatformFutex` (backed by `carrick-host::ulock`, which
-//! carries its OWN `__ulock` waiter table); this module is the FreeBSD peer,
-//! naming the operation behind `_umtx_op(2)` + the fork-shared waiter-count
-//! table. The two lanes' waiter-table workarounds stay lane-side by design:
+//! futex work: FreeBSD's cross-process futex ops, extracted for symmetry with
+//! Darwin. This is an extraction, NOT a shared cross-lane abstraction — no
+//! shared code names the operation today (the FreeBSD lane's run loop does);
+//! a shared caller awaits a future loop merge. The Darwin lane already names
+//! its shared futex behind `carrick_hal::PlatformFutex` (backed by
+//! `carrick-host::ulock`, which carries its OWN `__ulock` waiter table); this
+//! module is the FreeBSD peer, naming the operation behind `_umtx_op(2)` + the
+//! fork-shared waiter-count table. The two lanes' waiter-table workarounds stay lane-side by design:
 //! each reconstructs a woken-count / atomic-requeue its host primitive does not
 //! natively report, and the accounting is specific to that primitive's quirk.
 //!
