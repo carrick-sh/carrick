@@ -798,10 +798,6 @@ pub(crate) mod test_host {
             unsafe { sys_icache_invalidate(exec_ptr as *mut core::ffi::c_void, len) };
         }
 
-        fn after_fork_child(&self) {
-            unsafe { libc::pthread_jit_write_protect_np(1) };
-        }
-
         fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
             // Mirror of `DarwinHostJit`: MAP_JIT is MAP_PRIVATE, so the
             // inherited mapping is already the child's own CoW copy.
@@ -852,8 +848,6 @@ pub(crate) mod test_host {
         fn end_thread_write(&self) {}
 
         fn flush_icache(&self, _exec_ptr: *const u8, _len: usize) {}
-
-        fn after_fork_child(&self) {}
 
         fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
             // MAP_PRIVATE anonymous mapping: the inherited pages are

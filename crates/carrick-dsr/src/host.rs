@@ -124,19 +124,21 @@ pub trait NativeHostJit: Send + Sync {
     fn begin_thread_write(&self);
 
     /// Revert [`Self::begin_thread_write`] for the calling thread.
+    ///
+    /// This is also the sole fork-child protection repair for every host:
+    /// [`crate::cache::TranslationCache::after_fork_child`] calls straight
+    /// through to this method, not through a separate per-host fork hook.
+    /// A `NativeHostJit::after_fork_child` method used to exist alongside it
+    /// (documented as the "IN-PLACE repair hook" for lanes whose region
+    /// survives fork, e.g. Darwin re-asserting the MAP_JIT write-protect
+    /// bit) but the Phase-1 seams audit found no production call site ever
+    /// invoked it — Darwin's own impl just called `end_thread_write` again,
+    /// redundantly — so it was removed rather than kept as dead API surface.
     fn end_thread_write(&self);
 
     /// Make `len` freshly written bytes at `exec_ptr` (EXEC va) visible to
     /// instruction fetch (AArch64: icache invalidate; x86: no-op).
     fn flush_icache(&self, exec_ptr: *const u8, len: usize);
-
-    /// Repair per-thread protection state inherited by the sole surviving
-    /// thread after `fork(2)`, IN PLACE, for lanes whose region SURVIVES
-    /// fork unchanged (Darwin: re-assert the write-protect bit; the child
-    /// reuses the inherited mapping and must NOT re-map). Region
-    /// REPLACEMENT — for lanes where the inherited region is unsafe to
-    /// keep using — is [`Self::remap_for_fork_child`], not this method.
-    fn after_fork_child(&self);
 
     /// Fork-repair contract. Called in the CHILD immediately after
     /// `fork(2)` by lanes whose fork path routes region repair through this seam

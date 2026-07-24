@@ -46,8 +46,6 @@ mod unsupported {
 
         fn flush_icache(&self, _exec_ptr: *const u8, _len: usize) {}
 
-        fn after_fork_child(&self) {}
-
         fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
             Err(std::io::Error::other(
                 "no native host JIT implementation for this target yet",

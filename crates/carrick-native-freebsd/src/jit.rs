@@ -31,10 +31,10 @@
 //! capacity, never the inherited one. The runtime's `fork_child_rebuild`
 //! (`carrick-runtime/src/native_freebsd.rs`) calls this instead of
 //! `map_code_cache` directly, so a fork child NEVER keeps executing against
-//! the parent's SHM object. `after_fork_child` stays a no-op here: it is the
-//! IN-PLACE repair hook for lanes whose region SURVIVES fork (Darwin); this
-//! lane's fork repair is entirely REGION REPLACEMENT, done by
-//! `remap_for_fork_child` before the child's first guest thread runs.
+//! the parent's SHM object. This lane's fork repair is entirely REGION
+//! REPLACEMENT, done by `remap_for_fork_child` before the child's first
+//! guest thread runs — there is no in-place protection-state repair to do
+//! (no MAP_JIT toggle on this lane).
 
 use std::io;
 use std::ptr::NonNull;
@@ -167,13 +167,6 @@ impl NativeHostJit for FreebsdHostJit {
     fn flush_icache(&self, _exec_ptr: *const u8, _len: usize) {
         // Coherent I-cache on x86; freshly-published (never-executed) code
         // needs no barrier beyond the publication index's Release store.
-    }
-
-    fn after_fork_child(&self) {
-        // No per-thread protection state to repair on this lane (no MAP_JIT
-        // toggle). This lane's fork repair is REGION REPLACEMENT, not
-        // in-place repair — see `remap_for_fork_child` and the module doc's
-        // fork-hazard section.
     }
 
     fn remap_for_fork_child(&self, prior: &JitRegion) -> io::Result<ForkChildJit> {
