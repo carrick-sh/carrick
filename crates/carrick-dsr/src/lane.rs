@@ -21,11 +21,37 @@ pub trait GuestIsa: 'static + Send + Sync {
     const GUEST_PAGE_SIZE: usize;
 }
 
-/// Host-OS half of a native lane. Phase 1: JIT authority only.
+/// Host-OS half of a native lane. Phase 1: JIT authority only. Phase 2 adds
+/// two small identity-memory seam methods (both default to the safe,
+/// zero-behavior-change value every non-FreeBSD host wants): see
+/// `carrick_dsr::identity_memory`'s module doc for why these are plain
+/// methods here rather than a second generic parameter on that module's
+/// `IdentityGuestMemory<A>`.
 pub trait NativeHost: 'static + Send + Sync {
     const NAME: &'static str; // "darwin" | "freebsd"
 
     fn active_jit() -> &'static dyn NativeHostJit;
+
+    /// Stable, fork-coherent waiter-key derivation for a guest MAP_SHARED
+    /// futex word at `host_addr` (identity model: host VA == guest VA).
+    /// `None` when the host cannot resolve a backing identity (the caller
+    /// falls back to `host_addr` itself). FreeBSD resolves this through
+    /// `kern.proc.vmmap` vnode identity; no other host needs it today.
+    fn shared_futex_waiter_key(host_addr: usize) -> Option<usize> {
+        let _ = host_addr;
+        None
+    }
+
+    /// Extra `mmap(2)` flag bits a host adds to a `MAP_FIXED` request to make
+    /// it atomically fail rather than silently replace existing bytes when
+    /// the target range is already occupied (FreeBSD/NetBSD: `MAP_EXCL`;
+    /// Darwin has no such flag — a `MAP_FIXED` there always replaces, so the
+    /// identity-memory model's own overlap bookkeeping —
+    /// `NativeMappingTransaction`'s disjoint-range check — is the only
+    /// protection on hosts where this returns 0).
+    fn exclusive_fixed_map_flag() -> i32 {
+        0
+    }
 }
 
 /// A concrete (ISA, Host) pairing. Native lanes are same-ISA by definition.

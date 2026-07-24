@@ -32,6 +32,7 @@ pub mod address;
 pub mod cache;
 pub mod fault;
 pub mod host;
+pub mod identity_memory;
 pub mod ids;
 pub mod lane;
 pub mod native_error;

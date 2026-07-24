@@ -26,11 +26,13 @@
 #![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 
 use std::convert::Infallible;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 
 use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
+use carrick_dsr::identity_memory::*;
+use carrick_dsr::lane::NativeHost;
 use carrick_dsr_x86::block::{X86BlockPlanError, X86Exit};
 use carrick_dsr_x86::decode::{X86InstClass, classify};
 use carrick_dsr_x86::gateway::{
@@ -46,12 +48,12 @@ use carrick_dsr_x86::{
     emit::{ScratchRestore, emit_block_linked},
     plan_block_with_reader,
 };
-use carrick_guest_mem::{
-    GuestMemory, GuestVa, MemoryError, RepointPrivateError, X8664SyscallFrame,
-};
+#[cfg(test)]
+use carrick_guest_mem::RepointPrivateError;
+use carrick_guest_mem::{GuestMemory, GuestVa, MemoryError, X8664SyscallFrame};
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_hal::{GuestArch, Reg, RegAccess};
-use carrick_native_freebsd::{FreebsdHostJit, fault};
+use carrick_native_freebsd::{FreebsdHost, FreebsdHostJit, fault};
 use goblin::elf::Elf;
 use goblin::elf::header::{EM_X86_64, ET_DYN, ET_EXEC};
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
@@ -113,22 +115,32 @@ impl GuestArenas {
             Ok(()) => Ok(Self {
                 mappings: candidate.commit(),
             }),
-            Err(error) => Err(candidate.rollback(error)),
+            Err(error) => {
+                // `NativeMappingTransaction::rollback` lives in carrick-dsr and
+                // therefore speaks `NativeMemoryError`, not this crate's own
+                // `RuntimeError`; fold the teardown-failure strings (if any)
+                // into `error` directly rather than round-tripping through a
+                // foreign error type's `Display` (which would double-prefix
+                // `RuntimeError::Unsupported`'s own "unsupported in this
+                // backend: " text). See `carrick-dsr`'s
+                // `NativeMappingTransaction::rollback_teardown_errors` doc.
+                let label = candidate.label();
+                let rollback_errors = candidate.rollback_teardown_errors();
+                Err(if rollback_errors.is_empty() {
+                    error
+                } else {
+                    RuntimeError::Unsupported(format!(
+                        "{error}; {label} rollback failed: {}",
+                        rollback_errors.join("; ")
+                    ))
+                })
+            }
         }
     }
 
     fn teardown(&self) -> Result<(), RuntimeError> {
-        teardown_native_mappings(&self.mappings)
+        teardown_native_mappings(&self.mappings).map_err(RuntimeError::from)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FixedRwReservation {
-    /// Initial ownership acquisition: a collision must fail without replacing
-    /// even one byte of the pre-existing host mapping.
-    Exclusive,
-    /// Exec retains the original arena owner while replacing its backing.
-    ReplaceOwned,
 }
 
 /// Map `[base, base+len)` as anonymous RW at exactly `base`.
@@ -149,6 +161,7 @@ fn reserve_fixed_rw(
         libc::PROT_READ | libc::PROT_WRITE,
         Some(base),
         reservation,
+        FreebsdHost::exclusive_fixed_map_flag(),
     );
     if p == libc::MAP_FAILED.cast() {
         return Err(RuntimeError::Unsupported(format!(
@@ -199,487 +212,27 @@ const ARCH_GET_GS: u64 = 0x1004;
 /// `EINVAL`, as a negated Linux errno return.
 const NEG_EINVAL: i64 = -22;
 
-/// A guest address space where guest VA == host VA: `GuestMemory` reads and
-/// writes are plain host memory accesses at the guest address. The native
-/// model maps the guest image and every guest mapping into THIS process's
-/// address space, so no translation is needed. Out-of-bounds/unmapped guest
-/// pointers are not gated here — a bad pointer faults, and the fault shim
-/// turns an in-JIT fault into a typed Signal exit (a syscall-path bad pointer
-/// is a genuine EFAULT the handlers surface).
-#[derive(Clone, Default)]
-struct IdentityGuestMemory {
-    /// The active run's executable-mutation authority. Loader-only memory used
-    /// before a [`SharedRun`] exists intentionally carries `None`; every live
-    /// main/clone/fork thread binds the coordinator owned by its active run.
-    executable_epoch: Option<Arc<ExecutableEpoch>>,
-    /// The [`GuestMemory`] metadata setters predate fallible host mappings and
-    /// therefore cannot return a [`MemoryError`]. Keep the first host-mapping
-    /// failure typed until the surrounding native dispatch boundary consumes
-    /// it; the failed range is simultaneously left fail-closed in the registry.
-    mapping_failure: Option<carrick_guest_mem::MemoryError>,
-}
-
-impl IdentityGuestMemory {
-    fn uncoordinated() -> Self {
-        Self::default()
-    }
-
-    fn for_run(shared: &SharedRun) -> Self {
-        Self {
-            executable_epoch: Some(Arc::clone(&shared.executable_epoch)),
-            mapping_failure: None,
-        }
-    }
-
-    fn record_mapping_failure(
-        &mut self,
-        address: u64,
-        len: usize,
-        error: carrick_guest_mem::MemoryError,
-    ) {
-        IDENTITY_PROTECTIONS.set_unmapped(address, len, true);
-        if self.mapping_failure.is_none() {
-            self.mapping_failure = Some(error);
-        }
-    }
-
-    fn take_mapping_failure(&mut self) -> Option<carrick_guest_mem::MemoryError> {
-        self.mapping_failure.take()
-    }
-
-    /// Drop the inherited Arc without touching its mutex. A fork child has no
-    /// sibling JIT threads and may perform child-tid writes before the run loop
-    /// builds its fresh SharedRun; those writes must not acquire the parent's
-    /// possibly sibling-owned coordinator.
-    fn abandon_inherited_epoch_after_fork(&mut self) {
-        self.executable_epoch = None;
-    }
-
-    fn rebind_after_fork(&mut self, shared: &SharedRun) {
-        self.executable_epoch = Some(Arc::clone(&shared.executable_epoch));
-    }
-}
-
-/// Resolve a mapped vnode page to a process-independent futex waiter key using
-/// FreeBSD's documented `kern.proc.vmmap` ABI. Linux keys a shared futex by its
-/// backing object and byte offset, not by the caller's VA; after exec the same
-/// checkpoint file is commonly remapped at a different address. `_umtx_op`
-/// already uses that backing identity for the physical wait/wake. Carrick needs
-/// the same identity for its fork-shared waiter-count side table so WAKE returns
-/// Linux's count rather than a false zero.
-fn freebsd_shared_waiter_key(address: usize) -> Option<usize> {
-    let pid = unsafe { libc::getpid() };
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_VMMAP, pid];
-    let mut needed = 0usize;
-    // SAFETY: first sysctl call requests the required buffer size only.
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as u32,
-            std::ptr::null_mut(),
-            &mut needed,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-        || needed < std::mem::size_of::<libc::kinfo_vmentry>()
-    {
-        return None;
-    }
-    let mut bytes = vec![0u8; needed];
-    // SAFETY: `bytes` owns `needed` writable bytes and this is a read-only MIB.
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as u32,
-            bytes.as_mut_ptr().cast(),
-            &mut needed,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return None;
-    }
-    let mut cursor = 0usize;
-    while cursor
-        .checked_add(std::mem::size_of::<libc::kinfo_vmentry>())
-        .is_some_and(|end| end <= needed)
-    {
-        // SAFETY: the bounds check above covers one complete ABI entry. Sysctl
-        // entries need not be naturally aligned inside the byte buffer.
-        let entry = unsafe {
-            std::ptr::read_unaligned(bytes.as_ptr().add(cursor).cast::<libc::kinfo_vmentry>())
-        };
-        let entry_size = usize::try_from(entry.kve_structsize).ok()?;
-        if entry_size == 0
-            || cursor
-                .checked_add(entry_size)
-                .is_none_or(|end| end > needed)
-        {
-            break;
-        }
-        let address = address as u64;
-        if entry.kve_start <= address && address < entry.kve_end && entry.kve_vn_fileid != 0 {
-            let backing_offset = entry
-                .kve_offset
-                .checked_add(address.saturating_sub(entry.kve_start))?;
-            // Stable 64-bit avalanche over vnode fsid/fileid + byte offset.
-            let mut key = entry.kve_vn_fsid
-                ^ entry.kve_vn_fileid.rotate_left(21)
-                ^ backing_offset.rotate_left(42)
-                ^ 0x9e37_79b9_7f4a_7c15;
-            key ^= key >> 30;
-            key = key.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            key ^= key >> 27;
-            key = key.wrapping_mul(0x94d0_49bb_1331_11eb);
-            key ^= key >> 31;
-            return Some((key as usize) | 1);
-        }
-        cursor += entry_size;
-    }
-    None
-}
-
-const X86_64_USER_END_EXCLUSIVE: u64 = 1 << 47;
-// Carrick exposes Linux's default `/proc/sys/vm/mmap_min_addr` (64 KiB);
-// no guest mapping can legally back a syscall pointer below it.
-const LINUX_MMAP_MIN_ADDR: u64 = 0x1_0000;
-
-/// First byte outside Carrick's raw identity guest-pointer domain.
-fn identity_raw_fault_address(address: u64, length: usize) -> Option<u64> {
-    if length == 0 {
-        return None;
-    }
-    if length > isize::MAX as usize
-        || !(LINUX_MMAP_MIN_ADDR..X86_64_USER_END_EXCLUSIVE).contains(&address)
-    {
-        return Some(address);
-    }
-    match address.checked_add(length as u64) {
-        Some(end) if end <= X86_64_USER_END_EXCLUSIVE => None,
-        Some(_) => Some(X86_64_USER_END_EXCLUSIVE),
-        None => Some(address),
-    }
-}
-
-/// Linux x86-64 userspace occupies the low canonical half. Reject a raw range
-/// before turning it into a host pointer if it crosses that boundary, wraps, or
-/// exceeds Rust's slice size limit. This is a syscall-memory boundary: malformed
-/// guest pointers must become EFAULT, never a host SIGSEGV or slice UB.
-fn identity_raw_range_valid(address: u64, length: usize) -> bool {
-    identity_raw_fault_address(address, length).is_none()
-}
-
 #[cfg(test)]
 mod identity_raw_range_tests {
     use super::{
-        IDENTITY_PROTECTIONS, IdentityGuestMemory, PublishedFaultEntry, SharedWaitAssignment,
-        X86GatewayX87Witness, calibrate_x86_vvar_clock, cflow_guest_memory_fault,
-        cflow_memory_backend_error, cflow_raw_memory_fault, exclude_vfork_shared_ranges,
-        freebsd_shared_waiter_key, host_clock_ns, identity_checked_fetch_x86_instruction,
-        identity_checked_read_exact, identity_checked_write_exact,
-        identity_kernel_copy_pipe_census, identity_kernel_copyin_operation_census,
-        identity_kernel_copyout_operation_census, identity_raw_range_valid,
-        init_shared_waiter_table, normalize_x86_gateway_x87_fip, parse_loadable_elf,
-        recover_x86_fault_snapshot, reset_identity_kernel_copy_pipe_census,
+        NativeIdentityMemory, PublishedFaultEntry, SharedWaitAssignment, X86GatewayX87Witness,
+        calibrate_x86_vvar_clock, exclude_vfork_shared_ranges, host_clock_ns,
+        identity_checked_fetch_x86_instruction, identity_host_seam, init_shared_waiter_table,
+        normalize_x86_gateway_x87_fip, parse_loadable_elf, recover_x86_fault_snapshot,
+        shared_futex_requeue_umtx, shared_futex_wait_umtx, shared_futex_wake_umtx,
+        shared_waiter_slot, take_shared_wait_assignment, tsc_ns, wait_requeued_umtx,
+    };
+    // These moved to `carrick-dsr::identity_memory` (Phase 2 of the native-lane
+    // seam plan); the census/reset pair is `test-hooks`-gated there, reachable
+    // here via carrick-runtime's own `[dev-dependencies]` re-declaration of
+    // carrick-dsr with that feature (see that crate's Cargo.toml comment).
+    use carrick_dsr::identity_memory::{
+        IDENTITY_PROTECTIONS, identity_kernel_copyin_operation_census,
         reset_identity_kernel_copyin_operation_census,
-        reset_identity_kernel_copyout_operation_census, shared_futex_requeue_umtx,
-        shared_futex_wait_umtx, shared_futex_wake_umtx, shared_waiter_slot,
-        take_shared_wait_assignment, tsc_ns, wait_requeued_umtx,
     };
     use carrick_guest_mem::GuestMemory;
     use carrick_guest_mem::protections::{GuestMemoryFault, GuestMemoryFaultKind};
     use std::os::fd::AsRawFd;
-
-    #[test]
-    fn accepts_low_canonical_guest_ranges() {
-        assert!(identity_raw_range_valid(0x1_0000, 1));
-        assert!(identity_raw_range_valid((1 << 47) - 4096, 4096));
-    }
-
-    #[test]
-    fn rejects_null_wrapping_and_noncanonical_ranges() {
-        assert!(!identity_raw_range_valid(0, 1));
-        assert!(!identity_raw_range_valid(0x1000, 1));
-        assert!(!identity_raw_range_valid(u64::MAX - 1, 4));
-        assert!(!identity_raw_range_valid(1 << 47, 1));
-        assert!(!identity_raw_range_valid((1 << 47) - 1, 2));
-    }
-
-    #[test]
-    fn zero_length_access_never_forms_a_pointer() {
-        assert!(identity_raw_range_valid(0, 0));
-        assert!(identity_raw_range_valid(u64::MAX, 0));
-    }
-
-    #[test]
-    fn cflow_only_exposes_guest_access_failures_as_retryable_faults() {
-        use carrick_dsr_x86::cflow::{CflowError, CflowMemoryAccess, CflowMemoryFaultKind};
-
-        let address = 0x1234_5000;
-        assert_eq!(
-            cflow_guest_memory_fault(
-                CflowMemoryAccess::Read,
-                GuestMemoryFault {
-                    address: carrick_guest_mem::GuestVa(address),
-                    kind: GuestMemoryFaultKind::AccessDenied,
-                },
-            ),
-            CflowError::MemoryRead {
-                address,
-                kind: CflowMemoryFaultKind::AccessDenied,
-            }
-        );
-        assert_eq!(
-            cflow_raw_memory_fault(CflowMemoryAccess::Read, (1 << 47) - 4, 8),
-            Some(CflowError::MemoryRead {
-                address: 1 << 47,
-                kind: CflowMemoryFaultKind::Unmapped,
-            }),
-            "cross-boundary faults name the first inaccessible byte"
-        );
-        assert_eq!(
-            cflow_memory_backend_error(
-                CflowMemoryAccess::Write,
-                address,
-                carrick_guest_mem::MemoryError::HostMap("injected coordinator failure".into()),
-            ),
-            CflowError::MemoryBackend {
-                access: CflowMemoryAccess::Write,
-                address,
-                detail: "host mapping operation failed: injected coordinator failure".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn exact_checked_reader_uses_direct_materialized_copy_and_validates_before_mutation() {
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                8192,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(mapping, libc::MAP_FAILED);
-        let address = mapping as u64;
-        let source = [0x11, 0x22, 0x33, 0x44];
-        let mut snapshot = vec![0u8; 8192];
-        snapshot[4094..4098].copy_from_slice(&source);
-        IDENTITY_PROTECTIONS.set_mapping_protection_and_sharing(
-            address,
-            8192,
-            false,
-            false,
-            carrick_guest_mem::MappingSharing::Shared,
-        );
-        let mut memory = IdentityGuestMemory::uncoordinated();
-        memory
-            .repoint_private(address, 0, 8192, &snapshot)
-            .expect("physically materialize checked-read backing");
-        memory.set_mapping_protection_and_sharing(
-            address,
-            8192,
-            false,
-            false,
-            carrick_guest_mem::MappingSharing::Private,
-        );
-
-        let mut destination = [0u8; 4];
-        reset_identity_kernel_copy_pipe_census();
-        reset_identity_kernel_copyin_operation_census();
-        identity_checked_read_exact(carrick_guest_mem::GuestVa(address + 4094), &mut destination)
-            .expect("exact cross-page read");
-        assert_eq!(destination, source);
-        assert_eq!(identity_kernel_copy_pipe_census(), 0);
-        assert_eq!(
-            identity_kernel_copyin_operation_census(),
-            0,
-            "anonymous checked read must not create or operate a private pipe"
-        );
-
-        IDENTITY_PROTECTIONS.set_no_access(address + 4096, 4096, true);
-        destination.fill(0x7e);
-        let denied = identity_checked_read_exact(
-            carrick_guest_mem::GuestVa(address + 4094),
-            &mut destination,
-        );
-        assert_eq!(
-            denied,
-            Err(super::IdentityCheckedReadError::Fault(GuestMemoryFault {
-                address: carrick_guest_mem::GuestVa(address + 4096),
-                kind: GuestMemoryFaultKind::AccessDenied,
-            }))
-        );
-        assert_eq!(
-            destination, [0x7e; 4],
-            "complete-range ACCERR validation must precede destination mutation"
-        );
-        IDENTITY_PROTECTIONS.set_bus_fault(address + 4096, 4096, true);
-        assert_eq!(
-            identity_checked_read_exact(
-                carrick_guest_mem::GuestVa(address + 4096),
-                &mut destination[..1],
-            ),
-            Err(super::IdentityCheckedReadError::BusAddress {
-                address: carrick_guest_mem::GuestVa(address + 4096),
-            }),
-            "the same AccessDenied registry fault is BUS_ADRERR only for a published EOF tail"
-        );
-        IDENTITY_PROTECTIONS.set_bus_fault(address + 4096, 4096, false);
-        IDENTITY_PROTECTIONS.set_no_access(address + 4096, 4096, false);
-
-        IDENTITY_PROTECTIONS.set_unmapped(address + 4096, 4096, true);
-        destination.fill(0x5d);
-        let unmapped = identity_checked_read_exact(
-            carrick_guest_mem::GuestVa(address + 4094),
-            &mut destination,
-        );
-        assert_eq!(
-            unmapped,
-            Err(super::IdentityCheckedReadError::Fault(GuestMemoryFault {
-                address: carrick_guest_mem::GuestVa(address + 4096),
-                kind: GuestMemoryFaultKind::Unmapped,
-            }))
-        );
-        assert_eq!(
-            destination, [0x5d; 4],
-            "complete-range MAPERR validation must precede destination mutation"
-        );
-        IDENTITY_PROTECTIONS.set_unmapped(address + 4096, 4096, false);
-
-        let mut empty = [];
-        identity_checked_read_exact(carrick_guest_mem::GuestVa(0), &mut empty)
-            .expect("zero-length read never forms a host pointer");
-        assert_eq!(identity_kernel_copy_pipe_census(), 0);
-        assert_eq!(identity_kernel_copyin_operation_census(), 0);
-        {
-            let _mapping_guard = super::IDENTITY_HOST_MAPPING_LOCK.write();
-            IDENTITY_PROTECTIONS.set_unmapped(address, 8192, true);
-            assert_eq!(unsafe { libc::munmap(mapping, 8192) }, 0);
-        }
-    }
-
-    #[test]
-    fn exact_checked_writer_uses_direct_materialized_copy_and_validates_before_mutation() {
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                8192,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(mapping, libc::MAP_FAILED);
-        let address = mapping as u64;
-        IDENTITY_PROTECTIONS.set_mapping_protection_and_sharing(
-            address,
-            8192,
-            false,
-            false,
-            carrick_guest_mem::MappingSharing::Shared,
-        );
-        let mut memory = IdentityGuestMemory::uncoordinated();
-        memory
-            .repoint_private(address, 0, 8192, &[0; 8192])
-            .expect("physically materialize checked-write backing");
-        memory.set_mapping_protection_and_sharing(
-            address,
-            8192,
-            false,
-            false,
-            carrick_guest_mem::MappingSharing::Private,
-        );
-        let source = [0x19, 0x2a, 0x3b, 0x4c];
-
-        reset_identity_kernel_copy_pipe_census();
-        reset_identity_kernel_copyout_operation_census();
-        identity_checked_write_exact(&memory, carrick_guest_mem::GuestVa(address + 4094), &source)
-            .expect("exact cross-page private write");
-        // SAFETY: the test owns both mapped pages and the checked write succeeded.
-        let written = unsafe { std::slice::from_raw_parts((address + 4094) as *const u8, 4) };
-        assert_eq!(written, source);
-        assert_eq!(identity_kernel_copy_pipe_census(), 0);
-        assert_eq!(
-            identity_kernel_copyout_operation_census(),
-            0,
-            "anonymous checked write must not create or operate a private pipe"
-        );
-
-        let original = [0x61, 0x72, 0x83, 0x94];
-        // SAFETY: the test owns this writable cross-page destination.
-        unsafe { std::ptr::copy_nonoverlapping(original.as_ptr(), (address + 4094) as *mut u8, 4) };
-        IDENTITY_PROTECTIONS.set_no_write(address + 4096, 4096, true);
-        assert_eq!(
-            identity_checked_write_exact(
-                &memory,
-                carrick_guest_mem::GuestVa(address + 4094),
-                &source,
-            ),
-            Err(super::IdentityCheckedWriteError::Fault(GuestMemoryFault {
-                address: carrick_guest_mem::GuestVa(address + 4096),
-                kind: GuestMemoryFaultKind::AccessDenied,
-            }))
-        );
-        // SAFETY: complete-range validation must leave this owned mapping live.
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts((address + 4094) as *const u8, 4) },
-            original,
-            "complete-range ACCERR validation must precede guest mutation"
-        );
-        IDENTITY_PROTECTIONS.set_no_access(address + 4096, 4096, true);
-        IDENTITY_PROTECTIONS.set_bus_fault(address + 4096, 4096, true);
-        assert_eq!(
-            identity_checked_write_exact(
-                &memory,
-                carrick_guest_mem::GuestVa(address + 4096),
-                &source[..1],
-            ),
-            Err(super::IdentityCheckedWriteError::BusAddress {
-                address: carrick_guest_mem::GuestVa(address + 4096),
-            }),
-            "private EOF AccessDenied must remain a typed BUS_ADRERR write"
-        );
-        IDENTITY_PROTECTIONS.set_bus_fault(address + 4096, 4096, false);
-        IDENTITY_PROTECTIONS.set_no_access(address + 4096, 4096, false);
-        IDENTITY_PROTECTIONS.set_no_write(address + 4096, 4096, false);
-
-        IDENTITY_PROTECTIONS.set_unmapped(address + 4096, 4096, true);
-        assert_eq!(
-            identity_checked_write_exact(
-                &memory,
-                carrick_guest_mem::GuestVa(address + 4094),
-                &source,
-            ),
-            Err(super::IdentityCheckedWriteError::Fault(GuestMemoryFault {
-                address: carrick_guest_mem::GuestVa(address + 4096),
-                kind: GuestMemoryFaultKind::Unmapped,
-            }))
-        );
-        // SAFETY: metadata-only test hole leaves the host mapping readable.
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts((address + 4094) as *const u8, 4) },
-            original,
-            "complete-range MAPERR validation must precede guest mutation"
-        );
-        IDENTITY_PROTECTIONS.set_unmapped(address + 4096, 4096, false);
-
-        identity_checked_write_exact(&memory, carrick_guest_mem::GuestVa(0), &[])
-            .expect("zero-length write never forms a host pointer");
-        assert_eq!(identity_kernel_copy_pipe_census(), 0);
-        assert_eq!(identity_kernel_copyout_operation_census(), 0);
-        {
-            let _mapping_guard = super::IDENTITY_HOST_MAPPING_LOCK.write();
-            IDENTITY_PROTECTIONS.set_unmapped(address, 8192, true);
-            assert_eq!(unsafe { libc::munmap(mapping, 8192) }, 0);
-        }
-    }
 
     #[test]
     fn executable_private_repoint_isolates_fork_sibling_and_refreshes_direct_fetch() {
@@ -750,10 +303,7 @@ mod identity_raw_range_tests {
 
         let mut private_snapshot = vec![0u8; 4096];
         private_snapshot[..2].copy_from_slice(&[0xc3, 0x7a]);
-        let mut memory = IdentityGuestMemory {
-            executable_epoch: Some(std::sync::Arc::clone(&epoch)),
-            mapping_failure: None,
-        };
+        let mut memory = NativeIdentityMemory::for_run(&epoch, identity_host_seam());
         memory
             .repoint_private(address, 0, 4096, &private_snapshot)
             .expect("replace shared object with private materialized snapshot");
@@ -820,101 +370,6 @@ mod identity_raw_range_tests {
     }
 
     #[test]
-    fn middle_private_repoint_isolates_only_replaced_page_across_fork() {
-        const PAGE: usize = 4096;
-        const LEN: usize = 3 * PAGE;
-        let _test_guard = super::tests::lock_native_mapping_tests();
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                LEN,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(mapping, libc::MAP_FAILED);
-        let address = mapping as u64;
-        unsafe {
-            std::ptr::write_bytes(address as *mut u8, 0x11, PAGE);
-            std::ptr::write_bytes((address as usize + PAGE) as *mut u8, 0x22, PAGE);
-            std::ptr::write_bytes((address as usize + (2 * PAGE)) as *mut u8, 0x33, PAGE);
-        }
-        IDENTITY_PROTECTIONS.set_mapping_protection_and_sharing(
-            address,
-            LEN,
-            false,
-            false,
-            carrick_guest_mem::MappingSharing::Shared,
-        );
-
-        let mut release = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork partial replacement sibling failed");
-        if child == 0 {
-            unsafe { libc::close(release[1]) };
-            let mut byte = 0u8;
-            if unsafe { libc::read(release[0], (&mut byte as *mut u8).cast(), 1) } != 1 {
-                unsafe { libc::_exit(91) };
-            }
-            unsafe {
-                if (address as *const u8).read_volatile() != 0x11
-                    || ((address as usize + PAGE) as *const u8).read_volatile() != 0x22
-                    || ((address as usize + (2 * PAGE)) as *const u8).read_volatile() != 0x33
-                {
-                    libc::_exit(92);
-                }
-                (address as *mut u8).write_volatile(0x55);
-                ((address as usize + PAGE) as *mut u8).write_volatile(0x44);
-                ((address as usize + (2 * PAGE)) as *mut u8).write_volatile(0x66);
-                libc::_exit(0);
-            }
-        }
-        unsafe { libc::close(release[0]) };
-
-        let mut memory = IdentityGuestMemory::uncoordinated();
-        memory
-            .repoint_private(address + PAGE as u64, 0, PAGE, &[0x99; PAGE])
-            .expect("replace only middle shared page");
-        memory.set_mapping_protection_and_sharing(
-            address + PAGE as u64,
-            PAGE,
-            false,
-            false,
-            carrick_guest_mem::MappingSharing::Private,
-        );
-        assert_eq!(
-            unsafe { libc::write(release[1], [1u8].as_ptr().cast(), 1) },
-            1
-        );
-        unsafe { libc::close(release[1]) };
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 0);
-
-        assert_eq!(unsafe { (address as *const u8).read_volatile() }, 0x55);
-        assert_eq!(
-            unsafe { ((address as usize + PAGE) as *const u8).read_volatile() },
-            0x99,
-            "child must retain the old shared middle page"
-        );
-        assert_eq!(
-            unsafe { ((address as usize + (2 * PAGE)) as *const u8).read_volatile() },
-            0x66
-        );
-        assert!(IDENTITY_PROTECTIONS.range_mutable_shared_backing(address, 1));
-        assert!(!IDENTITY_PROTECTIONS.range_mutable_shared_backing(address + PAGE as u64, 1));
-        assert!(IDENTITY_PROTECTIONS.range_mutable_shared_backing(address + (2 * PAGE) as u64, 1));
-
-        memory
-            .unmap_range(address, LEN)
-            .expect("retire split replacement mapping");
-    }
-
-    #[test]
     fn unflagged_private_overlay_futex_does_not_cross_wake_but_shared_does() {
         const PAGE: usize = 4096;
         const LEN: usize = 2 * PAGE;
@@ -939,7 +394,7 @@ mod identity_raw_range_tests {
             false,
             carrick_guest_mem::MappingSharing::Shared,
         );
-        let memory = IdentityGuestMemory::uncoordinated();
+        let memory = NativeIdentityMemory::uncoordinated();
 
         let wait_until_parked = |key: usize| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -963,7 +418,7 @@ mod identity_raw_range_tests {
         let shared_child = unsafe { libc::fork() };
         assert!(shared_child >= 0, "fork shared futex waiter failed");
         if shared_child == 0 {
-            let child_memory = IdentityGuestMemory::uncoordinated();
+            let child_memory = NativeIdentityMemory::uncoordinated();
             let Some(location) = child_memory.shared_futex_location(address) else {
                 unsafe { libc::_exit(91) };
             };
@@ -1013,7 +468,7 @@ mod identity_raw_range_tests {
             };
         }
         wait_until_parked(old_shared_location.waiter_key());
-        let mut parent_memory = IdentityGuestMemory::uncoordinated();
+        let mut parent_memory = NativeIdentityMemory::uncoordinated();
         parent_memory
             .repoint_private(private_address, 0, PAGE, &[0; PAGE])
             .expect("replace same VA with private backing");
@@ -1044,135 +499,6 @@ mod identity_raw_range_tests {
         parent_memory
             .unmap_range(address, LEN)
             .expect("retire futex provenance test mapping");
-    }
-
-    #[test]
-    fn exact_checked_reader_contains_readable_file_mapping_bus_faults() {
-        const LEN: usize = 8192;
-        const FILE_END: u64 = 4096;
-        const HEADER_OFFSET: u64 = FILE_END + 512;
-
-        let file = tempfile::tempfile().expect("temporary file backing");
-        file.set_len(LEN as u64).expect("size file backing");
-        // SAFETY: this test owns the file and releases the complete mapping.
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                LEN,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(mapping, libc::MAP_FAILED);
-        let address = mapping as u64;
-        {
-            let _mapping_guard = super::IDENTITY_HOST_MAPPING_LOCK.write();
-            IDENTITY_PROTECTIONS.set_mapping_protection_and_sharing(
-                address,
-                LEN,
-                false,
-                false,
-                carrick_guest_mem::MappingSharing::Shared,
-            );
-        }
-
-        let valid_tail = [0x91u8, 0xa2];
-        // SAFETY: the temporary file is live and the write stays inside its
-        // first page, which remains backed after the truncation below.
-        assert_eq!(
-            unsafe {
-                libc::pwrite(
-                    file.as_raw_fd(),
-                    valid_tail.as_ptr().cast(),
-                    valid_tail.len(),
-                    (FILE_END - valid_tail.len() as u64) as libc::off_t,
-                )
-            },
-            valid_tail.len() as isize
-        );
-        file.set_len(FILE_END)
-            .expect("truncate after installing readable shared mapping");
-
-        let mut crossing = [0u8; 4];
-        reset_identity_kernel_copy_pipe_census();
-        reset_identity_kernel_copyin_operation_census();
-        assert_eq!(
-            identity_checked_read_exact(
-                carrick_guest_mem::GuestVa(address + FILE_END - 2),
-                &mut crossing,
-            ),
-            Err(super::IdentityCheckedReadError::BusAddress {
-                address: carrick_guest_mem::GuestVa(address + FILE_END),
-            }),
-            "a valid page tail followed by truncated backing must fault at the next page boundary"
-        );
-        assert_eq!(&crossing[..2], &valid_tail);
-        assert!(identity_kernel_copy_pipe_census() > 0);
-        assert!(
-            identity_kernel_copyin_operation_census() > 0,
-            "truncatable shared reads must retain kernel-contained copyin"
-        );
-
-        let mut destination = [0u8; 64];
-        reset_identity_kernel_copy_pipe_census();
-        reset_identity_kernel_copyin_operation_census();
-        assert_eq!(
-            identity_checked_read_exact(
-                carrick_guest_mem::GuestVa(address + HEADER_OFFSET),
-                &mut destination,
-            ),
-            Err(super::IdentityCheckedReadError::BusAddress {
-                address: carrick_guest_mem::GuestVa(address + HEADER_OFFSET),
-            }),
-            "kernel copyin must contain host SIGBUS and name the exact source range"
-        );
-        assert!(identity_kernel_copy_pipe_census() > 0);
-        assert!(identity_kernel_copyin_operation_census() > 0);
-
-        file.set_len(LEN as u64).expect("repair file backing");
-        let expected = [0x5au8; 64];
-        // SAFETY: expected is a valid local buffer and the repaired file range
-        // is wholly within the now-extended backing.
-        assert_eq!(
-            unsafe {
-                libc::pwrite(
-                    file.as_raw_fd(),
-                    expected.as_ptr().cast(),
-                    expected.len(),
-                    HEADER_OFFSET as libc::off_t,
-                )
-            },
-            expected.len() as isize
-        );
-        reset_identity_kernel_copy_pipe_census();
-        reset_identity_kernel_copyin_operation_census();
-        identity_checked_read_exact(
-            carrick_guest_mem::GuestVa(address + HEADER_OFFSET),
-            &mut destination,
-        )
-        .expect("repaired file-backed source must copy exactly");
-        assert_eq!(destination, expected);
-        assert!(identity_kernel_copy_pipe_census() > 0);
-        assert!(identity_kernel_copyin_operation_census() > 0);
-
-        let mut oversized = vec![0u8; super::IDENTITY_KERNEL_COPY_PIPE_BOUND + 1];
-        assert!(matches!(
-            identity_checked_read_exact(
-                carrick_guest_mem::GuestVa(address + FILE_END),
-                &mut oversized,
-            ),
-            Err(super::IdentityCheckedReadError::Backend { detail, .. })
-                if detail.contains("exceeds") && detail.contains("kernel-copy bound")
-        ));
-
-        {
-            let _mapping_guard = super::IDENTITY_HOST_MAPPING_LOCK.write();
-            IDENTITY_PROTECTIONS.set_unmapped(address, LEN, true);
-            // SAFETY: this test owns the complete mapping.
-            assert_eq!(unsafe { libc::munmap(mapping, LEN) }, 0);
-        }
     }
 
     #[test]
@@ -1367,186 +693,6 @@ mod identity_raw_range_tests {
             IDENTITY_PROTECTIONS.set_unmapped(address, LEN, true);
             // SAFETY: this test owns the complete mapping.
             assert_eq!(unsafe { libc::munmap(mapping, LEN) }, 0);
-        }
-    }
-
-    #[test]
-    fn cflow_write_contains_truncated_shared_mapping_bus_faults() {
-        use carrick_dsr_x86::cflow::{CflowError, CflowMemoryFaultKind, ControlFlowMemory};
-
-        const LEN: usize = 8192;
-        const FILE_END: u64 = 4096;
-        let file = tempfile::tempfile().expect("temporary file backing");
-        file.set_len(LEN as u64).expect("size file backing");
-        // SAFETY: this test owns the file and complete shared mapping.
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                LEN,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(mapping, libc::MAP_FAILED);
-        let address = mapping as u64;
-        {
-            let _mapping_guard = super::IDENTITY_HOST_MAPPING_LOCK.write();
-            IDENTITY_PROTECTIONS.set_mapping_protection_and_sharing(
-                address,
-                LEN,
-                false,
-                false,
-                carrick_guest_mem::MappingSharing::Shared,
-            );
-        }
-        file.set_len(FILE_END)
-            .expect("truncate writable shared mapping");
-
-        let value = 0x8877_6655_4433_2211u64;
-        let mut memory = IdentityGuestMemory::uncoordinated();
-        {
-            let _mapping_guard = super::IDENTITY_HOST_MAPPING_LOCK.write();
-            IDENTITY_PROTECTIONS.set_no_access(address + FILE_END, 4096, true);
-        }
-        assert_eq!(
-            memory.write_u64(address + FILE_END, value),
-            Err(CflowError::MemoryWrite {
-                address: address + FILE_END,
-                kind: CflowMemoryFaultKind::AccessDenied,
-            }),
-            "registry ACCERR must take precedence over truncated backing"
-        );
-        {
-            let _mapping_guard = super::IDENTITY_HOST_MAPPING_LOCK.write();
-            IDENTITY_PROTECTIONS.set_no_access(address + FILE_END, 4096, false);
-            IDENTITY_PROTECTIONS.set_unmapped(address + FILE_END, 4096, true);
-        }
-        assert_eq!(
-            memory.write_u64(address + FILE_END, value),
-            Err(CflowError::MemoryWrite {
-                address: address + FILE_END,
-                kind: CflowMemoryFaultKind::Unmapped,
-            }),
-            "registry MAPERR must take precedence over truncated backing"
-        );
-        {
-            let _mapping_guard = super::IDENTITY_HOST_MAPPING_LOCK.write();
-            IDENTITY_PROTECTIONS.set_mapping_protection_and_sharing(
-                address + FILE_END,
-                4096,
-                false,
-                false,
-                carrick_guest_mem::MappingSharing::Shared,
-            );
-        }
-        reset_identity_kernel_copy_pipe_census();
-        reset_identity_kernel_copyout_operation_census();
-        assert_eq!(
-            memory.write_u64(address + FILE_END, value),
-            Err(CflowError::MemoryWrite {
-                address: address + FILE_END,
-                kind: CflowMemoryFaultKind::BusAddress,
-            }),
-            "kernel copyout must contain host SIGBUS and keep the cflow write retryable"
-        );
-        assert!(identity_kernel_copy_pipe_census() > 0);
-        assert!(
-            identity_kernel_copyout_operation_census() > 0,
-            "truncatable shared writes must retain kernel-contained copyout"
-        );
-
-        file.set_len(LEN as u64).expect("repair file backing");
-        reset_identity_kernel_copy_pipe_census();
-        reset_identity_kernel_copyout_operation_census();
-        memory
-            .write_u64(address + FILE_END, value)
-            .expect("repaired shared stack slot accepts the retried push");
-        assert!(identity_kernel_copy_pipe_census() > 0);
-        assert!(identity_kernel_copyout_operation_census() > 0);
-        let mut found = [0u8; 8];
-        // SAFETY: `found` is writable and the repaired file range is live.
-        assert_eq!(
-            unsafe {
-                libc::pread(
-                    file.as_raw_fd(),
-                    found.as_mut_ptr().cast(),
-                    found.len(),
-                    FILE_END as libc::off_t,
-                )
-            },
-            found.len() as isize
-        );
-        assert_eq!(found, value.to_le_bytes());
-
-        {
-            let _mapping_guard = super::IDENTITY_HOST_MAPPING_LOCK.write();
-            IDENTITY_PROTECTIONS.set_unmapped(address, LEN, true);
-            // SAFETY: this test owns the complete mapping.
-            assert_eq!(unsafe { libc::munmap(mapping, LEN) }, 0);
-        }
-    }
-
-    #[test]
-    fn direct_host_pointer_validation_does_not_make_pages_resident() {
-        let page = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                8192,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(page, libc::MAP_FAILED);
-        let memory = IdentityGuestMemory::uncoordinated();
-        let start = carrick_guest_mem::GuestVa(page as u64);
-        assert_eq!(memory.resident_pages(start, 2, 4096), Some(vec![0, 0]));
-        // Host backing alone is insufficient: the syscall pointer gate follows
-        // the complete guest VMA registry, so validation needs no host mincore.
-        IDENTITY_PROTECTIONS.set_unmapped(page as u64, 8192, true);
-        assert!(memory.host_ptr_for_read(page as u64, 8192).is_none());
-        IDENTITY_PROTECTIONS.set_mapping_protection(page as u64, 8192, false, false);
-        assert!(memory.host_ptr_for_read(page as u64, 8192).is_some());
-        assert_eq!(memory.resident_pages(start, 2, 4096), Some(vec![0, 0]));
-        unsafe { (page as *mut u8).write_volatile(0) };
-        assert_eq!(memory.resident_pages(start, 2, 4096), Some(vec![1, 0]));
-        unsafe { libc::munmap(page, 8192) };
-    }
-
-    #[test]
-    fn shared_waiter_key_follows_vnode_offset_not_mapping_address() {
-        const LEN: usize = 8192;
-        let file = tempfile::tempfile().expect("temporary backing file");
-        file.set_len(LEN as u64).expect("size backing file");
-        let map = || unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                LEN,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        let first = map();
-        let second = map();
-        assert_ne!(first, libc::MAP_FAILED);
-        assert_ne!(second, libc::MAP_FAILED);
-        assert_ne!(first, second);
-
-        let first_key = freebsd_shared_waiter_key(first as usize).expect("first vnode key");
-        let alias_key = freebsd_shared_waiter_key(second as usize).expect("alias vnode key");
-        let next_page_key =
-            freebsd_shared_waiter_key(first as usize + 4096).expect("second-page vnode key");
-        assert_eq!(first_key, alias_key);
-        assert_ne!(first_key, next_page_key);
-
-        unsafe {
-            libc::munmap(first, LEN);
-            libc::munmap(second, LEN);
         }
     }
 
@@ -1834,319 +980,6 @@ mod identity_raw_range_tests {
 }
 
 /// Process-wide syscall-path protection metadata for the identity lane. Each
-/// `IdentityGuestMemory` carries only its run's executable coordinator; the
-/// VMA-classification sets (`no_access` / `no_write` / post-`munmap`
-/// `unmapped`) live in ONE global that every instance's `protections()` gate
-/// reads. The dispatcher's mmap/munmap/mprotect handlers already publish into
-/// this via `set_no_access`/`set_unmapped`/`set_mapping_protection`, so a syscall
-/// that touches a `PROT_NONE` or freed guest range returns `EFAULT` instead of
-/// raw-faulting the host, and `mincore` (which probes through gated `read_bytes`)
-/// reports the freed range unmapped. Fork inherits the parent's COW mappings, so
-/// the child correctly starts from a copy of this set.
-static IDENTITY_PROTECTIONS: std::sync::LazyLock<
-    carrick_guest_mem::protections::MemoryProtections,
-> = std::sync::LazyLock::new(carrick_guest_mem::protections::MemoryProtections::default);
-/// Serializes raw host mapping transitions against fault-intolerant Rust-side
-/// signal-frame copies. Guest JIT accesses remain governed by the fault shim;
-/// this lock only prevents `mprotect`/`munmap`/`MAP_FIXED` from racing a host
-/// the kernel-contained copy after its metadata check.
-static IDENTITY_HOST_MAPPING_LOCK: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
-
-fn identity_host_mapping_write_until(
-    deadline: std::time::Instant,
-) -> Option<parking_lot::RwLockWriteGuard<'static, ()>> {
-    loop {
-        if let Some(guard) = IDENTITY_HOST_MAPPING_LOCK.try_write() {
-            return Some(guard);
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::yield_now();
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeMappingOperation {
-    General,
-    IdentityBacking,
-    IdentityProtection,
-    ElfReservation,
-    ElfSegment,
-    GuestStack,
-    Scratch,
-    Vvar,
-    VvarProtection,
-    Vdso,
-    HostAlias,
-}
-
-#[cfg(test)]
-impl NativeMappingOperation {
-    const COUNT: usize = 11;
-
-    const fn index(self) -> usize {
-        match self {
-            Self::General => 0,
-            Self::IdentityBacking => 1,
-            Self::IdentityProtection => 2,
-            Self::ElfReservation => 3,
-            Self::ElfSegment => 4,
-            Self::GuestStack => 5,
-            Self::Scratch => 6,
-            Self::Vvar => 7,
-            Self::VvarProtection => 8,
-            Self::Vdso => 9,
-            Self::HostAlias => 10,
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-enum InjectedMmapResult {
-    Failed,
-    WrongAddress,
-}
-
-#[cfg(test)]
-struct NativeMappingFaultInjection {
-    mmap: Option<(NativeMappingOperation, usize, InjectedMmapResult)>,
-    mmap_calls: [usize; NativeMappingOperation::COUNT],
-    mprotect: Option<(NativeMappingOperation, usize)>,
-    mprotect_calls: [usize; NativeMappingOperation::COUNT],
-    munmap: Option<usize>,
-    munmap_calls: usize,
-    munmaps: Vec<(u64, usize, i32)>,
-}
-
-#[cfg(test)]
-impl Default for NativeMappingFaultInjection {
-    fn default() -> Self {
-        Self {
-            mmap: None,
-            mmap_calls: [0; NativeMappingOperation::COUNT],
-            mprotect: None,
-            mprotect_calls: [0; NativeMappingOperation::COUNT],
-            munmap: None,
-            munmap_calls: 0,
-            munmaps: Vec::new(),
-        }
-    }
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static NATIVE_MAPPING_FAULTS: std::cell::RefCell<NativeMappingFaultInjection> =
-        std::cell::RefCell::new(NativeMappingFaultInjection::default());
-}
-
-#[cfg(test)]
-struct NativeMappingFaultGuard;
-
-#[cfg(test)]
-impl NativeMappingFaultGuard {
-    fn new() -> Self {
-        NATIVE_MAPPING_FAULTS.with(|faults| *faults.borrow_mut() = Default::default());
-        Self
-    }
-
-    fn fail_mmap(&self, operation: NativeMappingOperation, result: InjectedMmapResult) {
-        self.fail_mmap_at(operation, 0, result);
-    }
-
-    fn fail_mmap_at(
-        &self,
-        operation: NativeMappingOperation,
-        index: usize,
-        result: InjectedMmapResult,
-    ) {
-        NATIVE_MAPPING_FAULTS.with(|faults| {
-            faults.borrow_mut().mmap = Some((operation, index, result));
-        });
-    }
-
-    fn fail_mprotect(&self, operation: NativeMappingOperation) {
-        self.fail_mprotect_at(operation, 0);
-    }
-
-    fn fail_mprotect_at(&self, operation: NativeMappingOperation, index: usize) {
-        NATIVE_MAPPING_FAULTS.with(|faults| {
-            faults.borrow_mut().mprotect = Some((operation, index));
-        });
-    }
-
-    fn fail_next_munmap(&self) {
-        self.fail_munmap_at(0);
-    }
-
-    fn fail_munmap_at(&self, index: usize) {
-        NATIVE_MAPPING_FAULTS.with(|faults| faults.borrow_mut().munmap = Some(index));
-    }
-
-    fn mmap_call_count(&self, operation: NativeMappingOperation) -> usize {
-        NATIVE_MAPPING_FAULTS.with(|faults| faults.borrow().mmap_calls[operation.index()])
-    }
-
-    fn mprotect_call_count(&self, operation: NativeMappingOperation) -> usize {
-        NATIVE_MAPPING_FAULTS.with(|faults| faults.borrow().mprotect_calls[operation.index()])
-    }
-
-    fn munmaps(&self) -> Vec<(u64, usize, i32)> {
-        NATIVE_MAPPING_FAULTS.with(|faults| faults.borrow().munmaps.clone())
-    }
-}
-
-#[cfg(test)]
-impl Drop for NativeMappingFaultGuard {
-    fn drop(&mut self) {
-        NATIVE_MAPPING_FAULTS.with(|faults| *faults.borrow_mut() = Default::default());
-    }
-}
-
-fn host_mmap(
-    _operation: NativeMappingOperation,
-    address: *mut libc::c_void,
-    len: usize,
-    prot: i32,
-    flags: i32,
-    fd: i32,
-    offset: libc::off_t,
-) -> *mut libc::c_void {
-    #[cfg(test)]
-    if let Some(injected) = NATIVE_MAPPING_FAULTS.with(|faults| {
-        let mut faults = faults.borrow_mut();
-        let operation_index = _operation.index();
-        let call_index = faults.mmap_calls[operation_index];
-        faults.mmap_calls[operation_index] = call_index.saturating_add(1);
-        match faults.mmap {
-            Some((site, target_index, result))
-                if site == _operation && target_index == call_index =>
-            {
-                faults.mmap = None;
-                Some(result)
-            }
-            _ => None,
-        }
-    }) {
-        return match injected {
-            InjectedMmapResult::Failed => {
-                // SAFETY: FreeBSD exposes the calling thread's errno through
-                // `__error`; injected host failures must carry a real errno.
-                unsafe { *libc::__error() = libc::ENOMEM };
-                libc::MAP_FAILED
-            }
-            // Allocate a real, separately-owned mapping so exact-address
-            // validation must clean it up rather than merely rejecting a fake
-            // pointer which could not prove rollback.
-            InjectedMmapResult::WrongAddress => unsafe {
-                let first = libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    prot,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
-                    0,
-                );
-                if first != libc::MAP_FAILED && first == address {
-                    // The allocator may immediately reuse the just-freed
-                    // requested hole. Occupy it while asking for a second map,
-                    // then release it so the injected result is deterministically
-                    // wrong without leaving an unowned mapping behind.
-                    let second = libc::mmap(
-                        std::ptr::null_mut(),
-                        len,
-                        prot,
-                        libc::MAP_PRIVATE | libc::MAP_ANON,
-                        -1,
-                        0,
-                    );
-                    libc::munmap(first, len);
-                    second
-                } else {
-                    first
-                }
-            },
-        };
-    }
-    // SAFETY: each caller documents ownership and validates the returned map.
-    unsafe { libc::mmap(address, len, prot, flags, fd, offset) }
-}
-
-fn take_injected_mprotect_failure(_operation: NativeMappingOperation) -> bool {
-    #[cfg(test)]
-    return NATIVE_MAPPING_FAULTS.with(|faults| {
-        let mut faults = faults.borrow_mut();
-        let operation_index = _operation.index();
-        let call_index = faults.mprotect_calls[operation_index];
-        faults.mprotect_calls[operation_index] = call_index.saturating_add(1);
-        if matches!(
-            faults.mprotect,
-            Some((site, target_index)) if site == _operation && target_index == call_index
-        ) {
-            faults.mprotect = None;
-            true
-        } else {
-            false
-        }
-    });
-    #[cfg(not(test))]
-    {
-        false
-    }
-}
-
-fn host_mprotect(
-    operation: NativeMappingOperation,
-    address: *mut libc::c_void,
-    len: usize,
-    prot: i32,
-) -> i32 {
-    if take_injected_mprotect_failure(operation) {
-        // SAFETY: FreeBSD exposes the calling thread's errno through __error.
-        unsafe { *libc::__error() = libc::EIO };
-        return -1;
-    }
-    // SAFETY: callers hold the identity mapping writer for owned guest ranges.
-    unsafe { libc::mprotect(address, len, prot) }
-}
-
-fn host_munmap(address: *mut libc::c_void, len: usize) -> i32 {
-    #[cfg(test)]
-    let injected_failure = NATIVE_MAPPING_FAULTS.with(|faults| {
-        let mut faults = faults.borrow_mut();
-        let call_index = faults.munmap_calls;
-        faults.munmap_calls = call_index.saturating_add(1);
-        if faults.munmap == Some(call_index) {
-            faults.munmap = None;
-            true
-        } else {
-            false
-        }
-    });
-    #[cfg(not(test))]
-    let injected_failure = false;
-    // SAFETY: callers invoke this only for mappings whose ownership they hold.
-    let result = if injected_failure {
-        #[cfg(test)]
-        // SAFETY: FreeBSD exposes the calling thread's errno through __error.
-        unsafe {
-            *libc::__error() = libc::EIO;
-        }
-        -1
-    } else {
-        unsafe { libc::munmap(address, len) }
-    };
-    #[cfg(test)]
-    NATIVE_MAPPING_FAULTS.with(|faults| {
-        faults
-            .borrow_mut()
-            .munmaps
-            .push((address as u64, len, result));
-    });
-    result
-}
-
 /// A checked executable-code epoch observed atomically with JIT admission.
 /// Keeping this as a domain value prevents registration ids, guest addresses,
 /// and raw atomics from being substituted for the cache-validity generation.
@@ -2379,6 +1212,39 @@ struct ExecutableEpoch {
     failed_word: std::sync::atomic::AtomicBool,
     state: std::sync::Mutex<ExecutableEpochState>,
     cv: std::sync::Condvar,
+}
+
+/// Additive-only: exposes `ExecutableEpoch::begin_mutation` (unchanged below)
+/// through `carrick_dsr::identity_memory`'s minimal seam, so
+/// `IdentityGuestMemory<A>` can live in `carrick-dsr` without this whole
+/// ~4.2K-line JIT-admission/quiescence coordinator moving with it (Phase-3
+/// loop-merge territory). `self.begin_mutation()` inside this impl resolves
+/// to the INHERENT method below (inherent methods take priority over trait
+/// methods in Rust's method resolution, even from within the trait impl that
+/// shares the name), so this is delegation, not recursion.
+impl ExecutableMutationAuthority for ExecutableEpoch {
+    type Lease = ExecutableMutationLease;
+    type Error = ExecutableEpochError;
+
+    fn begin_mutation(self: &Arc<Self>) -> Result<Self::Lease, Self::Error> {
+        self.begin_mutation()
+    }
+}
+
+/// The concrete identity-memory instantiation the x86/FreeBSD native lane
+/// uses everywhere: the "one generic parameter deeper" version of
+/// `carrick_dsr::identity_memory::IdentityGuestMemory`, matching the same
+/// single-wiring-point pattern as `native/mod.rs`'s `HostNativeLane`.
+type NativeIdentityMemory = IdentityGuestMemory<ExecutableEpoch>;
+
+/// This lane's concrete `NativeHost` seam values, bundled once per call site
+/// rather than threaded as a second generic parameter on `IdentityGuestMemory`
+/// itself (see that module's doc for why).
+fn identity_host_seam() -> IdentityHostSeam {
+    IdentityHostSeam {
+        shared_futex_waiter_key: FreebsdHost::shared_futex_waiter_key,
+        exclusive_fixed_map_flag: FreebsdHost::exclusive_fixed_map_flag(),
+    }
 }
 
 impl ExecutableEpoch {
@@ -4297,7 +3163,7 @@ mod executable_epoch_tests {
         let alias_owner = epoch.register_current().expect("register alias owner");
         let outer = epoch.begin_mutation().expect("outer alias critical lease");
         let mut dispatcher = SyscallDispatcher::new();
-        let mut memory = IdentityGuestMemory::uncoordinated();
+        let mut memory = NativeIdentityMemory::uncoordinated();
         let outcome = dispatcher
             .dispatch(
                 SyscallRequest::new(
@@ -6348,10 +5214,7 @@ mod executable_epoch_tests {
         let writer_epoch = Arc::clone(&epoch);
         let (written_tx, written_rx) = std::sync::mpsc::sync_channel(1);
         let writer = std::thread::spawn(move || {
-            let mut memory = IdentityGuestMemory {
-                executable_epoch: Some(writer_epoch),
-                mapping_failure: None,
-            };
+            let mut memory = NativeIdentityMemory::for_run(&writer_epoch, identity_host_seam());
             memory
                 .write_bytes_raw(address, &[0x5a])
                 .expect("write executable byte");
@@ -6374,1465 +5237,6 @@ mod executable_epoch_tests {
 
         IDENTITY_PROTECTIONS.set_unmapped(address, PAGE as usize, true);
         assert_eq!(unsafe { libc::munmap(mapping, PAGE as usize) }, 0);
-    }
-}
-
-impl IdentityGuestMemory {
-    fn epoch_error(error: ExecutableEpochError) -> carrick_guest_mem::MemoryError {
-        carrick_guest_mem::MemoryError::HostMap(format!(
-            "native executable epoch failed: {error:?}"
-        ))
-    }
-
-    fn begin_executable_mutation(
-        &self,
-    ) -> Result<Option<ExecutableMutationLease>, carrick_guest_mem::MemoryError> {
-        self.executable_epoch
-            .as_ref()
-            .map(|epoch| epoch.begin_mutation().map_err(Self::epoch_error))
-            .transpose()
-    }
-
-    /// Obtain the executable epoch (when needed) before the host mapping writer.
-    /// A range initially classified as data is rechecked under the mapping lock;
-    /// if it became executable while the lock was being acquired, release and
-    /// retry in the required epoch-first order.
-    fn mapping_write_for_mutation(
-        &self,
-        address: u64,
-        len: usize,
-        requested_executable: bool,
-    ) -> Result<
-        (
-            Option<ExecutableMutationLease>,
-            parking_lot::RwLockWriteGuard<'static, ()>,
-        ),
-        carrick_guest_mem::MemoryError,
-    > {
-        if self.executable_epoch.is_none() {
-            return Ok((None, IDENTITY_HOST_MAPPING_LOCK.write()));
-        }
-        let mut mutation =
-            if requested_executable || IDENTITY_PROTECTIONS.range_has_executable(address, len) {
-                self.begin_executable_mutation()?
-            } else {
-                None
-            };
-        loop {
-            let mapping = IDENTITY_HOST_MAPPING_LOCK.write();
-            if mutation.is_some() || !IDENTITY_PROTECTIONS.range_has_executable(address, len) {
-                return Ok((mutation, mapping));
-            }
-            drop(mapping);
-            mutation = self.begin_executable_mutation()?;
-        }
-    }
-
-    /// Raw/checked host copies use the mapping reader, but executable overlap
-    /// still requires the epoch first. The under-lock recheck closes the same
-    /// data-to-text classification race as the mapping-writer helper.
-    fn mapping_read_for_write(
-        &self,
-        address: u64,
-        len: usize,
-    ) -> Result<
-        (
-            Option<ExecutableMutationLease>,
-            parking_lot::RwLockReadGuard<'static, ()>,
-        ),
-        carrick_guest_mem::MemoryError,
-    > {
-        if self.executable_epoch.is_none() {
-            return Ok((None, IDENTITY_HOST_MAPPING_LOCK.read()));
-        }
-        let mut mutation = if IDENTITY_PROTECTIONS.range_has_executable(address, len) {
-            self.begin_executable_mutation()?
-        } else {
-            None
-        };
-        loop {
-            let mapping = IDENTITY_HOST_MAPPING_LOCK.read();
-            if mutation.is_some() || !IDENTITY_PROTECTIONS.range_has_executable(address, len) {
-                return Ok((mutation, mapping));
-            }
-            drop(mapping);
-            mutation = self.begin_executable_mutation()?;
-        }
-    }
-}
-
-/// Re-establish host backing for only the exact holes inside
-/// `[address,address+len)`. Replacing the whole query because one subrange is
-/// absent would silently zero adjacent live pages. Tracked holes are snapshotted
-/// and clipped under the protection registry lock; an entirely untracked range
-/// is mapped exactly only when `mincore` proves its first page absent (the fresh
-/// native shared-aperture case).
-fn ensure_identity_backed_with_registry(
-    address: u64,
-    len: usize,
-    protections: &carrick_guest_mem::protections::MemoryProtections,
-) -> Result<(), MemoryError> {
-    if len == 0 || address < PAGE {
-        return Ok(());
-    }
-    let end = address.checked_add(len as u64).ok_or_else(|| {
-        MemoryError::HostMap(format!(
-            "native identity range overflows at 0x{address:x} for {len} bytes"
-        ))
-    })?;
-    let mut holes = protections.unmapped_intersections(address, len);
-    if holes.is_empty() {
-        let mut residency = 0u8;
-        // `mincore` is a non-faulting host mapping query. Fresh shared-aperture
-        // allocations have no protection metadata yet and no host mapping.
-        let start_is_mapped = unsafe {
-            libc::mincore(
-                address as *mut libc::c_void,
-                PAGE as usize,
-                (&mut residency as *mut u8).cast::<libc::c_char>(),
-            ) == 0
-        };
-        if start_is_mapped {
-            return Ok(());
-        }
-        holes.push((address, end));
-    }
-
-    let holes = holes
-        .into_iter()
-        .map(|(hole_start, hole_end)| {
-            usize::try_from(hole_end - hole_start)
-                .map(|hole_len| (hole_start, hole_end, hole_len))
-                .map_err(|_| {
-                    MemoryError::HostMap(format!(
-                        "native identity hole length does not fit host: \
-                         [0x{hole_start:x},0x{hole_end:x})"
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut candidate = NativeMappingTransaction::new("identity backing candidate");
-    for &(hole_start, _hole_end, hole_len) in &holes {
-        let mapped = host_mmap(
-            NativeMappingOperation::IdentityBacking,
-            hole_start as *mut libc::c_void,
-            hole_len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_FIXED | libc::MAP_EXCL | libc::MAP_ANON | libc::MAP_SHARED,
-            -1,
-            0,
-        );
-        if mapped == libc::MAP_FAILED {
-            let primary = RuntimeError::Unsupported(format!(
-                "native identity mmap at 0x{hole_start:x} for {hole_len} bytes failed: {}",
-                std::io::Error::last_os_error()
-            ));
-            return Err(MemoryError::HostMap(
-                candidate.rollback(primary).to_string(),
-            ));
-        }
-        let mapping = NativeMapping::claim(
-            mapped as u64,
-            hole_len,
-            NativeMappingOperation::IdentityBacking,
-            "identity backing hole",
-        );
-        if mapped as u64 != hole_start {
-            let returned = mapped as u64;
-            let cleanup = mapping.teardown().err();
-            let detail = cleanup
-                .map(|error| format!("; wrong-address cleanup failed: {error}"))
-                .unwrap_or_default();
-            let primary = RuntimeError::Unsupported(format!(
-                "native identity mmap requested 0x{hole_start:x} but returned 0x{returned:x}{detail}"
-            ));
-            return Err(MemoryError::HostMap(
-                candidate.rollback(primary).to_string(),
-            ));
-        }
-        if let Err(error) = candidate.acquire(mapping) {
-            return Err(MemoryError::HostMap(candidate.rollback(error).to_string()));
-        }
-    }
-
-    // Clear metadata only after every exact hole has live backing. Ownership
-    // then transfers from the candidate to the ordinary VMA/munmap lifecycle.
-    for &(hole_start, _hole_end, hole_len) in &holes {
-        protections.set_unmapped(hole_start, hole_len, false);
-    }
-    candidate.commit_to_vma();
-    Ok(())
-}
-
-fn ensure_identity_backed(address: u64, len: usize) -> Result<(), MemoryError> {
-    ensure_identity_backed_with_registry(address, len, &IDENTITY_PROTECTIONS)
-}
-
-fn identity_read_bytes_raw_unlocked(
-    address: u64,
-    length: usize,
-) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-    if length == 0 {
-        return Ok(Vec::new());
-    }
-    if !identity_raw_range_valid(address, length)
-        || IDENTITY_PROTECTIONS.range_unmapped(address, length)
-    {
-        return Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length });
-    }
-    // SAFETY: the mapping lock prevents host unmap/protection transitions while
-    // this identity host slice is live.
-    Ok(unsafe { std::slice::from_raw_parts(address as *const u8, length).to_vec() })
-}
-
-/// Copy into a range whose complete guest-writable permission was validated
-/// before the caller retained the identity mapping writer and protection
-/// snapshot. Those exact guards make re-reading protection metadata here both
-/// unnecessary and deadlocking; canonical-range validation remains checked.
-fn identity_write_prevalidated_unlocked(
-    address: u64,
-    bytes: &[u8],
-) -> Result<(), carrick_guest_mem::MemoryError> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    if !identity_raw_range_valid(address, bytes.len()) {
-        return Err(carrick_guest_mem::MemoryError::OutOfBounds {
-            address,
-            length: bytes.len(),
-        });
-    }
-    // SAFETY: service_fork retains both IDENTITY_HOST_MAPPING_LOCK's writer and
-    // IDENTITY_PROTECTIONS' exclusive guard from prevalidation through copy.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
-    }
-    Ok(())
-}
-
-fn identity_write_bytes_raw_unlocked(
-    address: u64,
-    bytes: &[u8],
-) -> Result<(), carrick_guest_mem::MemoryError> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    if !identity_raw_range_valid(address, bytes.len())
-        || IDENTITY_PROTECTIONS.range_unmapped(address, bytes.len())
-    {
-        return Err(carrick_guest_mem::MemoryError::OutOfBounds {
-            address,
-            length: bytes.len(),
-        });
-    }
-    // SAFETY: the mapping lock prevents host unmap/protection transitions while
-    // this identity host copy is in progress. Callers that enforce guest write
-    // permissions check `range_write_denied` under the same read guard.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
-    }
-    Ok(())
-}
-
-fn identity_apply_host_protection_preserving_bus(
-    address: u64,
-    len: usize,
-    host_prot: i32,
-) -> Result<Vec<(u64, u64)>, MemoryError> {
-    let bus_faults = IDENTITY_PROTECTIONS.bus_fault_intersections(address, len);
-    let end = address
-        .checked_add(u64::try_from(len).map_err(|_| MemoryError::OutOfBounds {
-            address,
-            length: len,
-        })?)
-        .ok_or(MemoryError::OutOfBounds {
-            address,
-            length: len,
-        })?;
-    let apply = |start: u64, range_end: u64, protection: i32| -> Result<(), MemoryError> {
-        let range_len = range_end.saturating_sub(start);
-        if range_len == 0 {
-            return Ok(());
-        }
-        let range_len = usize::try_from(range_len).map_err(|_| MemoryError::OutOfBounds {
-            address: start,
-            length: len,
-        })?;
-        if host_mprotect(
-            NativeMappingOperation::IdentityProtection,
-            start as *mut libc::c_void,
-            range_len,
-            protection,
-        ) != 0
-        {
-            return Err(MemoryError::HostMap(format!(
-                "native identity mprotect at 0x{start:x} for {range_len} bytes failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
-    };
-
-    let mut cursor = address;
-    for &(bus_start, bus_end) in &bus_faults {
-        apply(cursor, bus_start, host_prot)?;
-        apply(bus_start, bus_end, libc::PROT_NONE)?;
-        cursor = bus_end;
-    }
-    apply(cursor, end, host_prot)?;
-    Ok(bus_faults)
-}
-
-impl GuestMemory for IdentityGuestMemory {
-    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
-        Some(&IDENTITY_PROTECTIONS)
-    }
-
-    fn has_complete_mapping_metadata(&self) -> bool {
-        true
-    }
-
-    fn supports_concurrent_exec_protection(&self) -> bool {
-        true
-    }
-
-    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
-        let (_mutation, _mapping_guard) = match self.mapping_write_for_mutation(address, len, false)
-        {
-            Ok(guards) => guards,
-            Err(error) => {
-                self.record_mapping_failure(address, len, error);
-                return;
-            }
-        };
-        if !no_access && let Err(error) = ensure_identity_backed(address, len) {
-            self.record_mapping_failure(address, len, error);
-            return;
-        }
-        IDENTITY_PROTECTIONS.set_no_access(address, len, no_access);
-    }
-
-    fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
-        let (_mutation, _mapping_guard) = match self.mapping_write_for_mutation(address, len, false)
-        {
-            Ok(guards) => guards,
-            Err(error) => {
-                self.record_mapping_failure(address, len, error);
-                return;
-            }
-        };
-        IDENTITY_PROTECTIONS.set_no_write(address, len, no_write);
-    }
-
-    fn set_unmapped(&mut self, address: u64, len: usize, unmapped: bool) {
-        let (_mutation, _mapping_guard) = match self.mapping_write_for_mutation(address, len, false)
-        {
-            Ok(guards) => guards,
-            Err(error) => {
-                self.record_mapping_failure(address, len, error);
-                return;
-            }
-        };
-        // Route straight to the shared metadata's `set_unmapped` — the trait
-        // default would reclassify the hole through `set_no_access` first.
-        if !unmapped && let Err(error) = ensure_identity_backed(address, len) {
-            self.record_mapping_failure(address, len, error);
-            return;
-        }
-        IDENTITY_PROTECTIONS.set_unmapped(address, len, unmapped);
-    }
-
-    fn set_mapping_protection(
-        &mut self,
-        address: u64,
-        len: usize,
-        no_access: bool,
-        no_write: bool,
-    ) {
-        let (_mutation, _mapping_guard) = match self.mapping_write_for_mutation(address, len, false)
-        {
-            Ok(guards) => guards,
-            Err(error) => {
-                self.record_mapping_failure(address, len, error);
-                return;
-            }
-        };
-        // Establish backing before changing either host permission or metadata.
-        if let Err(error) = ensure_identity_backed(address, len) {
-            self.record_mapping_failure(address, len, error);
-            return;
-        }
-        let host_prot = if no_access {
-            libc::PROT_NONE
-        } else if no_write {
-            libc::PROT_READ
-        } else {
-            libc::PROT_READ | libc::PROT_WRITE
-        };
-        let bus_faults =
-            match identity_apply_host_protection_preserving_bus(address, len, host_prot) {
-                Ok(bus_faults) => bus_faults,
-                Err(error) => {
-                    self.record_mapping_failure(address, len, error);
-                    return;
-                }
-            };
-        // mprotect changes permission only: preserve the VMA's backing-sharing
-        // and EOF-tail classifications while publishing the new permission.
-        IDENTITY_PROTECTIONS.set_mapping_protection(address, len, no_access, no_write);
-        for (bus_start, bus_end) in bus_faults {
-            let Ok(bus_len) = usize::try_from(bus_end - bus_start) else {
-                self.record_mapping_failure(
-                    address,
-                    len,
-                    MemoryError::OutOfBounds {
-                        address: bus_start,
-                        length: len,
-                    },
-                );
-                return;
-            };
-            IDENTITY_PROTECTIONS.set_no_access(bus_start, bus_len, true);
-            IDENTITY_PROTECTIONS.set_executable(bus_start, bus_len, false);
-        }
-    }
-
-    fn set_mapping_sharing(
-        &mut self,
-        address: u64,
-        len: usize,
-        sharing: carrick_guest_mem::MappingSharing,
-    ) {
-        let (_mutation, _mapping_guard) = match self.mapping_write_for_mutation(address, len, false)
-        {
-            Ok(guards) => guards,
-            Err(error) => {
-                self.record_mapping_failure(address, len, error);
-                return;
-            }
-        };
-        IDENTITY_PROTECTIONS.set_mapping_sharing(address, len, sharing);
-    }
-
-    fn set_mapping_protection_and_sharing(
-        &mut self,
-        address: u64,
-        len: usize,
-        no_access: bool,
-        no_write: bool,
-        sharing: carrick_guest_mem::MappingSharing,
-    ) {
-        let (_mutation, _mapping_guard) = match self.mapping_write_for_mutation(address, len, false)
-        {
-            Ok(guards) => guards,
-            Err(error) => {
-                self.record_mapping_failure(address, len, error);
-                return;
-            }
-        };
-        // Shared metadata is a statement about a live host backing. Establish
-        // both backing and requested host protection first, then atomically
-        // replace permission/sharing metadata. The registry clears stale execute
-        // permission here; protect_range publishes the new execute state later.
-        if let Err(error) = ensure_identity_backed(address, len) {
-            self.record_mapping_failure(address, len, error);
-            return;
-        }
-        let host_prot = if no_access {
-            libc::PROT_NONE
-        } else if no_write {
-            libc::PROT_READ
-        } else {
-            libc::PROT_READ | libc::PROT_WRITE
-        };
-        if len != 0
-            && host_mprotect(
-                NativeMappingOperation::IdentityProtection,
-                address as *mut libc::c_void,
-                len,
-                host_prot,
-            ) != 0
-        {
-            let error = MemoryError::HostMap(format!(
-                "native identity mprotect at 0x{address:x} for {len} bytes failed: {}",
-                std::io::Error::last_os_error()
-            ));
-            self.record_mapping_failure(address, len, error);
-            return;
-        }
-        IDENTITY_PROTECTIONS
-            .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
-    }
-
-    fn protect_range(
-        &mut self,
-        address: u64,
-        len: usize,
-        prot: u64,
-    ) -> Result<(), carrick_guest_mem::MemoryError> {
-        if let Some(error) = self.take_mapping_failure() {
-            return Err(error);
-        }
-        let requested_executable = prot & crate::linux_abi::LINUX_PROT_EXEC != 0;
-        let (_mutation, _mapping_guard) =
-            match self.mapping_write_for_mutation(address, len, requested_executable) {
-                Ok(guards) => guards,
-                Err(error) => {
-                    IDENTITY_PROTECTIONS.set_unmapped(address, len, true);
-                    return Err(error);
-                }
-            };
-        if let Err(error) = ensure_identity_backed(address, len) {
-            IDENTITY_PROTECTIONS.set_unmapped(address, len, true);
-            return Err(error);
-        }
-        let readable =
-            prot & (crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC) != 0;
-        let writable = prot & crate::linux_abi::LINUX_PROT_WRITE != 0;
-        let executable = requested_executable;
-        // DSR never executes guest pages directly: executable mappings need a
-        // host-readable translation view, not host PROT_EXEC. Enforce guest
-        // stores with host read-only pages and PROT_NONE with inaccessible ones.
-        let host_prot = match (readable, writable) {
-            (_, true) => libc::PROT_READ | libc::PROT_WRITE,
-            (true, false) => libc::PROT_READ,
-            (false, false) => libc::PROT_NONE,
-        };
-        let bus_faults =
-            match identity_apply_host_protection_preserving_bus(address, len, host_prot) {
-                Ok(bus_faults) => bus_faults,
-                Err(error) => {
-                    IDENTITY_PROTECTIONS.set_unmapped(address, len, true);
-                    return Err(error);
-                }
-            };
-        IDENTITY_PROTECTIONS.set_mapping_protection(address, len, prot == 0, !writable);
-        IDENTITY_PROTECTIONS.set_executable(address, len, executable);
-        for (bus_start, bus_end) in bus_faults {
-            let bus_len =
-                usize::try_from(bus_end - bus_start).map_err(|_| MemoryError::OutOfBounds {
-                    address: bus_start,
-                    length: len,
-                })?;
-            IDENTITY_PROTECTIONS.set_no_access(bus_start, bus_len, true);
-            IDENTITY_PROTECTIONS.set_executable(bus_start, bus_len, false);
-        }
-        Ok(())
-    }
-
-    fn read_bytes(
-        &self,
-        address: u64,
-        length: usize,
-    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-        let _mapping_guard = IDENTITY_HOST_MAPPING_LOCK.read();
-        if length != 0 && IDENTITY_PROTECTIONS.range_no_access(address, length) {
-            return Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length });
-        }
-        identity_read_bytes_raw_unlocked(address, length)
-    }
-
-    fn read_bytes_raw(
-        &self,
-        address: u64,
-        length: usize,
-    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-        let _mapping_guard = IDENTITY_HOST_MAPPING_LOCK.read();
-        identity_read_bytes_raw_unlocked(address, length)
-    }
-
-    fn write_bytes(
-        &mut self,
-        address: u64,
-        bytes: &[u8],
-    ) -> Result<(), carrick_guest_mem::MemoryError> {
-        let (_mutation, _mapping_guard) = self.mapping_read_for_write(address, bytes.len())?;
-        if !bytes.is_empty() && IDENTITY_PROTECTIONS.range_write_denied(address, bytes.len()) {
-            return Err(carrick_guest_mem::MemoryError::OutOfBounds {
-                address,
-                length: bytes.len(),
-            });
-        }
-        identity_write_bytes_raw_unlocked(address, bytes)
-    }
-
-    fn write_bytes_raw(
-        &mut self,
-        address: u64,
-        bytes: &[u8],
-    ) -> Result<(), carrick_guest_mem::MemoryError> {
-        let (_mutation, _mapping_guard) = self.mapping_read_for_write(address, bytes.len())?;
-        identity_write_bytes_raw_unlocked(address, bytes)
-    }
-
-    /// Guest `munmap`/`mremap`-shrink actually releases the host pages, so the
-    /// freed range faults on access (guest `SIGSEGV`/`SEGV_MAPERR`) and `mincore`
-    /// reports it unmapped (ENOMEM) — matching Linux. A no-op left the identity
-    /// arena pages mapped+RW, so a raw read of a freed tail still succeeded and
-    /// `mincore` said mapped (`mremapshrink`, `mremapmove`, `mremapsharedshrink`).
-    /// `munmap` at the identity VA (guest VA == host VA) creates a genuine hole;
-    /// a later guest mmap that reuses this VA re-establishes backing through
-    /// `zero_backing` (which re-maps the hole before scrubbing it).
-    fn unmap_range(
-        &mut self,
-        address: u64,
-        len: usize,
-    ) -> Result<(), carrick_guest_mem::MemoryError> {
-        if len == 0 || address < PAGE {
-            return Ok(());
-        }
-        let (_mutation, _mapping_guard) = self.mapping_write_for_mutation(address, len, false)?;
-        if host_munmap(address as *mut libc::c_void, len) != 0 {
-            return Err(MemoryError::HostMap(format!(
-                "native identity munmap at 0x{address:x} for {len} bytes failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        // Record the hole so a syscall-path read/write returns EFAULT (not a host
-        // fault) and mincore reports it unmapped; a guest JIT access still faults
-        // the real hole and is caught by the fault shim as SEGV_MAPERR.
-        IDENTITY_PROTECTIONS.set_unmapped(address, len, true);
-        Ok(())
-    }
-
-    fn repoint_private(
-        &mut self,
-        va: u64,
-        _overlay_ipa: u64,
-        len: usize,
-        content: &[u8],
-    ) -> Result<(), RepointPrivateError> {
-        if content.len() != len {
-            return Err(RepointPrivateError::clean(MemoryError::OutOfBounds {
-                address: va,
-                length: content.len(),
-            }));
-        }
-        let (_mutation, _mapping_guard) = self
-            .mapping_write_for_mutation(va, len, false)
-            .map_err(RepointPrivateError::clean)?;
-        // VMM backends repoint stage-1 into a private overlay IPA. Identity
-        // execution has no page tables, so MAP_FIXED atomically replaces this
-        // process's mapping with anonymous MAP_PRIVATE storage. The complete
-        // file/zero snapshot was prepared before this call; copying it cannot
-        // fail after replacement. Mapping-sharing and execute metadata remain
-        // conservatively unchanged until the dispatcher publishes them after
-        // this physical transaction returns.
-        let mapped = host_mmap(
-            NativeMappingOperation::IdentityBacking,
-            va as *mut libc::c_void,
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_FIXED | libc::MAP_ANON | libc::MAP_PRIVATE,
-            -1,
-            0,
-        );
-        if mapped == libc::MAP_FAILED {
-            return Err(RepointPrivateError::clean(MemoryError::HostMap(format!(
-                "native private repoint at 0x{va:x} for {len} bytes failed: {}",
-                std::io::Error::last_os_error()
-            ))));
-        }
-        if mapped as u64 != va {
-            let misplaced = NativeMapping::claim(
-                mapped as u64,
-                len,
-                NativeMappingOperation::IdentityBacking,
-                "misplaced private repoint",
-            );
-            if misplaced.teardown().is_err() && misplaced.teardown().is_err() {
-                std::process::abort();
-            }
-            return Err(RepointPrivateError::clean(MemoryError::HostMap(format!(
-                "native private repoint requested 0x{va:x} but returned 0x{:x}",
-                mapped as u64
-            ))));
-        }
-        // SAFETY: the exact MAP_FIXED result owns `len == content.len()` writable
-        // bytes at `va`; the dispatcher-owned snapshot is disjoint host storage.
-        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), va as *mut u8, len) };
-        // Physical replacement is complete and this infallible metadata update
-        // retires any boot/shared classification before a direct caller can ask
-        // for an unflagged shared-futex key. The dispatcher republishes the full
-        // protection tuple after this transaction returns.
-        IDENTITY_PROTECTIONS.set_mapping_sharing(
-            va,
-            len,
-            carrick_guest_mem::MappingSharing::Private,
-        );
-        Ok(())
-    }
-
-    /// Scrub private anonymous backing. The typed reuse hook below performs the
-    /// actual replacement so this legacy bypass cannot silently pick a sharing
-    /// mode at an identity-host mapping boundary.
-    fn zero_backing(
-        &mut self,
-        address: u64,
-        len: usize,
-    ) -> Result<(), carrick_guest_mem::MemoryError> {
-        self.zero_anonymous_reuse(address, len, carrick_guest_mem::MappingSharing::Private)
-    }
-
-    /// Re-establish zero-filled anonymous backing while preserving the guest
-    /// mapping's physical sharing. A reused `MAP_SHARED` hole must remain a real
-    /// host `MAP_SHARED` object so writes after `fork` stay visible in both
-    /// processes; `zero_backing` historically remapped every hole MAP_PRIVATE.
-    fn zero_anonymous_reuse(
-        &mut self,
-        address: u64,
-        len: usize,
-        sharing: carrick_guest_mem::MappingSharing,
-    ) -> Result<(), carrick_guest_mem::MemoryError> {
-        if len == 0 {
-            return Ok(());
-        }
-        let (_mutation, _mapping_guard) = self.mapping_write_for_mutation(address, len, false)?;
-        let map_sharing = match sharing {
-            carrick_guest_mem::MappingSharing::Private => libc::MAP_PRIVATE,
-            carrick_guest_mem::MappingSharing::Shared => libc::MAP_SHARED,
-        };
-        // Identity VA. MAP_FIXED atomically replaces any current mapping (or
-        // fills a munmap hole) with fresh zero-filled anonymous RW pages. A
-        // failed exact replacement leaves the old host object, bytes, and guest
-        // sharing metadata untouched; scrubbing that old object and publishing
-        // the requested sharing would falsely claim a private mapping is shared.
-        let p = host_mmap(
-            NativeMappingOperation::IdentityBacking,
-            address as *mut libc::c_void,
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_FIXED | libc::MAP_ANON | map_sharing,
-            -1,
-            0,
-        );
-        if p == libc::MAP_FAILED {
-            return Err(MemoryError::HostMap(format!(
-                "native anonymous reuse replacement at 0x{address:x} for {len} bytes failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        if p as u64 != address {
-            let misplaced = NativeMapping::claim(
-                p as u64,
-                len,
-                NativeMappingOperation::IdentityBacking,
-                "misplaced anonymous reuse replacement",
-            );
-            if misplaced.teardown().is_err() && misplaced.teardown().is_err() {
-                // Drop is also fail-stop, but abort here makes the checked retry
-                // contract explicit and avoids returning while ownership is live.
-                std::process::abort();
-            }
-            return Err(MemoryError::HostMap(format!(
-                "native anonymous reuse replacement requested 0x{address:x} but returned 0x{:x}",
-                p as u64
-            )));
-        }
-        IDENTITY_PROTECTIONS
-            .set_mapping_protection_and_sharing(address, len, false, false, sharing);
-        Ok(())
-    }
-
-    fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
-        let _mapping_guard = IDENTITY_HOST_MAPPING_LOCK.read();
-        identity_raw_range_valid(address, length)
-            && !IDENTITY_PROTECTIONS.range_write_denied(address, length)
-    }
-
-    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
-        (identity_raw_range_valid(address, len)
-            && !IDENTITY_PROTECTIONS.range_unmapped(address, len)
-            && !IDENTITY_PROTECTIONS.range_no_access(address, len))
-        .then_some(address as *const u8)
-    }
-
-    fn host_ptr_for_write(&mut self, _address: u64, _len: usize) -> Option<*mut u8> {
-        // The trait cannot attach an IDENTITY_HOST_MAPPING_LOCK guard to the raw
-        // pointer's lifetime. A sibling could otherwise mprotect/munmap or start
-        // an executable mutation after this method returns but before the host
-        // kernel/libc consumes the pointer. Keep the copy path, whose epoch and
-        // mapping guards span the complete write.
-        None
-    }
-
-    fn resident_pages(
-        &self,
-        start: carrick_guest_mem::GuestVa,
-        page_count: u64,
-        page_size: u64,
-    ) -> Option<Vec<u8>> {
-        let pages = usize::try_from(page_count).ok()?;
-        let len = page_count.checked_mul(page_size)?;
-        let len = usize::try_from(len).ok()?;
-        if pages == 0 {
-            return Some(Vec::new());
-        }
-        let mut residency = vec![0i8; pages];
-        // SAFETY: identity guest VA is the live host mapping. `residency` has
-        // exactly one byte per queried FreeBSD page; this lane's guest and host
-        // page sizes are both 4 KiB.
-        if unsafe {
-            libc::mincore(
-                start.raw() as *mut libc::c_void,
-                len,
-                residency.as_mut_ptr(),
-            )
-        } != 0
-        {
-            return None;
-        }
-        Some(
-            residency
-                .into_iter()
-                .map(|byte| u8::from(byte & 1 != 0))
-                .collect(),
-        )
-    }
-
-    /// A SHARED (non-`FUTEX_PRIVATE`) futex word resolves to a fork-coherent host
-    /// word so a wake from ANOTHER forked process reaches a waiter parked here. In
-    /// the identity model the guest VA already IS that host word (a guest
-    /// `MAP_SHARED` page is genuinely shared across the host `fork`), so the
-    /// location is `Direct` at the address itself; the driver then waits/wakes on
-    /// it with FreeBSD `_umtx_op(UMTX_OP_WAIT_UINT/WAKE)`, whose non-private key is
-    /// the shared VM object + offset and so spans the fork. The dispatcher only
-    /// calls this after excluding `FUTEX_PRIVATE` and clear-child-tid words, so a
-    /// process-private futex never reaches here and keeps using the in-process
-    /// parking-lot `FutexTable`.
-    fn shared_futex_location(
-        &self,
-        guest_addr: u64,
-    ) -> Option<carrick_guest_mem::SharedFutexLocation> {
-        if !guest_addr.is_multiple_of(std::mem::align_of::<u32>() as u64)
-            || !IDENTITY_PROTECTIONS
-                .range_mutable_shared_backing(guest_addr, std::mem::size_of::<u32>())
-        {
-            return None;
-        }
-        let host_addr = guest_addr as usize;
-        Some(carrick_guest_mem::SharedFutexLocation::Direct {
-            word: carrick_guest_mem::HostVa(host_addr),
-            waiter_key: freebsd_shared_waiter_key(host_addr).unwrap_or(host_addr),
-        })
-    }
-}
-
-fn cflow_memory_backend_error(
-    access: cflow::CflowMemoryAccess,
-    address: u64,
-    error: impl std::fmt::Display,
-) -> cflow::CflowError {
-    cflow::CflowError::MemoryBackend {
-        access,
-        address,
-        detail: error.to_string(),
-    }
-}
-
-/// The largest architectural payload read by one XRSTOR component. Individual
-/// kernel transfers are smaller and page-contained; this bound prevents an
-/// accidental general-purpose copy API from growing behind the checked seam.
-const IDENTITY_KERNEL_COPY_PIPE_BOUND: usize = 1024;
-/// Keep every pipe transfer comfortably below FreeBSD's atomic pipe-write bound
-/// and split again at guest page boundaries so an EFAULT names the first page
-/// whose backing is inaccessible.
-const IDENTITY_KERNEL_COPY_CHUNK: usize = 512;
-/// Host signals can interrupt a syscall repeatedly. A guest-memory service must
-/// still terminate deterministically rather than spin forever under the mapping
-/// lock, so every no-progress EINTR path has this explicit retry budget.
-const IDENTITY_KERNEL_COPY_EINTR_LIMIT: usize = 16;
-
-#[derive(Debug, PartialEq, Eq)]
-enum IdentityCheckedReadError {
-    Fault(carrick_guest_mem::protections::GuestMemoryFault),
-    BusAddress { address: GuestVa },
-    Backend { address: GuestVa, detail: String },
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum IdentityCheckedWriteError {
-    Fault(carrick_guest_mem::protections::GuestMemoryFault),
-    BusAddress { address: GuestVa },
-    Backend { address: GuestVa, detail: String },
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum IdentityKernelCopyError {
-    GuestFault { address: GuestVa },
-    Backend { address: GuestVa, detail: String },
-}
-
-fn identity_checked_read_fault(
-    fault: carrick_guest_mem::protections::GuestMemoryFault,
-) -> IdentityCheckedReadError {
-    if fault.kind == carrick_guest_mem::protections::GuestMemoryFaultKind::AccessDenied
-        && IDENTITY_PROTECTIONS.range_bus_fault(fault.address.raw(), 1)
-    {
-        IdentityCheckedReadError::BusAddress {
-            address: fault.address,
-        }
-    } else {
-        IdentityCheckedReadError::Fault(fault)
-    }
-}
-
-fn identity_checked_write_fault(
-    fault: carrick_guest_mem::protections::GuestMemoryFault,
-) -> IdentityCheckedWriteError {
-    if fault.kind == carrick_guest_mem::protections::GuestMemoryFaultKind::AccessDenied
-        && IDENTITY_PROTECTIONS.range_bus_fault(fault.address.raw(), 1)
-    {
-        IdentityCheckedWriteError::BusAddress {
-            address: fault.address,
-        }
-    } else {
-        IdentityCheckedWriteError::Fault(fault)
-    }
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static IDENTITY_KERNEL_COPY_PIPE_CENSUS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-    static IDENTITY_KERNEL_COPYIN_OPERATION_CENSUS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-    static IDENTITY_KERNEL_COPYOUT_OPERATION_CENSUS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn reset_identity_kernel_copy_pipe_census() {
-    IDENTITY_KERNEL_COPY_PIPE_CENSUS.with(|census| census.set(0));
-}
-
-#[cfg(test)]
-fn identity_kernel_copy_pipe_census() -> usize {
-    IDENTITY_KERNEL_COPY_PIPE_CENSUS.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-fn reset_identity_kernel_copyin_operation_census() {
-    IDENTITY_KERNEL_COPYIN_OPERATION_CENSUS.with(|census| census.set(0));
-}
-
-#[cfg(test)]
-fn identity_kernel_copyin_operation_census() -> usize {
-    IDENTITY_KERNEL_COPYIN_OPERATION_CENSUS.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-fn reset_identity_kernel_copyout_operation_census() {
-    IDENTITY_KERNEL_COPYOUT_OPERATION_CENSUS.with(|census| census.set(0));
-}
-
-#[cfg(test)]
-fn identity_kernel_copyout_operation_census() -> usize {
-    IDENTITY_KERNEL_COPYOUT_OPERATION_CENSUS.with(std::cell::Cell::get)
-}
-
-fn identity_kernel_copy_pipe(
-    address: GuestVa,
-    operation: &'static str,
-) -> Result<(OwnedFd, OwnedFd), IdentityKernelCopyError> {
-    let mut raw_fds = [-1; 2];
-    let mut interruptions = 0usize;
-    loop {
-        // SAFETY: `raw_fds` names two writable integers. On success ownership
-        // moves immediately into `OwnedFd`; failures own no descriptors.
-        if unsafe { libc::pipe2(raw_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == 0 {
-            break;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EINTR)
-            && interruptions < IDENTITY_KERNEL_COPY_EINTR_LIMIT
-        {
-            interruptions += 1;
-            continue;
-        }
-        let detail = if error.raw_os_error() == Some(libc::EINTR) {
-            format!(
-                "creating private {operation} pipe exceeded the {}-interrupt retry bound",
-                IDENTITY_KERNEL_COPY_EINTR_LIMIT
-            )
-        } else {
-            format!("creating private {operation} pipe failed: {error}")
-        };
-        return Err(IdentityKernelCopyError::Backend { address, detail });
-    }
-    #[cfg(test)]
-    IDENTITY_KERNEL_COPY_PIPE_CENSUS.with(|census| census.set(census.get() + 1));
-    // SAFETY: successful `pipe2` returned two fresh owned descriptors.
-    let reader = unsafe { OwnedFd::from_raw_fd(raw_fds[0]) };
-    // SAFETY: ownership of the distinct write descriptor transfers once.
-    let writer = unsafe { OwnedFd::from_raw_fd(raw_fds[1]) };
-    Ok((reader, writer))
-}
-
-fn identity_kernel_copy_chunk(
-    address: GuestVa,
-    completed: usize,
-    remaining: usize,
-    operation: &'static str,
-) -> Result<(GuestVa, usize), IdentityKernelCopyError> {
-    let completed = u64::try_from(completed).map_err(|_| IdentityKernelCopyError::Backend {
-        address,
-        detail: format!("kernel-contained {operation} offset is not representable"),
-    })?;
-    let current =
-        address
-            .raw()
-            .checked_add(completed)
-            .ok_or_else(|| IdentityKernelCopyError::Backend {
-                address,
-                detail: format!("kernel-contained {operation} address overflowed"),
-            })?;
-    let page_remaining =
-        usize::try_from(PAGE - current % PAGE).map_err(|_| IdentityKernelCopyError::Backend {
-            address: GuestVa(current),
-            detail: format!("kernel-contained {operation} page extent is not representable"),
-        })?;
-    Ok((
-        GuestVa(current),
-        remaining
-            .min(page_remaining)
-            .min(IDENTITY_KERNEL_COPY_CHUNK),
-    ))
-}
-
-/// Ask the FreeBSD kernel to copy one guest range into a private nonblocking
-/// pipe, draining after every successful or partial write. `write(2)` performs
-/// copyin under kernel fault containment: a readable file mapping whose backing
-/// was truncated reports EFAULT instead of delivering host SIGBUS to Carrick.
-/// Every write starts with an empty pipe, is page-contained and at most 512
-/// bytes, and no guest address is ever used to construct a Rust slice.
-fn identity_kernel_copyin_exact_using(
-    address: GuestVa,
-    destination: &mut [u8],
-    pipe: Option<(&OwnedFd, &OwnedFd)>,
-) -> Result<(), IdentityKernelCopyError> {
-    if destination.len() > IDENTITY_KERNEL_COPY_PIPE_BOUND {
-        return Err(IdentityKernelCopyError::Backend {
-            address,
-            detail: format!(
-                "kernel-contained guest read of {} bytes exceeds the {}-byte pipe bound",
-                destination.len(),
-                IDENTITY_KERNEL_COPY_PIPE_BOUND
-            ),
-        });
-    }
-    if destination.is_empty() {
-        return Ok(());
-    }
-
-    let owned_pipe;
-    let (reader, writer) = match pipe {
-        Some(pipe) => pipe,
-        None => {
-            owned_pipe = identity_kernel_copy_pipe(address, "copyin")?;
-            (&owned_pipe.0, &owned_pipe.1)
-        }
-    };
-    let mut completed = 0usize;
-    while completed < destination.len() {
-        let (chunk_start, chunk_len) = identity_kernel_copy_chunk(
-            address,
-            completed,
-            destination.len() - completed,
-            "guest read",
-        )?;
-        #[cfg(test)]
-        IDENTITY_KERNEL_COPYIN_OPERATION_CENSUS.with(|census| census.set(census.get() + 1));
-        let mut interruptions = 0usize;
-        let accepted = loop {
-            // SAFETY: the source is intentionally an untrusted guest pointer.
-            // FreeBSD validates and copies it; Rust never dereferences it.
-            let copied = unsafe {
-                libc::write(
-                    writer.as_raw_fd(),
-                    chunk_start.raw() as usize as *const libc::c_void,
-                    chunk_len,
-                )
-            };
-            if copied >= 0 {
-                break usize::try_from(copied).map_err(|_| IdentityKernelCopyError::Backend {
-                    address: chunk_start,
-                    detail: "private copyin pipe write returned an invalid length".into(),
-                })?;
-            }
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EINTR) if interruptions < IDENTITY_KERNEL_COPY_EINTR_LIMIT => {
-                    interruptions += 1;
-                }
-                Some(libc::EINTR) => {
-                    return Err(IdentityKernelCopyError::Backend {
-                        address: chunk_start,
-                        detail: format!(
-                            "private copyin pipe write exceeded the {}-interrupt retry bound",
-                            IDENTITY_KERNEL_COPY_EINTR_LIMIT
-                        ),
-                    });
-                }
-                Some(libc::EAGAIN) => {
-                    return Err(IdentityKernelCopyError::Backend {
-                        address: chunk_start,
-                        detail: "private copyin pipe was not empty before a nonblocking write"
-                            .into(),
-                    });
-                }
-                Some(libc::EFAULT) => {
-                    return Err(IdentityKernelCopyError::GuestFault {
-                        address: chunk_start,
-                    });
-                }
-                _ => {
-                    return Err(IdentityKernelCopyError::Backend {
-                        address: chunk_start,
-                        detail: format!("private copyin pipe write failed: {error}"),
-                    });
-                }
-            }
-        };
-        if accepted == 0 || accepted > chunk_len {
-            return Err(IdentityKernelCopyError::Backend {
-                address: chunk_start,
-                detail: format!(
-                    "private copyin pipe write returned {accepted} bytes for a {chunk_len}-byte chunk"
-                ),
-            });
-        }
-
-        let mut drained = 0usize;
-        let mut interruptions = 0usize;
-        while drained < accepted {
-            // SAFETY: this pointer stays within the caller-owned destination.
-            // The pipe contains exactly `accepted - drained` bytes of guest data.
-            let copied = unsafe {
-                libc::read(
-                    reader.as_raw_fd(),
-                    destination.as_mut_ptr().add(completed + drained).cast(),
-                    accepted - drained,
-                )
-            };
-            if copied < 0 {
-                let error = std::io::Error::last_os_error();
-                match error.raw_os_error() {
-                    Some(libc::EINTR) if interruptions < IDENTITY_KERNEL_COPY_EINTR_LIMIT => {
-                        interruptions += 1;
-                        continue;
-                    }
-                    Some(libc::EINTR) => {
-                        return Err(IdentityKernelCopyError::Backend {
-                            address: chunk_start,
-                            detail: format!(
-                                "private copyin pipe drain exceeded the {}-interrupt retry bound",
-                                IDENTITY_KERNEL_COPY_EINTR_LIMIT
-                            ),
-                        });
-                    }
-                    Some(libc::EAGAIN) => {
-                        return Err(IdentityKernelCopyError::Backend {
-                            address: chunk_start,
-                            detail: format!(
-                                "private copyin pipe drain reached EAGAIN after accepting {accepted} bytes"
-                            ),
-                        });
-                    }
-                    _ => {
-                        return Err(IdentityKernelCopyError::Backend {
-                            address: chunk_start,
-                            detail: format!("private copyin pipe read failed: {error}"),
-                        });
-                    }
-                }
-            }
-            let copied = usize::try_from(copied).map_err(|_| IdentityKernelCopyError::Backend {
-                address: chunk_start,
-                detail: "private copyin pipe read returned an invalid length".into(),
-            })?;
-            if copied == 0 || copied > accepted - drained {
-                return Err(IdentityKernelCopyError::Backend {
-                    address: chunk_start,
-                    detail: format!(
-                        "private copyin pipe read returned {copied} bytes with {} bytes pending",
-                        accepted - drained
-                    ),
-                });
-            }
-            drained += copied;
-            interruptions = 0;
-        }
-        completed += accepted;
-    }
-    Ok(())
-}
-
-fn identity_kernel_copyin_exact(
-    address: GuestVa,
-    destination: &mut [u8],
-) -> Result<(), IdentityKernelCopyError> {
-    identity_kernel_copyin_exact_using(address, destination, None)
-}
-
-/// Symmetric kernel-contained copyout. Rust-owned bytes enter an empty private
-/// nonblocking pipe, then `read(2)` asks FreeBSD to copy them into the guest in
-/// page-contained, at-most-512-byte units. A writable MAP_SHARED page whose
-/// vnode was truncated therefore returns EFAULT instead of killing Carrick with
-/// host SIGBUS. Partial transfers are drained completely before the next write.
-fn identity_kernel_copyout_exact(
-    address: GuestVa,
-    source: &[u8],
-) -> Result<(), IdentityKernelCopyError> {
-    if source.len() > IDENTITY_KERNEL_COPY_PIPE_BOUND {
-        return Err(IdentityKernelCopyError::Backend {
-            address,
-            detail: format!(
-                "kernel-contained guest write of {} bytes exceeds the {}-byte pipe bound",
-                source.len(),
-                IDENTITY_KERNEL_COPY_PIPE_BOUND
-            ),
-        });
-    }
-    if source.is_empty() {
-        return Ok(());
-    }
-
-    let (reader, writer) = identity_kernel_copy_pipe(address, "copyout")?;
-    let mut completed = 0usize;
-    while completed < source.len() {
-        let (chunk_start, chunk_len) = identity_kernel_copy_chunk(
-            address,
-            completed,
-            source.len() - completed,
-            "guest write",
-        )?;
-        let mut interruptions = 0usize;
-        let accepted = loop {
-            // SAFETY: the source is a valid Rust slice and the requested chunk
-            // remains within it. The nonblocking pipe is empty by construction.
-            let copied = unsafe {
-                libc::write(
-                    writer.as_raw_fd(),
-                    source.as_ptr().add(completed).cast(),
-                    chunk_len,
-                )
-            };
-            if copied >= 0 {
-                break usize::try_from(copied).map_err(|_| IdentityKernelCopyError::Backend {
-                    address: chunk_start,
-                    detail: "private copyout pipe write returned an invalid length".into(),
-                })?;
-            }
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EINTR) if interruptions < IDENTITY_KERNEL_COPY_EINTR_LIMIT => {
-                    interruptions += 1;
-                }
-                Some(libc::EINTR) => {
-                    return Err(IdentityKernelCopyError::Backend {
-                        address: chunk_start,
-                        detail: format!(
-                            "private copyout pipe write exceeded the {}-interrupt retry bound",
-                            IDENTITY_KERNEL_COPY_EINTR_LIMIT
-                        ),
-                    });
-                }
-                Some(libc::EAGAIN) => {
-                    return Err(IdentityKernelCopyError::Backend {
-                        address: chunk_start,
-                        detail: "private copyout pipe was not empty before a nonblocking write"
-                            .into(),
-                    });
-                }
-                _ => {
-                    return Err(IdentityKernelCopyError::Backend {
-                        address: chunk_start,
-                        detail: format!("private copyout pipe write failed: {error}"),
-                    });
-                }
-            }
-        };
-        if accepted == 0 || accepted > chunk_len {
-            return Err(IdentityKernelCopyError::Backend {
-                address: chunk_start,
-                detail: format!(
-                    "private copyout pipe write returned {accepted} bytes for a {chunk_len}-byte chunk"
-                ),
-            });
-        }
-
-        let mut drained = 0usize;
-        let mut interruptions = 0usize;
-        while drained < accepted {
-            let destination = chunk_start
-                .raw()
-                .checked_add(drained as u64)
-                .ok_or_else(|| IdentityKernelCopyError::Backend {
-                    address: chunk_start,
-                    detail: "kernel-contained guest write address overflowed".into(),
-                })?;
-            #[cfg(test)]
-            IDENTITY_KERNEL_COPYOUT_OPERATION_CENSUS.with(|census| census.set(census.get() + 1));
-            // SAFETY: the destination is intentionally an untrusted guest
-            // pointer. FreeBSD validates it while copying out of the pipe.
-            let copied = unsafe {
-                libc::read(
-                    reader.as_raw_fd(),
-                    destination as usize as *mut libc::c_void,
-                    accepted - drained,
-                )
-            };
-            if copied < 0 {
-                let error = std::io::Error::last_os_error();
-                match error.raw_os_error() {
-                    Some(libc::EINTR) if interruptions < IDENTITY_KERNEL_COPY_EINTR_LIMIT => {
-                        interruptions += 1;
-                        continue;
-                    }
-                    Some(libc::EINTR) => {
-                        return Err(IdentityKernelCopyError::Backend {
-                            address: GuestVa(destination),
-                            detail: format!(
-                                "private copyout pipe drain exceeded the {}-interrupt retry bound",
-                                IDENTITY_KERNEL_COPY_EINTR_LIMIT
-                            ),
-                        });
-                    }
-                    Some(libc::EAGAIN) => {
-                        return Err(IdentityKernelCopyError::Backend {
-                            address: GuestVa(destination),
-                            detail: format!(
-                                "private copyout pipe drain reached EAGAIN after accepting {accepted} bytes"
-                            ),
-                        });
-                    }
-                    Some(libc::EFAULT) => {
-                        return Err(IdentityKernelCopyError::GuestFault {
-                            address: GuestVa(destination),
-                        });
-                    }
-                    _ => {
-                        return Err(IdentityKernelCopyError::Backend {
-                            address: GuestVa(destination),
-                            detail: format!("private copyout pipe read failed: {error}"),
-                        });
-                    }
-                }
-            }
-            let copied = usize::try_from(copied).map_err(|_| IdentityKernelCopyError::Backend {
-                address: GuestVa(destination),
-                detail: "private copyout pipe read returned an invalid length".into(),
-            })?;
-            if copied == 0 || copied > accepted - drained {
-                return Err(IdentityKernelCopyError::Backend {
-                    address: GuestVa(destination),
-                    detail: format!(
-                        "private copyout pipe read returned {copied} bytes with {} bytes pending",
-                        accepted - drained
-                    ),
-                });
-            }
-            drained += copied;
-            interruptions = 0;
-        }
-        completed += accepted;
-    }
-    Ok(())
-}
-
-/// Copy one exact architectural range from the identity guest mapping.
-///
-/// The host-mapping read lock spans raw-domain validation, complete-range
-/// protection and backing classification, and the copy. Mapping/protection
-/// transitions take the writer in the same outer-to-inner order, so a
-/// successful check cannot race `mprotect`, `munmap`, or `MAP_FIXED`.
-/// Anonymous/private materialized backing is copied directly after validation;
-/// mutable shared vnode backing retains FreeBSD copyin so an external truncate
-/// becomes a typed `BusAddress` instead of a host SIGBUS.
-fn identity_checked_read_exact(
-    address: GuestVa,
-    destination: &mut [u8],
-) -> Result<(), IdentityCheckedReadError> {
-    let _mapping_guard = IDENTITY_HOST_MAPPING_LOCK.read();
-    identity_checked_read_exact_under_mapping_lock(address, destination)
-}
-
-/// Inner checked read for callers that already hold the identity-mapping read
-/// lock. Keeping the lock outside a multi-byte instruction fetch makes execute,
-/// access, backing, and direct-or-kernel copy decisions one coherent mapping
-/// observation.
-fn identity_checked_read_exact_under_mapping_lock(
-    address: GuestVa,
-    destination: &mut [u8],
-) -> Result<(), IdentityCheckedReadError> {
-    if destination.len() > IDENTITY_KERNEL_COPY_PIPE_BOUND {
-        return Err(IdentityCheckedReadError::Backend {
-            address,
-            detail: format!(
-                "architectural guest read of {} bytes exceeds the {}-byte kernel-copy bound",
-                destination.len(),
-                IDENTITY_KERNEL_COPY_PIPE_BOUND
-            ),
-        });
-    }
-    if destination.is_empty() {
-        return Ok(());
-    }
-    if let Some(fault_address) = identity_raw_fault_address(address.raw(), destination.len()) {
-        return Err(IdentityCheckedReadError::Fault(
-            carrick_guest_mem::protections::GuestMemoryFault {
-                address: GuestVa(fault_address),
-                kind: carrick_guest_mem::protections::GuestMemoryFaultKind::Unmapped,
-            },
-        ));
-    }
-    if let Some(fault) = IDENTITY_PROTECTIONS.first_access_fault(
-        address,
-        destination.len(),
-        carrick_guest_mem::protections::GuestMemoryAccess::Read,
-    ) {
-        return Err(identity_checked_read_fault(fault));
-    }
-    if !IDENTITY_PROTECTIONS.range_mutable_shared_backing(address.raw(), destination.len()) {
-        // SAFETY: raw-domain and complete read access were validated before
-        // either pointer is dereferenced. The mapping reader excludes Carrick
-        // VMA transitions, while the mutable-shared exclusion proves the source
-        // is anonymous/private materialized backing that cannot be invalidated
-        // by an external vnode truncate. Checked-read destinations are
-        // Rust-owned architectural buffers and cannot overlap guest backing.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                address.raw() as usize as *const u8,
-                destination.as_mut_ptr(),
-                destination.len(),
-            );
-        }
-        return Ok(());
-    }
-    match identity_kernel_copyin_exact(address, destination) {
-        Ok(()) => Ok(()),
-        Err(IdentityKernelCopyError::GuestFault {
-            address: fault_address,
-        }) => {
-            // A Carrick mapping transition cannot occur while the reader is
-            // held, but classify again after kernel copyin so any registry
-            // fault always retains Linux MAPERR/ACCERR precedence.
-            if let Some(fault) = IDENTITY_PROTECTIONS.first_access_fault(
-                address,
-                destination.len(),
-                carrick_guest_mem::protections::GuestMemoryAccess::Read,
-            ) {
-                Err(identity_checked_read_fault(fault))
-            } else {
-                Err(IdentityCheckedReadError::BusAddress {
-                    address: fault_address,
-                })
-            }
-        }
-        Err(IdentityKernelCopyError::Backend { address, detail }) => {
-            Err(IdentityCheckedReadError::Backend { address, detail })
-        }
     }
 }
 
@@ -8069,173 +5473,6 @@ fn identity_checked_fetch_x86_instruction(
     }
 }
 
-/// Copy one exact architectural write into the identity guest mapping while
-/// retaining the executable-mutation lease, mapping reader, and complete-range
-/// protection/backing classification. The lease is the required cache
-/// invalidation hook for executable aliases and remains live through either the
-/// direct copy or kernel-contained copyout. Registry faults keep MAPERR/ACCERR
-/// precedence; only a still-mapped writable vnode hole is BUS_ADRERR.
-fn identity_checked_write_exact(
-    memory: &IdentityGuestMemory,
-    address: GuestVa,
-    source: &[u8],
-) -> Result<(), IdentityCheckedWriteError> {
-    let (_mutation, _mapping_guard) = memory
-        .mapping_read_for_write(address.raw(), source.len())
-        .map_err(|error| IdentityCheckedWriteError::Backend {
-            address,
-            detail: error.to_string(),
-        })?;
-    identity_checked_write_exact_under_mapping_lock(address, source)
-}
-
-fn identity_checked_write_range_under_mapping_lock(
-    address: GuestVa,
-    length: usize,
-) -> Result<(), IdentityCheckedWriteError> {
-    if let Some(fault_address) = identity_raw_fault_address(address.raw(), length) {
-        return Err(IdentityCheckedWriteError::Fault(
-            carrick_guest_mem::protections::GuestMemoryFault {
-                address: GuestVa(fault_address),
-                kind: carrick_guest_mem::protections::GuestMemoryFaultKind::Unmapped,
-            },
-        ));
-    }
-    if let Some(fault) = IDENTITY_PROTECTIONS.first_access_fault(
-        address,
-        length,
-        carrick_guest_mem::protections::GuestMemoryAccess::Write,
-    ) {
-        return Err(identity_checked_write_fault(fault));
-    }
-    Ok(())
-}
-
-/// Lower-level checked copyout used only after `mapping_read_for_write` has
-/// arbitrated executable mutation and retained its lease plus mapping reader.
-/// It must not be exposed as an independent write path.
-fn identity_checked_write_exact_under_mapping_lock(
-    address: GuestVa,
-    source: &[u8],
-) -> Result<(), IdentityCheckedWriteError> {
-    if source.len() > IDENTITY_KERNEL_COPY_PIPE_BOUND {
-        return Err(IdentityCheckedWriteError::Backend {
-            address,
-            detail: format!(
-                "architectural guest write of {} bytes exceeds the {}-byte kernel-copy bound",
-                source.len(),
-                IDENTITY_KERNEL_COPY_PIPE_BOUND
-            ),
-        });
-    }
-    if source.is_empty() {
-        return Ok(());
-    }
-    identity_checked_write_range_under_mapping_lock(address, source.len())?;
-    if !IDENTITY_PROTECTIONS.range_mutable_shared_backing(address.raw(), source.len()) {
-        // SAFETY: raw-domain and complete write access were validated before
-        // either pointer is dereferenced. The caller retains both the mapping
-        // reader and any executable-mutation lease, and the mutable-shared
-        // exclusion proves the destination cannot be invalidated by an external
-        // vnode truncate. Architectural source buffers are Rust-owned and do
-        // not overlap guest backing.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                source.as_ptr(),
-                address.raw() as usize as *mut u8,
-                source.len(),
-            );
-        }
-        return Ok(());
-    }
-    match identity_kernel_copyout_exact(address, source) {
-        Ok(()) => Ok(()),
-        Err(IdentityKernelCopyError::GuestFault {
-            address: fault_address,
-        }) => {
-            if let Some(fault) = IDENTITY_PROTECTIONS.first_access_fault(
-                address,
-                source.len(),
-                carrick_guest_mem::protections::GuestMemoryAccess::Write,
-            ) {
-                Err(identity_checked_write_fault(fault))
-            } else {
-                Err(IdentityCheckedWriteError::BusAddress {
-                    address: fault_address,
-                })
-            }
-        }
-        Err(IdentityKernelCopyError::Backend { address, detail }) => {
-            Err(IdentityCheckedWriteError::Backend { address, detail })
-        }
-    }
-}
-
-/// Read an arbitrary signal-frame extent under one coherent mapping snapshot,
-/// splitting only at the bounded checked-copy seam. The destination is
-/// Rust-owned, so a late checked failure cannot expose a partially restored
-/// architectural state.
-fn identity_checked_read_sigframe(
-    address: GuestVa,
-    destination: &mut [u8],
-) -> Result<(), IdentityCheckedReadError> {
-    let _mapping_guard = IDENTITY_HOST_MAPPING_LOCK.read();
-    let mut completed = 0usize;
-    for chunk in destination.chunks_mut(IDENTITY_KERNEL_COPY_PIPE_BOUND) {
-        let offset = u64::try_from(completed).map_err(|_| IdentityCheckedReadError::Backend {
-            address,
-            detail: "signal-frame read offset is not representable".into(),
-        })?;
-        let chunk_address = address
-            .raw()
-            .checked_add(offset)
-            .map(GuestVa)
-            .ok_or_else(|| IdentityCheckedReadError::Backend {
-                address,
-                detail: "signal-frame read address overflowed".into(),
-            })?;
-        identity_checked_read_exact_under_mapping_lock(chunk_address, chunk)?;
-        completed += chunk.len();
-    }
-    Ok(())
-}
-
-/// Write a complete signal-frame extent while retaining the executable-mutation
-/// lease and mapping reader in the ordinary outer-to-inner order. Registry
-/// permission is validated for the complete frame before the first byte is
-/// copied; mutable-shared chunks retain kernel containment for vnode-hole SIGBUS.
-fn identity_checked_write_sigframe(
-    memory: &IdentityGuestMemory,
-    address: GuestVa,
-    source: &[u8],
-) -> Result<(), IdentityCheckedWriteError> {
-    let (_mutation, _mapping_guard) = memory
-        .mapping_read_for_write(address.raw(), source.len())
-        .map_err(|error| IdentityCheckedWriteError::Backend {
-            address,
-            detail: error.to_string(),
-        })?;
-    identity_checked_write_range_under_mapping_lock(address, source.len())?;
-    let mut completed = 0usize;
-    for chunk in source.chunks(IDENTITY_KERNEL_COPY_PIPE_BOUND) {
-        let offset = u64::try_from(completed).map_err(|_| IdentityCheckedWriteError::Backend {
-            address,
-            detail: "signal-frame write offset is not representable".into(),
-        })?;
-        let chunk_address = address
-            .raw()
-            .checked_add(offset)
-            .map(GuestVa)
-            .ok_or_else(|| IdentityCheckedWriteError::Backend {
-                address,
-                detail: "signal-frame write address overflowed".into(),
-            })?;
-        identity_checked_write_exact_under_mapping_lock(chunk_address, chunk)?;
-        completed += chunk.len();
-    }
-    Ok(())
-}
-
 struct IdentityXstateMemoryReader;
 
 impl X86XstateMemoryReader for IdentityXstateMemoryReader {
@@ -8247,7 +5484,7 @@ impl X86XstateMemoryReader for IdentityXstateMemoryReader {
 }
 
 struct IdentityXstateMemoryWriter<'a> {
-    memory: &'a IdentityGuestMemory,
+    memory: &'a NativeIdentityMemory,
 }
 
 impl X86XstateMemoryWriter for IdentityXstateMemoryWriter<'_> {
@@ -8255,86 +5492,6 @@ impl X86XstateMemoryWriter for IdentityXstateMemoryWriter<'_> {
 
     fn write_exact(&mut self, address: GuestVa, source: &[u8]) -> Result<(), Self::Error> {
         identity_checked_write_exact(self.memory, address, source)
-    }
-}
-
-fn cflow_guest_memory_fault(
-    access: cflow::CflowMemoryAccess,
-    fault: carrick_guest_mem::protections::GuestMemoryFault,
-) -> cflow::CflowError {
-    let address = fault.address.raw();
-    let kind = match fault.kind {
-        carrick_guest_mem::protections::GuestMemoryFaultKind::Unmapped => {
-            cflow::CflowMemoryFaultKind::Unmapped
-        }
-        carrick_guest_mem::protections::GuestMemoryFaultKind::AccessDenied => {
-            cflow::CflowMemoryFaultKind::AccessDenied
-        }
-    };
-    match access {
-        cflow::CflowMemoryAccess::Read => cflow::CflowError::MemoryRead { address, kind },
-        cflow::CflowMemoryAccess::Write => cflow::CflowError::MemoryWrite { address, kind },
-    }
-}
-
-#[cfg(test)]
-fn cflow_raw_memory_fault(
-    access: cflow::CflowMemoryAccess,
-    address: u64,
-    length: usize,
-) -> Option<cflow::CflowError> {
-    identity_raw_fault_address(address, length).map(|address| match access {
-        cflow::CflowMemoryAccess::Read => cflow::CflowError::MemoryRead {
-            address,
-            kind: cflow::CflowMemoryFaultKind::Unmapped,
-        },
-        cflow::CflowMemoryAccess::Write => cflow::CflowError::MemoryWrite {
-            address,
-            kind: cflow::CflowMemoryFaultKind::Unmapped,
-        },
-    })
-}
-
-impl cflow::ControlFlowMemory for IdentityGuestMemory {
-    fn read_u64(&mut self, address: u64) -> Result<u64, cflow::CflowError> {
-        const LENGTH: usize = std::mem::size_of::<u64>();
-        let mut bytes = [0u8; LENGTH];
-        identity_checked_read_exact(GuestVa(address), &mut bytes).map_err(|error| match error {
-            IdentityCheckedReadError::Fault(fault) => {
-                cflow_guest_memory_fault(cflow::CflowMemoryAccess::Read, fault)
-            }
-            IdentityCheckedReadError::BusAddress { address } => cflow::CflowError::MemoryRead {
-                address: address.raw(),
-                kind: cflow::CflowMemoryFaultKind::BusAddress,
-            },
-            IdentityCheckedReadError::Backend { address, detail } => {
-                cflow_memory_backend_error(cflow::CflowMemoryAccess::Read, address.raw(), detail)
-            }
-        })?;
-        Ok(u64::from_le_bytes(bytes))
-    }
-
-    fn write_u64(&mut self, address: u64, value: u64) -> Result<(), cflow::CflowError> {
-        identity_checked_write_exact(self, GuestVa(address), &value.to_le_bytes()).map_err(
-            |error| match error {
-                IdentityCheckedWriteError::Fault(fault) => {
-                    cflow_guest_memory_fault(cflow::CflowMemoryAccess::Write, fault)
-                }
-                IdentityCheckedWriteError::BusAddress { address } => {
-                    cflow::CflowError::MemoryWrite {
-                        address: address.raw(),
-                        kind: cflow::CflowMemoryFaultKind::BusAddress,
-                    }
-                }
-                IdentityCheckedWriteError::Backend { address, detail } => {
-                    cflow_memory_backend_error(
-                        cflow::CflowMemoryAccess::Write,
-                        address.raw(),
-                        detail,
-                    )
-                }
-            },
-        )
     }
 }
 
@@ -8521,10 +5678,10 @@ impl GuestMemory for SigframeEngine<'_> {
         address: u64,
         bytes: &[u8],
     ) -> Result<(), carrick_guest_mem::MemoryError> {
-        let memory = IdentityGuestMemory {
-            executable_epoch: self.executable_epoch.as_ref().map(Arc::clone),
-            mapping_failure: None,
-        };
+        let memory = NativeIdentityMemory::from_epoch(
+            self.executable_epoch.as_ref().map(Arc::clone),
+            identity_host_seam(),
+        );
         identity_checked_write_sigframe(&memory, GuestVa(address), bytes)
             .map_err(|_| sigframe_guest_memory_error(address, bytes.len()))
     }
@@ -8534,10 +5691,10 @@ impl GuestMemory for SigframeEngine<'_> {
         address: u64,
         bytes: &[u8],
     ) -> Result<(), carrick_guest_mem::MemoryError> {
-        let memory = IdentityGuestMemory {
-            executable_epoch: self.executable_epoch.as_ref().map(Arc::clone),
-            mapping_failure: None,
-        };
+        let memory = NativeIdentityMemory::from_epoch(
+            self.executable_epoch.as_ref().map(Arc::clone),
+            identity_host_seam(),
+        );
         identity_checked_write_sigframe(&memory, GuestVa(address), bytes)
             .map_err(|_| sigframe_guest_memory_error(address, bytes.len()))
     }
@@ -9103,7 +6260,7 @@ struct LoadedImage {
 /// `GuestMemory` hooks. This makes an arbitrary canonical-but-unmapped pointer
 /// EFAULT before Rust constructs a host slice.
 fn protect_existing_identity_range(
-    memory: &IdentityGuestMemory,
+    memory: &NativeIdentityMemory,
     protections: &carrick_guest_mem::protections::MemoryProtections,
     address: u64,
     len: usize,
@@ -9146,7 +6303,7 @@ fn reset_identity_vmas_with_registry(
     const USER_END_EXCLUSIVE: u64 = 1 << 47;
     let user_len = (USER_END_EXCLUSIVE - USER_START) as usize;
     protections.reset_to_unmapped(USER_START, user_len);
-    let memory = IdentityGuestMemory::uncoordinated();
+    let memory = NativeIdentityMemory::uncoordinated();
     let publication = (|| {
         for &(start, end, prot) in &image.segment_protections {
             protect_existing_identity_range(
@@ -9194,7 +6351,7 @@ impl LoadedImage {
     /// teardown independently, so retries after a partial host failure are
     /// idempotent. Field `Drop` remains the rollback backstop.
     fn teardown(&self) -> Result<(), RuntimeError> {
-        teardown_native_mappings(&self.mappings)
+        teardown_native_mappings(&self.mappings).map_err(RuntimeError::from)
     }
 }
 
@@ -9319,380 +6476,6 @@ fn stamp_x86_vvar(vvar: *mut u8) -> Option<X86VvarClock> {
     Some(clock)
 }
 
-fn map_prot_at(
-    operation: NativeMappingOperation,
-    len: usize,
-    prot: i32,
-    fixed_at: Option<u64>,
-    reservation: FixedRwReservation,
-) -> *mut u8 {
-    let (addr, mut flags) = match fixed_at {
-        Some(a) => (
-            a as *mut libc::c_void,
-            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
-        ),
-        None => (std::ptr::null_mut(), libc::MAP_PRIVATE | libc::MAP_ANON),
-    };
-    if fixed_at.is_some() && reservation == FixedRwReservation::Exclusive {
-        flags |= libc::MAP_EXCL;
-    }
-    host_mmap(operation, addr, len, prot, flags, -1, 0).cast()
-}
-
-const NATIVE_MAPPING_LIVE: u8 = 0;
-const NATIVE_MAPPING_TEARING_DOWN: u8 = 1;
-const NATIVE_MAPPING_UNMAPPED: u8 = 2;
-
-/// Exclusive ownership of one native host mapping. It is deliberately not
-/// cloneable: ownership moves from the loader transaction into `LoadedImage`,
-/// while `Arc<LoadedImage>` clones only share that one owner.
-struct NativeMapping {
-    base: u64,
-    len: usize,
-    state: std::sync::atomic::AtomicU8,
-    operation: NativeMappingOperation,
-    label: &'static str,
-}
-
-impl NativeMapping {
-    fn claim(
-        base: u64,
-        len: usize,
-        operation: NativeMappingOperation,
-        label: &'static str,
-    ) -> Self {
-        Self {
-            base,
-            len,
-            state: std::sync::atomic::AtomicU8::new(NATIVE_MAPPING_LIVE),
-            operation,
-            label,
-        }
-    }
-
-    fn map_anonymous(
-        operation: NativeMappingOperation,
-        len: usize,
-        prot: i32,
-        fixed_at: Option<u64>,
-        label: &'static str,
-    ) -> Result<Self, RuntimeError> {
-        let mapped = map_prot_at(
-            operation,
-            len,
-            prot,
-            fixed_at,
-            FixedRwReservation::Exclusive,
-        );
-        if mapped.cast::<libc::c_void>() == libc::MAP_FAILED {
-            return Err(RuntimeError::Unsupported(format!(
-                "map native {label} ({operation:?}, {len} bytes) failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let mapping = Self::claim(mapped as u64, len, operation, label);
-        if let Some(expected) = fixed_at
-            && mapping.base != expected
-        {
-            let returned = mapping.base;
-            let cleanup = mapping.teardown().err();
-            let detail = cleanup
-                .map(|error| format!("; wrong-address cleanup failed: {error}"))
-                .unwrap_or_default();
-            return Err(RuntimeError::Unsupported(format!(
-                "map native {label} requested 0x{expected:x} but returned 0x{returned:x}{detail}"
-            )));
-        }
-        Ok(mapping)
-    }
-
-    /// Optional fixed mappings (vvar/vDSO) may be unavailable, but a misplaced
-    /// successful allocation is still owned and must be explicitly rolled back.
-    fn map_optional_fixed(
-        operation: NativeMappingOperation,
-        len: usize,
-        prot: i32,
-        expected: u64,
-        label: &'static str,
-    ) -> Result<Option<Self>, RuntimeError> {
-        let mapped = map_prot_at(
-            operation,
-            len,
-            prot,
-            Some(expected),
-            FixedRwReservation::Exclusive,
-        );
-        if mapped.cast::<libc::c_void>() == libc::MAP_FAILED {
-            return Ok(None);
-        }
-        let mapping = Self::claim(mapped as u64, len, operation, label);
-        if mapping.base != expected {
-            mapping.teardown()?;
-            return Ok(None);
-        }
-        Ok(Some(mapping))
-    }
-
-    fn protect(&self, operation: NativeMappingOperation, prot: i32) -> Result<(), RuntimeError> {
-        if self.state.load(std::sync::atomic::Ordering::Acquire) != NATIVE_MAPPING_LIVE {
-            return Err(RuntimeError::Unsupported(format!(
-                "protect non-live native {} ({:?})",
-                self.label, self.operation
-            )));
-        }
-        if host_mprotect(operation, self.base as *mut libc::c_void, self.len, prot) != 0 {
-            return Err(RuntimeError::Unsupported(format!(
-                "protect native {} at 0x{:x} for {} bytes failed: {}",
-                self.label,
-                self.base,
-                self.len,
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
-    }
-
-    /// Transfer a successfully installed dynamic mapping to the VMA lifecycle.
-    /// The bytes remain mapped; this owner is merely disarmed so its Drop cannot
-    /// tear down a mapping now tracked by the dispatcher's mmap/munmap state.
-    fn relinquish_to_vma(&mut self) {
-        *self.state.get_mut() = NATIVE_MAPPING_UNMAPPED;
-    }
-
-    fn teardown(&self) -> Result<(), RuntimeError> {
-        match self.state.compare_exchange(
-            NATIVE_MAPPING_LIVE,
-            NATIVE_MAPPING_TEARING_DOWN,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(_) => {}
-            Err(NATIVE_MAPPING_UNMAPPED) => return Ok(()),
-            Err(_) => {
-                return Err(RuntimeError::Unsupported(format!(
-                    "concurrent native {} teardown ({:?})",
-                    self.label, self.operation
-                )));
-            }
-        }
-        if host_munmap(self.base as *mut libc::c_void, self.len) == 0 {
-            self.state.store(
-                NATIVE_MAPPING_UNMAPPED,
-                std::sync::atomic::Ordering::Release,
-            );
-            Ok(())
-        } else {
-            self.state
-                .store(NATIVE_MAPPING_LIVE, std::sync::atomic::Ordering::Release);
-            Err(RuntimeError::Unsupported(format!(
-                "unmap native {} at 0x{:x} for {} bytes failed: {}",
-                self.label,
-                self.base,
-                self.len,
-                std::io::Error::last_os_error()
-            )))
-        }
-    }
-}
-
-impl Drop for NativeMapping {
-    fn drop(&mut self) {
-        if *self.state.get_mut() == NATIVE_MAPPING_UNMAPPED {
-            return;
-        }
-        if host_munmap(self.base as *mut libc::c_void, self.len) == 0 {
-            *self.state.get_mut() = NATIVE_MAPPING_UNMAPPED;
-            return;
-        }
-        // This is the final ownership backstop. Returning would lose the only
-        // record of a live mapping and permit a later independent owner of the
-        // same range. Fail-stop without unwinding or a panic payload.
-        std::process::abort();
-    }
-}
-
-fn teardown_native_mappings_collect(mappings: &[NativeMapping]) -> Vec<String> {
-    mappings
-        .iter()
-        .filter_map(|mapping| mapping.teardown().err().map(|error| error.to_string()))
-        .collect()
-}
-
-fn teardown_native_mappings(mappings: &[NativeMapping]) -> Result<(), RuntimeError> {
-    let errors = teardown_native_mappings_collect(mappings);
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(RuntimeError::Unsupported(format!(
-            "native mapping teardown failed: {}",
-            errors.join("; ")
-        )))
-    }
-}
-
-/// Explicit ownership transaction for a not-yet-published native address
-/// space. Every acquired mapping is range-checked against prior independent
-/// owners. All loader errors call `rollback`; `NativeMapping::Drop` is only the
-/// fail-stop backstop if a future call site bypasses that protocol.
-struct NativeMappingTransaction {
-    label: &'static str,
-    mappings: Vec<NativeMapping>,
-}
-
-impl NativeMappingTransaction {
-    fn new(label: &'static str) -> Self {
-        Self {
-            label,
-            mappings: Vec::new(),
-        }
-    }
-
-    fn acquire(&mut self, mapping: NativeMapping) -> Result<usize, RuntimeError> {
-        let Some(end) = mapping.base.checked_add(mapping.len as u64) else {
-            let primary = RuntimeError::Unsupported(format!(
-                "native {} range overflows at 0x{:x} for {} bytes",
-                mapping.label, mapping.base, mapping.len
-            ));
-            let cleanup = mapping.teardown().err();
-            return Err(match cleanup {
-                Some(error) => RuntimeError::Unsupported(format!(
-                    "{primary}; overflowing mapping rollback failed: {error}"
-                )),
-                None => primary,
-            });
-        };
-        if let Some(existing) = self.mappings.iter().find(|existing| {
-            let existing_end = existing.base.saturating_add(existing.len as u64);
-            mapping.base < existing_end && existing.base < end
-        }) {
-            let primary = RuntimeError::Unsupported(format!(
-                "native candidate ranges overlap: {} [0x{:x},0x{end:x}) and {} [0x{:x},0x{:x})",
-                mapping.label,
-                mapping.base,
-                existing.label,
-                existing.base,
-                existing.base.saturating_add(existing.len as u64)
-            ));
-            let cleanup = mapping.teardown().err();
-            return Err(match cleanup {
-                Some(error) => RuntimeError::Unsupported(format!(
-                    "{primary}; overlapping mapping rollback failed: {error}"
-                )),
-                None => primary,
-            });
-        }
-        let index = self.mappings.len();
-        self.mappings.push(mapping);
-        Ok(index)
-    }
-
-    fn map_anonymous(
-        &mut self,
-        operation: NativeMappingOperation,
-        len: usize,
-        prot: i32,
-        fixed_at: Option<u64>,
-        label: &'static str,
-    ) -> Result<usize, RuntimeError> {
-        let mapping = NativeMapping::map_anonymous(operation, len, prot, fixed_at, label)?;
-        self.acquire(mapping)
-    }
-
-    fn map_optional_fixed(
-        &mut self,
-        operation: NativeMappingOperation,
-        len: usize,
-        prot: i32,
-        expected: u64,
-        label: &'static str,
-    ) -> Result<Option<usize>, RuntimeError> {
-        NativeMapping::map_optional_fixed(operation, len, prot, expected, label)?
-            .map(|mapping| self.acquire(mapping))
-            .transpose()
-    }
-
-    fn mapping(&self, index: usize) -> &NativeMapping {
-        &self.mappings[index]
-    }
-
-    fn teardown_mapping(&mut self, index: usize) -> Result<(), RuntimeError> {
-        self.mappings[index].teardown()?;
-        self.mappings.remove(index);
-        Ok(())
-    }
-
-    fn commit(mut self) -> Vec<NativeMapping> {
-        std::mem::take(&mut self.mappings)
-    }
-
-    fn commit_to_vma(mut self) {
-        for mapping in &mut self.mappings {
-            mapping.relinquish_to_vma();
-        }
-    }
-
-    fn rollback(self, primary: RuntimeError) -> RuntimeError {
-        let mut rollback_errors = teardown_native_mappings_collect(&self.mappings);
-        if !rollback_errors.is_empty() {
-            // A one-shot host interruption or injected failure is reportable
-            // only after ownership has actually been discharged. Retry every
-            // still-live owner once; persistent failure reaches Drop and aborts
-            // rather than returning with an ownerless mapping.
-            let retry_errors = teardown_native_mappings_collect(&self.mappings);
-            rollback_errors.extend(
-                retry_errors
-                    .into_iter()
-                    .map(|error| format!("retry failed: {error}")),
-            );
-        }
-        if rollback_errors.is_empty() {
-            primary
-        } else {
-            RuntimeError::Unsupported(format!(
-                "{primary}; {} rollback failed: {}",
-                self.label,
-                rollback_errors.join("; ")
-            ))
-        }
-    }
-}
-
-fn map_fixed_replacement(
-    operation: NativeMappingOperation,
-    address: u64,
-    len: usize,
-    prot: i32,
-    label: &'static str,
-) -> Result<(), RuntimeError> {
-    // PT_LOAD pages intentionally replace bytes inside the reservation whose
-    // sole owner remains the surrounding `NativeMapping`.
-    let mapped = map_prot_at(
-        operation,
-        len,
-        prot,
-        Some(address),
-        FixedRwReservation::ReplaceOwned,
-    );
-    if mapped.cast::<libc::c_void>() == libc::MAP_FAILED {
-        return Err(RuntimeError::Unsupported(format!(
-            "map native {label} at 0x{address:x} failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    if mapped as u64 != address {
-        let returned = mapped as u64;
-        let misplaced = NativeMapping::claim(returned, len, operation, label);
-        let cleanup = misplaced.teardown().err();
-        let detail = cleanup
-            .map(|error| format!("; wrong-address cleanup failed: {error}"))
-            .unwrap_or_default();
-        return Err(RuntimeError::Unsupported(format!(
-            "map native {label} requested 0x{address:x} but returned 0x{returned:x}{detail}"
-        )));
-    }
-    Ok(())
-}
-
 struct MappedElf {
     bias: u64,
     entry: u64,
@@ -9736,6 +6519,7 @@ fn map_one_elf(
                 libc::PROT_NONE,
                 None,
                 "ELF reservation",
+                FreebsdHost::exclusive_fixed_map_flag(),
             )?;
             let bias = candidate.mapping(index).base - lo;
             (index, bias)
@@ -9747,6 +6531,7 @@ fn map_one_elf(
                 libc::PROT_NONE,
                 Some(lo),
                 "fixed ELF reservation",
+                FreebsdHost::exclusive_fixed_map_flag(),
             )?,
             0,
         ),
@@ -9866,6 +6651,7 @@ fn load_static_pie(
             libc::PROT_READ | libc::PROT_WRITE,
             None,
             "guest stack",
+            FreebsdHost::exclusive_fixed_map_flag(),
         )?;
         let stack = candidate.mapping(stack_index).base;
         let scratch_index = candidate.map_anonymous(
@@ -9874,6 +6660,7 @@ fn load_static_pie(
             libc::PROT_READ | libc::PROT_WRITE,
             None,
             "signal scratch",
+            FreebsdHost::exclusive_fixed_map_flag(),
         )?;
         let scratch = candidate.mapping(scratch_index).base;
 
@@ -9897,6 +6684,7 @@ fn load_static_pie(
                 libc::PROT_READ | libc::PROT_WRITE,
                 vvar_base,
                 "vvar",
+                FreebsdHost::exclusive_fixed_map_flag(),
             )? {
                 Some(vvar_index) => match candidate.map_optional_fixed(
                     NativeMappingOperation::Vdso,
@@ -9904,6 +6692,7 @@ fn load_static_pie(
                     libc::PROT_READ | libc::PROT_WRITE,
                     vdso_base,
                     "vDSO",
+                    FreebsdHost::exclusive_fixed_map_flag(),
                 )? {
                     Some(vdso_index) => {
                         let vvar_address = candidate.mapping(vvar_index).base;
@@ -10020,7 +6809,22 @@ fn load_static_pie(
             image.mappings = candidate.commit();
             Ok(image)
         }
-        Err(error) => Err(candidate.rollback(error)),
+        Err(error) => {
+            // See `GuestArenas::reserve`'s matching comment: fold the
+            // teardown-failure strings into `error` directly rather than
+            // round-tripping through `NativeMappingTransaction::rollback`'s
+            // `NativeMemoryError`.
+            let label = candidate.label();
+            let rollback_errors = candidate.rollback_teardown_errors();
+            Err(if rollback_errors.is_empty() {
+                error
+            } else {
+                RuntimeError::Unsupported(format!(
+                    "{error}; {label} rollback failed: {}",
+                    rollback_errors.join("; ")
+                ))
+            })
+        }
     }
 }
 
@@ -10455,7 +7259,7 @@ fn teardown_jit_region(region: &JitRegion) -> Result<(), RuntimeError> {
             "JIT writable alias",
         ),
     ];
-    teardown_native_mappings(&mappings)
+    teardown_native_mappings(&mappings).map_err(RuntimeError::from)
 }
 
 struct JitSetupCandidate {
@@ -11152,7 +7956,8 @@ fn spawn_clone_thread(
     req: CloneThreadRequest,
     executable_registration: &ExecutableThreadRegistration,
 ) -> Result<crate::thread::ThreadId, CloneThreadSpawnError> {
-    let mut tid_memory = IdentityGuestMemory::for_run(shared);
+    let mut tid_memory =
+        NativeIdentityMemory::for_run(&shared.executable_epoch, identity_host_seam());
     validate_clone_thread_tid_outputs(&tid_memory, req.parent_tid_addr, req.child_tid_addr)
         .map_err(|errno| CloneThreadSpawnError::Errno(errno.guest_retval()))?;
 
@@ -11216,7 +8021,8 @@ fn spawn_clone_thread(
                 return;
             }
 
-            let mut memory = IdentityGuestMemory::for_run(&child_shared);
+            let mut memory =
+                NativeIdentityMemory::for_run(&child_shared.executable_epoch, identity_host_seam());
             let mut waiter = crate::io_wait::ThreadWaiter::new(child_tid);
             let outcome = run_x86_thread(
                 ThreadStart::Detached {
@@ -11674,7 +8480,7 @@ pub(crate) fn run_static_x86_elf_bytes(
             return Err(rollback_started_native_run(&shared, &arenas, primary));
         }
     };
-    let mut memory = IdentityGuestMemory::for_run(&shared);
+    let mut memory = NativeIdentityMemory::for_run(&shared.executable_epoch, identity_host_seam());
     // The blocking-I/O waiter (fd wait / poll / select / sleep / blocking
     // write), shared with the KVM/bhyve single-thread loop.
     let mut waiter = crate::io_wait::ThreadWaiter::new(tid);
@@ -12218,7 +9024,7 @@ fn run_x86_thread(
     tid: crate::thread::ThreadId,
     slice_off: usize,
     slice_len: usize,
-    memory: &mut IdentityGuestMemory,
+    memory: &mut NativeIdentityMemory,
     waiter: &mut crate::io_wait::ThreadWaiter,
     executable_registration: &mut ExecutableThreadRegistration,
 ) -> ThreadRunOutcome {
@@ -13227,7 +10033,7 @@ fn run_x86_thread(
                                     ));
                                     break;
                                 }
-                                memory.rebind_after_fork(&active);
+                                memory.rebind_after_fork(&active.executable_epoch);
                                 cursor = 0;
                                 cursor_limit = JIT_SLICE_LEN;
                                 cache.clear();
@@ -13962,7 +10768,7 @@ fn run_x86_thread(
 #[allow(clippy::too_many_arguments)]
 fn service_syscall(
     shared: &Arc<SharedRun>,
-    memory: &mut IdentityGuestMemory,
+    memory: &mut NativeIdentityMemory,
     waiter: &mut crate::io_wait::ThreadWaiter,
     tid: crate::thread::ThreadId,
     snapshot: &mut X86UcontextSnapshot,
@@ -15138,7 +11944,7 @@ fn with_host_wait_safe<T>(
 fn service_syscall_threaded(
     dispatcher: &SyscallDispatcher,
     request: SyscallRequest,
-    memory: &mut IdentityGuestMemory,
+    memory: &mut NativeIdentityMemory,
     reporter: &CompatReporter,
     waiter: &mut crate::io_wait::ThreadWaiter,
     tid: crate::thread::ThreadId,
@@ -15894,7 +12700,7 @@ fn service_fork(
     shared: &Arc<SharedRun>,
     request: NativeForkRequest,
     snapshot: &mut X86UcontextSnapshot,
-    memory: &mut IdentityGuestMemory,
+    memory: &mut NativeIdentityMemory,
     resume: u64,
     executable_registration: &mut ExecutableThreadRegistration,
 ) -> Step {
@@ -16614,7 +13420,7 @@ fn service_map_host_alias(
     prot: u64,
     _prot_none: bool,
     snapshot: &mut X86UcontextSnapshot,
-    memory: &mut IdentityGuestMemory,
+    memory: &mut NativeIdentityMemory,
     resume: u64,
 ) -> Step {
     let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
@@ -16802,7 +13608,7 @@ fn service_arch_prctl(
     addr: u64,
     _snapshot: &mut X86UcontextSnapshot,
     guest_fsbase: &mut u64,
-    memory: &mut IdentityGuestMemory,
+    memory: &mut NativeIdentityMemory,
 ) -> i64 {
     match code {
         ARCH_SET_FS => {
@@ -17074,7 +13880,7 @@ fn service_xstate_save(
     bytes: &[u8],
     guest_fsbase: u64,
     snapshot: &X86UcontextSnapshot,
-    memory: &IdentityGuestMemory,
+    memory: &NativeIdentityMemory,
 ) -> Result<u64, X86XstateServiceError> {
     let plan = X86XstateSavePlan::decode_for_kind(
         kind,
@@ -17343,7 +14149,7 @@ fn service_legacy_state_transfer(
     bytes: &[u8],
     guest_fsbase: u64,
     snapshot: &mut X86UcontextSnapshot,
-    memory: &IdentityGuestMemory,
+    memory: &NativeIdentityMemory,
 ) -> Result<u64, X86XstateServiceError> {
     match kind {
         carrick_dsr_x86::decode::X86SensitiveKind::FxState(fx_kind) => {
@@ -17595,7 +14401,7 @@ mod tests {
         );
         IDENTITY_PROTECTIONS.set_mapping_protection(address, 4096, false, false);
         IDENTITY_PROTECTIONS.set_mapping_protection(address + 4096, 4096, false, true);
-        let memory = IdentityGuestMemory::uncoordinated();
+        let memory = NativeIdentityMemory::uncoordinated();
         let mut child_side_effects = 0usize;
         for request in [
             NativeForkRequest {
@@ -17653,7 +14459,7 @@ mod tests {
         );
         IDENTITY_PROTECTIONS.set_mapping_protection(address, 4096, false, false);
         IDENTITY_PROTECTIONS.set_mapping_protection(address + 4096, 4096, false, true);
-        let memory = IdentityGuestMemory::uncoordinated();
+        let memory = NativeIdentityMemory::uncoordinated();
 
         assert_eq!(
             validate_clone_thread_tid_outputs(&memory, address + 4094, 0),
@@ -17914,7 +14720,7 @@ mod tests {
 
     fn dispatch_fixed_alias_for_test(
         dispatcher: &mut SyscallDispatcher,
-        memory: &mut IdentityGuestMemory,
+        memory: &mut NativeIdentityMemory,
         address: u64,
         len: u64,
         prot: u64,
@@ -17965,7 +14771,7 @@ mod tests {
         let address = reserve_then_unmap_test_range(PAGE as usize);
         IDENTITY_PROTECTIONS.set_unmapped(address, PAGE as usize, true);
         let mut dispatcher = SyscallDispatcher::new();
-        let mut memory = IdentityGuestMemory::uncoordinated();
+        let mut memory = NativeIdentityMemory::uncoordinated();
         let (transaction, payload, file, shared, prot_none) = dispatch_fixed_alias_for_test(
             &mut dispatcher,
             &mut memory,
@@ -18037,7 +14843,7 @@ mod tests {
             unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
             let faults = NativeMappingFaultGuard::new();
             let mut dispatcher = SyscallDispatcher::new();
-            let mut memory = IdentityGuestMemory::uncoordinated();
+            let mut memory = NativeIdentityMemory::uncoordinated();
             let (transaction, mut payload, file, shared, prot_none) = dispatch_fixed_alias_for_test(
                 &mut dispatcher,
                 &mut memory,
@@ -18085,7 +14891,7 @@ mod tests {
         let address = reserve_then_unmap_test_range(PAGE as usize);
         IDENTITY_PROTECTIONS.set_unmapped(address, PAGE as usize, true);
         let mut dispatcher = SyscallDispatcher::new();
-        let mut memory = IdentityGuestMemory::uncoordinated();
+        let mut memory = NativeIdentityMemory::uncoordinated();
 
         let prior_prot = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC;
         let (transaction, payload, file, shared, prot_none) = dispatch_fixed_alias_for_test(
@@ -18175,7 +14981,7 @@ mod tests {
         let address = reserve_then_unmap_test_range(len as usize);
         IDENTITY_PROTECTIONS.set_unmapped(address, len as usize, true);
         let mut dispatcher = SyscallDispatcher::new();
-        let mut memory = IdentityGuestMemory::uncoordinated();
+        let mut memory = NativeIdentityMemory::uncoordinated();
         let prot = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
         let (transaction, payload, file, shared, prot_none) = dispatch_fixed_alias_for_test(
             &mut dispatcher,
@@ -18246,7 +15052,7 @@ mod tests {
         let _test_guard = lock_native_mapping_tests();
         let _faults = NativeMappingFaultGuard::new();
         let address = reserve_then_unmap_test_range(PAGE as usize);
-        let mut memory = IdentityGuestMemory::uncoordinated();
+        let mut memory = NativeIdentityMemory::uncoordinated();
         memory
             .zero_anonymous_reuse(
                 address,
@@ -18329,7 +15135,7 @@ mod tests {
             NativeMappingOperation::IdentityBacking,
             InjectedMmapResult::Failed,
         );
-        let mut memory = IdentityGuestMemory::uncoordinated();
+        let mut memory = NativeIdentityMemory::uncoordinated();
 
         assert!(matches!(
             memory.zero_anonymous_reuse(
@@ -18382,7 +15188,7 @@ mod tests {
             NativeMappingOperation::IdentityBacking,
             InjectedMmapResult::Failed,
         );
-        let mut memory = IdentityGuestMemory::uncoordinated();
+        let mut memory = NativeIdentityMemory::uncoordinated();
         let snapshot = vec![0x41; PAGE as usize];
 
         assert!(matches!(
@@ -18413,7 +15219,12 @@ mod tests {
         );
 
         assert!(matches!(
-            ensure_identity_backed_with_registry(address, PAGE as usize, &protections),
+            ensure_identity_backed_with_registry(
+                address,
+                PAGE as usize,
+                &protections,
+                FreebsdHost::exclusive_fixed_map_flag()
+            ),
             Err(MemoryError::HostMap(_))
         ));
         assert!(protections.range_unmapped(address, PAGE as usize));
@@ -18429,7 +15240,7 @@ mod tests {
             NativeMappingOperation::IdentityBacking,
             InjectedMmapResult::Failed,
         );
-        let mut memory = IdentityGuestMemory::uncoordinated();
+        let mut memory = NativeIdentityMemory::uncoordinated();
 
         memory.set_mapping_protection(address, PAGE as usize, false, false);
 
@@ -18453,7 +15264,12 @@ mod tests {
         );
 
         assert!(matches!(
-            ensure_identity_backed_with_registry(address, PAGE as usize, &protections),
+            ensure_identity_backed_with_registry(
+                address,
+                PAGE as usize,
+                &protections,
+                FreebsdHost::exclusive_fixed_map_flag()
+            ),
             Err(MemoryError::HostMap(_))
         ));
         assert!(protections.range_unmapped(address, PAGE as usize));
@@ -18524,8 +15340,13 @@ mod tests {
         let protections = carrick_guest_mem::protections::MemoryProtections::default();
         protections.set_unmapped(address + PAGE, PAGE as usize, true);
 
-        ensure_identity_backed_with_registry(address, len, &protections)
-            .expect("restore exact middle hole");
+        ensure_identity_backed_with_registry(
+            address,
+            len,
+            &protections,
+            FreebsdHost::exclusive_fixed_map_flag(),
+        )
+        .expect("restore exact middle hole");
 
         // SAFETY: all three pages are live after the checked restoration.
         unsafe {
@@ -18548,6 +15369,7 @@ mod tests {
             libc::PROT_READ | libc::PROT_WRITE,
             None,
             "reset test image",
+            FreebsdHost::exclusive_fixed_map_flag(),
         )
         .expect("map reset test image");
         let base = mapping.base;
@@ -18815,6 +15637,7 @@ mod tests {
             libc::PROT_READ | libc::PROT_WRITE,
             Some(start),
             "fixed collision occupant",
+            FreebsdHost::exclusive_fixed_map_flag(),
         )
         .expect("occupy ET_EXEC range exclusively");
         // SAFETY: the occupant owns a writable byte at `start`.
@@ -18841,6 +15664,7 @@ mod tests {
             libc::PROT_READ | libc::PROT_WRITE,
             Some(crate::vdso::LINUX_VVAR_BASE),
             "vvar collision occupant",
+            FreebsdHost::exclusive_fixed_map_flag(),
         )
         .expect("occupy fixed vvar range exclusively");
         // SAFETY: the test owner holds the writable vvar-range mapping.
@@ -18918,6 +15742,7 @@ mod tests {
                 libc::PROT_READ | libc::PROT_WRITE,
                 None,
                 "drop fail-stop test",
+                FreebsdHost::exclusive_fixed_map_flag(),
             )
             .unwrap_or_else(|_| unsafe { libc::_exit(91) });
             faults.fail_next_munmap();
@@ -18941,6 +15766,7 @@ mod tests {
             libc::PROT_READ | libc::PROT_WRITE,
             None,
             "terminal teardown test",
+            FreebsdHost::exclusive_fixed_map_flag(),
         )
         .expect("map terminal teardown test image");
         let epoch = ExecutableEpoch::new();

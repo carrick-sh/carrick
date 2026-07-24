@@ -18,6 +18,12 @@ use iced_x86::{
     Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register,
 };
 
+use carrick_dsr::identity_memory::{
+    ExecutableMutationAuthority, IdentityCheckedReadError, IdentityCheckedWriteError,
+    IdentityGuestMemory, identity_checked_read_exact, identity_checked_write_exact,
+};
+use carrick_guest_mem::GuestVa;
+
 use crate::gateway::{X86UcontextSnapshot, reg};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +85,99 @@ impl ControlFlowMemory for IdentityTestMemory {
         // SAFETY: same native-test-only identity-memory contract as `read_u64`.
         unsafe { (address as *mut u64).write_unaligned(value) };
         Ok(())
+    }
+}
+
+fn cflow_guest_memory_fault(
+    access: CflowMemoryAccess,
+    fault: carrick_guest_mem::protections::GuestMemoryFault,
+) -> CflowError {
+    let address = fault.address.raw();
+    let kind = match fault.kind {
+        carrick_guest_mem::protections::GuestMemoryFaultKind::Unmapped => {
+            CflowMemoryFaultKind::Unmapped
+        }
+        carrick_guest_mem::protections::GuestMemoryFaultKind::AccessDenied => {
+            CflowMemoryFaultKind::AccessDenied
+        }
+    };
+    match access {
+        CflowMemoryAccess::Read => CflowError::MemoryRead { address, kind },
+        CflowMemoryAccess::Write => CflowError::MemoryWrite { address, kind },
+    }
+}
+
+fn cflow_memory_backend_error(
+    access: CflowMemoryAccess,
+    address: u64,
+    error: impl std::fmt::Display,
+) -> CflowError {
+    let _ = access;
+    CflowError::MemoryBackend {
+        access,
+        address,
+        detail: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+fn cflow_raw_memory_fault(
+    access: CflowMemoryAccess,
+    address: u64,
+    length: usize,
+) -> Option<CflowError> {
+    carrick_dsr::identity_memory::identity_raw_fault_address(address, length).map(|address| {
+        match access {
+            CflowMemoryAccess::Read => CflowError::MemoryRead {
+                address,
+                kind: CflowMemoryFaultKind::Unmapped,
+            },
+            CflowMemoryAccess::Write => CflowError::MemoryWrite {
+                address,
+                kind: CflowMemoryFaultKind::Unmapped,
+            },
+        }
+    })
+}
+
+/// The only orphan-forced piece of the identity-memory closure: `IdentityGuestMemory<A>`
+/// is foreign to this crate and `ControlFlowMemory` is foreign to `carrick-dsr`
+/// (which does not depend on `carrick-dsr-x86`), so this impl can only live
+/// here — see `carrick-dsr::identity_memory`'s module doc.
+impl<A: ExecutableMutationAuthority> ControlFlowMemory for IdentityGuestMemory<A> {
+    fn read_u64(&mut self, address: u64) -> Result<u64, CflowError> {
+        const LENGTH: usize = std::mem::size_of::<u64>();
+        let mut bytes = [0u8; LENGTH];
+        identity_checked_read_exact(GuestVa(address), &mut bytes).map_err(|error| match error {
+            IdentityCheckedReadError::Fault(fault) => {
+                cflow_guest_memory_fault(CflowMemoryAccess::Read, fault)
+            }
+            IdentityCheckedReadError::BusAddress { address } => CflowError::MemoryRead {
+                address: address.raw(),
+                kind: CflowMemoryFaultKind::BusAddress,
+            },
+            IdentityCheckedReadError::Backend { address, detail } => {
+                cflow_memory_backend_error(CflowMemoryAccess::Read, address.raw(), detail)
+            }
+        })?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn write_u64(&mut self, address: u64, value: u64) -> Result<(), CflowError> {
+        identity_checked_write_exact(self, GuestVa(address), &value.to_le_bytes()).map_err(
+            |error| match error {
+                IdentityCheckedWriteError::Fault(fault) => {
+                    cflow_guest_memory_fault(CflowMemoryAccess::Write, fault)
+                }
+                IdentityCheckedWriteError::BusAddress { address } => CflowError::MemoryWrite {
+                    address: address.raw(),
+                    kind: CflowMemoryFaultKind::BusAddress,
+                },
+                IdentityCheckedWriteError::Backend { address, detail } => {
+                    cflow_memory_backend_error(CflowMemoryAccess::Write, address.raw(), detail)
+                }
+            },
+        )
     }
 }
 
@@ -368,8 +467,31 @@ fn condition_holds(code: ConditionCode, flags: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carrick_guest_mem::protections::{GuestMemoryFault, GuestMemoryFaultKind};
+    #[cfg(target_os = "freebsd")]
+    use std::os::fd::AsRawFd;
 
     const VA: u64 = 0x40_0000;
+
+    /// Test-only, no-op `ExecutableMutationAuthority`: these tests exercise
+    /// `IdentityGuestMemory::uncoordinated()`, whose `executable_epoch` is
+    /// always `None`, so this trait's own method is never actually invoked —
+    /// it exists only because `IdentityGuestMemory<A>` needs a concrete `A`
+    /// to monomorphize against. Its only consumer
+    /// (`cflow_write_contains_truncated_shared_mapping_bus_faults`) is
+    /// FreeBSD-gated (see that test's own doc comment).
+    #[cfg(target_os = "freebsd")]
+    struct TestMutationAuthority;
+
+    #[cfg(target_os = "freebsd")]
+    impl ExecutableMutationAuthority for TestMutationAuthority {
+        type Lease = ();
+        type Error = std::convert::Infallible;
+
+        fn begin_mutation(self: &std::sync::Arc<Self>) -> Result<Self::Lease, Self::Error> {
+            unreachable!("uncoordinated() never binds an executable_epoch")
+        }
+    }
 
     fn snap() -> X86UcontextSnapshot {
         X86UcontextSnapshot::new()
@@ -636,5 +758,176 @@ mod tests {
             resolve(&[0x64, 0xff, 0x20], VA, &mut s),
             Err(CflowError::Unsupported { va: VA })
         );
+    }
+
+    #[test]
+    fn cflow_only_exposes_guest_access_failures_as_retryable_faults() {
+        let address = 0x1234_5000;
+        assert_eq!(
+            cflow_guest_memory_fault(
+                CflowMemoryAccess::Read,
+                GuestMemoryFault {
+                    address: carrick_guest_mem::GuestVa(address),
+                    kind: GuestMemoryFaultKind::AccessDenied,
+                },
+            ),
+            CflowError::MemoryRead {
+                address,
+                kind: CflowMemoryFaultKind::AccessDenied,
+            }
+        );
+        assert_eq!(
+            cflow_raw_memory_fault(CflowMemoryAccess::Read, (1 << 47) - 4, 8),
+            Some(CflowError::MemoryRead {
+                address: 1 << 47,
+                kind: CflowMemoryFaultKind::Unmapped,
+            }),
+            "cross-boundary faults name the first inaccessible byte"
+        );
+        assert_eq!(
+            cflow_memory_backend_error(
+                CflowMemoryAccess::Write,
+                address,
+                carrick_guest_mem::MemoryError::HostMap("injected coordinator failure".into()),
+            ),
+            CflowError::MemoryBackend {
+                access: CflowMemoryAccess::Write,
+                address,
+                detail: "host mapping operation failed: injected coordinator failure".into(),
+            }
+        );
+    }
+
+    // FreeBSD-only: this pins a real host-kernel behavior difference, not a
+    // portability bug in `identity_kernel_copyout_exact`'s pipe-based
+    // containment trick. The write/read/pipe syscalls it uses exist
+    // identically on Darwin, but writing into a nonblocking pipe from a
+    // truncated `MAP_SHARED` file mapping only raises `EFAULT` on FreeBSD;
+    // this `IdentityGuestMemory` model is only ever instantiated by the
+    // FreeBSD/x86_64 native lane in production (Darwin's native lane uses a
+    // completely different `NativeDispatchMemory`/aarch64-translator type),
+    // so this is exactly the "moved code compiles everywhere, this one
+    // assertion is host-specific" case the parent plan anticipated.
+    #[test]
+    #[cfg(target_os = "freebsd")]
+    fn cflow_write_contains_truncated_shared_mapping_bus_faults() {
+        use carrick_dsr::identity_memory::{
+            IDENTITY_HOST_MAPPING_LOCK, IDENTITY_PROTECTIONS, identity_kernel_copy_pipe_census,
+            identity_kernel_copyout_operation_census, reset_identity_kernel_copy_pipe_census,
+            reset_identity_kernel_copyout_operation_census,
+        };
+
+        const LEN: usize = 8192;
+        const FILE_END: u64 = 4096;
+        let file = tempfile::tempfile().expect("temporary file backing");
+        file.set_len(LEN as u64).expect("size file backing");
+        // SAFETY: this test owns the file and complete shared mapping.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        let address = mapping as u64;
+        {
+            let _mapping_guard = IDENTITY_HOST_MAPPING_LOCK.write();
+            IDENTITY_PROTECTIONS.set_mapping_protection_and_sharing(
+                address,
+                LEN,
+                false,
+                false,
+                carrick_guest_mem::MappingSharing::Shared,
+            );
+        }
+        file.set_len(FILE_END)
+            .expect("truncate writable shared mapping");
+
+        let value = 0x8877_6655_4433_2211u64;
+        let mut memory = IdentityGuestMemory::<TestMutationAuthority>::uncoordinated();
+        {
+            let _mapping_guard = IDENTITY_HOST_MAPPING_LOCK.write();
+            IDENTITY_PROTECTIONS.set_no_access(address + FILE_END, 4096, true);
+        }
+        assert_eq!(
+            memory.write_u64(address + FILE_END, value),
+            Err(CflowError::MemoryWrite {
+                address: address + FILE_END,
+                kind: CflowMemoryFaultKind::AccessDenied,
+            }),
+            "registry ACCERR must take precedence over truncated backing"
+        );
+        {
+            let _mapping_guard = IDENTITY_HOST_MAPPING_LOCK.write();
+            IDENTITY_PROTECTIONS.set_no_access(address + FILE_END, 4096, false);
+            IDENTITY_PROTECTIONS.set_unmapped(address + FILE_END, 4096, true);
+        }
+        assert_eq!(
+            memory.write_u64(address + FILE_END, value),
+            Err(CflowError::MemoryWrite {
+                address: address + FILE_END,
+                kind: CflowMemoryFaultKind::Unmapped,
+            }),
+            "registry MAPERR must take precedence over truncated backing"
+        );
+        {
+            let _mapping_guard = IDENTITY_HOST_MAPPING_LOCK.write();
+            IDENTITY_PROTECTIONS.set_mapping_protection_and_sharing(
+                address + FILE_END,
+                4096,
+                false,
+                false,
+                carrick_guest_mem::MappingSharing::Shared,
+            );
+        }
+        reset_identity_kernel_copy_pipe_census();
+        reset_identity_kernel_copyout_operation_census();
+        assert_eq!(
+            memory.write_u64(address + FILE_END, value),
+            Err(CflowError::MemoryWrite {
+                address: address + FILE_END,
+                kind: CflowMemoryFaultKind::BusAddress,
+            }),
+            "kernel copyout must contain host SIGBUS and keep the cflow write retryable"
+        );
+        assert!(identity_kernel_copy_pipe_census() > 0);
+        assert!(
+            identity_kernel_copyout_operation_census() > 0,
+            "truncatable shared writes must retain kernel-contained copyout"
+        );
+
+        file.set_len(LEN as u64).expect("repair file backing");
+        reset_identity_kernel_copy_pipe_census();
+        reset_identity_kernel_copyout_operation_census();
+        memory
+            .write_u64(address + FILE_END, value)
+            .expect("repaired shared stack slot accepts the retried push");
+        assert!(identity_kernel_copy_pipe_census() > 0);
+        assert!(identity_kernel_copyout_operation_census() > 0);
+        let mut found = [0u8; 8];
+        // SAFETY: `found` is writable and the repaired file range is live.
+        assert_eq!(
+            unsafe {
+                libc::pread(
+                    file.as_raw_fd(),
+                    found.as_mut_ptr().cast(),
+                    found.len(),
+                    FILE_END as libc::off_t,
+                )
+            },
+            found.len() as isize
+        );
+        assert_eq!(found, value.to_le_bytes());
+
+        {
+            let _mapping_guard = IDENTITY_HOST_MAPPING_LOCK.write();
+            IDENTITY_PROTECTIONS.set_unmapped(address, LEN, true);
+            // SAFETY: this test owns the complete mapping.
+            assert_eq!(unsafe { libc::munmap(mapping, LEN) }, 0);
+        }
     }
 }
