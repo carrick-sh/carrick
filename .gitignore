@@ -18,3 +18,7 @@ __pycache__/
 
 # JIT/guest core dumps from native_run debugging
 *.core
+
+# scratch / local tooling (accidentally committed in phase-2; keep on disk, out of git)
+last_1000_commits.txt
+.codex/
