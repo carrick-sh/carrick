@@ -91,3 +91,15 @@ going to bring up netbsd on native backend" — we are at that state.
   NetBSD lane bring-up needs willow VM 201 or equivalent. If no x86 NetBSD
   host is available, the NetBSD task is BLOCKED on infra (maintainer decision)
   and Phase 3 lands pieces 1–3 as a complete sub-deliverable.
+
+## Correction (2026-07-24): Task-3 category error
+
+The Task-3 scout found — and the controller verified — that §"2. Exec-capsule +
+prepared_image adoption (FreeBSD)" above is WRONG: `native_prepared_image::prepare`
++ `native_exec_capsule` are the Darwin execve *self-reexec transport* (hard-gated
+`cfg(macos,aarch64)`), not a shared ELF loader, and `native_freebsd.rs` never
+duplicated them. There was no such duplication to remove. The REAL FreeBSD-loader
+dedup (maintainer-approved re-scope) is adopting `carrick_mem::AddressSpace`
+(`load_elf_bytes...` + `with_native_vdso` + `with_linux_initial_stack`) — which
+Darwin already uses and FreeBSD hand-rolls via `map_one_elf`. See the plan's
+re-scoped Task 3.
