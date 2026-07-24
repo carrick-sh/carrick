@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Merge the two per-lane thread run loops behind `NativeLane`, adopt the remaining shared POSIX modules on FreeBSD, factor cross-process futex behind a host seam, and bring up the NetBSD/x86_64 native lane as the acceptance test — completing the seam campaign.
+**Goal:** ~~Merge the two per-lane thread run loops behind `NativeLane`~~, adopt the remaining shared POSIX modules on FreeBSD, factor cross-process futex behind a host seam, and bring up the NetBSD/x86_64 native lane as the acceptance test — completing the seam campaign. **(REVISED 2026-07-24: the loop merge was SKIPPED — the Task-1 scout found the loops share only ~10% and the divergence is danger-zone (fault-lowering + xstate), not thin-re-frontable. Task 2 was redirected to the x86 translate/cache ENGINE EXTRACTION into `carrick-dsr-x86::translator`, achieving engine-level symmetry with aarch64's `ProcessTranslator` — see Task 2's Redirect block. The delivered campaign goal is engine symmetry + FreeBSD shared-loader/futex extraction, not a merged loop.)**
 
 **Architecture:** Final strangler stage on `native_freebsd.rs` (16.6K) + `native_darwin.rs` (13.0K) using the Phase-1/2 seams. The loop merge is the crux and is scouted before execution with a STOP gate. NetBSD bring-up is staged strictly behind pieces 1–3 gate-cleaning on FreeBSD.
 
@@ -122,6 +122,8 @@ silently). LTP-equivalence is the guard; the initial-stack/entry-state must matc
 
 - [ ] Baseline. Factor the seam; each lane implements its primitive. macOS + box green; LTP == baseline (futex-heavy LTP cases are the real proof — ensure the gate list includes them). Commit `refactor(dsr): cross-process futex behind the NativeHost seam`.
 
+**DEVIATION (2026-07-24):** the shared cross-lane `NativeHost` futex trait described above was NOT built — with the loop merge skipped (Task 2) there is no shared caller to name the operation. What landed (`3739c3f7`) is a FreeBSD-side EXTRACTION into `carrick-native-freebsd::futex` for symmetry with Darwin's `carrick-host::ulock`; a unified trait would regress Darwin's already-factored `carrick_hal::PlatformFutex`. NetBSD will MIRROR the module + dispatch the FreeBSD call sites, not slot into a trait. See the commit body.
+
 ## Task 5: NetBSD/x86_64 native lane bring-up (the acceptance test)
 
 **PREREQUISITE (Step 0, may be its own commit):** NetBSD x86 toolchain + host. Verify willow VM 201 (x86_64 NetBSD, rustup 1.96 per [[project_netbsd_nvmm_backend]]) is reachable and has libclang (bindgen prereq); if not, STOP → BLOCKED on infra (maintainer decision). Pieces 1–4 MUST be merged + FreeBSD-gate-clean before this task starts.
@@ -139,4 +141,4 @@ silently). LTP-equivalence is the guard; the initial-stack/entry-state must matc
 
 ## Phase 4 pointer
 
-If the loop merge lands: the campaign's structural goal is met and Phase 4 is polish + the deferred follow-ups (register-symmetry, reset_after_fork_for_exec rename, 9-test move, Default hardening, Intel-mac cfg proxy) + whatever the NetBSD red list surfaces. If NetBSD was infra-blocked: NetBSD bring-up is Phase 4's headline.
+**(REVISED 2026-07-24: the loop merge did NOT land — it was skipped, see the Goal note and Task 2's Redirect block.)** The campaign's delivered structural goal is engine-level symmetry (x86 translate/cache engine extracted to `carrick-dsr-x86::translator`, mirroring aarch64's `ProcessTranslator`) plus the FreeBSD shared-loader (`AddressSpace`) and futex extractions — NOT a merged cross-ISA loop, which remains a follow-up. NetBSD bring-up (Task 5) is Phase 4's headline (host is READY, not infra-blocked). Phase 4 is NetBSD + polish/deferred follow-ups (SharedFutexSyscall unification eval, register-symmetry, reset_after_fork_for_exec cross-crate rename, `map_one_elf` class-validation into carrick-mem, PT_INTERP byte-exact fixture, Default hardening, Intel-mac cfg proxy) + whatever the NetBSD red list surfaces.
