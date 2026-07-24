@@ -920,7 +920,10 @@ pub mod runtime {
     /// `--exec-backend native` (default) path on FreeBSD/amd64; the bhyve VMM
     /// runs only on an explicit `--exec-backend vmm` request — important on a
     /// host where a stray VMM run can fault the VM.
-    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(feature = "platform-freebsd", feature = "platform-netbsd"),
+        target_arch = "x86_64"
+    ))]
     pub fn run_elf_native_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
         let argv0 = path.to_string_lossy().into_owned();
         run_elf_native_dispatch_with_process(path, [argv0], std::iter::empty::<String>())
@@ -929,7 +932,10 @@ pub mod runtime {
     /// Run a static x86_64 ELF through the native backend with an explicit
     /// guest argument vector. This is primarily the standalone workload/LTP
     /// bring-up surface; the first item must be the guest-visible `argv[0]`.
-    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(feature = "platform-freebsd", feature = "platform-netbsd"),
+        target_arch = "x86_64"
+    ))]
     pub fn run_elf_native_dispatch_with_args(
         path: &std::path::Path,
         argv: impl IntoIterator<Item = String>,
@@ -938,7 +944,10 @@ pub mod runtime {
     }
 
     /// Run a static x86_64 ELF with explicit guest arguments and environment.
-    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(feature = "platform-freebsd", feature = "platform-netbsd"),
+        target_arch = "x86_64"
+    ))]
     pub fn run_elf_native_dispatch_with_process(
         path: &std::path::Path,
         argv: impl IntoIterator<Item = String>,
@@ -959,7 +968,10 @@ pub mod runtime {
     /// canonical container wiring in `execute.rs` (`RuntimeNetwork::create` +
     /// `SyscallDispatcher::with_network` + `seed_guest_baseline`). Set
     /// `CARRICK_NATIVE_NET_HOST=1` to fall back to the host-net dispatcher.
-    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(feature = "platform-freebsd", feature = "platform-netbsd"),
+        target_arch = "x86_64"
+    ))]
     fn make_native_dispatcher(executable: &std::path::Path) -> SyscallDispatcher {
         use crate::fs_backend::{FsBackend, HostFsBackend};
 
@@ -1808,7 +1820,10 @@ pub mod runtime {
                 resolved.clone(),
             )))
         })?;
-        #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(feature = "platform-freebsd", feature = "platform-netbsd"),
+            target_arch = "x86_64"
+        ))]
         if plan.backend == crate::page_profile::ExecutionBackend::Native {
             dispatcher.set_native_x86_64(true);
             let env = spec.envp.iter().map(|s| s.as_bytes().to_vec()).collect();
