@@ -58,6 +58,30 @@ pub trait NativeHost: 'static + Send + Sync {
     fn exclusive_fixed_map_flag() -> i32 {
         0
     }
+
+    /// Best-effort "become the guest's PID-namespace init (subreaper)" so an
+    /// orphaned guest grandchild (its middle parent exited) REPARENTS to this
+    /// process instead of host init, letting the guest's `wait4(-1)` reap it
+    /// (pid_namespaces(7) "pid 1 reaps orphans" + the `PR_SET_CHILD_SUBREAPER`
+    /// reparent target). FreeBSD implements this with
+    /// `procctl(PROC_REAP_ACQUIRE)`. The default is a graceful no-op for hosts
+    /// with no equivalent primitive (NetBSD): orphans then reparent to host
+    /// init, so a guest `wait4` of a grandchild returns `ECHILD` and the run
+    /// loop's getppid-reports-guest-init subreaper bookkeeping goes stale — a
+    /// precisely-scoped capability gap, not a crash.
+    fn become_guest_reaper() {}
+
+    /// Host TSC calibration for the x86 vDSO's `__vdso_clock_gettime`/
+    /// `__vdso_gettimeofday` fast paths, as
+    /// `(tsc_frequency_hz, realtime_off_ns, monotonic_off_ns)`. `None` (the
+    /// default) selects the vDSO's built-in Linux-syscall fallback — the
+    /// correct answer on any host that cannot prove an invariant, SMP-safe TSC
+    /// clocksource. FreeBSD reads `machdep.tsc_freq` gated on
+    /// `kern.timecounter.{invariant,smp}_tsc`; NetBSD lacks those sysctls and
+    /// keeps the default `None`.
+    fn vdso_tsc_calibration() -> Option<(u64, u64, u64)> {
+        None
+    }
 }
 
 /// A concrete (ISA, Host) pairing. Native lanes are same-ISA by definition.
