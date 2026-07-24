@@ -215,3 +215,26 @@ already up). The `/root/carrick` snapshot is a disposable `git archive` tree (no
 `.git`), left in place per the Task-0 convention. No persistent box mutation; no
 config changed. **Snapshot state: running, disposable snapshot at `e34ea71f`,
 safe to `qm stop 201` when the fleet needs the slot.**
+
+## Review corrections (2026-07-24, adversarial source-verify pass)
+
+An adversarial review verified the scout's load-bearing claims against native_freebsd.rs
+and CONFIRMED the core thesis (bounded host-glue; no run-loop LOGIC welded; thread-spawn
+gap does not exist) but corrected three over-optimistic framings:
+
+- **F1 (highest):** the inline TEST surface was omitted from the inventory. `mod
+  identity_raw_range_tests` (native_freebsd.rs:218, gated only `#[cfg(test)]`) is welded to
+  FreeBSD futex internals (`SYS_UMTX_OP`/`UMTX_OP_WAKE`/`waiter_parked_count`, 225-227/517)
+  and `libc::__error()` (11662) — no NetBSD analog. The `#![cfg]` flip breaks `cargo test`
+  on NetBSD. Fix: gate the FreeBSD-welded test surface `#[cfg(all(test, target_os="freebsd"))]`;
+  NetBSD unit-test coverage of the run loop is a red-list follow-on.
+- **F2:** the verdict line "futex + fault modules already exist on both crates" was false —
+  `carrick-native-netbsd` has fault/jit/lib but NO futex.rs; NetBSD futex is net-new
+  (~120-160 LoC via SYS___futex, 4-fn symmetric API, `init_shared_waiter_table` a no-op).
+- **F3:** the `procctl` "no-op" is behavioral, not free — guest double-forked orphans
+  reparent to host init (not guest-init), so guest `wait4` returns ECHILD and the run loop's
+  own subreaper bookkeeping (12093-12103) goes stale; red-list precisely. Kick is a signal
+  PAIR (65/+1); NetBSD needs 33 AND 34 reserved.
+
+Re-shaped tasks (3a seam+test-gate / 3b re-gate+NetBSD-futex / 4 wire / 5 acceptance) live in
+`docs/superpowers/plans/2026-07-24-netbsd-native-lane.md`.
