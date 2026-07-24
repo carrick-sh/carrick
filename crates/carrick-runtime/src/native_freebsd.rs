@@ -965,6 +965,40 @@ mod identity_raw_range_tests {
     }
 
     #[test]
+    fn direct_load_rejects_non_64_bit_elf() {
+        // A minimal, VALID ELFCLASS32 header that still names `EM_X86_64`:
+        // goblin parses it cleanly (so the reject cannot be blamed on a parse
+        // failure), exercising the direct-load path's own class guard. The
+        // check fires before any host mapping. Guards the carry-over fix:
+        // `plan_elf_load_bytes_for` validates `e_machine` but not the class,
+        // so `map_one_elf` must reject `!is_64` itself.
+        let mut elf = vec![0u8; 52];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 1; // EI_CLASS = ELFCLASS32
+        elf[5] = 1; // EI_DATA = ELFDATA2LSB
+        elf[6] = 1; // EI_VERSION = EV_CURRENT
+        elf[16..18].copy_from_slice(&goblin::elf::header::ET_EXEC.to_le_bytes());
+        elf[18..20].copy_from_slice(&goblin::elf::header::EM_X86_64.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        elf[40..42].copy_from_slice(&52u16.to_le_bytes()); // e_ehsize
+        let parsed = goblin::elf::Elf::parse(&elf).expect("hand-built ELF32 must parse");
+        assert!(
+            !parsed.is_64,
+            "fixture must be 32-bit for this test to be meaningful"
+        );
+        // `LoadedImage` is intentionally not `Debug`, so match rather than
+        // `expect_err` (which would need the Ok type to be printable).
+        match super::load_static_pie(&elf, None, &[], &[]) {
+            Err(super::RuntimeError::Unsupported(message)) => assert!(
+                message.contains("64-bit"),
+                "expected a 64-bit ELF-class rejection, got {message:?}"
+            ),
+            Err(other) => panic!("expected an Unsupported class rejection, got {other:?}"),
+            Ok(_) => panic!("native direct-load must reject a non-64-bit ELF"),
+        }
+    }
+
+    #[test]
     fn vfork_inheritance_excludes_existing_shared_vmas() {
         assert_eq!(
             exclude_vfork_shared_ranges(
@@ -6504,6 +6538,21 @@ fn map_one_elf(
     // non-x86_64 ELF) + PT_LOAD enumeration + entry/phdr/phent/phnum. The host
     // mapping, MAP_EXCL reservation, byte copy, and relative relocations remain
     // this lane's concern (carrick_mem never touches host memory).
+    //
+    // `plan_elf_load_bytes_for` validates `e_machine` but NOT the ELF *class*;
+    // this direct-load entrypoint historically rejected a non-64-bit object
+    // here, and the guest execve path still does (parse_loadable_elf's
+    // `!elf.is_64` guard). Restore that class check so an ELFCLASS32 object that
+    // nonetheless names `EM_X86_64` cannot reach the 64-bit mapper. Only a
+    // successfully parsed 32-bit ELF is rejected here; every other malformed
+    // input keeps falling through to the plan's own error below unchanged.
+    if let Ok(elf) = Elf::parse(bytes)
+        && !elf.is_64
+    {
+        return Err(RuntimeError::Unsupported(
+            "native x86 lane requires a 64-bit (ELFCLASS64) ELF".to_string(),
+        ));
+    }
     let base_plan = plan_elf_load_bytes_for(bytes, EM_X86_64).map_err(|_| {
         RuntimeError::Unsupported("native x86 lane requires a loadable x86_64 ELF".to_string())
     })?;
