@@ -130,6 +130,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+// Both traits are consumed only inside `snapshot_native_reexec_fd_table`
+// (`OsStrExt::as_bytes`) and `restore_native_reexec_fd_table`
+// (`OsStringExt::from_vec`), which carry the identical
+// `#[cfg(any(test, ...))]` gate.
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -699,6 +704,11 @@ mod ioring;
 mod fs;
 #[macro_use]
 mod mem;
+// This specific re-export path (`crate::dispatch::MemoryLayout`, as opposed
+// to the type itself, which `dispatch/mem.rs` uses unconditionally and
+// pervasively) is consumed only by `native_darwin.rs` and
+// `set_memory_layout` (both lane-gated to macOS/aarch64).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use mem::MemoryLayout;
 #[macro_use]
 mod net;
@@ -2528,6 +2538,9 @@ impl SyscallDispatcher {
         time::publish_rlimit_cpu_signal(self.async_signal_wake_owner(), signum);
     }
 
+    // Native self-reexec's only production caller is `native_darwin.rs`
+    // (this method's own lane gate matches it); no test exercises it directly.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn set_memory_layout(&self, layout: MemoryLayout) {
         *self.mem.lock() = mem::MemState::new_with_layout(layout);
     }
@@ -2733,12 +2746,19 @@ impl SyscallDispatcher {
         self.fs.rootfs_vfs.overlay.native_reexec_authority()
     }
 
+    // Native self-reexec's production callers (`native_darwin.rs` and
+    // `native_exec_capsule.rs`'s `begin_guest_exec`) are lane-gated to
+    // macOS/aarch64; this crate's own portable round-trip tests
+    // (`bind_mount_round_trip_preserves_nested_exec_bytes` et al.) still
+    // exercise the schema on every host, hence the `test` arm.
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn snapshot_native_reexec_bind_mounts(
         &self,
     ) -> Vec<crate::vfs::bind::NativeReexecBindMountV1> {
         self.fs.vfs_mounts.native_reexec_bind_mounts()
     }
 
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn restore_native_reexec_bind_mounts(
         &mut self,
         mounts: &[crate::vfs::bind::NativeReexecBindMountV1],
@@ -2812,10 +2832,14 @@ impl SyscallDispatcher {
 
     /// Capsule version 1 initially carries only bare stdio. Reject every richer
     /// fd-table shape before host exec until typed descriptor snapshots land.
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn validate_native_reexec_fd_state(&self) -> Result<(), String> {
         self.snapshot_native_reexec_fd_table().map(|_| ())
     }
 
+    // Diagnostic-only helper for `native_darwin.rs`'s self-reexec failure log
+    // (its only caller); no test calls it directly, unlike its neighbors above.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn native_reexec_fd_state_summary(&self) -> Vec<String> {
         let table = self.io.open_files.read();
         let mut summary = table
@@ -2833,6 +2857,7 @@ impl SyscallDispatcher {
         summary
     }
 
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn snapshot_native_reexec_process_state(
         &self,
     ) -> crate::native_exec_capsule::NativeReexecProcessStateV1 {
@@ -2877,6 +2902,7 @@ impl SyscallDispatcher {
         }
     }
 
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn restore_native_reexec_process_state(
         &mut self,
         state: &crate::native_exec_capsule::NativeReexecProcessStateV1,
@@ -2916,6 +2942,7 @@ impl SyscallDispatcher {
         ));
     }
 
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn snapshot_native_reexec_fd_table(&self) -> Result<NativeReexecFdTableV1, String> {
         let table = self.io.open_files.read();
         let stdio_cloexec = *self.io.stdio_cloexec.lock();
@@ -3112,6 +3139,7 @@ impl SyscallDispatcher {
         })
     }
 
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn restore_native_reexec_fd_table(
         &self,
         snapshot: &NativeReexecFdTableV1,

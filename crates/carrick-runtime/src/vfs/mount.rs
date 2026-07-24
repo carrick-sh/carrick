@@ -170,6 +170,10 @@ impl VfsMounts {
         self.entries.is_empty()
     }
 
+    // Only reached from `SyscallDispatcher::snapshot_native_reexec_bind_mounts`
+    // (`dispatch/mod.rs`), which carries the identical
+    // `#[cfg(any(test, ...))]` gate.
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(crate) fn native_reexec_bind_mounts(&self) -> Vec<super::bind::NativeReexecBindMountV1> {
         self.entries
             .iter()

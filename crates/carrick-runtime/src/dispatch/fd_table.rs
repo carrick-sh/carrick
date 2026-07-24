@@ -1077,6 +1077,10 @@ impl OpenFile {
 }
 
 impl OpenDescription {
+    // Both methods below are only reached from `snapshot_native_reexec_fd_table`
+    // (`dispatch/mod.rs`), which carries the identical
+    // `#[cfg(any(test, ...))]` gate.
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(super) fn reexec_host_fd(&self) -> Option<i32> {
         match self {
             Self::HostPipe { host_fd, .. }
@@ -1087,6 +1091,7 @@ impl OpenDescription {
         }
     }
 
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(super) fn reexec_kind_name(&self) -> &'static str {
         match self {
             Self::File { .. } => "file",

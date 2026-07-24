@@ -694,6 +694,11 @@ impl SyscallDispatcher {
         crate::host_signal::reset_routed_handlers_after_execve(ignored);
     }
 
+    // Only called from `snapshot_native_reexec_process_state`/
+    // `restore_native_reexec_process_state` (`dispatch/mod.rs`), which carry
+    // the identical `#[cfg(any(test, ...))]` gate — kept in lockstep so this
+    // helper never outlives (or is outlived by) its sole caller.
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(super) fn native_reexec_ignored_signals(&self) -> carrick_abi::SigSet {
         self.signal
             .lock()
@@ -705,6 +710,7 @@ impl SyscallDispatcher {
             })
     }
 
+    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     pub(super) fn restore_native_reexec_ignored_signals(&self, ignored: carrick_abi::SigSet) {
         let mut signal = self.signal.lock();
         signal.handlers.clear();

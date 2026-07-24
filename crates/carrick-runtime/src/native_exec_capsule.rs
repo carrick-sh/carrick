@@ -275,6 +275,12 @@ pub(crate) fn begin_pid_probe() -> anyhow::Result<()> {
     exec_capsule(payload, nonce, None)
 }
 
+// This function's only caller is `native_darwin.rs`, which is itself gated
+// to `cfg(target_os = "macos", target_arch = "aarch64")` (its own lane) —
+// see `lib.rs`'s module-decl comment. Gated the same way so it doesn't
+// become a newly-dead cross-reference (an unconditional call into a module
+// that no longer exists off that lane) when built elsewhere.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn begin_guest_exec(
     dispatcher: &crate::dispatch::SyscallDispatcher,
@@ -373,6 +379,13 @@ pub(crate) fn begin_guest_exec(
     exec_capsule(payload, nonce, prepared_artifact)
 }
 
+// This whole cluster (the failpoint enum, `attach_prepared_image`, and
+// `attach_prepared_image_inner`) is reached in production only from
+// `begin_guest_exec` (lane-gated to macOS/aarch64); this crate's own
+// `#[cfg(test)]` fixtures (`attach_prepared_image_with_failpoint` and the
+// direct `attach_prepared_image` calls in `mod tests`) exercise it on every
+// host, hence the `test` arm.
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreparedImageFailpoint {
     #[cfg(test)]
@@ -383,6 +396,7 @@ enum PreparedImageFailpoint {
     PreExecValidation,
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn attach_prepared_image(
     payload: &mut NativeExecCapsuleV1,
     image: &crate::memory::AddressSpace,
@@ -409,6 +423,7 @@ fn attach_prepared_image_with_failpoint(
     )
 }
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 fn attach_prepared_image_inner(
     payload: &mut NativeExecCapsuleV1,
     image: &crate::memory::AddressSpace,
@@ -785,6 +800,13 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
             before: payload.producer_pid,
             after: current_pid,
         }),
+        // Only `native_darwin.rs`'s `begin_guest_exec` ever produces a
+        // `GuestExec`-purpose capsule (its only caller, gated to
+        // `cfg(target_os = "macos", target_arch = "aarch64")` — see
+        // `lib.rs`'s module-decl comment), so this arm's `native_darwin::`
+        // calls are gated the same way rather than left as newly-dead
+        // cross-references off that lane.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         NativeExecCapsulePurposeV1::GuestExec => {
             let guest = payload
                 .guest_exec
@@ -801,6 +823,13 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
                 crate::native_darwin::resume_guest_from_capsule(guest, payload.argv, payload.env)?;
             Ok(crate::NativeSelfReexecOutcome::GuestExit(exit_code))
         }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        NativeExecCapsulePurposeV1::GuestExec => {
+            anyhow::bail!(
+                "native guest-exec self-reexec resume is only wired on macOS/aarch64 \
+                 (the only lane that ever produces a GuestExec-purpose capsule)"
+            )
+        }
     }
 }
 
@@ -814,6 +843,9 @@ fn emit_lifecycle(tid: i32, phase: crate::probes::DsrCacheLifecyclePhase) {
     crate::probes::dsr_cache_lifecycle(tid, phase, 0, 0, 0);
 }
 
+// Called only from `begin_guest_exec` (lane-gated to macOS/aarch64); no
+// test exercises the real xsig-ring transport directly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn snapshot_xsig() -> anyhow::Result<NativeReexecXsigV1> {
     let host_fd = carrick_signal_core::xsig::xsig_reexec_fd()
         .ok_or_else(|| anyhow::anyhow!("native guest exec has no xsignal ring backing fd"))?;
@@ -835,6 +867,10 @@ fn snapshot_xsig() -> anyhow::Result<NativeReexecXsigV1> {
     })
 }
 
+// Called only from `resume()`'s `GuestExec` arm (lane-gated to
+// macOS/aarch64, since that's the only capsule purpose that ever carries a
+// real xsig snapshot).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn adopt_xsig(snapshot: &NativeReexecXsigV1) -> anyhow::Result<()> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstat(snapshot.host_fd, stat.as_mut_ptr()) } < 0 {
