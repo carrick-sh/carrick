@@ -79,16 +79,13 @@ mod darwin {
             unsafe { carrick_native_clear_icache(exec_ptr as *mut libc::c_void, len) };
         }
 
-        fn after_fork_child(&self) {
-            unsafe { libc::pthread_jit_write_protect_np(1) };
-        }
-
         fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
             // MAP_JIT is MAP_PRIVATE: the fork child already holds its own
             // copy-on-write pages of the parent's region (contrast the
             // MAP_SHARED dual map on carrick-native-freebsd, which cannot
             // make this claim). Keep the inherited mapping in place;
-            // `after_fork_child` repairs the per-thread write-protect bit.
+            // `TranslationCache::after_fork_child` repairs the per-thread
+            // write-protect bit via `end_thread_write`.
             Ok(ForkChildJit::Inherited)
         }
     }
@@ -137,8 +134,6 @@ mod unsupported {
         fn end_thread_write(&self) {}
 
         fn flush_icache(&self, _exec_ptr: *const u8, _len: usize) {}
-
-        fn after_fork_child(&self) {}
 
         fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
             Err(std::io::Error::other(
