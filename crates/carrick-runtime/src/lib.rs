@@ -141,6 +141,16 @@ pub mod namespace;
 // `native_darwin`/`native_freebsd` below; Phase 2 replaces those bodies with
 // a single generic `NativeLane`-parameterized call apiece.
 pub(crate) mod native;
+// The macOS/aarch64 native (DSR) driver: executes a static AArch64 Linux ELF
+// through the carrick-dsr-aarch64 gateway (Apple Silicon MAP_JIT + the
+// assembled gateway entry/exit surface) and services its syscalls via the
+// shared SyscallDispatcher. Target-gated (the whole module is
+// `cfg(macos, aarch64)`) the same way `native_freebsd` below is gated to its
+// own lane — unscoped, it SIGILLs on a FreeBSD `--lib` test run that reaches
+// any of its Darwin-only bodies (Apple-Silicon-only MAP_JIT/pthread_jit
+// intrinsics and assembled AArch64 gateway code have no meaning on x86_64
+// FreeBSD).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod native_darwin;
 // The FreeBSD/amd64 native (DSR) driver: executes a static x86_64 Linux ELF
 // through the carrick-dsr-x86 gateway and services its syscalls via the shared
@@ -602,9 +612,17 @@ pub mod runtime {
     // `runtime.rs`): the neutral vDSO attach policy + debug-state snapshot,
     // referenced by the native backend on every platform.
     #[allow(unused_imports)]
-    pub(crate) use crate::vdso_policy::{
-        vdso_enabled_for_debug, with_optional_vdso, with_optional_vdso_at,
-    };
+    pub(crate) use crate::vdso_policy::{with_optional_vdso, with_optional_vdso_at};
+    // `vdso_enabled_for_debug` itself is gated in `vdso_policy.rs` to its
+    // actual callers' cfgs (no FreeBSD native-lane caller exists yet); mirror
+    // that gate here so this re-export doesn't try to name a symbol that
+    // doesn't exist on this lane.
+    #[allow(unused_imports)]
+    #[cfg(any(
+        feature = "platform-macos",
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) use crate::vdso_policy::vdso_enabled_for_debug;
 
     pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
 

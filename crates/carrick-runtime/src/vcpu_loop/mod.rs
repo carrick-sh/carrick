@@ -365,10 +365,20 @@ pub(crate) use quiesce::{fork_barrier, pt_barrier};
 use signal::deliver_fault_signal;
 pub(crate) use signal::is_default_ignore_signal;
 pub(crate) use signal::{
-    FaultSignalDisposition, deliver_pending_signal, inject_fault_signal, lower_el0_fault,
-    partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write, signal_progress_count,
-    signal_wait_expired, signal_wait_remaining, signal_wait_slice, upgrade_protection_si_code,
+    deliver_pending_signal, lower_el0_fault, partial_write_interrupt_outcome,
+    raise_sigpipe_for_blocking_write, signal_progress_count, signal_wait_expired,
+    signal_wait_remaining, signal_wait_slice,
 };
+// `FaultSignalDisposition`/`inject_fault_signal` are consumed only by
+// `native_darwin.rs`'s fault-injection path (its own lane gate matches this
+// one). `upgrade_protection_si_code` has an additional portable consumer:
+// `dispatch/mem.rs`'s `#[cfg(test)]` protection-fault tests call it via this
+// same `crate::vcpu_loop::` re-export on every host, so it needs the `test`
+// arm too or a non-macOS test build sees it as an unused import.
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+pub(crate) use signal::upgrade_protection_si_code;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use signal::{FaultSignalDisposition, inject_fault_signal};
 // Test-only consumer since the DSR translator (the lib-side caller) moved to
 // the arch crate; the ESR decode itself lives in carrick_dsr_aarch64::esr and
 // signal.rs re-exports it.
