@@ -804,6 +804,13 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
             errno: LinuxErrno::new(22)
         }
     );
+    // flags=0xdead sets an unrecognized bit alongside MREMAP_DONTUNMAP
+    // (bit 2). Confirmed against a real-Linux oracle (Linux 6.12.76,
+    // docker gcc:latest, 2026-07-23 — see .superpowers/sdd/mremap-ruling-report.md):
+    // real Linux rejects unrecognized mremap flag bits with EINVAL
+    // regardless of which other, recognized flag bits are also set — this
+    // assertion was already correct; `dispatch/mem.rs`'s handler and its
+    // own unit tests were the ones fixed to match.
     assert_eq!(
         dispatcher
             .dispatch(
