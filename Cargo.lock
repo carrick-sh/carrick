@@ -608,6 +608,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-native-netbsd"
+version = "0.1.0"
+dependencies = [
+ "carrick-dsr",
+ "libc",
+]
+
+[[package]]
 name = "carrick-observability"
 version = "0.1.0"
 dependencies = [
