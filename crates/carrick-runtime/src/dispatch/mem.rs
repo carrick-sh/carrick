@@ -3038,7 +3038,7 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, new_address: GuestPtr) {
+        fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, _new_address: GuestPtr) {
             let _host_alias_dispatch = this.begin_host_alias_dispatch();
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
@@ -3084,29 +3084,19 @@ impl SyscallDispatcher {
                 // emulate (exact fixed-replacement or DONTUNMAP zero-fill/
                 // fault contract on every backend). No allocator, backing,
                 // or VMA mutation has happened yet.
+                //
+                // Everything below this point in the handler runs ONLY when
+                // both flags are false (this is the only return before it),
+                // so it never needs to special-case a fixed destination or a
+                // retained source — that logic lived here until it was
+                // proven unreachable and deleted (see
+                // `.superpowers/sdd/mremap-ruling-report.md` and the
+                // Phase-2 final-review). Reintroducing MREMAP_FIXED/
+                // MREMAP_DONTUNMAP support means adding it back deliberately,
+                // not resurrecting dead branches.
                 return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
             }
             let layout = this.mem.lock().layout;
-            let fixed_new_address = if move_fixed {
-                if new_address.0 == 0 || !new_address.0.is_multiple_of(page_size) {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                if !range_within(new_address.0, new_size, layout.mmap_base, layout.mmap_size) {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                }
-                Some(new_address.0)
-            } else {
-                None
-            };
-            if let Some(new_address) = fixed_new_address {
-                let Some(new_end) = new_address.checked_add(new_size) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                };
-                if ranges_overlap(old_address.0, old_size, new_address, new_end) {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-            }
-            let move_requested = move_fixed || dontunmap;
             let source_in_arena =
                 range_within(old_address.0, old_size, layout.mmap_base, layout.mmap_size);
             if !source_in_arena && memory.read_bytes(old_address.0, 1).is_err() {
@@ -3116,9 +3106,7 @@ impl SyscallDispatcher {
                 Ok(metadata) => metadata,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            if source_metadata.sharing == ProcMapSharing::Shared
-                && (move_requested || new_size > old_size)
-            {
+            if source_metadata.sharing == ProcMapSharing::Shared && new_size > old_size {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             let shared_aperture_alloc = this
@@ -3168,7 +3156,7 @@ impl SyscallDispatcher {
                 if memory.read_bytes(old_address.0, 1).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                if !move_requested && new_size <= old_size {
+                if new_size <= old_size {
                     let tail_start = old_address.0.saturating_add(new_size);
                     let tail_len = old_size.saturating_sub(new_size);
                     if tail_len != 0 {
@@ -3240,7 +3228,7 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
-            if !move_requested && new_size <= old_size {
+            if new_size <= old_size {
                 // Linux mremap shrink unmaps the freed tail [old+new_size,
                 // old+old_size); carrick used to leave it mapped (a leak, and
                 // the stale bytes there could later be misread). Reclaim the
@@ -3294,7 +3282,7 @@ impl SyscallDispatcher {
                 });
             }
 
-            if !move_requested && old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
+            if old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
                 let Some(old_end) = old_address.0.checked_add(old_size) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
@@ -3349,10 +3337,10 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             let Some((new_addr, reused)) = this.next_mmap_address(
-                fixed_new_address.unwrap_or(0),
+                0,
                 new_size,
                 LINUX_PROT_READ | LINUX_PROT_WRITE,
-                if move_fixed { LINUX_MAP_FIXED } else { 0 },
+                0,
             ) else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
@@ -3363,9 +3351,7 @@ impl SyscallDispatcher {
             let copy_len = match usize::try_from(old_size.min(new_size)) {
                 Ok(len) => len,
                 Err(_) => {
-                    if !move_fixed {
-                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                    }
+                    this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
             };
@@ -3375,19 +3361,12 @@ impl SyscallDispatcher {
                 match memory.read_bytes_raw(old_address.0, copy_len) {
                     Ok(bytes) => bytes,
                     Err(_) => {
-                        if !move_fixed {
-                            this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
-                        }
+                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 }
             };
-            if (reused || move_fixed) && memory.zero_backing(new_addr, new_len).is_err() {
-                if move_fixed {
-                    // A fixed destination may have been partially overwritten;
-                    // its prior backing/content cannot be reconstructed.
-                    std::process::abort();
-                }
+            if reused && memory.zero_backing(new_addr, new_len).is_err() {
                 this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
@@ -3406,9 +3385,6 @@ impl SyscallDispatcher {
                 .protect_range(new_addr, new_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
                 .is_err()
             {
-                if move_fixed {
-                    std::process::abort();
-                }
                 this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
@@ -3417,9 +3393,6 @@ impl SyscallDispatcher {
                     .write_bytes_unchecked(new_addr, &copied)
                     .is_err()
             {
-                if move_fixed {
-                    std::process::abort();
-                }
                 this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
@@ -3434,20 +3407,8 @@ impl SyscallDispatcher {
                 .protect_range(new_addr, new_len, source_metadata.prot.bits())
                 .is_err()
             {
-                if move_fixed {
-                    std::process::abort();
-                }
                 this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            }
-            if move_fixed {
-                let Some(new_end) = new_addr.checked_add(new_size) else {
-                    std::process::abort();
-                };
-                let mut mem = this.mem.lock();
-                trim_ranges_for_range(&mut mem.free_regions, new_addr, new_size);
-                mem.mmap_next = mem.mmap_next.max(new_end);
-                mem.mmap_dirty_high = mem.mmap_dirty_high.max(new_end);
             }
             this.record_dynamic_mapping(
                 new_addr,
@@ -3457,21 +3418,22 @@ impl SyscallDispatcher {
                 source_metadata.path.clone(),
             );
             // mremap MOVE on Linux UNMAPS the source [old, old+old_size) (unless
-            // MREMAP_DONTUNMAP). carrick previously LEAKED it: the source VA
-            // stayed mapped with its stale bytes and was never returned to the
-            // allocator, so `mmap_next` ran away and glibc's view of which VAs
-            // are mapped diverged from carrick's (glibc considers the source
-            // freed). Reclaim the source exactly like munmap, so a later access
-            // faults and the VA is reusable — matching Linux and keeping the
-            // mmapped-chunk bookkeeping coherent across the BytesIO/recv_bytes
-            // realloc-grow cascade (test_multiprocessing test_connection's 16 MiB
-            // round-trip). MREMAP_DONTUNMAP keeps the source mapped.
+            // MREMAP_DONTUNMAP — refused above, so never true here: this handler
+            // always reclaims the source). carrick previously LEAKED it: the
+            // source VA stayed mapped with its stale bytes and was never
+            // returned to the allocator, so `mmap_next` ran away and glibc's
+            // view of which VAs are mapped diverged from carrick's (glibc
+            // considers the source freed). Reclaim the source exactly like
+            // munmap, so a later access faults and the VA is reusable —
+            // matching Linux and keeping the mmapped-chunk bookkeeping
+            // coherent across the BytesIO/recv_bytes realloc-grow cascade
+            // (test_multiprocessing test_connection's 16 MiB round-trip).
             // Guard: the destination must not overlap the source (it never does —
             // `new_addr` is freshly bump-allocated or a disjoint free region —
             // but reclaiming an overlapping source would unmap the live copy).
             let dst_overlaps_src = new_addr < old_address.0.wrapping_add(old_size)
                 && old_address.0 < new_addr.wrapping_add(new_size);
-            if flags & LINUX_MREMAP_DONTUNMAP == 0 && !dst_overlaps_src
+            if !dst_overlaps_src
                 && let Ok(old_len) = usize::try_from(old_size)
                     && old_len > 0
                 {
