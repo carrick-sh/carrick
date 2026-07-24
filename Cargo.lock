@@ -476,6 +476,7 @@ dependencies = [
  "goblin",
  "iced-x86",
  "libc",
+ "tempfile",
  "thiserror",
 ]
 
@@ -601,6 +602,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-dsr",
  "libc",
+ "tempfile",
 ]
 
 [[package]]

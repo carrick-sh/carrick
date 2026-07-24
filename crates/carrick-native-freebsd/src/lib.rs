@@ -21,6 +21,7 @@
 
 pub mod fault;
 pub mod jit;
+mod waiter_key;
 
 pub use jit::FreebsdHostJit;
 
@@ -42,6 +43,14 @@ impl carrick_dsr::lane::NativeHost for FreebsdHost {
 
     fn active_jit() -> &'static dyn carrick_dsr::host::NativeHostJit {
         active_host_jit()
+    }
+
+    fn shared_futex_waiter_key(host_addr: usize) -> Option<usize> {
+        waiter_key::shared_waiter_key(host_addr)
+    }
+
+    fn exclusive_fixed_map_flag() -> i32 {
+        libc::MAP_EXCL
     }
 }
 

@@ -11,6 +11,15 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Forwards to carrick-dsr's test-hook state (census counters/fault
+# injection), consumed by this crate's own moved-identity-memory tests in
+# `cflow.rs`. Never enabled by production builds; this crate's own test
+# target gets it through the [dev-dependencies] re-declaration below (same
+# pattern as carrick-runtime's own test-hooks feature).
+test-hooks = ["carrick-dsr/test-hooks"]
+
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-dsr = { path = "../carrick-dsr" }
@@ -22,6 +31,8 @@ thiserror.workspace = true
 cc = "1"
 
 [dev-dependencies]
+carrick-dsr = { path = "../carrick-dsr", features = ["test-hooks"] }
 carrick-native-freebsd = { path = "../carrick-native-freebsd" }
 libc.workspace = true
 goblin.workspace = true
+tempfile.workspace = true
