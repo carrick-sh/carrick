@@ -58,7 +58,7 @@ use carrick_hal::{GuestArch, Reg, RegAccess};
 use carrick_native_freebsd::{FreebsdHost, FreebsdHostJit, active_host_jit, fault};
 use goblin::elf::Elf;
 use goblin::elf::header::{EM_X86_64, ET_DYN, ET_EXEC};
-use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
+use goblin::elf::program_header::PT_LOAD;
 
 use carrick_mem::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, mmap_arena_size};
 
@@ -6482,6 +6482,8 @@ struct MappedElf {
     bias: u64,
     entry: u64,
     phdr: u64,
+    phent: u16,
+    phnum: u16,
     segments: Vec<(u64, u64)>,
     protections: Vec<(u64, u64, u64)>,
 }
@@ -6495,26 +6497,43 @@ fn map_one_elf(
     bytes: &[u8],
     apply_relative_relocations: bool,
 ) -> Result<MappedElf, RuntimeError> {
-    let elf = parse_loadable_elf(bytes, apply_relative_relocations).map_err(|_| {
+    use carrick_mem::elf::{ElfType, plan_elf_load_bytes_for};
+    use carrick_mem::memory::regions_from_load_plan_page_aligned;
+
+    // carrick_mem owns the ELF *description*: parse + machine check (rejects a
+    // non-x86_64 ELF) + PT_LOAD enumeration + entry/phdr/phent/phnum. The host
+    // mapping, MAP_EXCL reservation, byte copy, and relative relocations remain
+    // this lane's concern (carrick_mem never touches host memory).
+    let base_plan = plan_elf_load_bytes_for(bytes, EM_X86_64).map_err(|_| {
         RuntimeError::Unsupported("native x86 lane requires a loadable x86_64 ELF".to_string())
     })?;
-
-    let mut lo = u64::MAX;
-    let mut hi = 0u64;
-    for ph in &elf.program_headers {
-        if ph.p_type == PT_LOAD {
-            lo = lo.min(ph.p_vaddr & !(PAGE - 1));
-            hi = hi.max((ph.p_vaddr + ph.p_memsz + PAGE - 1) & !(PAGE - 1));
-        }
+    if !matches!(base_plan.e_type, ElfType::Dyn | ElfType::Exec) {
+        return Err(RuntimeError::Unsupported(format!(
+            "native x86 lane requires ET_DYN or ET_EXEC, found ELF type {:?}",
+            base_plan.e_type
+        )));
     }
-    if lo == u64::MAX {
+    if base_plan.segments.is_empty() {
         return Err(RuntimeError::Unsupported(
             "ELF has no PT_LOAD segments".to_string(),
         ));
     }
+
+    // Page-aligned load span of the object at its own link/default bias.
+    let default_bias = base_plan.load_bias;
+    let mut lo = u64::MAX;
+    let mut hi = 0u64;
+    for segment in &base_plan.segments {
+        let unbiased = segment.virtual_address.wrapping_sub(default_bias);
+        lo = lo.min(unbiased & !(PAGE - 1));
+        hi = hi.max((unbiased + segment.memory_size + PAGE - 1) & !(PAGE - 1));
+    }
     let span_len = (hi - lo) as usize;
-    let (reservation_index, bias) = match elf.header.e_type {
-        ET_DYN => {
+
+    // Reserve the object's span; ET_DYN takes a kernel-chosen base, ET_EXEC its
+    // fixed link address. `bias` is the delta from the object's own vaddrs.
+    let (reservation_index, bias) = match base_plan.e_type {
+        ElfType::Dyn => {
             let index = candidate.map_anonymous(
                 NativeMappingOperation::ElfReservation,
                 span_len,
@@ -6526,7 +6545,7 @@ fn map_one_elf(
             let bias = candidate.mapping(index).base - lo;
             (index, bias)
         }
-        ET_EXEC => (
+        _ => (
             candidate.map_anonymous(
                 NativeMappingOperation::ElfReservation,
                 span_len,
@@ -6537,24 +6556,26 @@ fn map_one_elf(
             )?,
             0,
         ),
-        other => {
-            return Err(RuntimeError::Unsupported(format!(
-                "native x86 lane requires ET_DYN or ET_EXEC, found ELF type {other}"
-            )));
-        }
     };
     let reservation = candidate.mapping(reservation_index);
     let reservation_start = reservation.base;
     let reservation_end = reservation_start.saturating_add(reservation.len as u64);
 
-    let mut segments = Vec::new();
-    let mut protections = Vec::new();
-    for ph in &elf.program_headers {
-        if ph.p_type != PT_LOAD {
-            continue;
-        }
-        let seg_lo = (ph.p_vaddr & !(PAGE - 1)) + bias;
-        let seg_hi = ((ph.p_vaddr + ph.p_memsz + PAGE - 1) & !(PAGE - 1)) + bias;
+    // Re-bias the description to the reserved base and materialise its
+    // page-aligned regions (file bytes at their in-page offset + zero padding)
+    // from carrick_mem — the same shape the previous hand-rolled loop produced.
+    let plan = base_plan.with_load_bias(bias);
+    let regions = regions_from_load_plan_page_aligned(bytes, &plan, PAGE).map_err(|error| {
+        RuntimeError::Unsupported(format!(
+            "native x86 lane failed to plan ELF regions: {error}"
+        ))
+    })?;
+
+    let mut segments = Vec::with_capacity(regions.len());
+    let mut protections = Vec::with_capacity(regions.len());
+    for region in &regions {
+        let seg_lo = region.start;
+        let seg_hi = region.end;
         if seg_lo < reservation_start || seg_hi > reservation_end || seg_hi <= seg_lo {
             return Err(RuntimeError::Unsupported(format!(
                 "ELF segment [0x{seg_lo:x},0x{seg_hi:x}) escapes owned reservation \
@@ -6563,13 +6584,13 @@ fn map_one_elf(
         }
         segments.push((seg_lo, seg_hi));
         let mut guest_prot = 0u64;
-        if ph.p_flags & PF_R != 0 {
+        if region.perms.read {
             guest_prot |= crate::linux_abi::LINUX_PROT_READ;
         }
-        if ph.p_flags & PF_W != 0 {
+        if region.perms.write {
             guest_prot |= crate::linux_abi::LINUX_PROT_WRITE;
         }
-        if ph.p_flags & PF_X != 0 {
+        if region.perms.execute {
             guest_prot |= crate::linux_abi::LINUX_PROT_EXEC;
         }
         protections.push((seg_lo, seg_hi, guest_prot));
@@ -6580,18 +6601,17 @@ fn map_one_elf(
             libc::PROT_READ | libc::PROT_WRITE,
             "ELF segment",
         )?;
-        let file_start = ph.p_offset as usize;
-        let file_end = (ph.p_offset + ph.p_filesz) as usize;
-        let src = bytes.get(file_start..file_end).ok_or_else(|| {
-            RuntimeError::Unsupported("ELF PT_LOAD file range is out of bounds".to_string())
-        })?;
-        // SAFETY: destination is inside the freshly mapped RW segment.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), (ph.p_vaddr + bias) as *mut u8, src.len())
-        };
+        let src = region.bytes();
+        // SAFETY: destination is inside the freshly mapped RW segment; `src`
+        // spans exactly [seg_lo, seg_hi) with the padding zero-filled, so the
+        // materialised bytes match the previous zero-map-then-copy exactly.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), seg_lo as *mut u8, src.len()) };
     }
 
     if apply_relative_relocations {
+        let elf = Elf::parse(bytes).map_err(|_| {
+            RuntimeError::Unsupported("native x86 lane failed to parse ELF relocations".to_string())
+        })?;
         for rela in elf.dynrelas.iter() {
             if rela.r_type != R_X86_64_RELATIVE {
                 return Err(RuntimeError::Unsupported(format!(
@@ -6606,19 +6626,13 @@ fn map_one_elf(
         }
     }
 
-    let phdr = elf
-        .program_headers
-        .iter()
-        .find(|ph| {
-            elf.header.e_phoff >= ph.p_offset
-                && elf.header.e_phoff < ph.p_offset.saturating_add(ph.p_filesz)
-        })
-        .map(|ph| bias + ph.p_vaddr + (elf.header.e_phoff - ph.p_offset))
-        .unwrap_or(bias + elf.header.e_phoff);
+    let phdr = plan.program_header_address.unwrap_or(plan.entry);
     Ok(MappedElf {
         bias,
-        entry: elf.entry + bias,
+        entry: plan.entry,
         phdr,
+        phent: plan.program_header_entry_size,
+        phnum: plan.program_header_count,
         segments,
         protections,
     })
@@ -6634,8 +6648,6 @@ fn load_static_pie(
 ) -> Result<LoadedImage, RuntimeError> {
     let mut candidate = NativeMappingTransaction::new("native image candidate");
     let result = (|| {
-        let elf =
-            Elf::parse(bytes).map_err(|e| RuntimeError::Unsupported(format!("parse ELF: {e}")))?;
         let main = map_one_elf(&mut candidate, bytes, interpreter_bytes.is_none())?;
         let interpreter = interpreter_bytes
             .map(|bytes| map_one_elf(&mut candidate, bytes, false))
@@ -6745,8 +6757,9 @@ fn load_static_pie(
             stack + GUEST_STACK_LEN as u64,
             argv,
             env,
-            &elf,
             main.phdr,
+            main.phent,
+            main.phnum,
             main.entry,
             interpreter.as_ref().map_or(0, |image| image.bias),
             vdso_base,
@@ -6958,8 +6971,9 @@ fn build_initial_stack(
     stack_top: u64,
     argv: &[Vec<u8>],
     env: &[Vec<u8>],
-    elf: &Elf,
     phdr_va: u64,
+    phent: u16,
+    phnum: u16,
     main_entry: u64,
     interpreter_base: u64,
     vdso_base: u64,
@@ -7028,8 +7042,8 @@ fn build_initial_stack(
     words.push(0); // envp NULL
     let mut auxv: Vec<(u64, u64)> = vec![
         (AT_PHDR, phdr_va),
-        (AT_PHENT, elf.header.e_phentsize as u64),
-        (AT_PHNUM, elf.header.e_phnum as u64),
+        (AT_PHENT, phent as u64),
+        (AT_PHNUM, phnum as u64),
         (AT_PAGESZ, PAGE),
         (AT_ENTRY, main_entry),
         (AT_RANDOM, random_ptr),
@@ -16190,8 +16204,18 @@ mod tests {
             .collect();
         let env = vec![b"PATH=/bin:/usr/bin".to_vec()];
 
-        let rsp =
-            build_initial_stack(stack_top, &argv, &env, &elf, 0x400040, 0x401000, 0, 0).unwrap();
+        let rsp = build_initial_stack(
+            stack_top,
+            &argv,
+            &env,
+            0x400040,
+            elf.header.e_phentsize,
+            elf.header.e_phnum,
+            0x401000,
+            0,
+            0,
+        )
+        .unwrap();
 
         assert!(rsp >= stack_bottom);
         assert!(rsp < stack_top);
