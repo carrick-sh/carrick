@@ -611,6 +611,7 @@ dependencies = [
 name = "carrick-native-netbsd"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-dsr",
  "libc",
 ]
@@ -661,6 +662,7 @@ dependencies = [
  "carrick-mem",
  "carrick-native-darwin",
  "carrick-native-freebsd",
+ "carrick-native-netbsd",
  "carrick-observability",
  "carrick-portable",
  "carrick-signal-core",

@@ -2076,6 +2076,52 @@ mod stub {
     stub!(signal_deliver(tid: i32, pending: i32));
     stub!(fire(event: &crate::compat::CompatEvent));
 
+    // Native-x86 (DSR) run-loop probes — no-op mirror of `real`'s, so the shared
+    // BSD native run loop (native_freebsd.rs, now compiled on NetBSD too, a
+    // stub/usdt-less target) links unchanged. `NativeX86XstateProbe` is defined
+    // here with the same public fields the run loop constructs.
+    stub!(native_x86_fault_stack(rbp: u64, stack_words: [u64; 4]));
+    stub!(native_x86_fault_history(pcs: [u64; 5]));
+    stub!(native_x86_pc(pc: u64, rsp: u64, rdi: u64, rbp: u64, stack_word: u64));
+    stub!(native_x86_resolve(source: u64, target: u64, rsp: u64, rdi: u64, rbp: u64));
+
+    #[allow(clippy::too_many_arguments, dead_code, unused_variables)]
+    #[inline(always)]
+    pub fn native_x86_fault(
+        pc: u64,
+        fault_address: u64,
+        rsp: u64,
+        rax: u64,
+        rcx: u64,
+        rdx: u64,
+        rdi: u64,
+        rsi: u64,
+        r8: u64,
+        rflags: u64,
+    ) {
+    }
+
+    /// Scalar payload for the opt-in native-x86 xstate transition probes
+    /// (mirrors `real::NativeX86XstateProbe` field-for-field).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct NativeX86XstateProbe {
+        pub source: u64,
+        pub target: u64,
+        pub event: u64,
+        pub flags: u64,
+        pub xstate_bv: u64,
+        pub fcw: u16,
+        pub mxcsr: u32,
+        pub pkru: u32,
+        pub legacy_hash: u64,
+        pub ymm_hash: u64,
+        pub opmask_zmm_hash: u64,
+        pub extended_hash: u64,
+    }
+
+    stub!(native_x86_xstate_edge(probe: NativeX86XstateProbe));
+    stub!(native_x86_xstate(probe: NativeX86XstateProbe));
+
     pub fn with_fork_footprint_class_probe<F>(_emit: F)
     where
         F: FnOnce(),

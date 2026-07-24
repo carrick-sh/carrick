@@ -1163,12 +1163,16 @@ pub unsafe fn sendfile_to_socket(file_fd: i32, sock_fd: i32, offset: i64, count:
     }
 }
 
-/// FreeBSD `minherit(2)` modes. The libc crate does not currently expose the
-/// function or constants, so keep the stable FreeBSD syscall ABI in this
+/// BSD `minherit(2)` modes. The libc crate does not currently expose the
+/// function or constants, so keep the stable BSD syscall ABI in this
 /// portability shim rather than declaring an ad-hoc C symbol in the runtime.
-#[cfg(target_os = "freebsd")]
+/// (The `FREEBSD_`-prefixed names are legacy — the shared native run loop now
+/// calls this on both BSDs; a rename is deferred.) FreeBSD `SHARE=0`/`COPY=1`;
+/// NetBSD `MAP_INHERIT_SHARE=0`/`MAP_INHERIT_COPY=1` (`/usr/include/sys/mman.h`
+/// :208-209) — the same values.
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 pub const FREEBSD_INHERIT_SHARE: i32 = 0;
-#[cfg(target_os = "freebsd")]
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 pub const FREEBSD_INHERIT_COPY: i32 = 1;
 
 /// Apply FreeBSD's inheritance policy to the mapped range `[addr, addr+len)`.
@@ -1182,6 +1186,22 @@ pub const FREEBSD_INHERIT_COPY: i32 = 1;
 pub unsafe fn freebsd_minherit(addr: *mut libc::c_void, len: usize, inherit: i32) -> i32 {
     const FREEBSD_SYS_MINHERIT: libc::c_int = 250;
     unsafe { libc::syscall(FREEBSD_SYS_MINHERIT, addr, len, inherit) as i32 }
+}
+
+/// Apply NetBSD's inheritance policy to the mapped range `[addr, addr+len)`.
+/// NetBSD also has `minherit(2)` (share=0/copy=1); the raw syscall keeps the
+/// clean-room ABI in the shim (`SYS_minherit = 273`,
+/// `/usr/include/sys/syscall.h:769`).
+///
+/// # Safety
+///
+/// `addr` and `len` must describe a valid mapped range in the calling process,
+/// and `inherit` must be a mode accepted by `minherit(2)`.
+#[cfg(target_os = "netbsd")]
+#[inline]
+pub unsafe fn freebsd_minherit(addr: *mut libc::c_void, len: usize, inherit: i32) -> i32 {
+    const NETBSD_SYS_MINHERIT: libc::c_int = 273;
+    unsafe { libc::syscall(NETBSD_SYS_MINHERIT, addr, len, inherit) as i32 }
 }
 
 /// Peer credentials `(pid, uid, gid)` of a connected `AF_UNIX` `host_fd`,

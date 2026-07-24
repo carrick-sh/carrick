@@ -23,7 +23,10 @@
 //! straight-line + returned/errno/exit dispatch outcomes and surfaces the
 //! rest as a typed error rather than guessing. Guest faults become typed
 //! `Signal` gateway exits via `carrick-native-freebsd`'s shim.
-#![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+#![cfg(all(
+    any(target_os = "freebsd", target_os = "netbsd"),
+    target_arch = "x86_64"
+))]
 
 use std::convert::Infallible;
 use std::os::fd::AsRawFd;
@@ -65,6 +68,19 @@ use carrick_hal::{GuestArch, Reg, RegAccess};
 use carrick_native_freebsd::{
     FreebsdHost as LaneHost, FreebsdHostJit as LaneHostJit, active_host_jit, fault,
 };
+#[cfg(target_os = "netbsd")]
+use carrick_native_netbsd::{
+    NetbsdHost as LaneHost, NetbsdHostJit as LaneHostJit, active_host_jit, fault,
+};
+// The cross-process shared-futex primitive, lane-selected: FreeBSD reconstructs
+// a woken count + logical requeue over `_umtx_op` via a fork-shared waiter
+// table; NetBSD's `__futex(2)` is Linux-shaped (native count + requeue), so its
+// module is a thin wrapper with no table. Both expose the same 4-fn API the run
+// loop's `SharedFutex*` outcomes call as `futex::…`.
+#[cfg(target_os = "freebsd")]
+use carrick_native_freebsd::futex;
+#[cfg(target_os = "netbsd")]
+use carrick_native_netbsd::futex;
 use goblin::elf::Elf;
 use goblin::elf::header::{EM_X86_64, ET_DYN, ET_EXEC};
 use goblin::elf::program_header::PT_LOAD;
@@ -240,6 +256,9 @@ mod identity_raw_range_tests {
     // `host_clock_ns`/`tsc_ns` moved to `carrick_native_freebsd::tsc` with the
     // TSC sysctl block (the host-ops seam); `calibrate_x86_vvar_clock` stays a
     // thin `super` wrapper over `NativeHost::vdso_tsc_calibration`.
+    // Absolute path (not the lane `futex` alias, which is out of scope inside
+    // this module): this FreeBSD-gated test reaches umtx-only internals that
+    // exist solely in the FreeBSD futex crate.
     use carrick_native_freebsd::futex::{
         SYS_UMTX_OP, UMTX_OP_WAKE, init_shared_waiter_table, shared_wait, shared_wake,
         waiter_parked_count,
@@ -6172,8 +6191,8 @@ fn native_transport_signal_set() -> libc::sigset_t {
             libc::SIGQUIT,
             libc::SIGTERM,
             libc::SIGCHLD,
-            FREEBSD_NATIVE_EXIT_KICK_SIGNAL,
-            FREEBSD_NATIVE_EXIT_KICK_SIGNAL + 1,
+            NATIVE_EXIT_KICK_SIGNAL,
+            NATIVE_EXIT_KICK_SIGNAL + 1,
         ] {
             libc::sigaddset(&mut signals, signal);
         }
@@ -7434,9 +7453,17 @@ impl Drop for ExitState {
     }
 }
 
-// FreeBSD's fixed SIGRTMIN. The libc crate does not expose it on this target;
-// unlike glibc, FreeBSD reserves no leading RT signals for pthread internals.
-const FREEBSD_NATIVE_EXIT_KICK_SIGNAL: i32 = 65;
+// The non-restarting exit-kick signal, lane-selected (used as a PAIR with
+// `+1`). Neither BSD's libc reserves leading real-time signals for pthread
+// internals (a glibc-ism), so the pair is a free, non-colliding kick channel
+// the run loop delivers per-thread with `pthread_kill`. FreeBSD's SIGRTMIN is
+// 65; NetBSD's is 33, sourced from the NetBSD host crate's single definition
+// (`fault::NATIVE_EXIT_KICK_SIGNAL`) so it cannot drift from the value the
+// kick handler is installed on.
+#[cfg(target_os = "freebsd")]
+const NATIVE_EXIT_KICK_SIGNAL: i32 = 65;
+#[cfg(target_os = "netbsd")]
+const NATIVE_EXIT_KICK_SIGNAL: i32 = carrick_native_netbsd::NATIVE_EXIT_KICK_SIGNAL;
 
 /// Everything a guest thread needs that is SHARED across the whole run: the
 /// interior-mutable dispatcher, the thread registry + futex table, the loaded
@@ -7636,7 +7663,7 @@ impl SharedRun {
             drop(threads);
             for pthread in targets {
                 unsafe {
-                    libc::pthread_kill(pthread, FREEBSD_NATIVE_EXIT_KICK_SIGNAL);
+                    libc::pthread_kill(pthread, NATIVE_EXIT_KICK_SIGNAL);
                 }
             }
             threads = self.host_threads.lock().unwrap_or_else(|p| p.into_inner());
@@ -7671,7 +7698,7 @@ impl SharedRun {
                 .wait_for_terminal_retirement(owner, deadline, |targets| {
                     for pthread in targets {
                         unsafe {
-                            libc::pthread_kill(*pthread, FREEBSD_NATIVE_EXIT_KICK_SIGNAL);
+                            libc::pthread_kill(*pthread, NATIVE_EXIT_KICK_SIGNAL);
                         }
                     }
                 }) {
@@ -8250,7 +8277,7 @@ pub(crate) fn run_static_x86_elf_bytes(
         ));
     }
     if let Err(error) = fault::install_kick_redirect(
-        FREEBSD_NATIVE_EXIT_KICK_SIGNAL,
+        NATIVE_EXIT_KICK_SIGNAL,
         kick_stub_addr(),
         fault::KickRcxRecovery {
             active_offset: CTX_KICK_RESTORE_RCX as u32,
@@ -8319,7 +8346,7 @@ pub(crate) fn run_static_x86_elf_bytes(
     // Fork-shared cross-process futex waiter-count table, so a shared FUTEX_WAKE
     // can report how many waiters it woke (Linux semantics; native _umtx_op does
     // not). Pre-fork so every descendant maps the same physical pages.
-    carrick_native_freebsd::futex::init_shared_waiter_table();
+    futex::init_shared_waiter_table();
     // Act as the guest's PID-namespace init so an orphaned guest grandchild (its
     // middle parent exited) REPARENTS to this process instead of host init,
     // letting the guest's wait4(-1) reap it — pid_namespaces(7) "pid 1 reaps
@@ -10732,7 +10759,7 @@ fn service_syscall(
             crate::thread::set_current_thread_state(tid, 'S');
             let retval =
                 match with_host_wait_safe(&shared.executable_epoch, executable_registration, |_| {
-                    carrick_native_freebsd::futex::shared_wait(
+                    futex::shared_wait(
                         location.wait_addr().raw(),
                         location.waiter_key(),
                         value,
@@ -10773,7 +10800,7 @@ fn service_syscall(
             crate::thread::set_current_thread_state(tid, 'S');
             let retval =
                 match with_host_wait_safe(&shared.executable_epoch, executable_registration, |_| {
-                    carrick_native_freebsd::futex::shared_wait(
+                    futex::shared_wait(
                         location.wait_addr().raw(),
                         location.waiter_key(),
                         value,
@@ -10808,11 +10835,8 @@ fn service_syscall(
         DispatchOutcome::SharedFutexWake {
             location, count, ..
         } => {
-            let retval = carrick_native_freebsd::futex::shared_wake(
-                location.wait_addr().raw(),
-                location.waiter_key(),
-                count,
-            );
+            let retval =
+                futex::shared_wake(location.wait_addr().raw(), location.waiter_key(), count);
             snapshot.gpr[reg::RAX] = retval as u64;
             if let Some(sig) = run_pending_signals(
                 shared,
@@ -10838,7 +10862,7 @@ fn service_syscall(
             requeue,
             ..
         } => {
-            let (woken, moved) = carrick_native_freebsd::futex::shared_requeue(
+            let (woken, moved) = futex::shared_requeue(
                 from.wait_addr().raw(),
                 from.waiter_key(),
                 to.waiter_key(),
@@ -11921,7 +11945,7 @@ fn service_fork(
             |targets| {
                 for pthread in targets {
                     unsafe {
-                        libc::pthread_kill(*pthread, FREEBSD_NATIVE_EXIT_KICK_SIGNAL);
+                        libc::pthread_kill(*pthread, NATIVE_EXIT_KICK_SIGNAL);
                     }
                 }
             },
@@ -15642,8 +15666,8 @@ mod tests {
                 libc::SIGQUIT,
                 libc::SIGTERM,
                 libc::SIGCHLD,
-                FREEBSD_NATIVE_EXIT_KICK_SIGNAL,
-                FREEBSD_NATIVE_EXIT_KICK_SIGNAL + 1,
+                NATIVE_EXIT_KICK_SIGNAL,
+                NATIVE_EXIT_KICK_SIGNAL + 1,
             ];
             for signal in transport {
                 libc::sigaddset(&mut blocked, signal);

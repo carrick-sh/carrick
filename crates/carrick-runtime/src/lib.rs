@@ -152,10 +152,17 @@ pub(crate) mod native;
 // FreeBSD).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod native_darwin;
-// The FreeBSD/amd64 native (DSR) driver: executes a static x86_64 Linux ELF
-// through the carrick-dsr-x86 gateway and services its syscalls via the shared
-// SyscallDispatcher. Target-gated (the whole module is `cfg(freebsd, x86_64)`).
-#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+// The BSD/amd64 native (DSR) driver: executes a static x86_64 Linux ELF through
+// the carrick-dsr-x86 gateway and services its syscalls via the shared
+// SyscallDispatcher. Shared between the FreeBSD and NetBSD host lanes over a
+// bounded host-ops seam (`LaneHost`/`LaneHostJit` + `fault` + `futex`); the
+// filename stays `native_freebsd` this campaign for git-blame continuity (a
+// lane-neutral rename is a logged follow-on). Target-gated to
+// `cfg(any(freebsd, netbsd), x86_64)`.
+#[cfg(all(
+    any(target_os = "freebsd", target_os = "netbsd"),
+    target_arch = "x86_64"
+))]
 pub(crate) mod native_freebsd;
 // The native fork-child host self-exec capsule: plain POSIX (fork + execve +
 // current_exe + FD_CLOEXEC fd transport — no Mach dependency), so it compiles
@@ -1969,7 +1976,10 @@ pub mod host_signal {
         _thread_pending: carrick_signal_core::ThreadPendingForkGuard,
         /// Freezes the unregistered timer helper across its complete
         /// publish+kicker+futex critical section on the native FreeBSD lane.
-        #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(target_os = "freebsd", target_os = "netbsd"),
+            target_arch = "x86_64"
+        ))]
         _timer_delivery: crate::timer_delivery::TimerForkGuard,
     }
 
@@ -1977,7 +1987,10 @@ pub mod host_signal {
     /// immediately before `libc::fork()`; drop immediately after in both
     /// processes, strictly before any child-side signal reinit.
     pub fn hold_signal_locks_for_fork() -> SignalForkLocks {
-        #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(target_os = "freebsd", target_os = "netbsd"),
+            target_arch = "x86_64"
+        ))]
         loop {
             // Match the helper's real nesting: timer delivery owns its mutex
             // before pending publication and kicker/futex registry access.
@@ -1995,7 +2008,10 @@ pub mod host_signal {
             std::thread::yield_now();
         }
 
-        #[cfg(not(all(target_os = "freebsd", target_arch = "x86_64")))]
+        #[cfg(not(all(
+            any(target_os = "freebsd", target_os = "netbsd"),
+            target_arch = "x86_64"
+        )))]
         {
             let child_watch = carrick_signal_core::child_watch::hold_for_fork();
             let thread_pending = carrick_signal_core::hold_thread_pending_for_fork();
@@ -2009,7 +2025,10 @@ pub mod host_signal {
     /// Acquire the complete signal-static fork bundle without an unbounded
     /// mutex wait. This is fork-path-only retry work; ordinary signal and
     /// syscall paths retain their existing single-lock fast path.
-    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_os = "freebsd", target_os = "netbsd"),
+        target_arch = "x86_64"
+    ))]
     pub fn try_hold_signal_locks_for_fork_until(
         deadline: std::time::Instant,
     ) -> Option<SignalForkLocks> {
@@ -2994,7 +3013,10 @@ pub mod timer_delivery {
     /// Opaque atfork guard for the real timer-delivery helper mutex. Holding it
     /// proves no unregistered timer thread can be inside the pending-signal,
     /// kicker-registry, or current-futex operations nested under `deliver`.
-    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_os = "freebsd", target_os = "netbsd"),
+        target_arch = "x86_64"
+    ))]
     pub struct TimerForkGuard {
         _delivery: std::sync::MutexGuard<'static, Option<Delivery>>,
     }
@@ -3003,7 +3025,10 @@ pub mod timer_delivery {
     /// bundle acquires this outer guard first, then try-acquires signal guards;
     /// any miss drops everything before retrying, matching `deliver`'s
     /// timer->pending lock order without an unbounded wait.
-    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_os = "freebsd", target_os = "netbsd"),
+        target_arch = "x86_64"
+    ))]
     pub fn try_hold_for_fork() -> Option<TimerForkGuard> {
         match cell().try_lock() {
             Ok(delivery) => Some(TimerForkGuard {
@@ -3018,7 +3043,10 @@ pub mod timer_delivery {
 
     /// Replace the inherited parent kicker after a native fork child installs
     /// its fresh current registry and futex table.
-    #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_os = "freebsd", target_os = "netbsd"),
+        target_arch = "x86_64"
+    ))]
     pub fn reset_after_fork_child(kicker: Arc<dyn carrick_hal::VcpuRegistry>, main_tid: ThreadId) {
         *lock() = Some(Delivery { kicker, main_tid });
     }
