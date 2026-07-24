@@ -2092,7 +2092,17 @@ fn regions_from_load_plan_with_shape(
     }
 }
 
-fn regions_from_load_plan_page_aligned(
+/// Build one page-aligned [`MemoryRegion`] per `PT_LOAD` segment of an
+/// already-biased [`LoadPlan`], with the segment's file bytes copied at their
+/// in-page offset and the surrounding page padding zero-filled. This is the
+/// ELF-*description* seam the native lanes drive their own host mapping from:
+/// each region carries `start`/`end`/`perms`/`bytes()` but performs **no** host
+/// `mmap` and resolves **no** `PT_INTERP`, so a caller that maps interpreters
+/// separately (FreeBSD's kernel-chosen-base loader) gets exactly the object's
+/// own segments. Machine-agnostic; the aarch64 boot path does not use the
+/// page-aligned shape (it uses `HvfMerged`), so exposing this leaves aarch64
+/// byte-identical.
+pub fn regions_from_load_plan_page_aligned(
     file: &[u8],
     plan: &LoadPlan,
     page_size: u64,
