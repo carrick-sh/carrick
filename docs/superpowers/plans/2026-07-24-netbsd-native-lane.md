@@ -45,11 +45,101 @@ Wake VM 201; sync current main. For EACH host primitive, characterize on the box
 
 - [ ] Implement + box unit test (fault → guest handler delivery). Commit `feat(netbsd): fault shim + kick transport`.
 
-## Task 3: Futex (mirror + lane dispatch)
+## Run-path scout verdict (2026-07-25, `e321f1ba`) + review corrections (`acae446e` review)
 
-**Files:** `carrick-native-netbsd/src/{futex.rs,waiter_key.rs}`, `crates/carrick-runtime/src/native_freebsd.rs`... — NO. NetBSD's run loop reuses the SAME native run path as FreeBSD (native_freebsd.rs is x86-lane, but the futex call sites reference `carrick_native_freebsd::futex` directly). The seam gap (Phase-3 Task-4 review): the four `SharedFutexWait/Wake/Requeue` call sites need LANE DISPATCH. Design the minimal dispatch (a small host-futex indirection selected by the same cfg as `HostNativeLane`, OR — better — factor the shared cross-lane futex indirection the Phase-3 Task-4 SharedFutexSyscall-precedent finding pointed at, if it fits sized-to-consumption). This is the one place NetBSD forces a shared-layer change (correctly — it's the seam completing). Scout the dispatch shape in Step 1; STOP if it needs speculative surface.
+The run-path sharing scout (`docs/superpowers/specs/2026-07-25-netbsd-runpath-sharing-scout.md`)
+inventoried native_freebsd.rs (15,784 ln, `#![cfg(all(freebsd,x86_64))]`). **Verdict:
+THESIS HOLDS — bounded host-glue, no run-loop LOGIC welded.** 4 shared-already / 9
+lane-dispatchable / **2 FreeBSD-welded** (both graceful: `procctl(PROC_REAP_ACQUIRE)`
+subreaper → red-list capability gap on NetBSD; TSC vDSO sysctl-names → `None` fallback).
+**No thread-spawn gap** — the guest-clone thread uses `std::thread::Builder` +
+`libc::pthread_kill` (native_freebsd.rs:7855/7696), portable; no `_lwp_create` needed.
 
-- [ ] Step 1: decide the futex lane-dispatch shape (mirror-module + cfg dispatch, or the SharedFutexSyscall-style shared trait). Step 2: implement `NetbsdSharedFutex` via SYS___futex (+ waiter-table only if Task-0 says SYS___futex needs it) + waiter_key (MAP_TRYFIXED). Step 3: wire the 4 call sites to dispatch by lane. Box test + fbsd box regression (the FreeBSD lane's futex must still pass — its own futex tests + the deflaked cross-fork test 12/12). Commit `feat(netbsd): cross-process futex + lane dispatch`.
+An adversarial review (verified against source) CONFIRMED the thesis but corrected three
+over-optimistic framings — folded into the tasks below:
+
+1. **[F1, highest] The inline TEST surface is FreeBSD-welded and un-inventoried.**
+   native_freebsd.rs has 119 `#[test]` fns; `mod identity_raw_range_tests`
+   (native_freebsd.rs:218, gated only `#[cfg(test)]`) imports
+   `carrick_native_freebsd::futex::{SYS_UMTX_OP, UMTX_OP_WAKE, waiter_parked_count}`
+   (225-227) and issues raw `SYS_UMTX_OP`/`UMTX_OP_WAKE` (517-524); another test uses
+   `libc::__error()` (11662, NetBSD is `__errno`). Flipping the file `#![cfg]` to
+   `any(freebsd,netbsd)` breaks `cargo test`/`--all-targets` on NetBSD. **Fix (Task 3a):**
+   gate the FreeBSD-welded inline test surface `#[cfg(all(test, target_os="freebsd"))]`.
+   The run loop's 119 unit tests stay FreeBSD-lane; NetBSD unit-test coverage of the shared
+   loop is a RED-LIST follow-on, not this campaign.
+2. **[F2] `carrick-native-netbsd` has NO `futex.rs` yet** (only fault/jit/lib). The
+   "futex module exists on both crates" claim was false; NetBSD futex is net-new (Task 3b),
+   mirroring the 4-fn symmetric API below.
+3. **[F3] `procctl` degradation is behavioral, not a pure no-op** — without it, guest
+   double-forked orphans reparent to host init (not guest-init), so guest `wait4` returns
+   ECHILD and the run loop's own subreaper bookkeeping (native_freebsd.rs:12093-12103,
+   getppid-reports-guest-init) goes stale. Red-list this behavior precisely. The kick is a
+   signal **pair** (`FREEBSD_NATIVE_EXIT_KICK_SIGNAL=65` and `+1`, at 6156-6157/15703-15704);
+   NetBSD's `NATIVE_EXIT_KICK_SIGNAL=33` needs `+1`=34 reserved too (both first-two-RT).
+
+**Box constraint:** Task 3a edits native_freebsd.rs while it is still freebsd-gated → it
+compiles only on FreeBSD in isolation. Because the FreeBSD box is contended (regression
+DEFERRED per maintainer), 3a+3b are authored as two logical commits but **verified as a
+stack on the NetBSD box** (VM 201) after 3b's cfg flip makes the file compile there; the
+FreeBSD-lane build+test+LTP regression gates **merge**, not authoring.
+
+## Task 3a: Host-ops seam + FreeBSD behind it + test-gating (behavior-preserving)
+
+**Files:** `crates/carrick-runtime/src/native_freebsd.rs`; `crates/carrick-dsr/src/lane.rs`
+(the `NativeHost` trait — add the 2 methods); `crates/carrick-native-freebsd/src/lib.rs`
+(FreeBSD impls of the 2 methods).
+
+- [ ] **Seam the host-primitive sites.** Introduce `type LaneHost = <HostNativeLane as
+  NativeLane>::Host` (or equivalent) and route the ~16 `MAP_EXCL`
+  (`FreebsdHost::exclusive_fixed_map_flag`), JIT (`active_host_jit`/`FreebsdHostJit` at
+  7175/8175/8275/8966/8995/9781), and waiter-key sites through it. Most are ALREADY behind
+  `NativeHost`/`NativeHostJit` trait methods — verify each is a mechanical alias swap; flag
+  any that isn't.
+- [ ] **Add 2 `NativeHost` methods** for the 2 welded services, FreeBSD impl only this task:
+  `become_guest_reaper()` (wraps `procctl(PROC_REAP_ACQUIRE)` at 8388) and
+  `vdso_tsc_calibration() -> Option<...>` (wraps the TSC sysctl block 6378-6462). Route the
+  two call sites through the trait. Default trait bodies: reaper = best-effort no-op returning
+  a "not-subreaper" indicator; tsc = `None`.
+- [ ] **Gate the FreeBSD-welded inline test surface** `#[cfg(all(test, target_os="freebsd"))]`
+  (F1): at minimum `mod identity_raw_range_tests` (218) and any `#[cfg(test)]` module
+  referencing `carrick_native_freebsd::futex::` internals or `libc::__error()`. On FreeBSD
+  this is a no-op (tests still compile+run); it prevents the NetBSD compile break in 3b.
+- [ ] Behavior-preserving on FreeBSD. Commit `refactor(native): host-ops seam behind
+  native_freebsd run loop`. FreeBSD-box build+test verification is DEFERRED (gates merge).
+
+## Task 3b: Re-gate to any(freebsd,netbsd) + NetBSD futex + dispatch
+
+**Files:** `crates/carrick-runtime/src/native_freebsd.rs` (the `#![cfg]` flip + module-alias
+`use` block + call-site path edits); new `crates/carrick-native-netbsd/src/futex.rs`;
+`carrick-native-netbsd/src/lib.rs` (export futex; impl the 2 `NativeHost` methods).
+
+- [ ] **NetBSD futex.rs** — mirror the FreeBSD symmetric production API via `SYS___futex`
+  (166): `pub fn init_shared_waiter_table()` → **no-op** (SYS___futex is Linux-shaped: native
+  woken-count + `FUTEX_CMP_REQUEUE`, so NO waiter-table workaround — per grounding doc);
+  `pub fn shared_wait(word: usize, waiter_key: usize, value: u32, timeout:
+  Option<Duration>, interrupted: &dyn Fn() -> bool) -> i64`;
+  `pub fn shared_wake(word: usize, waiter_key: usize, count: u32) -> i64`;
+  `pub fn shared_requeue(from_word: usize, from_key: usize, to_key: usize, wake_count: u32,
+  requeue_count: u32) -> (u32, u32)`. Clean-room: `SYS___futex` ABI from the box's
+  `/usr/include/sys/futex.h` + man page + `crates/carrick-vmm-nvmm/src/nvmm_futex.rs`
+  (in-repo art); the mremap-oracle pattern for any ABI question. Cross-process via the
+  MAP_SHARED word (grounding-doc-verified).
+- [ ] **Impl the 2 `NativeHost` methods on `NetbsdHost`**: `become_guest_reaper()` → the
+  graceful degradation (no procctl; document the ECHILD/getppid divergence, F3);
+  `vdso_tsc_calibration()` → `None` (NetBSD lacks the FreeBSD TSC sysctl names). Reserve
+  `NATIVE_EXIT_KICK_SIGNAL+1`=34 alongside 33 (F3 kick-pair).
+- [ ] **Re-gate + dispatch (atomic with the above):** flip native_freebsd.rs:26 `#![cfg]` to
+  `#![cfg(all(any(target_os="freebsd", target_os="netbsd"), target_arch="x86_64"))]`; replace
+  the 5 `carrick_native_freebsd::futex::` call sites (8379/10797/10838/10873/10903) with a
+  cfg-selected module alias (`use carrick_native_freebsd::futex;` on freebsd /
+  `use carrick_native_netbsd::futex;` on netbsd) + `futex::fn(...)`; same alias pattern for
+  the `fault` module + kick const. (Filename stays `native_freebsd.rs` this campaign for
+  git-blame continuity — rename to a neutral name is a logged follow-on.)
+- [ ] **Verify the 3a+3b stack on the NetBSD box** (VM 201): `LIBCLANG_PATH=/usr/pkg/lib
+  cargo build -p carrick-runtime` compiles; `carrick-native-netbsd` futex unit test
+  (cross-process wait/wake via MAP_SHARED word) passes. FreeBSD-lane regression DEFERRED
+  (gates merge). Commit `feat(netbsd): cross-process futex + re-gate run loop to any(freebsd,netbsd)`.
 
 ## Task 4: Wiring
 
@@ -69,4 +159,4 @@ Wake VM 201; sync current main. For EACH host primitive, characterize on the box
 
 ## Follow-on pointer
 
-The NetBSD red list becomes its own campaign (like the FreeBSD LTP ladders): kqueue EVFILT wiring, lwp/clone edge cases, signal/fork coherence, the futex-correctness items (futex_cmp_requeue) inherited from the shared lane. NetBSD reaching FreeBSD-parity is the follow-on goal.
+The NetBSD red list becomes its own campaign (like the FreeBSD LTP ladders): kqueue EVFILT wiring, lwp/clone edge cases, signal/fork coherence, the futex-correctness items (futex_cmp_requeue) inherited from the shared lane. NetBSD reaching FreeBSD-parity is the follow-on goal. **Named red-list carry-ins from the run-path review:** (F1) NetBSD lacks unit-test coverage of the shared run loop — the 119 native_freebsd.rs inline tests stay FreeBSD-gated; porting the OS-agnostic ones to run on NetBSD is a follow-on. (F3) `procctl` subreaper capability gap — guest double-forked orphans reparent to host init on NetBSD, so guest `wait4` of grandchildren returns ECHILD and getppid/subreaper bookkeeping (native_freebsd.rs:12093-12103) is stale; a NetBSD reap mechanism (or an accepted-limitation doc) is the follow-on. Rename `native_freebsd.rs` to a lane-neutral name (it now serves both BSDs) — deferred this campaign for git-blame continuity.
