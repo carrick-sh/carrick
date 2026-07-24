@@ -600,6 +600,7 @@ dependencies = [
 name = "carrick-native-freebsd"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-dsr",
  "libc",
  "tempfile",

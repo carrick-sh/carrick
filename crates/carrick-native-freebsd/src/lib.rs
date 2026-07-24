@@ -20,6 +20,7 @@
 #![cfg(target_os = "freebsd")]
 
 pub mod fault;
+pub mod futex;
 pub mod jit;
 mod waiter_key;
 
