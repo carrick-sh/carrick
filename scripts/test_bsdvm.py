@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -24,6 +25,49 @@ assert SPEC is not None and SPEC.loader is not None
 BSDVM = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = BSDVM
 SPEC.loader.exec_module(BSDVM)
+
+
+_HAVE_QEMU_IMG = shutil.which("qemu-img") is not None
+_needs_qemu_img = unittest.skipUnless(_HAVE_QEMU_IMG, "qemu-img not installed")
+
+
+def _mkqcow2(path: Path, size: str = "64M", backing: Path | None = None) -> Path:
+    """Create a REAL (tiny, sparse) qcow2 at `path`.
+
+    The golden-rotation tests deal in qcow2 backing-chain structure -- which
+    file references which -- so they have to operate on images qemu-img can
+    actually parse. A byte-blob stand-in cannot express a backing pointer at
+    all, and so cannot reproduce the 2026-07-25 corruption. These are
+    kilobytes on disk.
+    """
+    argv = ["qemu-img", "create", "-f", "qcow2"]
+    if backing is not None:
+        argv += ["-F", "qcow2", "-b", str(backing)]
+    argv += [str(path)]
+    if backing is None:
+        argv += [size]
+    subprocess.run(argv, check=True, capture_output=True)
+    return path
+
+
+def _img_info(path: Path) -> dict:
+    p = subprocess.run(
+        ["qemu-img", "info", "-f", "qcow2", "--output=json", str(path)],
+        check=True, capture_output=True, text=True,
+    )
+    return json.loads(p.stdout)
+
+
+def _virtual_size(path: Path) -> int:
+    return int(_img_info(path)["virtual-size"])
+
+
+def _backing_of(path: Path) -> str | None:
+    return _img_info(path).get("backing-filename")
+
+
+def _virtual_size_of_literal(size: str) -> int:
+    return int(size[:-1]) * {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}[size[-1]]
 
 
 class ConfigTests(unittest.TestCase):
@@ -727,28 +771,33 @@ class ProvisionOrchestrationTests(unittest.TestCase):
     filesystem operations run, against a tmpdir state root.
     """
 
+    # Distinct virtual sizes are how these tests tell one image from another
+    # after the renames: a qcow2's identity here is structural (its size and
+    # its backing pointer), not a byte blob.
+    BASE_SIZE = "64M"
+    OLD_GOLDEN_SIZE = "128M"
+
     @staticmethod
     def _fake_create_overlay(vm_name: str, name: str, backing: str) -> Path:
-        # Simpler than mocking subprocess.run's qemu-img argv shape: just
-        # materialize the overlay file the real create_overlay would have
-        # produced, so the real rename/unlink calls downstream have
-        # something real to operate on.
+        # A REAL overlay (see _mkqcow2): the rotation logic under test is
+        # about backing-chain structure, so the fixture has to have one.
         st = BSDVM.state_dir(vm_name)
         overlay = st / name
         if not overlay.exists():
-            overlay.write_bytes(b"work-product")
+            _mkqcow2(overlay, backing=st / backing)
         return overlay
 
+    @_needs_qemu_img
     def test_provision_force_success_rotates_golden_and_invalidates_overlays(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
                 vm_name = "freebsd-arm64"
                 st = BSDVM.state_dir(vm_name)
                 st.mkdir(parents=True)
-                (st / "base.qcow2").write_bytes(b"base")
-                (st / "golden.qcow2").write_bytes(b"old")
-                (st / "dev.qcow2").write_bytes(b"stale-dev")
-                (st / "gate-9.qcow2").write_bytes(b"stale-gate")
+                _mkqcow2(st / "base.qcow2", size=self.BASE_SIZE)
+                _mkqcow2(st / "golden.qcow2", size=self.OLD_GOLDEN_SIZE)
+                _mkqcow2(st / "dev.qcow2", backing=st / "golden.qcow2")
+                _mkqcow2(st / "gate-9.qcow2", backing=st / "golden.qcow2")
 
                 ns = mock.Mock(vm=vm_name, force=True)
                 with (
@@ -762,23 +811,40 @@ class ProvisionOrchestrationTests(unittest.TestCase):
                     rc = BSDVM.cmd_provision(ns)
                 self.assertEqual(rc, 0)
 
-                self.assertEqual((st / "golden.prev.qcow2").read_bytes(), b"old")
+                # The old golden was rotated aside intact (identified by its
+                # distinct virtual size), and the new golden is the work
+                # overlay -- still backed by base.qcow2, never by itself.
+                self.assertEqual(
+                    _virtual_size(st / "golden.prev.qcow2"),
+                    _virtual_size_of_literal(self.OLD_GOLDEN_SIZE),
+                )
                 self.assertTrue((st / "golden.qcow2").exists())
-                self.assertEqual((st / "golden.qcow2").read_bytes(), b"work-product")
+                self.assertEqual(
+                    Path(_backing_of(st / "golden.qcow2") or "").resolve(),
+                    (st / "base.qcow2").resolve(),
+                )
+                # And the published golden is openable end to end -- the check
+                # the 2026-07-25 incident had no equivalent of.
+                BSDVM._assert_openable(st / "golden.qcow2")
+                # dev.qcow2 is moved aside (a human's working disk), gate
+                # overlays are destroyed (machine scratch).
                 self.assertFalse((st / "dev.qcow2").exists())
+                stale = sorted(st.glob("dev.stale-*.qcow2"))
+                self.assertEqual(len(stale), 1, f"expected dev.qcow2 preserved aside, got {stale}")
                 self.assertFalse((st / "gate-9.qcow2").exists())
                 # ensure_dev_remote is called after the golden lands (never
                 # against the real repo's .git/config from this test).
                 ensure_remote.assert_called_once_with(BSDVM.VMS[vm_name])
 
+    @_needs_qemu_img
     def test_provision_failure_leaves_old_golden_untouched_and_stops_vm(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
                 vm_name = "freebsd-arm64"
                 st = BSDVM.state_dir(vm_name)
                 st.mkdir(parents=True)
-                (st / "base.qcow2").write_bytes(b"base")
-                (st / "golden.qcow2").write_bytes(b"old")
+                _mkqcow2(st / "base.qcow2", size=self.BASE_SIZE)
+                _mkqcow2(st / "golden.qcow2", size=self.OLD_GOLDEN_SIZE)
 
                 stop_calls: list[int] = []
                 ns = mock.Mock(vm=vm_name, force=True)
@@ -800,11 +866,17 @@ class ProvisionOrchestrationTests(unittest.TestCase):
                         BSDVM.cmd_provision(ns)
 
                 self.assertEqual(stop_calls, [12345])
-                self.assertEqual((st / "golden.qcow2").read_bytes(), b"old")
+                self.assertEqual(
+                    _virtual_size(st / "golden.qcow2"),
+                    _virtual_size_of_literal(self.OLD_GOLDEN_SIZE),
+                )
                 self.assertFalse((st / "golden.prev.qcow2").exists())
                 # The work overlay was created but never renamed onto golden.
                 self.assertTrue((st / "provision.qcow2").exists())
-                self.assertEqual((st / "provision.qcow2").read_bytes(), b"work-product")
+                self.assertEqual(
+                    Path(_backing_of(st / "provision.qcow2") or "").resolve(),
+                    (st / "base.qcow2").resolve(),
+                )
 
 
 class RunSerialProvisionLoginFallbackTests(unittest.TestCase):
@@ -837,9 +909,12 @@ class RunSerialProvisionLoginFallbackTests(unittest.TestCase):
                     received.append(conn.recv(64))  # sendline("") nudge
                     conn.sendall(b"# ")
                     # The function should now proceed into the provisioning
-                    # loop and send its first real command.
-                    received.append(conn.recv(4096))
-                    conn.sendall(b"# ")
+                    # loop and send its first real command, which it will only
+                    # consider done once a step sentinel carrying an exit
+                    # status comes back.
+                    received.append(conn.recv(8192))
+                    conn.sendall(b"__BSDVM_STEP_1_RC_0_END__\n# ")
+                    received.append(conn.recv(8192))  # the shutdown command
                     conn.close()
 
                 t = threading.Thread(target=server)
@@ -861,8 +936,10 @@ class RunSerialProvisionLoginFallbackTests(unittest.TestCase):
                     with (
                         mock.patch.object(BSDVM, "LOGIN_TIMEOUT_S", 0.4),
                         mock.patch.object(
-                            BSDVM, "provision_commands", return_value=[real_first_cmd]
+                            BSDVM, "provision_commands",
+                            return_value=[real_first_cmd, ("shutdown -p now", 5)],
                         ),
+                        mock.patch.object(BSDVM, "provision_postconditions", return_value=[]),
                         mock.patch.object(
                             BSDVM, "SerialConsole", side_effect=capturing_serial_console
                         ),
@@ -875,7 +952,11 @@ class RunSerialProvisionLoginFallbackTests(unittest.TestCase):
                     srv.close()
 
                 self.assertEqual(received[0], b"\n")  # sendline("") nudge
-                self.assertEqual(received[1], real_first_cmd[0].encode() + b"\n")
+                self.assertTrue(
+                    received[1].startswith(real_first_cmd[0].encode()),
+                    f"expected the real first command, got {received[1]!r}",
+                )
+                self.assertEqual(received[2], b"shutdown -p now\n")
 
 
 class ParseSymrefHeadTests(unittest.TestCase):
@@ -1784,6 +1865,621 @@ class CmdLadderTests(unittest.TestCase):
                 self.assertIn("no golden image", data["results"][0]["error"])
                 self.assertTrue(data["results"][1]["steps_ok"])
                 self.assertTrue(data["results"][1]["exit_ok"])
+
+
+def _recv_line(conn: socket.socket, timeout_s: float = 5.0) -> bytes:
+    """Read until a full newline-terminated line has arrived.
+
+    A single `recv` can return a partial line (or two coalesced ones), so the
+    scripted fake consoles below cannot assume one recv == one command.
+    """
+    conn.settimeout(timeout_s)
+    buf = b""
+    while b"\n" not in buf:
+        chunk = conn.recv(8192)
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+class _ScriptedConsole:
+    """A fake qemu serial chardev that replies to each received line from a
+    scripted list, recording everything it was sent.
+
+    `preload` is written the instant the client connects -- that is how the
+    stale-buffer scenarios below get junk sitting in the console buffer
+    BEFORE any command is issued.
+    """
+
+    def __init__(self, sock_path: Path, replies: list[bytes], preload: bytes = b"") -> None:
+        self.received: list[bytes] = []
+        self._replies = replies
+        self._preload = preload
+        self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._srv.bind(str(sock_path))
+        self._srv.listen(1)
+        self._conn: socket.socket | None = None
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        try:
+            conn, _ = self._srv.accept()
+        except OSError:
+            return
+        self._conn = conn
+        try:
+            if self._preload:
+                conn.sendall(self._preload)
+            for reply in self._replies:
+                line = _recv_line(conn)
+                if not line:
+                    return
+                self.received.append(line)
+                if reply:
+                    conn.sendall(reply)
+            # Stay connected so a client still waiting sees a timeout rather
+            # than an EOF (ConnectionError), which is a different failure.
+            with contextlib.suppress(OSError):
+                _recv_line(conn, timeout_s=3.0)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        self._thread.join(timeout=5)
+        for s in (self._conn, self._srv):
+            if s is not None:
+                with contextlib.suppress(OSError):
+                    s.close()
+
+
+def _sentinel(idx: int, rc: int) -> bytes:
+    """What a real guest shell emits when step `idx` exits with `rc`."""
+    return f"__BSDVM_STEP_{idx}_RC_{rc}_END__\r\n# ".encode()
+
+
+class ProvisionStepExitStatusTests(unittest.TestCase):
+    """`_run_step` must PROVE each provisioning command succeeded.
+
+    The 2026-07-25 refresh-golden incident was misread as a silent
+    provisioning no-op, and while the real cause turned out to be the golden
+    rotation, the investigation confirmed the tool genuinely could not tell
+    the two apart: `_run_serial_provision` waited for a shell PROMPT and
+    never for an exit status, so a command that failed instantly and a
+    command that worked produced identical, successful-looking runs. These
+    tests pin the exit-status contract that closes that.
+    """
+
+    @contextlib.contextmanager
+    def _console(self, replies: list[bytes], preload: bytes = b""):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                st = BSDVM.state_dir("freebsd-arm64")
+                st.mkdir(parents=True)
+                server = _ScriptedConsole(st / "serial.sock", replies, preload=preload)
+                con = BSDVM.SerialConsole(st / "serial.sock")
+                try:
+                    with mock.patch.object(BSDVM, "DRAIN_QUIET_S", 0.05):
+                        yield con, server
+                finally:
+                    con._sock.close()
+                    server.close()
+
+    def test_nonzero_exit_status_fails_provisioning(self) -> None:
+        with self._console([_sentinel(1, 1)]) as (con, server):
+            with self.assertRaises(SystemExit) as cm:
+                BSDVM._run_step(con, "freebsd-arm64", "pkg install -y llvm19", 5, 1)
+        msg = str(cm.exception)
+        self.assertIn("rc=1", msg)
+        self.assertIn("pkg install -y llvm19", msg)
+
+    def test_zero_exit_status_passes(self) -> None:
+        with self._console([_sentinel(1, 0)]) as (con, server):
+            BSDVM._run_step(con, "freebsd-arm64", "true", 5, 1)
+        self.assertTrue(server.received[0].startswith(b"true; echo "))
+
+    def test_stale_prompts_in_buffer_do_not_skip_the_command(self) -> None:
+        """A prompt already sitting in the buffer must not be mistaken for
+        this command's completion.
+
+        Under the old PROMPT-based wait, the preloaded prompts below would
+        have satisfied the expect immediately and the loop would have marched
+        on -- possibly without the command having run at all. Here the step
+        must still send its command AND still wait for that command's own
+        sentinel.
+        """
+        preload = b"\r\nsome banner text # \r\n# \r\n# "
+        with self._console([_sentinel(1, 0)], preload=preload) as (con, server):
+            BSDVM._run_step(con, "freebsd-arm64", "pkg bootstrap -f", 5, 1)
+        self.assertEqual(len(server.received), 1, "the command must actually be sent")
+        self.assertTrue(server.received[0].startswith(b"pkg bootstrap -f; echo "))
+
+    def test_stale_prompt_cannot_mask_a_failing_command(self) -> None:
+        # Same stale buffer, but the command genuinely fails: the stale
+        # prompts must not turn that into a pass.
+        preload = b"# \r\n# \r\n# "
+        with self._console([_sentinel(1, 127)], preload=preload) as (con, server):
+            with self.assertRaises(SystemExit) as cm:
+                BSDVM._run_step(con, "freebsd-arm64", "pkg install -y llvm19", 5, 1)
+        self.assertIn("rc=127", str(cm.exception))
+
+    def test_command_echo_is_not_mistaken_for_the_result(self) -> None:
+        """The serial tty echoes the command line back, and that echo contains
+        the sentinel with a LITERAL `$?` in it.
+
+        If the pattern did not require digits, this echo would match and every
+        step would "succeed" the instant it was sent -- the original bug,
+        reintroduced one layer down. So: reply with the echo alone and nothing
+        else, and require that the step does NOT accept it.
+        """
+        cmd = "pkg install -y llvm19"
+        echo_only = f'{cmd}; echo "__BSDVM_STEP_1_RC_$?_END__"\r\n'.encode()
+        with self._console([echo_only]) as (con, server):
+            with self.assertRaises(SystemExit) as cm:
+                BSDVM._run_step(con, "freebsd-arm64", cmd, 0.7, 1)
+        self.assertIn("never reported an exit status", str(cm.exception))
+
+    def test_sentinel_pattern_does_not_cross_match_between_steps(self) -> None:
+        # Step 1's pattern must not match step 10's sentinel (a plain
+        # `__BSDVM_STEP_1` prefix would).
+        self.assertIsNone(BSDVM._step_sentinel_re(1).search(b"__BSDVM_STEP_10_RC_0_END__"))
+        self.assertIsNotNone(BSDVM._step_sentinel_re(10).search(b"__BSDVM_STEP_10_RC_0_END__"))
+        # And a literal `$?` (the echo) never matches, at any index.
+        self.assertIsNone(BSDVM._step_sentinel_re(3).search(b"__BSDVM_STEP_3_RC_$?_END__"))
+
+    def test_expect_re_consumes_through_the_match(self) -> None:
+        # Leftovers from step N must not be able to satisfy step N+1.
+        with self._console([_sentinel(1, 0) + _sentinel(2, 0)]) as (con, server):
+            BSDVM._run_step(con, "freebsd-arm64", "true", 5, 1)
+            self.assertNotIn(b"__BSDVM_STEP_1_RC_", con._buf)
+
+
+class ProvisionPostconditionTests(unittest.TestCase):
+    """`refresh-golden` must refuse to rotate a golden whose toolchain is not
+    actually there. This is the check that would have caught the 2026-07-25
+    incident had provisioning genuinely no-opped, which is what it looked
+    like for the first several hours of the investigation.
+    """
+
+    def _install_packages(self, vm_name: str) -> set[str]:
+        """Package names on the install lines of the real provisioning data."""
+        pkgs: set[str] = set()
+        for cmd, _ in BSDVM.provision_commands(BSDVM.VMS[vm_name], "ssh-ed25519 AAAA test"):
+            for m in re.finditer(r"(?:pkg install -y|pkg_add -U)\s+([^|&;]+)", cmd):
+                pkgs.update(m.group(1).split())
+        return pkgs
+
+    def test_every_installed_package_has_a_postcondition_entry(self) -> None:
+        for vm_name, proofs in (
+            ("freebsd-arm64", BSDVM._FREEBSD_PKG_PROOFS),
+            ("netbsd-arm64", BSDVM._NETBSD_PKG_PROOFS),
+        ):
+            installed = self._install_packages(vm_name)
+            self.assertTrue(installed, f"{vm_name}: parsed no packages from the install lines")
+            missing = installed - set(proofs)
+            self.assertEqual(
+                missing, set(),
+                f"{vm_name}: package(s) {sorted(missing)} are installed by "
+                "provision_commands but have no post-condition proof -- add one to "
+                "the *_PKG_PROOFS table (None if genuinely optional), or a future "
+                "golden can ship without them and nothing will notice",
+            )
+
+    def test_postconditions_prove_the_libclang_path_the_env_prefix_pins(self) -> None:
+        """bindgen dlopens libclang via LIBCLANG_PATH; if the golden lacks it
+        the acceptance lane dies at build time. Prove the exact path the gate
+        will use, not merely that a package is registered.
+        """
+        for vm_name in ("freebsd-arm64", "netbsd-arm64"):
+            vm = BSDVM.VMS[vm_name]
+            m = re.search(r"LIBCLANG_PATH=(\S+?)[;\s]", vm.remote_env_prefix)
+            self.assertIsNotNone(m, f"{vm_name}: no LIBCLANG_PATH in remote_env_prefix")
+            libdir = m.group(1)
+            checks = " ; ".join(c for c, _ in BSDVM.provision_postconditions(vm))
+            self.assertIn(
+                f"{libdir}/libclang.so", checks,
+                f"{vm_name}: post-conditions must prove the libclang the gate loads",
+            )
+
+    def test_postconditions_prove_the_repo_and_ssh_key(self) -> None:
+        for vm_name in ("freebsd-arm64", "netbsd-arm64"):
+            checks = " ; ".join(
+                c for c, _ in BSDVM.provision_postconditions(BSDVM.VMS[vm_name])
+            )
+            self.assertIn("/root/carrick/.git", checks)
+            self.assertIn("authorized_keys", checks)
+
+    def test_provision_commands_end_with_shutdown(self) -> None:
+        # _run_serial_provision splices the post-conditions in ahead of the
+        # terminal shutdown, so that terminal position is a contract.
+        for vm_name in ("freebsd-arm64", "netbsd-arm64"):
+            cmds = BSDVM.provision_commands(BSDVM.VMS[vm_name], "ssh-ed25519 AAAA test")
+            self.assertTrue(cmds[-1][0].startswith("shutdown"))
+            self.assertEqual(
+                [c for c, _ in cmds if c.startswith("shutdown")], [cmds[-1][0]],
+                f"{vm_name}: exactly one shutdown, and it must be last",
+            )
+
+
+class RunSerialProvisionPostconditionOrderTests(unittest.TestCase):
+    """End-to-end over a scripted console: post-conditions run BEFORE the
+    guest powers off, and a failing one aborts the run with the shutdown
+    never sent -- so the caller's except-block stops the VM and the existing
+    golden is never rotated.
+    """
+
+    @contextlib.contextmanager
+    def _run(self, replies: list[bytes]):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm = BSDVM.VMS["freebsd-arm64"]
+                st = BSDVM.state_dir(vm.name)
+                st.mkdir(parents=True)
+                # login handshake ("root") then the scripted step replies
+                server = _ScriptedConsole(st / "serial.sock", [b"# "] + replies, preload=b"login: ")
+                created: list[BSDVM.SerialConsole] = []
+                real_ctor = BSDVM.SerialConsole
+
+                def capturing(sock_path_arg):
+                    con = real_ctor(sock_path_arg)
+                    created.append(con)
+                    return con
+
+                try:
+                    with (
+                        mock.patch.object(BSDVM, "DRAIN_QUIET_S", 0.05),
+                        mock.patch.object(BSDVM, "SerialConsole", side_effect=capturing),
+                        mock.patch.object(
+                            BSDVM, "provision_commands",
+                            return_value=[("install-everything", 5), ("shutdown -p now", 5)],
+                        ),
+                        mock.patch.object(
+                            BSDVM, "provision_postconditions",
+                            return_value=[("prove-llvm", 5), ("prove-rust", 5)],
+                        ),
+                    ):
+                        yield vm, server
+                finally:
+                    for con in created:
+                        con._sock.close()
+                    server.close()
+
+    def test_postconditions_run_between_provisioning_and_shutdown(self) -> None:
+        replies = [_sentinel(1, 0), _sentinel(2, 0), _sentinel(3, 0), b""]
+        with self._run(replies) as (vm, server):
+            BSDVM._run_serial_provision(vm, "ssh-ed25519 AAAA test")
+        sent = [line.split(b";")[0].strip() for line in server.received]
+        self.assertEqual(
+            sent,
+            [b"root", b"install-everything", b"prove-llvm", b"prove-rust", b"shutdown -p now"],
+        )
+
+    def test_failing_postcondition_aborts_before_shutdown_is_sent(self) -> None:
+        # Provisioning "succeeds", but the toolchain it was supposed to
+        # install is not there. The run must die, and the guest must NOT be
+        # powered off behind a success message.
+        replies = [_sentinel(1, 0), _sentinel(2, 1), b""]
+        with self._run(replies) as (vm, server):
+            with self.assertRaises(SystemExit) as cm:
+                BSDVM._run_serial_provision(vm, "ssh-ed25519 AAAA test")
+            self.assertIn("rc=1", str(cm.exception))
+            self.assertIn("prove-llvm", str(cm.exception))
+            sent = [line.split(b";")[0].strip() for line in server.received]
+        self.assertNotIn(b"shutdown -p now", sent)
+
+
+@_needs_qemu_img
+class GoldenPublishGuardTests(unittest.TestCase):
+    """The 2026-07-25 corruption, reproduced against real qemu-img, and the
+    guards that now refuse to publish it.
+
+    Reproduction is the OLD `cmd_refresh_golden` sequence exactly: flatten,
+    rotate, stack a provision overlay on the flattened golden, unlink that
+    golden, rename the overlay onto it. The result is a qcow2 whose backing
+    file is its own path.
+    """
+
+    @staticmethod
+    def _corrupt_golden(st: Path) -> Path:
+        _mkqcow2(st / "base.qcow2")
+        _mkqcow2(st / "golden.qcow2", backing=st / "base.qcow2")
+        subprocess.run(
+            ["qemu-img", "convert", "-O", "qcow2",
+             str(st / "golden.qcow2"), str(st / "golden.flat.qcow2")],
+            check=True, capture_output=True,
+        )
+        (st / "golden.qcow2").rename(st / "golden.prev.qcow2")
+        (st / "golden.flat.qcow2").rename(st / "golden.qcow2")
+        _mkqcow2(st / "provision.qcow2", backing=st / "golden.qcow2")
+        (st / "golden.qcow2").unlink()               # the bug
+        (st / "provision.qcow2").rename(st / "golden.qcow2")  # the bug
+        return st / "golden.qcow2"
+
+    def test_the_corruption_reproduces_and_is_consumer_fatal(self) -> None:
+        # Pins that this really is the failure mode -- if a future qemu-img
+        # stops exploding here, the guards below are still right but this
+        # test's premise needs revisiting.
+        with tempfile.TemporaryDirectory() as td:
+            st = Path(td)
+            golden = self._corrupt_golden(st)
+            self.assertEqual(
+                Path(_img_info(golden)["backing-filename"]).resolve(), golden.resolve()
+            )
+            # Creating a consumer overlay on it (what `up`, `gate` and
+            # `ladder` all do) does not fail cleanly: qemu-img recurses the
+            # backing chain until it dies of stack exhaustion. Measured
+            # unbounded it takes ~67s to reach SIGSEGV (rc=139) -- far too
+            # slow for a unit suite -- so bound it and accept "did not
+            # succeed", timeout included, as the property under test.
+            try:
+                made = subprocess.run(
+                    ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
+                     "-b", str(golden), str(st / "dev.qcow2")],
+                    capture_output=True, timeout=5,
+                )
+            except subprocess.TimeoutExpired:
+                return
+            self.assertNotEqual(made.returncode, 0, "a self-backed golden must not be usable")
+
+    def test_assert_publishable_refuses_a_candidate_backed_by_its_destination(self) -> None:
+        # The guard runs BEFORE the rename, which is the only point at which
+        # the corruption is both detectable and still harmless.
+        with tempfile.TemporaryDirectory() as td:
+            st = Path(td)
+            _mkqcow2(st / "base.qcow2")
+            _mkqcow2(st / "golden.qcow2", backing=st / "base.qcow2")
+            _mkqcow2(st / "provision.qcow2", backing=st / "golden.qcow2")
+            with self.assertRaises(SystemExit) as cm:
+                BSDVM._assert_publishable(st / "provision.qcow2", st / "golden.qcow2")
+            self.assertIn("reference itself", str(cm.exception))
+
+    def test_assert_publishable_allows_a_legitimately_backed_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            st = Path(td)
+            _mkqcow2(st / "base.qcow2")
+            _mkqcow2(st / "provision.qcow2", backing=st / "base.qcow2")
+            BSDVM._assert_publishable(st / "provision.qcow2", st / "golden.qcow2")
+
+    def test_assert_publishable_allows_a_standalone_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            st = Path(td)
+            _mkqcow2(st / "golden.new.qcow2")
+            BSDVM._assert_publishable(st / "golden.new.qcow2", st / "golden.qcow2")
+
+    def test_assert_publishable_refuses_a_non_qcow2_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            st = Path(td)
+            (st / "provision.qcow2").write_bytes(b"truncated-or-garbage")
+            with self.assertRaises(SystemExit) as cm:
+                BSDVM._assert_publishable(st / "provision.qcow2", st / "golden.qcow2")
+            self.assertIn("cannot open it as qcow2", str(cm.exception))
+
+    def test_assert_openable_rejects_a_self_referential_image_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            golden = self._corrupt_golden(Path(td))
+            with self.assertRaises(SystemExit):
+                BSDVM._assert_openable(golden)
+
+
+@_needs_qemu_img
+class RefreshGoldenOrchestrationTests(unittest.TestCase):
+    """`cmd_refresh_golden`'s rotation, which had ZERO coverage when it
+    corrupted the freebsd-arm64 golden on 2026-07-25.
+
+    All VM boundaries are mocked; the qcow2 files are real, because backing
+    chain structure is precisely what went wrong.
+    """
+
+    OLD_GOLDEN_SIZE = "128M"
+
+    @staticmethod
+    def _fake_create_overlay(vm_name: str, name: str, backing: str) -> Path:
+        st = BSDVM.state_dir(vm_name)
+        overlay = st / name
+        if not overlay.exists():
+            _mkqcow2(overlay, backing=st / backing)
+        return overlay
+
+    @contextlib.contextmanager
+    def _fixture(self, provision_side_effect=None):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                vm_name = "freebsd-arm64"
+                st = BSDVM.state_dir(vm_name)
+                st.mkdir(parents=True)
+                _mkqcow2(st / "base.qcow2")
+                _mkqcow2(st / "golden.qcow2", size=self.OLD_GOLDEN_SIZE)
+                _mkqcow2(st / "dev.qcow2", backing=st / "golden.qcow2")
+                with (
+                    mock.patch.object(BSDVM, "boot", return_value=None),
+                    mock.patch.object(
+                        BSDVM, "_run_serial_provision",
+                        side_effect=provision_side_effect, return_value=None,
+                    ),
+                    mock.patch.object(BSDVM, "wait_for_shutdown", return_value=None),
+                    mock.patch.object(BSDVM, "read_pubkey", return_value="ssh-ed25519 AAAA test"),
+                    mock.patch.object(
+                        BSDVM, "create_overlay", side_effect=self._fake_create_overlay
+                    ),
+                    mock.patch.object(BSDVM, "ensure_dev_remote"),
+                    mock.patch.object(BSDVM, "read_pid", return_value=None),
+                ):
+                    yield st, mock.Mock(vm=vm_name)
+
+    def test_refresh_publishes_a_standalone_openable_golden(self) -> None:
+        with self._fixture() as (st, ns):
+            rc = BSDVM.cmd_refresh_golden(ns)
+            self.assertEqual(rc, 0)
+            golden = st / "golden.qcow2"
+            # Standalone: the flatten happens at the END, into a third name,
+            # so the published golden chains onto nothing at all -- it cannot
+            # reference itself and does not even depend on base.qcow2.
+            self.assertIsNone(_backing_of(golden))
+            BSDVM._assert_openable(golden)
+            # The property that actually broke: a consumer overlay can be made.
+            made = subprocess.run(
+                ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
+                 "-b", str(golden), str(st / "consumer.qcow2")],
+                capture_output=True,
+            )
+            self.assertEqual(made.returncode, 0, made.stderr.decode(errors="replace"))
+            # Scratch is cleaned up.
+            self.assertFalse((st / "provision.qcow2").exists())
+            self.assertFalse((st / "golden.new.qcow2").exists())
+            self.assertFalse((st / "golden.flat.qcow2").exists())
+
+    def test_refresh_rotates_the_old_golden_by_rename_never_unlink(self) -> None:
+        """`golden.prev.qcow2` must be the SAME FILE the refresh started with.
+
+        Comparing inode numbers is the point: the old code destroyed a full
+        disk image with `golden.unlink()` while an overlay still referenced
+        it. A rename preserves the inode; an unlink-and-recreate cannot.
+        """
+        with self._fixture() as (st, ns):
+            before_ino = (st / "golden.qcow2").stat().st_ino
+            rc = BSDVM.cmd_refresh_golden(ns)
+            self.assertEqual(rc, 0)
+            prev = st / "golden.prev.qcow2"
+            self.assertTrue(prev.exists(), "the only rollback must survive the refresh")
+            self.assertEqual(prev.stat().st_ino, before_ino)
+            self.assertEqual(_virtual_size(prev), _virtual_size_of_literal(self.OLD_GOLDEN_SIZE))
+
+    def test_refresh_keeps_the_golden_in_place_while_provisioning_on_top_of_it(self) -> None:
+        """Nothing may unlink the image the provision overlay is stacked on.
+
+        This is the incident's mechanism stated directly. The old code stacked
+        `work` on a freshly flattened golden.qcow2 and then ran
+        `golden.unlink()` -- destroying that full disk image while `work`'s
+        header still named it, which is what turned the rename into a
+        self-reference. So: note the inode of the overlay's backing file
+        during provisioning, and require that the very same inode is still
+        present on disk when the command returns.
+        """
+        seen: list[tuple[int, str | None]] = []
+
+        def during_provision(vm, pubkey):
+            st = BSDVM.state_dir(vm.name)
+            golden = st / "golden.qcow2"
+            work = st / "provision.qcow2"
+            self.assertTrue(golden.exists(), "golden.qcow2 vanished mid-provision")
+            seen.append((golden.stat().st_ino, _backing_of(work)))
+
+        with self._fixture(provision_side_effect=during_provision) as (st, ns):
+            BSDVM.cmd_refresh_golden(ns)
+            self.assertEqual(len(seen), 1)
+            backing_ino, work_backing = seen[0]
+            self.assertEqual(
+                Path(work_backing or "").resolve(), (st / "golden.qcow2").resolve(),
+                "the work overlay must be stacked on golden.qcow2",
+            )
+            survivors = {p.stat().st_ino for p in st.iterdir() if p.is_file()}
+            self.assertIn(
+                backing_ino, survivors,
+                "the image the provision overlay was stacked on was UNLINKED during "
+                "the refresh -- that is the 2026-07-25 corruption's mechanism",
+            )
+
+    def test_refresh_failure_leaves_the_existing_golden_untouched(self) -> None:
+        with self._fixture(provision_side_effect=RuntimeError("provisioning boom")) as (st, ns):
+            with self.assertRaises(RuntimeError):
+                BSDVM.cmd_refresh_golden(ns)
+            # The golden is still the original, still openable, still usable.
+            self.assertEqual(
+                _virtual_size(st / "golden.qcow2"),
+                _virtual_size_of_literal(self.OLD_GOLDEN_SIZE),
+            )
+            BSDVM._assert_openable(st / "golden.qcow2")
+            self.assertFalse((st / "golden.prev.qcow2").exists())
+            # And the human's working overlay is untouched on a failed run.
+            self.assertTrue((st / "dev.qcow2").exists())
+
+    def test_refresh_moves_the_dev_overlay_aside_rather_than_destroying_it(self) -> None:
+        # The incident deleted a dev.qcow2 carrying a hand-installed
+        # toolchain. Invalidation is still mandatory (its backing changed
+        # underneath it), but it must not be destructive.
+        with self._fixture() as (st, ns):
+            BSDVM.cmd_refresh_golden(ns)
+            self.assertFalse((st / "dev.qcow2").exists())
+            stale = sorted(st.glob("dev.stale-*.qcow2"))
+            self.assertEqual(len(stale), 1, f"expected the dev overlay kept aside, got {stale}")
+
+    def test_refresh_without_a_golden_is_refused(self) -> None:
+        with self._fixture() as (st, ns):
+            (st / "golden.qcow2").unlink()
+            with self.assertRaises(SystemExit) as cm:
+                BSDVM.cmd_refresh_golden(ns)
+            self.assertIn("nothing to refresh", str(cm.exception))
+
+
+class GracefulPoweroffTests(unittest.TestCase):
+    """`down` must ask the guest to power itself off before cutting power.
+
+    `stop_pid` signals QEMU, not the guest -- a hard power cut. NetBSD does
+    not survive one: its root FFS comes back dirty and the next boot aborts
+    in fsck (`UNEXPECTED INCONSISTENCY; RUN fsck_ffs MANUALLY`). Measured
+    2026-07-25, when a single up/down cycle destroyed a freshly created
+    netbsd-arm64 dev.qcow2.
+    """
+
+    def _down(self, *, pids: list[int | None], ssh=None):
+        """Run cmd_down with read_pid scripted, returning the stop_pid calls."""
+        stop_calls: list[int] = []
+        ssh = ssh if ssh is not None else mock.DEFAULT
+        with (
+            mock.patch.object(BSDVM, "POWEROFF_TIMEOUT_S", 0.3),
+            mock.patch.object(BSDVM, "read_pid", side_effect=pids),
+            mock.patch.object(BSDVM, "ssh_run", side_effect=ssh) as ssh_mock,
+            mock.patch.object(BSDVM, "stop_pid", side_effect=stop_calls.append),
+            mock.patch.object(BSDVM, "pidfile_path", return_value=Path("/nonexistent/qemu.pid")),
+        ):
+            rc = BSDVM.cmd_down(mock.Mock(vm="netbsd-arm64"))
+        return rc, stop_calls, ssh_mock
+
+    def test_down_asks_the_guest_to_power_off_and_does_not_pull_the_plug(self) -> None:
+        # read_pid: once for cmd_down's "is it running", then gone -- the
+        # guest powered itself off.
+        rc, stop_calls, ssh_mock = self._down(
+            pids=[4242, None], ssh=lambda *a, **k: subprocess.CompletedProcess([], 0, "", "")
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(stop_calls, [], "the plug must not be pulled on a clean poweroff")
+        sent = ssh_mock.call_args[0][1]
+        self.assertIn("shutdown -p now", sent)
+
+    def test_down_pulls_the_plug_when_the_guest_ignores_the_request(self) -> None:
+        rc, stop_calls, _ = self._down(
+            pids=[4242] + [4242] * 40,
+            ssh=lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""),
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(stop_calls, [4242], "a guest that will not power off must still be stopped")
+
+    def test_down_pulls_the_plug_when_ssh_is_unreachable(self) -> None:
+        # A guest still booting (or wedged) has no ssh route; falling back is
+        # no worse than the old unconditional behaviour.
+        rc, stop_calls, _ = self._down(
+            pids=[4242] + [4242] * 40,
+            ssh=subprocess.TimeoutExpired(cmd="ssh", timeout=30),
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(stop_calls, [4242])
+
+    def test_down_on_a_stopped_vm_does_nothing(self) -> None:
+        rc, stop_calls, ssh_mock = self._down(pids=[None])
+        self.assertEqual(rc, 0)
+        self.assertEqual(stop_calls, [])
+        ssh_mock.assert_not_called()
+
+    def test_graceful_poweroff_reports_failure_without_raising(self) -> None:
+        with (
+            mock.patch.object(BSDVM, "POWEROFF_TIMEOUT_S", 0.2),
+            mock.patch.object(BSDVM, "read_pid", return_value=999),
+            mock.patch.object(
+                BSDVM, "ssh_run", side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=30)
+            ),
+        ):
+            self.assertFalse(BSDVM.graceful_poweroff(BSDVM.VMS["netbsd-arm64"]))
 
 
 if __name__ == "__main__":
