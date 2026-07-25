@@ -1641,6 +1641,44 @@ pub mod runtime {
         )
     }
 
+    /// No VMM OCI engine exists for this (platform feature, host arch) pair.
+    ///
+    /// The four arms above are each `all(feature, target_arch)`, but the sole
+    /// caller — `execute::Runtime::execute` — is gated on the platform feature
+    /// ALONE, and it cannot be `cfg`'d away: `Runtime::execute` is the CLI's
+    /// platform-agnostic run seam, named from three un-gated call sites in
+    /// `carrick-cli` (`commands.rs`, `lifecycle.rs` ×2). So on a host arch with
+    /// no engine — the aarch64 BSD lanes, which run the native (no-VMM)
+    /// backend rather than a guest VM — the caller would fail to resolve.
+    /// Answer with an explicit runtime refusal instead of an unresolved name.
+    ///
+    /// The predicate is the exact set-union of the four arms above, negated,
+    /// so under every configuration that builds today (linux+aarch64,
+    /// linux+x86_64, freebsd+x86_64, netbsd+x86_64) this item is `cfg`'d out
+    /// and the emitted code is byte-identical. Keeping the predicate in ONE
+    /// place is drift-safe in the fail-closed direction: adding a fifth engine
+    /// arm without widening the negation is a duplicate-definition COMPILE
+    /// error, not a silently-shadowed wrong path.
+    ///
+    /// TODO(aarch64-bsd T5): route this to the native lane
+    /// (`crate::native::run_oci_native`) once the aarch64 BSD lanes land.
+    #[cfg(not(any(
+        all(
+            feature = "platform-linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            any(feature = "platform-freebsd", feature = "platform-netbsd"),
+            target_arch = "x86_64"
+        ),
+    )))]
+    pub fn run_oci(spec: &carrick_spec::RunSpec) -> Result<RunResult, RuntimeError> {
+        let _ = spec;
+        Err(RuntimeError::Unsupported(
+            "no VMM OCI engine is built for this host architecture".to_string(),
+        ))
+    }
+
     /// Phase 5 entry helper: run an OCI container under KVM. The macOS sibling
     /// of this is `Runtime::execute`'s `FsBackendKind::Host` path (execute.rs):
     /// extract the image layers onto a scratch rootfs, root the dispatcher there,
