@@ -157,6 +157,71 @@ The verdict is a tool, not the truth. Each of these has burned us:
   (e.g. a clone-thread racing a 40s deadline), run it 3× before believing either
   a MATCH or a DIFF.
 
+## Get Linux syscall ground truth: `bpftrace` INSIDE the oracle
+
+Use `bpftrace` inside the Docker oracle for Linux syscall shape — this is a
+strict requirement. The LTP container already ships it (validated as
+`bpftrace v0.20.2`); use that in-container copy, not a host-side tracer. Do
+**not** use guest `strace` for Linux-in-Docker syscall evidence: it perturbs
+test behaviour and is not accepted as Docker-oracle syscall evidence.
+
+Run it in a separate Docker-only phase (never alongside carrick), with
+privileges and tracefs mounted inside the container. Validate the tool before
+trusting a trace:
+
+```sh
+docker run --rm --privileged --pid=host localhost:5050/ltp:arm64 sh -lc \
+  'mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true; bpftrace -V; bpftrace -e "BEGIN { printf(\"ok\\n\"); exit(); }"'
+```
+
+Then trace the case with the same wrapper:
+
+```sh
+docker run --rm --privileged --pid=host localhost:5050/ltp:arm64 sh -lc \
+  'mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true; bpftrace -e "..." -c /opt/ltp/testcases/bin/<case>'
+```
+
+If `bpftrace -l 'tracepoint:syscalls:*'` says
+`/sys/kernel/tracing/available_events` is missing, the tracefs mount step was
+skipped.
+
+Keep the trace attached to the Linux oracle's semantics, not just to "what
+failed under carrick": Docker `mmap13` showed a shared file mapping past EOF is
+`SIGBUS`/`BUS_ADRERR`, while `mmap18`'s first cases pass because Linux grows the
+stack VMA before faulting.
+
+## Attribute a gate REGRESSION or CRASH before you fix it
+
+Don't assume a gate failure is your change. In order:
+
+1. **Reduce to a minimal fast reproducer first** — never iterate on the 5-minute
+   suite. A 90s repro turns each hypothesis into a tight loop.
+2. **Does Docker fail it too?** Then it isn't carrick's bug.
+3. **Does the pre-change binary fail it?**
+   `git checkout <pre-session> -- <the files your commits touched>`, rebuild
+   signed, re-run the repro. If it still fails, the bug predates your work (fix
+   forward anyway, but you've cleared yourself).
+4. **Check the suite's blessed baseline verdict.** A `carrick[Empty]`/TIMEOUT
+   gating a suite the baseline had *completing* is a flake or timeout-under-load,
+   not a content regression.
+5. **A load-probabilistic verdict makes a one-run-per-point bisect converge on
+   the WRONG commit.** Sample each bisect point ≥2×, check the report-only lanes
+   (gnu / amd64) for the same failure signature at "green" points, and suspect
+   the PROBE itself before the runtime: force the probe's race deterministic and
+   run that variant under the Docker oracle — if Linux fails it identically, the
+   probe is the bug.
+
+Two worked examples, both of which cost real time:
+
+- The `cpython-socket` gating crash was a pre-existing `sendfile`
+  partial-EAGAIN over-send, not that session's HVF work — proven by reproducing
+  it on the pre-session binary.
+- `expectcontinue` implicated a fd-ownership refactor via a clean
+  green/green/green/red bisect. The real defect was the probe's phase-local read
+  buffer dropping kernel-coalesced bytes: real Linux failed the forced-coalesce
+  variant identically, and the "green" stage-14 run's report-only gnu lane
+  already showed the same failure.
+
 ## Reduce: the focusing move
 
 A raw LTP failure is a poor goal — it drags in the framework, a fork tree, root

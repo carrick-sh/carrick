@@ -91,6 +91,56 @@ keeps one persistent `X86DsrContext` per host guest thread; the block loop calls
 context or move its embedded snapshot per entry. Snapshot cloning is reserved
 for the semantic Linux `clone` boundary, not ordinary translated execution.
 
+## FreeBSD/amd64: launch-time tracing and ground truth
+
+`carrick trace` targets the container/VMM run, not the bare in-process native
+runner, so use the tools below for the DSR lane. **Don't timeout-and-grep; get
+ground truth.** (Worked example: a real std Rust binary spun; these tools pinned
+it to a `jmp .` self-loop from an empty page-spanning `Continue` block in one
+pass, after hours of grep-guessing got nowhere.)
+
+`cargo run -p carrick-runtime --example native_run -- <elf>` is the standalone
+single-run driver to attach a debugger or tracer to (build with
+`--no-default-features --features platform-freebsd`). It registers the carrick
+USDT provider, so probes are live.
+
+For launch-time dtrace USDT — the event observability path, no env logging —
+probe names use HYPHENS: `carrick<PID>:::syscall-return`, not `syscall__return`.
+USDT probes register after process start, so use `-Z` and `-c` to launch and own
+the target for its whole lifetime. Guest syscall census:
+
+```sh
+dtrace -Zq -c "…/native_run <elf>" \
+  -n 'carrick*:::syscall-return { @[copyinstr(arg1)] = count(); } tick-3s { exit(0); }'
+```
+
+`syscall-entry` arg0 is the CANONICAL number post-normalization. The hard gate
+above still applies: never `dtrace -p`, pid-provider, or USDT fasttrap probes on
+a continuing native process.
+
+**gcore + disassemble the JIT.** `gcore -c core PID`, then:
+
+```sh
+lldb …/native_run -c core -o "register read rip r15" -o "disassemble -b -s \$rip"
+```
+
+lldb can't unwind the JIT frame yet, BUT the core holds the guest's **live**
+registers (the gateway loaded them into the real CPU) and the JIT bytes at `rip`
+are the translated guest instructions — disassembling them shows exactly what
+the guest is doing. NOTE: the core is ~34 GB (the 32 GiB mmap arena); export
+`CARRICK_MMAP_ARENA_GIB=1` to shrink it.
+
+**Make unhandled scenarios LOUD.** The driver's no-progress and unsupported
+paths print a breadcrumb (recent block VAs, the mapped segments, the raw guest
+bytes at the fault). Keep extending that to every unhandled path — a rich fault
+string beats a debugger round-trip. Never let a failure surface as an empty
+result a `grep` can hide.
+
+**TODO (unwind through the JIT):** teach the carrick lldb scripts to unwind the
+JIT→gateway→Rust frames (synthesize unwind info from the gateway's saved
+`host_rsp`/`host_callee` in the ctx at `%r15`), so `bt` reaches
+`run_static_x86_elf` and its locals (`next`, `image.segments`, the block cache).
+
 ## Darwin/arm64 first pass
 
 1. Build and sign with `just build`; verify with
