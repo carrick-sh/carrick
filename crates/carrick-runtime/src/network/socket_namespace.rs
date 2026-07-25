@@ -130,6 +130,33 @@ struct UdpReplyEndpoint {
     gateway_v4: Ipv4Addr,
 }
 
+/// What a published-port relay forwards to: the container endpoint it looks up,
+/// and the namespace that owns it.
+///
+/// The namespace travels with the endpoint because it is what decides whether a
+/// record found at that path is this container's -- see [`RecordTrust`]. It is
+/// taken from the relay's own lease's spec at `publish_port` time, i.e. in the
+/// root process before any guest fork, so it is the same value every fork child
+/// stamps onto the records it publishes.
+#[derive(Debug, Clone)]
+struct RelayTarget {
+    endpoint: VirtualEndpoint,
+    namespace_id: Option<NetworkNamespaceId>,
+}
+
+impl RelayTarget {
+    /// A relay with no namespace of its own can make no ownership claim, so it
+    /// narrows nothing. Such a spec cannot register an endpoint in the first
+    /// place (`materialize_bridge_bind` and `prepare_tcp_listen` both require the
+    /// id), so it has no records to protect.
+    fn trust(&self) -> RecordTrust<'_> {
+        match self.namespace_id.as_ref() {
+            Some(namespace_id) => RecordTrust::OwnNamespaceOnly(namespace_id),
+            None => RecordTrust::AnyNamespace,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct BridgeHelperForkState {
     fork_gate: Arc<Mutex<()>>,
@@ -341,9 +368,9 @@ impl SocketNamespaceProvider {
         registry.insert(key.clone(), host_addr);
         drop(registry);
         if let Some(lease_id) = self.lease_for_namespace(&namespace_id)? {
-            self.write_endpoint_file_for_lease(lease_id, &key, host_addr)?;
+            self.write_endpoint_file_for_lease(lease_id, &key, Some(&namespace_id), host_addr)?;
         } else {
-            self.write_endpoint_file(&key, host_addr)?;
+            self.write_endpoint_file(&key, Some(&namespace_id), host_addr)?;
         }
         Ok(())
     }
@@ -828,10 +855,13 @@ impl SocketNamespaceProvider {
             IpAddr::V4(spec.ipv4),
             mapping.container_port,
         ));
-        let target = VirtualEndpoint {
-            scope: bridge_scope(spec.bridge_id, spec.namespace_id.as_ref(), target_addr),
-            addr: target_addr,
-            protocol: PortProtocol::Tcp,
+        let target = RelayTarget {
+            endpoint: VirtualEndpoint {
+                scope: bridge_scope(spec.bridge_id, spec.namespace_id.as_ref(), target_addr),
+                addr: target_addr,
+                protocol: PortProtocol::Tcp,
+            },
+            namespace_id: spec.namespace_id,
         };
         let fork_state = BridgeHelperForkState {
             fork_gate: Arc::clone(&self.fork_gate),
@@ -894,14 +924,17 @@ impl SocketNamespaceProvider {
             IpAddr::V4(spec.ipv4),
             mapping.container_port,
         ));
-        let target = VirtualEndpoint {
-            scope: bridge_scope(
-                spec.bridge_id.clone(),
-                spec.namespace_id.as_ref(),
-                target_addr,
-            ),
-            addr: target_addr,
-            protocol: PortProtocol::Udp,
+        let target = RelayTarget {
+            endpoint: VirtualEndpoint {
+                scope: bridge_scope(
+                    spec.bridge_id.clone(),
+                    spec.namespace_id.as_ref(),
+                    target_addr,
+                ),
+                addr: target_addr,
+                protocol: PortProtocol::Udp,
+            },
+            namespace_id: spec.namespace_id.clone(),
         };
         // `bridge_realm` ignores the port, so deriving the reply realm once
         // here, from the gateway address, is exact for every datagram.
@@ -951,18 +984,26 @@ impl SocketNamespaceProvider {
     fn write_endpoint_file(
         &self,
         endpoint: &VirtualEndpoint,
+        namespace_id: Option<&NetworkNamespaceId>,
         host_addr: HostSocketAddr,
     ) -> Result<(), String> {
-        self.write_endpoint_file_for_lease(NetworkLeaseId(0), endpoint, host_addr)
+        self.write_endpoint_file_for_lease(NetworkLeaseId(0), endpoint, namespace_id, host_addr)
     }
 
     fn write_endpoint_file_for_lease(
         &self,
         lease_id: NetworkLeaseId,
         endpoint: &VirtualEndpoint,
+        namespace_id: Option<&NetworkNamespaceId>,
         host_addr: HostSocketAddr,
     ) -> Result<(), String> {
-        let paths = write_endpoint_file(&self.fork_gate, &self.endpoint_dir, endpoint, host_addr)?;
+        let paths = write_endpoint_file(
+            &self.fork_gate,
+            &self.endpoint_dir,
+            endpoint,
+            namespace_id,
+            host_addr,
+        )?;
         let mut owned = self
             .owned_endpoint_files
             .lock()
@@ -1602,16 +1643,17 @@ fn encode_listener_reservation(reservation: ListenerReservation) -> String {
 
 /// This process's identity, minted once and inherited across `fork`.
 ///
-/// It is process-global rather than per-provider on purpose: a fork child must
-/// compare *equal* to its parent (it publishes into the same namespace and the
-/// parent's relay has to accept what it wrote), and two providers constructed in
-/// one process stand in for exactly that relationship in the tests. Forcing it
-/// from `SocketNamespaceProvider::new` -- which runs before the guest boots --
-/// means the value is already set when `fork()` copies this memory, so no child
-/// ever mints a different one.
+/// **Diagnostic only — nothing is admitted or refused on it.** Record ownership
+/// is decided by `ns=` (see [`RecordTrust`]), because the namespace is the real
+/// boundary: `carrick exec` runs as a separate *process* that legitimately
+/// shares its container's namespace. What this adds over `pid=` is that a pid is
+/// reused by the OS, so mixing in a monotonic timestamp lets a human reading a
+/// record (or an `NSREJECT` ring entry) tell a recycled pid's stale record from
+/// a live one, and tell one process family's publications from another's.
 ///
-/// The pid alone would be reused by the OS; mixing in a monotonic timestamp
-/// makes a stale record of a recycled pid distinguishable from a live one.
+/// It is process-global rather than per-provider so a fork child compares equal
+/// to its parent, and forcing it from `SocketNamespaceProvider::new` -- before
+/// the guest boots -- means the value is already set when `fork()` copies it.
 fn instance_id() -> u128 {
     static INSTANCE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
     *INSTANCE.get_or_init(|| {
@@ -1639,11 +1681,31 @@ fn record_key(endpoint_dir: &Path, path: &Path) -> String {
         .into_owned()
 }
 
-fn encode_endpoint_record(endpoint_dir: &Path, path: &Path, addr: SocketAddr) -> String {
+/// The namespace a record was published for, hex-encoded so an arbitrary
+/// container id or `--name` cannot inject a newline into the record format.
+///
+/// This is the field record ownership is decided on: it says *which container's*
+/// listener the record describes, which is what a published-port relay actually
+/// needs to know. Process identity would be the wrong question -- see
+/// [`RecordTrust`].
+fn record_namespace_field(namespace_id: Option<&NetworkNamespaceId>) -> String {
+    match namespace_id {
+        Some(namespace_id) => format!("ns={}\n", hex_name(namespace_id.as_str())),
+        None => String::new(),
+    }
+}
+
+fn encode_endpoint_record(
+    endpoint_dir: &Path,
+    path: &Path,
+    addr: SocketAddr,
+    namespace_id: Option<&NetworkNamespaceId>,
+) -> String {
     format!(
-        "{addr}\npid={}\ninstance={:032x}\nkey={}\n",
+        "{addr}\npid={}\ninstance={:032x}\n{}key={}\n",
         std::process::id(),
         instance_id(),
+        record_namespace_field(namespace_id),
         record_key(endpoint_dir, path)
     )
 }
@@ -1667,24 +1729,34 @@ fn record_key_matches(endpoint_dir: &Path, path: &Path, raw: &str) -> bool {
     }
 }
 
-fn record_instance(raw: &str) -> Option<u128> {
-    u128::from_str_radix(record_field(raw, "instance=")?, 16).ok()
+/// Was this record published for `owner`'s container?
+///
+/// A record with no `ns=` at all makes no claim -- it predates the field -- so
+/// it is accepted, exactly as for `key=`. Only a record that names a *different*
+/// namespace is a genuine disagreement about whose listener it describes.
+fn record_namespace_matches(raw: &str, owner: &NetworkNamespaceId) -> bool {
+    match record_field(raw, "ns=") {
+        Some(claimed) => claimed == hex_name(owner.as_str()),
+        None => true,
+    }
 }
 
 fn write_endpoint_file(
     fork_gate: &Arc<Mutex<()>>,
     endpoint_dir: &Path,
     endpoint: &VirtualEndpoint,
+    namespace_id: Option<&NetworkNamespaceId>,
     host_addr: HostSocketAddr,
 ) -> Result<Vec<(PathBuf, String)>, String> {
     let _fork_gate = fork_gate.lock().unwrap_or_else(|p| p.into_inner());
     let scope_dir = endpoint_scope_dir(endpoint_dir, &endpoint.scope);
     let path = endpoint_path(endpoint_dir, endpoint);
-    let contents = encode_endpoint_record(endpoint_dir, &path, host_addr.0);
+    let contents = encode_endpoint_record(endpoint_dir, &path, host_addr.0, namespace_id);
     write_record(&scope_dir, &path, &contents)
         .map_err(|e| format!("failed to record socket namespace endpoint: {e}"))?;
     let reverse_path = reverse_endpoint_path(endpoint_dir, host_addr, endpoint.protocol);
-    let reverse_contents = encode_endpoint_record(endpoint_dir, &reverse_path, endpoint.addr.0);
+    let reverse_contents =
+        encode_endpoint_record(endpoint_dir, &reverse_path, endpoint.addr.0, namespace_id);
     write_record(endpoint_dir, &reverse_path, &reverse_contents)
         .map_err(|e| format!("failed to record socket namespace reverse endpoint: {e}"))?;
     Ok(vec![(path, contents), (reverse_path, reverse_contents)])
@@ -1697,18 +1769,26 @@ fn remove_endpoint_files(fork_gate: &Arc<Mutex<()>>, files: Vec<(PathBuf, String
     }
 }
 
-/// How much of its own identity a reader demands of a record.
+/// Whose records a reader is willing to be answered by.
+///
+/// The boundary is the **namespace**, not the process. An endpoint record
+/// describes a particular container's listener, and the set of processes
+/// entitled to publish that is exactly the set sharing its namespace id: the run
+/// process, every guest fork child, and a `carrick exec` -- which is a separate
+/// process handed the container's namespace id
+/// (`carrick-cli/src/lifecycle.rs:1187`). Two different instances never share
+/// one, so this separates them without splitting a container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstanceTrust {
+enum RecordTrust<'a> {
     /// Any live instance's record may answer. This is the guest-facing rule and
     /// the reason the endpoint namespace is machine-global at all: a container
     /// resolving `db` must reach the `db` a *different* `carrick run` process
     /// published.
-    AnyInstance,
-    /// Only this instance (and its fork children, which share the id) may
-    /// answer. Used by the published-port relays, whose target is derived from
-    /// their own lease's spec.
-    OwnInstanceOnly,
+    AnyNamespace,
+    /// Only a record published for this namespace may answer. Used by the
+    /// published-port relays, whose target is derived from their own lease's
+    /// spec.
+    OwnNamespaceOnly(&'a NetworkNamespaceId),
 }
 
 fn read_endpoint_file(
@@ -1716,19 +1796,14 @@ fn read_endpoint_file(
     endpoint_dir: &Path,
     endpoint: &VirtualEndpoint,
 ) -> Option<HostSocketAddr> {
-    read_endpoint_file_trusting(
-        fork_gate,
-        endpoint_dir,
-        endpoint,
-        InstanceTrust::AnyInstance,
-    )
+    read_endpoint_file_trusting(fork_gate, endpoint_dir, endpoint, RecordTrust::AnyNamespace)
 }
 
 fn read_endpoint_file_trusting(
     fork_gate: &Arc<Mutex<()>>,
     endpoint_dir: &Path,
     endpoint: &VirtualEndpoint,
-    trust: InstanceTrust,
+    trust: RecordTrust<'_>,
 ) -> Option<HostSocketAddr> {
     let _fork_gate = fork_gate.lock().unwrap_or_else(|p| p.into_inner());
     let path = endpoint_path(endpoint_dir, endpoint);
@@ -1738,10 +1813,10 @@ fn read_endpoint_file_trusting(
                 warn_rejected_record("key", &path);
                 return None;
             }
-            if trust == InstanceTrust::OwnInstanceOnly
-                && record_instance(&raw) != Some(instance_id())
+            if let RecordTrust::OwnNamespaceOnly(owner) = trust
+                && !record_namespace_matches(&raw, owner)
             {
-                warn_rejected_record("instance", &path);
+                warn_rejected_record("namespace", &path);
                 return None;
             }
             raw.lines().next()?.trim().parse().ok().map(HostSocketAddr)
@@ -1902,26 +1977,32 @@ fn connect_tracked_tcp(
 /// copy-on-write copy of the registry and is invisible here. The durable record
 /// is the only channel, which is exactly why that record must not be ambiguous.
 ///
-/// The relay demands the record be its **own** instance's. Its target is built
-/// from its own lease's spec, so a record written by an unrelated process is
-/// wrong whatever it says -- including the case realm-qualification cannot fix,
-/// two concurrent instances that were given the same `--name` and therefore the
-/// same name-derived address. Refusing is what the guest would see anyway if the
-/// peer instance were not running; serving it would send this user's traffic
-/// into another user's container.
+/// The relay demands the record have been published for its **own namespace**
+/// (`RecordTrust::OwnNamespaceOnly`). A record describes one container's
+/// listener, and the processes entitled to publish that container's listener are
+/// exactly those sharing its namespace id -- the run process and every guest
+/// fork child, *and* a `carrick exec`, which is a separate process handed the
+/// same id (`carrick-cli/src/lifecycle.rs:1187` matches `:389`). So a port
+/// published by `carrick run -p 8080:80` is served when the listener is bound by
+/// an `exec`ed command rather than by the container's own entrypoint, which is
+/// what Docker does and what a process-identity check would have broken. A
+/// record from a *different* namespace is another container's and is refused:
+/// refusing is what the guest would see anyway if that peer were not running,
+/// while serving it would send this user's traffic into another user's
+/// container.
 ///
-/// The one thing this rejects that today accepts: a `carrick exec` process
-/// (a separate process sharing the container's namespace id) that binds the
-/// published container port itself, rather than the run's own guest binding it.
-/// Process identity cannot tell that apart from the duplicate-`--name` case --
-/// both are "a different process publishing my target" -- and the rejection is
-/// loud (`warn_rejected_record`) rather than a silent mis-delivery.
+/// Deliberately out of scope here: two concurrent instances given the same
+/// `--name` share a namespace id *and* a name-derived address, so this check
+/// cannot separate them -- and should not try, because that is a name-uniqueness
+/// problem. The fix is an `O_EXCL` claim refusing a second container while a
+/// live one holds the name, tracked as a follow-on; see
+/// `docs/superpowers/specs/2026-07-25-published-port-crosswiring-design.md` §9.2.
 fn published_tcp_accept_loop(
     listener: ForkTrackedSocket<TcpListener>,
     fork_state: BridgeHelperForkState,
     registry: Arc<Mutex<HashMap<VirtualEndpoint, HostSocketAddr>>>,
     endpoint_dir: Arc<PathBuf>,
-    target: VirtualEndpoint,
+    target: RelayTarget,
     stop: Arc<AtomicBool>,
 ) {
     let fork_gate = &fork_state.fork_gate;
@@ -1943,14 +2024,14 @@ fn published_tcp_accept_loop(
                     registry
                         .lock()
                         .ok()
-                        .and_then(|registry| registry.get(&target).copied())
+                        .and_then(|registry| registry.get(&target.endpoint).copied())
                 }
                 .or_else(|| {
                     read_endpoint_file_trusting(
                         fork_gate,
                         &endpoint_dir,
-                        &target,
-                        InstanceTrust::OwnInstanceOnly,
+                        &target.endpoint,
+                        target.trust(),
                     )
                 });
                 // Create and publish the fd while fork is excluded, then leave
@@ -2037,7 +2118,7 @@ fn published_udp_loop(
     fork_state: BridgeHelperForkState,
     registry: Arc<Mutex<HashMap<VirtualEndpoint, HostSocketAddr>>>,
     endpoint_dir: Arc<PathBuf>,
-    target: VirtualEndpoint,
+    target: RelayTarget,
     reply: UdpReplyEndpoint,
     stop: Arc<AtomicBool>,
 ) {
@@ -2053,14 +2134,14 @@ fn published_udp_loop(
                     registry
                         .lock()
                         .ok()
-                        .and_then(|registry| registry.get(&target).copied())
+                        .and_then(|registry| registry.get(&target.endpoint).copied())
                 }
                 .or_else(|| {
                     read_endpoint_file_trusting(
                         fork_gate,
                         &endpoint_dir,
-                        &target,
-                        InstanceTrust::OwnInstanceOnly,
+                        &target.endpoint,
+                        target.trust(),
                     )
                 });
                 let Some(target_addr) = target_addr else {
@@ -2096,6 +2177,7 @@ fn published_udp_loop(
                     fork_gate,
                     &endpoint_dir,
                     &reply_endpoint,
+                    target.namespace_id.as_ref(),
                     HostSocketAddr(outbound_addr),
                 )
                 .unwrap_or_default();
@@ -3691,7 +3773,7 @@ mod tests {
             protocol: PortProtocol::Tcp,
         };
         provider
-            .write_endpoint_file(&peer, host(target_addr))
+            .write_endpoint_file(&peer, spec.namespace_id.as_ref(), host(target_addr))
             .expect("write endpoint file");
         {
             let registry = provider.registry.lock().expect("registry");
@@ -5158,7 +5240,7 @@ mod tests {
 
         let endpoint = bridge_endpoint(&spec, 8080, PortProtocol::Tcp);
         if provider
-            .write_endpoint_file(&endpoint, host(target_addr))
+            .write_endpoint_file(&endpoint, spec.namespace_id.as_ref(), host(target_addr))
             .is_err()
         {
             code |= 16;
@@ -5319,7 +5401,7 @@ mod tests {
         // Published without touching the registry, so the child's hit can only
         // come from the file at the realm-qualified path.
         provider
-            .write_endpoint_file(&prefork, prefork_host)
+            .write_endpoint_file(&prefork, spec.namespace_id.as_ref(), prefork_host)
             .expect("pre-fork endpoint");
         let postfork = bridge_endpoint(&spec, 7002, PortProtocol::Tcp);
         let postfork_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 47002));
@@ -5511,7 +5593,7 @@ mod tests {
         write_record(
             &dir,
             &path,
-            &encode_endpoint_record(&provider.endpoint_dir, &path, host_addr.0),
+            &encode_endpoint_record(&provider.endpoint_dir, &path, host_addr.0, None),
         )
         .expect("honest record");
         assert_eq!(resolve(), Some(host_addr));
@@ -5539,15 +5621,27 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// A published relay's target comes from its own lease's spec, so a record
-    /// written by an unrelated process is wrong whatever it says. This is the
-    /// case realm-qualification cannot reach: two instances given the same
-    /// `--name`, hence the same name-derived address and the same path. Only the
-    /// instance identity distinguishes them.
-    #[test]
-    fn published_relay_refuses_a_foreign_instance_record() {
+    struct RelayOutcome {
+        served: Vec<u8>,
+        dialed: bool,
+    }
+
+    /// Drive one published-port relay against a container record seeded with a
+    /// chosen identity, and report what it did.
+    ///
+    /// The seeded container listener answers with a token the moment it is
+    /// dialed, so "refused" and "proxied" differ by the bytes the client
+    /// receives -- an observable, not a timeout. Whichever way the check breaks,
+    /// the test fails with the evidence in hand instead of hanging on a listener
+    /// nobody accepts. The record always carries a live owner pid and the
+    /// correct `key=`, so the identity fields are the only thing that can decide
+    /// the outcome.
+    fn drive_relay_with_seeded_record(
+        container_port: u16,
+        record_namespace: Option<&NetworkNamespaceId>,
+        record_instance: u128,
+    ) -> RelayOutcome {
         let host_port = free_loopback_port();
-        let container_port = 8099;
         let mapping = PortMapping {
             host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             host_port: Some(host_port),
@@ -5559,59 +5653,104 @@ mod tests {
         let lease = provider.create_namespace(&spec).expect("namespace");
         provider.publish_port(lease.id, mapping).expect("publish");
 
-        // The foreign container's listener answers with a token the moment it is
-        // dialed, so "the relay refused" and "the relay proxied" differ by the
-        // bytes the client receives -- an observable, not a timeout. If the
-        // relay were to trust the record, this test fails with those bytes in
-        // hand instead of hanging on a listener nobody accepts.
-        let foreign_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("foreign bind");
-        let foreign_addr = foreign_listener.local_addr().expect("foreign addr");
+        let container_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("container bind");
+        let container_addr = container_listener.local_addr().expect("container addr");
         let dialed = Arc::new(AtomicBool::new(false));
         let thread_dialed = Arc::clone(&dialed);
-        let foreign = thread::spawn(move || {
-            if let Ok((mut stream, _)) = foreign_listener.accept() {
+        let acceptor = thread::spawn(move || {
+            if let Ok((mut stream, _)) = container_listener.accept() {
                 thread_dialed.store(true, Ordering::SeqCst);
-                let _ = stream.write_all(b"FOREIGN");
+                let _ = stream.write_all(b"SERVED");
             }
         });
 
-        // Live owner, correct key, exactly the path this relay reads -- only the
-        // instance is another's.
         let endpoint = bridge_endpoint(&spec, container_port, PortProtocol::Tcp);
         let path = endpoint_path(&provider.endpoint_dir, &endpoint);
         let dir = endpoint_scope_dir(&provider.endpoint_dir, &endpoint.scope);
         let record = format!(
-            "{foreign_addr}\npid={}\ninstance={:032x}\nkey={}\n",
+            "{container_addr}\npid={}\ninstance={record_instance:032x}\n{}key={}\n",
             std::process::id(),
-            instance_id() ^ 1,
+            record_namespace_field(record_namespace),
             record_key(&provider.endpoint_dir, &path)
         );
-        write_record(&dir, &path, &record).expect("seed foreign record");
+        write_record(&dir, &path, &record).expect("seed record");
 
         let mut client =
             TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).expect("connect published");
         let mut served = Vec::new();
         client.read_to_end(&mut served).expect("read to end");
-        assert!(
-            served.is_empty(),
-            "relay proxied into a foreign instance's container: {:?}",
-            String::from_utf8_lossy(&served)
-        );
-
         // The client observing end-of-stream happens strictly after the relay
-        // decided what to do with the record, so any connection it would have
-        // made has already been accepted by now.
-        assert!(
-            !dialed.load(Ordering::SeqCst),
-            "relay dialed a foreign instance's listener"
-        );
+        // decided what to do with the record, so any dial it would have made has
+        // already been accepted by now.
+        let outcome = RelayOutcome {
+            served,
+            dialed: dialed.load(Ordering::SeqCst),
+        };
 
-        // Release the waiting acceptor so the test owns no blocked thread.
-        drop(TcpStream::connect(foreign_addr).expect("release foreign acceptor"));
-        foreign.join().expect("foreign acceptor thread");
-
+        // Release a still-waiting acceptor so the test owns no blocked thread.
+        // If the relay already dialed, the acceptor has returned and closed its
+        // listener, so a refused connect here is that case, not a failure.
+        let _ = TcpStream::connect(container_addr);
+        acceptor.join().expect("acceptor thread");
         let _ = fs::remove_file(&path);
         provider.destroy_namespace(lease.id).expect("destroy");
+        outcome
+    }
+
+    /// A record published for a *different* namespace describes a different
+    /// container's listener, so the relay refuses it. This is the cross-instance
+    /// case that survives realm-qualification: two runs whose records can land
+    /// on one path, e.g. because they were given the same `--name` and so the
+    /// same name-derived address.
+    #[test]
+    fn published_relay_refuses_a_record_from_another_namespace() {
+        let outcome = drive_relay_with_seeded_record(
+            8099,
+            Some(&NetworkNamespaceId::new("some-other-container")),
+            instance_id() ^ 1,
+        );
+        assert!(
+            outcome.served.is_empty(),
+            "relay proxied into another namespace's container: {:?}",
+            String::from_utf8_lossy(&outcome.served)
+        );
+        assert!(!outcome.dialed, "relay dialed another namespace's listener");
+    }
+
+    /// The `carrick exec` shape, and the reason the check is scoped to the
+    /// namespace rather than to the process: a *separate process*, with its own
+    /// instance identity, publishing the container listener for the namespace it
+    /// was handed. `carrick exec` gets the run's `network_namespace_id`
+    /// (`carrick-cli/src/lifecycle.rs:1187` matches `:389`), so a port published
+    /// by `carrick run -p 8080:80` must still be served when the listener is
+    /// bound by an `exec`ed command rather than the container's entrypoint --
+    /// Docker forwards to whatever is listening in the container, whichever
+    /// process bound it.
+    #[test]
+    fn published_relay_serves_an_exec_shaped_record_from_its_own_namespace() {
+        let outcome = drive_relay_with_seeded_record(
+            8100,
+            Some(&this_instance_namespace()),
+            // A different instance identity: exec is not a fork child, so it
+            // mints its own. Admission must not look at this.
+            instance_id() ^ 1,
+        );
+        assert_eq!(
+            outcome.served.as_slice(),
+            b"SERVED",
+            "relay refused its own container's listener because a sibling process published it"
+        );
+        assert!(outcome.dialed);
+    }
+
+    /// A record with no `ns=` makes no claim -- it predates the field -- so it
+    /// is placed by its path alone, the same rule `key=` uses.
+    #[test]
+    fn published_relay_serves_a_record_that_claims_no_namespace() {
+        let outcome = drive_relay_with_seeded_record(8101, None, instance_id());
+        assert_eq!(outcome.served.as_slice(), b"SERVED");
+        assert!(outcome.dialed);
     }
 
     /// Reclamation unlinks a record because an earlier read showed its owner

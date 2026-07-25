@@ -231,15 +231,30 @@ Cheap, spec-free, and each item is an independent bug fix:
    catches a path-scheme bug, a build-skew record, and a mid-migration mixed directory *loudly*
    instead of by mis-serving. Cost: one `str` compare on a string the reader already read; no extra
    syscalls; O(1) reads stay O(1).
-3. **Strict own-instance check at the relay only.** Add `instance=<hex u128>` (process-global
-   `OnceLock`, forced in `SocketNamespaceProvider::new:241` — i.e. pre-fork, so parent and every
-   fork child compare equal) and have `published_tcp_accept_loop:1398` / `published_udp_loop:1501`
-   **refuse any record whose `instance` is not their own**. The relay's target is built from *its
-   own lease's spec*; a foreign record there is *always* wrong, with no exception — including the
-   duplicate-`--name` case F2 cannot fix. One-shot `AtomicBool`-gated warning to stderr, then drop
+3. **Own-*namespace* check at the relay only.** Add `ns=<hex namespace id>` to every forward and
+   reverse record and have `published_tcp_accept_loop` / `published_udp_loop` **refuse any record
+   published for a namespace other than their own** (a record with no `ns=` makes no claim and is
+   accepted, the same rule `key=` uses). One-shot `AtomicBool`-gated warning to stderr, then drop
    the connection. Guest-facing paths stay silent and map to `ECONNREFUSED` (`:511`, `:533`) as
    Linux would; observability goes to the always-on event ring (one new
    `event_ring.rs` kind `NSREJECT`, one dict entry in `scripts/carrick_lldb.py:331`).
+
+   **The boundary is the namespace, not the process.** An earlier draft of this spec proposed a
+   strict own-*instance* check (a process-global `instance=` id) on the claim that "the relay's
+   target is built from its own lease's spec, so a foreign record there is always wrong, with no
+   exception". **That claim was wrong and is retracted.** `carrick exec` is a separate *process*
+   that is handed the container's namespace id (`carrick-cli/src/lifecycle.rs:1187`, matching the
+   run's own `:389`), so an `exec`ed command that binds the published container port publishes a
+   perfectly legitimate record from a different process. A process-identity check refuses it and
+   breaks `carrick run -p 8080:80` + `carrick exec … <server>`, which Docker serves. The set of
+   processes entitled to publish a container's listener is exactly the set sharing its namespace
+   id — the run process, every guest fork child, and any `exec` — and two different instances never
+   share one. `instance=` is still recorded, but as a **diagnostic only**: it distinguishes process
+   families and survives pid reuse when a human reads a record or an `NSREJECT` ring entry.
+
+   Duplicate `--name` is deliberately *not* covered by this check: two such instances share a
+   namespace id as well as an address, so no identity check can separate them. That is a
+   name-uniqueness problem and is tracked as the follow-on in §9.2.
 4. **Guard the stale unlink.** `read_namespace_file:1289` unlinks any dead-owner record; a reader
    that read old bytes, lost the CPU while a writer renamed fresh bytes in, then unlinked, would
    **destroy a live publication**. Re-read-and-compare before unlink (same pattern as `:1681-1691`).
@@ -316,12 +331,13 @@ the registry does *not* contain the key).
    private realm is keyed on that same id, so exec's matching condition is *identical to today's*
    for loopback and becomes the *same* condition for the unnamed bridge key. Nothing new can break
    that isn't already broken today.
-5. F3's `instance=` id is a process-global `OnceLock` forced in `new()` (pre-fork), so it is inherited
-   memory: parent and children compare equal, and the relay's strict check does not reject a child's
-   post-fork publication. It must be process-global, not per-provider, or
-   `translate_host_source_reads_fork_coherent_endpoint_files:2534` (two providers in one process,
-   standing in for a fork child) would fail. Identity (`instance=`, may read) stays separate from
-   delete-ownership (`owned_endpoint_files`, may delete) — C8 requires exactly that split.
+5. F3's relay admission is keyed on `ns=`, which is the spec's `namespace_id` — the same
+   fork-copied value F2's realm derives from — so a fork child's post-fork publication carries the
+   id its parent's relay is looking for, and no communication is needed. `instance=` is a
+   process-global `OnceLock` forced in `new()` (pre-fork) so it is stable across a fork, but since
+   nothing is admitted or refused on it, it cannot affect this property either way. Identity
+   (`ns=`/`instance=`, may read) stays separate from delete-ownership (`owned_endpoint_files`, may
+   delete) — C8 requires exactly that split.
 
 ---
 
@@ -407,11 +423,16 @@ instances at all.
    `pid=` line: publish over an existing record and assert the observed content is always one of the
    two complete versions (deterministic by construction with `rename`, and the pre-fix `O_TRUNC`
    variant is demonstrable with a seeded partial file).
-8. **`relay_refuses_a_foreign_instance_record`** (F3.3) — seed a record with a foreign
-   `instance=`; the relay resolves `None`, drops the inbound socket, and the client's `read_to_end`
-   returns `0` — a happens-after edge, not a timeout. Then assert the foreign listener was never
-   connected via `set_nonblocking(true)` + `accept() == WouldBlock`, which is sound because any
-   connection would necessarily have preceded the drop the client already observed.
+8. **`published_relay_refuses_a_record_from_another_namespace`** (F3.3) — seed a record with a
+   foreign `ns=`; the relay resolves `None`, drops the inbound socket, and the client's
+   `read_to_end` returns `0` — a happens-after edge, not a timeout. The seeded container listener
+   answers with a token the instant it is dialed, so a relay that wrongly trusted the record fails
+   the assertion *with the bytes in hand* rather than hanging on a listener nobody accepts (an
+   earlier `set_nonblocking` + `accept() == WouldBlock` formulation hung under mutation). Paired
+   with **`published_relay_serves_an_exec_shaped_record_from_its_own_namespace`**, which seeds the
+   same namespace but a *different* `instance=` — the `carrick exec` shape — and asserts it is
+   served; that is the case a process-identity check would have broken, and it is what pins the
+   boundary at the namespace.
 9. **Existing conformance gate**: `conformance_bridge_compose_pair` (`conformance.rs:1562`) and the
    `-p` published-port probe (`conformance.rs:2763`) must both stay green, unmodified. They are the
    end-to-end proof that C1 and C2-C4 survived.
@@ -427,7 +448,7 @@ instances at all.
 | F2 reclamation sweep (realm dirs) | ~35 | `network/socket_namespace.rs` |
 | F3.1 atomic rename (3 writers) | ~30 | `network/socket_namespace.rs` |
 | F3.2 `key=` + reject | ~25 | `network/socket_namespace.rs` |
-| F3.3 `instance=` + relay reject + event ring | ~45 | `network/socket_namespace.rs`, `event_ring.rs`, `scripts/carrick_lldb.py` |
+| F3.3 `ns=` + relay reject + event ring | ~45 | `network/socket_namespace.rs`, `event_ring.rs`, `scripts/carrick_lldb.py` |
 | F3.4 guarded stale unlink | ~8 | `network/socket_namespace.rs` |
 | **total production** | **~300** | 5 files, 3 crates + 1 script |
 | tests (9 above, incl. the two-process harness) | ~320 | `socket_namespace.rs` tests + 1 helper bin |
@@ -445,10 +466,13 @@ instances at all.
    other" is undefined today and only appears to work via the cross-wire this spec removes. Closing
    this genuinely requires angle A (IPAM). See ruling R2.
 2. **Duplicate `--name` across concurrent instances still aliases** — both are `Shared` with the same
-   name-derived IP. F3.3 makes the relay case loud and fast instead of silent; the durable fix is a
-   name-uniqueness claim (an `O_EXCL` `name-<hex bridge>-<hex name>` record with stale-owner
-   takeover, checked in `create_namespace:1640`, failing with Docker's "name is already in use") or
-   IPAM. Recommended as a small follow-up.
+   name-derived IP, *and* both derive the same `namespace_id` from that name, so F3.3's relay check
+   cannot separate them either: they are indistinguishable by every identity the system has, which
+   is precisely the sense in which this is a name-uniqueness bug rather than a routing one. The
+   durable fix is a name-uniqueness claim (an `O_EXCL` `name-<hex bridge>-<hex name>` record with
+   stale-owner takeover, checked in `create_namespace:1640`, failing with Docker's "name is already
+   in use") or IPAM. **Tracked as the follow-on to this work** — deliberately out of scope here, and
+   the relay's namespace check is documented as not covering it.
 3. **Name-hash birthday collisions** — `bridge_ipv4_for_name` has 253×253 = 64,009 buckets
    (`carrick-spec:542`), so two *different* names collide with ~50% probability around 300
    concurrent named containers. Needs IPAM.
@@ -498,11 +522,16 @@ conflict enforcement, `inspect` realism, name-collision headroom) rather than as
 fix.
 
 **R3 — How much of angle C to adopt.**
-*Either* **F3 as scoped here** (atomic `rename`, `key=` self-check, own-instance check **at the relay
-only**, guarded stale unlink — ~110 LoC, each an independent bug fix);
+*Either* **F3 as scoped here** (atomic `rename`, `key=` self-check, own-namespace check **at the
+relay only**, guarded stale unlink — ~110 LoC, each an independent bug fix);
 *or* full angle C (per-record `instance=`/`owner=` policy evaluated at all six read sites), which
 duplicates F2's partition in record content and creates a second source of truth that can disagree
 with the path;
-*or* none (F2 alone), which leaves the duplicate-`--name` case silent and leaves the `O_TRUNC`
-empty-read window open.
+*or* none (F2 alone), which leaves the `O_TRUNC` empty-read window open.
+
+**RULED (during implementation): F3 as scoped, with the relay check keyed on the NAMESPACE, not the
+process.** The original text of F3.3 asserted that a foreign record at the relay is "always wrong,
+with no exception"; implementation review found the exception — `carrick exec` — and the premise was
+retracted. See F3.3 above for the reasoning and for what this deliberately does *not* cover
+(duplicate `--name`, now tracked as the §9.2 follow-on).
 **Recommendation: F3 as scoped.**
