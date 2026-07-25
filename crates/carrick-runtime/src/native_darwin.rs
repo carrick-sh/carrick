@@ -10261,21 +10261,27 @@ mod tests {
             let page = 16 * 1024_u64;
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
             let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
-            // Bookkeep the page as guest PROT_NONE so `exclusive_load_for`'s
-            // `prepare_temporary_host_access` call must commit a `HostLift`
-            // refcount before its width match's `_ => return
-            // Err(Unsupported)` arm rejects an unsupported width and returns
-            // early -- exactly the prepare-then-fallible-op-then-restore
-            // window `HostLiftRestoreGuard` exists to backstop.
+            // Bookkeep the page as guest PROT_NONE so ANY host access to it must
+            // first lift it. `exclusive_load_for` now validates the access width
+            // UP FRONT (rejecting anything outside {1,2,4,8} with `OutOfBounds`)
+            // BEFORE it calls `prepare_temporary_host_access`, so an unsupported
+            // width never commits a `HostLift` refcount in the first place -- the
+            // lift table must stay empty on this error path.
             memory.native_page_protections.insert(guest.raw(), 0);
             let mut reservation = None;
             let error = memory
                 .exclusive_load_for(guest.raw(), 16, true, &mut reservation)
                 .expect_err("width 16 is not a supported exclusive-load width");
-            assert_eq!(error, MemoryError::Unsupported);
+            assert_eq!(
+                error,
+                MemoryError::OutOfBounds {
+                    address: guest.raw(),
+                    length: 16,
+                }
+            );
             assert!(
                 memory.host_access_lifts.lock().is_empty(),
-                "an error between prepare and restore must not strand the host-lift refcount",
+                "an unsupported width rejected before prepare must never commit a host-lift refcount",
             );
         });
     }
@@ -10286,11 +10292,13 @@ mod tests {
             let page = 16 * 1024_u64;
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
             let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
-            // Same setup as `exclusive_load_for_restores_host_lift_on_unsupported_width_error`,
-            // but drives `exclusive_store_for`'s prepare(write=true)-then-
-            // width-match window. The reservation is hand-built (rather than
-            // obtained via `exclusive_load_for`) so its `location.width`
-            // matches the unsupported width this call passes.
+            // Same setup as `exclusive_load_for_restores_host_lift_on_unsupported_width_error`:
+            // `exclusive_store_for` also validates the access width UP FRONT
+            // (rejecting anything outside {1,2,4,8} with `OutOfBounds`) BEFORE it
+            // calls `prepare_temporary_host_access`, so the unsupported width can
+            // never commit a `HostLift` refcount. The reservation is hand-built
+            // (rather than obtained via `exclusive_load_for`) so its
+            // `location.width` matches the unsupported width this call passes.
             memory.native_page_protections.insert(guest.raw(), 0);
             let mut reservation = Some(NativeExclusiveReservation {
                 location: NativeExclusiveLocation {
@@ -10303,10 +10311,16 @@ mod tests {
             let error = memory
                 .exclusive_store_for(guest.raw(), 16, 0, true, &mut reservation)
                 .expect_err("width 16 is not a supported exclusive-store width");
-            assert_eq!(error, MemoryError::Unsupported);
+            assert_eq!(
+                error,
+                MemoryError::OutOfBounds {
+                    address: guest.raw(),
+                    length: 16,
+                }
+            );
             assert!(
                 memory.host_access_lifts.lock().is_empty(),
-                "an error between prepare and restore must not strand the host-lift refcount",
+                "an unsupported width rejected before prepare must never commit a host-lift refcount",
             );
         });
     }
@@ -11928,6 +11942,15 @@ mod tests {
     fn native_prepared_mapping_fixture(
         relocations: bool,
     ) -> (AddressSpace, Vec<NativeRelativeRelocation>, ExecutionPlan) {
+        // Every prepared-mapping test funnels through this builder before it maps
+        // (`map_prepared_for_plan` / `map_for_plan`), and each mapping builds a
+        // `ProcessTranslator` that resolves the Darwin host JIT through the
+        // process-global seam production installs at every native-backend entry
+        // (`install_native_probe_sink`). The `#[cfg(test)]` harness installs it
+        // here so each test is order-independent: without it the mapping fails
+        // "no host JIT installed" in isolation and only passes when a sibling
+        // test happened to install it first. Idempotent / first-install-wins.
+        dsr::install_test_host_jit();
         let plan = native16k_test_plan();
         let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
             &dsr_test_elf(&[0xd65f_03c0]),
@@ -11962,6 +11985,9 @@ mod tests {
     }
 
     fn native_biased_prepared_mapping_fixture() -> (AddressSpace, ExecutionPlan) {
+        // See `native_prepared_mapping_fixture`: install the host-JIT seam before
+        // the biased test maps. Idempotent / first-install-wins.
+        dsr::install_test_host_jit();
         let plan = native16k_test_plan();
         let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
             &dsr_low_et_exec_test_elf(&[0xd65f_03c0]),
@@ -12381,7 +12407,12 @@ mod tests {
                 plan.page_geometry,
             ) {
                 Ok(_) => panic!("prepared mapping failpoint must fail"),
-                Err(error) => error,
+                // `map_prepared_for_plan` surfaces `NativeMemoryError`; the
+                // runtime's public boundary wraps it into `RuntimeError` (the
+                // `From` edge in run_result.rs), which is what a guest sees and
+                // what the expected "unsupported in this backend: ..." string
+                // describes. Assert at that production-visible layer.
+                Err(error) => RuntimeError::from(error),
             };
             assert_eq!(error.to_string(), expected);
             let supplemental = take_native_test_supplemental_rollbacks();
@@ -12468,7 +12499,9 @@ mod tests {
                 plan.page_geometry,
             ) {
                 Ok(_) => panic!("biased late failpoint must fail"),
-                Err(error) => error,
+                // Wrap at the runtime's public boundary (see the shared helper)
+                // so the assertion checks the guest-visible message.
+                Err(error) => RuntimeError::from(error),
             };
             assert_eq!(
                 error.to_string(),
