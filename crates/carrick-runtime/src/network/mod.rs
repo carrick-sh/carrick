@@ -293,16 +293,66 @@ pub struct RuntimeNetwork {
     pub lease: NetworkLease,
 }
 
+/// Give a bridge namespace an identity no other instance can hold, once, in the
+/// process that is about to boot the guest.
+///
+/// The endpoint namespace is a machine-global directory whose record paths are
+/// built from the namespace id, so an id that is a *constant* -- which
+/// `NetworkNamespaceSpec::bridge_default` used to hand out as the literal
+/// `"default"` -- makes two concurrent runs share one key. The loopback scope is
+/// keyed on the id alone, so that constant made one guest's `127.0.0.1:8080`
+/// resolvable and connectable from a different instance's guest.
+///
+/// This is the single defaulting site on purpose. Every other spec builder can
+/// now only *narrow* the identity (a container id, a `--name`, the container a
+/// `--network container:X` sidecar joins); none can leave it constant, and no
+/// future builder can regress it by forgetting to set it.
+///
+/// It must run here, and it must store what it sampled. `RuntimeNetwork::create`
+/// runs in the root host process during run setup, strictly before the guest
+/// boots and therefore before any guest `fork`, so the id is frozen into the
+/// spec that `fork()` copies. Deriving it from `getpid()` *at use* instead would
+/// break fork-coherence outright: a forked child's pid differs from its
+/// parent's, so it would compute a different id and stop resolving every record
+/// its parent published.
+fn instance_scoped_spec(spec: &NetworkNamespaceSpec) -> NetworkNamespaceSpec {
+    if spec.mode != NetworkMode::Bridge {
+        // Only the bridge provider keys durable state on the id; host/none
+        // ignore it, and minting one for them would be a behaviour change with
+        // nothing to fix.
+        return spec.clone();
+    }
+    let needs_identity = match spec.namespace_id.as_ref() {
+        None => true,
+        Some(id) => id.as_str() == NetworkNamespaceId::LEGACY_SHARED,
+    };
+    if !needs_identity {
+        return spec.clone();
+    }
+    let mut spec = spec.clone();
+    spec.namespace_id = Some(NetworkNamespaceId::anonymous(std::process::id()));
+    spec
+}
+
 impl RuntimeNetwork {
     pub fn create(spec: &NetworkNamespaceSpec) -> Result<Self, String> {
-        let model = model::LinuxNetworkModel::from_spec(spec);
-        let provider = select_provider(spec);
-        let lease = provider.create_namespace(spec)?;
+        let spec = instance_scoped_spec(spec);
+        debug_assert!(
+            spec.mode != NetworkMode::Bridge
+                || spec
+                    .namespace_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() != NetworkNamespaceId::LEGACY_SHARED),
+            "a bridge namespace must carry an instance-unique id before the provider sees it"
+        );
+        let model = model::LinuxNetworkModel::from_spec(&spec);
+        let provider = select_provider(&spec);
+        let lease = provider.create_namespace(&spec)?;
         for mapping in &spec.published_ports {
             provider.publish_port(lease.id, mapping.clone())?;
         }
         Ok(Self {
-            spec: spec.clone(),
+            spec,
             model,
             provider,
             lease,
@@ -426,6 +476,45 @@ mod tests {
         assert!(!caps.network_extension_policy);
         assert!(!caps.guest_created_network_namespaces);
         assert!(!caps.requires_privilege);
+    }
+
+    /// No spec may reach the socket-namespace provider still carrying a
+    /// constant namespace id. The endpoint namespace is machine-global and its
+    /// loopback records are keyed on that id alone, so a constant there makes
+    /// one guest's `127.0.0.1:<port>` resolvable from a concurrent instance.
+    ///
+    /// The id must also be *sampled once and stored*: `RuntimeNetwork::create`
+    /// runs before the guest boots, so what it stores is what `fork()` copies,
+    /// and every fork child derives the same record paths as its parent.
+    #[test]
+    fn bridge_namespace_is_instance_scoped_before_the_provider_sees_it() {
+        let expected = NetworkNamespaceId::anonymous(std::process::id());
+
+        let unnamed = RuntimeNetwork::create(&NetworkNamespaceSpec::bridge_default(
+            None,
+            Vec::new(),
+            Vec::new(),
+        ))
+        .expect("create bridge network");
+        assert_eq!(unnamed.spec.namespace_id.as_ref(), Some(&expected));
+
+        // A persisted or hand-built spec carrying the retired literal is
+        // replaced too, so the constant cannot be smuggled back in.
+        let mut legacy = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        legacy.namespace_id = Some(NetworkNamespaceId::new(NetworkNamespaceId::LEGACY_SHARED));
+        let legacy = RuntimeNetwork::create(&legacy).expect("create legacy bridge network");
+        assert_eq!(legacy.spec.namespace_id.as_ref(), Some(&expected));
+
+        // An identity a caller narrowed on purpose -- a container id, a
+        // `--name`, or the container a `--network container:X` sidecar joins --
+        // is exactly what `carrick exec` relies on being preserved.
+        let mut explicit = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        explicit.namespace_id = Some(NetworkNamespaceId::new("container-abc"));
+        let explicit = RuntimeNetwork::create(&explicit).expect("create explicit bridge network");
+        assert_eq!(
+            explicit.spec.namespace_id.as_ref(),
+            Some(&NetworkNamespaceId::new("container-abc"))
+        );
     }
 
     #[test]

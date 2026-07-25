@@ -68,6 +68,11 @@ pub const DSRFAULT_PC: u8 = 16;
 pub const DSRFAULT_ADDR: u8 = 17;
 pub const DSRFAULT_SP: u8 = 18;
 pub const DSRFAULT_LR: u8 = 19;
+/// A socket-namespace record was refused for claiming to belong to a different
+/// key or a different instance. The guest-facing paths map that to
+/// `ECONNREFUSED` and say nothing, so this ring entry is the only per-occurrence
+/// record of a cross-instance mis-publication.
+pub const NSREJECT: u8 = 20;
 
 #[cfg(feature = "event-ring-dump")]
 fn dir() -> Option<&'static str> {
@@ -215,6 +220,7 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
             "DSRFAULT lr={:#018x}",
             (a as u32 as u64) | ((b as u32 as u64) << 32)
         ),
+        NSREJECT => format!("NSREJECT pathhash={a:#010x} reasonhash={b:#010x} pid={c}"),
         _ => String::new(),
     }
 }
