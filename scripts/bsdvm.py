@@ -171,7 +171,24 @@ def qemu_args(vm: VmConfig, overlay: Path, extra_drives: list[str] | None = None
         "-m", "6144",
         "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
         "-drive", f"if=pflash,format=raw,file={ensure_efivars(vm.name)}",
-        "-drive", f"if=virtio,format=qcow2,file={overlay}",
+        # `cache.direct=on` keeps the guest's disk image out of the HOST page
+        # cache. Without it the host caches qcow2 contents that the guest is
+        # already caching in its own RAM -- pure duplication on a machine that
+        # is also holding the guest's `-m` allocation.
+        #
+        # Measured on this Mac (netbsd-arm64, read-only `tar -cf /dev/null
+        # /usr /var`, cold boot per variant): host file-backed pages grew
+        # +1.76 GiB during the run WITHOUT this flag and +0.00 GiB WITH it,
+        # while guest RSS was unchanged (6.76 vs 6.60 GiB). Two loaded guests
+        # already drive this 32 GiB host to ~0.1 GiB free, so the saving is
+        # not academic.
+        #
+        # No speed cost to weigh: macOS has no O_DIRECT, so QEMU implements
+        # this as fcntl(F_NOCACHE), and QEMU issue #642 found cache modes make
+        # no measurable I/O difference on macOS hosts. Note F_NOCACHE only
+        # stops FURTHER caching -- it cannot purge an already-warm cache -- so
+        # the benefit accrues from boot.
+        "-drive", f"if=virtio,format=qcow2,file={overlay},cache.direct=on",
         "-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{vm.ssh_port}-:22",
         "-device", "virtio-net-pci,netdev=n0",
         "-device", "virtio-rng-pci",
