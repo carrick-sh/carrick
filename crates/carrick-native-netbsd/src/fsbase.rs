@@ -46,6 +46,17 @@ const X86_64_SET_FSBASE: usize = 17;
 /// `sysarch(SET_FSBASE)` with a caller-owned slot does not fail in practice, and
 /// a fail-open store of a bad base is no worse than the `wrfsbase` it replaces.
 ///
+/// **It also MUST NOT clobber any FP/vector/x87/MMX register — in addition to
+/// being TLS-free.** The gateway (`gateway_x86_64.S`) calls `set_fsbase_fn`
+/// (this fn, via `X86DsrContext::set_fsbase_fn`) at two NetBSD sites: site 2,
+/// BEFORE the host XSAVE, and site 3, AFTER the host XRSTOR. Any FP-state
+/// clobber in between would corrupt the host's saved FP/vector snapshot
+/// invisibly — no fault, just silently wrong FP/vector register contents
+/// later. Keep this a pure-integer syscall leaf (as written: `push`/`mov`/
+/// `syscall`/`pop`/`ret`, no `movaps`/`fxsave`/anything vector-touching); do
+/// NOT route it through a libc wrapper, which may spill/reload via SSE or
+/// otherwise touch vector registers.
+///
 /// SysV entry: `%rdi = base`. Returns `()`.
 #[unsafe(naked)]
 pub extern "C" fn set(base: u64) {

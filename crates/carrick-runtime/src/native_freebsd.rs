@@ -41,7 +41,7 @@ use carrick_dsr_x86::decode::{X86InstClass, classify};
 use carrick_dsr_x86::gateway::{
     CTX_FAULT_RECORD, CTX_KICK_RESTORE_RCX, CTX_SCRATCH2, kick_stub_addr, reg, signal_stub_addr,
 };
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 use carrick_dsr_x86::plan_block;
 use carrick_dsr_x86::translator::{
     GuardedChainPatch, PendingChainEdge, PublishedFaultEntry, X86ThreadTranslator,
@@ -53,7 +53,7 @@ use carrick_dsr_x86::{
     X86X87ExceptionKind, X86XstateMemoryReader, X86XstateMemoryWriter, X86XstateRestoreError,
     X86XstateRestorePlan, X86XstateSaveError, X86XstateSavePlan, cflow, plan_block_with_reader,
 };
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 use carrick_guest_mem::RepointPrivateError;
 use carrick_guest_mem::{GuestMemory, GuestVa, MemoryError, X8664SyscallFrame};
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
@@ -1362,7 +1362,7 @@ impl ExecutableEpoch {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "freebsd"))]
     fn register_starting(
         self: &Arc<Self>,
     ) -> Result<ExecutableThreadRegistration, ExecutableEpochError> {
@@ -1794,7 +1794,7 @@ impl ExecutableEpoch {
         self.begin_terminal_inner(registration, None, on_reserved)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "freebsd"))]
     fn begin_terminal_with_timeout<'a>(
         self: &Arc<Self>,
         registration: &'a ExecutableThreadRegistration,
@@ -2945,7 +2945,7 @@ impl Drop for ExecutableMutationLease {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 mod executable_epoch_tests {
     use super::*;
     use static_assertions::assert_not_impl_any;
@@ -7813,7 +7813,7 @@ enum CloneThreadSpawnError {
     Fatal(String),
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 thread_local! {
     static FAIL_NEXT_NATIVE_CLONE_THREAD_SPAWN: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
@@ -7824,7 +7824,7 @@ fn spawn_native_clone_host_thread(
     name: String,
     body: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "freebsd"))]
     if FAIL_NEXT_NATIVE_CLONE_THREAD_SPAWN.with(|fail| fail.replace(false)) {
         return Err(std::io::Error::other(
             "injected native clone thread spawn failure",
@@ -11625,7 +11625,7 @@ struct NativeVforkPrepareError {
     rollback_failed: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 thread_local! {
     static NATIVE_MINHERIT_FAILURE_SCRIPT: std::cell::RefCell<std::collections::VecDeque<bool>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
@@ -11702,10 +11702,10 @@ fn kill_and_reap_native_fork_child(pid: i32) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 struct NativeForkGateWriteFailureGuard;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 impl NativeForkGateWriteFailureGuard {
     fn fail_next() -> Self {
         NATIVE_FORK_GATE_WRITE_FAILURES.with(|failures| failures.set(1));
@@ -11713,7 +11713,7 @@ impl NativeForkGateWriteFailureGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 impl Drop for NativeForkGateWriteFailureGuard {
     fn drop(&mut self) {
         NATIVE_FORK_GATE_WRITE_FAILURES.with(|failures| failures.set(0));
@@ -11721,7 +11721,7 @@ impl Drop for NativeForkGateWriteFailureGuard {
 }
 
 fn native_minherit(address: u64, len: usize, inheritance: libc::c_int) -> libc::c_int {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "freebsd"))]
     if NATIVE_MINHERIT_FAILURE_SCRIPT
         .with(|script| script.borrow_mut().pop_front().unwrap_or(false))
     {
@@ -11730,10 +11730,10 @@ fn native_minherit(address: u64, len: usize, inheritance: libc::c_int) -> libc::
     unsafe { carrick_portable::freebsd_minherit(address as *mut libc::c_void, len, inheritance) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 struct NativeMinheritFailureGuard;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 impl NativeMinheritFailureGuard {
     fn install(script: impl IntoIterator<Item = bool>) -> Self {
         NATIVE_MINHERIT_FAILURE_SCRIPT.with(|state| {
@@ -11743,7 +11743,7 @@ impl NativeMinheritFailureGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 impl Drop for NativeMinheritFailureGuard {
     fn drop(&mut self) {
         NATIVE_MINHERIT_FAILURE_SCRIPT.with(|state| state.borrow_mut().clear());
@@ -12700,7 +12700,7 @@ fn service_map_host_alias(
     // Inject protection failure before MAP_FIXED replaces an existing host VMA;
     // this test-only preflight proves dispatcher/runtime rollback against the
     // real prior mapping rather than manufacturing a post-replacement hole.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "freebsd"))]
     if take_injected_mprotect_failure(NativeMappingOperation::HostAlias) {
         snapshot.gpr[reg::RAX] = crate::linux_abi::LINUX_ENOMEM.guest_retval() as u64;
         return Step::Continue(resume);
@@ -13612,7 +13612,7 @@ fn service_sensitive(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "freebsd"))]
 mod tests {
     use super::*;
 

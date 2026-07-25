@@ -67,6 +67,9 @@ carrick_dsr_x86_enter_raw:
     // survives the call; rdi carries the base; rax/rcx are dead here.
     movq CTX_GUEST_FSBASE(%r15), %rdi
     subq $8, %rsp                        // 16-byte SysV alignment for the call
+    // This call is BEFORE the host XSAVE below: the callee must preserve
+    // every FP/vector/x87/MMX register, or it silently corrupts the host FP
+    // snapshot about to be taken.
     call *CTX_SET_FSBASE_FN(%r15)
     addq $8, %rsp
 #else
@@ -298,6 +301,9 @@ carrick_dsr_x86_exit_common:
     // so it does not itself deref the (currently guest) FS base.
     movq CTX_HOST_FSBASE(%r15), %rdi
     subq $8, %rsp                        // 16-byte SysV alignment for the call
+    // This call is AFTER the host XRSTOR above: the callee must preserve
+    // every FP/vector/x87/MMX register, or it silently corrupts the host FP
+    // state just restored.
     call *CTX_SET_FSBASE_FN(%r15)
     addq $8, %rsp
 #else
