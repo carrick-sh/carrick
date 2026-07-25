@@ -19,6 +19,7 @@
 #![cfg(target_os = "netbsd")]
 
 pub mod fault;
+pub mod fsbase;
 pub mod futex;
 pub mod jit;
 

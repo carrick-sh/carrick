@@ -8956,6 +8956,21 @@ fn run_x86_thread(
     // 33 KiB value per block made GCC spend most host samples in `memcpy`.
     let mut context = X86DsrContext::new(snapshot, 0, next);
     context.guest_fsbase = guest_fsbase;
+    // NetBSD 10.x does not enable ring-3 CR4.FSGSBASE, so the shared gateway's
+    // inline `rdfsbase`/`wrfsbase` would `#UD`. Inject the host FS-base swap
+    // seam: capture this host thread's base ONCE (it is invariant per host
+    // thread — GET-elimination) to prime the gateway's site-3 restore, and hand
+    // the gateway the TLS-free `sysarch(X86_64_SET_FSBASE)` leaf it calls at
+    // sites 2/3. FreeBSD leaves both fields at their default 0 and takes the
+    // gateway's `#else` inline-instruction path. This runs on every host thread
+    // that constructs a context here (initial + detached clone threads); a fork
+    // child keeps this same context object with the same (fork-preserved) base,
+    // so no re-capture is needed at the fork-child rebuild.
+    #[cfg(target_os = "netbsd")]
+    {
+        context.host_fsbase = carrick_native_netbsd::fsbase::get();
+        context.set_fsbase_fn = carrick_native_netbsd::fsbase::set as *const () as u64;
+    }
     // This thread's private slice of the shared JIT code cache, wrapped in
     // the shared bump-allocator (`carrick_dsr::cache::TranslationCache`)
     // instead of hand-rolled cursor arithmetic. `from_region` borrows the
