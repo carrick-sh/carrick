@@ -671,7 +671,7 @@ pub fn ensure_identity_backed_with_registry(
             libc::mincore(
                 address as *mut libc::c_void,
                 PAGE as usize,
-                (&mut residency as *mut u8).cast::<libc::c_char>(),
+                (&mut residency as *mut u8).cast(),
             ) == 0
         };
         if start_is_mapped {
@@ -1362,7 +1362,7 @@ impl<A: ExecutableMutationAuthority> GuestMemory for IdentityGuestMemory<A> {
         if pages == 0 {
             return Some(Vec::new());
         }
-        let mut residency = vec![0i8; pages];
+        let mut residency = vec![0u8; pages];
         // SAFETY: identity guest VA is the live host mapping. `residency` has
         // exactly one byte per queried FreeBSD page; this lane's guest and host
         // page sizes are both 4 KiB.
@@ -1370,7 +1370,7 @@ impl<A: ExecutableMutationAuthority> GuestMemory for IdentityGuestMemory<A> {
             libc::mincore(
                 start.raw() as *mut libc::c_void,
                 len,
-                residency.as_mut_ptr(),
+                residency.as_mut_ptr().cast(),
             )
         } != 0
         {
