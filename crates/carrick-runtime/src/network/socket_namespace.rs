@@ -1377,6 +1377,19 @@ fn proxy_tcp_stream(
     mut outbound: ForkTrackedSocket<TcpStream>,
     fork_state: BridgeHelperForkState,
 ) -> io::Result<()> {
+    // The relay copies each direction with blocking reads and writes, so both
+    // descriptors must be in blocking mode before any copying starts. They are
+    // not blocking by construction: on BSD-derived hosts (macOS, FreeBSD,
+    // NetBSD) `accept()` inherits O_NONBLOCK from the listener, and the
+    // published TCP listener is deliberately nonblocking so its accept loop can
+    // observe `stop`. A nonblocking descriptor would turn the very first
+    // `EAGAIN` -- i.e. "the peer has not sent anything yet" -- into a spurious
+    // end-of-stream, half-closing a live connection and abortively resetting it
+    // once the unread peer data is discarded on close. Clearing the flag before
+    // the `try_clone` calls also covers the cloned halves, which share the
+    // underlying file description and therefore its status flags.
+    inbound.set_nonblocking(false)?;
+    outbound.set_nonblocking(false)?;
     let fork_gate = &fork_state.fork_gate;
     let fork_tracked_fds = &fork_state.tracked_fds;
     let (mut inbound_clone, mut outbound_clone) = {
@@ -2625,6 +2638,9 @@ mod tests {
         server.join().expect("server thread");
 
         assert_eq!(&reply, b"ok");
+        provider
+            .destroy_namespace(lease.id)
+            .expect("destroy namespace");
     }
 
     #[test]
@@ -2719,6 +2735,73 @@ mod tests {
         server.join().expect("server thread");
 
         assert_eq!(&reply, b"ok");
+        provider
+            .destroy_namespace(lease.id)
+            .expect("destroy namespace");
+        // `write_endpoint_file` records ownership under the reserved lease 0, so
+        // release it too and leave no endpoint file behind in the shared
+        // fork-coherent directory.
+        provider
+            .destroy_namespace(NetworkLeaseId(0))
+            .expect("release fork-coherent endpoint file");
+    }
+
+    /// A published-port relay must keep forwarding client bytes that arrive
+    /// after the relay is already running. On BSD-derived hosts `accept()`
+    /// inherits `O_NONBLOCK` from the (nonblocking) published listener, so the
+    /// accepted descriptor must be put back into blocking mode before the
+    /// blocking copy loop reads from it -- otherwise the first read races the
+    /// client, returns `EAGAIN`, and the relay mistakes it for end-of-stream.
+    #[test]
+    fn publish_tcp_forwards_client_bytes_that_arrive_after_the_target_speaks_first() {
+        let host_port = free_loopback_port();
+        let container_port = 8083;
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port,
+            protocol: PortProtocol::Tcp,
+        };
+        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+        provider.publish_port(lease.id, mapping).expect("publish");
+
+        let target_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("target bind");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        // The target speaks first, so the client provably sends nothing until
+        // the relay has already started copying in both directions.
+        let server = thread::spawn(move || {
+            let (mut stream, _) = target_listener.accept().expect("target accept");
+            stream.write_all(b"srv").expect("write greeting");
+            let mut buf = [0_u8; 4];
+            stream.read_exact(&mut buf).expect("read ping");
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"ok").expect("write ok");
+        });
+        provider
+            .register_virtual_endpoint(
+                spec.bridge_id.clone(),
+                spec.namespace_id.clone().expect("namespace id"),
+                guest(SocketAddr::new(IpAddr::V4(spec.ipv4), container_port)),
+                PortProtocol::Tcp,
+                host(target_addr),
+            )
+            .expect("register");
+
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).expect("connect");
+        let mut greeting = [0_u8; 3];
+        client.read_exact(&mut greeting).expect("read greeting");
+        assert_eq!(&greeting, b"srv");
+        client.write_all(b"ping").expect("write ping");
+        let mut reply = [0_u8; 2];
+        client.read_exact(&mut reply).expect("read reply");
+        server.join().expect("server thread");
+
+        assert_eq!(&reply, b"ok");
+        provider
+            .destroy_namespace(lease.id)
+            .expect("destroy namespace");
     }
 
     #[test]
