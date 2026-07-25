@@ -940,21 +940,75 @@ mod identity_raw_range_tests {
 
     #[test]
     fn calibrated_x86_vvar_tracks_host_clocks() {
-        let clock = calibrate_x86_vvar_clock().expect("FreeBSD amd64 TSC frequency");
-        let tsc = unsafe { std::arch::x86_64::_rdtsc() };
-        let counter_ns = tsc_ns(tsc, clock.frequency);
-        let vvar_realtime = counter_ns.wrapping_add(clock.realtime_off_ns);
-        let vvar_monotonic = counter_ns.wrapping_add(clock.monotonic_off_ns);
-        let host_realtime = host_clock_ns(libc::CLOCK_REALTIME).expect("host realtime");
-        let host_monotonic = host_clock_ns(libc::CLOCK_MONOTONIC).expect("host monotonic");
-        assert!(
-            vvar_realtime.abs_diff(host_realtime) < 50_000_000,
-            "vvar realtime calibration drifted: vvar={vvar_realtime}, host={host_realtime}"
+        // Part 1 - host-independent proof of the vvar-clock tracking MATH.
+        //
+        // The live TSC is only a valid vDSO clocksource on a host whose counter
+        // is invariant AND SMP-safe; `calibrate` returns `None` otherwise (e.g.
+        // the nested test VMs report kern.timecounter.{invariant,smp}_tsc = 0, so
+        // `machdep.tsc_freq` is present but the counter can jump on vCPU
+        // migration). The old `.expect(...)` therefore PANICKED on such a host —
+        // it tested the host's TSC quality, not carrick's logic. Pin the two
+        // pieces of real logic with fixed inputs so this holds on ANY host:
+        //   1. `tsc_ns` converts raw TSC counts to ns at the reported frequency.
+        //   2. the calibration offset (`host_clock - tsc_ns(tsc)`) inverts that
+        //      conversion, so `tsc_ns(tsc) + offset` reproduces the host clock and
+        //      tracks it one-for-one as the counter advances.
+        let frequency = 2_500_000_000u64; // 2.5 GHz, an arbitrary invariant TSC.
+
+        // (1) Unit conversion is exact at whole-fraction boundaries.
+        assert_eq!(tsc_ns(0, frequency), 0);
+        assert_eq!(tsc_ns(frequency, frequency), 1_000_000_000);
+        assert_eq!(tsc_ns(frequency / 2, frequency), 500_000_000);
+
+        // (2) The offset inverts the conversion at the calibration instant, and
+        //     the reconstructed clock advances with elapsed TSC ticks.
+        let tsc_at_calib = 9_876_543_210u64;
+        let host_at_calib = 1_700_000_000_123_456_789u64;
+        let realtime_off = host_at_calib.wrapping_sub(tsc_ns(tsc_at_calib, frequency));
+        let vvar_at_calib = tsc_ns(tsc_at_calib, frequency).wrapping_add(realtime_off);
+        assert_eq!(
+            vvar_at_calib, host_at_calib,
+            "offset must reproduce the host clock at the calibration instant"
         );
+        // 30 ms of TSC ticks later the vvar clock must track the host clock that
+        // advanced by the same 30 ms — here within integer-division rounding
+        // (<1 us), far tighter than the 50 ms bound the live path tolerates.
+        let elapsed_ns = 30_000_000u64;
+        let tsc_later = tsc_at_calib + (frequency * elapsed_ns) / 1_000_000_000;
+        let vvar_later = tsc_ns(tsc_later, frequency).wrapping_add(realtime_off);
+        let host_later = host_at_calib + elapsed_ns;
         assert!(
-            vvar_monotonic.abs_diff(host_monotonic) < 50_000_000,
-            "vvar monotonic calibration drifted: vvar={vvar_monotonic}, host={host_monotonic}"
+            vvar_later.abs_diff(host_later) < 1_000,
+            "vvar clock must track the host clock as TSC advances: vvar={vvar_later}, host={host_later}"
         );
+
+        // Part 2 - the live integration, branched on the host's REAL,
+        // deterministically-detectable invariant-TSC capability (never a panic).
+        match calibrate_x86_vvar_clock() {
+            // This host's TSC is not invariant + SMP-safe (calibrate declined):
+            // the vDSO must fall back to the Linux syscall path, so there is no
+            // TSC-derived clock to track. Asserting tracking here would be
+            // asserting a clocksource the host itself rejected.
+            None => {}
+            // Invariant + SMP-safe TSC: the wired-up calibration must track the
+            // host clocks. Bracketed reads keep drift well under 50 ms.
+            Some(clock) => {
+                let tsc = unsafe { std::arch::x86_64::_rdtsc() };
+                let counter_ns = tsc_ns(tsc, clock.frequency);
+                let vvar_realtime = counter_ns.wrapping_add(clock.realtime_off_ns);
+                let vvar_monotonic = counter_ns.wrapping_add(clock.monotonic_off_ns);
+                let host_realtime = host_clock_ns(libc::CLOCK_REALTIME).expect("host realtime");
+                let host_monotonic = host_clock_ns(libc::CLOCK_MONOTONIC).expect("host monotonic");
+                assert!(
+                    vvar_realtime.abs_diff(host_realtime) < 50_000_000,
+                    "vvar realtime calibration drifted: vvar={vvar_realtime}, host={host_realtime}"
+                );
+                assert!(
+                    vvar_monotonic.abs_diff(host_monotonic) < 50_000_000,
+                    "vvar monotonic calibration drifted: vvar={vvar_monotonic}, host={host_monotonic}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -15406,13 +15460,25 @@ mod tests {
 
         let mut snapshot = X86UcontextSnapshot::new();
         snapshot.rip = 0x401234;
-        snapshot.xsave[2..4].copy_from_slice(&0x0081u16.to_le_bytes());
+        // A WAIT/FWAIT faults only on an UNMASKED pending x87 exception. The
+        // snapshot's default FCW (byte 0) is 0x037F, which MASKS all six
+        // exceptions (bits 0..=5 set), so a status word with the invalid-operation
+        // flag set is silently absorbed by the FPU on real hardware -- no #MF, no
+        // SIGFPE -- and `service_sensitive` correctly returns `Ok(())` for it.
+        // (The earlier form set the status bits but left the mask default, an
+        // architecturally impossible faulting state, and wrongly expected a
+        // SIGFPE.) Clear the invalid-operation MASK so the exception is unmasked,
+        // then set FSW = IE|ES (ES=bit7 is the error summary hardware raises when
+        // an unmasked exception is pending). Now WAIT must deliver SIGFPE.
+        let fcw = 0x037Fu16 & !0x0001u16; // unmask IE (invalid operation)
+        snapshot.xsave[0..2].copy_from_slice(&fcw.to_le_bytes());
+        snapshot.xsave[2..4].copy_from_slice(&0x0081u16.to_le_bytes()); // FSW: ES|IE
         let before = snapshot.clone();
         assert_eq!(
             service_sensitive(X87Wait, &mut snapshot),
             Err(X86SensitiveServiceError::Signal {
                 signum: crate::linux_abi::LINUX_SIGFPE,
-                code: 7,
+                code: 7, // FPE_FLTINV (invalid operation)
                 address: 0x401234,
             })
         );
@@ -15420,6 +15486,12 @@ mod tests {
         assert_eq!(snapshot.gpr, before.gpr);
         assert_eq!(snapshot.rip, before.rip);
 
+        // With the exception MASKED (restore the default control word), the same
+        // pending status bit must NOT fault -- WAIT completes silently.
+        snapshot.xsave[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
+        service_sensitive(X87Wait, &mut snapshot).expect("masked pending exception must not fault");
+
+        // And with no pending exception at all, WAIT completes.
         snapshot.xsave[2..4].copy_from_slice(&0u16.to_le_bytes());
         service_sensitive(X87Wait, &mut snapshot).expect("clear WAIT must complete");
     }
