@@ -2217,6 +2217,17 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
+            // The per-thread MAP_JIT write-protect bit is NOT reliably
+            // inherited executable-only across `fork(2)` on Apple Silicon: a
+            // process that has toggled the bit (as the wider test suite does)
+            // can hand the sole surviving child a WRITABLE (non-executable)
+            // window, so executing the inherited cache faults with SIGBUS.
+            // The production fork path never executes inherited translated code
+            // without first repairing this via `TranslationCache::after_fork_child`
+            // (see `carrick-dsr-aarch64` translator's `after_fork_child` →
+            // `state.cache.after_fork_child()`); this test must honor the same
+            // contract before it dereferences the inherited entry.
+            cache.after_fork_child();
             let function: extern "C" fn() -> u64 =
                 unsafe { std::mem::transmute(published.entry().host().raw()) };
             unsafe { libc::_exit(i32::from(function() != 42)) };
