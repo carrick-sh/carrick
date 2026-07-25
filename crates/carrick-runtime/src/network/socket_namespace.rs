@@ -1030,7 +1030,58 @@ impl SocketNamespaceProvider {
 }
 
 fn shared_endpoint_dir() -> PathBuf {
-    std::env::temp_dir().join("carrick-netns-socket-bridge")
+    let dir = std::env::temp_dir().join("carrick-netns-socket-bridge");
+    // The fork-coherent endpoint namespace is machine-global and its file names
+    // are keyed by (scope, guest addr, protocol) only. `bridge_default` derives
+    // a constant bridge id and a constant 172.31.0.2 for an unnamed container,
+    // so two unit-test processes running at the same time -- two `just ci`
+    // invocations, two lanes -- write the *same* endpoint file and cross-wire
+    // one suite's published-port relay onto the other suite's target listener:
+    // one client gets its reply from the wrong process while its own listener
+    // never accepts (a hang in `server.join()`), and the other sees the
+    // discarded connection as ECONNRESET. Give the unit tests a process-private
+    // subdirectory so no concurrently running test binary can alias them. This
+    // keeps coverage identical -- every provider and fork child in the test
+    // process resolves the same directory, so the fork-coherence paths still
+    // exercise real files -- and it keeps test files out of the directory that
+    // real runs scan.
+    #[cfg(test)]
+    let dir = {
+        reclaim_dead_test_endpoint_dirs(&dir);
+        dir.join(format!("test-{}", std::process::id()))
+    };
+    dir
+}
+
+/// Remove the per-process test endpoint directories of test binaries that have
+/// exited, so the process-private scoping above cannot accumulate. This mirrors
+/// how `read_namespace_file` reclaims a single endpoint file whose owner is
+/// gone: the whole subdirectory has exactly one owning pid, so a dead owner
+/// makes all of it reclaimable. Runs once per process, before the first
+/// provider's directory is created.
+#[cfg(test)]
+fn reclaim_dead_test_endpoint_dirs(root: &Path) {
+    static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    SWEPT.get_or_init(|| {
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        let self_pid = std::process::id() as i32;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(owner) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("test-"))
+                .and_then(|pid| pid.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if owner == self_pid || process_is_alive(owner) {
+                continue;
+            }
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    });
 }
 
 fn endpoint_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
