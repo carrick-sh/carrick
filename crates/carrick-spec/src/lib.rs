@@ -370,8 +370,38 @@ pub enum SeccompPolicy {
 pub struct NetworkNamespaceId(String);
 
 impl NetworkNamespaceId {
+    /// The namespace id `NetworkNamespaceSpec::bridge_default` used to hardcode.
+    /// It is a machine-wide constant, so every instance that kept it shared one
+    /// loopback endpoint key (`ns-<hex "default">-127.0.0.1-<port>-<proto>`) and
+    /// one guest's `127.0.0.1:8080` was resolvable from a concurrent instance.
+    /// Nothing constructs it any more; the runtime's defaulting choke point
+    /// still recognises it so a persisted or hand-built spec cannot smuggle it
+    /// back in.
+    pub const LEGACY_SHARED: &'static str = "default";
+
+    /// Prefix of an identity derived from a process rather than from a user
+    /// name: `anon-<pid>`. It is minted once per run, before any guest fork, so
+    /// every fork child inherits the same id (fork-coherence) while two
+    /// concurrent runs never share one.
+    const ANONYMOUS_PREFIX: &'static str = "anon-";
+
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    /// The identity of a run that has no better name to go by. `pid` is passed
+    /// in rather than read here so this crate stays a pure description of a
+    /// container: the caller decides *when* the pid is sampled, which is what
+    /// makes the id fork-coherent (sampled once at spec build, never at use).
+    pub fn anonymous(pid: u32) -> Self {
+        Self(format!("{}{pid}", Self::ANONYMOUS_PREFIX))
+    }
+
+    /// The pid this identity was minted from, if it is an `anon-<pid>` one.
+    /// Lets a reclaimer decide a whole family of records with a single liveness
+    /// check instead of one per file.
+    pub fn anonymous_owner_pid(&self) -> Option<i32> {
+        self.0.strip_prefix(Self::ANONYMOUS_PREFIX)?.parse().ok()
     }
 
     pub fn as_str(&self) -> &str {
@@ -488,7 +518,11 @@ impl NetworkNamespaceSpec {
         };
         Self {
             mode: NetworkMode::Bridge,
-            namespace_id: Some(NetworkNamespaceId::new("default")),
+            // Deliberately unnamed. A constant id here is a machine-wide
+            // constant, and every path builder keyed on it then aliases across
+            // concurrent instances. The runtime mints an instance-unique id in
+            // one place (`RuntimeNetwork::create`), before any guest fork.
+            namespace_id: None,
             bridge_id,
             container_name,
             aliases,
@@ -528,6 +562,21 @@ impl NetworkNamespaceSpec {
         }
         self.attachments.clone()
     }
+}
+
+/// Is `ip` in the default bridge's placeholder /24 (`172.31.0.0/24`)?
+///
+/// `bridge_ipv4_for_name` derives `third = 1 + bucket/253` for every non-empty
+/// name, so a name-derived address is always in `172.31.[1..=253].[2..=254]` --
+/// disjoint from this /24, which therefore holds only the gateway
+/// (`172.31.0.1`) and the "no address was allocated, here is a placeholder"
+/// address handed to an unnamed container (`172.31.0.2`). That disjointness is
+/// load-bearing: it is what lets the runtime treat a `172.31.0.0/24` endpoint
+/// as private to one instance without touching any address a user can name.
+/// `unnamed_container_address_is_disjoint_from_every_named_one` pins it.
+pub fn is_bridge_placeholder_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 172 && octets[1] == 31 && octets[2] == 0
 }
 
 fn bridge_ipv4_for_name(container_name: Option<&str>) -> Ipv4Addr {
@@ -975,6 +1024,59 @@ mod tests {
         assert_ne!(db.ipv4, Ipv4Addr::new(172, 31, 0, 2));
         assert_eq!(db.ipv4.octets()[0..2], [172, 31]);
         assert_eq!(web.ipv4.octets()[0..2], [172, 31]);
+    }
+
+    /// The runtime treats a `172.31.0.0/24` bridge endpoint as private to one
+    /// instance. That is only sound because no *name* can ever be hashed into
+    /// that /24 -- otherwise realm-qualifying it would quietly make a named,
+    /// DNS-advertised container unreachable from a peer instance. Cover the
+    /// whole bucket space rather than a couple of samples.
+    #[test]
+    fn unnamed_container_address_is_disjoint_from_every_named_one() {
+        assert!(is_bridge_placeholder_ipv4(bridge_ipv4_for_name(None)));
+        assert!(is_bridge_placeholder_ipv4(bridge_ipv4_for_name(Some(""))));
+        assert!(is_bridge_placeholder_ipv4(Ipv4Addr::new(172, 31, 0, 1)));
+
+        let mut seen_third = std::collections::HashSet::new();
+        for index in 0..20_000u32 {
+            let name = format!("container-{index}");
+            let ipv4 = bridge_ipv4_for_name(Some(&name));
+            assert!(
+                !is_bridge_placeholder_ipv4(ipv4),
+                "name {name:?} hashed into the placeholder /24: {ipv4}"
+            );
+            let octets = ipv4.octets();
+            assert_eq!(octets[0..2], [172, 31]);
+            assert!((1..=253).contains(&octets[2]), "third octet {octets:?}");
+            assert!((2..=254).contains(&octets[3]), "fourth octet {octets:?}");
+            seen_third.insert(octets[2]);
+        }
+        // Non-vacuity: the sample really did exercise the third-octet range,
+        // rather than landing on one bucket that happens to avoid the /24.
+        assert!(seen_third.len() > 200, "sampled {} rows", seen_third.len());
+    }
+
+    /// `bridge_default` must not name the namespace. A constant id there is a
+    /// machine-wide constant, and the endpoint namespace is machine-global.
+    #[test]
+    fn bridge_default_leaves_the_namespace_unnamed() {
+        let spec = NetworkNamespaceSpec::bridge_default(None, vec![], vec![]);
+        assert!(spec.namespace_id.is_none());
+        let named = NetworkNamespaceSpec::bridge_default(Some("db".to_string()), vec![], vec![]);
+        assert!(named.namespace_id.is_none());
+    }
+
+    #[test]
+    fn anonymous_namespace_ids_round_trip_their_owner_pid() {
+        let id = NetworkNamespaceId::anonymous(4321);
+        assert_eq!(id.as_str(), "anon-4321");
+        assert_eq!(id.anonymous_owner_pid(), Some(4321));
+        assert_ne!(id, NetworkNamespaceId::anonymous(4322));
+        assert_eq!(NetworkNamespaceId::new("db").anonymous_owner_pid(), None);
+        assert_eq!(
+            NetworkNamespaceId::new(NetworkNamespaceId::LEGACY_SHARED).anonymous_owner_pid(),
+            None
+        );
     }
 
     #[test]

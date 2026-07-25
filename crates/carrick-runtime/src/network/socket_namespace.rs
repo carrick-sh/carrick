@@ -48,8 +48,34 @@ struct VirtualEndpoint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum EndpointScope {
-    Bridge(BridgeId),
+    Bridge {
+        bridge: BridgeId,
+        realm: BridgeRealm,
+    },
     Namespace(NetworkNamespaceId),
+}
+
+/// Who is entitled to mean a bridge address.
+///
+/// The endpoint namespace is machine-global, and a bridge endpoint used to be
+/// keyed by `(bridge id, guest addr, protocol)` alone. Every one of those is a
+/// compile-time constant for an unnamed container on the default bridge
+/// (`carrick0`, `172.31.0.2`), so two concurrent `carrick run -p ...` instances
+/// wrote and read the *same* record: an inbound connection to one instance's
+/// published host port was proxied into the *other* instance's container
+/// listener, silently, with no diagnostic. The realm restores the missing
+/// component of the key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum BridgeRealm {
+    /// A name-derived address. Intentionally visible machine-wide: this is what
+    /// makes two separate `carrick run --name db` / `--name web` processes reach
+    /// each other on the default bridge, which is a shipped, conformance-tested
+    /// feature (`conformance_bridge_compose_pair`).
+    Shared,
+    /// The `172.31.0.0/24` placeholder handed to a container with no name. It is
+    /// not an address anyone allocated, so the only processes that can
+    /// meaningfully mean it are one instance and its fork children.
+    Private(NetworkNamespaceId),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,6 +114,20 @@ struct PublishedTcpProxy {
 struct PublishedUdpProxy {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+/// Where a published-UDP relay publishes the transient endpoint that lets the
+/// guest recognise a reply's source.
+///
+/// The realm must be derived from the *gateway* address the record is keyed on,
+/// not from the container address of the relay's target: `translate_host_source`
+/// re-derives it from the gateway address it reads back, and for a named
+/// container (shared realm, gateway inside the private range) the writer and the
+/// verifier would otherwise look in two different directories.
+#[derive(Debug, Clone)]
+struct UdpReplyEndpoint {
+    scope: EndpointScope,
+    gateway_v4: Ipv4Addr,
 }
 
 #[derive(Clone)]
@@ -239,7 +279,30 @@ impl Default for SocketNamespaceProvider {
 
 impl SocketNamespaceProvider {
     pub fn new() -> Self {
-        let endpoint_dir = shared_endpoint_dir();
+        Self::rooted_at(shared_endpoint_dir())
+    }
+
+    /// Build a provider over an explicit namespace root.
+    ///
+    /// Test-only, and there is deliberately no environment override for it: the
+    /// production root has to be a single machine-global directory or
+    /// cross-instance service resolution stops working. The unit tests need it
+    /// because `shared_endpoint_dir` gives each test *process* a private
+    /// subdirectory -- which is what keeps two concurrent `cargo test` runs from
+    /// aliasing each other, but also means no test could otherwise model two
+    /// instances sharing one namespace, i.e. the exact layout this module's
+    /// aliasing bugs live in.
+    #[cfg(test)]
+    fn with_endpoint_root(root: &Path) -> Self {
+        Self::rooted_at(root.to_path_buf())
+    }
+
+    fn rooted_at(endpoint_dir: PathBuf) -> Self {
+        // Force this process's identity here, before the provider can publish
+        // anything and -- crucially -- before the guest boots and forks. Every
+        // fork child then inherits the value already stored, so a child's
+        // publications are accepted by its parent's relay.
+        let _ = instance_id();
         let _ = fs::create_dir_all(&endpoint_dir);
         Self {
             fork_gate: Arc::new(Mutex::new(())),
@@ -387,11 +450,12 @@ impl SocketNamespaceProvider {
     pub fn resolve_registered_connect(
         &self,
         bridge_id: &BridgeId,
+        namespace_id: Option<&NetworkNamespaceId>,
         virtual_addr: GuestSocketAddr,
         protocol: PortProtocol,
     ) -> Result<Option<HostSocketAddr>, String> {
         let key = VirtualEndpoint {
-            scope: EndpointScope::Bridge(bridge_id.clone()),
+            scope: bridge_scope(bridge_id.clone(), namespace_id, virtual_addr),
             addr: virtual_addr,
             protocol,
         };
@@ -503,9 +567,12 @@ impl SocketNamespaceProvider {
             return Ok(ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED));
         }
         for attachment in effective_attachments(spec) {
-            if let Some(host) =
-                self.resolve_registered_connect(&attachment.bridge_id, requested, protocol)?
-            {
+            if let Some(host) = self.resolve_registered_connect(
+                &attachment.bridge_id,
+                spec.namespace_id.as_ref(),
+                requested,
+                protocol,
+            )? {
                 return Ok(ConnectTarget::Host(host));
             }
         }
@@ -757,12 +824,13 @@ impl SocketNamespaceProvider {
             .set_nonblocking(true)
             .map_err(|e| format!("failed to configure published TCP listener: {e}"))?;
         let stop = Arc::new(AtomicBool::new(false));
+        let target_addr = GuestSocketAddr(SocketAddr::new(
+            IpAddr::V4(spec.ipv4),
+            mapping.container_port,
+        ));
         let target = VirtualEndpoint {
-            scope: EndpointScope::Bridge(spec.bridge_id),
-            addr: GuestSocketAddr(SocketAddr::new(
-                IpAddr::V4(spec.ipv4),
-                mapping.container_port,
-            )),
+            scope: bridge_scope(spec.bridge_id, spec.namespace_id.as_ref(), target_addr),
+            addr: target_addr,
             protocol: PortProtocol::Tcp,
         };
         let fork_state = BridgeHelperForkState {
@@ -822,15 +890,29 @@ impl SocketNamespaceProvider {
             .set_nonblocking(true)
             .map_err(|e| format!("failed to configure published UDP listener: {e}"))?;
         let stop = Arc::new(AtomicBool::new(false));
+        let target_addr = GuestSocketAddr(SocketAddr::new(
+            IpAddr::V4(spec.ipv4),
+            mapping.container_port,
+        ));
         let target = VirtualEndpoint {
-            scope: EndpointScope::Bridge(spec.bridge_id),
-            addr: GuestSocketAddr(SocketAddr::new(
-                IpAddr::V4(spec.ipv4),
-                mapping.container_port,
-            )),
+            scope: bridge_scope(
+                spec.bridge_id.clone(),
+                spec.namespace_id.as_ref(),
+                target_addr,
+            ),
+            addr: target_addr,
             protocol: PortProtocol::Udp,
         };
-        let gateway_v4 = spec.gateway_v4;
+        // `bridge_realm` ignores the port, so deriving the reply realm once
+        // here, from the gateway address, is exact for every datagram.
+        let reply = UdpReplyEndpoint {
+            scope: bridge_scope(
+                spec.bridge_id,
+                spec.namespace_id.as_ref(),
+                GuestSocketAddr(SocketAddr::new(IpAddr::V4(spec.gateway_v4), 0)),
+            ),
+            gateway_v4: spec.gateway_v4,
+        };
         let fork_state = BridgeHelperForkState {
             fork_gate: Arc::clone(&self.fork_gate),
             tracked_fds: Arc::clone(&self.fork_tracked_fds),
@@ -847,7 +929,7 @@ impl SocketNamespaceProvider {
                     registry,
                     endpoint_dir,
                     target,
-                    gateway_v4,
+                    reply,
                     thread_stop,
                 )
             })
@@ -1010,10 +1092,10 @@ impl SocketNamespaceProvider {
             }
         }
         let contents = encode_listener_reservation(reservation);
-        fs::create_dir_all(&*self.endpoint_dir).map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
         for endpoint in endpoints {
+            let dir = endpoint_scope_dir(&self.endpoint_dir, &endpoint.scope);
             let path = listener_path(&self.endpoint_dir, &endpoint);
-            fs::write(&path, &contents).map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
+            write_record(&dir, &path, &contents).map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
             self.track_owned_file(lease_id, path, contents.clone())
                 .map_err(|_| carrick_abi::LINUX_EADDRINUSE)?;
         }
@@ -1027,6 +1109,14 @@ const SERVICE_SHARD_PREFIX: &str = "svc-";
 /// Name prefix of a directory owned in its entirety by a single process, whose
 /// pid is the rest of the name.
 const PER_PROCESS_DIR_PREFIX: &str = "test-";
+
+/// Name prefix of a private realm directory: `inst-<hex namespace id>`.
+///
+/// It must not collide with any other prefix the namespace root carries, and in
+/// particular must never begin with [`SERVICE_SHARD_PREFIX`] -- the service
+/// readers enumerate the root by prefix and a realm dir has to be invisible to
+/// them.
+const PRIVATE_REALM_PREFIX: &str = "inst-";
 
 /// How many entries of the endpoint namespace one process visits while
 /// reclaiming dead-owner litter. The pass runs once, synchronously, before the
@@ -1138,6 +1228,36 @@ fn reclaim_stale_endpoint_records(root: &Path, budget: usize) -> usize {
             }
             continue;
         }
+        if let Some(encoded) = name.strip_prefix(PRIVATE_REALM_PREFIX) {
+            visited += 1;
+            // A private realm belongs to one namespace id, and in practice that
+            // id is `anon-<pid>` -- so, exactly like a `test-<pid>` directory,
+            // one liveness check settles every record inside it. This is the
+            // only thing that reaches the `bridge-`/`listen-` families at all:
+            // nothing ever enumerates them by name, so the lazy per-file rule
+            // can never visit them, and before realms existed they were
+            // unreclaimable by construction.
+            let owner = unhex_name(encoded)
+                .map(NetworkNamespaceId::new)
+                .and_then(|id| id.anonymous_owner_pid());
+            if let Some(owner) = owner
+                && owner != self_pid
+                && !process_is_alive(owner)
+            {
+                visited += remove_tree_within_budget(&entry.path(), budget.saturating_sub(visited));
+                continue;
+            }
+            // A realm whose id is not pid-derived (a caller that set an explicit
+            // `network_namespace_id` and still landed on a placeholder address)
+            // falls back to the same per-file rule as everything else. No new
+            // liveness predicate is introduced.
+            visited += reclaim_records_under(&entry.path(), budget.saturating_sub(visited));
+            // Succeeds only while the realm is empty, so a realm another
+            // instance is still publishing into is left in place; a writer that
+            // loses that race re-creates the directory and retries.
+            let _ = fs::remove_dir(entry.path());
+            continue;
+        }
         if name.starts_with(SERVICE_SHARD_PREFIX) {
             visited += 1;
             visited += reclaim_records_under(&entry.path(), budget.saturating_sub(visited));
@@ -1193,18 +1313,66 @@ fn remove_tree_within_budget(dir: &Path, budget: usize) -> usize {
     visited
 }
 
-/// Write one durable record, creating its directory first. The reclaim pass
-/// removes a service directory once it is empty, so a writer that loses that
-/// race re-creates the directory and retries rather than failing the guest's
-/// `create_namespace`.
+/// Write one durable record, creating its directory first.
+///
+/// The write is a temp-file-plus-`rename`, not an `fs::write`. `fs::write` is
+/// `O_TRUNC` + `write`, which publishes an **empty** file for the window between
+/// the two: a concurrent reader that lands in it finds no `pid=` line, decides
+/// there is no such endpoint, and drops a connection that should have been
+/// forwarded (or answers a DNS query with nothing). `rename` is atomic, so a
+/// reader observes either the complete old record or the complete new one and
+/// never a partial. That window is independent of any cross-instance aliasing --
+/// it is reachable by one instance republishing over its own record -- and it
+/// has to be closed before any content-based check on a record can be sound.
+///
+/// The temp name carries the writer's pid so a crashed writer's leftover is
+/// reclaimable by the same liveness rule as every other record, and a counter so
+/// two threads of one process cannot collide.
+///
+/// The reclaim pass removes a record directory once it is empty, so a writer
+/// that loses that race re-creates the directory and retries rather than failing
+/// the guest's `create_namespace`.
 fn write_record(dir: &Path, path: &Path, contents: &str) -> io::Result<()> {
     fs::create_dir_all(dir)?;
-    match fs::write(path, contents) {
+    match write_record_once(dir, path, contents) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             fs::create_dir_all(dir)?;
-            fs::write(path, contents)
+            write_record_once(dir, path, contents)
         }
         other => other,
+    }
+}
+
+fn write_record_once(dir: &Path, path: &Path, contents: &str) -> io::Result<()> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let temp = dir.join(format!(
+        ".carrick-tmp-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&temp, contents)?;
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&temp);
+            Err(err)
+        }
+    }
+}
+
+/// Remove `path` only if it still holds exactly `expected`.
+///
+/// Every unlink in this module is a *reclamation* of a record whose owner was
+/// observed dead, decided from bytes that were read earlier. Between the read
+/// and the unlink the owner's successor can rename a live record into the same
+/// path, and unlinking then destroys a live publication -- the record is gone,
+/// but the process that owns the socket is very much alive and will never write
+/// it again. Re-reading and comparing first makes the unlink conditional on the
+/// bytes the decision was actually made from.
+fn remove_record_if_unchanged(path: &Path, expected: &str) -> bool {
+    match fs::read_to_string(path) {
+        Ok(current) if current == expected => fs::remove_file(path).is_ok(),
+        _ => false,
     }
 }
 
@@ -1215,12 +1383,19 @@ fn endpoint_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
     };
     let ip = endpoint.addr.0.ip().to_string().replace(':', "_");
     let scope = endpoint_scope_path_component(&endpoint.scope);
-    endpoint_dir.join(format!(
+    endpoint_scope_dir(endpoint_dir, &endpoint.scope).join(format!(
         "{scope}-{ip}-{}-{protocol}",
         endpoint.addr.0.port()
     ))
 }
 
+/// Reverse records stay at the namespace root, in every realm.
+///
+/// Their key is a *real host socket address*, which is globally unique while the
+/// socket is live -- it cannot alias the way a placeholder guest address does.
+/// Keeping them shared is also required: translating a peer address on every
+/// accept/recvfrom has to find the record of whichever instance owns that host
+/// port, which is frequently not this one.
 fn reverse_endpoint_path(
     endpoint_dir: &Path,
     host_addr: HostSocketAddr,
@@ -1234,10 +1409,13 @@ fn reverse_endpoint_path(
     endpoint_dir.join(format!("reverse-{ip}-{}-{protocol}", host_addr.0.port()))
 }
 
+/// Listener reservations follow their endpoint into its realm: they are keyed by
+/// the same `VirtualEndpoint`, so an unnamed container's `EADDRINUSE` bookkeeping
+/// stays as private as the endpoint it reserves.
 fn listener_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
     let ip = endpoint.addr.0.ip().to_string().replace(':', "_");
     let scope = endpoint_scope_path_component(&endpoint.scope);
-    endpoint_dir.join(format!(
+    endpoint_scope_dir(endpoint_dir, &endpoint.scope).join(format!(
         "listen-{scope}-{ip}-{}-tcp",
         endpoint.addr.0.port()
     ))
@@ -1269,6 +1447,55 @@ fn service_record_path(name_dir: &Path, addr: Ipv4Addr) -> PathBuf {
     name_dir.join(format!("addr-{}", addr.to_string().replace('.', "_")))
 }
 
+/// The ONE decision that partitions bridge endpoints into "anyone on this
+/// machine may resolve this" and "only my own instance may". Pure, and called
+/// with the same inputs by the publisher and by every resolver, so the registry
+/// key and the file path can never disagree about which realm a record is in.
+///
+/// The rule is the address: `carrick_spec::is_bridge_placeholder_ipv4` is true
+/// only inside `172.31.0.0/24`, which no container *name* can ever hash into
+/// (proved by `unnamed_container_address_is_disjoint_from_every_named_one`) and
+/// which `--ip` refuses. So an address in it means "nothing was allocated, here
+/// is a placeholder" -- there is no DNS record for it, no user can name it, and
+/// the set of processes that can meaningfully mean it is exactly one run and
+/// its fork children.
+///
+/// **This is the one behaviour change.** Two concurrent *unnamed* containers
+/// stop being able to reach each other at `172.31.0.2`. They alias today, and
+/// that aliasing IS the cross-wire being removed -- there was never a
+/// well-defined "other container" at that address, only whichever instance
+/// wrote the record last. Docker gives each container a distinct address; giving
+/// carrick real per-container addresses is IPAM work, scheduled separately.
+///
+/// `namespace_id` is `Option` because two callers -- the published-port relays'
+/// target and `resolve_registered_connect` -- can be handed a spec that never
+/// named a namespace. Such a spec cannot register an endpoint at all
+/// (`materialize_bridge_bind` and `prepare_tcp_listen` both require the id), so
+/// it has no records of its own to find; `Shared` keeps its lookups exactly
+/// where they are today rather than inventing an identity for it.
+///
+/// It must never be a `getpid()`-at-use decision: `namespace_id` is sampled once
+/// at spec build, before any fork, so a forked child derives its parent's realm.
+fn bridge_realm(namespace_id: Option<&NetworkNamespaceId>, guest_ip: IpAddr) -> BridgeRealm {
+    match (guest_ip, namespace_id) {
+        (IpAddr::V4(ip), Some(namespace_id)) if carrick_spec::is_bridge_placeholder_ipv4(ip) => {
+            BridgeRealm::Private(namespace_id.clone())
+        }
+        _ => BridgeRealm::Shared,
+    }
+}
+
+fn bridge_scope(
+    bridge_id: BridgeId,
+    namespace_id: Option<&NetworkNamespaceId>,
+    virtual_addr: GuestSocketAddr,
+) -> EndpointScope {
+    EndpointScope::Bridge {
+        realm: bridge_realm(namespace_id, virtual_addr.0.ip()),
+        bridge: bridge_id,
+    }
+}
+
 fn endpoint_scope(
     bridge_id: BridgeId,
     namespace_id: NetworkNamespaceId,
@@ -1277,13 +1504,34 @@ fn endpoint_scope(
     if virtual_addr.0.ip().is_loopback() {
         EndpointScope::Namespace(namespace_id)
     } else {
-        EndpointScope::Bridge(bridge_id)
+        bridge_scope(bridge_id, Some(&namespace_id), virtual_addr)
+    }
+}
+
+/// The directory a record of `scope` lives in, relative to the namespace root.
+///
+/// A private realm is a *subdirectory* rather than a filename prefix because
+/// that is the variant reclamation can use: every private realm id is
+/// `anon-<pid>` in practice, so `inst-<hex anon-pid>/` is decidable as a whole
+/// directory with one liveness check -- reaching the `bridge-`/`listen-` record
+/// families that the per-file lazy rule can never reach, because nothing ever
+/// enumerates them by name.
+fn endpoint_scope_dir(endpoint_dir: &Path, scope: &EndpointScope) -> PathBuf {
+    match scope {
+        EndpointScope::Bridge {
+            realm: BridgeRealm::Private(namespace_id),
+            ..
+        } => endpoint_dir.join(format!(
+            "{PRIVATE_REALM_PREFIX}{}",
+            hex_name(namespace_id.as_str())
+        )),
+        _ => endpoint_dir.to_path_buf(),
     }
 }
 
 fn endpoint_scope_path_component(scope: &EndpointScope) -> String {
     match scope {
-        EndpointScope::Bridge(bridge) => format!("bridge-{}", hex_name(bridge.as_str())),
+        EndpointScope::Bridge { bridge, .. } => format!("bridge-{}", hex_name(bridge.as_str())),
         EndpointScope::Namespace(namespace) => format!("ns-{}", hex_name(namespace.as_str())),
     }
 }
@@ -1295,6 +1543,20 @@ fn hex_name(name: &str) -> String {
         let _ = write!(&mut encoded, "{byte:02x}");
     }
     encoded
+}
+
+/// Inverse of [`hex_name`]. Only reclamation needs it: it reads a realm id back
+/// out of a directory name to ask whether that instance is still alive.
+fn unhex_name(encoded: &str) -> Option<String> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks(2) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        bytes.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn service_names_for(container_name: Option<&String>, aliases: &[String]) -> Vec<String> {
@@ -1338,6 +1600,77 @@ fn encode_listener_reservation(reservation: ListenerReservation) -> String {
     )
 }
 
+/// This process's identity, minted once and inherited across `fork`.
+///
+/// It is process-global rather than per-provider on purpose: a fork child must
+/// compare *equal* to its parent (it publishes into the same namespace and the
+/// parent's relay has to accept what it wrote), and two providers constructed in
+/// one process stand in for exactly that relationship in the tests. Forcing it
+/// from `SocketNamespaceProvider::new` -- which runs before the guest boots --
+/// means the value is already set when `fork()` copies this memory, so no child
+/// ever mints a different one.
+///
+/// The pid alone would be reused by the OS; mixing in a monotonic timestamp
+/// makes a stale record of a recycled pid distinguishable from a live one.
+fn instance_id() -> u128 {
+    static INSTANCE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *INSTANCE.get_or_init(|| {
+        let pid = u128::from(std::process::id());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        (pid << 96) | (nanos & ((1 << 96) - 1))
+    })
+}
+
+/// The record's own name for itself: its path relative to the namespace root.
+///
+/// A reader computes a path from the tuple it is asking about and then reads
+/// whatever is there. `key=` closes that loop by making the record state which
+/// tuple it believes it answers, so a path-scheme bug, a build-skew record or a
+/// half-migrated directory is caught as a mismatch instead of being served as if
+/// it were the right answer. It costs one string compare on bytes the reader has
+/// already read: no extra syscall, and an O(1) read stays O(1).
+fn record_key(endpoint_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(endpoint_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn encode_endpoint_record(endpoint_dir: &Path, path: &Path, addr: SocketAddr) -> String {
+    format!(
+        "{addr}\npid={}\ninstance={:032x}\nkey={}\n",
+        std::process::id(),
+        instance_id(),
+        record_key(endpoint_dir, path)
+    )
+}
+
+fn record_field<'a>(raw: &'a str, field: &str) -> Option<&'a str> {
+    raw.lines()
+        .find_map(|line| line.strip_prefix(field))
+        .map(str::trim)
+}
+
+/// Does this record claim to answer the tuple the reader asked about?
+///
+/// A record with no `key=` at all makes no claim -- it predates the field, and
+/// its own path is the only thing that placed it -- so it is accepted. Only a
+/// record that names a *different* key is rejected, because that can only come
+/// from a genuine disagreement about where records live.
+fn record_key_matches(endpoint_dir: &Path, path: &Path, raw: &str) -> bool {
+    match record_field(raw, "key=") {
+        Some(claimed) => claimed == record_key(endpoint_dir, path),
+        None => true,
+    }
+}
+
+fn record_instance(raw: &str) -> Option<u128> {
+    u128::from_str_radix(record_field(raw, "instance=")?, 16).ok()
+}
+
 fn write_endpoint_file(
     fork_gate: &Arc<Mutex<()>>,
     endpoint_dir: &Path,
@@ -1345,15 +1678,14 @@ fn write_endpoint_file(
     host_addr: HostSocketAddr,
 ) -> Result<Vec<(PathBuf, String)>, String> {
     let _fork_gate = fork_gate.lock().unwrap_or_else(|p| p.into_inner());
-    fs::create_dir_all(endpoint_dir)
-        .map_err(|e| format!("failed to create socket namespace endpoint directory: {e}"))?;
+    let scope_dir = endpoint_scope_dir(endpoint_dir, &endpoint.scope);
     let path = endpoint_path(endpoint_dir, endpoint);
-    let contents = format!("{}\npid={}\n", host_addr.0, std::process::id());
-    fs::write(&path, &contents)
+    let contents = encode_endpoint_record(endpoint_dir, &path, host_addr.0);
+    write_record(&scope_dir, &path, &contents)
         .map_err(|e| format!("failed to record socket namespace endpoint: {e}"))?;
     let reverse_path = reverse_endpoint_path(endpoint_dir, host_addr, endpoint.protocol);
-    let reverse_contents = format!("{}\npid={}\n", endpoint.addr.0, std::process::id());
-    fs::write(&reverse_path, &reverse_contents)
+    let reverse_contents = encode_endpoint_record(endpoint_dir, &reverse_path, endpoint.addr.0);
+    write_record(endpoint_dir, &reverse_path, &reverse_contents)
         .map_err(|e| format!("failed to record socket namespace reverse endpoint: {e}"))?;
     Ok(vec![(path, contents), (reverse_path, reverse_contents)])
 }
@@ -1361,13 +1693,22 @@ fn write_endpoint_file(
 fn remove_endpoint_files(fork_gate: &Arc<Mutex<()>>, files: Vec<(PathBuf, String)>) {
     let _fork_gate = fork_gate.lock().unwrap_or_else(|p| p.into_inner());
     for (path, expected_contents) in files {
-        match fs::read_to_string(&path) {
-            Ok(contents) if contents == expected_contents => {
-                let _ = fs::remove_file(path);
-            }
-            _ => {}
-        }
+        remove_record_if_unchanged(&path, &expected_contents);
     }
+}
+
+/// How much of its own identity a reader demands of a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceTrust {
+    /// Any live instance's record may answer. This is the guest-facing rule and
+    /// the reason the endpoint namespace is machine-global at all: a container
+    /// resolving `db` must reach the `db` a *different* `carrick run` process
+    /// published.
+    AnyInstance,
+    /// Only this instance (and its fork children, which share the id) may
+    /// answer. Used by the published-port relays, whose target is derived from
+    /// their own lease's spec.
+    OwnInstanceOnly,
 }
 
 fn read_endpoint_file(
@@ -1375,10 +1716,36 @@ fn read_endpoint_file(
     endpoint_dir: &Path,
     endpoint: &VirtualEndpoint,
 ) -> Option<HostSocketAddr> {
+    read_endpoint_file_trusting(
+        fork_gate,
+        endpoint_dir,
+        endpoint,
+        InstanceTrust::AnyInstance,
+    )
+}
+
+fn read_endpoint_file_trusting(
+    fork_gate: &Arc<Mutex<()>>,
+    endpoint_dir: &Path,
+    endpoint: &VirtualEndpoint,
+    trust: InstanceTrust,
+) -> Option<HostSocketAddr> {
     let _fork_gate = fork_gate.lock().unwrap_or_else(|p| p.into_inner());
     let path = endpoint_path(endpoint_dir, endpoint);
     match read_namespace_file(&path)? {
-        NamespaceFile::Live(raw) => raw.lines().next()?.trim().parse().ok().map(HostSocketAddr),
+        NamespaceFile::Live(raw) => {
+            if !record_key_matches(endpoint_dir, &path, &raw) {
+                warn_rejected_record("key", &path);
+                return None;
+            }
+            if trust == InstanceTrust::OwnInstanceOnly
+                && record_instance(&raw) != Some(instance_id())
+            {
+                warn_rejected_record("instance", &path);
+                return None;
+            }
+            raw.lines().next()?.trim().parse().ok().map(HostSocketAddr)
+        }
         NamespaceFile::Stale(raw) => {
             if let Ok(host_addr) = raw.lines().next()?.trim().parse::<SocketAddr>() {
                 let reverse_path = reverse_endpoint_path(
@@ -1393,6 +1760,27 @@ fn read_endpoint_file(
     }
 }
 
+/// A record was refused for claiming to be something else. Guest-facing paths
+/// stay silent and surface `ECONNREFUSED` as Linux would, so this is the only
+/// place the condition is visible; say it once per process on stderr (a
+/// per-connection message would be a flood), and put every occurrence in the
+/// always-on event ring where a core or a live `lldb` picks it up.
+fn warn_rejected_record(reason: &str, path: &Path) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    crate::event_ring::rec(
+        crate::event_ring::NSREJECT,
+        crate::event_ring::path_hash(path.as_os_str().as_encoded_bytes()),
+        crate::event_ring::path_hash(reason.as_bytes()),
+        std::process::id() as i32,
+    );
+    if !WARNED.swap(true, Ordering::SeqCst) {
+        eprintln!(
+            "carrick: refused a socket-namespace record that belongs to another {reason}: {}",
+            path.display()
+        );
+    }
+}
+
 fn read_reverse_endpoint_file(
     fork_gate: &Arc<Mutex<()>>,
     endpoint_dir: &Path,
@@ -1402,6 +1790,10 @@ fn read_reverse_endpoint_file(
     let _fork_gate = fork_gate.lock().unwrap_or_else(|p| p.into_inner());
     let path = reverse_endpoint_path(endpoint_dir, host_addr, protocol);
     let raw = read_live_namespace_file(&path)?;
+    if !record_key_matches(endpoint_dir, &path, &raw) {
+        warn_rejected_record("key", &path);
+        return None;
+    }
     raw.lines().next()?.trim().parse().ok().map(GuestSocketAddr)
 }
 
@@ -1419,7 +1811,10 @@ fn read_namespace_file(path: &Path) -> Option<NamespaceFile> {
     if process_is_alive(owner_pid) {
         return Some(NamespaceFile::Live(raw));
     }
-    let _ = fs::remove_file(path);
+    // Reclaim, but only the bytes this verdict was reached from: the dead
+    // owner's successor may have renamed a live record in while this read was
+    // off the CPU, and unlinking that would destroy a live publication.
+    remove_record_if_unchanged(path, &raw);
     Some(NamespaceFile::Stale(raw))
 }
 
@@ -1499,6 +1894,28 @@ fn connect_tracked_tcp(
     Ok(socket.map_preserving_fd(Into::into))
 }
 
+/// Serve a published host port by proxying each inbound connection to whatever
+/// currently backs `target` inside this container.
+///
+/// The registry lookup usually misses: the guest listener is bound by a *forked*
+/// descendant, whose `register_virtual_endpoint` landed in its own
+/// copy-on-write copy of the registry and is invisible here. The durable record
+/// is the only channel, which is exactly why that record must not be ambiguous.
+///
+/// The relay demands the record be its **own** instance's. Its target is built
+/// from its own lease's spec, so a record written by an unrelated process is
+/// wrong whatever it says -- including the case realm-qualification cannot fix,
+/// two concurrent instances that were given the same `--name` and therefore the
+/// same name-derived address. Refusing is what the guest would see anyway if the
+/// peer instance were not running; serving it would send this user's traffic
+/// into another user's container.
+///
+/// The one thing this rejects that today accepts: a `carrick exec` process
+/// (a separate process sharing the container's namespace id) that binds the
+/// published container port itself, rather than the run's own guest binding it.
+/// Process identity cannot tell that apart from the duplicate-`--name` case --
+/// both are "a different process publishing my target" -- and the rejection is
+/// loud (`warn_rejected_record`) rather than a silent mis-delivery.
 fn published_tcp_accept_loop(
     listener: ForkTrackedSocket<TcpListener>,
     fork_state: BridgeHelperForkState,
@@ -1528,7 +1945,14 @@ fn published_tcp_accept_loop(
                         .ok()
                         .and_then(|registry| registry.get(&target).copied())
                 }
-                .or_else(|| read_endpoint_file(fork_gate, &endpoint_dir, &target));
+                .or_else(|| {
+                    read_endpoint_file_trusting(
+                        fork_gate,
+                        &endpoint_dir,
+                        &target,
+                        InstanceTrust::OwnInstanceOnly,
+                    )
+                });
                 // Create and publish the fd while fork is excluded, then leave
                 // the gate before the bounded nonblocking network operation.
                 let connected = target_addr.and_then(|target_addr| {
@@ -1614,7 +2038,7 @@ fn published_udp_loop(
     registry: Arc<Mutex<HashMap<VirtualEndpoint, HostSocketAddr>>>,
     endpoint_dir: Arc<PathBuf>,
     target: VirtualEndpoint,
-    gateway_v4: Ipv4Addr,
+    reply: UdpReplyEndpoint,
     stop: Arc<AtomicBool>,
 ) {
     let fork_gate = &fork_state.fork_gate;
@@ -1631,7 +2055,14 @@ fn published_udp_loop(
                         .ok()
                         .and_then(|registry| registry.get(&target).copied())
                 }
-                .or_else(|| read_endpoint_file(fork_gate, &endpoint_dir, &target));
+                .or_else(|| {
+                    read_endpoint_file_trusting(
+                        fork_gate,
+                        &endpoint_dir,
+                        &target,
+                        InstanceTrust::OwnInstanceOnly,
+                    )
+                });
                 let Some(target_addr) = target_addr else {
                     continue;
                 };
@@ -1654,9 +2085,9 @@ fn published_udp_loop(
                     continue;
                 };
                 let reply_endpoint = VirtualEndpoint {
-                    scope: target.scope.clone(),
+                    scope: reply.scope.clone(),
                     addr: GuestSocketAddr(SocketAddr::new(
-                        IpAddr::V4(gateway_v4),
+                        IpAddr::V4(reply.gateway_v4),
                         outbound_addr.port(),
                     )),
                     protocol: PortProtocol::Udp,
@@ -1866,7 +2297,14 @@ impl NetworkProvider for SocketNamespaceProvider {
         if let Ok(mut socket_addrs) = self.socket_addrs.lock() {
             socket_addrs.retain(|_, state| state.lease_id != Some(lease_id));
         }
-        let _ = fs::remove_dir(&*self.endpoint_dir);
+        // Deliberately does NOT remove the namespace root. `fs::remove_dir`
+        // succeeds the moment the directory is empty, and the directory is
+        // machine-global: a concurrent instance that has published nothing yet,
+        // or whose records were just reclaimed, would have the root pulled out
+        // from under it. Its writers re-create it, but its two `read_dir`
+        // service scans would silently return empty in between -- a transient
+        // DNS/`/etc/hosts` miss with no error anywhere. The root is now
+        // reclaimed by the once-per-process pass instead.
         Ok(())
     }
 
@@ -2007,6 +2445,22 @@ mod tests {
 
     fn guest(addr: SocketAddr) -> GuestSocketAddr {
         GuestSocketAddr(addr)
+    }
+
+    /// The namespace id `RuntimeNetwork::create` mints for this process.
+    fn this_instance_namespace() -> NetworkNamespaceId {
+        NetworkNamespaceId::anonymous(std::process::id())
+    }
+
+    /// A spec shaped exactly like the one `carrick run -p ... <image>` builds
+    /// with no `--name`: the default bridge, the `172.31.0.2` placeholder, and
+    /// an instance-unique namespace id minted before any fork. That is the shape
+    /// the published-port cross-wiring lived in, so it is the shape these tests
+    /// exercise.
+    fn unnamed_bridge_spec(published_ports: Vec<PortMapping>) -> NetworkNamespaceSpec {
+        let mut spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), published_ports);
+        spec.namespace_id = Some(this_instance_namespace());
+        spec
     }
 
     fn reclaim_fixture_root(label: &str) -> PathBuf {
@@ -2195,7 +2649,12 @@ mod tests {
                 code |= 16;
             }
             if provider
-                .resolve_registered_connect(&bridge, post_endpoint, PortProtocol::Tcp)
+                .resolve_registered_connect(
+                    &bridge,
+                    postfork.namespace_id.as_ref(),
+                    post_endpoint,
+                    PortProtocol::Tcp,
+                )
                 .ok()
                 .flatten()
                 != Some(post_host)
@@ -2488,12 +2947,19 @@ mod tests {
         );
     }
 
+    /// The namespace `provider_with_endpoint` publishes under. Its address is
+    /// the unnamed placeholder, so its records live in that namespace's private
+    /// realm and every lookup has to name the same namespace to find them.
+    fn endpoint_owner_namespace() -> NetworkNamespaceId {
+        NetworkNamespaceId::new("a")
+    }
+
     fn provider_with_endpoint() -> SocketNamespaceProvider {
         let provider = SocketNamespaceProvider::new();
         provider
             .register_virtual_endpoint(
                 BridgeId::new("carrick0"),
-                NetworkNamespaceId::new("a"),
+                endpoint_owner_namespace(),
                 guest(SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)),
                     80,
@@ -2511,6 +2977,7 @@ mod tests {
         let target = provider
             .resolve_registered_connect(
                 &BridgeId::new("carrick0"),
+                Some(&endpoint_owner_namespace()),
                 guest(SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)),
                     80,
@@ -2548,6 +3015,7 @@ mod tests {
         let target = provider
             .resolve_registered_connect(
                 &BridgeId::new("carrick1"),
+                Some(&endpoint_owner_namespace()),
                 guest(SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2)),
                     80,
@@ -2560,7 +3028,7 @@ mod tests {
 
     #[test]
     fn materialize_bind_maps_container_ip_to_loopback() {
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        let spec = unnamed_bridge_spec(Vec::new());
         let provider = SocketNamespaceProvider::new();
         provider.create_namespace(&spec).expect("namespace");
         let requested = SocketAddr::new(IpAddr::V4(spec.ipv4), 80);
@@ -2578,7 +3046,7 @@ mod tests {
 
     #[test]
     fn materialize_bind_rejects_foreign_container_ip() {
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        let spec = unnamed_bridge_spec(Vec::new());
         let provider = SocketNamespaceProvider::new();
         let requested = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 31, 0, 99)), 80);
         let err = provider
@@ -2589,7 +3057,7 @@ mod tests {
 
     #[test]
     fn bridge_connect_to_registered_peer_rewrites_to_loopback() {
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        let spec = unnamed_bridge_spec(Vec::new());
         let provider = SocketNamespaceProvider::new();
         provider.create_namespace(&spec).expect("namespace");
         let peer = SocketAddr::new(IpAddr::V4(spec.ipv4), 8080);
@@ -2933,12 +3401,17 @@ mod tests {
 
     #[test]
     fn destroy_namespace_removes_fork_coherent_endpoint_files() {
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        let spec = unnamed_bridge_spec(Vec::new());
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
+        let peer_addr = guest(SocketAddr::new(IpAddr::V4(spec.ipv4), 8080));
         let peer = VirtualEndpoint {
-            scope: EndpointScope::Bridge(spec.bridge_id.clone()),
-            addr: guest(SocketAddr::new(IpAddr::V4(spec.ipv4), 8080)),
+            scope: bridge_scope(
+                spec.bridge_id.clone(),
+                spec.namespace_id.as_ref(),
+                peer_addr,
+            ),
+            addr: peer_addr,
             protocol: PortProtocol::Tcp,
         };
         provider
@@ -2968,7 +3441,7 @@ mod tests {
 
     #[test]
     fn translate_host_source_reads_fork_coherent_endpoint_files() {
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        let spec = unnamed_bridge_spec(Vec::new());
         let writer = SocketNamespaceProvider::new();
         let reader = SocketNamespaceProvider::new();
         reader.create_namespace(&spec).expect("reader namespace");
@@ -3005,12 +3478,15 @@ mod tests {
     #[test]
     fn stale_endpoint_file_reclaims_reverse_record() {
         let provider = SocketNamespaceProvider::new();
+        // A name-derived address, i.e. the shared realm: this pins reclamation
+        // of the records that stay machine-visible.
+        let peer_addr = guest(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 31, 42, 9)),
+            8080,
+        ));
         let peer = VirtualEndpoint {
-            scope: EndpointScope::Bridge(BridgeId::new("stale-pair")),
-            addr: guest(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(172, 31, 42, 9)),
-                8080,
-            )),
+            scope: bridge_scope(BridgeId::new("stale-pair"), None, peer_addr),
+            addr: peer_addr,
             protocol: PortProtocol::Tcp,
         };
         let host_addr = host(SocketAddr::new(
@@ -3024,7 +3500,12 @@ mod tests {
         fs::write(&reverse_file, format!("{}\npid=0\n", peer.addr.0)).expect("reverse file");
 
         let resolved = provider
-            .resolve_registered_connect(&BridgeId::new("stale-pair"), peer.addr, peer.protocol)
+            .resolve_registered_connect(
+                &BridgeId::new("stale-pair"),
+                None,
+                peer.addr,
+                peer.protocol,
+            )
             .expect("resolve stale endpoint");
 
         assert_eq!(resolved, None);
@@ -3048,7 +3529,7 @@ mod tests {
             container_port: 8081,
             protocol: PortProtocol::Tcp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
 
@@ -3071,7 +3552,7 @@ mod tests {
             container_port: 8080,
             protocol: PortProtocol::Tcp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
         provider.publish_port(lease.id, mapping).expect("publish");
@@ -3094,7 +3575,7 @@ mod tests {
             container_port,
             protocol: PortProtocol::Tcp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
         provider.publish_port(lease.id, mapping).expect("publish");
@@ -3186,7 +3667,7 @@ mod tests {
             container_port,
             protocol: PortProtocol::Tcp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
         provider.publish_port(lease.id, mapping).expect("publish");
@@ -3199,9 +3680,14 @@ mod tests {
             stream.read_exact(&mut buf).expect("read ping");
             stream.write_all(b"ok").expect("write ok");
         });
+        let peer_addr = guest(SocketAddr::new(IpAddr::V4(spec.ipv4), container_port));
         let peer = VirtualEndpoint {
-            scope: EndpointScope::Bridge(spec.bridge_id.clone()),
-            addr: guest(SocketAddr::new(IpAddr::V4(spec.ipv4), container_port)),
+            scope: bridge_scope(
+                spec.bridge_id.clone(),
+                spec.namespace_id.as_ref(),
+                peer_addr,
+            ),
+            addr: peer_addr,
             protocol: PortProtocol::Tcp,
         };
         provider
@@ -3249,7 +3735,7 @@ mod tests {
             container_port,
             protocol: PortProtocol::Tcp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
         provider.publish_port(lease.id, mapping).expect("publish");
@@ -3301,7 +3787,7 @@ mod tests {
             container_port: 8081,
             protocol: PortProtocol::Udp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
 
@@ -3326,7 +3812,7 @@ mod tests {
             container_port: 8080,
             protocol: PortProtocol::Udp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
         provider.publish_port(lease.id, mapping).expect("publish");
@@ -3361,11 +3847,7 @@ mod tests {
             container_port: 8081,
             protocol: PortProtocol::Udp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(
-            None,
-            Vec::new(),
-            vec![tcp_mapping.clone(), udp_mapping.clone()],
-        );
+        let spec = unnamed_bridge_spec(vec![tcp_mapping.clone(), udp_mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
         provider
@@ -3446,7 +3928,7 @@ mod tests {
             container_port,
             protocol: PortProtocol::Udp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
         provider.publish_port(lease.id, mapping).expect("publish");
@@ -3564,7 +4046,7 @@ mod tests {
             container_port,
             protocol: PortProtocol::Tcp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
         provider.publish_port(lease.id, mapping).expect("publish");
@@ -3793,7 +4275,7 @@ mod tests {
             container_port,
             protocol: PortProtocol::Udp,
         };
-        let spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
         let provider = SocketNamespaceProvider::new();
         let lease = provider.create_namespace(&spec).expect("namespace");
         provider.publish_port(lease.id, mapping).expect("publish");
@@ -4109,9 +4591,11 @@ mod tests {
         let mut client_spec =
             NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
         client_spec.bridge_id = bridge.clone();
+        client_spec.namespace_id = Some(NetworkNamespaceId::new("peer-client-ns"));
         let mut server_spec =
             NetworkNamespaceSpec::bridge_default(Some("db".to_string()), Vec::new(), Vec::new());
         server_spec.bridge_id = bridge;
+        server_spec.namespace_id = Some(NetworkNamespaceId::new("peer-server-ns"));
 
         let writer = SocketNamespaceProvider::new();
         writer
@@ -4168,7 +4652,11 @@ mod tests {
             )
             .expect("register durable endpoint");
         let endpoint = VirtualEndpoint {
-            scope: EndpointScope::Bridge(spec.bridge_id.clone()),
+            scope: bridge_scope(
+                spec.bridge_id.clone(),
+                spec.namespace_id.as_ref(),
+                guest_addr,
+            ),
             addr: guest_addr,
             protocol: PortProtocol::Tcp,
         };
@@ -4300,6 +4788,7 @@ mod tests {
         let mut client_spec =
             NetworkNamespaceSpec::bridge_default(Some("web".to_string()), Vec::new(), Vec::new());
         client_spec.bridge_id = primary.clone();
+        client_spec.namespace_id = Some(NetworkNamespaceId::new("attachment-client-ns"));
         client_spec.ipv4 = Ipv4Addr::new(172, 31, 70, 10);
         client_spec.attachments = vec![
             NetworkAttachmentSpec::bridge_default(
@@ -4318,6 +4807,7 @@ mod tests {
         let mut server_spec =
             NetworkNamespaceSpec::bridge_default(Some("db".to_string()), Vec::new(), Vec::new());
         server_spec.bridge_id = primary;
+        server_spec.namespace_id = Some(NetworkNamespaceId::new("attachment-server-ns"));
         server_spec.attachments = vec![
             NetworkAttachmentSpec::bridge_default(
                 server_spec.bridge_id.clone(),
@@ -4364,5 +4854,787 @@ mod tests {
                 .expect("translate host source"),
             Some(guest_source)
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Published-port cross-wiring: an unnamed container on the default bridge
+    // gave every component of the endpoint key a constant value, so two
+    // concurrent instances read and wrote the same record.
+    // ---------------------------------------------------------------------
+
+    /// A namespace root two providers -- standing in for two instances -- share,
+    /// the way every real run shares the machine-global one.
+    fn shared_instance_root(label: &str) -> PathBuf {
+        let root = shared_endpoint_dir().join(format!("shared-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("shared root");
+        root
+    }
+
+    /// Two ports that are provably distinct: both listeners are held at once, so
+    /// the kernel cannot hand out the same number twice.
+    fn two_free_loopback_ports() -> (u16, u16) {
+        let first = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve first port");
+        let second = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve second port");
+        (
+            first.local_addr().expect("first addr").port(),
+            second.local_addr().expect("second addr").port(),
+        )
+    }
+
+    fn bridge_endpoint(
+        spec: &NetworkNamespaceSpec,
+        port: u16,
+        protocol: PortProtocol,
+    ) -> VirtualEndpoint {
+        let addr = guest(SocketAddr::new(IpAddr::V4(spec.ipv4), port));
+        VirtualEndpoint {
+            scope: bridge_scope(spec.bridge_id.clone(), spec.namespace_id.as_ref(), addr),
+            addr,
+            protocol,
+        }
+    }
+
+    fn unnamed_instance_spec(namespace_id: &str) -> NetworkNamespaceSpec {
+        let mut spec = NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        spec.namespace_id = Some(NetworkNamespaceId::new(namespace_id));
+        spec
+    }
+
+    /// Two instances that both got the unnamed placeholder address must not
+    /// share its endpoint record. Every component of that key -- bridge
+    /// `carrick0`, address `172.31.0.2` -- is a constant, so the namespace id is
+    /// the only thing that can separate them, and it separates them in the path
+    /// rather than only in the in-process registry (which a fork child's
+    /// copy-on-write copy makes useless for this).
+    #[test]
+    fn unnamed_bridge_endpoints_are_private_per_instance() {
+        let root = shared_instance_root("private-realm");
+        let spec_a = unnamed_instance_spec("anon-instance-a");
+        let spec_b = unnamed_instance_spec("anon-instance-b");
+        assert_eq!(
+            spec_a.ipv4, spec_b.ipv4,
+            "the precondition: two unnamed containers really are handed one address"
+        );
+        assert_eq!(spec_a.bridge_id, spec_b.bridge_id);
+
+        let instance_a = SocketNamespaceProvider::with_endpoint_root(&root);
+        let instance_b = SocketNamespaceProvider::with_endpoint_root(&root);
+        let lease_a = instance_a.create_namespace(&spec_a).expect("namespace a");
+        instance_b.create_namespace(&spec_b).expect("namespace b");
+
+        let host_a = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41001));
+        let host_b = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41002));
+        let endpoint_a = bridge_endpoint(&spec_a, 8080, PortProtocol::Tcp);
+        let endpoint_b = bridge_endpoint(&spec_b, 8080, PortProtocol::Tcp);
+        assert_eq!(endpoint_a.addr, endpoint_b.addr);
+        instance_a
+            .register_virtual_endpoint(
+                spec_a.bridge_id.clone(),
+                spec_a.namespace_id.clone().expect("namespace id a"),
+                endpoint_a.addr,
+                PortProtocol::Tcp,
+                host_a,
+            )
+            .expect("register a");
+        instance_b
+            .register_virtual_endpoint(
+                spec_b.bridge_id.clone(),
+                spec_b.namespace_id.clone().expect("namespace id b"),
+                endpoint_b.addr,
+                PortProtocol::Tcp,
+                host_b,
+            )
+            .expect("register b");
+
+        let path_a = endpoint_path(&root, &endpoint_a);
+        let path_b = endpoint_path(&root, &endpoint_b);
+        assert_ne!(path_a, path_b, "one key for two instances is the defect");
+        assert!(path_a.exists() && path_b.exists());
+        assert_eq!(
+            path_a.parent().expect("realm dir a"),
+            root.join(format!(
+                "{PRIVATE_REALM_PREFIX}{}",
+                hex_name("anon-instance-a")
+            ))
+        );
+
+        // Resolve from a third provider whose registry is empty, so the answer
+        // can only have come from the files -- the same position a published
+        // relay is in when the guest listener was bound by a fork child.
+        let reader = SocketNamespaceProvider::with_endpoint_root(&root);
+        assert_eq!(
+            reader
+                .resolve_registered_connect(
+                    &spec_a.bridge_id,
+                    spec_a.namespace_id.as_ref(),
+                    endpoint_a.addr,
+                    PortProtocol::Tcp,
+                )
+                .expect("resolve a"),
+            Some(host_a)
+        );
+        assert_eq!(
+            reader
+                .resolve_registered_connect(
+                    &spec_b.bridge_id,
+                    spec_b.namespace_id.as_ref(),
+                    endpoint_b.addr,
+                    PortProtocol::Tcp,
+                )
+                .expect("resolve b"),
+            Some(host_b)
+        );
+
+        // A's teardown must not take B's publication with it. Before realms, A's
+        // record had already been overwritten by B, so A silently skipped its own
+        // cleanup and leaked instead.
+        instance_a
+            .destroy_namespace(lease_a.id)
+            .expect("destroy namespace a");
+        assert!(!path_a.exists(), "A must remove its own record");
+        assert!(path_b.exists(), "A must not remove B's record");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The regression test for the cross-wire itself, in the shape it ships in:
+    /// two separate **processes**, each publishing a port for an unnamed
+    /// container, sharing one endpoint namespace.
+    ///
+    /// Every ordering edge is a blocking pipe read or a `waitpid`; nothing
+    /// sleeps and nothing retries. Each child publishes its port, records its
+    /// container listener, writes one ready byte and blocks. The parent reads
+    /// **both** ready bytes before connecting to anything, so both records are
+    /// on disk first -- which is what makes the pre-fix failure certain rather
+    /// than a race: with one shared key, whichever child wrote last owns it, and
+    /// the other child's relay necessarily proxies to the wrong container.
+    ///
+    /// Each child publishes its container listener with `write_endpoint_file`
+    /// rather than `register_virtual_endpoint`, and asserts its own registry
+    /// does not hold the key. That is the real shape: the guest listener is
+    /// bound by a *forked descendant*, whose registry insert landed in its own
+    /// copy-on-write copy, so the relay has nothing in memory and the durable
+    /// record is the only channel.
+    #[test]
+    fn published_relays_of_two_instances_do_not_cross_wire() {
+        // Mint this process's instance id before forking, so both children
+        // inherit the same one. That is deliberate: it holds the identity check
+        // constant so this test can only pass because the *key* separates the
+        // two instances, not because their process identities differ.
+        let _ = instance_id();
+        let root = shared_instance_root("crosswire");
+        let (port_a, port_b) = two_free_loopback_ports();
+        let instances = [(port_a, *b"AAAA"), (port_b, *b"BBBB")];
+
+        let mut release = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe(release.as_mut_ptr()) },
+            0,
+            "release pipe: {}",
+            io::Error::last_os_error()
+        );
+        let (release_read, release_write) = (release[0], release[1]);
+
+        let mut children = Vec::new();
+        for (host_port, token) in instances {
+            let mut ready = [0i32; 2];
+            assert_eq!(
+                unsafe { libc::pipe(ready.as_mut_ptr()) },
+                0,
+                "ready pipe: {}",
+                io::Error::last_os_error()
+            );
+            let (ready_read, ready_write) = (ready[0], ready[1]);
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+            if pid == 0 {
+                unsafe {
+                    libc::close(ready_read);
+                    // The child must not hold the release pipe's write end or
+                    // the parent closing its own copy would never be an EOF.
+                    libc::close(release_write);
+                }
+                let code =
+                    run_crosswire_instance(&root, host_port, token, ready_write, release_read);
+                unsafe { libc::_exit(code) };
+            }
+            unsafe { libc::close(ready_write) };
+            children.push((pid, ready_read));
+        }
+        unsafe { libc::close(release_read) };
+
+        // Happens-after: both listeners are bound and both records are written.
+        for (_, ready_read) in &children {
+            let mut byte = 0u8;
+            assert_eq!(
+                unsafe { libc::read(*ready_read, (&raw mut byte).cast(), 1) },
+                1,
+                "child never reported ready: {}",
+                io::Error::last_os_error()
+            );
+        }
+
+        let mut served = Vec::new();
+        for (host_port, _) in instances {
+            let mut client =
+                TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).expect("connect published");
+            let mut reply = [0_u8; 4];
+            client
+                .read_exact(&mut reply)
+                .unwrap_or_else(|e| panic!("published port {host_port} served nothing: {e}"));
+            served.push(reply);
+        }
+
+        unsafe { libc::close(release_write) };
+        for (pid, ready_read) in children {
+            unsafe { libc::close(ready_read) };
+            let mut status = 0i32;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &raw mut status, 0) },
+                pid,
+                "waitpid: {}",
+                io::Error::last_os_error()
+            );
+            assert!(libc::WIFEXITED(status), "instance did not exit normally");
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                0,
+                "instance failed to set itself up (bitmask)"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        for (index, (_, token)) in instances.iter().enumerate() {
+            assert_eq!(
+                &served[index],
+                token,
+                "published port {} was proxied into the wrong container: served {:?}, expected {:?}",
+                instances[index].0,
+                String::from_utf8_lossy(&served[index]),
+                String::from_utf8_lossy(token)
+            );
+        }
+    }
+
+    /// One instance of the cross-wire harness, running in its own process.
+    /// Returns a bitmask so a failure is reported through `waitpid` rather than
+    /// by unwinding a panic through a forked child.
+    fn run_crosswire_instance(
+        root: &Path,
+        host_port: u16,
+        token: [u8; 4],
+        ready_fd: RawFd,
+        release_fd: RawFd,
+    ) -> i32 {
+        let mut code = 0;
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port: 8080,
+            protocol: PortProtocol::Tcp,
+        };
+        let mut spec =
+            NetworkNamespaceSpec::bridge_default(None, Vec::new(), vec![mapping.clone()]);
+        spec.namespace_id = Some(NetworkNamespaceId::anonymous(std::process::id()));
+        let provider = SocketNamespaceProvider::with_endpoint_root(root);
+        let Ok(lease) = provider.create_namespace(&spec) else {
+            return 1;
+        };
+        if provider.publish_port(lease.id, mapping).is_err() {
+            code |= 2;
+        }
+
+        let Ok(target_listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+            return code | 4;
+        };
+        let Ok(target_addr) = target_listener.local_addr() else {
+            return code | 8;
+        };
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = target_listener.accept() {
+                let _ = stream.write_all(&token);
+            }
+        });
+
+        let endpoint = bridge_endpoint(&spec, 8080, PortProtocol::Tcp);
+        if provider
+            .write_endpoint_file(&endpoint, host(target_addr))
+            .is_err()
+        {
+            code |= 16;
+        }
+        if provider
+            .registry
+            .lock()
+            .map(|registry| registry.contains_key(&endpoint))
+            .unwrap_or(true)
+        {
+            // Without this the relay would answer from its own memory and the
+            // durable record -- the thing that aliases -- would never be read.
+            code |= 32;
+        }
+
+        if unsafe { libc::write(ready_fd, [1u8].as_ptr().cast(), 1) } != 1 {
+            code |= 64;
+        }
+        let mut byte = 0u8;
+        let _ = unsafe { libc::read(release_fd, (&raw mut byte).cast(), 1) };
+        code
+    }
+
+    /// The shipped feature realm-qualification must not touch: two separate
+    /// `carrick run --name db` / `--name web` processes reaching each other on
+    /// the **default** bridge. That is what `conformance_bridge_compose_pair`
+    /// exercises end to end, and a scheme that made every instance private would
+    /// delete it.
+    #[test]
+    fn named_bridge_endpoints_stay_shared_across_instances() {
+        let root = shared_instance_root("named-shared");
+        let mut db = NetworkNamespaceSpec::bridge_default(Some("db".to_string()), vec![], vec![]);
+        db.namespace_id = Some(NetworkNamespaceId::new("named-db-ns"));
+        let mut web = NetworkNamespaceSpec::bridge_default(Some("web".to_string()), vec![], vec![]);
+        web.namespace_id = Some(NetworkNamespaceId::new("named-web-ns"));
+        assert_eq!(
+            db.bridge_id,
+            BridgeId::default_bridge(),
+            "the compose pair runs on the default bridge, not a user-declared one"
+        );
+        assert_ne!(db.ipv4, web.ipv4);
+
+        let db_instance = SocketNamespaceProvider::with_endpoint_root(&root);
+        let web_instance = SocketNamespaceProvider::with_endpoint_root(&root);
+        db_instance.create_namespace(&db).expect("db namespace");
+        web_instance.create_namespace(&web).expect("web namespace");
+
+        let db_endpoint = bridge_endpoint(&db, 5432, PortProtocol::Tcp);
+        let db_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45432));
+        db_instance
+            .register_virtual_endpoint(
+                db.bridge_id.clone(),
+                db.namespace_id.clone().expect("db namespace id"),
+                db_endpoint.addr,
+                PortProtocol::Tcp,
+                db_host,
+            )
+            .expect("register db endpoint");
+
+        // Byte-identical to the pre-realm layout: at the root, no realm
+        // component. Nothing about a named container's storage moved.
+        let db_path = endpoint_path(&root, &db_endpoint);
+        assert_eq!(db_path.parent().expect("db record parent"), root);
+        assert_eq!(
+            db_path.file_name().expect("db record name"),
+            std::ffi::OsStr::new(&format!(
+                "bridge-{}-{}-5432-tcp",
+                hex_name(BridgeId::default_bridge().as_str()),
+                db.ipv4
+            ))
+        );
+
+        // A different instance resolves it: address, DNS name and the reverse
+        // translation every accept/recvfrom does.
+        assert_eq!(
+            web_instance
+                .resolve_bridge_connect(&web, db_endpoint.addr, PortProtocol::Tcp)
+                .expect("web resolves db"),
+            ConnectTarget::Host(db_host)
+        );
+        assert_eq!(
+            web_instance
+                .resolve_service_name(&web, "db")
+                .expect("web resolves the db name"),
+            vec![db.ipv4]
+        );
+        assert_eq!(
+            web_instance
+                .translate_host_source(db_host, PortProtocol::Tcp)
+                .expect("web translates db's host source"),
+            Some(db_endpoint.addr)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The second aliasing channel: loopback endpoints are scoped by namespace
+    /// id alone, and `bridge_default` used to hand every instance the constant
+    /// `"default"`, so one guest's `127.0.0.1:9000` was resolvable -- and
+    /// connectable -- from a concurrent instance's guest.
+    #[test]
+    fn loopback_endpoints_are_private_to_their_instance() {
+        let root = shared_instance_root("loopback");
+        let spec_a = unnamed_instance_spec("loopback-a");
+        let spec_b = unnamed_instance_spec("loopback-b");
+
+        let instance_a = SocketNamespaceProvider::with_endpoint_root(&root);
+        instance_a.create_namespace(&spec_a).expect("namespace a");
+        let loopback = guest(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000));
+        let host_a = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49001));
+        instance_a
+            .register_virtual_endpoint(
+                spec_a.bridge_id.clone(),
+                spec_a.namespace_id.clone().expect("namespace id a"),
+                loopback,
+                PortProtocol::Tcp,
+                host_a,
+            )
+            .expect("register loopback a");
+
+        // A fresh process-shaped reader, so the answer comes from the files.
+        let reader = SocketNamespaceProvider::with_endpoint_root(&root);
+        reader.create_namespace(&spec_a).expect("reader knows a");
+        reader.create_namespace(&spec_b).expect("reader knows b");
+        assert_eq!(
+            reader
+                .resolve_bridge_connect(&spec_a, loopback, PortProtocol::Tcp)
+                .expect("a resolves its own loopback"),
+            ConnectTarget::Host(host_a)
+        );
+        assert_eq!(
+            reader
+                .resolve_bridge_connect(&spec_b, loopback, PortProtocol::Tcp)
+                .expect("b must not reach a's loopback"),
+            ConnectTarget::Denied(carrick_abi::LINUX_ECONNREFUSED)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Fork-coherence for the realm-qualified key. The realm is derived from
+    /// `namespace_id`, which lives in spec memory `fork()` copies, so a child
+    /// must compute the identical path with no communication -- both for a
+    /// record its parent published *before* the fork and for one published
+    /// *after* it, which the child's copy-on-write registry can never explain.
+    #[test]
+    fn forked_child_resolves_private_realm_endpoints_across_the_fork() {
+        let mut spec = unnamed_bridge_spec(Vec::new());
+        spec.namespace_id = Some(NetworkNamespaceId::new(format!(
+            "fork-realm-{}",
+            std::process::id()
+        )));
+        spec.bridge_id = BridgeId::new(format!("fork-realm-bridge-{}", std::process::id()));
+        assert!(carrick_spec::is_bridge_placeholder_ipv4(spec.ipv4));
+
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+        let prefork = bridge_endpoint(&spec, 7001, PortProtocol::Tcp);
+        let prefork_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 47001));
+        // Published without touching the registry, so the child's hit can only
+        // come from the file at the realm-qualified path.
+        provider
+            .write_endpoint_file(&prefork, prefork_host)
+            .expect("pre-fork endpoint");
+        let postfork = bridge_endpoint(&spec, 7002, PortProtocol::Tcp);
+        let postfork_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 47002));
+        let realm_dir = provider.endpoint_dir.join(format!(
+            "{PRIVATE_REALM_PREFIX}{}",
+            hex_name(spec.namespace_id.as_ref().expect("namespace id").as_str())
+        ));
+
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe(fds.as_mut_ptr()) },
+            0,
+            "pipe: {}",
+            io::Error::last_os_error()
+        );
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe { libc::close(write_fd) };
+            let mut byte = 0u8;
+            let mut code = 0;
+            if unsafe { libc::read(read_fd, (&raw mut byte).cast(), 1) } != 1 {
+                code |= 1;
+            }
+            if provider
+                .resolve_bridge_connect(&spec, prefork.addr, PortProtocol::Tcp)
+                .ok()
+                != Some(ConnectTarget::Host(prefork_host))
+            {
+                code |= 2;
+            }
+            if provider
+                .resolve_bridge_connect(&spec, postfork.addr, PortProtocol::Tcp)
+                .ok()
+                != Some(ConnectTarget::Host(postfork_host))
+            {
+                code |= 4;
+            }
+            if endpoint_path(&provider.endpoint_dir, &postfork).parent()
+                != Some(realm_dir.as_path())
+            {
+                code |= 8;
+            }
+            unsafe { libc::_exit(code) };
+        }
+
+        unsafe { libc::close(read_fd) };
+        provider
+            .register_virtual_endpoint(
+                spec.bridge_id.clone(),
+                spec.namespace_id.clone().expect("namespace id"),
+                postfork.addr,
+                PortProtocol::Tcp,
+                postfork_host,
+            )
+            .expect("post-fork endpoint");
+        assert_eq!(
+            unsafe { libc::write(write_fd, [1u8].as_ptr().cast(), 1) },
+            1,
+            "signal child: {}",
+            io::Error::last_os_error()
+        );
+        unsafe { libc::close(write_fd) };
+
+        let mut status = 0i32;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &raw mut status, 0) },
+            pid,
+            "waitpid: {}",
+            io::Error::last_os_error()
+        );
+        assert!(libc::WIFEXITED(status), "child did not exit normally");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "forked child lost its parent's private-realm records (bitmask)"
+        );
+        provider.destroy_namespace(lease.id).expect("destroy");
+        provider
+            .destroy_namespace(NetworkLeaseId(0))
+            .expect("release the registry-free publication");
+    }
+
+    /// A private realm is `anon-<pid>`, so one liveness check settles every
+    /// record inside it -- reaching the `bridge-`/`listen-` families that
+    /// nothing ever enumerates by name and that the per-file rule therefore
+    /// could never visit.
+    #[test]
+    fn a_dead_instances_private_realm_is_reclaimed_whole() {
+        let root = reclaim_fixture_root("realm");
+        let self_pid = std::process::id() as i32;
+        // `process_is_alive` reports pid <= 0 as gone, so "dead" is decidable
+        // here rather than a race against a real exit.
+        let dead = root.join(format!("{PRIVATE_REALM_PREFIX}{}", hex_name("anon-0")));
+        let live = root.join(format!(
+            "{PRIVATE_REALM_PREFIX}{}",
+            hex_name(&format!("anon-{self_pid}"))
+        ));
+        let named = root.join(format!("{PRIVATE_REALM_PREFIX}{}", hex_name("explicit-ns")));
+
+        let dead_endpoint = dead.join("bridge-6465616431-172.31.0.2-8080-tcp");
+        let dead_listener = dead.join("listen-bridge-6465616431-172.31.0.2-8080-tcp");
+        let live_endpoint = live.join("bridge-6c69766531-172.31.0.2-8080-tcp");
+        let named_dead = named.join("bridge-6e616d6564-172.31.0.2-8080-tcp");
+        write_fixture_record(&dead_endpoint, 0);
+        write_fixture_record(&dead_listener, 0);
+        write_fixture_record(&live_endpoint, self_pid);
+        write_fixture_record(&named_dead, 0);
+
+        assert!(reclaim_stale_endpoint_records(&root, ENDPOINT_RECLAIM_BUDGET) > 0);
+
+        assert!(
+            !dead.exists(),
+            "a dead instance's realm is decidable as a unit"
+        );
+        assert!(live_endpoint.exists(), "a live instance keeps its records");
+        assert!(
+            !named_dead.exists(),
+            "a realm whose id is not pid-derived still gets per-file reclamation"
+        );
+        assert!(!named.exists(), "and its emptied directory is removed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Publishing over a live record must never expose an empty one.
+    /// `fs::write` is `O_TRUNC` + `write`: a reader landing between the two
+    /// finds no `pid=` line, concludes the endpoint does not exist, and drops a
+    /// connection that should have been forwarded. `rename` has no such window,
+    /// and the inode changing is the observable proof that the new record was
+    /// built elsewhere and moved into place rather than written over the live
+    /// one.
+    #[test]
+    fn a_republished_record_replaces_its_predecessor_atomically() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = reclaim_fixture_root("atomic");
+        let path = root.join("bridge-61746f6d69-172.31.9.9-8080-tcp");
+        let first = "127.0.0.1:1\npid=1\n";
+        let second = "127.0.0.1:2\npid=2\n";
+
+        write_record(&root, &path, first).expect("first publication");
+        let first_ino = fs::metadata(&path).expect("first metadata").ino();
+        write_record(&root, &path, second).expect("republication");
+
+        assert_ne!(
+            first_ino,
+            fs::metadata(&path).expect("second metadata").ino(),
+            "a republish must rename a complete record into place, not truncate the live one"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("record"), second);
+        let entries: Vec<_> = fs::read_dir(&root)
+            .expect("read root")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(entries.len(), 1, "temp files must not survive: {entries:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A record states which key it believes it answers. A reader that computed
+    /// a path from a tuple and found a record claiming a *different* tuple has
+    /// caught a real disagreement -- a path-scheme bug, a build-skew record, a
+    /// half-migrated directory -- and must refuse it rather than serve it.
+    /// A record with no claim at all is not a disagreement, so it still answers.
+    #[test]
+    fn a_record_claiming_a_different_key_is_refused() {
+        let provider = SocketNamespaceProvider::new();
+        let bridge = BridgeId::new(format!("key-check-{}", std::process::id()));
+        let addr = guest(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 31, 55, 7)),
+            8080,
+        ));
+        let endpoint = VirtualEndpoint {
+            scope: bridge_scope(bridge.clone(), None, addr),
+            addr,
+            protocol: PortProtocol::Tcp,
+        };
+        let path = endpoint_path(&provider.endpoint_dir, &endpoint);
+        let dir = endpoint_scope_dir(&provider.endpoint_dir, &endpoint.scope);
+        let host_addr = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45507));
+        let resolve = || {
+            provider
+                .resolve_registered_connect(&bridge, None, addr, PortProtocol::Tcp)
+                .expect("resolve")
+        };
+
+        write_record(
+            &dir,
+            &path,
+            &encode_endpoint_record(&provider.endpoint_dir, &path, host_addr.0),
+        )
+        .expect("honest record");
+        assert_eq!(resolve(), Some(host_addr));
+
+        let liar = format!(
+            "{}\npid={}\ninstance={:032x}\nkey=bridge-6465616462656566-172.31.55.7-8080-tcp\n",
+            host_addr.0,
+            std::process::id(),
+            instance_id()
+        );
+        write_record(&dir, &path, &liar).expect("mismatched record");
+        assert_eq!(resolve(), None, "a record must not answer for another key");
+
+        write_record(
+            &dir,
+            &path,
+            &format!("{}\npid={}\n", host_addr.0, std::process::id()),
+        )
+        .expect("claimless record");
+        assert_eq!(
+            resolve(),
+            Some(host_addr),
+            "a record that makes no claim is placed by its path alone"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A published relay's target comes from its own lease's spec, so a record
+    /// written by an unrelated process is wrong whatever it says. This is the
+    /// case realm-qualification cannot reach: two instances given the same
+    /// `--name`, hence the same name-derived address and the same path. Only the
+    /// instance identity distinguishes them.
+    #[test]
+    fn published_relay_refuses_a_foreign_instance_record() {
+        let host_port = free_loopback_port();
+        let container_port = 8099;
+        let mapping = PortMapping {
+            host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            host_port: Some(host_port),
+            container_port,
+            protocol: PortProtocol::Tcp,
+        };
+        let spec = unnamed_bridge_spec(vec![mapping.clone()]);
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("namespace");
+        provider.publish_port(lease.id, mapping).expect("publish");
+
+        // The foreign container's listener answers with a token the moment it is
+        // dialed, so "the relay refused" and "the relay proxied" differ by the
+        // bytes the client receives -- an observable, not a timeout. If the
+        // relay were to trust the record, this test fails with those bytes in
+        // hand instead of hanging on a listener nobody accepts.
+        let foreign_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("foreign bind");
+        let foreign_addr = foreign_listener.local_addr().expect("foreign addr");
+        let dialed = Arc::new(AtomicBool::new(false));
+        let thread_dialed = Arc::clone(&dialed);
+        let foreign = thread::spawn(move || {
+            if let Ok((mut stream, _)) = foreign_listener.accept() {
+                thread_dialed.store(true, Ordering::SeqCst);
+                let _ = stream.write_all(b"FOREIGN");
+            }
+        });
+
+        // Live owner, correct key, exactly the path this relay reads -- only the
+        // instance is another's.
+        let endpoint = bridge_endpoint(&spec, container_port, PortProtocol::Tcp);
+        let path = endpoint_path(&provider.endpoint_dir, &endpoint);
+        let dir = endpoint_scope_dir(&provider.endpoint_dir, &endpoint.scope);
+        let record = format!(
+            "{foreign_addr}\npid={}\ninstance={:032x}\nkey={}\n",
+            std::process::id(),
+            instance_id() ^ 1,
+            record_key(&provider.endpoint_dir, &path)
+        );
+        write_record(&dir, &path, &record).expect("seed foreign record");
+
+        let mut client =
+            TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).expect("connect published");
+        let mut served = Vec::new();
+        client.read_to_end(&mut served).expect("read to end");
+        assert!(
+            served.is_empty(),
+            "relay proxied into a foreign instance's container: {:?}",
+            String::from_utf8_lossy(&served)
+        );
+
+        // The client observing end-of-stream happens strictly after the relay
+        // decided what to do with the record, so any connection it would have
+        // made has already been accepted by now.
+        assert!(
+            !dialed.load(Ordering::SeqCst),
+            "relay dialed a foreign instance's listener"
+        );
+
+        // Release the waiting acceptor so the test owns no blocked thread.
+        drop(TcpStream::connect(foreign_addr).expect("release foreign acceptor"));
+        foreign.join().expect("foreign acceptor thread");
+
+        let _ = fs::remove_file(&path);
+        provider.destroy_namespace(lease.id).expect("destroy");
+    }
+
+    /// Reclamation unlinks a record because an earlier read showed its owner
+    /// gone. Between that read and the unlink the owner's successor can rename a
+    /// live record into the same path, and unlinking *that* destroys a live
+    /// publication the owner will never rewrite. The unlink is therefore
+    /// conditional on the bytes the verdict was reached from.
+    #[test]
+    fn a_condemned_record_is_only_unlinked_while_it_still_holds_the_condemned_bytes() {
+        let root = reclaim_fixture_root("guarded-unlink");
+        let path = root.join("bridge-6775617264-172.31.9.9-8080-tcp");
+        let condemned = "127.0.0.1:1\npid=0\n";
+
+        fs::write(&path, condemned).expect("seed condemned record");
+        assert!(remove_record_if_unchanged(&path, condemned));
+        assert!(!path.exists(), "a still-condemned record is reclaimed");
+
+        fs::write(&path, "127.0.0.1:2\npid=1\n").expect("successor record");
+        assert!(!remove_record_if_unchanged(&path, condemned));
+        assert!(
+            path.exists(),
+            "a successor's live record must survive the predecessor's reclamation"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

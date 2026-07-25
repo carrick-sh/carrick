@@ -380,11 +380,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
                     let ipv4 = attachment
                         .ipv4
                         .as_deref()
-                        .map(|ipv4| {
-                            ipv4.parse().map_err(|_| {
-                                format!("invalid IPv4 address {ipv4:?} for bridge attachment")
-                            })
-                        })
+                        .map(parse_bridge_ipv4)
                         .transpose()?;
                     attachments.push(NetworkAttachmentSpec::bridge_default(
                         attachment.bridge_id,
@@ -429,9 +425,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         if network.mode != NetworkMode::Bridge {
             return Err("--ip requires bridge networking".to_string());
         }
-        network.ipv4 = ipv4
-            .parse()
-            .map_err(|_| format!("invalid IPv4 address {ipv4:?}"))?;
+        network.ipv4 = parse_bridge_ipv4(&ipv4)?;
     }
 
     // 6. Launch-time syscall policy: docker's default profile model unless
@@ -463,6 +457,31 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         gid,
         seccomp_policy,
     })
+}
+
+/// Parse a user-supplied bridge address (`--ip`, or a per-attachment
+/// `ipv4_address`).
+///
+/// `172.31.0.0/24` is refused: it is the default bridge's placeholder range,
+/// holding the gateway and the address handed to a container that has no name
+/// to derive one from. No name can hash into it
+/// (`carrick_spec::is_bridge_placeholder_ipv4`), and the runtime relies on that
+/// to scope an unnamed container's endpoint records to its own instance. An
+/// address a user pinned there would be advertised in DNS but resolvable only
+/// from inside its own run, so reject it up front with a reason rather than
+/// hand out a half-reachable address.
+fn parse_bridge_ipv4(ipv4: &str) -> Result<std::net::Ipv4Addr, String> {
+    let parsed: std::net::Ipv4Addr = ipv4
+        .parse()
+        .map_err(|_| format!("invalid IPv4 address {ipv4:?}"))?;
+    if carrick_spec::is_bridge_placeholder_ipv4(parsed) {
+        return Err(format!(
+            "IPv4 address {ipv4:?} is in the bridge's reserved 172.31.0.0/24 \
+             (gateway and unnamed-container placeholder); pick an address in \
+             172.31.1.0 - 172.31.253.255"
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Parse a `docker run --user` value as numeric `uid[:gid]`. `gid` defaults to 0
@@ -652,6 +671,52 @@ mod tests {
 
         assert_eq!(spec.network.mode, NetworkMode::Bridge);
         assert_eq!(spec.network.ipv4.to_string(), "172.31.44.10");
+    }
+
+    /// `172.31.0.0/24` holds the bridge gateway and the placeholder handed to a
+    /// container with no name, and the runtime scopes endpoint records at those
+    /// addresses to a single instance. An address a user pinned there would be
+    /// advertised in DNS but resolvable only from inside its own run, so it is
+    /// refused up front with a reason.
+    #[test]
+    fn a_pinned_ipv4_in_the_bridge_placeholder_range_is_rejected() {
+        for pinned in ["172.31.0.2", "172.31.0.1", "172.31.0.200"] {
+            let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+            let mut req = base_req(None);
+            req.network = NetworkMode::Bridge;
+            req.network_ipv4 = Some(pinned.to_string());
+
+            let error = resolve_run_spec(req, image).expect_err("must reject the reserved /24");
+            assert!(
+                error.contains("172.31.0.0/24"),
+                "error must name the reserved range: {error}"
+            );
+        }
+
+        // The neighbouring /24s stay usable, and so does an invalid address's
+        // original diagnostic.
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.network = NetworkMode::Bridge;
+        req.network_ipv4 = Some("172.31.1.2".to_string());
+        assert_eq!(
+            resolve_run_spec(req, image)
+                .expect("172.31.1.2 is allocatable")
+                .network
+                .ipv4
+                .to_string(),
+            "172.31.1.2"
+        );
+
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.network = NetworkMode::Bridge;
+        req.network_ipv4 = Some("not-an-address".to_string());
+        assert!(
+            resolve_run_spec(req, image)
+                .expect_err("invalid address")
+                .contains("invalid IPv4 address")
+        );
     }
 
     #[test]

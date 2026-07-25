@@ -360,6 +360,10 @@ _EVENTRING_KINDS = {
         "DSRFAULT",
         lambda a, b, c: f"lr={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x}",
     ),
+    20: (
+        "NSREJECT",
+        lambda a, b, c: f"pathhash={a & 0xffffffff:#010x} reasonhash={b & 0xffffffff:#010x} pid={c}",
+    ),
 }
 
 
