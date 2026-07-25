@@ -53,3 +53,47 @@ impl HostSignalGlue for BhyveGlue {
         crate::install_bhyve_kick_handler();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BhyveGlue;
+    use carrick_host_bsd::native_glue::BsdNativeGlue;
+    use carrick_signal_core::HostSignalGlue;
+
+    /// Drift guard for the aarch64 BSD lanes. On FreeBSD/aarch64 there is no
+    /// bhyve crate (bhyve virtualizes the host ISA and is x86_64-only), so
+    /// `carrick-runtime`'s `ActiveGlue` resolves to
+    /// [`BsdNativeGlue`] instead of [`BhyveGlue`]. The two must express the SAME
+    /// FreeBSD signal policy — the only intended divergence is
+    /// `install_kick_handler` (bhyve installs a bare `EINTR` no-op for `vm_run`;
+    /// the native lane owns its kick redirect), which has no observable value to
+    /// compare. This test is the mechanical check that nothing else drifts; it
+    /// runs on exactly the target where both types are compiled.
+    #[test]
+    fn the_bhyve_glue_and_the_native_lane_glue_express_one_freebsd_policy() {
+        assert_eq!(BhyveGlue::kick_signal(), BsdNativeGlue::kick_signal());
+        assert_eq!(BhyveGlue::nudge_signum(), BsdNativeGlue::nudge_signum());
+        for signum in 0..=64 {
+            assert_eq!(
+                BhyveGlue::host_to_linux(signum),
+                BsdNativeGlue::host_to_linux(signum),
+                "host_to_linux diverged at {signum}"
+            );
+            assert_eq!(
+                BhyveGlue::linux_to_host(signum),
+                BsdNativeGlue::linux_to_host(signum),
+                "linux_to_host diverged at {signum}"
+            );
+            assert_eq!(
+                BhyveGlue::is_claimed(signum),
+                BsdNativeGlue::is_claimed(signum),
+                "is_claimed diverged at {signum}"
+            );
+            assert_eq!(
+                BhyveGlue::skip_install_routing(signum),
+                BsdNativeGlue::skip_install_routing(signum),
+                "skip_install_routing diverged at {signum}"
+            );
+        }
+    }
+}

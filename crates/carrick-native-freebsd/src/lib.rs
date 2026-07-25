@@ -51,6 +51,26 @@ mod waiter_key;
 
 pub use jit::FreebsdHostJit;
 
+/// FreeBSD's kick signal: `SIGRTMIN` = 65. The run loop uses it as a signal
+/// PAIR (this value and `+1`), delivered per-thread with `pthread_kill`.
+///
+/// Lives at the crate root, not in `fault`, because the value is a FreeBSD
+/// **OS** fact rather than an amd64 one: `fault` is amd64-gated, and the
+/// constant must stay available on every FreeBSD arch (the aarch64 lane needs
+/// it to resolve its host-signal glue). This mirrors
+/// `carrick_native_netbsd::NATIVE_EXIT_KICK_SIGNAL` exactly; `carrick-runtime`
+/// consumes both by this crate-root path.
+pub const NATIVE_EXIT_KICK_SIGNAL: libc::c_int = 65;
+
+// The exit kick is used as a PAIR. FreeBSD's `SIGRTMIN`=65 / `SIGRTMAX`=126
+// makes both 65 and 66 valid, free real-time signals (libthr reserves no
+// leading RT signals, unlike glibc), so the pair collides with no runtime
+// handler.
+const _: () = assert!(
+    NATIVE_EXIT_KICK_SIGNAL == 65 && NATIVE_EXIT_KICK_SIGNAL + 1 == 66,
+    "the exit-kick signal pair (65, 66) must be free real-time signals"
+);
+
 /// The process-wide host-JIT instance handed to
 /// `carrick_dsr_aarch64::translator::install_host_jit`-style installers by
 /// the runtime's lane wiring (M0.8).

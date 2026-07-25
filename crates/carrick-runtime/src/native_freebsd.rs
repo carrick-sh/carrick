@@ -7519,11 +7519,13 @@ impl Drop for ExitState {
 // `+1`). Neither BSD's libc reserves leading real-time signals for pthread
 // internals (a glibc-ism), so the pair is a free, non-colliding kick channel
 // the run loop delivers per-thread with `pthread_kill`. FreeBSD's SIGRTMIN is
-// 65; NetBSD's is 33, sourced from the NetBSD host crate's single definition
-// (`fault::NATIVE_EXIT_KICK_SIGNAL`) so it cannot drift from the value the
-// kick handler is installed on.
+// 65 and NetBSD's is 33, each sourced from its host crate's single crate-root
+// definition (`NATIVE_EXIT_KICK_SIGNAL`) so neither can drift from the value
+// the kick handler is installed on — or from the number the lane's host-signal
+// glue reserves (`carrick_host_bsd::native_glue::NATIVE_KICK_SIGNAL`, asserted
+// equal in `lib.rs`).
 #[cfg(target_os = "freebsd")]
-const NATIVE_EXIT_KICK_SIGNAL: i32 = 65;
+const NATIVE_EXIT_KICK_SIGNAL: i32 = carrick_native_freebsd::NATIVE_EXIT_KICK_SIGNAL;
 #[cfg(target_os = "netbsd")]
 const NATIVE_EXIT_KICK_SIGNAL: i32 = carrick_native_netbsd::NATIVE_EXIT_KICK_SIGNAL;
 

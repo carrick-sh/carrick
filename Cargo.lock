@@ -537,6 +537,7 @@ dependencies = [
  "carrick-abi",
  "carrick-hal",
  "carrick-host",
+ "carrick-signal-core",
  "libc",
 ]
 
