@@ -9672,18 +9672,18 @@ mod overlay_dispatch_tests {
         assert!(reporter.finish().unhandled_syscalls.is_empty());
     }
 
-    // Environmental red-list: shared-anon MAP_ANON recycled-range zero-fill is
-    // unreliable on the nested test VMs — this fails PRE-EXISTINGLY on BOTH the
-    // FreeBSD and NetBSD CI VMs (confirmed: it also fails on the pre-campaign
-    // baseline c8fe6192, so it is not a native-lane regression). Gated off on
-    // NetBSD to keep the NetBSD lib suite green during bring-up; the FreeBSD box
-    // tolerates it as pre-existing. A VM-robust recycle path is a follow-on.
-    #[cfg(not(target_os = "netbsd"))]
+    // A `munmap`'d shared-anon slot that a later mmap recycles MUST be scrubbed
+    // before reuse (no prior-tenant bytes leak into the new mapping). The scrub
+    // runs `zero_anonymous_reuse` over the whole recycled HVF page, so the test
+    // memory must actually be able to hold the scrubbed range: `CountingMemory`
+    // is based at `LINUX_SHARED_FILE_BASE` with the full slot backed, otherwise
+    // the scrub write faults `OutOfBounds` and the mmap fails ENOMEM.
     #[test]
     fn reused_shared_anon_mmap_zeroes_recycled_range() {
         let reporter = CompatReporter::default();
         let mut dispatcher = SyscallDispatcher::new();
-        let mut memory = CountingMemory::new(0x10000, vec![0u8; 0x1000]);
+        let mut memory =
+            CountingMemory::new(crate::memory::LINUX_SHARED_FILE_BASE, vec![0u8; 0x4000]);
         let mmap_args = SyscallArgs::from([
             0,
             0x4000,
@@ -9733,9 +9733,12 @@ mod overlay_dispatch_tests {
                 value: crate::memory::LINUX_SHARED_FILE_BASE as i64
             }
         );
+        // The recycled slot is one HVF page (`HVF_PAGE_SIZE` = 0x4000) and the
+        // scrub streams it through `zero_range_chunked` in 4 KiB `ZERO_CHUNK`
+        // writes, so 0x4000 / 0x1000 = 4 raw writes cover it exactly once.
         assert_eq!(
             memory.writes.get(),
-            1,
+            4,
             "reused MAP_SHARED|MAP_ANON ranges must still be scrubbed before reuse"
         );
         assert!(reporter.finish().unhandled_syscalls.is_empty());
