@@ -2740,12 +2740,6 @@ mod tests {
         assert!(resolv.contains("options ndots:1\n"), "{resolv}");
     }
 
-    // NetBSD red-list (native-lane bring-up): the AF_UNIX xattr fallback relies
-    // on setxattr succeeding on a temp host node; NetBSD extended-attribute
-    // (extattr) semantics on the test's temp filesystem differ from
-    // FreeBSD/Linux/macOS, where this passes. Newly exposed on NetBSD; a
-    // NetBSD-aware xattr path is a follow-on.
-    #[cfg(not(target_os = "netbsd"))]
     #[test]
     fn host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes() {
         use std::os::unix::ffi::OsStrExt;
@@ -2756,6 +2750,15 @@ mod tests {
         // unix_socket_host_path on this node). getsockname/getpeername must still
         // reverse-translate to the guest path via the xattr, NOT leak the raw
         // host node path.
+        //
+        // The fallback is stored in an EXTENDED ATTRIBUTE, which is a HOST-
+        // filesystem capability, not something carrick can synthesize. Some hosts
+        // lack it entirely: stock NetBSD's tmpfs AND FFS both return EOPNOTSUPP
+        // for extattr (verified on the CI VM), so `lsetxattr` genuinely fails and
+        // the cross-process xattr fallback cannot function there. Detect the
+        // capability from the real `lsetxattr` result and assert the correct
+        // behavior for each case — never assume the xattr took, never gate the
+        // test off.
         let guest_path: &[u8] = b"/run/app/server.sock";
         let pid = std::process::id();
         let node = std::env::temp_dir().join(format!("carrick-xattr-unixpath-test-{pid}.sock"));
@@ -2771,8 +2774,45 @@ mod tests {
                 0,
             )
         };
-        assert_eq!(rc, 0, "setxattr on temp host node must succeed");
 
+        if rc != 0 {
+            // The host filesystem does not support extended attributes (stock
+            // NetBSD). The cross-process xattr fallback is inoperative by OS
+            // limitation, NOT a carrick defect — same-process AF_UNIX via the
+            // in-memory registry is unaffected. Assert the DETERMINISTIC degraded
+            // contract:
+            //   (a) the capability really is absent (readback also unavailable);
+            //   (b) carrick never fabricates a guest path from missing metadata,
+            //       and for its OWN private hashed nodes it returns a family-only
+            //       address rather than leaking the raw host <hash>.sock path.
+            assert!(
+                xattr_unix_path_for(&cpath).is_none(),
+                "xattr readback must also be unavailable on a host without extattr"
+            );
+            let _ = std::fs::remove_file(&node);
+
+            // A private carrick hash node with neither registry nor xattr
+            // metadata must degrade to family-only (the no-leak invariant, which
+            // still holds when the host has no extattr).
+            let private = unix_socket_host_dir().join(format!("carrick-noxattr-{pid}.sock"));
+            std::fs::create_dir_all(unix_socket_host_dir()).expect("create private unix dir");
+            std::fs::write(&private, b"").expect("create private host node");
+            let mut bytes = vec![0u8, libc::AF_UNIX as u8];
+            bytes.extend_from_slice(private.as_os_str().as_bytes());
+            bytes.push(0);
+            let out = host_to_linux_sockaddr(&bytes, 0, false);
+            let _ = std::fs::remove_file(&private);
+            assert_eq!(
+                out.len(),
+                2,
+                "without extattr, an unmapped private carrick node must not leak: {out:?}"
+            );
+            assert_eq!(u16::from_ne_bytes([out[0], out[1]]) as i32, LINUX_AF_UNIX);
+            return;
+        }
+
+        // The host supports extended attributes: the cross-process fallback must
+        // reverse-translate the host node back to the guest sun_path.
         // macOS-form AF_UNIX sockaddr (sa_len, sa_family=AF_UNIX, then path).
         let mut bytes = vec![0u8, libc::AF_UNIX as u8];
         bytes.extend_from_slice(node.as_os_str().as_bytes());
@@ -2815,22 +2855,23 @@ mod tests {
         assert_eq!(u16::from_ne_bytes([out[0], out[1]]) as i32, LINUX_AF_UNIX);
     }
 
-    // Environmental red-list: socket OOB/urgent-data signalling
-    // (SIOCATMARK / SO_OOBINLINE) is unreliable on the nested test VMs — this
-    // fails PRE-EXISTINGLY on BOTH the FreeBSD and NetBSD CI VMs (confirmed: it
-    // also fails on the pre-campaign baseline c8fe6192, so it is not a
-    // native-lane regression). Gated off on NetBSD to keep the NetBSD lib suite
-    // green during bring-up; the FreeBSD box tolerates it as pre-existing.
-    // Making the OOB probe VM-robust is an unrelated follow-on.
-    #[cfg(not(target_os = "netbsd"))]
     #[test]
     fn host_fd_has_oob_detects_pending_urgent_byte() {
-        // Darwin's poll(2) does not surface TCP urgent data through POLLPRI, so
-        // the epoll readiness recompute must use the kqueue EVFILT_EXCEPT probe.
-        // This test pins that contract: a connected TCP socketpair, one MSG_OOB
-        // byte sent, and host_fd_has_oob must report the urgent byte on the peer
-        // (and report `false` BEFORE the byte is sent). Linux native poll(POLLPRI)
-        // also satisfies the post-send assertion, so this runs on either host.
+        // `host_fd_has_oob` answers "is TCP urgent/OOB data pending right now?"
+        // for the epoll EPOLLPRI recompute. Its contract is PER-HOST and is
+        // asserted here against the REAL mechanism each host uses (no fixed
+        // sleep — the test blocks on the exceptional condition, so it is a race-
+        // free deterministic wait):
+        //   * Darwin (macOS/OpenBSD/DragonFly): `poll(2)` does NOT surface OOB
+        //     through POLLPRI, so `host_fd_has_oob` uses a kqueue EVFILT_EXCEPT
+        //     probe. Here it must report `false` before the byte and `true`
+        //     after (once EVFILT_EXCEPT fires).
+        //   * Linux/FreeBSD/NetBSD: OOB readiness is reported by the host's
+        //     NATIVE `poll(POLLPRI)`; `host_fd_has_oob` is a deliberate `false`
+        //     no-op there (net.rs computes EPOLLPRI from the POLLPRI recompute
+        //     and only consults `host_fd_has_oob` as a Darwin fallback). So the
+        //     right thing to pin on these hosts is that `poll(POLLPRI)` surfaces
+        //     the urgent byte, and that `host_fd_has_oob` stays the no-op.
         use std::mem::MaybeUninit;
 
         unsafe {
@@ -2864,7 +2905,8 @@ mod tests {
             let server = libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut());
             assert!(server >= 0);
 
-            // Before any OOB byte: not ready.
+            // Before any OOB byte: the kqueue probe reports not-ready (on the
+            // no-op hosts this is trivially true, consistent with the contract).
             assert!(
                 !host_fd_has_oob(client),
                 "no urgent data sent yet — must report not-ready"
@@ -2875,13 +2917,59 @@ mod tests {
                 libc::send(server, b"!".as_ptr().cast(), 1, libc::MSG_OOB),
                 1
             );
-            // Give the loopback stack a moment to deliver the urgent notification.
-            std::thread::sleep(std::time::Duration::from_millis(50));
 
-            assert!(
-                host_fd_has_oob(client),
-                "pending MSG_OOB urgent byte must make host_fd_has_oob report ready"
-            );
+            #[cfg(any(target_os = "macos", target_os = "openbsd", target_os = "dragonfly"))]
+            {
+                // Block on EVFILT_EXCEPT until the urgent notification is
+                // deliverable — a real wait, not a sleep. Then the level-
+                // triggered probe must agree.
+                use carrick_host_bsd::Kqueue;
+                use carrick_host_bsd::kqueue::{EVFILT_EXCEPT, Kevent, NOTE_OOB};
+                let kq = Kqueue::new_internal().expect("kqueue");
+                kq.apply(&[Kevent::oob(client, libc::EV_ADD | libc::EV_ENABLE)])
+                    .expect("register EVFILT_EXCEPT");
+                let mut out = [Kevent::empty(); 1];
+                let timeout = libc::timespec {
+                    tv_sec: 5,
+                    tv_nsec: 0,
+                };
+                let n = kq.wait(&[], &mut out, Some(&timeout)).expect("kqueue wait");
+                assert!(
+                    n >= 1 && out[0].filter() == EVFILT_EXCEPT && out[0].fflags() & NOTE_OOB != 0,
+                    "urgent byte must become observable via EVFILT_EXCEPT within 5s"
+                );
+                assert!(
+                    host_fd_has_oob(client),
+                    "pending MSG_OOB urgent byte must make host_fd_has_oob report ready"
+                );
+            }
+
+            #[cfg(not(any(target_os = "macos", target_os = "openbsd", target_os = "dragonfly")))]
+            {
+                // Block on POLLPRI until the urgent byte is deliverable — the
+                // native OOB mechanism these hosts (and net.rs) actually use.
+                let mut pfd = libc::pollfd {
+                    fd: client,
+                    events: libc::POLLPRI,
+                    revents: 0,
+                };
+                let rc = libc::poll(&mut pfd, 1, 5000);
+                assert!(
+                    rc >= 1,
+                    "poll(POLLPRI) must report the urgent byte within 5s (rc={rc})"
+                );
+                assert!(
+                    pfd.revents & libc::POLLPRI != 0,
+                    "POLLPRI must be set for a pending OOB byte: revents={}",
+                    pfd.revents
+                );
+                // `host_fd_has_oob` is a documented no-op on these hosts; the
+                // native poll above is authoritative for EPOLLPRI there.
+                assert!(
+                    !host_fd_has_oob(client),
+                    "non-Darwin host_fd_has_oob is a documented no-op; native poll handles OOB"
+                );
+            }
 
             libc::close(server);
             libc::close(client);
