@@ -64,6 +64,16 @@ platform-linux = ["dep:carrick-vmm-kvm", "dep:carrick-host-linux"]
 # FreeBSD/bhyve backend (scaffolding; aarch64 FreeBSD host needed for L2).
 # Mirrors platform-linux.
 # Pulls in carrick-host-bsd for the FreeBSD kqueue EventMultiplexer (shared with macOS).
+#
+# The two `dep:carrick-vmm-*` edges below resolve against ARCH-SCOPED
+# `[target.'cfg(...)'.dependencies]` tables further down, not the plain
+# `[dependencies]` table: bhyve and NVMM virtualize the HOST ISA, so both are
+# x86_64-only, while `platform-freebsd`/`platform-netbsd` mean "the FreeBSD /
+# NetBSD host backend" on every arch. A `dep:` reference to an optional
+# dependency whose target table does not match is accepted by cargo and
+# activates nothing (a genuinely undeclared name still errors at manifest
+# parse), so the SAME feature name selects bhyve+native on amd64 and
+# native-only on arm64 — no parallel `platform-*-native` universe.
 platform-freebsd = ["dep:carrick-vmm-bhyve", "dep:carrick-host-bsd"]
 platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd"]
 [dependencies]
@@ -78,8 +88,8 @@ carrick-vmm-kvm = { path = "../carrick-vmm-kvm", optional = true }
 # The Linux host-OS layer (epoll EventMultiplexer + errno identity), split out
 # of the KVM backend. Pulled in alongside carrick-vmm-kvm by platform-linux.
 carrick-host-linux = { path = "../carrick-host-linux", optional = true }
-carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
-carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm", optional = true }
+# carrick-vmm-bhyve / carrick-vmm-nvmm are NOT declared here: they are
+# x86_64-only and live in arch-scoped target tables below.
 carrick-dsr = { path = "../carrick-dsr" }
 # The AArch64 guest-ISA translator crate. UNCONDITIONAL: it compiles on every
 # host (bad64/dynasmrt are pure Rust); only its assembled gateway is
@@ -126,6 +136,23 @@ usdt.workspace = true
 zerocopy.workspace = true
 carrick-spec = { path = "../carrick-spec" }
 
+
+# The FreeBSD/bhyve VMM backend, pulled in by `platform-freebsd`. Arch-scoped,
+# not just OS-scoped: bhyve virtualizes the host ISA, so this crate is
+# x86_64-only. Its own crate-level gate keys on `target_os`, which matches on
+# FreeBSD/aarch64 too, so an OS-only dependency edge would compile libvmmapi
+# and the x86 engine into an aarch64 build that has no VMM lane at all.
+# NOTE: because `dep:carrick-vmm-bhyve` in `[features]` is silently inert on a
+# non-matching target (cargo emits no diagnostic that the feature enabled
+# nothing), this comment is the only signal — keep it.
+[target.'cfg(all(target_os = "freebsd", target_arch = "x86_64"))'.dependencies]
+carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
+
+# The NetBSD/NVMM VMM backend, arch-scoped for the same reason. NVMM is an
+# x86-only NetBSD subsystem and there is no `/usr/lib/libnvmm.so` on arm64, so
+# the manifest is what keeps `-lnvmm` off a NetBSD/aarch64 link line.
+[target.'cfg(all(target_os = "netbsd", target_arch = "x86_64"))'.dependencies]
+carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm", optional = true }
 
 # The real FreeBSD native-lane host layer (dual-mapped W^X JIT); selected by
 # target, not feature — the lane is a property of the host, and the crate

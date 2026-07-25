@@ -11,9 +11,11 @@
 //! next-PC (`io.npc`) so we can resume past the `out` without manually adding
 //! the instruction length.
 //!
-//! Gated `cfg(target_os = "netbsd")` so the crate compiles to nothing (and the
-//! test is absent) on the default macOS/Linux workspace build.
-#![cfg(target_os = "netbsd")]
+//! Gated `cfg(all(target_os = "netbsd", target_arch = "x86_64"))` — matching
+//! the crate's own gate — so the test compiles to nothing (and is absent) on
+//! the default macOS/Linux workspace build and on NetBSD/aarch64, where NVMM
+//! does not exist.
+#![cfg(all(target_os = "netbsd", target_arch = "x86_64"))]
 
 use carrick_vmm_nvmm::nvmm::{
     self, NVMM_PROT_EXEC, NVMM_PROT_READ, NVMM_PROT_WRITE, NVMM_VCPU_EXIT_HALTED,

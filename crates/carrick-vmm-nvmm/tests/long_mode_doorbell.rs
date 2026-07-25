@@ -14,7 +14,7 @@
 //! (opt-in, set on eager-fault boxes) rather than unconditionally `#[ignore]`d,
 //! so the capable box actually asserts the ring-0 → IO-exit baseline while
 //! stock boxes still skip it. Same env-gate pattern as `CARRICK_NVMM_FIXTURE`.
-#![cfg(target_os = "netbsd")]
+#![cfg(all(target_os = "netbsd", target_arch = "x86_64"))]
 #![allow(clippy::expect_used)]
 
 use std::path::PathBuf;

@@ -16,7 +16,7 @@
 //! CARRICK_NVMM_FIXTURE=/root/fixtures/hello \
 //!   cargo test -p carrick-vmm-nvmm --test live_nvmm_x86 -- --nocapture
 //! ```
-#![cfg(target_os = "netbsd")]
+#![cfg(all(target_os = "netbsd", target_arch = "x86_64"))]
 #![allow(clippy::expect_used)]
 
 use std::io::Read as _;

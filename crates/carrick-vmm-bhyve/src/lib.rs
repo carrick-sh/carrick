@@ -15,8 +15,15 @@
 //! access); on x86_64 the aarch64-named `HvVm`/`HvVcpu` impls are deliberately
 //! not provided and the x86 backend uses the inherent surface instead.
 //!
-//! On every non-FreeBSD host this crate is intentionally empty.
-#![cfg(target_os = "freebsd")]
+//! On every host that is not FreeBSD/x86_64 this crate is intentionally empty.
+//! The arch half of that gate closes the one hole the per-module
+//! `#[cfg(target_arch = "x86_64")]` attributes below leave open: `pub mod vmm`
+//! (and its `#[link(name = "vmmapi")]`) is not per-module gated, so an
+//! OS-only gate compiled libvmmapi into a FreeBSD/aarch64 build that has no
+//! VMM lane. `carrick-runtime`/`carrick-cli` scope the dependency edge to
+//! `all(target_os = "freebsd", target_arch = "x86_64")`; this is the defence
+//! in depth behind it.
+#![cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 
 pub mod vmm;
 #[cfg(target_arch = "x86_64")]
