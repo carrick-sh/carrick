@@ -514,6 +514,12 @@ def stop_pid(
     raise SystemExit(f"pid {pid} did not exit after SIGKILL; inspect manually")
 
 
+# How long the console must be quiet before `SerialConsole.drain` calls the
+# buffer clear. Module-level so tests can shrink it (mock.patch.object)
+# instead of paying it on every step, same as LOGIN_TIMEOUT_S.
+DRAIN_QUIET_S = 0.3
+
+
 class SerialConsole:
     """Line-oriented expect over the qemu chardev unix socket."""
 
@@ -551,6 +557,61 @@ class SerialConsole:
             f"serial expect timed out waiting for {pattern!r} "
             f"(see {self._log_hint})"
         )
+
+    def expect_re(self, pattern: "re.Pattern[bytes]", timeout_s: float) -> "re.Match[bytes]":
+        """`expect`, but matching a compiled regex instead of a literal.
+
+        Same consume-through-the-match semantics as `expect`: everything up to
+        and including the match is removed from the buffer, so a later call
+        can never re-match an earlier command's output. This is what makes the
+        exit-status sentinel in `_run_step` reliable -- see its comment for
+        why the pattern must require a digit rather than match a fixed string.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            m = pattern.search(self._buf)
+            if m is not None:
+                self._buf = self._buf[m.end():]
+                return m
+            try:
+                chunk = self._sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError(
+                        f"serial connection closed while waiting for {pattern.pattern!r} "
+                        f"(see {self._log_hint})"
+                    )
+                self._buf += chunk
+            except socket.timeout:
+                pass
+        raise TimeoutError(
+            f"serial expect timed out waiting for {pattern.pattern!r} "
+            f"(see {self._log_hint})"
+        )
+
+    def drain(self, quiet_s: float | None = None) -> bytes:
+        """Discard everything currently buffered or in flight, returning it.
+
+        Called immediately before each provisioning command is sent so that
+        nothing already sitting in the buffer -- a late-arriving prompt, a
+        package manager's post-install trigger output, a login banner that
+        happens to contain "# " -- can be mistaken for that command's own
+        response. Reads until the socket has been quiet for `quiet_s`.
+        """
+        if quiet_s is None:
+            quiet_s = DRAIN_QUIET_S
+        dropped = self._buf
+        self._buf = b""
+        deadline = time.monotonic() + quiet_s
+        while time.monotonic() < deadline:
+            try:
+                chunk = self._sock.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            dropped += chunk
+            deadline = time.monotonic() + quiet_s
+        return dropped
 
     def sendline(self, s: str) -> None:
         self._sock.sendall(s.encode() + b"\n")
@@ -702,6 +763,65 @@ def provision_commands(vm: VmConfig, pubkey: str) -> list[tuple[str, float]]:
     ]
 
 
+# Per-package proof that the package's payload is actually usable on the
+# guest, keyed by the package name as it appears on the install line in
+# `provision_commands`. `provision_postconditions` is built from these, and
+# `ProvisionPostconditionDataTests` asserts every installed package has an
+# entry -- so adding a package to the install line without a proof is a test
+# failure rather than a silently unverified golden image.
+#
+# These exist because of the 2026-07-25 refresh-golden incident: provisioning
+# was believed to have installed llvm19 and nothing in the tool ever checked.
+# (In that incident the install genuinely worked and the golden ROTATION is
+# what corrupted the image -- but the tool could not have told the difference,
+# which is the defect these close. `_assert_openable` closes the other half.)
+_FREEBSD_PKG_PROOFS: dict[str, str | None] = {
+    "git": "command -v git",
+    "just": "command -v just",
+    # The `rust` package is the one whose name does not match its payload.
+    "rust": "command -v rustc && command -v cargo",
+    "python3": "command -v python3",
+    # bindgen (bad64-sys, on the aarch64 acceptance path) dlopens libclang;
+    # `VMS[...].remote_env_prefix` pins LIBCLANG_PATH at exactly this libdir,
+    # so prove the file that variable points at, not merely that pkg thinks
+    # the package is registered.
+    "llvm19": "test -x /usr/local/llvm19/bin/clang && test -r /usr/local/llvm19/lib/libclang.so",
+}
+_NETBSD_PKG_PROOFS: dict[str, str | None] = {
+    "git": "command -v git",
+    "rust": "command -v rustc && command -v cargo",
+    "clang": "test -r /usr/pkg/lib/libclang.so",
+    # `just` is genuinely best-effort on pkgsrc/aarch64 -- its install line
+    # tolerates absence (`|| echo 'just unavailable (ok)'`) and gates call
+    # cargo directly -- so it gets no post-condition. Explicit None rather
+    # than a missing key so the drift test can tell "deliberately optional"
+    # from "someone forgot".
+    "just": None,
+}
+
+
+def provision_postconditions(vm: VmConfig) -> list[tuple[str, float]]:
+    """Checks run over the serial console, through the same exit-status-verified
+    path as provisioning itself, IMMEDIATELY BEFORE the guest powers off.
+
+    Running them here rather than over ssh after a reboot is deliberate: a
+    failure raises while the caller is still inside its try/except, so the VM
+    is stopped and the existing golden.qcow2 is never rotated. There is no
+    extra boot.
+    """
+    if vm.name == "freebsd-arm64":
+        env, proofs = "export PATH=/usr/local/bin:/usr/local/sbin:$PATH; ", _FREEBSD_PKG_PROOFS
+    else:
+        env, proofs = "export PATH=/usr/pkg/bin:/usr/pkg/sbin:$PATH; ", _NETBSD_PKG_PROOFS
+    # One step per package so a failure names the package that is missing.
+    steps: list[tuple[str, float]] = [
+        (env + proof, 60) for proof in proofs.values() if proof is not None
+    ]
+    steps.append(("test -d /root/carrick/.git", 30))
+    steps.append(("test -s /root/.ssh/authorized_keys", 30))
+    return steps
+
+
 def write_cloudinit_seed(vm_name: str, pubkey: str) -> Path:
     """Write the FreeBSD NoCloud seed (meta-data + user-data) and pack it into
     seed.iso. `provision_commands` is the single source of truth for what
@@ -751,6 +871,52 @@ def wait_for_shutdown(vm_name: str, timeout_s: float) -> None:
     raise SystemExit(f"{vm_name}: qemu did not exit after guest shutdown (see serial.log)")
 
 
+def _step_sentinel_re(idx: int) -> "re.Pattern[bytes]":
+    """The pattern `_run_step` waits for, for step number `idx`.
+
+    It must require DIGITS where the exit status goes. The serial tty echoes
+    the command line back verbatim, and that echo contains the literal `$?`,
+    so a fixed-string match (or a `.*` here) would match the ECHO instead of
+    the output -- reintroducing exactly the "returned without running" bug
+    this whole mechanism exists to close, one layer down. `_RC_` immediately
+    after the index also keeps step 1's pattern from matching step 10's
+    sentinel.
+    """
+    return re.compile(rb"__BSDVM_STEP_" + str(idx).encode() + rb"_RC_(\d+)_END__")
+
+
+def _run_step(con: SerialConsole, vm_name: str, cmd: str, timeout_s: float, idx: int) -> None:
+    """Send one provisioning command and PROVE it succeeded.
+
+    Waiting for a shell PROMPT (what this used to do) cannot distinguish "the
+    command ran and worked" from "the command failed instantly and the shell
+    came back", nor from "a prompt was already sitting in the buffer and the
+    command was never even sent". Both were live silent-success paths. The
+    sentinel carries the command's own `$?`, so neither is possible: a
+    nonzero status is a hard failure, and a missing sentinel is a timeout.
+    """
+    label = f"{cmd[:70]}…" if len(cmd) > 70 else cmd
+    print(f"[provision {vm_name}] {label}")
+    # Drop anything already buffered (a late prompt, a package manager's
+    # trailing trigger output, a banner containing "# ") so this step can
+    # only ever match its own sentinel.
+    con.drain()
+    con.sendline(f'{cmd}; echo "__BSDVM_STEP_{idx}_RC_$?_END__"')
+    try:
+        m = con.expect_re(_step_sentinel_re(idx), timeout_s=timeout_s)
+    except TimeoutError as exc:
+        raise SystemExit(
+            f"{vm_name}: provisioning step {idx} never reported an exit status "
+            f"within {timeout_s}s: {cmd!r} ({exc})"
+        ) from exc
+    rc = int(m.group(1))
+    if rc != 0:
+        raise SystemExit(
+            f"{vm_name}: provisioning step {idx} FAILED rc={rc}: {cmd!r} "
+            f"(see {state_dir(vm_name) / 'serial.log'})"
+        )
+
+
 def _run_serial_provision(vm: VmConfig, pubkey: str) -> None:
     st = state_dir(vm.name)
     con = SerialConsole(st / "serial.sock")
@@ -765,12 +931,94 @@ def _run_serial_provision(vm: VmConfig, pubkey: str) -> None:
     else:
         con.sendline("root")
         con.expect(PROMPT, timeout_s=120)
-    for cmd, timeout_s in provision_commands(vm, pubkey):
-        print(f"[provision {vm.name}] {cmd[:70]}…" if len(cmd) > 70 else f"[provision {vm.name}] {cmd}")
-        con.sendline(cmd)
-        if cmd.startswith("shutdown"):
-            break
-        con.expect(PROMPT, timeout_s=timeout_s)
+    # Note that neither PROMPT match above is load-bearing for correctness:
+    # if either matched something that was not really a shell prompt, step 1
+    # below still has to produce a real sentinel or the run fails loudly.
+
+    steps = list(provision_commands(vm, pubkey))
+    # `shutdown` is the one command that legitimately never returns to a
+    # prompt, so it cannot be exit-status checked; splice the post-conditions
+    # in AHEAD of it. Asserting the terminal step's identity (rather than
+    # `break`ing on the first command that happens to start with "shutdown")
+    # means a data change that moves or drops it fails here instead of
+    # silently skipping every later step.
+    if not steps or not steps[-1][0].startswith("shutdown"):
+        raise SystemExit(
+            f"{vm.name}: provision_commands must end with a shutdown step; "
+            f"got {steps[-1][0]!r} if any"
+        )
+    shutdown_cmd = steps.pop()[0]
+    steps.extend(provision_postconditions(vm))
+
+    for idx, (cmd, timeout_s) in enumerate(steps, start=1):
+        _run_step(con, vm.name, cmd, timeout_s, idx)
+
+    print(f"[provision {vm.name}] {shutdown_cmd}")
+    con.drain()
+    con.sendline(shutdown_cmd)
+
+
+def _image_backing_file(img: Path) -> str | None:
+    """The qcow2 backing-file path recorded in `img`'s header, or None.
+
+    `-f qcow2` is deliberate throughout this pair of helpers: without it
+    qemu-img probes the format and happily reports a truncated or garbage
+    file as `raw` with no backing file, so a corrupt candidate would sail
+    through the very checks meant to stop it.
+    """
+    p = subprocess.run(
+        ["qemu-img", "info", "-f", "qcow2", "--output=json", str(img)],
+        capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        raise SystemExit(
+            f"refusing to publish {img.name}: qemu-img cannot open it as qcow2 "
+            f"(rc={p.returncode}): {p.stderr.strip() or p.stdout.strip()}"
+        )
+    return json.loads(p.stdout).get("backing-filename")
+
+
+def _assert_publishable(candidate: Path, dest: Path) -> None:
+    """Check `candidate` BEFORE it is renamed onto `dest`.
+
+    Self-reference is a property of a qcow2's PATH, not of its bytes: the
+    2026-07-25 incident's image was perfectly loadable right up until the
+    rename that moved it on top of the path its own header named as its
+    backing file. So this has to be checked against the DESTINATION path,
+    before the rename -- checking the candidate where it currently sits
+    cannot see it (measured: the same corrupt file passes `qemu-img info
+    --backing-chain` under any name other than its backing file's).
+
+    Doing it before the rename is what keeps the failure non-destructive:
+    the existing golden.qcow2 is still in place and still openable.
+    """
+    backing = _image_backing_file(candidate)  # raises if not an openable qcow2
+    if backing is not None and Path(backing).resolve() == dest.resolve():
+        raise SystemExit(
+            f"refusing to publish {candidate.name} as {dest.name}: its qcow2 "
+            f"backing file is {backing}, so the rename would make it reference "
+            "itself (an unopenable infinite backing chain -- this is the "
+            "2026-07-25 refresh-golden corruption)"
+        )
+
+
+def _assert_openable(img: Path) -> None:
+    """Confirm a just-published image really opens, chain and all.
+
+    `--backing-chain` is what actually walks the chain, so it is what detects
+    a loop; `_assert_publishable` should have made that unreachable, and this
+    is the belt-and-braces check that the artifact consumers will open is the
+    artifact we think we published.
+    """
+    p = subprocess.run(
+        ["qemu-img", "info", "-f", "qcow2", "--backing-chain", str(img)],
+        capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        raise SystemExit(
+            f"published {img.name} but qemu-img cannot open it "
+            f"(rc={p.returncode}): {p.stderr.strip() or p.stdout.strip()}"
+        )
 
 
 def _invalidate_consumer_overlays(vm_name: str) -> None:
@@ -787,8 +1035,17 @@ def _invalidate_consumer_overlays(vm_name: str) -> None:
     cmd_refresh_golden.
     """
     st = state_dir(vm_name)
-    candidates = [st / "dev.qcow2"] + sorted(st.glob("gate-*.qcow2"))
-    for overlay in candidates:
+    # dev.qcow2 is a human's working disk (the 2026-07-25 incident deleted one
+    # carrying a hand-installed toolchain), so move it aside under a name
+    # nothing consumes instead of destroying it. gate-*.qcow2 are machine-made
+    # per-run scratch and are regenerated on demand, so those are unlinked --
+    # and renaming them "aside" would leave them matching the same glob.
+    dev = st / "dev.qcow2"
+    if dev.exists():
+        stale = st / f"dev.stale-{int(time.time())}.qcow2"
+        dev.rename(stale)
+        print(f"moved stale overlay dev.qcow2 -> {stale.name} (backing golden replaced)")
+    for overlay in sorted(st.glob("gate-*.qcow2")):
         if overlay.exists():
             overlay.unlink()
             print(f"removed stale overlay {overlay.name} (backing golden replaced)")
@@ -843,11 +1100,13 @@ def cmd_provision(args: argparse.Namespace) -> int:
         if pid is not None:
             stop_pid(pid)
         raise
+    _assert_publishable(work, golden)
     prev = st / "golden.prev.qcow2"
     if golden.exists():
         prev.unlink(missing_ok=True)
         golden.rename(prev)
     work.rename(golden)
+    _assert_openable(golden)
     _invalidate_consumer_overlays(vm.name)
     ensure_dev_remote(vm)
     print(f"golden image ready: {golden}")
@@ -861,12 +1120,25 @@ def cmd_refresh_golden(args: argparse.Namespace) -> int:
     if not golden.exists():
         raise SystemExit(f"nothing to refresh; run: bsdvm.py provision {vm.name}")
     prev = st / "golden.prev.qcow2"
-    prev.unlink(missing_ok=True)
-    # Flatten first so the new golden does not chain onto the rotated file.
-    subprocess.run(["qemu-img", "convert", "-O", "qcow2", str(golden), str(st / "golden.flat.qcow2")], check=True)
-    golden.rename(prev)
-    (st / "golden.flat.qcow2").rename(golden)
-    # Reprovision on top of the flattened golden as the new base for update cmds.
+    # Reprovision on top of the CURRENT golden. golden.qcow2 is not moved,
+    # renamed or unlinked anywhere between here and the rotation at the
+    # bottom, which is the whole point:
+    #
+    # This function used to flatten UP FRONT (golden -> golden.prev, flat ->
+    # golden), stack `work` on that flattened golden, and then -- after
+    # provisioning -- `golden.unlink()` followed by `work.rename(golden)`.
+    # `create_overlay` records an ABSOLUTE backing path, so that unlink
+    # destroyed the full disk image `work` depended on and the rename dropped
+    # `work` onto the exact path its own header still named as its backing
+    # file. The result was a self-referential qcow2 that no consumer can open
+    # (`qemu-img create -b` on it exits SIGSEGV walking an infinite chain) --
+    # published with a success message, on 2026-07-25, taking the freebsd
+    # lane's golden and its dev overlay out together.
+    #
+    # Flattening at the END into a THIRD name instead makes that class of bug
+    # unrepresentable: nothing is ever unlinked while something references it,
+    # the new golden is standalone (it does not even chain onto base.qcow2),
+    # and if anything below fails the existing golden is still in place.
     (st / "provision.qcow2").unlink(missing_ok=True)
     work = create_overlay(vm.name, "provision.qcow2", "golden.qcow2")
     pubkey = read_pubkey()
@@ -879,12 +1151,20 @@ def cmd_refresh_golden(args: argparse.Namespace) -> int:
         if pid is not None:
             stop_pid(pid)
         raise
-    golden.unlink()
-    work.rename(golden)
+    fresh = st / "golden.new.qcow2"
+    fresh.unlink(missing_ok=True)
+    subprocess.run(["qemu-img", "convert", "-O", "qcow2", str(work), str(fresh)], check=True)
+    _assert_publishable(fresh, golden)
+    prev.unlink(missing_ok=True)
+    golden.rename(prev)  # rename, never unlink -- mirrors cmd_provision
+    fresh.rename(golden)
+    _assert_openable(golden)
+    work.unlink(missing_ok=True)
     # The just-flattened/reprovisioned golden.qcow2 has entirely different
     # content at the same path than what any pre-existing dev.qcow2/gate-*.qcow2
     # was created against -- see _invalidate_consumer_overlays.
     _invalidate_consumer_overlays(vm.name)
+    ensure_dev_remote(vm)
     print(f"golden refreshed (previous kept at {prev})")
     return 0
 
@@ -1357,13 +1637,56 @@ def cmd_up(args: argparse.Namespace) -> int:
     return 0
 
 
+# How long to wait for a guest to power itself off before pulling the plug.
+# Module-level so tests can shrink it, same as LOGIN_TIMEOUT_S.
+POWEROFF_TIMEOUT_S = 120
+
+
+def graceful_poweroff(vm: VmConfig, timeout_s: float | None = None) -> bool:
+    """Ask the guest to power itself off. True if qemu exited on its own.
+
+    `stop_pid` alone is a HARD power cut: it signals qemu, not the guest. A
+    NetBSD guest does not survive that -- its root FFS comes back dirty and
+    the next boot dies in fsck with `UNEXPECTED INCONSISTENCY; RUN fsck_ffs
+    MANUALLY` / `ABORTING BOOT`, which is unrecoverable without hand-repair
+    (MEASURED 2026-07-25: two netbsd-arm64 dev.qcow2 overlays destroyed this
+    way, one of them by a single `up`/`down` cycle). So try the guest's own
+    shutdown path first and only fall back to the plug.
+
+    Best-effort by construction: a wedged or pre-ssh guest just returns False
+    and the caller pulls the plug, which is no worse than before.
+    """
+    if timeout_s is None:
+        timeout_s = POWEROFF_TIMEOUT_S
+    try:
+        # The connection dies underneath this as the guest goes down, so its
+        # exit status is meaningless -- what matters is whether qemu exits.
+        ssh_run(vm, "shutdown -p now", timeout_s=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if read_pid(vm.name) is None:
+            return True
+        time.sleep(1)
+    return False
+
+
 def cmd_down(args: argparse.Namespace) -> int:
     pid = read_pid(args.vm)
     if pid is None:
         print(f"{args.vm}: not running")
     else:
-        stop_pid(pid)
-        print(f"{args.vm}: stopped")
+        vm = _resolve_vm(args.vm)
+        if vm is not None and graceful_poweroff(vm):
+            print(f"{args.vm}: powered off cleanly")
+        else:
+            # Either there is no ssh route to this guest or it ignored the
+            # request. Pull the plug -- and say so, because on a
+            # journal-less guest this is the step that can cost the overlay.
+            print(f"{args.vm}: guest did not power off; pulling the plug (disk may need fsck)")
+            stop_pid(pid)
+            print(f"{args.vm}: stopped")
     pidfile_path(args.vm).unlink(missing_ok=True)
     return 0
 
