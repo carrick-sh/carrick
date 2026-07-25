@@ -3300,6 +3300,22 @@ impl SyscallDispatcher {
                 }
                 let read_avail_update = if raw_ready & READ_READY_BITS == 0 {
                     Some(0)
+                } else if read_avail == 0 {
+                    // Readable, but FIONREAD reports no byte count: a LISTENER
+                    // (its pending-connection depth lives in the kqueue edge's
+                    // `data`, not FIONREAD), an EOF/HUP read end, or a 0-length
+                    // datagram. Recording 0 here would DESYNC this level
+                    // re-sample from the kqueue-edge path, which records the
+                    // absolute accept-queue depth (>=1). If this level path
+                    // observes and reports the readiness first (its poll(2) can
+                    // beat the not-yet-drained knote) and stores 0, the later
+                    // drain of that SAME knote sees `count (1) > last_read_avail
+                    // (0)` and spuriously redelivers the already-reported,
+                    // still-unaccepted edge. Floor the baseline at the readiness
+                    // we just reported so only a genuine depth increase (a NEW
+                    // connection) re-arms the ET edge; a real byte count always
+                    // takes the branch below and is unaffected.
+                    Some(interest.last_read_avail.max(1))
                 } else {
                     Some(read_avail)
                 };
