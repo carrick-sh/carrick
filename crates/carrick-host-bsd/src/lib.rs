@@ -21,3 +21,8 @@ pub use multiplexer::KqueueMultiplexer;
 /// The one BSD-family `linux <-> host` signal-number translation table (shared
 /// by the HVF/macOS and bhyve/FreeBSD backends; previously triplicated).
 pub mod signum;
+
+/// The BSD **native (no-VMM) lane's** `HostSignalGlue` — the `ActiveGlue` a
+/// FreeBSD/NetBSD build with no VMM crate (i.e. aarch64) resolves to. Empty on
+/// macOS, whose native lane runs under the HVF crate's own glue.
+pub mod native_glue;

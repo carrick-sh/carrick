@@ -389,17 +389,26 @@ pub mod trap {
 // call-site name, so `crate::threaded_impl::hvf_futex(table)` resolves to a
 // fully functional shared+private futex on every platform arm — a real
 // implementation, not a degrade.
+//
+// The two BSD arms are ARCH-scoped, not just feature-scoped: `make_bhyve_futex`
+// / `make_nvmm_futex` live in the VMM crates, which are x86_64-only (bhyve and
+// NVMM virtualize the host ISA), so on FreeBSD/NetBSD aarch64 this module has
+// no member and is not compiled at all. That is deliberate and fail-closed —
+// the aarch64 BSD native lane's futex is the lane's own (T5), and an absent
+// symbol is a compile error rather than a wrong shared-futex implementation.
 #[cfg(any(
     feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
+    all(
+        any(feature = "platform-freebsd", feature = "platform-netbsd"),
+        target_arch = "x86_64"
+    )
 ))]
 pub mod threaded_impl {
-    #[cfg(feature = "platform-freebsd")]
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
     pub use carrick_vmm_bhyve::make_bhyve_futex as hvf_futex;
     #[cfg(feature = "platform-linux")]
     pub use carrick_vmm_kvm::make_kvm_futex as hvf_futex;
-    #[cfg(feature = "platform-netbsd")]
+    #[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
     pub use carrick_vmm_nvmm::make_nvmm_futex as hvf_futex;
 }
 
@@ -640,6 +649,15 @@ pub mod runtime {
     pub use crate::run_result::{RunResult, RuntimeError};
     // The shared loop + host seam now live in the neutral `threaded_loop` module
     // (F3); the KVM/bhyve/NVMM HostBackend impls + wrappers below reference them.
+    // Arch-scoped on the BSDs for the same reason those impls are: bhyve/NVMM
+    // are x86_64-only, so an aarch64 BSD build has no `HostBackend` impl here.
+    #[cfg(any(
+        feature = "platform-linux",
+        all(
+            any(feature = "platform-freebsd", feature = "platform-netbsd"),
+            target_arch = "x86_64"
+        )
+    ))]
     use crate::threaded_loop::{HostBackend, run_threaded_loop};
 
     pub const DEFAULT_MAX_TRAPS: usize = 1_000_000;
@@ -759,10 +777,10 @@ pub mod runtime {
     /// bhyve's [`HostBackend`]: `_umtx_op` futex, the `BhyveForkCoordinator`
     /// (stops/joins the FreeBSD host-signal pump across `libc::fork`), and
     /// `BhyveTimerDelivery`.
-    #[cfg(feature = "platform-freebsd")]
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
     pub struct BhyveHostBackend;
 
-    #[cfg(feature = "platform-freebsd")]
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
     impl HostBackend for BhyveHostBackend {
         fn make_futex(
             &self,
@@ -790,10 +808,10 @@ pub mod runtime {
 
     /// NVMM's [`HostBackend`]: NetBSD `__futex`, `NvmmForkCoordinator`, and
     /// `NvmmTimerDelivery`.
-    #[cfg(feature = "platform-netbsd")]
+    #[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
     pub struct NvmmHostBackend;
 
-    #[cfg(feature = "platform-netbsd")]
+    #[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
     impl HostBackend for NvmmHostBackend {
         fn make_futex(
             &self,
@@ -858,7 +876,7 @@ pub mod runtime {
     /// x86_64 bhyve guests run through the same canonical dispatcher/fork/futex/
     /// timer plumbing as KVM (and HVF), with only the host trait objects (the
     /// `_umtx_op` futex, the `BhyveForkCoordinator`, `BhyveTimerDelivery`) differing.
-    #[cfg(feature = "platform-freebsd")]
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
     pub fn run_threaded_bhyve_loop<E>(
         engine: E,
         dispatcher: SyscallDispatcher,
@@ -871,7 +889,7 @@ pub mod runtime {
         run_threaded_loop(engine, dispatcher, BhyveHostBackend, max_traps)
     }
 
-    #[cfg(feature = "platform-netbsd")]
+    #[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
     pub fn run_threaded_nvmm_loop<E>(
         engine: E,
         dispatcher: SyscallDispatcher,
@@ -894,7 +912,7 @@ pub mod runtime {
     /// The carrick-vmm-bhyve helpers return `Result<_, String>`; map those to
     /// `RuntimeError::Unsupported` (the variant the codebase uses for opaque
     /// backend messages).
-    #[cfg(feature = "platform-freebsd")]
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
     pub fn run_elf_bhyve_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
         if std::env::var_os("CARRICK_NO_THREADS").is_some() {
             let code = carrick_vmm_bhyve::run_elf::run_elf_bhyve(path)
@@ -1065,7 +1083,7 @@ pub mod runtime {
         dispatcher
     }
 
-    #[cfg(feature = "platform-netbsd")]
+    #[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
     pub fn run_elf_nvmm_dispatch(path: &std::path::Path) -> Result<RunResult, RuntimeError> {
         if std::env::var_os("CARRICK_NO_THREADS").is_some() {
             let code = carrick_vmm_nvmm::run_elf::run_elf_nvmm(path)
@@ -1431,10 +1449,15 @@ pub mod runtime {
     /// and seed a minimal Linux baseline (`/tmp`, `/etc/{passwd,group,hosts,…}`),
     /// mirroring carrick-cli's `--fs host`. If the backend can't be created the
     /// guest simply has no filesystem (the runner still works for fs-free code).
+    // A VMM-lane helper: only the KVM / bhyve / NVMM drivers call it, and the
+    // two BSD VMMs are x86_64-only, so an aarch64 BSD build (native lane, no
+    // VMM) does not compile it. Same predicate as the `run_oci` engine arms.
     #[cfg(any(
         feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
+        all(
+            any(feature = "platform-freebsd", feature = "platform-netbsd"),
+            target_arch = "x86_64"
+        )
     ))]
     fn make_linux_dispatcher() -> SyscallDispatcher {
         use crate::fs_backend::{FsBackend, HostFsBackend};
@@ -1458,10 +1481,15 @@ pub mod runtime {
 
     /// Pre-create the standard Linux directories and a few `/etc` databases a
     /// raw static binary assumes exist (it has no OCI rootfs to supply them).
+    // A VMM-lane helper: only the KVM / bhyve / NVMM drivers call it, and the
+    // two BSD VMMs are x86_64-only, so an aarch64 BSD build (native lane, no
+    // VMM) does not compile it. Same predicate as the `run_oci` engine arms.
     #[cfg(any(
         feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
+        all(
+            any(feature = "platform-freebsd", feature = "platform-netbsd"),
+            target_arch = "x86_64"
+        )
     ))]
     fn seed_linux_baseline(backend: &mut dyn crate::fs_backend::FsBackend) {
         for dir in [
@@ -1509,10 +1537,14 @@ pub mod runtime {
     /// `PATH`, etc.; clobbering them (as `seed_linux_baseline` does for the bare
     /// run-elf runner) would silently override the image. Mirrors the macOS
     /// `seed_guest_baseline` + `set_baseline_file_if_missing` (execute.rs).
+    // A VMM-lane helper (see `make_linux_dispatcher`): the BSD VMMs are
+    // x86_64-only, so an aarch64 BSD build does not compile it.
     #[cfg(any(
         feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
+        all(
+            any(feature = "platform-freebsd", feature = "platform-netbsd"),
+            target_arch = "x86_64"
+        )
     ))]
     // Used by the OCI run_oci path on non-macOS VMM backends.
     #[cfg_attr(
@@ -1685,10 +1717,15 @@ pub mod runtime {
     /// set cwd/uid/gid, load the entrypoint FROM the rootfs, and run it with the
     /// OCI argv/env. The only divergence is the run-loop entry: this drives the
     /// selected KVM engine through `run_threaded_kvm_loop` instead of the HVF loop.
+    // A VMM-lane helper: only the KVM / bhyve / NVMM drivers call it, and the
+    // two BSD VMMs are x86_64-only, so an aarch64 BSD build (native lane, no
+    // VMM) does not compile it. Same predicate as the `run_oci` engine arms.
     #[cfg(any(
         feature = "platform-linux",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
+        all(
+            any(feature = "platform-freebsd", feature = "platform-netbsd"),
+            target_arch = "x86_64"
+        )
     ))]
     fn run_oci_with_engine<E, Build, Run>(
         spec: &carrick_spec::RunSpec,
@@ -2111,12 +2148,51 @@ pub mod host_signal {
     // is now ONE generic call through the shared `carrick_signal_core::host_glue`
     // / `carrick_hal::signal_pump`, parameterized here. A new kick backend adds one
     // line + a `HostSignalGlue` impl and inherits the whole shared driver.
+    //
+    // UNLIKE the VMM entry points, this alias cannot simply be arch-gated away
+    // on the aarch64 BSD lanes: every guest-facing signal operation in this
+    // module is a generic call through `ActiveGlue`, and those are reached from
+    // the arch-neutral dispatcher on every host. So the two BSD arms are
+    // arch-SPLIT rather than arch-gated — x86_64 keeps the VMM crate's glue
+    // byte-for-byte, and a BSD build with no VMM crate (aarch64) resolves to
+    // `carrick_host_bsd::native_glue::BsdNativeGlue`, which expresses the same
+    // per-OS policy from the same single-source `carrick_host_bsd::signum`
+    // table. `bhyve_signal_backend` / `nvmm_signal_backend` carry the test that
+    // asserts the two agree on every signal number.
     #[cfg(feature = "platform-linux")]
     pub(crate) type ActiveGlue = carrick_vmm_kvm::KvmGlue;
-    #[cfg(feature = "platform-freebsd")]
+    #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
     pub(crate) type ActiveGlue = carrick_vmm_bhyve::BhyveGlue;
-    #[cfg(feature = "platform-netbsd")]
+    #[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
     pub(crate) type ActiveGlue = carrick_vmm_nvmm::NvmmGlue;
+    #[cfg(all(
+        any(feature = "platform-freebsd", feature = "platform-netbsd"),
+        not(target_arch = "x86_64")
+    ))]
+    pub(crate) type ActiveGlue = carrick_host_bsd::native_glue::BsdNativeGlue;
+
+    // The kick signal the native lane's run loop `pthread_kill`s with (each
+    // native host crate's `NATIVE_EXIT_KICK_SIGNAL`) and the kick signal the
+    // lane's host-signal glue RESERVES (never mirrors a guest disposition onto)
+    // must be the same number — otherwise the glue would happily route a guest
+    // signal onto the very number the run loop uses to interrupt a guest
+    // thread. The two constants have separate homes (the per-OS native host
+    // crate vs the shared BSD host crate, neither of which may depend on the
+    // other), so this is the mechanical tie. Compile-time, on every BSD arch.
+    #[cfg(all(feature = "platform-freebsd", target_os = "freebsd"))]
+    const _: () = assert!(
+        carrick_host_bsd::native_glue::NATIVE_KICK_SIGNAL
+            == carrick_native_freebsd::NATIVE_EXIT_KICK_SIGNAL,
+        "the FreeBSD native lane's exit-kick signal and the number its \
+         host-signal glue reserves have drifted apart"
+    );
+    #[cfg(all(feature = "platform-netbsd", target_os = "netbsd"))]
+    const _: () = assert!(
+        carrick_host_bsd::native_glue::NATIVE_KICK_SIGNAL
+            == carrick_native_netbsd::NATIVE_EXIT_KICK_SIGNAL,
+        "the NetBSD native lane's exit-kick signal and the number its \
+         host-signal glue reserves have drifted apart"
+    );
 
     // `has_pending_for` / `has_unblocked_pending_for` are NOT pure re-exports on
     // KVM: a cross-process guest signal may be sitting in the shared xsignal ring
