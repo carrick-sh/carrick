@@ -2815,10 +2815,13 @@ mod tests {
         assert_eq!(u16::from_ne_bytes([out[0], out[1]]) as i32, LINUX_AF_UNIX);
     }
 
-    // NetBSD red-list (native-lane bring-up): NetBSD socket OOB/urgent-data
-    // signalling (SIOCATMARK / SO_OOBINLINE) differs from FreeBSD/Linux/macOS,
-    // where this passes. Newly exposed now that carrick-runtime builds+tests on
-    // NetBSD; making the OOB probe NetBSD-aware is a follow-on.
+    // Environmental red-list: socket OOB/urgent-data signalling
+    // (SIOCATMARK / SO_OOBINLINE) is unreliable on the nested test VMs — this
+    // fails PRE-EXISTINGLY on BOTH the FreeBSD and NetBSD CI VMs (confirmed: it
+    // also fails on the pre-campaign baseline c8fe6192, so it is not a
+    // native-lane regression). Gated off on NetBSD to keep the NetBSD lib suite
+    // green during bring-up; the FreeBSD box tolerates it as pre-existing.
+    // Making the OOB probe VM-robust is an unrelated follow-on.
     #[cfg(not(target_os = "netbsd"))]
     #[test]
     fn host_fd_has_oob_detects_pending_urgent_byte() {

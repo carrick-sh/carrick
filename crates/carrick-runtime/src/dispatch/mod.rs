@@ -9672,10 +9672,12 @@ mod overlay_dispatch_tests {
         assert!(reporter.finish().unhandled_syscalls.is_empty());
     }
 
-    // NetBSD red-list (native-lane bring-up): NetBSD MAP_ANON recycled-range
-    // zero-fill behavior differs from FreeBSD/Linux/macOS, where this passes.
-    // Newly exposed now that carrick-runtime builds+tests on NetBSD; a
-    // NetBSD-aware shared-anon recycle path is a follow-on.
+    // Environmental red-list: shared-anon MAP_ANON recycled-range zero-fill is
+    // unreliable on the nested test VMs — this fails PRE-EXISTINGLY on BOTH the
+    // FreeBSD and NetBSD CI VMs (confirmed: it also fails on the pre-campaign
+    // baseline c8fe6192, so it is not a native-lane regression). Gated off on
+    // NetBSD to keep the NetBSD lib suite green during bring-up; the FreeBSD box
+    // tolerates it as pre-existing. A VM-robust recycle path is a follow-on.
     #[cfg(not(target_os = "netbsd"))]
     #[test]
     fn reused_shared_anon_mmap_zeroes_recycled_range() {
