@@ -61,7 +61,40 @@ use super::{EpollKqueue, Fd, GuestPtr, HostFd, inode_for_path, linux_mode};
 #[derive(Debug, Clone)]
 pub(super) struct EpollInterest {
     pub(super) event: LinuxEpollEvent,
+    /// Readiness bits already REPORTED to the guest for this registration. The
+    /// software EPOLLET latch: `raw & !last_ready` is the edge. Cleared on
+    /// consumption ([`crate::dispatch::SyscallDispatcher::epoll_rearm_after_io`]
+    /// — an I/O syscall on the fd services the delivered edge), which is what
+    /// makes the NEXT assertion a fresh edge.
     pub(super) last_ready: u32,
+    /// Readiness COUNT the reported readiness in `last_ready` was observed at,
+    /// so a SECOND edge can be delivered while the first is still unconsumed
+    /// (`observed > last_read_avail` — see `epoll_pwait_wait_core`). What the
+    /// count measures is per-fd:
+    ///
+    /// - a FIONREAD-measurable fd (pipe, stream socket, datagram socket): bytes
+    ///   buffered. Monotone until the guest reads, and a read decrements this
+    ///   baseline by the bytes consumed.
+    /// - a LISTENER: the pending accept-queue depth (the multiplexer edge's
+    ///   `readiness_count`; FIONREAD is always 0 for a listener). This is NOT
+    ///   monotone — accepting drains it — so growth alone would be an unsound
+    ///   arrival predicate. It is sound here because the guest-driven way the
+    ///   depth falls, accept, is ALSO the consumption that resets this baseline
+    ///   and `last_ready` to 0: within any window containing no accept the
+    ///   depth only rises. A listener's ET readiness is therefore "a connection
+    ///   arrived since you last drained" — carried by `raw & !last_ready` after
+    ///   the consumption re-arm — with growth covering only the extra arrivals
+    ///   that land while an earlier edge is still unaccepted.
+    ///   (`epoll_et_delivers_listener_edge_after_accept_drain` pins the drain
+    ///   half, `..._without_read_byte_growth` the growth half.)
+    ///
+    ///   The remaining way a depth could fall without an accept is the host
+    ///   dropping an already-queued connection (measured NOT to happen on
+    ///   macOS: a queued connection reset by its client stays in the queue and
+    ///   is returned by accept). Were a host to do it, the effect is bounded to
+    ///   deferring one edge for a guest that was told EPOLLIN and has not yet
+    ///   accepted — its first accept, which the ET contract requires, resets
+    ///   the baseline.
     pub(super) last_read_avail: u64,
     /// Edge-triggered write side was attempted and returned EAGAIN after an
     /// earlier EPOLLOUT delivery. Keep the host write filter armed while still
