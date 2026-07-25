@@ -13,13 +13,17 @@
 //!    (`pthread_jit_write_protect_np`), so the write pointer IS the exec
 //!    pointer and `begin/end_thread_write` flip the calling thread's bit.
 //!    `flush_icache` is mandatory (AArch64 non-coherent I-cache).
-//!  * **FreeBSD** (`carrick-native-freebsd`): no MAP_JIT and `mprotect`
-//!    flips would be process-wide (a writer would yank X from under
-//!    concurrently-executing guest threads), so the region is DUAL-MAPPED —
-//!    one RX mapping for execution, one RW alias for writers —
-//!    `begin/end_thread_write` are no-ops, and `flush_icache` is a no-op on
-//!    x86 (coherent I-cache; cross-modification ordering is the ARCH
-//!    crate's problem at its patch sites).
+//!  * **FreeBSD** (`carrick-native-freebsd`, and its NetBSD twin
+//!    `carrick-native-netbsd`): no MAP_JIT and `mprotect` flips would be
+//!    process-wide (a writer would yank X from under concurrently-executing
+//!    guest threads), so the region is DUAL-MAPPED — one RX mapping for
+//!    execution, one RW alias for writers — and `begin/end_thread_write` are
+//!    no-ops. `flush_icache` is a no-op on **x86_64 only** (coherent I-cache;
+//!    cross-modification ordering is the ARCH crate's problem at its patch
+//!    sites). That is a property of the ARCH, not of the lane: on a BSD
+//!    aarch64 host the same dual-map lane has no cache-maintenance body yet,
+//!    so it fails closed — `supported()` returns `Err` and `flush_icache`
+//!    aborts rather than claim a coherence it cannot deliver.
 //!
 //! The cache addresses code by EXEC va and derives the write destination
 //! via [`JitRegion::write_ptr_for`], so both shapes fall out of one calling

@@ -15,16 +15,56 @@
 //! `carrick-native-freebsd`); other targets compile it to nothing, so the
 //! module doc above uses a plain code span rather than an intra-doc link that
 //! `cargo doc` could not resolve off-NetBSD.
+//!
+//! ## Which of this crate is amd64-welded, and which is not
+//!
+//! NetBSD/aarch64 is a real host (the aarch64 BSD native-lane campaign), so
+//! the crate-level gate is `target_os` and the arch axis is applied
+//! per-module — the `carrick-native-darwin` pattern:
+//!
+//! * `fault` is **amd64-only**: it indexes the register file as
+//!   `mcontext_t.__gregs[_REG_RIP/_REG_RSP/_REG_R15/_REG_RCX]`, and those
+//!   `_REG_*` constants exist only in libc's NetBSD **x86_64** module. The
+//!   array itself differs in both element type and length on aarch64
+//!   (`[greg_t; 32]` vs `[c___greg_t; 26]`), so an aarch64 shim is a port,
+//!   not a cfg.
+//! * `fsbase` is **amd64-only**: a `naked_asm!` `sysarch(2)` leaf in x86
+//!   mnemonics, serving `carrick-dsr-x86`'s FSGSBASE gateway seam. AArch64
+//!   has no FS base at all (TLS is `TPIDR_EL0`), so there is nothing to port.
+//! * `futex` and `jit`'s mapping machinery are **arch-neutral**
+//!   (`__futex(2)`, `shm_open` + `mmap`) and stay compiled on every NetBSD
+//!   arch on purpose — whether they behave on arm64 (notably: whether PaX
+//!   MPROTECT permits the RX/RW dual map) is exactly what the aarch64 lane
+//!   needs to learn, so gating them out would hide the answer.
+//! * The one genuinely arch-shaped thing inside `jit` is `flush_icache`,
+//!   whose x86 no-op is WRONG on aarch64's non-coherent I-cache. See `jit`
+//!   for how that is made fail-closed rather than silently stale.
 
 #![cfg(target_os = "netbsd")]
 
+#[cfg(target_arch = "x86_64")]
 pub mod fault;
+#[cfg(target_arch = "x86_64")]
 pub mod fsbase;
 pub mod futex;
 pub mod jit;
 
-pub use fault::NATIVE_EXIT_KICK_SIGNAL;
 pub use jit::NetbsdHostJit;
+
+/// NetBSD's kick signal: SIGRTMIN. The libc crate does not expose `SIGRTMIN`
+/// on this target (Task-2 box probe: `SIGRTMIN=33`, `SIGRTMAX=63`, `NSIG=64`),
+/// so it is named here as a constant — the same shape as the FreeBSD lane's
+/// hardcoded 65. NetBSD's libpthread does not reserve leading real-time
+/// signals for internal use (a glibc-ism), so SIGRTMIN is a free,
+/// non-colliding kick channel the run loop delivers per-thread via
+/// `pthread_kill(thread, SIGRTMIN)`.
+///
+/// Lives at the crate root, not in `fault`, because the value is a NetBSD
+/// **OS** fact rather than an amd64 one: `fault` is amd64-gated, and the
+/// constant (and the compile-time pair assertion below) must stay available
+/// on every NetBSD arch. `carrick-runtime` already consumes it by this
+/// crate-root path.
+pub const NATIVE_EXIT_KICK_SIGNAL: libc::c_int = 33;
 
 // The run loop uses the exit kick as a signal PAIR (`NATIVE_EXIT_KICK_SIGNAL`
 // and `+1`). NetBSD's `SIGRTMIN=33`/`SIGRTMAX=63` (Task-2 box probe) makes both
@@ -88,6 +128,16 @@ mod tests {
     #[test]
     fn netbsd_host_name_and_jit_are_wired() {
         assert_eq!(NetbsdHost::NAME, "netbsd");
-        NetbsdHost::active_jit().supported().expect("supported");
+        if cfg!(target_arch = "x86_64") {
+            NetbsdHost::active_jit().supported().expect("supported");
+        } else {
+            // Not a weakened assertion: on an arch whose I-cache is not
+            // coherent, a lane whose `flush_icache` has no cache-maintenance
+            // body MUST refuse before anything maps code.
+            assert!(
+                NetbsdHost::active_jit().supported().is_err(),
+                "non-amd64 NetBSD must fail closed: no aarch64 I-cache flush yet"
+            );
+        }
     }
 }
