@@ -42,6 +42,16 @@ macos+aarch64 and `gateway.rs:465+` stubs every exit address to 0 off-Darwin, so
 tests **cannot execute one translated instruction** on a BSD. They prove the crate compiles
 and its pure-Rust + real-`mmap` logic passes. They do not prove translation works.
 
+> **CORRECTION (prereq fix round 1, verified on `freebsd-arm64`).** The 87/0 figure is
+> reproducible only **after** the B5 fix (`ab766d59`), not at the commit T0 recorded it
+> against. `vec![0i8; pages]` (B5) was already present at `c0c8ded8` — introduced by
+> `59c495dc`, removed by `ab766d59` — and `carrick-dsr` is un-gated
+> (`carrick-dsr/src/lib.rs:35`), so on `aarch64-unknown-freebsd` (where `c_char == u8`)
+> `cargo test -p carrick-dsr-aarch64` at `c0c8ded8` fails to COMPILE with
+> `E0308 expected *mut u8, found *mut i8` at `identity_memory.rs:1373`. The number is
+> right and the thesis stands; only the attribution was wrong. Re-measured at
+> `ab766d59` and later: 87/0 on both guests.
+
 **The caveats, in order of how much they change the plan:**
 
 1. **Host page size is 4096 on BOTH guests** (P1.1/P1.2/P1.3 ×2, three independent sources
@@ -1247,12 +1257,23 @@ sleep, this is a real open question. **Report as OPEN, not settled.**
 | Stage | Command | report_only | available |
 |---|---|---|---|
 | stage0 | `cargo test -p carrick-portable -p carrick-hal -p carrick-host -p carrick-mem` | False | **True** |
-| stage1 | `cargo build --workspace` | True ("red list IS the bring-up worklist") | **True** |
+| stage1 | `cargo build -p carrick-cli --no-default-features --features {platform_feature}` (was `cargo build --workspace`; changed in prereq fix round 1 — see below) | True ("red list IS the bring-up worklist") | **True** |
 | stage2 | `cmds=[]` | True | **False** — note "requires NativeLane aarch64 host lanes (seam extraction)" |
 | stage3 | `cmds=[]` | True | **False** — note "requires stage2 + LTP gate tooling (native-x86-ltp-gate lineage)" |
 
 `run_gate` raises `SystemExit` for any unavailable stage at :1026-1027 — **before** the
 golden-image check (:1028) and the `out_dir` creation (:1033-1034).
+
+**stage1's command changed in prereq fix round 1.** `cargo build --workspace` builds every
+member with DEFAULT features, and `carrick-runtime`'s `default = ["platform-macos"]` means
+that on a BSD it drags in `carrick-vmm-hvf` (no crate-level `#![cfg]`) and then trips
+`carrick-cli`'s own `build.rs` assertion that `platform-macos` requires
+`target_os = "macos"` — V12, i.e. **pure artifact**: neither crate is on the aarch64 BSD
+acceptance path, and the resulting ~18-error red list is not a bring-up worklist. stage1 now
+builds the acceptance path itself against the guest's own backend, via a new
+`VmConfig.platform_feature` (`platform-freebsd` / `platform-netbsd`) substituted into the
+stage command for `{platform_feature}`. Both guests are **green** on that command as of the
+prereq fix round.
 
 **Correction to the brief's framing:** the stage2 note is **still accurate**, not stale.
 Its stated requirement is "NativeLane aarch64 host lanes", and those still do not exist —
@@ -1406,6 +1427,49 @@ no CRT, no std). `crates/carrick-dsr-aarch64/` has **no `tests/` directory at al
 | **B4c** predicted second bindgen failure (freebsd) | PREDICTED | **CONFIRMED.** Base FreeBSD/aarch64 ships clang 19.1.7 **binaries** but **no shared libclang** (`ls /usr/lib/libclang.so*` and `/usr/local/llvm*/lib/libclang.so*` both empty). `pkg install -y llvm19` (261 MiB download / 2 GiB installed, pulls libedit+lua53) provides `/usr/local/llvm19/lib/libclang.so.19.1.7`; with `LIBCLANG_PATH` set, bad64-sys builds and carrick-dsr-aarch64 produces a 31 MB rlib. **100% provisioning, no code change.** |
 | **B5 — NEW** | not on any list | **`crates/carrick-dsr/src/identity_memory.rs:1365` `let mut residency = vec![0i8; pages];` passed to `libc::mincore(_, _, *mut c_char)` at `:1373`.** `c_char` is **UNSIGNED** on aarch64 everywhere except Apple ⇒ unconditional E0308. **Measured on BOTH guests; source-verified independently by BOTH verifiers**, including that the file's only `target_os` gates are at `:2634+` inside the `#[cfg(test)]` module opened at `:2630` — so this is unconditional **production** code in a crate §1.3 lists as SHARED-ALREADY with "zero arch gates in production code". **It blocks `carrick-dsr-aarch64`, i.e. the aarch64 translate engine, exactly as bindgen does.** One-line fix: `vec![0 as libc::c_char; pages]`; the sibling site at `:674` already uses the correct portable `.cast::<libc::c_char>()` form, and grep shows `:1365` is the only hardcoded-`i8` site in `crates/*/src`. **Must land before or with the libclang provisioning or nothing downstream builds.** By the same mechanism it must also break aarch64-linux (INFERRED — correct by AAPCS64, unmeasured there). Cheap audit item: never hardcode `i8`/`u8` where libc says `c_char`. |
 | **B6 — NEW** | not on any list | **`carrick-runtime/src/lib.rs:589 crate::runtime::run_oci(spec)` is an UN-GATED caller** inside an `impl Runtime` gated only on `any(feature = …)`, while all four `pub fn run_oci` **definitions** (`:1601`, `:1612`, `:1621`, `:1633`) are gated `all(feature = "platform-X", target_arch = "x86_64"\|"aarch64")`. This document previously read `run_oci` as "arch-gated — proof the predicate was applied unevenly"; **it is arch-gated at the definition and unresolved at the caller, so the unevenness cuts the other way.** ⚠️ **MAGNITUDE CORRECTION:** the freebsd probe report called this "5 unresolved call sites"; the verifier established it is **ONE** E0425 whose diagnostic *notes* the four cfg'd-out candidates. **Worklist item = 1 line, not 5.** The generalized lesson stands: **the arch-gating pass must gate callers, not just definitions.** |
+
+#### PREREQ FIX ROUND 1 — what is now CLOSED, measured on both guests
+
+`cargo build -p carrick-cli --no-default-features --features platform-{freebsd,netbsd}` is
+**rc=0 on freebsd-arm64 AND netbsd-arm64** (aarch64), with `carrick-engine` and `carrick-cli`
+compiled through. That closes **B1, B2, B3, B5 and B6** as build blockers:
+
+- **B5** — `identity_memory.rs` `mincore` residency buffers are `vec![0 as libc::c_char; …]`
+  (`ab766d59`); correct simultaneously on macOS/FreeBSD/NetBSD/Linux.
+- **B6** — the un-gated `run_oci` caller resolves through a fail-closed
+  "no VMM OCI engine on this host arch" arm whose predicate is the exact negated set-union of
+  the four engine arms, so a fifth engine arm that forgets to widen it is a duplicate-definition
+  COMPILE error (`32cdecb9`).
+- **B1** — the four amd64-welded modules are arch-gated (`fault` + `tsc` in
+  `carrick-native-freebsd`, `fault` + `fsbase` in `carrick-native-netbsd`); the predicted 10th
+  `fsbase` codegen break did NOT materialize because the module is gated out entirely
+  (`d3c7a55f`). The arch-NEUTRAL modules (`jit`, `futex`, `waiter_key`) were deliberately left
+  compiled on aarch64 — and all pass there, answering the PaX-vs-dual-map and
+  `_umtx_op`/`__futex`-on-arm64 unknowns positively.
+- **B2/B3** — the `dep:carrick-vmm-{bhyve,nvmm}` edges resolve against ARCH-SCOPED
+  `[target.'cfg(…)'.dependencies]` tables (`628aeada`), so neither VMM crate is in the aarch64
+  dependency closure (measured with `cargo tree`) and NetBSD never reaches the `-lnvmm` edge.
+  The **source**-level references (10 sites in `carrick-runtime/src/lib.rs`) are now arch-gated
+  to `x86_64` too. Two of them could not simply be gated away and were re-seamed instead:
+  `threaded_impl::hvf_futex` (the module now has no member on aarch64 BSD, so the lane's futex
+  is an absent symbol — a compile error, not a wrong implementation) and `host_signal::ActiveGlue`
+  (reached from the arch-neutral dispatcher on every host, so it is arch-SPLIT: x86_64 keeps
+  `BhyveGlue`/`NvmmGlue` byte-for-byte, aarch64 resolves to the new
+  `carrick_host_bsd::native_glue::BsdNativeGlue`, and the VMM crates carry a test asserting the
+  two agree on every signal number).
+
+**B4a is REFUTED at HEAD**: `carrick-observability` (hence usdt/usdt-impl 0.6.0) builds clean
+inside the green freebsd-arm64 `platform-freebsd` build above. No `[patch.crates-io]` was needed.
+
+**Not closed, and NOT prereq work** (see §7): the 9 → 3 residual `cargo test -p carrick-dsr`
+failures on netbsd-arm64. Six were the crate's own `#[cfg(test)]` `TestHostJit` asking for an
+RWX `MAP_ANON` mapping that NetBSD PaX MPROTECT refuses; that double now maps R|W only (it never
+executes cache bytes) and those six pass. The remaining **three are the 2^47 identity-pointer
+ceiling** — `identity_memory.rs`'s `X86_64_USER_END_EXCLUSIVE` classifies every NetBSD/aarch64
+`mmap` result above 2^47 as `Unmapped`. That constant must become ISA-keyed (aarch64 user VA is
+2^48), which is a real runtime-semantics change belonging to the Phase-2 identity-memory
+neutralization, not to gating/plumbing. FreeBSD/aarch64 is unaffected (86/0) because its `mmap`
+stays below 2^47 — i.e. this is a latent hazard the FreeBSD lane will not surface.
 
 **Two evidence-hygiene notes carried forward from verification** (the findings are real either
 way, but the provenance was misstated): freebsd P0.5b's 10 runtime errors were observed **with a
