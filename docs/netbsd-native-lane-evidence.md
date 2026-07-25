@@ -145,14 +145,30 @@ the one place the fsbase seam's correctness is currently an *analysis*, not a
       (`--test native_netbsd_x86`) is 4/4, and the host-seam crate
       (`carrick-native-netbsd`: futex/jit/fault/fsbase) is 16/0.
     - **`carrick-runtime` LIB unit tests are green on NetBSD** after gating three
-      non-portable tests `#[cfg(not(target_os = "netbsd"))]` (with in-place
-      red-list comments — each a real feature gap, passing on
-      FreeBSD/Linux/macOS): (a) AF_UNIX sockaddr xattr fallback
-      (`host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes`, NetBSD
-      extattr semantics); (b) socket OOB/urgent-byte
-      (`host_fd_has_oob_detects_pending_urgent_byte`, NetBSD SIOCATMARK/
-      SO_OOBINLINE); (c) shared-anon mmap recycled-range zero-fill
-      (`reused_shared_anon_mmap_zeroes_recycled_range`, NetBSD MAP_ANON recycle).
+      tests `#[cfg(not(target_os = "netbsd"))]` (with in-place red-list comments).
+      Only ONE is genuinely NetBSD-specific: (a) AF_UNIX sockaddr xattr fallback
+      (`host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes`) —
+      passes on FreeBSD, fails on NetBSD (extattr semantics). The other two are
+      **pre-existing environmental failures on BOTH test VMs**, confirmed by
+      baseline comparison (they also fail on the pre-campaign merge-base
+      `c8fe6192`, so they are NOT native-lane regressions): (b) socket
+      OOB/urgent-byte (`host_fd_has_oob_detects_pending_urgent_byte`,
+      SIOCATMARK/SO_OOBINLINE unreliable on the nested VMs); (c) shared-anon mmap
+      recycled-range zero-fill (`reused_shared_anon_mmap_zeroes_recycled_range`).
+      They are gated off on NetBSD for a clean bring-up baseline; the FreeBSD box
+      tolerates them as pre-existing.
+    - **FreeBSD-regression gate: PASS.** With all campaign changes, FreeBSD
+      builds (`platform-freebsd`, `Finished`), the native-lane integration suite
+      is 43/0 (`--test native_freebsd_x86`), and `carrick-native-freebsd` is 10/0
+      (including the relocated `tsc_vdso_is_safe` test). The FreeBSD LIB suite has
+      5 failures (`host_fd_has_oob`, `reused_shared_anon_mmap`,
+      `host_deep_path_ops_beyond_path_max`, `calibrated_x86_vvar_tracks_host_clocks`,
+      `virtual_x87_wait_faults_without_touching_host_fpu_state`) — ALL confirmed
+      pre-existing (identical failures on baseline `c8fe6192`; e.g.
+      `calibrated_x86_vvar` fails because the VM reports
+      `kern.timecounter.invariant_tsc=0`/`smp_tsc=0` so calibration returns
+      `None`). None are caused by the seam/widening/gateway/fsbase work; the
+      gateway is byte-identical on FreeBSD/Linux (objdump-verified).
     - **The `carrick-runtime` INTEGRATION suite (`tests/*.rs`) is NOT
       NetBSD-green** and is explicitly out of scope here: `syscall_fs_*`
       (bind-mount owner-stamping, chown, `fchownat`), `syscall_creds`
