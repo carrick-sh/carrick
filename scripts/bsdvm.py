@@ -1191,6 +1191,38 @@ def ssh_run(vm: VmConfig, cmd: str, timeout_s: float) -> subprocess.CompletedPro
     )
 
 
+def interactive_ssh_argv(vm: VmConfig, command: list[str]) -> list[str]:
+    """argv for `bsdvm ssh <vm> [cmd...]`.
+
+    Pure (no I/O beyond `ssh_base`'s state-dir mkdir) so it can be unit tested
+    directly, like `parse_symref_head`.
+
+    Two properties matter, and both are why this subcommand exists rather than
+    everyone hand-rolling `ssh -p 2201 root@127.0.0.1`:
+
+    * it inherits `ssh_base`'s per-state-dir `UserKnownHostsFile` +
+      `StrictHostKeyChecking=accept-new`, so re-provisioning a guest (new
+      overlay => new host key) can never wedge callers with
+      "Host key verification failed" against `~/.ssh/known_hosts`; and
+    * it applies `remote_env_prefix`, so a remote command gets the guest's
+      toolchain environment (cargo on PATH, `LIBCLANG_PATH`) without every
+      caller remembering to prefix it.
+
+    An empty `command` means an interactive login shell, which takes no env
+    prefix (the login shell sources the profile itself).
+    """
+    base = ssh_base(vm)
+    if not command:
+        return base
+    return base + [vm.remote_env_prefix + shlex.join(command)]
+
+
+def cmd_ssh(args: argparse.Namespace) -> int:
+    vm = _resolve_vm(args.vm)
+    assert vm is not None  # main() validated it
+    return subprocess.call(interactive_ssh_argv(vm, list(args.command)))
+
+
 def ssh_wait(vm: VmConfig, timeout_s: float = 300) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -1733,6 +1765,12 @@ def main(argv: list[str]) -> int:
     refresh_golden = sub.add_parser("refresh-golden")
     refresh_golden.add_argument("vm")
     refresh_golden.set_defaults(func=cmd_refresh_golden)
+    ssh_p = sub.add_parser("ssh")
+    ssh_p.add_argument("vm")
+    # REMAINDER so the remote command's own flags reach the guest instead of
+    # being parsed here (e.g. `bsdvm ssh netbsd-arm64 cargo build -p foo`).
+    ssh_p.add_argument("command", nargs=argparse.REMAINDER)
+    ssh_p.set_defaults(func=cmd_ssh)
     gate = sub.add_parser("gate")
     gate.add_argument("vm")
     gate.add_argument("stage")
