@@ -21,15 +21,82 @@
 //!    no-ops. `flush_icache` is a no-op on **x86_64 only** (coherent I-cache;
 //!    cross-modification ordering is the ARCH crate's problem at its patch
 //!    sites). That is a property of the ARCH, not of the lane: on a BSD
-//!    aarch64 host the same dual-map lane has no cache-maintenance body yet,
-//!    so it fails closed — `supported()` returns `Err` and `flush_icache`
-//!    aborts rather than claim a coherence it cannot deliver.
+//!    aarch64 host the same dual-map lane cleans/invalidates through
+//!    `clear_icache_range` below, and on any OTHER arch it still fails closed —
+//!    `supported()` returns `Err` and `flush_icache` aborts rather than claim
+//!    a coherence it cannot deliver.
 //!
 //! The cache addresses code by EXEC va and derives the write destination
 //! via [`JitRegion::write_ptr_for`], so both shapes fall out of one calling
 //! convention with no cfg at the call sites.
 
 use std::ptr::NonNull;
+
+// The toolchain's own cache-maintenance helper (compiler-rt `__clear_cache` /
+// libgcc), which every AArch64 target provides because
+// `__builtin___clear_cache` lowers to a call to it off Darwin. Verified to
+// link on both aarch64 BSD guests with a bare `rustc` (no extra `-l`):
+// FreeBSD 15.1/aarch64 resolves it from base `libcompiler_rt.a`, NetBSD
+// 10.1/aarch64 from base `libgcc`.
+//
+// Using the toolchain body rather than a hand-rolled `dc cvau`/`ic ivau` loop
+// keeps the cache-line granule (`CTR_EL0.{DminLine,IminLine}`) and the
+// range-end rounding in the one place that is already right for the host, and
+// it sidesteps the `SCTLR_EL1.{UCT,UCI}` EL0-accessibility question entirely.
+//
+// Scoped to the aarch64 BSD hosts that consume it rather than to
+// `target_arch = "aarch64"` alone: Darwin lowers `__builtin___clear_cache` to
+// `sys_icache_invalidate` and is not required to export a `__clear_cache`
+// symbol at all, so declaring it there would risk an undefined symbol in the
+// one lane that already has a working (and different) answer.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "freebsd", target_os = "netbsd")
+))]
+unsafe extern "C" {
+    fn __clear_cache(start: *mut std::ffi::c_char, end: *mut std::ffi::c_char);
+}
+
+/// Make `len` bytes freshly written at `exec_ptr` visible to instruction
+/// fetch on AArch64 — clean the data cache to the point of unification,
+/// invalidate the instruction cache, and synchronise (`dc cvau` / `dsb ish` /
+/// `ic ivau` / `dsb ish` / `isb`).
+///
+/// **This is not optional on AArch64.** Unlike x86, AArch64 instruction
+/// caches are not coherent with the data side, so code published with no
+/// maintenance executes the STALE previous bytes — measured on
+/// `freebsd-arm64` during the aarch64 lane scout (probe P7.2 case iv:
+/// re-publishing a function through the RW alias with no maintenance ran the
+/// PREVIOUS function's body). The regression is silent: no fault, no error
+/// return, just the wrong instructions.
+///
+/// `exec_ptr` is the EXEC-side alias on a dual-mapped host, which is correct
+/// even though the bytes were stored through the RW alias: ARMv8-A requires
+/// data and unified caches to behave as PIPT, both aliases map the same
+/// physical frame, and `DC CVAU` is permission-checked as a READ so a
+/// `PROT_READ|PROT_EXEC` alias suffices (all three measured in P7.2).
+///
+/// A zero-length range is a no-op — `__clear_cache(p, p)` would be too, but
+/// the early return also keeps the pointer arithmetic below in-bounds.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "freebsd", target_os = "netbsd")
+))]
+pub fn clear_icache_range(exec_ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let start = exec_ptr as *mut std::ffi::c_char;
+    // SAFETY: the caller's contract is that `exec_ptr..exec_ptr+len` is one
+    // live, published code range, so the end pointer is in bounds (one past
+    // the last byte). `c_char` is one byte on every target, so this is byte
+    // arithmetic regardless of its signedness (which differs across the
+    // fleet — both aarch64 BSDs have an UNSIGNED `char`).
+    let end = unsafe { start.add(len) };
+    // SAFETY: `start..end` is a live mapping readable by this process;
+    // `__clear_cache` only issues cache maintenance over it.
+    unsafe { __clear_cache(start, end) };
+}
 
 /// A mapped JIT code cache. `exec_base` is where translated code runs;
 /// `write_base` is where its bytes are written. Equal on Darwin (MAP_JIT);
