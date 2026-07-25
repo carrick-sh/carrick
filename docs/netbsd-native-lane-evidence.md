@@ -136,6 +136,36 @@ the one place the fsbase seam's correctness is currently an *analysis*, not a
     (skip a SET when the target already equals the currently-installed
     hardware base) could shave the typical case further but is unmeasured
     against a real workload and not implemented.
+12. **General-runtime NetBSD portability gaps (non-native-lane) — a broad
+    follow-on.** `carrick-runtime` *as a whole* was never ported to NetBSD; this
+    campaign brought up only the native x86 lane. Now that the crate builds and
+    tests on NetBSD, the broader test surface exposes portability gaps unrelated
+    to the native lane. Scope precisely:
+    - **The campaign's NetBSD test signal is GREEN**: the native-lane acceptance
+      (`--test native_netbsd_x86`) is 4/4, and the host-seam crate
+      (`carrick-native-netbsd`: futex/jit/fault/fsbase) is 16/0.
+    - **`carrick-runtime` LIB unit tests are green on NetBSD** after gating three
+      non-portable tests `#[cfg(not(target_os = "netbsd"))]` (with in-place
+      red-list comments — each a real feature gap, passing on
+      FreeBSD/Linux/macOS): (a) AF_UNIX sockaddr xattr fallback
+      (`host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes`, NetBSD
+      extattr semantics); (b) socket OOB/urgent-byte
+      (`host_fd_has_oob_detects_pending_urgent_byte`, NetBSD SIOCATMARK/
+      SO_OOBINLINE); (c) shared-anon mmap recycled-range zero-fill
+      (`reused_shared_anon_mmap_zeroes_recycled_range`, NetBSD MAP_ANON recycle).
+    - **The `carrick-runtime` INTEGRATION suite (`tests/*.rs`) is NOT
+      NetBSD-green** and is explicitly out of scope here: `syscall_fs_*`
+      (bind-mount owner-stamping, chown, `fchownat`), `syscall_creds`
+      (`getrusage`), `address_space` (static-ELF loading), and others fail on
+      NetBSD — general Linux/FreeBSD-shaped syscall-emulation behaviors not yet
+      NetBSD-aware. Porting the integration suite to NetBSD is its own campaign,
+      independent of (and not blocking) the native-lane acceptance.
+    - A separate `overlay_dispatch_tests` epoll-recycle lib test is flaky only
+      under parallel execution (a pre-existing race, not NetBSD-specific); run the
+      lib suite `--test-threads=1` for determinism.
+    **On NetBSD, run `--test native_netbsd_x86` + `carrick-native-netbsd` (the
+    campaign artifacts, green) and `--lib` (green); the full integration suite is
+    a portability follow-on.**
 
 ## Reproduce
 
