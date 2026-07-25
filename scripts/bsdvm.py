@@ -31,7 +31,16 @@ class VmConfig:
     image_candidates: list[str]
     checksum_url: str
     image_format: str  # "qcow2.xz" | "img.gz"
-    remote_path_prefix: str = ""
+    # Environment prepended to EVERY `ssh_run` command string. It must be an
+    # `export ...; ` statement, never a bare `VAR=value ` prefix: a prefix
+    # assignment scopes the variable to the single command it precedes, and
+    # every gate command has the shape `cd /root/carrick && cargo ...`, so a
+    # prefix would apply to the `cd` and NOT to cargo. Measured on both guests
+    # (`ssh <box> 'V=x cd /tmp && env | grep -c V'` -> 0). This was inert for
+    # the whole life of the NetBSD PATH prefix; it only ever appeared to work
+    # because NetBSD's non-login ssh PATH already contains /usr/pkg/bin.
+    # `PathExportShapeTests` covers the shape.
+    remote_env_prefix: str = ""
     pinned_sha512: str | None = None
     # The `carrick-runtime`/`carrick-cli` platform feature that selects this
     # guest's host backend. Substituted into a stage command as
@@ -66,6 +75,15 @@ VMS: dict[str, VmConfig] = {
         ],
         checksum_url=f"{_FB_BASE}/CHECKSUM.SHA512",
         image_format="qcow2.xz",
+        # Pin the libclang bindgen (bad64-sys) loads to the llvm19 the
+        # provisioning step installs. MEASURED: not strictly required today —
+        # with LIBCLANG_PATH unset, a clean `cargo build -p bad64-sys` succeeds
+        # on this guest because clang-sys globs `/usr/local/llvm*/lib` on
+        # FreeBSD, and that llvm19 tree is the only libclang on the box (there
+        # is no /usr/local/lib/libclang* or /usr/lib/libclang*). Pinned anyway
+        # so the gate does not depend on a build script's glob ORDER once a
+        # second llvm lands in /usr/local.
+        remote_env_prefix="export LIBCLANG_PATH=/usr/local/llvm19/lib; ",
     ),
     "netbsd-arm64": VmConfig(
         name="netbsd-arm64",
@@ -75,8 +93,16 @@ VMS: dict[str, VmConfig] = {
         image_candidates=[f"{_NB_BASE}/arm64.img.gz"],
         checksum_url=f"{_NB_BASE}/SHA512",
         image_format="img.gz",
-        # Non-login ssh on NetBSD lacks /usr/pkg/bin (fleet-wide gotcha).
-        remote_path_prefix="PATH=/usr/pkg/bin:/usr/pkg/sbin:$PATH ",
+        # Non-login ssh on NetBSD lacks /usr/pkg/bin (fleet-wide gotcha) — on
+        # THIS guest it happens to be present already, but keep it explicit
+        # rather than resting on an image's default PATH. LIBCLANG_PATH is the
+        # same determinism pin as the FreeBSD entry; MEASURED not required here
+        # either, because the pkgsrc `clang` package pulls `llvm`, whose
+        # /usr/pkg/bin/llvm-config clang-sys falls back to for the libdir (a
+        # clean `cargo build -p bad64-sys` with it unset succeeds).
+        remote_env_prefix=(
+            "export PATH=/usr/pkg/bin:/usr/pkg/sbin:$PATH LIBCLANG_PATH=/usr/pkg/lib; "
+        ),
         # pinned: no upstream checksum published for gzimg (verified 2026-07-22); update when bumping NetBSD version
         pinned_sha512=(
             "9cd92b45c6efa43cc01ce6ecf6452ff71eda94f98458bcd0f0c16730eb48e86"
@@ -578,7 +604,15 @@ def provision_commands(vm: VmConfig, pubkey: str) -> list[tuple[str, float]]:
              "echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config && "
              "service sshd restart", 120),
             ("env ASSUME_ALWAYS_YES=yes pkg bootstrap -f", 600),
-            ("env ASSUME_ALWAYS_YES=yes pkg install -y git just rust python3", 3600),
+            # `llvm19` is NOT optional tooling, it is a BUILD dependency of the
+            # aarch64 acceptance path: carrick-dsr-aarch64 -> bad64 -> bad64-sys
+            # runs `bindgen` in its build script, and bindgen dlopens libclang.
+            # FreeBSD base ships none (no /usr/lib/libclang*, no
+            # /usr/local/lib/libclang*), so without this the stage1 gate dies
+            # with `Unable to find libclang`. The package puts it at
+            # /usr/local/llvm19/lib, which `remote_env_prefix` pins as
+            # LIBCLANG_PATH. Mirrors the NetBSD `clang` line below.
+            ("env ASSUME_ALWAYS_YES=yes pkg install -y git just rust python3 llvm19", 3600),
             # A login shell's PATH already includes /usr/local/bin, but
             # `export` (not a plain prefix assignment) still matters here:
             # a bare `PATH=... cmd1 && cmd2` only scopes PATH to cmd1,
@@ -645,10 +679,12 @@ def provision_commands(vm: VmConfig, pubkey: str) -> list[tuple[str, float]]:
         # matching: ['libclang.so', 'libclang.so.*']"`. Installing the pkgsrc
         # `clang` package puts it at /usr/pkg/lib and pulls `llvm`, whose
         # /usr/pkg/bin/llvm-config is what clang-sys falls back to for the
-        # libdir -- so no LIBCLANG_PATH in `remote_path_prefix` is needed
-        # (verified on-box: a clean bad64-sys rebuild succeeds with the env var
-        # unset). This was invisible while stage1 was `cargo build --workspace`,
-        # which died on carrick-vmm-hvf long before reaching a bad64-sys compile.
+        # libdir -- so LIBCLANG_PATH is not REQUIRED here (re-verified on-box
+        # 2026-07-25: a clean bad64-sys rebuild succeeds with the env var
+        # unset). `remote_env_prefix` pins it anyway, for the determinism
+        # reason stated there, not because the build needs it. This was
+        # invisible while stage1 was `cargo build --workspace`, which died on
+        # carrick-vmm-hvf long before reaching a bad64-sys compile.
         ("export PKG_PATH=https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/aarch64/10.0_2026Q1/All; "
          "/usr/sbin/pkg_add -U git rust clang || /usr/sbin/pkg_add -U git rust clang", 3600),
         # `just` may be absent from pkgsrc aarch64; gates call cargo directly.
@@ -868,7 +904,7 @@ def ssh_base(vm: VmConfig) -> list[str]:
 
 def ssh_run(vm: VmConfig, cmd: str, timeout_s: float) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ssh_base(vm) + [vm.remote_path_prefix + cmd],
+        ssh_base(vm) + [vm.remote_env_prefix + cmd],
         capture_output=True,
         text=True,
         timeout=timeout_s,
