@@ -144,31 +144,80 @@ the one place the fsbase seam's correctness is currently an *analysis*, not a
     - **The campaign's NetBSD test signal is GREEN**: the native-lane acceptance
       (`--test native_netbsd_x86`) is 4/4, and the host-seam crate
       (`carrick-native-netbsd`: futex/jit/fault/fsbase) is 16/0.
-    - **`carrick-runtime` LIB unit tests are green on NetBSD** after gating three
-      tests `#[cfg(not(target_os = "netbsd"))]` (with in-place red-list comments).
-      Only ONE is genuinely NetBSD-specific: (a) AF_UNIX sockaddr xattr fallback
-      (`host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes`) —
-      passes on FreeBSD, fails on NetBSD (extattr semantics). The other two are
-      **pre-existing environmental failures on BOTH test VMs**, confirmed by
-      baseline comparison (they also fail on the pre-campaign merge-base
-      `c8fe6192`, so they are NOT native-lane regressions): (b) socket
-      OOB/urgent-byte (`host_fd_has_oob_detects_pending_urgent_byte`,
-      SIOCATMARK/SO_OOBINLINE unreliable on the nested VMs); (c) shared-anon mmap
-      recycled-range zero-fill (`reused_shared_anon_mmap_zeroes_recycled_range`).
-      They are gated off on NetBSD for a clean bring-up baseline; the FreeBSD box
-      tolerates them as pre-existing.
+    - **`carrick-runtime` LIB unit tests are green on NetBSD and FreeBSD** — the
+      earlier bring-up gated three tests `#[cfg(not(target_os = "netbsd"))]` to
+      fake a green suite; that "gate-to-hide" has been REVERTED and every one of
+      these five tests (which failed pre-existingly on the merge-base `c8fe6192`,
+      never native-lane regressions) is now genuinely **deterministic + correct**
+      on macOS/Linux/FreeBSD/NetBSD. None was actually "environmental/flaky" — the
+      real root causes were:
+      1. `calibrated_x86_vvar_tracks_host_clocks` (FreeBSD-gated) —
+         **testing-the-wrong-thing.** It `.expect()`-panicked whenever
+         `calibrate_x86_vvar_clock()` returns `None`, which it does on any host
+         whose TSC is not invariant + SMP-safe — e.g. the CI VMs report
+         `kern.timecounter.invariant_tsc=0`/`smp_tsc=0` (verified), so
+         `machdep.tsc_freq` is present but the counter is not a valid vDSO
+         clocksource. FIX: the test now proves the tracking MATH (`tsc_ns` unit
+         conversion + offset inversion + one-for-one advance) with FIXED inputs
+         (host-independent), then branches deterministically on the host's real
+         capability — `None` ⇒ assert calibration correctly declined (nothing to
+         track); `Some` ⇒ assert live tracking within 50 ms. No panic, any host.
+      2. `virtual_x87_wait_faults_without_touching_host_fpu_state` (FreeBSD-gated)
+         — **wrong test, not a carrick bug.** It set FSW = IE|ES but left the
+         default FCW (`0x037F`, which MASKS all six x87 exceptions) and expected a
+         SIGFPE. A WAIT/FWAIT faults only on an UNMASKED pending exception; with
+         IE masked the FPU absorbs it silently, so `service_sensitive` correctly
+         returned `Ok(())` (empirically `left: Ok(()), right: Err(SIGFPE)`). FIX:
+         the test now unmasks IE in FCW so the pending exception genuinely faults
+         (SIGFPE/FPE_FLTINV), and also asserts the MASKED case does NOT fault.
+         Pure snapshot logic — never touches host FPU; deterministic.
+      3. `host_deep_path_ops_beyond_path_max` (all hosts) — **real code gap,
+         fixed.** The `>PATH_MAX` chunked-descent (`HostFsBackend::at` /
+         `deep_anchor`) was gated `#[cfg(target_os = "linux")]` only, but
+         FreeBSD's cap-std resolves a whole relative path in ONE
+         `openat(O_RESOLVE_BENEATH)` syscall — `PATH_MAX`-bounded (1024 on
+         FreeBSD) exactly like Linux `openat2`. So deep paths got ENAMETOOLONG on
+         FreeBSD (failed at len 1206, just past 1024). FIX: enable the chunked
+         descent on FreeBSD with a `PATH_MAX`-appropriate `DEEP_PATH_CHUNK` (512).
+         NetBSD (and macOS) lack RESOLVE_BENEATH, so their cap-std walks
+         component-by-component and never hits the limit — the branch stays
+         compiled out there and the test passes natively (verified).
+      4. `host_fd_has_oob_detects_pending_urgent_byte` (all hosts) —
+         **testing-the-wrong-thing (plus a sleep-race).** `host_fd_has_oob` is a
+         DELIBERATE `false` no-op on Linux/FreeBSD/NetBSD (those answer EPOLLPRI
+         via native `poll(POLLPRI)`; the kqueue `EVFILT_EXCEPT` probe exists only
+         for Darwin, whose `poll` doesn't surface OOB). The old test asserted the
+         Darwin contract on every host and used a 50 ms sleep. FIX: per-host
+         contract with a real blocking wait (no sleep) — Darwin blocks on
+         `EVFILT_EXCEPT` then asserts `host_fd_has_oob` is `true`; non-Darwin
+         blocks on `poll(POLLPRI)` (the mechanism those hosts actually use) and
+         asserts `host_fd_has_oob` stays the documented no-op.
+      5. `host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes` (all
+         hosts) — **host-capability gap, deterministically detected; NOT a
+         carrick bug.** The cross-process AF_UNIX `sun_path` fallback stores the
+         guest path in an EXTENDED ATTRIBUTE on the host socket node. Stock NetBSD
+         has NO extattr support: `setextattr`/`extattr_set_link` returns
+         EOPNOTSUPP on BOTH tmpfs (`/tmp`, the default `TMPDIR`) AND the FFS root
+         (`/dev/dk0` on `/`) — verified on the CI VM. carrick's API usage
+         (`extattr_set_link`/`extattr_get_link`) is correct; the OS simply lacks
+         the capability, and carrick degrades safely (a private hashed node with
+         no metadata returns a family-only address — it never leaks the raw host
+         path). Same-process AF_UNIX via the in-memory registry is unaffected.
+         FIX: the test detects the capability from the real `lsetxattr` result —
+         supported (macOS/Linux/FreeBSD) ⇒ assert reverse-translation; unsupported
+         (stock NetBSD) ⇒ assert the degraded no-leak contract. Deterministic on
+         every host.
+      A sixth test, `reused_shared_anon_mmap_zeroes_recycled_range`, was un-gated
+      and fixed separately (commit `dc3317d3`) and passes on NetBSD.
+      **Determinism proof:** each fixed test was run 10× on the FreeBSD VM and 10×
+      on the NetBSD VM (and 15× on macOS for the OOB test) — 0 failures.
     - **FreeBSD-regression gate: PASS.** With all campaign changes, FreeBSD
       builds (`platform-freebsd`, `Finished`), the native-lane integration suite
       is 43/0 (`--test native_freebsd_x86`), and `carrick-native-freebsd` is 10/0
-      (including the relocated `tsc_vdso_is_safe` test). The FreeBSD LIB suite has
-      5 failures (`host_fd_has_oob`, `reused_shared_anon_mmap`,
-      `host_deep_path_ops_beyond_path_max`, `calibrated_x86_vvar_tracks_host_clocks`,
-      `virtual_x87_wait_faults_without_touching_host_fpu_state`) — ALL confirmed
-      pre-existing (identical failures on baseline `c8fe6192`; e.g.
-      `calibrated_x86_vvar` fails because the VM reports
-      `kern.timecounter.invariant_tsc=0`/`smp_tsc=0` so calibration returns
-      `None`). None are caused by the seam/widening/gateway/fsbase work; the
-      gateway is byte-identical on FreeBSD/Linux (objdump-verified).
+      (including the relocated `tsc_vdso_is_safe` test). The FreeBSD LIB suite's
+      five previously-failing tests above are now GREEN (6/6 including
+      `reused_shared_anon_mmap`, 10×). The gateway is byte-identical on
+      FreeBSD/Linux (objdump-verified).
     - **The `carrick-runtime` INTEGRATION suite (`tests/*.rs`) is NOT
       NetBSD-green** and is explicitly out of scope here: `syscall_fs_*`
       (bind-mount owner-stamping, chown, `fchownat`), `syscall_creds`
