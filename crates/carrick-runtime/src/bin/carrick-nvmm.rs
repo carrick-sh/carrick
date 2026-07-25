@@ -2,8 +2,20 @@
 //! `carrick-runtime` dispatcher.
 //!
 //! Usage: `carrick-nvmm run-elf <x86_64-elf>`
+//!
+//! NetBSD/**x86_64** only. `required-features = ["platform-netbsd"]` cannot
+//! express an arch, and both entry points this driver calls
+//! (`run_elf_real_dispatch`, `run_oci`) exist only under
+//! `all(feature = "platform-netbsd", target_arch = "x86_64")` — NVMM is an
+//! x86-only NetBSD subsystem. So the arch belongs in the `cfg` here, or a
+//! NetBSD/aarch64 `cargo build`/`clippy --all-targets` picks this bin up and
+//! fails on two unresolved names instead of taking the stub `main` below.
 
-#[cfg(all(target_os = "netbsd", feature = "platform-netbsd"))]
+#[cfg(all(
+    target_os = "netbsd",
+    feature = "platform-netbsd",
+    target_arch = "x86_64"
+))]
 fn main() {
     use std::io::Write as _;
 
@@ -103,8 +115,15 @@ fn main() {
     }
 }
 
-#[cfg(not(all(target_os = "netbsd", feature = "platform-netbsd")))]
+#[cfg(not(all(
+    target_os = "netbsd",
+    feature = "platform-netbsd",
+    target_arch = "x86_64"
+)))]
 fn main() {
-    eprintln!("carrick-nvmm requires a NetBSD host built with --features platform-netbsd");
+    eprintln!(
+        "carrick-nvmm requires a NetBSD/x86_64 host built with --features platform-netbsd \
+         (NVMM is an x86-only NetBSD subsystem)"
+    );
     std::process::exit(1);
 }
