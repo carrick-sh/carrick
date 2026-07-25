@@ -808,11 +808,26 @@ pub(crate) mod test_host {
         }
     }
 
-    // Non-Darwin test hosts: a plain RWX private anonymous mapping with
-    // write_base == exec_base. Thread write windows are no-ops (the mapping
-    // is always writable) and `flush_icache` is a no-op -- fine on x86_64
-    // (coherent I-cache; `core::arch` has no icache op there), and this
-    // crate's tests never execute cache bytes on other hosts.
+    // Non-Darwin test hosts: a plain READ|WRITE private anonymous mapping with
+    // write_base == exec_base. Thread write windows are no-ops (the mapping is
+    // always writable) and `flush_icache` is a no-op -- fine on x86_64
+    // (coherent I-cache; `core::arch` has no icache op there), and this crate's
+    // tests never execute cache bytes on any host (nothing here transmutes a
+    // cache address to a function pointer; a lane that must EXECUTE supplies
+    // its own real `NativeHostJit`, e.g. `carrick_native_netbsd::NetbsdHostJit`).
+    //
+    // Deliberately NOT `PROT_EXEC`: a W|X anonymous mapping is not something
+    // any real carrick host lane asks for -- Darwin uses MAP_JIT and the two
+    // BSD lanes use a `shm_open` dual RX/RW map -- and hosts that enforce W^X
+    // REFUSE it outright. NetBSD/aarch64 with PaX MPROTECT
+    // (`security.pax.mprotect.{enabled,global}=1`, the GENERIC64 default)
+    // fails this `mmap` with EACCES and pins `maxprot` at map time, so even a
+    // later `mprotect` to RX cannot recover -- which took down six of this
+    // crate's tests on that host while the production NetBSD lane's real
+    // dual-mapped JIT passed. Asking only for the protection the double
+    // actually uses is both honest and portable; if a test ever does execute
+    // cache bytes it now faults loudly on every host rather than working on
+    // some and being unbuildable on others.
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     impl NativeHostJit for TestHostJit {
         fn supported(&self) -> Result<(), &'static str> {
@@ -824,7 +839,7 @@ pub(crate) mod test_host {
                 libc::mmap(
                     std::ptr::null_mut(),
                     capacity,
-                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_PRIVATE | libc::MAP_ANON,
                     -1,
                     0,
