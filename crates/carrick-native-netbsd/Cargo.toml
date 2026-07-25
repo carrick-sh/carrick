@@ -14,4 +14,12 @@ workspace = true
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-dsr = { path = "../carrick-dsr" }
+# The `PlatformFutex` seam this lane's futex adapter plugs into
+# (`platform_futex.rs`): `carrick-thread` owns the generic
+# `FutexTableNativeFutex` + the private `FutexTable`, `carrick-hal`
+# the `PlatformFutex` trait itself. Acyclic: neither depends on this
+# crate, and both are already in every native lane's graph via
+# `carrick-runtime`.
+carrick-hal = { path = "../carrick-hal" }
+carrick-thread = { path = "../carrick-thread" }
 libc.workspace = true
