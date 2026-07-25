@@ -35,9 +35,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(nb.ssh_port, 2202)
         self.assertEqual(fb.remote, "fbsd-arm")
         self.assertEqual(nb.remote, "nbsd-arm")
-        # NetBSD non-login ssh PATH gotcha must be baked into config.
-        self.assertIn("/usr/pkg/bin", nb.remote_path_prefix)
-        self.assertEqual(fb.remote_path_prefix, "")
+        # NetBSD non-login ssh PATH gotcha must be baked into config, and both
+        # guests must pin the libclang bindgen (bad64-sys) loads.
+        self.assertIn("/usr/pkg/bin", nb.remote_env_prefix)
+        self.assertIn("LIBCLANG_PATH=/usr/pkg/lib", nb.remote_env_prefix)
+        self.assertIn("LIBCLANG_PATH=/usr/local/llvm19/lib", fb.remote_env_prefix)
 
     def test_state_dir_env_override(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -570,7 +572,10 @@ class ProvisionDataTests(unittest.TestCase):
         )
         for needle in (
             "authorized_keys", "sshd_enable=YES", "pkg install",
-            "git", "rust", "receive.denyCurrentBranch updateInstead",
+            "git", "rust",
+            # libclang for bad64-sys's bindgen; FreeBSD base ships none.
+            "llvm19",
+            "receive.denyCurrentBranch updateInstead",
             "shutdown -p now",
         ):
             self.assertIn(needle, cmds)
@@ -613,6 +618,32 @@ class PathExportShapeTests(unittest.TestCase):
                     f"PATH to the first command: {cmd!r}"
                 ),
             )
+
+    def test_remote_env_prefix_uses_export_not_a_bare_assignment(self) -> None:
+        """The SAME footgun, in the one place it went unnoticed for longer: the
+        per-VM env prefix is prepended to command strings of the shape
+        `cd /root/carrick && cargo ...`, so a bare `VAR=value ` prefix would
+        scope the variable to the `cd` and never reach cargo (measured on both
+        guests). It must be a terminated `export ...; ` statement.
+        """
+        for vm_name in ("freebsd-arm64", "netbsd-arm64"):
+            prefix = BSDVM.VMS[vm_name].remote_env_prefix
+            self.assertTrue(prefix, f"{vm_name}: expected a non-empty env prefix")
+            self.assertRegex(
+                prefix,
+                r"^export \S+=.*; $",
+                msg=(
+                    f"{vm_name}: env prefix must be `export ...; ` — a bare "
+                    f"`VAR=value ` prefix dies at the first `&&`: {prefix!r}"
+                ),
+            )
+            # And it must actually survive a compound command in a real shell.
+            probe = subprocess.run(
+                ["/bin/sh", "-c", prefix + "cd / && env"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("LIBCLANG_PATH=", probe.stdout)
 
     def test_git_setup_command_uses_export_path(self) -> None:
         for vm_name in ("freebsd-arm64", "netbsd-arm64"):
@@ -887,13 +918,25 @@ class SshGitTests(unittest.TestCase):
         self.assertIn("known_hosts", joined)
         self.assertIn("root@127.0.0.1", joined)
 
-    def test_ssh_run_applies_netbsd_path_prefix(self) -> None:
-        vm = BSDVM.VMS["netbsd-arm64"]
-        with mock.patch.object(BSDVM.subprocess, "run") as run:
-            run.return_value = mock.Mock(returncode=0)
-            BSDVM.ssh_run(vm, "cargo --version", timeout_s=10)
-        remote_cmd = run.call_args.args[0][-1]
-        self.assertTrue(remote_cmd.startswith("PATH=/usr/pkg/bin"))
+    def test_ssh_run_applies_the_env_prefix(self) -> None:
+        """Every remote command carries its VM's env prefix, in the `export`
+        form that survives the `&&` in a real gate command (see
+        `PathExportShapeTests`)."""
+        for vm_name, needles in (
+            ("netbsd-arm64", ("export PATH=/usr/pkg/bin", "LIBCLANG_PATH=/usr/pkg/lib")),
+            ("freebsd-arm64", ("export LIBCLANG_PATH=/usr/local/llvm19/lib",)),
+        ):
+            vm = BSDVM.VMS[vm_name]
+            with mock.patch.object(BSDVM.subprocess, "run") as run:
+                run.return_value = mock.Mock(returncode=0)
+                BSDVM.ssh_run(vm, "cd /root/carrick && cargo --version", timeout_s=10)
+            remote_cmd = run.call_args.args[0][-1]
+            self.assertTrue(
+                remote_cmd.startswith("export "), f"{vm_name}: {remote_cmd!r}"
+            )
+            for needle in needles:
+                self.assertIn(needle, remote_cmd, f"{vm_name}: {remote_cmd!r}")
+            self.assertTrue(remote_cmd.endswith("cargo --version"))
 
     def test_git_url(self) -> None:
         self.assertEqual(
