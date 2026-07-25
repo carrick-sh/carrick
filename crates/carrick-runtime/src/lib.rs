@@ -390,20 +390,34 @@ pub mod trap {
 // fully functional shared+private futex on every platform arm — a real
 // implementation, not a degrade.
 //
-// The two BSD arms are ARCH-scoped, not just feature-scoped: `make_bhyve_futex`
-// / `make_nvmm_futex` live in the VMM crates, which are x86_64-only (bhyve and
-// NVMM virtualize the host ISA), so on FreeBSD/NetBSD aarch64 this module has
-// no member and is not compiled at all. That is deliberate and fail-closed —
-// the aarch64 BSD native lane's futex is the lane's own (T5), and an absent
-// symbol is a compile error rather than a wrong shared-futex implementation.
+// The BSD arms are ARCH-scoped, not just feature-scoped, and the two arches
+// resolve to DIFFERENT crates:
+//
+//  * amd64 takes `make_bhyve_futex` / `make_nvmm_futex` from the VMM crates,
+//    which are x86_64-only (bhyve and NVMM virtualize the host ISA).
+//  * arm64 takes the NATIVE lane's own adapter from
+//    `carrick-native-{freebsd,netbsd}::platform_futex`, because there is no VMM
+//    crate there at all — and, more importantly, because the VMM shim would be
+//    WRONG for this lane even if it existed: it reconstructs a woken count from
+//    a `SharedFutexLocation::Mirror`'s explicit waiter-count word, which the
+//    native memory backends never produce (they return `Direct`, whose
+//    `waiter_count_addr()` is `None`), so every cross-process FreeBSD
+//    `FUTEX_WAKE` would report zero woken and requeue would be lost on both.
+//
+// (Until the aarch64 adapter landed this module simply had no member on arm64,
+// so a lane wiring it up got a compile error instead of a wrong futex.)
 #[cfg(any(
     feature = "platform-linux",
     all(
         any(feature = "platform-freebsd", feature = "platform-netbsd"),
-        target_arch = "x86_64"
+        any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
 pub mod threaded_impl {
+    #[cfg(all(feature = "platform-freebsd", target_arch = "aarch64"))]
+    pub use carrick_native_freebsd::platform_futex::make_freebsd_native_futex as hvf_futex;
+    #[cfg(all(feature = "platform-netbsd", target_arch = "aarch64"))]
+    pub use carrick_native_netbsd::platform_futex::make_netbsd_native_futex as hvf_futex;
     #[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
     pub use carrick_vmm_bhyve::make_bhyve_futex as hvf_futex;
     #[cfg(feature = "platform-linux")]

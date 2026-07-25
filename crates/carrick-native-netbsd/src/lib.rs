@@ -36,6 +36,9 @@
 //!   arch on purpose — whether they behave on arm64 (notably: whether PaX
 //!   MPROTECT permits the RX/RW dual map) is exactly what the aarch64 lane
 //!   needs to learn, so gating them out would hide the answer.
+//! * `platform_futex` is **arch-neutral**: it is the `PlatformFutex` adapter
+//!   over `futex` that the aarch64 run loop consumes, written so the x86 lane
+//!   can adopt it when the two run loops merge.
 //! * The one genuinely arch-shaped thing inside `jit` is `flush_icache`,
 //!   whose x86 no-op is WRONG on aarch64's non-coherent I-cache. `jit` has a
 //!   real `__clear_cache` body for aarch64 and fails closed on any other
@@ -49,6 +52,7 @@ pub mod fault;
 pub mod fsbase;
 pub mod futex;
 pub mod jit;
+pub mod platform_futex;
 
 pub use jit::NetbsdHostJit;
 
