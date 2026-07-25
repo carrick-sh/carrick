@@ -3175,6 +3175,17 @@ impl SyscallDispatcher {
                                 };
                                 let clear_write_backpressure =
                                     write_backpressured && raw & LINUX_EPOLLOUT != 0;
+                                // Growth over the recorded baseline delivers a
+                                // SECOND ET edge while the first is still
+                                // unconsumed. It is not the mechanism that
+                                // carries the ordinary "ready again after you
+                                // drained" case — that is `raw & !last_ready`
+                                // once consumption re-armed the latch
+                                // (`epoll_rearm_after_io`). See
+                                // `EpollInterest::last_read_avail` for what the
+                                // count means per fd and why growth is a sound
+                                // arrival predicate for a listener even though
+                                // its accept-queue depth is non-monotone.
                                 let read_growth = if requested & LINUX_EPOLLET != 0
                                     && raw & READ_READY_BITS != 0
                                     && observed_read_avail > last_read_avail
@@ -3301,20 +3312,41 @@ impl SyscallDispatcher {
                 let read_avail_update = if raw_ready & READ_READY_BITS == 0 {
                     Some(0)
                 } else if read_avail == 0 {
-                    // Readable, but FIONREAD reports no byte count: a LISTENER
-                    // (its pending-connection depth lives in the kqueue edge's
-                    // `data`, not FIONREAD), an EOF/HUP read end, or a 0-length
-                    // datagram. Recording 0 here would DESYNC this level
-                    // re-sample from the kqueue-edge path, which records the
-                    // absolute accept-queue depth (>=1). If this level path
-                    // observes and reports the readiness first (its poll(2) can
-                    // beat the not-yet-drained knote) and stores 0, the later
-                    // drain of that SAME knote sees `count (1) > last_read_avail
-                    // (0)` and spuriously redelivers the already-reported,
-                    // still-unaccepted edge. Floor the baseline at the readiness
-                    // we just reported so only a genuine depth increase (a NEW
-                    // connection) re-arms the ET edge; a real byte count always
-                    // takes the branch below and is unaffected.
+                    // Readable, but FIONREAD reports no byte count. The case
+                    // this floor EXISTS for is a LISTENER: its readiness count
+                    // is the pending accept-queue depth, which lives in the
+                    // multiplexer edge's `readiness_count` (>=1), not in
+                    // FIONREAD. Recording 0 here would DESYNC this level
+                    // re-sample from the edge path: if this path observes and
+                    // reports the readiness first (its poll(2) can beat the
+                    // not-yet-drained knote) and stores 0, the later drain of
+                    // that SAME knote sees `count (1) > last_read_avail (0)`,
+                    // reads it as growth, and spuriously redelivers the
+                    // already-reported, still-unaccepted connection. Flooring
+                    // the baseline at the readiness just reported keeps only a
+                    // genuine depth increase (a NEW connection) re-arming the
+                    // edge. A real byte count takes the branch below.
+                    //
+                    // The branch is NOT listener-only, so be precise about what
+                    // it does to the other two fds that report readable with
+                    // FIONREAD == 0 (for both, the edge path's count is 0 too,
+                    // so there is no desync to fix and the floor is pure
+                    // conservatism):
+                    //   - an EOF/HUP read end: terminal. No later count can
+                    //     ever exceed the floor because no more data can arrive,
+                    //     and consumption (a read returning 0) resets the
+                    //     baseline outright. Inert.
+                    //   - a 0-length datagram: the one case where the floor can
+                    //     defer an edge. A follow-up 1-byte datagram lands at
+                    //     count 1, which no longer exceeds the floored baseline,
+                    //     so it is not reported as growth while the 0-length
+                    //     readiness is STILL UNCONSUMED (a recv of any size
+                    //     resets the baseline and re-arms). Bounded to that
+                    //     window, and only on the level-first ordering; fixing
+                    //     it properly needs the multiplexer to report a count
+                    //     FIONREAD cannot see (an arrival counter / queue depth)
+                    //     rather than this path guessing one, so it is left
+                    //     documented instead of special-cased here.
                     Some(interest.last_read_avail.max(1))
                 } else {
                     Some(read_avail)

@@ -8340,6 +8340,226 @@ mod overlay_dispatch_tests {
         assert_eq!(data, listener as u64);
     }
 
+    // A listener's ET readiness is "a connection ARRIVED since you last
+    // drained", NOT "the accept queue got deeper": its readiness COUNT (the
+    // kqueue `EVFILT_READ` `data` = pending accept-queue depth, which is the
+    // only count a listener has — FIONREAD is always 0) is not monotonic,
+    // because accepting drains it. So the low-rate SEQUENTIAL-connect shape
+    // below cycles the depth 0 -> 1 -> 0 and every arrival after the first is
+    // reported at a depth EQUAL to (never greater than) the depth the previous
+    // edge was reported at:
+    //
+    //   connN arrives (depth 1) -> epoll_wait MUST deliver the edge
+    //   accept to EAGAIN        (depth 0)
+    //
+    // `epoll_pwait`'s depth-growth term (`observed > last_read_avail`) cannot
+    // see that arrival — it is the CONSUMPTION re-arm (`epoll_rearm_after_io`:
+    // an accept-family syscall on the listener clears the read latch AND zeroes
+    // the count baseline) that turns it back into a fresh `raw & !last_ready`
+    // edge. This test pins that contract from the guest's side: if the drain
+    // ever stopped resetting the latch/baseline (e.g. by decrementing the depth
+    // instead of clearing it), connection N would stall until connection N+1
+    // pushed the depth to 2 — a real hang for an ET accept loop.
+    // (Sibling test `..._without_read_byte_growth` drives the depth
+    // MONOTONICALLY 1 -> 2 without ever accepting, so it covers only the
+    // growth term and cannot see this.)
+    #[test]
+    fn epoll_et_delivers_listener_edge_after_accept_drain() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
+
+        // Non-blocking listener: the ET contract is "accept until EAGAIN".
+        let listener = returned(h.call(
+            198,
+            [
+                LINUX_AF_INET as u64,
+                LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                0,
+                0,
+                0,
+                0,
+            ],
+        )) as i32;
+
+        let bind_addr = h.reserve(16);
+        let mut sockaddr = [0u8; 16];
+        sockaddr[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+        sockaddr[2..4].copy_from_slice(&0u16.to_be_bytes());
+        sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        h.memory.write_bytes(bind_addr, &sockaddr).unwrap();
+        assert_eq!(
+            returned(h.call(200, [listener as u64, bind_addr, 16, 0, 0, 0])),
+            0
+        );
+        assert_eq!(returned(h.call(201, [listener as u64, 8, 0, 0, 0, 0])), 0);
+
+        let name_addr = h.reserve(16);
+        let name_len_addr = h.reserve(4);
+        h.memory
+            .write_bytes(name_len_addr, &(16u32).to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            returned(h.call(204, [listener as u64, name_addr, name_len_addr, 0, 0, 0],)),
+            0
+        );
+        let bound = h.memory.read_bytes(name_addr, 16).unwrap();
+        let port = u16::from_be_bytes([bound[2], bound[3]]);
+        assert_ne!(port, 0);
+
+        let ev_addr = h.reserve(16);
+        let mut ev = [0u8; 16];
+        ev[0..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLET).to_le_bytes());
+        ev[8..16].copy_from_slice(&(listener as u64).to_le_bytes());
+        h.memory.write_bytes(ev_addr, &ev).unwrap();
+        assert_eq!(
+            returned(h.call(
+                21,
+                [epfd, LINUX_EPOLL_CTL_ADD, listener as u64, ev_addr, 0, 0],
+            )),
+            0
+        );
+
+        let listener_host_fd = h
+            .dispatcher
+            .host_fd_for_poll(listener)
+            .expect("listener host fd")
+            .get();
+
+        let mut host_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            host_addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        }
+        host_addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        host_addr.sin_port = port.to_be();
+        host_addr.sin_addr = libc::in_addr {
+            s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        };
+        // The TCP handshake is asynchronous relative to the client's connect()
+        // returning, so BLOCK (bounded) on the listener's host readability
+        // instead of sleeping: once poll(2) reports POLLIN the connection is in
+        // the accept queue and every assertion below is deterministic.
+        let connect_client = || {
+            let client = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            assert!(client >= 0, "host client socket");
+            let rc = unsafe {
+                libc::connect(
+                    client,
+                    &host_addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "host client connect");
+            let mut pfd = libc::pollfd {
+                fd: listener_host_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let poll_rc = unsafe { libc::poll(&mut pfd, 1, 10_000) };
+            assert_eq!(poll_rc, 1, "listener must become readable after connect");
+            assert_ne!(pfd.revents & libc::POLLIN, 0);
+            client
+        };
+
+        let out_addr = h.reserve(16);
+        let accepted_addr = h.reserve(16);
+        let accepted_len_addr = h.reserve(4);
+        let accept_once = |h: &mut Harness| {
+            h.memory
+                .write_bytes(accepted_len_addr, &(16u32).to_ne_bytes())
+                .unwrap();
+            h.call(
+                202,
+                [listener as u64, accepted_addr, accepted_len_addr, 0, 0, 0],
+            )
+        };
+        let listener_latch = |h: &Harness| {
+            let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
+            let open = epoll_open.description.read();
+            let OpenDescription::Epoll { interest, .. } = &*open else {
+                panic!("epfd should be an epoll description");
+            };
+            let slot = interest.get(&listener).expect("listener interest");
+            (slot.last_ready, slot.last_read_avail)
+        };
+
+        let mut clients = Vec::new();
+        let mut accepted = Vec::new();
+        let mut latch_after_drain = Vec::new();
+        // Three sequential arrivals. Round 1 is the only one a "count grew"
+        // predicate could carry; rounds 2 and 3 arrive at the SAME depth (1)
+        // round 1 was reported at.
+        for round in 1..=3 {
+            clients.push(connect_client());
+
+            let n = returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0]));
+            assert_eq!(
+                n, 1,
+                "round {round}: the listener EPOLLET edge for a connection that \
+                 arrived after an accept-drain must be delivered — the depth is \
+                 back at 1, so growth-over-baseline cannot see it"
+            );
+            let out = h.memory.read_bytes(out_addr, 16).unwrap();
+            let events = u32::from_le_bytes(out[0..4].try_into().unwrap());
+            let data = u64::from_le_bytes(out[8..16].try_into().unwrap());
+            assert_ne!(events & LINUX_EPOLLIN, 0, "round {round}: EPOLLIN");
+            assert_eq!(data, listener as u64, "round {round}: epoll_data");
+            let (last_ready, _) = listener_latch(&h);
+            assert_ne!(
+                last_ready & LINUX_EPOLLIN,
+                0,
+                "round {round}: delivery must latch the reported readiness"
+            );
+
+            // The same, still-unaccepted connection must NOT be redelivered:
+            // the latch masks it and the count baseline records the depth it was
+            // reported at, so the not-yet-drained kqueue knote cannot masquerade
+            // as growth.
+            assert_eq!(
+                returned(h.call(22, [epfd, out_addr, 1, 0, 0, 0])),
+                0,
+                "round {round}: EPOLLET must not redeliver a still-unaccepted \
+                 listener level"
+            );
+
+            // Drain to EAGAIN, exactly as an ET accept loop does.
+            let fd = returned(accept_once(&mut h)) as i32;
+            assert!(fd >= 0, "round {round}: accept must yield the connection");
+            accepted.push(fd);
+            assert_eq!(
+                errno(accept_once(&mut h)),
+                LINUX_EAGAIN.get(),
+                "round {round}: listener must drain to EAGAIN"
+            );
+
+            latch_after_drain.push((round, listener_latch(&h)));
+        }
+
+        for client in clients {
+            unsafe { libc::close(client) };
+        }
+
+        // The MECHANISM behind the deliveries above, asserted after the fact so
+        // a regression reports the guest-visible stall first: the drain is what
+        // re-arms the ET edge, so both the latch and the depth baseline must be
+        // back to "nothing reported" and the next arrival is a fresh
+        // `raw & !last_ready` edge at depth 1 again.
+        for (round, latch) in latch_after_drain {
+            assert_eq!(
+                latch,
+                (0, 0),
+                "round {round}: an accept-drain must reset the listener ET read \
+                 latch AND its readiness-count baseline"
+            );
+        }
+    }
+
     #[test]
     fn epoll_et_write_eagain_after_partial_write_keeps_write_filter_armed() {
         let mut h = Harness::new();
