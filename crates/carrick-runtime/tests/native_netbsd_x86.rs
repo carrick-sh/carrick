@@ -11,22 +11,26 @@
 //! NetBSD red-list worklist tracked in `docs/netbsd-native-lane-evidence.md`,
 //! not gated here.
 //!
-//! ## BLOCKED (2026-07-24): userspace FSGSBASE is unavailable on NetBSD 10.1
+//! ## UNBLOCKED (2026-07-24): host-abstracted fsbase-swap seam landed
 //!
-//! Every test below is `#[ignore]`d because NONE of them currently reach a
-//! single guest instruction: the SHARED `carrick-dsr-x86` gateway trampoline
-//! (`gateway_x86_64.S`) swaps the hardware FS base with `rdfsbase`/`wrfsbase`
-//! (offsets 56/58/273). NetBSD 10.1/amd64 does NOT enable `CR4.FSGSBASE` for
-//! ring-3 (no sysctl toggle exists), so `rdfsbase %rcx` in the enter prologue
-//! (`carrick_dsr_x86_enter_raw+59`) raises `#UD` → SIGILL and terminates the
-//! host process before the guest runs. The CPU advertises FSGSBASE
-//! (`CPUID.07H:EBX.FSGSBASE=1`); the kernel simply gates the ring-3 CR4 bit.
+//! These tests were previously `#[ignore]`d because NONE reached a single
+//! guest instruction: the SHARED `carrick-dsr-x86` gateway trampoline
+//! (`gateway_x86_64.S`) swapped the hardware FS base with `rdfsbase`/`wrfsbase`.
+//! NetBSD 10.1/amd64 does NOT enable `CR4.FSGSBASE` for ring-3 (no sysctl
+//! toggle exists), so `rdfsbase %rcx` in the enter prologue raised `#UD` →
+//! SIGILL and terminated the host process before the guest ran. The CPU
+//! advertises FSGSBASE (`CPUID.07H:EBX.FSGSBASE=1`); the kernel gates the
+//! ring-3 CR4 bit.
 //!
-//! This is a shared-seam gap, not a NetBSD-lane-glue bug: the gateway assembly
-//! bakes in a FreeBSD/Linux CPU-feature assumption. The follow-on (see
-//! `docs/netbsd-native-lane-evidence.md`) is a host-abstracted fsbase-swap seam
-//! (NetBSD: `sysarch(X86_64_GET_FSBASE/SET_FSBASE)`). REMOVE the `#[ignore]`s
-//! once that lands: these tests are the ready acceptance ladder.
+//! The fix (docs/superpowers/specs/2026-07-24-fsbase-swap-seam-design.md) is a
+//! host-abstracted fsbase-swap seam: the gateway's fsbase sites are wrapped in
+//! `#if defined(__NetBSD__)`, and on NetBSD the base is installed/restored
+//! through a host-injected `X86DsrContext::set_fsbase_fn` pointer — a TLS-free
+//! `sysarch(X86_64_SET_FSBASE)` leaf in `carrick_native_netbsd::fsbase` — with
+//! the host base captured once per thread via `sysarch(X86_64_GET_FSBASE)`.
+//! FreeBSD/Linux keep the exact inline instructions (the guarded path is not
+//! assembled off-NetBSD), so those lanes stay byte-identical. The `#[ignore]`s
+//! are removed: this is the acceptance ladder for the NetBSD native lane.
 //!
 //! Run ONLY this file on the box (the inline `mod tests` in the FreeBSD-shaped
 //! sources is a separate, pre-existing red-list item):
@@ -45,7 +49,6 @@ fn fixture(name: &str) -> std::path::PathBuf {
 /// NetBSD native run loop (ELF load → DSR translation → JIT execute → real
 /// dispatcher servicing `write`/`exit_group`) is live end-to-end.
 #[test]
-#[ignore = "blocked: NetBSD 10.1 has no ring-3 FSGSBASE; gateway rdfsbase/wrfsbase SIGILLs — see docs/netbsd-native-lane-evidence.md"]
 fn tinyguest_runs_natively_through_the_real_dispatcher() {
     let path = fixture("tinyguest-x86_64-linux");
     assert!(path.exists(), "fixture missing: {}", path.display());
@@ -67,7 +70,6 @@ fn tinyguest_runs_natively_through_the_real_dispatcher() {
 /// cache: 1000 getpid + 1000 gettid calls chain natively, only the final
 /// `exit_group` traps to Rust.
 #[test]
-#[ignore = "blocked: NetBSD 10.1 has no ring-3 FSGSBASE; gateway rdfsbase/wrfsbase SIGILLs — see docs/netbsd-native-lane-evidence.md"]
 fn identity_loop_chains_without_rust_traps() {
     let path = fixture("identity-loop-x86_64-linux");
     assert!(path.exists(), "fixture missing: {}", path.display());
@@ -88,7 +90,6 @@ fn identity_loop_chains_without_rust_traps() {
 /// the loop's control flow, registers, and flags stayed correct across the
 /// whole chain.
 #[test]
-#[ignore = "blocked: NetBSD 10.1 has no ring-3 FSGSBASE; gateway rdfsbase/wrfsbase SIGILLs — see docs/netbsd-native-lane-evidence.md"]
 fn compute_loop_chains_direct_branches() {
     let path = fixture("computeloop-x86_64-linux");
     if !path.exists() {
@@ -126,7 +127,6 @@ fn compute_loop_chains_direct_branches() {
 /// signal/sigaltstack setup, brk/mmap heap, RIP-relative rodata, PLT/indirect
 /// calls, a page-spanning instruction) and the buffered-stdout write path.
 #[test]
-#[ignore = "blocked: NetBSD 10.1 has no ring-3 FSGSBASE; gateway rdfsbase/wrfsbase SIGILLs — see docs/netbsd-native-lane-evidence.md"]
 fn hello_std_rust_binary_runs_natively() {
     let path = fixture("hello-std-x86_64-linux");
     if !path.exists() {
