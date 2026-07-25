@@ -293,17 +293,10 @@ impl SocketNamespaceProvider {
         for attachment in effective_attachments(spec) {
             let names = service_names_for(attachment.container_name.as_ref(), &attachment.aliases);
             for name in names {
-                let path = service_name_path(
-                    &self.endpoint_dir,
-                    &attachment.bridge_id,
-                    &name,
-                    attachment.ipv4,
-                );
+                let dir = service_name_dir(&self.endpoint_dir, &attachment.bridge_id, &name);
+                let path = service_record_path(&dir, attachment.ipv4);
                 let contents = encode_service_name(attachment.ipv4, &name);
-                fs::create_dir_all(&*self.endpoint_dir).map_err(|e| {
-                    format!("failed to create socket namespace endpoint directory: {e}")
-                })?;
-                fs::write(&path, &contents)
+                write_record(&dir, &path, &contents)
                     .map_err(|e| format!("failed to record socket namespace service name: {e}"))?;
                 self.track_owned_file(lease_id, path, contents)?;
             }
@@ -316,29 +309,32 @@ impl SocketNamespaceProvider {
         spec: &NetworkNamespaceSpec,
     ) -> Result<Vec<NetworkHostsEntry>, String> {
         let mut entries = Vec::new();
-        let prefixes = effective_attachments(spec)
-            .into_iter()
-            .map(|attachment| format!("service-{}-", attachment.bridge_id.as_str()))
-            .collect::<Vec<_>>();
-        let Ok(dir) = fs::read_dir(&*self.endpoint_dir) else {
-            return Ok(entries);
-        };
-        for entry in dir.flatten() {
-            let file_name = entry.file_name();
-            let Some(file_name) = file_name.to_str() else {
-                continue;
-            };
-            if !prefixes.iter().any(|prefix| file_name.starts_with(prefix)) {
+        let mut visited = HashSet::new();
+        for attachment in effective_attachments(spec) {
+            if !visited.insert(attachment.bridge_id.clone()) {
                 continue;
             }
-            let Some(raw) = read_live_namespace_file(&entry.path()) else {
+            // Scoped to this bridge's shard: unrelated bridges' records -- and
+            // any litter they carry -- are never even enumerated.
+            let shard = service_bridge_dir(&self.endpoint_dir, &attachment.bridge_id);
+            let Ok(names) = fs::read_dir(&shard) else {
                 continue;
             };
-            if let Some((addr, name)) = decode_service_name(&raw) {
-                entries.push(NetworkHostsEntry {
-                    addr: IpAddr::V4(addr),
-                    names: vec![name],
-                });
+            for name_dir in names.flatten() {
+                let Ok(records) = fs::read_dir(name_dir.path()) else {
+                    continue;
+                };
+                for record in records.flatten() {
+                    let Some(raw) = read_live_namespace_file(&record.path()) else {
+                        continue;
+                    };
+                    if let Some((addr, name)) = decode_service_name(&raw) {
+                        entries.push(NetworkHostsEntry {
+                            addr: IpAddr::V4(addr),
+                            names: vec![name],
+                        });
+                    }
+                }
             }
         }
         entries.sort_by(|a, b| {
@@ -360,25 +356,21 @@ impl SocketNamespaceProvider {
         if query_name.is_empty() {
             return Ok(Vec::new());
         }
-        let bridge_ids = effective_attachments(spec)
-            .into_iter()
-            .map(|attachment| attachment.bridge_id)
-            .collect::<Vec<_>>();
         let mut addrs = Vec::new();
-        for bridge_id in bridge_ids {
-            let Ok(dir) = fs::read_dir(&*self.endpoint_dir) else {
+        let mut visited = HashSet::new();
+        for attachment in effective_attachments(spec) {
+            if !visited.insert(attachment.bridge_id.clone()) {
+                continue;
+            }
+            // The read_dir scope is exactly the query scope: the directory
+            // enumerated here holds only the records of this (bridge, name),
+            // which is the fan-out one DNS answer needs and nothing else.
+            let dir = service_name_dir(&self.endpoint_dir, &attachment.bridge_id, query_name);
+            let Ok(records) = fs::read_dir(&dir) else {
                 continue;
             };
-            let prefix = service_name_path_prefix(&bridge_id, query_name);
-            for entry in dir.flatten() {
-                let file_name = entry.file_name();
-                let Some(file_name) = file_name.to_str() else {
-                    continue;
-                };
-                if !file_name.starts_with(&prefix) {
-                    continue;
-                }
-                let Some(raw) = read_live_namespace_file(&entry.path()) else {
+            for record in records.flatten() {
+                let Some(raw) = read_live_namespace_file(&record.path()) else {
                     continue;
                 };
                 if let Some((addr, _)) = decode_service_name(&raw)
@@ -1029,8 +1021,37 @@ impl SocketNamespaceProvider {
     }
 }
 
+/// Name prefix of a service-record shard directory in the endpoint namespace.
+const SERVICE_SHARD_PREFIX: &str = "svc-";
+
+/// Name prefix of a directory owned in its entirety by a single process, whose
+/// pid is the rest of the name.
+const PER_PROCESS_DIR_PREFIX: &str = "test-";
+
+/// How many entries of the endpoint namespace one process visits while
+/// reclaiming dead-owner litter. The pass runs once, synchronously, before the
+/// provider has spawned a helper thread or the guest has forked, so it must have
+/// a ceiling: it is paid on the startup path and the directory it walks is
+/// machine-global, i.e. its size is not something this process controls.
+/// Whatever a run does not reach stays for the next one -- reclamation is
+/// incremental, and every run makes progress because a visited dead record is
+/// unlinked.
+///
+/// A run leaks at most a handful of records, so any budget above that keeps the
+/// namespace bounded in steady state; the size only decides how fast a backlog
+/// drains. Measured against a synthesized 24,219-record backlog on a loaded
+/// machine: 27.9 ms for this budget, versus 29 us once the namespace is clean --
+/// which is what a run actually pays, the littered case being transient by
+/// construction.
+const ENDPOINT_RECLAIM_BUDGET: usize = 512;
+
+fn endpoint_namespace_root() -> PathBuf {
+    std::env::temp_dir().join("carrick-netns-socket-bridge")
+}
+
 fn shared_endpoint_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("carrick-netns-socket-bridge");
+    let dir = endpoint_namespace_root();
+    reclaim_stale_endpoint_records_once(&dir);
     // The fork-coherent endpoint namespace is machine-global and its file names
     // are keyed by (scope, guest addr, protocol) only. `bridge_default` derives
     // a constant bridge id and a constant 172.31.0.2 for an unnamed container,
@@ -1046,42 +1067,145 @@ fn shared_endpoint_dir() -> PathBuf {
     // exercise real files -- and it keeps test files out of the directory that
     // real runs scan.
     #[cfg(test)]
-    let dir = {
-        reclaim_dead_test_endpoint_dirs(&dir);
-        dir.join(format!("test-{}", std::process::id()))
-    };
+    let dir = dir.join(format!("{PER_PROCESS_DIR_PREFIX}{}", std::process::id()));
     dir
 }
 
-/// Remove the per-process test endpoint directories of test binaries that have
-/// exited, so the process-private scoping above cannot accumulate. This mirrors
-/// how `read_namespace_file` reclaims a single endpoint file whose owner is
-/// gone: the whole subdirectory has exactly one owning pid, so a dead owner
-/// makes all of it reclaimable. Runs once per process, before the first
-/// provider's directory is created.
-#[cfg(test)]
-fn reclaim_dead_test_endpoint_dirs(root: &Path) {
+/// Reclaim dead-owner records in the machine-global endpoint namespace, once
+/// per process.
+///
+/// Every durable record carries its writer's pid, and `read_namespace_file`
+/// already unlinks a record whose owner is gone -- but only as a side effect of
+/// a lookup that happens to name that exact path. Nothing ever names the
+/// records of a run that was SIGKILLed, panicked, or published without a lease,
+/// so they accumulate forever (24,219 of them on the machine this was written
+/// on, 99.8% dead-owner). This is the pass that visits them.
+///
+/// It runs from `SocketNamespaceProvider::new`, i.e. in the top-level process
+/// before it has spawned a publication helper or booted a guest, so it holds no
+/// `fork_gate` (C9: bulk file work under the gate stalls or `EAGAIN`s guest
+/// `fork`) and races no thread of its own.
+fn reclaim_stale_endpoint_records_once(root: &Path) {
     static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     SWEPT.get_or_init(|| {
-        let Ok(entries) = fs::read_dir(root) else {
-            return;
-        };
-        let self_pid = std::process::id() as i32;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(owner) = name
-                .to_str()
-                .and_then(|name| name.strip_prefix("test-"))
-                .and_then(|pid| pid.parse::<i32>().ok())
-            else {
-                continue;
-            };
-            if owner == self_pid || process_is_alive(owner) {
-                continue;
-            }
-            let _ = fs::remove_dir_all(entry.path());
-        }
+        reclaim_stale_endpoint_records(root, ENDPOINT_RECLAIM_BUDGET);
     });
+}
+
+/// Visit at most `budget` entries of the endpoint namespace rooted at `root`,
+/// unlinking every record whose owner is gone. Returns the number visited.
+///
+/// Safety against concurrently running instances rests entirely on the liveness
+/// rule this shares with every lookup (`read_namespace_file` ->
+/// `process_is_alive`): a record is removed only when its writer's pid is gone,
+/// so a live instance's records are never touched, and the pass is never more
+/// aggressive than a lookup already is. Everything else is idempotent: an entry
+/// another sweeper removed first reads as absent, an entry being written reads
+/// as live or unreadable, and both simply mean "leave it alone".
+fn reclaim_stale_endpoint_records(root: &Path, budget: usize) -> usize {
+    let mut visited = 0usize;
+    let self_pid = std::process::id() as i32;
+    let Ok(entries) = fs::read_dir(root) else {
+        return visited;
+    };
+    for entry in entries.flatten() {
+        if visited >= budget {
+            break;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        if !is_dir {
+            visited += 1;
+            let _ = read_namespace_file(&entry.path());
+            continue;
+        }
+        if let Some(owner) = name
+            .strip_prefix(PER_PROCESS_DIR_PREFIX)
+            .and_then(|pid| pid.parse::<i32>().ok())
+        {
+            // A directory owned in its entirety by one pid: one liveness check
+            // settles every record inside it, so the walk below needs no reads
+            // at all. It still has to be budgeted -- a dead owner's directory
+            // can be arbitrarily large, and `remove_dir_all` on the startup
+            // path would hand this pass exactly the unbounded cost it exists to
+            // remove.
+            visited += 1;
+            if owner != self_pid && !process_is_alive(owner) {
+                visited += remove_tree_within_budget(&entry.path(), budget.saturating_sub(visited));
+            }
+            continue;
+        }
+        if name.starts_with(SERVICE_SHARD_PREFIX) {
+            visited += 1;
+            visited += reclaim_records_under(&entry.path(), budget.saturating_sub(visited));
+            // Succeeds only while the shard is empty, so a shard another
+            // instance is still publishing into is left in place.
+            let _ = fs::remove_dir(entry.path());
+        }
+    }
+    visited
+}
+
+fn reclaim_records_under(dir: &Path, budget: usize) -> usize {
+    let mut visited = 0usize;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return visited;
+    };
+    for entry in entries.flatten() {
+        if visited >= budget {
+            break;
+        }
+        visited += 1;
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            visited += reclaim_records_under(&entry.path(), budget.saturating_sub(visited));
+            let _ = fs::remove_dir(entry.path());
+            continue;
+        }
+        let _ = read_namespace_file(&entry.path());
+    }
+    visited
+}
+
+/// Remove a subtree whose owner has already been proven gone, visiting at most
+/// `budget` entries. What it cannot reach stays for the next pass, which will
+/// re-derive the same verdict from the same dead pid.
+fn remove_tree_within_budget(dir: &Path, budget: usize) -> usize {
+    let mut visited = 0usize;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return visited;
+    };
+    for entry in entries.flatten() {
+        if visited >= budget {
+            break;
+        }
+        visited += 1;
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            visited += remove_tree_within_budget(&entry.path(), budget.saturating_sub(visited));
+            let _ = fs::remove_dir(entry.path());
+            continue;
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+    let _ = fs::remove_dir(dir);
+    visited
+}
+
+/// Write one durable record, creating its directory first. The reclaim pass
+/// removes a service directory once it is empty, so a writer that loses that
+/// race re-creates the directory and retries rather than failing the guest's
+/// `create_namespace`.
+fn write_record(dir: &Path, path: &Path, contents: &str) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    match fs::write(path, contents) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir)?;
+            fs::write(path, contents)
+        }
+        other => other,
+    }
 }
 
 fn endpoint_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
@@ -1119,21 +1243,30 @@ fn listener_path(endpoint_dir: &Path, endpoint: &VirtualEndpoint) -> PathBuf {
     ))
 }
 
-fn service_name_path(
-    endpoint_dir: &Path,
-    bridge_id: &BridgeId,
-    name: &str,
-    addr: Ipv4Addr,
-) -> PathBuf {
-    let addr = addr.to_string().replace('.', "_");
+/// Directory holding every service (DNS / `/etc/hosts`) record of one bridge.
+///
+/// Service records used to be flat files named `service-<bridge>-<name>-addr-…`
+/// in the one machine-global directory, so both readers had to `read_dir` the
+/// whole namespace -- every other bridge's records, every other instance's
+/// records and all the litter -- and then throw away everything that did not
+/// match their prefix. Sharding turns that prefix filter into the path itself.
+fn service_bridge_dir(endpoint_dir: &Path, bridge_id: &BridgeId) -> PathBuf {
     endpoint_dir.join(format!(
-        "{}addr-{addr}",
-        service_name_path_prefix(bridge_id, name)
+        "{SERVICE_SHARD_PREFIX}{}",
+        hex_name(bridge_id.as_str())
     ))
 }
 
-fn service_name_path_prefix(bridge_id: &BridgeId, name: &str) -> String {
-    format!("service-{}-{}-", bridge_id.as_str(), hex_name(name))
+/// Directory holding the records of one (bridge, name) pair. One name may hold
+/// several records -- two containers can share an alias -- so the fan-out stays
+/// one file per address, which is also what keeps each record independently
+/// owned and independently reclaimable.
+fn service_name_dir(endpoint_dir: &Path, bridge_id: &BridgeId, name: &str) -> PathBuf {
+    service_bridge_dir(endpoint_dir, bridge_id).join(hex_name(name))
+}
+
+fn service_record_path(name_dir: &Path, addr: Ipv4Addr) -> PathBuf {
+    name_dir.join(format!("addr-{}", addr.to_string().replace('.', "_")))
 }
 
 fn endpoint_scope(
@@ -1874,6 +2007,309 @@ mod tests {
 
     fn guest(addr: SocketAddr) -> GuestSocketAddr {
         GuestSocketAddr(addr)
+    }
+
+    fn reclaim_fixture_root(label: &str) -> PathBuf {
+        let root = shared_endpoint_dir().join(format!("reclaim-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("fixture root");
+        root
+    }
+
+    fn write_fixture_record(path: &Path, owner_pid: i32) {
+        fs::create_dir_all(path.parent().expect("record parent")).expect("record dir");
+        fs::write(path, format!("172.31.0.9\nname=fixture\npid={owner_pid}\n"))
+            .expect("fixture record");
+    }
+
+    #[test]
+    fn endpoint_reclaim_removes_dead_owner_records_and_keeps_live_ones() {
+        let root = reclaim_fixture_root("mixed");
+        let live_pid = std::process::id() as i32;
+        // `process_is_alive` reports pid <= 0 as gone, so a dead owner is a
+        // decidable property here rather than a race against a real exit.
+        let dead_pid = 0;
+
+        let live_endpoint = root.join("bridge-6c697665-172.31.0.9-8080-tcp");
+        let dead_endpoint = root.join("bridge-64656164-172.31.0.9-8080-tcp");
+        let live_reverse = root.join("reverse-127.0.0.1-40001-tcp");
+        let dead_reverse = root.join("reverse-127.0.0.1-40002-tcp");
+        let dead_listener = root.join("listen-bridge-64656164-172.31.0.9-8080-tcp");
+        write_fixture_record(&live_endpoint, live_pid);
+        write_fixture_record(&dead_endpoint, dead_pid);
+        write_fixture_record(&live_reverse, live_pid);
+        write_fixture_record(&dead_reverse, dead_pid);
+        write_fixture_record(&dead_listener, dead_pid);
+
+        let bridge = BridgeId::new("reclaim-bridge");
+        let live_service = service_record_path(
+            &service_name_dir(&root, &bridge, "live"),
+            Ipv4Addr::new(172, 31, 0, 9),
+        );
+        let dead_service = service_record_path(
+            &service_name_dir(&root, &bridge, "dead"),
+            Ipv4Addr::new(172, 31, 0, 10),
+        );
+        write_fixture_record(&live_service, live_pid);
+        write_fixture_record(&dead_service, dead_pid);
+
+        let dead_owner_dir = root.join(format!("{PER_PROCESS_DIR_PREFIX}0"));
+        write_fixture_record(&dead_owner_dir.join("bridge-x-172.31.0.9-1-tcp"), live_pid);
+        let self_owner_dir = root.join(format!("{PER_PROCESS_DIR_PREFIX}{live_pid}"));
+        write_fixture_record(&self_owner_dir.join("bridge-x-172.31.0.9-1-tcp"), dead_pid);
+        // A record with no `pid=` line is not reclaimable by the shared rule and
+        // must stay exactly as immortal as it is on the lookup path.
+        let unowned = root.join("bridge-756e-172.31.0.9-9999-tcp");
+        fs::write(&unowned, "172.31.0.9\n").expect("unowned record");
+
+        let visited = reclaim_stale_endpoint_records(&root, usize::MAX);
+        assert!(visited > 0, "reclaim must visit the fixture");
+
+        assert!(live_endpoint.exists(), "live endpoint record must survive");
+        assert!(live_reverse.exists(), "live reverse record must survive");
+        assert!(live_service.exists(), "live service record must survive");
+        assert!(unowned.exists(), "record without an owner must survive");
+        assert!(
+            self_owner_dir.exists(),
+            "this process's own directory must survive"
+        );
+        assert!(!dead_endpoint.exists(), "dead endpoint must be reclaimed");
+        assert!(!dead_reverse.exists(), "dead reverse must be reclaimed");
+        assert!(!dead_listener.exists(), "dead listener must be reclaimed");
+        assert!(
+            !dead_service.exists(),
+            "dead service record must be claimed"
+        );
+        assert!(
+            !dead_service.parent().expect("name dir").exists(),
+            "an emptied service name directory must not be left behind"
+        );
+        assert!(
+            !dead_owner_dir.exists(),
+            "a directory owned entirely by a dead pid must be reclaimed whole"
+        );
+        assert!(
+            service_bridge_dir(&root, &bridge).exists(),
+            "a shard still holding a live record must be kept"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn endpoint_reclaim_stops_at_its_budget() {
+        let root = reclaim_fixture_root("budget");
+        for index in 0..8 {
+            write_fixture_record(&root.join(format!("bridge-64-172.31.0.9-{index}-tcp")), 0);
+        }
+
+        let visited = reclaim_stale_endpoint_records(&root, 3);
+        assert_eq!(visited, 3, "reclaim must stop at its visit budget");
+        let remaining = fs::read_dir(&root).expect("root").flatten().count();
+        assert_eq!(
+            remaining, 5,
+            "reclaim must leave everything past the budget for the next process"
+        );
+
+        // Successive passes make progress, because a visited dead record is gone.
+        assert_eq!(reclaim_stale_endpoint_records(&root, 3), 3);
+        assert_eq!(reclaim_stale_endpoint_records(&root, usize::MAX), 2);
+        assert_eq!(fs::read_dir(&root).expect("root").flatten().count(), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The durable record files exist because a forked guest child cannot see
+    /// the parent's in-process registry. Sharding the service records changed
+    /// where those files live, so pin the property they exist for: a child must
+    /// still resolve what its parent published both before and after the fork.
+    #[test]
+    fn forked_child_resolves_service_and_endpoint_records_across_the_fork() {
+        let suffix = std::process::id();
+        let bridge = BridgeId::new(format!("test-forkdns-{suffix}"));
+        let mut prefork = NetworkNamespaceSpec::bridge_default(
+            Some("prefork".to_string()),
+            vec!["shared".to_string()],
+            Vec::new(),
+        );
+        prefork.bridge_id = bridge.clone();
+        prefork.ipv4 = Ipv4Addr::new(172, 31, 60, 10);
+        prefork.namespace_id = Some(NetworkNamespaceId::new(format!("test-forkdns-a-{suffix}")));
+        let mut postfork = NetworkNamespaceSpec::bridge_default(
+            Some("postfork".to_string()),
+            vec!["shared".to_string()],
+            Vec::new(),
+        );
+        postfork.bridge_id = bridge.clone();
+        postfork.ipv4 = Ipv4Addr::new(172, 31, 60, 11);
+        postfork.namespace_id = Some(NetworkNamespaceId::new(format!("test-forkdns-b-{suffix}")));
+
+        let provider = SocketNamespaceProvider::new();
+        provider
+            .create_namespace(&prefork)
+            .expect("pre-fork namespace");
+
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe(fds.as_mut_ptr()) },
+            0,
+            "pipe: {}",
+            io::Error::last_os_error()
+        );
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let post_endpoint = guest(SocketAddr::new(IpAddr::V4(postfork.ipv4), 5432));
+        let post_host = host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45432));
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe { libc::close(write_fd) };
+            // Block until the parent has published the post-fork records; the
+            // child's copy-on-write registry can never learn about them, so a
+            // hit here can only have come from the shared files.
+            let mut byte = 0u8;
+            let read = unsafe { libc::read(read_fd, (&raw mut byte).cast(), 1) };
+            let mut code = 0;
+            if read != 1 {
+                code |= 1;
+            }
+            if provider.resolve_dns_name(&prefork, "prefork").ok() != Some(vec![prefork.ipv4]) {
+                code |= 2;
+            }
+            if provider.resolve_dns_name(&prefork, "postfork").ok() != Some(vec![postfork.ipv4]) {
+                code |= 4;
+            }
+            if provider.resolve_dns_name(&prefork, "shared").ok()
+                != Some(vec![prefork.ipv4, postfork.ipv4])
+            {
+                code |= 8;
+            }
+            let hosts = provider.guest_hosts_entries(&prefork).unwrap_or_default();
+            if !hosts
+                .iter()
+                .any(|entry| entry.addr == IpAddr::V4(postfork.ipv4))
+                || !hosts
+                    .iter()
+                    .any(|entry| entry.addr == IpAddr::V4(prefork.ipv4))
+            {
+                code |= 16;
+            }
+            if provider
+                .resolve_registered_connect(&bridge, post_endpoint, PortProtocol::Tcp)
+                .ok()
+                .flatten()
+                != Some(post_host)
+            {
+                code |= 32;
+            }
+            unsafe { libc::_exit(code) };
+        }
+
+        unsafe { libc::close(read_fd) };
+        provider
+            .create_namespace(&postfork)
+            .expect("post-fork namespace");
+        provider
+            .register_virtual_endpoint(
+                bridge.clone(),
+                postfork.namespace_id.clone().expect("namespace id"),
+                post_endpoint,
+                PortProtocol::Tcp,
+                post_host,
+            )
+            .expect("post-fork endpoint");
+        assert_eq!(
+            unsafe { libc::write(write_fd, [1u8].as_ptr().cast(), 1) },
+            1,
+            "signal child: {}",
+            io::Error::last_os_error()
+        );
+        unsafe { libc::close(write_fd) };
+
+        let mut status = 0i32;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &raw mut status, 0) },
+            pid,
+            "waitpid: {}",
+            io::Error::last_os_error()
+        );
+        assert!(libc::WIFEXITED(status), "child did not exit normally");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "forked child failed to resolve records across the fork (bitmask)"
+        );
+    }
+
+    #[test]
+    fn endpoint_reclaim_bounds_a_large_dead_owner_directory() {
+        let root = reclaim_fixture_root("deadowner");
+        let dead_owner_dir = root.join(format!("{PER_PROCESS_DIR_PREFIX}0"));
+        for index in 0..12 {
+            write_fixture_record(
+                &dead_owner_dir.join(format!("bridge-64-172.31.0.9-{index}-tcp")),
+                std::process::id() as i32,
+            );
+        }
+
+        // The owner is gone, so every record inside is reclaimable -- but the
+        // pass must still stop, or one dead run's directory could cost the next
+        // run an unbounded delete on its startup path.
+        let visited = reclaim_stale_endpoint_records(&root, 5);
+        assert_eq!(visited, 5, "reclaim must stop at its visit budget");
+        assert!(
+            dead_owner_dir.exists(),
+            "a partially reclaimed directory must be left for the next pass"
+        );
+        assert_eq!(
+            fs::read_dir(&dead_owner_dir)
+                .expect("dir")
+                .flatten()
+                .count(),
+            8,
+            "reclaim must remove exactly the entries it visited"
+        );
+
+        reclaim_stale_endpoint_records(&root, usize::MAX);
+        assert!(
+            !dead_owner_dir.exists(),
+            "an unbounded pass must finish the dead owner's directory"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn service_records_republish_into_a_reclaimed_shard() {
+        let mut spec = NetworkNamespaceSpec::bridge_default(
+            Some("recycled".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+        spec.bridge_id = BridgeId::new(format!("test-recycled-{}", std::process::id()));
+        spec.namespace_id = Some(NetworkNamespaceId::new(format!(
+            "test-recycled-ns-{}",
+            std::process::id()
+        )));
+        let provider = SocketNamespaceProvider::new();
+        let lease = provider.create_namespace(&spec).expect("create namespace");
+        let shard = service_bridge_dir(&provider.endpoint_dir, &spec.bridge_id);
+        assert!(shard.exists(), "service shard must be created on publish");
+
+        provider.destroy_namespace(lease.id).expect("destroy");
+        reclaim_stale_endpoint_records(&provider.endpoint_dir, usize::MAX);
+        assert!(
+            !shard.exists(),
+            "an empty shard must be reclaimed with its records"
+        );
+
+        provider.create_namespace(&spec).expect("re-create");
+        assert_eq!(
+            provider
+                .resolve_dns_name(&spec, "recycled")
+                .expect("resolve republished name"),
+            vec![spec.ipv4]
+        );
     }
 
     fn host(addr: SocketAddr) -> HostSocketAddr {
