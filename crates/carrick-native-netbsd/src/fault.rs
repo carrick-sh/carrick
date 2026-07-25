@@ -152,8 +152,9 @@ pub struct KickRcxRecovery {
 /// cache it rewrites RIP to `kick_stub`, giving the runtime the same typed
 /// boundary that a VMM backend gets when its vCPU run call is kicked.
 ///
-/// `signal` is the lane's chosen kick signal — see [`NATIVE_EXIT_KICK_SIGNAL`]
-/// (NetBSD's SIGRTMIN, delivered per-thread with `pthread_kill` by the run loop).
+/// `signal` is the lane's chosen kick signal — see
+/// [`crate::NATIVE_EXIT_KICK_SIGNAL`] (NetBSD's SIGRTMIN, delivered per-thread
+/// with `pthread_kill` by the run loop).
 pub fn install_kick_redirect(
     signal: libc::c_int,
     kick_stub: u64,
@@ -174,14 +175,6 @@ pub fn install_kick_redirect(
     }
     Ok(())
 }
-
-/// NetBSD's kick signal: SIGRTMIN. The libc crate does not expose `SIGRTMIN` on
-/// this target (Task-2 box probe: `SIGRTMIN=33`, `SIGRTMAX=63`, `NSIG=64`), so
-/// it is named here as a constant — the same shape as the FreeBSD lane's
-/// hardcoded 65. NetBSD's libpthread does not reserve leading real-time signals
-/// for internal use (a glibc-ism), so SIGRTMIN is a free, non-colliding kick
-/// channel the run loop delivers per-thread via `pthread_kill(thread, SIGRTMIN)`.
-pub const NATIVE_EXIT_KICK_SIGNAL: libc::c_int = 33;
 
 /// Kick handler: no allocation, TLS, locks, or libc calls. A signal outside
 /// translated code returns normally, causing a blocking host syscall to report

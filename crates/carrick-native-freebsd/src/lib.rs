@@ -16,12 +16,36 @@
 //!
 //! The whole crate is FreeBSD-only by construction; other targets compile it
 //! to nothing (same `#![cfg]` pattern as `carrick-host-bsd`).
+//!
+//! ## Which of this crate is amd64-welded, and which is not
+//!
+//! FreeBSD/aarch64 is a real host (the aarch64 BSD native-lane campaign), so
+//! the crate-level gate is `target_os` and the arch axis is applied
+//! per-module — the `carrick-native-darwin` pattern:
+//!
+//! * `fault` is **amd64-only**: it reads the named amd64 `mcontext_t` fields
+//!   `mc_rip`/`mc_r15`/`mc_rcx`, which do not exist on FreeBSD/aarch64 (whose
+//!   `mcontext_t` is `mc_gpregs: gpregs { gp_x, gp_lr, gp_sp, gp_elr,
+//!   gp_spsr }`). An aarch64 fault shim is its own port, not a cfg.
+//! * `tsc` is **amd64-only**: `std::arch::x86_64::_rdtsc` plus the
+//!   `machdep.tsc_freq` / `kern.timecounter.*_tsc` sysctls, and it exists to
+//!   calibrate the **x86** vDSO, which an aarch64 guest does not have.
+//! * `futex`, `waiter_key` and `jit`'s mapping machinery are **arch-neutral**
+//!   (`_umtx_op`, `sysctl(KERN_PROC_VMMAP)`, `shm_open(SHM_ANON)` + `mmap`)
+//!   and stay compiled on every FreeBSD arch on purpose — whether they behave
+//!   on arm64 is exactly what the aarch64 lane needs to learn, so gating them
+//!   out would hide the answer rather than produce it.
+//! * The one genuinely arch-shaped thing inside `jit` is `flush_icache`,
+//!   whose x86 no-op is WRONG on aarch64's non-coherent I-cache. See `jit`
+//!   for how that is made fail-closed rather than silently stale.
 
 #![cfg(target_os = "freebsd")]
 
+#[cfg(target_arch = "x86_64")]
 pub mod fault;
 pub mod futex;
 pub mod jit;
+#[cfg(target_arch = "x86_64")]
 pub mod tsc;
 mod waiter_key;
 
@@ -73,6 +97,10 @@ impl carrick_dsr::lane::NativeHost for FreebsdHost {
         }
     }
 
+    // amd64 only. On any other FreeBSD arch the trait's default `None` is the
+    // correct answer — there is no TSC to calibrate and no x86 vDSO to feed —
+    // so the override is simply absent rather than stubbed.
+    #[cfg(target_arch = "x86_64")]
     fn vdso_tsc_calibration() -> Option<(u64, u64, u64)> {
         tsc::calibrate()
     }
@@ -86,6 +114,16 @@ mod tests {
     #[test]
     fn freebsd_host_name_and_jit_are_wired() {
         assert_eq!(FreebsdHost::NAME, "freebsd");
-        FreebsdHost::active_jit().supported().expect("supported");
+        if cfg!(target_arch = "x86_64") {
+            FreebsdHost::active_jit().supported().expect("supported");
+        } else {
+            // Not a weakened assertion: on an arch whose I-cache is not
+            // coherent, a lane whose `flush_icache` has no cache-maintenance
+            // body MUST refuse before anything maps code.
+            assert!(
+                FreebsdHost::active_jit().supported().is_err(),
+                "non-amd64 FreeBSD must fail closed: no aarch64 I-cache flush yet"
+            );
+        }
     }
 }

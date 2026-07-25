@@ -19,9 +19,37 @@
 //!
 //! Writers write through the RW alias (`JitRegion::write_ptr_for`), executors
 //! run the RX alias, no protection ever flips, and `begin/end_thread_write`
-//! are no-ops. `flush_icache` is a no-op: x86 has a coherent instruction cache
-//! (cross-modifying-code ORDERING at live patch sites is the x86 arch crate's
-//! contract at its patch encodings, not a flush).
+//! are no-ops.
+//!
+//! ## `flush_icache` is arch-shaped, and fails closed off amd64
+//!
+//! On **x86_64** `flush_icache` is a no-op, and that is CORRECT: x86 has a
+//! coherent instruction cache (cross-modifying-code ORDERING at live patch
+//! sites is the x86 arch crate's contract at its patch encodings, not a
+//! flush). The mapping machinery around it is arch-neutral (`shm_open` +
+//! `shm_unlink` + two `mmap`s), so it stays compiled on every NetBSD arch.
+//!
+//! That asymmetry was a live silent-corruption trap: the no-op was gated on
+//! `target_os` alone, so a NetBSD/**aarch64** build would resolve to it and
+//! execute STALE instructions after publishing code (the equivalent failure
+//! was measured on freebsd-arm64 during the aarch64 lane scout). AArch64
+//! needs real `__clear_cache`-style maintenance, which this crate does not
+//! have yet.
+//!
+//! So off amd64 this lane refuses instead of pretending, at both reachable
+//! entries:
+//!
+//! * [`NativeHostJit::supported`] returns `Err`, so `TranslationCache::new`
+//!   gets a typed cache-policy error before a single byte is mapped.
+//! * `flush_icache` **aborts**. It returns `()` — it has no error channel —
+//!   and it is reachable WITHOUT any mapped code cache:
+//!   `carrick-dsr-aarch64`'s `mapped_memory::native_clear_icache` publishes
+//!   GUEST exec pages through `installed_host_jit()`, which `supported()`'s
+//!   refusal does not gate. Returning normally would claim coherence that
+//!   does not exist; fail-stop is the only honest answer a `-> ()` method can
+//!   give under the workspace's `panic`/`unimplemented` denials.
+//!
+//! Both arms disappear the moment a real aarch64 flush lands here.
 //!
 //! ## Fork hazard — CLOSED, enforced by `remap_for_fork_child`
 //!
@@ -195,7 +223,21 @@ impl NativeHostJit for NetbsdHostJit {
         // Dual mapping needs nothing exotic; a W^X-hardened kernel that
         // refuses PROT_EXEC shm mappings surfaces at map_code_cache as a
         // typed Host error instead.
-        Ok(())
+        #[cfg(target_arch = "x86_64")]
+        {
+            Ok(())
+        }
+        // Off amd64 the mapping half would work, but `flush_icache` below has
+        // no cache-maintenance body — see the module doc. Refuse here so
+        // `TranslationCache::new` fails closed before anything maps code.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Err(
+                "NetBSD native host JIT: no I-cache maintenance on this arch \
+                 (flush_icache needs a real __clear_cache body before an \
+                 aarch64 lane may publish code)",
+            )
+        }
     }
 
     fn map_code_cache(&self, capacity: usize) -> io::Result<JitRegion> {
@@ -250,9 +292,23 @@ impl NativeHostJit for NetbsdHostJit {
 
     fn end_thread_write(&self) {}
 
+    #[cfg(target_arch = "x86_64")]
     fn flush_icache(&self, _exec_ptr: *const u8, _len: usize) {
         // Coherent I-cache on x86; freshly-published (never-executed) code
         // needs no barrier beyond the publication index's Release store.
+    }
+
+    /// Fail-stop: this arch needs real I-cache maintenance and this crate has
+    /// none yet (module doc). Reachable without a mapped code cache via
+    /// `carrick-dsr-aarch64`'s `mapped_memory::native_clear_icache`, which
+    /// publishes GUEST exec pages through `installed_host_jit()` — so
+    /// `supported()`'s refusal does not cover this path. Returning would
+    /// silently execute stale instructions; `abort` is the only fail-stop a
+    /// `-> ()` method can give under the workspace's `panic`/`unimplemented`
+    /// denials.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn flush_icache(&self, _exec_ptr: *const u8, _len: usize) {
+        std::process::abort()
     }
 
     fn remap_for_fork_child(&self, prior: &JitRegion) -> io::Result<ForkChildJit> {
@@ -271,6 +327,26 @@ mod tests {
 
     const CAPACITY: usize = 64 * 1024;
 
+    /// `supported()` is this lane's arch gate: `Ok` on amd64 (coherent
+    /// I-cache, so the no-op `flush_icache` is correct), `Err` elsewhere until
+    /// a real cache-maintenance body lands. The mapping tests below stay
+    /// arch-NEUTRAL on purpose — whether `shm_open` + a dual RX/RW map works
+    /// on NetBSD/aarch64 (where PaX MPROTECT pins each mapping's maxprot at
+    /// `mmap` time) is exactly what the aarch64 lane needs measured, so they
+    /// must not be gated away.
+    #[test]
+    fn supported_matches_the_icache_maintenance_this_lane_has() {
+        let jit = NetbsdHostJit;
+        if cfg!(target_arch = "x86_64") {
+            jit.supported().expect("amd64 has a coherent I-cache");
+        } else {
+            assert!(
+                jit.supported().is_err(),
+                "a lane with no I-cache maintenance must fail closed"
+            );
+        }
+    }
+
     #[test]
     fn shm_name_formats_without_heap() {
         let mut buf = [0u8; 64];
@@ -282,7 +358,6 @@ mod tests {
     #[test]
     fn dual_map_aliases_one_object() {
         let jit = NetbsdHostJit;
-        jit.supported().expect("supported");
         let region = jit.map_code_cache(CAPACITY).expect("map");
         assert_ne!(
             region.exec_base.as_ptr(),
@@ -321,7 +396,11 @@ mod tests {
         unsafe { jit.unmap(&region) };
     }
 
+    // amd64 only: the payload is raw x86_64 machine code, and the assertion
+    // CALLS it. It is also one of only two tests that invoke `flush_icache`,
+    // which is a fail-stop `abort` off amd64 by design.
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn written_code_executes_through_the_exec_view() {
         // The end-to-end contract: bytes written through the RW alias run as
         // code from the RX view — `mov eax, 42; ret` on x86_64.
@@ -385,7 +464,10 @@ mod tests {
         }
     }
 
+    // amd64 only: the parent and child both write raw x86_64 machine code and
+    // CALL it, and the test flushes the I-cache on both sides.
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn fork_child_fresh_region_does_not_corrupt_parent_exec() {
         // The Task-0 `jit_probe.c` proof, now as a Rust unit test with a REAL
         // fork. The parent publishes `mov eax, 0x11; ret`. A fork child obtains
