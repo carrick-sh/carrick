@@ -85,64 +85,40 @@ compile/lint/test only.
 | `just kvm-smoke` / `just kvm-smoke-lima` | KVM backend smoke (real `/dev/kvm`, via lima from macOS). |
 | `just install-hooks` | Install the git hooks (do this once per clone). |
 
-**Toolchain:** pinned to Rust **1.96.0** ([`rust-toolchain.toml`](rust-toolchain.toml)),
-**edition 2024**, resolver 2, workspace members `crates/*`. Workspace lints
-**deny** `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented` in
-non-test code (tests are exempt via [`clippy.toml`](clippy.toml)); `release` has
-`overflow-checks = true`. Note CI pins toolchain via `@stable` (moving), so a
-freshly released stable can flag lints your local 1.96.0 doesn't — keep local in
-sync with `rustup update stable`.
+**Toolchain:** the pin, edition, workspace members and the `deny`ed lints live in
+[`rust-toolchain.toml`](rust-toolchain.toml) and [`Cargo.toml`](Cargo.toml) —
+read those, their comments explain the why. The one thing not written there: CI
+pins the toolchain via `@stable` (moving), so a freshly released stable can flag
+lints your pinned local toolchain doesn't — keep local in sync with
+`rustup update stable`.
 
 ---
 
 ## Repository map
 
-31-crate Cargo workspace under [`crates/`](crates/) (see
-[`crates/README.md`](crates/README.md)). Dependency direction:
-`cli → engine → {image, runtime} → spec`. The HAL/platform split
-([`docs/hal.md`](docs/hal.md)) separates platform-neutral contracts from
-per-VMM and per-host implementations so KVM/bhyve/NVMM can share the runtime
-without pulling in HVF/applevisor. Use the `carrick-vmm-*` names for VMM crates
-(`carrick-vmm-hvf`, not the historical `carrick-hvf`).
+**[`crates/README.md`](crates/README.md) is the crate map** — every crate's role,
+the product path `cli → engine → {image, runtime} → spec`, and the per-platform
+feature-closure rules. Read it rather than a summary here; it does not go stale.
+The HAL/platform split ([`docs/hal.md`](docs/hal.md)) separates platform-neutral
+contracts from per-VMM and per-host implementations so KVM/bhyve/NVMM can share
+the runtime without pulling in HVF/applevisor.
 
-**Native (DSR) backend** (no-VMM same-ISA translation; seams landed per
-[`docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md`](docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md))
-- `carrick-dsr` — platform-neutral DSR core: the `NativeLane`/`GuestIsa`/`NativeHost` seam traits (`lane.rs`), translation cache + publication index behind the `NativeHostJit` host seam, `prepared_image`, profiling census, page-geometry vocabulary, probe-sink seam, test hooks. Kept `ring`/`usdt`-free so a non-mac rig can darwin-cross-check it.
-- `carrick-dsr-aarch64` — AArch64 guest-ISA lane: bad64/dynasmrt decode/emit, block planner + exclusive fusion, gateway (`gateway_aarch64.S`), counter virtualization, artifact store, mapped memory + translator.
-- `carrick-dsr-x86` — x86_64 guest-ISA lane: `iced-x86` decode/classify, block planning + control-flow lowering, a hand-rolled byte-level block emitter (no dynasmrt — ahead of this spec's fixed decision), gateway (`gateway_x86_64.S`) + full x87/SSE/AVX state transfer; already runs real Linux/x86_64 ELF binaries through `native_freebsd.rs`.
-- `carrick-native-darwin` — Darwin `NativeHost` impl (`DarwinHost`): `MAP_JIT`/`pthread_jit_write_protect_np` JIT cache, the byte-for-byte-moved `csrc/native_darwin.c` trap/kick shim.
-- `carrick-native-freebsd` — FreeBSD `NativeHost` impl (`FreebsdHost`): SHM_ANON dual-mapped W^X JIT cache (no process-wide `mprotect` flip), amd64 `mcontext_t` trap shim.
-- `carrick-runtime/src/native_darwin.rs` (~13.0k lines, ~7.1k of it `mod tests`) and `src/native_freebsd.rs` (~19.7k lines) are the two lanes' thread-loop/dispatch-adapter/signal-lowering/fork-exec drivers; both route exclusively through the one wiring point, `carrick-runtime/src/native/mod.rs` (`type HostNativeLane` resolves to `DarwinAarch64Lane` or `FreebsdX8664Lane`), plus its `native/fork_child.rs` shared post-fork dispatcher reset.
-- Plan: [`docs/superpowers/plans/2026-07-23-native-lane-seam-phase1.md`](docs/superpowers/plans/2026-07-23-native-lane-seam-phase1.md); Phase 2 (separate plan) merges the two drivers' thread loops behind `NativeLane` and neutralizes `IdentityGuestMemory`/`NativeMapping` into an ISA-keyed identity-memory module.
+Two conventions the code alone would teach wrong:
 
-**VMM backends** (hypervisor implementations over `carrick-hal`)
-- `carrick-vmm-hvf` — macOS Hypervisor.framework backend; the mature one (trap loop, vCPU cluster).
-- `carrick-vmm-kvm` — Linux/KVM backend (AArch64 path plus x86_64 lane).
-- `carrick-vmm-bhyve` — FreeBSD/bhyve backend (x86_64 lane on FreeBSD/amd64).
-- `carrick-vmm-nvmm` — NetBSD/NVMM backend (x86_64 lane; target-host behavior matters).
-- `carrick-x86` — shared x86_64 VMM-backend engine used by KVM/bhyve/NVMM.
-- `carrick-aarch64` — shared AArch64 engine (`Aarch64EngineCore`) used by the HVF AArch64 path (and shared with the KVM AArch64 lane).
-
-**Host backends** (host-primitive impls)
-- `carrick-host` — Darwin host-primitive helpers for the runtime.
-- `carrick-host-bsd` — BSD-family (`cfg(carrick_bsd_family)`) impls of hal traits.
-- `carrick-host-linux` — Linux host-OS glue (native epoll, etc.).
-- `carrick-portable` — thin per-OS shim for raw `libc` symbols that differ/are absent across hosts.
-
-**Core runtime & contracts**
-- `carrick-runtime` — the core (~41k lines): ELF loading, syscall dispatch, VFS, fs backends, `execute(&RunSpec)`.
-- `carrick-hal` — traits-only leaf crate, zero OS/hypervisor deps (trap, hypervisor, guest-arch, event, futex, threaded-loop contracts).
-- `carrick-abi` — Linux ABI constants + wire structs with compile-time size/offset/uniqueness asserts.
-- `carrick-mem` / `carrick-guest-mem` — guest address-space construction (page tables, vectors, trampolines, ELF layout) / shared guest-memory hub types.
-- `carrick-spec` — vocabulary nouns (`RunSpec`, `ContainerSpec`, `ImageConfig`, `Mount`, `NamespaceConfig`).
-- `carrick-image` — OCI image acquisition + content store. `carrick-engine` — lowers a docker-style request into a `RunSpec`. `carrick-cli` — the `carrick` binary.
-
-**Platform-neutral subsystem cores**
-- `carrick-thread` — thread registry, private-futex park table, fork/page-table quiesce barriers.
-- `carrick-signal-core` — neutral pending-signal bookkeeping. `carrick-timer-core` — interval/POSIX timer slots.
-- `carrick-observability` — platform-neutral compat reporter (`compat-report`).
-
-**Support:** `carrick-conformance` (harness), `carrick-test-support` (integration/CLI helpers, rootfs assembly).
+- **Use the `carrick-vmm-*` names for VMM crates** (`carrick-vmm-hvf`, not the
+  historical `carrick-hvf`).
+- **The two native (DSR) drivers have exactly ONE wiring point.**
+  `carrick-runtime/src/native_darwin.rs` and `src/native_freebsd.rs` route
+  exclusively through `carrick-runtime/src/native/mod.rs` (`type HostNativeLane`
+  resolves to `DarwinAarch64Lane` or `FreebsdX8664Lane`), plus its
+  `native/fork_child.rs` shared post-fork dispatcher reset. Don't add a second.
+  Seam design:
+  [`docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md`](docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md);
+  Phase 1 plan:
+  [`docs/superpowers/plans/2026-07-23-native-lane-seam-phase1.md`](docs/superpowers/plans/2026-07-23-native-lane-seam-phase1.md).
+  Phase 2 (separate plan) merges the two drivers' thread loops behind
+  `NativeLane` and neutralizes `IdentityGuestMemory`/`NativeMapping` into an
+  ISA-keyed identity-memory module.
 
 ### Where key subsystems live
 - **Trap loop / syscall dispatch** — mature macOS trap loop in `crates/carrick-vmm-hvf/src/trap.rs`; x86 loop in `crates/carrick-x86/src/engine.rs` with backend adapters; dispatch in `crates/carrick-runtime/src/dispatch/mod.rs` (`SyscallDispatcher`, per-subsystem locks); syscall metadata in `crates/carrick-abi/src/syscall.rs` and guest-arch tables under `carrick-hal`.
@@ -193,23 +169,12 @@ If it fails in Docker too, it's not carrick's bug.
   routine gates run carrick-only. Single-run gating is non-deterministic
   (Go-under-HVF races); treat flaky flips as flakiness (retry / `known_gaps`),
   not regressions.
-- **Use `bpftrace` inside the Docker oracle for Linux syscall shape — strict
-  requirement.** The LTP container already has `bpftrace` installed (validated
-  as `bpftrace v0.20.2`); use that in-container copy rather than a host-side
-  tracer. Do **not** use guest `strace` for Linux-in-Docker syscall evidence;
-  it perturbs test behaviour and is not accepted as Docker oracle syscall
-  evidence. Run `bpftrace` in a separate Docker-only phase (never alongside
-  Carrick), with privileges and tracefs mounted inside the container. Validate
-  the tool before trusting a trace:
-  `docker run --rm --privileged --pid=host localhost:5050/ltp:arm64 sh -lc 'mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true; bpftrace -V; bpftrace -e "BEGIN { printf(\"ok\\n\"); exit(); }"'`.
-  Then trace the case with the same wrapper, for example:
-  `docker run --rm --privileged --pid=host localhost:5050/ltp:arm64 sh -lc 'mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true; bpftrace -e "..." -c /opt/ltp/testcases/bin/<case>'`.
-  If `bpftrace -l 'tracepoint:syscalls:*'` says
-  `/sys/kernel/tracing/available_events` is missing, the tracefs mount step was
-  skipped. Keep the trace attached to the Linux oracle's semantics, not just to
-  "what failed under Carrick": for example, Docker `mmap13` showed a shared file
-  mapping past EOF is `SIGBUS`/`BUS_ADRERR`, while `mmap18`'s first cases pass
-  because Linux grows the stack VMA before faulting.
+- **Linux syscall shape comes from `bpftrace` INSIDE the Docker oracle — never
+  from guest `strace`.** `strace` perturbs test behaviour and is not accepted as
+  Docker-oracle syscall evidence. The container ships `bpftrace`; run it in a
+  Docker-only phase, never alongside carrick. Full recipe (privileges, the
+  tracefs mount, tool validation) in
+  [`.agents/skills/ltp-conformance`](.agents/skills/ltp-conformance).
 - **The cache key is the suite *declaration*, not the image digest.** It is a
   stable JSON of `OracleKey` (image, cmd, env, `docker_platform`, verdict…), so
   the committed cache stays valid across machines that may not have the images.
@@ -225,27 +190,13 @@ If it fails in Docker too, it's not carrick's bug.
   (`git checkout <pre-fix> -- <file>`, rebuild signed, confirm DIFF), then restore
   the fix and confirm MATCH. A probe that passes immediately proves nothing.
 - **Attribute a gate REGRESSION/CRASH before you fix it — don't assume it's your
-  change.** (1) Reduce to a minimal fast reproducer first — never iterate on the
-  5-minute suite (a 90s repro turns each hypothesis into a tight loop). (2) Does
-  **Docker** fail it too? Then it isn't carrick's bug. (3) Does the **pre-change
-  binary** fail it? `git checkout <pre-session> -- <the files your commits
-  touched>`, rebuild signed, re-run the repro — if it still fails, the bug
-  predates your work (fix forward anyway, but you've cleared yourself). (4) Check
-  the suite's **blessed baseline** verdict: a `carrick[Empty]`/TIMEOUT gating a
-  suite the baseline had *completing* is a flake/timeout-under-load, not a content
-  regression. (Worked example: the `cpython-socket` gating crash was a
-  pre-existing `sendfile` partial-EAGAIN over-send, not the session's HVF work —
-  proven by reproducing it on the pre-session binary.) (5) **A load-probabilistic
-  verdict makes a one-run-per-point bisect converge on the WRONG commit.** Sample
-  each bisect point ≥2×, check the report-only lanes (gnu / amd64) for the same
-  failure signature at "green" points, and suspect the PROBE itself before the
-  runtime: force the probe's race deterministic and run that variant under the
-  Docker oracle — if Linux fails it identically, the probe is the bug. (Worked
-  example: `expectcontinue` implicated a fd-ownership refactor via a clean
-  green/green/green/red bisect; the real defect was the probe's phase-local read
-  buffer dropping kernel-coalesced bytes — real Linux failed the forced-coalesce
-  variant identically, and the "green" stage-14 run's report-only gnu lane
-  already showed the same failure.)
+  change.** Reduce to a fast reproducer, then ask in order: does Docker fail it
+  too, does the pre-change binary fail it, and what did the blessed baseline say?
+  A load-probabilistic verdict will make a one-run-per-point bisect converge on
+  the WRONG commit — sample each point ≥2× and suspect the PROBE before the
+  runtime. The full procedure and two worked examples (`cpython-socket`,
+  `expectcontinue`) are in
+  [`.agents/skills/ltp-conformance`](.agents/skills/ltp-conformance).
 - **Probe-gate mechanics that silently lie:** the gate's logs contain binary
   bytes — grep them with `-a` or your matches vanish without error. And run the
   gate (`cargo test -p carrick-cli --test conformance conformance_probes`) from
@@ -291,58 +242,16 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
 The x86_64 native lane (`carrick-runtime/src/native_freebsd.rs`, driver
 `runtime::run_elf_native_dispatch`) runs guest code from a JIT cache with the
 `carrick-dsr-x86` gateway. `carrick trace` targets the container/VMM run, not
-this bare in-process runner — use these instead. **Don't timeout-and-grep; get
-ground truth.** (Worked example: a real std Rust binary spun; the tools below
-pinned it to a `jmp .` self-loop from an empty page-spanning `Continue` block in
-one pass, after hours of grep-guessing got nowhere.)
-
-- **`cargo run -p carrick-runtime --example native_run -- <elf>`** is the
-  standalone single-run driver to attach a debugger/tracer to (build with
-  `--no-default-features --features platform-freebsd`). It registers the carrick
-  USDT provider so probes are live.
-- **Launch-time dtrace USDT (the event observability path — no env logging).**
-  Probe names use HYPHENS: `carrick<PID>:::syscall-return` (not
-  `syscall__return`). USDT probes register after process start, so use `-Z` and
-  `-c` to launch and own the target for its whole lifetime. Guest syscall census:
-  `dtrace -Zq -c "…/native_run <elf>" -n 'carrick*:::syscall-return { @[copyinstr(arg1)] = count(); } tick-3s { exit(0); }'`.
-  `syscall-entry` arg0 is the CANONICAL number post-normalization. **Never use
-  `dtrace -p`, pid-provider probes, or USDT fasttrap probes on a continuing
-  native process**: detach leaked `SIGTRAP` and killed a live Kaniko build.
-- **Profile an already-running process with the supported kernel-only tool:**
-  `sudo scripts/native-x86-profile.py PID --seconds 5` (add `--guest-elf PATH`
-  or `--json` as needed). It discovers the existing process tree and follows new
-  forks; discovers ASLR, JIT, Carrick, and libc mappings; reports syscall mix,
-  symbolicated host RIPs, guest-PC census, and sampled memcpy callers/sizes; and
-  verifies that the process survived with stable executable mappings. It uses
-  only the kernel `profile`/`syscall`/`proc` providers — no process grab or
-  breakpoint patching. DSR owns guest RSP, so `ustack()` is not authoritative;
-  the tool reads `exit_resume` through `%r15` using the matching binary's
-  versioned `carrick debug native-x86-layout` contract. **Never hardcode the
-  context offset** (XSAVE expansion moved it from 720 to 33024).
-- **The native-x86 gateway is zero-copy by contract.** One persistent
-  `X86DsrContext` owns each host guest thread's register/XSAVE state; hot
-  entries call `prepare_entry()` and mutate only scalars. Do not reconstruct
-  the 33 KiB context or copy its 16 KiB snapshot around a block loop. The large
-  types deliberately are not `Copy`; an explicit snapshot clone is reserved
-  for Linux task creation. Profile regressions with
-  `scripts/native-x86-profile.py`: 16,384/16,576-byte `memcpy` samples that
-  scale with gateway entries are a correctness-of-performance failure.
-- **gcore + disassemble the JIT.** `gcore -c core PID`, then
-  `lldb …/native_run -c core -o "register read rip r15" -o "disassemble -b -s \$rip"`.
-  lldb can't unwind the JIT frame yet, BUT the core holds the guest's **live
-  registers** (the gateway loaded them into the real CPU) and the JIT bytes at
-  `rip` are the translated guest instructions — disassembling them shows exactly
-  what the guest is doing. NOTE: the core is ~34 GB (the 32 GiB mmap arena);
-  export `CARRICK_MMAP_ARENA_GIB=1` to shrink it.
-- **Make unhandled scenarios LOUD.** The driver's no-progress / unsupported paths
-  print a breadcrumb (recent block VAs, the mapped segments, the raw guest bytes
-  at the fault). Keep extending that to every unhandled path — a rich fault string
-  beats a debugger round-trip. Never let a failure surface as an empty result a
-  `grep` can hide.
-- **TODO (unwind through the JIT):** teach the carrick lldb scripts to unwind the
-  JIT→gateway→Rust frames (synthesize unwind info from the gateway's saved
-  `host_rsp`/`host_callee` in the ctx at `%r15`), so `bt` reaches
-  `run_static_x86_elf` and its locals (`next`, `image.segments`, the block cache).
+this bare in-process runner. **Never use `dtrace -p`, pid-provider probes, or
+USDT fasttrap probes on a continuing native process** — a detach leaked
+`SIGTRAP` and killed a live Kaniko build; the supported profiler
+(`sudo scripts/native-x86-profile.py PID`) uses kernel providers only. **Never
+hardcode the context offset** (XSAVE expansion moved it from 720 to 33024), and
+**the native-x86 gateway is zero-copy by contract** — 16,384/16,576-byte
+`memcpy` samples that scale with gateway entries are a performance-correctness
+failure. The launch-time `native_run` driver, the USDT census recipe, the
+gcore-and-disassemble-the-JIT procedure, and the JIT-unwind TODO are in
+[`.agents/skills/carrick-native-debug`](.agents/skills/carrick-native-debug).
 
 ---
 
