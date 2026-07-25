@@ -1211,6 +1211,46 @@ class GateTests(unittest.TestCase):
         self.assertIn("carrick-mem", s0.cmds[0])
         s1 = BSDVM.STAGES["stage1"]
         self.assertTrue(s1.available and s1.report_only)
+        # stage1 measures the ACCEPTANCE PATH, not `--workspace`: a default-feature
+        # workspace build on a BSD selects platform-macos and fails on carrick-vmm-hvf
+        # / carrick-cli's build.rs, which is pure artifact (scout spec V12).
+        self.assertNotIn("--workspace", s1.cmds[0])
+        self.assertIn("--no-default-features", s1.cmds[0])
+        self.assertIn("{platform_feature}", s1.cmds[0])
+
+    def test_every_vm_names_the_platform_feature_stage1_substitutes(self) -> None:
+        # The placeholder is useless if a VM leaves it empty: the command would
+        # degrade to a bare `--features` and fail with a confusing cargo error.
+        for vm_name, vm in BSDVM.VMS.items():
+            self.assertTrue(
+                vm.platform_feature.startswith("platform-"),
+                f"{vm_name}: platform_feature={vm.platform_feature!r}",
+            )
+
+    def test_stage_cmds_substitute_the_vms_platform_feature(self) -> None:
+        self.assertEqual(
+            BSDVM.STAGES["stage1"].cmds[0].replace(
+                "{platform_feature}", BSDVM.VMS["netbsd-arm64"].platform_feature
+            ),
+            "cd /root/carrick && cargo build -p carrick-cli "
+            "--no-default-features --features platform-netbsd",
+        )
+
+    def test_stage_cmds_with_braces_survive_substitution(self) -> None:
+        # Substitution is a plain `str.replace`, not `str.format`: a stage command
+        # is a shell line and may legitimately contain braces (brace expansion, awk).
+        stage = BSDVM.Stage(
+            cmds=["echo {a,b} && awk '{print $1}' {platform_feature}"],
+            report_only=True,
+            available=True,
+        )
+        vm = BSDVM.VMS["freebsd-arm64"]
+        rendered = [
+            cmd.replace("{platform_feature}", vm.platform_feature) for cmd in stage.cmds
+        ]
+        self.assertEqual(
+            rendered, ["echo {a,b} && awk '{print $1}' platform-freebsd"]
+        )
         self.assertFalse(BSDVM.STAGES["stage2"].available)
         self.assertIn("NativeLane", BSDVM.STAGES["stage2"].note)
         self.assertFalse(BSDVM.STAGES["stage3"].available)
