@@ -30,6 +30,11 @@
 .equ CTX_KICK_RESTORE_RCX, 33192
 .equ CTX_EXIT_KICKED_ADDR, 33200
 .equ CTX_EXECUTABLE_STOP_WORD, 33208
+// Host-injected `extern "C" fn(base: u64)` that installs a hardware FS base via
+// the host's mechanism. Only referenced on the `#if defined(__NetBSD__)` path,
+// where the kernel does not enable ring-3 CR4.FSGSBASE. See gateway.rs
+// (`CTX_SET_FSBASE_FN` / `X86DsrContext::set_fsbase_fn`).
+.equ CTX_SET_FSBASE_FN, 33240
 
 .text
 
@@ -52,10 +57,24 @@ carrick_dsr_x86_enter_raw:
     // every full entry. Zero is a real guest FS base, not a sentinel: skipping
     // that write would expose host TLS to a guest after ARCH_SET_FS(0).
     // (rax/rcx are dead here: guest GPRs load below.)
+#if defined(__NetBSD__)
+    // NetBSD 10.x does NOT enable ring-3 CR4.FSGSBASE, so rdfsbase/wrfsbase #UD
+    // in userland. Site 1 (the rdfsbase host-base capture) is ELIMINATED: the
+    // host base is invariant per host thread and was captured once via
+    // sysarch(X86_64_GET_FSBASE) at run-loop setup (CTX_HOST_FSBASE already
+    // holds it). Site 2 installs the guest base through the host-injected
+    // sysarch(X86_64_SET_FSBASE) leaf. %r15 (ctx) is SysV callee-saved and
+    // survives the call; rdi carries the base; rax/rcx are dead here.
+    movq CTX_GUEST_FSBASE(%r15), %rdi
+    subq $8, %rsp                        // 16-byte SysV alignment for the call
+    call *CTX_SET_FSBASE_FN(%r15)
+    addq $8, %rsp
+#else
     movq CTX_GUEST_FSBASE(%r15), %rax
     rdfsbase %rcx
     movq %rcx, CTX_HOST_FSBASE(%r15)
     wrfsbase %rax
+#endif
     // Preserve the complete host extended state, then install the guest's
     // hardware-safe state. Host PKRU is included; guest PKRU is virtualized
     // outside this XSAVE payload so it cannot revoke gateway/context access.
@@ -269,8 +288,22 @@ carrick_dsr_x86_exit_common:
     // Every full entry installed the guest fs base, including zero. Restore
     // the saved host base on every full exit before any Rust/libc code runs.
     // Return-cache hits bypass this full-exit path and remain guest-resident.
+#if defined(__NetBSD__)
+    // NetBSD: restore the host base through the injected sysarch leaf (site 3).
+    // The host stack is already active (HOST_RSP restored above). The call may
+    // clobber caller-saved regs, but that is harmless here: %eax is reloaded
+    // with the exit status below, and every host callee-saved register is
+    // restored from the context immediately after (the movq HOST_CALLEE...
+    // block). %r15 (ctx) survives the call by SysV. The set leaf is TLS-free,
+    // so it does not itself deref the (currently guest) FS base.
+    movq CTX_HOST_FSBASE(%r15), %rdi
+    subq $8, %rsp                        // 16-byte SysV alignment for the call
+    call *CTX_SET_FSBASE_FN(%r15)
+    addq $8, %rsp
+#else
     movq CTX_HOST_FSBASE(%r15), %rax
     wrfsbase %rax
+#endif
 
     // Restore host callee-saved; return status in %eax. Restore host r15 last.
     movl CTX_EXIT_STATUS(%r15), %eax

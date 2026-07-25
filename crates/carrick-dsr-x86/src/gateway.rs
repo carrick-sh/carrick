@@ -994,6 +994,20 @@ pub struct X86DsrContext {
     /// `last_copied_x87_guest_data_va`. Written last so an asynchronous exit
     /// never consumes an incomplete address.
     pub last_copied_x87_data_valid: u32,
+    /// Host-injected `extern "C" fn(base: u64)` that installs a hardware FS base
+    /// via the host's mechanism, or `0` when the host uses the inline FSGSBASE
+    /// instructions. On hosts whose kernel enables ring-3 `CR4.FSGSBASE`
+    /// (FreeBSD, Linux, Darwin) the gateway swaps the base with inline
+    /// `rdfsbase`/`wrfsbase` and this stays `0`, unused. On NetBSD 10.x — which
+    /// does NOT enable ring-3 FSGSBASE, so those instructions `#UD` — the
+    /// runtime fills this with `carrick_native_netbsd::fsbase::set` (a TLS-free
+    /// raw `sysarch(X86_64_SET_FSBASE)` leaf) and the `#if defined(__NetBSD__)`
+    /// gateway path installs/restores the base through it (see
+    /// `gateway_x86_64.S` sites 2/3 and `CTX_SET_FSBASE_FN`). The field is a
+    /// host-agnostic `u64`: `carrick-dsr-x86` learns no host syscall ABI. It
+    /// appends into the context's pre-existing tail padding, so no hot offset
+    /// moves and `size_of::<X86DsrContext>()` is unchanged.
+    pub set_fsbase_fn: u64,
 }
 
 /// Byte offset of [`X86DsrContext::exit_resume`] — the guest VA the exit stub
@@ -1045,6 +1059,11 @@ pub const CTX_LAST_COPIED_X87_GUEST_VA: i32 = 33_216;
 pub const CTX_LAST_COPIED_X87_GUEST_DATA_VA: i32 = 33_224;
 /// Byte offset of its validity witness; zero guest addresses are valid.
 pub const CTX_LAST_COPIED_X87_DATA_VALID: i32 = 33_232;
+/// Byte offset of [`X86DsrContext::set_fsbase_fn`] (mirrored in the `.S` as
+/// `CTX_SET_FSBASE_FN`): the host-injected FS-base install pointer the NetBSD
+/// gateway path calls at sites 2/3. Appended into the tail padding, so no hot
+/// offset moves and the context size is unchanged.
+pub const CTX_SET_FSBASE_FN: i32 = 33_240;
 /// Byte offset of the virtualized guest `%r15` slot inside the snapshot
 /// (`gpr[15]`): the emitter's r15-rename loads/stores it directly.
 pub const SNAP_GUEST_R15: i32 = 120;
@@ -1133,6 +1152,9 @@ impl X86DsrContext {
             last_copied_x87_guest_va: 0,
             last_copied_x87_guest_data_va: 0,
             last_copied_x87_data_valid: 0,
+            // Default: inline FSGSBASE (FreeBSD/Linux/Darwin). The NetBSD run
+            // loop overrides this per host thread before the first enter.
+            set_fsbase_fn: 0,
         }
     }
 
@@ -1267,6 +1289,8 @@ const _: () = assert!(
     std::mem::offset_of!(X86DsrContext, last_copied_x87_data_valid) as i32
         == CTX_LAST_COPIED_X87_DATA_VALID
 );
+const _: () =
+    assert!(std::mem::offset_of!(X86DsrContext, set_fsbase_fn) as i32 == CTX_SET_FSBASE_FN);
 const _: () = assert!(std::mem::size_of::<X86IndirectCacheEntry>() == 32);
 const _: () = assert!(std::mem::size_of::<X86DsrContext>() == 33_280);
 const _: () = assert!(std::mem::offset_of!(X86DsrContext, exit_resume) as i32 == CTX_EXIT_RESUME);
