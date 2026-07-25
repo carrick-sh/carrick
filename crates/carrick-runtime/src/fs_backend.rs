@@ -2159,7 +2159,7 @@ impl HostFsBackend {
         &'a self,
         rel: &'p Path,
     ) -> std::io::Result<(DirAt<'a>, std::borrow::Cow<'p, Path>)> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if rel.as_os_str().len() >= DEEP_PATH_CHUNK
             && let Some((anchor, tail)) = self.deep_anchor(rel)?
         {
@@ -2175,7 +2175,7 @@ impl HostFsBackend {
     /// chunk (a single huge component — let the normal path report the
     /// error). A descent failure (e.g. a missing intermediate) is the same
     /// error the underlying operation would surface on a real kernel walk.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn deep_anchor(&self, rel: &Path) -> std::io::Result<Option<(cap_std::fs::Dir, PathBuf)>> {
         let mut anchor: Option<cap_std::fs::Dir> = None;
         let mut chunk = PathBuf::new();
@@ -2913,12 +2913,22 @@ pub(crate) fn write_owner_xattr(
 }
 
 /// Byte length from which a relative path is resolved via chunked descent
-/// instead of one full-path cap-std call (Linux only; see
-/// [`HostFsBackend::at`]). Comfortably below the kernel's `PATH_MAX` (4096)
-/// so every host path string — a flushed chunk or the tail, each at most
-/// this bound plus one ≤`NAME_MAX` (255) component — stays legal.
+/// instead of one full-path cap-std call (see [`HostFsBackend::at`]). Set
+/// comfortably below the host kernel's `PATH_MAX` so every host path string —
+/// a flushed chunk or the tail, each at most this bound plus one ≤`NAME_MAX`
+/// (255) component — stays legal.
+///
+/// Linux `openat2(RESOLVE_BENEATH)` and FreeBSD `openat(O_RESOLVE_BENEATH)`
+/// both resolve a whole relative path in ONE syscall, so cap-std's containment
+/// call is `getname()`/`PATH_MAX`-bounded on both (Linux 4096, FreeBSD 1024).
+/// macOS and NetBSD lack RESOLVE_BENEATH, so cap-std walks component-by-
+/// component there and never hits the limit — the deep branch is compiled out.
 #[cfg(target_os = "linux")]
 const DEEP_PATH_CHUNK: usize = 3000;
+// FreeBSD `PATH_MAX` is 1024: keep a chunk (≤ this + one 255-byte component)
+// safely under it.
+#[cfg(target_os = "freebsd")]
+const DEEP_PATH_CHUNK: usize = 512;
 
 /// A borrowed-or-anchored cap-std dir handle, paired with the (possibly
 /// shortened) path to use against it — produced by [`HostFsBackend::at`].
@@ -2926,9 +2936,9 @@ const DEEP_PATH_CHUNK: usize = 3000;
 enum DirAt<'a> {
     /// Short path: the sandbox root itself, no extra handle opened.
     Root(&'a cap_std::fs::Dir),
-    /// Deep path (Linux): an intermediate directory opened by chunked
+    /// Deep path (Linux / FreeBSD): an intermediate directory opened by chunked
     /// descent; operations run on the short tail relative to it.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     Anchor(cap_std::fs::Dir),
 }
 
@@ -2937,7 +2947,7 @@ impl std::ops::Deref for DirAt<'_> {
     fn deref(&self) -> &cap_std::fs::Dir {
         match self {
             DirAt::Root(dir) => dir,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             DirAt::Anchor(dir) => dir,
         }
     }
