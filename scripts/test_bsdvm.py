@@ -426,6 +426,42 @@ class QemuArgsTests(unittest.TestCase):
                 self.assertEqual(p2.read_bytes(), b"mutated")  # no re-copy
 
 
+class InteractiveSshTests(unittest.TestCase):
+    """`bsdvm ssh` exists so nobody hand-rolls `ssh -p 220x root@127.0.0.1`:
+    that path uses ~/.ssh/known_hosts, which breaks with "Host key
+    verification failed" the moment a guest is re-provisioned (new overlay =>
+    new host key), and it silently drops the guest's toolchain env prefix."""
+
+    def _argv(self, vm_name: str, command: list[str]) -> list[str]:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"CARRICK_BSDVM_STATE": td}):
+                return BSDVM.interactive_ssh_argv(BSDVM.VMS[vm_name], command)
+
+    def test_pins_bsdvm_known_hosts_not_the_users(self) -> None:
+        argv = self._argv("netbsd-arm64", ["true"])
+        joined = " ".join(argv)
+        self.assertIn("UserKnownHostsFile=", joined)
+        self.assertNotIn(str(Path.home() / ".ssh"), joined)
+        self.assertIn("StrictHostKeyChecking=accept-new", joined)
+        self.assertIn("-p", argv)
+        self.assertIn("2202", argv)
+
+    def test_remote_command_carries_the_guest_env_prefix(self) -> None:
+        vm = BSDVM.VMS["freebsd-arm64"]
+        argv = self._argv("freebsd-arm64", ["cargo", "build", "-p", "carrick-mem"])
+        self.assertTrue(argv[-1].startswith(vm.remote_env_prefix))
+        self.assertTrue(argv[-1].endswith("cargo build -p carrick-mem"))
+
+    def test_remote_command_is_quoted_not_concatenated(self) -> None:
+        argv = self._argv("netbsd-arm64", ["sh", "-c", "echo a b"])
+        # shlex.join keeps the multi-word argument one argument on the guest.
+        self.assertIn("'echo a b'", argv[-1])
+
+    def test_no_command_means_interactive_shell_with_no_env_prefix(self) -> None:
+        argv = self._argv("netbsd-arm64", [])
+        self.assertEqual(argv[-1], "root@127.0.0.1")
+
+
 class LifecycleTests(unittest.TestCase):
     def test_stop_pid_escalates_to_kill(self) -> None:
         calls: list[tuple[int, int]] = []

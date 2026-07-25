@@ -373,6 +373,13 @@ bsdvm-down VM:
 bsdvm-ps:
     python3 scripts/bsdvm.py ps
 
+# Run a command on a guest (or open a login shell with no ARGS). Prefer this
+# over hand-rolled `ssh -p 220x root@127.0.0.1`: it pins bsdvm's own
+# known_hosts (so re-provisioning a guest can't wedge you with "Host key
+# verification failed") and applies the guest's toolchain env prefix.
+bsdvm-ssh VM *ARGS:
+    python3 scripts/bsdvm.py ssh {{VM}} {{ARGS}}
+
 bsdvm-gate VM STAGE="stage0":
     python3 scripts/bsdvm.py gate {{VM}} {{STAGE}}
 
