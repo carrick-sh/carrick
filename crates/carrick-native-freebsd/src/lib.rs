@@ -36,8 +36,9 @@
 //!   on arm64 is exactly what the aarch64 lane needs to learn, so gating them
 //!   out would hide the answer rather than produce it.
 //! * The one genuinely arch-shaped thing inside `jit` is `flush_icache`,
-//!   whose x86 no-op is WRONG on aarch64's non-coherent I-cache. See `jit`
-//!   for how that is made fail-closed rather than silently stale.
+//!   whose x86 no-op is WRONG on aarch64's non-coherent I-cache. `jit` has a
+//!   real `__clear_cache` body for aarch64 and fails closed on any other
+//!   non-x86 arch.
 
 #![cfg(target_os = "freebsd")]
 
@@ -134,7 +135,10 @@ mod tests {
     #[test]
     fn freebsd_host_name_and_jit_are_wired() {
         assert_eq!(FreebsdHost::NAME, "freebsd");
-        if cfg!(target_arch = "x86_64") {
+        if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+            // amd64: coherent I-cache, the no-op flush is correct. aarch64:
+            // `flush_icache` does real `__clear_cache` maintenance, proven by
+            // `jit::tests::republished_code_is_not_stale_after_flush_icache`.
             FreebsdHost::active_jit().supported().expect("supported");
         } else {
             // Not a weakened assertion: on an arch whose I-cache is not
@@ -142,7 +146,7 @@ mod tests {
             // body MUST refuse before anything maps code.
             assert!(
                 FreebsdHost::active_jit().supported().is_err(),
-                "non-amd64 FreeBSD must fail closed: no aarch64 I-cache flush yet"
+                "a FreeBSD arch with no I-cache flush must fail closed"
             );
         }
     }
