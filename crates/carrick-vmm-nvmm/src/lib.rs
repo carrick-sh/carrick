@@ -18,8 +18,17 @@
 //! host backend, exactly as FreeBSD's libvmmapi was. The Linux GUEST ABI is
 //! not involved here.
 //!
-//! On every non-NetBSD host this crate is intentionally empty.
-#![cfg(target_os = "netbsd")]
+//! On every host that is not NetBSD/x86_64 this crate is intentionally empty.
+//! The arch half of that gate is load-bearing, not decorative: NVMM is an
+//! x86-only NetBSD subsystem (no `/usr/lib/libnvmm.so`, no `/usr/include/nvmm.h`
+//! and no `/dev/nvmm` on NetBSD/aarch64), and this crate has no per-module arch
+//! gating at all — `nvmm_x86_engine`, `run_elf` and `nvmm.rs`'s
+//! `#[link(name = "nvmm")]` would otherwise all compile on NetBSD/aarch64.
+//! `carrick-runtime`/`carrick-cli` already scope the dependency edge to
+//! `all(target_os = "netbsd", target_arch = "x86_64")`; this gate is the
+//! defence in depth that keeps an accidental un-scoped edge an empty crate
+//! rather than a `-lnvmm` link failure.
+#![cfg(all(target_os = "netbsd", target_arch = "x86_64"))]
 
 pub mod nvmm;
 mod nvmm_futex;

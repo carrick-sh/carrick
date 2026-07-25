@@ -22,6 +22,12 @@ syscall-shim   = ["carrick-runtime/syscall-shim"]
 # exactly as today. `platform-linux` links NO HVF.
 platform-macos = ["dep:carrick-vmm-hvf", "dep:carrick-host-bsd", "carrick-runtime/platform-macos", "carrick-engine/platform-macos"]
 platform-linux = ["dep:carrick-vmm-kvm", "carrick-runtime/platform-linux", "carrick-engine/platform-linux"]
+# `dep:carrick-vmm-bhyve` / `dep:carrick-vmm-nvmm` resolve against the
+# ARCH-SCOPED target tables at the bottom of this file: both VMMs are
+# x86_64-only, while the platform feature names the HOST backend on every arch.
+# On a non-matching target cargo accepts the `dep:` reference and activates
+# nothing, so one feature name covers both arches (see carrick-runtime's
+# Cargo.toml for the full rationale).
 platform-freebsd = ["dep:carrick-vmm-bhyve", "dep:carrick-host-bsd", "carrick-runtime/platform-freebsd", "carrick-engine/platform-freebsd"]
 platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd", "carrick-runtime/platform-netbsd", "carrick-engine/platform-netbsd"]
 # In-memory fs backend selection (`--fs memory`). Default OFF on purpose; opt in
@@ -57,8 +63,8 @@ carrick-runtime = { path = "../carrick-runtime", default-features = false }
 carrick-vmm-hvf = { path = "../carrick-vmm-hvf", optional = true }
 carrick-host-bsd = { path = "../carrick-host-bsd", optional = true }
 carrick-vmm-kvm = { path = "../carrick-vmm-kvm", optional = true }
-carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
-carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm", optional = true }
+# carrick-vmm-bhyve / carrick-vmm-nvmm are NOT declared here: they are
+# x86_64-only and live in arch-scoped target tables at the bottom of this file.
 carrick-spec = { path = "../carrick-spec", features = ["clap"] }
 carrick-image = { path = "../carrick-image" }
 carrick-engine = { path = "../carrick-engine", default-features = false }
@@ -93,3 +99,14 @@ futures-util.workspace = true
 tokio.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# Arch-scoped for the same reason as carrick-runtime's copies: bhyve and NVMM
+# are x86_64-only VMMs whose own crate-level gates key on `target_os` alone, so
+# an OS-only dependency edge would drag libvmmapi / -lnvmm and the x86 engine
+# into an aarch64 BSD build that has no VMM lane. `platform-freebsd` /
+# `platform-netbsd` still name the host backend on both arches.
+[target.'cfg(all(target_os = "freebsd", target_arch = "x86_64"))'.dependencies]
+carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
+
+[target.'cfg(all(target_os = "netbsd", target_arch = "x86_64"))'.dependencies]
+carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm", optional = true }
