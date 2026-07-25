@@ -700,7 +700,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "usdt",
  "zerocopy",
 ]
 

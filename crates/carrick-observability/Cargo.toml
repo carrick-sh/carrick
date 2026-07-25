@@ -24,13 +24,21 @@ parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-# usdt is non-target-gated on purpose. On macOS/FreeBSD/Linux it provides the
-# REAL provider machinery the `probes::real` module fires (macOS/FreeBSD via
-# DTrace, Linux via SystemTap SDT `.note.stapsdt` anchors read by bpftrace); on
-# other targets (e.g. NetBSD) the crate compiles as a pure-Rust no-op, but its
-# `usdt::Error` type is still needed by the `probes::stub` `register_dtrace_probes`
-# signature (which the dispatcher calls on every platform). This mirrors
-# carrick-runtime's existing usage and is the proven cross-platform pattern —
-# target-gating usdt would break the stub signature. The real provider mod is
-# cfg'd to macOS/FreeBSD/Linux (usdt >=0.6 emits Linux probes on stable Rust).
+
+# usdt is scoped to EXACTLY the target set that compiles `probes::real` — see
+# the matching `#[cfg]` at the top of src/probes.rs. Everything else links
+# `probes::stub`, which fires nothing and (since `register_dtrace_probes` now
+# returns the crate-local `ProbeRegistrationError`) names no `usdt` type at all.
+#
+# This is not cosmetic scoping: `usdt-impl` 0.6.0 DOES NOT COMPILE on
+# aarch64-unknown-freebsd. Its build.rs picks the `Standard` (illumos/FreeBSD)
+# DTrace backend from `target_os` alone, and that backend's `no-linker.rs:166`
+# writes `modname[i] = byte as i8` into a `[std::os::raw::c_char; 64]`. FreeBSD's
+# `c_char` is `i8` on x86_64 but `u8` on aarch64, so the aarch64 lane gets E0308
+# ("expected `[u8; 64]`, found `[i8; 64]`") and the whole acceptance-path build
+# dies. 0.6.0 is the newest published release, so there is no version to move to.
+# The stub arm was ALREADY selected on every target this scoping drops (aarch64
+# freebsd/linux, netbsd), so no probe capability is lost — dropping the edge is
+# what lets those targets build at all.
+[target.'cfg(any(target_os = "macos", all(any(target_os = "linux", target_os = "freebsd"), target_arch = "x86_64")))'.dependencies]
 usdt.workspace = true

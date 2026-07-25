@@ -619,8 +619,21 @@ def provision_commands(vm: VmConfig, pubkey: str) -> list[tuple[str, float]]:
         # redirect; it just hangs with no output and no timeout. Point
         # PKG_PATH at the resolved location directly (empirically confirmed
         # to carry git-2.53.0 and rust-1.91.1nb1 as of 2026-07-22).
+        #
+        # `clang` is NOT optional tooling here, it is a BUILD dependency of the
+        # aarch64 acceptance path: carrick-dsr-aarch64 -> bad64 -> bad64-sys runs
+        # `bindgen` in its build script, and bindgen dlopens libclang. NetBSD
+        # base ships no libclang, so without this the stage1 gate dies with
+        # `Unable to find libclang: "couldn't find any valid shared libraries
+        # matching: ['libclang.so', 'libclang.so.*']"`. Installing the pkgsrc
+        # `clang` package puts it at /usr/pkg/lib and pulls `llvm`, whose
+        # /usr/pkg/bin/llvm-config is what clang-sys falls back to for the
+        # libdir -- so no LIBCLANG_PATH in `remote_path_prefix` is needed
+        # (verified on-box: a clean bad64-sys rebuild succeeds with the env var
+        # unset). This was invisible while stage1 was `cargo build --workspace`,
+        # which died on carrick-vmm-hvf long before reaching a bad64-sys compile.
         ("export PKG_PATH=https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/aarch64/10.0_2026Q1/All; "
-         "/usr/sbin/pkg_add -U git rust || /usr/sbin/pkg_add -U git rust", 3600),
+         "/usr/sbin/pkg_add -U git rust clang || /usr/sbin/pkg_add -U git rust clang", 3600),
         # `just` may be absent from pkgsrc aarch64; gates call cargo directly.
         ("export PKG_PATH=https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/aarch64/10.0_2026Q1/All; "
          "/usr/sbin/pkg_add -U just || echo 'just unavailable (ok)'", 600),

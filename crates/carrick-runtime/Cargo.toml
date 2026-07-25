@@ -132,7 +132,11 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-usdt.workspace = true
+# NOTE: no `usdt` edge here. This crate names no `usdt` type — the provider (and
+# its `register_dtrace_probes`) lives in carrick-observability, which scopes the
+# `usdt` dependency to the targets whose `probes::real` arm actually fires it.
+# An unconditional edge here would drag `usdt-impl` into an aarch64-FreeBSD build
+# that cannot compile it (see the carrick-observability manifest for the E0308).
 zerocopy.workspace = true
 carrick-spec = { path = "../carrick-spec" }
 

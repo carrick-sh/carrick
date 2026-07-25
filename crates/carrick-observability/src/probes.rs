@@ -23,15 +23,46 @@
 //!     emit `rdi`/`rsi`/… and fail with "invalid register" — those targets take
 //!     the stub instead.
 //!   * `stub` — a byte-for-byte signature mirror with empty bodies, compiled on
-//!     every OTHER target (NetBSD, and aarch64 linux/freebsd). The non-probe
+//!     every OTHER target (NetBSD, and aarch64 linux/freebsd), which is also
+//!     exactly the set that links NO `usdt` at all. The non-probe
 //!     helpers (`guest_mem_probe_points`,
 //!     `guest_mem_copy`, `guest_mem_point`) carry their REAL bodies in BOTH arms
 //!     so behaviour is identical regardless of platform.
 //!
-//! `usdt` is a non-target-gated dependency of this crate: on stub targets it
-//! compiles as a pure-Rust no-op, but `usdt::Error` is still needed by the
-//! stub's `register_dtrace_probes` return type (the dispatcher calls it on every
-//! platform). See the crate manifest comment for why this is the correct choice.
+//! `usdt` is a TARGET-SCOPED dependency of this crate, gated to exactly the set
+//! above (see the crate manifest). Nothing outside the `real` module names a
+//! `usdt` type: [`register_dtrace_probes`] returns the crate-local
+//! [`ProbeRegistrationError`], so the `stub` arm needs no `usdt` at all.
+
+/// Failure returned by `register_dtrace_probes`.
+///
+/// Deliberately a crate-local type rather than `usdt::Error`. `usdt` is
+/// target-scoped to the `real` arm's target set, so its error type does not
+/// exist on `stub` targets, and the dispatcher calls `register_dtrace_probes` on
+/// EVERY platform. The `real` arm forwards `usdt::Error`'s own `Display` text
+/// verbatim, so what a user sees is unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeRegistrationError(String);
+
+impl ProbeRegistrationError {
+    /// Build a registration failure from an already-rendered message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// The failure text, as the underlying provider rendered it.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProbeRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProbeRegistrationError {}
 
 #[cfg(any(
     target_os = "macos",
@@ -1813,13 +1844,15 @@ mod real {
         carrick_usdt::signal__deliver!(|| (tid, pending));
     }
 
-    pub fn register_dtrace_probes() -> Result<(), usdt::Error> {
+    pub fn register_dtrace_probes() -> Result<(), super::ProbeRegistrationError> {
         // Install the compat reporter's per-event probe hook so every recorded
         // CompatEvent fires its DTrace probe. compat lives in the neutral
         // carrick-observability crate (no usdt dep) and only fires probes through
         // this hook; Linux/bhyve never install it. Idempotent (OnceLock).
         crate::compat::set_probe_hook(fire);
-        usdt::register_probes()
+        // `usdt::Error`'s own Display text, verbatim — the callers only ever
+        // render this, so the message is byte-identical to returning it directly.
+        usdt::register_probes().map_err(|err| super::ProbeRegistrationError::new(err.to_string()))
     }
 
     pub fn fire(event: &CompatEvent) {
@@ -1987,8 +2020,10 @@ mod real {
     )
 )))]
 mod stub {
-    //! No-op probe surface for backends whose host OS does not support `usdt`
-    //! (Linux, NetBSD). Every public item the `real` module exports is mirrored
+    //! No-op probe surface for the targets that link no `usdt` at all — NetBSD,
+    //! plus aarch64 linux/freebsd (see the module header: usdt 0.6's SDT backend
+    //! is x86-only, and its FreeBSD DTrace backend does not even compile on
+    //! aarch64). Every public item the `real` module exports is mirrored
     //! here with an IDENTICAL signature and an empty body, so the dispatcher's
     //! `crate::probes::…` call sites compile unchanged. The three non-probe
     //! helpers (`guest_mem_probe_points`/`guest_mem_copy`/`guest_mem_point`) are
@@ -2196,7 +2231,7 @@ mod stub {
     ) {
     }
 
-    pub fn register_dtrace_probes() -> Result<(), usdt::Error> {
+    pub fn register_dtrace_probes() -> Result<(), super::ProbeRegistrationError> {
         Ok(())
     }
 }
