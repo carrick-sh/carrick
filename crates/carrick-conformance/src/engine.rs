@@ -27,6 +27,129 @@ pub struct RunOutput {
     pub elapsed_ms: u64,
     pub run_id: String,
     pub argv: Vec<String>,
+    /// Evidence captured at the moment of a TIMEOUT, so the verdict can say
+    /// WHY the deadline was missed instead of just that it was. `None` when the
+    /// run did not time out (or the host could not answer).
+    pub timeout_evidence: Option<TimeoutEvidence>,
+}
+
+/// What the box looked like when a suite hit its deadline.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeoutEvidence {
+    /// CPU (user+sys) the carrick process had consumed, sampled just BEFORE the
+    /// kill. Low CPU against a long wall time means it was not spinning.
+    pub cpu_ms: Option<u64>,
+    /// 1-minute load average at the deadline.
+    pub loadavg_1m: Option<f64>,
+    /// Cores, so load can be read as an oversubscription ratio.
+    pub ncpu: usize,
+}
+
+/// Why a suite missed its deadline. A bare TIMEOUT conflates three very
+/// different situations, and the project has already been burned by treating
+/// them alike: a healthy `kill10` "timed out" at ~suite 1000 of a full-tier run
+/// purely because leaked guests had degraded the box, and no amount of staring
+/// at kill10 would ever have explained it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeoutKind {
+    /// Burned CPU the whole time: a real spin/livelock in carrick or the guest.
+    Spinning,
+    /// Got little CPU while the box was oversubscribed — the MEASUREMENT is
+    /// invalid, not the suite. Re-run it on a quiet box before believing it.
+    Starved,
+    /// Got little CPU while the box was idle: nobody was competing, so the
+    /// guest was waiting on something that never came. A real hang.
+    Blocked,
+    /// The host would not tell us (no CPU sample / no load average).
+    Unknown,
+}
+
+impl TimeoutKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimeoutKind::Spinning => "spinning",
+            TimeoutKind::Starved => "starved",
+            TimeoutKind::Blocked => "blocked",
+            TimeoutKind::Unknown => "unknown",
+        }
+    }
+
+    /// A starved run measured the BOX, not carrick, so it must not be recorded
+    /// as a carrick failure. Every other kind is a real signal.
+    pub fn is_measurement_failure(self) -> bool {
+        matches!(self, TimeoutKind::Starved)
+    }
+}
+
+/// Classify a missed deadline. Pure, so the thresholds are unit-testable
+/// without needing a wedged guest to hand.
+///
+/// The discriminator is CPU consumed vs wall elapsed, disambiguated by system
+/// load — because low CPU alone cannot separate "descheduled" from "blocked
+/// forever": both consume nothing. Load is what tells them apart. If the box
+/// was oversubscribed the suite was competing for cores; if it was idle, the
+/// guest had every chance to run and chose not to.
+pub fn classify_timeout(
+    cpu_ms: Option<u64>,
+    wall_ms: u64,
+    loadavg_1m: Option<f64>,
+    ncpu: usize,
+) -> TimeoutKind {
+    let (Some(cpu_ms), Some(load)) = (cpu_ms, loadavg_1m) else {
+        return TimeoutKind::Unknown;
+    };
+    if wall_ms == 0 || ncpu == 0 {
+        return TimeoutKind::Unknown;
+    }
+    let duty = cpu_ms as f64 / wall_ms as f64;
+    // A single-threaded spin sits near 1.0; a multi-threaded one exceeds it.
+    // 0.5 keeps a busy-but-not-pegged guest on the spinning side.
+    if duty >= 0.5 {
+        return TimeoutKind::Spinning;
+    }
+    // Oversubscribed = more runnable work than cores. 1.5x is deliberately
+    // conservative: below it, blaming the scheduler is not credible.
+    if load >= 1.5 * ncpu as f64 {
+        TimeoutKind::Starved
+    } else {
+        TimeoutKind::Blocked
+    }
+}
+
+/// CPU (user+sys) consumed by `pid`, sampled while it is still alive.
+#[cfg(target_os = "macos")]
+fn pid_cpu_ms(pid: i32) -> Option<u64> {
+    let mut ri: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: RUSAGE_INFO_V2 writes exactly one rusage_info_v2 through the
+    // struct address cast to `rusage_info_t*` — the same call carrick-host's
+    // `self_cpu_total_ns` makes, with another pid.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            &mut ri as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // ri_*_time are mach time units; on Apple Silicon the timebase is 1:1 with
+    // nanoseconds, and an exact conversion is not needed for a duty-cycle
+    // threshold.
+    Some(ri.ri_user_time.saturating_add(ri.ri_system_time) / 1_000_000)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pid_cpu_ms(_pid: i32) -> Option<u64> {
+    None
+}
+
+fn loadavg_1m() -> Option<f64> {
+    let mut avg = [0f64; 3];
+    // SAFETY: writes at most 3 doubles into a 3-element array.
+    let got = unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) };
+    (got >= 1).then_some(avg[0])
 }
 
 impl RunOutput {
@@ -316,12 +439,24 @@ fn run_one(
     let pid = child.id() as i32;
 
     let mut timed_out = false;
+    let mut timeout_evidence = None;
     let exit_code = loop {
         match child.try_wait()? {
             Some(status) => break status.code().unwrap_or(-1),
             None => {
                 if start.elapsed() >= deadline {
                     timed_out = true;
+                    // Sample BEFORE the kill: once the process is gone the host
+                    // can no longer tell us whether it was spinning or idle,
+                    // and that is the whole difference between "carrick hung"
+                    // and "this box was too busy to measure anything".
+                    timeout_evidence = Some(TimeoutEvidence {
+                        cpu_ms: pid_cpu_ms(pid),
+                        loadavg_1m: loadavg_1m(),
+                        ncpu: std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(0),
+                    });
                     kill_scoped(pid, run_id, engine, cleanup.as_ref());
                     // Reap whatever is left.
                     let _ = child.wait();
@@ -353,6 +488,7 @@ fn run_one(
         elapsed_ms: elapsed_ms(start.elapsed()),
         run_id: run_id.to_string(),
         argv,
+        timeout_evidence,
     })
 }
 
@@ -449,6 +585,81 @@ fn kill_scoped(pid: i32, run_id: &str, engine: Engine, cleanup: Option<&CarrickC
 
 #[cfg(test)]
 mod tests {
+    use super::{TimeoutKind, classify_timeout};
+
+    /// A bare TIMEOUT conflates three different worlds. These thresholds are the
+    /// line between "carrick is broken" and "this box was too busy to measure
+    /// anything", so they are pinned: a healthy `kill10` was once condemned as a
+    /// hang purely because leaked guests had degraded the machine.
+    #[test]
+    fn timeout_classification_separates_spinning_starved_and_blocked() {
+        // Burned CPU nearly the whole wall time: a real spin, regardless of load.
+        assert_eq!(
+            classify_timeout(Some(190_000), 200_000, Some(0.5), 10),
+            TimeoutKind::Spinning
+        );
+        assert_eq!(
+            classify_timeout(Some(190_000), 200_000, Some(40.0), 10),
+            TimeoutKind::Spinning,
+            "a spin is a spin even on a busy box"
+        );
+        // Idle process on an oversubscribed box: the scheduler starved it.
+        assert_eq!(
+            classify_timeout(Some(3_000), 200_000, Some(20.0), 10),
+            TimeoutKind::Starved
+        );
+        // Idle process on an IDLE box: nobody was competing, so it was waiting
+        // on something that never came. That is a real hang.
+        assert_eq!(
+            classify_timeout(Some(3_000), 200_000, Some(1.0), 10),
+            TimeoutKind::Blocked
+        );
+        // Right at the oversubscription line, blaming the scheduler is not
+        // credible below 1.5x.
+        assert_eq!(
+            classify_timeout(Some(3_000), 200_000, Some(14.9), 10),
+            TimeoutKind::Blocked
+        );
+        assert_eq!(
+            classify_timeout(Some(3_000), 200_000, Some(15.0), 10),
+            TimeoutKind::Starved
+        );
+    }
+
+    #[test]
+    fn timeout_classification_admits_when_the_host_did_not_answer() {
+        // Never guess: an unmeasured timeout must not masquerade as a diagnosis.
+        assert_eq!(
+            classify_timeout(None, 200_000, Some(20.0), 10),
+            TimeoutKind::Unknown
+        );
+        assert_eq!(
+            classify_timeout(Some(3_000), 200_000, None, 10),
+            TimeoutKind::Unknown
+        );
+        assert_eq!(
+            classify_timeout(Some(3_000), 0, Some(1.0), 10),
+            TimeoutKind::Unknown
+        );
+        assert_eq!(
+            classify_timeout(Some(3_000), 200_000, Some(1.0), 0),
+            TimeoutKind::Unknown
+        );
+    }
+
+    #[test]
+    fn only_starvation_is_a_measurement_failure() {
+        // Starved measured the box; everything else measured carrick.
+        assert!(TimeoutKind::Starved.is_measurement_failure());
+        for kind in [
+            TimeoutKind::Spinning,
+            TimeoutKind::Blocked,
+            TimeoutKind::Unknown,
+        ] {
+            assert!(!kind.is_measurement_failure(), "{kind:?} must still block");
+        }
+    }
+
     use super::*;
 
     #[test]

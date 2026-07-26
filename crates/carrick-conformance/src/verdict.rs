@@ -66,6 +66,11 @@ pub struct SuiteReport {
     pub docker: SideSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perf: Option<PerfSummary>,
+    /// For a TIMEOUT only: WHY the deadline was missed (spinning / starved /
+    /// blocked). A starved verdict measured the box, not carrick — see
+    /// [`crate::engine::classify_timeout`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_kind: Option<crate::engine::TimeoutKind>,
     /// diverging ids that are NOT excused (the regression set, or first-obs NEW set).
     pub new_diffs: Vec<String>,
     /// diverging ids excused by known_gaps or an unchanged baseline pair.
