@@ -176,6 +176,17 @@ struct Args {
     /// overwrite their cached results (use after rebuilding an image's contents).
     #[arg(long)]
     refresh_oracle: bool,
+    /// Require every selected suite to have a cached oracle, and FAIL UP FRONT
+    /// naming the misses instead of falling back to docker.
+    ///
+    /// For docker-less runners (a GitHub-hosted macOS runner executes guests on
+    /// the native backend — no entitlement, no nested virt — but has no Docker).
+    /// There, a cache miss would otherwise surface as a confusing mid-run docker
+    /// failure, or as a determinant-field change silently invalidating every key
+    /// and triggering a full fresh docker pass. Failing early, naming the
+    /// uncached suites, keeps the lane deterministic.
+    #[arg(long)]
+    require_cached_oracle: bool,
     /// Skip the pre-run image-freshness guard (which re-pulls carrick's copy of
     /// any image whose registry digest moved, so carrick and docker run the same
     /// bytes). Use offline or when you deliberately want carrick's cached image.
@@ -431,6 +442,37 @@ fn run() -> anyhow::Result<ExitCode> {
                 })
                 .unzip()
         };
+
+    // Docker-less lanes: refuse to start rather than fall back to docker
+    // mid-run. Naming every miss at once makes a determinant-field change
+    // (which invalidates the whole cache) obvious instead of looking like a
+    // broken runner.
+    if args.require_cached_oracle {
+        if args.refresh_oracle {
+            eprintln!("--require-cached-oracle conflicts with --refresh-oracle");
+            std::process::exit(2);
+        }
+        let missing: Vec<&str> = selected
+            .iter()
+            .zip(&cached)
+            .filter(|(_, hit)| hit.is_none())
+            .map(|(suite, _)| suite.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            eprintln!(
+                "--require-cached-oracle: {} of {n} selected suite(s) have no cached oracle for \
+                 platform {docker_platform:?}; this lane cannot run docker. Re-bless the cache on \
+                 a box with the images (`--refresh-oracle`) and commit it.",
+                missing.len()
+            );
+            for id in &missing {
+                eprintln!("  uncached: {id}");
+            }
+            std::process::exit(2);
+        }
+        eprintln!("oracle: all {n} selected suite(s) cached; running carrick-only");
+    }
+
     let stream = Mutex::new(std::fs::File::create(args.results_path()).ok());
     let streamed_reports = Mutex::new(Vec::new());
     let fail_fast_stop = AtomicBool::new(false);
