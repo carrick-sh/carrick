@@ -138,6 +138,10 @@ pub(crate) enum Commands {
         path: PathBuf,
         #[arg(long = "rootfs-layer")]
         rootfs_layers: Vec<PathBuf>,
+        /// Opt-in debugging bound on guest traps (default: unlimited). Use it to
+        /// stop a runaway guest while tracing; it is NOT a health check —
+        /// exceeding a fixed count of successfully-serviced syscalls says
+        /// nothing about whether the guest is stuck.
         #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
         max_traps: usize,
         /// Write a JSON dump of the guest address-space layout (PIE base,
@@ -326,6 +330,10 @@ pub(crate) enum Commands {
         /// installed.
         #[arg(long, value_name = "OS/ARCH")]
         platform: Option<String>,
+        /// Opt-in debugging bound on guest traps (default: unlimited). Use it to
+        /// stop a runaway guest while tracing; it is NOT a health check —
+        /// exceeding a fixed count of successfully-serviced syscalls says
+        /// nothing about whether the guest is stuck.
         #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
         max_traps: usize,
         /// See `run-elf --debug-state-path`.
