@@ -92,6 +92,66 @@ jobs:
           just test-integration
 
 
+  # The first CI lane that EXECUTES real guests on a GITHUB-HOSTED runner.
+  #
+  # Every other guest-executing lane here is dormant behind a self-hosted runner
+  # (kvm-smoke wants /dev/kvm, hvf-conformance wants an entitled Mac). The native
+  # backend needs NEITHER: no hypervisor, no com.apple.security.hypervisor, no
+  # nested virt — it runs guest code as host-native process state under MAP_JIT
+  # with ad-hoc signing (`codesign --sign -`, no Apple identity). It is also the
+  # backend carrick SHIPS by default, which the entitled HVF lane is not.
+  #
+  # Docker is absent on hosted macOS runners, and it is not needed: the committed
+  # oracle cache is keyed by the suite DECLARATION (not an image digest), so a
+  # routine gate executes carrick only and diffs against it. --require-cached-oracle
+  # turns a cache miss into an up-front failure naming the misses, instead of a
+  # confusing mid-run fallback to a docker that isn't there.
+  #
+  # Scope honestly: this proves the shipped backend still executes go/node/cpython
+  # workloads and matches the blessed oracle. It is the smoke tier (23 suites), not
+  # the full 2104-suite gate, and the oracle side is cached rather than re-observed.
+  #
+  # Not on pull_request: hosted macOS minutes bill at 10x, and the run is ~15-25
+  # min. Push-to-main, nightly, and manual keep the signal without taxing every PR.
+  native-conformance:
+    name: native backend · guest conformance (smoke)
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: macos-14 # Apple Silicon; hosted, unentitled
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # Guests need real fd headroom: carrick relocates its internal fds above
+      # the guest range, and 2048 is demonstrably too few (the default 256 far
+      # more so). Same sysctl+ulimit pattern as the unit-test steps above —
+      # `ulimit` does not persist across steps, so raise it in this shell.
+      - name: Native lane smoke (carrick-only, cached oracle)
+        run: |
+          sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=524288 || true
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)" || true
+          echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+          just conformance-native smoke --require-cached-oracle
+
+      # The per-suite jsonl is the evidence for a failed run: it carries each
+      # verdict plus, for a TIMEOUT, the starved-vs-blocked-vs-spinning
+      # classification that says whether the runner was merely overloaded.
+      - name: Upload conformance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-conformance-smoke
+          path: target/conformance/results.macos-native-dsr.smoke.jsonl
+          if-no-files-found: warn
+
   # L1 — cross-compile our OWNED crates for aarch64-linux + assert the
   # platform-linux dependency closure links NO macOS hypervisor (carrick-vmm-hvf /
   # applevisor). Proves the C4 decouple and the carrick-vmm-hvf/build.rs host-cfg
