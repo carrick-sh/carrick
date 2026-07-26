@@ -176,6 +176,28 @@ struct Args {
     /// overwrite their cached results (use after rebuilding an image's contents).
     #[arg(long)]
     refresh_oracle: bool,
+    /// Bless even though these suites TIMED OUT or CRASHED (repeatable).
+    ///
+    /// A timeout normally blocks a bless because there is no measured result to
+    /// bless. This is the deliberate, named exception for a KNOWN hang that we
+    /// are choosing to carry rather than let it hold the whole lane hostage.
+    ///
+    /// An allow-listed suite is NOT written to the baseline/overlay: recording
+    /// its timeout as the expected verdict would make a future run's identical
+    /// hang compare MATCH and silently stop gating. Leaving it unblessed means
+    /// it keeps failing against the shared baseline until it is actually fixed,
+    /// so every subsequent bless must name it again — the acknowledgement is
+    /// explicit and repeated, never inherited silently.
+    #[arg(long = "allow-hang", value_name = "SUITE")]
+    allow_hang: Vec<String>,
+    /// Bless from a COMPLETED run's results jsonl instead of re-running the gate.
+    ///
+    /// The bless is a pure function of a full run's reports, so a finished run
+    /// should not have to be repeated (hours) just to record it. Every
+    /// full-tier suite must be present in the file, otherwise a truncated or
+    /// filtered run would silently bless a subset.
+    #[arg(long, value_name = "PATH")]
+    bless_from: Option<PathBuf>,
     /// Require every selected suite to have a cached oracle, and FAIL UP FRONT
     /// naming the misses instead of falling back to docker.
     ///
@@ -406,6 +428,53 @@ fn run() -> anyhow::Result<ExitCode> {
         if refreshed > 0 {
             eprintln!("image-guard: re-pulled {refreshed} stale image(s)");
         }
+    }
+
+    // Bless a FINISHED run without repeating it: the bless is a pure function of
+    // a full run's reports. Guarded by a completeness check so a truncated or
+    // filtered results file cannot silently bless a subset of the tier.
+    if let Some(path) = args.bless_from.clone() {
+        if !args.bless {
+            eprintln!("--bless-from requires --bless");
+            return Ok(ExitCode::from(2));
+        }
+        let text = std::fs::read_to_string(&path)?; // nosemgrep
+        let reports: Vec<SuiteReport> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!("{}: malformed report line: {e}", path.display()))?;
+        let have: std::collections::BTreeSet<&str> =
+            reports.iter().map(|r| r.name.as_str()).collect();
+        let missing: Vec<&str> = selected
+            .iter()
+            .map(|s| s.name.as_str())
+            .filter(|name| !have.contains(name))
+            .collect();
+        if !missing.is_empty() {
+            eprintln!(
+                "--bless-from refused: {} of {} selected suite(s) are absent from {} — blessing a \
+                 partial run would drop them from the artifact. Finish the run first.",
+                missing.len(),
+                selected.len(),
+                path.display()
+            );
+            for name in missing.iter().take(20) {
+                eprintln!("  missing: {name}");
+            }
+            if missing.len() > 20 {
+                eprintln!("  ... and {} more", missing.len() - 20);
+            }
+            return Ok(ExitCode::from(2));
+        }
+        eprintln!(
+            "bless-from: {} report(s) loaded from {}",
+            reports.len(),
+            path.display()
+        );
+        bless(&args, &selected, tier, &reports)?;
+        return Ok(ExitCode::SUCCESS);
     }
 
     let n = selected.len();
@@ -938,6 +1007,56 @@ fn bless_blocks(target: BlessTarget, verdict: Verdict) -> bool {
     }
 }
 
+/// How a run's reports partition against the bless gate. Pure (no IO) so the
+/// policy is unit-tested directly; the side-effecting [`bless`] only prints and
+/// writes what this decides.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BlessGate<'a> {
+    /// Suites that must be resolved before this target can be blessed.
+    blocking: Vec<&'a str>,
+    /// Suites whose hang is deliberately carried via `--allow-hang`. Waived from
+    /// `blocking` AND withheld from the written artifact.
+    carried: Vec<&'a str>,
+    /// `--allow-hang` names that did not actually block — a stale allowlist.
+    stale: Vec<&'a str>,
+    /// Timeouts that measured an oversubscribed box rather than carrick.
+    starved: Vec<&'a str>,
+}
+
+fn bless_gate<'a>(
+    target: BlessTarget,
+    reports: &'a [SuiteReport],
+    allow_hang: &'a [String],
+) -> BlessGate<'a> {
+    let allowed: std::collections::BTreeSet<&str> = allow_hang.iter().map(String::as_str).collect();
+    let carried: Vec<&str> = reports
+        .iter()
+        .filter(|r| bless_blocks(target, r.verdict) && allowed.contains(r.name.as_str()))
+        .map(|r| r.name.as_str())
+        .collect();
+    BlessGate {
+        blocking: reports
+            .iter()
+            .filter(|r| bless_blocks(target, r.verdict) && timeout_blocks_bless(r.timeout_kind))
+            .map(|r| r.name.as_str())
+            .filter(|name| !allowed.contains(name))
+            .collect(),
+        // A name that no longer blocks is stale: report it so the list gets
+        // pruned once the hang is fixed, instead of waiving a suite forever.
+        stale: allowed
+            .iter()
+            .copied()
+            .filter(|name| !carried.contains(name))
+            .collect(),
+        carried,
+        starved: reports
+            .iter()
+            .filter(|r| !timeout_blocks_bless(r.timeout_kind))
+            .map(|r| r.name.as_str())
+            .collect(),
+    }
+}
+
 fn bless(
     args: &Args,
     selected: &[Suite],
@@ -953,19 +1072,35 @@ fn bless(
     // truth; a bring-up-lane bless writes ONLY that lane's overlay instead, so it
     // can never overwrite them with lane-specific observations.
     let target = bless_target(&args.lane).map_err(|e| anyhow::anyhow!(e))?;
-    let bad: Vec<&str> = reports
-        .iter()
-        .filter(|r| bless_blocks(target, r.verdict) && timeout_blocks_bless(r.timeout_kind))
-        .map(|r| r.name.as_str())
-        .collect();
+    // Deliberately-carried hangs (--allow-hang). Named, warned, and left OUT of
+    // the written artifact so the hang keeps gating until it is really fixed.
+    let BlessGate {
+        blocking: bad,
+        carried,
+        stale,
+        starved,
+    } = bless_gate(target, reports, &args.allow_hang);
+    if !stale.is_empty() {
+        eprintln!(
+            "warning: --allow-hang named {} suite(s) that did NOT time out or crash; drop them \
+             from the invocation: {}",
+            stale.len(),
+            stale.join(", ")
+        );
+    }
+    if !carried.is_empty() {
+        eprintln!(
+            "warning: --allow-hang: blessing WITHOUT {} unresolved hang(s): {}. They are left \
+             UNBLESSED (absent from the written artifact), so they keep failing against the \
+             shared baseline and every future bless must name them again.",
+            carried.len(),
+            carried.join(", ")
+        );
+    }
+
     // Starved suites do not block, but they are NOT a clean bill of health:
     // their measurements were invalid, so say so loudly rather than let a
     // degraded box pass for a green one.
-    let starved: Vec<&str> = reports
-        .iter()
-        .filter(|r| !timeout_blocks_bless(r.timeout_kind))
-        .map(|r| r.name.as_str())
-        .collect();
     if !starved.is_empty() {
         eprintln!(
             "warning: {} suite(s) TIMED OUT while the box was oversubscribed (STARVED) — their \
@@ -989,6 +1124,18 @@ fn bless(
         );
     }
     let _ = selected; // (kept for symmetry / future per-suite bless)
+    // Drop the carried hangs: a timeout has no measured result, so writing one
+    // would bless "it hangs" as the expectation and retire the signal.
+    let written: Vec<SuiteReport> = if carried.is_empty() {
+        reports.to_vec()
+    } else {
+        reports
+            .iter()
+            .filter(|r| !carried.contains(&r.name.as_str()))
+            .cloned()
+            .collect()
+    };
+    let reports: &[SuiteReport] = &written;
     match target {
         BlessTarget::SharedBaseline => {
             write_baseline_reports(&args.baseline, reports)?;
@@ -2215,6 +2362,95 @@ mod tests {
         let cached_without_timing = perf_summary(12_345, None);
         assert_eq!(cached_without_timing.oracle_ms, None);
         assert_eq!(cached_without_timing.carrick_to_oracle_ratio, None);
+    }
+
+    fn gate_report(
+        name: &str,
+        verdict: Verdict,
+        timeout_kind: Option<crate::engine::TimeoutKind>,
+    ) -> SuiteReport {
+        SuiteReport {
+            name: name.to_string(),
+            ecosystem: "ltp".to_string(),
+            tier: "full".to_string(),
+            verdict,
+            gating: false,
+            carrick: SideSummary {
+                result: parsers::SuiteOutcome::Success,
+                totals: parsers::Totals::default(),
+            },
+            docker: SideSummary {
+                result: parsers::SuiteOutcome::Success,
+                totals: parsers::Totals::default(),
+            },
+            perf: None,
+            timeout_kind,
+            new_diffs: Vec::new(),
+            known_diffs: Vec::new(),
+            carrick_run_id: "conf-test-c00".to_string(),
+            docker_run_id: "<cached>".to_string(),
+            carrick_argv: vec!["carrick".to_string()],
+            docker_argv: vec!["docker".to_string()],
+            pairs: Default::default(),
+        }
+    }
+
+    /// `--allow-hang` waives a named hang from the bless gate WITHOUT turning it
+    /// into a blessed expectation: the suite lands in `carried` (withheld from the
+    /// written artifact by `bless`) rather than merely dropping out of `blocking`.
+    /// Blessing "it times out" would make the next identical hang compare MATCH.
+    #[test]
+    fn allow_hang_carries_named_hangs_and_still_blocks_the_rest() {
+        use crate::engine::TimeoutKind;
+        let target = BlessTarget::LaneOverlay("native-dsr");
+        let reports = [
+            gate_report(
+                "ltp-epoll-ltp",
+                Verdict::Timeout,
+                Some(TimeoutKind::Blocked),
+            ),
+            gate_report("ltp-select04", Verdict::Timeout, Some(TimeoutKind::Blocked)),
+            gate_report("ltp-other", Verdict::Timeout, Some(TimeoutKind::Blocked)),
+            gate_report("ltp-fine", Verdict::Match, None),
+        ];
+
+        let allow = vec!["ltp-epoll-ltp".to_string(), "ltp-select04".to_string()];
+        let gate = bless_gate(target, &reports, &allow);
+        assert_eq!(gate.carried, vec!["ltp-epoll-ltp", "ltp-select04"]);
+        // An un-named hang still blocks: the waiver is per-suite, not a blanket
+        // "ignore timeouts" switch.
+        assert_eq!(gate.blocking, vec!["ltp-other"]);
+        assert!(gate.stale.is_empty());
+
+        // With no allowlist every hang blocks and nothing is carried.
+        let gate = bless_gate(target, &reports, &[]);
+        assert_eq!(
+            gate.blocking,
+            vec!["ltp-epoll-ltp", "ltp-select04", "ltp-other"]
+        );
+        assert!(gate.carried.is_empty());
+    }
+
+    /// An allowlist entry that no longer hangs is reported as stale, so a fixed
+    /// suite's waiver gets pruned instead of silently exempting it forever.
+    #[test]
+    fn allow_hang_reports_stale_entries_and_leaves_starved_unblocking() {
+        use crate::engine::TimeoutKind;
+        let target = BlessTarget::LaneOverlay("native-dsr");
+        let reports = [
+            gate_report("ltp-fixed", Verdict::Match, None),
+            gate_report("ltp-noisy", Verdict::Timeout, Some(TimeoutKind::Starved)),
+        ];
+
+        let allow = vec!["ltp-fixed".to_string(), "ltp-never-ran".to_string()];
+        let gate = bless_gate(target, &reports, &allow);
+        // Neither name is carried: one passed, the other is not in the run at all.
+        assert!(gate.carried.is_empty());
+        assert_eq!(gate.stale, vec!["ltp-fixed", "ltp-never-ran"]);
+        // A STARVED timeout measured the box, so it neither blocks nor is carried
+        // — it is surfaced separately.
+        assert!(gate.blocking.is_empty());
+        assert_eq!(gate.starved, vec!["ltp-noisy"]);
     }
 
     #[test]
