@@ -2970,6 +2970,36 @@ impl SyscallDispatcher {
         Some((read_fd, capacity.saturating_sub(queued)))
     }
 
+    /// Room in a host-pipe destination, in bytes — `None` when `fd` is not a
+    /// host pipe. Uses the same accounting the write path applies
+    /// ([`super::host_pipe_write_room`]), so a `splice(2)` that bounds its read
+    /// window by this value never hands the writer more than the pipe can take.
+    /// Unlike [`Self::host_pipe_splice_staging_target`] this accepts any host
+    /// pipe write end, including pty and bidirectional ends.
+    fn splice_pipe_write_room(&self, fd: i32) -> Option<usize> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        let OpenDescription::HostPipe {
+            base,
+            pipe_id,
+            is_read_end,
+            bidirectional,
+            host_fd,
+            ..
+        } = &*open
+        else {
+            return None;
+        };
+        let (capacity, queued) = self.host_pipe_capacity_state(
+            base,
+            *pipe_id,
+            *is_read_end,
+            *bidirectional,
+            host_fd.raw(),
+        )?;
+        super::host_pipe_write_room(capacity, queued)
+    }
+
     pub(in crate::dispatch) fn host_pipe_capacity_state(
         &self,
         base: &OpenDescriptionBase,
@@ -3569,7 +3599,36 @@ impl SyscallDispatcher {
         bytes: &[u8],
         tid: crate::thread::ThreadId,
     ) -> DispatchOutcome {
-        let nonblocking = self.io_is_nonblocking(fd, 0);
+        self.write_output_fd_inner(fd, bytes, tid, false)
+    }
+
+    /// `splice(2)` flavour of [`Self::write_output_fd`]: the destination is
+    /// written with non-blocking semantics, so a pipe that fills mid-transfer
+    /// yields a SHORT count (or `EAGAIN` when nothing moved) instead of parking
+    /// until every byte is delivered.
+    ///
+    /// `write(2)` must deliver the whole buffer and may block to do it;
+    /// `splice(2)` explicitly may transfer fewer bytes than requested and
+    /// leaves the loop to the caller. Using the `write(2)` contract for splice
+    /// deadlocks whenever the only reader is the same single-threaded guest —
+    /// it cannot drain the pipe until the splice it is blocked in returns.
+    fn write_output_fd_partial(
+        &self,
+        fd: i32,
+        bytes: &[u8],
+        tid: crate::thread::ThreadId,
+    ) -> DispatchOutcome {
+        self.write_output_fd_inner(fd, bytes, tid, true)
+    }
+
+    fn write_output_fd_inner(
+        &self,
+        fd: i32,
+        bytes: &[u8],
+        tid: crate::thread::ThreadId,
+        partial_ok: bool,
+    ) -> DispatchOutcome {
+        let nonblocking = partial_ok || self.io_is_nonblocking(fd, 0);
         // Mirror `write`/`writev`: any fd present in `open_files` (e.g.
         // after a dup3 over stdio) takes precedence over the built-in
         // stdout/stderr buffers. Without this, `busybox cat`'s
@@ -8837,9 +8896,39 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
             }
 
+            // splice(2) into a pipe moves at most what the pipe can hold and
+            // returns a SHORT count; the caller loops. `write_output_fd` below
+            // implements write(2) semantics instead — deliver every byte, parking
+            // on POLLOUT when the pipe fills — so handing it more than the
+            // destination's room deadlocks whenever the only reader is the same
+            // single-threaded guest. coreutils `cat` drains its bounce pipe only
+            // AFTER this splice returns, so `cat` of any file larger than one
+            // pipe-full parked forever. Bound the read window by the room the
+            // write path itself accounts for (`host_pipe_write_room`).
+            let count = match this.splice_pipe_write_room(out_fd.0) {
+                Some(room) if room > 0 => count.min(room),
+                // Full pipe (or not a plain one-way host pipe): leave `count`
+                // alone. A genuinely full pipe is exactly the case blocking
+                // splice(2) is specified to wait out, and the write path's own
+                // staging handles it.
+                _ => count,
+            };
             let mut offset = this.sendfile_offset(in_fd.0, off_in_address, memory)??;
             let bytes = this.sendfile_bytes(in_fd.0, offset, count)?;
-            let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
+            let outcome = match this.write_output_fd_partial(out_fd.0, &bytes, tid) {
+                // Nothing moved: the destination pipe is full. SPLICE_F_NONBLOCK
+                // reports EAGAIN; a blocking splice(2) must wait for room. Waiting
+                // is safe in exactly this case — a full pipe can only be drained by
+                // a DIFFERENT thread, so the write(2)-semantics path cannot
+                // self-deadlock the way it does on a partially-filled pipe.
+                DispatchOutcome::Errno { errno } if errno == LINUX_EAGAIN => {
+                    if splice_flags.contains(LinuxSpliceFlags::NONBLOCK) {
+                        return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                    }
+                    this.write_output_fd(out_fd.0, &bytes, tid)
+                }
+                other => other,
+            };
             let DispatchOutcome::Returned { value } = outcome else {
                 return Ok(outcome);
             };
@@ -8855,6 +8944,21 @@ impl SyscallDispatcher {
                         | OpenDescription::SyntheticFile {
                             offset: current, ..
                         } => *current = offset,
+                        // Same contract as `sendfile`: HostFile reads via `pread`
+                        // (sendfile_bytes), which does NOT advance the kernel
+                        // offset, and `sendfile_offset` reads that offset back
+                        // with `lseek(SEEK_CUR)`. Advance it explicitly or the
+                        // next iteration re-reads the same window. Without this,
+                        // coreutils `cat` — which drains a file through a pipe
+                        // with `splice(file, NULL, pipe, NULL, n)` in a loop —
+                        // re-sends offset 0 forever and never reaches EOF.
+                        OpenDescription::HostFile { host_fd, .. } => {
+                            // SAFETY: host_fd is a live regular-file fd owned by
+                            // this guest fd; lseek to an absolute position is benign.
+                            unsafe {
+                                libc::lseek(host_fd.raw(), offset as libc::off_t, libc::SEEK_SET);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -11829,6 +11933,122 @@ mod tests {
             .take_splice_pipe_bytes(read_fd, host_read, 6)
             .expect("take staged bytes");
         assert_eq!(bytes, b"abcdef");
+    }
+
+    /// `splice(2)` from a host-backed file into a pipe must BOTH advance the
+    /// source's kernel offset when `off_in` is NULL AND return a SHORT count
+    /// bounded by the destination pipe. `write(2)` may block until every byte
+    /// lands; `splice(2)` may not — and coreutils `cat` drains its bounce pipe
+    /// only AFTER the splice returns, so a "deliver it all" splice deadlocks a
+    /// single-threaded guest, while a non-advancing offset re-sends byte 0
+    /// forever. Both shapes hung `cat` on `ubuntu:latest` (uutils).
+    #[test]
+    fn splice_host_file_to_pipe_returns_short_and_advances_offset() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("carrick-splice-loop-{}", std::process::id()));
+        // Larger than any pipe buffer, so one splice CANNOT move it all.
+        let contents = vec![0xa5u8; 512 * 1024];
+        std::fs::write(&path, &contents).expect("write splice source");
+
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let host_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
+        assert!(host_fd >= 0, "open splice source");
+
+        let dispatcher = SyscallDispatcher::new();
+        let source = OpenFile::new(
+            Arc::new(RwLock::new(OpenDescription::HostFile {
+                host_fd: HostFdRef::new(host_fd),
+                metadata: RootFsMetadata {
+                    path: path.clone(),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o644,
+                    size: contents.len(),
+                },
+                base: OpenDescriptionBase::new(0),
+                writable: false,
+            })),
+            0,
+        );
+        let in_fd = dispatcher
+            .install_fd_at_or_above(3, source)
+            .expect("install splice source fd");
+
+        let mut host_pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(host_pipe.as_mut_ptr()) }, 0);
+        let read_open = OpenFile::new(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_pipe[0]),
+                is_read_end: true,
+                pipe_id: 4242,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+            })),
+            0,
+        );
+        let write_open = OpenFile::new(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_pipe[1]),
+                is_read_end: false,
+                pipe_id: 4242,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+            })),
+            0,
+        );
+        let (_read_fd, write_fd) = dispatcher
+            .install_fd_pair_at_or_above(4, read_open, write_open)
+            .expect("install host pipe pair");
+
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let outcome = dispatcher
+            .dispatch_normalized(
+                SyscallRequest::new(
+                    76,
+                    SyscallArgs::from([
+                        in_fd as u64,
+                        0,
+                        write_fd as u64,
+                        0,
+                        contents.len() as u64,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .expect("splice is a claimed syscall")
+            .expect("splice must not be a fatal DispatchError");
+
+        let DispatchOutcome::Returned { value } = outcome else {
+            let _ = std::fs::remove_file(&path);
+            panic!(
+                "splice into a pipe must return a count, got {outcome:?}: a \
+                 write(2)-style transfer that parks until every byte lands \
+                 deadlocks a single-threaded guest"
+            );
+        };
+        let moved = usize::try_from(value).expect("non-negative splice count");
+        assert!(moved > 0, "splice moved nothing");
+        assert!(
+            moved < contents.len(),
+            "expected a SHORT transfer bounded by the pipe, moved all {moved}"
+        );
+
+        // `off_in` was NULL, so the source's kernel offset must have advanced by
+        // exactly what moved; otherwise the next iteration re-reads byte 0.
+        let pos = unsafe { libc::lseek(host_fd, 0, libc::SEEK_CUR) };
+        assert_eq!(
+            pos, moved as i64,
+            "a NULL off_in splice must advance the source offset"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
