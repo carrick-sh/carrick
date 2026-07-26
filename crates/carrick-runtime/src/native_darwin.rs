@@ -4679,22 +4679,68 @@ fn dispatch_native_syscall_inner<const PROFILE: bool>(
     }
 }
 
-fn native_unsafe_postfork_threads_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+/// Opt-OUT escape hatch: restore the historical blanket refusal of guest thread
+/// creation in a fork child.
+///
+/// The polarity is deliberately inverted from the original
+/// `CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS` opt-IN. Post-fork thread creation is
+/// now permitted by default (see [`native_clone_thread_rejection`]); this exists
+/// so a wedge found in the field can be re-guarded without a rebuild, not
+/// because the refusal is expected to be needed.
+fn native_refuse_postfork_threads_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value == Some(std::ffi::OsStr::new("1"))
 }
 
 fn native_clone_thread_rejection(memory: &SharedNativeMemory) -> Option<&'static str> {
-    let unsafe_postfork_threads = native_unsafe_postfork_threads_enabled(
-        std::env::var_os("CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS").as_deref(),
-    );
-    if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire)
-        && !unsafe_postfork_threads
-    {
-        return Some(
-            "native Darwin cannot create guest threads in a fork child: emulated execve cannot reset the host libdispatch post-fork state",
-        );
+    // HISTORY: this used to refuse ALL guest thread creation in a fork child,
+    // because "forked guest exec cannot safely reinitialize Darwin libdispatch"
+    // — a real observed libdispatch host trap, not a theoretical one (f56eaa95,
+    // 2026-07-11). That premise no longer holds, and the refusal cost more than
+    // it bought:
+    //
+    //   * The reason expired two days later. The fork-child host self-reexec
+    //     (a8b33532, 2026-07-13) does exactly the host-state reinitialization
+    //     this message says is impossible.
+    //   * Carrick never calls libdispatch. The genuine CF/LaunchServices hazard
+    //     was a `proctitle` Mach round-trip to launchservicesd, and it was fixed
+    //     by not calling CF at all (see dispatch/proctitle.rs) — a different bug
+    //     from creating a thread.
+    //   * The VMM lane never had this restriction; its fork child rebuilds a
+    //     fresh VM and spawns threads freely. Refusing here made the SHIPPED
+    //     default backend less capable than the one it is replacing.
+    //   * It broke real Linux programs. Creating a thread in a fork child is
+    //     ordinary POSIX; it failed `test_threading.ThreadJoinOnShutdown`
+    //     tests 2 and 3 with "can't start new thread".
+    //   * It was expensive. LTP's tst_test framework forks and then wants a
+    //     thread; the refusal forced a slow fallback worth ~30s per suite.
+    //
+    // Retired on evidence, not reasoning: 2x the full conformance smoke tier at
+    // 23/23 with no hang (including 278 fork+exec-heavy cpython-subprocess
+    // tests), 200 fork->thread->join cycles, and 100 fork->LIVE-thread->execve
+    // cycles — that last being precisely the sequence the original message
+    // named — all clean.
+    if let Some(reason) = postfork_thread_refusal(
+        NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire),
+        std::env::var_os("CARRICK_NATIVE_REFUSE_POSTFORK_THREADS").as_deref(),
+    ) {
+        return Some(reason);
     }
     memory.read().native16k_clone_thread_rejection()
+}
+
+/// The post-fork thread decision, as a pure function of its two inputs, so the
+/// policy can be unit tested without mutating the `NATIVE_FORKED_GUEST_CHILD`
+/// process-global (which would leak across the serial test suite).
+fn postfork_thread_refusal(
+    is_fork_child: bool,
+    refuse_env: Option<&std::ffi::OsStr>,
+) -> Option<&'static str> {
+    if is_fork_child && native_refuse_postfork_threads_enabled(refuse_env) {
+        return Some(
+            "guest thread creation in a fork child refused by CARRICK_NATIVE_REFUSE_POSTFORK_THREADS",
+        );
+    }
+    None
 }
 
 /// Preserve one guest deadline across internal readiness re-dispatches, even
@@ -8570,19 +8616,58 @@ mod tests {
     }
 
     #[test]
-    fn native_unsafe_postfork_threads_requires_exact_one() {
+    fn native_refuse_postfork_threads_requires_exact_one() {
         use std::ffi::OsStr;
 
-        assert!(!native_unsafe_postfork_threads_enabled(None));
+        // Unset means "do not refuse" — post-fork guest thread creation is
+        // permitted by default. This is the inverse of the historical
+        // CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS opt-in, so the unset case is
+        // the one that matters most: a typo in the variable name must leave
+        // threads WORKING, not silently re-enable a refusal that broke real
+        // Linux programs and cost ~30s per LTP suite.
+        assert!(!native_refuse_postfork_threads_enabled(None));
         for value in ["", "0", "true", "01", "yes"] {
             assert!(
-                !native_unsafe_postfork_threads_enabled(Some(OsStr::new(value))),
+                !native_refuse_postfork_threads_enabled(Some(OsStr::new(value))),
                 "unexpectedly accepted {value:?}"
             );
         }
-        assert!(native_unsafe_postfork_threads_enabled(Some(OsStr::new(
+        assert!(native_refuse_postfork_threads_enabled(Some(OsStr::new(
             "1"
         ))));
+    }
+
+    /// Pins the behaviour retired in the post-fork-threads change: a fork child
+    /// may create guest threads. Creating a thread after `fork(2)` is ordinary
+    /// POSIX — CPython's `ThreadJoinOnShutdown` tests 2/3 do exactly it — and
+    /// carrick refused it for months on the SHIPPED default backend, which also
+    /// cost ~30s per LTP suite because `tst_test` forks and then wants a thread.
+    /// If this ever returns `Some` for the default (unset) configuration again,
+    /// those failures come back silently.
+    #[test]
+    fn fork_child_may_create_guest_threads_by_default() {
+        use std::ffi::OsStr;
+
+        // The case that matters: a fork child, no override set.
+        assert_eq!(postfork_thread_refusal(true, None), None);
+        // A non-child is never refused either way.
+        assert_eq!(postfork_thread_refusal(false, None), None);
+        assert_eq!(
+            postfork_thread_refusal(false, Some(OsStr::new("1"))),
+            None,
+            "the refusal is scoped to fork children"
+        );
+        // The opt-OUT escape hatch still works, for re-guarding a field wedge
+        // without a rebuild.
+        assert!(postfork_thread_refusal(true, Some(OsStr::new("1"))).is_some());
+        // A typo must fail OPEN (threads keep working), not closed.
+        for typo in ["", "0", "true", "yes", "01"] {
+            assert_eq!(
+                postfork_thread_refusal(true, Some(OsStr::new(typo))),
+                None,
+                "{typo:?} must not re-enable the refusal"
+            );
+        }
     }
 
     #[test]
