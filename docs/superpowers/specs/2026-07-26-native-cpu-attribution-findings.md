@@ -102,6 +102,56 @@ emulation alone:
    i-cache/iTLB working-set problem independent of instruction quality. NOT yet
    measured — needs Instruments/`kperf` PMCs, which DTrace cannot read.
 
+## Root cause: exclusive fusion is fail-closed in the mode we ship
+
+The translator already has the fix. `block::analyze_exclusive_region` fuses an
+`LDXR..STXR` region into one self-contained block precisely so it does not trap.
+It is not firing, and the counters say exactly why:
+
+| fusion disposition | count |
+|---|---|
+| `fusion_eligible_backend_disabled` | **14,916,457** |
+| `fusion_not_load` | 14,853,470 (the `STXR` halves — expected) |
+| `fusion_fused_direct` | **9** |
+| `fusion_virtualized_operand` / `_base` | 0 |
+| `fusion_biased_no_safe_scratch` | 0 |
+| every other rejection | 0 |
+
+Nothing is being *rejected*. 14.9M sites are eligible, a safe scratch register is
+available at all of them, and the backend is disabled by policy:
+
+```rust
+let fusion_policy = match memory.address_mode() {
+    NativeAddressMode::Direct => ExclusiveFusionPolicy::Direct,
+    NativeAddressMode::Biased { .. } => ExclusiveFusionPolicy::BiasedDisabled,
+};
+```
+
+> Biased execution stays fail-closed until forced asynchronous recovery proves
+> that every guest register and NZCV mutation in an accepted region can be
+> rolled back.
+
+Fusion ships enabled only in **Direct** address mode. Production runs **Biased**.
+So the gate is one correctness obligation — rollback of guest register and NZCV
+state when a forced asynchronous exit lands inside an accepted region — and
+discharging it converts 14.9M traps per hello-world build into fused blocks.
+
+This was a deliberate, documented fail-closed choice, not an oversight. What is
+new here is its measured price on a real workload.
+
+## Calibration: what a same-ISA translator should cost
+
+Published same-ISA-family DBT (AArch32→AArch64, MAMBO, PLDI'16) runs at **under
+7.5% geometric-mean overhead**. We are at ~4000%. That gap is not the intrinsic
+cost of translation — it is the cost of leaving translated code 38.9M times.
+Treat any "translation is inherently expensive" reasoning as refuted.
+
+The literature also names the next lever after this one: **chaining/hyperchaining**,
+patching direct branches block-to-block at translation time and extending the
+same treatment to indirect branches, so blocks stop returning to the dispatcher.
+That maps onto our remaining 20% `exit_resolve_indirect` and 3.6%
+`exit_resolve_direct`.
+
 ## Secondary: capsule work repeated per process
 
 ~18% of all CPU is carrick re-running container/capsule setup on each of the 65
@@ -138,12 +188,18 @@ re-measure translation before sizing AOT.**
 
 ## Ranked directions
 
-1. **Run exclusive load/store natively instead of trapping.** Removes 76% of
-   gateway exits, shrinks per-block glue, lengthens blocks, and cuts translation
-   volume — the only single change that plausibly moves a 40x gap materially.
-   Same-ISA aarch64-on-aarch64 with identity-mapped guest memory is the
-   favourable case; the open question is why the exclusive monitor cannot be
-   used directly today.
+1. **Make biased-mode exclusive fusion correct, and make it the only path.**
+   This is not a flag to add. The performance is required, so `BiasedDisabled`
+   must stop being what production runs — not become something a deployment can
+   opt into. The work is the correctness obligation the comment names: prove
+   that a forced asynchronous exit landing inside an accepted region can roll
+   back every guest register and NZCV mutation, then delete the disabled
+   production path. If a switch is still wanted for differential testing it is a
+   COMPILE feature, never an environment variable: an env-gated fast path means
+   the shipped default is the slow one, which is the situation being fixed.
+   Removes 76% of gateway exits, shrinks per-block glue, lengthens blocks, and
+   cuts translation volume — the only single change that plausibly moves a 40x
+   gap materially.
 2. **Cut per-gateway-entry cost.** 11.4 s of cache-index lookup across 38.9M
    entries is ~290 ns per entry. Even with (1), indirect resolves remain 20% of
    exits.
