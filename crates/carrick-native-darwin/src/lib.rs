@@ -20,6 +20,7 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod aot;
 pub mod jit;
 
 #[cfg(target_arch = "aarch64")]
