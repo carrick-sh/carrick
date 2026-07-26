@@ -674,7 +674,14 @@ pub mod runtime {
     ))]
     use crate::threaded_loop::{HostBackend, run_threaded_loop};
 
-    pub const DEFAULT_MAX_TRAPS: usize = 1_000_000;
+    /// Default guest trap budget: **unlimited** — see the macOS `runtime`
+    /// module's copy for the full rationale. Short version: the old
+    /// `1_000_000` watchdog killed real workloads (a legitimate CPython
+    /// `unittest` exceeds it, and the conformance harness overrode it on every
+    /// invocation), so a fixed count of successfully-serviced syscalls is not a
+    /// useful stuck-guest signal. `--max-traps N` stays as an opt-in debugging
+    /// bound.
+    pub const DEFAULT_MAX_TRAPS: usize = usize::MAX;
     pub(crate) const ROSETTA_INTERPRETER: &str =
         "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
     pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
