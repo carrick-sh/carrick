@@ -1020,6 +1020,31 @@ mod real {
         /// dtrace operators can see exactly how the guest invokes a
         /// child (e.g. apt's sqv method calling /usr/bin/sqv).
         fn execve__argv(_: u32, _: &str, _: &str) {}
+        /// This process's own carrick image base and ASLR slide.
+        ///
+        /// Guest processes on the native lane are host processes that
+        /// SELF-REEXEC, so each carries a different slide from the supervisor
+        /// and from its siblings. DTrace resolves a user PC to a symbol only
+        /// while the owning process is still alive; guest toolchain processes
+        /// live for milliseconds to seconds, so by the time a profile is read
+        /// almost every sampled PC belongs to a process that no longer exists
+        /// and resolves to bare hex. A profile that cannot name its own hot
+        /// code is not evidence.
+        ///
+        /// Firing this once per guest process lets a consumer keep a pid ->
+        /// base map and symbolicate OFFLINE, after exit, against the on-disk
+        /// binary (`scripts/symbolicate.py`). `guest_base` carries the guest
+        /// ELF's load address for the same reason: the native lane maps guest
+        /// text into the same address space, so a sampled PC can legitimately
+        /// land in the guest image rather than in ours.
+        fn host__image__base(_: u32, _: u64, _: i64, _: &str) {}
+        /// The INNER guest image: `pid`, load base, entry, and path.
+        ///
+        /// Reported separately from `host-image-base` because they are two
+        /// different files at two different bases sharing one address space.
+        /// A guest PC resolved against carrick's symbol table produces a name,
+        /// not an error -- so the two must never be conflated.
+        fn guest__image__base(_: u32, _: u64, _: u64, _: &str) {}
         /// Host-pipe I/O: `dir` is 0 for read, 1 for write; `n` is the
         /// byte count (negative on error). Used to trace whether a forked
         /// child's stdout actually reaches the parent's pipe read.
@@ -1486,6 +1511,71 @@ mod real {
             .collect::<Vec<_>>()
             .join(" ");
         carrick_usdt::execve__argv!(|| (std::process::id(), path, joined.as_str()));
+    }
+
+    /// Publish this process's carrick image base / ASLR slide for offline
+    /// symbolication. See the `host__image__base` provider doc for why a
+    /// per-process announcement is required rather than one global base.
+    ///
+    /// Reports the HOST (carrick) image only. The inner guest image is a
+    /// separate address range with a separate on-disk file, announced by
+    /// [`guest_image_base`]; a consumer needs both, and conflating them
+    /// resolves a guest PC against carrick's symbol table, which yields a
+    /// plausible name that is simply wrong.
+    pub fn host_image_base() {
+        // Image 0 is the main executable. The mach_header address IS the
+        // runtime __TEXT base, which is what `atos -l` wants; the slide is
+        // reported alongside it so a consumer can convert either way, and the
+        // path so nobody has to GUESS which binary to symbolicate against --
+        // a rebuilt or stale `target/release/carrick` otherwise resolves to
+        // confident nonsense rather than to an error.
+        //
+        // `mach2` rather than `libc`: libc deprecated these in its favour, and
+        // the workspace denies warnings.
+        //
+        // SAFETY: all three are dyld queries taking an image index that is
+        // always valid (index 0 exists in every Mach-O process). The header
+        // pointer is only read as an integer, never dereferenced; the name is a
+        // dyld-owned NUL-terminated string that lives as long as the image, so
+        // the borrow taken here cannot dangle.
+        #[cfg(target_os = "macos")]
+        {
+            // The probe macro expands to its own `unsafe`, so the FFI is scoped
+            // tightly here rather than wrapping the fire as well. The path is
+            // taken as an owned String inside the block: the borrow would
+            // otherwise be tied to a temporary `CStr` built from a raw pointer.
+            // This fires once per guest process, so the allocation is free in
+            // any sense that matters.
+            let (base, slide, path) = unsafe {
+                let name = mach2::dyld::_dyld_get_image_name(0);
+                (
+                    mach2::dyld::_dyld_get_image_header(0) as usize as u64,
+                    mach2::dyld::_dyld_get_image_vmaddr_slide(0) as i64,
+                    if name.is_null() {
+                        String::new()
+                    } else {
+                        std::ffi::CStr::from_ptr(name)
+                            .to_string_lossy()
+                            .into_owned()
+                    },
+                )
+            };
+            carrick_usdt::host__image__base!(|| (std::process::id(), base, slide, path.as_str()));
+        }
+        // Not macOS: dyld is the mechanism above, and only the Darwin native
+        // lane self-reexecs its guest processes. Announcing a base we have not
+        // actually queried would be worse than announcing none -- a consumer
+        // cannot tell a fabricated base from a real one.
+    }
+
+    /// Publish the INNER guest image: where the Linux binary this process is
+    /// running got loaded, and which file it came from.
+    ///
+    /// The native lane maps guest text into the same address space as carrick's
+    /// own code, so a sampled PC can land in either. Without this, guest-range
+    /// PCs are indistinguishable from JIT output and get reported as unmapped.
+    pub fn guest_image_base(base: u64, entry: u64, path: &str) {
+        carrick_usdt::guest__image__base!(|| (std::process::id(), base, entry, path));
     }
 
     pub fn fs_op(op: &str, path: &str, errno: i32) {
@@ -2349,6 +2439,8 @@ mod stub {
     stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
     stub!(lifecycle(phase: u32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
+    stub!(host_image_base());
+    stub!(guest_image_base(base: u64, entry: u64, path: &str));
     stub!(fs_op(op: &str, path: &str, errno: i32));
     stub!(host_pipe_io(host_fd: i32, dir: i32, n: i64));
     stub!(epoll_ctl(epfd: i32, op: u64, fd: i32, events: u32, data: u64, errno: i32));

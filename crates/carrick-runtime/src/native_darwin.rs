@@ -2439,6 +2439,12 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 )?;
             }
             DispatchOutcome::Exit { code } => {
+                // Fire before anything below: the forked-child arm ends in
+                // `_exit(2)`, so a probe placed after it never runs and every
+                // guest process that is not the container's pid 1 would be
+                // missing its exit event -- which is exactly the population a
+                // process-lifecycle census is measuring.
+                crate::probes::guest_exit(code);
                 // `exit_group` (or `exit(2)` as the last live thread): every
                 // OTHER live guest thread of this process dies unconditionally
                 // and instantly at the `libc::_exit()` below, with zero chance
@@ -2633,6 +2639,18 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 }
             }
             DispatchOutcome::Execve { path, argv, env } => {
+                // Same probe, same position as the shared (`runtime.rs`) and
+                // FreeBSD native lanes: it names the image a guest process is
+                // becoming, and is the only event that identifies a guest
+                // process to a tracer. Without it a toolchain workload is an
+                // anonymous wall of host pids.
+                crate::probes::execve_argv(&path, &argv);
+                // Announce this process's own image base in the same breath.
+                // Guest processes self-reexec, so each carries its own ASLR
+                // slide, and a profile sampled from a process that has since
+                // exited can only be symbolicated if the process said where it
+                // was loaded while it was alive.
+                crate::probes::host_image_base();
                 if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                     native_reexec_lifecycle(
                         carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreflightBegin,
@@ -2652,6 +2670,17 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         resolved_argv,
                         executable_digest,
                     )) => {
+                        // The inner guest image, now that its load address is
+                        // known. Guest text shares this address space with
+                        // carrick's own code, so a profiler that knows only the
+                        // host image reports guest PCs as unmapped -- or worse,
+                        // resolves them against carrick's symbol table and gets
+                        // a name that is wrong rather than an error.
+                        crate::probes::guest_image_base(
+                            image.regions().iter().map(|r| r.start).min().unwrap_or(0),
+                            image.entry(),
+                            &resolved,
+                        );
                         if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                             if let Err(reason) = dispatcher.validate_native_reexec_fd_state() {
                                 tracing::warn!(

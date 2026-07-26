@@ -20,6 +20,13 @@ workspace = true
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 libc.workspace = true
+
+# `probes::host_image_base` reads the main image's base/slide/path through dyld.
+# libc deprecated those three in favour of mach2, and the workspace denies
+# warnings, so take them from mach2 directly. macOS-only: dyld is macOS-only,
+# and the callers are the Darwin native lane.
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
