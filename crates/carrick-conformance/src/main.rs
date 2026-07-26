@@ -114,8 +114,11 @@ struct Args {
     /// absent/empty -> no-op.
     #[arg(long)]
     baseline_overlay: Option<PathBuf>,
-    #[arg(long, default_value = "target/conformance/results.jsonl")]
-    jsonl: PathBuf,
+    /// Where to write this run's per-suite results. Defaults to a path derived
+    /// from lane/tier/filtering (see [`default_results_path`]) so a cheap run
+    /// cannot destroy an expensive one's data.
+    #[arg(long)]
+    jsonl: Option<PathBuf>,
     /// Rewrite baseline.jsonl + support-matrix.md from this run (guarded).
     #[arg(long)]
     bless: bool,
@@ -232,12 +235,12 @@ fn run() -> anyhow::Result<ExitCode> {
     );
 
     if args.render_matrix {
-        let reports = read_reports(&args.jsonl)?;
+        let reports = read_reports(&args.results_path())?;
         let md = matrix::render(&reports);
         write_matrix(&md)?;
         eprintln!(
             "rendered docs/support-matrix.md from {}",
-            args.jsonl.display()
+            args.results_path().display()
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -428,7 +431,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 })
                 .unzip()
         };
-    let stream = Mutex::new(std::fs::File::create(&args.jsonl).ok());
+    let stream = Mutex::new(std::fs::File::create(args.results_path()).ok());
     let streamed_reports = Mutex::new(Vec::new());
     let fail_fast_stop = AtomicBool::new(false);
     let phase1_gating = AtomicUsize::new(0);
@@ -495,7 +498,7 @@ fn run() -> anyhow::Result<ExitCode> {
         let reports = streamed_reports
             .into_inner()
             .unwrap_or_else(|e| e.into_inner());
-        write_reports(&args.jsonl, &reports)?;
+        write_reports(&args.results_path(), &reports)?;
         print_summary(&reports);
         eprintln!(
             "\nFAIL-FAST: {} cached-oracle gating verdict(s) exceeded max {} \
@@ -601,7 +604,7 @@ fn run() -> anyhow::Result<ExitCode> {
     let retries = args.flake_retries;
     let gating_before = reports.iter().filter(|r| r.gating).count();
     if fail_fast.should_abort(gating_before) {
-        write_reports(&args.jsonl, &reports)?;
+        write_reports(&args.results_path(), &reports)?;
         print_summary(&reports);
         eprintln!(
             "\nFAIL-FAST: {gating_before} gating verdict(s) exceeded max {}; \
@@ -637,7 +640,7 @@ fn run() -> anyhow::Result<ExitCode> {
         eprintln!("retry-on-flake: {recovered} flake(s) recovered, {still} still gating");
     }
 
-    write_reports(&args.jsonl, &reports)?;
+    write_reports(&args.results_path(), &reports)?;
     print_summary(&reports);
 
     let gating = reports.iter().filter(|r| r.gating).count();
@@ -712,6 +715,11 @@ fn build_report(
             totals: d_res.totals.clone(),
         },
         perf: c_elapsed_ms.map(|elapsed_ms| perf_summary(elapsed_ms, docker.elapsed_ms)),
+        // Only meaningful on a TIMEOUT, and only when the host answered.
+        timeout_kind: cout.and_then(|o| {
+            o.timeout_evidence
+                .map(|e| engine::classify_timeout(e.cpu_ms, o.elapsed_ms, e.loadavg_1m, e.ncpu))
+        }),
         new_diffs: cl.new_diffs,
         known_diffs: cl.known_diffs,
         carrick_run_id: c_runid,
@@ -830,6 +838,53 @@ fn bless_target(lane: &str) -> Result<BlessTarget, String> {
 /// blesses only its OWN overlay and runs an amd64 oracle that legitimately cannot
 /// cover every suite yet, so ORACLE_FAIL there is an expected coverage gap, not a
 /// bless blocker. Pure (no IO) so the guard is unit-tested directly.
+impl Args {
+    /// This run's results path: `--jsonl` when given, else a default keyed on
+    /// lane/tier/filtering so runs cannot clobber each other.
+    fn results_path(&self) -> PathBuf {
+        self.jsonl.clone().unwrap_or_else(|| {
+            let tier = parse_tier(&self.tier).unwrap_or(Tier::Full);
+            let filtered = !self.ecosystem.is_empty() || !self.suite.is_empty();
+            default_results_path(&self.lane, tier, filtered)
+        })
+    }
+}
+
+/// Where a run's results land when `--jsonl` is not given.
+///
+/// This used to be a single fixed `results.jsonl`, which meant ANY later run
+/// destroyed the previous one's data — and the cheap runs are exactly the ones
+/// you fire while investigating an expensive one. A 2-suite reproduction
+/// silently wiped the per-suite records of a 1175-suite full-tier run mid-triage
+/// here, and only the 23 outlier lines that had already been echoed to a log
+/// survived.
+///
+/// Keying the default on lane + tier + whether the run was filtered keeps runs
+/// from overwriting each other in the ways that actually happen: a filtered
+/// reproduction against an unfiltered gate, a smoke gate against a full one, and
+/// one lane against another. `--jsonl` still points anywhere explicitly.
+fn default_results_path(lane: &str, tier: Tier, filtered: bool) -> PathBuf {
+    let lane = lane
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let suffix = if filtered { ".filtered" } else { "" };
+    PathBuf::from(format!(
+        "target/conformance/results.{lane}.{}{suffix}.jsonl",
+        tier_str(tier)
+    ))
+}
+
+/// A STARVED timeout measured the BOX, not carrick: the suite got little CPU
+/// while the machine was oversubscribed, so the run proves nothing either way.
+/// It must not block a bless (that would let an unrelated noisy neighbour veto
+/// a baseline), and it must not be silently swallowed either — the summary
+/// prints starved suites explicitly so a run whose measurements were invalid
+/// is visible rather than quietly "fine".
+fn timeout_blocks_bless(kind: Option<crate::engine::TimeoutKind>) -> bool {
+    !kind.is_some_and(crate::engine::TimeoutKind::is_measurement_failure)
+}
+
 fn bless_blocks(target: BlessTarget, verdict: Verdict) -> bool {
     match verdict {
         Verdict::Timeout | Verdict::CarrickCrash => true,
@@ -858,9 +913,26 @@ fn bless(
     let target = bless_target(&args.lane).map_err(|e| anyhow::anyhow!(e))?;
     let bad: Vec<&str> = reports
         .iter()
-        .filter(|r| bless_blocks(target, r.verdict))
+        .filter(|r| bless_blocks(target, r.verdict) && timeout_blocks_bless(r.timeout_kind))
         .map(|r| r.name.as_str())
         .collect();
+    // Starved suites do not block, but they are NOT a clean bill of health:
+    // their measurements were invalid, so say so loudly rather than let a
+    // degraded box pass for a green one.
+    let starved: Vec<&str> = reports
+        .iter()
+        .filter(|r| !timeout_blocks_bless(r.timeout_kind))
+        .map(|r| r.name.as_str())
+        .collect();
+    if !starved.is_empty() {
+        eprintln!(
+            "warning: {} suite(s) TIMED OUT while the box was oversubscribed (STARVED) — their \
+             results measured the machine, not carrick, and are being blessed as-is. Re-run on a \
+             quiet box to get a real verdict for: {}",
+            starved.len(),
+            starved.join(", ")
+        );
+    }
     if !bad.is_empty() {
         // A shared-baseline (hvf) bless additionally blocks on ORACLE_FAIL; a
         // bring-up-lane overlay bless does not, so name only the verdicts that
@@ -1285,8 +1357,15 @@ fn print_summary(reports: &[SuiteReport]) {
             String::new()
         };
         let perf = perf_annotation(r);
+        // A bare TIMEOUT is not a diagnosis. Say WHY the deadline was missed so
+        // the reader can tell "carrick hung" (blocked/spinning) from "this box
+        // was too busy to measure anything" (starved) without re-running it.
+        let why = r
+            .timeout_kind
+            .map(|k| format!(" [{}]", k.as_str()))
+            .unwrap_or_default();
         eprintln!(
-            "  {mark} {:14} {:40} carrick[{}] oracle[{}]{infra}{perf}",
+            "  {mark} {:14} {:40} carrick[{}] oracle[{}]{infra}{why}{perf}",
             r.verdict.as_str(),
             r.name,
             side(&r.carrick),
@@ -1734,6 +1813,44 @@ fn walk_newest(dir: &Path, newest: &mut Option<std::time::SystemTime>) {
 
 #[cfg(test)]
 mod tests {
+    /// A cheap run must never destroy an expensive one's data. This is not
+    /// hypothetical: a 2-suite reproduction wiped the per-suite records of a
+    /// 1175-suite full-tier run mid-triage, and only the handful of lines
+    /// already echoed to a log survived.
+    #[test]
+    fn results_paths_do_not_collide_across_runs() {
+        use super::default_results_path;
+        let full = default_results_path("macos-native-dsr", Tier::Full, false);
+        let filtered = default_results_path("macos-native-dsr", Tier::Full, true);
+        let smoke = default_results_path("macos-native-dsr", Tier::Smoke, false);
+        let other_lane = default_results_path("hvf", Tier::Full, false);
+
+        // The three ways runs actually clobbered each other, all now distinct.
+        assert_ne!(
+            full, filtered,
+            "a filtered reproduction must not overwrite a gate"
+        );
+        assert_ne!(full, smoke, "a smoke gate must not overwrite a full one");
+        assert_ne!(full, other_lane, "lanes must not overwrite each other");
+        assert_ne!(filtered, smoke);
+
+        assert!(full.to_string_lossy().contains("macos-native-dsr"));
+        assert!(full.to_string_lossy().contains("full"));
+        assert!(filtered.to_string_lossy().contains("filtered"));
+        assert!(!full.to_string_lossy().contains("filtered"));
+    }
+
+    #[test]
+    fn results_path_sanitizes_lane_into_a_filename() {
+        use super::default_results_path;
+        // A lane string reaches the filesystem; anything path-ish in it must not
+        // escape target/conformance/.
+        let p = default_results_path("../../etc/passwd", Tier::Full, false);
+        let s = p.to_string_lossy();
+        assert!(!s.contains(".."), "lane must not traverse: {s}");
+        assert!(s.starts_with("target/conformance/"), "{s}");
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -2075,6 +2192,7 @@ mod tests {
                 totals: parsers::Totals::default(),
             },
             perf: Some(perf_summary(10_000, Some(1_000))),
+            timeout_kind: None,
             new_diffs: Vec::new(),
             known_diffs: Vec::new(),
             carrick_run_id: "conf-test-c00".to_string(),
