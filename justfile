@@ -194,8 +194,19 @@ conformance TIER="full" *ARGS: build
     cargo run -p carrick-conformance -- --tier {{TIER}} {{ARGS}}
 
 # Fast pre-merge regression gate: the smoke tier, non-zero exit on any regression.
+# NOTE: this runs the VMM/HVF lane (`lane.rs` injects `--exec-backend vmm`), which
+# is NOT the backend carrick ships by default. Use `conformance-native` for that.
 conformance-quick: build
     cargo run -p carrick-conformance -- --tier smoke
+
+# The SAME fast gate, pointed at the backend carrick actually ships
+# (`ExecBackendRequest::Native`). The published baseline/support-matrix belong to
+# the VMM lane; this lane's overlay (scripts/conformance/baseline.native-dsr.jsonl)
+# is essentially empty, so treat its output as a measurement, not a regression
+# check, until it has been blessed. Verdicts here are load-coupled — run it on a
+# quiet machine or you will bisect onto the wrong commit.
+conformance-native TIER="smoke" *ARGS: build
+    cargo run -p carrick-conformance -- --tier {{TIER}} --lane macos-native-dsr {{ARGS}}
 
 # KVM/lima Docker-parity gate (Phase 5). Builds carrick IN-GUEST for platform-linux,
 # then runs the smoke tier on the KVM lane vs the (backend-independent) docker oracles,
