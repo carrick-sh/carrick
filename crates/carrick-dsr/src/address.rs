@@ -342,16 +342,93 @@ fn intersect_host_ranges(
     result
 }
 
+/// Reserve one inaccessible guard span of the guest aperture.
+///
+/// On Darwin this deliberately does NOT go through `mmap`. XNU splits a large
+/// anonymous `vm_map_enter` into 128 MiB `ANON_CHUNK_SIZE` entries unless the
+/// mapping's `max_protection` is `VM_PROT_NONE`, and BSD `mmap` hardcodes
+/// `maxprot = VM_PROT_ALL` for anonymous mappings, so `mmap(PROT_NONE)` of the
+/// 2 TiB biased aperture produced ~16.4k map entries. `vm_map_fork` re-inserts
+/// every one of them into each forked child, which measured as the single
+/// largest term in Carrick's host `fork(2)` cost. `mach_vm_map` can ask for
+/// `max_protection = VM_PROT_NONE` directly and yields ONE entry.
+/// See `carrick_host::host_proc::reserve_inaccessible_vm_span`.
 fn map_reservation(start: usize, end: usize) -> Result<OwnedHostMapping, NativeAddressError> {
     let length = end
         .checked_sub(start)
         .ok_or(NativeAddressError::InvalidHostRange { start, length: 0 })?;
-    // MAP_NORESERVE is load-bearing on Darwin (reservations must not charge
-    // swap); FreeBSD's libc deprecates it as a no-op since FreeBSD 11, which
-    // is exactly the semantics we want there too.
-    #[allow(deprecated)]
-    let flags = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE;
-    OwnedHostMapping::map_exact(HostVa(start), length, libc::PROT_NONE, flags)
+    #[cfg(target_os = "macos")]
+    {
+        map_inaccessible_span(
+            HostVa(start),
+            length,
+            carrick_host::host_proc::InaccessibleSpanPlacement::FailIfOccupied,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // MAP_NORESERVE is load-bearing on Darwin (reservations must not charge
+        // swap); FreeBSD's libc deprecates it as a no-op since FreeBSD 11, which
+        // is exactly the semantics we want there too.
+        #[allow(deprecated)]
+        let flags = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE;
+        OwnedHostMapping::map_exact(HostVa(start), length, libc::PROT_NONE, flags)
+    }
+}
+
+/// Darwin single-entry inaccessible reservation, mapped onto the same
+/// `OwnedHostMapping` rollback contract `map_exact` provides. A collision or a
+/// redirect surfaces as `HostCollision` so the bias-candidate probe keeps
+/// falling through to the next candidate exactly as it did under `mmap`.
+#[cfg(target_os = "macos")]
+fn map_inaccessible_span(
+    requested: HostVa,
+    length: usize,
+    placement: carrick_host::host_proc::InaccessibleSpanPlacement,
+) -> Result<OwnedHostMapping, NativeAddressError> {
+    use carrick_host::host_proc::{InaccessibleReservation, reserve_inaccessible_vm_span};
+
+    if length == 0 {
+        return Err(NativeAddressError::InvalidHostRange {
+            start: requested.raw(),
+            length,
+        });
+    }
+    let end = requested
+        .raw()
+        .checked_add(length)
+        .ok_or(NativeAddressError::InvalidHostRange {
+            start: requested.raw(),
+            length,
+        })?;
+    let outcome = reserve_inaccessible_vm_span(requested.raw() as u64, length as u64, placement)
+        .map_err(|source| NativeAddressError::HostMapping {
+            requested: requested.raw(),
+            length,
+            source: std::io::Error::other(source.to_string()),
+        })?;
+    match outcome {
+        InaccessibleReservation::Reserved => Ok(OwnedHostMapping {
+            range: requested..HostVa(end),
+            unmap_on_drop: true,
+        }),
+        InaccessibleReservation::NoSpace => Err(NativeAddressError::HostCollision {
+            requested: requested.raw(),
+            actual: requested.raw(),
+            length,
+        }),
+        InaccessibleReservation::Redirected { actual } => {
+            let actual = actual as usize;
+            // The kernel placed it elsewhere; give the span straight back so a
+            // failed candidate never leaks VA.
+            let _ = unsafe { libc::munmap(actual as *mut libc::c_void, length) };
+            Err(NativeAddressError::HostCollision {
+                requested: requested.raw(),
+                actual,
+                length,
+            })
+        }
+    }
 }
 
 fn checked_guest_range(start: u64, length: u64) -> Result<Range<GuestVa>, NativeAddressError> {
@@ -512,26 +589,45 @@ impl NativeLayout {
                     length: 0,
                 },
             )?;
-            // See `map_reservation` on the MAP_NORESERVE deprecation.
+            // Ownership check first: this path replaces whatever currently
+            // occupies the range, so it must stay confined to owned ranges
+            // exactly as the MAP_FIXED form was.
             #[allow(deprecated)]
             let requested_flags = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE;
             let flags = self.fixed_mapping_flags(range.start, length, requested_flags)?;
-            let mapped = unsafe {
-                libc::mmap(
-                    range.start.raw() as *mut libc::c_void,
+            #[cfg(target_os = "macos")]
+            {
+                let _ = flags;
+                // Rebuild the guard as a single entry, for the same reason the
+                // initial reservation does — otherwise every post-`execve`
+                // fork pays the ~16.4k-entry re-insertion cost again.
+                map_inaccessible_span(
+                    range.start,
                     length,
-                    libc::PROT_NONE,
-                    flags,
-                    -1,
-                    0,
-                )
-            };
-            if mapped == libc::MAP_FAILED || mapped as usize != range.start.raw() {
-                return Err(NativeAddressError::HostMapping {
-                    requested: range.start.raw(),
-                    length,
-                    source: std::io::Error::last_os_error(),
-                });
+                    carrick_host::host_proc::InaccessibleSpanPlacement::ReplaceOwnedRange,
+                )?
+                .commit();
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // See `map_reservation` on the MAP_NORESERVE deprecation.
+                let mapped = unsafe {
+                    libc::mmap(
+                        range.start.raw() as *mut libc::c_void,
+                        length,
+                        libc::PROT_NONE,
+                        flags,
+                        -1,
+                        0,
+                    )
+                };
+                if mapped == libc::MAP_FAILED || mapped as usize != range.start.raw() {
+                    return Err(NativeAddressError::HostMapping {
+                        requested: range.start.raw(),
+                        length,
+                        source: std::io::Error::last_os_error(),
+                    });
+                }
             }
         }
         Ok(())

@@ -194,6 +194,122 @@ impl Drop for DirectVmReservation {
     }
 }
 
+/// Whether an inaccessible reservation may replace live host mappings.
+///
+/// Named rather than a bare `bool` because the two values have opposite
+/// safety polarity: `FailIfOccupied` is the collision-probing contract every
+/// first-time reservation needs, while `ReplaceOwnedRange` destroys whatever
+/// is mapped and is only sound for a range Carrick already owns.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InaccessibleSpanPlacement {
+    /// Fail with `NoSpace` if any page of the interval is already mapped.
+    FailIfOccupied,
+    /// Replace the interval's existing entries, as `MAP_FIXED` would. Only
+    /// valid for a range the caller already owns.
+    ReplaceOwnedRange,
+}
+
+/// Outcome of an exact, inaccessible VA reservation.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub enum InaccessibleReservation {
+    Reserved,
+    /// Some page of the requested interval is already mapped. The host map is
+    /// untouched: `VM_FLAGS_FIXED` without the separate overwrite flag fails
+    /// closed rather than replacing a live mapping.
+    NoSpace,
+    /// The kernel honoured the size but not the address.
+    Redirected {
+        actual: u64,
+    },
+}
+
+/// Reserve `[start, start + length)` as an inaccessible, fork-inherited
+/// placeholder, as ONE VM map entry regardless of span size.
+///
+/// The entry count is the whole point, and it is why this cannot be `mmap`.
+/// XNU splits a large anonymous `vm_map_enter` into `ANON_CHUNK_SIZE` (128 MiB)
+/// entries, but `vm_map.c` skips that split when `max_protection ==
+/// VM_PROT_NONE` — the comment there says splitting an inaccessible reservation
+/// "serves no purpose and just slows down operations on the VM map". BSD `mmap`
+/// cannot express that: `kern_mman.c` hardcodes `maxprot = VM_PROT_ALL` for
+/// every anonymous mapping, so `mmap(PROT_NONE)` of the 2 TiB biased guest
+/// aperture yields ~16.4k entries that `vm_map_fork` must re-insert one at a
+/// time into every forked child. Measured on macOS 27.0 (xnu-13432): 16,384
+/// entries and +1.38 ms per host `fork(2)` via `mmap`, versus 1 entry and
+/// +0.06 ms via this call.
+///
+/// `VM_INHERIT_COPY` is preserved, so the child still inherits the reservation
+/// at the same addresses; entries with no VM object take `vm_map_fork`'s copy
+/// fast path either way. Carving usable memory back out with `MAP_FIXED` is
+/// unaffected — the overwrite replaces the entry, so the reservation's
+/// `max_protection` never constrains the mapping that supersedes it.
+#[cfg(target_os = "macos")]
+pub fn reserve_inaccessible_vm_span(
+    start: u64,
+    length: u64,
+    placement: InaccessibleSpanPlacement,
+) -> Result<InaccessibleReservation, DirectVmReservationError> {
+    let task = unsafe { mach2::traps::mach_task_self() };
+    reserve_inaccessible_vm_span_on(task, start, length, placement)
+}
+
+#[cfg(target_os = "macos")]
+fn reserve_inaccessible_vm_span_on(
+    task: libc::mach_port_t,
+    start: u64,
+    length: u64,
+    placement: InaccessibleSpanPlacement,
+) -> Result<InaccessibleReservation, DirectVmReservationError> {
+    start
+        .checked_add(length)
+        .filter(|end| length != 0 && *end > start)
+        .ok_or(DirectVmReservationError::InvalidRange { start, length })?;
+    let mut address = start;
+    let flags = match placement {
+        InaccessibleSpanPlacement::FailIfOccupied => mach2::vm_statistics::VM_FLAGS_FIXED,
+        InaccessibleSpanPlacement::ReplaceOwnedRange => {
+            mach2::vm_statistics::VM_FLAGS_FIXED | mach2::vm_statistics::VM_FLAGS_OVERWRITE
+        }
+    };
+    // SAFETY: the caller supplies a checked, non-empty range. A null memory
+    // object makes this a pure VA reservation with no backing pages, so
+    // `VM_PROT_NONE` for both current and maximum protection is coherent.
+    // `VM_FLAGS_FIXED` requests this exact interval; overwrite is a separate
+    // Mach flag passed only for `ReplaceOwnedRange`, so under the default
+    // placement an occupied page makes the call fail instead of replacing
+    // host memory.
+    let kr = unsafe {
+        mach2::vm::mach_vm_map(
+            task,
+            &mut address,
+            length,
+            0,
+            flags,
+            0,
+            0,
+            0,
+            mach2::vm_prot::VM_PROT_NONE,
+            mach2::vm_prot::VM_PROT_NONE,
+            mach2::vm_inherit::VM_INHERIT_COPY,
+        )
+    };
+    if kr == mach2::kern_return::KERN_NO_SPACE {
+        return Ok(InaccessibleReservation::NoSpace);
+    }
+    if kr != libc::KERN_SUCCESS {
+        return Err(DirectVmReservationError::Kernel {
+            operation: "mach_vm_map inaccessible native reservation",
+            code: kr,
+        });
+    }
+    if address != start {
+        return Ok(InaccessibleReservation::Redirected { actual: address });
+    }
+    Ok(InaccessibleReservation::Reserved)
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{
@@ -731,47 +847,23 @@ mod imp {
         let end = start
             .checked_add(length)
             .ok_or(DirectVmReservationError::InvalidRange { start, length })?;
-        let mut address = start;
-        // SAFETY: the caller supplies a checked, non-empty range.
-        // `VM_FLAGS_FIXED` requests this exact interval; overwrite is a
-        // separate Mach flag which Carrick deliberately never passes, so an
-        // occupied page makes the call fail instead of replacing host memory.
-        let allocation_kr = unsafe {
-            mach2::vm::mach_vm_allocate(
-                task,
-                &mut address,
-                length,
-                mach2::vm_statistics::VM_FLAGS_FIXED,
-            )
-        };
-        if allocation_kr == mach2::kern_return::KERN_NO_SPACE {
-            return Ok(ExactReservationResult::NoSpace);
+        match super::reserve_inaccessible_vm_span_on(
+            task,
+            start,
+            length,
+            super::InaccessibleSpanPlacement::FailIfOccupied,
+        )? {
+            super::InaccessibleReservation::Reserved => Ok(ExactReservationResult::Reserved),
+            super::InaccessibleReservation::NoSpace => Ok(ExactReservationResult::NoSpace),
+            super::InaccessibleReservation::Redirected { actual } => {
+                let _ = unsafe { mach2::vm::mach_vm_deallocate(task, actual, length) };
+                Err(DirectVmReservationError::Redirected {
+                    requested_start: start,
+                    requested_end: end,
+                    actual,
+                })
+            }
         }
-        if allocation_kr != libc::KERN_SUCCESS {
-            return Err(DirectVmReservationError::Kernel {
-                operation: "mach_vm_allocate fixed native direct reservation",
-                code: allocation_kr,
-            });
-        }
-        if address != start {
-            let _ = unsafe { mach2::vm::mach_vm_deallocate(task, address, length) };
-            return Err(DirectVmReservationError::Redirected {
-                requested_start: start,
-                requested_end: end,
-                actual: address,
-            });
-        }
-        let protect_kr = unsafe {
-            mach2::vm::mach_vm_protect(task, address, length, 0, mach2::vm_prot::VM_PROT_NONE)
-        };
-        if protect_kr != libc::KERN_SUCCESS {
-            let _ = unsafe { mach2::vm::mach_vm_deallocate(task, address, length) };
-            return Err(DirectVmReservationError::Kernel {
-                operation: "mach_vm_protect native direct reservation",
-                code: protect_kr,
-            });
-        }
-        Ok(ExactReservationResult::Reserved)
     }
 
     /// Acquire one future Direct interval without overwriting any host mapping.
