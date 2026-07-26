@@ -289,6 +289,264 @@ dsr_ordinal_enum! {
     }
 }
 
+/// Which side of a native (DSR) fork a `fork-lifecycle` sample describes.
+///
+/// Deliberately the SAME role convention the HVF lane and
+/// `scripts/dtrace/fork-phases.d` already use for `arg0` (that script
+/// aggregates `@lifecycle_us[(int)arg0, (int)arg1]`, i.e. keyed on
+/// `(role, phase)`), so a native run drops straight into the existing script
+/// with no edits: `0` = the forking parent (and the common pre-fork work it
+/// does on behalf of both processes), `1` = the fork child.
+///
+/// The role is never passed by a caller — [`NativeForkPhase::role`] derives it
+/// from the phase, so a child phase can never be reported under the parent
+/// role (the mis-pairing that a bare `i32` role argument invites).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum NativeForkRole {
+    /// The forking thread, before `fork(2)` and on the parent's return path.
+    Parent = 0,
+    /// The fork child, from `fork(2)` returning zero until the guest is
+    /// resumable.
+    Child = 1,
+}
+
+impl NativeForkRole {
+    /// The wire value for the probe's `role` argument. Raw escapes ONLY here,
+    /// at the USDT boundary.
+    #[inline(always)]
+    pub const fn raw(self) -> i32 {
+        self as i32
+    }
+}
+
+/// One attributable span of a native (DSR) guest fork, as reported through the
+/// shared `fork-lifecycle` USDT probe.
+///
+/// # Why a distinct ordinal block
+///
+/// The `fork-lifecycle` probe is shared with the HVF/VMM lane, whose phase
+/// numbers are ad-hoc integers with no legend (runtime `0..9` and `50..55`,
+/// aarch64 `0..6`, HVF `10..18`, distinguished only by a role offset). Rather
+/// than extend that, the native lane claims its OWN contiguous, documented
+/// ordinal block so a `fork-phases.d` capture is self-describing and a native
+/// span can never be confused with an HVF span even if both ever appeared in
+/// one trace:
+///
+/// * `100..=107` — parent / common ([`NativeForkRole::Parent`])
+/// * `120..=125` — child ([`NativeForkRole::Child`])
+///
+/// # Legend
+///
+/// Every variant reports the duration of the JUST-FINISHED span in the probe's
+/// `elapsed_us`; the `a`/`b` arguments are phase-specific and documented per
+/// variant below. The parent spans partition the fork path end to end, so
+/// summing them accounts for the whole parent-side cost; the child spans
+/// partition `fork(2)`-returns-zero → guest resumable.
+///
+/// Discriminants are explicit and unique BY CONSTRUCTION: `rustc` rejects a
+/// duplicate enum discriminant, so this table cannot silently collide the way
+/// a list of hand-numbered `const`s can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum NativeForkPhase {
+    /// Parent: waiting for the process-wide fork serialization token (the CAS
+    /// `try_begin_fork` loop, which sleeps 200us between attempts and parks at
+    /// any in-flight fork's quiesce barrier). `a` = 1 if the token was NOT
+    /// taken on the first attempt (i.e. this fork actually queued behind
+    /// another), else 0. `b` = 0.
+    TokenAcquire = 100,
+    /// Parent: the sibling stop-the-world drain. Recorded UNCONDITIONALLY,
+    /// including the single-threaded case where no drain runs at all — so
+    /// "the quiesce costs nothing at threads=0" is measured, not assumed.
+    /// `a` = live guest-thread count at entry, `b` = 1 if the drain actually
+    /// engaged (`a > 1`), else 0.
+    SiblingQuiesce = 101,
+    /// Parent: draining in-flight thread-exit cleanups so `fork(2)` cannot
+    /// hand the child a process-global signal mutex held by a thread that does
+    /// not exist in it. `a` = cleanups still in flight when the span ended
+    /// (nonzero means the 5 s bound expired), `b` = 0.
+    ExitCleanupDrain = 102,
+    /// Parent: pinning the non-guest helper gates (network publication and the
+    /// RLIMIT_CPU helper) that must not be mid-iteration across `fork(2)`.
+    /// `a` = 1 if a gate failed to quiesce and the fork degraded to EAGAIN,
+    /// else 0. `b` = 0.
+    HelperGates = 103,
+    /// Parent: pre-fork bookkeeping — the vfork suspend pipe, the child's
+    /// ns-pid allocation and prepared child record, and taking the
+    /// across-fork barrier/signal-static locks. `a` = the allocated child
+    /// ns-pid (`-1` when PID namespaces are off or allocation failed),
+    /// `b` = 1 if a vfork suspend pipe was armed, else 0.
+    PreForkBookkeeping = 104,
+    /// Parent AND child: the host `fork(2)` call itself, plus the immediate
+    /// release of the locks held across it. Fired on BOTH sides with the same
+    /// measured span (each process reads its own return from the one call), so
+    /// the role distinguishes them. `a` = the `fork(2)` return value (child
+    /// host pid in the parent, 0 in the child, `-1` on failure), `b` = 0.
+    HostFork = 105,
+    /// Parent: post-fork bookkeeping before the guest resumes — releasing the
+    /// quiesce, publishing the child's process record / ns-pid registration /
+    /// run-state, installing a CLONE_PIDFD descriptor, writing the child tid
+    /// back to guest memory, and arming the child-exit watch. `a` = the
+    /// guest-visible child pid returned to the guest, `b` = 0.
+    ParentPublish = 106,
+    /// Parent: the vfork suspend — guest-paced (it ends when the child
+    /// `execve`s or exits), so it is reported SEPARATELY from
+    /// [`Self::ParentPublish`] and must not be read as carrick overhead.
+    /// `a` = child host pid, `b` = 0. Not fired for an ordinary fork.
+    VforkSuspend = 107,
+
+    /// Child: repairing the barrier/exec-replacement state inherited through
+    /// `fork(2)` (quiesce + fork flags, the parked-thread count that belongs
+    /// to parent threads, the exec-replacement owner, the image-replaced
+    /// marker) and adopting the vfork release descriptor. `a` = 1 if this
+    /// child holds a vfork release descriptor, else 0. `b` = 0.
+    ChildBarrierRepair = 120,
+    /// Child: the shared dispatcher fork-child reset — the nine ordered hooks
+    /// in `native::fork_child::AFTER_FORK_CHILD_STEPS` (output buffers, event
+    /// ring, host signals, FIFO beacons, then the network/epoll/proc/mem/sysv
+    /// subsystem hooks). `a` = the number of hooks run, `b` = 0.
+    ChildDispatcherReset = 121,
+    /// Child: rebuilding this thread's runtime — a fresh thread runtime and
+    /// registry, retiring the dead siblings' per-tid signal state, re-keying
+    /// this thread's own, binding a new kick target, and starting the signal
+    /// wake pump. `a` = the child's new guest tid, `b` = 0.
+    ChildRuntimeReset = 122,
+    /// Child: re-establishing guest-visible state — CPU-time accounting reset,
+    /// the child's process record and RLIMIT_CPU helper, the vDSO RNG
+    /// generation re-stamp (so the COW-inherited getrandom state does not
+    /// replay the parent's keystream), run-state publication, and the
+    /// parent/child tid write-backs into guest RAM. `a` = the child's ns-pid,
+    /// `b` = 0.
+    ChildGuestState = 123,
+    /// Child: TOTAL from `fork(2)` returning zero to the end of the in-runtime
+    /// child repair — the sum of [`Self::ChildBarrierRepair`],
+    /// [`Self::ChildDispatcherReset`], [`Self::ChildRuntimeReset`] and
+    /// [`Self::ChildGuestState`]. `a` = the child's ns-pid, `b` = 0.
+    ChildRuntimeRepairTotal = 124,
+    /// Child: the DSR translator's own fork-child repair
+    /// (`translator.after_fork_child`) — the last work before the guest is
+    /// resumable, and the span nothing measured before. Fired from the run
+    /// loop rather than the fork handler because the translator lives there.
+    /// `a` = the child's guest tid, `b` = 0.
+    ChildTranslatorRebuild = 125,
+}
+
+impl NativeForkPhase {
+    /// Every phase, for the ordinal-block/uniqueness assertions.
+    pub const ALL: [Self; 14] = [
+        Self::TokenAcquire,
+        Self::SiblingQuiesce,
+        Self::ExitCleanupDrain,
+        Self::HelperGates,
+        Self::PreForkBookkeeping,
+        Self::HostFork,
+        Self::ParentPublish,
+        Self::VforkSuspend,
+        Self::ChildBarrierRepair,
+        Self::ChildDispatcherReset,
+        Self::ChildRuntimeReset,
+        Self::ChildGuestState,
+        Self::ChildRuntimeRepairTotal,
+        Self::ChildTranslatorRebuild,
+    ];
+
+    /// The role this phase belongs to, derived from the phase itself so a
+    /// caller cannot pair a child phase with the parent role.
+    ///
+    /// [`Self::HostFork`] is the one phase BOTH processes fire; its role is
+    /// resolved at the call site via [`native_fork_lifecycle_as`], which is
+    /// the only entry point that takes a role explicitly.
+    #[inline(always)]
+    pub const fn role(self) -> NativeForkRole {
+        match self {
+            Self::TokenAcquire
+            | Self::SiblingQuiesce
+            | Self::ExitCleanupDrain
+            | Self::HelperGates
+            | Self::PreForkBookkeeping
+            | Self::HostFork
+            | Self::ParentPublish
+            | Self::VforkSuspend => NativeForkRole::Parent,
+            Self::ChildBarrierRepair
+            | Self::ChildDispatcherReset
+            | Self::ChildRuntimeReset
+            | Self::ChildGuestState
+            | Self::ChildRuntimeRepairTotal
+            | Self::ChildTranslatorRebuild => NativeForkRole::Child,
+        }
+    }
+
+    /// The wire value for the probe's `phase` argument. Raw escapes ONLY here,
+    /// at the USDT boundary.
+    #[inline(always)]
+    pub const fn raw(self) -> i32 {
+        self as i32
+    }
+}
+
+#[cfg(test)]
+mod native_fork_probe_abi {
+    use super::{NativeForkPhase, NativeForkRole};
+
+    #[test]
+    fn roles_match_the_shared_fork_lifecycle_convention() {
+        // `scripts/dtrace/fork-phases.d` keys its aggregations on
+        // `(arg0, arg1)`; arg0 must keep meaning what it means on the HVF lane.
+        assert_eq!(NativeForkRole::Parent.raw(), 0);
+        assert_eq!(NativeForkRole::Child.raw(), 1);
+    }
+
+    #[test]
+    fn phase_ordinals_are_unique_and_stay_in_the_documented_native_block() {
+        let mut seen: Vec<i32> = NativeForkPhase::ALL.map(NativeForkPhase::raw).to_vec();
+        let count = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "native fork phase ordinals collided");
+
+        // The native block is 100..=107 (parent) and 120..=125 (child). Every
+        // HVF/aarch64 phase in the tree is < 60, so the two lanes cannot alias.
+        for phase in NativeForkPhase::ALL {
+            let raw = phase.raw();
+            match phase.role() {
+                NativeForkRole::Parent => assert!(
+                    (100..=107).contains(&raw),
+                    "{phase:?} = {raw} is outside the documented parent block 100..=107",
+                ),
+                NativeForkRole::Child => assert!(
+                    (120..=125).contains(&raw),
+                    "{phase:?} = {raw} is outside the documented child block 120..=125",
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn phase_block_membership_matches_the_documented_legend() {
+        assert_eq!(NativeForkPhase::TokenAcquire.raw(), 100);
+        assert_eq!(NativeForkPhase::SiblingQuiesce.raw(), 101);
+        assert_eq!(NativeForkPhase::ExitCleanupDrain.raw(), 102);
+        assert_eq!(NativeForkPhase::HelperGates.raw(), 103);
+        assert_eq!(NativeForkPhase::PreForkBookkeeping.raw(), 104);
+        assert_eq!(NativeForkPhase::HostFork.raw(), 105);
+        assert_eq!(NativeForkPhase::ParentPublish.raw(), 106);
+        assert_eq!(NativeForkPhase::VforkSuspend.raw(), 107);
+        assert_eq!(NativeForkPhase::ChildBarrierRepair.raw(), 120);
+        assert_eq!(NativeForkPhase::ChildDispatcherReset.raw(), 121);
+        assert_eq!(NativeForkPhase::ChildRuntimeReset.raw(), 122);
+        assert_eq!(NativeForkPhase::ChildGuestState.raw(), 123);
+        assert_eq!(NativeForkPhase::ChildRuntimeRepairTotal.raw(), 124);
+        assert_eq!(NativeForkPhase::ChildTranslatorRebuild.raw(), 125);
+    }
+
+    #[test]
+    fn probe_wrappers_expose_typed_phase_only_signatures() {
+        let _: fn(NativeForkPhase, u64, i64, i64) = super::native_fork_lifecycle;
+        let _: fn(NativeForkRole, NativeForkPhase, u64, i64, i64) = super::native_fork_lifecycle_as;
+    }
+}
+
 #[cfg(test)]
 mod dsr_probe_abi {
     use super::{
@@ -1389,6 +1647,31 @@ mod real {
         carrick_usdt::fork__lifecycle!(|| (role, phase, elapsed_us, a, b));
     }
 
+    /// Typed native-lane (DSR) entry point to the same `fork-lifecycle` probe.
+    ///
+    /// The role is DERIVED from the phase (see [`super::NativeForkPhase::role`]),
+    /// so the native fork path never names a role integer and cannot report a
+    /// child phase under the parent role. Both ordinals are converted to the
+    /// probe's `i32` wire form INSIDE the closure, which `usdt` invokes only
+    /// when a consumer is attached.
+    pub fn native_fork_lifecycle(phase: super::NativeForkPhase, elapsed_us: u64, a: i64, b: i64) {
+        carrick_usdt::fork__lifecycle!(|| { (phase.role().raw(), phase.raw(), elapsed_us, a, b) });
+    }
+
+    /// [`native_fork_lifecycle`] for the one phase both processes fire
+    /// ([`super::NativeForkPhase::HostFork`]): each side of `fork(2)` reports
+    /// the same measured span under its OWN role, so the role is supplied by
+    /// the call site rather than derived.
+    pub fn native_fork_lifecycle_as(
+        role: super::NativeForkRole,
+        phase: super::NativeForkPhase,
+        elapsed_us: u64,
+        a: i64,
+        b: i64,
+    ) {
+        carrick_usdt::fork__lifecycle!(|| (role.raw(), phase.raw(), elapsed_us, a, b));
+    }
+
     pub fn fork_footprint(
         phase: i32,
         vm_region_count: u64,
@@ -2080,6 +2363,8 @@ mod stub {
     stub!(fork_quiesce(phase: i32, a: i64, b: i64, tid: i32));
     stub!(fork_rebuild(role: i32, phase: i32, desc_count: u64, map_count: u64, elapsed_us: u64));
     stub!(fork_lifecycle(role: i32, phase: i32, elapsed_us: u64, a: i64, b: i64));
+    stub!(native_fork_lifecycle(phase: super::NativeForkPhase, elapsed_us: u64, a: i64, b: i64));
+    stub!(native_fork_lifecycle_as(role: super::NativeForkRole, phase: super::NativeForkPhase, elapsed_us: u64, a: i64, b: i64));
     stub!(fork_footprint(phase: i32, vm_region_count: u64, arena_high_water: u64, resident_bytes: u64, virtual_bytes: u64));
     stub!(fork_footprint_class(class_id: i32, region_count: u64, scan_bytes: u64, resident_bytes: u64, flags: u64));
     stub!(fork_post(pid: i32, pc: u64, elr: u64));

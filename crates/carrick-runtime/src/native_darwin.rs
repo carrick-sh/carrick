@@ -62,6 +62,10 @@ use crate::dispatch::{
 use crate::memory::{AddressSpace, AddressSpaceError};
 use crate::native_prepared_image::{NativeRelativeRelocation, ValidatedPreparedImage};
 use crate::page_profile::ExecutionPlan;
+// Typed fork-lifecycle ordinals for THIS lane. The raw `role`/`phase` integers
+// the `fork-lifecycle` USDT probe carries are produced only inside
+// `probes::native_fork_lifecycle{,_as}`; nothing on the fork path names one.
+use crate::probes::{NativeForkPhase, NativeForkRole};
 use crate::runtime::{RunResult, RuntimeError, maybe_dump_debug_state};
 use carrick_guest_mem::RepointPrivateError;
 use carrick_guest_mem::protections::MemoryProtections;
@@ -173,6 +177,13 @@ struct NativeForkRequest {
     exit_signal: u32,
     child_stack: u64,
     vfork: Option<u64>,
+    /// Guest PC and PSTATE at the fork-like syscall, carried in purely so the
+    /// `fork-pre`/`fork-post` USDT bracket reports the same shape HVF does
+    /// (`scripts/dtrace/fork-phases.d` reads them). The native lane has no EL1,
+    /// so the probes' `elr` argument is reported as 0 and `cpsr` carries
+    /// PSTATE.
+    guest_pc: u64,
+    guest_pstate: u64,
 }
 
 struct NativeVforkCompletion {
@@ -1835,7 +1846,13 @@ struct NativeCloneThreadRequest {
 /// Outcome of [`NativeThreadRuntime::acquire_fork_token`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeForkTokenFlow {
-    Acquired,
+    /// The process-wide fork token is held by this thread. `contended` records
+    /// whether the CAS failed at least once, i.e. this fork QUEUED behind
+    /// another fork/exec rather than taking a free token — the discriminator
+    /// the `fork-lifecycle` `TokenAcquire` sample reports, so a long
+    /// acquisition can be attributed to real serialization instead of guessed
+    /// at from elapsed time alone.
+    Acquired { contended: bool },
     /// An execve by ANOTHER thread is replacing the thread group; the caller
     /// must retire this thread instead of proceeding.
     RetireForExec,
@@ -2554,6 +2571,8 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     exit_signal,
                     child_stack,
                     vfork,
+                    guest_pc: snapshot.pc,
+                    guest_pstate: snapshot.pstate,
                 };
                 match handle_native_fork(
                     &dispatcher,
@@ -2568,7 +2587,27 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         child_stack,
                     } => {
                         if fork_child {
+                            // The LAST post-fork repair before the child's
+                            // guest is resumable, and the one the fork handler
+                            // cannot time (the translator lives here). Closing
+                            // the child's `fork-pre`/`fork-post` bracket after
+                            // it means the bracket spans everything the guest
+                            // actually waits for.
+                            let translator_rebuild_start = std::time::Instant::now();
                             translator.after_fork_child(thread_runtime.tid().raw());
+                            let translator_rebuild_us = translator_rebuild_start
+                                .elapsed()
+                                .as_micros()
+                                .min(u128::from(u64::MAX))
+                                as u64;
+                            crate::probes::native_fork_lifecycle(
+                                NativeForkPhase::ChildTranslatorRebuild,
+                                translator_rebuild_us,
+                                i64::from(thread_runtime.tid().raw()),
+                                0,
+                            );
+                            // `arg0 == 0` is the D script's child clause.
+                            crate::probes::fork_post(0, snapshot.pc, 0);
                             if child_stack != 0 {
                                 snapshot.sp = child_stack;
                             }
@@ -3324,7 +3363,9 @@ impl NativeThreadRuntime {
     /// backstop against an unknown holder, not a pacing bound.
     fn acquire_fork_token(&self) -> NativeForkTokenFlow {
         let deadline = Instant::now() + Duration::from_secs(120);
+        let mut contended = false;
         while !crate::fork_quiesce::barrier().try_begin_fork() {
+            contended = true;
             if crate::fork_quiesce::exec_replacing_other_thread(self.tid) {
                 return NativeForkTokenFlow::RetireForExec;
             }
@@ -3334,7 +3375,7 @@ impl NativeThreadRuntime {
             }
             std::thread::sleep(Duration::from_micros(200));
         }
-        NativeForkTokenFlow::Acquired
+        NativeForkTokenFlow::Acquired { contended }
     }
 
     fn signal_thread(&self, target: crate::thread::ThreadId, signum: i32) -> i64 {
@@ -5165,13 +5206,40 @@ fn handle_native_fork(
             "native Darwin run-elf fork does not yet support CLONE_PARENT".to_string(),
         ));
     }
+    // Fork-lifecycle attribution for the NATIVE (DSR) lane. Until now only the
+    // HVF backend fired these probes, so a fork on the shipped default backend
+    // was a single opaque ~4.6 ms span (vs ~0.53 ms for a bare macOS
+    // fork+exit+reap) with nothing to attribute the difference to. The spans
+    // below partition that cost; the phase legend lives on
+    // `probes::NativeForkPhase`.
+    //
+    // COST: `Instant::now()` is read only on this path. A guest fork already
+    // costs milliseconds, and nothing here is on the per-syscall or per-block
+    // hot path, so a handful of timestamp reads is not measurable — but that
+    // is exactly why they must not be copied into the dispatch loop.
+    let elapsed_us = |start: Instant| -> u64 {
+        let micros = start.elapsed().as_micros();
+        micros.min(u128::from(u64::MAX)) as u64
+    };
+    // Mirror HVF's `fork-pre`/`fork-post` contract so `fork-phases.d` brackets
+    // a native fork with NO edits. No EL1 on this lane: `elr` is reported 0 and
+    // `cpsr` carries the guest PSTATE.
+    crate::probes::fork_pre(request.guest_pc, 0, request.guest_pstate);
     // Serialize forks (and exclude a concurrent execve teardown): the same
     // CAS token the HVF fork barrier uses. A loser parks at the in-flight
     // fork's barrier so its drain counts this thread; a loser that observes
     // an execve replacement retires instead (its whole thread group is being
     // destroyed — the fork never happens, matching Linux).
+    let token_start = Instant::now();
     match thread_runtime.acquire_fork_token() {
-        NativeForkTokenFlow::Acquired => {}
+        NativeForkTokenFlow::Acquired { contended } => {
+            crate::probes::native_fork_lifecycle(
+                NativeForkPhase::TokenAcquire,
+                elapsed_us(token_start),
+                i64::from(contended),
+                0,
+            );
+        }
         NativeForkTokenFlow::RetireForExec => return Ok(NativeForkFlow::RetireForExec),
         NativeForkTokenFlow::TimedOut => {
             tracing::error!(
@@ -5194,7 +5262,14 @@ fn handle_native_fork(
     // to 1 (parking siblings unregister first, park second — same contract as
     // HVF's `handle_fork`). Exited-mid-quiesce threads also leave the count.
     let mut quiesced = false;
-    if thread_runtime.registry.live_count() > 1 {
+    // Measured UNCONDITIONALLY, including the single-threaded case that never
+    // enters the drain at all. "The stop-the-world costs nothing at threads=0"
+    // is then a reading off the trace rather than an assumption — which is the
+    // whole reason this probe exists: the native fork is ~8.7x a host fork at
+    // threads=0, where this path is provably not entered.
+    let quiesce_start = Instant::now();
+    let live_at_fork = thread_runtime.registry.live_count();
+    if live_at_fork > 1 {
         // linux4k boundary: the 4K-on-16K guarded-page fault emulation is not
         // multithread-safe (MT guarded faults corrupt its state and could
         // SIGSEGV the host — forkfpreclaim on linux4k; task_c2615fa2 tracks
@@ -5267,6 +5342,12 @@ fn handle_native_fork(
         }
         quiesced = true;
     }
+    crate::probes::native_fork_lifecycle(
+        NativeForkPhase::SiblingQuiesce,
+        elapsed_us(quiesce_start),
+        live_at_fork as i64,
+        i64::from(quiesced),
+    );
     // Drain in-flight EXIT CLEANUPS before forking: an exiting thread has
     // already left the kicker (so the quiesce above never counted it) but may
     // still be mutating process-global signal state under process-wide
@@ -5274,6 +5355,7 @@ fn handle_native_fork(
     // mutex held by a thread that does not exist in it (the HVF go-os_exec
     // vfork wedge). Bounded, then proceed (status-quo risk) — mirrors HVF.
     {
+        let cleanup_start = Instant::now();
         let cleanup_deadline = Instant::now() + Duration::from_secs(5);
         while crate::fork_quiesce::exit_cleanups_in_flight() > 0 {
             if Instant::now() >= cleanup_deadline {
@@ -5286,6 +5368,12 @@ fn handle_native_fork(
             }
             std::thread::yield_now();
         }
+        crate::probes::native_fork_lifecycle(
+            NativeForkPhase::ExitCleanupDrain,
+            elapsed_us(cleanup_start),
+            crate::fork_quiesce::exit_cleanups_in_flight() as i64,
+            0,
+        );
     }
     let end_fork_state = |quiesced: bool| {
         if quiesced {
@@ -5297,9 +5385,16 @@ fn handle_native_fork(
     // guest drain is complete, pin their outer gates before any fork-shared
     // provider/timer mutex, using one absolute deadline and rolling back without
     // calling fork if either helper fails to leave its short iteration.
+    let helper_start = Instant::now();
     let helper_deadline = Instant::now() + Duration::from_secs(10);
     let Some(network_fork_guard) = dispatcher.begin_network_fork_guard_until(helper_deadline)
     else {
+        crate::probes::native_fork_lifecycle(
+            NativeForkPhase::HelperGates,
+            elapsed_us(helper_start),
+            1,
+            0,
+        );
         end_fork_state(quiesced);
         return Ok(NativeForkFlow::Resume {
             value: crate::linux_abi::LINUX_EAGAIN.guest_retval(),
@@ -5309,6 +5404,12 @@ fn handle_native_fork(
     };
     let Some(rlimit_cpu_fork_guard) = dispatcher.begin_rlimit_cpu_fork_guard_until(helper_deadline)
     else {
+        crate::probes::native_fork_lifecycle(
+            NativeForkPhase::HelperGates,
+            elapsed_us(helper_start),
+            1,
+            0,
+        );
         drop(network_fork_guard);
         end_fork_state(quiesced);
         return Ok(NativeForkFlow::Resume {
@@ -5317,6 +5418,18 @@ fn handle_native_fork(
             child_stack: 0,
         });
     };
+    crate::probes::native_fork_lifecycle(
+        NativeForkPhase::HelperGates,
+        elapsed_us(helper_start),
+        0,
+        0,
+    );
+    // Everything from here to `libc::fork` is pre-fork bookkeeping done on
+    // behalf of BOTH processes. The EAGAIN/error arms inside it short-circuit
+    // WITHOUT a phase sample by design: a `fork-pre` with no `fork-post` is
+    // already the trace signature of an abandoned fork, and emitting a partial
+    // span would corrupt the phase averages the D script aggregates.
+    let bookkeeping_start = Instant::now();
     let vfork_pipe = if request.vfork.is_some() {
         memory.read().set_fork_inheritance(true);
         match vfork_pipe_pair() {
@@ -5379,6 +5492,13 @@ fn handle_native_fork(
     // kicker registry needs no hold: a stale COW runtime skips it entirely
     // (`forked_stale` in NativeThreadRuntime::drop).
     let fork_signal_locks = crate::host_signal::hold_signal_locks_for_fork();
+    crate::probes::native_fork_lifecycle(
+        NativeForkPhase::PreForkBookkeeping,
+        elapsed_us(bookkeeping_start),
+        child_ns_pid.map(i64::from).unwrap_or(-1),
+        i64::from(vfork_pipe.is_some()),
+    );
+    let host_fork_start = Instant::now();
     let child = unsafe { libc::fork() };
     // Both branches: drop the prepare bundle before any signal-static use.
     // The parent releases its guards normally; the child publishes a fresh
@@ -5387,6 +5507,21 @@ fn handle_native_fork(
     drop(rlimit_cpu_fork_guard);
     drop(network_fork_guard);
     drop(paused_guard);
+    // Both processes return from the ONE `fork(2)` and each measures its own
+    // side of it (they diverge in the kernel, so the two samples are genuinely
+    // different numbers), hence the explicit role: the phase alone cannot
+    // derive it.
+    crate::probes::native_fork_lifecycle_as(
+        if child == 0 {
+            NativeForkRole::Child
+        } else {
+            NativeForkRole::Parent
+        },
+        NativeForkPhase::HostFork,
+        elapsed_us(host_fork_start),
+        i64::from(child),
+        0,
+    );
     if child < 0 {
         crate::guest_cpu::abort_prepared_child_record();
         if let Some((read_fd, write_fd)) = vfork_pipe {
@@ -5402,6 +5537,11 @@ fn handle_native_fork(
         });
     }
     if child == 0 {
+        // CHILD: everything from here to the `Resume` below is the post-fork
+        // repair the guest cannot resume without. Nothing measured it before —
+        // it is the one span the perf_fork_scale numbers had no name for.
+        let child_repair_start = Instant::now();
+        let mut child_phase_start = child_repair_start;
         // Repair the inherited barrier state FIRST: the quiesce/fork flags
         // (and the parked-thread count, which belongs to PARENT threads that
         // do not exist here) would otherwise park this child's run loop at
@@ -5424,8 +5564,22 @@ fn handle_native_fork(
         }
         NATIVE_FORKED_GUEST_CHILD.store(true, std::sync::atomic::Ordering::Release);
         native_trace_fork_phase("child-guard-installed");
+        crate::probes::native_fork_lifecycle(
+            NativeForkPhase::ChildBarrierRepair,
+            elapsed_us(child_phase_start),
+            i64::from(vfork_pipe.is_some()),
+            0,
+        );
+        child_phase_start = Instant::now();
         native_after_fork_child(dispatcher);
         native_trace_fork_phase("child-dispatcher-reset");
+        crate::probes::native_fork_lifecycle(
+            NativeForkPhase::ChildDispatcherReset,
+            elapsed_us(child_phase_start),
+            crate::native::fork_child::after_fork_child_steps().len() as i64,
+            0,
+        );
+        child_phase_start = Instant::now();
         thread_runtime.reset_after_fork_child();
         // Retire SIBLING per-tid signal state before re-keying the forking
         // thread's own: fork clones only the calling thread, and the child's
@@ -5437,6 +5591,13 @@ fn handle_native_fork(
         thread_runtime.prepare_kick_target()?;
         thread_runtime.start_signal_wake_pump();
         native_trace_fork_phase("child-thread-runtime-reset");
+        crate::probes::native_fork_lifecycle(
+            NativeForkPhase::ChildRuntimeReset,
+            elapsed_us(child_phase_start),
+            i64::from(thread_runtime.tid().raw()),
+            0,
+        );
+        child_phase_start = Instant::now();
         crate::guest_cpu::reset();
         crate::guest_cpu::complete_child_record_post_fork_child();
         dispatcher.rlimit_cpu_after_fork_child().map_err(|error| {
@@ -5458,6 +5619,23 @@ fn handle_native_fork(
             let _ = write_guest_ram_through_lock(memory, addr, &self_tid);
         }
         native_trace_fork_phase("child-resume");
+        let child_ns_pid_self = i64::from(crate::namespace::pid::self_ns_pid());
+        crate::probes::native_fork_lifecycle(
+            NativeForkPhase::ChildGuestState,
+            elapsed_us(child_phase_start),
+            child_ns_pid_self,
+            0,
+        );
+        crate::probes::native_fork_lifecycle(
+            NativeForkPhase::ChildRuntimeRepairTotal,
+            elapsed_us(child_repair_start),
+            child_ns_pid_self,
+            0,
+        );
+        // NOTE: `fork-post` for the CHILD is fired by the run loop, not here —
+        // the DSR translator's own fork-child repair
+        // (`ChildTranslatorRebuild`) still has to run before the guest is
+        // resumable, and the translator lives at the call site.
         return Ok(NativeForkFlow::Resume {
             value: 0,
             fork_child: true,
@@ -5471,14 +5649,30 @@ fn handle_native_fork(
     // CoW fork landing inside it would wrongly SHARE guest-writable memory
     // with its child. The suspend is bounded (60 s) and exec-interruptible,
     // so the token hold is too.
+    // PARENT: post-fork bookkeeping and child-record publication, i.e. every
+    // remaining microsecond before the guest resumes.
+    let parent_publish_start = Instant::now();
     if quiesced {
         barrier.end_quiesce();
     }
+    // The vfork suspend is GUEST-PACED (it ends when the child execve's or
+    // exits), so it is reported as its own phase and SUBTRACTED from
+    // `ParentPublish` — folding it in would make carrick's own post-fork cost
+    // look arbitrarily large on any vfork+exec workload.
+    let mut vfork_suspend_us = 0u64;
     let vfork_wait = if let Some((read_fd, write_fd)) = vfork_pipe {
+        let vfork_suspend_start = Instant::now();
         close_fd(write_fd);
         let wait = wait_native_vfork_completion(read_fd, thread_runtime.tid());
         close_fd(read_fd);
         memory.read().set_fork_inheritance(false);
+        vfork_suspend_us = elapsed_us(vfork_suspend_start);
+        crate::probes::native_fork_lifecycle(
+            NativeForkPhase::VforkSuspend,
+            vfork_suspend_us,
+            i64::from(child),
+            0,
+        );
         wait
     } else {
         Ok(NativeVforkWait::Completed)
@@ -5515,6 +5709,16 @@ fn handle_native_fork(
         let _ = write_guest_ram_through_lock(memory, addr, &tid);
     }
     native_register_child_exit_watch(dispatcher, child, request.exit_signal, thread_runtime.tid());
+    crate::probes::native_fork_lifecycle(
+        NativeForkPhase::ParentPublish,
+        elapsed_us(parent_publish_start).saturating_sub(vfork_suspend_us),
+        i64::from(guest_child_pid),
+        0,
+    );
+    // Close the parent's `fork-pre`/`fork-post` bracket. `arg0` is the HOST
+    // child pid (nonzero), which is what makes the D script's parent clause
+    // distinguishable from its `arg0 == 0` child clause.
+    crate::probes::fork_post(child, request.guest_pc, 0);
     Ok(NativeForkFlow::Resume {
         value: i64::from(guest_child_pid),
         fork_child: false,
