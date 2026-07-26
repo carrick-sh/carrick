@@ -791,6 +791,38 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
     unsafe {
         libc::close(fd);
     }
+    // Re-stamp the scoped-cleanup proctitle. The self-reexec REPLACED this
+    // process image, and an `execve` resets the title: `ps` shows the raw
+    // `carrick __native-exec-resume --capsule-fd N --nonce …` argv, which
+    // carries neither the `carrick:<run-id>:` title nor `--name <run-id>`. Both
+    // scoped reapers — `scripts/sudo/kill.sh` and the conformance engine's
+    // `kill_scoped` — match ONLY that title, so every resumed guest was
+    // invisible to cleanup and leaked: 27 survived a single 1175-suite
+    // conformance run, reparented to init and still alive 26 minutes later.
+    // Leaked guests then drive box load up and spuriously TIMEOUT *other*
+    // concurrent suites, which is precisely the failure engine.rs's own comment
+    // warns about ("turning a clean ~33 CRASH_TIMEOUT baseline into 160+") and
+    // is what made a healthy `kill10` time out at ~suite 1000 while being
+    // unreproducible under five controlled pressure models.
+    //
+    // `run_id()` inside the setter reads `CARRICK_RUN_ID`, which survives the
+    // execve in the inherited environment (the capsule exec copies
+    // `std::env::vars_os`), so the id is still available here.
+    {
+        let name_bytes: &[u8] = payload
+            .argv
+            .first()
+            .map(Vec::as_slice)
+            .filter(|argv0| !argv0.is_empty())
+            .unwrap_or(payload.host_executable_path.as_slice());
+        // Basename only: the title's job is to be greppable, not to reproduce a
+        // full path in a fixed-width argv buffer.
+        let basename = name_bytes
+            .rsplit(|&b| b == b'/')
+            .next()
+            .unwrap_or(name_bytes);
+        crate::dispatch::set_host_process_name(basename);
+    }
     emit_lifecycle(
         current_pid as i32,
         crate::probes::DsrCacheLifecyclePhase::HostSelfReexecCapsuleEnd,
