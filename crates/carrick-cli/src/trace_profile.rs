@@ -48,6 +48,7 @@ pub(crate) enum TraceProfileKind {
     Dsr,
     DsrIndirect,
     DsrFork,
+    NativeWall,
 }
 
 impl TraceProfileKind {
@@ -56,6 +57,7 @@ impl TraceProfileKind {
             Self::Dsr => "dsr",
             Self::DsrIndirect => "dsr-indirect",
             Self::DsrFork => "dsr-fork",
+            Self::NativeWall => "native-wall",
         }
     }
 
@@ -69,6 +71,7 @@ impl TraceProfileKind {
             Self::Dsr => carrick_runtime::dtrace_consumer::BUNDLED_DSR_PROFILE_D,
             Self::DsrIndirect => carrick_runtime::dtrace_consumer::BUNDLED_DSR_INDIRECT_D,
             Self::DsrFork => carrick_runtime::dtrace_consumer::BUNDLED_DSR_FORK_D,
+            Self::NativeWall => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_WALL_D,
         }
     }
 
@@ -77,6 +80,7 @@ impl TraceProfileKind {
             "dsr" => Ok(Self::Dsr),
             "dsr-indirect" => Ok(Self::DsrIndirect),
             "dsr-fork" => Ok(Self::DsrFork),
+            "native-wall" => Ok(Self::NativeWall),
             other => bail!("unknown DSR profile {other:?}"),
         }
     }
@@ -86,6 +90,50 @@ impl TraceProfileKind {
 struct ProfileRecord {
     record_type: RecordType,
     fields: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct StackTraceRecord {
+    state: String,
+    pid: u64,
+    value_ns: u64,
+    frames: Vec<String>,
+}
+
+impl StackTraceRecord {
+    fn begin(line: &str) -> Result<Self> {
+        let mut parts = line.split('|');
+        if parts.next() != Some("NWSTACK1") || parts.next() != Some("begin") {
+            bail!("invalid native-wall stack header");
+        }
+        let mut fields = BTreeMap::new();
+        for raw_field in parts {
+            let (key, value) = raw_field
+                .split_once('=')
+                .ok_or_else(|| anyhow!("stack field lacks '=': {raw_field:?}"))?;
+            if key.is_empty() || value.is_empty() {
+                bail!("stack field has an empty key or value");
+            }
+            match fields.entry(key.to_owned()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(value.to_owned());
+                }
+                Entry::Occupied(_) => bail!("duplicate stack field {key:?}"),
+            }
+        }
+        let required = |key: &str| {
+            fields
+                .get(key)
+                .map(String::as_str)
+                .ok_or_else(|| anyhow!("stack record is missing {key:?}"))
+        };
+        Ok(Self {
+            state: required("state")?.to_owned(),
+            pid: parse_u64(required("pid")?).context("invalid stack pid")?,
+            value_ns: parse_u64(required("value_ns")?).context("invalid stack duration")?,
+            frames: Vec::new(),
+        })
+    }
 }
 
 impl ProfileRecord {
@@ -254,6 +302,72 @@ struct MetricBuilder {
     incomplete: u64,
 }
 
+fn summed_count(
+    grouped: &BTreeMap<ProfileScope, MetricBuilder>,
+    phase: &str,
+    kind: Option<&str>,
+) -> Option<u64> {
+    let mut found = false;
+    let mut total = 0_u64;
+    for (scope, metric) in grouped {
+        if scope.phase.as_deref() == Some(phase)
+            && kind.is_none_or(|expected| scope.kind.as_deref() == Some(expected))
+            && let Some(value) = metric.count
+        {
+            found = true;
+            total = total.saturating_add(value);
+        }
+    }
+    found.then_some(total)
+}
+
+fn summed_total_ns(grouped: &BTreeMap<ProfileScope, MetricBuilder>, phase: &str) -> Option<u64> {
+    let mut found = false;
+    let mut total = 0_u64;
+    for (scope, metric) in grouped {
+        if scope.phase.as_deref() == Some(phase)
+            && let Some(value) = metric.total_ns
+        {
+            found = true;
+            total = total.saturating_add(value);
+        }
+    }
+    found.then_some(total)
+}
+
+fn validate_native_wall_metrics(
+    grouped: &BTreeMap<ProfileScope, MetricBuilder>,
+    stack_traces: &[StackTraceRecord],
+) -> Result<()> {
+    let wall_samples = summed_count(grouped, "wall-samples", None)
+        .filter(|value| *value != 0)
+        .ok_or_else(|| anyhow!("native-wall profile has no wall samples"))?;
+    let wall_buckets = summed_count(grouped, "wall-state", None)
+        .ok_or_else(|| anyhow!("native-wall profile has no wall-state buckets"))?;
+    if wall_buckets != wall_samples {
+        bail!("native-wall wall-state buckets sum to {wall_buckets}, expected {wall_samples}");
+    }
+    summed_total_ns(grouped, "elapsed")
+        .filter(|value| *value != 0)
+        .ok_or_else(|| anyhow!("native-wall profile has no elapsed duration"))?;
+    let live_at_end = summed_count(grouped, "process-lifecycle", Some("live-at-end"))
+        .ok_or_else(|| anyhow!("native-wall profile has no live-at-end count"))?;
+    if live_at_end != 0 {
+        bail!("native-wall profile ended with {live_at_end} tracked process(es)");
+    }
+    let cpu_samples = summed_count(grouped, "cpu-user-pc", None)
+        .unwrap_or(0)
+        .saturating_add(summed_count(grouped, "cpu-kernel-pc", None).unwrap_or(0));
+    if cpu_samples == 0 {
+        bail!("native-wall profile has no CPU samples");
+    }
+    let voluntary_ns = summed_total_ns(grouped, "offcpu-voluntary-total").unwrap_or(0);
+    if voluntary_ns != 0 && stack_traces.is_empty() {
+        bail!("native-wall profile has voluntary off-CPU time but no blocking stacks");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub(crate) enum ProfileMetric {
@@ -277,6 +391,12 @@ pub(crate) enum ProfileMetric {
         metric: String,
         used: u64,
         capacity: u64,
+    },
+    StackTrace {
+        state: String,
+        pid: u64,
+        value_ns: u64,
+        frames: Vec<String>,
     },
     Completion,
 }
@@ -352,6 +472,8 @@ impl ProfileSummary {
 
         let mut grouped = BTreeMap::<ProfileScope, MetricBuilder>::new();
         let mut high_water = BTreeMap::<(ProfileScope, String), (u64, u64)>::new();
+        let mut stack_traces = Vec::<StackTraceRecord>::new();
+        let mut open_stack = None::<StackTraceRecord>;
         let mut completion = None;
 
         for (index, raw_line) in lines.into_iter().enumerate() {
@@ -364,6 +486,37 @@ impl ProfileSummary {
                     "profile record appears after completion at line {}",
                     index + 1
                 );
+            }
+            if let Some(stack) = open_stack.as_mut() {
+                if line == "NWSTACK1|end" {
+                    let stack = open_stack
+                        .take()
+                        .ok_or_else(|| anyhow!("native-wall stack state disappeared"))?;
+                    if stack.frames.is_empty() {
+                        bail!("native-wall stack at line {} has no frames", index + 1);
+                    }
+                    stack_traces.push(stack);
+                } else if line.starts_with("NWSTACK1|begin") {
+                    bail!("nested native-wall stack at line {}", index + 1);
+                } else if line.starts_with("DSRPROF1|") {
+                    bail!(
+                        "profile record interrupted native-wall stack at line {}",
+                        index + 1
+                    );
+                } else {
+                    stack.frames.push(line.to_owned());
+                }
+                continue;
+            }
+            if line.starts_with("NWSTACK1|begin") {
+                open_stack = Some(
+                    StackTraceRecord::begin(line)
+                        .with_context(|| format!("invalid stack at line {}", index + 1))?,
+                );
+                continue;
+            }
+            if line == "NWSTACK1|end" {
+                bail!("native-wall stack end without begin at line {}", index + 1);
             }
             let record = ProfileRecord::parse(line)
                 .with_context(|| format!("invalid profile record at line {}", index + 1))?;
@@ -444,9 +597,18 @@ impl ProfileSummary {
                 RecordType::Complete => unreachable!("completion handled above"),
             }
         }
+        if open_stack.is_some() {
+            bail!("profile stream ended inside a native-wall stack");
+        }
 
         let (profile, bounded, target_exit_reason) =
             completion.ok_or_else(|| anyhow!("profile stream is missing its completion record"))?;
+        if !stack_traces.is_empty() && profile != TraceProfileKind::NativeWall {
+            bail!("stack records are valid only for the native-wall profile");
+        }
+        if profile == TraceProfileKind::NativeWall {
+            validate_native_wall_metrics(&grouped, &stack_traces)?;
+        }
         for (scope, builder) in &grouped {
             let exact_fields = [
                 builder.count.is_some(),
@@ -552,6 +714,25 @@ impl ProfileSummary {
                     metric,
                     used,
                     capacity,
+                },
+                sampling_interval: None,
+            });
+        }
+        for stack in stack_traces {
+            metrics.push(ProfileOutputMetric {
+                scope: ProfileScope {
+                    phase: Some("offcpu-voluntary-stack".to_owned()),
+                    pid: Some(stack.pid),
+                    tid: None,
+                    kind: Some(stack.state.clone()),
+                    source_pc: None,
+                    target_pc: None,
+                },
+                metric: ProfileMetric::StackTrace {
+                    state: stack.state,
+                    pid: stack.pid,
+                    value_ns: stack.value_ns,
+                    frames: stack.frames,
                 },
                 sampling_interval: None,
             });
@@ -734,6 +915,113 @@ mod tests {
         assert!(TraceProfileKind::Dsr.requires_runtime_profile());
         assert!(!TraceProfileKind::DsrIndirect.requires_runtime_profile());
         assert!(TraceProfileKind::DsrFork.requires_runtime_profile());
+    }
+
+    #[test]
+    fn native_wall_profile_parses_reconciled_samples_and_blocking_stack() {
+        assert!(!TraceProfileKind::NativeWall.requires_runtime_profile());
+        let summary = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=120",
+                "DSRPROF1|count|phase=wall-state|kind=runnable-descheduled|value=40",
+                "DSRPROF1|count|phase=wall-state|kind=all-sleeping|value=35",
+                "DSRPROF1|count|phase=wall-state|kind=transition|value=2",
+                "DSRPROF1|count|phase=wall-samples|value=197",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=499",
+                "DSRPROF1|total|phase=offcpu-voluntary-pc|pid=42|source_pc=0x2000|value_ns=1000",
+                "DSRPROF1|total|phase=offcpu-voluntary-total|value_ns=1000",
+                "NWSTACK1|begin|state=voluntary|pid=42|value_ns=900",
+                "0x2000",
+                "0x3000",
+                "NWSTACK1|end",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("complete native wall profile");
+
+        summary
+            .require_profile(TraceProfileKind::NativeWall)
+            .expect("matching profile");
+        assert!(summary.completion.complete);
+        assert!(summary.metrics.iter().any(|metric| matches!(
+            &metric.metric,
+            ProfileMetric::StackTrace {
+                state,
+                pid: 42,
+                value_ns: 900,
+                frames,
+            } if state == "voluntary" && frames == &["0x2000", "0x3000"]
+        )));
+    }
+
+    #[test]
+    fn native_wall_profile_rejects_unreconciled_populations() {
+        let cases = [
+            (
+                "missing elapsed duration",
+                vec![
+                    "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=10",
+                    "DSRPROF1|count|phase=wall-samples|value=10",
+                    "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=5",
+                    "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                    "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+                ],
+            ),
+            (
+                "wall bucket mismatch",
+                vec![
+                    "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=9",
+                    "DSRPROF1|count|phase=wall-samples|value=10",
+                    "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=5",
+                    "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                    "DSRPROF1|total|phase=elapsed|value_ns=1000",
+                    "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+                ],
+            ),
+            (
+                "live process at end",
+                vec![
+                    "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=10",
+                    "DSRPROF1|count|phase=wall-samples|value=10",
+                    "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=5",
+                    "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=1",
+                    "DSRPROF1|total|phase=elapsed|value_ns=1000",
+                    "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+                ],
+            ),
+            (
+                "missing CPU sample",
+                vec![
+                    "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=10",
+                    "DSRPROF1|count|phase=wall-samples|value=10",
+                    "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                    "DSRPROF1|total|phase=elapsed|value_ns=1000",
+                    "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+                ],
+            ),
+            (
+                "voluntary time without stack",
+                vec![
+                    "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=10",
+                    "DSRPROF1|count|phase=wall-samples|value=10",
+                    "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=5",
+                    "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                    "DSRPROF1|total|phase=elapsed|value_ns=1000",
+                    "DSRPROF1|total|phase=offcpu-voluntary-total|value_ns=500",
+                    "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+                ],
+            ),
+        ];
+
+        for (case, lines) in cases {
+            assert!(
+                ProfileSummary::from_lines(lines, ProfileCaptureStatus::default()).is_err(),
+                "{case} was accepted"
+            );
+        }
     }
 
     #[test]

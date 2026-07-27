@@ -2109,6 +2109,8 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
         NativeThreadStart::Detached { context, .. } => *context,
     };
     let process_translator = memory.read().dsr_process_translator()?;
+    let cache_range = process_translator.cache_host_range();
+    crate::probes::host_jit_range(cache_range.start, cache_range.end);
     let mut translator =
         dsr::ThreadTranslator::for_process(process_translator, thread_runtime.tid().raw());
     debug_assert_eq!(translator.profiling_enabled(), PROFILE);
