@@ -56,6 +56,8 @@ pub(crate) struct NativeGuestExecV1 {
     #[serde(default)]
     pub(crate) artifact_spike: Option<NativeReexecArtifactSpikeV1>,
     #[serde(default)]
+    pub(crate) aot_cache: Option<NativeReexecAotCacheV1>,
+    #[serde(default)]
     pub(crate) bind_mounts: Vec<crate::vfs::bind::NativeReexecBindMountV1>,
     pub(crate) fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1,
     pub(crate) xsig: NativeReexecXsigV1,
@@ -105,6 +107,50 @@ pub(crate) struct NativeReexecArtifactSpikeV1 {
     pub(crate) host_inode: u64,
     pub(crate) host_size: u64,
     pub(crate) authority_nonce: [u8; 16],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeReexecAotCacheV1 {
+    pub(crate) host_fd: i32,
+    pub(crate) original_host_fd_flags: i32,
+    pub(crate) host_device: u64,
+    pub(crate) host_inode: u64,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) creator_pid: i32,
+    pub(crate) authority_nonce: [u8; 16],
+    pub(crate) translator_abi: u32,
+}
+
+impl From<carrick_native_darwin::aot_cache::ContainerCacheReexecConfig> for NativeReexecAotCacheV1 {
+    fn from(config: carrick_native_darwin::aot_cache::ContainerCacheReexecConfig) -> Self {
+        Self {
+            host_fd: config.host_fd,
+            original_host_fd_flags: config.original_host_fd_flags,
+            host_device: config.host_device,
+            host_inode: config.host_inode,
+            path: config.path,
+            creator_pid: config.creator_pid,
+            authority_nonce: config.authority_nonce,
+            translator_abi: config.translator_abi,
+        }
+    }
+}
+
+impl From<&NativeReexecAotCacheV1>
+    for carrick_native_darwin::aot_cache::ContainerCacheReexecConfig
+{
+    fn from(snapshot: &NativeReexecAotCacheV1) -> Self {
+        Self {
+            host_fd: snapshot.host_fd,
+            original_host_fd_flags: snapshot.original_host_fd_flags,
+            host_device: snapshot.host_device,
+            host_inode: snapshot.host_inode,
+            path: snapshot.path.clone(),
+            creator_pid: snapshot.creator_pid,
+            authority_nonce: snapshot.authority_nonce,
+            translator_abi: snapshot.translator_abi,
+        }
+    }
 }
 
 // The artifact-spike authority itself moved to `carrick-dsr-aarch64`, which
@@ -224,6 +270,14 @@ impl NativeGuestExecV1 {
             || self
                 .artifact_spike
                 .is_some_and(|artifact| artifact.host_fd < 0 || artifact.host_size == 0)
+            || self.aot_cache.as_ref().is_some_and(|cache| {
+                cache.host_fd < 0
+                    || cache.creator_pid <= 0
+                    || cache.path.as_os_str().is_empty()
+                    || cache.path.as_os_str().as_bytes().len() > MAX_PATH_LEN
+                    || !cache.path.is_absolute()
+                    || cache.translator_abi != carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_V1
+            })
             || (self.process_state.ptrace_traceme && self.kernel_arena.is_none())
             || self.bind_mounts.len() > MAX_VECTOR_ITEMS
             || self.fd_table.files.len() > MAX_VECTOR_ITEMS
@@ -335,6 +389,7 @@ pub(crate) fn begin_guest_exec(
         }
     })?;
     let artifact_spike = crate::native_darwin::artifact_spike_authority_snapshot_if_enabled()?;
+    let aot_cache = crate::native_darwin::aot_cache_authority_snapshot()?;
     let mut payload = NativeExecCapsuleV1 {
         producer_pid: unsafe { libc::getpid() as u32 },
         purpose: NativeExecCapsulePurposeV1::GuestExec,
@@ -353,6 +408,7 @@ pub(crate) fn begin_guest_exec(
             kernel_arena: Some(kernel_arena),
             shared_futex_waiters: Some(shared_futex_waiters),
             artifact_spike,
+            aot_cache,
             bind_mounts,
             fd_table,
             xsig,
@@ -610,6 +666,13 @@ where
                 artifact.original_host_fd_flags & !libc::FD_CLOEXEC,
             )?;
         }
+        if let Some(cache) = &guest.aot_cache {
+            prepared_host_fds.prepare(
+                cache.host_fd,
+                cache.original_host_fd_flags,
+                cache.original_host_fd_flags & !libc::FD_CLOEXEC,
+            )?;
+        }
         prepared_host_fds.prepare(
             guest.xsig.host_fd,
             guest.xsig.original_host_fd_flags,
@@ -845,6 +908,9 @@ pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::Native
                 .ok_or_else(|| anyhow::anyhow!("native guest exec capsule has no guest state"))?;
             if let Some(artifact) = &guest.artifact_spike {
                 crate::native_darwin::adopt_artifact_spike_for_resume(artifact)?;
+            }
+            if let Some(cache) = &guest.aot_cache {
+                crate::native_darwin::adopt_aot_cache_for_resume(cache)?;
             }
             adopt_xsig(&guest.xsig)?;
             emit_lifecycle(
@@ -1162,6 +1228,7 @@ mod tests {
                 kernel_arena: None,
                 shared_futex_waiters: None,
                 artifact_spike: None,
+                aot_cache: None,
                 bind_mounts: Vec::new(),
                 fd_table: crate::dispatch::fd_table::NativeReexecFdTableV1 {
                     files: Vec::new(),
@@ -1613,6 +1680,37 @@ mod tests {
         });
 
         let result = exec_capsule_with(payload, [0x44; 16], None, |_| {
+            assert_eq!(fd_flags(fd) & libc::FD_CLOEXEC, 0);
+            std::io::Error::from_raw_os_error(libc::ENOEXEC)
+        });
+        assert!(result.is_err());
+        assert_eq!(fd_flags(fd), original_flags);
+    }
+
+    #[test]
+    fn container_cache_authority_survives_capsule_exec() {
+        let cache = tempfile::tempdir().expect("cache directory");
+        let directory = std::fs::File::open(cache.path()).expect("open cache directory");
+        let fd = directory.as_raw_fd();
+        let original_flags = fd_flags(fd);
+        let identity = host_identity(fd);
+        let mut payload = sample();
+        payload
+            .guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .aot_cache = Some(super::NativeReexecAotCacheV1 {
+            host_fd: fd,
+            original_host_fd_flags: original_flags,
+            host_device: identity.st_dev as u64,
+            host_inode: identity.st_ino,
+            path: cache.path().to_path_buf(),
+            creator_pid: unsafe { libc::getpid() },
+            authority_nonce: [0x6b; 16],
+            translator_abi: carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_V1,
+        });
+
+        let result = exec_capsule_with(payload, [0x45; 16], None, |_| {
             assert_eq!(fd_flags(fd) & libc::FD_CLOEXEC, 0);
             std::io::Error::from_raw_os_error(libc::ENOEXEC)
         });

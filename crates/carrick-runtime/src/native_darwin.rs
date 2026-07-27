@@ -23,6 +23,20 @@ pub(crate) fn adopt_artifact_spike_for_resume(
 ) -> anyhow::Result<()> {
     dsr::artifact_spike::adopt_for_resume(snapshot)
 }
+
+pub(crate) fn aot_cache_authority_snapshot()
+-> anyhow::Result<Option<crate::native_exec_capsule::NativeReexecAotCacheV1>> {
+    carrick_native_darwin::aot_cache::container_cache_snapshot()
+        .map(|snapshot| snapshot.map(Into::into))
+        .map_err(|error| anyhow::anyhow!("snapshot native AOT cache authority: {error}"))
+}
+
+pub(crate) fn adopt_aot_cache_for_resume(
+    snapshot: &crate::native_exec_capsule::NativeReexecAotCacheV1,
+) -> anyhow::Result<()> {
+    carrick_native_darwin::aot_cache::adopt_container_cache(&snapshot.into())
+        .map_err(|error| anyhow::anyhow!("adopt native AOT cache authority: {error}"))
+}
 // The native guest-memory model (NativeMappedMemory + handle/config, the
 // exec-mapping machinery) and the bad64 fault-path emulation moved to
 // `carrick_dsr_aarch64::{mapped_memory, emulate}` as the
@@ -1559,6 +1573,8 @@ fn run_image_in_child(
     relative_relocations: Vec<NativeRelativeRelocation>,
     plan: &ExecutionPlan,
 ) -> Result<RunResult, RuntimeError> {
+    let _cache_session =
+        carrick_native_darwin::aot_cache::begin_container_cache().map_err(AddressSpaceError::Io)?;
     let stdout_pipe = pipe_pair()?;
     let stderr_pipe = pipe_pair()?;
     let pid = unsafe { libc::fork() };
