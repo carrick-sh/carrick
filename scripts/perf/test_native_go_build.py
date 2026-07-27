@@ -134,6 +134,20 @@ class NativeGoBuildTest(unittest.TestCase):
 
         self.assertEqual(log.read_text().splitlines(), [f"rm -f {sample['run_id']}"])
 
+    def test_sample_can_retain_complete_captured_output(self):
+        directory, _ = self.install_fake_docker("arm64")
+        captured = directory / "profile" / "docker-1.log"
+
+        native_go_build.run_sample(
+            directory,
+            "docker",
+            index=1,
+            timeout_seconds=5,
+            captured_output=captured,
+        )
+
+        self.assertEqual(captured.read_text(), "BUILD_OK\n")
+
     def test_phase_summary_keeps_engine_boundaries(self):
         summary = native_go_build.summarize_phases(
             {
