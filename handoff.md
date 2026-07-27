@@ -127,7 +127,8 @@ near enough to repay roughly 260 million additional exits. Filtering to a
 transitively closed direct-target subset made things worse (55.24 s) and was
 also reverted.
 
-The first immutable-code-compatible late-binding precursor now carries exact
+**H004 is selected as `SPIKING`:** the first immutable-code-compatible
+late-binding precursor now carries exact
 target authority through the two-way per-thread cache. It is correct across
 private/shared and cross-unit targets, and translator ABI 2 rejects the old
 16-byte cache population. Three untraced samples were stable at 25.169,
