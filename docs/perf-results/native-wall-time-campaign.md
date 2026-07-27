@@ -43,6 +43,8 @@ Current milestone: **M1 — accounted baseline**. M0 is complete.
 | E003a | paired runner at `e53f1608` | accepted tooling | Identical cold-cache Carrick/Docker commands, native-arm64 image validation, scoped cleanup and v2 phase/ratio artifact |
 | E003b | `target/perf/native-wall-smoke-c.jsonl` | tooling-only; raw untracked | Signed local AArch64 trace: natural exit, 44 metric rows, 102 reconciled wall samples, JIT range present, zero live processes and zero drops |
 | E003c | `target/perf/native-wall-smoke-c-summary.json` | tooling-only; derived untracked | Live analyzer agreement: 99.5% wall-timer coverage, 99.0% CPU classification, zero live processes, accepted without weakening the 99/90/80 thresholds |
+| E003d | `target/perf/native-wall-smoke-d{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Native container smoke printed `TRACE_OK`; 709 rows, natural zero-drop exit, 99.9% wall coverage, 98.3% CPU classification, zero live processes |
+| E003e | `target/perf/native-wall-scope-a{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Concurrent unrelated Carrick PIDs 96365/96381 produced zero scoped CPU, off-CPU, or image rows; traced tree retained 99.8% wall and 97.9% CPU coverage |
 | E004 | fresh Carrick/Docker baseline | pending | Official `C0`, `D0`, `R0` |
 | E005 | whole-tree attribution run A | pending | First reconciled current-state proportions |
 | E006 | whole-tree attribution run B | pending | Stability and dominant-rank replication |
@@ -111,7 +113,7 @@ to `PROPOSED`.
 | Wave | Focused tests | Signed Go demo | Native smoke | Node/CPython guardrails | `just ci` | State |
 |---|---|---|---|---|---|---|
 | historical `9c25688d` | green | green | 23/23 MATCH | Go sync 52/52; CPython threading 193/193; subprocess 278/278 | green | accepted starting implementation |
-| M1 measurement tooling | 18 Rust + 17 Python tests green | local static AArch64 trace completed naturally | n/a | n/a | signed build + DOF present | collector and fail-closed analyzer agree live; Go-build evidence pending |
+| M1 measurement tooling | 18 Rust + 17 Python tests green | native container smoke printed `TRACE_OK` | n/a | n/a | signed build + DOF present | analyzer accepted container and adversarial scope traces; Go-build evidence pending |
 
 ## Decisions
 

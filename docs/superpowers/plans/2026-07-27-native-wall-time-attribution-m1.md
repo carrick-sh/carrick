@@ -633,7 +633,7 @@ The body names the 99%, 90%, 80%, and five-percentage-point gates.
 - Produces one accepted short-workload profile before Go-build tracing is
   allowed.
 
-- [ ] **Step 1: Check host and trace prerequisites**
+- [x] **Step 1: Check host and trace prerequisites**
 
 Run:
 
@@ -647,7 +647,7 @@ otool -l target/release/carrick | grep -A2 __dof_carrick
 
 Do not use `--allow-busy` for evidence.
 
-- [ ] **Step 2: Run a bounded native smoke trace**
+- [x] **Step 2: Run a bounded native smoke trace**
 
 Use a unique run ID:
 
@@ -664,7 +664,7 @@ CARRICK_RUN_ID=native-wall-smoke-<stamp> \
 Expected: natural completion, `TRACE_OK`, zero drops, nonzero wall and CPU
 samples, zero live processes.
 
-- [ ] **Step 3: Run the summarizer**
+- [x] **Step 3: Run the summarizer**
 
 Run:
 
@@ -679,13 +679,13 @@ Expected: accepted reconciliation. If it fails, record the exact failed
 invariant in the ledger before modifying the profile; do not weaken a threshold
 to force green.
 
-- [ ] **Step 4: Validate population scoping adversarially**
+- [x] **Step 4: Validate population scoping adversarially**
 
 Start an unrelated stamped Carrick `/bin/sleep 15` run, then repeat the short
 trace. Assert the unrelated PID appears nowhere in `cpu-user-pc`,
 `offcpu-*`, or `image-base` rows. Clean each run by its own run ID.
 
-- [ ] **Step 5: Commit any profiler correction**
+- [x] **Step 5: Commit any profiler correction**
 
 If Tasks 4.2–4.4 required code changes, rerun focused tests and commit:
 
@@ -699,6 +699,9 @@ git commit -m "fix(native): make wall profile reconcile"
 
 If no correction was required, record the live receipt in the ledger with no
 empty commit.
+
+No correction was required. The container smoke and concurrent-unrelated-tree
+scope check were accepted and recorded in the campaign ledger.
 
 ---
 
