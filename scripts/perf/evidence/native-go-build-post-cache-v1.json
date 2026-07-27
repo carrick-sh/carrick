@@ -1,0 +1,61 @@
+{
+  "binary": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+  "binary_sha256": "9cc21ee404c7482bbdbe73beddffc5b822b63320f1d735de5a66a5a92fc486ef",
+  "finished_at": "2026-07-27T10:18:45.764269+00:00",
+  "git_commit": "deb9a80e2eb72bb71042fbf518a09407891925fd",
+  "git_dirty": false,
+  "git_status": [],
+  "host": {
+    "busy_override": false,
+    "load_average": [
+      5.60205078125,
+      6.08447265625,
+      5.25244140625
+    ],
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "preflight_reasons": []
+  },
+  "median_ms": 19485,
+  "sample_count": 5,
+  "samples": [
+    {
+      "build_ok": true,
+      "elapsed_ms": 19485,
+      "index": 1,
+      "return_code": 0,
+      "run_id": "native-go-build-79093-1785147427457965000-1"
+    },
+    {
+      "build_ok": true,
+      "elapsed_ms": 19392,
+      "index": 2,
+      "return_code": 0,
+      "run_id": "native-go-build-79093-1785147447027022000-2"
+    },
+    {
+      "build_ok": true,
+      "elapsed_ms": 19342,
+      "index": 3,
+      "return_code": 0,
+      "run_id": "native-go-build-79093-1785147466507465000-3"
+    },
+    {
+      "build_ok": true,
+      "elapsed_ms": 19707,
+      "index": 4,
+      "return_code": 0,
+      "run_id": "native-go-build-79093-1785147485940337000-4"
+    },
+    {
+      "build_ok": true,
+      "elapsed_ms": 19917,
+      "index": 5,
+      "return_code": 0,
+      "run_id": "native-go-build-79093-1785147505737215000-5"
+    }
+  ],
+  "schema": "carrick.native-go-build.v1",
+  "started_at": "2026-07-27T10:17:07.457745+00:00"
+}

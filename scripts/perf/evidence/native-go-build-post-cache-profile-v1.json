@@ -1,0 +1,41 @@
+{
+  "schema": "carrick.native-go-build-profile.v1",
+  "captured_at": "2026-07-27T10:19:30Z",
+  "git_commit": "deb9a80e2eb72bb71042fbf518a09407891925fd",
+  "git_dirty": false,
+  "binary_sha256": "9cc21ee404c7482bbdbe73beddffc5b822b63320f1d735de5a66a5a92fc486ef",
+  "run_id": "native-post-cache-profile-v1",
+  "workload": "go-build cold GOCACHE",
+  "build_ok": true,
+  "profile": {
+    "translations": 1867805,
+    "duplicate_publications": 0,
+    "cache_lookups": 1868311,
+    "cache_lookup_hits": 506,
+    "translation_ns": 8521019526,
+    "translation_decode_ns": 2584533336,
+    "translation_emit_ns": 5805699527,
+    "translation_publication_ns": 1148446765,
+    "gateway_entries": 2395609,
+    "indirect_resolver_exits": 862580,
+    "direct_resolver_exits": 1433321,
+    "syscall_exits": 95693,
+    "supervisor_self_cpu_ns": 1597895000,
+    "children_cpu_ns": 43826227000
+  },
+  "comparison_profile": {
+    "description": "retained two-way cache with unused source capture removed, before redundant publication arbitration removal",
+    "translations": 1865250,
+    "duplicate_publications": 0,
+    "translation_publication_ns": 2824203046,
+    "gateway_entries": 2392684,
+    "indirect_resolver_exits": 862936,
+    "children_cpu_ns": 44299983000
+  },
+  "observed_change": {
+    "translation_publication_ns": -1675756281,
+    "translation_publication_percent": -59.33,
+    "children_cpu_ns": -473756000,
+    "children_cpu_percent": -1.07
+  }
+}

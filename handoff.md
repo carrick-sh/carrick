@@ -1,7 +1,7 @@
 # Native-lane performance handoff
 
-**Date:** 2026-07-26
-**Branch:** `main`
+**Date:** 2026-07-27
+**Branch:** `codex/native-aarch64-container-cache`
 **Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
 default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
@@ -15,15 +15,18 @@ default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
 ## Current state
 
-Goal in flight: **get carrick's overhead on real workloads toward 2x.** This
-session took the reference workload from **15.7x to 10.7x** against the Docker
-oracle, and — more useful than the number — replaced guesswork with attribution:
-every remaining chunk of cost now has a named phase and a counter behind it.
+Goal in flight: **get carrick's overhead on real workloads toward 2x.** The
+first session took the reference workload from **15.7x to 10.7x** under its
+CPU-overhead convention. The continuation on
+`codex/native-aarch64-container-cache` reduced the authoritative wall median
+from **21,786 ms to 19,485 ms** (−10.56%). This is meaningful progress, but it
+is not close to the 2x destination and must not be presented as completion.
 
-All work is committed on `main`, `just ci` green, `just conformance-quick` clean
-on the native lane (no regressions, including `go-sync` 52/52 and
-`cpython-threading` 193/193 — the suites that would break first if fused atomics
-were wrong).
+The earlier fusion/gateway work is on `main`; the continuation is committed on
+the branch named above. `just ci` is green and
+`just conformance-native smoke --workers 4` is clean (no regressions, including
+`go-sync` 52/52 and `cpython-threading` 193/193 — the suites that would break
+first if fused atomics or shared generation authority were wrong).
 
 Reference workload: the conformance `go-build` case — `go build` of a
 hello-world with a cold `GOCACHE`.
@@ -33,14 +36,77 @@ hello-world with a cold `GOCACHE`.
 | session start | 31,965 ms | — |
 | + exclusive fusion (`8ffcbb4b`) | 23,650 ms | −26.0% |
 | + gateway indirection (`26de3c07`) | **21,786 ms** | **−31.8%** |
+| + two-way chaining + cold-publication cleanup (`deb9a80e`) | **19,485 ms** | **−39.0%** |
 | Docker oracle | 942 ms (2.26 CPU-s) | — |
 
 Every carrick figure is five untraced back-to-back runs on an idle machine,
 median reported. **Measure this way or not at all** — see Traps.
 
-Throwaway harness at
-`/Users/tjfontaine/.claude/jobs/63060941/tmp/gobuild.sh`; worth promoting into
-`scripts/perf/` if this continues.
+The workload now has a checked-in runner:
+`scripts/perf/native_go_build.py`. The authoritative continuation evidence is
+`scripts/perf/evidence/native-go-build-post-cache-v1.json` (19,485, 19,392,
+19,342, 19,707, 19,917 ms; clean commit and accepted idle-host preflight).
+
+## 2026-07-27 continuation
+
+### Default-path wins retained
+
+- The per-thread indirect target cache is now two-way set associative (2 MiB
+  per thread). Against the old direct-mapped profile, indirect resolver exits
+  fell **1,509,230 → 862,580** (−42.9%) and total gateway entries fell
+  **3,037,449 → 2,395,609** (−21.1%).
+- Translation no longer captures source words unless artifact recording or
+  shared-unit publication is enabled. Emitted PC maps, direct links and
+  recovery metadata move into process ownership instead of cloning.
+- AArch64 cold publication no longer enters a second mutex/B-tree arbitration
+  index. `ProcessState::translate` already holds the process write guard and
+  rechecks the authoritative block map under it; profiles recorded zero
+  duplicates across ~1.87M translations. Clean-profile publication time fell
+  **2.824 s → 1.148 s** (−59.3%).
+- `InstructionMap` validates monotonic emitted offsets in one scan rather than
+  allocating and sorting a second vector. Keep this as dead-allocation removal;
+  its isolated five-run wall result was inside host noise.
+
+Profile evidence:
+`scripts/perf/evidence/native-go-build-post-cache-profile-v1.json`.
+
+### Portable translation reuse is correct but not a default performance win
+
+The container-scoped design is implemented through image-digest keys, portable
+artifact normalization, immutable signed Mach-O units, exec-carried authority,
+unit-scoped generation bindings and cross-unit fail-closed chaining.
+`CARRICK_DSR_ARTIFACT_SPIKE=1` and
+`CARRICK_DSR_SHARED_TRANSLATION=1` remain explicit opt-ins:
+
+- artifact replay median: 19,967 ms versus its 19,759 ms nearby control;
+- signed shared-unit variants: 31–77 s, depending on unit policy.
+
+The correctness seam is worth keeping, but enabling it by default would be a
+regression. The next design must amortize signing/dlopen at a much coarser
+granularity and publish early enough for sibling compiler processes to reuse
+the code.
+
+### Experiments stopped
+
+- startup Clap/bincode fast path: 19,748 ms versus 19,759 ms control;
+- eager return-continuation priming: 19,676 ms versus 19,614 ms control;
+- four-way 4 MiB target cache: 19,705 ms;
+- two-way 1 MiB target cache: 19,735 ms;
+- custom block-index hasher: 19,464 ms versus 19,466 ms control.
+
+All were reverted. Do not resurrect them without new evidence.
+
+### Verification receipts
+
+- Signed native demo: Linux `aarch64`, Go 1.24.13, compile and execute
+  `native-go-ok`.
+- `just conformance-native smoke --workers 4`: 23/23 MATCH, including
+  `go-sync` 52/52, `cpython-threading` 193/193 and
+  `cpython-subprocess` 278/278.
+- `just ci`: green after the final implementation commits.
+- Red-first tests cover cache collisions, trusted private-cache entry,
+  shared-unit authority, cross-unit rejection, portable image isolation,
+  metadata ownership, monotonic PC maps and redundant publication removal.
 
 ## Commits
 
@@ -50,6 +116,8 @@ Throwaway harness at
 | `52011a46` | Root-cause writeup of the 40x CPU gap. |
 | `8ffcbb4b` | **Biased-mode exclusive fusion enabled** — the big win. |
 | `26de3c07` | **Gateway exit addresses moved into `DsrContext`** — smaller win, and the prerequisite for sharing translations. |
+| `423895d5` | Container-scoped portable translation reuse plus the default two-way cache and allocation reductions. |
+| `deb9a80e` | Remove redundant AArch64 cold-publication arbitration. |
 
 Findings doc:
 `docs/superpowers/specs/2026-07-26-native-cpu-attribution-findings.md`.
@@ -160,7 +228,7 @@ of this per process.
 
 ---
 
-## Next work, ranked by measured evidence
+## Prior work ranking and disposition
 
 ### A. Translation cache — largest lever, 28.3 s
 
@@ -217,6 +285,25 @@ Hash the executable digest once; skip clap/serde re-parse on self-reexec.
 Published same-ISA DBT (AArch32→AArch64, MAMBO, PLDI'16) runs under **7.5%**
 overhead. We are far above that, so treat "translation is inherently expensive"
 as refuted — the gap is defects, not physics.
+
+## Next work, ranked by current evidence
+
+1. **Make coarse portable units cheap enough to win.** The correctness path is
+   present, but signing/dlopen and late publication overwhelm saved
+   translations. Measure unit production/consumption by executable and publish
+   one immutable unit before sibling fan-out; do not reintroduce per-block
+   rebinding.
+2. **Reduce the remaining 862k indirect exits.** The two-way cache proved
+   collision pressure was real. The residual is now the next chaining target:
+   classify return/call-site locality and test a bounded return-target strategy,
+   retaining only a five-run win.
+3. **Reduce emission cost.** The clean profile spends 5.806 s in emission for
+   1.868M translations. Attribute assembler allocation, relocation recording,
+   cache publication and icache work separately before changing code.
+4. **Revisit per-process capsule setup only with a process-lifetime trace.** The
+   attempted Clap/bincode shortcut was noise. Digest and mountpoint reuse may
+   still matter, but the old ~18% sample needs fresh attribution after the
+   translation changes.
 
 ---
 
