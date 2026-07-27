@@ -55,6 +55,9 @@ Current milestone: **M1 — accounted baseline**. M0 is complete.
 | E005e | `target/perf/native-go-build-wall-bounded-spike-e{.jsonl,.attribution.json}` | accepted tooling spike; dirty provenance, raw untracked | Zero drops, 100.0% wall reconciliation, 91.1% resolved CPU; 98.5% wall on-CPU and 1.5% runnable-descheduled |
 | E005f | `target/perf/native-go-build-wall-clean-{a,b}-a915c134.jsonl` | rejected replication pair; raw untracked | Clean A resolved only 87.5% CPU while clean B resolved 91.0%; stable large buckets but unstable Carrick/JIT classification rejected the pair |
 | E005g | `target/perf/native-go-build-wall-inherited-jit-spike-a{.jsonl,.attribution.json}` | accepted tooling spike; dirty provenance, raw untracked | Propagating the parent's current JIT range produced 67 multi-range children, zero drops, 100.0% wall reconciliation, and 91.0% resolved CPU |
+| E005h | `target/perf/native-go-build-wall-clean-{a,b}-a9425329.jsonl` | rejected replication pair; raw untracked | Even with inherited JIT ranges, clean A/B resolved only 83.7%/87.6%; the post-self-reexec Carrick base was still unpublished when a process exited without another guest execve |
+| E005i | `target/perf/native-go-build-module-vmmap-a.{raw,txt}` | diagnostic; raw untracked | Same-run live module/VM-map join: all 434 anonymous samples in the captured Go parent belonged to exactly its 64 MiB MAP_JIT region (309) or Carrick `__TEXT` (125), with no fourth executable population |
+| E005j | `target/perf/native-go-build-wall-loop-base-spike-a{.jsonl,.attribution.json}` | accepted tooling spike; dirty provenance, raw untracked | Loop-boundary host-base publication plus exact-text fallback: zero drops, 100.0% wall reconciliation, 90.4% resolved CPU |
 | E006 | clean whole-tree attribution run A | pending | First commit-exact accepted trace |
 | E007 | clean whole-tree attribution run B | pending | Stability and dominant-rank replication |
 
@@ -98,6 +101,16 @@ Propagating the parent's exact JIT start/end at process creation yields two
 ranges in 67 children on the same workload and restores the accepted 91.0%
 resolved-CPU result. Clean replication must still prove that this closes the
 run-to-run gap.
+
+It did not. The next clean pair showed that a self-reexeced process may run to
+exit without issuing another guest execve, so the execve-site host-image probe
+never publishes its final Carrick ASLR base. The profiled native loop now
+publishes the host base at the same boundary as the current JIT range. A
+same-run DTrace module census joined to `vmmap` also proves that raw private PCs
+in the sampled Go parent belonged only to MAP_JIT or Carrick `__TEXT`.
+Consequently, an address inside the PID's exact announced host range is
+conservatively classified as `other-carrick` when `atos` lacks a symbol; it is
+never assigned to a named Carrick subsystem.
 
 ### Elapsed wall-state occupancy
 
