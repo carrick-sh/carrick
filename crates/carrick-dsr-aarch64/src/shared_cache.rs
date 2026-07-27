@@ -691,7 +691,13 @@ mod tests {
             Vec::new(),
             vec![DirectLink {
                 slot: CacheOffset::published(0),
+                source: GuestVa(0x400000),
                 target: GuestVa(0x400100),
+                kind: crate::emit::DirectLinkKind::Branch,
+                stub: crate::emit::DirectStubEnvelope {
+                    start: CacheOffset::published(4),
+                    end: CacheOffset::published(12),
+                },
             }],
             Vec::new(),
             Vec::new(),
