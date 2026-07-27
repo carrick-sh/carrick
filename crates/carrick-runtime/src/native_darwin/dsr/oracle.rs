@@ -3066,6 +3066,647 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
     );
 }
 
+/// What one `live_biased_exclusive_kick_sweep` run observed: which emitted
+/// words a real asynchronous kick was actually taken at, and how often each
+/// scratch GPR was genuinely clobbered at the landing point.
+#[derive(Debug)]
+struct FusedRegionKickSweep {
+    landings: BTreeSet<usize>,
+    emitted_words: usize,
+    spill_index: usize,
+    load_index: usize,
+    store_index: usize,
+    retry_index: usize,
+    in_region_kicks: u64,
+    entry_kicks: u64,
+    stale_entry_kicks: u64,
+    clobbered_address: u64,
+    clobbered_bias: u64,
+}
+
+impl FusedRegionKickSweep {
+    /// (a) A region SETUP word, after both spills -- i.e. inside the clobber
+    /// window, not merely inside the block.
+    fn covered_setup(&self) -> bool {
+        self.landings
+            .iter()
+            .any(|index| *index > self.spill_index + 1 && *index < self.load_index)
+    }
+
+    /// (b) One of the region's body `Copy` words.
+    fn covered_body(&self) -> bool {
+        self.landings
+            .iter()
+            .any(|index| *index > self.load_index && *index < self.store_index)
+    }
+
+    /// (c) The rewritten exclusive store.
+    fn covered_store(&self) -> bool {
+        self.landings.contains(&self.store_index)
+    }
+
+    /// (d) The relocated retry branch itself.
+    fn covered_retry_branch(&self) -> bool {
+        self.landings.contains(&self.retry_index)
+    }
+
+    /// The retry EDGE (`b region_top`), which only executes when the store
+    /// actually failed. Reported, never required: reaching it depends on
+    /// winning a race against the monitor contender.
+    fn covered_retry_edge(&self) -> bool {
+        self.landings.contains(&(self.retry_index + 2))
+    }
+
+    fn covered_all(&self) -> bool {
+        self.covered_setup()
+            && self.covered_body()
+            && self.covered_store()
+            && self.covered_retry_branch()
+            && self.covered_retry_edge()
+            && self.clobbered_address > 0
+            && self.clobbered_bias > 0
+    }
+}
+
+/// Drive real `pthread_kill(SIGPIPE)` kicks INTO a fused biased exclusive
+/// region and check obligation (R) plus resume legality at every landing.
+///
+/// The region is the production one end to end: `block::plan_block` reads the
+/// guest words through a live biased `NativeMappedMemory` and must return a
+/// `FusedBiased` `ExclusiveRegion`, and the production emitter lowers it. The
+/// only test-side edit to the emitted code is re-pointing the region's success
+/// direct link at the block entry, so the loop keeps re-executing natively
+/// instead of leaving through the gateway -- which is what gives the
+/// asynchronous signal a translated region to land in.
+///
+/// The landing WORD is not controllable: the C handler
+/// (`carrick_native_dsr_signal_handler`) captures whatever `__pc` the kernel
+/// interrupted. So this drives many kicks with a jittered arming threshold,
+/// asserts the invariant at EVERY landing, and returns the set of words it
+/// actually reached. `body_len` shifts that set: which words the core reports
+/// as the interrupted PC is microarchitectural, so the caller sweeps several
+/// body widths and takes the union.
+#[allow(
+    clippy::panic,
+    reason = "oracle helper: fails fast on a broken fixture exactly like its test caller"
+)]
+fn live_biased_exclusive_kick_sweep(
+    guest_code: GuestVa,
+    body_len: usize,
+    max_kicks: u64,
+) -> FusedRegionKickSweep {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    // Assembled with `clang -c -arch arm64`:
+    //   ldaxr w0, [x1] / .rept N: add w0, w0, #1 / stlxr w3, w0, [x1]
+    //   / cbnz w3, -(N+2)*4
+    // -- the canonical RMW retry loop, plus a trailing svc so the planner has
+    // a well-formed instruction after the region.
+    const LDAXR_W0_X1: u32 = 0x885f_fc20;
+    const ADD_W0_W0_1: u32 = 0x1100_0400;
+    const STLXR_W3_W0_X1: u32 = 0x8803_fc20;
+    const SVC_0: u32 = 0xd400_0001;
+    // Distinctive guest values for the two clobbered scratch GPRs.
+    const GUEST_ADDRESS_SCRATCH: u64 = 0x5a5a_a5a5_0000_0011;
+    const GUEST_BIAS_SCRATCH: u64 = 0x5a5a_a5a5_0000_0010;
+
+    let retry_displacement = -(i32::try_from(body_len).expect("body length fits i32") + 2);
+    let cbnz_back = 0x3500_0000 | ((retry_displacement as u32 & 0x7_ffff) << 5) | 3;
+    let mut guest_words = vec![LDAXR_W0_X1];
+    guest_words.extend(std::iter::repeat_n(ADD_W0_W0_1, body_len));
+    guest_words.extend([STLXR_W3_W0_X1, cbnz_back, SVC_0]);
+    let fixture = biased_translator_fixture(&guest_words, guest_code);
+
+    // 1. The production planner must FUSE this region in biased mode.
+    let plan = super::block::plan_block(&fixture.memory, guest_code, CodeGeneration::INITIAL, 256)
+        .expect("plan the live biased exclusive region");
+    let PlannedExit::ExclusiveRegion {
+        exit: region,
+        fusion,
+        ..
+    } = plan.exit
+    else {
+        panic!("biased planning must fuse this region, got {:?}", plan.exit);
+    };
+    assert_eq!(
+        fusion.disposition,
+        super::types::ExclusiveFusionDisposition::FusedBiased,
+        "the live kick oracle must exercise the FUSED biased lowering"
+    );
+    let scratch = fusion
+        .biased_scratch
+        .expect("a fused biased region carries its scratch plan");
+    let address_register = scratch.address.index();
+    let bias_register = scratch.bias.index();
+    assert_ne!(address_register, bias_register);
+    let address_index = usize::try_from(address_register).expect("address scratch index");
+    let bias_index = usize::try_from(bias_register).expect("bias scratch index");
+    let start = region.start.raw();
+    let end = region.end.raw();
+    assert_eq!(start, guest_code.raw());
+    assert_eq!(end, guest_code.raw() + (body_len as u64 + 3) * 4);
+
+    // 2. Emit it with the production emitter, then turn the region into a
+    //    native self-loop by re-pointing its success direct link at the entry.
+    let mut cache = TranslationCache::new(
+        64 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate fused-region kick cache");
+    let emitted = emit_block(
+        &mut cache,
+        &plan,
+        super::emit::EmitAddressMode::Biased {
+            host_bias: fixture.host_bias,
+        },
+    )
+    .expect("emit the fused biased exclusive region");
+    assert_eq!(
+        emitted.direct_links().len(),
+        1,
+        "an early-exit-free region leaves through exactly one direct link"
+    );
+    let link = emitted.direct_links()[0];
+    let site = super::cache::LinkSite {
+        source: emitted.entry(),
+        slot: link.slot,
+    };
+    let self_link = super::encode_aarch64_direct_branch(site, emitted.entry())
+        .expect("encode the region self-link");
+    cache
+        .patch_code_word(site, self_link)
+        .expect("re-point the region exit at its own entry");
+
+    // 3. Pin the emitted layout, so the per-word resume expectations below are
+    //    an independent statement about the lowering rather than a restatement
+    //    of the PC map they are checking.
+    let words = (0..emitted.len() / 4)
+        .map(|index| unsafe {
+            std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
+        })
+        .collect::<Vec<_>>();
+    let save_address = 0xf900_0000 | ((1120 / 8) << 10) | (28 << 5) | address_register;
+    let save_bias = 0xf900_0000 | ((1128 / 8) << 10) | (28 << 5) | bias_register;
+    let restore_address = 0xf940_0000 | ((1120 / 8) << 10) | (28 << 5) | address_register;
+    let restore_bias = 0xf940_0000 | ((1128 / 8) << 10) | (28 << 5) | bias_register;
+    let rewritten_load = (LDAXR_W0_X1 & !(0x1f << 5)) | (address_register << 5);
+    let rewritten_store = (STLXR_W3_W0_X1 & !(0x1f << 5)) | (address_register << 5);
+    let spill_index = words
+        .iter()
+        .position(|word| *word == save_address)
+        .expect("region prologue spills the address scratch");
+    assert_eq!(
+        words[spill_index + 1],
+        save_bias,
+        "region prologue spills the bias scratch"
+    );
+    let load_index = words
+        .iter()
+        .position(|word| *word == rewritten_load)
+        .expect("rewritten exclusive load");
+    assert!(load_index > spill_index + 1, "the spills precede the load");
+    let store_index = load_index + body_len + 1;
+    let retry_index = store_index + 1;
+    for (index, word) in words
+        .iter()
+        .enumerate()
+        .take(store_index)
+        .skip(load_index + 1)
+    {
+        assert_eq!(*word, ADD_W0_W0_1, "body copy at word {index}");
+    }
+    assert_eq!(words[store_index], rewritten_store, "rewritten store");
+    assert_eq!(
+        words[retry_index] & 0xff00_0000,
+        0x3500_0000,
+        "relocated retry CBNZ"
+    );
+    assert_eq!(
+        words[retry_index + 1] & 0xfc00_0000,
+        0x1400_0000,
+        "b success_restore"
+    );
+    assert_eq!(
+        words[retry_index + 2] & 0xfc00_0000,
+        0x1400_0000,
+        "b region_top (the retry edge)"
+    );
+    assert_eq!(words[retry_index + 3], restore_address, "success restore");
+    assert_eq!(words[retry_index + 4], restore_bias, "success restore");
+    assert_eq!(words[retry_index + 6], restore_address, "slow restore");
+    assert_eq!(words[retry_index + 7], restore_bias, "slow restore");
+
+    // Resume legality, per emitted word, derived from that layout alone.
+    let expected_resume = |index: usize| -> Vec<u64> {
+        let Some(step) = index.checked_sub(load_index) else {
+            // Prologue and address validation: the region has not started, so
+            // all of these resume at the exclusive load.
+            return vec![start];
+        };
+        let step = step as u64;
+        let body = body_len as u64;
+        if step <= body + 2 {
+            // The load, every body copy, the store and the retry branch each
+            // resume at their OWN guest PC. Restarting the region from the
+            // load would re-apply the body's non-re-derivable `add`.
+            vec![start + 4 * step]
+        } else if step == body + 3 {
+            // Fallthrough into the success restore.
+            vec![end]
+        } else if step == body + 4 {
+            // The retry EDGE is an iteration boundary: back to the load.
+            vec![start]
+        } else if step <= body + 7 {
+            // Success restore (two loads) plus its tail branch.
+            vec![end]
+        } else if step <= body + 10 {
+            // Slow restore (two loads) plus its tail branch.
+            vec![start]
+        } else {
+            // Exit tails: the success tail maps to the region end, the
+            // sensitive fallback tail to the load.
+            vec![start, end]
+        }
+    };
+
+    // 4. Live kicks. SIGPIPE must be deliverable on this thread.
+    let mut unblock: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut original: libc::sigset_t = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::sigemptyset(&mut unblock) }, 0);
+    assert_eq!(unsafe { libc::sigaddset(&mut unblock, libc::SIGPIPE) }, 0);
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, &mut original) },
+        0
+    );
+
+    let counter_address = fixture.data_host.raw();
+    let stop = Arc::new(AtomicBool::new(false));
+    let armed = Arc::new(AtomicU64::new(0));
+    let delivered = Arc::new(AtomicU64::new(0));
+
+    // Stop and join the helper threads even when an assertion unwinds: they
+    // touch `fixture`'s guest mapping, which the unwind is about to unmap.
+    struct SweepThreads {
+        stop: Arc<AtomicBool>,
+        armed: Arc<AtomicU64>,
+        joins: Vec<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for SweepThreads {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.armed.store(0, Ordering::Release);
+            for join in self.joins.drain(..) {
+                drop(join.join());
+            }
+        }
+    }
+
+    // A contender that clears this thread's exclusive monitor WITHOUT
+    // disturbing the counter, so the guest's STXR sometimes fails and the
+    // retry edge actually executes.
+    let contender_stop = Arc::clone(&stop);
+    let contender = std::thread::spawn(move || {
+        let cell = unsafe { &*(counter_address as *const AtomicU32) };
+        while !contender_stop.load(Ordering::Relaxed) {
+            cell.fetch_add(0, Ordering::SeqCst);
+            for _ in 0..32 {
+                std::hint::spin_loop();
+            }
+        }
+    });
+
+    let target = unsafe { libc::pthread_self() };
+    let sender_stop = Arc::clone(&stop);
+    let sender_armed = Arc::clone(&armed);
+    let sender_delivered = Arc::clone(&delivered);
+    let sender = std::thread::spawn(move || {
+        let cell = unsafe { &*(counter_address as *const AtomicU32) };
+        while !sender_stop.load(Ordering::Acquire) {
+            let request = sender_armed.load(Ordering::Acquire);
+            if request == 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            // Let the translated loop run a jittered number of iterations so
+            // the interrupt lands at a different word each time.
+            let threshold = (request & 0xffff_ffff) as u32;
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while cell.load(Ordering::Relaxed) < threshold
+                && Instant::now() < deadline
+                && sender_armed.load(Ordering::Acquire) == request
+            {
+                std::hint::spin_loop();
+            }
+            // The counter is published by the region's own STXR, so kicking
+            // the instant the threshold is observed phase-locks the interrupt
+            // to a fixed offset after a successful store (measured: whole runs
+            // of emitted words were never reported). Smear the phase with a
+            // per-request jitter so the landing point sweeps the loop.
+            let jitter = (request >> 32).wrapping_mul(2_654_435_761) % 1_021;
+            for _ in 0..jitter {
+                std::hint::spin_loop();
+            }
+            // One kick, then a SLOW retry. A SIGPIPE delivered outside
+            // translated execution is dropped by the handler, so a single shot
+            // is not a liveness guarantee -- but a fast retry lands a second
+            // signal in the gateway's exit window and overwrites the first
+            // kick's published exit, so retry only after the entry has had
+            // ample time to return.
+            while sender_armed.load(Ordering::Acquire) == request {
+                assert_eq!(unsafe { libc::pthread_kill(target, libc::SIGPIPE) }, 0);
+                sender_delivered.fetch_add(1, Ordering::Relaxed);
+                let retry_at = Instant::now() + Duration::from_millis(50);
+                while sender_armed.load(Ordering::Acquire) == request && Instant::now() < retry_at {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    });
+
+    let _threads = SweepThreads {
+        stop: Arc::clone(&stop),
+        armed: Arc::clone(&armed),
+        joins: vec![sender, contender],
+    };
+
+    let indirect = IndirectTargetCache::new();
+    let cache_start = emitted.entry().host().raw();
+    let cache_end = cache_start + emitted.len();
+    let mut stack = vec![0_u8; 64 * 1024];
+    let mut sweep = FusedRegionKickSweep {
+        landings: BTreeSet::new(),
+        emitted_words: words.len(),
+        spill_index,
+        load_index,
+        store_index,
+        retry_index,
+        in_region_kicks: 0,
+        entry_kicks: 0,
+        stale_entry_kicks: 0,
+        clobbered_address: 0,
+        clobbered_bias: 0,
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut iteration = 0_u64;
+    while !sweep.covered_all() && iteration < max_kicks && Instant::now() < deadline {
+        iteration += 1;
+
+        let cell = unsafe { &*(counter_address as *const AtomicU32) };
+        cell.store(0, Ordering::SeqCst);
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = guest_code.raw();
+        snapshot.x[1] = fixture.guest_data.raw();
+        snapshot.x[address_index] = GUEST_ADDRESS_SCRATCH;
+        snapshot.x[bias_index] = GUEST_BIAS_SCRATCH;
+        snapshot.pstate = 0xa000_0000;
+        let expected_pstate = snapshot.pstate;
+        let mut exit = NativeDsrExit::Kick {
+            resume: guest_code,
+            rewrite_scratch: 0,
+            rewrite_context_scratch: 0,
+            generation_pstate_scratch: 0,
+            indirect_x15_scratch: 0,
+            indirect_x30_scratch: 0,
+        };
+
+        armed.store(
+            (iteration << 32) | (1 + (iteration * 37) % 3_000),
+            Ordering::Release,
+        );
+        super::gateway::enter_translated_with_cache_range(
+            emitted.entry(),
+            &mut snapshot,
+            &mut exit,
+            &indirect,
+            cache_start,
+            cache_end,
+            crate::native_darwin::address::NativeAddressMode::Biased {
+                host_bias: fixture.host_bias,
+            },
+        )
+        .expect("execute the fused biased region under a live kick");
+        armed.store(0, Ordering::Release);
+
+        match exit {
+            NativeDsrExit::Kick {
+                resume,
+                rewrite_scratch,
+                rewrite_context_scratch,
+                generation_pstate_scratch,
+                indirect_x15_scratch,
+                indirect_x30_scratch,
+            } => {
+                sweep.in_region_kicks += 1;
+                let raw = resume.raw();
+                assert!(
+                    raw >= cache_start as u64 && raw < cache_end as u64,
+                    "kick resume 0x{raw:x} is outside the published block"
+                );
+                let offset =
+                    u32::try_from(raw - cache_start as u64).expect("kick cache offset fits u32");
+                assert_eq!(offset % 4, 0, "kick landed off an instruction boundary");
+                let index = offset as usize / 4;
+                let cache_offset = super::types::CacheOffset::published(offset);
+                let guest_pc = emitted
+                    .map()
+                    .guest_for_cache(cache_offset)
+                    .expect("the landing word maps to a guest PC");
+                let recovery = emitted
+                    .recovery()
+                    .iter()
+                    .find(|entry| entry.cache == cache_offset)
+                    .map(|entry| entry.action);
+                let raw_address = snapshot.x[address_index];
+                let raw_bias = snapshot.x[bias_index];
+                if let Some(action) = recovery {
+                    super::recover_rewrite_state(
+                        &mut snapshot,
+                        action,
+                        rewrite_scratch,
+                        rewrite_context_scratch,
+                        generation_pstate_scratch,
+                        indirect_x15_scratch,
+                        indirect_x30_scratch,
+                    )
+                    .expect("recover the interrupted fused exclusive region");
+                }
+                snapshot.pc =
+                    super::recovery_resume_pc(guest_pc, recovery).expect("region resume PC");
+
+                // Obligation (R): both clobbered guest GPRs are back.
+                assert_eq!(
+                    snapshot.x[address_index],
+                    GUEST_ADDRESS_SCRATCH,
+                    "address scratch x{address_register} not restored at word {index} \
+                     (body_len={body_len}, guest PC 0x{:x}, recovery {recovery:?})",
+                    guest_pc.raw()
+                );
+                assert_eq!(
+                    snapshot.x[bias_index],
+                    GUEST_BIAS_SCRATCH,
+                    "bias scratch x{bias_register} not restored at word {index} \
+                     (body_len={body_len}, guest PC 0x{:x}, recovery {recovery:?})",
+                    guest_pc.raw()
+                );
+                // Obligation (N): nothing the lowering emits writes NZCV.
+                assert_eq!(
+                    snapshot.pstate, expected_pstate,
+                    "PSTATE mutated by the fused region at word {index} (body_len={body_len})"
+                );
+                let legal = expected_resume(index);
+                assert!(
+                    legal.contains(&snapshot.pc),
+                    "word {index} (body_len={body_len}, guest PC 0x{:x}) resumed at 0x{:x}, \
+                     expected one of {legal:x?}",
+                    guest_pc.raw(),
+                    snapshot.pc
+                );
+                if raw_address != GUEST_ADDRESS_SCRATCH {
+                    sweep.clobbered_address += 1;
+                }
+                if raw_bias != GUEST_BIAS_SCRATCH {
+                    sweep.clobbered_bias += 1;
+                }
+                sweep.landings.insert(index);
+            }
+            NativeDsrExit::KickAtEntry { resume } => {
+                // The kick became deliverable outside translated code; the
+                // handler must hand back the untouched guest snapshot. A
+                // retried SIGPIPE that lands in the gateway's exit window
+                // republishes the FIRST kick's captured host PC (a harness
+                // artifact of kicking a thread that has no one-shot
+                // `NativeKickState` bound); count those separately rather than
+                // asserting on a snapshot the handler already replaced.
+                sweep.entry_kicks += 1;
+                if resume == guest_code {
+                    assert_eq!(snapshot.x[address_index], GUEST_ADDRESS_SCRATCH);
+                    assert_eq!(snapshot.x[bias_index], GUEST_BIAS_SCRATCH);
+                } else {
+                    sweep.stale_entry_kicks += 1;
+                }
+            }
+            other => panic!("fused region must only leave through a kick, got {other:?}"),
+        }
+    }
+
+    drop(_threads);
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &original, std::ptr::null_mut()) },
+        0
+    );
+
+    eprintln!(
+        "body_len={body_len}: {iteration} entries, {} in-region kicks, {} at entry \
+         ({} stale), {} SIGPIPEs; {} distinct landing words of {} emitted \
+         (setup={}, body={}, store={}, retry_branch={}, retry_edge={}); \
+         clobbered before recovery: address={}, bias={}; landings={:?}",
+        sweep.in_region_kicks,
+        sweep.entry_kicks,
+        sweep.stale_entry_kicks,
+        delivered.load(Ordering::Relaxed),
+        sweep.landings.len(),
+        sweep.emitted_words,
+        sweep.covered_setup(),
+        sweep.covered_body(),
+        sweep.covered_store(),
+        sweep.covered_retry_branch(),
+        sweep.covered_retry_edge(),
+        sweep.clobbered_address,
+        sweep.clobbered_bias,
+        sweep.landings,
+    );
+    sweep
+}
+
+/// A LIVE asynchronous interrupt landing INSIDE a fused biased exclusive
+/// region -- the case `ExclusiveFusionPolicy::BiasedDisabled` existed to
+/// avoid, and therefore the case that has to hold for that gate's removal to
+/// be sound. Nothing else in the suite delivers a real asynchronous signal
+/// into a fused region.
+///
+/// Obligation (R) -- "the two clobbered guest GPRs can be rolled back" -- is
+/// checked in the only form that can fail: after production recovery runs,
+/// both scratch registers must equal the guest values that were live at entry,
+/// and the run is required to have observed landings where each of them was
+/// genuinely clobbered beforehand, otherwise the assertion would be vacuous.
+/// Resume legality is checked per word against the lowering's structure.
+///
+/// Landing on a SPECIFIC word is NOT controllable in this harness: the C
+/// handler captures whatever `__pc` the kernel interrupted, and which words the
+/// core reports is microarchitectural (with a one-instruction body the ALU word
+/// between the pair was never reported in 8000 kicks, while with a 16-word body
+/// the store never was). So the test sweeps several body widths and requires
+/// the UNION of their landings to cover a setup word, a body copy word, the
+/// store and the retry branch.
+#[test]
+fn dsr_live_kick_inside_fused_biased_exclusive_region_restores_both_scratch_gprs() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    // Which emitted words the core reports as the interrupted PC is
+    // microarchitectural and shifts with the body width, so sweep widths until
+    // their UNION covers every required word. `4` reaches all of them on its
+    // own most runs; the rest are the fallback.
+    let mut sweeps: Vec<FusedRegionKickSweep> = Vec::new();
+    for (index, body_len) in [4_usize, 2, 16, 1].into_iter().enumerate() {
+        sweeps.push(live_biased_exclusive_kick_sweep(
+            GuestVa(0x21_0000_0000 + (index as u64) * 0x10_0000),
+            body_len,
+            40_000,
+        ));
+        if sweeps.iter().any(FusedRegionKickSweep::covered_setup)
+            && sweeps.iter().any(FusedRegionKickSweep::covered_body)
+            && sweeps.iter().any(FusedRegionKickSweep::covered_store)
+            && sweeps
+                .iter()
+                .any(FusedRegionKickSweep::covered_retry_branch)
+        {
+            break;
+        }
+    }
+
+    let in_region_kicks: u64 = sweeps.iter().map(|sweep| sweep.in_region_kicks).sum();
+    let clobbered_address: u64 = sweeps.iter().map(|sweep| sweep.clobbered_address).sum();
+    let clobbered_bias: u64 = sweeps.iter().map(|sweep| sweep.clobbered_bias).sum();
+    let distinct_landings: usize = sweeps.iter().map(|sweep| sweep.landings.len()).sum();
+    let covered_setup = sweeps.iter().any(FusedRegionKickSweep::covered_setup);
+    let covered_body = sweeps.iter().any(FusedRegionKickSweep::covered_body);
+    let covered_store = sweeps.iter().any(FusedRegionKickSweep::covered_store);
+    let covered_retry_branch = sweeps
+        .iter()
+        .any(FusedRegionKickSweep::covered_retry_branch);
+    let covered_retry_edge = sweeps.iter().any(FusedRegionKickSweep::covered_retry_edge);
+
+    eprintln!(
+        "live biased fused-exclusive kick union: {in_region_kicks} in-region kicks over \
+         {} sweeps, {distinct_landings} distinct landing words; setup={covered_setup}, \
+         body={covered_body}, store={covered_store}, retry_branch={covered_retry_branch}, \
+         retry_edge={covered_retry_edge}",
+        sweeps.len(),
+    );
+
+    assert!(in_region_kicks > 0, "no kick landed inside a fused region");
+    // Without a landing where each register was genuinely clobbered, the
+    // restore assertions inside the sweep would hold vacuously.
+    assert!(
+        clobbered_address > 0 && clobbered_bias > 0,
+        "no landing found either scratch register clobbered: address={clobbered_address}, \
+         bias={clobbered_bias}"
+    );
+    assert!(covered_setup, "(a) no kick landed on a region setup word");
+    assert!(
+        covered_body,
+        "(b) no kick landed on a region body copy word"
+    );
+    assert!(covered_store, "(c) no kick landed on the exclusive store");
+    assert!(
+        covered_retry_branch,
+        "(d) no kick landed on the retry branch"
+    );
+    // The retry EDGE additionally needs the store to have FAILED, which
+    // depends on winning a race against the monitor contender, so it is
+    // reported rather than required.
+    eprintln!("retry edge (`b region_top`) landing observed: {covered_retry_edge}");
+}
 #[test]
 fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
     let _signal_oracle = install_signal_handlers_for_oracle();

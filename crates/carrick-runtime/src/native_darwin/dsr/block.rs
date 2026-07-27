@@ -174,15 +174,19 @@ mod tests {
     #[test]
     fn production_biased_exclusive_planner_records_only_safe_scratch_candidates() {
         let start = GuestVa(0x21_0000_0000);
+        // Biased mode now FUSES (see `block::fusion_policy_for`), so the
+        // canonical CAS leaves the planner as a lowered `ExclusiveRegion`
+        // rather than the `Sensitive` trap fallback it used to. The property
+        // this test exists for is unchanged: a safe scratch plan is recorded.
         let eligible = plan_biased_memory_via_production(&canonical_cas(start));
         assert!(matches!(
             eligible.exit,
-            PlannedExit::Sensitive {
-                fusion: Some(ExclusiveFusionSite {
-                    disposition: ExclusiveFusionDisposition::EligibleBackendDisabled,
+            PlannedExit::ExclusiveRegion {
+                fusion: ExclusiveFusionSite {
+                    disposition: ExclusiveFusionDisposition::FusedBiased,
                     biased_scratch: Some(_),
                     ..
-                }),
+                },
                 ..
             }
         ));
@@ -233,17 +237,20 @@ mod tests {
                 encode_cbnz_w(GuestVa(start.raw() + 12), start, 3),
             ];
             let plan = plan_biased_memory_via_production(&words);
-            let PlannedExit::Sensitive {
+            // Fused, not trapped: these are the real shapes Go's sync/atomic
+            // emits, and they are the population that made `sensitive_exclusive`
+            // 76% of all gateway exits before biased fusion was enabled.
+            let PlannedExit::ExclusiveRegion {
                 fusion:
-                    Some(ExclusiveFusionSite {
-                        disposition: ExclusiveFusionDisposition::EligibleBackendDisabled,
+                    ExclusiveFusionSite {
+                        disposition: ExclusiveFusionDisposition::FusedBiased,
                         biased_scratch: Some(scratch),
                         ..
-                    }),
+                    },
                 ..
             } = plan.exit
             else {
-                panic!("Go atomic {name} body did not record a safe biased scratch plan");
+                panic!("Go atomic {name} body did not fuse with a safe biased scratch plan");
             };
             for used in [0, 1, 2, 3, 4, 27] {
                 assert_ne!(scratch.address.index(), used, "{name} address scratch");

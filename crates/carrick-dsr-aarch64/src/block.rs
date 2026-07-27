@@ -742,6 +742,29 @@ fn analyze_exclusive_region(
 ///
 /// Moved from the runtime's `dsr::block` shim once `NativeMappedMemory`
 /// arrived in this crate: it composes the pure `plan_with_reader` core with
+/// The address-mode -> fusion-policy mapping, as its own function so it can be
+/// asserted directly.
+///
+/// It was previously a `match` inline in [`plan_block`], which made it
+/// effectively untestable: `plan_block` needs a live `NativeMappedMemory`, so
+/// every fusion test drove `plan_with_reader` and passed the policy as a literal
+/// argument instead. Those tests prove the planner honours the policy it is
+/// handed; they cannot fail if THIS mapping regresses. A reviewer demonstrated
+/// exactly that -- reverting this mapping to `BiasedDisabled` left the
+/// "fuses under biased enabled" test green, because that test never reached
+/// here. Extracting the mapping is what makes the production decision assertable
+/// (`biased_address_mode_selects_the_enabled_fusion_policy`).
+pub(crate) const fn fusion_policy_for(
+    mode: carrick_dsr::address::NativeAddressMode,
+) -> ExclusiveFusionPolicy {
+    match mode {
+        carrick_dsr::address::NativeAddressMode::Direct => ExclusiveFusionPolicy::Direct,
+        carrick_dsr::address::NativeAddressMode::Biased { .. } => {
+            ExclusiveFusionPolicy::BiasedEnabled
+        }
+    }
+}
+
 /// the memory-reader closure and the address-mode fusion policy.
 pub fn plan_block(
     memory: &crate::mapped_memory::NativeMappedMemory,
@@ -749,18 +772,42 @@ pub fn plan_block(
     generation: crate::types::CodeGeneration,
     max_instructions: usize,
 ) -> Result<BlockPlan, crate::types::DsrError> {
-    // Direct mode keeps its existing fused execution. Biased execution stays
-    // fail-closed until forced asynchronous recovery proves that every guest
-    // register and NZCV mutation in an accepted region can be rolled back.
-    // The disabled policy still measures eligible sites and exercises the
-    // typed emitter in focused tests without exposing incomplete recovery to
-    // production guests.
-    let fusion_policy = match memory.address_mode() {
-        carrick_dsr::address::NativeAddressMode::Direct => ExclusiveFusionPolicy::Direct,
-        carrick_dsr::address::NativeAddressMode::Biased { .. } => {
-            ExclusiveFusionPolicy::BiasedDisabled
-        }
-    };
+    // Both address modes fuse. The obligation that kept biased execution
+    // fail-closed -- "every guest register and NZCV mutation in an accepted
+    // region can be rolled back" -- is discharged, and it decomposes into two
+    // claims that are NOT the same kind of thing:
+    //
+    // Registers. The lowering clobbers exactly two guest GPRs (the address and
+    // bias scratch). Both are spilled to context slots 1120/1128 BEFORE either
+    // changes, every emitted word in the clobber window carries a
+    // `RecoverBiasedExclusive` entry, and `recover_rewrite_state` restores both
+    // from those slots on the fault and kick paths alike. This is live code, not
+    // new work.
+    //
+    // NZCV. There is nothing to roll back INSIDE the region: no DSR-inserted
+    // word between the spills and the restores writes the flags. The lowering
+    // uses only ORR/UBFM/CBZ/ADD-immediate/ADD-register/MOVZ/MOVK/B/LDR/STR/
+    // CLREX -- the flag-setting encodings (ADDS, SUBS/CMP, ANDS) appear nowhere.
+    // The guest's own body compares do write NZCV, but those are architectural,
+    // and the host PSTATE the snapshot captures IS the guest's NZCV. So the
+    // correct gate for the region body is a STATIC assertion of flag-neutrality
+    // rather than a recovery mechanism; it is
+    // `biased_fused_region_inserts_no_nzcv_writing_word`.
+    //
+    // Scope that assertion honestly: it covers the words emitted INTO the
+    // region. It says nothing about the `br x17` into the gateway on the slow
+    // path, because a branch writes no flags and the decoder correctly reports
+    // that -- guest NZCV across a gateway crossing is the gateway's existing
+    // save/restore contract, unchanged by fusion and not established by that
+    // test.
+    //
+    // Resume legality is carried per word by the PC map rather than by rewinding
+    // the region: setup words resume at the load, body words resume at their own
+    // guest PC, and the retry edge resumes at the load only where the store has
+    // already run and FAILED -- an iteration boundary. A blanket
+    // restart-from-load would be UNSOUND, because the accepted body may contain
+    // a non-re-derivable update (`add w9, w9, #1`) that restarting double-applies.
+    let fusion_policy = fusion_policy_for(memory.address_mode());
     plan_with_reader(
         start,
         generation,
@@ -1840,6 +1887,107 @@ mod tests {
                     ..
                 }
             ));
+        }
+
+        /// The positive counterpart of
+        /// `biased_planner_reports_canonical_region_as_eligible_but_disabled`:
+        /// with the biased backend ENABLED, the same canonical CAS region must
+        /// actually fuse -- `PlannedExit::ExclusiveRegion` with a `FusedBiased`
+        /// disposition, not the `EligibleBackendDisabled` trap fallback -- and
+        /// it must carry the scratch plan the lowering spills to context slots
+        /// 1120/1128. The two scratch registers must be distinct (they hold the
+        /// biased address and the bias itself simultaneously) and neither may be
+        /// x18/x28, which are carrick's own reserved/virtualized registers.
+        /// The production address-mode -> policy decision itself.
+        ///
+        /// Every other fusion test in this module drives `plan_with_reader` with
+        /// the policy passed as a literal, so none of them can fail if this
+        /// mapping regresses -- reverting it to `BiasedDisabled` leaves them all
+        /// green, which is precisely the false confidence this test exists to
+        /// remove. `fusion_policy_for` is the only thing `plan_block` consults,
+        /// so asserting it here IS asserting the shipped behaviour.
+        #[test]
+        fn biased_address_mode_selects_the_enabled_fusion_policy() {
+            use carrick_dsr::address::{NativeAddressMode, NativeHostBias};
+
+            /// Any well-formed bias; the mapping under test inspects only the
+            /// VARIANT, never the value.
+            fn biased_test_host_bias() -> NativeHostBias {
+                NativeHostBias::new(0x80_0000_0000, 0x4000)
+                    .expect("aperture-aligned bias is well formed")
+            }
+
+            assert_eq!(
+                fusion_policy_for(NativeAddressMode::Direct),
+                ExclusiveFusionPolicy::Direct,
+                "direct mode keeps its long-standing fused lowering"
+            );
+            assert_eq!(
+                fusion_policy_for(NativeAddressMode::Biased {
+                    host_bias: biased_test_host_bias(),
+                }),
+                ExclusiveFusionPolicy::BiasedEnabled,
+                "biased mode must FUSE, not fall back to the per-exclusive trap: \
+                 BiasedDisabled here costs ~30M gateway exits on a go build"
+            );
+            // BiasedDisabled must not be reachable from any address mode. It
+            // remains constructible so focused tests can still exercise the
+            // eligible-but-not-lowered path, but production must never select it.
+            for mode in [
+                NativeAddressMode::Direct,
+                NativeAddressMode::Biased {
+                    host_bias: biased_test_host_bias(),
+                },
+            ] {
+                assert_ne!(
+                    fusion_policy_for(mode),
+                    ExclusiveFusionPolicy::BiasedDisabled,
+                    "no address mode may select the disabled policy in production"
+                );
+            }
+        }
+
+        #[test]
+        fn production_planner_fuses_a_leading_exclusive_region_under_biased_enabled() {
+            let start = GuestVa(0x4000);
+            let plan = plan_via_production(
+                &canonical_cas(start),
+                start,
+                ExclusiveFusionPolicy::BiasedEnabled,
+                0x1000,
+            );
+            match plan.exit {
+                PlannedExit::ExclusiveRegion {
+                    guest,
+                    exit,
+                    fusion,
+                    ..
+                } => {
+                    assert_eq!(guest, start);
+                    assert_eq!(fusion.disposition, ExclusiveFusionDisposition::FusedBiased);
+                    assert_eq!(exit.start, start);
+                    assert_eq!(exit.end, GuestVa(0x4014));
+                    assert_eq!(exit.store_word, STLXR_W3_W4_X1);
+                    assert_eq!(exit.retry_word, encode_cbnz_w(GuestVa(0x4010), start, 3));
+                    assert_eq!(
+                        exit.early_exit_word,
+                        Some(encode_b_cond(GuestVa(0x4008), GuestVa(0x4014), COND_NE))
+                    );
+                    let Some(scratch) = fusion.biased_scratch else {
+                        panic!("a fused biased region must carry a scratch plan: {fusion:?}");
+                    };
+                    assert_ne!(
+                        scratch.address.index(),
+                        scratch.bias.index(),
+                        "address and bias scratch are live at the same time"
+                    );
+                    for register in [scratch.address.index(), scratch.bias.index()] {
+                        assert_ne!(register, 18, "x18 is carrick-reserved, not guest-visible");
+                        assert_ne!(register, 28, "x28 is carrick-reserved, not guest-visible");
+                    }
+                }
+                other => panic!("expected fused biased ExclusiveRegion, got {other:?}"),
+            }
         }
 
         #[test]
