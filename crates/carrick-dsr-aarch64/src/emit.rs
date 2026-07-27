@@ -218,6 +218,22 @@ pub enum RecoveryAction {
     RecoverCounterRead(CounterReadRecovery),
     RecoverBiasedMemory(BiasedMemoryRecovery),
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
+    RestoreDirectBinding {
+        phase: DirectBindingRecoveryPhase,
+        committed_link: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DirectBindingRecoveryPhase {
+    ScratchCapture,
+    CellAddress,
+    TargetAcquire,
+    AuthorityValidate,
+    AuthorityInstall,
+    ArchitecturalRestore,
+    FinalBranch,
+    MissExit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -307,10 +323,28 @@ pub struct RecoveryEntry {
     pub action: RecoveryAction,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DirectLinkKind {
+    Branch,
+    Call,
+    ConditionalTaken,
+    ConditionalFallthrough,
+    Continue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectStubEnvelope {
+    pub start: CacheOffset,
+    pub end: CacheOffset,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectLink {
     pub slot: CacheOffset,
+    pub source: GuestVa,
     pub target: GuestVa,
+    pub kind: DirectLinkKind,
+    pub stub: DirectStubEnvelope,
 }
 
 impl EmittedBlock {
@@ -991,7 +1025,7 @@ fn emit_indirect_exit(
         ; .arch aarch64
         ; cbz x17, =>miss
     );
-    emit_target_authority_switch(assembler, entries, guest, miss)?;
+    let _ = emit_target_authority_switch(assembler, entries, guest, miss)?;
     // Keep ordinary translated targets out of custom physical x18 entirely.
     // Preserve the validated cache PC from physical x17 in the context while
     // guest x15/x16/x17 and NZCV are restored, then reload and recheck it
@@ -1137,12 +1171,17 @@ fn emit_indirect_exit(
 /// On entry x15 addresses the target-cache record and x17 is its executable
 /// pointer. The resolver publishes the pointer, range, and generation-binding
 /// table as one thread-local record while translated code is not running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TargetAuthorityPhases {
+    install_start: CacheOffset,
+}
+
 fn emit_target_authority_switch(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     guest: GuestVa,
     miss: dynasmrt::DynamicLabel,
-) -> Result<(), DsrError> {
+) -> Result<TargetAuthorityPhases, DsrError> {
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -1183,6 +1222,7 @@ fn emit_target_authority_switch(
         ; .arch aarch64
         ; b.hs =>miss
     );
+    let install_start = current_offset(assembler)?;
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -1208,7 +1248,7 @@ fn emit_target_authority_switch(
         ; .arch aarch64
         ; str x15, [x28, super::gateway::CTX_GENERATION_BINDINGS]
     );
-    Ok(())
+    Ok(TargetAuthorityPhases { install_start })
 }
 
 /// Emit a direct edge that can chain through the per-thread target cache.
@@ -1219,50 +1259,81 @@ fn emit_target_authority_switch(
 /// target, then later executions branch directly when the target belongs to
 /// the currently entered unit. The cache-range checks are the generation-
 /// authority boundary; a cross-unit target always returns through the gateway.
+fn record_direct_binding_phase(
+    recovery: &mut Vec<RecoveryEntry>,
+    start: CacheOffset,
+    end: CacheOffset,
+    phase: DirectBindingRecoveryPhase,
+    committed_link: Option<u64>,
+) -> Result<(), DsrError> {
+    if start.get() > end.get() || !start.get().is_multiple_of(4) || !end.get().is_multiple_of(4) {
+        return Err(DsrError::CachePolicy(format!(
+            "invalid direct-binding recovery range {}..{}",
+            start.get(),
+            end.get()
+        )));
+    }
+    for offset in (start.get()..end.get()).step_by(4) {
+        recovery.push(RecoveryEntry {
+            cache: CacheOffset::published(offset),
+            action: RecoveryAction::RestoreDirectBinding {
+                phase,
+                committed_link,
+            },
+        });
+    }
+    Ok(())
+}
+
 fn emit_cached_direct_exit(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
-    guest: GuestVa,
+    map_guest: GuestVa,
+    source_guest: GuestVa,
     target: GuestVa,
+    committed_link: Option<u64>,
     recovery: &mut Vec<RecoveryEntry>,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
-    map_next(assembler, entries, guest)?;
+    let scratch_capture_start = current_offset(assembler)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x15, [x28, #1160]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x16, [x28, #1120]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x30, [x28, #1168]
     );
-    emit_word(assembler, entries, guest, 0xd53b_4210)?; // mrs x16, nzcv
-    let register_recovery = current_offset(assembler)?;
-    map_next(assembler, entries, guest)?;
+    emit_word(assembler, entries, map_guest, 0xd53b_4210)?; // mrs x16, nzcv
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x16, [x28, #936]
     );
-    recovery.push(RecoveryEntry {
-        cache: register_recovery,
-        action: RecoveryAction::RestoreIndirectResolver,
-    });
-    let full_recovery_start = current_offset(assembler)?;
+    record_direct_binding_phase(
+        recovery,
+        scratch_capture_start,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::ScratchCapture,
+        committed_link,
+    )?;
+    let cell_address_start = current_offset(assembler)?;
     emit_mov_u64(
         assembler,
         entries,
-        guest,
+        map_guest,
         17,
         MaterializedValue::Guest(target.raw()),
         recording.as_deref_mut(),
     )?;
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x17, [x28, #1080]
@@ -1270,132 +1341,179 @@ fn emit_cached_direct_exit(
 
     let miss = assembler.new_dynamic_label();
     let hit = assembler.new_dynamic_label();
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x15, [x28, super::gateway::CTX_INDIRECT_CACHE]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; cbz x15, =>miss
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; eor x16, x17, x17, LSR #12
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ubfx x16, x16, #2, #super::gateway::INDIRECT_CACHE_INDEX_BITS
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; add x15, x15, x16, LSL #super::gateway::INDIRECT_CACHE_ENTRY_SHIFT
     );
-    map_next(assembler, entries, guest)?;
+    record_direct_binding_phase(
+        recovery,
+        cell_address_start,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::CellAddress,
+        committed_link,
+    )?;
+    let target_acquire_start = current_offset(assembler)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x16, [x15]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; cmp x16, x17
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; b.eq =>hit
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; add x15, x15, #32
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x16, [x15]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; cmp x16, x17
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; b.ne =>miss
         ; =>hit
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x17, [x15, #8]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; cbz x17, =>miss
     );
-    emit_target_authority_switch(assembler, entries, guest, miss)?;
-    map_next(assembler, entries, guest)?;
+    record_direct_binding_phase(
+        recovery,
+        target_acquire_start,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::TargetAcquire,
+        committed_link,
+    )?;
+    let authority_validate_start = current_offset(assembler)?;
+    let authority = emit_target_authority_switch(assembler, entries, map_guest, miss)?;
+    record_direct_binding_phase(
+        recovery,
+        authority_validate_start,
+        authority.install_start,
+        DirectBindingRecoveryPhase::AuthorityValidate,
+        committed_link,
+    )?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x17, [x28, #1072]
     );
-    map_next(assembler, entries, guest)?;
+    record_direct_binding_phase(
+        recovery,
+        authority.install_start,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::AuthorityInstall,
+        committed_link,
+    )?;
+    let architectural_restore_start = current_offset(assembler)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x16, [x28, #936]
     );
-    emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
-    map_next(assembler, entries, guest)?;
+    emit_word(assembler, entries, map_guest, 0xd51b_4210)?; // msr nzcv, x16
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x15, [x28, #1160]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x16, [x28, #1120]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x30, [x28, #1168]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x17, [x28, #1072]
     );
-    map_next(assembler, entries, guest)?;
+    record_direct_binding_phase(
+        recovery,
+        architectural_restore_start,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::ArchitecturalRestore,
+        committed_link,
+    )?;
+    let final_branch_start = current_offset(assembler)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; br x17
         ; =>miss
     );
-    map_next(assembler, entries, guest)?;
+    record_direct_binding_phase(
+        recovery,
+        final_branch_start,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::FinalBranch,
+        committed_link,
+    )?;
+    let miss_exit_start = current_offset(assembler)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x16, [x28, #936]
     );
-    emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
-    map_next(assembler, entries, guest)?;
+    emit_word(assembler, entries, map_guest, 0xd51b_4210)?; // msr nzcv, x16
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x15, [x28, #1160]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x16, [x28, #1120]
     );
-    map_next(assembler, entries, guest)?;
+    map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x30, [x28, #1168]
@@ -1403,21 +1521,20 @@ fn emit_cached_direct_exit(
     emit_gateway_exit(
         assembler,
         entries,
-        guest,
+        map_guest,
         target,
-        Some(guest),
+        Some(source_guest),
         2,
         GatewayKind::Direct,
         recording,
     )?;
-    let resolver_end = current_offset(assembler)?;
-    for offset in (full_recovery_start.get()..resolver_end.get()).step_by(4) {
-        recovery.push(RecoveryEntry {
-            cache: CacheOffset::published(offset),
-            action: RecoveryAction::RestoreIndirectResolver,
-        });
-    }
-    Ok(())
+    record_direct_binding_phase(
+        recovery,
+        miss_exit_start,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::MissExit,
+        committed_link,
+    )
 }
 
 fn rewritten_virtual_word(
@@ -2783,6 +2900,7 @@ fn emit_region_direct_exit(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     direct_links: &mut Vec<DirectLink>,
+    recovery: &mut Vec<RecoveryEntry>,
     map_guest: GuestVa,
     source_guest: GuestVa,
     target: GuestVa,
@@ -2803,18 +2921,29 @@ fn emit_region_direct_exit(
         ; str x17, [x28, #1128]
     );
     let slot = current_offset(assembler)?;
-    direct_links.push(DirectLink { slot, target });
     emit_word(assembler, entries, map_guest, 0x1400_0001)?;
-    emit_gateway_exit(
+    let stub_start = current_offset(assembler)?;
+    emit_cached_direct_exit(
         assembler,
         entries,
         map_guest,
+        source_guest,
         target,
-        Some(source_guest),
-        2,
-        GatewayKind::Direct,
+        None,
+        recovery,
         recording,
-    )
+    )?;
+    direct_links.push(DirectLink {
+        slot,
+        source: source_guest,
+        target,
+        kind: DirectLinkKind::Continue,
+        stub: DirectStubEnvelope {
+            start: stub_start,
+            end: current_offset(assembler)?,
+        },
+    });
+    Ok(())
 }
 
 fn emit_biased_exclusive_word(
@@ -3339,6 +3468,7 @@ fn emit_biased_exclusive_region(
         assembler,
         entries,
         direct_links,
+        recovery,
         exit.end,
         retry_pc,
         exit.end,
@@ -3354,6 +3484,7 @@ fn emit_biased_exclusive_region(
             assembler,
             entries,
             direct_links,
+            recovery,
             target,
             branch_guest,
             target,
@@ -3551,6 +3682,7 @@ fn emit_exclusive_region(
         assembler,
         entries,
         direct_links,
+        recovery,
         exit.end,
         retry_pc,
         exit.end,
@@ -3569,6 +3701,7 @@ fn emit_exclusive_region(
             assembler,
             entries,
             direct_links,
+            recovery,
             target,
             branch_guest,
             target,
@@ -4097,19 +4230,33 @@ fn assemble_block_inner(
                 super::types::DirectKind::Branch | super::types::DirectKind::Call
             ) {
                 let slot = current_offset(&assembler)?;
-                direct_links.push(DirectLink {
-                    slot,
-                    target: exit.target,
-                });
                 emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
+                let stub_start = current_offset(&assembler)?;
+                let (kind, committed_link) = if exit.kind == super::types::DirectKind::Call {
+                    (DirectLinkKind::Call, Some(exit.resume.raw()))
+                } else {
+                    (DirectLinkKind::Branch, None)
+                };
                 emit_cached_direct_exit(
                     &mut assembler,
                     &mut entries,
                     exit_guest,
+                    exit_guest,
                     exit.target,
+                    committed_link,
                     &mut recovery,
                     recording.as_deref_mut(),
                 )?;
+                direct_links.push(DirectLink {
+                    slot,
+                    source: exit_guest,
+                    target: exit.target,
+                    kind,
+                    stub: DirectStubEnvelope {
+                        start: stub_start,
+                        end: current_offset(&assembler)?,
+                    },
+                });
             } else {
                 let virtual_offset = exit
                     .register
@@ -4130,18 +4277,10 @@ fn assemble_block_inner(
                     relocated_direct_word(word, exit, virtual_offset.map(|_| 18))?,
                 )?;
                 let fall_slot = current_offset(&assembler)?;
-                direct_links.push(DirectLink {
-                    slot: fall_slot,
-                    target: exit.resume,
-                });
                 // `b +2` skips exactly the taken-branch word below to reach the
                 // fall-through stub, which stays correct however long a stub is.
                 emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0002)?;
                 let taken_slot = current_offset(&assembler)?;
-                direct_links.push(DirectLink {
-                    slot: taken_slot,
-                    target: exit.target,
-                });
                 // A LABEL, not a hardcoded displacement. This was
                 // `0x1400_0012` -- "branch forward 18 instructions" --
                 // which silently encoded the length of the fall-through
@@ -4152,30 +4291,52 @@ fn assemble_block_inner(
                     ; .arch aarch64
                     ; b =>taken_stub
                 );
-                emit_gateway_exit(
+                let fall_stub_start = current_offset(&assembler)?;
+                emit_cached_direct_exit(
                     &mut assembler,
                     &mut entries,
                     exit_guest,
+                    exit_guest,
                     exit.resume,
-                    Some(exit_guest),
-                    2,
-                    GatewayKind::Direct,
+                    None,
+                    &mut recovery,
                     recording.as_deref_mut(),
                 )?;
+                direct_links.push(DirectLink {
+                    slot: fall_slot,
+                    source: exit_guest,
+                    target: exit.resume,
+                    kind: DirectLinkKind::ConditionalFallthrough,
+                    stub: DirectStubEnvelope {
+                        start: fall_stub_start,
+                        end: current_offset(&assembler)?,
+                    },
+                });
                 dynasmrt::dynasm!(assembler
                     ; .arch aarch64
                     ; =>taken_stub
                 );
-                emit_gateway_exit(
+                let taken_stub_start = current_offset(&assembler)?;
+                emit_cached_direct_exit(
                     &mut assembler,
                     &mut entries,
                     exit_guest,
+                    exit_guest,
                     exit.target,
-                    Some(exit_guest),
-                    2,
-                    GatewayKind::Direct,
+                    None,
+                    &mut recovery,
                     recording.as_deref_mut(),
                 )?;
+                direct_links.push(DirectLink {
+                    slot: taken_slot,
+                    source: exit_guest,
+                    target: exit.target,
+                    kind: DirectLinkKind::ConditionalTaken,
+                    stub: DirectStubEnvelope {
+                        start: taken_stub_start,
+                        end: current_offset(&assembler)?,
+                    },
+                });
             }
         } else if let PlannedExit::Indirect { exit, .. } = plan.exit {
             emit_indirect_exit(
@@ -4207,6 +4368,7 @@ fn assemble_block_inner(
                     &mut assembler,
                     &mut entries,
                     &mut direct_links,
+                    &mut recovery,
                     exit.resume,
                     exit_guest,
                     exit.resume,
@@ -4227,18 +4389,28 @@ fn assemble_block_inner(
             }
         } else if let PlannedExit::Continue { target, .. } = plan.exit {
             let slot = current_offset(&assembler)?;
-            direct_links.push(DirectLink { slot, target });
             emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
-            emit_gateway_exit(
+            let stub_start = current_offset(&assembler)?;
+            emit_cached_direct_exit(
                 &mut assembler,
                 &mut entries,
                 exit_guest,
+                exit_guest,
                 target,
-                Some(exit_guest),
-                2,
-                GatewayKind::Direct,
+                None,
+                &mut recovery,
                 recording.as_deref_mut(),
             )?;
+            direct_links.push(DirectLink {
+                slot,
+                source: exit_guest,
+                target,
+                kind: DirectLinkKind::Continue,
+                stub: DirectStubEnvelope {
+                    start: stub_start,
+                    end: current_offset(&assembler)?,
+                },
+            });
         } else if let PlannedExit::Unsupported { .. } = plan.exit {
             emit_gateway_exit(
                 &mut assembler,
@@ -4354,6 +4526,17 @@ pub fn recover_rewrite_state(
     saved_indirect_x15: u64,
     saved_indirect_x30: u64,
 ) -> Result<(), crate::types::DsrError> {
+    if let RecoveryAction::RestoreDirectBinding { committed_link, .. } = action {
+        snapshot.x[15] = saved_indirect_x15;
+        snapshot.x[16] = saved_scratch;
+        snapshot.x[17] = saved_context_scratch;
+        snapshot.x[30] = saved_indirect_x30;
+        snapshot.pstate = saved_generation_pstate;
+        if let Some(committed_link) = committed_link {
+            snapshot.x[30] = committed_link;
+        }
+        return Ok(());
+    }
     if let RecoveryAction::RecoverCounterRead(recovery) = action {
         let committed = recovery
             .instruction_complete
@@ -4640,6 +4823,11 @@ pub fn recover_rewrite_state(
                 "counter recovery escaped its typed handler".to_string(),
             ));
         }
+        RecoveryAction::RestoreDirectBinding { .. } => {
+            return Err(crate::types::DsrError::CachePolicy(
+                "direct-binding recovery escaped its typed handler".to_string(),
+            ));
+        }
     };
     let index = usize::try_from(register).map_err(|_| {
         crate::types::DsrError::CachePolicy("rewrite scratch index overflow".to_string())
@@ -4689,7 +4877,9 @@ pub fn recover_rewrite_state(
 #[cfg(test)]
 mod tests {
     use super::super::block::PlannedInst;
-    use super::super::types::{CodeGeneration, CounterDestination, CounterRead};
+    use super::super::types::{
+        CodeGeneration, CounterDestination, CounterRead, DirectExit, DirectKind,
+    };
     use super::*;
 
     fn copy_plan() -> BlockPlan {
@@ -4746,44 +4936,268 @@ mod tests {
         assert!(error.to_string().contains("non-monotonic cache offsets"));
     }
 
+    #[derive(Clone, Copy)]
+    struct ExpectedDirectLink {
+        source: GuestVa,
+        target: GuestVa,
+        kind: DirectLinkKind,
+        slot: u32,
+        stub_start: u32,
+        stub_end: u32,
+        committed_link: Option<u64>,
+    }
+
+    fn direct_plan(exit: PlannedExit) -> BlockPlan {
+        BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4004),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit,
+        }
+    }
+
+    fn assert_direct_links(
+        case: &str,
+        links: &[DirectLink],
+        recovery: &[RecoveryEntry],
+        expected: &[ExpectedDirectLink],
+    ) {
+        assert_eq!(links.len(), expected.len(), "{case}: direct-link count");
+        for (link, expected) in links.iter().zip(expected) {
+            assert_eq!(link.source, expected.source, "{case}: source");
+            assert_eq!(link.target, expected.target, "{case}: target");
+            assert_eq!(link.kind, expected.kind, "{case}: kind");
+            assert_eq!(link.slot.get(), expected.slot, "{case}: slot");
+            assert_eq!(
+                link.stub,
+                DirectStubEnvelope {
+                    start: CacheOffset::published(expected.stub_start),
+                    end: CacheOffset::published(expected.stub_end),
+                },
+                "{case}: stub envelope"
+            );
+            assert!(
+                link.stub.start.get() < link.stub.end.get(),
+                "{case}: stub envelope must be nonempty"
+            );
+            for offset in (link.stub.start.get()..link.stub.end.get()).step_by(4) {
+                let actions = recovery
+                    .iter()
+                    .filter(|entry| entry.cache.get() == offset)
+                    .map(|entry| entry.action)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actions.len(),
+                    1,
+                    "{case}: offset {offset} must have exactly one recovery action"
+                );
+                assert!(
+                    matches!(
+                        actions[0],
+                        RecoveryAction::RestoreDirectBinding {
+                            phase: DirectBindingRecoveryPhase::ScratchCapture
+                                | DirectBindingRecoveryPhase::CellAddress
+                                | DirectBindingRecoveryPhase::TargetAcquire
+                                | DirectBindingRecoveryPhase::AuthorityValidate
+                                | DirectBindingRecoveryPhase::AuthorityInstall
+                                | DirectBindingRecoveryPhase::ArchitecturalRestore
+                                | DirectBindingRecoveryPhase::FinalBranch
+                                | DirectBindingRecoveryPhase::MissExit,
+                            committed_link,
+                        } if committed_link == expected.committed_link
+                    ),
+                    "{case}: offset {offset} must declare a direct-binding recovery phase"
+                );
+            }
+        }
+    }
+
     #[test]
-    fn cached_direct_preamble_recovery_preserves_committed_call_link() {
-        let guest = GuestVa(0x5000);
+    fn direct_edges_record_exact_identity_and_recovery_envelopes() {
+        let branch = direct_plan(PlannedExit::Direct {
+            guest: GuestVa(0x4000),
+            word: 0x1400_0400,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target: GuestVa(0x5000),
+                resume: GuestVa(0x4004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        });
+        let call = direct_plan(PlannedExit::Direct {
+            guest: GuestVa(0x4000),
+            word: 0x9400_0400,
+            exit: DirectExit {
+                kind: DirectKind::Call,
+                target: GuestVa(0x5000),
+                resume: GuestVa(0x4004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        });
+        let conditional = direct_plan(PlannedExit::Direct {
+            guest: GuestVa(0x4000),
+            word: 0x5400_8000,
+            exit: DirectExit {
+                kind: DirectKind::Conditional,
+                target: GuestVa(0x5000),
+                resume: GuestVa(0x4004),
+                condition: Some(bad64::Condition::EQ),
+                register: None,
+                bit: None,
+            },
+        });
+        let continuation = direct_plan(PlannedExit::Continue {
+            target: GuestVa(0x4004),
+            limit: super::super::block::BlockLimit::InstructionLimit,
+        });
+
+        let cases = [
+            (
+                "branch",
+                assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
+                    .expect("assemble branch"),
+                vec![ExpectedDirectLink {
+                    source: GuestVa(0x4000),
+                    target: GuestVa(0x5000),
+                    kind: DirectLinkKind::Branch,
+                    slot: 16,
+                    stub_start: 20,
+                    stub_end: 276,
+                    committed_link: None,
+                }],
+            ),
+            (
+                "call",
+                assemble_block_inner(&call, None, EmitAddressMode::Direct, None)
+                    .expect("assemble call"),
+                vec![ExpectedDirectLink {
+                    source: GuestVa(0x4000),
+                    target: GuestVa(0x5000),
+                    kind: DirectLinkKind::Call,
+                    slot: 32,
+                    stub_start: 36,
+                    stub_end: 292,
+                    committed_link: Some(0x4004),
+                }],
+            ),
+            (
+                "conditional",
+                assemble_block_inner(&conditional, None, EmitAddressMode::Direct, None)
+                    .expect("assemble conditional"),
+                vec![
+                    ExpectedDirectLink {
+                        source: GuestVa(0x4000),
+                        target: GuestVa(0x4004),
+                        kind: DirectLinkKind::ConditionalFallthrough,
+                        slot: 20,
+                        stub_start: 28,
+                        stub_end: 284,
+                        committed_link: None,
+                    },
+                    ExpectedDirectLink {
+                        source: GuestVa(0x4000),
+                        target: GuestVa(0x5000),
+                        kind: DirectLinkKind::ConditionalTaken,
+                        slot: 24,
+                        stub_start: 284,
+                        stub_end: 540,
+                        committed_link: None,
+                    },
+                ],
+            ),
+            (
+                "continue",
+                assemble_block_inner(&continuation, None, EmitAddressMode::Direct, None)
+                    .expect("assemble continuation"),
+                vec![ExpectedDirectLink {
+                    source: GuestVa(0x4004),
+                    target: GuestVa(0x4004),
+                    kind: DirectLinkKind::Continue,
+                    slot: 16,
+                    stub_start: 20,
+                    stub_end: 276,
+                    committed_link: None,
+                }],
+            ),
+        ];
+        for (case, assembled, expected) in cases {
+            assert_direct_links(
+                case,
+                &assembled.direct_links,
+                &assembled.recovery,
+                &expected,
+            );
+        }
+
         let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
         let mut entries = Vec::new();
+        let mut direct_links = Vec::new();
         let mut recovery = Vec::new();
-        emit_cached_direct_exit(
+        emit_region_direct_exit(
             &mut assembler,
             &mut entries,
-            guest,
-            GuestVa(0x6000),
+            &mut direct_links,
             &mut recovery,
+            GuestVa(0x7010),
+            GuestVa(0x7008),
+            GuestVa(0x7010),
+            false,
             None,
         )
-        .expect("emit cached direct exit");
-        let action = recovery
-            .first()
-            .expect("cached direct preamble recovery")
-            .action;
+        .expect("emit fused-exclusive continuation");
+        let _ = assembler
+            .finalize()
+            .expect("finalize fused-exclusive continuation");
+        assert_direct_links(
+            "fused-exclusive continuation",
+            &direct_links,
+            &recovery,
+            &[ExpectedDirectLink {
+                source: GuestVa(0x7008),
+                target: GuestVa(0x7010),
+                kind: DirectLinkKind::Continue,
+                slot: 8,
+                stub_start: 12,
+                stub_end: 268,
+                committed_link: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn direct_binding_recovery_preserves_a_committed_call_link() {
         let committed_link = 0x5004;
         let mut snapshot = crate::snapshot::NativeUcontextSnapshot::default();
-        snapshot.x[30] = 0xdead_beef;
+        snapshot.x[15] = 0xdead_0015;
+        snapshot.x[16] = 0xdead_0016;
+        snapshot.x[17] = 0xdead_0017;
+        snapshot.x[30] = 0xdead_0030;
+        snapshot.pstate = 0xdead_0000;
 
         recover_rewrite_state(
             &mut snapshot,
-            action,
+            RecoveryAction::RestoreDirectBinding {
+                phase: DirectBindingRecoveryPhase::FinalBranch,
+                committed_link: Some(committed_link),
+            },
             0x16,
             0x17,
             0x6000_0000,
             0x15,
-            committed_link,
+            0x30,
         )
-        .expect("recover cached direct preamble");
+        .expect("recover direct-binding preamble");
 
-        assert_eq!(
-            snapshot.x[30], committed_link,
-            "a signal after BL committed LR must not restore the caller's stale x30"
-        );
+        assert_eq!(snapshot.x[15], 0x15);
+        assert_eq!(snapshot.x[16], 0x16);
+        assert_eq!(snapshot.x[17], 0x17);
+        assert_eq!(snapshot.x[30], committed_link);
+        assert_eq!(snapshot.pstate, 0x6000_0000);
     }
 
     #[test]

@@ -17,8 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use super::emit::{
-    BiasedBase, BiasedBaseCoordinate, BiasedExclusiveRecovery, DirectLink, EmitAddressMode,
-    EmittedBlock, PcMapEntry, RecoveryAction, RecoveryEntry,
+    BiasedBase, BiasedBaseCoordinate, BiasedExclusiveRecovery, DirectBindingRecoveryPhase,
+    DirectLink, DirectLinkKind, DirectStubEnvelope, EmitAddressMode, EmittedBlock, PcMapEntry,
+    RecoveryAction, RecoveryEntry,
 };
 use super::types::{CacheOffset, DsrError};
 use carrick_dsr::cache::TranslationCache;
@@ -168,11 +169,21 @@ impl ArtifactKey {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+struct WireDirectLink {
+    slot: u32,
+    source: u64,
+    target: u64,
+    kind: DirectLinkKind,
+    stub_start: u32,
+    stub_end: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct WireArtifactTemplate {
     words: Vec<u32>,
     map_deltas: Vec<(i64, u32)>,
     recovery_deltas: Vec<(u32, PortableRecoveryAction)>,
-    direct_links: Vec<(u32, u64)>,
+    direct_links: Vec<WireDirectLink>,
     relocations: Vec<ArtifactRelocation>,
     source_words: Vec<u32>,
 }
@@ -232,7 +243,14 @@ impl From<&ArtifactTemplate> for WireArtifactTemplate {
             direct_links: template
                 .direct_links
                 .iter()
-                .map(|link| (link.slot.get(), link.target.raw()))
+                .map(|link| WireDirectLink {
+                    slot: link.slot.get(),
+                    source: link.source.raw(),
+                    target: link.target.raw(),
+                    kind: link.kind,
+                    stub_start: link.stub.start.get(),
+                    stub_end: link.stub.end.get(),
+                })
                 .collect(),
             relocations: template.relocations.clone(),
             source_words: template.source_words.clone(),
@@ -275,9 +293,15 @@ impl From<WireArtifactTemplate> for ArtifactTemplate {
             direct_links: template
                 .direct_links
                 .into_iter()
-                .map(|(slot, target)| DirectLink {
-                    slot: CacheOffset::published(slot),
-                    target: carrick_guest_mem::GuestVa(target),
+                .map(|link| DirectLink {
+                    slot: CacheOffset::published(link.slot),
+                    source: carrick_guest_mem::GuestVa(link.source),
+                    target: carrick_guest_mem::GuestVa(link.target),
+                    kind: link.kind,
+                    stub: DirectStubEnvelope {
+                        start: CacheOffset::published(link.stub_start),
+                        end: CacheOffset::published(link.stub_end),
+                    },
                 })
                 .collect(),
             relocations: template.relocations,
@@ -1138,6 +1162,10 @@ enum PortableRecoveryAction {
     RecoverCounterRead(super::emit::CounterReadRecovery),
     RecoverBiasedMemory(PortableBiasedMemoryRecovery),
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
+    RestoreDirectBinding {
+        phase: DirectBindingRecoveryPhase,
+        committed_link: Option<u64>,
+    },
 }
 
 impl PortableRecoveryAction {
@@ -1243,6 +1271,13 @@ impl PortableRecoveryAction {
             RecoveryAction::RecoverBiasedExclusive(recovery) => {
                 Self::RecoverBiasedExclusive(recovery)
             }
+            RecoveryAction::RestoreDirectBinding {
+                phase,
+                committed_link,
+            } => Self::RestoreDirectBinding {
+                phase,
+                committed_link,
+            },
         })
     }
 
@@ -1349,6 +1384,13 @@ impl PortableRecoveryAction {
             Self::RecoverBiasedExclusive(recovery) => {
                 RecoveryAction::RecoverBiasedExclusive(recovery)
             }
+            Self::RestoreDirectBinding {
+                phase,
+                committed_link,
+            } => RecoveryAction::RestoreDirectBinding {
+                phase,
+                committed_link,
+            },
         })
     }
 }
@@ -1696,8 +1738,8 @@ fn replay_artifact_parts(
 mod tests {
     use super::*;
     use crate::emit::{
-        BiasedBase, BiasedBaseCoordinate, BiasedMemoryRecovery, DirectLink, PcMapEntry,
-        RecoveryAction, RecoveryEntry,
+        BiasedBase, BiasedBaseCoordinate, BiasedMemoryRecovery, DirectLink, DirectLinkKind,
+        DirectStubEnvelope, PcMapEntry, RecoveryAction, RecoveryEntry,
     };
     use crate::types::CacheOffset;
     use carrick_dsr::address::NativeHostBias;
@@ -1736,21 +1778,30 @@ mod tests {
         ])
         .expect("unique fixture bindings");
         let bias = NativeHostBias::new(host_bias, 16 * 1024).expect("aligned fixture bias");
-        let recovery = vec![RecoveryEntry {
-            cache: CacheOffset::published(0),
-            action: RecoveryAction::RecoverBiasedMemory(BiasedMemoryRecovery {
-                scratch_registers: [16, 17, 0, 0],
-                scratch_count: 2,
-                base_scratch: 16,
-                base: BiasedBase::Register(0),
-                base_coordinate: BiasedBaseCoordinate::Guest,
-                commit_base: false,
-                virtual_x18_scratch: None,
-                virtual_x28_scratch: None,
-                host_bias: bias,
-                instruction_complete: false,
-            }),
-        }];
+        let recovery = vec![
+            RecoveryEntry {
+                cache: CacheOffset::published(0),
+                action: RecoveryAction::RecoverBiasedMemory(BiasedMemoryRecovery {
+                    scratch_registers: [16, 17, 0, 0],
+                    scratch_count: 2,
+                    base_scratch: 16,
+                    base: BiasedBase::Register(0),
+                    base_coordinate: BiasedBaseCoordinate::Guest,
+                    commit_base: false,
+                    virtual_x18_scratch: None,
+                    virtual_x28_scratch: None,
+                    host_bias: bias,
+                    instruction_complete: false,
+                }),
+            },
+            RecoveryEntry {
+                cache: CacheOffset::published(4),
+                action: RecoveryAction::RestoreDirectBinding {
+                    phase: DirectBindingRecoveryPhase::AuthorityInstall,
+                    committed_link: Some(0x4004),
+                },
+            },
+        ];
         let template = ArtifactTemplate::normalize(
             words,
             vec![PcMapEntry {
@@ -1760,7 +1811,13 @@ mod tests {
             recovery,
             vec![DirectLink {
                 slot: CacheOffset::published(20),
+                source: GuestVa(0x4000),
                 target: GuestVa(0x5000),
+                kind: DirectLinkKind::Branch,
+                stub: DirectStubEnvelope {
+                    start: CacheOffset::published(24),
+                    end: CacheOffset::published(28),
+                },
             }],
             vec![0xd280_0540, 0xd65f_03c0],
             vec![relocation],
