@@ -53,6 +53,8 @@ Current milestone: **M1 — accounted baseline**. M0 is complete.
 | E005c | `target/perf/native-go-build-wall-bounded-spike-b.jsonl` | rejected diagnostic; raw untracked | Fork-inherited host-base spike observed 65 dual-base PIDs, but 220 dynamic drops rejected the capture; an untyped DTrace zero also truncated all address keys to 32 bits |
 | E005d | `target/perf/native-go-build-wall-bounded-spike-c.jsonl` | rejected diagnostic; raw untracked | Corrected 64-bit, zero-drop inherited-base run reached 89.650% resolved CPU, still 0.350 percentage points below the gate |
 | E005e | `target/perf/native-go-build-wall-bounded-spike-e{.jsonl,.attribution.json}` | accepted tooling spike; dirty provenance, raw untracked | Zero drops, 100.0% wall reconciliation, 91.1% resolved CPU; 98.5% wall on-CPU and 1.5% runnable-descheduled |
+| E005f | `target/perf/native-go-build-wall-clean-{a,b}-a915c134.jsonl` | rejected replication pair; raw untracked | Clean A resolved only 87.5% CPU while clean B resolved 91.0%; stable large buckets but unstable Carrick/JIT classification rejected the pair |
+| E005g | `target/perf/native-go-build-wall-inherited-jit-spike-a{.jsonl,.attribution.json}` | accepted tooling spike; dirty provenance, raw untracked | Propagating the parent's current JIT range produced 67 multi-range children, zero drops, 100.0% wall reconciliation, and 91.0% resolved CPU |
 | E006 | clean whole-tree attribution run A | pending | First commit-exact accepted trace |
 | E007 | clean whole-tree attribution run B | pending | Stability and dominant-rank replication |
 
@@ -80,16 +82,22 @@ being assumed safe.
 The first bounded full-workload run showed that children execute from their
 inherited Carrick mapping before self-reexec publishes the replacement ASLR
 base. The DTrace process-create path now propagates the parent's exact base to
-the child, and keeps the state explicitly 64-bit. The initially proposed
-multi-JIT explanation was not supported: the accepted spike observed no PID
-with more than one JIT range. Range-keyed deduplication remains as
-correctness-hardening, not as an attributed coverage gain.
+the child, and keeps the state explicitly 64-bit.
 
 The first accepted tooling spike attributes CPU samples as 37.3% translated
 guest, 33.5% Darwin kernel, 8.4% Darwin userspace, 5.9% process setup, 3.7%
 other Carrick, 2.0% dispatch, 0.4% gateway, 0.1% translation, and 8.9%
 unresolved. It is not promoted to campaign evidence because the tooling
 worktree was dirty; two clean commit-exact captures still gate M1.
+
+The first clean replication pair then exposed a second inherited mapping:
+fork children execute translations from the parent's current JIT cache before
+their replacement cache is announced. The original per-PID range census
+therefore saw no duplicates because it was missing the inherited range.
+Propagating the parent's exact JIT start/end at process creation yields two
+ranges in 67 children on the same workload and restores the accepted 91.0%
+resolved-CPU result. Clean replication must still prove that this closes the
+run-to-run gap.
 
 ### Elapsed wall-state occupancy
 
