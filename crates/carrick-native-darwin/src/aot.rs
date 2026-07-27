@@ -1,5 +1,5 @@
 //! Stage 1 of the file-backed AOT translation cache
-//! ([`docs/superpowers/specs/2026-07-26-file-backed-aot-cache-design.md`]):
+//! (`docs/superpowers/specs/2026-07-26-file-backed-aot-cache-design.md`):
 //! emit translated code as a loadable, ad-hoc-signable Mach-O dylib instead of
 //! writing it into `MAP_JIT` memory.
 //!

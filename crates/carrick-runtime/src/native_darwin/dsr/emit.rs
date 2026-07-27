@@ -1909,5 +1909,178 @@ mod tests {
                 Ok(_) => panic!("biased exclusive emission must trip the :1442 tripwire"),
             }
         }
+
+        /// True when the decoded instruction can mutate NZCV.
+        ///
+        /// `bad64::Instruction::flags_set()` is the decoder's own answer for
+        /// the flag-SETTING data-processing family (the `S` bit, and its
+        /// `CMP`/`CMN`/`TST`/`CCMP`/`FCMP` aliases). It is derived from the
+        /// disassembler's `setflags` field, which is `FLAGEFFECT_NONE` for the
+        /// handful of instructions that write NZCV without being flag-setting
+        /// arithmetic, so those are rejected explicitly by op (and, for `MSR`,
+        /// by destination system register). Positive controls in the test below
+        /// pin BOTH halves of this predicate so neither can rot into a
+        /// tautology.
+        fn writes_nzcv(instruction: &bad64::Instruction) -> bool {
+            if instruction.flags_set().is_some() {
+                return true;
+            }
+            if matches!(
+                instruction.op(),
+                bad64::Op::CFINV
+                    | bad64::Op::RMIF
+                    | bad64::Op::SETF8
+                    | bad64::Op::SETF16
+                    | bad64::Op::AXFLAG
+                    | bad64::Op::XAFLAG
+            ) {
+                return true;
+            }
+            matches!(instruction.op(), bad64::Op::MSR | bad64::Op::MSRR)
+                && instruction
+                    .operands()
+                    .iter()
+                    .any(|operand| matches!(operand, bad64::Operand::SysReg(bad64::SysReg::NZCV)))
+        }
+
+        /// Obligation (N) of the biased fused-exclusive recovery contract,
+        /// asserted MECHANICALLY rather than by prose.
+        ///
+        /// A fault or a forced asynchronous kick inside an accepted region
+        /// resumes the guest at a per-word PC with ONLY the two scratch GPRs
+        /// rolled back (`RecoveryAction::RecoverBiasedExclusive` ->
+        /// `recover_rewrite_state`). There is no NZCV rollback, so no
+        /// DSR-INSERTED word in the lowering may mutate NZCV. The guest's own
+        /// body words may -- those writes are architectural: the guest would
+        /// have performed them at that same PC on real hardware, and the PC map
+        /// resumes each of them at its own guest PC.
+        ///
+        /// The decoder can express "writes NZCV" directly, so this test uses
+        /// `bad64` rather than an allowlist of permitted inserted encodings: an
+        /// allowlist would have to be re-derived by hand every time the emitter
+        /// grows a word, and would silently accept a flag-setting variant of an
+        /// already-permitted encoding (e.g. `ADD` -> `ADDS`, which differ in one
+        /// bit). `writes_nzcv` above documents the one place the decoder's
+        /// `flags_set()` needs supplementing.
+        ///
+        /// The guest's own words are subtracted by IDENTIFYING them, not by
+        /// counting: each is located as the unique emitted word whose PC-map
+        /// entry is that guest PC and whose decoded op matches the op of the
+        /// original guest instruction. Asserting uniqueness is what stops the
+        /// subtraction from silently swallowing an inserted word.
+        #[test]
+        fn biased_fused_region_inserts_no_nzcv_writing_word() {
+            // Positive control A: `flags_set()` alone does NOT cover every NZCV
+            // write, so the op/system-register half of `writes_nzcv` is
+            // load-bearing rather than decorative. `msr nzcv, x0`:
+            const MSR_NZCV_X0: u32 = 0xd51b_4200;
+            let msr = bad64::decode(MSR_NZCV_X0, 0x1000).expect("msr nzcv, x0 must decode");
+            assert_eq!(
+                msr.flags_set(),
+                None,
+                "flags_set() is not expected to cover MSR NZCV"
+            );
+            assert!(
+                writes_nzcv(&msr),
+                "the MSR guard must catch a direct write to NZCV"
+            );
+
+            let emitted = emit_test_biased_cas().expect("emit biased CAS");
+            let words = emitted_words(&emitted);
+            let base = emitted.entry().host().raw() as u64;
+
+            // The guest program this region was planned from: the four body
+            // words at 0x4000.. plus the retry branch at 0x4010, exactly as
+            // `emit_test_biased_cas` builds them.
+            let guest_program: [(GuestVa, u32); 5] = [
+                (GuestVa(0x4000), LDAXR_W0_X1),
+                (GuestVa(0x4004), CMP_W0_W2),
+                (
+                    GuestVa(0x4008),
+                    encode_b_cond(GuestVa(0x4008), GuestVa(0x4014), 1),
+                ),
+                (GuestVa(0x400c), STLXR_W3_W4_X1),
+                (
+                    GuestVa(0x4010),
+                    encode_cbnz_w(GuestVa(0x4010), GuestVa(0x4000), 3),
+                ),
+            ];
+
+            let mut guest_indices = std::collections::BTreeSet::new();
+            for (guest, guest_word) in guest_program {
+                let guest_op = bad64::decode(guest_word, guest.raw())
+                    .unwrap_or_else(|err| {
+                        panic!("guest word 0x{guest_word:08x} must decode: {err:?}")
+                    })
+                    .op();
+                let matches: Vec<usize> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|&(index, &word)| {
+                        let offset = CacheOffset::published((index * 4) as u32);
+                        emitted.map().guest_for_cache(offset) == Some(guest)
+                            && bad64::decode(word, base + (index * 4) as u64)
+                                .is_ok_and(|inst| inst.op() == guest_op)
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "guest 0x{:x} ({guest_op:?}) must lower to exactly one emitted word, got {matches:?}",
+                    guest.raw()
+                );
+                assert!(guest_indices.insert(matches[0]));
+            }
+            assert_eq!(
+                guest_indices.len(),
+                guest_program.len(),
+                "each guest instruction must subtract a distinct emitted word"
+            );
+
+            // Positive control B: the detector is live on this very stream. The
+            // guest's own `cmp w0, w2` DOES write NZCV, and it is a subtracted
+            // (guest) word -- if `writes_nzcv` were vacuously false the whole
+            // assertion below would prove nothing.
+            let cmp_index = words
+                .iter()
+                .position(|&word| word == CMP_W0_W2)
+                .expect("the guest compare survives verbatim");
+            assert!(guest_indices.contains(&cmp_index));
+            assert!(
+                writes_nzcv(
+                    &bad64::decode(words[cmp_index], base + (cmp_index * 4) as u64)
+                        .expect("guest compare decodes")
+                ),
+                "the guest compare must be detected as an NZCV writer"
+            );
+
+            // Every remaining word is DSR-inserted and must be flag-neutral.
+            let mut inserted = 0usize;
+            for (index, &word) in words.iter().enumerate() {
+                if guest_indices.contains(&index) {
+                    continue;
+                }
+                inserted += 1;
+                let pc = base + (index * 4) as u64;
+                // An undecodable word cannot be certified flag-neutral.
+                let instruction = bad64::decode(word, pc).unwrap_or_else(|err| {
+                    panic!(
+                        "inserted word 0x{word:08x} at +{:#x} must decode: {err:?}",
+                        index * 4
+                    )
+                });
+                assert!(
+                    !writes_nzcv(&instruction),
+                    "DSR-inserted word 0x{word:08x} at +{:#x} ({instruction}) writes NZCV, \
+                     but biased exclusive recovery rolls back only the two scratch GPRs",
+                    index * 4
+                );
+            }
+            assert!(
+                inserted > 32,
+                "the biased lowering must actually have been emitted, saw {inserted} inserted words"
+            );
+        }
     }
 }

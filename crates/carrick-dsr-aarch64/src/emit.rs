@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 
 use carrick_guest_mem::{GuestVa, HostVa};
@@ -46,40 +45,58 @@ pub struct PcMapEntry {
 #[derive(Debug)]
 pub struct InstructionMap {
     entries: Vec<PcMapEntry>,
-    forward: BTreeMap<GuestVa, CacheOffset>,
-    inverse: BTreeMap<CacheOffset, GuestVa>,
 }
 
 impl InstructionMap {
+    /// Validates the entry list and keeps ONLY the list.
+    ///
+    /// This used to build and RETAIN a `guest -> cache` and a `cache -> guest`
+    /// `BTreeMap` for every emitted block. Neither lookup has a production
+    /// caller -- `cache_for_guest` and `guest_for_cache` are reached only from
+    /// `#[cfg(test)]` modules and the oracle -- so on a toolchain workload that
+    /// translates ~1.5M blocks of ~25 entries each, that was tens of millions of
+    /// B-tree inserts, and two maps retained per block, to answer questions
+    /// nothing asks. Translation is the largest single phase of this lane's CPU,
+    /// so dead work on the emit path is worth deleting rather than tolerating.
+    ///
+    /// The duplicate-offset invariant that the `inverse` map enforced as a side
+    /// effect is NOT dropped: it is checked here against a scratch vector that
+    /// dies with this call. Two entries sharing a cache offset would make the
+    /// recovery and PC-map lookups ambiguous -- a translator bug -- so it stays
+    /// a hard error rather than becoming a debug assertion.
     fn new(entries: Vec<PcMapEntry>) -> Result<Self, DsrError> {
-        let mut forward = BTreeMap::new();
-        let mut inverse = BTreeMap::new();
-        for entry in &entries {
-            forward.entry(entry.guest).or_insert(entry.cache);
-            if inverse.insert(entry.cache, entry.guest).is_some() {
-                return Err(DsrError::CachePolicy(format!(
-                    "duplicate cache offset in DSR instruction map: {}",
-                    entry.cache.get()
-                )));
-            }
+        let mut offsets: Vec<u32> = entries.iter().map(|entry| entry.cache.get()).collect();
+        offsets.sort_unstable();
+        if let Some(pair) = offsets.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(DsrError::CachePolicy(format!(
+                "duplicate cache offset in DSR instruction map: {}",
+                pair[0]
+            )));
         }
-        Ok(Self {
-            entries,
-            forward,
-            inverse,
-        })
+        Ok(Self { entries })
     }
 
     pub fn entries(&self) -> &[PcMapEntry] {
         &self.entries
     }
 
+    /// Linear scan; see this type's constructor for why there is no index.
+    ///
+    /// Returns the FIRST match, preserving the `or_insert` semantics of the map
+    /// this replaced: several emitted words can share one guest PC, and the
+    /// earliest is that PC's entry point in the block.
     pub fn cache_for_guest(&self, guest: GuestVa) -> Option<CacheOffset> {
-        self.forward.get(&guest).copied()
+        self.entries
+            .iter()
+            .find(|entry| entry.guest == guest)
+            .map(|entry| entry.cache)
     }
 
     pub fn guest_for_cache(&self, cache: CacheOffset) -> Option<GuestVa> {
-        self.inverse.get(&cache).copied()
+        self.entries
+            .iter()
+            .find(|entry| entry.cache == cache)
+            .map(|entry| entry.guest)
     }
 }
 
