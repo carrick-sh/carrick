@@ -6,6 +6,8 @@
 
 use carrick_guest_mem::GuestVa;
 
+use crate::direct_binding::DirectBindingMiss;
+
 // The ISA-neutral halves live in `carrick-dsr`; re-exported here so the
 // AArch64 plan/emit vocabulary keeps presenting one `types::*` surface.
 // `BlockId` is staged contract surface with no runtime consumer yet (the
@@ -270,6 +272,7 @@ pub enum NativeDsrExit {
     ResolveDirect {
         source: GuestVa,
         target: GuestVa,
+        binding: Option<DirectBindingMiss>,
     },
     ResolveIndirect {
         source: GuestVa,
