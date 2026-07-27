@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import native_wall_attribution
@@ -272,6 +273,47 @@ class NativeWallAttributionTest(unittest.TestCase):
             summary["cpu"]["darwin-user-images"][0]["path"],
             "/usr/lib/libSystem.B.dylib",
         )
+        self.assertTrue(summary["accepted"])
+
+    def test_exact_host_range_without_symbol_is_other_carrick(self):
+        rows = profile_rows(jit_samples=400)
+        rows.insert(
+            -1,
+            row(
+                "image-base",
+                exact(count=1),
+                kind="host",
+                pid=42,
+                source_pc=0x8000,
+            ),
+        )
+        rows.insert(
+            -1,
+            row(
+                "cpu-user-pc",
+                exact(count=50),
+                pid=42,
+                source_pc=0x8800,
+            ),
+        )
+        binary = self.directory / "carrick"
+        binary.touch()
+
+        with (
+            mock.patch.object(
+                native_wall_attribution, "image_text_size", return_value=0x1000
+            ),
+            mock.patch.object(
+                native_wall_attribution, "atos_batch", return_value={}
+            ),
+        ):
+            summary = native_wall_attribution.summarize(
+                native_wall_attribution.load_profile(self.write_profile(rows)),
+                binary,
+            )
+
+        self.assertEqual(summary["cpu"]["other-carrick"]["samples"], 50)
+        self.assertEqual(summary["cpu"]["unresolved"]["samples"], 0)
         self.assertTrue(summary["accepted"])
 
     def test_accepts_profile_with_no_offcpu_aggregations(self):

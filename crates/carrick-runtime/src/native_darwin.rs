@@ -2110,6 +2110,14 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
     };
     let process_translator = memory.read().dsr_process_translator()?;
     let cache_range = process_translator.cache_host_range();
+    if PROFILE {
+        // A guest exec can host-self-reexec carrick and then run to exit
+        // without issuing another execve. Publish the replacement ASLR base at
+        // the same profiled loop boundary as its JIT range; the execve-site
+        // announcement alone otherwise leaves that final host image unknown.
+        crate::probes::host_image_base();
+        crate::probes::host_image_catalog();
+    }
     crate::probes::host_jit_range(cache_range.start, cache_range.end);
     let mut translator =
         dsr::ThreadTranslator::for_process(process_translator, thread_runtime.tid().raw());

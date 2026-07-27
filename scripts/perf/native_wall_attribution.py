@@ -473,6 +473,13 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
         if symbol is not None:
             cpu_counts[classify_host_symbol(symbol)] += samples
             continue
+        if _inside(row.source_pc, host_ranges.get(row.pid, [])):
+            # The exact per-process Mach-O __TEXT announcement proves
+            # ownership even when atos has no symbol for a stripped thunk or
+            # address between symbols. Keep it in the deliberately broad
+            # Carrick bucket rather than inventing a subsystem attribution.
+            cpu_counts["other-carrick"] += samples
+            continue
         image_path = _dyld_image_path(
             row.source_pc,
             dyld_ranges.get(row.pid, []),
@@ -524,6 +531,10 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
                 address, jit_ranges.get(row.pid, [])
             ):
                 rendered_frames.append(f"[translated-guest {address:#x}]")
+            elif row.pid is not None and _inside(
+                address, host_ranges.get(row.pid, [])
+            ):
+                rendered_frames.append(f"[carrick-text {address:#x}]")
             elif row.pid is not None and (
                 image_path := _dyld_image_path(
                     address,
