@@ -173,7 +173,7 @@ Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
 | H001 | PROPOSED | 862,580 residual indirect resolver exits | event count, wall share pending | Classify call/return locality; test one bounded return-target structure | Two variants fail to reduce exits and untraced wall |
 | H002 | PROPOSED | 5.806 s diagnostic emission time across 1.868M translations | stale traced aggregate | Sample and split allocation, relocation, publication and I-cache work; spike only the dominant subphase | No current dominant subphase or two variants fail wall gate |
 | H003 | PROPOSED | Older profile assigned CPU to repeated capsule setup | stale sample | Refresh process-lifetime share and critical-path overlap; reuse only the dominant durable input | Current share is small/non-critical or two variants fail |
-| H004 | SPIKING | Full shared-unit mode takes 40.211 s, but publish-only takes 20.74 s and load-without-indexing takes 22.78 s | eager consumer indexing adds about 17.2 s; four units contain 28 MiB code and 49 MiB manifests | Replace eager whole-unit block/PC/recovery registration with demand-indexed immutable metadata; preserve direct-link and recovery correctness | Two lazy-index variants fail to beat the 19.375 s baseline or require per-process code rewriting |
+| H004 | SPIKING | Shared execution raises gateway entries from 2.40M to 262.22M: 68.93M direct plus 62.06M indirect resolver exits | shared profile uses 127.1 child CPU-s; default profile used 43.8 child CPU-s | Add immutable-code-compatible late binding for unresolved direct edges, then remeasure resolver counts and wall | Two edge-cache variants fail to cut resolver exits and beat the 19.375 s baseline |
 | H005 | PROPOSED | Scheduling/blocking share is unknown | unmeasured | Partition wall occupancy and rank voluntary blocking stacks | Fully compute-active with no dominant wait mechanism |
 
 The table order is provisional until E005 and E006 exist.
@@ -188,6 +188,10 @@ The table order is provisional until E005 and E006 exist.
 | 2026-07-27 | H004 | publish but never load | Isolate producer cost | 20.74 s | n/a | producer adds only 0.93 s; consumer is dominant |
 | 2026-07-27 | H004 | load/parse but skip block indexing | Separate manifest decode/dlopen from eager registration | 22.78 s | n/a | about 17.2 s belongs after load, in eager indexing |
 | 2026-07-27 | H004 | cap each segment unit to 10,000 / 1,000 / 250 / 100 blocks | Test whether bounded hot-prefix units avoid eager amplification | 41.49 / 37.62 / 21.30 / 20.44 s | n/a | size cliff confirmed; no cap beats control |
+| 2026-07-27 | H004 | lazy all-unit metadata | Avoid eager PC/recovery registration | 57.45 s, 126.95 user-s | n/a | reject; repeated unit lookup made the hot path worse |
+| 2026-07-27 | H004 | eager guest index, lazy PC/recovery metadata | Keep the warm lookup path without expanding all metadata | 39.12 s, 92.13 user-s | n/a | reject; only about 1 s better than full mode |
+| 2026-07-27 | H004 | omit portable generation guard | Test whether binding-index prelude causes shared execution cost | 38.73 s, 91.46 user-s | n/a | reject and revert; essentially unchanged |
+| 2026-07-27 | H004 | transitively closed direct-target subset | Publish only blocks whose direct targets share the immutable unit | 55.24 s, 139.49 user-s | n/a | reject; lost reuse and remained resolver-heavy |
 
 Prior rejected experiments remain recorded in `handoff.md`; they are not reset
 to `PROPOSED`.
@@ -211,9 +215,11 @@ to `PROPOSED`.
 5. M1 CPU classification accepts 85% rather than 90%; the clean pair already
    has stable dominant categories, while more image mapping does not advance
    the primary wall-clock goal.
-6. H004 is selected over H001 because the cache isolation exposes roughly
-   17.2 seconds of Carrick-owned eager consumer work, while the residual
-   indirect resolver population has a much smaller count-based ceiling.
+6. H004 is selected over H001 because the cache profile exposes 262.22 million
+   gateway entries, versus 2.40 million on default. The initial no-index
+   isolation implicated consumer work, but two lazy-metadata spikes falsified
+   indexing as the dominant cause; executing immutable units amplifies
+   unresolved edges instead.
 
 ## Next action
 
@@ -225,4 +231,5 @@ Write and validate the executable M1 plan:
 - [x] Collect fresh untraced `C0`/`D0`.
 - [x] Collect two complete traced runs and rank H001–H005.
 - [x] Select and screen the current shared-cache implementation.
-- [ ] Replace eager whole-unit metadata registration with demand indexing.
+- [x] Falsify metadata indexing and generation guards as dominant causes.
+- [ ] Add portable late binding for unresolved shared-unit direct edges.
