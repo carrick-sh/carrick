@@ -48,7 +48,13 @@ Current milestone: **M1 — accounted baseline**. M0 is complete.
 | E003f | `target/perf/native-wall-catalog-smoke-b{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Exec smoke published one 391-range dyld catalog inside the enabled USDT closure; exact ranges classified Darwin userspace while preserving 99.7% wall and 97.3% CPU coverage |
 | E004 | `scripts/perf/evidence/native-go-build-wall-baseline-v1.json` | accepted | Clean `3b8aa399`, binary `593acb…`, serial five-plus-five run: `C0=19,375 ms`, `D0=1,007 ms`, `R0=19.2403x`; Docker image is native arm64 |
 | E005 | `target/perf/native-go-build-wall-profile-a-rejected-v1.jsonl` | rejected diagnostic; raw untracked | Natural zero-drop Go build with 100.0% wall coverage, but only 80.375% CPU classification; 19.6% unresolved fails the fixed 90% gate |
-| E006 | whole-tree attribution run B | pending | Stability and dominant-rank replication |
+| E005a | `target/perf/native-go-build-wall-profile-a-v1.raw` | rejected diagnostic; raw untracked | Dyld-catalog retry completed `BUILD_OK` but capture completion was false: 68,485 aggregation drops and 50,349 dynamic-variable drops |
+| E005b | `target/perf/native-go-build-wall-bounded-spike-a.jsonl` | rejected diagnostic; raw untracked | Bounded 80-range catalog eliminated drops, but 88.248% resolved CPU remained below the fixed 90% gate |
+| E005c | `target/perf/native-go-build-wall-bounded-spike-b.jsonl` | rejected diagnostic; raw untracked | Fork-inherited host-base spike observed 65 dual-base PIDs, but 220 dynamic drops rejected the capture; an untyped DTrace zero also truncated all address keys to 32 bits |
+| E005d | `target/perf/native-go-build-wall-bounded-spike-c.jsonl` | rejected diagnostic; raw untracked | Corrected 64-bit, zero-drop inherited-base run reached 89.650% resolved CPU, still 0.350 percentage points below the gate |
+| E005e | `target/perf/native-go-build-wall-bounded-spike-e{.jsonl,.attribution.json}` | accepted tooling spike; dirty provenance, raw untracked | Zero drops, 100.0% wall reconciliation, 91.1% resolved CPU; 98.5% wall on-CPU and 1.5% runnable-descheduled |
+| E006 | clean whole-tree attribution run A | pending | First commit-exact accepted trace |
+| E007 | clean whole-tree attribution run B | pending | Stability and dominant-rank replication |
 
 ## Whole-tree attribution
 
@@ -61,6 +67,29 @@ trace is repeated; they are not assumed to be translated guest execution.
 The correction publishes exact executable dyld ranges lazily through USDT and
 adds `darwin-userspace` plus per-image shares; it does not widen the JIT range
 or weaken the 90% classification gate.
+The first full retry with that correction is also rejected: collector state
+was undersized for the combined high-cardinality PC aggregations and 64 KiB
+catalog strings. Buffer capacity must be sized from the raw census before
+another evidence trace.
+The census found 391 ranges per child, while Carrick plus the Darwin
+process-runtime family covered all but one dyld-classified sample. The bounded
+retry announces 80 exact runtime ranges (about 6.8 KiB per child) under a
+16 KiB string cap; any excluded framework PC remains unresolved rather than
+being assumed safe.
+
+The first bounded full-workload run showed that children execute from their
+inherited Carrick mapping before self-reexec publishes the replacement ASLR
+base. The DTrace process-create path now propagates the parent's exact base to
+the child, and keeps the state explicitly 64-bit. The initially proposed
+multi-JIT explanation was not supported: the accepted spike observed no PID
+with more than one JIT range. Range-keyed deduplication remains as
+correctness-hardening, not as an attributed coverage gain.
+
+The first accepted tooling spike attributes CPU samples as 37.3% translated
+guest, 33.5% Darwin kernel, 8.4% Darwin userspace, 5.9% process setup, 3.7%
+other Carrick, 2.0% dispatch, 0.4% gateway, 0.1% translation, and 8.9%
+unresolved. It is not promoted to campaign evidence because the tooling
+worktree was dirty; two clean commit-exact captures still gate M1.
 
 ### Elapsed wall-state occupancy
 
