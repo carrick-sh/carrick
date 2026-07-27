@@ -734,22 +734,17 @@ fn emit_gateway_exit(
         ; .arch aarch64
         ; str w17, [x28, #1096]
     );
-    let gateway_address = match gateway {
-        GatewayKind::Syscall => super::gateway::syscall_exit_address(),
-        GatewayKind::Direct => super::gateway::direct_exit_address(),
-        GatewayKind::Indirect => super::gateway::indirect_exit_address(),
-        GatewayKind::Sensitive => super::gateway::sensitive_exit_address(),
-        GatewayKind::Unsupported => super::gateway::unsupported_exit_address(),
-        GatewayKind::Signal => super::gateway::signal_exit_address(),
-    };
-    emit_mov_u64(
-        assembler,
-        entries,
-        guest,
-        17,
-        MaterializedValue::Process(ProcessValue::Gateway(gateway), gateway_address),
-        recording.as_deref_mut(),
-    )?;
+    // Load the gateway entry point from the context rather than materializing
+    // it into the block: one `ldr` instead of a four-word `movz`/`movk` chain,
+    // and no host code address baked into emitted bytes (guest processes
+    // self-reexec with different slides, so an embedded one pins the block to
+    // its emitting process).
+    let gateway_offset = super::gateway::exit_address_offset(gateway);
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x28, #gateway_offset]
+    );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -3734,13 +3729,31 @@ fn emit_block_inner(
                     slot: fall_slot,
                     target: exit.resume,
                 });
+                // `b +2` skips exactly the taken-branch word below to reach the
+                // fall-through stub, which stays correct however long a stub is.
                 emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0002)?;
                 let taken_slot = current_offset(&assembler)?;
                 direct_links.push(DirectLink {
                     slot: taken_slot,
                     target: exit.target,
                 });
-                emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0012)?;
+                // A LABEL, not a hardcoded displacement. This was `0x1400_0012`
+                // -- "branch forward 18 instructions" -- which silently encoded
+                // the length of the fall-through gateway stub emitted below it.
+                // Shortening that stub by three words (materializing the gateway
+                // address from the context instead of a `movz`/`movk` chain) sent
+                // the taken edge three instructions INTO the taken stub, past its
+                // `mov x17, <target>`, so it published whatever x17 happened to
+                // hold as the guest's branch target. Nothing in the type system
+                // or the tests connected the two; only the live direct-flow
+                // oracle caught it, and only because its seeded x17 was a
+                // recognisable value.
+                let taken_stub = assembler.new_dynamic_label();
+                map_next(&assembler, &mut entries, exit_guest)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; b =>taken_stub
+                );
                 emit_gateway_exit(
                     &mut assembler,
                     &mut entries,
@@ -3751,6 +3764,10 @@ fn emit_block_inner(
                     GatewayKind::Direct,
                     recording.as_deref_mut(),
                 )?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; =>taken_stub
+                );
                 emit_gateway_exit(
                     &mut assembler,
                     &mut entries,

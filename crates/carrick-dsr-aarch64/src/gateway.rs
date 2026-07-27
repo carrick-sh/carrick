@@ -118,6 +118,29 @@ pub struct DsrContext {
     pub host_bias: u64,
     pub biased_guest_fault_address: u64,
     pub biased_fault_pad: u64,
+    /// The six gateway exit entry points, so emitted code can REACH them
+    /// without EMBEDDING them. Guest processes self-reexec with different ASLR
+    /// slides, so a gateway address baked into a block pins that block to the
+    /// process that emitted it; a context load does not. Same mechanism as
+    /// `host_bias` above.
+    pub exit_syscall_addr: u64,
+    pub exit_direct_addr: u64,
+    pub exit_indirect_addr: u64,
+    pub exit_sensitive_addr: u64,
+    pub exit_unsupported_addr: u64,
+    pub exit_signal_addr: u64,
+}
+
+/// Context byte offset of the gateway exit entry point for `kind`.
+pub const fn exit_address_offset(kind: crate::artifact_spike::GatewayKind) -> u32 {
+    match kind {
+        crate::artifact_spike::GatewayKind::Syscall => 1216,
+        crate::artifact_spike::GatewayKind::Direct => 1224,
+        crate::artifact_spike::GatewayKind::Indirect => 1232,
+        crate::artifact_spike::GatewayKind::Sensitive => 1240,
+        crate::artifact_spike::GatewayKind::Unsupported => 1248,
+        crate::artifact_spike::GatewayKind::Signal => 1256,
+    }
 }
 
 impl DsrContext {
@@ -190,6 +213,12 @@ impl DsrContext {
             host_bias: address_mode.bias(),
             biased_guest_fault_address: 0,
             biased_fault_pad: 0,
+            exit_syscall_addr: syscall_exit_address(),
+            exit_direct_addr: direct_exit_address(),
+            exit_indirect_addr: indirect_exit_address(),
+            exit_sensitive_addr: sensitive_exit_address(),
+            exit_unsupported_addr: unsupported_exit_address(),
+            exit_signal_addr: signal_exit_address(),
         }
     }
 }
@@ -217,7 +246,13 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, cache_start) == 1176);
 const _: () = assert!(std::mem::offset_of!(DsrContext, cache_end) == 1184);
 const _: () = assert!(std::mem::offset_of!(DsrContext, host_bias) == 1192);
 const _: () = assert!(std::mem::offset_of!(DsrContext, biased_guest_fault_address) == 1200);
-const _: () = assert!(std::mem::size_of::<DsrContext>() == 1216);
+const _: () = assert!(std::mem::offset_of!(DsrContext, exit_syscall_addr) == 1216);
+const _: () = assert!(std::mem::offset_of!(DsrContext, exit_direct_addr) == 1224);
+const _: () = assert!(std::mem::offset_of!(DsrContext, exit_indirect_addr) == 1232);
+const _: () = assert!(std::mem::offset_of!(DsrContext, exit_sensitive_addr) == 1240);
+const _: () = assert!(std::mem::offset_of!(DsrContext, exit_unsupported_addr) == 1248);
+const _: () = assert!(std::mem::offset_of!(DsrContext, exit_signal_addr) == 1256);
+const _: () = assert!(std::mem::size_of::<DsrContext>() == 1264);
 const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 32);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, guest) == 0);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, generation) == 8);
@@ -567,6 +602,6 @@ mod indirect_cache_tests {
             std::mem::offset_of!(DsrContext, biased_guest_fault_address),
             1200
         );
-        assert_eq!(std::mem::size_of::<DsrContext>(), 1216);
+        assert_eq!(std::mem::size_of::<DsrContext>(), 1264);
     }
 }

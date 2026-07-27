@@ -422,7 +422,12 @@ mod tests {
         )
         .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &copy_plan()).expect("emit copy-only block");
-        assert_eq!(emitted.len(), 72);
+        // 60, down from 72: the exit stub materialized its gateway address with
+        // a four-word `movz`/`movk` chain and now loads it from the context in
+        // one `ldr`. Pinned deliberately -- emitted size is a first-order cost
+        // on this lane (~717 MB of JIT output for one `go build`), and this is
+        // the cheapest regression detector for it.
+        assert_eq!(emitted.len(), 60);
         let original_words = [0xd503_201f, 0x9100_0400];
         let entry_word =
             unsafe { std::ptr::read_unaligned(emitted.entry().host().raw() as *const u32) };
