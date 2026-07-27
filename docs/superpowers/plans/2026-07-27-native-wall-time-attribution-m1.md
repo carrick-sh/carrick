@@ -497,7 +497,7 @@ and the focused tests.
   and `compare(a: Summary, b: Summary) -> dict[str, object]`.
 - Exits nonzero instead of publishing when reconciliation or coverage fails.
 
-- [ ] **Step 1: Add red tests with a complete synthetic profile**
+- [x] **Step 1: Add red tests with a complete synthetic profile**
 
 Create a fixture inline in `test_native_wall_attribution.py` with:
 
@@ -522,7 +522,7 @@ Add negative tests for nonzero drops, 98% wall reconciliation, 11% unresolved
 CPU, stack coverage below 80%, a live process at end, and a dominant category
 moving more than five percentage points between comparison inputs.
 
-- [ ] **Step 2: Run the focused Python tests and verify red**
+- [x] **Step 2: Run the focused Python tests and verify red**
 
 Run:
 
@@ -532,7 +532,7 @@ python3 -m unittest scripts/perf/test_native_wall_attribution.py -v
 
 Expected: import failure because `native_wall_attribution.py` does not exist.
 
-- [ ] **Step 3: Implement JSONL loading and completion checks**
+- [x] **Step 3: Implement JSONL loading and completion checks**
 
 Parse every line independently. Require one completion row and identical
 `run_id`, `git_sha`, `binary_sha256`, `profile`, and completion state across
@@ -543,7 +543,7 @@ Use dataclasses for immutable parsed rows and summaries. Reject duplicate
 `(phase,pid,kind,source_pc,type)` keys instead of silently adding independent
 publisher rows.
 
-- [ ] **Step 4: Classify sampled PCs**
+- [x] **Step 4: Classify sampled PCs**
 
 Refactor reusable address helpers from `scripts/symbolicate.py` without
 changing its CLI output. Resolve host PCs in one `atos` batch per image/base.
@@ -566,7 +566,7 @@ as JIT.
 Kernel PCs group by symbol when the JSON row contains a name and otherwise by
 raw PC under `darwin-kernel`.
 
-- [ ] **Step 5: Enforce campaign reconciliation**
+- [x] **Step 5: Enforce campaign reconciliation**
 
 Publish only when:
 
@@ -580,7 +580,7 @@ For two profiles, require the dominant-category order to agree and each
 category above 10% to stay within five percentage points. Report a failed
 stability result without overwriting an earlier accepted single-run summary.
 
-- [ ] **Step 6: Add atomic JSON publication and human output**
+- [x] **Step 6: Add atomic JSON publication and human output**
 
 Support:
 
@@ -595,7 +595,7 @@ Write to a sibling temporary file, `fsync`, and `os.replace`. Human output
 prints elapsed wall, average CPU parallelism, wall-state shares, CPU shares,
 off-CPU top stacks, unresolved coverage, and stability.
 
-- [ ] **Step 7: Run tests**
+- [x] **Step 7: Run tests**
 
 Run:
 
@@ -607,7 +607,7 @@ python3 -m unittest \
 
 Expected: all tests pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add scripts/perf/native_wall_attribution.py \

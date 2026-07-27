@@ -42,6 +42,7 @@ Current milestone: **M1 — accounted baseline**. M0 is complete.
 | E003 | `handoff.md` at `9c25688d` | accepted controller input | Prior wins, rejected experiments, traps and verification receipts |
 | E003a | paired runner at `e53f1608` | accepted tooling | Identical cold-cache Carrick/Docker commands, native-arm64 image validation, scoped cleanup and v2 phase/ratio artifact |
 | E003b | `target/perf/native-wall-smoke-c.jsonl` | tooling-only; raw untracked | Signed local AArch64 trace: natural exit, 44 metric rows, 102 reconciled wall samples, JIT range present, zero live processes and zero drops |
+| E003c | `target/perf/native-wall-smoke-c-summary.json` | tooling-only; derived untracked | Live analyzer agreement: 99.5% wall-timer coverage, 99.0% CPU classification, zero live processes, accepted without weakening the 99/90/80 thresholds |
 | E004 | fresh Carrick/Docker baseline | pending | Official `C0`, `D0`, `R0` |
 | E005 | whole-tree attribution run A | pending | First reconciled current-state proportions |
 | E006 | whole-tree attribution run B | pending | Stability and dominant-rank replication |
@@ -110,7 +111,7 @@ to `PROPOSED`.
 | Wave | Focused tests | Signed Go demo | Native smoke | Node/CPython guardrails | `just ci` | State |
 |---|---|---|---|---|---|---|
 | historical `9c25688d` | green | green | 23/23 MATCH | Go sync 52/52; CPython threading 193/193; subprocess 278/278 | green | accepted starting implementation |
-| M1 measurement tooling | 18 trace parser + cache-range tests green | local static AArch64 trace completed naturally | n/a | n/a | signed build + DOF present | profiler smoke accepted; Go-build evidence pending |
+| M1 measurement tooling | 18 Rust + 17 Python tests green | local static AArch64 trace completed naturally | n/a | n/a | signed build + DOF present | collector and fail-closed analyzer agree live; Go-build evidence pending |
 
 ## Decisions
 
@@ -128,6 +129,6 @@ Write and validate the executable M1 plan:
 
 - [x] Extend the benchmark runner with a semantically identical Docker phase.
 - [x] Build a launch-scoped whole-tree wall-state/on-CPU/off-CPU DTrace profile.
-- [ ] Add the fail-closed attribution summarizer.
+- [x] Add the fail-closed attribution summarizer.
 - [ ] Collect fresh untraced `C0`/`D0`.
 - [ ] Collect two complete traced runs and rank H001–H005.
