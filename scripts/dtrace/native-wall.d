@@ -1,9 +1,9 @@
 #pragma D option quiet
-#pragma D option dynvarsize=64m
+#pragma D option dynvarsize=128m
 #pragma D option bufsize=32m
 #pragma D option aggsize=32m
 #pragma D option ustackframes=24
-#pragma D option strsize=64k
+#pragma D option strsize=16k
 
 /*
  * Whole-process-tree attribution for the Darwin/AArch64 native lane.
@@ -25,8 +25,9 @@ dtrace:::BEGIN
 	target_exit_reason = 0;
 	track_pid[$target] = 1;
 	thread_state[$target, 0] = 0;
-	jit_seen[$target] = 0;
+	jit_seen[$target, 0, 0] = 0;
 	catalog_seen[$target] = 0;
+	host_base[$target] = (uint64_t)0;
 	live_pids = 1;
 	on_cpu_threads = 0;
 	runnable_threads = 0;
@@ -38,8 +39,15 @@ proc:::create
 /track_pid[pid]/
 {
 	track_pid[args[0]->pr_pid] = 1;
+	host_base[args[0]->pr_pid] = (uint64_t)host_base[pid];
 	live_pids++;
 	@process_events["create"] = count();
+}
+
+proc:::create
+/track_pid[pid] && host_base[pid] != 0/
+{
+	@image_base["host", args[0]->pr_pid, host_base[pid]] = count();
 }
 
 proc:::lwp-exit
@@ -56,6 +64,7 @@ proc:::exit
 /track_pid[pid] && pid != $target/
 {
 	track_pid[pid] = 0;
+	host_base[pid] = (uint64_t)0;
 	live_pids--;
 	@process_events["exit"] = count();
 }
@@ -149,6 +158,7 @@ profile-499
 carrick*:::host-image-base
 /track_pid[pid]/
 {
+	host_base[arg0] = (uint64_t)arg1;
 	@image_base["host", arg0, arg1] = count();
 }
 
@@ -166,9 +176,9 @@ carrick*:::guest-image-base
 }
 
 carrick*:::host-jit-range
-/track_pid[pid] && jit_seen[arg0] == 0/
+/track_pid[pid] && jit_seen[arg0, arg1, arg2] == 0/
 {
-	jit_seen[arg0] = 1;
+	jit_seen[arg0, arg1, arg2] = 1;
 	@image_base["jit-start", arg0, arg1] = count();
 	@image_base["jit-end", arg0, arg2] = count();
 }

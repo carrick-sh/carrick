@@ -1693,7 +1693,9 @@ mod real {
                         .to_string_lossy()
                         .into_owned()
                 };
-                ranges.extend(executable_ranges(header, slide, &path));
+                if profile_runtime_image_path(&path) {
+                    ranges.extend(executable_ranges(header, slide, &path));
+                }
             }
         }
         HostImageCatalog {
@@ -1702,11 +1704,27 @@ mod real {
         }
     }
 
-    /// Publish exact executable ranges for every loaded dyld image.
+    #[cfg(target_os = "macos")]
+    fn profile_runtime_image_path(path: &str) -> bool {
+        [
+            "/usr/lib/system/",
+            "/usr/lib/libSystem",
+            "/usr/lib/libobjc",
+            "/usr/lib/objc/",
+            "/usr/lib/libc++",
+            "/usr/lib/libdtrace",
+        ]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    }
+
+    /// Publish exact executable ranges for Darwin's process runtime images.
     ///
     /// The snapshot is constructed inside the probe closure. `usdt` invokes
     /// that closure only when `host-image-catalog` has a live consumer, keeping
-    /// the ordinary native path at its single disabled-probe branch.
+    /// the ordinary native path at its single disabled-probe branch. Carrick's
+    /// own text has a separate exact announcement; framework PCs outside this
+    /// bounded catalog remain unresolved and count against the coverage gate.
     #[cfg(target_os = "macos")]
     #[allow(clippy::redundant_closure)] // usdt rejects a bare function item.
     pub fn host_image_catalog() {
@@ -2458,10 +2476,8 @@ mod real {
     mod tests {
         #[cfg(target_os = "macos")]
         #[test]
-        fn host_image_catalog_contains_this_test_function() {
+        fn host_image_catalog_contains_darwin_runtime() {
             let catalog = super::host_image_catalog_snapshot();
-            let function =
-                host_image_catalog_contains_this_test_function as *const () as usize as u64;
 
             assert_eq!(catalog.pid, std::process::id());
             assert!(catalog.ranges.iter().all(|range| range.start < range.end));
@@ -2469,10 +2485,28 @@ mod real {
                 catalog
                     .ranges
                     .iter()
-                    .any(|range| range.start <= function && function < range.end),
-                "test function {function:#x} absent from {} executable ranges",
+                    .any(|range| range.path == "/usr/lib/system/libsystem_kernel.dylib"),
+                "libsystem_kernel absent from {} runtime ranges",
                 catalog.ranges.len()
             );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn profile_runtime_image_filter_is_bounded_and_explicit() {
+            for accepted in [
+                "/usr/lib/system/libsystem_kernel.dylib",
+                "/usr/lib/libSystem.B.dylib",
+                "/usr/lib/libobjc.A.dylib",
+                "/usr/lib/objc/libobjcMsgSend.dylib",
+                "/usr/lib/libc++.1.dylib",
+                "/usr/lib/libdtrace.dylib",
+            ] {
+                assert!(super::profile_runtime_image_path(accepted), "{accepted}");
+            }
+            assert!(!super::profile_runtime_image_path(
+                "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+            ));
         }
 
         #[test]
