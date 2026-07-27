@@ -266,6 +266,7 @@ pub struct ProcessTranslator {
     // `pub` for the runtime's still-resident test suites (see ThreadTranslator).
     pub state: RwLock<ProcessState>,
     private_target_authority: Box<gateway::TargetCacheAuthority>,
+    private_jit_epoch: Arc<crate::direct_binding::PrivateJitEpoch>,
 }
 
 impl Drop for ProcessTranslator {
@@ -315,6 +316,7 @@ pub struct ProcessState {
     shared_candidates:
         BTreeMap<carrick_guest_mem::GuestVa, Vec<crate::shared_cache::PortableBlockCandidate>>,
     shared_publish_attempted: bool,
+    direct_bindings: crate::direct_binding::DirectBindingRegistry,
 }
 
 struct SharedTranslationConfiguration {
@@ -329,6 +331,7 @@ struct SharedBlockAuthority {
     cache_start: usize,
     cache_end: usize,
     target_authority: usize,
+    loaded_unit_index: usize,
 }
 
 impl SharedBlockAuthority {
@@ -342,6 +345,7 @@ struct LoadedSharedUnit {
     _unit: crate::shared_cache::SharedLoadedTranslationUnit,
     _generation_bindings: Box<[gateway::GenerationBinding]>,
     _target_authority: Box<gateway::TargetCacheAuthority>,
+    _direct_binding_unit_index: Option<usize>,
 }
 
 const fn translation_source_words_required(
@@ -1173,6 +1177,7 @@ impl ProcessTranslator {
                 cache_range.end,
                 std::ptr::null(),
             )),
+            private_jit_epoch: crate::direct_binding::PrivateJitEpoch::process_owner(),
             state: RwLock::new(ProcessState {
                 cache,
                 artifact_store: artifact_spike::store_if_enabled()?,
@@ -1194,6 +1199,9 @@ impl ProcessTranslator {
                 shared_recording_segments: BTreeSet::new(),
                 shared_candidates: BTreeMap::new(),
                 shared_publish_attempted: false,
+                direct_bindings: crate::direct_binding::DirectBindingRegistry::new(
+                    crate::shared_cache::direct_binding_runtime_enabled(),
+                ),
             }),
         };
         probes::dsr_cache_capacity(
@@ -1453,6 +1461,8 @@ impl ProcessState {
             generation_bindings.as_ptr(),
         ));
         let target_authority_pointer = target_authority.as_ref() as *const _;
+        let loaded_unit_index = self.loaded_shared_units.len();
+        let direct_binding_unit_index = self.direct_bindings.register_loaded_unit(&unit)?;
         let host_bias = unit.manifest.key.host_bias();
         for (block, observation) in unit.manifest.blocks.iter_mut().zip(observations) {
             let address = cache_start
@@ -1500,6 +1510,7 @@ impl ProcessState {
                     cache_start,
                     cache_end,
                     target_authority: target_authority_pointer as usize,
+                    loaded_unit_index,
                 },
             );
         }
@@ -1511,6 +1522,7 @@ impl ProcessState {
             _unit: unit,
             _generation_bindings: generation_bindings,
             _target_authority: target_authority,
+            _direct_binding_unit_index: direct_binding_unit_index,
         });
         let result = self.blocks.get(&(guest, generation)).copied();
         if result.is_some() {
@@ -2308,6 +2320,60 @@ impl ThreadTranslator {
         )))
     }
 
+    fn direct_binding_target(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+        generation: types::CodeGeneration,
+        entry: types::CacheVa,
+    ) -> Result<crate::direct_binding::DirectBindingTarget, types::DsrError> {
+        let state = self.process.state.read();
+        if let Some(authority) = state
+            .shared_blocks
+            .get(&(guest, generation))
+            .copied()
+            .filter(|authority| authority.owns(entry))
+        {
+            let loaded = state
+                .loaded_shared_units
+                .get(authority.loaded_unit_index)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(
+                        "shared direct-binding authority lost its loaded unit".to_string(),
+                    )
+                })?;
+            return Ok(crate::direct_binding::DirectBindingTarget::shared_in_unit(
+                crate::direct_binding::DirectBindingTargetPrefix {
+                    target_cache_pc: entry.host().raw() as u64,
+                    cache_start: authority.cache_start as u64,
+                    cache_end: authority.cache_end as u64,
+                    generation_bindings: authority.generation_bindings as u64,
+                },
+                guest,
+                generation,
+                loaded._unit.clone(),
+                authority.loaded_unit_index,
+            ));
+        }
+        let cache_range = state.cache.host_range();
+        if self.process.private_target_authority.owns(entry) {
+            return Ok(crate::direct_binding::DirectBindingTarget::private(
+                crate::direct_binding::DirectBindingTargetPrefix {
+                    target_cache_pc: entry.host().raw() as u64,
+                    cache_start: cache_range.start as u64,
+                    cache_end: cache_range.end as u64,
+                    generation_bindings: 0,
+                },
+                guest,
+                generation,
+                &self.process.private_jit_epoch,
+            ));
+        }
+        Err(types::DsrError::CachePolicy(format!(
+            "translated target 0x{:x} has no retained direct-binding authority",
+            entry.host().raw()
+        )))
+    }
+
     fn resolve_indirect<const PROFILE: bool>(
         &mut self,
         memory: &NativeMappedMemory,
@@ -2726,7 +2792,7 @@ impl ThreadTranslator {
             types::NativeDsrExit::ResolveDirect {
                 source,
                 target,
-                binding: _,
+                binding,
             } => {
                 probes::dsr_resolve_begin(
                     self.tid,
@@ -2755,6 +2821,19 @@ impl ThreadTranslator {
                     translated.entry,
                     authority,
                 );
+                let direct_bindings_enabled = self.process.state.read().direct_bindings.enabled();
+                if let Some(binding) = binding
+                    && direct_bindings_enabled
+                    && let Ok(descriptor) =
+                        self.direct_binding_target(target, translated.generation, translated.entry)
+                {
+                    let _ = self
+                        .process
+                        .state
+                        .write()
+                        .direct_bindings
+                        .publish(binding, source, target, descriptor);
+                }
                 probes::dsr_cache_event(
                     self.tid,
                     probes::DsrCacheEventKind::TargetPublish,
@@ -3089,9 +3168,386 @@ mod tests {
             cache_start: 0x1000,
             cache_end: 0x2000,
             target_authority: 0,
+            loaded_unit_index: 0,
         };
         assert!(authority.owns(types::CacheVa::published(carrick_guest_mem::HostVa(0x1800))));
         assert!(!authority.owns(types::CacheVa::published(carrick_guest_mem::HostVa(0x2800))));
+    }
+
+    mod direct_binding_owner_and_publication {
+        use super::{ProcessTranslator, TEST_HOST_JIT};
+        use crate::direct_binding::{
+            DirectBindingCellVa, DirectBindingMiss, DirectBindingOrdinal,
+            DirectBindingPublishOutcome, DirectBindingRegistry, DirectBindingTarget,
+            DirectBindingTargetPrefix, PrivateJitEpoch,
+        };
+        use crate::emit::DirectLinkKind;
+        use crate::shared_cache::{
+            AddressModeIdentity, DIRECT_BINDING_CELL_SIZE, DirectBindingLayout, ExecutableIdentity,
+            GuestCodeLen, ImageFileLen, ImageFileOffset, NativePageProfileIdentity,
+            SharedLoadedTranslationUnit, SourceFingerprint, TRANSLATION_UNIT_SCHEMA_V2,
+            TranslationUnitKey, TranslationUnitManifest, UnresolvedDirectBindingRecord,
+        };
+        use crate::types::CodeGeneration;
+        use carrick_guest_mem::GuestVa;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicPtr, Ordering};
+
+        struct UnitFixture {
+            storage: Box<[AtomicPtr<DirectBindingTarget>]>,
+            unit: SharedLoadedTranslationUnit,
+        }
+
+        fn key(seed: u8) -> TranslationUnitKey {
+            TranslationUnitKey::for_segment(
+                ExecutableIdentity::Digest([seed; 32]),
+                ImageFileOffset::new(u64::from(seed) * 0x1000),
+                ImageFileLen::new(0x4000).expect("nonzero file length"),
+                GuestVa(0x40_0000),
+                GuestCodeLen::new(0x4000).expect("nonzero guest length"),
+                SourceFingerprint([seed.wrapping_add(1); 32]),
+                NativePageProfileIdentity::Native16k,
+                AddressModeIdentity::Direct,
+            )
+        }
+
+        fn record(source: GuestVa, target: GuestVa, ordinal: u32) -> UnresolvedDirectBindingRecord {
+            UnresolvedDirectBindingRecord {
+                source,
+                target,
+                kind: DirectLinkKind::Branch,
+                ordinal: DirectBindingOrdinal::claimed(ordinal),
+                stub_start: ordinal * 128,
+                stub_end: ordinal * 128 + 128,
+            }
+        }
+
+        fn sidecar_unit(
+            unit_key: TranslationUnitKey,
+            records: Vec<UnresolvedDirectBindingRecord>,
+        ) -> UnitFixture {
+            let storage = std::iter::repeat_with(|| AtomicPtr::new(std::ptr::null_mut()))
+                .take(records.len())
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let binding_base =
+                DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
+            let binding_data_len = u64::try_from(
+                records
+                    .len()
+                    .checked_mul(DIRECT_BINDING_CELL_SIZE as usize)
+                    .expect("binding data length"),
+            )
+            .expect("binding data length fits u64");
+            let unit = SharedLoadedTranslationUnit::new_with_binding_base(
+                TranslationUnitManifest {
+                    schema: TRANSLATION_UNIT_SCHEMA_V2,
+                    key: unit_key,
+                    dylib_sha256: [0x55; 32],
+                    base_export: "test_code".to_string(),
+                    code_len: 0x1000,
+                    blocks: Vec::new(),
+                    binding_layout: DirectBindingLayout::SidecarV1,
+                    binding_export: "test_bindings".to_string(),
+                    binding_data_len,
+                    cell_size: DIRECT_BINDING_CELL_SIZE,
+                    bindings: records,
+                    binding_relocations: Vec::new(),
+                },
+                0x10_0000,
+                Some(binding_base),
+                Arc::new(()),
+            );
+            UnitFixture { storage, unit }
+        }
+
+        fn process_with_direct_bindings() -> ProcessTranslator {
+            let process =
+                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+            process.state.write().direct_bindings = DirectBindingRegistry::new(true);
+            process
+        }
+
+        fn private_target(
+            target: GuestVa,
+            generation: CodeGeneration,
+            cache_pc: u64,
+            epoch: &Arc<PrivateJitEpoch>,
+        ) -> DirectBindingTarget {
+            DirectBindingTarget::private(
+                DirectBindingTargetPrefix {
+                    target_cache_pc: cache_pc,
+                    cache_start: 0x80_0000,
+                    cache_end: 0x81_0000,
+                    generation_bindings: 0,
+                },
+                target,
+                generation,
+                epoch,
+            )
+        }
+
+        #[test]
+        fn miss_must_match_one_exact_loaded_owner_cell_and_ordinal() {
+            let source = GuestVa(0x40_0100);
+            let target = GuestVa(0x50_0100);
+            let fixture = sidecar_unit(key(1), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register owner")
+                .expect("SidecarV1 owner");
+            let cell = fixture.unit.binding_base.expect("binding base");
+
+            let owner = state
+                .direct_bindings
+                .owner_key(
+                    DirectBindingMiss {
+                        cell,
+                        ordinal: DirectBindingOrdinal::claimed(0),
+                    },
+                    source,
+                    target,
+                )
+                .expect("exact owner");
+            assert_eq!(owner.unit, fixture.unit.manifest.key);
+            assert_eq!(owner.ordinal, DirectBindingOrdinal::claimed(0));
+            assert_eq!(
+                state.direct_bindings.owner_key(
+                    DirectBindingMiss {
+                        cell,
+                        ordinal: DirectBindingOrdinal::claimed(1),
+                    },
+                    source,
+                    target,
+                ),
+                None,
+            );
+            assert_eq!(
+                state.direct_bindings.owner_key(
+                    DirectBindingMiss {
+                        cell: DirectBindingCellVa::mapped(
+                            fixture.storage.as_ptr() as usize + DIRECT_BINDING_CELL_SIZE as usize,
+                        )
+                        .expect("aligned adjacent address"),
+                        ordinal: DirectBindingOrdinal::claimed(0),
+                    },
+                    source,
+                    target,
+                ),
+                None,
+            );
+        }
+
+        #[test]
+        fn guest_source_target_pair_cannot_select_another_unit_instance() {
+            let source = GuestVa(0x40_0200);
+            let target = GuestVa(0x50_0200);
+            let first = sidecar_unit(key(2), vec![record(source, target, 0)]);
+            let second = sidecar_unit(key(3), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&first.unit)
+                .expect("register first")
+                .expect("first owner");
+            state
+                .direct_bindings
+                .register_loaded_unit(&second.unit)
+                .expect("register second")
+                .expect("second owner");
+
+            let owner = state
+                .direct_bindings
+                .owner_key(
+                    DirectBindingMiss {
+                        cell: first.unit.binding_base.expect("first binding base"),
+                        ordinal: DirectBindingOrdinal::claimed(0),
+                    },
+                    source,
+                    target,
+                )
+                .expect("first exact owner");
+
+            assert_eq!(owner.unit, first.unit.manifest.key);
+            assert_ne!(owner.unit, second.unit.manifest.key);
+        }
+
+        #[test]
+        fn first_publisher_sets_the_bitmap_and_incoming_record() {
+            let source = GuestVa(0x40_0300);
+            let target = GuestVa(0x50_0300);
+            let fixture = sidecar_unit(key(4), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let epoch = PrivateJitEpoch::process_owner();
+            let miss = DirectBindingMiss {
+                cell: fixture.unit.binding_base.expect("binding base"),
+                ordinal: DirectBindingOrdinal::claimed(0),
+            };
+            let mut state = process.state.write();
+            let unit_index = state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register owner")
+                .expect("SidecarV1 owner");
+
+            let outcome = state.direct_bindings.publish(
+                miss,
+                source,
+                target,
+                private_target(target, CodeGeneration::INITIAL, 0x80_0100, &epoch),
+            );
+
+            assert_eq!(outcome, DirectBindingPublishOutcome::Published);
+            assert!(state.direct_bindings.is_published(unit_index, miss.ordinal));
+            assert_eq!(
+                state
+                    .direct_bindings
+                    .incoming_count(target, CodeGeneration::INITIAL),
+                1,
+            );
+            assert!(!fixture.storage[0].load(Ordering::Acquire).is_null());
+        }
+
+        #[test]
+        fn a_valid_losing_publisher_accepts_the_complete_winner() {
+            let source = GuestVa(0x40_0400);
+            let target = GuestVa(0x50_0400);
+            let fixture = sidecar_unit(key(5), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let epoch = PrivateJitEpoch::process_owner();
+            let miss = DirectBindingMiss {
+                cell: fixture.unit.binding_base.expect("binding base"),
+                ordinal: DirectBindingOrdinal::claimed(0),
+            };
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register owner")
+                .expect("SidecarV1 owner");
+            assert_eq!(
+                state.direct_bindings.publish(
+                    miss,
+                    source,
+                    target,
+                    private_target(target, CodeGeneration::INITIAL, 0x80_0200, &epoch),
+                ),
+                DirectBindingPublishOutcome::Published,
+            );
+            let winner = fixture.storage[0].load(Ordering::Acquire);
+
+            let outcome = state.direct_bindings.publish(
+                miss,
+                source,
+                target,
+                private_target(target, CodeGeneration::INITIAL, 0x80_0200, &epoch),
+            );
+
+            assert_eq!(outcome, DirectBindingPublishOutcome::ExistingWinner);
+            assert_eq!(fixture.storage[0].load(Ordering::Acquire), winner);
+            assert_eq!(
+                state
+                    .direct_bindings
+                    .incoming_count(target, CodeGeneration::INITIAL),
+                1,
+            );
+            assert_eq!(state.direct_bindings.counters().cas_losses, 1);
+        }
+
+        #[test]
+        fn a_stale_winner_is_exactly_cleared_and_retried_once() {
+            let source = GuestVa(0x40_0500);
+            let target = GuestVa(0x50_0500);
+            let fixture = sidecar_unit(key(6), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let epoch = PrivateJitEpoch::process_owner();
+            let miss = DirectBindingMiss {
+                cell: fixture.unit.binding_base.expect("binding base"),
+                ordinal: DirectBindingOrdinal::claimed(0),
+            };
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register owner")
+                .expect("SidecarV1 owner");
+            assert_eq!(
+                state.direct_bindings.publish(
+                    miss,
+                    source,
+                    target,
+                    private_target(target, CodeGeneration::claimed(1), 0x80_0300, &epoch),
+                ),
+                DirectBindingPublishOutcome::Published,
+            );
+            let stale = fixture.storage[0].load(Ordering::Acquire);
+
+            let outcome = state.direct_bindings.publish(
+                miss,
+                source,
+                target,
+                private_target(target, CodeGeneration::claimed(2), 0x80_0400, &epoch),
+            );
+
+            assert_eq!(outcome, DirectBindingPublishOutcome::PublishedAfterStale);
+            assert_ne!(fixture.storage[0].load(Ordering::Acquire), stale);
+            assert_eq!(state.direct_bindings.counters().stale_winner_clears, 1);
+            assert_eq!(state.direct_bindings.counters().publication_retries, 1);
+            assert_eq!(
+                state
+                    .direct_bindings
+                    .incoming_count(target, CodeGeneration::claimed(2)),
+                1,
+            );
+        }
+
+        #[test]
+        fn failed_owner_or_authority_validation_leaves_the_cell_null() {
+            let source = GuestVa(0x40_0600);
+            let target = GuestVa(0x50_0600);
+            let fixture = sidecar_unit(key(7), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let epoch = PrivateJitEpoch::process_owner();
+            let cell = fixture.unit.binding_base.expect("binding base");
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register owner")
+                .expect("SidecarV1 owner");
+
+            assert_eq!(
+                state.direct_bindings.publish(
+                    DirectBindingMiss {
+                        cell,
+                        ordinal: DirectBindingOrdinal::claimed(1),
+                    },
+                    source,
+                    target,
+                    private_target(target, CodeGeneration::INITIAL, 0x80_0500, &epoch),
+                ),
+                DirectBindingPublishOutcome::Rejected,
+            );
+            assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
+
+            assert_eq!(
+                state.direct_bindings.publish(
+                    DirectBindingMiss {
+                        cell,
+                        ordinal: DirectBindingOrdinal::claimed(0),
+                    },
+                    source,
+                    target,
+                    private_target(target, CodeGeneration::INITIAL, 0x90_0000, &epoch),
+                ),
+                DirectBindingPublishOutcome::Rejected,
+            );
+            assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
+        }
     }
 
     #[test]
