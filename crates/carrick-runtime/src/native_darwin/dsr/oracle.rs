@@ -2274,6 +2274,139 @@ fn portable_direct_call_chains_through_published_target_authority() {
 }
 
 #[test]
+fn portable_direct_cache_hit_switches_cross_unit_authority_tuple() {
+    let mut source_cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate direct source cache");
+    let mut target_cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate direct target cache");
+    let source_guest = GuestVa(0x13_c00);
+    let target_guest = GuestVa(source_guest.raw() + 8);
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+        .expect("construct cross-unit direct bias");
+    let source = super::emit::record_portable_block_artifact(
+        &BlockPlan {
+            start: source_guest,
+            end: GuestVa(source_guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Direct {
+                guest: source_guest,
+                word: 0x1400_0002,
+                exit: DirectExit {
+                    kind: DirectKind::Branch,
+                    target: target_guest,
+                    resume: GuestVa(source_guest.raw() + 4),
+                    condition: None,
+                    register: None,
+                    bit: None,
+                },
+            },
+        },
+        0,
+        super::emit::EmitAddressMode::Biased { host_bias },
+        vec![0x1400_0002],
+    )
+    .expect("record cross-unit direct source");
+    let target = super::emit::record_portable_block_artifact(
+        &BlockPlan {
+            start: target_guest,
+            end: GuestVa(target_guest.raw() + 4),
+            generation: CodeGeneration::claimed(1),
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest: target_guest,
+                resume: GuestVa(target_guest.raw() + 4),
+            },
+        },
+        1,
+        super::emit::EmitAddressMode::Biased { host_bias },
+        vec![0xd400_0001],
+    )
+    .expect("record cross-unit direct target");
+    let source = source_cache
+        .publish_words(
+            &source
+                .template
+                .materialize_immutable_words(Some(host_bias.get()))
+                .expect("materialize cross-unit direct source"),
+        )
+        .expect("publish cross-unit direct source");
+    let target = target_cache
+        .publish_words(
+            &target
+                .template
+                .materialize_immutable_words(Some(host_bias.get()))
+                .expect("materialize cross-unit direct target"),
+        )
+        .expect("publish cross-unit direct target");
+    let source_generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
+    let target_generation = std::sync::atomic::AtomicU64::new(CodeGeneration::claimed(1).get());
+    let source_bindings = [
+        super::gateway::GenerationBinding::new(&source_generation, CodeGeneration::INITIAL),
+        super::gateway::GenerationBinding::new(&target_generation, CodeGeneration::claimed(2)),
+    ];
+    let target_bindings = [
+        super::gateway::GenerationBinding::new(&source_generation, CodeGeneration::claimed(2)),
+        super::gateway::GenerationBinding::new(&target_generation, CodeGeneration::claimed(1)),
+    ];
+    let source_range = source_cache.host_range();
+    let target_range = target_cache.host_range();
+    assert_ne!(
+        source_range, target_range,
+        "source and target must use distinct caches"
+    );
+    assert_ne!(
+        source_bindings.as_ptr(),
+        target_bindings.as_ptr(),
+        "source and target must use distinct generation-binding tables"
+    );
+    let target_authority = super::gateway::TargetCacheAuthority::new(
+        target_range.start,
+        target_range.end,
+        target_bindings.as_ptr(),
+    );
+    let mut indirect = IndirectTargetCache::new();
+    indirect.publish(
+        target_guest,
+        CodeGeneration::claimed(1),
+        target.entry(),
+        &target_authority,
+    );
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let mut exit = NativeDsrExit::ResolveDirect {
+        source: source_guest,
+        target: target_guest,
+    };
+
+    super::gateway::enter_translated_with_cache_range_and_generation_bindings(
+        source.entry(),
+        &mut snapshot,
+        &mut exit,
+        &indirect,
+        source_range.start,
+        source_range.end,
+        crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+        &source_bindings,
+    )
+    .expect("execute cross-unit direct cache hit");
+
+    assert_eq!(
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target_guest.raw() + 4),
+        },
+        "the direct cache hit must install the target range and binding table before entry"
+    );
+}
+
+#[test]
 fn dsr_indirect_flow_blr_sets_guest_link_and_alternates_targets() {
     let mut cache = TranslationCache::new(
         16 * 1024,
