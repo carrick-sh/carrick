@@ -1,6 +1,9 @@
 # File-backed AOT translation cache: getting DSR code out of `MAP_JIT`
 
-**Status:** design, implementation started at Stage 1.
+**Status:** superseded after Stage 1 by
+[`2026-07-26-container-lifetime-translation-cache-design.md`](2026-07-26-container-lifetime-translation-cache-design.md).
+The Mach-O emitter and its measurements remain authoritative; the persistent
+cross-run store, environment-gated rollout, and per-block replay stages do not.
 **Lane:** Darwin/aarch64 native (DSR) — the shipped default backend.
 **Motivating measurement:** a guest `fork(2)` costs 567 µs more than it needs to,
 because our translation cache lives in `MAP_JIT` memory.
