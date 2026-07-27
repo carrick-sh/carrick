@@ -1404,15 +1404,15 @@ pub(crate) fn rewrite_direct_binding_stub(
         (63, 0xd61f_0220), // br x17
     ];
     if precursor[..capture.len()] != capture
-        || !is_mov_wide_x17(&precursor[5..9])
-        || !is_mov_wide_x17(&precursor[50..54])
-        || !is_mov_wide_x17(&precursor[55..59])
+        || decode_mov_wide_x17(&precursor[5..9]) != Some(link.target.raw())
+        || decode_mov_wide_x17(&precursor[50..54]) != Some(link.target.raw())
+        || decode_mov_wide_x17(&precursor[55..59]) != Some(link.source.raw())
         || authority_fixed
             .iter()
             .any(|(index, expected)| precursor[*index] != *expected)
     {
         return Err(DsrError::CachePolicy(
-            "direct-binding precursor instruction shape does not match the authority resolver"
+            "direct-binding precursor instruction shape or owner identity does not match the authority resolver"
                 .to_string(),
         ));
     }
@@ -1496,14 +1496,20 @@ pub(crate) fn rewrite_direct_binding_stub(
     })
 }
 
-fn is_mov_wide_x17(words: &[u32]) -> bool {
+fn decode_mov_wide_x17(words: &[u32]) -> Option<u64> {
     const IMM16_MASK: u32 = 0x001f_ffe0;
     let expected = [0xd280_0011, 0xf2a0_0011, 0xf2c0_0011, 0xf2e0_0011];
-    words.len() == expected.len()
-        && words
-            .iter()
-            .zip(expected)
-            .all(|(word, expected)| *word & !IMM16_MASK == expected)
+    if words.len() != expected.len() {
+        return None;
+    }
+    let mut value = 0_u64;
+    for (index, (word, expected)) in words.iter().zip(expected).enumerate() {
+        if *word & !IMM16_MASK != expected {
+            return None;
+        }
+        value |= u64::from((*word & IMM16_MASK) >> 5) << (index * 16);
+    }
+    Some(value)
 }
 
 fn emit_cached_direct_exit(
@@ -5732,6 +5738,68 @@ mod tests {
                 .contains("direct-binding precursor instruction shape"),
             "unexpected error: {error}"
         );
+    }
+
+    fn assert_shape_valid_owner_identity_mismatch_rejects(case: &str, mov_word: usize) {
+        let branch = direct_plan(PlannedExit::Direct {
+            guest: GuestVa(0x4000),
+            word: 0x1400_0400,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target: GuestVa(0x5000),
+                resume: GuestVa(0x4004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        });
+        let assembled = assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
+            .expect("assemble direct branch");
+        let link = assembled.direct_links[0];
+        let mut code = assembled
+            .words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let word_offset =
+            usize::try_from(link.stub.start.get()).expect("stub start") + mov_word * 4;
+        let original = u32::from_le_bytes(
+            code[word_offset..word_offset + 4]
+                .try_into()
+                .expect("MOV-wide word"),
+        );
+        code[word_offset..word_offset + 4].copy_from_slice(&(original ^ (1 << 5)).to_le_bytes());
+
+        let error = match rewrite_direct_binding_stub(
+            &mut code,
+            link,
+            crate::direct_binding::DirectBindingOrdinal::claimed(0),
+            0,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("{case}: shape-valid wrong identity must reject"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("direct-binding precursor instruction shape"),
+            "{case}: unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn sidecar_rewrite_rejects_shape_valid_first_target_identity_mismatch() {
+        assert_shape_valid_owner_identity_mismatch_rejects("first target identity", 5);
+    }
+
+    #[test]
+    fn sidecar_rewrite_rejects_shape_valid_second_target_identity_mismatch() {
+        assert_shape_valid_owner_identity_mismatch_rejects("second target identity", 50);
+    }
+
+    #[test]
+    fn sidecar_rewrite_rejects_shape_valid_source_identity_mismatch() {
+        assert_shape_valid_owner_identity_mismatch_rejects("source identity", 55);
     }
 
     #[test]

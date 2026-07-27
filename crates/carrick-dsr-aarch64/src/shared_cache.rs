@@ -808,24 +808,18 @@ impl TranslationUnitManifest {
                         relocation.miss_adrp_offset,
                         relocation.miss_add_offset,
                     ];
-                    let hit_add = relocation
-                        .adrp_offset
-                        .checked_add(4)
-                        .ok_or(UnitMissReason::ManifestRange)?;
-                    let miss_add = relocation
-                        .miss_adrp_offset
-                        .checked_add(4)
-                        .ok_or(UnitMissReason::ManifestRange)?;
+                    let expected_offsets =
+                        expected_direct_binding_relocation_offsets(binding.stub_start)
+                            .ok_or(UnitMissReason::ManifestRange)?;
                     if !relocation_ordinals.insert(relocation.ordinal)
                         || relocation.data_offset != expected_data_offset
+                        || offsets != expected_offsets
                         || offsets.iter().any(|offset| {
                             !offset.is_multiple_of(4)
                                 || *offset < binding.stub_start
                                 || u64::from(*offset) + 4 > u64::from(binding.stub_end)
                                 || u64::from(*offset) + 4 > self.code_len
                         })
-                        || relocation.add_offset != hit_add
-                        || relocation.miss_add_offset != miss_add
                     {
                         return Err(UnitMissReason::ManifestRange);
                     }
@@ -860,6 +854,15 @@ impl TranslationUnitManifest {
         }
         Ok(())
     }
+}
+
+fn expected_direct_binding_relocation_offsets(stub_start: u32) -> Option<[u32; 4]> {
+    Some([
+        stub_start.checked_add(20)?,
+        stub_start.checked_add(24)?,
+        stub_start.checked_add(108)?,
+        stub_start.checked_add(112)?,
+    ])
 }
 
 fn code_word(code: &[u8], offset: u32) -> Result<u32, UnitMissReason> {
@@ -1462,6 +1465,45 @@ mod tests {
             manifest.validate_binding_code(&code),
             Err(UnitMissReason::ManifestRange),
             "wrong miss relocation instruction shape"
+        );
+    }
+
+    #[test]
+    fn schema_v2_rejects_aliased_direct_binding_relocations() {
+        let mut aliased = manifest_v2_fixture();
+        aliased.binding_relocations[0].miss_adrp_offset =
+            aliased.binding_relocations[0].adrp_offset;
+        aliased.binding_relocations[0].miss_add_offset = aliased.binding_relocations[0].add_offset;
+        assert_eq!(
+            aliased.validate_ranges(),
+            Err(UnitMissReason::ManifestRange),
+            "hit and miss relocation pairs must not alias"
+        );
+    }
+
+    #[test]
+    fn schema_v2_rejects_shifted_but_contained_direct_binding_relocations() {
+        let mut shifted = manifest_v2_fixture();
+        shifted.binding_relocations[0].adrp_offset += 4;
+        shifted.binding_relocations[0].add_offset += 4;
+        assert_eq!(
+            shifted.validate_ranges(),
+            Err(UnitMissReason::ManifestRange),
+            "contained relocation pairs must still own their fixed stub offsets"
+        );
+    }
+
+    #[test]
+    fn direct_binding_relocation_offsets_reject_stub_start_overflow() {
+        assert_eq!(
+            expected_direct_binding_relocation_offsets(u32::MAX - 19),
+            None,
+            "hit ADRP arithmetic must be checked"
+        );
+        assert_eq!(
+            expected_direct_binding_relocation_offsets(u32::MAX - 107),
+            None,
+            "miss ADRP arithmetic must be checked independently"
         );
     }
 
