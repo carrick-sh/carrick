@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub const TRANSLATOR_ABI_V1: u32 = 1;
+pub const TRANSLATOR_ABI_CURRENT: u32 = 2;
 pub const TRANSLATION_UNIT_SCHEMA_V1: u32 = 1;
 pub const MAX_TRANSLATION_UNIT_CODE_BYTES: usize = 64 * 1024 * 1024;
 pub const TRANSLATION_UNIT_BASE_EXPORT: &str = "carrick_aot_unit_base";
@@ -159,7 +159,7 @@ impl TranslationUnitKey {
             source_fingerprint,
             page_profile,
             address_mode,
-            translator_abi: TRANSLATOR_ABI_V1,
+            translator_abi: TRANSLATOR_ABI_CURRENT,
         }
     }
 
@@ -495,7 +495,7 @@ impl TranslationUnitManifest {
         if self.schema != TRANSLATION_UNIT_SCHEMA_V1 {
             return Err(UnitMissReason::Schema);
         }
-        if self.key.translator_abi() != TRANSLATOR_ABI_V1 {
+        if self.key.translator_abi() != TRANSLATOR_ABI_CURRENT {
             return Err(UnitMissReason::TranslatorAbi);
         }
         if self.base_export != TRANSLATION_UNIT_BASE_EXPORT
@@ -652,6 +652,30 @@ mod tests {
         assert_eq!(
             manifest.validate_source(&[0xd280_0020]),
             Err(UnitMissReason::SourceFingerprint)
+        );
+    }
+
+    #[test]
+    fn previous_target_cache_abi_is_rejected() {
+        let source = [0xd280_0000_u32];
+        let mut manifest = TranslationUnitManifest {
+            schema: TRANSLATION_UNIT_SCHEMA_V1,
+            key: key(
+                ExecutableIdentity::Digest([0x11; 32]),
+                SourceFingerprint::from_words(&source),
+                AddressModeIdentity::Direct,
+            ),
+            dylib_sha256: [0x22; 32],
+            base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+            code_len: 4,
+            blocks: Vec::new(),
+        };
+        manifest.key.translator_abi = 1;
+
+        assert_eq!(
+            manifest.validate_ranges(),
+            Err(UnitMissReason::TranslatorAbi),
+            "units emitted for the 16-byte target cache must not load into the authority-carrying runtime"
         );
     }
 

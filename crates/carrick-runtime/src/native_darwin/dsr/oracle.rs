@@ -2139,27 +2139,30 @@ fn portable_direct_block_exits_through_context_gateway() {
     );
 }
 
-#[test]
-fn portable_direct_block_uses_resolver_until_unit_pack_links_it() {
+fn assert_portable_direct_block_chains_through_published_target_authority(
+    kind: DirectKind,
+    word: u32,
+) {
     let mut cache = TranslationCache::new(
         32 * 1024,
         crate::native_darwin::darwin_jit::active_host_jit(),
     )
     .expect("allocate portable direct chaining cache");
     let guest = GuestVa(0x13_a00);
-    let target = GuestVa(guest.raw() + 4);
+    let resume = GuestVa(guest.raw() + 4);
+    let target = GuestVa(guest.raw() + 8);
     let source_plan = BlockPlan {
         start: guest,
-        end: target,
+        end: resume,
         generation: CodeGeneration::INITIAL,
         instructions: Vec::new(),
         exit: PlannedExit::Direct {
             guest,
-            word: 0x1400_0001,
+            word,
             exit: DirectExit {
-                kind: DirectKind::Branch,
+                kind,
                 target,
-                resume: target,
+                resume,
                 condition: None,
                 register: None,
                 bit: None,
@@ -2182,7 +2185,7 @@ fn portable_direct_block_uses_resolver_until_unit_pack_links_it() {
         &source_plan,
         0,
         super::emit::EmitAddressMode::Biased { host_bias },
-        vec![0x1400_0001],
+        vec![word],
     )
     .expect("record portable direct source");
     let target_artifact = super::emit::record_portable_block_artifact(
@@ -2214,9 +2217,16 @@ fn portable_direct_block_uses_resolver_until_unit_pack_links_it() {
         super::gateway::GenerationBinding::new(&generations[0], CodeGeneration::INITIAL),
         super::gateway::GenerationBinding::new(&generations[1], CodeGeneration::INITIAL),
     ];
-    let mut indirect = IndirectTargetCache::new();
-    indirect.publish(target, CodeGeneration::INITIAL, target_block.entry());
     let range = cache.host_range();
+    let authority =
+        super::gateway::TargetCacheAuthority::new(range.start, range.end, bindings.as_ptr());
+    let mut indirect = IndirectTargetCache::new();
+    indirect.publish(
+        target,
+        CodeGeneration::INITIAL,
+        target_block.entry(),
+        &authority,
+    );
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     let mut exit = NativeDsrExit::ResolveDirect {
@@ -2238,10 +2248,28 @@ fn portable_direct_block_uses_resolver_until_unit_pack_links_it() {
 
     assert_eq!(
         exit,
-        NativeDsrExit::ResolveDirect {
-            source: guest,
-            target,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target.raw() + 4),
         }
+    );
+    if kind == DirectKind::Call {
+        assert_eq!(snapshot.x[30], resume.raw());
+    }
+}
+
+#[test]
+fn portable_direct_branch_chains_through_published_target_authority() {
+    assert_portable_direct_block_chains_through_published_target_authority(
+        DirectKind::Branch,
+        0x1400_0002,
+    );
+}
+
+#[test]
+fn portable_direct_call_chains_through_published_target_authority() {
+    assert_portable_direct_block_chains_through_published_target_authority(
+        DirectKind::Call,
+        0x9400_0002,
     );
 }
 
@@ -2385,9 +2413,22 @@ fn dsr_indirect_cache_keeps_old_index_aliases_hot() {
         },
     )
     .expect("emit alias source");
+    let range = code.host_range();
+    let authority =
+        super::gateway::TargetCacheAuthority::new(range.start, range.end, std::ptr::null());
     let mut indirect = IndirectTargetCache::new();
-    indirect.publish(first, CodeGeneration::INITIAL, first_block.entry());
-    indirect.publish(second, CodeGeneration::INITIAL, second_block.entry());
+    indirect.publish(
+        first,
+        CodeGeneration::INITIAL,
+        first_block.entry(),
+        &authority,
+    );
+    indirect.publish(
+        second,
+        CodeGeneration::INITIAL,
+        second_block.entry(),
+        &authority,
+    );
 
     let mut stack = vec![0_u8; 16 * 1024];
     for target in [first, second] {
@@ -2458,8 +2499,11 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
         },
     )
     .expect("emit indirect cache-hit source");
+    let range = code.host_range();
+    let authority =
+        super::gateway::TargetCacheAuthority::new(range.start, range.end, std::ptr::null());
     let mut indirect = IndirectTargetCache::new();
-    indirect.publish(target_guest, target_generation, target.entry());
+    indirect.publish(target_guest, target_generation, target.entry(), &authority);
 
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -2513,7 +2557,7 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
 }
 
 #[test]
-fn dsr_indirect_cache_rejects_target_outside_active_translation_unit() {
+fn dsr_indirect_cache_installs_target_outside_active_translation_unit() {
     let source_guest = GuestVa(0x18_240);
     let target_guest = GuestVa(0x18_280);
     let mut source_code = TranslationCache::new(
@@ -2559,8 +2603,19 @@ fn dsr_indirect_cache_rejects_target_outside_active_translation_unit() {
         },
     )
     .expect("emit separate indirect target");
+    let target_range = target_code.host_range();
+    let authority = super::gateway::TargetCacheAuthority::new(
+        target_range.start,
+        target_range.end,
+        std::ptr::null(),
+    );
     let mut indirect = IndirectTargetCache::new();
-    indirect.publish(target_guest, CodeGeneration::INITIAL, target.entry());
+    indirect.publish(
+        target_guest,
+        CodeGeneration::INITIAL,
+        target.entry(),
+        &authority,
+    );
 
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -2584,11 +2639,19 @@ fn dsr_indirect_cache_rejects_target_outside_active_translation_unit() {
     .expect("execute source with an out-of-unit cached target");
 
     assert_eq!(
-        exit, expected,
-        "a target owned by another unit must return through prepare_entry"
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target_guest.raw() + 4),
+        },
+        "a cached target must install its own unit authority"
     );
 
-    indirect.publish(target_guest, CodeGeneration::INITIAL, target.entry());
+    indirect.publish(
+        target_guest,
+        CodeGeneration::INITIAL,
+        target.entry(),
+        &authority,
+    );
     snapshot.pc = source_guest.raw();
     snapshot.x[0] = target_guest.raw();
     exit = expected;
@@ -2603,8 +2666,11 @@ fn dsr_indirect_cache_rejects_target_outside_active_translation_unit() {
     )
     .expect("execute source after republishing cross-unit target");
     assert_eq!(
-        exit, expected,
-        "a cross-unit target must return through prepare_entry even after publication"
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target_guest.raw() + 4),
+        },
+        "republishing preserves the target unit authority"
     );
 
     snapshot.pc = source_guest.raw();
@@ -2670,8 +2736,16 @@ fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
         },
     )
     .expect("emit cached BLR source");
+    let range = code.host_range();
+    let authority =
+        super::gateway::TargetCacheAuthority::new(range.start, range.end, std::ptr::null());
     let mut indirect = IndirectTargetCache::new();
-    indirect.publish(target_guest, CodeGeneration::INITIAL, target.entry());
+    indirect.publish(
+        target_guest,
+        CodeGeneration::INITIAL,
+        target.entry(),
+        &authority,
+    );
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
     snapshot.x[0] = target_guest.raw();
@@ -3392,7 +3466,7 @@ fn published_shared_block_prevents_second_process_translation() {
 }
 
 #[test]
-fn shared_unit_indirect_path_chains_through_context_authority() {
+fn shared_to_private_indirect_cache_hit_installs_target_authority() {
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
         NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate, PublishOutcome,
@@ -3430,8 +3504,6 @@ fn shared_unit_indirect_path_chains_through_context_authority() {
     let first_plan = super::block::plan_block(&fixture.memory, guest, generation, 256)
         .expect("plan indirect source");
     let target = GuestVa(guest.raw() + 4);
-    let second_plan = super::block::plan_block(&fixture.memory, target, generation, 256)
-        .expect("plan indirect target");
     let first = super::emit::record_portable_block_artifact(
         &first_plan,
         0,
@@ -3441,41 +3513,24 @@ fn shared_unit_indirect_path_chains_through_context_authority() {
         vec![words[0]],
     )
     .expect("record portable indirect source");
-    let second = super::emit::record_portable_block_artifact(
-        &second_plan,
-        1,
-        super::emit::EmitAddressMode::Biased {
-            host_bias: fixture.host_bias,
-        },
-        vec![words[1]],
-    )
-    .expect("record portable indirect target");
     let key = TranslationUnitKey::for_segment(
         ExecutableIdentity::Digest([0x77; 32]),
         ImageFileOffset::new(0),
-        ImageFileLen::new(16 * 1024).expect("nonzero file length"),
+        ImageFileLen::new(4).expect("nonzero file length"),
         guest,
-        GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
-        SourceFingerprint::from_words(&words),
+        GuestCodeLen::new(4).expect("nonzero guest length"),
+        SourceFingerprint::from_words(&words[..1]),
         NativePageProfileIdentity::Native16k,
         AddressModeIdentity::biased(fixture.host_bias),
     );
     let pending = PendingTranslationUnit::pack(
         key.clone(),
-        vec![
-            PortableBlockCandidate {
-                guest_start: guest,
-                generation_binding: 0,
-                requires_sensitive_metadata: false,
-                template: first.template,
-            },
-            PortableBlockCandidate {
-                guest_start: target,
-                generation_binding: 1,
-                requires_sensitive_metadata: false,
-                template: second.template,
-            },
-        ],
+        vec![PortableBlockCandidate {
+            guest_start: guest,
+            generation_binding: 0,
+            requires_sensitive_metadata: false,
+            template: first.template,
+        }],
     )
     .expect("pack indirect fixture unit");
     let code_words = pending
@@ -3514,10 +3569,10 @@ fn shared_unit_indirect_path_chains_through_context_authority() {
                 address_mode: AddressModeIdentity::biased(fixture.host_bias),
                 segments: vec![SharedExecutableSegment {
                     file_offset: ImageFileOffset::new(0),
-                    file_len: ImageFileLen::new(16 * 1024).expect("nonzero file length"),
+                    file_len: ImageFileLen::new(4).expect("nonzero file length"),
                     guest_start: guest,
-                    guest_len: GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
-                    source_words: words.to_vec().into(),
+                    guest_len: GuestCodeLen::new(4).expect("nonzero guest length"),
+                    source_words: words[..1].to_vec().into(),
                 }],
             },
             Arc::new(FixtureStore(SharedLoadedTranslationUnit::new(

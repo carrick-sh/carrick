@@ -187,7 +187,7 @@ impl ContainerCacheAuthority {
     fn adopt(config: &ContainerCacheReexecConfig) -> std::io::Result<Self> {
         if config.host_fd < 0
             || !config.path.is_absolute()
-            || config.translator_abi != carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_V1
+            || config.translator_abi != carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_CURRENT
         {
             return Err(invalid_data("invalid inherited cache authority"));
         }
@@ -266,7 +266,7 @@ impl ContainerCacheAuthority {
             path: self.path.clone(),
             creator_pid: self.creator_pid,
             authority_nonce: self.authority_nonce,
-            translator_abi: carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_V1,
+            translator_abi: carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_CURRENT,
         })
     }
 

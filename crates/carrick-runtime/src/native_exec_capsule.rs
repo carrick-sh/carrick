@@ -276,7 +276,8 @@ impl NativeGuestExecV1 {
                     || cache.path.as_os_str().is_empty()
                     || cache.path.as_os_str().as_bytes().len() > MAX_PATH_LEN
                     || !cache.path.is_absolute()
-                    || cache.translator_abi != carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_V1
+                    || cache.translator_abi
+                        != carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_CURRENT
             })
             || (self.process_state.ptrace_traceme && self.kernel_arena.is_none())
             || self.bind_mounts.len() > MAX_VECTOR_ITEMS
@@ -1707,7 +1708,7 @@ mod tests {
             path: cache.path().to_path_buf(),
             creator_pid: unsafe { libc::getpid() },
             authority_nonce: [0x6b; 16],
-            translator_abi: carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_V1,
+            translator_abi: carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_CURRENT,
         });
 
         let result = exec_capsule_with(payload, [0x45; 16], None, |_| {
