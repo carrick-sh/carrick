@@ -34,6 +34,7 @@ pub mod mapped_memory;
 // call site (notably `carrick-runtime`'s `native_prepared_image.rs` shim) is
 // unchanged.
 pub use carrick_dsr::prepared_image;
+pub mod shared_cache;
 pub mod snapshot;
 pub mod translator;
 pub mod types;
