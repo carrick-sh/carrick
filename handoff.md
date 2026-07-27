@@ -104,17 +104,30 @@ The first post-M1 cache isolation found a concrete step-function seam:
 The kept full-cache census contained four dylibs (about 28 MiB) and four
 manifests (about 49 MiB). Publication is not the regression: removing all
 durability syncs changed almost nothing, and publishing while translating
-normally adds only about 0.93 s. Roughly 17.2 seconds appears after successful
-load, in eager reconstruction and registration of every block's lookup,
-PC-map, recovery, generation and direct-link authority. A 100-block cap
-collapses the regression but does not beat default, confirming a size cliff.
+normally adds only about 0.93 s. A 100-block cap collapses the regression but
+does not beat default, confirming a size cliff.
 
-**Next implementation target:** retain immutable file-backed units but index
-their block/PC/recovery metadata on demand (or in an equivalently compact
-unit-level structure). It must preserve recovery for intra-unit direct links
-and must not rewrite code per process. Screen two untraced runs first; retain
-only after five samples beat the official 19.375 s baseline and correctness
-guardrails pass.
+The first isolation made eager metadata indexing look responsible, but the
+implementation spikes falsified that interpretation. Fully lazy metadata took
+57.45 s; retaining only the compact guest-entry index took 39.12 s, barely
+better than the original. Omitting the portable generation guard still took
+38.73 s. All were reverted.
+
+The reconciled shared-mode count profile identifies the real amplification:
+**262,216,112 gateway entries**, including **68,932,094 direct resolver exits**
+and **62,056,062 indirect resolver exits**, with 127.1 child CPU-s. The default
+profile had 2,395,609 gateway entries, 1,433,321 direct exits, 862,580 indirect
+exits and 43.8 child CPU-s. Translation fell only 1,867,805 → 1,256,885, nowhere
+near enough to repay roughly 260 million additional exits. Filtering to a
+transitively closed direct-target subset made things worse (55.24 s) and was
+also reverted.
+
+**Next implementation target:** immutable-code-compatible late binding for
+direct edges whose targets were absent when a unit was signed. The loaded unit
+must not take the resolver on every execution of the same edge. Reprofile
+gateway/direct/indirect counts before wall retention; screen two untraced runs
+first, then require five samples to beat the official 19.375 s baseline and
+pass correctness guardrails.
 
 ### Portable translation reuse is correct but not a default performance win
 
