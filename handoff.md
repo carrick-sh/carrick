@@ -83,6 +83,11 @@ untraced samples on both sides, in separate phases. Whole-process-tree DTrace
 then partitions elapsed wall state and on-/off-CPU resource time before the
 next optimization is selected. Node and CPython remain guardrails.
 
+The measured official baseline is `C0=19,375 ms` (five fresh untraced Carrick
+samples), `D0=1,007 ms` (five fresh native-arm64 Docker samples), and
+`R0=19.2403x` (`C0 / D0`). It replaces neither the historical 19,485/942 ms
+reference nor any one-sample screen.
+
 The M1 attribution gate is now closed at commit `34ce4c3c`. The user explicitly
 lowered the CPU classification threshold from 90% to 85% so the campaign could
 return to wall-clock work. The clean `688357ef` pair classified 88.3%/89.8% of
@@ -122,12 +127,33 @@ near enough to repay roughly 260 million additional exits. Filtering to a
 transitively closed direct-target subset made things worse (55.24 s) and was
 also reverted.
 
-**Next implementation target:** immutable-code-compatible late binding for
-direct edges whose targets were absent when a unit was signed. The loaded unit
-must not take the resolver on every execution of the same edge. Reprofile
-gateway/direct/indirect counts before wall retention; screen two untraced runs
-first, then require five samples to beat the official 19.375 s baseline and
-pass correctness guardrails.
+The first immutable-code-compatible late-binding precursor now carries exact
+target authority through the two-way per-thread cache. It is correct across
+private/shared and cross-unit targets, and translator ABI 2 rejects the old
+16-byte cache population. Three untraced samples were stable at 25.169,
+25.268 and 25.082 s. That recovers much of the 40.2 s shared-mode regression,
+but it is still slower than the 19.375 s official baseline and is not a
+retained primary-goal win.
+
+A natural resolver-only DTrace run measured 941,784 remaining indirect misses.
+Although 82,266/124,947 source sites were monomorphic, the top one/two targets
+cover only 44.6%/54.9% of miss events; the hot tail is high-entropy. A second,
+bounded trace saw 17,155,262 direct misses in 45 traced seconds. Its hottest
+edge alone fired 1,473,595 times: `0x1a748 → 0x1a74c`, verified in the native
+arm64 Docker oracle as Go `compile`'s `CBZ R1` fall-through.
+
+Two conditional-edge spikes are rejected and reverted. Emitting the full
+authority-aware lookup at every private/shared edge exhausted the 64 MiB
+private JIT cache. Restricting it to portable artifacts produced one 24.664 s
+sample, then crashed in Go runtime stack code on replication. Do not resurrect
+that inline family.
+
+**Next implementation target:** an immutable-code-compatible, compact per-edge
+binding sidecar. Each loaded unit should own mutable cells keyed by stable edge
+identity; the cell must publish target PC plus executable authority/version,
+and the short immutable edge stub must have explicit asynchronous recovery
+coverage. Screen two untraced runs first, then require five samples to beat the
+official 19.375 s baseline and pass correctness guardrails.
 
 ### Portable translation reuse is correct but not a default performance win
 

@@ -19,7 +19,9 @@
 | Destination | 2.0x | Two independent five-sample campaigns |
 | Destination progress | 0.0% | `(R0 - R) / (R0 - 2.0)` |
 
-Current milestone: **M1 — accounted baseline**. M0 is complete.
+Current milestone: **M2 — compact immutable-edge binding**. M0 and M1 are
+complete; the first authority-carrying cache family is correct but has not
+beaten `C0`.
 
 ## Measurement contract
 
@@ -64,6 +66,10 @@ Current milestone: **M1 — accounted baseline**. M0 is complete.
 | E005k | `target/perf/native-go-build-wall-initial-base-spike-a{.jsonl,.attribution.json}` | accepted tooling spike; dirty provenance, raw untracked | Publishing the initial fork child's Carrick image before guest setup: zero drops, 100.0% wall reconciliation, 92.1% resolved CPU |
 | E006 | `target/perf/native-go-build-wall-clean-a-688357ef.jsonl` | accepted raw; untracked | Commit-exact zero-drop trace with 100.0% wall reconciliation and 88.3% resolved CPU |
 | E007 | `target/perf/native-go-build-wall-clean-b-688357ef.jsonl` plus `scripts/perf/evidence/native-go-build-wall-attribution-v1.json` | accepted | Replication reached 89.8% resolved CPU; every category above 10% stayed within five percentage points |
+| E008 | `target/perf/native-edge-shape-authority-v2-b.raw` | accepted diagnostic; raw untracked | Natural `BUILD_OK` resolver trace: authority caching cuts indirect resolver events to 941,784; 82,266/124,947 sites are monomorphic, but top-one/top-two targets cover only 44.6%/54.9% of miss events |
+| E009 | `target/perf/native-edge-shape-authority-v2-c.raw` | bounded diagnostic; raw untracked | First 45 traced seconds contain 17,155,262 direct resolver events; the hottest edge (`0x1a748 → 0x1a74c`) accounts for 1,473,595 and is the fall-through of Go `compile`'s `CBZ R1` |
+| E010 | `target/perf/native-go-build-authority-v2-stress-screen.json` | accepted screen; dirty provenance | Three correct untraced samples: 25,169, 25,268 and 25,082 ms; authority switching removes most resolver amplification but remains slower than `C0=19,375 ms` |
+| E011 | `target/perf/native-go-build-portable-conditional-v3-populate.json` plus failed replication log | rejected spike; raw untracked | Artifact-only inline conditional caching screened at 24,664 ms, then crashed in Go stack/runtime code; the all-code version exhausted the 64 MiB private JIT cache |
 
 ## Whole-tree attribution
 
@@ -173,7 +179,7 @@ Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
 | H001 | PROPOSED | 862,580 residual indirect resolver exits | event count, wall share pending | Classify call/return locality; test one bounded return-target structure | Two variants fail to reduce exits and untraced wall |
 | H002 | PROPOSED | 5.806 s diagnostic emission time across 1.868M translations | stale traced aggregate | Sample and split allocation, relocation, publication and I-cache work; spike only the dominant subphase | No current dominant subphase or two variants fail wall gate |
 | H003 | PROPOSED | Older profile assigned CPU to repeated capsule setup | stale sample | Refresh process-lifetime share and critical-path overlap; reuse only the dominant durable input | Current share is small/non-critical or two variants fail |
-| H004 | SPIKING | Shared execution raises gateway entries from 2.40M to 262.22M: 68.93M direct plus 62.06M indirect resolver exits | shared profile uses 127.1 child CPU-s; default profile used 43.8 child CPU-s | Add immutable-code-compatible late binding for unresolved direct edges, then remeasure resolver counts and wall | Two edge-cache variants fail to cut resolver exits and beat the 19.375 s baseline |
+| H004 | SPIKING | Authority caching leaves at least 17.16M bounded direct misses, led by one conditional fall-through edge at 1.47M | authority-v2 wall median 25.169 s; `C0` is 19.375 s | Add compact per-edge mutable binding cells with explicit recovery semantics; avoid an inline lookup/PIC at each immutable edge | Two compact binding variants fail to beat `C0`, or recovery/correctness cannot be proved |
 | H005 | PROPOSED | Scheduling/blocking share is unknown | unmeasured | Partition wall occupancy and rank voluntary blocking stacks | Fully compute-active with no dominant wait mechanism |
 
 The table order is provisional until E005 and E006 exist.
@@ -192,6 +198,9 @@ The table order is provisional until E005 and E006 exist.
 | 2026-07-27 | H004 | eager guest index, lazy PC/recovery metadata | Keep the warm lookup path without expanding all metadata | 39.12 s, 92.13 user-s | n/a | reject; only about 1 s better than full mode |
 | 2026-07-27 | H004 | omit portable generation guard | Test whether binding-index prelude causes shared execution cost | 38.73 s, 91.46 user-s | n/a | reject and revert; essentially unchanged |
 | 2026-07-27 | H004 | transitively closed direct-target subset | Publish only blocks whose direct targets share the immutable unit | 55.24 s, 139.49 user-s | n/a | reject; lost reuse and remained resolver-heavy |
+| 2026-07-27 | H004 | authority-carrying two-way target cache for direct/indirect edges | Permit safe cross-unit chaining without mutating signed code | 25.169 s median across three correct samples | n/a | keep as correctness precursor, not a wall win |
+| 2026-07-27 | H004 | inline conditional target-cache lookup in all code | Collapse the 1.47M hottest fall-through misses | failed: 64 MiB private JIT cache exhausted | n/a | reject; code-size explosion |
+| 2026-07-27 | H004 | inline conditional lookup only in portable artifacts | Avoid private-cache expansion while chaining shared conditionals | 24.664 s first sample; replication crashed in Go runtime | n/a | reject and revert; too small and unsafe |
 
 Prior rejected experiments remain recorded in `handoff.md`; they are not reset
 to `PROPOSED`.
@@ -220,6 +229,12 @@ to `PROPOSED`.
    isolation implicated consumer work, but two lazy-metadata spikes falsified
    indexing as the dominant cause; executing immutable units amplifies
    unresolved edges instead.
+7. DBT/JIT precedent and the edge-shape trace both select immutable code plus
+   mutable per-process binding state. Do not add another full inline target
+   cache: it either exhausts private code capacity or perturbs asynchronous
+   recovery. A direct binding must have a stable edge identity, bounded
+   sidecar size, publication ordering, authority/version data and a recovery
+   oracle before it receives a wall screen.
 
 ## Next action
 
@@ -232,4 +247,8 @@ Write and validate the executable M1 plan:
 - [x] Collect two complete traced runs and rank H001–H005.
 - [x] Select and screen the current shared-cache implementation.
 - [x] Falsify metadata indexing and generation guards as dominant causes.
-- [ ] Add portable late binding for unresolved shared-unit direct edges.
+- [x] Prove authority-carrying cross-unit direct/indirect cache hits.
+- [x] Measure direct-edge heat and indirect miss entropy.
+- [x] Falsify full inline conditional caching on code size and recovery.
+- [ ] Add compact per-edge mutable binding cells for unresolved shared-unit
+      direct edges.
