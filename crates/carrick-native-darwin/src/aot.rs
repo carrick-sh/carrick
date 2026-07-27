@@ -261,6 +261,15 @@ struct AotLayoutLengths {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct AotPreflightLengths {
+    sizeofcmds: u64,
+    code_len: u64,
+    data_len: u64,
+    export_count: u64,
+    export_name_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct AotSectionLayout {
     code_addr: u64,
     text_vmsize: u64,
@@ -295,12 +304,26 @@ struct AotLayout {
     output_len: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AotPreflight {
+    sections: AotSectionLayout,
+    nlists_len: u64,
+    nlists_capacity: usize,
+    strtab_len: u64,
+    strtab_capacity: usize,
+}
+
 fn layout_overflow(field: &'static str) -> AotEmitError {
     AotEmitError::LayoutOverflow { field }
 }
 
 fn checked_add(left: u64, right: u64, field: &'static str) -> Result<u64, AotEmitError> {
     left.checked_add(right)
+        .ok_or_else(|| layout_overflow(field))
+}
+
+fn checked_mul(left: u64, right: u64, field: &'static str) -> Result<u64, AotEmitError> {
+    left.checked_mul(right)
         .ok_or_else(|| layout_overflow(field))
 }
 
@@ -422,6 +445,69 @@ fn checked_layout(lengths: AotLayoutLengths) -> Result<AotLayout, AotEmitError> 
         stroff: stroff_u32,
         strsize,
         output_len: checked_usize(output_len, "output length")?,
+    })
+}
+
+fn checked_preflight(lengths: AotPreflightLengths) -> Result<AotPreflight, AotEmitError> {
+    // The trie root carries its child count in one byte. Check it before any
+    // per-export vectors are built.
+    checked_u8(lengths.export_count, "export trie child count")?;
+
+    // The string table is exact from lengths alone: one leading NUL, then an
+    // underscore and trailing NUL around every caller-supplied name.
+    let string_overhead = checked_add(
+        1,
+        checked_mul(lengths.export_count, 2, "string table size")?,
+        "string table size",
+    )?;
+    let strtab_len = checked_align_up(
+        checked_add(
+            string_overhead,
+            lengths.export_name_bytes,
+            "string table size",
+        )?,
+        8,
+        "string table size",
+    )?;
+    checked_u32(strtab_len, "string table size")?;
+
+    // A root edge needs `_name\0` plus at most ten ULEB bytes for its child
+    // offset. A terminal needs at most thirteen bytes: one terminal-size ULEB,
+    // one flags ULEB, a ten-byte address ULEB, and its zero child count.
+    // Therefore 2 + name_bytes + 25 * exports is a content-independent upper
+    // bound; align it exactly as `export_trie` does.
+    let trie_len_bound = checked_align_up(
+        checked_add(
+            checked_add(2, lengths.export_name_bytes, "export trie size")?,
+            checked_mul(lengths.export_count, 25, "export trie size")?,
+            "export trie size",
+        )?,
+        8,
+        "export trie size",
+    )?;
+    checked_u32(trie_len_bound, "export trie size")?;
+
+    let nlists_len = checked_mul(lengths.export_count, 16, "symbol table size")?;
+    let sections = checked_section_layout(lengths.sizeofcmds, lengths.code_len, lengths.data_len)?;
+
+    // Pressure-test the largest layout that content can produce. If the upper
+    // bound fits, later exact construction cannot overflow a fixed-width field.
+    checked_layout(AotLayoutLengths {
+        sizeofcmds: lengths.sizeofcmds,
+        code_len: lengths.code_len,
+        data_len: lengths.data_len,
+        trie_len: trie_len_bound,
+        nlists_len,
+        strtab_len,
+        export_count: lengths.export_count,
+    })?;
+
+    Ok(AotPreflight {
+        sections,
+        nlists_len,
+        nlists_capacity: checked_usize(nlists_len, "symbol table size")?,
+        strtab_len,
+        strtab_capacity: checked_usize(strtab_len, "string table size")?,
     })
 }
 
@@ -647,7 +733,6 @@ fn export_trie(exports: &[(String, u64)]) -> Result<Vec<u8>, AotEmitError> {
 /// `dlopen`.
 pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
     use macho::*;
-    validate(image)?;
 
     const SEG_CMD: u64 = 72;
     const SECT: u64 = 80;
@@ -686,7 +771,26 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
     let code_len = checked_u64(image.code.len(), "code length")?;
     let data_len = checked_u64(image.data.len(), "data length")?;
     let export_count = checked_u64(image.exports.len(), "symbol count")?;
-    let sections = checked_section_layout(sizeofcmds, code_len, data_len)?;
+    let export_name_bytes = image.exports.iter().try_fold(0u64, |total, export| {
+        checked_add(
+            total,
+            checked_u64(export.name.len(), "export name bytes")?,
+            "export name bytes",
+        )
+    })?;
+    let preflight = checked_preflight(AotPreflightLengths {
+        sizeofcmds,
+        code_len,
+        data_len,
+        export_count,
+        export_name_bytes,
+    })?;
+
+    // Validation can allocate owned names for typed errors. Keep it after the
+    // length-only preflight so no allocation happens before every deterministic
+    // fixed-width and layout rejection has run.
+    validate(image)?;
+    let sections = preflight.sections;
 
     // `__TEXT` has vmaddr 0 and covers the header, so a section's vmaddr and its
     // file offset are the same number.
@@ -721,7 +825,8 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
     let trie = export_trie(&trie_exports)?;
 
     // String table: a leading NUL, then each `_name`.
-    let mut strtab = vec![0u8];
+    let mut strtab = Vec::with_capacity(preflight.strtab_capacity);
+    strtab.push(0);
     let mut name_offsets = Vec::with_capacity(image.exports.len());
     for export in image.exports {
         name_offsets.push(strtab.len());
@@ -734,21 +839,19 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
     }
 
     let trie_len = checked_u64(trie.len(), "export trie size")?;
-    let nlists_len = export_count
-        .checked_mul(16)
-        .ok_or_else(|| layout_overflow("symbol table size"))?;
     let strtab_len = checked_u64(strtab.len(), "string table size")?;
+    debug_assert_eq!(strtab_len, preflight.strtab_len);
     let layout = checked_layout(AotLayoutLengths {
         sizeofcmds,
         code_len,
         data_len,
         trie_len,
-        nlists_len,
+        nlists_len: preflight.nlists_len,
         strtab_len,
         export_count,
     })?;
 
-    let mut nlists = Vec::new();
+    let mut nlists = Vec::with_capacity(preflight.nlists_capacity);
     for (i, (_, section, addr)) in resolved.iter().enumerate() {
         let name_offset = checked_u32(
             checked_u64(name_offsets[i], "string table name offset")?,
@@ -763,7 +866,7 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
         nlists.extend_from_slice(&0u16.to_le_bytes());
         nlists.extend_from_slice(&addr.to_le_bytes());
     }
-    debug_assert!(u64::try_from(nlists.len()).ok() == Some(nlists_len));
+    debug_assert!(u64::try_from(nlists.len()).ok() == Some(preflight.nlists_len));
 
     let mut cmds: Vec<u8> = Vec::with_capacity(layout.sizeofcmds_usize);
     let segment_command_size = checked_u32(SEG_CMD, "segment command size")?;
@@ -1560,6 +1663,64 @@ mod tests {
                 value: 256,
             })
         ));
+    }
+
+    #[test]
+    fn rejects_unrepresentable_inputs_in_length_only_preflight() {
+        fn lengths(
+            code_len: u64,
+            data_len: u64,
+            export_count: u64,
+            export_name_bytes: u64,
+        ) -> AotPreflightLengths {
+            AotPreflightLengths {
+                sizeofcmds: if data_len == 0 { 456 } else { 608 },
+                code_len,
+                data_len,
+                export_count,
+                export_name_bytes,
+            }
+        }
+
+        fn assert_narrowing(input: AotPreflightLengths, field: &'static str) {
+            assert!(
+                matches!(
+                    checked_preflight(input),
+                    Err(AotEmitError::MachOFieldOutOfRange {
+                        field: actual,
+                        ..
+                    }) if actual == field
+                ),
+                "{field} must reject before proportional allocation"
+            );
+        }
+
+        fn assert_overflow(input: AotPreflightLengths, field: &'static str) {
+            assert!(
+                matches!(
+                    checked_preflight(input),
+                    Err(AotEmitError::LayoutOverflow {
+                        field: actual
+                    }) if actual == field
+                ),
+                "{field} must reject before proportional allocation"
+            );
+        }
+
+        let beyond_u32 = u64::from(u32::MAX) + 1;
+        assert_narrowing(lengths(beyond_u32, 0, 0, 0), "linkedit offset");
+        assert_narrowing(lengths(8, beyond_u32, 0, 0), "linkedit offset");
+        assert_narrowing(lengths(8, 0, 256, 0), "export trie child count");
+
+        assert_narrowing(lengths(8, 0, 1, u64::from(u32::MAX)), "string table size");
+        assert_overflow(lengths(8, 0, 1, u64::MAX), "string table size");
+
+        // The exact string table still fits, but the trie must duplicate all
+        // names and also carry edges, ULEB offsets, and terminal records.
+        assert_narrowing(
+            lengths(8, 0, 255, u64::from(u32::MAX) - 4096),
+            "export trie size",
+        );
     }
 
     #[test]
