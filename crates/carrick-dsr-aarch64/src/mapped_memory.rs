@@ -1658,6 +1658,7 @@ impl NativeMappedMemory {
         }
         let retained_target_ranges = prepared.native_layout.owned_ranges();
         let retired_ranges = subtract_host_ranges(&self.owned_host_ranges, retained_target_ranges);
+        let retiring_translator = self.dsr_process_translator()?;
         // Everything above remains pre-PONR: it may validate and allocate,
         // and dropping `prepared` must leave the authoritative old image
         // untouched. From here onward replacement may retire or overwrite old
@@ -1665,6 +1666,9 @@ impl NativeMappedMemory {
         // Any subsequent failure is fatal and the new layout becomes the sole
         // rollback owner for those transferred intervals.
         prepared.native_layout.arm_prepared_adoptions();
+        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecCacheResetBegin);
+        retiring_translator.reset_after_fork_for_exec();
+        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecCacheResetEnd);
         for range in &retired_ranges {
             let start = range.start.raw();
             let end = range.end.raw();
@@ -1685,15 +1689,13 @@ impl NativeMappedMemory {
         let PreparedNativeExecMapping {
             native_layout,
             process_translator,
-            reset_inherited_translator,
+            reset_inherited_translator: _,
             direct_target_reservations,
             rollback_plan,
         } = prepared;
         native_layout
             .reset_biased_aperture_to_guards()
             .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
-        let inherited_translator =
-            reset_inherited_translator.then(|| Arc::clone(&process_translator));
         let replacement = Self::map_with_layout(
             image,
             native_memory_layout(),
@@ -1712,19 +1714,9 @@ impl NativeMappedMemory {
         )?;
         lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecRelocationEnd);
         lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecImageMapEnd);
-        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecCacheResetBegin);
-        if let Some(translator) = inherited_translator {
-            // A fork child cannot allocate a fresh JIT cache safely, so exec
-            // reuses its inherited mapping. Keep the old cache intact until
-            // the complete replacement image is mapped and relocated; only
-            // then clear its inherited translations before the thread-level
-            // handoff can execute the new image.
-            translator.reset_after_fork_for_exec();
-        }
         for reservation in direct_target_reservations {
             reservation.commit();
         }
-        lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecCacheResetEnd);
         *self = replacement;
         Ok(())
     }

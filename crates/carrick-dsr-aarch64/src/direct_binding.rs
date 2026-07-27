@@ -4,6 +4,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::time::{Duration, Instant};
 
 use carrick_guest_mem::GuestVa;
 
@@ -12,6 +13,8 @@ use crate::shared_cache::{
     UnresolvedDirectBindingRecord,
 };
 use crate::types::{CodeGeneration, DsrError};
+
+const DARWIN_HOST_PAGE_SIZE: usize = 16 * 1024;
 
 /// Dense identity of one unresolved direct-binding stub in a translation unit.
 #[repr(transparent)]
@@ -284,6 +287,31 @@ pub struct DirectBindingClearStats {
     pub bitmap_bits_cleared: u64,
 }
 
+/// Sparse child-side repair statistics for inherited sidecar publications.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ForkBindingClearStats {
+    pub cells_cleared: u64,
+    pub pages_touched: u64,
+    pub duration: Duration,
+}
+
+/// Whole-image direct-binding teardown statistics for exec diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecBindingClearStats {
+    pub cells_cleared: u64,
+    pub pages_touched: u64,
+    pub descriptors_dropped: u64,
+    pub units_dropped: u64,
+    pub duration: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectBindingExecClearPhase {
+    Cells,
+    Indexes,
+    Descriptors,
+}
+
 /// Result of one cold-path publication attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectBindingPublishOutcome {
@@ -305,6 +333,21 @@ pub struct DirectBindingRegistry {
     descriptors: Vec<Box<DirectBindingTarget>>,
     incoming: BTreeMap<(GuestVa, CodeGeneration), Vec<IncomingDirectBinding>>,
     counters: DirectBindingCounters,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectBindingArenaSnapshot {
+    pub owners_len: usize,
+    pub units_len: usize,
+    pub units_capacity: usize,
+    pub descriptors_len: usize,
+    pub descriptors_capacity: usize,
+    pub incoming_len: usize,
+    pub records_address: usize,
+    pub records_len: usize,
+    pub bitmap_address: usize,
+    pub bitmap_len: usize,
 }
 
 impl DirectBindingRegistry {
@@ -608,6 +651,72 @@ impl DirectBindingRegistry {
         self.counters
     }
 
+    /// Clears only bitmap-published cells in a fork child's COW sidecars.
+    ///
+    /// The walk is allocation-free: it visits the already allocated unit
+    /// array, bitmap words, and record arrays, and retains every descriptor,
+    /// reverse edge, owner, and unit arena for safe child-side rebinding.
+    pub fn clear_inherited_after_fork(&mut self) -> ForkBindingClearStats {
+        let started = Instant::now();
+        let (cells_cleared, pages_touched) = self.clear_published_cells();
+        self.counters = DirectBindingCounters::default();
+        ForkBindingClearStats {
+            cells_cleared,
+            pages_touched,
+            duration: started.elapsed(),
+        }
+    }
+
+    /// Clears every published cell and retires all direct-binding ownership.
+    pub fn clear_all_before_exec(&mut self) -> ExecBindingClearStats {
+        self.clear_all_before_exec_with_recorder(|_| {})
+    }
+
+    pub(crate) fn clear_all_before_exec_with_recorder(
+        &mut self,
+        mut recorder: impl FnMut(DirectBindingExecClearPhase),
+    ) -> ExecBindingClearStats {
+        let started = Instant::now();
+        let (cells_cleared, pages_touched) = self.clear_published_cells();
+        recorder(DirectBindingExecClearPhase::Cells);
+
+        self.incoming.clear();
+        self.owners_by_cell.clear();
+        recorder(DirectBindingExecClearPhase::Indexes);
+
+        let descriptors_dropped = u64::try_from(self.descriptors.len()).unwrap_or(u64::MAX);
+        self.descriptors.clear();
+        recorder(DirectBindingExecClearPhase::Descriptors);
+
+        let units_dropped = u64::try_from(self.units.len()).unwrap_or(u64::MAX);
+        self.units.clear();
+        self.counters = DirectBindingCounters::default();
+        ExecBindingClearStats {
+            cells_cleared,
+            pages_touched,
+            descriptors_dropped,
+            units_dropped,
+            duration: started.elapsed(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn arena_snapshot_for_test(&self, unit_index: usize) -> DirectBindingArenaSnapshot {
+        let unit = &self.units[unit_index];
+        DirectBindingArenaSnapshot {
+            owners_len: self.owners_by_cell.len(),
+            units_len: self.units.len(),
+            units_capacity: self.units.capacity(),
+            descriptors_len: self.descriptors.len(),
+            descriptors_capacity: self.descriptors.capacity(),
+            incoming_len: self.incoming.len(),
+            records_address: unit.records.as_ptr() as usize,
+            records_len: unit.records.len(),
+            bitmap_address: unit.published_bitmap.as_ptr() as usize,
+            bitmap_len: unit.published_bitmap.len(),
+        }
+    }
+
     fn validated_owner(
         &self,
         miss: DirectBindingMiss,
@@ -698,6 +807,37 @@ impl DirectBindingRegistry {
                 expected,
             });
         self.counters.cas_wins = self.counters.cas_wins.saturating_add(1);
+    }
+
+    fn clear_published_cells(&mut self) -> (u64, u64) {
+        let mut cells_cleared = 0_u64;
+        let mut pages_touched = 0_u64;
+        for unit in &mut self.units {
+            let mut last_page = None;
+            for (word_index, word) in unit.published_bitmap.iter_mut().enumerate() {
+                let mut published = *word;
+                *word = 0;
+                while published != 0 {
+                    let bit = published.trailing_zeros() as usize;
+                    published &= published - 1;
+                    let ordinal = word_index * u64::BITS as usize + bit;
+                    if ordinal >= unit.records.len() {
+                        continue;
+                    }
+                    let address =
+                        unit.binding_base.get() + ordinal * DIRECT_BINDING_CELL_SIZE as usize;
+                    let cell = DirectBindingCellVa(address);
+                    DirectBindingCellRef::registered(cell).clear_release();
+                    cells_cleared = cells_cleared.saturating_add(1);
+                    let page = address & !(DARWIN_HOST_PAGE_SIZE - 1);
+                    if last_page != Some(page) {
+                        pages_touched = pages_touched.saturating_add(1);
+                        last_page = Some(page);
+                    }
+                }
+            }
+        }
+        (cells_cleared, pages_touched)
     }
 }
 

@@ -19,6 +19,7 @@
 //!   `carrick_host::host_proc::ThreadPort` (the mach port on Darwin).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
 use carrick_dsr::probes;
@@ -199,6 +200,17 @@ pub enum ThreadExit {
     Unsupported(String),
 }
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectBindingResetEvent {
+    CellsCleared,
+    ThreadCachesCleared,
+    IndexesCleared,
+    DescriptorsDropped,
+    UnitsDropped,
+    PrivateCursorReset,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum ThreadFault {
     Host { signal: i32, code: i32 },
@@ -267,6 +279,7 @@ pub struct ProcessTranslator {
     pub state: RwLock<ProcessState>,
     private_target_authority: Box<gateway::TargetCacheAuthority>,
     private_jit_epoch: Arc<crate::direct_binding::PrivateJitEpoch>,
+    exec_thread_caches_cleared: AtomicBool,
 }
 
 impl Drop for ProcessTranslator {
@@ -760,6 +773,19 @@ impl ThreadTranslator {
         );
     }
 
+    /// Clears the surviving thread's direct-target state under exec quiesce.
+    ///
+    /// The runtime calls this after sibling retirement and before mapped
+    /// memory starts retiring the old image. No translated execution may
+    /// resume until `reset_for_exec` installs the replacement process.
+    pub fn prepare_direct_binding_exec_reset(&mut self) {
+        self.resume_entry = None;
+        self.indirect_cache.clear();
+        self.process
+            .exec_thread_caches_cleared
+            .store(true, AtomicOrdering::Release);
+    }
+
     pub fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) {
         self.reset_for_exec_with_sink(next, |frames| {
             let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, frames);
@@ -777,6 +803,9 @@ impl ThreadTranslator {
         }
         self.process = next;
         self.resume_entry = None;
+        self.process
+            .exec_thread_caches_cleared
+            .store(false, AtomicOrdering::Release);
         self.start_next_profile_epoch();
         self.last_kick = None;
         self.indirect_cache.clear();
@@ -1178,6 +1207,7 @@ impl ProcessTranslator {
                 std::ptr::null(),
             )),
             private_jit_epoch: crate::direct_binding::PrivateJitEpoch::process_owner(),
+            exec_thread_caches_cleared: AtomicBool::new(false),
             state: RwLock::new(ProcessState {
                 cache,
                 artifact_store: artifact_spike::store_if_enabled()?,
@@ -1335,20 +1365,68 @@ impl ProcessTranslator {
         )
     }
 
-    pub fn after_fork_child(&self) {
+    pub fn after_fork_child(&self) -> crate::direct_binding::ForkBindingClearStats {
         let mut state = self.state.write();
+        let direct_binding_stats = state.direct_bindings.clear_inherited_after_fork();
         state.cache.after_fork_child();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
+        self.exec_thread_caches_cleared
+            .store(false, AtomicOrdering::Release);
         let capacity = u64::try_from(state.cache.capacity_bytes()).unwrap_or(u64::MAX);
         drop(state);
         probes::dsr_cache_capacity(probes::DsrCacheRole::Child, capacity);
+        direct_binding_stats
     }
 
-    pub fn reset_after_fork_for_exec(&self) {
+    pub fn reset_after_fork_for_exec(&self) -> crate::direct_binding::ExecBindingClearStats {
+        self.reset_after_fork_for_exec_inner(|_| {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_after_fork_for_exec_with_recorder(
+        &self,
+        recorder: impl FnMut(DirectBindingResetEvent),
+    ) -> crate::direct_binding::ExecBindingClearStats {
+        self.reset_after_fork_for_exec_inner(recorder)
+    }
+
+    fn reset_after_fork_for_exec_inner(
+        &self,
+        mut recorder: impl FnMut(DirectBindingResetEvent),
+    ) -> crate::direct_binding::ExecBindingClearStats {
         let mut state = self.state.write();
+        let direct_bindings_enabled = state.direct_bindings.enabled();
+        let thread_caches_cleared = self
+            .exec_thread_caches_cleared
+            .load(AtomicOrdering::Acquire);
+        let clear_stats = state
+            .direct_bindings
+            .clear_all_before_exec_with_recorder(|phase| match phase {
+                crate::direct_binding::DirectBindingExecClearPhase::Cells => {
+                    recorder(DirectBindingResetEvent::CellsCleared);
+                    assert!(
+                        thread_caches_cleared || !direct_bindings_enabled,
+                        "direct-binding exec reset requires quiesced thread caches"
+                    );
+                    recorder(DirectBindingResetEvent::ThreadCachesCleared);
+                }
+                crate::direct_binding::DirectBindingExecClearPhase::Indexes => {
+                    recorder(DirectBindingResetEvent::IndexesCleared);
+                }
+                crate::direct_binding::DirectBindingExecClearPhase::Descriptors => {
+                    recorder(DirectBindingResetEvent::DescriptorsDropped);
+                    assert_eq!(
+                        Arc::strong_count(&self.private_jit_epoch),
+                        1,
+                        "private JIT cursor cannot reset while a descriptor epoch lease survives"
+                    );
+                }
+            });
+        state.shared_blocks.clear();
+        state.loaded_shared_units.clear();
+        recorder(DirectBindingResetEvent::UnitsDropped);
         state.published.clear();
-        state.cache.reset_after_fork_for_exec();
         state.blocks.clear();
         state.pending.clear();
         state.stats = ResolverStats::default();
@@ -1357,12 +1435,18 @@ impl ProcessTranslator {
         state.unsupported.clear();
         state.dependencies = cache::PageBlockDependencies::default();
         state.shared_translation = None;
-        state.shared_blocks.clear();
-        state.loaded_shared_units.clear();
         state.shared_unit_segments_consulted.clear();
         state.shared_recording_segments.clear();
         state.shared_candidates.clear();
         state.shared_publish_attempted = false;
+        state.cache.reset_after_fork_for_exec();
+        recorder(DirectBindingResetEvent::PrivateCursorReset);
+        clear_stats
+    }
+
+    #[cfg(test)]
+    pub fn private_epoch_leases_for_test(&self) -> usize {
+        crate::direct_binding::PrivateJitEpoch::live_descriptor_leases(&self.private_jit_epoch)
     }
 }
 
@@ -3626,6 +3710,308 @@ mod tests {
                 DirectBindingPublishOutcome::Rejected,
             );
             assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
+        }
+    }
+
+    mod direct_binding_fork_reset {
+        use super::direct_binding_owner_and_publication::{
+            UnitFixture, key, private_target, process_with_direct_bindings, record, sidecar_unit,
+        };
+        use crate::direct_binding::{
+            DirectBindingCellRef, DirectBindingCellVa, DirectBindingMiss, DirectBindingOrdinal,
+            DirectBindingPublishOutcome, DirectBindingTarget,
+        };
+        use crate::types::CodeGeneration;
+        use carrick_guest_mem::GuestVa;
+        use std::sync::atomic::Ordering;
+
+        pub(super) fn one_published_binding(
+            seed: u8,
+        ) -> (UnitFixture, super::ProcessTranslator, GuestVa, GuestVa) {
+            let source = GuestVa(0x41_0000 + u64::from(seed) * 0x100);
+            let target = GuestVa(0x51_0000 + u64::from(seed) * 0x100);
+            let fixture = sidecar_unit(key(seed), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register owner")
+                .expect("SidecarV1 owner");
+            assert_eq!(
+                state.direct_bindings.publish(
+                    DirectBindingMiss {
+                        cell: fixture.unit.binding_base.expect("binding base"),
+                        ordinal: DirectBindingOrdinal::claimed(0),
+                    },
+                    source,
+                    target,
+                    private_target(
+                        target,
+                        CodeGeneration::INITIAL,
+                        0x80_0100,
+                        &process.private_jit_epoch,
+                    ),
+                ),
+                DirectBindingPublishOutcome::Published,
+            );
+            drop(state);
+            (fixture, process, source, target)
+        }
+
+        fn child_exit_status(pid: libc::pid_t) -> i32 {
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+            libc::WEXITSTATUS(status)
+        }
+
+        #[test]
+        fn fork_child_clears_only_published_ordinals_without_allocation() {
+            let records = (0..70_u32)
+                .map(|ordinal| {
+                    record(
+                        GuestVa(0x42_0000 + u64::from(ordinal) * 4),
+                        GuestVa(0x52_0000 + u64::from(ordinal) * 4),
+                        ordinal,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let fixture = sidecar_unit(key(20), records);
+            let process = process_with_direct_bindings();
+            let unit_index;
+            {
+                let mut state = process.state.write();
+                unit_index = state
+                    .direct_bindings
+                    .register_loaded_unit(&fixture.unit)
+                    .expect("register owner")
+                    .expect("SidecarV1 owner");
+                for ordinal in [1_u32, 65] {
+                    let source = GuestVa(0x42_0000 + u64::from(ordinal) * 4);
+                    let target = GuestVa(0x52_0000 + u64::from(ordinal) * 4);
+                    assert_eq!(
+                        state.direct_bindings.publish(
+                            DirectBindingMiss {
+                                cell: DirectBindingCellVa::mapped(
+                                    fixture.storage.as_ptr() as usize
+                                        + ordinal as usize
+                                            * crate::shared_cache::DIRECT_BINDING_CELL_SIZE
+                                                as usize,
+                                )
+                                .expect("published cell"),
+                                ordinal: DirectBindingOrdinal::claimed(ordinal),
+                            },
+                            source,
+                            target,
+                            private_target(
+                                target,
+                                CodeGeneration::INITIAL,
+                                0x80_1000 + u64::from(ordinal) * 4,
+                                &process.private_jit_epoch,
+                            ),
+                        ),
+                        DirectBindingPublishOutcome::Published,
+                    );
+                }
+            }
+            let unpublished_target = Box::new(private_target(
+                GuestVa(0x52_0008),
+                CodeGeneration::INITIAL,
+                0x80_2000,
+                &process.private_jit_epoch,
+            ));
+            let unpublished_pointer =
+                std::ptr::from_ref::<DirectBindingTarget>(unpublished_target.as_ref()).cast_mut();
+            let unpublished_cell =
+                DirectBindingCellVa::mapped(fixture.storage.as_ptr() as usize + 2 * 8)
+                    .expect("unpublished cell");
+            // SAFETY: the fixture owns this live cell and `unpublished_target`
+            // outlives every load below.
+            unsafe {
+                DirectBindingCellRef::from_mapped_address(unpublished_cell)
+                    .expect("fixture cell")
+                    .publish_null(unpublished_pointer)
+                    .expect("install untracked sentinel");
+            }
+            let before = process
+                .state
+                .read()
+                .direct_bindings
+                .arena_snapshot_for_test(unit_index);
+
+            let stats = process.after_fork_child();
+
+            let after = process
+                .state
+                .read()
+                .direct_bindings
+                .arena_snapshot_for_test(unit_index);
+            assert_eq!(after, before, "fork repair must not grow or reclaim arenas");
+            assert_eq!(stats.cells_cleared, 2);
+            assert!(stats.pages_touched >= 1);
+            assert!(fixture.storage[1].load(Ordering::Acquire).is_null());
+            assert!(fixture.storage[65].load(Ordering::Acquire).is_null());
+            assert_eq!(
+                fixture.storage[2].load(Ordering::Acquire),
+                unpublished_pointer,
+                "a cell without a published bitmap bit must not be touched"
+            );
+        }
+
+        #[test]
+        fn fork_child_clear_is_cow_private_from_the_parent() {
+            let (fixture, process, _, _) = one_published_binding(21);
+            let parent_pointer = fixture.storage[0].load(Ordering::Acquire);
+            assert!(!parent_pointer.is_null());
+
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                process.after_fork_child();
+                let cleared = fixture.storage[0].load(Ordering::Acquire).is_null();
+                unsafe { libc::_exit(i32::from(!cleared)) };
+            }
+
+            assert_eq!(
+                child_exit_status(pid),
+                0,
+                "child did not clear its COW cell"
+            );
+            assert_eq!(
+                fixture.storage[0].load(Ordering::Acquire),
+                parent_pointer,
+                "child repair must not mutate the parent's COW sidecar"
+            );
+        }
+
+        #[test]
+        fn child_rebind_does_not_mutate_parent_cells() {
+            let (fixture, process, source, target) = one_published_binding(22);
+            let parent_pointer = fixture.storage[0].load(Ordering::Acquire);
+            assert!(!parent_pointer.is_null());
+
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                process.after_fork_child();
+                let outcome = process.state.write().direct_bindings.publish(
+                    DirectBindingMiss {
+                        cell: fixture.unit.binding_base.expect("binding base"),
+                        ordinal: DirectBindingOrdinal::claimed(0),
+                    },
+                    source,
+                    target,
+                    private_target(
+                        target,
+                        CodeGeneration::INITIAL,
+                        0x80_0200,
+                        &process.private_jit_epoch,
+                    ),
+                );
+                let rebound = fixture.storage[0].load(Ordering::Acquire);
+                let private_rebind =
+                    outcome == DirectBindingPublishOutcome::Published && rebound != parent_pointer;
+                unsafe { libc::_exit(i32::from(!private_rebind)) };
+            }
+
+            assert_eq!(child_exit_status(pid), 0, "child did not rebind from null");
+            assert_eq!(
+                fixture.storage[0].load(Ordering::Acquire),
+                parent_pointer,
+                "the child's new descriptor must stay private to its COW image"
+            );
+        }
+    }
+
+    mod direct_binding_exec_reset {
+        use super::super::{DirectBindingResetEvent, ThreadTranslator};
+        use super::direct_binding_fork_reset::one_published_binding;
+        use crate::types::{CacheVa, CodeGeneration};
+        use carrick_guest_mem::{GuestVa, HostVa};
+        use std::sync::Arc;
+
+        const EXPECTED_ORDER: [DirectBindingResetEvent; 6] = [
+            DirectBindingResetEvent::CellsCleared,
+            DirectBindingResetEvent::ThreadCachesCleared,
+            DirectBindingResetEvent::IndexesCleared,
+            DirectBindingResetEvent::DescriptorsDropped,
+            DirectBindingResetEvent::UnitsDropped,
+            DirectBindingResetEvent::PrivateCursorReset,
+        ];
+
+        fn prepare_thread(process: &Arc<super::super::ProcessTranslator>) -> ThreadTranslator {
+            let guest = GuestVa(0x60_0000);
+            let entry = CacheVa::published(HostVa(process.cache_host_range().start as usize));
+            let mut thread = ThreadTranslator::for_process(Arc::clone(process), 42);
+            thread.resume_entry = Some((guest, CodeGeneration::INITIAL, entry));
+            thread.indirect_cache.publish(
+                guest,
+                CodeGeneration::INITIAL,
+                entry,
+                process.private_target_authority.as_ref(),
+            );
+            // SAFETY: the thread exclusively owns this fixed-layout cache,
+            // and the slice covers exactly its two 32-byte ways per set.
+            let words_before = unsafe {
+                std::slice::from_raw_parts(
+                    thread.indirect_cache.as_ptr().cast::<u64>(),
+                    crate::gateway::INDIRECT_CACHE_ENTRIES * 8,
+                )
+            };
+            assert!(words_before.iter().any(|word| *word != 0));
+
+            thread.prepare_direct_binding_exec_reset();
+
+            assert!(thread.resume_entry.is_none());
+            // SAFETY: as above; preparation completed synchronously while
+            // this test retains exclusive access to the thread translator.
+            let words_after = unsafe {
+                std::slice::from_raw_parts(
+                    thread.indirect_cache.as_ptr().cast::<u64>(),
+                    crate::gateway::INDIRECT_CACHE_ENTRIES * 8,
+                )
+            };
+            assert!(words_after.iter().all(|word| *word == 0));
+            thread
+        }
+
+        #[test]
+        fn exec_clears_cells_before_descriptors_units_and_private_cursor() {
+            let (fixture, process, _, _) = one_published_binding(23);
+            let process = Arc::new(process);
+            let _thread = prepare_thread(&process);
+            let mut events = Vec::new();
+
+            process.reset_after_fork_for_exec_with_recorder(|event| events.push(event));
+
+            assert_eq!(events, EXPECTED_ORDER);
+            assert!(
+                fixture.storage[0]
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .is_null(),
+                "exec must clear every published cell before retiring its descriptor"
+            );
+        }
+
+        #[test]
+        fn private_cursor_reuse_requires_the_last_descriptor_epoch_lease_to_drop() {
+            let (_fixture, process, _, _) = one_published_binding(24);
+            let process = Arc::new(process);
+            let mut thread = prepare_thread(&process);
+            assert_eq!(process.private_epoch_leases_for_test(), 1);
+            let mut first = Vec::new();
+
+            process.reset_after_fork_for_exec_with_recorder(|event| first.push(event));
+
+            assert_eq!(process.private_epoch_leases_for_test(), 0);
+            assert_eq!(first, EXPECTED_ORDER);
+            let mut second = Vec::new();
+            process.reset_after_fork_for_exec_with_recorder(|event| second.push(event));
+            assert_eq!(second, EXPECTED_ORDER, "exec reset must be idempotent");
+            assert_eq!(process.private_epoch_leases_for_test(), 0);
+            thread.reset_for_exec(Arc::clone(&process));
+            assert!(thread.resume_entry.is_none());
         }
     }
 
