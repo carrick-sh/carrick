@@ -263,6 +263,7 @@ pub struct ThreadTranslator {
 pub struct ProcessTranslator {
     // `pub` for the runtime's still-resident test suites (see ThreadTranslator).
     pub state: RwLock<ProcessState>,
+    private_target_authority: Box<gateway::TargetCacheAuthority>,
 }
 
 impl Drop for ProcessTranslator {
@@ -325,6 +326,7 @@ struct SharedBlockAuthority {
     generation_binding_count: usize,
     cache_start: usize,
     cache_end: usize,
+    target_authority: usize,
 }
 
 impl SharedBlockAuthority {
@@ -337,6 +339,7 @@ impl SharedBlockAuthority {
 struct LoadedSharedUnit {
     _unit: crate::shared_cache::SharedLoadedTranslationUnit,
     _generation_bindings: Box<[gateway::GenerationBinding]>,
+    _target_authority: Box<gateway::TargetCacheAuthority>,
 }
 
 const fn translation_source_words_required(
@@ -1160,9 +1163,16 @@ impl ProcessTranslator {
         host: &'static dyn NativeHostJit,
     ) -> Result<Self, types::DsrError> {
         artifact_spike::ensure_authority_if_enabled()?;
+        let cache = cache::TranslationCache::new(capacity, host)?;
+        let cache_range = cache.host_range();
         let translator = Self {
+            private_target_authority: Box::new(gateway::TargetCacheAuthority::new(
+                cache_range.start,
+                cache_range.end,
+                std::ptr::null(),
+            )),
             state: RwLock::new(ProcessState {
-                cache: cache::TranslationCache::new(capacity, host)?,
+                cache,
                 artifact_store: artifact_spike::store_if_enabled()?,
                 blocks: BTreeMap::new(),
                 pending: BTreeMap::new(),
@@ -1429,6 +1439,12 @@ impl ProcessState {
             .ok_or_else(|| {
                 types::DsrError::CachePolicy("shared translation range overflow".to_string())
             })?;
+        let target_authority = Box::new(gateway::TargetCacheAuthority::new(
+            cache_start,
+            cache_end,
+            generation_bindings.as_ptr(),
+        ));
+        let target_authority_pointer = target_authority.as_ref() as *const _;
         let host_bias = unit.manifest.key.host_bias();
         for (block, observation) in unit.manifest.blocks.iter_mut().zip(observations) {
             let address = cache_start
@@ -1475,6 +1491,7 @@ impl ProcessState {
                     generation_binding_count: generation_bindings.len(),
                     cache_start,
                     cache_end,
+                    target_authority: target_authority_pointer as usize,
                 },
             );
         }
@@ -1485,6 +1502,7 @@ impl ProcessState {
         self.loaded_shared_units.push(LoadedSharedUnit {
             _unit: unit,
             _generation_bindings: generation_bindings,
+            _target_authority: target_authority,
         });
         let result = self.blocks.get(&(guest, generation)).copied();
         if result.is_some() {
@@ -2257,6 +2275,31 @@ impl ThreadTranslator {
         self.process.state.read().guest_pc_for_cache(cache_pc)
     }
 
+    fn target_cache_authority(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+        generation: types::CodeGeneration,
+        entry: types::CacheVa,
+    ) -> Result<*const gateway::TargetCacheAuthority, types::DsrError> {
+        let state = self.process.state.read();
+        if let Some(authority) = state
+            .shared_blocks
+            .get(&(guest, generation))
+            .copied()
+            .filter(|authority| authority.owns(entry))
+        {
+            return Ok(authority.target_authority as *const gateway::TargetCacheAuthority);
+        }
+        drop(state);
+        if self.process.private_target_authority.owns(entry) {
+            return Ok(self.process.private_target_authority.as_ref() as *const _);
+        }
+        Err(types::DsrError::CachePolicy(format!(
+            "translated target 0x{:x} has no executable authority",
+            entry.host().raw()
+        )))
+    }
+
     fn resolve_indirect<const PROFILE: bool>(
         &mut self,
         memory: &NativeMappedMemory,
@@ -2265,8 +2308,10 @@ impl ThreadTranslator {
     ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
         self.stats.add(ResolverStat::ResolverExits, 1);
         let translated = self.translate::<PROFILE>(memory, target)?;
+        let authority =
+            self.target_cache_authority(target, translated.generation, translated.entry)?;
         self.indirect_cache
-            .publish(target, translated.generation, translated.entry);
+            .publish(target, translated.generation, translated.entry, authority);
         probes::dsr_cache_event(
             self.tid,
             probes::DsrCacheEventKind::TargetPublish,
@@ -2690,8 +2735,14 @@ impl ThreadTranslator {
                         return Err(error);
                     }
                 };
-                self.indirect_cache
-                    .publish(target, translated.generation, translated.entry);
+                let authority =
+                    self.target_cache_authority(target, translated.generation, translated.entry)?;
+                self.indirect_cache.publish(
+                    target,
+                    translated.generation,
+                    translated.entry,
+                    authority,
+                );
                 probes::dsr_cache_event(
                     self.tid,
                     probes::DsrCacheEventKind::TargetPublish,
@@ -3025,6 +3076,7 @@ mod tests {
             generation_binding_count: 3,
             cache_start: 0x1000,
             cache_end: 0x2000,
+            target_authority: 0,
         };
         assert!(authority.owns(types::CacheVa::published(carrick_guest_mem::HostVa(0x1800))));
         assert!(!authority.owns(types::CacheVa::published(carrick_guest_mem::HostVa(0x2800))));

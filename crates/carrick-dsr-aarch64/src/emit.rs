@@ -960,7 +960,7 @@ fn emit_indirect_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; add x15, x15, #16
+        ; add x15, x15, #32
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
@@ -991,13 +991,7 @@ fn emit_indirect_exit(
         ; .arch aarch64
         ; cbz x17, =>miss
     );
-    // Inline-cache entries are shared by every block this thread enters, but
-    // executable ownership is not: ordinary JIT code and each immutable
-    // translation unit carry different generation authority. Only chain
-    // within the active unit so the target's generation guard observes the
-    // binding table installed for that unit. Cross-unit edges return through
-    // the resolver, whose next `prepare_entry` installs the target authority.
-    emit_target_authority_check(assembler, entries, guest, miss)?;
+    emit_target_authority_switch(assembler, entries, guest, miss)?;
     // Keep ordinary translated targets out of custom physical x18 entirely.
     // Preserve the validated cache PC from physical x17 in the context while
     // guest x15/x16/x17 and NZCV are restored, then reload and recheck it
@@ -1138,38 +1132,36 @@ fn emit_indirect_exit(
     Ok(())
 }
 
-/// Validate the cached target against the current executable authority.
+/// Validate and install the cached target's executable authority.
 ///
 /// On entry x15 addresses the target-cache record and x17 is its executable
-/// pointer. A target outside the active private cache or immutable unit must
-/// return through `prepare_entry`, which installs that target's generation
-/// authority before execution.
-fn emit_target_authority_check(
+/// pointer. The resolver publishes the pointer, range, and generation-binding
+/// table as one thread-local record while translated code is not running.
+fn emit_target_authority_switch(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     guest: GuestVa,
     miss: dynasmrt::DynamicLabel,
 ) -> Result<(), DsrError> {
-    let ready = assembler.new_dynamic_label();
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr w16, [x28, super::gateway::CTX_ENFORCE_CACHE_AUTHORITY]
+        ; ldr x16, [x15, #16]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; cbz w16, =>ready
+        ; cbz x16, =>miss
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x16, [x28, super::gateway::CTX_CACHE_START]
+        ; ldr x15, [x16]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; cmp x17, x16
+        ; cmp x17, x15
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
@@ -1179,18 +1171,42 @@ fn emit_target_authority_check(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x16, [x28, super::gateway::CTX_CACHE_END]
+        ; ldr x15, [x16, #8]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; cmp x17, x16
+        ; cmp x17, x15
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; b.hs =>miss
-        ; =>ready
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x15, [x28, super::gateway::CTX_CACHE_END]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x15, [x16]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x15, [x28, super::gateway::CTX_CACHE_START]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x15, [x16, #16]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x15, [x28, super::gateway::CTX_GENERATION_BINDINGS]
     );
     Ok(())
 }
@@ -1235,7 +1251,7 @@ fn emit_cached_direct_exit(
     );
     recovery.push(RecoveryEntry {
         cache: register_recovery,
-        action: RecoveryAction::RestoreIndirectRegisters,
+        action: RecoveryAction::RestoreIndirectResolver,
     });
     let full_recovery_start = current_offset(assembler)?;
     emit_mov_u64(
@@ -1297,7 +1313,7 @@ fn emit_cached_direct_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; add x15, x15, #16
+        ; add x15, x15, #32
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
@@ -1325,7 +1341,7 @@ fn emit_cached_direct_exit(
         ; .arch aarch64
         ; cbz x17, =>miss
     );
-    emit_target_authority_check(assembler, entries, guest, miss)?;
+    emit_target_authority_switch(assembler, entries, guest, miss)?;
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -4086,14 +4102,12 @@ fn assemble_block_inner(
                     target: exit.target,
                 });
                 emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
-                emit_gateway_exit(
+                emit_cached_direct_exit(
                     &mut assembler,
                     &mut entries,
                     exit_guest,
                     exit.target,
-                    Some(exit_guest),
-                    2,
-                    GatewayKind::Direct,
+                    &mut recovery,
                     recording.as_deref_mut(),
                 )?;
             } else {
@@ -4730,6 +4744,46 @@ mod tests {
         ])
         .expect_err("out-of-order offsets must be rejected");
         assert!(error.to_string().contains("non-monotonic cache offsets"));
+    }
+
+    #[test]
+    fn cached_direct_preamble_recovery_preserves_committed_call_link() {
+        let guest = GuestVa(0x5000);
+        let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
+        let mut entries = Vec::new();
+        let mut recovery = Vec::new();
+        emit_cached_direct_exit(
+            &mut assembler,
+            &mut entries,
+            guest,
+            GuestVa(0x6000),
+            &mut recovery,
+            None,
+        )
+        .expect("emit cached direct exit");
+        let action = recovery
+            .first()
+            .expect("cached direct preamble recovery")
+            .action;
+        let committed_link = 0x5004;
+        let mut snapshot = crate::snapshot::NativeUcontextSnapshot::default();
+        snapshot.x[30] = 0xdead_beef;
+
+        recover_rewrite_state(
+            &mut snapshot,
+            action,
+            0x16,
+            0x17,
+            0x6000_0000,
+            0x15,
+            committed_link,
+        )
+        .expect("recover cached direct preamble");
+
+        assert_eq!(
+            snapshot.x[30], committed_link,
+            "a signal after BL committed LR must not restore the caller's stale x30"
+        );
     }
 
     #[test]

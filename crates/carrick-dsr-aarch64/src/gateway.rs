@@ -17,10 +17,10 @@ use crate::snapshot::NativeUcontextSnapshot;
 
 use std::sync::atomic::AtomicU64;
 
-pub const INDIRECT_CACHE_ENTRIES: usize = 65_536;
+pub const INDIRECT_CACHE_ENTRIES: usize = 32_768;
 pub const INDIRECT_CACHE_MASK: u64 = (INDIRECT_CACHE_ENTRIES - 1) as u64;
-pub const INDIRECT_CACHE_INDEX_BITS: u32 = 16;
-pub const INDIRECT_CACHE_ENTRY_SHIFT: u32 = 5;
+pub const INDIRECT_CACHE_INDEX_BITS: u32 = 15;
+pub const INDIRECT_CACHE_ENTRY_SHIFT: u32 = 6;
 pub const CTX_INDIRECT_CACHE: u32 = 1136;
 pub const CTX_GENERATION: u32 = 1144;
 pub const CTX_ENFORCE_CACHE_AUTHORITY: u32 = 1156;
@@ -59,9 +59,39 @@ impl GenerationBinding {
 pub struct IndirectTargetCacheEntry {
     guest: u64,
     cache: u64,
+    authority: u64,
+    reserved: u64,
 }
 
-#[repr(C, align(32))]
+/// Executable ownership installed when a target-cache hit crosses from one
+/// immutable translation unit (or the private JIT) into another.
+#[repr(C)]
+pub struct TargetCacheAuthority {
+    cache_start: u64,
+    cache_end: u64,
+    generation_bindings: u64,
+}
+
+impl TargetCacheAuthority {
+    pub fn new(
+        cache_start: usize,
+        cache_end: usize,
+        generation_bindings: *const GenerationBinding,
+    ) -> Self {
+        Self {
+            cache_start: cache_start as u64,
+            cache_end: cache_end as u64,
+            generation_bindings: generation_bindings as usize as u64,
+        }
+    }
+
+    pub fn owns(&self, entry: CacheVa) -> bool {
+        let address = entry.host().raw() as u64;
+        (self.cache_start..self.cache_end).contains(&address)
+    }
+}
+
+#[repr(C, align(64))]
 struct IndirectTargetCacheSet {
     ways: [IndirectTargetCacheEntry; 2],
 }
@@ -81,7 +111,12 @@ impl IndirectTargetCache {
     pub fn new() -> Self {
         let entries = (0..INDIRECT_CACHE_ENTRIES)
             .map(|_| IndirectTargetCacheSet {
-                ways: std::array::from_fn(|_| IndirectTargetCacheEntry { guest: 0, cache: 0 }),
+                ways: std::array::from_fn(|_| IndirectTargetCacheEntry {
+                    guest: 0,
+                    cache: 0,
+                    authority: 0,
+                    reserved: 0,
+                }),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -97,6 +132,7 @@ impl IndirectTargetCache {
         guest: carrick_guest_mem::GuestVa,
         _generation: CodeGeneration,
         cache: CacheVa,
+        authority: *const TargetCacheAuthority,
     ) {
         let set = &mut self.entries[indirect_cache_index(guest)];
         let way = set
@@ -111,6 +147,7 @@ impl IndirectTargetCache {
         // translated reader is not running, so plain stores are sufficient.
         entry.guest = 0;
         entry.cache = cache.host().raw() as u64;
+        entry.authority = authority as usize as u64;
         entry.guest = guest.raw();
     }
 
@@ -120,6 +157,7 @@ impl IndirectTargetCache {
                 // Make the entry unreachable before clearing its payload.
                 entry.guest = 0;
                 entry.cache = 0;
+                entry.authority = 0;
             }
         }
     }
@@ -306,10 +344,11 @@ const _: () = assert!(std::mem::size_of::<DsrContext>() == 1280);
 const _: () = assert!(std::mem::size_of::<GenerationBinding>() == 16);
 const _: () = assert!(std::mem::offset_of!(GenerationBinding, current) == 0);
 const _: () = assert!(std::mem::offset_of!(GenerationBinding, expected) == 8);
-const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 16);
-const _: () = assert!(std::mem::size_of::<IndirectTargetCacheSet>() == 32);
+const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 32);
+const _: () = assert!(std::mem::size_of::<IndirectTargetCacheSet>() == 64);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, guest) == 0);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, cache) == 8);
+const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, authority) == 16);
 
 // ---------------------------------------------------------------------------
 // The assembled gateway. This module is the ONE target boundary in this
@@ -759,8 +798,8 @@ mod indirect_cache_tests {
 
     #[test]
     fn indirect_cache_uses_compact_two_way_2mib_layout() {
-        assert_eq!(INDIRECT_CACHE_ENTRIES, 65_536);
-        assert_eq!(std::mem::size_of::<IndirectTargetCacheEntry>(), 16);
+        assert_eq!(INDIRECT_CACHE_ENTRIES, 32_768);
+        assert_eq!(std::mem::size_of::<IndirectTargetCacheEntry>(), 32);
         assert_eq!(
             INDIRECT_CACHE_ENTRIES * 2 * std::mem::size_of::<IndirectTargetCacheEntry>(),
             2 * 1024 * 1024,
@@ -780,11 +819,13 @@ mod indirect_cache_tests {
         );
         assert_eq!(guests.len(), 2);
         let mut cache = IndirectTargetCache::new();
+        let authority = TargetCacheAuthority::new(0x10_000, 0x20_000, std::ptr::null());
         for (index, guest) in guests.iter().copied().enumerate() {
             cache.publish(
                 guest,
                 CodeGeneration::INITIAL,
                 CacheVa::published(carrick_guest_mem::HostVa(0x10_000 + index * 0x1000)),
+                &authority,
             );
         }
 
