@@ -249,6 +249,7 @@ def run_sample(
     engine: str,
     index: int,
     timeout_seconds: int,
+    captured_output: pathlib.Path | None = None,
 ) -> dict[str, object]:
     run_id = (
         f"native-go-build-{engine}-{os.getpid()}-{time.time_ns()}-{index}"
@@ -274,6 +275,9 @@ def run_sample(
         else:
             docker_cleanup(run_id)
     combined = result.stdout + result.stderr
+    if captured_output is not None:
+        captured_output.parent.mkdir(parents=True, exist_ok=True)
+        captured_output.write_text(combined)
     if result.returncode != 0 or "BUILD_OK" not in combined:
         raise RuntimeError(
             f"go-build sample {index} failed: run_id={run_id} "
@@ -294,11 +298,22 @@ def run_phase(
     engine: str,
     samples: int,
     timeout_seconds: int,
+    captured_output_dir: pathlib.Path | None = None,
 ) -> list[dict[str, object]]:
     if engine == ENGINE_DOCKER:
         validate_docker_image()
     return [
-        run_sample(repo, engine, index + 1, timeout_seconds)
+        run_sample(
+            repo,
+            engine,
+            index + 1,
+            timeout_seconds,
+            (
+                captured_output_dir / f"{engine}-{index + 1}.log"
+                if captured_output_dir is not None
+                else None
+            ),
+        )
         for index in range(samples)
     ]
 
@@ -331,6 +346,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="run despite active compilers, Carrick processes, spin loops, or load",
     )
+    parser.add_argument(
+        "--captured-output-dir",
+        type=pathlib.Path,
+        help=(
+            "retain each sample's complete stdout/stderr as "
+            "<engine>-<sample>.log"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -354,7 +377,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     started_at = utc_now()
     samples_by_engine = {
-        engine: run_phase(repo, engine, args.samples, args.timeout_seconds)
+        engine: run_phase(
+            repo,
+            engine,
+            args.samples,
+            args.timeout_seconds,
+            args.captured_output_dir,
+        )
         for engine in engines
     }
     phases = summarize_phases(samples_by_engine)
