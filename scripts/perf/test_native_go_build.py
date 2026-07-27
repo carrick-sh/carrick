@@ -6,9 +6,11 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import native_go_build
@@ -147,6 +149,85 @@ class NativeGoBuildTest(unittest.TestCase):
         )
 
         self.assertEqual(captured.read_text(), "BUILD_OK\n")
+
+    def test_timeout_retains_partial_stdout_and_stderr_before_reraising(self):
+        directory, _ = self.install_fake_docker("arm64")
+        captured = directory / "profile" / "docker-1.log"
+        run_id = "native-go-build-docker-123-456-1"
+        timeout = subprocess.TimeoutExpired(
+            ["docker", "run"],
+            5,
+            output="partial stdout\n",
+            stderr="partial stderr\n",
+        )
+
+        with (
+            mock.patch.object(native_go_build.os, "getpid", return_value=123),
+            mock.patch.object(native_go_build.time, "time_ns", return_value=456),
+            mock.patch.object(
+                native_go_build.subprocess, "run", side_effect=timeout
+            ),
+            mock.patch.object(native_go_build, "docker_cleanup") as cleanup,
+            self.assertRaises(subprocess.TimeoutExpired),
+        ):
+            native_go_build.run_sample(
+                directory,
+                "docker",
+                index=1,
+                timeout_seconds=5,
+                captured_output=captured,
+            )
+
+        self.assertEqual(captured.read_text(), "partial stdout\npartial stderr\n")
+        cleanup.assert_called_once_with(run_id)
+
+    def test_cleanup_failure_does_not_suppress_failed_sample_capture(self):
+        directory, _ = self.install_fake_docker("arm64")
+        captured = directory / "profile" / "docker-1.log"
+        run_id = "native-go-build-docker-123-456-1"
+        result = subprocess.CompletedProcess(
+            ["docker", "run"], 1, "sample stdout\n", "sample stderr\n"
+        )
+
+        with (
+            mock.patch.object(native_go_build.os, "getpid", return_value=123),
+            mock.patch.object(native_go_build.time, "time_ns", return_value=456),
+            mock.patch.object(native_go_build.subprocess, "run", return_value=result),
+            mock.patch.object(
+                native_go_build,
+                "docker_cleanup",
+                side_effect=subprocess.TimeoutExpired(["docker", "rm"], 30),
+            ) as cleanup,
+            self.assertRaisesRegex(RuntimeError, "go-build sample 1 failed"),
+        ):
+            native_go_build.run_sample(
+                directory,
+                "docker",
+                index=1,
+                timeout_seconds=5,
+                captured_output=captured,
+            )
+
+        self.assertEqual(captured.read_text(), "sample stdout\nsample stderr\n")
+        cleanup.assert_called_once_with(run_id)
+
+    def test_phase_names_each_captured_output_by_engine_and_sample(self):
+        directory, _ = self.install_fake_docker("arm64")
+        captures = directory / "profile"
+
+        with mock.patch.object(native_go_build, "run_sample", return_value={}) as run:
+            native_go_build.run_phase(
+                directory,
+                "carrick",
+                samples=2,
+                timeout_seconds=5,
+                captured_output_dir=captures,
+            )
+
+        self.assertEqual(
+            [call.args[4] for call in run.call_args_list],
+            [captures / "carrick-1.log", captures / "carrick-2.log"],
+        )
 
     def test_phase_summary_keeps_engine_boundaries(self):
         summary = native_go_build.summarize_phases(
