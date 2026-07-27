@@ -58,6 +58,7 @@ Current milestone: **M1 — accounted baseline**. M0 is complete.
 | E005h | `target/perf/native-go-build-wall-clean-{a,b}-a9425329.jsonl` | rejected replication pair; raw untracked | Even with inherited JIT ranges, clean A/B resolved only 83.7%/87.6%; the post-self-reexec Carrick base was still unpublished when a process exited without another guest execve |
 | E005i | `target/perf/native-go-build-module-vmmap-a.{raw,txt}` | diagnostic; raw untracked | Same-run live module/VM-map join: all 434 anonymous samples in the captured Go parent belonged to exactly its 64 MiB MAP_JIT region (309) or Carrick `__TEXT` (125), with no fourth executable population |
 | E005j | `target/perf/native-go-build-wall-loop-base-spike-a{.jsonl,.attribution.json}` | accepted tooling spike; dirty provenance, raw untracked | Loop-boundary host-base publication plus exact-text fallback: zero drops, 100.0% wall reconciliation, 90.4% resolved CPU |
+| E005k | `target/perf/native-go-build-wall-initial-base-spike-a{.jsonl,.attribution.json}` | accepted tooling spike; dirty provenance, raw untracked | Publishing the initial fork child's Carrick image before guest setup: zero drops, 100.0% wall reconciliation, 92.1% resolved CPU |
 | E006 | clean whole-tree attribution run A | pending | First commit-exact accepted trace |
 | E007 | clean whole-tree attribution run B | pending | Stability and dominant-rank replication |
 
@@ -111,6 +112,13 @@ in the sampled Go parent belonged only to MAP_JIT or Carrick `__TEXT`.
 Consequently, an address inside the PID's exact announced host range is
 conservatively classified as `other-carrick` when `atos` lacks a symbol; it is
 never assigned to a named Carrick subsystem.
+
+The final missing base was the initial guest child itself. The outer native
+runner has never entered a guest loop, so its first `proc:::create` has no
+host-image state to propagate. The child now publishes its Carrick image
+immediately after the existing process-runtime attribution anchor and before
+guest setup or descendant forks. This lifted the next full-workload spike to
+92.1% resolved CPU.
 
 ### Elapsed wall-state occupancy
 

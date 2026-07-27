@@ -1600,6 +1600,14 @@ fn run_image_in_child(
         // child, and its rusage clock restarted at fork, so the window must
         // anchor after the fork (env-gated; profile-off reads no clocks).
         dsr::profile::mark_native_process_runtime_entry();
+        if std::env::var_os("CARRICK_DSR_PROFILE").is_some() {
+            // The outer native runner has not entered a guest loop, so it has
+            // no host-image announcement for proc:::create to inherit. Name
+            // this initial fork child's Carrick mapping before it can execute
+            // setup work or fork descendants from that ASLR base.
+            crate::probes::host_image_base();
+            crate::probes::host_image_catalog();
+        }
         match run_image_in_current_process(
             NativeImageSource::Legacy {
                 image,
