@@ -770,13 +770,14 @@ impl ArtifactBindings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaterializedValue {
     Guest(u64),
+    Stable(u64),
     Process(ProcessValue, u64),
 }
 
 impl MaterializedValue {
     pub const fn raw(self) -> u64 {
         match self {
-            Self::Guest(value) | Self::Process(_, value) => value,
+            Self::Guest(value) | Self::Stable(value) | Self::Process(_, value) => value,
         }
     }
 }

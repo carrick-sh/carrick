@@ -23,6 +23,27 @@ pub const INDIRECT_CACHE_INDEX_BITS: u32 = 13;
 pub const INDIRECT_CACHE_ENTRY_SHIFT: u32 = 5;
 pub const CTX_INDIRECT_CACHE: u32 = 1136;
 pub const CTX_GENERATION: u32 = 1144;
+pub const CTX_GENERATION_BINDINGS: u32 = 1264;
+
+/// Process-local data referenced by an immutable translated block.
+///
+/// The block embeds only this table's stable index. The current-generation
+/// pointer and expected value are installed for the process entering it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GenerationBinding {
+    pub current: *const AtomicU64,
+    pub expected: u64,
+}
+
+impl GenerationBinding {
+    pub fn new(current: &AtomicU64, expected: CodeGeneration) -> Self {
+        Self {
+            current,
+            expected: expected.get(),
+        }
+    }
+}
 
 #[repr(C, align(32))]
 pub struct IndirectTargetCacheEntry {
@@ -129,6 +150,7 @@ pub struct DsrContext {
     pub exit_sensitive_addr: u64,
     pub exit_unsupported_addr: u64,
     pub exit_signal_addr: u64,
+    pub generation_bindings: *const GenerationBinding,
 }
 
 /// Context byte offset of the gateway exit entry point for `kind`.
@@ -219,6 +241,7 @@ impl DsrContext {
             exit_sensitive_addr: sensitive_exit_address(),
             exit_unsupported_addr: unsupported_exit_address(),
             exit_signal_addr: signal_exit_address(),
+            generation_bindings: std::ptr::null(),
         }
     }
 }
@@ -252,7 +275,11 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, exit_indirect_addr) == 12
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_sensitive_addr) == 1240);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_unsupported_addr) == 1248);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_signal_addr) == 1256);
-const _: () = assert!(std::mem::size_of::<DsrContext>() == 1264);
+const _: () = assert!(std::mem::offset_of!(DsrContext, generation_bindings) == 1264);
+const _: () = assert!(std::mem::size_of::<DsrContext>() == 1280);
+const _: () = assert!(std::mem::size_of::<GenerationBinding>() == 16);
+const _: () = assert!(std::mem::offset_of!(GenerationBinding, current) == 0);
+const _: () = assert!(std::mem::offset_of!(GenerationBinding, expected) == 8);
 const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 32);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, guest) == 0);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, generation) == 8);
@@ -316,6 +343,7 @@ mod native_gateway {
             0,
             usize::MAX,
             carrick_dsr::address::NativeAddressMode::Direct,
+            std::ptr::null(),
         )
     }
 
@@ -334,6 +362,7 @@ mod native_gateway {
             0,
             usize::MAX,
             address_mode,
+            std::ptr::null(),
         )
     }
 
@@ -352,6 +381,7 @@ mod native_gateway {
             0,
             usize::MAX,
             carrick_dsr::address::NativeAddressMode::Direct,
+            std::ptr::null(),
         )
     }
 
@@ -373,6 +403,31 @@ mod native_gateway {
             cache_start,
             cache_end,
             address_mode,
+            std::ptr::null(),
+        )
+    }
+
+    pub fn enter_translated_with_generation_bindings(
+        entry: CacheVa,
+        snapshot: &mut NativeUcontextSnapshot,
+        exit: &mut NativeDsrExit,
+        generation_bindings: &[GenerationBinding],
+    ) -> Result<(), DsrError> {
+        if generation_bindings.is_empty() {
+            return Err(DsrError::Gateway(
+                "binding-index block entered without generation bindings".to_string(),
+            ));
+        }
+        enter_translated_raw(
+            entry,
+            snapshot,
+            exit,
+            std::ptr::null(),
+            CodeGeneration::INITIAL,
+            0,
+            usize::MAX,
+            carrick_dsr::address::NativeAddressMode::Direct,
+            generation_bindings.as_ptr(),
         )
     }
 
@@ -389,6 +444,7 @@ mod native_gateway {
         cache_start: usize,
         cache_end: usize,
         address_mode: carrick_dsr::address::NativeAddressMode,
+        generation_bindings: *const GenerationBinding,
     ) -> Result<(), DsrError> {
         if !matches!(
             *exit,
@@ -414,6 +470,7 @@ mod native_gateway {
             cache_end,
             address_mode,
         );
+        context.generation_bindings = generation_bindings;
         let rc = unsafe { carrick_dsr_enter_raw(&mut context) };
         if !matches!(rc, 1..=8) {
             return Err(DsrError::Gateway(format!(
@@ -568,6 +625,15 @@ mod native_gateway {
     ) -> Result<(), DsrError> {
         Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
     }
+
+    pub fn enter_translated_with_generation_bindings(
+        _entry: CacheVa,
+        _snapshot: &mut NativeUcontextSnapshot,
+        _exit: &mut NativeDsrExit,
+        _generation_bindings: &[GenerationBinding],
+    ) -> Result<(), DsrError> {
+        Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -602,6 +668,7 @@ mod indirect_cache_tests {
             std::mem::offset_of!(DsrContext, biased_guest_fault_address),
             1200
         );
-        assert_eq!(std::mem::size_of::<DsrContext>(), 1264);
+        assert_eq!(std::mem::offset_of!(DsrContext, generation_bindings), 1264);
+        assert_eq!(std::mem::size_of::<DsrContext>(), 1280);
     }
 }

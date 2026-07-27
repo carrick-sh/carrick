@@ -2778,6 +2778,177 @@ fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
 }
 
 #[test]
+fn binding_generation_guard_contains_no_process_pointer() {
+    use std::sync::atomic::AtomicU64;
+
+    let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+    let process_pointer = (&generation as *const AtomicU64 as usize as u64).to_le_bytes();
+    let adversarial_pointer = 0x1234_5678_9abc_def0_u64.to_le_bytes();
+    let guest = GuestVa(0x1b_300);
+    let plan = BlockPlan {
+        start: guest,
+        end: GuestVa(guest.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest,
+            action: InstAction::Copy(0x9100_0400), // add x0, x0, #1
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest.raw() + 4),
+            resume: GuestVa(guest.raw() + 8),
+        },
+    };
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate binding generation guard cache");
+    let emitted = super::emit::emit_block_with_generation_direct(
+        &mut cache,
+        &plan,
+        GenerationGuard::binding(3, CodeGeneration::INITIAL),
+    )
+    .expect("emit binding generation guard");
+    let bytes = unsafe {
+        std::slice::from_raw_parts(emitted.entry().host().raw() as *const u8, emitted.len())
+    };
+    let words = bytes
+        .chunks_exact(std::mem::size_of::<u32>())
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("complete emitted word")))
+        .collect::<Vec<_>>();
+    let materialized_values = words
+        .windows(4)
+        .filter_map(|words| {
+            let register = words[0] & 0x1f;
+            let immediate_mask = (0xffff << 5) | 0x1f;
+            let expected_bases = [
+                0xd280_0000,
+                0xf280_0000 | (1 << 21),
+                0xf280_0000 | (2 << 21),
+                0xf280_0000 | (3 << 21),
+            ];
+            if words
+                .iter()
+                .zip(expected_bases)
+                .any(|(word, base)| word & 0x1f != register || word & !immediate_mask != base)
+            {
+                return None;
+            }
+            Some(
+                words
+                    .iter()
+                    .enumerate()
+                    .fold(0_u64, |value, (halfword, word)| {
+                        value | (u64::from((word >> 5) & 0xffff) << (halfword * 16))
+                    }),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        !materialized_values.contains(&u64::from_le_bytes(process_pointer)),
+        "immutable binding guard embedded a process pointer"
+    );
+    assert!(
+        !materialized_values.contains(&u64::from_le_bytes(adversarial_pointer)),
+        "immutable binding guard embedded the adversarial process pointer"
+    );
+    let operations = words
+        .iter()
+        .enumerate()
+        .map(|(index, word)| {
+            bad64::decode(*word, guest.raw() + (index as u64 * 4))
+                .expect("decode binding generation guard")
+                .op()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        operations.windows(4).any(|window| {
+            window
+                == [
+                    bad64::Op::ADD,
+                    bad64::Op::LDP,
+                    bad64::Op::LDAR,
+                    bad64::Op::CMP,
+                ]
+        }),
+        "binding guard must index the process table then atomically compare its binding"
+    );
+}
+
+#[test]
+fn binding_generation_guard_exits_stale_after_atomic_changes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+    let bindings = [super::gateway::GenerationBinding::new(
+        &generation,
+        CodeGeneration::INITIAL,
+    )];
+    let guest = GuestVa(0x1b_400);
+    let plan = BlockPlan {
+        start: guest,
+        end: GuestVa(guest.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest,
+            action: InstAction::Copy(0x9100_0400), // add x0, x0, #1
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest.raw() + 4),
+            resume: GuestVa(guest.raw() + 8),
+        },
+    };
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate binding generation guard cache");
+    let emitted = super::emit::emit_block_with_generation_direct(
+        &mut cache,
+        &plan,
+        GenerationGuard::binding(0, CodeGeneration::INITIAL),
+    )
+    .expect("emit binding generation guard");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let original_x0 = snapshot.x[0];
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest.raw() + 8),
+    };
+    super::gateway::enter_translated_with_generation_bindings(
+        emitted.entry(),
+        &mut snapshot,
+        &mut exit,
+        &bindings,
+    )
+    .expect("execute current binding guard");
+    assert_eq!(snapshot.x[0], original_x0 + 1);
+
+    generation.fetch_add(2, Ordering::Release);
+    snapshot.x[0] = original_x0;
+    snapshot.pc = guest.raw();
+    super::gateway::enter_translated_with_generation_bindings(
+        emitted.entry(),
+        &mut snapshot,
+        &mut exit,
+        &bindings,
+    )
+    .expect("reject stale binding guard");
+    assert_eq!(
+        snapshot.x[0], original_x0,
+        "stale binding guest instruction executed"
+    );
+    assert_eq!(
+        exit,
+        NativeDsrExit::ResolveDirect {
+            source: guest,
+            target: guest,
+        }
+    );
+}
+
+#[test]
 fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
     let _signal_oracle = install_signal_handlers_for_oracle();
     let mut cache = TranslationCache::new(
