@@ -455,6 +455,35 @@ impl DirectBindingRegistry {
         target: GuestVa,
         descriptor: DirectBindingTarget,
     ) -> DirectBindingPublishOutcome {
+        self.publish_with_stale_observer(miss, source, target, descriptor, |_, _| {})
+    }
+
+    #[cfg(test)]
+    pub fn publish_with_stale_observer_for_test<F>(
+        &mut self,
+        miss: DirectBindingMiss,
+        source: GuestVa,
+        target: GuestVa,
+        descriptor: DirectBindingTarget,
+        observer: F,
+    ) -> DirectBindingPublishOutcome
+    where
+        F: FnOnce(&mut Self, *mut DirectBindingTarget),
+    {
+        self.publish_with_stale_observer(miss, source, target, descriptor, observer)
+    }
+
+    fn publish_with_stale_observer<F>(
+        &mut self,
+        miss: DirectBindingMiss,
+        source: GuestVa,
+        target: GuestVa,
+        descriptor: DirectBindingTarget,
+        observer: F,
+    ) -> DirectBindingPublishOutcome
+    where
+        F: FnOnce(&mut Self, *mut DirectBindingTarget),
+    {
         let Some((source_key, unit_index)) = self.validated_owner(miss, source, target) else {
             self.counters.owner_validation_failures =
                 self.counters.owner_validation_failures.saturating_add(1);
@@ -489,13 +518,14 @@ impl DirectBindingRegistry {
                 if self.winner_matches(winner, descriptor_index) {
                     return DirectBindingPublishOutcome::ExistingWinner;
                 }
+                observer(self, winner);
                 if !cell.clear_if(winner) {
+                    // The cell no longer contains the exact pointer this
+                    // publisher classified as stale. A replacement belongs to
+                    // its own publisher and must never be cleared here.
                     let current = cell.load_acquire();
                     if self.winner_matches(current, descriptor_index) {
                         return DirectBindingPublishOutcome::ExistingWinner;
-                    }
-                    if !current.is_null() {
-                        let _ = cell.clear_if(current);
                     }
                     return DirectBindingPublishOutcome::Rejected;
                 }
@@ -513,7 +543,8 @@ impl DirectBindingRegistry {
                         if self.winner_matches(retry_winner, descriptor_index) {
                             DirectBindingPublishOutcome::ExistingWinner
                         } else {
-                            let _ = cell.clear_if(retry_winner);
+                            // The single retry is consumed. This winner was
+                            // never classified as stale, so leave it untouched.
                             DirectBindingPublishOutcome::Rejected
                         }
                     }
