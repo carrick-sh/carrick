@@ -3177,7 +3177,7 @@ mod tests {
     mod direct_binding_owner_and_publication {
         use super::{ProcessTranslator, TEST_HOST_JIT};
         use crate::direct_binding::{
-            DirectBindingCellVa, DirectBindingMiss, DirectBindingOrdinal,
+            DirectBindingCellRef, DirectBindingCellVa, DirectBindingMiss, DirectBindingOrdinal,
             DirectBindingPublishOutcome, DirectBindingRegistry, DirectBindingTarget,
             DirectBindingTargetPrefix, PrivateJitEpoch,
         };
@@ -3501,6 +3501,73 @@ mod tests {
                 state
                     .direct_bindings
                     .incoming_count(target, CodeGeneration::claimed(2)),
+                1,
+            );
+        }
+
+        #[test]
+        fn a_replacement_winner_survives_a_lost_exact_stale_clear() {
+            let source = GuestVa(0x40_0580);
+            let target = GuestVa(0x50_0580);
+            let fixture = sidecar_unit(key(8), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let epoch = PrivateJitEpoch::process_owner();
+            let miss = DirectBindingMiss {
+                cell: fixture.unit.binding_base.expect("binding base"),
+                ordinal: DirectBindingOrdinal::claimed(0),
+            };
+            let mut state = process.state.write();
+            let unit_index = state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register owner")
+                .expect("SidecarV1 owner");
+            assert_eq!(
+                state.direct_bindings.publish(
+                    miss,
+                    source,
+                    target,
+                    private_target(target, CodeGeneration::claimed(1), 0x80_0600, &epoch),
+                ),
+                DirectBindingPublishOutcome::Published,
+            );
+            let stale = fixture.storage[0].load(Ordering::Acquire);
+            let mut replacement = std::ptr::null_mut();
+
+            let outcome = state.direct_bindings.publish_with_stale_observer_for_test(
+                miss,
+                source,
+                target,
+                private_target(target, CodeGeneration::claimed(2), 0x80_0700, &epoch),
+                |registry, observed_stale| {
+                    assert_eq!(observed_stale, stale);
+                    // SAFETY: the fixture owns this live `AtomicPtr` cell
+                    // until the state guard and registry are dropped.
+                    let cell = unsafe {
+                        DirectBindingCellRef::from_mapped_address(miss.cell).expect("fixture cell")
+                    };
+                    assert!(cell.clear_if(observed_stale));
+                    assert_eq!(
+                        registry.publish(
+                            miss,
+                            source,
+                            target,
+                            private_target(target, CodeGeneration::claimed(3), 0x80_0800, &epoch,),
+                        ),
+                        DirectBindingPublishOutcome::Published,
+                    );
+                    replacement = cell.load_acquire();
+                    assert!(!replacement.is_null());
+                },
+            );
+
+            assert_eq!(outcome, DirectBindingPublishOutcome::Rejected);
+            assert_eq!(fixture.storage[0].load(Ordering::Acquire), replacement);
+            assert!(state.direct_bindings.is_published(unit_index, miss.ordinal));
+            assert_eq!(
+                state
+                    .direct_bindings
+                    .incoming_count(target, CodeGeneration::claimed(3)),
                 1,
             );
         }
