@@ -1318,6 +1318,13 @@ impl ProcessTranslator {
             .map_or(0, |configuration| configuration.image.segments.len())
     }
 
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn enable_direct_bindings_for_test(&self) {
+        self.state.write().direct_bindings =
+            crate::direct_binding::DirectBindingRegistry::new(true);
+    }
+
     #[doc(hidden)]
     pub fn lifecycle_snapshot(&self) -> (u64, u64, u64) {
         let state = self.state.read();

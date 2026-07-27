@@ -3787,6 +3787,236 @@ fn shared_to_private_indirect_cache_hit_installs_target_authority() {
 }
 
 #[test]
+fn stale_target_translation_rebinds_and_then_hits_the_real_sidecar_cell() {
+    use carrick_dsr_aarch64::direct_binding::DirectBindingCellRef;
+    use carrick_dsr_aarch64::shared_cache::{
+        AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
+        ImageFileOffset, NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate,
+        SharedExecutableSegment, SharedImageConfig, SourceFingerprint, TranslationUnitKey,
+        TranslationUnitStore,
+    };
+
+    const PAGE_SIZE: u64 = 16 * 1024;
+    let source_word = 0x1400_1000; // b +16 KiB
+    let source = GuestVa(0x20_0000_0000);
+    let target = GuestVa(source.raw() + PAGE_SIZE);
+    let mut fixture = biased_translator_fixture(&[source_word], source);
+    fixture.memory.regions[1].guest_writable = false;
+    fixture.memory.regions[1].default_prot =
+        crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC;
+    // SAFETY: `data_host` owns the second live writable fixture page.
+    unsafe { (fixture.data_host.raw() as *mut u32).write(0xd400_0001) };
+    fixture.translator.process.enable_direct_bindings_for_test();
+
+    let source_generation = fixture
+        .memory
+        .dsr_generation_observation(source)
+        .expect("observe source generation")
+        .expected();
+    let source_plan = super::block::plan_block(&fixture.memory, source, source_generation, 256)
+        .expect("plan direct source");
+    let source_artifact = super::emit::record_portable_block_artifact(
+        &source_plan,
+        0,
+        super::emit::EmitAddressMode::Biased {
+            host_bias: fixture.host_bias,
+        },
+        vec![source_word],
+    )
+    .expect("record direct source");
+    let executable = ExecutableIdentity::Digest([0xa5; 32]);
+    let key = TranslationUnitKey::for_segment(
+        executable.clone(),
+        ImageFileOffset::new(0),
+        ImageFileLen::new(4).expect("source file length"),
+        source,
+        GuestCodeLen::new(4).expect("source guest length"),
+        SourceFingerprint::from_words(&[source_word]),
+        NativePageProfileIdentity::Native16k,
+        AddressModeIdentity::biased(fixture.host_bias),
+    );
+    let pending = PendingTranslationUnit::pack(
+        key.clone(),
+        vec![PortableBlockCandidate {
+            guest_start: source,
+            generation_binding: 0,
+            requires_sensitive_metadata: false,
+            template: source_artifact.template,
+        }],
+        DirectBindingLayout::SidecarV1,
+    )
+    .expect("pack direct-binding sidecar");
+    assert_eq!(pending.bindings.len(), 1);
+
+    let _cache_session =
+        carrick_native_darwin::aot_cache::begin_container_cache().expect("begin container cache");
+    let store = Arc::new(carrick_native_darwin::aot_cache::ActiveContainerUnitStore);
+    assert_eq!(
+        store.publish(&pending).expect("publish sidecar unit"),
+        carrick_dsr_aarch64::shared_cache::PublishOutcome::Winner,
+    );
+    let loaded = store
+        .load(&key, &[source_word])
+        .expect("load sidecar unit")
+        .expect("published sidecar unit");
+    let binding_base = loaded.binding_base.expect("SidecarV1 binding base");
+    // SAFETY: `loaded` pins the dylib and its writable binding cell until the
+    // final traversal and all acquired loads below have completed.
+    let cell = unsafe {
+        DirectBindingCellRef::from_mapped_address(binding_base).expect("loaded sidecar cell")
+    };
+    assert!(cell.load_acquire().is_null());
+
+    fixture
+        .translator
+        .process
+        .configure_shared_image(
+            SharedImageConfig {
+                executable,
+                page_profile: NativePageProfileIdentity::Native16k,
+                address_mode: AddressModeIdentity::biased(fixture.host_bias),
+                segments: vec![SharedExecutableSegment {
+                    file_offset: ImageFileOffset::new(0),
+                    file_len: ImageFileLen::new(4).expect("source file length"),
+                    guest_start: source,
+                    guest_len: GuestCodeLen::new(4).expect("source guest length"),
+                    source_words: vec![source_word].into(),
+                }],
+            },
+            store,
+        )
+        .expect("configure sidecar source");
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = source.raw();
+    let prepared_source = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("load shared direct source");
+    let first_miss = fixture
+        .translator
+        .enter_prepared::<false>(prepared_source, &mut snapshot)
+        .expect("execute first sidecar miss");
+    assert!(matches!(
+        first_miss.exit,
+        NativeDsrExit::ResolveDirect {
+            source: resolved_source,
+            target: resolved_target,
+            binding: Some(_),
+        } if resolved_source == source && resolved_target == target
+    ));
+    assert!(matches!(
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared_source, first_miss)
+            .expect("resolve generation-one target"),
+        super::ThreadExit::Continue
+    ));
+    let generation_one_target = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare generation-one target");
+    assert_eq!(generation_one_target.generation, CodeGeneration::INITIAL);
+    assert!(!cell.load_acquire().is_null());
+
+    snapshot.pc = source.raw();
+    let prepared_source = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare generation-one sidecar hit");
+    let first_hit = fixture
+        .translator
+        .enter_prepared::<false>(prepared_source, &mut snapshot)
+        .expect("execute generation-one sidecar hit");
+    assert_eq!(
+        first_hit.exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target.raw() + 4),
+        }
+    );
+
+    let generation_two = fixture
+        .memory
+        .note_dsr_code_mutation(target.raw(), 4)
+        .expect("mutate target generation")
+        .expect("nonempty mutation");
+    snapshot.pc = target.raw();
+    let stale_guard = fixture
+        .translator
+        .enter_prepared::<false>(generation_one_target, &mut snapshot)
+        .expect("execute emitted generation-one guard");
+    assert!(matches!(
+        stale_guard.exit,
+        NativeDsrExit::ResolveDirect {
+            source: stale_source,
+            target: stale_target,
+            binding: None,
+        } if stale_source == target && stale_target == target
+    ));
+
+    snapshot.pc = target.raw();
+    let generation_two_target = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("translate stale target through production cache path");
+    assert_eq!(generation_two_target.generation, generation_two);
+    assert!(
+        cell.load_acquire().is_null(),
+        "stale target translation must invalidate its incoming sidecar cell"
+    );
+
+    snapshot.pc = source.raw();
+    let prepared_source = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare source after target invalidation");
+    let rebind_miss = fixture
+        .translator
+        .enter_prepared::<false>(prepared_source, &mut snapshot)
+        .expect("execute real rebound resolver path");
+    assert!(matches!(
+        rebind_miss.exit,
+        NativeDsrExit::ResolveDirect {
+            source: resolved_source,
+            target: resolved_target,
+            binding: Some(_),
+        } if resolved_source == source && resolved_target == target
+    ));
+    assert!(matches!(
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared_source, rebind_miss)
+            .expect("resolve generation-two target"),
+        super::ThreadExit::Continue
+    ));
+    let rebound = cell.load_acquire();
+    assert!(!rebound.is_null());
+    // SAFETY: the process registry retains the descriptor, and `loaded` pins
+    // the cell through this acquired read.
+    let rebound = unsafe { &*rebound };
+    assert_eq!(rebound.target_generation(), generation_two);
+
+    snapshot.pc = source.raw();
+    let prepared_source = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare rebound sidecar hit");
+    let final_hit = fixture
+        .translator
+        .enter_prepared::<false>(prepared_source, &mut snapshot)
+        .expect("execute rebound sidecar cell hit");
+    assert_eq!(
+        final_hit.exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target.raw() + 4),
+        },
+        "the traversal after rebind must bypass the resolver"
+    );
+    assert!(!cell.load_acquire().is_null());
+}
+
+#[test]
 fn translated_block_is_published_on_retirement_and_reused() {
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
