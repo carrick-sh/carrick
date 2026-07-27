@@ -33,10 +33,17 @@
 //!
 //! # Scope of this module
 //!
-//! Emission only. It turns a caller-supplied blob of already-translated arm64
-//! instructions into the bytes of a dylib exporting one symbol at a
-//! caller-chosen offset. Signing, the on-disk store, cache keying and the
-//! translator wiring are later stages and deliberately live elsewhere.
+//! Emission only. It turns caller-supplied translated arm64 instructions and
+//! writable binding cells into the bytes of a dylib with section-aware exports.
+//! Signing, the on-disk store, cache keying and translator wiring deliberately
+//! live elsewhere.
+
+/// A loadable section in an emitted unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AotSection {
+    Text,
+    Data,
+}
 
 /// A symbol to export from an emitted unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,8 +51,46 @@ pub struct AotExport<'a> {
     /// Exported symbol name, as `dlsym` will see it (no leading underscore —
     /// the emitter adds the Mach-O `_` prefix).
     pub name: &'a str,
-    /// Byte offset of the entry point within `code`.
+    /// Section that owns the exported address.
+    pub section: AotSection,
+    /// Byte offset within `section`.
     pub offset: u32,
+}
+
+/// One AArch64 `ADRP`/`ADD` pair that materializes a data-cell address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AotCodeToDataRelocation {
+    pub adrp_offset: u32,
+    pub add_offset: u32,
+    pub data_offset: u32,
+}
+
+/// Complete immutable input to one emitted Mach-O image.
+pub struct AotImage<'a> {
+    pub code: &'a [u8],
+    pub data: &'a [u8],
+    pub exports: &'a [AotExport<'a>],
+    pub relocations: &'a [AotCodeToDataRelocation],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AotRelocationError {
+    CodeOffset {
+        adrp_offset: u32,
+        add_offset: u32,
+        code_len: usize,
+    },
+    WrongShape {
+        adrp: u32,
+        add: u32,
+    },
+    DataOffset {
+        data_offset: u32,
+        data_len: usize,
+    },
+    PageDelta {
+        delta_pages: i128,
+    },
 }
 
 /// Why an emission attempt could not produce a loadable unit. Every variant is
@@ -54,11 +99,19 @@ pub struct AotExport<'a> {
 pub enum AotEmitError {
     /// `code` was empty, or not a whole number of 4-byte arm64 instructions.
     CodeNotInstructionAligned(usize),
-    /// An export pointed outside `code`, or was itself misaligned.
+    /// An export pointed outside its declared section, or was misaligned.
     ExportOutOfRange {
         name: String,
+        section: AotSection,
         offset: u32,
-        code_len: usize,
+        section_len: usize,
+    },
+    /// A writable cell sidecar is not a whole number of atomic 8-byte cells.
+    DataNotCellAligned(usize),
+    /// A code-to-data relocation was not safe or representable.
+    RelocationInvalid {
+        index: usize,
+        reason: AotRelocationError,
     },
     /// A symbol name cannot be represented in a Mach-O string table.
     SymbolNameUnrepresentable(String),
@@ -77,13 +130,23 @@ impl std::fmt::Display for AotEmitError {
             ),
             Self::ExportOutOfRange {
                 name,
+                section,
                 offset,
-                code_len,
+                section_len,
             } => write!(
                 f,
-                "export {name:?} at offset {offset} is outside the {code_len}-byte code blob \
-                 (or is not 4-byte aligned)"
+                "export {name:?} at offset {offset} is outside the {section_len}-byte \
+                 {section:?} section (or is not section-aligned)"
             ),
+            Self::DataNotCellAligned(len) => {
+                write!(
+                    f,
+                    "AOT data must contain whole 8-byte cells, got {len} bytes"
+                )
+            }
+            Self::RelocationInvalid { index, reason } => {
+                write!(f, "AOT relocation {index} is invalid: {reason:?}")
+            }
             Self::SymbolNameUnrepresentable(name) => {
                 write!(f, "symbol name {name:?} cannot be encoded (embedded NUL)")
             }
@@ -97,22 +160,30 @@ impl std::error::Error for AotEmitError {}
 /// Validate an emission request. Split out from the writer so the preconditions
 /// are testable without producing a file, and so every rejection is a typed
 /// fallback reason rather than a panic inside the translator.
-pub fn validate(code: &[u8], exports: &[AotExport<'_>]) -> Result<(), AotEmitError> {
-    if code.is_empty() || !code.len().is_multiple_of(4) {
-        return Err(AotEmitError::CodeNotInstructionAligned(code.len()));
+pub fn validate(image: &AotImage<'_>) -> Result<(), AotEmitError> {
+    if image.code.is_empty() || !image.code.len().is_multiple_of(4) {
+        return Err(AotEmitError::CodeNotInstructionAligned(image.code.len()));
     }
-    for export in exports {
+    if !image.data.len().is_multiple_of(8) {
+        return Err(AotEmitError::DataNotCellAligned(image.data.len()));
+    }
+    for export in image.exports {
         if export.name.as_bytes().contains(&0) {
             return Err(AotEmitError::SymbolNameUnrepresentable(
                 export.name.to_owned(),
             ));
         }
+        let (section_len, alignment) = match export.section {
+            AotSection::Text => (image.code.len(), 4),
+            AotSection::Data => (image.data.len(), 8),
+        };
         let offset = export.offset as usize;
-        if offset >= code.len() || !offset.is_multiple_of(4) {
+        if offset >= section_len || !offset.is_multiple_of(alignment) {
             return Err(AotEmitError::ExportOutOfRange {
                 name: export.name.to_owned(),
+                section: export.section,
                 offset: export.offset,
-                code_len: code.len(),
+                section_len,
             });
         }
     }
@@ -139,6 +210,7 @@ mod macho {
     pub const LC_DYLD_INFO_ONLY: u32 = 0x22 | LC_REQ_DYLD;
 
     pub const VM_PROT_READ: i32 = 0x1;
+    pub const VM_PROT_WRITE: i32 = 0x2;
     pub const VM_PROT_EXECUTE: i32 = 0x4;
     pub const PLATFORM_MACOS: u32 = 1;
 
@@ -149,6 +221,8 @@ mod macho {
 
     /// arm64 macOS page size. `__LINKEDIT` must start on a page boundary.
     pub const PAGE: u64 = 16384;
+    /// Architectural page size used by AArch64 `ADRP`.
+    pub const ADRP_PAGE: u64 = 4096;
     /// Slack between the load commands and the first section.
     ///
     /// Signing APPENDS an `LC_CODE_SIGNATURE` (16 bytes). With a tight header
@@ -157,6 +231,108 @@ mod macho {
     /// which faults on the first call rather than failing to load. Real linkers
     /// leave slack for exactly this reason.
     pub const HEADER_SLACK: u64 = 256;
+}
+
+fn patch_code_to_data_relocations(
+    code: &mut [u8],
+    code_vmaddr: u64,
+    data_vmaddr: u64,
+    data_len: usize,
+    relocations: &[AotCodeToDataRelocation],
+) -> Result<(), AotEmitError> {
+    use macho::ADRP_PAGE;
+
+    const ADRP_X15: u32 = 0x9000_000f;
+    const ADD_X15_X15_0: u32 = 0x9100_01ef;
+    const ADRP_MIN_PAGES: i128 = -(1 << 20);
+    const ADRP_MAX_PAGES: i128 = (1 << 20) - 1;
+
+    let mut patches = Vec::with_capacity(relocations.len());
+    for (index, relocation) in relocations.iter().copied().enumerate() {
+        let adrp_offset = relocation.adrp_offset as usize;
+        let add_offset = relocation.add_offset as usize;
+        let adrp_end = adrp_offset.checked_add(4);
+        let add_end = add_offset.checked_add(4);
+        let invalid_code_offset = || AotEmitError::RelocationInvalid {
+            index,
+            reason: AotRelocationError::CodeOffset {
+                adrp_offset: relocation.adrp_offset,
+                add_offset: relocation.add_offset,
+                code_len: code.len(),
+            },
+        };
+        if !adrp_offset.is_multiple_of(4)
+            || !add_offset.is_multiple_of(4)
+            || adrp_end.is_none_or(|end| end > code.len())
+            || add_end.is_none_or(|end| end > code.len())
+        {
+            return Err(invalid_code_offset());
+        }
+        let adrp_bytes: [u8; 4] = code
+            .get(adrp_offset..adrp_end.ok_or_else(invalid_code_offset)?)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(invalid_code_offset)?;
+        let add_bytes: [u8; 4] = code
+            .get(add_offset..add_end.ok_or_else(invalid_code_offset)?)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(invalid_code_offset)?;
+        let adrp = u32::from_le_bytes(adrp_bytes);
+        let add = u32::from_le_bytes(add_bytes);
+        if adrp != ADRP_X15 || add != ADD_X15_X15_0 {
+            return Err(AotEmitError::RelocationInvalid {
+                index,
+                reason: AotRelocationError::WrongShape { adrp, add },
+            });
+        }
+
+        let data_offset = relocation.data_offset as usize;
+        if !data_offset.is_multiple_of(8)
+            || data_offset.checked_add(8).is_none_or(|end| end > data_len)
+        {
+            return Err(AotEmitError::RelocationInvalid {
+                index,
+                reason: AotRelocationError::DataOffset {
+                    data_offset: relocation.data_offset,
+                    data_len,
+                },
+            });
+        }
+
+        let pc = code_vmaddr.checked_add(u64::from(relocation.adrp_offset));
+        let target = data_vmaddr.checked_add(u64::from(relocation.data_offset));
+        let (Some(pc), Some(target)) = (pc, target) else {
+            return Err(AotEmitError::RelocationInvalid {
+                index,
+                reason: AotRelocationError::PageDelta {
+                    delta_pages: i128::MAX,
+                },
+            });
+        };
+        let pc_page = pc & !(ADRP_PAGE - 1);
+        let target_page = target & !(ADRP_PAGE - 1);
+        let delta_pages = (i128::from(target_page) - i128::from(pc_page)) / i128::from(ADRP_PAGE);
+        if !(ADRP_MIN_PAGES..=ADRP_MAX_PAGES).contains(&delta_pages) {
+            return Err(AotEmitError::RelocationInvalid {
+                index,
+                reason: AotRelocationError::PageDelta { delta_pages },
+            });
+        }
+
+        let immediate = (delta_pages as i64 as u64) & 0x1f_ffff;
+        let patched_adrp =
+            ADRP_X15 | ((immediate & 0x3) as u32) << 29 | ((immediate >> 2) as u32) << 5;
+        let low_twelve = (target & (ADRP_PAGE - 1)) as u32;
+        let patched_add = ADD_X15_X15_0 | (low_twelve << 10);
+        patches.push((adrp_offset, patched_adrp, add_offset, patched_add));
+    }
+
+    // The validation loop above is intentionally complete before this first
+    // write: one malformed late record must leave every earlier pair pristine.
+    for (adrp_offset, adrp, add_offset, add) in patches {
+        code[adrp_offset..adrp_offset + 4].copy_from_slice(&adrp.to_le_bytes());
+        code[add_offset..add_offset + 4].copy_from_slice(&add.to_le_bytes());
+    }
+    Ok(())
 }
 
 fn uleb128(mut value: u64, out: &mut Vec<u8>) {
@@ -230,8 +406,7 @@ fn export_trie(exports: &[(String, u64)]) -> Vec<u8> {
     unreachable!("export trie offsets converge in at most a couple of rounds")
 }
 
-/// Emit a complete, loadable arm64 `MH_DYLIB` whose `__TEXT,__text` is `code`
-/// and which exports `exports`.
+/// Emit a complete, loadable arm64 `MH_DYLIB` for `image`.
 ///
 /// Written directly rather than emitted as a relocatable object and linked:
 /// SPIKED AND PROVEN that dyld loads a hand-built dylib with **no
@@ -243,9 +418,9 @@ fn export_trie(exports: &[(String, u64)]) -> Vec<u8> {
 /// The result is NOT signed. AMFI refuses to map an unsigned file executable
 /// (MEASURED: `mmap(PROT_EXEC)` -> `EPERM`), so a caller must sign before
 /// `dlopen`.
-pub fn emit_dylib(code: &[u8], exports: &[AotExport<'_>]) -> Result<Vec<u8>, AotEmitError> {
+pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
     use macho::*;
-    validate(code, exports)?;
+    validate(image)?;
 
     const SEG_CMD: u64 = 72;
     const SECT: u64 = 80;
@@ -259,7 +434,9 @@ pub fn emit_dylib(code: &[u8], exports: &[AotExport<'_>]) -> Result<Vec<u8>, Aot
     let install_name = b"@rpath/carrick_aot.dylib";
     let id_dylib_cmd = 24 + (install_name.len() as u64 + 1).next_multiple_of(8);
 
+    let has_data = !image.data.is_empty();
     let sizeofcmds = (SEG_CMD + SECT)
+        + if has_data { SEG_CMD + SECT } else { 0 }
         + SEG_CMD
         + id_dylib_cmd
         + DYLD_INFO_CMD
@@ -271,19 +448,49 @@ pub fn emit_dylib(code: &[u8], exports: &[AotExport<'_>]) -> Result<Vec<u8>, Aot
     // `__TEXT` has vmaddr 0 and covers the header, so a section's vmaddr and its
     // file offset are the same number.
     let code_addr = header_size;
-    let text_vmsize = (code_addr + code.len() as u64).next_multiple_of(PAGE);
-    let linkedit_off = text_vmsize;
+    let text_vmsize = (code_addr + image.code.len() as u64).next_multiple_of(PAGE);
+    let data_addr = text_vmsize;
+    let data_vmsize = if has_data {
+        (image.data.len() as u64).next_multiple_of(PAGE)
+    } else {
+        0
+    };
+    let linkedit_off = data_addr + data_vmsize;
 
-    let resolved: Vec<(String, u64)> = exports
+    let mut code = image.code.to_vec();
+    patch_code_to_data_relocations(
+        &mut code,
+        code_addr,
+        data_addr,
+        image.data.len(),
+        image.relocations,
+    )?;
+
+    let resolved: Vec<(String, AotSection, u64)> = image
+        .exports
         .iter()
-        .map(|e| (e.name.to_owned(), code_addr + u64::from(e.offset)))
+        .map(|export| {
+            let section_addr = match export.section {
+                AotSection::Text => code_addr,
+                AotSection::Data => data_addr,
+            };
+            (
+                export.name.to_owned(),
+                export.section,
+                section_addr + u64::from(export.offset),
+            )
+        })
         .collect();
-    let trie = export_trie(&resolved);
+    let trie_exports = resolved
+        .iter()
+        .map(|(name, _, addr)| (name.clone(), *addr))
+        .collect::<Vec<_>>();
+    let trie = export_trie(&trie_exports);
 
     // String table: a leading NUL, then each `_name`.
     let mut strtab = vec![0u8];
-    let mut name_offsets = Vec::with_capacity(exports.len());
-    for export in exports {
+    let mut name_offsets = Vec::with_capacity(image.exports.len());
+    for export in image.exports {
         name_offsets.push(strtab.len() as u32);
         strtab.push(b'_');
         strtab.extend_from_slice(export.name.as_bytes());
@@ -294,10 +501,13 @@ pub fn emit_dylib(code: &[u8], exports: &[AotExport<'_>]) -> Result<Vec<u8>, Aot
     }
 
     let mut nlists = Vec::new();
-    for (i, (_, addr)) in resolved.iter().enumerate() {
+    for (i, (_, section, addr)) in resolved.iter().enumerate() {
         nlists.extend_from_slice(&name_offsets[i].to_le_bytes());
         nlists.push(N_SECT_EXT);
-        nlists.push(1); // section 1 == __text
+        nlists.push(match section {
+            AotSection::Text => 1,
+            AotSection::Data => 2,
+        });
         nlists.extend_from_slice(&0u16.to_le_bytes());
         nlists.extend_from_slice(&addr.to_le_bytes());
     }
@@ -355,6 +565,35 @@ pub fn emit_dylib(code: &[u8], exports: &[AotExport<'_>]) -> Result<Vec<u8>, Aot
         cmds.extend_from_slice(&v.to_le_bytes());
     }
 
+    if has_data {
+        seg(
+            b"__DATA",
+            data_addr,
+            data_vmsize,
+            data_addr,
+            image.data.len() as u64,
+            VM_PROT_READ | VM_PROT_WRITE,
+            1,
+            SEG_CMD + SECT,
+            &mut cmds,
+        );
+        // section_64 for __data. Its segment begins on a 16 KiB boundary;
+        // align=3 records the stronger 8-byte atomic-cell alignment contract.
+        let mut sect_name = [0u8; 16];
+        sect_name[..6].copy_from_slice(b"__data");
+        let mut seg_name = [0u8; 16];
+        seg_name[..6].copy_from_slice(b"__DATA");
+        cmds.extend_from_slice(&sect_name);
+        cmds.extend_from_slice(&seg_name);
+        cmds.extend_from_slice(&data_addr.to_le_bytes());
+        cmds.extend_from_slice(&(image.data.len() as u64).to_le_bytes());
+        cmds.extend_from_slice(&(data_addr as u32).to_le_bytes());
+        cmds.extend_from_slice(&3u32.to_le_bytes()); // align 2^3 = 8-byte cells
+        for value in [0u32; 6] {
+            cmds.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
     seg(
         b"__LINKEDIT",
         linkedit_off,
@@ -397,7 +636,7 @@ pub fn emit_dylib(code: &[u8], exports: &[AotExport<'_>]) -> Result<Vec<u8>, Aot
     cmds.extend_from_slice(&(SYMTAB_CMD as u32).to_le_bytes());
     for v in [
         symoff as u32,
-        exports.len() as u32,
+        image.exports.len() as u32,
         stroff as u32,
         strtab.len() as u32,
     ] {
@@ -407,7 +646,7 @@ pub fn emit_dylib(code: &[u8], exports: &[AotExport<'_>]) -> Result<Vec<u8>, Aot
     // LC_DYSYMTAB. dyld ENFORCES `iundefsym == iextdefsym + nextdefsym`;
     // violating it rejects the image with "indirect symbol table
     // iundefsym != iextdefsym+nextdefsym".
-    let n = exports.len() as u32;
+    let n = image.exports.len() as u32;
     cmds.extend_from_slice(&LC_DYSYMTAB.to_le_bytes());
     cmds.extend_from_slice(&(DYSYMTAB_CMD as u32).to_le_bytes());
     for v in [0u32, 0, 0, n, n, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
@@ -428,14 +667,18 @@ pub fn emit_dylib(code: &[u8], exports: &[AotExport<'_>]) -> Result<Vec<u8>, Aot
     out.extend_from_slice(&CPU_TYPE_ARM64.to_le_bytes());
     out.extend_from_slice(&CPU_SUBTYPE_ARM64_ALL.to_le_bytes());
     out.extend_from_slice(&MH_DYLIB.to_le_bytes());
-    out.extend_from_slice(&7u32.to_le_bytes()); // ncmds
+    out.extend_from_slice(&(if has_data { 8u32 } else { 7u32 }).to_le_bytes());
     out.extend_from_slice(&(sizeofcmds as u32).to_le_bytes());
     out.extend_from_slice(&(MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL).to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // reserved
     out.extend_from_slice(&cmds);
     out.resize(code_addr as usize, 0); // HEADER_SLACK
-    out.extend_from_slice(code);
+    out.extend_from_slice(&code);
     out.resize(linkedit_off as usize, 0);
+    if has_data {
+        let data_start = data_addr as usize;
+        out[data_start..data_start + image.data.len()].copy_from_slice(image.data);
+    }
     out.extend_from_slice(&trie);
     out.extend_from_slice(&nlists);
     out.extend_from_slice(&strtab);
@@ -445,21 +688,242 @@ pub fn emit_dylib(code: &[u8], exports: &[AotExport<'_>]) -> Result<Vec<u8>, Aot
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     /// `mov w0, #42 ; ret` — the smallest blob whose execution proves the whole
     /// pipeline (emit -> sign -> dlopen -> dlsym -> call) actually works.
     const MOV42_RET: [u8; 8] = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
+    const ADRP_X15: u32 = 0x9000_000f;
+    const ADD_X15_X15_0: u32 = 0x9100_01ef;
+
+    #[derive(Debug)]
+    struct SectionView {
+        name: String,
+        addr: u64,
+        size: u64,
+        offset: u32,
+        align: u32,
+    }
+
+    #[derive(Debug)]
+    struct SegmentView {
+        name: String,
+        vmaddr: u64,
+        vmsize: u64,
+        fileoff: u64,
+        filesize: u64,
+        maxprot: i32,
+        initprot: i32,
+        sections: Vec<SectionView>,
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("u32 field"))
+    }
+
+    fn read_i32(bytes: &[u8], offset: usize) -> i32 {
+        i32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("i32 field"))
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("u64 field"))
+    }
+
+    fn fixed_name(bytes: &[u8]) -> String {
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        std::str::from_utf8(&bytes[..end])
+            .expect("ASCII Mach-O name")
+            .to_owned()
+    }
+
+    fn load_commands(bytes: &[u8]) -> Vec<(u32, usize, usize)> {
+        let mut commands = Vec::new();
+        let mut offset = 32;
+        for _ in 0..read_u32(bytes, 16) {
+            let command = read_u32(bytes, offset);
+            let size = read_u32(bytes, offset + 4) as usize;
+            assert!(size >= 8, "load command must include its header");
+            commands.push((command, offset, size));
+            offset += size;
+        }
+        assert_eq!(offset, 32 + read_u32(bytes, 20) as usize);
+        commands
+    }
+
+    fn segments(bytes: &[u8]) -> Vec<SegmentView> {
+        load_commands(bytes)
+            .into_iter()
+            .filter_map(|(command, offset, size)| {
+                if command != macho::LC_SEGMENT_64 {
+                    return None;
+                }
+                let nsects = read_u32(bytes, offset + 64) as usize;
+                assert_eq!(size, 72 + nsects * 80);
+                let sections = (0..nsects)
+                    .map(|index| {
+                        let section = offset + 72 + index * 80;
+                        SectionView {
+                            name: fixed_name(&bytes[section..section + 16]),
+                            addr: read_u64(bytes, section + 32),
+                            size: read_u64(bytes, section + 40),
+                            offset: read_u32(bytes, section + 48),
+                            align: read_u32(bytes, section + 52),
+                        }
+                    })
+                    .collect();
+                Some(SegmentView {
+                    name: fixed_name(&bytes[offset + 8..offset + 24]),
+                    vmaddr: read_u64(bytes, offset + 24),
+                    vmsize: read_u64(bytes, offset + 32),
+                    fileoff: read_u64(bytes, offset + 40),
+                    filesize: read_u64(bytes, offset + 48),
+                    maxprot: read_i32(bytes, offset + 56),
+                    initprot: read_i32(bytes, offset + 60),
+                    sections,
+                })
+            })
+            .collect()
+    }
+
+    fn section<'a>(segments: &'a [SegmentView], segment: &str) -> &'a SectionView {
+        let segment = segments
+            .iter()
+            .find(|candidate| candidate.name == segment)
+            .expect("declared segment");
+        assert_eq!(segment.sections.len(), 1);
+        &segment.sections[0]
+    }
+
+    fn read_uleb(bytes: &[u8], cursor: &mut usize) -> u64 {
+        let mut value = 0_u64;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[*cursor];
+            *cursor += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+            assert!(shift < 64, "ULEB128 value overflow");
+        }
+    }
+
+    fn exported_addresses(bytes: &[u8]) -> BTreeMap<String, u64> {
+        let (_, command, _) = load_commands(bytes)
+            .into_iter()
+            .find(|(kind, _, _)| *kind == macho::LC_DYLD_INFO_ONLY)
+            .expect("LC_DYLD_INFO_ONLY");
+        let export_offset = read_u32(bytes, command + 40) as usize;
+        let export_size = read_u32(bytes, command + 44) as usize;
+        let trie = &bytes[export_offset..export_offset + export_size];
+        let mut cursor = 0;
+        assert_eq!(read_uleb(trie, &mut cursor), 0, "root is not terminal");
+        let child_count = trie[cursor] as usize;
+        cursor += 1;
+        let mut children = Vec::with_capacity(child_count);
+        for _ in 0..child_count {
+            let name_start = cursor;
+            let name_len = trie[name_start..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .expect("terminated export edge");
+            let name = std::str::from_utf8(&trie[name_start + 1..name_start + name_len])
+                .expect("ASCII export")
+                .to_owned();
+            cursor = name_start + name_len + 1;
+            let child_offset = read_uleb(trie, &mut cursor) as usize;
+            children.push((name, child_offset));
+        }
+        children
+            .into_iter()
+            .map(|(name, mut child)| {
+                let terminal_size = read_uleb(trie, &mut child);
+                assert!(terminal_size >= 2);
+                assert_eq!(read_uleb(trie, &mut child), 0, "regular export");
+                (name, read_uleb(trie, &mut child))
+            })
+            .collect()
+    }
+
+    fn symbols(bytes: &[u8]) -> BTreeMap<String, (u8, u64)> {
+        let (_, command, _) = load_commands(bytes)
+            .into_iter()
+            .find(|(kind, _, _)| *kind == macho::LC_SYMTAB)
+            .expect("LC_SYMTAB");
+        let symoff = read_u32(bytes, command + 8) as usize;
+        let nsyms = read_u32(bytes, command + 12) as usize;
+        let stroff = read_u32(bytes, command + 16) as usize;
+        (0..nsyms)
+            .map(|index| {
+                let nlist = symoff + index * 16;
+                let name_offset = read_u32(bytes, nlist) as usize;
+                let name_start = stroff + name_offset + 1;
+                let name_len = bytes[name_start..]
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .expect("terminated symbol");
+                let name = std::str::from_utf8(&bytes[name_start..name_start + name_len])
+                    .expect("ASCII symbol")
+                    .to_owned();
+                (name, (bytes[nlist + 5], read_u64(bytes, nlist + 8)))
+            })
+            .collect()
+    }
+
+    fn placeholder_code(pair_count: usize) -> Vec<u8> {
+        let mut code = Vec::with_capacity(pair_count * 8);
+        for _ in 0..pair_count {
+            code.extend_from_slice(&ADRP_X15.to_le_bytes());
+            code.extend_from_slice(&ADD_X15_X15_0.to_le_bytes());
+        }
+        code
+    }
+
+    fn decode_code_to_data_address(code: &[u8], adrp_offset: u32, code_addr: u64) -> u64 {
+        let adrp_offset = adrp_offset as usize;
+        let adrp = read_u32(code, adrp_offset);
+        let add = read_u32(code, adrp_offset + 4);
+        let imm21 = (((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 0x3);
+        let page_delta = i64::from(((imm21 << 11) as i32) >> 11);
+        let pc_page = (code_addr + adrp_offset as u64) & !0xfff;
+        let target_page = (i128::from(pc_page) + i128::from(page_delta) * 4096) as u64;
+        target_page + u64::from((add >> 10) & 0xfff)
+    }
+
+    fn text_export(name: &str, offset: u32) -> AotExport<'_> {
+        AotExport {
+            name,
+            section: AotSection::Text,
+            offset,
+        }
+    }
 
     #[test]
     fn rejects_code_that_is_not_whole_instructions() {
         // A truncated blob would emit a dylib that faults on entry rather than
         // failing here, so this must be caught before anything is written.
+        let truncated = AotImage {
+            code: &MOV42_RET[..5],
+            data: &[],
+            exports: &[],
+            relocations: &[],
+        };
         assert!(matches!(
-            validate(&MOV42_RET[..5], &[]),
+            validate(&truncated),
             Err(AotEmitError::CodeNotInstructionAligned(5))
         ));
+        let empty = AotImage {
+            code: &[],
+            data: &[],
+            exports: &[],
+            relocations: &[],
+        };
         assert!(matches!(
-            validate(&[], &[]),
+            validate(&empty),
             Err(AotEmitError::CodeNotInstructionAligned(0))
         ));
     }
@@ -468,19 +932,310 @@ mod tests {
     fn rejects_exports_outside_the_code_blob() {
         let past_end = AotExport {
             name: "carrick_aot_entry",
+            section: AotSection::Text,
             offset: 8,
         };
+        let image = AotImage {
+            code: &MOV42_RET,
+            data: &[],
+            exports: &[past_end],
+            relocations: &[],
+        };
         assert!(matches!(
-            validate(&MOV42_RET, &[past_end]),
+            validate(&image),
             Err(AotEmitError::ExportOutOfRange { offset: 8, .. })
         ));
         let misaligned = AotExport {
             name: "carrick_aot_entry",
+            section: AotSection::Text,
             offset: 2,
         };
+        let image = AotImage {
+            code: &MOV42_RET,
+            data: &[],
+            exports: &[misaligned],
+            relocations: &[],
+        };
         assert!(matches!(
-            validate(&MOV42_RET, &[misaligned]),
+            validate(&image),
             Err(AotEmitError::ExportOutOfRange { offset: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn emits_text_data_and_linkedit_with_exact_protections() {
+        let data = [0x5a; 16];
+        let exports = [
+            text_export("carrick_aot_entry", 0),
+            AotExport {
+                name: "carrick_aot_data",
+                section: AotSection::Data,
+                offset: 0,
+            },
+        ];
+        let bytes = emit_dylib(&AotImage {
+            code: &MOV42_RET,
+            data: &data,
+            exports: &exports,
+            relocations: &[],
+        })
+        .expect("emit text and writable data");
+        let segments = segments(&bytes);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.name.as_str())
+                .collect::<Vec<_>>(),
+            ["__TEXT", "__DATA", "__LINKEDIT"]
+        );
+
+        let text = &segments[0];
+        let data_segment = &segments[1];
+        let linkedit = &segments[2];
+        assert_eq!((text.maxprot, text.initprot), (5, 5), "text must be r-x");
+        assert_eq!(
+            (data_segment.maxprot, data_segment.initprot),
+            (3, 3),
+            "data must be rw-"
+        );
+        assert_eq!(
+            (linkedit.maxprot, linkedit.initprot),
+            (1, 1),
+            "linkedit must be r--"
+        );
+        assert_eq!(data_segment.maxprot & macho::VM_PROT_EXECUTE, 0);
+        assert_eq!(data_segment.vmaddr % macho::PAGE, 0);
+        assert_eq!(data_segment.fileoff % macho::PAGE, 0);
+        assert_eq!(data_segment.filesize, data.len() as u64);
+        assert_eq!(data_segment.vmsize, macho::PAGE);
+        assert_eq!(linkedit.vmaddr, data_segment.vmaddr + data_segment.vmsize);
+        assert_eq!(linkedit.fileoff, data_segment.fileoff + data_segment.vmsize);
+
+        let text_section = section(&segments, "__TEXT");
+        let data_section = section(&segments, "__DATA");
+        assert_eq!(text_section.name, "__text");
+        assert_eq!(text_section.align, 2);
+        assert_eq!(data_section.name, "__data");
+        assert_eq!(data_section.align, 3);
+        assert_eq!(data_section.addr % 8, 0);
+        assert_eq!(data_section.offset % 8, 0);
+        assert_eq!(data_section.size, data.len() as u64);
+        assert_eq!(
+            &bytes[data_section.offset as usize..data_section.offset as usize + data.len()],
+            &data
+        );
+    }
+
+    #[test]
+    fn exports_resolve_to_their_declared_sections() {
+        let data = [0x11; 16];
+        let exports = [
+            text_export("text_entry", 4),
+            AotExport {
+                name: "data_cell",
+                section: AotSection::Data,
+                offset: 8,
+            },
+        ];
+        let bytes = emit_dylib(&AotImage {
+            code: &MOV42_RET,
+            data: &data,
+            exports: &exports,
+            relocations: &[],
+        })
+        .expect("emit section-aware exports");
+        let segments = segments(&bytes);
+        let text_addr = section(&segments, "__TEXT").addr;
+        let data_addr = section(&segments, "__DATA").addr;
+        let nlists = symbols(&bytes);
+        assert_eq!(nlists["text_entry"], (1, text_addr + 4));
+        assert_eq!(nlists["data_cell"], (2, data_addr + 8));
+
+        let trie = exported_addresses(&bytes);
+        assert_eq!(trie["text_entry"], text_addr + 4);
+        assert_eq!(trie["data_cell"], data_addr + 8);
+    }
+
+    #[test]
+    fn patches_positive_and_negative_adrp_displacements() {
+        let code = placeholder_code(1);
+        let data = [0; 16];
+        let relocations = [AotCodeToDataRelocation {
+            adrp_offset: 0,
+            add_offset: 4,
+            data_offset: 8,
+        }];
+        let bytes = emit_dylib(&AotImage {
+            code: &code,
+            data: &data,
+            exports: &[],
+            relocations: &relocations,
+        })
+        .expect("patch positive relocation");
+        let segments = segments(&bytes);
+        let text = section(&segments, "__TEXT");
+        let data = section(&segments, "__DATA");
+        let emitted_code = &bytes[text.offset as usize..text.offset as usize + text.size as usize];
+        assert_eq!(
+            decode_code_to_data_address(emitted_code, 0, text.addr),
+            data.addr + 8
+        );
+
+        // Exercise the signed half of ADRP encoding directly: conventional
+        // Mach-O layout places data after text, while the instruction encoding
+        // must still preserve the full signed architectural range.
+        let mut negative_code = placeholder_code(1);
+        patch_code_to_data_relocations(&mut negative_code, 0x9000, 0x2000, 16, &relocations)
+            .expect("patch negative relocation");
+        assert_eq!(
+            decode_code_to_data_address(&negative_code, 0, 0x9000),
+            0x2008
+        );
+    }
+
+    #[test]
+    fn rejects_unaligned_out_of_range_or_wrong_shape_relocations() {
+        fn assert_emit_rejected(code: &[u8], data: &[u8], relocation: AotCodeToDataRelocation) {
+            let image = AotImage {
+                code,
+                data,
+                exports: &[],
+                relocations: &[relocation],
+            };
+            assert!(
+                matches!(
+                    emit_dylib(&image),
+                    Err(AotEmitError::RelocationInvalid { .. })
+                ),
+                "relocation must be rejected: {relocation:?}"
+            );
+        }
+
+        let code = placeholder_code(1);
+        let data = [0; 16];
+        assert_emit_rejected(
+            &code,
+            &data,
+            AotCodeToDataRelocation {
+                adrp_offset: 2,
+                add_offset: 4,
+                data_offset: 0,
+            },
+        );
+        assert_emit_rejected(
+            &code,
+            &data,
+            AotCodeToDataRelocation {
+                adrp_offset: 0,
+                add_offset: code.len() as u32,
+                data_offset: 0,
+            },
+        );
+        let mut wrong_adrp = code.clone();
+        wrong_adrp[..4].copy_from_slice(&0xd503_201f_u32.to_le_bytes());
+        assert_emit_rejected(
+            &wrong_adrp,
+            &data,
+            AotCodeToDataRelocation {
+                adrp_offset: 0,
+                add_offset: 4,
+                data_offset: 0,
+            },
+        );
+        let mut wrong_add = code.clone();
+        wrong_add[4..8].copy_from_slice(&(ADD_X15_X15_0 | (1 << 10)).to_le_bytes());
+        assert_emit_rejected(
+            &wrong_add,
+            &data,
+            AotCodeToDataRelocation {
+                adrp_offset: 0,
+                add_offset: 4,
+                data_offset: 0,
+            },
+        );
+        for data_offset in [1, data.len() as u32] {
+            assert_emit_rejected(
+                &code,
+                &data,
+                AotCodeToDataRelocation {
+                    adrp_offset: 0,
+                    add_offset: 4,
+                    data_offset,
+                },
+            );
+        }
+
+        let mut too_far = code.clone();
+        let original = too_far.clone();
+        let error =
+            patch_code_to_data_relocations(&mut too_far, 0, 1_u64 << 32, 16, &[relocations()[0]])
+                .expect_err("positive 2^20-page displacement is out of range");
+        assert!(matches!(error, AotEmitError::RelocationInvalid { .. }));
+        assert_eq!(too_far, original, "rejected patch must not mutate code");
+
+        let mut too_far = code.clone();
+        let original = too_far.clone();
+        let error = patch_code_to_data_relocations(
+            &mut too_far,
+            (1_u64 << 32) + 4096,
+            0,
+            16,
+            &[relocations()[0]],
+        )
+        .expect_err("negative displacement below -2^20 pages is out of range");
+        assert!(matches!(error, AotEmitError::RelocationInvalid { .. }));
+        assert_eq!(too_far, original, "rejected patch must not mutate code");
+
+        let mut all_or_nothing = placeholder_code(2);
+        all_or_nothing[12..16].copy_from_slice(&0xd503_201f_u32.to_le_bytes());
+        let original = all_or_nothing.clone();
+        let relocations = [
+            AotCodeToDataRelocation {
+                adrp_offset: 0,
+                add_offset: 4,
+                data_offset: 0,
+            },
+            AotCodeToDataRelocation {
+                adrp_offset: 8,
+                add_offset: 12,
+                data_offset: 8,
+            },
+        ];
+        patch_code_to_data_relocations(&mut all_or_nothing, 0, 0x4000, 16, &relocations)
+            .expect_err("late wrong-shape relocation must reject the whole set");
+        assert_eq!(
+            all_or_nothing, original,
+            "no relocation may patch until the complete set validates"
+        );
+    }
+
+    fn relocations() -> [AotCodeToDataRelocation; 1] {
+        [AotCodeToDataRelocation {
+            adrp_offset: 0,
+            add_offset: 4,
+            data_offset: 0,
+        }]
+    }
+
+    #[test]
+    fn rejects_a_data_export_when_no_data_section_exists() {
+        let export = AotExport {
+            name: "missing_data",
+            section: AotSection::Data,
+            offset: 0,
+        };
+        let image = AotImage {
+            code: &MOV42_RET,
+            data: &[],
+            exports: &[export],
+            relocations: &[],
+        };
+        assert!(matches!(
+            emit_dylib(&image),
+            Err(AotEmitError::ExportOutOfRange {
+                section: AotSection::Data,
+                ..
+            })
         ));
     }
 
@@ -497,11 +1252,14 @@ mod tests {
     /// too slow for a hot path).
     #[test]
     fn emitted_dylib_is_signable_loadable_and_executable() {
-        let entry = AotExport {
-            name: "carrick_aot_entry",
-            offset: 0,
-        };
-        let bytes = emit_dylib(&MOV42_RET, &[entry]).expect("emit a one-instruction unit");
+        let entry = text_export("carrick_aot_entry", 0);
+        let bytes = emit_dylib(&AotImage {
+            code: &MOV42_RET,
+            data: &[],
+            exports: &[entry],
+            relocations: &[],
+        })
+        .expect("emit a one-instruction unit");
 
         let dir = std::env::temp_dir().join(format!("carrick-aot-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -556,10 +1314,13 @@ mod tests {
 
     #[test]
     fn accepts_a_well_formed_unit() {
-        let entry = AotExport {
-            name: "carrick_aot_entry",
-            offset: 0,
+        let entry = text_export("carrick_aot_entry", 0);
+        let image = AotImage {
+            code: &MOV42_RET,
+            data: &[],
+            exports: &[entry],
+            relocations: &[],
         };
-        assert!(validate(&MOV42_RET, &[entry]).is_ok());
+        assert!(validate(&image).is_ok());
     }
 }

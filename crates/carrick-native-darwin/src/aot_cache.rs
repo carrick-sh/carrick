@@ -308,12 +308,6 @@ impl ContainerCacheAuthority {
                 UnitMissReason::ManifestRange,
             ));
         }
-        if !pending.binding_data.is_empty() {
-            return Err(UnitStoreError::new(
-                "publish binding data before data-segment support",
-                UnitMissReason::ManifestRange,
-            ));
-        }
         let preflight_manifest = manifest_for_pending(pending, [0; 32]);
         preflight_manifest
             .validate_ranges()
@@ -350,14 +344,43 @@ impl ContainerCacheAuthority {
                 )
             })?;
         }
-        let dylib = crate::aot::emit_dylib(
-            &pending.code,
-            &[crate::aot::AotExport {
-                name: TRANSLATION_UNIT_BASE_EXPORT,
+        let mut exports = vec![crate::aot::AotExport {
+            name: TRANSLATION_UNIT_BASE_EXPORT,
+            section: crate::aot::AotSection::Text,
+            offset: 0,
+        }];
+        if !pending.binding_data.is_empty() {
+            exports.push(crate::aot::AotExport {
+                name: &pending.binding_export,
+                section: crate::aot::AotSection::Data,
                 offset: 0,
-            }],
-        )
-        .map_err(|error| {
+            });
+        }
+        let relocations = pending
+            .binding_relocations
+            .iter()
+            .flat_map(|relocation| {
+                [
+                    crate::aot::AotCodeToDataRelocation {
+                        adrp_offset: relocation.adrp_offset,
+                        add_offset: relocation.add_offset,
+                        data_offset: relocation.data_offset,
+                    },
+                    crate::aot::AotCodeToDataRelocation {
+                        adrp_offset: relocation.miss_adrp_offset,
+                        add_offset: relocation.miss_add_offset,
+                        data_offset: relocation.data_offset,
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let image = crate::aot::AotImage {
+            code: &pending.code,
+            data: &pending.binding_data,
+            exports: &exports,
+            relocations: &relocations,
+        };
+        let dylib = crate::aot::emit_dylib(&image).map_err(|error| {
             UnitStoreError::with_source(
                 "emit translation dylib",
                 UnitMissReason::ManifestRange,
@@ -845,9 +868,12 @@ fn owns_cleanup(creator_pid: i32, current_pid: i32) -> bool {
 mod tests {
     use super::*;
     use carrick_dsr::address::NativeHostBias;
+    use carrick_dsr_aarch64::direct_binding::DirectBindingOrdinal;
+    use carrick_dsr_aarch64::emit::DirectLinkKind;
     use carrick_dsr_aarch64::shared_cache::{
-        AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
-        ImageFileOffset, NativePageProfileIdentity, SourceFingerprint,
+        AddressModeIdentity, DirectBindingLayout, DirectBindingRelocation, ExecutableIdentity,
+        GuestCodeLen, ImageFileLen, ImageFileOffset, NativePageProfileIdentity, SourceFingerprint,
+        TRANSLATION_UNIT_BINDING_EXPORT, UnresolvedDirectBindingRecord,
     };
     use carrick_guest_mem::GuestVa;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -1054,20 +1080,103 @@ mod tests {
     }
 
     #[test]
-    fn publisher_rejects_nonempty_binding_data_until_data_emission_lands() {
+    fn publisher_emits_and_loads_complete_binding_sidecar() {
+        fn decoded_cell_address(
+            code: &[u8],
+            code_addr: usize,
+            adrp_offset: usize,
+            add_offset: usize,
+        ) -> usize {
+            let adrp = u32::from_le_bytes(
+                code[adrp_offset..adrp_offset + 4]
+                    .try_into()
+                    .expect("mapped ADRP"),
+            );
+            let add = u32::from_le_bytes(
+                code[add_offset..add_offset + 4]
+                    .try_into()
+                    .expect("mapped ADD"),
+            );
+            let immediate = (((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 0x3);
+            let delta_pages = i128::from(((immediate << 11) as i32) >> 11);
+            let pc_page = (code_addr + adrp_offset) & !0xfff;
+            (pc_page as i128 + delta_pages * 4096) as usize + ((add >> 10) & 0xfff) as usize
+        }
+
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let mut pending = fixture_pending();
+        pending.code.resize(288, 0);
+        pending.code[..MOV42_RET.len()].copy_from_slice(&MOV42_RET);
+        for offset in [52, 140] {
+            pending.code[offset..offset + 4].copy_from_slice(&0x9000_000f_u32.to_le_bytes());
+        }
+        for offset in [56, 144] {
+            pending.code[offset..offset + 4].copy_from_slice(&0x9100_01ef_u32.to_le_bytes());
+        }
         pending.binding_layout = DirectBindingLayout::SidecarV1;
-        pending.binding_export =
-            carrick_dsr_aarch64::shared_cache::TRANSLATION_UNIT_BINDING_EXPORT.to_owned();
+        pending.binding_export = TRANSLATION_UNIT_BINDING_EXPORT.to_owned();
         pending.binding_data_len = 8;
         pending.cell_size = 8;
+        pending.bindings = vec![UnresolvedDirectBindingRecord {
+            source: GuestVa(0x400000),
+            target: GuestVa(0x500000),
+            kind: DirectLinkKind::Branch,
+            ordinal: DirectBindingOrdinal::claimed(0),
+            stub_start: 32,
+            stub_end: 288,
+        }];
+        pending.binding_relocations = vec![DirectBindingRelocation {
+            ordinal: DirectBindingOrdinal::claimed(0),
+            adrp_offset: 52,
+            add_offset: 56,
+            miss_adrp_offset: 140,
+            miss_add_offset: 144,
+            data_offset: 0,
+        }];
         pending.binding_data = vec![0; 8];
 
-        let error = authority
-            .publish_unit(&pending)
-            .expect_err("Task 7 must not publish an incomplete data segment");
-        assert_eq!(error.reason(), UnitMissReason::ManifestRange);
+        assert_eq!(
+            authority
+                .publish_unit(&pending)
+                .expect("publish complete sidecar"),
+            PublishOutcome::Winner
+        );
+        let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
+        let loaded = authority
+            .load_unit(&pending.key, &source_words)
+            .expect("load complete sidecar");
+        let binding_symbol =
+            CString::new(TRANSLATION_UNIT_BINDING_EXPORT).expect("binding export CString");
+        let binding_base =
+            unsafe { libc::dlsym(loaded.handle.as_ptr(), binding_symbol.as_ptr()) }.cast::<u8>();
+        let binding_base = std::ptr::NonNull::new(binding_base).expect("resolve binding export");
+        assert!((binding_base.as_ptr() as usize).is_multiple_of(DIRECT_BINDING_CELL_SIZE as usize));
+        // SAFETY: the base export and manifest code length were validated by
+        // `load_unit`; the dlopen handle remains owned by `loaded`.
+        let mapped_code =
+            unsafe { std::slice::from_raw_parts(loaded.base.as_ptr(), pending.code.len()) };
+        for (adrp_offset, add_offset) in [(52, 56), (140, 144)] {
+            assert_eq!(
+                decoded_cell_address(
+                    mapped_code,
+                    loaded.base.as_ptr() as usize,
+                    adrp_offset,
+                    add_offset,
+                ),
+                binding_base.as_ptr() as usize,
+                "hit and miss sites must both address the same binding cell"
+            );
+        }
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(binding_base.as_ptr(), 8) },
+            &[0; 8]
+        );
+        assert_eq!(
+            authority
+                .publish_unit(&pending)
+                .expect("republish complete sidecar"),
+            PublishOutcome::Existing
+        );
     }
 
     #[test]
