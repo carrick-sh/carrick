@@ -1717,7 +1717,7 @@ impl NativeMappedMemory {
             // A fork child cannot allocate a fresh JIT cache safely, so exec
             // reuses its inherited mapping. Keep the old cache intact until
             // the complete replacement image is mapped and relocated; only
-            // then clear its inherited publications before the thread-level
+            // then clear its inherited translations before the thread-level
             // handoff can execute the new image.
             translator.reset_after_fork_for_exec();
         }

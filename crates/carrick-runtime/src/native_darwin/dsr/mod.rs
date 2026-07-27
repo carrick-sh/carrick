@@ -270,6 +270,7 @@ mod tests {
     fn mapped_dsr_test_memory(
         words: &[u32],
     ) -> Result<(super::super::NativeMappedMemory, GuestVa), String> {
+        super::install_test_host_jit();
         let page_size = 16 * 1024_u64;
         let layout = super::super::MemoryLayout {
             heap_base: super::super::NATIVE_DARWIN_HEAP_BASE,
@@ -326,6 +327,12 @@ mod tests {
                 {
                     return Err(format!(
                         "unexpected outcomes: first={first:?} second={second:?}"
+                    ));
+                }
+                if state.stats.duplicate_publications != 0 {
+                    return Err(format!(
+                        "exclusive ProcessState translation recorded {} impossible duplicate publications",
+                        state.stats.duplicate_publications
                     ));
                 }
                 drop(state);
@@ -749,7 +756,7 @@ mod tests {
         );
         let key = (PC, super::types::CodeGeneration::INITIAL);
         let entry = super::types::CacheVa::published(carrick_guest_mem::HostVa(0x1000));
-        old.state.read().publications.get_or_publish(key, || entry);
+        old.state.write().blocks.insert(key, entry);
         let mut thread = super::ThreadTranslator::for_process(std::sync::Arc::clone(&old), 0);
         let next = std::sync::Arc::new(
             super::test_process_translator(16 * 1024).expect("create next translator"),
@@ -758,8 +765,8 @@ mod tests {
         thread.reset_for_exec(next);
 
         assert_eq!(
-            old.state.read().publications.published_count(),
-            1,
+            old.state.read().blocks.get(&key),
+            Some(&entry),
             "pre-exec threads must retain old PC metadata until their Arc retires"
         );
     }
@@ -1609,16 +1616,11 @@ mod tests {
             super::test_process_translator(16 * 1024).expect("create inherited translator");
         let key = (PC, super::types::CodeGeneration::INITIAL);
         let entry = super::types::CacheVa::published(carrick_guest_mem::HostVa(0x1000));
-        process
-            .state
-            .read()
-            .publications
-            .get_or_publish(key, || entry);
+        process.state.write().blocks.insert(key, entry);
 
         process.reset_after_fork_for_exec();
 
         let state = process.state.read();
-        assert_eq!(state.publications.published_count(), 0);
         assert!(state.blocks.is_empty());
         assert!(state.published.is_empty());
     }

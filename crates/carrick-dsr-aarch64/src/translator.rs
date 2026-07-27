@@ -301,7 +301,6 @@ pub struct ProcessState {
         BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), (u32, bad64::Op)>,
     pub published: Vec<PublishedBlock>,
     pub dependencies: cache::PageBlockDependencies,
-    pub publications: cache::ConcurrentPublicationIndex,
     pub profiling: bool,
     artifact_image_digest: Option<[u8; 32]>,
     shared_translation: Option<SharedTranslationConfiguration>,
@@ -1167,7 +1166,6 @@ impl ProcessTranslator {
                 unsupported: BTreeMap::new(),
                 published: Vec::new(),
                 dependencies: cache::PageBlockDependencies::default(),
-                publications: cache::ConcurrentPublicationIndex::default(),
                 profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
                 artifact_image_digest: None,
                 shared_translation: None,
@@ -1295,7 +1293,6 @@ impl ProcessTranslator {
     pub fn after_fork_child(&self) {
         let mut state = self.state.write();
         state.cache.after_fork_child();
-        state.publications.after_fork_child();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
         let capacity = u64::try_from(state.cache.capacity_bytes()).unwrap_or(u64::MAX);
@@ -1314,7 +1311,6 @@ impl ProcessTranslator {
         state.sensitive.clear();
         state.unsupported.clear();
         state.dependencies = cache::PageBlockDependencies::default();
-        state.publications.reset_for_exec();
         state.shared_translation = None;
         state.shared_blocks.clear();
         state.loaded_shared_units.clear();
@@ -1531,7 +1527,6 @@ impl ProcessState {
     )]
     fn publish_emitted(
         &mut self,
-        tid: i32,
         memory: &NativeMappedMemory,
         key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
         source_page: carrick_guest_mem::GuestVa,
@@ -1541,34 +1536,14 @@ impl ProcessState {
         outcome: TranslationOutcome,
     ) -> Result<TranslationResult, types::DsrError> {
         let entry = emitted.entry();
-        // The extracted publication index is probe-free; fire the exact
-        // pre-extraction DuplicateWait subphase probes from its observer.
-        let published_entry = self
-            .publications
-            .get_or_publish_observed(key, || entry, &|event| match event {
-                cache::PublicationWaitEvent::WaitBegin => probes::dsr_translate_subphase_begin(
-                    tid,
-                    probes::DsrTranslationSubphase::DuplicateWait,
-                    key.0.raw(),
-                    key.1.get(),
-                ),
-                cache::PublicationWaitEvent::WaitEnd => probes::dsr_translate_subphase_end(
-                    tid,
-                    probes::DsrTranslationSubphase::DuplicateWait,
-                    key.0.raw(),
-                    key.1.get(),
-                ),
-            });
-        if published_entry != entry {
-            self.stats.add(ResolverStat::DuplicatePublications, 1);
-            return Ok(TranslationResult {
-                entry: published_entry,
-                generation: key.1,
-                outcome,
-                emitted_bytes,
-                cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
-            });
-        }
+        // `ProcessState::translate` owns `&mut self` from the process
+        // translator's write guard. It re-checks `blocks` after acquiring
+        // that guard, then retains exclusive access through this publication.
+        // A second mutex-protected publication index cannot arbitrate a race
+        // here: Rust already makes a concurrent `&mut ProcessState`
+        // impossible. The former index performed two mutex acquisitions and
+        // two BTreeMap mutations for every newly translated block while
+        // recording zero duplicate publications in production profiles.
         let emitted_len = emitted.len();
         let (map, links, recovery) = emitted.into_runtime_metadata();
         self.published.push(PublishedBlock {
@@ -1760,7 +1735,6 @@ impl ProcessState {
                         u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
                     );
                     return self.publish_emitted(
-                        tid,
                         memory,
                         key,
                         source_page,
@@ -2069,7 +2043,6 @@ impl ProcessState {
             );
             let publication_started = self.profiling.then(std::time::Instant::now);
             let publication_result = self.publish_emitted(
-                tid,
                 memory,
                 key,
                 source_page,
