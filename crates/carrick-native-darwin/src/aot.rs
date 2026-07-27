@@ -113,6 +113,10 @@ pub enum AotEmitError {
         index: usize,
         reason: AotRelocationError,
     },
+    /// File-layout arithmetic overflowed before a representable image existed.
+    LayoutOverflow { field: &'static str },
+    /// A value did not fit the fixed-width Mach-O field that carries it.
+    MachOFieldOutOfRange { field: &'static str, value: u64 },
     /// A symbol name cannot be represented in a Mach-O string table.
     SymbolNameUnrepresentable(String),
     /// The Mach-O writer rejected the unit. Kept as a string because the
@@ -147,6 +151,12 @@ impl std::fmt::Display for AotEmitError {
             Self::RelocationInvalid { index, reason } => {
                 write!(f, "AOT relocation {index} is invalid: {reason:?}")
             }
+            Self::LayoutOverflow { field } => {
+                write!(f, "AOT layout overflow while computing {field}")
+            }
+            Self::MachOFieldOutOfRange { field, value } => {
+                write!(f, "AOT {field} value {value} does not fit its Mach-O field")
+            }
             Self::SymbolNameUnrepresentable(name) => {
                 write!(f, "symbol name {name:?} cannot be encoded (embedded NUL)")
             }
@@ -177,7 +187,13 @@ pub fn validate(image: &AotImage<'_>) -> Result<(), AotEmitError> {
             AotSection::Text => (image.code.len(), 4),
             AotSection::Data => (image.data.len(), 8),
         };
-        let offset = export.offset as usize;
+        let offset =
+            usize::try_from(export.offset).map_err(|_| AotEmitError::ExportOutOfRange {
+                name: export.name.to_owned(),
+                section: export.section,
+                offset: export.offset,
+                section_len,
+            })?;
         if offset >= section_len || !offset.is_multiple_of(alignment) {
             return Err(AotEmitError::ExportOutOfRange {
                 name: export.name.to_owned(),
@@ -233,6 +249,182 @@ mod macho {
     pub const HEADER_SLACK: u64 = 256;
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AotLayoutLengths {
+    sizeofcmds: u64,
+    code_len: u64,
+    data_len: u64,
+    trie_len: u64,
+    nlists_len: u64,
+    strtab_len: u64,
+    export_count: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AotSectionLayout {
+    code_addr: u64,
+    text_vmsize: u64,
+    data_addr: u64,
+    data_vmsize: u64,
+    linkedit_off: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AotLayout {
+    sizeofcmds: u32,
+    sizeofcmds_usize: usize,
+    code_addr: u64,
+    code_start: usize,
+    code_fileoff: u32,
+    text_vmsize: u64,
+    data_addr: u64,
+    data_start: Option<usize>,
+    data_end: Option<usize>,
+    data_fileoff: Option<u32>,
+    data_vmsize: u64,
+    linkedit_off: u64,
+    linkedit_start: usize,
+    linkedit_size: u64,
+    linkedit_vmsize: u64,
+    export_off: u32,
+    export_size: u32,
+    symoff: u32,
+    nsyms: u32,
+    stroff: u32,
+    strsize: u32,
+    output_len: usize,
+}
+
+fn layout_overflow(field: &'static str) -> AotEmitError {
+    AotEmitError::LayoutOverflow { field }
+}
+
+fn checked_add(left: u64, right: u64, field: &'static str) -> Result<u64, AotEmitError> {
+    left.checked_add(right)
+        .ok_or_else(|| layout_overflow(field))
+}
+
+fn checked_align_up(value: u64, alignment: u64, field: &'static str) -> Result<u64, AotEmitError> {
+    let mask = alignment
+        .checked_sub(1)
+        .ok_or_else(|| layout_overflow(field))?;
+    Ok(checked_add(value, mask, field)? & !mask)
+}
+
+fn checked_u32(value: u64, field: &'static str) -> Result<u32, AotEmitError> {
+    u32::try_from(value).map_err(|_| AotEmitError::MachOFieldOutOfRange { field, value })
+}
+
+fn checked_u8(value: u64, field: &'static str) -> Result<u8, AotEmitError> {
+    u8::try_from(value).map_err(|_| AotEmitError::MachOFieldOutOfRange { field, value })
+}
+
+fn checked_u64(value: usize, field: &'static str) -> Result<u64, AotEmitError> {
+    u64::try_from(value).map_err(|_| layout_overflow(field))
+}
+
+fn checked_usize(value: u64, field: &'static str) -> Result<usize, AotEmitError> {
+    usize::try_from(value).map_err(|_| AotEmitError::MachOFieldOutOfRange { field, value })
+}
+
+fn checked_section_layout(
+    sizeofcmds: u64,
+    code_len: u64,
+    data_len: u64,
+) -> Result<AotSectionLayout, AotEmitError> {
+    use macho::{HEADER_SLACK, PAGE};
+
+    let header_size = checked_add(
+        checked_add(32, sizeofcmds, "header size")?,
+        HEADER_SLACK,
+        "header size",
+    )?;
+    let text_end = checked_add(header_size, code_len, "text end")?;
+    let text_vmsize = checked_align_up(text_end, PAGE, "text vmsize")?;
+    let data_vmsize = if data_len == 0 {
+        0
+    } else {
+        checked_align_up(data_len, PAGE, "data vmsize")?
+    };
+    let linkedit_off = checked_add(text_vmsize, data_vmsize, "linkedit offset")?;
+    Ok(AotSectionLayout {
+        code_addr: header_size,
+        text_vmsize,
+        data_addr: text_vmsize,
+        data_vmsize,
+        linkedit_off,
+    })
+}
+
+fn checked_layout(lengths: AotLayoutLengths) -> Result<AotLayout, AotEmitError> {
+    use macho::PAGE;
+
+    let sections = checked_section_layout(lengths.sizeofcmds, lengths.code_len, lengths.data_len)?;
+    let symoff = checked_add(
+        sections.linkedit_off,
+        lengths.trie_len,
+        "symbol table offset",
+    )?;
+    let stroff = checked_add(symoff, lengths.nlists_len, "string table offset")?;
+    let linkedit_size = checked_add(
+        checked_add(lengths.trie_len, lengths.nlists_len, "linkedit size")?,
+        lengths.strtab_len,
+        "linkedit size",
+    )?;
+    let linkedit_vmsize = checked_align_up(linkedit_size, PAGE, "linkedit vmsize")?;
+    let output_len = checked_add(sections.linkedit_off, linkedit_size, "output length")?;
+
+    let sizeofcmds = checked_u32(lengths.sizeofcmds, "load command size")?;
+    let export_off = checked_u32(sections.linkedit_off, "linkedit offset")?;
+    let export_size = checked_u32(lengths.trie_len, "export trie size")?;
+    let symoff_u32 = checked_u32(symoff, "symbol table offset")?;
+    let nsyms = checked_u32(lengths.export_count, "symbol count")?;
+    let stroff_u32 = checked_u32(stroff, "string table offset")?;
+    let strsize = checked_u32(lengths.strtab_len, "string table size")?;
+    let code_fileoff = checked_u32(sections.code_addr, "text section offset")?;
+    let data_fileoff = if lengths.data_len == 0 {
+        None
+    } else {
+        Some(checked_u32(sections.data_addr, "data section offset")?)
+    };
+
+    let data_end = if lengths.data_len == 0 {
+        None
+    } else {
+        Some(checked_usize(
+            checked_add(sections.data_addr, lengths.data_len, "data section end")?,
+            "data section end",
+        )?)
+    };
+
+    Ok(AotLayout {
+        sizeofcmds,
+        sizeofcmds_usize: checked_usize(lengths.sizeofcmds, "load command size")?,
+        code_addr: sections.code_addr,
+        code_start: checked_usize(sections.code_addr, "text section offset")?,
+        code_fileoff,
+        text_vmsize: sections.text_vmsize,
+        data_addr: sections.data_addr,
+        data_start: data_fileoff
+            .map(|_| checked_usize(sections.data_addr, "data section offset"))
+            .transpose()?,
+        data_end,
+        data_fileoff,
+        data_vmsize: sections.data_vmsize,
+        linkedit_off: sections.linkedit_off,
+        linkedit_start: checked_usize(sections.linkedit_off, "linkedit offset")?,
+        linkedit_size,
+        linkedit_vmsize,
+        export_off,
+        export_size,
+        symoff: symoff_u32,
+        nsyms,
+        stroff: stroff_u32,
+        strsize,
+        output_len: checked_usize(output_len, "output length")?,
+    })
+}
+
 fn patch_code_to_data_relocations(
     code: &mut [u8],
     code_vmaddr: u64,
@@ -249,10 +441,6 @@ fn patch_code_to_data_relocations(
 
     let mut patches = Vec::with_capacity(relocations.len());
     for (index, relocation) in relocations.iter().copied().enumerate() {
-        let adrp_offset = relocation.adrp_offset as usize;
-        let add_offset = relocation.add_offset as usize;
-        let adrp_end = adrp_offset.checked_add(4);
-        let add_end = add_offset.checked_add(4);
         let invalid_code_offset = || AotEmitError::RelocationInvalid {
             index,
             reason: AotRelocationError::CodeOffset {
@@ -261,6 +449,12 @@ fn patch_code_to_data_relocations(
                 code_len: code.len(),
             },
         };
+        let adrp_offset =
+            usize::try_from(relocation.adrp_offset).map_err(|_| invalid_code_offset())?;
+        let add_offset =
+            usize::try_from(relocation.add_offset).map_err(|_| invalid_code_offset())?;
+        let adrp_end = adrp_offset.checked_add(4);
+        let add_end = add_offset.checked_add(4);
         if !adrp_offset.is_multiple_of(4)
             || !add_offset.is_multiple_of(4)
             || adrp_end.is_none_or(|end| end > code.len())
@@ -285,17 +479,19 @@ fn patch_code_to_data_relocations(
             });
         }
 
-        let data_offset = relocation.data_offset as usize;
+        let invalid_data_offset = || AotEmitError::RelocationInvalid {
+            index,
+            reason: AotRelocationError::DataOffset {
+                data_offset: relocation.data_offset,
+                data_len,
+            },
+        };
+        let data_offset =
+            usize::try_from(relocation.data_offset).map_err(|_| invalid_data_offset())?;
         if !data_offset.is_multiple_of(8)
             || data_offset.checked_add(8).is_none_or(|end| end > data_len)
         {
-            return Err(AotEmitError::RelocationInvalid {
-                index,
-                reason: AotRelocationError::DataOffset {
-                    data_offset: relocation.data_offset,
-                    data_len,
-                },
-            });
+            return Err(invalid_data_offset());
         }
 
         let pc = code_vmaddr.checked_add(u64::from(relocation.adrp_offset));
@@ -318,19 +514,39 @@ fn patch_code_to_data_relocations(
             });
         }
 
-        let immediate = (delta_pages as i64 as u64) & 0x1f_ffff;
-        let patched_adrp =
-            ADRP_X15 | ((immediate & 0x3) as u32) << 29 | ((immediate >> 2) as u32) << 5;
-        let low_twelve = (target & (ADRP_PAGE - 1)) as u32;
+        let encoded_delta = if delta_pages < 0 {
+            delta_pages + (1 << 21)
+        } else {
+            delta_pages
+        };
+        let immediate =
+            u32::try_from(encoded_delta).map_err(|_| AotEmitError::RelocationInvalid {
+                index,
+                reason: AotRelocationError::PageDelta { delta_pages },
+            })?;
+        let patched_adrp = ADRP_X15 | ((immediate & 0x3) << 29) | ((immediate >> 2) << 5);
+        let low_twelve = u32::try_from(target & (ADRP_PAGE - 1)).map_err(|_| {
+            AotEmitError::RelocationInvalid {
+                index,
+                reason: AotRelocationError::PageDelta { delta_pages },
+            }
+        })?;
         let patched_add = ADD_X15_X15_0 | (low_twelve << 10);
-        patches.push((adrp_offset, patched_adrp, add_offset, patched_add));
+        patches.push((
+            adrp_offset,
+            adrp_end.ok_or_else(invalid_code_offset)?,
+            patched_adrp,
+            add_offset,
+            add_end.ok_or_else(invalid_code_offset)?,
+            patched_add,
+        ));
     }
 
     // The validation loop above is intentionally complete before this first
     // write: one malformed late record must leave every earlier pair pristine.
-    for (adrp_offset, adrp, add_offset, add) in patches {
-        code[adrp_offset..adrp_offset + 4].copy_from_slice(&adrp.to_le_bytes());
-        code[add_offset..add_offset + 4].copy_from_slice(&add.to_le_bytes());
+    for (adrp_offset, adrp_end, adrp, add_offset, add_end, add) in patches {
+        code[adrp_offset..adrp_end].copy_from_slice(&adrp.to_le_bytes());
+        code[add_offset..add_end].copy_from_slice(&add.to_le_bytes());
     }
     Ok(())
 }
@@ -354,7 +570,9 @@ fn uleb128(mut value: u64, out: &mut Vec<u8>) {
 /// A spike that searched too narrow a range silently emitted offset 7 for a true
 /// offset of 21, which sent dyld into the middle of a symbol name and trapped
 /// inside `mach_o::ExportsTrie::valid`.
-fn export_trie(exports: &[(String, u64)]) -> Vec<u8> {
+fn export_trie(exports: &[(String, u64)]) -> Result<Vec<u8>, AotEmitError> {
+    let export_count = checked_u64(exports.len(), "export trie child count")?;
+    let child_count = checked_u8(export_count, "export trie child count")?;
     // Terminal node per export: terminal_size, flags(0 = regular), address,
     // then a zero child count.
     let terminals: Vec<Vec<u8>> = exports
@@ -364,19 +582,22 @@ fn export_trie(exports: &[(String, u64)]) -> Vec<u8> {
             uleb128(0, &mut payload); // EXPORT_SYMBOL_FLAGS_KIND_REGULAR
             uleb128(*addr, &mut payload);
             let mut node = Vec::new();
-            uleb128(payload.len() as u64, &mut node);
+            uleb128(
+                checked_u64(payload.len(), "export trie terminal size")?,
+                &mut node,
+            );
             node.extend_from_slice(&payload);
             node.push(0); // no children
-            node
+            Ok(node)
         })
-        .collect();
+        .collect::<Result<_, AotEmitError>>()?;
 
     let mut offsets: Vec<u64> = vec![0; exports.len()];
     let mut root = Vec::new();
     for _ in 0..16 {
         root.clear();
         uleb128(0, &mut root); // root is not itself terminal
-        root.push(exports.len() as u8);
+        root.push(child_count);
         for (i, (name, _)) in exports.iter().enumerate() {
             // The trie stores the MACH-O name, i.e. with the leading
             // underscore; `dlsym("foo")` looks up `_foo`.
@@ -385,11 +606,15 @@ fn export_trie(exports: &[(String, u64)]) -> Vec<u8> {
             root.push(0);
             uleb128(offsets[i], &mut root);
         }
-        let mut cursor = root.len() as u64;
+        let mut cursor = checked_u64(root.len(), "export trie offset")?;
         let mut next = Vec::with_capacity(exports.len());
         for terminal in &terminals {
             next.push(cursor);
-            cursor += terminal.len() as u64;
+            cursor = checked_add(
+                cursor,
+                checked_u64(terminal.len(), "export trie offset")?,
+                "export trie offset",
+            )?;
         }
         if next == offsets {
             let mut trie = root;
@@ -399,11 +624,13 @@ fn export_trie(exports: &[(String, u64)]) -> Vec<u8> {
             while !trie.len().is_multiple_of(8) {
                 trie.push(0);
             }
-            return trie;
+            return Ok(trie);
         }
         offsets = next;
     }
-    unreachable!("export trie offsets converge in at most a couple of rounds")
+    Err(AotEmitError::Writer(
+        "export trie offsets did not converge".to_owned(),
+    ))
 }
 
 /// Emit a complete, loadable arm64 `MH_DYLIB` for `image`.
@@ -432,36 +659,42 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
     // image with a bare "not a mach-o".
 
     let install_name = b"@rpath/carrick_aot.dylib";
-    let id_dylib_cmd = 24 + (install_name.len() as u64 + 1).next_multiple_of(8);
-
     let has_data = !image.data.is_empty();
-    let sizeofcmds = (SEG_CMD + SECT)
-        + if has_data { SEG_CMD + SECT } else { 0 }
-        + SEG_CMD
-        + id_dylib_cmd
-        + DYLD_INFO_CMD
-        + SYMTAB_CMD
-        + DYSYMTAB_CMD
-        + BUILD_VERSION_CMD;
-    let header_size = 32 + sizeofcmds + HEADER_SLACK;
+    let install_name_size = checked_add(
+        checked_u64(install_name.len(), "install name size")?,
+        1,
+        "install name size",
+    )?;
+    let id_dylib_cmd = checked_add(
+        24,
+        checked_align_up(install_name_size, 8, "install name size")?,
+        "install-name command size",
+    )?;
+    let mut sizeofcmds = 0;
+    for command_size in [
+        SEG_CMD + SECT,
+        if has_data { SEG_CMD + SECT } else { 0 },
+        SEG_CMD,
+        id_dylib_cmd,
+        DYLD_INFO_CMD,
+        SYMTAB_CMD,
+        DYSYMTAB_CMD,
+        BUILD_VERSION_CMD,
+    ] {
+        sizeofcmds = checked_add(sizeofcmds, command_size, "load command size")?;
+    }
+    let code_len = checked_u64(image.code.len(), "code length")?;
+    let data_len = checked_u64(image.data.len(), "data length")?;
+    let export_count = checked_u64(image.exports.len(), "symbol count")?;
+    let sections = checked_section_layout(sizeofcmds, code_len, data_len)?;
 
     // `__TEXT` has vmaddr 0 and covers the header, so a section's vmaddr and its
     // file offset are the same number.
-    let code_addr = header_size;
-    let text_vmsize = (code_addr + image.code.len() as u64).next_multiple_of(PAGE);
-    let data_addr = text_vmsize;
-    let data_vmsize = if has_data {
-        (image.data.len() as u64).next_multiple_of(PAGE)
-    } else {
-        0
-    };
-    let linkedit_off = data_addr + data_vmsize;
-
     let mut code = image.code.to_vec();
     patch_code_to_data_relocations(
         &mut code,
-        code_addr,
-        data_addr,
+        sections.code_addr,
+        sections.data_addr,
         image.data.len(),
         image.relocations,
     )?;
@@ -471,27 +704,27 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
         .iter()
         .map(|export| {
             let section_addr = match export.section {
-                AotSection::Text => code_addr,
-                AotSection::Data => data_addr,
+                AotSection::Text => sections.code_addr,
+                AotSection::Data => sections.data_addr,
             };
-            (
+            Ok((
                 export.name.to_owned(),
                 export.section,
-                section_addr + u64::from(export.offset),
-            )
+                checked_add(section_addr, u64::from(export.offset), "export address")?,
+            ))
         })
-        .collect();
+        .collect::<Result<_, AotEmitError>>()?;
     let trie_exports = resolved
         .iter()
         .map(|(name, _, addr)| (name.clone(), *addr))
         .collect::<Vec<_>>();
-    let trie = export_trie(&trie_exports);
+    let trie = export_trie(&trie_exports)?;
 
     // String table: a leading NUL, then each `_name`.
     let mut strtab = vec![0u8];
     let mut name_offsets = Vec::with_capacity(image.exports.len());
     for export in image.exports {
-        name_offsets.push(strtab.len() as u32);
+        name_offsets.push(strtab.len());
         strtab.push(b'_');
         strtab.extend_from_slice(export.name.as_bytes());
         strtab.push(0);
@@ -500,9 +733,28 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
         strtab.push(0);
     }
 
+    let trie_len = checked_u64(trie.len(), "export trie size")?;
+    let nlists_len = export_count
+        .checked_mul(16)
+        .ok_or_else(|| layout_overflow("symbol table size"))?;
+    let strtab_len = checked_u64(strtab.len(), "string table size")?;
+    let layout = checked_layout(AotLayoutLengths {
+        sizeofcmds,
+        code_len,
+        data_len,
+        trie_len,
+        nlists_len,
+        strtab_len,
+        export_count,
+    })?;
+
     let mut nlists = Vec::new();
     for (i, (_, section, addr)) in resolved.iter().enumerate() {
-        nlists.extend_from_slice(&name_offsets[i].to_le_bytes());
+        let name_offset = checked_u32(
+            checked_u64(name_offsets[i], "string table name offset")?,
+            "string table name offset",
+        )?;
+        nlists.extend_from_slice(&name_offset.to_le_bytes());
         nlists.push(N_SECT_EXT);
         nlists.push(match section {
             AotSection::Text => 1,
@@ -511,12 +763,17 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
         nlists.extend_from_slice(&0u16.to_le_bytes());
         nlists.extend_from_slice(&addr.to_le_bytes());
     }
+    debug_assert!(u64::try_from(nlists.len()).ok() == Some(nlists_len));
 
-    let symoff = linkedit_off + trie.len() as u64;
-    let stroff = symoff + nlists.len() as u64;
-    let linkedit_size = trie.len() as u64 + nlists.len() as u64 + strtab.len() as u64;
-
-    let mut cmds: Vec<u8> = Vec::with_capacity(sizeofcmds as usize);
+    let mut cmds: Vec<u8> = Vec::with_capacity(layout.sizeofcmds_usize);
+    let segment_command_size = checked_u32(SEG_CMD, "segment command size")?;
+    let segment_section_command_size = checked_u32(SEG_CMD + SECT, "segment command size")?;
+    let id_dylib_command_size = checked_u32(id_dylib_cmd, "install-name command size")?;
+    let id_dylib_command_size_usize = checked_usize(id_dylib_cmd, "install-name command size")?;
+    let dyld_info_command_size = checked_u32(DYLD_INFO_CMD, "dyld info command size")?;
+    let symtab_command_size = checked_u32(SYMTAB_CMD, "symbol table command size")?;
+    let dysymtab_command_size = checked_u32(DYSYMTAB_CMD, "dynamic symbol command size")?;
+    let build_version_command_size = checked_u32(BUILD_VERSION_CMD, "build-version command size")?;
     let seg = |name: &[u8],
                vmaddr: u64,
                vmsize: u64,
@@ -524,10 +781,10 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
                fsize: u64,
                prot: i32,
                nsects: i32,
-               cmdsize: u64,
+               cmdsize: u32,
                out: &mut Vec<u8>| {
         out.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
-        out.extend_from_slice(&(cmdsize as u32).to_le_bytes());
+        out.extend_from_slice(&cmdsize.to_le_bytes());
         let mut padded = [0u8; 16];
         padded[..name.len()].copy_from_slice(name);
         out.extend_from_slice(&padded);
@@ -542,12 +799,12 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
     seg(
         b"__TEXT",
         0,
-        text_vmsize,
+        layout.text_vmsize,
         0,
-        text_vmsize,
+        layout.text_vmsize,
         VM_PROT_READ | VM_PROT_EXECUTE,
         1,
-        SEG_CMD + SECT,
+        segment_section_command_size,
         &mut cmds,
     );
     // section_64 for __text
@@ -557,24 +814,27 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
     seg_name[..6].copy_from_slice(b"__TEXT");
     cmds.extend_from_slice(&sect_name);
     cmds.extend_from_slice(&seg_name);
-    cmds.extend_from_slice(&code_addr.to_le_bytes());
-    cmds.extend_from_slice(&(code.len() as u64).to_le_bytes());
-    cmds.extend_from_slice(&(code_addr as u32).to_le_bytes());
+    cmds.extend_from_slice(&layout.code_addr.to_le_bytes());
+    cmds.extend_from_slice(&code_len.to_le_bytes());
+    cmds.extend_from_slice(&layout.code_fileoff.to_le_bytes());
     cmds.extend_from_slice(&2u32.to_le_bytes()); // align 2^2 = 4, the arm64 instruction size
     for v in [0u32, 0, TEXT_SECTION_FLAGS, 0, 0, 0] {
         cmds.extend_from_slice(&v.to_le_bytes());
     }
 
     if has_data {
+        let Some(data_fileoff) = layout.data_fileoff else {
+            return Err(layout_overflow("data section offset"));
+        };
         seg(
             b"__DATA",
-            data_addr,
-            data_vmsize,
-            data_addr,
-            image.data.len() as u64,
+            layout.data_addr,
+            layout.data_vmsize,
+            layout.data_addr,
+            data_len,
             VM_PROT_READ | VM_PROT_WRITE,
             1,
-            SEG_CMD + SECT,
+            segment_section_command_size,
             &mut cmds,
         );
         // section_64 for __data. Its segment begins on a 16 KiB boundary;
@@ -585,9 +845,9 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
         seg_name[..6].copy_from_slice(b"__DATA");
         cmds.extend_from_slice(&sect_name);
         cmds.extend_from_slice(&seg_name);
-        cmds.extend_from_slice(&data_addr.to_le_bytes());
-        cmds.extend_from_slice(&(image.data.len() as u64).to_le_bytes());
-        cmds.extend_from_slice(&(data_addr as u32).to_le_bytes());
+        cmds.extend_from_slice(&layout.data_addr.to_le_bytes());
+        cmds.extend_from_slice(&data_len.to_le_bytes());
+        cmds.extend_from_slice(&data_fileoff.to_le_bytes());
         cmds.extend_from_slice(&3u32.to_le_bytes()); // align 2^3 = 8-byte cells
         for value in [0u32; 6] {
             cmds.extend_from_slice(&value.to_le_bytes());
@@ -596,13 +856,13 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
 
     seg(
         b"__LINKEDIT",
-        linkedit_off,
-        linkedit_size.next_multiple_of(PAGE),
-        linkedit_off,
-        linkedit_size,
+        layout.linkedit_off,
+        layout.linkedit_vmsize,
+        layout.linkedit_off,
+        layout.linkedit_size,
         VM_PROT_READ,
         0,
-        SEG_CMD,
+        segment_command_size,
         &mut cmds,
     );
 
@@ -611,12 +871,12 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
     // a shorter length than declared and desynchronised `sizeofcmds`.
     let id_start = cmds.len();
     cmds.extend_from_slice(&LC_ID_DYLIB.to_le_bytes());
-    cmds.extend_from_slice(&(id_dylib_cmd as u32).to_le_bytes());
+    cmds.extend_from_slice(&id_dylib_command_size.to_le_bytes());
     for v in [24u32, 0, 0x1_0000, 0x1_0000] {
         cmds.extend_from_slice(&v.to_le_bytes());
     }
     cmds.extend_from_slice(install_name);
-    while (cmds.len() - id_start) < id_dylib_cmd as usize {
+    while (cmds.len() - id_start) < id_dylib_command_size_usize {
         cmds.push(0);
     }
 
@@ -624,60 +884,57 @@ pub fn emit_dylib(image: &AotImage<'_>) -> Result<Vec<u8>, AotEmitError> {
     // The trie MUST land in the export pair; a spike that put it in the
     // lazy-bind pair made dyld read trie bytes as bind opcodes.
     cmds.extend_from_slice(&LC_DYLD_INFO_ONLY.to_le_bytes());
-    cmds.extend_from_slice(&(DYLD_INFO_CMD as u32).to_le_bytes());
+    cmds.extend_from_slice(&dyld_info_command_size.to_le_bytes());
     for v in [0u32, 0, 0, 0, 0, 0, 0, 0] {
         cmds.extend_from_slice(&v.to_le_bytes());
     }
-    cmds.extend_from_slice(&(linkedit_off as u32).to_le_bytes());
-    cmds.extend_from_slice(&(trie.len() as u32).to_le_bytes());
+    cmds.extend_from_slice(&layout.export_off.to_le_bytes());
+    cmds.extend_from_slice(&layout.export_size.to_le_bytes());
 
     // LC_SYMTAB
     cmds.extend_from_slice(&LC_SYMTAB.to_le_bytes());
-    cmds.extend_from_slice(&(SYMTAB_CMD as u32).to_le_bytes());
-    for v in [
-        symoff as u32,
-        image.exports.len() as u32,
-        stroff as u32,
-        strtab.len() as u32,
-    ] {
+    cmds.extend_from_slice(&symtab_command_size.to_le_bytes());
+    for v in [layout.symoff, layout.nsyms, layout.stroff, layout.strsize] {
         cmds.extend_from_slice(&v.to_le_bytes());
     }
 
     // LC_DYSYMTAB. dyld ENFORCES `iundefsym == iextdefsym + nextdefsym`;
     // violating it rejects the image with "indirect symbol table
     // iundefsym != iextdefsym+nextdefsym".
-    let n = image.exports.len() as u32;
+    let n = layout.nsyms;
     cmds.extend_from_slice(&LC_DYSYMTAB.to_le_bytes());
-    cmds.extend_from_slice(&(DYSYMTAB_CMD as u32).to_le_bytes());
+    cmds.extend_from_slice(&dysymtab_command_size.to_le_bytes());
     for v in [0u32, 0, 0, n, n, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
         cmds.extend_from_slice(&v.to_le_bytes());
     }
 
     // LC_BUILD_VERSION, ntools = 0.
     cmds.extend_from_slice(&LC_BUILD_VERSION.to_le_bytes());
-    cmds.extend_from_slice(&(BUILD_VERSION_CMD as u32).to_le_bytes());
+    cmds.extend_from_slice(&build_version_command_size.to_le_bytes());
     for v in [PLATFORM_MACOS, 11 << 16, 11 << 16, 0] {
         cmds.extend_from_slice(&v.to_le_bytes());
     }
 
-    debug_assert_eq!(cmds.len() as u64, sizeofcmds);
+    debug_assert_eq!(cmds.len(), layout.sizeofcmds_usize);
 
-    let mut out = Vec::with_capacity((linkedit_off + linkedit_size) as usize);
+    let mut out = Vec::with_capacity(layout.output_len);
     out.extend_from_slice(&MH_MAGIC_64.to_le_bytes());
     out.extend_from_slice(&CPU_TYPE_ARM64.to_le_bytes());
     out.extend_from_slice(&CPU_SUBTYPE_ARM64_ALL.to_le_bytes());
     out.extend_from_slice(&MH_DYLIB.to_le_bytes());
     out.extend_from_slice(&(if has_data { 8u32 } else { 7u32 }).to_le_bytes());
-    out.extend_from_slice(&(sizeofcmds as u32).to_le_bytes());
+    out.extend_from_slice(&layout.sizeofcmds.to_le_bytes());
     out.extend_from_slice(&(MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL).to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // reserved
     out.extend_from_slice(&cmds);
-    out.resize(code_addr as usize, 0); // HEADER_SLACK
+    out.resize(layout.code_start, 0); // HEADER_SLACK
     out.extend_from_slice(&code);
-    out.resize(linkedit_off as usize, 0);
+    out.resize(layout.linkedit_start, 0);
     if has_data {
-        let data_start = data_addr as usize;
-        out[data_start..data_start + image.data.len()].copy_from_slice(image.data);
+        let (Some(data_start), Some(data_end)) = (layout.data_start, layout.data_end) else {
+            return Err(layout_overflow("data section offset"));
+        };
+        out[data_start..data_end].copy_from_slice(image.data);
     }
     out.extend_from_slice(&trie);
     out.extend_from_slice(&nlists);
@@ -1215,6 +1472,94 @@ mod tests {
             add_offset: 4,
             data_offset: 0,
         }]
+    }
+
+    #[test]
+    fn rejects_overflowing_layout_and_linkedit_offsets_without_allocating() {
+        fn lengths(code_len: u64, data_len: u64) -> AotLayoutLengths {
+            AotLayoutLengths {
+                sizeofcmds: if data_len == 0 { 456 } else { 608 },
+                code_len,
+                data_len,
+                trie_len: 0,
+                nlists_len: 0,
+                strtab_len: 0,
+                export_count: 0,
+            }
+        }
+
+        fn assert_overflow(input: AotLayoutLengths, field: &'static str) {
+            assert!(
+                matches!(
+                    checked_layout(input),
+                    Err(AotEmitError::LayoutOverflow {
+                        field: actual
+                    }) if actual == field
+                ),
+                "{field} must reject arithmetic overflow"
+            );
+        }
+
+        fn assert_narrowing(input: AotLayoutLengths, field: &'static str) {
+            assert!(
+                matches!(
+                    checked_layout(input),
+                    Err(AotEmitError::MachOFieldOutOfRange {
+                        field: actual,
+                        ..
+                    }) if actual == field
+                ),
+                "{field} must reject u32 truncation"
+            );
+        }
+
+        // With data, the fixed command layout puts code at byte 896.
+        assert_overflow(lengths(8, u64::MAX), "data vmsize");
+        let last_u64_page = !(macho::PAGE - 1);
+        assert_overflow(lengths(last_u64_page - 896, macho::PAGE), "linkedit offset");
+        let mut output_length = lengths(8, 0);
+        output_length.strtab_len = last_u64_page;
+        assert_overflow(output_length, "output length");
+
+        // With no data, the fixed command layout puts code at byte 744.
+        assert_narrowing(lengths(u64::from(u32::MAX) + 1 - 744, 0), "linkedit offset");
+        let last_u32_page = u64::from(u32::MAX) & !(macho::PAGE - 1);
+        let code_len = last_u32_page - 744;
+
+        let mut symoff = lengths(code_len, 0);
+        symoff.trie_len = macho::PAGE;
+        assert_narrowing(symoff, "symbol table offset");
+
+        let mut stroff = lengths(code_len, 0);
+        stroff.trie_len = 8;
+        stroff.nlists_len = macho::PAGE - 8;
+        assert_narrowing(stroff, "string table offset");
+
+        let mut trie_size = lengths(8, 0);
+        trie_size.trie_len = u64::from(u32::MAX) + 1;
+        assert_narrowing(trie_size, "export trie size");
+
+        let mut string_size = lengths(8, 0);
+        string_size.strtab_len = u64::from(u32::MAX) + 1;
+        assert_narrowing(string_size, "string table size");
+
+        let mut symbol_count = lengths(8, 0);
+        symbol_count.export_count = u64::from(u32::MAX) + 1;
+        assert_narrowing(symbol_count, "symbol count");
+    }
+
+    #[test]
+    fn rejects_an_export_trie_child_count_that_does_not_fit() {
+        let exports = (0..=u8::MAX)
+            .map(|index| (format!("symbol_{index}"), u64::from(index)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            export_trie(&exports),
+            Err(AotEmitError::MachOFieldOutOfRange {
+                field: "export trie child count",
+                value: 256,
+            })
+        ));
     }
 
     #[test]
