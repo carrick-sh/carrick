@@ -89,6 +89,7 @@ pub const BUNDLED_GUEST_STACK_D: &str = include_str!("../../../scripts/dtrace/gu
 pub const BUNDLED_DSR_PROFILE_D: &str = include_str!("../../../scripts/dtrace/dsr-profile.d");
 pub const BUNDLED_DSR_INDIRECT_D: &str = include_str!("../../../scripts/dtrace/dsr-indirect.d");
 pub const BUNDLED_DSR_FORK_D: &str = include_str!("../../../scripts/dtrace/dsr-fork.d");
+pub const BUNDLED_NATIVE_WALL_D: &str = include_str!("../../../scripts/dtrace/native-wall.d");
 
 const DTRACE_VERSION: c_int = 3;
 const DTRACE_PROBESPEC_NAME: c_int = 3;

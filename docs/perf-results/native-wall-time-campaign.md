@@ -1,7 +1,7 @@
 # Darwin/AArch64 native wall-time campaign ledger
 
 **Updated:** 2026-07-27  
-**Status:** ACTIVE — measurement construction  
+**Status:** ACTIVE — M1 measurement construction
 **Primary workload:** cold-GOCACHE `go-build`  
 **Design:** [Darwin native wall-time attribution campaign](../superpowers/specs/2026-07-27-native-wall-time-attribution-campaign-design.md)
 
@@ -19,7 +19,7 @@
 | Destination | 2.0x | Two independent five-sample campaigns |
 | Destination progress | pending | `(R0 - R) / (R0 - 2.0)` |
 
-Current milestone: **M0 — controller**.
+Current milestone: **M1 — accounted baseline**. M0 is complete.
 
 ## Measurement contract
 
@@ -40,6 +40,8 @@ Current milestone: **M0 — controller**.
 | E001 | `scripts/perf/evidence/native-go-build-post-cache-v1.json` | accepted historical | Five clean untraced Carrick samples: 19,485, 19,392, 19,342, 19,707, 19,917 ms |
 | E002 | `scripts/perf/evidence/native-go-build-post-cache-profile-v1.json` | accepted historical diagnostic | Current internal counts and phase aggregates; traced timing is diagnostic |
 | E003 | `handoff.md` at `9c25688d` | accepted controller input | Prior wins, rejected experiments, traps and verification receipts |
+| E003a | paired runner at `e53f1608` | accepted tooling | Identical cold-cache Carrick/Docker commands, native-arm64 image validation, scoped cleanup and v2 phase/ratio artifact |
+| E003b | `target/perf/native-wall-smoke-c.jsonl` | tooling-only; raw untracked | Signed local AArch64 trace: natural exit, 44 metric rows, 102 reconciled wall samples, JIT range present, zero live processes and zero drops |
 | E004 | fresh Carrick/Docker baseline | pending | Official `C0`, `D0`, `R0` |
 | E005 | whole-tree attribution run A | pending | First reconciled current-state proportions |
 | E006 | whole-tree attribution run B | pending | Stability and dominant-rank replication |
@@ -108,7 +110,7 @@ to `PROPOSED`.
 | Wave | Focused tests | Signed Go demo | Native smoke | Node/CPython guardrails | `just ci` | State |
 |---|---|---|---|---|---|---|
 | historical `9c25688d` | green | green | 23/23 MATCH | Go sync 52/52; CPython threading 193/193; subprocess 278/278 | green | accepted starting implementation |
-| M1 measurement | n/a | pending trace natural completion | n/a | n/a | n/a | pending |
+| M1 measurement tooling | 18 trace parser + cache-range tests green | local static AArch64 trace completed naturally | n/a | n/a | signed build + DOF present | profiler smoke accepted; Go-build evidence pending |
 
 ## Decisions
 
@@ -124,8 +126,8 @@ to `PROPOSED`.
 
 Write and validate the executable M1 plan:
 
-1. extend the benchmark runner with a semantically identical Docker phase;
-2. build a launch-scoped whole-tree wall-state/on-CPU/off-CPU DTrace profile;
-3. add a fail-closed parser and summary artifact;
-4. collect fresh untraced `C0`/`D0`;
-5. collect two complete traced runs and rank H001–H005.
+- [x] Extend the benchmark runner with a semantically identical Docker phase.
+- [x] Build a launch-scoped whole-tree wall-state/on-CPU/off-CPU DTrace profile.
+- [ ] Add the fail-closed attribution summarizer.
+- [ ] Collect fresh untraced `C0`/`D0`.
+- [ ] Collect two complete traced runs and rank H001–H005.

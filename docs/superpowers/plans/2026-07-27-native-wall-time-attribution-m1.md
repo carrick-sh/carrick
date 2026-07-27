@@ -200,8 +200,6 @@ the phases are deliberately serial, and the focused Python test command.
 - Modify: `crates/carrick-runtime/src/native_darwin.rs`
 - Modify: `crates/carrick-runtime/src/dtrace_consumer.rs`
 - Modify: `crates/carrick-cli/src/trace_profile.rs`
-- Modify: `crates/carrick-cli/src/commands.rs`
-- Modify: `crates/carrick-cli/tests/trace_profile.rs`
 
 **Interfaces:**
 - Produces CLI value `--profile native-wall`.
@@ -217,49 +215,45 @@ the phases are deliberately serial, and the focused Python test command.
   other drop makes completion false.
 - Does not enable `CARRICK_DSR_PROFILE`; it samples normal production code.
 
-- [ ] **Step 1: Add red enum, protocol, and scoping tests**
+- [x] **Step 1: Add red enum, protocol, and stack-parser tests**
 
-Extend the unit tests in `trace_profile.rs`:
+Extend the unit tests in `trace_profile.rs` with a complete synthetic stream:
 
 ```rust
 #[test]
-fn native_wall_profile_is_sampling_only() {
-    assert_eq!(TraceProfileKind::NativeWall.as_str(), "native-wall");
+fn native_wall_profile_parses_reconciled_samples_and_blocking_stack() {
     assert!(!TraceProfileKind::NativeWall.requires_runtime_profile());
-    assert!(TraceProfileKind::NativeWall
-        .bundled_script()
-        .contains("track_pid[$target] = 1"));
+    let summary = ProfileSummary::from_lines(
+        [
+            "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=120",
+            "DSRPROF1|count|phase=wall-samples|value=120",
+            "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=499",
+            "NWSTACK1|begin|state=voluntary|pid=42|value_ns=900",
+            "0x2000",
+            "NWSTACK1|end",
+            "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+            "DSRPROF1|total|phase=elapsed|value_ns=1000000000",
+            "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+        ],
+        ProfileCaptureStatus::default(),
+    )
+    .expect("complete native wall profile");
+    assert!(summary.completion.complete);
 }
 ```
 
-Extend `crates/carrick-cli/tests/trace_profile.rs` to assert the bundled script:
+Add a table-driven rejection test for missing elapsed time, mismatched wall
+buckets, live processes, missing CPU samples, and voluntary time without a
+stack. Launch scoping is proved live in Task 4 rather than by grepping D source.
 
-```rust
-assert!(script.contains("proc:::create"));
-assert!(script.contains("sched:::off-cpu"));
-assert!(script.contains("profile-499"));
-assert!(script.contains("tick-197hz"));
-assert!(!script.contains("execname == \"carrick\""));
-assert!(script.contains(
-    "DSRPROF1|complete|profile=native-wall|bounded=%d|target_exit_reason=%d"
-));
-```
-
-Add a parser test containing one row for every new phase and completion with
-`profile=native-wall`.
-
-- [ ] **Step 2: Add a red JIT-range announcement test**
+- [x] **Step 2: Add a red JIT-range announcement test**
 
 Add a `ProcessTranslator` unit test that asserts
 `cache_host_range()` is nonempty and its size equals the configured cache
-capacity. Add a source-shape integration assertion beside the existing image
-probe checks:
+capacity using a real anonymous test mapping. The live smoke in Task 4 verifies
+that the runtime announcement reaches JSONL.
 
-```rust
-assert!(native_darwin.contains("crate::probes::host_jit_range("));
-```
-
-- [ ] **Step 3: Run the focused Rust tests and verify red**
+- [x] **Step 3: Run the focused Rust tests and verify red**
 
 Run:
 
@@ -271,7 +265,7 @@ cargo test -p carrick-dsr-aarch64 cache_host_range -- --nocapture
 Expected: compile failure because `TraceProfileKind::NativeWall` does not
 exist and `cache_host_range()` is absent.
 
-- [ ] **Step 4: Add the bundled profile kind**
+- [x] **Step 4: Add the bundled profile kind**
 
 Add `NativeWall` to `TraceProfileKind`, `as_str`, `parse_protocol`, and
 `bundled_script`. Export:
@@ -284,7 +278,7 @@ pub const BUNDLED_NATIVE_WALL_D: &str =
 from `carrick-runtime/src/dtrace_consumer.rs`. Leave
 `requires_runtime_profile()` false for this variant.
 
-- [ ] **Step 5: Add explicit JIT-range observability**
+- [x] **Step 5: Add explicit JIT-range observability**
 
 Add `host__jit__range(pid: u32, start: u64, end: u64)` to the USDT provider and
 the public wrapper:
@@ -309,7 +303,7 @@ range probe. In the D program, admit only tracked PIDs and emit only the first
 announcement per PID as two `image-base` rows with kinds `jit-start` and
 `jit-end`.
 
-- [ ] **Step 6: Implement launch-owned process and thread state**
+- [x] **Step 6: Implement launch-owned process and thread state**
 
 In `scripts/dtrace/native-wall.d`, use:
 
@@ -355,7 +349,7 @@ every transition. On `proc:::lwp-exit`, remove that LWP's current contribution
 from the global state counts and clear its state. Never use `progenyof()` or an
 `execname` predicate.
 
-- [ ] **Step 7: Add wall, CPU, and off-CPU sampling**
+- [x] **Step 7: Add wall, CPU, and off-CPU sampling**
 
 Use `tick-197hz` as the single wall sampler:
 
@@ -392,7 +386,7 @@ keyed by PID and saved PC. For voluntary waits, also aggregate
 `@voluntary_stack[pid, ustack(24)] = sum(duration)`. Clear the thread-local
 timestamp after consumption.
 
-- [ ] **Step 8: Emit only machine-protocol rows from `END`**
+- [x] **Step 8: Emit only machine-protocol rows from `END`**
 
 Print every aggregation as `DSRPROF1` records. Examples:
 
@@ -420,13 +414,13 @@ machine-readable delimiters:
 
 ```d
 trunc(@voluntary_stack, 32);
-printa("NWSTACK1|begin|state=voluntary|pid=%d|value_ns=%@d\n"
-    "%kNWSTACK1|end\n", @voluntary_stack);
+printa("NWSTACK1|begin|state=voluntary|pid=%d|value_ns=%@d\n%kNWSTACK1|end\n",
+    @voluntary_stack);
 ```
 
 Do not print human headings or unversioned aggregations.
 
-- [ ] **Step 9: Enforce native-wall-specific completion invariants**
+- [x] **Step 9: Enforce native-wall-specific completion invariants**
 
 Extend `ProfileSummary::from_lines` with a small state machine that accepts
 `NWSTACK1|begin`, stack-frame lines, and `NWSTACK1|end` only for a
@@ -455,7 +449,7 @@ duration, or any `NWSTACK1` block in another profile. After grouping a
 Keep the existing drop, interruption, target-reason, duplicate-completion, and
 post-completion failures.
 
-- [ ] **Step 10: Run tests, build signed, and verify DOF**
+- [x] **Step 10: Run tests, build signed, and verify DOF**
 
 Run:
 
@@ -468,7 +462,7 @@ otool -l target/release/carrick | grep -A2 __dof_carrick
 
 Expected: focused tests pass; signed binary builds; `__dof_carrick` is present.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add scripts/dtrace/native-wall.d \
@@ -476,9 +470,7 @@ git add scripts/dtrace/native-wall.d \
   crates/carrick-dsr-aarch64/src/translator.rs \
   crates/carrick-runtime/src/native_darwin.rs \
   crates/carrick-runtime/src/dtrace_consumer.rs \
-  crates/carrick-cli/src/trace_profile.rs \
-  crates/carrick-cli/src/commands.rs \
-  crates/carrick-cli/tests/trace_profile.rs
+  crates/carrick-cli/src/trace_profile.rs
 git commit -m "diagnostics(native): add whole-tree wall profile"
 ```
 

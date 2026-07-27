@@ -1152,10 +1152,17 @@ impl Drop for ThreadTranslator {
 
 impl ProcessTranslator {
     pub fn new(capacity: usize) -> Result<Self, types::DsrError> {
+        Self::new_with_host(capacity, active_host_jit()?)
+    }
+
+    fn new_with_host(
+        capacity: usize,
+        host: &'static dyn NativeHostJit,
+    ) -> Result<Self, types::DsrError> {
         artifact_spike::ensure_authority_if_enabled()?;
         let translator = Self {
             state: RwLock::new(ProcessState {
-                cache: cache::TranslationCache::new(capacity, active_host_jit()?)?,
+                cache: cache::TranslationCache::new(capacity, host)?,
                 artifact_store: artifact_spike::store_if_enabled()?,
                 blocks: BTreeMap::new(),
                 pending: BTreeMap::new(),
@@ -1182,6 +1189,11 @@ impl ProcessTranslator {
             u64::try_from(capacity).unwrap_or(u64::MAX),
         );
         Ok(translator)
+    }
+
+    pub fn cache_host_range(&self) -> std::ops::Range<u64> {
+        let range = self.state.read().cache.host_range();
+        range.start as u64..range.end as u64
     }
 
     pub fn configure_shared_image(
@@ -2931,13 +2943,62 @@ mod tests {
     // carrick_dsr::probes mirrors (ordinal-identical to the USDT enums
     // by the mirrored-ordinal tests in carrick-dsr).
     use super::{
-        DsrErrorProbeExt as _, NativeDsrExitProbeExt as _, SharedBlockAuthority,
+        DsrErrorProbeExt as _, NativeDsrExitProbeExt as _, ProcessTranslator, SharedBlockAuthority,
         translation_source_words_required,
     };
     use crate::types;
+    use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
     use carrick_guest_mem::GuestVa;
+    use std::ptr::NonNull;
 
     const PC: GuestVa = GuestVa(0x1000);
+
+    struct TestHostJit;
+
+    static TEST_HOST_JIT: TestHostJit = TestHostJit;
+
+    impl NativeHostJit for TestHostJit {
+        fn supported(&self) -> Result<(), &'static str> {
+            Ok(())
+        }
+
+        fn map_code_cache(&self, capacity: usize) -> std::io::Result<JitRegion> {
+            let mapped = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    capacity,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            let base = NonNull::new(mapped.cast::<u8>())
+                .ok_or_else(|| std::io::Error::other("mmap returned null"))?;
+            Ok(JitRegion {
+                exec_base: base,
+                write_base: base,
+                capacity,
+            })
+        }
+
+        unsafe fn unmap(&self, region: &JitRegion) {
+            let _ = unsafe { libc::munmap(region.exec_base.as_ptr().cast(), region.capacity) };
+        }
+
+        fn begin_thread_write(&self) {}
+
+        fn end_thread_write(&self) {}
+
+        fn flush_icache(&self, _exec_ptr: *const u8, _len: usize) {}
+
+        fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
+            Ok(ForkChildJit::Inherited)
+        }
+    }
 
     #[test]
     fn source_words_are_captured_only_for_enabled_reuse_consumers() {
@@ -2945,6 +3006,16 @@ mod tests {
         assert!(translation_source_words_required(true, false));
         assert!(translation_source_words_required(false, true));
         assert!(translation_source_words_required(true, true));
+    }
+
+    #[test]
+    fn cache_host_range_matches_configured_executable_capacity() {
+        let translator =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let range = translator.cache_host_range();
+
+        assert!(range.start < range.end);
+        assert_eq!(range.end - range.start, 64 * 1024);
     }
 
     #[test]

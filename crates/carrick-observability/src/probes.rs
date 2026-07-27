@@ -1045,6 +1045,12 @@ mod real {
         /// A guest PC resolved against carrick's symbol table produces a name,
         /// not an error -- so the two must never be conflated.
         fn guest__image__base(_: u32, _: u64, _: u64, _: &str) {}
+        /// Half-open executable range of this process's anonymous DSR cache.
+        ///
+        /// A sampled PC outside the host and guest images may be translated
+        /// code or a system dylib. The exact range lets a profiler distinguish
+        /// those cases without an address-layout heuristic.
+        fn host__jit__range(_: u32, _: u64, _: u64) {}
         /// Host-pipe I/O: `dir` is 0 for read, 1 for write; `n` is the
         /// byte count (negative on error). Used to trace whether a forked
         /// child's stdout actually reaches the parent's pipe read.
@@ -1576,6 +1582,11 @@ mod real {
     /// PCs are indistinguishable from JIT output and get reported as unmapped.
     pub fn guest_image_base(base: u64, entry: u64, path: &str) {
         carrick_usdt::guest__image__base!(|| (std::process::id(), base, entry, path));
+    }
+
+    /// Publish the half-open executable range of this process's DSR code cache.
+    pub fn host_jit_range(start: u64, end: u64) {
+        carrick_usdt::host__jit__range!(|| (std::process::id(), start, end));
     }
 
     pub fn fs_op(op: &str, path: &str, errno: i32) {
@@ -2441,6 +2452,7 @@ mod stub {
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(host_image_base());
     stub!(guest_image_base(base: u64, entry: u64, path: &str));
+    stub!(host_jit_range(start: u64, end: u64));
     stub!(fs_op(op: &str, path: &str, errno: i32));
     stub!(host_pipe_io(host_fd: i32, dir: i32, n: i64));
     stub!(epoll_ctl(epfd: i32, op: u64, fd: i32, events: u32, data: u64, errno: i32));
