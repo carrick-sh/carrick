@@ -360,6 +360,38 @@ pub trait TranslationUnitStore: Send + Sync {
     fn publish(&self, pending: &PendingTranslationUnit) -> Result<PublishOutcome, UnitMissReason>;
 }
 
+#[derive(Clone, Debug)]
+pub struct SharedImageConfig {
+    pub executable: ExecutableIdentity,
+    pub page_profile: NativePageProfileIdentity,
+    pub address_mode: AddressModeIdentity,
+    pub segments: Vec<SharedExecutableSegment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedExecutableSegment {
+    pub file_offset: ImageFileOffset,
+    pub file_len: ImageFileLen,
+    pub guest_start: GuestVa,
+    pub guest_len: GuestCodeLen,
+    pub source_words: Vec<u32>,
+}
+
+impl SharedImageConfig {
+    pub fn key_for_segment(&self, segment: &SharedExecutableSegment) -> TranslationUnitKey {
+        TranslationUnitKey::for_segment(
+            self.executable.clone(),
+            segment.file_offset,
+            segment.file_len,
+            segment.guest_start,
+            segment.guest_len,
+            SourceFingerprint::from_words(&segment.source_words),
+            self.page_profile,
+            self.address_mode,
+        )
+    }
+}
+
 impl TranslationUnitManifest {
     pub fn validate_source(&self, source_words: &[u32]) -> Result<(), UnitMissReason> {
         if self.key.source_fingerprint() != SourceFingerprint::from_words(source_words) {

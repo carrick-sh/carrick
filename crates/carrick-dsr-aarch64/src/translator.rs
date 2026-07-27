@@ -293,6 +293,12 @@ pub struct ProcessState {
     pub dependencies: cache::PageBlockDependencies,
     pub publications: cache::ConcurrentPublicationIndex,
     pub profiling: bool,
+    shared_translation: Option<SharedTranslationConfiguration>,
+}
+
+struct SharedTranslationConfiguration {
+    image: crate::shared_cache::SharedImageConfig,
+    _store: Arc<dyn crate::shared_cache::TranslationUnitStore>,
 }
 
 #[derive(Clone, Copy)]
@@ -1111,6 +1117,7 @@ impl ProcessTranslator {
                 dependencies: cache::PageBlockDependencies::default(),
                 publications: cache::ConcurrentPublicationIndex::default(),
                 profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
+                shared_translation: None,
             }),
         };
         probes::dsr_cache_capacity(
@@ -1118,6 +1125,38 @@ impl ProcessTranslator {
             u64::try_from(capacity).unwrap_or(u64::MAX),
         );
         Ok(translator)
+    }
+
+    pub fn configure_shared_image(
+        &self,
+        image: crate::shared_cache::SharedImageConfig,
+        store: Arc<dyn crate::shared_cache::TranslationUnitStore>,
+    ) -> Result<(), types::DsrError> {
+        if image.segments.is_empty() {
+            return Err(types::DsrError::CachePolicy(
+                "shared translation image has no executable segments".to_string(),
+            ));
+        }
+        let mut state = self.state.write();
+        if state.shared_translation.is_some() {
+            return Err(types::DsrError::CachePolicy(
+                "shared translation image was already configured".to_string(),
+            ));
+        }
+        state.shared_translation = Some(SharedTranslationConfiguration {
+            image,
+            _store: store,
+        });
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn configured_shared_segment_count(&self) -> usize {
+        self.state
+            .read()
+            .shared_translation
+            .as_ref()
+            .map_or(0, |configuration| configuration.image.segments.len())
     }
 
     #[doc(hidden)]
@@ -1153,6 +1192,7 @@ impl ProcessTranslator {
         state.unsupported.clear();
         state.dependencies = cache::PageBlockDependencies::default();
         state.publications.reset_for_exec();
+        state.shared_translation = None;
     }
 }
 
