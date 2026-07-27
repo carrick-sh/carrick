@@ -2060,8 +2060,13 @@ mod tests {
                 "the guest compare must be detected as an NZCV writer"
             );
 
-            // Every remaining word is DSR-inserted and must be flag-neutral.
+            // Every remaining word is DSR-inserted. A word covered by biased
+            // exclusive recovery must remain flag-neutral because that action
+            // rolls back only its two scratch GPRs. A nested direct-binding
+            // stub has its own exact-PC recovery domain and may write NZCV
+            // only after its capture prefix has committed the saved flags.
             let mut inserted = 0usize;
+            let mut direct_binding_nzcv_writers = 0usize;
             for (index, &word) in words.iter().enumerate() {
                 if guest_indices.contains(&index) {
                     continue;
@@ -2075,16 +2080,51 @@ mod tests {
                         index * 4
                     )
                 });
-                assert!(
-                    !writes_nzcv(&instruction),
-                    "DSR-inserted word 0x{word:08x} at +{:#x} ({instruction}) writes NZCV, \
-                     but biased exclusive recovery rolls back only the two scratch GPRs",
-                    index * 4
-                );
+                if writes_nzcv(&instruction) {
+                    let offset = CacheOffset::published((index * 4) as u32);
+                    let recovery = emitted
+                        .recovery()
+                        .iter()
+                        .filter(|entry| entry.cache == offset)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        recovery.len(),
+                        1,
+                        "NZCV-writing inserted word 0x{word:08x} at +{:#x} \
+                         must have exactly one recovery action, got {recovery:?}",
+                        index * 4
+                    );
+                    match recovery[0].action {
+                        RecoveryAction::RestoreDirectBinding {
+                            capture_progress: DirectBindingCaptureProgress::Complete,
+                            ..
+                        } => {
+                            direct_binding_nzcv_writers += 1;
+                        }
+                        RecoveryAction::RecoverBiasedExclusive(_) => {
+                            panic!(
+                                "DSR-inserted word 0x{word:08x} at +{:#x} ({instruction}) \
+                                 writes NZCV under biased-exclusive two-GPR recovery",
+                                index * 4
+                            );
+                        }
+                        action => {
+                            panic!(
+                                "DSR-inserted word 0x{word:08x} at +{:#x} ({instruction}) \
+                                 writes NZCV without complete direct-binding recovery: {action:?}",
+                                index * 4
+                            );
+                        }
+                    }
+                }
             }
             assert!(
                 inserted > 32,
                 "the biased lowering must actually have been emitted, saw {inserted} inserted words"
+            );
+            assert!(
+                direct_binding_nzcv_writers > 0,
+                "the nested direct-binding stub must exercise exact-PC NZCV recovery"
             );
         }
     }
