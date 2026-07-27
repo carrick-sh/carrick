@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
-use crate::direct_binding::DirectBindingOrdinal;
+use crate::direct_binding::{DirectBindingCellVa, DirectBindingOrdinal};
 use crate::emit::{DirectLinkKind, DirectStubEnvelope};
 
 pub const TRANSLATOR_ABI_CURRENT: u32 = 3;
@@ -18,7 +18,68 @@ pub const MAX_TRANSLATION_UNIT_CODE_BYTES: usize = 64 * 1024 * 1024;
 pub const TRANSLATION_UNIT_BASE_EXPORT: &str = "carrick_aot_unit_base";
 pub const TRANSLATION_UNIT_BINDING_EXPORT: &str = "carrick_aot_unit_bindings";
 const DARWIN_HOST_PAGE_SIZE: u64 = 16 * 1024;
+const DARWIN_HOST_PAGE_SIZE_USIZE: usize = 16 * 1024;
 static DIRECT_BINDING_RUNTIME_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Exact maximum protection assigned to one loaded AOT mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadedTranslationProtection {
+    ImmutableCode,
+    BindingCells,
+}
+
+/// Pins both the current and maximum protection of a loaded AOT mapping.
+///
+/// # Safety
+///
+/// `address..address + length` must identify live pages owned exclusively by
+/// the loaded translation unit. Pinning maximum protection is irreversible for
+/// the lifetime of that mapping.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub unsafe fn pin_loaded_translation_protection(
+    address: std::ptr::NonNull<u8>,
+    length: usize,
+    protection: LoadedTranslationProtection,
+) -> Result<(), i32> {
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::vm::mach_vm_protect;
+
+    if length == 0 {
+        return Err(libc::KERN_INVALID_ARGUMENT);
+    }
+    let page_size = DARWIN_HOST_PAGE_SIZE_USIZE;
+    let start = address.as_ptr() as usize;
+    if !start.is_multiple_of(page_size) || !length.is_multiple_of(page_size) {
+        return Err(libc::KERN_INVALID_ARGUMENT);
+    }
+    start
+        .checked_add(length)
+        .ok_or(libc::KERN_INVALID_ADDRESS)?;
+    let size = u64::try_from(length).map_err(|_| libc::KERN_INVALID_ADDRESS)?;
+    let native_protection = match protection {
+        LoadedTranslationProtection::ImmutableCode => libc::VM_PROT_READ | libc::VM_PROT_EXECUTE,
+        LoadedTranslationProtection::BindingCells => libc::VM_PROT_READ | libc::VM_PROT_WRITE,
+    };
+    let task = unsafe { mach2::traps::mach_task_self() };
+    let set_maximum = unsafe { mach_vm_protect(task, start as u64, size, 1, native_protection) };
+    if set_maximum != KERN_SUCCESS {
+        return Err(set_maximum);
+    }
+    let set_current = unsafe { mach_vm_protect(task, start as u64, size, 0, native_protection) };
+    if set_current != KERN_SUCCESS {
+        return Err(set_current);
+    }
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub unsafe fn pin_loaded_translation_protection(
+    _address: std::ptr::NonNull<u8>,
+    _length: usize,
+    _protection: LoadedTranslationProtection,
+) -> Result<(), i32> {
+    Err(libc::ENOTSUP)
+}
 
 pub fn direct_binding_runtime_enabled() -> bool {
     *DIRECT_BINDING_RUNTIME_ENABLED.get_or_init(|| {
@@ -634,6 +695,7 @@ pub enum PublishOutcome {
 pub struct SharedLoadedTranslationUnit {
     pub manifest: TranslationUnitManifest,
     pub base: usize,
+    pub binding_base: Option<DirectBindingCellVa>,
     _lease: Arc<dyn Send + Sync>,
 }
 
@@ -646,6 +708,21 @@ impl SharedLoadedTranslationUnit {
         Self {
             manifest,
             base,
+            binding_base: None,
+            _lease: lease,
+        }
+    }
+
+    pub fn new_with_binding_base(
+        manifest: TranslationUnitManifest,
+        base: usize,
+        binding_base: Option<DirectBindingCellVa>,
+        lease: Arc<dyn Send + Sync>,
+    ) -> Self {
+        Self {
+            manifest,
+            base,
+            binding_base,
             _lease: lease,
         }
     }
