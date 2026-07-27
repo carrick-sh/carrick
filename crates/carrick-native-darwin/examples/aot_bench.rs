@@ -14,7 +14,7 @@
 //! Run: `cargo run -p carrick-native-darwin --example aot_bench --release`
 //! Keep the box quiet: fork timings are load-sensitive.
 
-use carrick_native_darwin::aot::{AotExport, emit_dylib};
+use carrick_native_darwin::aot::{AotExport, AotImage, AotSection, emit_dylib};
 use std::time::Instant;
 
 /// `mov w0, #42 ; ret`
@@ -64,11 +64,18 @@ fn publish(
 ) -> (u128, u128, u128, std::path::PathBuf) {
     let export = AotExport {
         name: "carrick_aot_entry",
+        section: AotSection::Text,
         offset: 0,
     };
 
     let t = Instant::now();
-    let bytes = emit_dylib(code, &[export]).expect("emit");
+    let bytes = emit_dylib(&AotImage {
+        code,
+        data: &[],
+        exports: &[export],
+        relocations: &[],
+    })
+    .expect("emit");
     let emit_us = t.elapsed().as_micros();
 
     let path = dir.join(format!("{name}.dylib"));
