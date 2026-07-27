@@ -1720,6 +1720,34 @@ mod tests {
     }
 
     #[test]
+    fn capsule_rejects_previous_container_cache_translator_abi() {
+        let cache = tempfile::tempdir().expect("cache directory");
+        let directory = std::fs::File::open(cache.path()).expect("open cache directory");
+        let fd = directory.as_raw_fd();
+        let identity = host_identity(fd);
+        let mut payload = sample();
+        payload
+            .guest_exec
+            .as_mut()
+            .expect("guest payload")
+            .aot_cache = Some(super::NativeReexecAotCacheV1 {
+            host_fd: fd,
+            original_host_fd_flags: fd_flags(fd),
+            host_device: identity.st_dev as u64,
+            host_inode: identity.st_ino,
+            path: cache.path().to_path_buf(),
+            creator_pid: unsafe { libc::getpid() },
+            authority_nonce: [0x6c; 16],
+            translator_abi: 2,
+        });
+
+        assert!(matches!(
+            payload.validate(),
+            Err(super::NativeExecCapsuleError::InvalidField("guest_exec"))
+        ));
+    }
+
+    #[test]
     fn capsule_validation_failure_keeps_artifact_cloexec_and_closes_owner() {
         if !host_page_geometry_matches_fixtures() {
             return;

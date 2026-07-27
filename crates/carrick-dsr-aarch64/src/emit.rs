@@ -1312,6 +1312,200 @@ fn record_direct_binding_phase(
     Ok(())
 }
 
+const DIRECT_BINDING_STUB_WORDS: usize = 64;
+const DIRECT_BINDING_CAPTURE_WORDS: usize = 5;
+const DIRECT_BINDING_HIT_WORDS: usize = 22;
+const DIRECT_BINDING_MISS_WORD: usize = DIRECT_BINDING_CAPTURE_WORDS + DIRECT_BINDING_HIT_WORDS;
+
+pub(crate) fn rewrite_direct_binding_stub(
+    code: &mut [u8],
+    link: DirectLink,
+    ordinal: crate::direct_binding::DirectBindingOrdinal,
+    data_offset: u32,
+) -> Result<crate::shared_cache::DirectBindingRelocation, DsrError> {
+    let start = usize::try_from(link.stub.start.get()).map_err(|_| {
+        DsrError::CachePolicy("direct-binding stub start does not fit usize".to_string())
+    })?;
+    let end = usize::try_from(link.stub.end.get()).map_err(|_| {
+        DsrError::CachePolicy("direct-binding stub end does not fit usize".to_string())
+    })?;
+    let stub = code.get_mut(start..end).ok_or_else(|| {
+        DsrError::CachePolicy("direct-binding stub envelope is out of bounds".to_string())
+    })?;
+    if stub.len() != DIRECT_BINDING_STUB_WORDS * std::mem::size_of::<u32>() {
+        return Err(DsrError::CachePolicy(format!(
+            "direct-binding precursor instruction shape has {} bytes, expected {}",
+            stub.len(),
+            DIRECT_BINDING_STUB_WORDS * std::mem::size_of::<u32>()
+        )));
+    }
+    let mut precursor = [0_u32; DIRECT_BINDING_STUB_WORDS];
+    for (word, bytes) in precursor.iter_mut().zip(stub.chunks_exact(4)) {
+        *word = u32::from_le_bytes(bytes.try_into().map_err(|_| {
+            DsrError::CachePolicy(
+                "direct-binding precursor instruction shape is truncated".to_string(),
+            )
+        })?);
+    }
+    let capture = [
+        0xf902_478f, // str x15, [x28, #1160]
+        0xf902_3390, // str x16, [x28, #1120]
+        0xf902_4b9e, // str x30, [x28, #1168]
+        0xd53b_4210, // mrs x16, nzcv
+        0xf901_d790, // str x16, [x28, #936]
+    ];
+    let authority_fixed = [
+        (9, 0xf902_1f91),  // str x17, [x28, #1080]
+        (10, 0xf942_3b8f), // ldr x15, [x28, #1136]
+        (11, 0xb400_044f), // cbz x15, resolver
+        (12, 0xca51_3230), // eor x16, x17, lsr #12
+        (13, 0xd342_4210), // ubfx x16, x16, #2, #15
+        (14, 0x8b10_19ef), // add x15, x15, x16, lsl #6
+        (15, 0xf940_01f0), // ldr x16, [x15]
+        (16, 0xeb11_021f), // cmp x16, x17
+        (17, 0x5400_00a0), // b.eq probe generation
+        (18, 0x9100_81ef), // add x15, x15, #32
+        (19, 0xf940_01f0), // ldr x16, [x15]
+        (20, 0xeb11_021f), // cmp x16, x17
+        (21, 0x5400_0301), // b.ne resolver
+        (22, 0xf940_05f1), // ldr x17, [x15, #8]
+        (23, 0xb400_02d1), // cbz x17, resolver
+        (24, 0xf940_09f0), // ldr x16, [x15, #16]
+        (25, 0xb400_0290), // cbz x16, resolver
+        (26, 0xf940_020f), // ldr x15, [x16]
+        (27, 0xeb0f_023f), // cmp x17, x15
+        (28, 0x5400_0223), // b.lo resolver
+        (29, 0xf940_060f), // ldr x15, [x16, #8]
+        (30, 0xeb0f_023f), // cmp x17, x15
+        (31, 0x5400_01c2), // b.hs resolver
+        (32, 0xf902_538f), // str x15, [x28, #1184]
+        (33, 0xf940_020f), // ldr x15, [x16]
+        (34, 0xf902_4f8f), // str x15, [x28, #1176]
+        (35, 0xf940_0a0f), // ldr x15, [x16, #16]
+        (36, 0xf902_7b8f), // str x15, [x28, #1264]
+        (37, 0xf902_1b91), // str x17, [x28, #1072]
+        (38, 0xf941_d790), // ldr x16, [x28, #936]
+        (39, 0xd51b_4210), // msr nzcv, x16
+        (40, 0xf942_478f), // ldr x15, [x28, #1160]
+        (41, 0xf942_3390), // ldr x16, [x28, #1120]
+        (42, 0xf942_4b9e), // ldr x30, [x28, #1168]
+        (43, 0xf942_1b91), // ldr x17, [x28, #1072]
+        (44, 0xd61f_0220), // br x17
+        (45, 0xf941_d790), // ldr x16, [x28, #936]
+        (46, 0xd51b_4210), // msr nzcv, x16
+        (47, 0xf942_478f), // ldr x15, [x28, #1160]
+        (48, 0xf942_3390), // ldr x16, [x28, #1120]
+        (49, 0xf942_4b9e), // ldr x30, [x28, #1168]
+        (54, 0xf902_1f91), // str x17, [x28, #1080]
+        (59, 0xf902_2391), // str x17, [x28, #1088]
+        (60, 0x5280_0051), // mov w17, #2
+        (61, 0xb904_4b91), // str w17, [x28, #1096]
+        (62, 0xf942_6791), // ldr x17, [x28, #1224]
+        (63, 0xd61f_0220), // br x17
+    ];
+    if precursor[..capture.len()] != capture
+        || !is_mov_wide_x17(&precursor[5..9])
+        || !is_mov_wide_x17(&precursor[50..54])
+        || !is_mov_wide_x17(&precursor[55..59])
+        || authority_fixed
+            .iter()
+            .any(|(index, expected)| precursor[*index] != *expected)
+    {
+        return Err(DsrError::CachePolicy(
+            "direct-binding precursor instruction shape does not match the authority resolver"
+                .to_string(),
+        ));
+    }
+
+    let hit = [
+        0x9000_000f, // adrp x15, binding-cell-page
+        0x9100_01ef, // add x15, x15, binding-cell-pageoff
+        0xc8df_fdf1, // ldar x17, [x15]
+        0xb400_0271, // cbz x17, miss
+        0xf902_8b91, // str x17, [x28, #1296]
+        0xf940_0230, // ldr x16, [x17]
+        0xa940_fa2f, // ldp x15, x30, [x17, #8]
+        0xeb0f_021f, // cmp x16, x15
+        0x5400_01c3, // b.lo miss
+        0xeb1e_021f, // cmp x16, x30
+        0x5400_0182, // b.hs miss
+        0xf940_0e31, // ldr x17, [x17, #24]
+        0xf902_7b91, // str x17, [x28, #1264]
+        0x9112_6391, // add x17, x28, #1176
+        0xa900_7a2f, // stp x15, x30, [x17]
+        0xf902_1b90, // str x16, [x28, #1072]
+        0xf851_0230, // ldur x16, [x17, #-240]
+        0xd51b_4210, // msr nzcv, x16
+        0xa97f_7a2f, // ldp x15, x30, [x17, #-16]
+        0xf85c_8230, // ldur x16, [x17, #-56]
+        0xf859_8231, // ldur x17, [x17, #-104]
+        0xd61f_0220, // br x17
+    ];
+    let low_ordinal = ordinal.get() & 0xffff;
+    let high_ordinal = ordinal.get() >> 16;
+    let miss_prefix = [
+        0x9000_000f,                       // adrp x15, binding-cell-page
+        0x9100_01ef,                       // add x15, x15, binding-cell-pageoff
+        0xf902_838f,                       // str x15, [x28, #1280]
+        0x5280_0011 | (low_ordinal << 5),  // movz w17, ordinal[15:0]
+        0x72a0_0011 | (high_ordinal << 5), // movk w17, ordinal[31:16], lsl #16
+        0xb905_0b91,                       // str w17, [x28, #1288]
+        0x5280_0031,                       // mov w17, #1
+        0xb905_0f91,                       // str w17, [x28, #1292]
+        0xf902_8b9f,                       // str xzr, [x28, #1296]
+        0xf941_d790,                       // ldr x16, [x28, #936]
+        0xd51b_4210,                       // msr nzcv, x16
+        0xf942_478f,                       // ldr x15, [x28, #1160]
+        0xf942_3390,                       // ldr x16, [x28, #1120]
+        0xf942_4b9e,                       // ldr x30, [x28, #1168]
+    ];
+    let resolver = precursor[50..64].to_vec();
+    let mut rewritten = vec![0xd503_201f; DIRECT_BINDING_STUB_WORDS];
+    rewritten[..capture.len()].copy_from_slice(&capture);
+    rewritten[DIRECT_BINDING_CAPTURE_WORDS..DIRECT_BINDING_MISS_WORD].copy_from_slice(&hit);
+    let miss_prefix_end = DIRECT_BINDING_MISS_WORD + miss_prefix.len();
+    rewritten[DIRECT_BINDING_MISS_WORD..miss_prefix_end].copy_from_slice(&miss_prefix);
+    rewritten[miss_prefix_end..miss_prefix_end + resolver.len()].copy_from_slice(&resolver);
+    for (bytes, word) in stub.chunks_exact_mut(4).zip(rewritten) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+
+    let adrp_offset = link
+        .stub
+        .start
+        .get()
+        .checked_add((DIRECT_BINDING_CAPTURE_WORDS * 4) as u32)
+        .ok_or_else(|| DsrError::CachePolicy("hit relocation offset overflow".to_string()))?;
+    let miss_adrp_offset = link
+        .stub
+        .start
+        .get()
+        .checked_add((DIRECT_BINDING_MISS_WORD * 4) as u32)
+        .ok_or_else(|| DsrError::CachePolicy("miss relocation offset overflow".to_string()))?;
+    Ok(crate::shared_cache::DirectBindingRelocation {
+        ordinal,
+        adrp_offset,
+        add_offset: adrp_offset
+            .checked_add(4)
+            .ok_or_else(|| DsrError::CachePolicy("hit ADD offset overflow".to_string()))?,
+        miss_adrp_offset,
+        miss_add_offset: miss_adrp_offset
+            .checked_add(4)
+            .ok_or_else(|| DsrError::CachePolicy("miss ADD offset overflow".to_string()))?,
+        data_offset,
+    })
+}
+
+fn is_mov_wide_x17(words: &[u32]) -> bool {
+    const IMM16_MASK: u32 = 0x001f_ffe0;
+    let expected = [0xd280_0011, 0xf2a0_0011, 0xf2c0_0011, 0xf2e0_0011];
+    words.len() == expected.len()
+        && words
+            .iter()
+            .zip(expected)
+            .all(|(word, expected)| *word & !IMM16_MASK == expected)
+}
+
 fn emit_cached_direct_exit(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
@@ -5363,6 +5557,181 @@ mod tests {
             assert_eq!(snapshot.x[30], live_x30, "{case}: x30");
             assert_eq!(snapshot.pstate, live_nzcv, "{case}: NZCV");
         }
+    }
+
+    #[test]
+    fn sidecar_v1_hit_path_is_exactly_twenty_two_instructions() {
+        let branch = direct_plan(PlannedExit::Direct {
+            guest: GuestVa(0x4000),
+            word: 0x1400_0400,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target: GuestVa(0x5000),
+                resume: GuestVa(0x4004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        });
+        let assembled = assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
+            .expect("assemble direct branch");
+        let link = assembled.direct_links[0];
+        let mut code = assembled
+            .words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+
+        let relocation = rewrite_direct_binding_stub(
+            &mut code,
+            link,
+            crate::direct_binding::DirectBindingOrdinal::claimed(7),
+            56,
+        )
+        .expect("rewrite sidecar stub");
+        assert_eq!(relocation.adrp_offset, link.stub.start.get() + 20);
+        assert_eq!(relocation.add_offset, link.stub.start.get() + 24);
+        assert_eq!(relocation.miss_adrp_offset, link.stub.start.get() + 108);
+        assert_eq!(relocation.miss_add_offset, link.stub.start.get() + 112);
+        assert_eq!(relocation.data_offset, 56);
+
+        let hit_start = usize::try_from(relocation.adrp_offset).expect("hit start");
+        let hit_end = hit_start + 22 * std::mem::size_of::<u32>();
+        let hit_words = code[hit_start..hit_end]
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("instruction word")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hit_words,
+            vec![
+                0x9000_000f, // adrp x15, binding-cell-page
+                0x9100_01ef, // add x15, x15, binding-cell-pageoff
+                0xc8df_fdf1, // ldar x17, [x15]
+                0xb400_0271, // cbz x17, miss
+                0xf902_8b91, // str x17, [x28, #1296]
+                0xf940_0230, // ldr x16, [x17]
+                0xa940_fa2f, // ldp x15, x30, [x17, #8]
+                0xeb0f_021f, // cmp x16, x15
+                0x5400_01c3, // b.lo miss
+                0xeb1e_021f, // cmp x16, x30
+                0x5400_0182, // b.hs miss
+                0xf940_0e31, // ldr x17, [x17, #24]
+                0xf902_7b91, // str x17, [x28, #1264]
+                0x9112_6391, // add x17, x28, #1176
+                0xa900_7a2f, // stp x15, x30, [x17]
+                0xf902_1b90, // str x16, [x28, #1072]
+                0xf851_0230, // ldur x16, [x17, #-240]
+                0xd51b_4210, // msr nzcv, x16
+                0xa97f_7a2f, // ldp x15, x30, [x17, #-16]
+                0xf85c_8230, // ldur x16, [x17, #-56]
+                0xf859_8231, // ldur x17, [x17, #-104]
+                0xd61f_0220, // br x17
+            ]
+        );
+
+        let stub_start = usize::try_from(link.stub.start.get()).expect("stub start");
+        let capture_words = code[stub_start..hit_start]
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("capture word")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            capture_words,
+            vec![
+                0xf902_478f,
+                0xf902_3390,
+                0xf902_4b9e,
+                0xd53b_4210,
+                0xf901_d790,
+            ],
+            "scratch capture must remain before the 22-word hit path"
+        );
+
+        let miss_start = usize::try_from(relocation.miss_adrp_offset).expect("miss start");
+        let miss_end = miss_start + 28 * std::mem::size_of::<u32>();
+        let miss_words = code[miss_start..miss_end]
+            .chunks_exact(std::mem::size_of::<u32>())
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("miss word")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            miss_words,
+            vec![
+                0x9000_000f, // adrp x15, binding-cell-page
+                0x9100_01ef, // add x15, x15, binding-cell-pageoff
+                0xf902_838f, // str x15, [x28, #1280]
+                0x5280_00f1, // movz w17, #7
+                0x72a0_0011, // movk w17, #0, lsl #16
+                0xb905_0b91, // str w17, [x28, #1288]
+                0x5280_0031, // mov w17, #1
+                0xb905_0f91, // str w17, [x28, #1292]
+                0xf902_8b9f, // str xzr, [x28, #1296]
+                0xf941_d790, // ldr x16, [x28, #936]
+                0xd51b_4210, // msr nzcv, x16
+                0xf942_478f, // ldr x15, [x28, #1160]
+                0xf942_3390, // ldr x16, [x28, #1120]
+                0xf942_4b9e, // ldr x30, [x28, #1168]
+                0xd28a_0011, // mov x17, #0x5000
+                0xf2a0_0011,
+                0xf2c0_0011,
+                0xf2e0_0011,
+                0xf902_1f91, // str x17, [x28, #1080]
+                0xd288_0011, // mov x17, #0x4000
+                0xf2a0_0011,
+                0xf2c0_0011,
+                0xf2e0_0011,
+                0xf902_2391, // str x17, [x28, #1088]
+                0x5280_0051, // mov w17, #2
+                0xb904_4b91, // str w17, [x28, #1096]
+                0xf942_6791, // ldr x17, [x28, #1224]
+                0xd61f_0220, // br x17
+            ],
+            "miss path must publish typed identity, restore state, and reuse the direct resolver"
+        );
+        assert!(
+            code[miss_end..usize::try_from(link.stub.end.get()).expect("stub end")]
+                .chunks_exact(4)
+                .all(|bytes| bytes == 0xd503_201f_u32.to_le_bytes()),
+            "unused envelope words must remain unreachable NOP padding"
+        );
+    }
+
+    #[test]
+    fn sidecar_rewrite_rejects_an_envelope_with_the_wrong_instruction_shape() {
+        let branch = direct_plan(PlannedExit::Direct {
+            guest: GuestVa(0x4000),
+            word: 0x1400_0400,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target: GuestVa(0x5000),
+                resume: GuestVa(0x4004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        });
+        let assembled = assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
+            .expect("assemble direct branch");
+        let link = assembled.direct_links[0];
+        let mut code = assembled
+            .words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let stub_start = usize::try_from(link.stub.start.get()).expect("stub start");
+        code[stub_start..stub_start + 4].copy_from_slice(&0xd503_201f_u32.to_le_bytes());
+
+        let error = rewrite_direct_binding_stub(
+            &mut code,
+            link,
+            crate::direct_binding::DirectBindingOrdinal::claimed(0),
+            0,
+        )
+        .expect_err("wrong precursor shape must reject");
+        assert!(
+            error
+                .to_string()
+                .contains("direct-binding precursor instruction shape"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

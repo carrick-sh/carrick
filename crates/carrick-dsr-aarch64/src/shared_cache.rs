@@ -4,14 +4,28 @@ use carrick_dsr::address::NativeHostBias;
 use carrick_guest_mem::GuestVa;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
 
-pub const TRANSLATOR_ABI_CURRENT: u32 = 2;
+use crate::direct_binding::DirectBindingOrdinal;
+use crate::emit::{DirectLinkKind, DirectStubEnvelope};
+
+pub const TRANSLATOR_ABI_CURRENT: u32 = 3;
 pub const TRANSLATION_UNIT_SCHEMA_V1: u32 = 1;
+pub const TRANSLATION_UNIT_SCHEMA_V2: u32 = 2;
+pub const DIRECT_BINDING_CELL_SIZE: u32 = 8;
 pub const MAX_TRANSLATION_UNIT_CODE_BYTES: usize = 64 * 1024 * 1024;
 pub const TRANSLATION_UNIT_BASE_EXPORT: &str = "carrick_aot_unit_base";
+pub const TRANSLATION_UNIT_BINDING_EXPORT: &str = "carrick_aot_unit_bindings";
 const DARWIN_HOST_PAGE_SIZE: u64 = 16 * 1024;
+static DIRECT_BINDING_RUNTIME_ENABLED: OnceLock<bool> = OnceLock::new();
+
+pub fn direct_binding_runtime_enabled() -> bool {
+    *DIRECT_BINDING_RUNTIME_ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_DSR_DIRECT_BINDINGS").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct SourceFingerprint(pub [u8; 32]);
@@ -253,6 +267,12 @@ pub struct TranslationUnitManifest {
     pub base_export: String,
     pub code_len: u64,
     pub blocks: Vec<PortableBlockRecord>,
+    pub binding_layout: DirectBindingLayout,
+    pub binding_export: String,
+    pub binding_data_len: u64,
+    pub cell_size: u32,
+    pub bindings: Vec<UnresolvedDirectBindingRecord>,
+    pub binding_relocations: Vec<DirectBindingRelocation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,6 +280,83 @@ pub struct PendingTranslationUnit {
     pub key: TranslationUnitKey,
     pub code: Vec<u8>,
     pub blocks: Vec<PortableBlockRecord>,
+    pub binding_layout: DirectBindingLayout,
+    pub binding_export: String,
+    pub binding_data_len: u64,
+    pub cell_size: u32,
+    pub bindings: Vec<UnresolvedDirectBindingRecord>,
+    pub binding_relocations: Vec<DirectBindingRelocation>,
+    pub binding_data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectBindingLayout {
+    Disabled,
+    SidecarV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnresolvedDirectBindingRecord {
+    pub source: GuestVa,
+    pub target: GuestVa,
+    pub kind: DirectLinkKind,
+    pub ordinal: DirectBindingOrdinal,
+    pub stub_start: u32,
+    pub stub_end: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireUnresolvedDirectBindingRecord {
+    source: u64,
+    target: u64,
+    kind: DirectLinkKind,
+    ordinal: DirectBindingOrdinal,
+    stub_start: u32,
+    stub_end: u32,
+}
+
+impl Serialize for UnresolvedDirectBindingRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        WireUnresolvedDirectBindingRecord {
+            source: self.source.raw(),
+            target: self.target.raw(),
+            kind: self.kind,
+            ordinal: self.ordinal,
+            stub_start: self.stub_start,
+            stub_end: self.stub_end,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UnresolvedDirectBindingRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WireUnresolvedDirectBindingRecord::deserialize(deserializer)?;
+        Ok(Self {
+            source: GuestVa(wire.source),
+            target: GuestVa(wire.target),
+            kind: wire.kind,
+            ordinal: wire.ordinal,
+            stub_start: wire.stub_start,
+            stub_end: wire.stub_end,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectBindingRelocation {
+    pub ordinal: DirectBindingOrdinal,
+    pub adrp_offset: u32,
+    pub add_offset: u32,
+    pub miss_adrp_offset: u32,
+    pub miss_add_offset: u32,
+    pub data_offset: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,6 +371,7 @@ impl PendingTranslationUnit {
     pub fn pack(
         key: TranslationUnitKey,
         candidates: Vec<PortableBlockCandidate>,
+        binding_layout: DirectBindingLayout,
     ) -> Result<Self, crate::types::DsrError> {
         let mut code = Vec::new();
         let mut blocks = Vec::with_capacity(candidates.len());
@@ -320,69 +418,196 @@ impl PendingTranslationUnit {
                 template: candidate.template.into_runtime_metadata_only(),
             });
         }
+        let mut unresolved = Vec::new();
         for (source_entry, links) in direct_links {
             for link in links {
-                let Some(target_entry) = entries.get(&link.target).copied() else {
-                    continue;
-                };
-                let source = source_entry.checked_add(link.slot.get()).ok_or_else(|| {
+                let slot = source_entry.checked_add(link.slot.get()).ok_or_else(|| {
                     crate::types::DsrError::CachePolicy(
                         "translation unit direct-link source overflow".to_string(),
                     )
                 })?;
-                if !source.is_multiple_of(4) {
+                let stub_start =
+                    source_entry
+                        .checked_add(link.stub.start.get())
+                        .ok_or_else(|| {
+                            crate::types::DsrError::CachePolicy(
+                                "translation unit direct-link stub start overflow".to_string(),
+                            )
+                        })?;
+                let stub_end = source_entry
+                    .checked_add(link.stub.end.get())
+                    .ok_or_else(|| {
+                        crate::types::DsrError::CachePolicy(
+                            "translation unit direct-link stub end overflow".to_string(),
+                        )
+                    })?;
+                if !slot.is_multiple_of(4)
+                    || !stub_start.is_multiple_of(4)
+                    || !stub_end.is_multiple_of(4)
+                    || stub_start >= stub_end
+                    || u64::from(stub_end) > code.len() as u64
+                {
                     return Err(crate::types::DsrError::CachePolicy(format!(
-                        "translation unit direct-link source is unaligned: {source}"
+                        "translation unit direct-link geometry is invalid: slot={slot} stub={stub_start}..{stub_end}"
                     )));
                 }
-                let displacement = i64::from(target_entry) - i64::from(source);
-                if displacement % 4 != 0 {
-                    return Err(crate::types::DsrError::CachePolicy(format!(
-                        "translation unit direct-link displacement is unaligned: {displacement}"
-                    )));
-                }
-                let words = displacement / 4;
-                if !(-(1_i64 << 25)..(1_i64 << 25)).contains(&words) {
-                    return Err(crate::types::DsrError::CachePolicy(format!(
-                        "translation unit direct-link target is out of range: {displacement}"
-                    )));
-                }
-                let offset = usize::try_from(source).map_err(|_| {
-                    crate::types::DsrError::CachePolicy(
-                        "translation unit direct-link offset does not fit usize".to_string(),
-                    )
-                })?;
-                let end = offset.checked_add(4).ok_or_else(|| {
-                    crate::types::DsrError::CachePolicy(
-                        "translation unit direct-link word overflow".to_string(),
-                    )
-                })?;
-                let bytes = code.get_mut(offset..end).ok_or_else(|| {
-                    crate::types::DsrError::CachePolicy(
-                        "translation unit direct-link slot is out of bounds".to_string(),
-                    )
-                })?;
-                let existing = u32::from_le_bytes(bytes.try_into().map_err(|_| {
-                    crate::types::DsrError::CachePolicy(
-                        "translation unit direct-link word is malformed".to_string(),
-                    )
-                })?);
-                if existing & 0xfc00_0000 != 0x1400_0000 {
-                    return Err(crate::types::DsrError::CachePolicy(format!(
-                        "translation unit direct-link slot is not an AArch64 B: 0x{existing:08x}"
-                    )));
-                }
-                let linked = 0x1400_0000 | ((words as i32 as u32) & 0x03ff_ffff);
-                bytes.copy_from_slice(&linked.to_le_bytes());
+                let absolute = crate::emit::DirectLink {
+                    slot: crate::types::CacheOffset::published(slot),
+                    source: link.source,
+                    target: link.target,
+                    kind: link.kind,
+                    stub: DirectStubEnvelope {
+                        start: crate::types::CacheOffset::published(stub_start),
+                        end: crate::types::CacheOffset::published(stub_end),
+                    },
+                };
+                let Some(target_entry) = entries.get(&link.target).copied() else {
+                    unresolved.push(absolute);
+                    continue;
+                };
+                patch_same_unit_direct_link(&mut code, slot, target_entry)?;
             }
         }
+        unresolved.sort_by_key(|link| link.stub.start.get());
+        if unresolved
+            .windows(2)
+            .any(|pair| pair[0].stub.end.get() > pair[1].stub.start.get())
+        {
+            return Err(crate::types::DsrError::CachePolicy(
+                "translation unit has conflicting direct-binding stub owners".to_string(),
+            ));
+        }
+
+        let bindings = unresolved
+            .iter()
+            .enumerate()
+            .map(|(index, link)| {
+                let ordinal = u32::try_from(index)
+                    .map(DirectBindingOrdinal::claimed)
+                    .map_err(|_| {
+                        crate::types::DsrError::CachePolicy(
+                            "translation unit direct-binding ordinal exceeds u32".to_string(),
+                        )
+                    })?;
+                Ok(UnresolvedDirectBindingRecord {
+                    source: link.source,
+                    target: link.target,
+                    kind: link.kind,
+                    ordinal,
+                    stub_start: link.stub.start.get(),
+                    stub_end: link.stub.end.get(),
+                })
+            })
+            .collect::<Result<Vec<_>, crate::types::DsrError>>()?;
+
+        let (binding_export, cell_size, binding_data, binding_relocations) = match binding_layout {
+            DirectBindingLayout::Disabled => (String::new(), 0, Vec::new(), Vec::new()),
+            DirectBindingLayout::SidecarV1 => {
+                let binding_data_len = bindings
+                    .len()
+                    .checked_mul(DIRECT_BINDING_CELL_SIZE as usize)
+                    .ok_or_else(|| {
+                        crate::types::DsrError::CachePolicy(
+                            "translation unit binding data length overflow".to_string(),
+                        )
+                    })?;
+                let binding_data = vec![0; binding_data_len];
+                let mut relocations = Vec::with_capacity(bindings.len());
+                for (link, binding) in unresolved.iter().copied().zip(&bindings) {
+                    let data_offset = binding
+                        .ordinal
+                        .get()
+                        .checked_mul(DIRECT_BINDING_CELL_SIZE)
+                        .ok_or_else(|| {
+                            crate::types::DsrError::CachePolicy(
+                                "translation unit binding data offset overflow".to_string(),
+                            )
+                        })?;
+                    relocations.push(crate::emit::rewrite_direct_binding_stub(
+                        &mut code,
+                        link,
+                        binding.ordinal,
+                        data_offset,
+                    )?);
+                }
+                (
+                    TRANSLATION_UNIT_BINDING_EXPORT.to_owned(),
+                    DIRECT_BINDING_CELL_SIZE,
+                    binding_data,
+                    relocations,
+                )
+            }
+        };
+        let binding_data_len = u64::try_from(binding_data.len()).map_err(|_| {
+            crate::types::DsrError::CachePolicy(
+                "translation unit binding data length exceeds u64".to_string(),
+            )
+        })?;
         if code.is_empty() {
             return Err(crate::types::DsrError::CachePolicy(
                 "translation unit contains no blocks".to_string(),
             ));
         }
-        Ok(Self { key, code, blocks })
+        Ok(Self {
+            key,
+            code,
+            blocks,
+            binding_layout,
+            binding_export,
+            binding_data_len,
+            cell_size,
+            bindings,
+            binding_relocations,
+            binding_data,
+        })
     }
+}
+
+fn patch_same_unit_direct_link(
+    code: &mut [u8],
+    source: u32,
+    target_entry: u32,
+) -> Result<(), crate::types::DsrError> {
+    let displacement = i64::from(target_entry) - i64::from(source);
+    if displacement % 4 != 0 {
+        return Err(crate::types::DsrError::CachePolicy(format!(
+            "translation unit direct-link displacement is unaligned: {displacement}"
+        )));
+    }
+    let words = displacement / 4;
+    if !(-(1_i64 << 25)..(1_i64 << 25)).contains(&words) {
+        return Err(crate::types::DsrError::CachePolicy(format!(
+            "translation unit direct-link target is out of range: {displacement}"
+        )));
+    }
+    let offset = usize::try_from(source).map_err(|_| {
+        crate::types::DsrError::CachePolicy(
+            "translation unit direct-link offset does not fit usize".to_string(),
+        )
+    })?;
+    let end = offset.checked_add(4).ok_or_else(|| {
+        crate::types::DsrError::CachePolicy(
+            "translation unit direct-link word overflow".to_string(),
+        )
+    })?;
+    let bytes = code.get_mut(offset..end).ok_or_else(|| {
+        crate::types::DsrError::CachePolicy(
+            "translation unit direct-link slot is out of bounds".to_string(),
+        )
+    })?;
+    let existing = u32::from_le_bytes(bytes.try_into().map_err(|_| {
+        crate::types::DsrError::CachePolicy(
+            "translation unit direct-link word is malformed".to_string(),
+        )
+    })?);
+    if existing & 0xfc00_0000 != 0x1400_0000 {
+        return Err(crate::types::DsrError::CachePolicy(format!(
+            "translation unit direct-link slot is not an AArch64 B: 0x{existing:08x}"
+        )));
+    }
+    let linked = 0x1400_0000 | ((words as i32 as u32) & 0x03ff_ffff);
+    bytes.copy_from_slice(&linked.to_le_bytes());
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,7 +717,7 @@ impl TranslationUnitManifest {
     }
 
     pub fn validate_ranges(&self) -> Result<(), UnitMissReason> {
-        if self.schema != TRANSLATION_UNIT_SCHEMA_V1 {
+        if self.schema != TRANSLATION_UNIT_SCHEMA_V2 {
             return Err(UnitMissReason::Schema);
         }
         if self.key.translator_abi() != TRANSLATOR_ABI_CURRENT {
@@ -516,8 +741,136 @@ impl TranslationUnitManifest {
                 return Err(UnitMissReason::ManifestRange);
             }
         }
+        let same_unit_targets = self
+            .blocks
+            .iter()
+            .map(|block| block.guest_start)
+            .collect::<BTreeSet<_>>();
+        let mut owners = BTreeSet::new();
+        let mut previous_stub_end = None;
+        for (index, binding) in self.bindings.iter().enumerate() {
+            let expected_ordinal =
+                u32::try_from(index).map_err(|_| UnitMissReason::ManifestRange)?;
+            if binding.ordinal.get() != expected_ordinal
+                || !binding.stub_start.is_multiple_of(4)
+                || !binding.stub_end.is_multiple_of(4)
+                || binding.stub_start >= binding.stub_end
+                || u64::from(binding.stub_end) > self.code_len
+                || !owners.insert(binding.stub_start)
+                || previous_stub_end.is_some_and(|end| end > binding.stub_start)
+                || same_unit_targets.contains(&binding.target)
+            {
+                return Err(UnitMissReason::ManifestRange);
+            }
+            previous_stub_end = Some(binding.stub_end);
+        }
+        match self.binding_layout {
+            DirectBindingLayout::Disabled => {
+                if !self.binding_export.is_empty()
+                    || self.binding_data_len != 0
+                    || self.cell_size != 0
+                    || !self.binding_relocations.is_empty()
+                {
+                    return Err(UnitMissReason::ManifestRange);
+                }
+            }
+            DirectBindingLayout::SidecarV1 => {
+                let expected_len = u64::try_from(self.bindings.len())
+                    .ok()
+                    .and_then(|count| count.checked_mul(u64::from(DIRECT_BINDING_CELL_SIZE)))
+                    .ok_or(UnitMissReason::ManifestRange)?;
+                if self.binding_export != TRANSLATION_UNIT_BINDING_EXPORT
+                    || self.cell_size != DIRECT_BINDING_CELL_SIZE
+                    || !self
+                        .binding_data_len
+                        .is_multiple_of(u64::from(DIRECT_BINDING_CELL_SIZE))
+                    || self.binding_data_len != expected_len
+                    || self.binding_relocations.len() != self.bindings.len()
+                {
+                    return Err(UnitMissReason::ManifestRange);
+                }
+                let mut relocation_ordinals = BTreeSet::new();
+                for relocation in &self.binding_relocations {
+                    let ordinal = usize::try_from(relocation.ordinal.get())
+                        .map_err(|_| UnitMissReason::ManifestRange)?;
+                    let binding = self
+                        .bindings
+                        .get(ordinal)
+                        .ok_or(UnitMissReason::ManifestRange)?;
+                    let expected_data_offset = relocation
+                        .ordinal
+                        .get()
+                        .checked_mul(DIRECT_BINDING_CELL_SIZE)
+                        .ok_or(UnitMissReason::ManifestRange)?;
+                    let offsets = [
+                        relocation.adrp_offset,
+                        relocation.add_offset,
+                        relocation.miss_adrp_offset,
+                        relocation.miss_add_offset,
+                    ];
+                    let hit_add = relocation
+                        .adrp_offset
+                        .checked_add(4)
+                        .ok_or(UnitMissReason::ManifestRange)?;
+                    let miss_add = relocation
+                        .miss_adrp_offset
+                        .checked_add(4)
+                        .ok_or(UnitMissReason::ManifestRange)?;
+                    if !relocation_ordinals.insert(relocation.ordinal)
+                        || relocation.data_offset != expected_data_offset
+                        || offsets.iter().any(|offset| {
+                            !offset.is_multiple_of(4)
+                                || *offset < binding.stub_start
+                                || u64::from(*offset) + 4 > u64::from(binding.stub_end)
+                                || u64::from(*offset) + 4 > self.code_len
+                        })
+                        || relocation.add_offset != hit_add
+                        || relocation.miss_add_offset != miss_add
+                    {
+                        return Err(UnitMissReason::ManifestRange);
+                    }
+                }
+            }
+        }
         Ok(())
     }
+
+    pub fn validate_binding_data(&self, binding_data: &[u8]) -> Result<(), UnitMissReason> {
+        if u64::try_from(binding_data.len()).ok() != Some(self.binding_data_len)
+            || binding_data.iter().any(|byte| *byte != 0)
+        {
+            return Err(UnitMissReason::ManifestRange);
+        }
+        Ok(())
+    }
+
+    pub fn validate_binding_code(&self, code: &[u8]) -> Result<(), UnitMissReason> {
+        self.validate_ranges()?;
+        for relocation in &self.binding_relocations {
+            for (adrp_offset, add_offset) in [
+                (relocation.adrp_offset, relocation.add_offset),
+                (relocation.miss_adrp_offset, relocation.miss_add_offset),
+            ] {
+                let adrp = code_word(code, adrp_offset)?;
+                let add = code_word(code, add_offset)?;
+                if adrp & 0x9f00_001f != 0x9000_000f || add & 0xffc0_03ff != 0x9100_01ef {
+                    return Err(UnitMissReason::ManifestRange);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn code_word(code: &[u8], offset: u32) -> Result<u32, UnitMissReason> {
+    let start = usize::try_from(offset).map_err(|_| UnitMissReason::ManifestRange)?;
+    let end = start.checked_add(4).ok_or(UnitMissReason::ManifestRange)?;
+    let bytes = code.get(start..end).ok_or(UnitMissReason::ManifestRange)?;
+    Ok(u32::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| UnitMissReason::ManifestRange)?,
+    ))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -611,8 +964,9 @@ impl<'de> Deserialize<'de> for TranslationUnitKey {
 mod tests {
     use super::*;
     use crate::artifact_spike::{ArtifactBindings, ArtifactTemplate};
-    use crate::emit::{DirectLink, PcMapEntry};
-    use crate::types::CacheOffset;
+    use crate::block::{BlockPlan, PlannedExit};
+    use crate::emit::{DirectLink, DirectLinkKind, DirectStubEnvelope, PcMapEntry};
+    use crate::types::{CacheOffset, CodeGeneration, DirectExit, DirectKind};
     use carrick_dsr::address::NativeHostBias;
     use carrick_guest_mem::GuestVa;
 
@@ -633,11 +987,87 @@ mod tests {
         )
     }
 
+    fn unresolved_direct_template(source: GuestVa, target: GuestVa) -> ArtifactTemplate {
+        crate::emit::record_portable_block_artifact(
+            &BlockPlan {
+                start: source,
+                end: GuestVa(source.raw() + 4),
+                generation: CodeGeneration::INITIAL,
+                instructions: Vec::new(),
+                exit: PlannedExit::Direct {
+                    guest: source,
+                    word: 0x1400_0001,
+                    exit: DirectExit {
+                        kind: DirectKind::Branch,
+                        target,
+                        resume: GuestVa(source.raw() + 4),
+                        condition: None,
+                        register: None,
+                        bit: None,
+                    },
+                },
+            },
+            0,
+            crate::emit::EmitAddressMode::Direct,
+            vec![0x1400_0001],
+        )
+        .expect("record unresolved direct template")
+        .template
+    }
+
+    fn empty_template() -> ArtifactTemplate {
+        ArtifactTemplate::normalize(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &ArtifactBindings::from_values([]).expect("empty bindings"),
+        )
+        .expect("empty template")
+    }
+
+    fn manifest_v2_fixture() -> TranslationUnitManifest {
+        TranslationUnitManifest {
+            schema: TRANSLATION_UNIT_SCHEMA_V2,
+            key: key(
+                ExecutableIdentity::Digest([0x11; 32]),
+                SourceFingerprint([0xaa; 32]),
+                AddressModeIdentity::Direct,
+            ),
+            dylib_sha256: [0x22; 32],
+            base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+            code_len: 512,
+            blocks: Vec::new(),
+            binding_layout: DirectBindingLayout::SidecarV1,
+            binding_export: TRANSLATION_UNIT_BINDING_EXPORT.to_owned(),
+            binding_data_len: u64::from(DIRECT_BINDING_CELL_SIZE),
+            cell_size: DIRECT_BINDING_CELL_SIZE,
+            bindings: vec![UnresolvedDirectBindingRecord {
+                source: GuestVa(0x400000),
+                target: GuestVa(0x500000),
+                kind: DirectLinkKind::Branch,
+                ordinal: DirectBindingOrdinal::claimed(0),
+                stub_start: 32,
+                stub_end: 288,
+            }],
+            binding_relocations: vec![DirectBindingRelocation {
+                ordinal: DirectBindingOrdinal::claimed(0),
+                adrp_offset: 52,
+                add_offset: 56,
+                miss_adrp_offset: 140,
+                miss_add_offset: 144,
+                data_offset: 0,
+            }],
+        }
+    }
+
     #[test]
     fn source_fingerprint_mismatch_is_a_typed_miss() {
         let source = [0xd280_0000_u32];
         let manifest = TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V1,
+            schema: TRANSLATION_UNIT_SCHEMA_V2,
             key: key(
                 ExecutableIdentity::Digest([0x11; 32]),
                 SourceFingerprint::from_words(&source),
@@ -647,6 +1077,12 @@ mod tests {
             base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
             code_len: 4,
             blocks: Vec::new(),
+            binding_layout: DirectBindingLayout::Disabled,
+            binding_export: String::new(),
+            binding_data_len: 0,
+            cell_size: 0,
+            bindings: Vec::new(),
+            binding_relocations: Vec::new(),
         };
 
         assert_eq!(
@@ -659,7 +1095,7 @@ mod tests {
     fn previous_target_cache_abi_is_rejected() {
         let source = [0xd280_0000_u32];
         let mut manifest = TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V1,
+            schema: TRANSLATION_UNIT_SCHEMA_V2,
             key: key(
                 ExecutableIdentity::Digest([0x11; 32]),
                 SourceFingerprint::from_words(&source),
@@ -669,18 +1105,24 @@ mod tests {
             base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
             code_len: 4,
             blocks: Vec::new(),
+            binding_layout: DirectBindingLayout::Disabled,
+            binding_export: String::new(),
+            binding_data_len: 0,
+            cell_size: 0,
+            bindings: Vec::new(),
+            binding_relocations: Vec::new(),
         };
-        manifest.key.translator_abi = 1;
+        manifest.key.translator_abi = 2;
 
         assert_eq!(
             manifest.validate_ranges(),
             Err(UnitMissReason::TranslatorAbi),
-            "units emitted for the 16-byte target cache must not load into the authority-carrying runtime"
+            "ABI-2 authority precursors must not load into the direct-binding sidecar runtime"
         );
     }
 
     #[test]
-    fn pack_links_direct_edges_between_blocks_in_the_same_unit() {
+    fn same_unit_links_patch_to_b_and_receive_no_cells() {
         let bindings = ArtifactBindings::from_values([]).expect("empty bindings");
         let source = ArtifactTemplate::normalize(
             vec![0x1400_0001, 0xd503_201f, 0xd503_201f],
@@ -737,12 +1179,289 @@ mod tests {
                     template: target,
                 },
             ],
+            DirectBindingLayout::SidecarV1,
         )
         .expect("pack unit");
 
         assert_eq!(
             u32::from_le_bytes(pending.code[0..4].try_into().expect("branch word")),
             0x1400_0003
+        );
+        assert!(pending.bindings.is_empty());
+        assert!(pending.binding_data.is_empty());
+        assert!(pending.binding_relocations.is_empty());
+    }
+
+    #[test]
+    fn unresolved_stubs_receive_ordinals_in_source_offset_order() {
+        let bindings = ArtifactBindings::from_values([]).expect("empty bindings");
+        let template = ArtifactTemplate::normalize(
+            vec![
+                0x1400_0001,
+                0x1400_0001,
+                0xd503_201f,
+                0xd503_201f,
+                0xd503_201f,
+                0xd503_201f,
+            ],
+            vec![PcMapEntry {
+                guest: GuestVa(0x400000),
+                cache: CacheOffset::published(0),
+            }],
+            Vec::new(),
+            vec![
+                DirectLink {
+                    slot: CacheOffset::published(4),
+                    source: GuestVa(0x400004),
+                    target: GuestVa(0x600000),
+                    kind: DirectLinkKind::Branch,
+                    stub: DirectStubEnvelope {
+                        start: CacheOffset::published(16),
+                        end: CacheOffset::published(24),
+                    },
+                },
+                DirectLink {
+                    slot: CacheOffset::published(0),
+                    source: GuestVa(0x400000),
+                    target: GuestVa(0x500000),
+                    kind: DirectLinkKind::Branch,
+                    stub: DirectStubEnvelope {
+                        start: CacheOffset::published(8),
+                        end: CacheOffset::published(16),
+                    },
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+            &bindings,
+        )
+        .expect("out-of-order unresolved template");
+        let pending = PendingTranslationUnit::pack(
+            key(
+                ExecutableIdentity::Digest([0x11; 32]),
+                SourceFingerprint([0xaa; 32]),
+                AddressModeIdentity::Direct,
+            ),
+            vec![PortableBlockCandidate {
+                guest_start: GuestVa(0x400000),
+                generation_binding: 0,
+                requires_sensitive_metadata: false,
+                template,
+            }],
+            DirectBindingLayout::Disabled,
+        )
+        .expect("pack disabled unit");
+
+        assert_eq!(
+            pending
+                .bindings
+                .iter()
+                .map(|binding| (
+                    binding.stub_start,
+                    binding.ordinal.get(),
+                    binding.source,
+                    binding.target,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (8, 0, GuestVa(0x400000), GuestVa(0x500000)),
+                (16, 1, GuestVa(0x400004), GuestVa(0x600000)),
+            ]
+        );
+        assert!(pending.binding_data.is_empty());
+        assert!(pending.binding_relocations.is_empty());
+        assert_eq!(
+            pending
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("disabled word")))
+                .collect::<Vec<_>>(),
+            vec![
+                0x1400_0001,
+                0x1400_0001,
+                0xd503_201f,
+                0xd503_201f,
+                0xd503_201f,
+                0xd503_201f,
+            ],
+            "Disabled must preserve the authority precursor byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn equal_source_target_pairs_still_own_distinct_cells() {
+        let source = GuestVa(0x400000);
+        let target = GuestVa(0x500000);
+        let template = unresolved_direct_template(source, target);
+        let pending = PendingTranslationUnit::pack(
+            key(
+                ExecutableIdentity::Digest([0x11; 32]),
+                SourceFingerprint([0xaa; 32]),
+                AddressModeIdentity::Direct,
+            ),
+            vec![
+                PortableBlockCandidate {
+                    guest_start: GuestVa(0x400000),
+                    generation_binding: 0,
+                    requires_sensitive_metadata: false,
+                    template: template.clone(),
+                },
+                PortableBlockCandidate {
+                    guest_start: GuestVa(0x400100),
+                    generation_binding: 1,
+                    requires_sensitive_metadata: false,
+                    template,
+                },
+            ],
+            DirectBindingLayout::SidecarV1,
+        )
+        .expect("pack duplicate-edge unit");
+
+        assert_eq!(pending.bindings.len(), 2);
+        assert_eq!(pending.bindings[0].source, source);
+        assert_eq!(pending.bindings[1].source, source);
+        assert_eq!(pending.bindings[0].target, target);
+        assert_eq!(pending.bindings[1].target, target);
+        assert_eq!(pending.bindings[0].ordinal.get(), 0);
+        assert_eq!(pending.bindings[1].ordinal.get(), 1);
+        assert_eq!(pending.binding_data, vec![0; 16]);
+        assert_eq!(pending.binding_relocations.len(), 2);
+        assert_eq!(pending.binding_relocations[0].data_offset, 0);
+        assert_eq!(pending.binding_relocations[1].data_offset, 8);
+    }
+
+    #[test]
+    fn schema_v2_rejects_old_abi_nonzero_cells_and_out_of_stub_relocations() {
+        fn assert_range_miss(case: &str, manifest: TranslationUnitManifest) {
+            assert_eq!(
+                manifest.validate_ranges(),
+                Err(UnitMissReason::ManifestRange),
+                "{case}"
+            );
+        }
+
+        let mut old_schema = manifest_v2_fixture();
+        old_schema.schema = 1;
+        assert_eq!(
+            old_schema.validate_ranges(),
+            Err(UnitMissReason::Schema),
+            "old schema"
+        );
+
+        let mut old_abi = manifest_v2_fixture();
+        old_abi.key.translator_abi = 2;
+        assert_eq!(
+            old_abi.validate_ranges(),
+            Err(UnitMissReason::TranslatorAbi),
+            "old translator ABI"
+        );
+
+        let mut unaligned_data = manifest_v2_fixture();
+        unaligned_data.binding_data_len = 9;
+        assert_range_miss("unaligned data length", unaligned_data);
+
+        let mut inconsistent_data = manifest_v2_fixture();
+        inconsistent_data.binding_data_len = 16;
+        assert_range_miss("inconsistent data length", inconsistent_data);
+
+        let mut duplicate_ordinal = manifest_v2_fixture();
+        duplicate_ordinal
+            .bindings
+            .push(UnresolvedDirectBindingRecord {
+                source: GuestVa(0x400100),
+                target: GuestVa(0x500100),
+                kind: DirectLinkKind::Branch,
+                ordinal: DirectBindingOrdinal::claimed(0),
+                stub_start: 288,
+                stub_end: 512,
+            });
+        duplicate_ordinal
+            .binding_relocations
+            .push(DirectBindingRelocation {
+                ordinal: DirectBindingOrdinal::claimed(0),
+                adrp_offset: 308,
+                add_offset: 312,
+                miss_adrp_offset: 396,
+                miss_add_offset: 400,
+                data_offset: 8,
+            });
+        duplicate_ordinal.binding_data_len = 16;
+        assert_range_miss("duplicate ordinal", duplicate_ordinal);
+
+        let mut conflicting_owner = manifest_v2_fixture();
+        conflicting_owner
+            .bindings
+            .push(UnresolvedDirectBindingRecord {
+                source: GuestVa(0x400100),
+                target: GuestVa(0x500100),
+                kind: DirectLinkKind::Call,
+                ordinal: DirectBindingOrdinal::claimed(1),
+                stub_start: 32,
+                stub_end: 288,
+            });
+        conflicting_owner
+            .binding_relocations
+            .push(DirectBindingRelocation {
+                ordinal: DirectBindingOrdinal::claimed(1),
+                adrp_offset: 52,
+                add_offset: 56,
+                miss_adrp_offset: 140,
+                miss_add_offset: 144,
+                data_offset: 8,
+            });
+        conflicting_owner.binding_data_len = 16;
+        assert_range_miss("conflicting stub owner", conflicting_owner);
+
+        let mut same_unit_binding = manifest_v2_fixture();
+        same_unit_binding.blocks.push(PortableBlockRecord {
+            guest_start: GuestVa(0x500000),
+            generation_binding: 0,
+            entry_offset: 0,
+            code_len: 4,
+            requires_sensitive_metadata: false,
+            template: empty_template(),
+        });
+        assert_range_miss("same-unit binding", same_unit_binding);
+
+        let mut out_of_envelope = manifest_v2_fixture();
+        out_of_envelope.binding_relocations[0].adrp_offset = 28;
+        assert_range_miss("out-of-envelope relocation", out_of_envelope);
+
+        let mut miss_out_of_envelope = manifest_v2_fixture();
+        miss_out_of_envelope.binding_relocations[0].miss_add_offset = 288;
+        assert_range_miss("out-of-envelope miss relocation", miss_out_of_envelope);
+
+        let manifest = manifest_v2_fixture();
+        assert_eq!(
+            manifest.validate_binding_data(&[0; 8]),
+            Ok(()),
+            "zero cells"
+        );
+        assert_eq!(
+            manifest.validate_binding_data(&[0, 0, 0, 0, 0, 0, 0, 1]),
+            Err(UnitMissReason::ManifestRange),
+            "nonzero cell bytes"
+        );
+
+        let mut code = vec![0; 512];
+        for (offset, word) in [
+            (52, 0x9000_000f_u32),
+            (56, 0x9100_01ef),
+            (140, 0x9000_000f),
+            (144, 0x9100_01ef),
+        ] {
+            code[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        assert_eq!(
+            manifest.validate_binding_code(&code),
+            Ok(()),
+            "both typed relocation pairs"
+        );
+        code[144..148].copy_from_slice(&0xd503_201f_u32.to_le_bytes());
+        assert_eq!(
+            manifest.validate_binding_code(&code),
+            Err(UnitMissReason::ManifestRange),
+            "wrong miss relocation instruction shape"
         );
     }
 

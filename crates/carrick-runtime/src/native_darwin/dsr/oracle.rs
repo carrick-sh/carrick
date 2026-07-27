@@ -3464,10 +3464,10 @@ fn binding_generation_guard_exits_stale_after_atomic_changes() {
 #[test]
 fn published_shared_block_prevents_second_process_translation() {
     use carrick_dsr_aarch64::shared_cache::{
-        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
-        NativePageProfileIdentity, PortableBlockRecord, PublishOutcome, SharedExecutableSegment,
-        SharedImageConfig, SharedLoadedTranslationUnit, SourceFingerprint,
-        TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V1, TranslationUnitKey,
+        AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
+        ImageFileOffset, NativePageProfileIdentity, PortableBlockRecord, PublishOutcome,
+        SharedExecutableSegment, SharedImageConfig, SharedLoadedTranslationUnit, SourceFingerprint,
+        TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey,
         TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
     };
 
@@ -3535,7 +3535,7 @@ fn published_shared_block_prevents_second_process_translation() {
         AddressModeIdentity::biased(fixture.host_bias),
     );
     let manifest = TranslationUnitManifest {
-        schema: TRANSLATION_UNIT_SCHEMA_V1,
+        schema: TRANSLATION_UNIT_SCHEMA_V2,
         key: key.clone(),
         dylib_sha256: [0x22; 32],
         base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
@@ -3548,6 +3548,12 @@ fn published_shared_block_prevents_second_process_translation() {
             requires_sensitive_metadata: false,
             template: record.template,
         }],
+        binding_layout: DirectBindingLayout::Disabled,
+        binding_export: String::new(),
+        binding_data_len: 0,
+        cell_size: 0,
+        bindings: Vec::new(),
+        binding_relocations: Vec::new(),
     };
     let lease: Arc<dyn Send + Sync> = cache;
     let store = Arc::new(FixtureStore {
@@ -3616,11 +3622,11 @@ fn published_shared_block_prevents_second_process_translation() {
 #[test]
 fn shared_to_private_indirect_cache_hit_installs_target_authority() {
     use carrick_dsr_aarch64::shared_cache::{
-        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
-        NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate, PublishOutcome,
-        SharedExecutableSegment, SharedImageConfig, SharedLoadedTranslationUnit, SourceFingerprint,
-        TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V1, TranslationUnitKey,
-        TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
+        AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
+        ImageFileOffset, NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate,
+        PublishOutcome, SharedExecutableSegment, SharedImageConfig, SharedLoadedTranslationUnit,
+        SourceFingerprint, TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V2,
+        TranslationUnitKey, TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
     };
 
     struct FixtureStore(SharedLoadedTranslationUnit);
@@ -3679,6 +3685,7 @@ fn shared_to_private_indirect_cache_hit_installs_target_authority() {
             requires_sensitive_metadata: false,
             template: first.template,
         }],
+        DirectBindingLayout::Disabled,
     )
     .expect("pack indirect fixture unit");
     let code_words = pending
@@ -3698,12 +3705,18 @@ fn shared_to_private_indirect_cache_hit_installs_target_authority() {
         .publish_words(&code_words)
         .expect("publish indirect fixture unit");
     let manifest = TranslationUnitManifest {
-        schema: TRANSLATION_UNIT_SCHEMA_V1,
+        schema: TRANSLATION_UNIT_SCHEMA_V2,
         key: key.clone(),
         dylib_sha256: [0x88; 32],
         base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
         code_len: pending.code.len() as u64,
         blocks: pending.blocks,
+        binding_layout: pending.binding_layout,
+        binding_export: pending.binding_export,
+        binding_data_len: pending.binding_data_len,
+        cell_size: pending.cell_size,
+        bindings: pending.bindings,
+        binding_relocations: pending.binding_relocations,
     };
     let base = emitted.entry().host().raw();
     let lease: Arc<dyn Send + Sync> = cache;
@@ -3779,7 +3792,7 @@ fn translated_block_is_published_on_retirement_and_reused() {
         AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
         NativePageProfileIdentity, PendingTranslationUnit, PublishOutcome, SharedExecutableSegment,
         SharedImageConfig, SharedLoadedTranslationUnit, TRANSLATION_UNIT_BASE_EXPORT,
-        TRANSLATION_UNIT_SCHEMA_V1, TranslationUnitKey, TranslationUnitManifest,
+        TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey, TranslationUnitManifest,
         TranslationUnitStore, UnitMissReason,
     };
 
@@ -3831,12 +3844,18 @@ fn translated_block_is_published_on_retirement_and_reused() {
                 .expect("publish retirement fixture words");
             let base = emitted.entry().host().raw();
             let manifest = TranslationUnitManifest {
-                schema: TRANSLATION_UNIT_SCHEMA_V1,
+                schema: TRANSLATION_UNIT_SCHEMA_V2,
                 key: pending.key.clone(),
                 dylib_sha256: [0x33; 32],
                 base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
                 code_len: pending.code.len() as u64,
                 blocks: pending.blocks.clone(),
+                binding_layout: pending.binding_layout,
+                binding_export: pending.binding_export.clone(),
+                binding_data_len: pending.binding_data_len,
+                cell_size: pending.cell_size,
+                bindings: pending.bindings.clone(),
+                binding_relocations: pending.binding_relocations.clone(),
             };
             let lease: Arc<dyn Send + Sync> = cache;
             *loaded = Some(SharedLoadedTranslationUnit::new(manifest, base, lease));

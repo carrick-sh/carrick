@@ -40,8 +40,9 @@ mod tests {
     use super::super::block::{BlockPlan, PlannedExit, PlannedInst};
     use super::super::cache::TranslationCache;
     use super::super::emit::{
-        BiasedBase, BiasedBaseCoordinate, BiasedMemoryRecovery, DirectLink, EmitAddressMode,
-        GenerationGuard, PcMapEntry, RecoveryAction, RecoveryEntry,
+        BiasedBase, BiasedBaseCoordinate, BiasedMemoryRecovery, DirectLink, DirectLinkKind,
+        DirectStubEnvelope, EmitAddressMode, GenerationGuard, PcMapEntry, RecoveryAction,
+        RecoveryEntry,
     };
     use super::super::types::{
         CacheOffset, CodeGeneration, CounterDestination, CounterRead, InstAction,
@@ -107,7 +108,13 @@ mod tests {
             recovery,
             vec![DirectLink {
                 slot: CacheOffset::published(20),
+                source: GuestVa(0x4000),
                 target: GuestVa(0x5000),
+                kind: DirectLinkKind::Branch,
+                stub: DirectStubEnvelope {
+                    start: CacheOffset::published(24),
+                    end: CacheOffset::published(28),
+                },
             }],
             vec![0xd280_0540, 0xd65f_03c0],
             vec![relocation],

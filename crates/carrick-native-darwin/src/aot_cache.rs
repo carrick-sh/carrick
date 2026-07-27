@@ -11,8 +11,9 @@ use std::sync::Mutex;
 
 pub use carrick_dsr_aarch64::shared_cache::PublishOutcome;
 use carrick_dsr_aarch64::shared_cache::{
-    MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit, TRANSLATION_UNIT_BASE_EXPORT,
-    TRANSLATION_UNIT_SCHEMA_V1, TranslationUnitKey, TranslationUnitManifest, UnitMissReason,
+    DIRECT_BINDING_CELL_SIZE, MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit,
+    TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey,
+    TranslationUnitManifest, UnitMissReason,
 };
 use sha2::{Digest, Sha256};
 
@@ -126,6 +127,26 @@ fn decode_manifest(bytes: &[u8]) -> Result<TranslationUnitManifest, std::io::Err
         )));
     }
     Ok(manifest)
+}
+
+fn manifest_for_pending(
+    pending: &PendingTranslationUnit,
+    dylib_sha256: [u8; 32],
+) -> TranslationUnitManifest {
+    TranslationUnitManifest {
+        schema: TRANSLATION_UNIT_SCHEMA_V2,
+        key: pending.key.clone(),
+        dylib_sha256,
+        base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+        code_len: pending.code.len() as u64,
+        blocks: pending.blocks.clone(),
+        binding_layout: pending.binding_layout,
+        binding_export: pending.binding_export.clone(),
+        binding_data_len: pending.binding_data_len,
+        cell_size: pending.cell_size,
+        bindings: pending.bindings.clone(),
+        binding_relocations: pending.binding_relocations.clone(),
+    }
 }
 
 /// Identity required to adopt one container's cache directory after host
@@ -287,6 +308,18 @@ impl ContainerCacheAuthority {
                 UnitMissReason::ManifestRange,
             ));
         }
+        if !pending.binding_data.is_empty() {
+            return Err(UnitStoreError::new(
+                "publish binding data before data-segment support",
+                UnitMissReason::ManifestRange,
+            ));
+        }
+        let preflight_manifest = manifest_for_pending(pending, [0; 32]);
+        preflight_manifest
+            .validate_ranges()
+            .and_then(|()| preflight_manifest.validate_binding_data(&pending.binding_data))
+            .and_then(|()| preflight_manifest.validate_binding_code(&pending.code))
+            .map_err(|reason| UnitStoreError::new("validate pending unit", reason))?;
         let stem = pending.key.file_stem().map_err(|error| {
             UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
         })?;
@@ -358,14 +391,7 @@ impl ContainerCacheAuthority {
         let signed_dylib = std::fs::read(dylib_temp.path()).map_err(|error| {
             UnitStoreError::with_source("read signed dylib", UnitMissReason::DylibDigest, error)
         })?;
-        let manifest = TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V1,
-            key: pending.key.clone(),
-            dylib_sha256: Sha256::digest(&signed_dylib).into(),
-            base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
-            code_len: pending.code.len() as u64,
-            blocks: pending.blocks.clone(),
-        };
+        let manifest = manifest_for_pending(pending, Sha256::digest(&signed_dylib).into());
         manifest
             .validate_ranges()
             .map_err(|reason| UnitStoreError::new("validate manifest", reason))?;
@@ -536,6 +562,68 @@ impl ContainerCacheAuthority {
                 UnitMissReason::Dlopen,
             ));
         };
+        if !manifest.binding_relocations.is_empty() {
+            let code_len = usize::try_from(manifest.code_len).map_err(|_| {
+                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
+                UnitStoreError::new(
+                    "validate mapped translation code",
+                    UnitMissReason::ManifestRange,
+                )
+            })?;
+            // SAFETY: `base` is the validated translation-unit text export and
+            // schema validation bounds the declared code length. The mapping
+            // remains live under `handle` for this validation.
+            let mapped_code = unsafe { std::slice::from_raw_parts(base.as_ptr(), code_len) };
+            if let Err(reason) = manifest.validate_binding_code(mapped_code) {
+                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
+                return Err(UnitStoreError::new(
+                    "validate mapped translation code",
+                    reason,
+                ));
+            }
+        }
+        if manifest.binding_data_len != 0 {
+            let binding_symbol =
+                CString::new(manifest.binding_export.as_bytes()).map_err(|error| {
+                    let _ = unsafe { libc::dlclose(handle.as_ptr()) };
+                    UnitStoreError::with_source(
+                        "encode binding export",
+                        UnitMissReason::Dlopen,
+                        error,
+                    )
+                })?;
+            let binding_base =
+                unsafe { libc::dlsym(handle.as_ptr(), binding_symbol.as_ptr()) }.cast::<u8>();
+            let Some(binding_base) = std::ptr::NonNull::new(binding_base) else {
+                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
+                return Err(UnitStoreError::new(
+                    "resolve translation unit bindings",
+                    UnitMissReason::Dlopen,
+                ));
+            };
+            let binding_len = usize::try_from(manifest.binding_data_len).map_err(|_| {
+                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
+                UnitStoreError::new(
+                    "validate mapped binding cells",
+                    UnitMissReason::ManifestRange,
+                )
+            })?;
+            if !(binding_base.as_ptr() as usize).is_multiple_of(DIRECT_BINDING_CELL_SIZE as usize) {
+                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
+                return Err(UnitStoreError::new(
+                    "validate mapped binding alignment",
+                    UnitMissReason::ManifestRange,
+                ));
+            }
+            // SAFETY: the resolved binding export names the manifest-declared
+            // data region, which stays mapped under `handle` during validation.
+            let binding_data =
+                unsafe { std::slice::from_raw_parts(binding_base.as_ptr(), binding_len) };
+            if let Err(reason) = manifest.validate_binding_data(binding_data) {
+                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
+                return Err(UnitStoreError::new("validate mapped binding cells", reason));
+            }
+        }
         Ok(LoadedTranslationUnit {
             manifest,
             base,
@@ -758,8 +846,8 @@ mod tests {
     use super::*;
     use carrick_dsr::address::NativeHostBias;
     use carrick_dsr_aarch64::shared_cache::{
-        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
-        NativePageProfileIdentity, SourceFingerprint,
+        AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
+        ImageFileOffset, NativePageProfileIdentity, SourceFingerprint,
     };
     use carrick_guest_mem::GuestVa;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -784,18 +872,31 @@ mod tests {
             ),
             code: MOV42_RET.to_vec(),
             blocks: Vec::new(),
+            binding_layout: DirectBindingLayout::Disabled,
+            binding_export: String::new(),
+            binding_data_len: 0,
+            cell_size: 0,
+            bindings: Vec::new(),
+            binding_relocations: Vec::new(),
+            binding_data: Vec::new(),
         }
     }
 
     fn fixture_manifest() -> TranslationUnitManifest {
         let pending = fixture_pending();
         TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V1,
+            schema: TRANSLATION_UNIT_SCHEMA_V2,
             key: pending.key,
             dylib_sha256: [0x22; 32],
             base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
             code_len: pending.code.len() as u64,
             blocks: pending.blocks,
+            binding_layout: pending.binding_layout,
+            binding_export: pending.binding_export,
+            binding_data_len: pending.binding_data_len,
+            cell_size: pending.cell_size,
+            bindings: pending.bindings,
+            binding_relocations: pending.binding_relocations,
         }
     }
 
@@ -950,6 +1051,23 @@ mod tests {
                 .all(|entry| !entry.file_name().to_string_lossy().starts_with(".tmp")),
             "publisher left a temporary file"
         );
+    }
+
+    #[test]
+    fn publisher_rejects_nonempty_binding_data_until_data_emission_lands() {
+        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let mut pending = fixture_pending();
+        pending.binding_layout = DirectBindingLayout::SidecarV1;
+        pending.binding_export =
+            carrick_dsr_aarch64::shared_cache::TRANSLATION_UNIT_BINDING_EXPORT.to_owned();
+        pending.binding_data_len = 8;
+        pending.cell_size = 8;
+        pending.binding_data = vec![0; 8];
+
+        let error = authority
+            .publish_unit(&pending)
+            .expect_err("Task 7 must not publish an incomplete data segment");
+        assert_eq!(error.reason(), UnitMissReason::ManifestRange);
     }
 
     #[test]
