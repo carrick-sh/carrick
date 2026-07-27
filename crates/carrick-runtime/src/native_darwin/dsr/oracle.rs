@@ -1638,6 +1638,7 @@ fn dsr_direct_flow_unresolved_branch_reports_guest_target() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: GuestVa(0x8000),
         target,
+        binding: None,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
         .expect("execute unresolved direct branch");
@@ -1646,6 +1647,7 @@ fn dsr_direct_flow_unresolved_branch_reports_guest_target() {
         NativeDsrExit::ResolveDirect {
             source: GuestVa(0x8000),
             target,
+            binding: None,
         }
     );
 }
@@ -1728,6 +1730,7 @@ fn dsr_direct_flow_linked_branch_stays_in_translated_code_and_preserves_x17() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: GuestVa(0xa004),
         target: GuestVa(0xb000),
+        binding: None,
     };
     enter_translated(source.entry(), &mut snapshot, &mut exit).expect("execute linked branch");
     assert_eq!(snapshot.x[0], expected_x0);
@@ -1781,6 +1784,7 @@ fn dsr_direct_flow_conditional_edges_select_taken_and_fallthrough_links() {
         let mut exit = NativeDsrExit::ResolveDirect {
             source: GuestVa(0xc000),
             target: GuestVa(0xc100),
+            binding: None,
         };
         enter_translated(source.entry(), &mut snapshot, &mut exit)
             .expect("execute linked conditional branch");
@@ -1848,6 +1852,7 @@ fn dsr_direct_flow_linked_call_observes_guest_lr() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: GuestVa(0xd000),
         target: GuestVa(0xe000),
+        binding: None,
     };
     enter_translated(call.entry(), &mut snapshot, &mut exit).expect("execute linked call");
     assert_eq!(snapshot.x[30], 0xe004);
@@ -1891,6 +1896,7 @@ fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
         let mut observed = NativeDsrExit::ResolveDirect {
             source: start,
             target: exit.target,
+            binding: None,
         };
         enter_translated(emitted.entry(), &mut snapshot, &mut observed)
             .expect("execute conditional edge");
@@ -1900,6 +1906,7 @@ fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
             NativeDsrExit::ResolveDirect {
                 source: start,
                 target: GuestVa(start.raw() + 8),
+                binding: None,
             },
             "conditional word 0x{word:08x}"
         );
@@ -2015,6 +2022,7 @@ fn dsr_direct_flow_linked_backward_loop_reaches_fallthrough() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: GuestVa(0xf004),
         target: GuestVa(0xf000),
+        binding: None,
     };
     enter_translated(loop_block.entry(), &mut snapshot, &mut exit)
         .expect("execute linked backward loop");
@@ -2122,6 +2130,7 @@ fn portable_direct_block_exits_through_context_gateway() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: guest,
         target,
+        binding: None,
     };
     super::gateway::enter_translated_with_generation_bindings(
         emitted.entry(),
@@ -2135,6 +2144,7 @@ fn portable_direct_block_exits_through_context_gateway() {
         NativeDsrExit::ResolveDirect {
             source: guest,
             target,
+            binding: None,
         }
     );
 }
@@ -2232,6 +2242,7 @@ fn assert_portable_direct_block_chains_through_published_target_authority(
     let mut exit = NativeDsrExit::ResolveDirect {
         source: guest,
         target,
+        binding: None,
     };
 
     super::gateway::enter_translated_with_cache_range_and_generation_bindings(
@@ -2383,6 +2394,7 @@ fn portable_direct_cache_hit_switches_cross_unit_authority_tuple() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: source_guest,
         target: target_guest,
+        binding: None,
     };
 
     super::gateway::enter_translated_with_cache_range_and_generation_bindings(
@@ -2685,6 +2697,7 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
         NativeDsrExit::ResolveDirect {
             source: target_guest,
             target: target_guest,
+            binding: None,
         }
     );
 }
@@ -3271,6 +3284,7 @@ fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
         NativeDsrExit::ResolveDirect {
             source: guest,
             target: guest,
+            binding: None,
         }
     );
 }
@@ -3442,6 +3456,7 @@ fn binding_generation_guard_exits_stale_after_atomic_changes() {
         NativeDsrExit::ResolveDirect {
             source: guest,
             target: guest,
+            binding: None,
         }
     );
 }

@@ -13,6 +13,7 @@
 //! shim's ABI helpers, which live in csrc/native_darwin.c).
 
 use super::types::{CacheVa, CodeGeneration, DsrError, NativeDsrExit};
+use crate::direct_binding::{DirectBindingCellVa, DirectBindingMiss, DirectBindingOrdinal};
 use crate::snapshot::NativeUcontextSnapshot;
 
 use std::sync::atomic::AtomicU64;
@@ -27,6 +28,10 @@ pub const CTX_ENFORCE_CACHE_AUTHORITY: u32 = 1156;
 pub const CTX_CACHE_START: u32 = 1176;
 pub const CTX_CACHE_END: u32 = 1184;
 pub const CTX_GENERATION_BINDINGS: u32 = 1264;
+pub const CTX_DIRECT_BINDING_CELL: u32 = 1280;
+pub const CTX_DIRECT_BINDING_ORDINAL: u32 = 1288;
+pub const CTX_DIRECT_BINDING_PRESENT: u32 = 1292;
+pub const CTX_DIRECT_BINDING_TARGET: u32 = 1296;
 
 /// Process-local data referenced by an immutable translated block.
 ///
@@ -214,6 +219,13 @@ pub struct DsrContext {
     pub exit_unsupported_addr: u64,
     pub exit_signal_addr: u64,
     pub generation_bindings: *const GenerationBinding,
+    /// Preserves the old 1280-byte ABI boundary before appended fields.
+    pub gateway_abi_tail_pad: u64,
+    pub direct_binding_cell: u64,
+    pub direct_binding_ordinal: u32,
+    pub direct_binding_present: u32,
+    pub direct_binding_target: u64,
+    pub direct_binding_pad: u64,
 }
 
 /// Context byte offset of the gateway exit entry point for `kind`.
@@ -226,6 +238,26 @@ pub const fn exit_address_offset(kind: crate::artifact_spike::GatewayKind) -> u3
         crate::artifact_spike::GatewayKind::Unsupported => 1248,
         crate::artifact_spike::GatewayKind::Signal => 1256,
     }
+}
+
+#[cfg(not(test))]
+fn gateway_exit_addresses() -> [u64; 6] {
+    [
+        syscall_exit_address(),
+        direct_exit_address(),
+        indirect_exit_address(),
+        sensitive_exit_address(),
+        unsupported_exit_address(),
+        signal_exit_address(),
+    ]
+}
+
+#[cfg(test)]
+fn gateway_exit_addresses() -> [u64; 6] {
+    // Standalone crate tests do not link the runtime C ABI helpers reached by
+    // the assembled gateway. Context-construction tests need only deterministic
+    // placeholders; runtime builds continue to install the real addresses.
+    [0; 6]
 }
 
 impl DsrContext {
@@ -243,9 +275,17 @@ impl DsrContext {
         cache_end: usize,
         address_mode: carrick_dsr::address::NativeAddressMode,
     ) -> Self {
+        let [
+            exit_syscall_addr,
+            exit_direct_addr,
+            exit_indirect_addr,
+            exit_sensitive_addr,
+            exit_unsupported_addr,
+            exit_signal_addr,
+        ] = gateway_exit_addresses();
         let (exit_target, exit_source, _exit_status, exit_link, exit_has_link) = match exit {
             NativeDsrExit::Syscall { resume } => (resume.raw(), 0, 1, 0, 0),
-            NativeDsrExit::ResolveDirect { source, target } => {
+            NativeDsrExit::ResolveDirect { source, target, .. } => {
                 (target.raw(), source.raw(), 2, 0, 0)
             }
             NativeDsrExit::ResolveIndirect {
@@ -298,14 +338,39 @@ impl DsrContext {
             host_bias: address_mode.bias(),
             biased_guest_fault_address: 0,
             biased_fault_pad: 0,
-            exit_syscall_addr: syscall_exit_address(),
-            exit_direct_addr: direct_exit_address(),
-            exit_indirect_addr: indirect_exit_address(),
-            exit_sensitive_addr: sensitive_exit_address(),
-            exit_unsupported_addr: unsupported_exit_address(),
-            exit_signal_addr: signal_exit_address(),
+            exit_syscall_addr,
+            exit_direct_addr,
+            exit_indirect_addr,
+            exit_sensitive_addr,
+            exit_unsupported_addr,
+            exit_signal_addr,
             generation_bindings: std::ptr::null(),
+            gateway_abi_tail_pad: 0,
+            direct_binding_cell: 0,
+            direct_binding_ordinal: 0,
+            direct_binding_present: 0,
+            direct_binding_target: 0,
+            direct_binding_pad: 0,
         }
+    }
+}
+
+fn decode_direct_exit(context: &DsrContext) -> NativeDsrExit {
+    let binding = if context.direct_binding_present == 1 {
+        usize::try_from(context.direct_binding_cell)
+            .ok()
+            .and_then(DirectBindingCellVa::mapped)
+            .map(|cell| DirectBindingMiss {
+                cell,
+                ordinal: DirectBindingOrdinal::claimed(context.direct_binding_ordinal),
+            })
+    } else {
+        None
+    };
+    NativeDsrExit::ResolveDirect {
+        source: carrick_guest_mem::GuestVa(context.exit_source),
+        target: carrick_guest_mem::GuestVa(context.exit_target),
+        binding,
     }
 }
 
@@ -340,7 +405,13 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, exit_sensitive_addr) == 1
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_unsupported_addr) == 1248);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_signal_addr) == 1256);
 const _: () = assert!(std::mem::offset_of!(DsrContext, generation_bindings) == 1264);
-const _: () = assert!(std::mem::size_of::<DsrContext>() == 1280);
+const _: () = assert!(std::mem::offset_of!(DsrContext, gateway_abi_tail_pad) == 1272);
+const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_cell) == 1280);
+const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_ordinal) == 1288);
+const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_present) == 1292);
+const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_target) == 1296);
+const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_pad) == 1304);
+const _: () = assert!(std::mem::size_of::<DsrContext>() == 1312);
 const _: () = assert!(std::mem::size_of::<GenerationBinding>() == 16);
 const _: () = assert!(std::mem::offset_of!(GenerationBinding, current) == 0);
 const _: () = assert!(std::mem::offset_of!(GenerationBinding, expected) == 8);
@@ -608,10 +679,7 @@ mod native_gateway {
             1 => NativeDsrExit::Syscall {
                 resume: carrick_guest_mem::GuestVa(context.exit_target),
             },
-            2 => NativeDsrExit::ResolveDirect {
-                source: carrick_guest_mem::GuestVa(context.exit_source),
-                target: carrick_guest_mem::GuestVa(context.exit_target),
-            },
+            2 => decode_direct_exit(&context),
             3 => NativeDsrExit::ResolveIndirect {
                 source: carrick_guest_mem::GuestVa(context.exit_source),
                 target: carrick_guest_mem::GuestVa(context.exit_target),
@@ -843,7 +911,7 @@ mod indirect_cache_tests {
     }
 
     #[test]
-    fn dsr_context_appends_host_bias_without_shifting_gateway_fields() {
+    fn direct_binding_fields_append_without_moving_the_existing_gateway_abi() {
         assert_eq!(std::mem::offset_of!(DsrContext, cache_end), 1184);
         assert_eq!(std::mem::offset_of!(DsrContext, host_bias), 1192);
         assert_eq!(
@@ -851,6 +919,141 @@ mod indirect_cache_tests {
             1200
         );
         assert_eq!(std::mem::offset_of!(DsrContext, generation_bindings), 1264);
-        assert_eq!(std::mem::size_of::<DsrContext>(), 1280);
+        assert_eq!(std::mem::offset_of!(DsrContext, gateway_abi_tail_pad), 1272);
+        assert_eq!(std::mem::offset_of!(DsrContext, direct_binding_cell), 1280);
+        assert_eq!(
+            std::mem::offset_of!(DsrContext, direct_binding_ordinal),
+            1288
+        );
+        assert_eq!(
+            std::mem::offset_of!(DsrContext, direct_binding_present),
+            1292
+        );
+        assert_eq!(
+            std::mem::offset_of!(DsrContext, direct_binding_target),
+            1296
+        );
+        assert_eq!(std::mem::offset_of!(DsrContext, direct_binding_pad), 1304);
+        assert_eq!(std::mem::size_of::<DsrContext>(), 1312);
+    }
+
+    #[test]
+    fn direct_exit_decodes_an_exact_typed_binding_miss() {
+        let mut context = DsrContext::new(
+            NativeUcontextSnapshot::default(),
+            CacheVa::published(carrick_guest_mem::HostVa(0x10_000)),
+            NativeDsrExit::ResolveDirect {
+                source: carrick_guest_mem::GuestVa(0x4000),
+                target: carrick_guest_mem::GuestVa(0x5000),
+                binding: None,
+            },
+            std::ptr::null(),
+            CodeGeneration::INITIAL,
+            0x10_000,
+            0x20_000,
+            carrick_dsr::address::NativeAddressMode::Direct,
+        );
+        context.direct_binding_cell = 0x20_000;
+        context.direct_binding_ordinal = 7;
+        context.direct_binding_present = 1;
+
+        assert_eq!(
+            decode_direct_exit(&context),
+            NativeDsrExit::ResolveDirect {
+                source: carrick_guest_mem::GuestVa(0x4000),
+                target: carrick_guest_mem::GuestVa(0x5000),
+                binding: Some(crate::direct_binding::DirectBindingMiss {
+                    cell: crate::direct_binding::DirectBindingCellVa::mapped(0x20_000)
+                        .expect("aligned cell"),
+                    ordinal: crate::direct_binding::DirectBindingOrdinal::claimed(7),
+                }),
+            }
+        );
+
+        for (present, cell) in [(0, 0x20_000), (2, 0x20_000), (1, 0), (1, 0x20_001)] {
+            context.direct_binding_present = present;
+            context.direct_binding_cell = cell;
+            assert_eq!(
+                decode_direct_exit(&context),
+                NativeDsrExit::ResolveDirect {
+                    source: carrick_guest_mem::GuestVa(0x4000),
+                    target: carrick_guest_mem::GuestVa(0x5000),
+                    binding: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn new_context_clears_stale_binding_authority_for_every_exit_kind() {
+        let guest = carrick_guest_mem::GuestVa(0x4000);
+        let exits = [
+            NativeDsrExit::Syscall { resume: guest },
+            NativeDsrExit::ResolveDirect {
+                source: guest,
+                target: guest,
+                binding: None,
+            },
+            NativeDsrExit::ResolveIndirect {
+                source: guest,
+                target: guest,
+                link: Some(guest),
+            },
+            NativeDsrExit::Sensitive {
+                guest_pc: guest,
+                resume: guest,
+                generation: CodeGeneration::INITIAL,
+            },
+            NativeDsrExit::Fault {
+                guest_pc: guest,
+                signal: libc::SIGSEGV,
+                code: 0,
+                address: carrick_guest_mem::HostVa(0x20_000),
+                rewrite_scratch: 0,
+                rewrite_context_scratch: 0,
+                generation_pstate_scratch: 0,
+                indirect_x15_scratch: 0,
+                indirect_x30_scratch: 0,
+                physical_x18: 0,
+                gateway_phase: 0,
+                biased_guest_fault_address: 0,
+            },
+            NativeDsrExit::Kick {
+                resume: guest,
+                rewrite_scratch: 0,
+                rewrite_context_scratch: 0,
+                generation_pstate_scratch: 0,
+                indirect_x15_scratch: 0,
+                indirect_x30_scratch: 0,
+            },
+            NativeDsrExit::KickAtEntry { resume: guest },
+            NativeDsrExit::StaleGeneration {
+                guest_pc: guest,
+                observed: CodeGeneration::INITIAL,
+            },
+            NativeDsrExit::Unsupported {
+                guest_pc: guest,
+                word: 0,
+                op: bad64::Op::UDF,
+            },
+        ];
+
+        for exit in exits {
+            let context = DsrContext::new(
+                NativeUcontextSnapshot::default(),
+                CacheVa::published(carrick_guest_mem::HostVa(0x10_000)),
+                exit,
+                std::ptr::null(),
+                CodeGeneration::INITIAL,
+                0x10_000,
+                0x20_000,
+                carrick_dsr::address::NativeAddressMode::Direct,
+            );
+            assert_eq!(context.direct_binding_cell, 0, "exit={exit:?}");
+            assert_eq!(context.direct_binding_ordinal, 0, "exit={exit:?}");
+            assert_eq!(context.direct_binding_present, 0, "exit={exit:?}");
+            assert_eq!(context.direct_binding_target, 0, "exit={exit:?}");
+            assert_eq!(context.direct_binding_pad, 0, "exit={exit:?}");
+        }
     }
 }

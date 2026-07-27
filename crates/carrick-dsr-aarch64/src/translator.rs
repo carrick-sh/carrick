@@ -44,9 +44,11 @@ impl NativeDsrExitProbeExt for types::NativeDsrExit {
 
         match self {
             Self::Syscall { resume } => (DsrExitKind::Syscall, resume.raw(), 0, 1),
-            Self::ResolveDirect { source, target } => {
-                (DsrExitKind::DirectResolver, source.raw(), target.raw(), 2)
-            }
+            Self::ResolveDirect {
+                source,
+                target,
+                binding: _,
+            } => (DsrExitKind::DirectResolver, source.raw(), target.raw(), 2),
             Self::ResolveIndirect { source, target, .. } => {
                 (DsrExitKind::IndirectResolver, source.raw(), target.raw(), 3)
             }
@@ -2715,7 +2717,11 @@ impl ThreadTranslator {
         }
         Ok(match exit.exit {
             types::NativeDsrExit::Syscall { resume } => ThreadExit::Syscall { resume },
-            types::NativeDsrExit::ResolveDirect { source, target } => {
+            types::NativeDsrExit::ResolveDirect {
+                source,
+                target,
+                binding: _,
+            } => {
                 probes::dsr_resolve_begin(
                     self.tid,
                     probes::DsrResolveKind::Direct,
@@ -3189,7 +3195,11 @@ mod tests {
                 (DsrExitKind::Syscall, target.raw(), 0, 1),
             ),
             (
-                NativeDsrExit::ResolveDirect { source: PC, target },
+                NativeDsrExit::ResolveDirect {
+                    source: PC,
+                    target,
+                    binding: None,
+                },
                 (DsrExitKind::DirectResolver, PC.raw(), target.raw(), 2),
             ),
             (
