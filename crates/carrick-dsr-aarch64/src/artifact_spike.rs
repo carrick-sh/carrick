@@ -17,9 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use super::emit::{
-    BiasedBase, BiasedBaseCoordinate, BiasedExclusiveRecovery, DirectBindingRecoveryPhase,
-    DirectLink, DirectLinkKind, DirectStubEnvelope, EmitAddressMode, EmittedBlock, PcMapEntry,
-    RecoveryAction, RecoveryEntry,
+    BiasedBase, BiasedBaseCoordinate, BiasedExclusiveRecovery, DirectBindingCaptureProgress,
+    DirectBindingRecoveryPhase, DirectLink, DirectLinkKind, DirectStubEnvelope, EmitAddressMode,
+    EmittedBlock, PcMapEntry, RecoveryAction, RecoveryEntry,
 };
 use super::types::{CacheOffset, DsrError};
 use carrick_dsr::cache::TranslationCache;
@@ -1164,6 +1164,7 @@ enum PortableRecoveryAction {
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
     RestoreDirectBinding {
         phase: DirectBindingRecoveryPhase,
+        capture_progress: DirectBindingCaptureProgress,
         committed_link: Option<u64>,
     },
 }
@@ -1273,9 +1274,11 @@ impl PortableRecoveryAction {
             }
             RecoveryAction::RestoreDirectBinding {
                 phase,
+                capture_progress,
                 committed_link,
             } => Self::RestoreDirectBinding {
                 phase,
+                capture_progress,
                 committed_link,
             },
         })
@@ -1386,9 +1389,11 @@ impl PortableRecoveryAction {
             }
             Self::RestoreDirectBinding {
                 phase,
+                capture_progress,
                 committed_link,
             } => RecoveryAction::RestoreDirectBinding {
                 phase,
+                capture_progress,
                 committed_link,
             },
         })
@@ -1798,6 +1803,7 @@ mod tests {
                 cache: CacheOffset::published(4),
                 action: RecoveryAction::RestoreDirectBinding {
                     phase: DirectBindingRecoveryPhase::AuthorityInstall,
+                    capture_progress: DirectBindingCaptureProgress::Complete,
                     committed_link: Some(0x4004),
                 },
             },

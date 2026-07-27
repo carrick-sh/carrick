@@ -220,6 +220,7 @@ pub enum RecoveryAction {
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
     RestoreDirectBinding {
         phase: DirectBindingRecoveryPhase,
+        capture_progress: DirectBindingCaptureProgress,
         committed_link: Option<u64>,
     },
 }
@@ -234,6 +235,15 @@ pub enum DirectBindingRecoveryPhase {
     ArchitecturalRestore,
     FinalBranch,
     MissExit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DirectBindingCaptureProgress {
+    None,
+    X15,
+    X15X16,
+    X15X16X30,
+    Complete,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1259,6 +1269,23 @@ fn emit_target_authority_switch(
 /// target, then later executions branch directly when the target belongs to
 /// the currently entered unit. The cache-range checks are the generation-
 /// authority boundary; a cross-unit target always returns through the gateway.
+fn record_direct_binding_recovery(
+    recovery: &mut Vec<RecoveryEntry>,
+    cache: CacheOffset,
+    phase: DirectBindingRecoveryPhase,
+    capture_progress: DirectBindingCaptureProgress,
+    committed_link: Option<u64>,
+) {
+    recovery.push(RecoveryEntry {
+        cache,
+        action: RecoveryAction::RestoreDirectBinding {
+            phase,
+            capture_progress,
+            committed_link,
+        },
+    });
+}
+
 fn record_direct_binding_phase(
     recovery: &mut Vec<RecoveryEntry>,
     start: CacheOffset,
@@ -1274,13 +1301,13 @@ fn record_direct_binding_phase(
         )));
     }
     for offset in (start.get()..end.get()).step_by(4) {
-        recovery.push(RecoveryEntry {
-            cache: CacheOffset::published(offset),
-            action: RecoveryAction::RestoreDirectBinding {
-                phase,
-                committed_link,
-            },
-        });
+        record_direct_binding_recovery(
+            recovery,
+            CacheOffset::published(offset),
+            phase,
+            DirectBindingCaptureProgress::Complete,
+            committed_link,
+        );
     }
     Ok(())
 }
@@ -1296,34 +1323,62 @@ fn emit_cached_direct_exit(
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     let scratch_capture_start = current_offset(assembler)?;
+    record_direct_binding_recovery(
+        recovery,
+        scratch_capture_start,
+        DirectBindingRecoveryPhase::ScratchCapture,
+        DirectBindingCaptureProgress::None,
+        committed_link,
+    );
     map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x15, [x28, #1160]
+    );
+    record_direct_binding_recovery(
+        recovery,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::ScratchCapture,
+        DirectBindingCaptureProgress::X15,
+        committed_link,
     );
     map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x16, [x28, #1120]
     );
+    record_direct_binding_recovery(
+        recovery,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::ScratchCapture,
+        DirectBindingCaptureProgress::X15X16,
+        committed_link,
+    );
     map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x30, [x28, #1168]
     );
+    record_direct_binding_recovery(
+        recovery,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::ScratchCapture,
+        DirectBindingCaptureProgress::X15X16X30,
+        committed_link,
+    );
     emit_word(assembler, entries, map_guest, 0xd53b_4210)?; // mrs x16, nzcv
+    record_direct_binding_recovery(
+        recovery,
+        current_offset(assembler)?,
+        DirectBindingRecoveryPhase::ScratchCapture,
+        DirectBindingCaptureProgress::X15X16X30,
+        committed_link,
+    );
     map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x16, [x28, #936]
     );
-    record_direct_binding_phase(
-        recovery,
-        scratch_capture_start,
-        current_offset(assembler)?,
-        DirectBindingRecoveryPhase::ScratchCapture,
-        committed_link,
-    )?;
     let cell_address_start = current_offset(assembler)?;
     emit_mov_u64(
         assembler,
@@ -4526,12 +4581,34 @@ pub fn recover_rewrite_state(
     saved_indirect_x15: u64,
     saved_indirect_x30: u64,
 ) -> Result<(), crate::types::DsrError> {
-    if let RecoveryAction::RestoreDirectBinding { committed_link, .. } = action {
-        snapshot.x[15] = saved_indirect_x15;
-        snapshot.x[16] = saved_scratch;
+    if let RecoveryAction::RestoreDirectBinding {
+        capture_progress,
+        committed_link,
+        ..
+    } = action
+    {
         snapshot.x[17] = saved_context_scratch;
-        snapshot.x[30] = saved_indirect_x30;
-        snapshot.pstate = saved_generation_pstate;
+        match capture_progress {
+            DirectBindingCaptureProgress::None => {}
+            DirectBindingCaptureProgress::X15 => {
+                snapshot.x[15] = saved_indirect_x15;
+            }
+            DirectBindingCaptureProgress::X15X16 => {
+                snapshot.x[15] = saved_indirect_x15;
+                snapshot.x[16] = saved_scratch;
+            }
+            DirectBindingCaptureProgress::X15X16X30 => {
+                snapshot.x[15] = saved_indirect_x15;
+                snapshot.x[16] = saved_scratch;
+                snapshot.x[30] = saved_indirect_x30;
+            }
+            DirectBindingCaptureProgress::Complete => {
+                snapshot.x[15] = saved_indirect_x15;
+                snapshot.x[16] = saved_scratch;
+                snapshot.x[30] = saved_indirect_x30;
+                snapshot.pstate = saved_generation_pstate;
+            }
+        }
         if let Some(committed_link) = committed_link {
             snapshot.x[30] = committed_link;
         }
@@ -5004,6 +5081,7 @@ mod tests {
                                 | DirectBindingRecoveryPhase::ArchitecturalRestore
                                 | DirectBindingRecoveryPhase::FinalBranch
                                 | DirectBindingRecoveryPhase::MissExit,
+                            capture_progress: _,
                             committed_link,
                         } if committed_link == expected.committed_link
                     ),
@@ -5170,6 +5248,124 @@ mod tests {
     }
 
     #[test]
+    fn direct_binding_capture_prefix_recovers_only_committed_scratch() {
+        let branch = direct_plan(PlannedExit::Direct {
+            guest: GuestVa(0x4000),
+            word: 0x1400_0400,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target: GuestVa(0x5000),
+                resume: GuestVa(0x4004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        });
+        let assembled = assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
+            .expect("assemble direct branch");
+        let stub = assembled.direct_links[0].stub;
+        let live_x15 = 0x1500_0015;
+        let live_x16 = 0x1600_0016;
+        let live_x17 = 0x1700_0017;
+        let live_x30 = 0x3000_0030;
+        let live_nzcv = 0x6000_0000;
+        let stale_x15 = 0xdead_0015;
+        let stale_x16 = 0xdead_0016;
+        let stale_x30 = 0xdead_0030;
+        let stale_nzcv = 0xdead_0000;
+        let cases = [
+            (
+                "before x15 capture",
+                0,
+                DirectBindingCaptureProgress::None,
+                stale_x15,
+                stale_x16,
+                stale_x30,
+                live_x16,
+            ),
+            (
+                "after x15 capture",
+                4,
+                DirectBindingCaptureProgress::X15,
+                live_x15,
+                stale_x16,
+                stale_x30,
+                live_x16,
+            ),
+            (
+                "after x16 capture",
+                8,
+                DirectBindingCaptureProgress::X15X16,
+                live_x15,
+                live_x16,
+                stale_x30,
+                live_x16,
+            ),
+            (
+                "after x30 capture",
+                12,
+                DirectBindingCaptureProgress::X15X16X30,
+                live_x15,
+                live_x16,
+                live_x30,
+                live_x16,
+            ),
+            (
+                "after nzcv read",
+                16,
+                DirectBindingCaptureProgress::X15X16X30,
+                live_x15,
+                live_x16,
+                live_x30,
+                live_nzcv,
+            ),
+        ];
+
+        for (case, delta, expected_progress, saved_x15, saved_x16, saved_x30, interrupted_x16) in
+            cases
+        {
+            let action = assembled
+                .recovery
+                .iter()
+                .find(|entry| entry.cache.get() == stub.start.get() + delta)
+                .unwrap_or_else(|| panic!("{case}: capture recovery entry"))
+                .action;
+            assert_eq!(
+                action,
+                RecoveryAction::RestoreDirectBinding {
+                    phase: DirectBindingRecoveryPhase::ScratchCapture,
+                    capture_progress: expected_progress,
+                    committed_link: None,
+                },
+                "{case}: typed capture progress"
+            );
+            let mut snapshot = crate::snapshot::NativeUcontextSnapshot::default();
+            snapshot.x[15] = live_x15;
+            snapshot.x[16] = interrupted_x16;
+            snapshot.x[17] = live_x17;
+            snapshot.x[30] = live_x30;
+            snapshot.pstate = live_nzcv;
+
+            recover_rewrite_state(
+                &mut snapshot,
+                action,
+                saved_x16,
+                live_x17,
+                stale_nzcv,
+                saved_x15,
+                saved_x30,
+            )
+            .unwrap_or_else(|error| panic!("{case}: recover capture prefix: {error}"));
+
+            assert_eq!(snapshot.x[15], live_x15, "{case}: x15");
+            assert_eq!(snapshot.x[16], live_x16, "{case}: x16");
+            assert_eq!(snapshot.x[17], live_x17, "{case}: x17");
+            assert_eq!(snapshot.x[30], live_x30, "{case}: x30");
+            assert_eq!(snapshot.pstate, live_nzcv, "{case}: NZCV");
+        }
+    }
+
+    #[test]
     fn direct_binding_recovery_preserves_a_committed_call_link() {
         let committed_link = 0x5004;
         let mut snapshot = crate::snapshot::NativeUcontextSnapshot::default();
@@ -5183,6 +5379,7 @@ mod tests {
             &mut snapshot,
             RecoveryAction::RestoreDirectBinding {
                 phase: DirectBindingRecoveryPhase::FinalBranch,
+                capture_progress: DirectBindingCaptureProgress::Complete,
                 committed_link: Some(committed_link),
             },
             0x16,
