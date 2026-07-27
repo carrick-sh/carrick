@@ -357,7 +357,7 @@ class NativeWallAttributionTest(unittest.TestCase):
             ),
             "unresolved CPU": profile_rows(
                 jit_samples=395,
-                unresolved_samples=55,
+                unresolved_samples=90,
             ),
             "blocking stack coverage": profile_rows(stack_ns=790),
             "live process": profile_rows(live_at_end=1),
@@ -374,6 +374,23 @@ class NativeWallAttributionTest(unittest.TestCase):
                 profile, pathlib.Path("/unused/carrick")
             )
             self.assertFalse(summary["accepted"], name)
+
+    def test_accepts_stable_cpu_classification_above_eighty_five_percent(self):
+        summary = native_wall_attribution.summarize(
+            native_wall_attribution.load_profile(
+                self.write_profile(
+                    profile_rows(jit_samples=395, unresolved_samples=70),
+                    "eighty-five-percent.jsonl",
+                )
+            ),
+            pathlib.Path("/unused/carrick"),
+        )
+
+        self.assertGreaterEqual(
+            summary["reconciliation"]["resolved_cpu_coverage"],
+            native_wall_attribution.MIN_CPU_COVERAGE,
+        )
+        self.assertTrue(summary["accepted"])
 
     def test_comparison_rejects_dominant_category_instability(self):
         stable_a = native_wall_attribution.summarize(

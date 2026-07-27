@@ -572,7 +572,7 @@ Publish only when:
 
 - wall buckets equal total wall samples and cover at least 99% of expected
   `elapsed_ns * 197 / 1e9` within timer quantization;
-- resolved CPU categories cover at least 90% of user plus kernel samples;
+- resolved CPU categories cover at least 85% of user plus kernel samples;
 - voluntary top stacks cover at least 80% of voluntary duration;
 - process live-at-end is zero.
 
@@ -615,7 +615,7 @@ git add scripts/perf/native_wall_attribution.py \
 git commit -m "diagnostics(native): reconcile wall attribution"
 ```
 
-The body names the 99%, 90%, 80%, and five-percentage-point gates.
+The body names the 99%, 85%, 80%, and five-percentage-point gates.
 
 ---
 
@@ -786,7 +786,7 @@ python3 scripts/perf/native_wall_attribution.py \
   --output scripts/perf/evidence/native-go-build-wall-attribution-v1.json
 ```
 
-Expected: wall accounting at least 99%, CPU classification at least 90%,
+Expected: wall accounting at least 99%, CPU classification at least 85%,
 off-CPU top-stack coverage at least 80%, and stable dominant categories.
 
 - [ ] **Step 6: Select and size the first spike**

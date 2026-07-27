@@ -1,0 +1,333 @@
+{
+  "accepted": true,
+  "comparison": {
+    "accepted": true,
+    "category_absolute_deltas": {
+      "darwin-kernel": 0.0016508478751121047,
+      "darwin-userspace": 0.002209949917905546,
+      "dispatch": 0.006654394085271197,
+      "gateway": 0.0004920836114468354,
+      "other-carrick": 0.010527959668744417,
+      "process-setup": 0.0012796904509052992,
+      "translated-guest": 0.002722687674752533,
+      "translation": 0.00258847625242408,
+      "unresolved": 0.015227541445678588
+    },
+    "dominant_category": "translated-guest",
+    "failures": []
+  },
+  "profiles": [
+    {
+      "accepted": true,
+      "average_cpu_parallelism": 2.3158423136879414,
+      "cpu": {
+        "darwin-kernel": {
+          "samples": 9750,
+          "share": 0.34507166873119804
+        },
+        "darwin-user-images": [
+          {
+            "path": "/usr/lib/system/libsystem_platform.dylib",
+            "samples": 1078,
+            "share": 0.0381525393735622
+          },
+          {
+            "path": "/usr/lib/system/libsystem_malloc.dylib",
+            "samples": 932,
+            "share": 0.03298531233410016
+          },
+          {
+            "path": "/usr/lib/system/libsystem_kernel.dylib",
+            "samples": 195,
+            "share": 0.0069014333746239605
+          },
+          {
+            "path": "/usr/lib/system/libsystem_pthread.dylib",
+            "samples": 104,
+            "share": 0.0036807644664661123
+          },
+          {
+            "path": "/usr/lib/libobjc.A.dylib",
+            "samples": 6,
+            "share": 0.0002123517961422757
+          },
+          {
+            "path": "/usr/lib/system/libdyld.dylib",
+            "samples": 6,
+            "share": 0.0002123517961422757
+          },
+          {
+            "path": "/usr/lib/system/libsystem_c.dylib",
+            "samples": 5,
+            "share": 0.00017695983011856308
+          },
+          {
+            "path": "/usr/lib/system/libxpc.dylib",
+            "samples": 4,
+            "share": 0.00014156786409485046
+          },
+          {
+            "path": "/usr/lib/system/libdispatch.dylib",
+            "samples": 1,
+            "share": 3.5391966023712616e-05
+          },
+          {
+            "path": "/usr/lib/system/libsystem_notify.dylib",
+            "samples": 1,
+            "share": 3.5391966023712616e-05
+          }
+        ],
+        "darwin-userspace": {
+          "samples": 2332,
+          "share": 0.08253406476729783
+        },
+        "dispatch": {
+          "samples": 25,
+          "share": 0.0008847991505928155
+        },
+        "gateway": {
+          "samples": 7,
+          "share": 0.00024774376216598834
+        },
+        "other-carrick": {
+          "samples": 905,
+          "share": 0.032029729251459915
+        },
+        "process-setup": {
+          "samples": 1451,
+          "share": 0.05135374270040701
+        },
+        "translated-guest": {
+          "samples": 10371,
+          "share": 0.36705007963192354
+        },
+        "translation": {
+          "samples": 103,
+          "share": 0.0036453725004423998
+        },
+        "unresolved": {
+          "samples": 3311,
+          "share": 0.11718279950451248
+        }
+      },
+      "elapsed_ns": 24450389458,
+      "failures": [],
+      "offcpu": {
+        "runnable_ns": 458696132358,
+        "top_stack_coverage": 1.0,
+        "top_stacks": [],
+        "voluntary_ns": 0
+      },
+      "profile_path": "target/perf/native-go-build-wall-clean-a-688357ef.jsonl",
+      "provenance": {
+        "binary_sha256": "4c1a017ce215a91cfe026b84dfe136773a8e586a3bd181dfeea358245e8f7165",
+        "command": [
+          "run",
+          "--exec-backend",
+          "native",
+          "-e",
+          "CARRICK_RUN_ID=native-go-build-wall-clean-a-688357ef-20260727",
+          "-w",
+          "/tmp",
+          "localhost:5005/carrick-go-conformance:1.24",
+          "/bin/sh",
+          "-c",
+          "set -eu; cd /tmp; rm -rf \"gc-$CARRICK_RUN_ID\"; printf \"package main\\nfunc main(){println(\\\"ok\\\")}\\n\" > h.go; GOCACHE=\"/tmp/gc-$CARRICK_RUN_ID\" /usr/local/go/bin/go build -o h ./h.go; ./h; echo BUILD_OK"
+        ],
+        "git_dirty": false,
+        "git_sha": "688357ef6b72b299daf5990d494fff7d1a7a7805",
+        "host": "Mac.localdomain",
+        "run_id": "native-go-build-wall-clean-a-688357ef-20260727"
+      },
+      "reconciliation": {
+        "cpu_samples": 28255,
+        "expected_wall_samples": 4816.726723226,
+        "live_processes_at_end": 0,
+        "resolved_cpu_coverage": 0.8828172004954875,
+        "resolved_cpu_samples": 24944,
+        "voluntary_stack_ns": 0,
+        "wall_bucket_total": 4816,
+        "wall_samples": 4816,
+        "wall_timer_coverage": 0.9998491250868571
+      },
+      "schema": "carrick.native-wall-attribution.v1",
+      "wall_state": {
+        "all-sleeping": {
+          "samples": 0,
+          "share": 0.0
+        },
+        "on-cpu": {
+          "samples": 4664,
+          "share": 0.96843853820598
+        },
+        "runnable-descheduled": {
+          "samples": 122,
+          "share": 0.025332225913621262
+        },
+        "transition": {
+          "samples": 30,
+          "share": 0.006229235880398671
+        }
+      }
+    },
+    {
+      "accepted": true,
+      "average_cpu_parallelism": 2.3398933525138266,
+      "cpu": {
+        "darwin-kernel": {
+          "samples": 9748,
+          "share": 0.34342082085608594
+        },
+        "darwin-user-images": [
+          {
+            "path": "/usr/lib/system/libsystem_platform.dylib",
+            "samples": 1046,
+            "share": 0.03685044918090541
+          },
+          {
+            "path": "/usr/lib/system/libsystem_malloc.dylib",
+            "samples": 909,
+            "share": 0.03202395631495508
+          },
+          {
+            "path": "/usr/lib/system/libsystem_kernel.dylib",
+            "samples": 198,
+            "share": 0.006975515236920909
+          },
+          {
+            "path": "/usr/lib/system/libsystem_pthread.dylib",
+            "samples": 106,
+            "share": 0.003734366742998062
+          },
+          {
+            "path": "/usr/lib/libobjc.A.dylib",
+            "samples": 5,
+            "share": 0.00017614937466971993
+          },
+          {
+            "path": "/usr/lib/system/libdyld.dylib",
+            "samples": 5,
+            "share": 0.00017614937466971993
+          },
+          {
+            "path": "/usr/lib/system/libsystem_c.dylib",
+            "samples": 4,
+            "share": 0.00014091949973577594
+          },
+          {
+            "path": "/usr/lib/system/libxpc.dylib",
+            "samples": 2,
+            "share": 7.045974986788797e-05
+          },
+          {
+            "path": "/usr/lib/system/libcorecrypto.dylib",
+            "samples": 2,
+            "share": 7.045974986788797e-05
+          },
+          {
+            "path": "/usr/lib/objc/libobjcMsgSend.dylib",
+            "samples": 2,
+            "share": 7.045974986788797e-05
+          },
+          {
+            "path": "/usr/lib/system/libsystem_notify.dylib",
+            "samples": 1,
+            "share": 3.5229874933943984e-05
+          }
+        ],
+        "darwin-userspace": {
+          "samples": 2280,
+          "share": 0.08032411484939228
+        },
+        "dispatch": {
+          "samples": 214,
+          "share": 0.007539193235864013
+        },
+        "gateway": {
+          "samples": 21,
+          "share": 0.0007398273736128237
+        },
+        "other-carrick": {
+          "samples": 1208,
+          "share": 0.04255768892020433
+        },
+        "process-setup": {
+          "samples": 1494,
+          "share": 0.05263343315131231
+        },
+        "translated-guest": {
+          "samples": 10496,
+          "share": 0.3697727673066761
+        },
+        "translation": {
+          "samples": 30,
+          "share": 0.0010568962480183195
+        },
+        "unresolved": {
+          "samples": 2894,
+          "share": 0.10195525805883389
+        }
+      },
+      "elapsed_ns": 24310410333,
+      "failures": [],
+      "offcpu": {
+        "runnable_ns": 467214579936,
+        "top_stack_coverage": 1.0,
+        "top_stacks": [],
+        "voluntary_ns": 0
+      },
+      "profile_path": "target/perf/native-go-build-wall-clean-b-688357ef.jsonl",
+      "provenance": {
+        "binary_sha256": "4c1a017ce215a91cfe026b84dfe136773a8e586a3bd181dfeea358245e8f7165",
+        "command": [
+          "run",
+          "--exec-backend",
+          "native",
+          "-e",
+          "CARRICK_RUN_ID=native-go-build-wall-clean-b-688357ef-20260727",
+          "-w",
+          "/tmp",
+          "localhost:5005/carrick-go-conformance:1.24",
+          "/bin/sh",
+          "-c",
+          "set -eu; cd /tmp; rm -rf \"gc-$CARRICK_RUN_ID\"; printf \"package main\\nfunc main(){println(\\\"ok\\\")}\\n\" > h.go; GOCACHE=\"/tmp/gc-$CARRICK_RUN_ID\" /usr/local/go/bin/go build -o h ./h.go; ./h; echo BUILD_OK"
+        ],
+        "git_dirty": false,
+        "git_sha": "688357ef6b72b299daf5990d494fff7d1a7a7805",
+        "host": "Mac.localdomain",
+        "run_id": "native-go-build-wall-clean-b-688357ef-20260727"
+      },
+      "reconciliation": {
+        "cpu_samples": 28385,
+        "expected_wall_samples": 4789.150835601,
+        "live_processes_at_end": 0,
+        "resolved_cpu_coverage": 0.8980447419411661,
+        "resolved_cpu_samples": 25491,
+        "voluntary_stack_ns": 0,
+        "wall_bucket_total": 4788,
+        "wall_samples": 4788,
+        "wall_timer_coverage": 0.9997596994455792
+      },
+      "schema": "carrick.native-wall-attribution.v1",
+      "wall_state": {
+        "all-sleeping": {
+          "samples": 0,
+          "share": 0.0
+        },
+        "on-cpu": {
+          "samples": 4778,
+          "share": 0.9979114452798663
+        },
+        "runnable-descheduled": {
+          "samples": 10,
+          "share": 0.0020885547201336674
+        },
+        "transition": {
+          "samples": 0,
+          "share": 0.0
+        }
+      }
+    }
+  ],
+  "schema": "carrick.native-wall-attribution.v1"
+}

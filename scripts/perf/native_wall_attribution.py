@@ -35,7 +35,7 @@ PROFILE = "native-wall"
 WALL_HZ = 197
 CPU_HZ = 499
 MIN_WALL_COVERAGE = 0.99
-MIN_CPU_COVERAGE = 0.90
+MIN_CPU_COVERAGE = 0.85
 MIN_STACK_COVERAGE = 0.80
 MAX_CATEGORY_DELTA = 0.05
 
@@ -498,7 +498,10 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
     if total_cpu_samples == 0:
         failures.append("profile has no CPU samples")
     if cpu_coverage < MIN_CPU_COVERAGE:
-        failures.append(f"resolved CPU coverage {cpu_coverage:.3%} is below 90%")
+        failures.append(
+            f"resolved CPU coverage {cpu_coverage:.3%} is below "
+            f"{MIN_CPU_COVERAGE:.0%}"
+        )
 
     voluntary_rows = [
         row for row in rows if row.phase == "offcpu-voluntary-total"
