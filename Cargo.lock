@@ -594,8 +594,11 @@ name = "carrick-native-darwin"
 version = "0.1.0"
 dependencies = [
  "carrick-dsr",
+ "carrick-dsr-aarch64",
  "cc",
+ "getrandom 0.3.4",
  "libc",
+ "tempfile",
 ]
 
 [[package]]
