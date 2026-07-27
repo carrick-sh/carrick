@@ -60,17 +60,18 @@ impl InstructionMap {
     /// so dead work on the emit path is worth deleting rather than tolerating.
     ///
     /// The duplicate-offset invariant that the `inverse` map enforced as a side
-    /// effect is NOT dropped: it is checked here against a scratch vector that
-    /// dies with this call. Two entries sharing a cache offset would make the
-    /// recovery and PC-map lookups ambiguous -- a translator bug -- so it stays
-    /// a hard error rather than becoming a debug assertion.
+    /// effect is NOT dropped. Emission appends entries in cache order, so one
+    /// strict-monotonicity scan rejects both duplicates and out-of-order
+    /// artifact input without allocating and sorting a second vector.
     fn new(entries: Vec<PcMapEntry>) -> Result<Self, DsrError> {
-        let mut offsets: Vec<u32> = entries.iter().map(|entry| entry.cache.get()).collect();
-        offsets.sort_unstable();
-        if let Some(pair) = offsets.windows(2).find(|pair| pair[0] == pair[1]) {
+        if let Some(pair) = entries
+            .windows(2)
+            .find(|pair| pair[0].cache.get() >= pair[1].cache.get())
+        {
             return Err(DsrError::CachePolicy(format!(
-                "duplicate cache offset in DSR instruction map: {}",
-                pair[0]
+                "non-monotonic cache offsets in DSR instruction map: {} then {}",
+                pair[0].cache.get(),
+                pair[1].cache.get(),
             )));
         }
         Ok(Self { entries })
@@ -78,6 +79,10 @@ impl InstructionMap {
 
     pub fn entries(&self) -> &[PcMapEntry] {
         &self.entries
+    }
+
+    pub fn into_entries(self) -> Vec<PcMapEntry> {
+        self.entries
     }
 
     /// Linear scan; see this type's constructor for why there is no index.
@@ -105,6 +110,27 @@ pub struct EmittedBlock {
     map: InstructionMap,
     direct_links: Vec<DirectLink>,
     recovery: Vec<RecoveryEntry>,
+}
+
+struct AssembledBlock {
+    words: Vec<u32>,
+    map: InstructionMap,
+    direct_links: Vec<DirectLink>,
+    recovery: Vec<RecoveryEntry>,
+}
+
+impl AssembledBlock {
+    fn publish(self, cache: &mut TranslationCache) -> Result<EmittedBlock, DsrError> {
+        let mut writer = cache.begin_write(self.words.len().saturating_mul(4))?;
+        writer.write_words(&self.words)?;
+        let code = writer.publish()?;
+        Ok(EmittedBlock {
+            code,
+            map: self.map,
+            direct_links: self.direct_links,
+            recovery: self.recovery,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,6 +350,10 @@ impl EmittedBlock {
 
     pub fn recovery(&self) -> &[RecoveryEntry] {
         &self.recovery
+    }
+
+    pub fn into_runtime_metadata(self) -> (Vec<PcMapEntry>, Vec<DirectLink>, Vec<RecoveryEntry>) {
+        (self.map.into_entries(), self.direct_links, self.recovery)
     }
 }
 
@@ -886,6 +916,7 @@ fn emit_indirect_exit(
     // returns inside translated code. Restore every guest-visible scratch
     // value on both hit and miss paths.
     let miss = assembler.new_dynamic_label();
+    let hit = assembler.new_dynamic_label();
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -914,7 +945,27 @@ fn emit_indirect_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldar x16, [x15]
+        ; ldr x16, [x15]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cmp x16, x17
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b.eq =>hit
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; add x15, x15, #16
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x15]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
@@ -925,6 +976,7 @@ fn emit_indirect_exit(
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; b.ne =>miss
+        ; =>hit
     );
     // The cache entry's generation belongs to the target page, not the source
     // block in the current gateway context. The target block's first-instruction
@@ -932,13 +984,20 @@ fn emit_indirect_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x17, [x15, #16]
+        ; ldr x17, [x15, #8]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; cbz x17, =>miss
     );
+    // Inline-cache entries are shared by every block this thread enters, but
+    // executable ownership is not: ordinary JIT code and each immutable
+    // translation unit carry different generation authority. Only chain
+    // within the active unit so the target's generation guard observes the
+    // binding table installed for that unit. Cross-unit edges return through
+    // the resolver, whose next `prepare_entry` installs the target authority.
+    emit_target_authority_check(assembler, entries, guest, miss)?;
     // Keep ordinary translated targets out of custom physical x18 entirely.
     // Preserve the validated cache PC from physical x17 in the context while
     // guest x15/x16/x17 and NZCV are restored, then reload and recheck it
@@ -1058,22 +1117,283 @@ fn emit_indirect_exit(
         ; .arch aarch64
         ; str w17, [x28, #1096]
     );
-    emit_mov_u64(
-        assembler,
-        entries,
-        guest,
-        17,
-        MaterializedValue::Process(
-            ProcessValue::Gateway(GatewayKind::Indirect),
-            super::gateway::indirect_exit_address(),
-        ),
-        recording.as_deref_mut(),
-    )?;
+    let gateway_offset = super::gateway::exit_address_offset(GatewayKind::Indirect);
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x28, #gateway_offset]
+    );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; br x17
     );
+    let resolver_end = current_offset(assembler)?;
+    for offset in (full_recovery_start.get()..resolver_end.get()).step_by(4) {
+        recovery.push(RecoveryEntry {
+            cache: CacheOffset::published(offset),
+            action: RecoveryAction::RestoreIndirectResolver,
+        });
+    }
+    Ok(())
+}
+
+/// Validate the cached target against the current executable authority.
+///
+/// On entry x15 addresses the target-cache record and x17 is its executable
+/// pointer. A target outside the active private cache or immutable unit must
+/// return through `prepare_entry`, which installs that target's generation
+/// authority before execution.
+fn emit_target_authority_check(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    guest: GuestVa,
+    miss: dynasmrt::DynamicLabel,
+) -> Result<(), DsrError> {
+    let ready = assembler.new_dynamic_label();
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr w16, [x28, super::gateway::CTX_ENFORCE_CACHE_AUTHORITY]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbz w16, =>ready
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, super::gateway::CTX_CACHE_START]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cmp x17, x16
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b.lo =>miss
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, super::gateway::CTX_CACHE_END]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cmp x17, x16
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b.hs =>miss
+        ; =>ready
+    );
+    Ok(())
+}
+
+/// Emit a direct edge that can chain through the per-thread target cache.
+///
+/// Immutable translation units cannot patch their branch words after dyld
+/// maps them. This gives their hot direct edges the same unit-scoped chaining
+/// mechanism as indirect edges: the first miss resolves and publishes the
+/// target, then later executions branch directly when the target belongs to
+/// the currently entered unit. The cache-range checks are the generation-
+/// authority boundary; a cross-unit target always returns through the gateway.
+fn emit_cached_direct_exit(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    guest: GuestVa,
+    target: GuestVa,
+    recovery: &mut Vec<RecoveryEntry>,
+    mut recording: Option<&mut ArtifactRecording>,
+) -> Result<(), DsrError> {
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x15, [x28, #1160]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x16, [x28, #1120]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x30, [x28, #1168]
+    );
+    emit_word(assembler, entries, guest, 0xd53b_4210)?; // mrs x16, nzcv
+    let register_recovery = current_offset(assembler)?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x16, [x28, #936]
+    );
+    recovery.push(RecoveryEntry {
+        cache: register_recovery,
+        action: RecoveryAction::RestoreIndirectRegisters,
+    });
+    let full_recovery_start = current_offset(assembler)?;
+    emit_mov_u64(
+        assembler,
+        entries,
+        guest,
+        17,
+        MaterializedValue::Guest(target.raw()),
+        recording.as_deref_mut(),
+    )?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #1080]
+    );
+
+    let miss = assembler.new_dynamic_label();
+    let hit = assembler.new_dynamic_label();
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x15, [x28, super::gateway::CTX_INDIRECT_CACHE]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbz x15, =>miss
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; eor x16, x17, x17, LSR #12
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ubfx x16, x16, #2, #super::gateway::INDIRECT_CACHE_INDEX_BITS
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; add x15, x15, x16, LSL #super::gateway::INDIRECT_CACHE_ENTRY_SHIFT
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x15]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cmp x16, x17
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b.eq =>hit
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; add x15, x15, #16
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x15]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cmp x16, x17
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b.ne =>miss
+        ; =>hit
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x15, #8]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbz x17, =>miss
+    );
+    emit_target_authority_check(assembler, entries, guest, miss)?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #1072]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #936]
+    );
+    emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x15, [x28, #1160]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #1120]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x30, [x28, #1168]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x28, #1072]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; br x17
+        ; =>miss
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #936]
+    );
+    emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x15, [x28, #1160]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #1120]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x30, [x28, #1168]
+    );
+    emit_gateway_exit(
+        assembler,
+        entries,
+        guest,
+        target,
+        Some(guest),
+        2,
+        GatewayKind::Direct,
+        recording,
+    )?;
     let resolver_end = current_offset(assembler)?;
     for offset in (full_recovery_start.get()..resolver_end.get()).step_by(4) {
         recovery.push(RecoveryEntry {
@@ -2334,7 +2654,7 @@ pub fn emit_block(
     plan: &BlockPlan,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    emit_block_inner(cache, plan, None, mode, None)
+    assemble_block_inner(plan, None, mode, None)?.publish(cache)
 }
 
 pub fn emit_block_direct(
@@ -2350,7 +2670,7 @@ pub fn emit_block_with_generation(
     guard: GenerationGuard,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    emit_block_inner(cache, plan, Some(guard), mode, None)
+    assemble_block_inner(plan, Some(guard), mode, None)?.publish(cache)
 }
 
 pub fn emit_block_recording_artifact(
@@ -2379,24 +2699,46 @@ pub fn emit_block_recording_artifact_optional(
     if let EmitAddressMode::Biased { host_bias } = mode {
         recording.bind(ProcessValue::HostBias, host_bias.get())?;
     }
-    let emitted = emit_block_inner(cache, plan, Some(guard), mode, Some(&mut recording))?;
-    let words = (0..emitted.len() / std::mem::size_of::<u32>())
-        .map(|index| unsafe {
-            std::ptr::read_unaligned(
-                (emitted.entry().host().raw() + index * std::mem::size_of::<u32>()) as *const u32,
-            )
-        })
-        .collect();
+    let assembled = assemble_block_inner(plan, Some(guard), mode, Some(&mut recording))?;
     let artifact = recording
         .finish(
-            words,
-            emitted.map().entries().to_vec(),
-            emitted.recovery().to_vec(),
-            emitted.direct_links().to_vec(),
+            assembled.words.clone(),
+            assembled.map.entries().to_vec(),
+            assembled.recovery.clone(),
+            assembled.direct_links.clone(),
             source_words,
         )
         .ok();
+    let emitted = assembled.publish(cache)?;
     Ok((emitted, artifact))
+}
+
+pub fn record_portable_block_artifact(
+    plan: &BlockPlan,
+    generation_binding: u32,
+    mode: EmitAddressMode,
+    source_words: Vec<u32>,
+) -> Result<ArtifactRecord, DsrError> {
+    let mut recording = ArtifactRecording::default();
+    if let EmitAddressMode::Biased { host_bias } = mode {
+        recording.bind(ProcessValue::HostBias, host_bias.get())?;
+    }
+    let assembled = assemble_block_inner(
+        plan,
+        Some(GenerationGuard::binding(
+            generation_binding,
+            plan.generation,
+        )),
+        mode,
+        Some(&mut recording),
+    )?;
+    recording.finish(
+        assembled.words,
+        assembled.map.entries().to_vec(),
+        assembled.recovery,
+        assembled.direct_links,
+        source_words,
+    )
 }
 
 pub fn emit_block_with_generation_direct(
@@ -3226,13 +3568,12 @@ fn emit_exclusive_region(
     clippy::needless_option_as_deref,
     reason = "block lowering reborrows optional recording across independent emission paths"
 )]
-fn emit_block_inner(
-    cache: &mut TranslationCache,
+fn assemble_block_inner(
     plan: &BlockPlan,
     guard: Option<GenerationGuard>,
     mode: EmitAddressMode,
     mut recording: Option<&mut ArtifactRecording>,
-) -> Result<EmittedBlock, DsrError> {
+) -> Result<AssembledBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
     let mut entries = Vec::with_capacity(plan.instructions.len() + 8);
     let mut direct_links = Vec::new();
@@ -3787,17 +4128,10 @@ fn emit_block_inner(
                     slot: taken_slot,
                     target: exit.target,
                 });
-                // A LABEL, not a hardcoded displacement. This was `0x1400_0012`
-                // -- "branch forward 18 instructions" -- which silently encoded
-                // the length of the fall-through gateway stub emitted below it.
-                // Shortening that stub by three words (materializing the gateway
-                // address from the context instead of a `movz`/`movk` chain) sent
-                // the taken edge three instructions INTO the taken stub, past its
-                // `mov x17, <target>`, so it published whatever x17 happened to
-                // hold as the guest's branch target. Nothing in the type system
-                // or the tests connected the two; only the live direct-flow
-                // oracle caught it, and only because its seeded x17 was a
-                // recognisable value.
+                // A LABEL, not a hardcoded displacement. This was
+                // `0x1400_0012` -- "branch forward 18 instructions" --
+                // which silently encoded the length of the fall-through
+                // gateway stub emitted below it.
                 let taken_stub = assembler.new_dynamic_label();
                 map_next(&assembler, &mut entries, exit_guest)?;
                 dynasmrt::dynasm!(assembler
@@ -3967,11 +4301,8 @@ fn emit_block_inner(
         .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         .collect::<Vec<_>>();
     let map = InstructionMap::new(entries)?;
-    let mut writer = cache.begin_write(bytes.len())?;
-    writer.write_words(&words)?;
-    let code = writer.publish()?;
-    Ok(EmittedBlock {
-        code,
+    Ok(AssembledBlock {
+        words,
         map,
         direct_links,
         recovery,
@@ -4367,6 +4698,38 @@ mod tests {
                 resume: GuestVa(0x400c),
             },
         }
+    }
+
+    #[test]
+    fn instruction_map_releases_owned_entries_without_cloning() {
+        let entries = vec![
+            PcMapEntry {
+                guest: GuestVa(0x4000),
+                cache: CacheOffset::published(0),
+            },
+            PcMapEntry {
+                guest: GuestVa(0x4004),
+                cache: CacheOffset::published(4),
+            },
+        ];
+        let map = InstructionMap::new(entries.clone()).expect("build instruction map");
+        assert_eq!(map.into_entries(), entries);
+    }
+
+    #[test]
+    fn instruction_map_rejects_non_monotonic_cache_offsets() {
+        let error = InstructionMap::new(vec![
+            PcMapEntry {
+                guest: GuestVa(0x4000),
+                cache: CacheOffset::published(4),
+            },
+            PcMapEntry {
+                guest: GuestVa(0x4004),
+                cache: CacheOffset::published(0),
+            },
+        ])
+        .expect_err("out-of-order offsets must be rejected");
+        assert!(error.to_string().contains("non-monotonic cache offsets"));
     }
 
     #[test]

@@ -15,14 +15,17 @@
 use super::types::{CacheVa, CodeGeneration, DsrError, NativeDsrExit};
 use crate::snapshot::NativeUcontextSnapshot;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
-pub const INDIRECT_CACHE_ENTRIES: usize = 8192;
+pub const INDIRECT_CACHE_ENTRIES: usize = 65_536;
 pub const INDIRECT_CACHE_MASK: u64 = (INDIRECT_CACHE_ENTRIES - 1) as u64;
-pub const INDIRECT_CACHE_INDEX_BITS: u32 = 13;
+pub const INDIRECT_CACHE_INDEX_BITS: u32 = 16;
 pub const INDIRECT_CACHE_ENTRY_SHIFT: u32 = 5;
 pub const CTX_INDIRECT_CACHE: u32 = 1136;
 pub const CTX_GENERATION: u32 = 1144;
+pub const CTX_ENFORCE_CACHE_AUTHORITY: u32 = 1156;
+pub const CTX_CACHE_START: u32 = 1176;
+pub const CTX_CACHE_END: u32 = 1184;
 pub const CTX_GENERATION_BINDINGS: u32 = 1264;
 
 /// Process-local data referenced by an immutable translated block.
@@ -32,9 +35,16 @@ pub const CTX_GENERATION_BINDINGS: u32 = 1264;
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct GenerationBinding {
-    pub current: *const AtomicU64,
-    pub expected: u64,
+    current: *const AtomicU64,
+    expected: u64,
 }
+
+// SAFETY: `current` can only be constructed from a shared `AtomicU64`; users
+// retaining a binding table also retain the mapped-memory generation table.
+// Translated code only performs an acquire load through the pointer.
+unsafe impl Send for GenerationBinding {}
+// SAFETY: see `Send`; the pointee is atomic and the expected value immutable.
+unsafe impl Sync for GenerationBinding {}
 
 impl GenerationBinding {
     pub fn new(current: &AtomicU64, expected: CodeGeneration) -> Self {
@@ -45,12 +55,15 @@ impl GenerationBinding {
     }
 }
 
-#[repr(C, align(32))]
+#[repr(C, align(16))]
 pub struct IndirectTargetCacheEntry {
-    guest: AtomicU64,
-    generation: AtomicU64,
-    cache: AtomicU64,
-    pad: u64,
+    guest: u64,
+    cache: u64,
+}
+
+#[repr(C, align(32))]
+struct IndirectTargetCacheSet {
+    ways: [IndirectTargetCacheEntry; 2],
 }
 
 #[inline(always)]
@@ -61,46 +74,58 @@ fn indirect_cache_index(guest: carrick_guest_mem::GuestVa) -> usize {
 }
 
 pub struct IndirectTargetCache {
-    entries: Box<[IndirectTargetCacheEntry; INDIRECT_CACHE_ENTRIES]>,
+    entries: Box<[IndirectTargetCacheSet; INDIRECT_CACHE_ENTRIES]>,
 }
 
 impl IndirectTargetCache {
     pub fn new() -> Self {
-        Self {
-            entries: Box::new(std::array::from_fn(|_| IndirectTargetCacheEntry {
-                guest: AtomicU64::new(0),
-                generation: AtomicU64::new(0),
-                cache: AtomicU64::new(0),
-                pad: 0,
-            })),
-        }
+        let entries = (0..INDIRECT_CACHE_ENTRIES)
+            .map(|_| IndirectTargetCacheSet {
+                ways: std::array::from_fn(|_| IndirectTargetCacheEntry { guest: 0, cache: 0 }),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let entries = match entries.try_into() {
+            Ok(entries) => entries,
+            Err(_) => unreachable!("indirect target cache length is fixed"),
+        };
+        Self { entries }
     }
 
     pub fn publish(
-        &self,
+        &mut self,
         guest: carrick_guest_mem::GuestVa,
-        generation: CodeGeneration,
+        _generation: CodeGeneration,
         cache: CacheVa,
     ) {
-        let entry = &self.entries[indirect_cache_index(guest)];
-        entry
-            .cache
-            .store(cache.host().raw() as u64, Ordering::Relaxed);
-        entry.generation.store(generation.get(), Ordering::Relaxed);
-        entry.guest.store(guest.raw(), Ordering::Release);
+        let set = &mut self.entries[indirect_cache_index(guest)];
+        let way = set
+            .ways
+            .iter()
+            .position(|entry| entry.guest == guest.raw() || entry.guest == 0)
+            .unwrap_or_else(|| {
+                usize::from(((guest.raw() >> (2 + INDIRECT_CACHE_INDEX_BITS)) & 1) != 0)
+            });
+        let entry = &mut set.ways[way];
+        // A thread translator owns its table. Rust publishes only while the
+        // translated reader is not running, so plain stores are sufficient.
+        entry.guest = 0;
+        entry.cache = cache.host().raw() as u64;
+        entry.guest = guest.raw();
     }
 
-    pub fn clear(&self) {
-        for entry in self.entries.iter() {
-            // Make the entry unreachable before clearing its payload.
-            entry.guest.store(0, Ordering::Release);
-            entry.generation.store(0, Ordering::Relaxed);
-            entry.cache.store(0, Ordering::Relaxed);
+    pub fn clear(&mut self) {
+        for set in self.entries.iter_mut() {
+            for entry in &mut set.ways {
+                // Make the entry unreachable before clearing its payload.
+                entry.guest = 0;
+                entry.cache = 0;
+            }
         }
     }
 
     pub fn as_ptr(&self) -> *const IndirectTargetCacheEntry {
-        self.entries.as_ptr()
+        self.entries.as_ptr().cast()
     }
 }
 
@@ -131,7 +156,7 @@ pub struct DsrContext {
     pub generation: u64,
     /// Gateway phase: 1 entering, 0 translated code, 2 leaving after capture.
     pub entry_in_progress: u32,
-    pub entry_pad: u32,
+    pub enforce_cache_authority: u32,
     pub indirect_x15_scratch: u64,
     pub indirect_x30_scratch: u64,
     pub cache_start: u64,
@@ -227,7 +252,7 @@ impl DsrContext {
             indirect_cache,
             generation: generation.get(),
             entry_in_progress: 1,
-            entry_pad: 0,
+            enforce_cache_authority: 1,
             indirect_x15_scratch: snapshot.x[15],
             indirect_x30_scratch: snapshot.x[30],
             cache_start: cache_start as u64,
@@ -263,6 +288,7 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, rewrite_context_scratch) 
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_cache) == 1136);
 const _: () = assert!(std::mem::offset_of!(DsrContext, generation) == 1144);
 const _: () = assert!(std::mem::offset_of!(DsrContext, entry_in_progress) == 1152);
+const _: () = assert!(std::mem::offset_of!(DsrContext, enforce_cache_authority) == 1156);
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x15_scratch) == 1160);
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x30_scratch) == 1168);
 const _: () = assert!(std::mem::offset_of!(DsrContext, cache_start) == 1176);
@@ -280,10 +306,10 @@ const _: () = assert!(std::mem::size_of::<DsrContext>() == 1280);
 const _: () = assert!(std::mem::size_of::<GenerationBinding>() == 16);
 const _: () = assert!(std::mem::offset_of!(GenerationBinding, current) == 0);
 const _: () = assert!(std::mem::offset_of!(GenerationBinding, expected) == 8);
-const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 32);
+const _: () = assert!(std::mem::size_of::<IndirectTargetCacheEntry>() == 16);
+const _: () = assert!(std::mem::size_of::<IndirectTargetCacheSet>() == 32);
 const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, guest) == 0);
-const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, generation) == 8);
-const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, cache) == 16);
+const _: () = assert!(std::mem::offset_of!(IndirectTargetCacheEntry, cache) == 8);
 
 // ---------------------------------------------------------------------------
 // The assembled gateway. This module is the ONE target boundary in this
@@ -344,6 +370,7 @@ mod native_gateway {
             usize::MAX,
             carrick_dsr::address::NativeAddressMode::Direct,
             std::ptr::null(),
+            true,
         )
     }
 
@@ -363,6 +390,7 @@ mod native_gateway {
             usize::MAX,
             address_mode,
             std::ptr::null(),
+            true,
         )
     }
 
@@ -382,6 +410,7 @@ mod native_gateway {
             usize::MAX,
             carrick_dsr::address::NativeAddressMode::Direct,
             std::ptr::null(),
+            true,
         )
     }
 
@@ -404,6 +433,28 @@ mod native_gateway {
             cache_end,
             address_mode,
             std::ptr::null(),
+            true,
+        )
+    }
+
+    pub fn enter_translated_with_trusted_private_cache(
+        entry: CacheVa,
+        snapshot: &mut NativeUcontextSnapshot,
+        exit: &mut NativeDsrExit,
+        indirect_cache: &IndirectTargetCache,
+        address_mode: carrick_dsr::address::NativeAddressMode,
+    ) -> Result<(), DsrError> {
+        enter_translated_raw(
+            entry,
+            snapshot,
+            exit,
+            indirect_cache.as_ptr(),
+            CodeGeneration::INITIAL,
+            0,
+            usize::MAX,
+            address_mode,
+            std::ptr::null(),
+            false,
         )
     }
 
@@ -428,6 +479,40 @@ mod native_gateway {
             usize::MAX,
             carrick_dsr::address::NativeAddressMode::Direct,
             generation_bindings.as_ptr(),
+            true,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "shared entry pins its cache and generation-table authorities"
+    )]
+    pub fn enter_translated_with_cache_range_and_generation_bindings(
+        entry: CacheVa,
+        snapshot: &mut NativeUcontextSnapshot,
+        exit: &mut NativeDsrExit,
+        indirect_cache: &IndirectTargetCache,
+        cache_start: usize,
+        cache_end: usize,
+        address_mode: carrick_dsr::address::NativeAddressMode,
+        generation_bindings: &[GenerationBinding],
+    ) -> Result<(), DsrError> {
+        if generation_bindings.is_empty() {
+            return Err(DsrError::Gateway(
+                "shared block entered without generation bindings".to_string(),
+            ));
+        }
+        enter_translated_raw(
+            entry,
+            snapshot,
+            exit,
+            indirect_cache.as_ptr(),
+            CodeGeneration::INITIAL,
+            cache_start,
+            cache_end,
+            address_mode,
+            generation_bindings.as_ptr(),
+            true,
         )
     }
 
@@ -445,6 +530,7 @@ mod native_gateway {
         cache_end: usize,
         address_mode: carrick_dsr::address::NativeAddressMode,
         generation_bindings: *const GenerationBinding,
+        enforce_cache_authority: bool,
     ) -> Result<(), DsrError> {
         if !matches!(
             *exit,
@@ -471,6 +557,7 @@ mod native_gateway {
             address_mode,
         );
         context.generation_bindings = generation_bindings;
+        context.enforce_cache_authority = u32::from(enforce_cache_authority);
         let rc = unsafe { carrick_dsr_enter_raw(&mut context) };
         if !matches!(rc, 1..=8) {
             return Err(DsrError::Gateway(format!(
@@ -592,6 +679,16 @@ mod native_gateway {
         Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
     }
 
+    pub fn enter_translated_with_trusted_private_cache(
+        _entry: CacheVa,
+        _snapshot: &mut NativeUcontextSnapshot,
+        _exit: &mut NativeDsrExit,
+        _indirect_cache: &IndirectTargetCache,
+        _address_mode: carrick_dsr::address::NativeAddressMode,
+    ) -> Result<(), DsrError> {
+        Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
+    }
+
     pub fn enter_translated_in_mode(
         _entry: CacheVa,
         _snapshot: &mut NativeUcontextSnapshot,
@@ -634,6 +731,23 @@ mod native_gateway {
     ) -> Result<(), DsrError> {
         Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
     }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "matches the live shared gateway entry signature"
+    )]
+    pub fn enter_translated_with_cache_range_and_generation_bindings(
+        _entry: CacheVa,
+        _snapshot: &mut NativeUcontextSnapshot,
+        _exit: &mut NativeDsrExit,
+        _indirect_cache: &IndirectTargetCache,
+        _cache_start: usize,
+        _cache_end: usize,
+        _address_mode: carrick_dsr::address::NativeAddressMode,
+        _generation_bindings: &[GenerationBinding],
+    ) -> Result<(), DsrError> {
+        Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -644,13 +758,40 @@ mod indirect_cache_tests {
     use super::*;
 
     #[test]
-    fn indirect_cache_uses_approved_256kib_layout() {
-        assert_eq!(INDIRECT_CACHE_ENTRIES, 8192);
-        assert_eq!(std::mem::size_of::<IndirectTargetCacheEntry>(), 32);
+    fn indirect_cache_uses_compact_two_way_2mib_layout() {
+        assert_eq!(INDIRECT_CACHE_ENTRIES, 65_536);
+        assert_eq!(std::mem::size_of::<IndirectTargetCacheEntry>(), 16);
         assert_eq!(
-            INDIRECT_CACHE_ENTRIES * std::mem::size_of::<IndirectTargetCacheEntry>(),
-            256 * 1024,
+            INDIRECT_CACHE_ENTRIES * 2 * std::mem::size_of::<IndirectTargetCacheEntry>(),
+            2 * 1024 * 1024,
         );
+    }
+
+    #[test]
+    fn two_colliding_guests_remain_reachable_in_cache_ways() {
+        let first = carrick_guest_mem::GuestVa(0x40_000);
+        let mut guests = vec![first];
+        guests.extend(
+            (0x40_004..)
+                .step_by(4)
+                .map(carrick_guest_mem::GuestVa)
+                .filter(|guest| indirect_cache_index(*guest) == indirect_cache_index(first))
+                .take(1),
+        );
+        assert_eq!(guests.len(), 2);
+        let mut cache = IndirectTargetCache::new();
+        for (index, guest) in guests.iter().copied().enumerate() {
+            cache.publish(
+                guest,
+                CodeGeneration::INITIAL,
+                CacheVa::published(carrick_guest_mem::HostVa(0x10_000 + index * 0x1000)),
+            );
+        }
+
+        let set = &cache.entries[indirect_cache_index(first)];
+        for (way, guest) in guests.into_iter().enumerate() {
+            assert_eq!(set.ways[way].guest, guest.raw());
+        }
     }
 
     #[test]

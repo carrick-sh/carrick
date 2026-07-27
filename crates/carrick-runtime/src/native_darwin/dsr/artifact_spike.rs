@@ -186,8 +186,9 @@ mod tests {
             crate::native_darwin::darwin_jit::active_host_jit(),
         )
         .expect("replay counter cache");
-        let replay = replay_artifact(&mut replay_cache, &record.template, &record.bindings)
-            .expect("replay counter artifact");
+        let replay =
+            replay_artifact_owned(&mut replay_cache, record.template.clone(), &record.bindings)
+                .expect("replay counter artifact without cloning decoded buffers");
 
         assert_eq!(fresh.map().entries(), replay.map().entries());
         assert_eq!(fresh.recovery(), replay.recovery());

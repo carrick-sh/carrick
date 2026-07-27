@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 const AUTHORITY_MARKER: &str = ".carrick-authority";
 const AUTHORITY_NONCE_LEN: usize = 16;
+const MANIFEST_DECODE_LIMIT: usize = 256 * 1024 * 1024;
 
 static CONTAINER_CACHE: Mutex<Option<ContainerCacheAuthority>> = Mutex::new(None);
 
@@ -102,6 +103,29 @@ impl Drop for UnitFileLock {
     fn drop(&mut self) {
         let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
+}
+
+fn encode_manifest(manifest: &TranslationUnitManifest) -> Result<Vec<u8>, std::io::Error> {
+    bincode::serde::encode_to_vec(
+        manifest,
+        bincode::config::standard().with_limit::<MANIFEST_DECODE_LIMIT>(),
+    )
+    .map_err(|error| invalid_data(format!("encode translation unit manifest: {error}")))
+}
+
+fn decode_manifest(bytes: &[u8]) -> Result<TranslationUnitManifest, std::io::Error> {
+    let (manifest, consumed) = bincode::serde::decode_from_slice(
+        bytes,
+        bincode::config::standard().with_limit::<MANIFEST_DECODE_LIMIT>(),
+    )
+    .map_err(|error| invalid_data(format!("decode translation unit manifest: {error}")))?;
+    if consumed != bytes.len() {
+        return Err(invalid_data(format!(
+            "translation unit manifest has {} trailing bytes",
+            bytes.len().saturating_sub(consumed),
+        )));
+    }
+    Ok(manifest)
 }
 
 /// Identity required to adopt one container's cache directory after host
@@ -263,6 +287,36 @@ impl ContainerCacheAuthority {
                 UnitMissReason::ManifestRange,
             ));
         }
+        let stem = pending.key.file_stem().map_err(|error| {
+            UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
+        })?;
+        // Winner selection must precede Mach-O emission and codesigning.
+        // Toolchain workloads retire many identical siblings at once; taking
+        // the per-key lock only after signing made every loser pay the full
+        // signing cost even though exactly one pair could be published.
+        let _lock = self.lock_unit(&stem)?;
+        let (final_dylib, final_manifest) = self.final_paths(&stem);
+        if final_dylib.is_file() && final_manifest.is_file() {
+            return Ok(PublishOutcome::Existing);
+        }
+        if final_dylib.exists() {
+            std::fs::remove_file(&final_dylib).map_err(|error| {
+                UnitStoreError::with_source(
+                    "remove partial dylib",
+                    UnitMissReason::MissingPair,
+                    error,
+                )
+            })?;
+        }
+        if final_manifest.exists() {
+            std::fs::remove_file(&final_manifest).map_err(|error| {
+                UnitStoreError::with_source(
+                    "remove partial manifest",
+                    UnitMissReason::MissingPair,
+                    error,
+                )
+            })?;
+        }
         let dylib = crate::aot::emit_dylib(
             &pending.code,
             &[crate::aot::AotExport {
@@ -315,7 +369,7 @@ impl ContainerCacheAuthority {
         manifest
             .validate_ranges()
             .map_err(|reason| UnitStoreError::new("validate manifest", reason))?;
-        let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| {
+        let manifest_bytes = encode_manifest(&manifest).map_err(|error| {
             UnitStoreError::with_source("encode manifest", UnitMissReason::Schema, error)
         })?;
         let mut manifest_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
@@ -347,32 +401,6 @@ impl ContainerCacheAuthority {
             )
         })?;
 
-        let stem = pending.key.file_stem().map_err(|error| {
-            UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
-        })?;
-        let _lock = self.lock_unit(&stem)?;
-        let (final_dylib, final_manifest) = self.final_paths(&stem);
-        if final_dylib.is_file() && final_manifest.is_file() {
-            return Ok(PublishOutcome::Existing);
-        }
-        if final_dylib.exists() {
-            std::fs::remove_file(&final_dylib).map_err(|error| {
-                UnitStoreError::with_source(
-                    "remove partial dylib",
-                    UnitMissReason::MissingPair,
-                    error,
-                )
-            })?;
-        }
-        if final_manifest.exists() {
-            std::fs::remove_file(&final_manifest).map_err(|error| {
-                UnitStoreError::with_source(
-                    "remove partial manifest",
-                    UnitMissReason::MissingPair,
-                    error,
-                )
-            })?;
-        }
         std::fs::rename(dylib_temp.path(), &final_dylib).map_err(|error| {
             UnitStoreError::with_source("publish dylib", UnitMissReason::MissingPair, error)
         })?;
@@ -380,6 +408,70 @@ impl ContainerCacheAuthority {
             UnitStoreError::with_source("publish manifest", UnitMissReason::MissingPair, error)
         })?;
         Ok(PublishOutcome::Winner)
+    }
+
+    pub fn claim_recording(&self, key: &TranslationUnitKey) -> Result<bool, UnitStoreError> {
+        let stem = key.file_stem().map_err(|error| {
+            UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
+        })?;
+        let _lock = self.lock_unit(&stem)?;
+        let (dylib, manifest) = self.final_paths(&stem);
+        if dylib.is_file() && manifest.is_file() {
+            return Ok(false);
+        }
+        let seen = self.path.join(format!("{stem}.seen"));
+        if !seen.exists() {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(seen)
+                .map_err(|error| {
+                    UnitStoreError::with_source(
+                        "mark first unit observation",
+                        UnitMissReason::MissingPair,
+                        error,
+                    )
+                })?;
+            return Ok(false);
+        }
+        let builder = self.path.join(format!("{stem}.builder"));
+        if let Ok(owner) = std::fs::read_to_string(&builder)
+            && let Ok(owner) = owner.trim().parse::<i32>()
+        {
+            let rc = unsafe { libc::kill(owner, 0) };
+            if rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Ok(false);
+            }
+        }
+        let mut builder_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(builder)
+            .map_err(|error| {
+                UnitStoreError::with_source(
+                    "claim unit recording",
+                    UnitMissReason::MissingPair,
+                    error,
+                )
+            })?;
+        write!(builder_file, "{}", unsafe { libc::getpid() }).map_err(|error| {
+            UnitStoreError::with_source(
+                "write unit recording owner",
+                UnitMissReason::MissingPair,
+                error,
+            )
+        })?;
+        builder_file.flush().map_err(|error| {
+            UnitStoreError::with_source(
+                "flush unit recording owner",
+                UnitMissReason::MissingPair,
+                error,
+            )
+        })?;
+        Ok(true)
     }
 
     pub fn load_unit(
@@ -401,7 +493,7 @@ impl ContainerCacheAuthority {
             UnitStoreError::with_source("read manifest", UnitMissReason::Schema, error)
         })?;
         let manifest: TranslationUnitManifest =
-            serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            decode_manifest(&manifest_bytes).map_err(|error| {
                 UnitStoreError::with_source("decode manifest", UnitMissReason::Schema, error)
             })?;
         manifest
@@ -475,7 +567,7 @@ impl ContainerCacheAuthority {
     fn final_paths(&self, stem: &str) -> (PathBuf, PathBuf) {
         (
             self.path.join(format!("{stem}.dylib")),
-            self.path.join(format!("{stem}.json")),
+            self.path.join(format!("{stem}.manifest")),
         )
     }
 
@@ -518,6 +610,12 @@ fn sign_and_verify(path: &Path) -> Result<(), UnitStoreError> {
 impl Drop for ContainerCacheAuthority {
     fn drop(&mut self) {
         if self.cleanup_owner && owns_cleanup(self.creator_pid, unsafe { libc::getpid() }) {
+            if std::env::var_os("CARRICK_DSR_KEEP_CONTAINER_CACHE").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            {
+                eprintln!("CARRICK_SHARED_CACHE_KEPT path={}", self.path.display());
+                return;
+            }
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
@@ -626,6 +724,18 @@ impl carrick_dsr_aarch64::shared_cache::TranslationUnitStore for ActiveContainer
             .publish_unit(pending)
             .map_err(|error| error.reason())
     }
+
+    fn claim_recording(&self, key: &TranslationUnitKey) -> bool {
+        CONTAINER_CACHE
+            .lock()
+            .ok()
+            .and_then(|active| {
+                active
+                    .as_ref()
+                    .and_then(|authority| authority.claim_recording(key).ok())
+            })
+            .unwrap_or(false)
+    }
 }
 
 fn open_directory(path: &Path) -> std::io::Result<File> {
@@ -674,6 +784,18 @@ mod tests {
             ),
             code: MOV42_RET.to_vec(),
             blocks: Vec::new(),
+        }
+    }
+
+    fn fixture_manifest() -> TranslationUnitManifest {
+        let pending = fixture_pending();
+        TranslationUnitManifest {
+            schema: TRANSLATION_UNIT_SCHEMA_V1,
+            key: pending.key,
+            dylib_sha256: [0x22; 32],
+            base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+            code_len: pending.code.len() as u64,
+            blocks: pending.blocks,
         }
     }
 
@@ -827,6 +949,47 @@ mod tests {
                 .filter_map(Result::ok)
                 .all(|entry| !entry.file_name().to_string_lossy().starts_with(".tmp")),
             "publisher left a temporary file"
+        );
+    }
+
+    #[test]
+    fn manifest_wire_format_is_materially_smaller_than_json() {
+        let manifest = fixture_manifest();
+        let json = serde_json::to_vec(&manifest).expect("encode comparison JSON");
+        let encoded = encode_manifest(&manifest).expect("encode compact manifest");
+        let decoded = decode_manifest(&encoded).expect("decode compact manifest");
+
+        assert_eq!(decoded, manifest);
+        assert!(
+            encoded.len().saturating_mul(2) < json.len(),
+            "compact manifest is {} bytes versus {} bytes of JSON",
+            encoded.len(),
+            json.len(),
+        );
+    }
+
+    #[test]
+    fn recurring_unit_elects_exactly_one_recorder() {
+        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let key = fixture_pending().key;
+
+        assert!(
+            !authority
+                .claim_recording(&key)
+                .expect("record first observation"),
+            "a one-off executable must not pay portable recording cost"
+        );
+        assert!(
+            authority
+                .claim_recording(&key)
+                .expect("elect second observation"),
+            "the second process proves recurrence and owns recording"
+        );
+        assert!(
+            !authority
+                .claim_recording(&key)
+                .expect("observe live recorder"),
+            "a live recorder must exclude the thundering herd"
         );
     }
 
