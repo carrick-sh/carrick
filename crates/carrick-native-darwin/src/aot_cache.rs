@@ -9,7 +9,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use carrick_dsr_aarch64::direct_binding::DirectBindingCellVa;
+use carrick_dsr_aarch64::direct_binding::{DirectBindingCellRef, DirectBindingCellVa};
 pub use carrick_dsr_aarch64::shared_cache::PublishOutcome;
 use carrick_dsr_aarch64::shared_cache::{
     LoadedTranslationProtection, MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit,
@@ -385,6 +385,44 @@ fn loaded_segment_range(
     let start = image_base.checked_add(relative_start)?;
     start.checked_add(length)?;
     std::ptr::NonNull::new(start as *mut u8).map(|start| (start, length))
+}
+
+fn validate_loaded_binding_cells_atomically(
+    manifest: &TranslationUnitManifest,
+    binding_base: DirectBindingCellVa,
+) -> Result<(), UnitMissReason> {
+    manifest.validate_ranges()?;
+    let binding_len =
+        usize::try_from(manifest.binding_data_len).map_err(|_| UnitMissReason::ManifestRange)?;
+    let cell_size =
+        usize::try_from(manifest.cell_size).map_err(|_| UnitMissReason::ManifestRange)?;
+    for binding in &manifest.bindings {
+        let ordinal =
+            usize::try_from(binding.ordinal.get()).map_err(|_| UnitMissReason::ManifestRange)?;
+        let offset = ordinal
+            .checked_mul(cell_size)
+            .ok_or(UnitMissReason::ManifestRange)?;
+        let cell_end = offset
+            .checked_add(cell_size)
+            .ok_or(UnitMissReason::ManifestRange)?;
+        if cell_end > binding_len {
+            return Err(UnitMissReason::ManifestRange);
+        }
+        let address = binding_base
+            .get()
+            .checked_add(offset)
+            .ok_or(UnitMissReason::ManifestRange)?;
+        let address = DirectBindingCellVa::mapped(address).ok_or(UnitMissReason::ManifestRange)?;
+        // SAFETY: the loaded data export and manifest range were validated
+        // before this function is called. Checked ordinal arithmetic keeps
+        // this address within that live initialized binding-cell mapping.
+        let cell = unsafe { DirectBindingCellRef::from_mapped_address(address) }
+            .map_err(|_| UnitMissReason::ManifestRange)?;
+        if !cell.load_acquire().is_null() {
+            return Err(UnitMissReason::ManifestRange);
+        }
+    }
+    Ok(())
 }
 
 fn manifest_for_pending(
@@ -1006,11 +1044,9 @@ impl ContainerCacheAuthority {
                     invalid_data(format!("mach_vm_protect returned {status}")),
                 ));
             }
-            // SAFETY: the resolved binding export names the manifest-declared
-            // data region, which stays mapped under `handle` during validation.
-            let binding_data =
-                unsafe { std::slice::from_raw_parts(binding_base.as_ptr(), binding_len) };
-            if let Err(reason) = manifest.validate_binding_data(binding_data) {
+            if let Err(reason) =
+                validate_loaded_binding_cells_atomically(&manifest, binding_cell_base)
+            {
                 let _ = unsafe { libc::dlclose(handle.as_ptr()) };
                 return Err(UnitStoreError::new("validate mapped binding cells", reason));
             }
@@ -1243,7 +1279,8 @@ mod tests {
     use super::*;
     use carrick_dsr::address::NativeHostBias;
     use carrick_dsr_aarch64::direct_binding::{
-        DirectBindingCellRef, DirectBindingOrdinal, DirectBindingTarget,
+        DirectBindingCellRef, DirectBindingOrdinal, DirectBindingTarget, DirectBindingTargetPrefix,
+        PrivateJitEpoch,
     };
     use carrick_dsr_aarch64::emit::DirectLinkKind;
     use carrick_dsr_aarch64::shared_cache::{
@@ -1252,6 +1289,7 @@ mod tests {
         NativePageProfileIdentity, SharedLoadedTranslationUnit, SourceFingerprint,
         TRANSLATION_UNIT_BINDING_EXPORT, UnresolvedDirectBindingRecord,
     };
+    use carrick_dsr_aarch64::types::CodeGeneration;
     use carrick_guest_mem::GuestVa;
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::fs::PermissionsExt;
@@ -1666,6 +1704,54 @@ mod tests {
                 .expect("republish complete sidecar"),
             PublishOutcome::Existing
         );
+    }
+
+    #[test]
+    fn second_load_rejects_atomically_published_binding_cell() {
+        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let pending = fixture_pending_with_binding_sidecar();
+        authority
+            .publish_unit(&pending)
+            .expect("publish binding sidecar");
+        let first = authority
+            .load_unit(&pending.key, &fixture_source_words())
+            .expect("first load");
+        let binding_base = first.binding_base.expect("typed binding base");
+        let cell = unsafe { DirectBindingCellRef::from_mapped_address(binding_base) }
+            .expect("mapped atomic binding cell");
+        let epoch = PrivateJitEpoch::process_owner();
+        let target = Box::into_raw(Box::new(DirectBindingTarget::private(
+            DirectBindingTargetPrefix {
+                target_cache_pc: 0x1000,
+                cache_start: 0x1000,
+                cache_end: 0x2000,
+                generation_bindings: 0x3000,
+            },
+            GuestVa(0x500000),
+            CodeGeneration::claimed(1),
+            &epoch,
+        )));
+        assert!(
+            (target as usize).is_multiple_of(std::mem::align_of::<DirectBindingTarget>()),
+            "published descriptor pointer must be naturally aligned"
+        );
+        cell.publish_null(target)
+            .expect("atomically publish descriptor");
+
+        assert_eq!(
+            validate_loaded_binding_cells_atomically(&first.manifest, binding_base),
+            Err(UnitMissReason::ManifestRange),
+            "atomic revalidation must observe the published descriptor"
+        );
+        let error = authority
+            .load_unit(&pending.key, &fixture_source_words())
+            .expect_err("second load must reject a process-private nonzero cell");
+        assert_eq!(error.reason(), UnitMissReason::ManifestRange);
+
+        assert!(cell.clear_if(target), "clear published test descriptor");
+        // SAFETY: this test allocated `target`, successfully cleared its sole
+        // published cell, and retains no other pointer to the allocation.
+        unsafe { drop(Box::from_raw(target)) };
     }
 
     #[test]
