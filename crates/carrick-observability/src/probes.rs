@@ -773,6 +773,21 @@ mod real {
 
     use crate::compat::{CompatEvent, SyscallArgs};
 
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub(crate) struct HostImageRange {
+        start: u64,
+        end: u64,
+        path: String,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub(crate) struct HostImageCatalog {
+        pid: u32,
+        ranges: Vec<HostImageRange>,
+    }
+
     /// USDT probes for the carrick provider. The `usdt` crate's hard cap is
     /// 6 args per probe, so syscall args ride as a `&SyscallArgs` reference
     /// — usdt JSON-encodes it through serde and passes the resulting
@@ -780,8 +795,6 @@ mod real {
     /// the JSON (looks like `[v0,v1,v2,v3,v4,v5]`).
     #[usdt::provider(provider = "carrick")]
     mod carrick_usdt {
-        use crate::compat::SyscallArgs;
-
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6], contiguous); DTrace
         // does `copyin(arg2, 48)` and reads the six args by offset. This probe
         // fires on EVERY guest syscall, so we must NOT JSON-encode here — that
@@ -1038,6 +1051,12 @@ mod real {
         /// text into the same address space, so a sampled PC can legitimately
         /// land in the guest image rather than in ours.
         fn host__image__base(_: u32, _: u64, _: i64, _: &str) {}
+        /// Executable dyld image ranges for this process.
+        ///
+        /// The catalog is JSON-encoded lazily by `usdt`, so enumerating dyld
+        /// images costs nothing unless this exact probe is enabled.
+        #[cfg(target_os = "macos")]
+        fn host__image__catalog(_: crate::probes::real::HostImageCatalog) {}
         /// The INNER guest image: `pid`, load base, entry, and path.
         ///
         /// Reported separately from `host-image-base` because they are two
@@ -1573,6 +1592,129 @@ mod real {
         // actually queried would be worse than announcing none -- a consumer
         // cannot tell a fabricated base from a real one.
     }
+
+    #[cfg(target_os = "macos")]
+    fn runtime_address(vmaddr: u64, slide: isize) -> Option<u64> {
+        if slide >= 0 {
+            vmaddr.checked_add(slide as u64)
+        } else {
+            vmaddr.checked_sub(slide.unsigned_abs() as u64)
+        }
+    }
+
+    /// Read one dyld image's executable Mach-O segments.
+    ///
+    /// # Safety
+    ///
+    /// `header` must be the live image header returned by dyld for `slide` and
+    /// must remain mapped while this function walks its bounded load-command
+    /// table.
+    #[cfg(target_os = "macos")]
+    unsafe fn executable_ranges(
+        header: *const mach2::loader::mach_header,
+        slide: isize,
+        path: &str,
+    ) -> Vec<HostImageRange> {
+        if header.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: the caller's contract supplies a live dyld image header.
+        let header_value = unsafe { std::ptr::read_unaligned(header) };
+        if header_value.magic != libc::MH_MAGIC_64 {
+            return Vec::new();
+        }
+
+        // `mach2::mach_header` models the common 28-byte prefix. A 64-bit
+        // Mach-O header has one trailing reserved u32 before load commands.
+        let commands = unsafe {
+            header
+                .cast::<u8>()
+                .add(std::mem::size_of::<mach2::loader::mach_header>() + 4)
+        };
+        let command_bytes = header_value.sizeofcmds as usize;
+        let mut offset = 0_usize;
+        let mut ranges = Vec::new();
+        for _ in 0..header_value.ncmds {
+            if command_bytes.saturating_sub(offset) < std::mem::size_of::<libc::load_command>() {
+                break;
+            }
+            // SAFETY: the size guard keeps the fixed command header in bounds.
+            let command = unsafe {
+                std::ptr::read_unaligned(commands.add(offset).cast::<libc::load_command>())
+            };
+            let command_size = command.cmdsize as usize;
+            if command_size < std::mem::size_of::<libc::load_command>()
+                || command_size > command_bytes.saturating_sub(offset)
+            {
+                break;
+            }
+            if command.cmd == libc::LC_SEGMENT_64
+                && command_size >= std::mem::size_of::<libc::segment_command_64>()
+            {
+                // SAFETY: `cmdsize` proves the complete segment command is
+                // inside dyld's load-command table.
+                let segment = unsafe {
+                    std::ptr::read_unaligned(
+                        commands.add(offset).cast::<libc::segment_command_64>(),
+                    )
+                };
+                if segment.initprot & libc::VM_PROT_EXECUTE != 0
+                    && segment.vmsize != 0
+                    && let Some(start) = runtime_address(segment.vmaddr, slide)
+                    && let Some(end) = start.checked_add(segment.vmsize)
+                {
+                    ranges.push(HostImageRange {
+                        start,
+                        end,
+                        path: path.to_owned(),
+                    });
+                }
+            }
+            offset += command_size;
+        }
+        ranges
+    }
+
+    #[cfg(target_os = "macos")]
+    fn host_image_catalog_snapshot() -> HostImageCatalog {
+        let mut ranges = Vec::new();
+        // SAFETY: dyld owns the returned image table and its names/headers for
+        // the process lifetime. The count bounds every query, and
+        // `executable_ranges` bounds all reads by the header's command table.
+        unsafe {
+            for index in 0..mach2::dyld::_dyld_image_count() {
+                let header = mach2::dyld::_dyld_get_image_header(index);
+                let name = mach2::dyld::_dyld_get_image_name(index);
+                let slide = mach2::dyld::_dyld_get_image_vmaddr_slide(index);
+                let path = if name.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(name)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                ranges.extend(executable_ranges(header, slide, &path));
+            }
+        }
+        HostImageCatalog {
+            pid: std::process::id(),
+            ranges,
+        }
+    }
+
+    /// Publish exact executable ranges for every loaded dyld image.
+    ///
+    /// The snapshot is constructed inside the probe closure. `usdt` invokes
+    /// that closure only when `host-image-catalog` has a live consumer, keeping
+    /// the ordinary native path at its single disabled-probe branch.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::redundant_closure)] // usdt rejects a bare function item.
+    pub fn host_image_catalog() {
+        carrick_usdt::host__image__catalog!(|| host_image_catalog_snapshot());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn host_image_catalog() {}
 
     /// Publish the INNER guest image: where the Linux binary this process is
     /// running got loaded, and which file it came from.
@@ -2314,6 +2456,25 @@ mod real {
 
     #[cfg(test)]
     mod tests {
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn host_image_catalog_contains_this_test_function() {
+            let catalog = super::host_image_catalog_snapshot();
+            let function =
+                host_image_catalog_contains_this_test_function as *const () as usize as u64;
+
+            assert_eq!(catalog.pid, std::process::id());
+            assert!(catalog.ranges.iter().all(|range| range.start < range.end));
+            assert!(
+                catalog
+                    .ranges
+                    .iter()
+                    .any(|range| range.start <= function && function < range.end),
+                "test function {function:#x} absent from {} executable ranges",
+                catalog.ranges.len()
+            );
+        }
+
         #[test]
         fn guest_mem_probe_digest_reports_wrapping_sum_and_edges() {
             let bytes = [
@@ -2451,6 +2612,7 @@ mod stub {
     stub!(lifecycle(phase: u32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(host_image_base());
+    stub!(host_image_catalog());
     stub!(guest_image_base(base: u64, entry: u64, path: &str));
     stub!(host_jit_range(start: u64, end: u64));
     stub!(fs_op(op: &str, path: &str, errno: i32));

@@ -45,13 +45,22 @@ Current milestone: **M1 — accounted baseline**. M0 is complete.
 | E003c | `target/perf/native-wall-smoke-c-summary.json` | tooling-only; derived untracked | Live analyzer agreement: 99.5% wall-timer coverage, 99.0% CPU classification, zero live processes, accepted without weakening the 99/90/80 thresholds |
 | E003d | `target/perf/native-wall-smoke-d{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Native container smoke printed `TRACE_OK`; 709 rows, natural zero-drop exit, 99.9% wall coverage, 98.3% CPU classification, zero live processes |
 | E003e | `target/perf/native-wall-scope-a{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Concurrent unrelated Carrick PIDs 96365/96381 produced zero scoped CPU, off-CPU, or image rows; traced tree retained 99.8% wall and 97.9% CPU coverage |
+| E003f | `target/perf/native-wall-catalog-smoke-b{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Exec smoke published one 391-range dyld catalog inside the enabled USDT closure; exact ranges classified Darwin userspace while preserving 99.7% wall and 97.3% CPU coverage |
 | E004 | `scripts/perf/evidence/native-go-build-wall-baseline-v1.json` | accepted | Clean, idle-host, serial five-plus-five run: `C0=19,249 ms`, `D0=1,029 ms`, `R0=18.7065x`; Docker image is native arm64 |
-| E005 | whole-tree attribution run A | pending | First reconciled current-state proportions |
+| E005 | `target/perf/native-go-build-wall-profile-a-rejected-v1.jsonl` | rejected diagnostic; raw untracked | Natural zero-drop Go build with 100.0% wall coverage, but only 80.375% CPU classification; 19.6% unresolved fails the fixed 90% gate |
 | E006 | whole-tree attribution run B | pending | Stability and dominant-rank replication |
 
 ## Whole-tree attribution
 
 No current trace satisfies the campaign reconciliation contract yet.
+
+Trace A reached every collector-level completion invariant but is not accepted
+campaign evidence: the summarizer left 19.6% of CPU samples unresolved. The
+profiler/classifier must identify those exact address populations before the
+trace is repeated; they are not assumed to be translated guest execution.
+The correction publishes exact executable dyld ranges lazily through USDT and
+adds `darwin-userspace` plus per-image shares; it does not widen the JIT range
+or weaken the 90% classification gate.
 
 ### Elapsed wall-state occupancy
 
