@@ -2707,6 +2707,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 // exited can only be symbolicated if the process said where it
                 // was loaded while it was alive.
                 crate::probes::host_image_base();
+                crate::probes::host_image_catalog();
                 if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                     native_reexec_lifecycle(
                         carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreflightBegin,

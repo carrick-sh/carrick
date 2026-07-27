@@ -51,6 +51,7 @@ CPU_CATEGORIES = (
     "gateway",
     "dispatch",
     "process-setup",
+    "darwin-userspace",
     "darwin-kernel",
     "other-carrick",
     "unresolved",
@@ -299,8 +300,54 @@ def _address_ranges(
     return dict(jit_ranges), dict(host_ranges)
 
 
+def _dyld_image_ranges(
+    rows: tuple[ProfileRow, ...],
+) -> dict[int, list[tuple[int, int, str]]]:
+    catalogs: dict[int, list[tuple[int, int, str]]] = {}
+    for row in rows:
+        if row.metric_type != "image-catalog":
+            continue
+        pid = _require_int(row.metric.get("pid"), "image catalog pid")
+        if row.pid != pid:
+            raise ValueError(
+                f"image catalog scope pid {row.pid} does not match metric pid {pid}"
+            )
+        raw_ranges = row.metric.get("ranges")
+        if not isinstance(raw_ranges, list) or not raw_ranges:
+            raise ValueError(f"image catalog for pid {pid} has no ranges")
+        ranges: list[tuple[int, int, str]] = []
+        for raw_range in raw_ranges:
+            if not isinstance(raw_range, dict):
+                raise ValueError(f"image catalog for pid {pid} has a non-object range")
+            start = _require_int(raw_range.get("start"), "image range start")
+            end = _require_int(raw_range.get("end"), "image range end")
+            path = raw_range.get("path")
+            if start >= end:
+                raise ValueError(
+                    f"image catalog for pid {pid} has invalid range "
+                    f"{start:#x}..{end:#x}"
+                )
+            if not isinstance(path, str):
+                raise ValueError(f"image catalog for pid {pid} has invalid path")
+            ranges.append((start, end, path))
+        if pid in catalogs:
+            raise ValueError(f"duplicate image catalog for pid {pid}")
+        catalogs[pid] = ranges
+    return catalogs
+
+
 def _inside(address: int, ranges: list[tuple[int, int]]) -> bool:
     return any(start <= address < end for start, end in ranges)
+
+
+def _dyld_image_path(
+    address: int,
+    ranges: list[tuple[int, int, str]],
+) -> str | None:
+    for start, end, path in ranges:
+        if start <= address < end:
+            return path
+    return None
 
 
 def _host_symbols(
@@ -381,6 +428,7 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
         failures.append(f"{live_at_end} tracked process(es) remained live at end")
 
     jit_ranges, host_ranges = _address_ranges(rows, binary)
+    dyld_ranges = _dyld_image_ranges(rows)
     cpu_rows = [
         row
         for row in rows
@@ -409,6 +457,7 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
     host_symbols = _host_symbols(binary, host_ranges, host_addresses)
 
     cpu_counts = Counter({category: 0 for category in CPU_CATEGORIES})
+    darwin_user_images: Counter[str] = Counter()
     for row in cpu_rows:
         samples = _exact_count(row)
         if row.phase == "cpu-kernel-pc":
@@ -421,10 +470,18 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
             cpu_counts["translated-guest"] += samples
             continue
         symbol = host_symbols.get((row.pid, row.source_pc))
-        if symbol is None:
-            cpu_counts["unresolved"] += samples
+        if symbol is not None:
+            cpu_counts[classify_host_symbol(symbol)] += samples
             continue
-        cpu_counts[classify_host_symbol(symbol)] += samples
+        image_path = _dyld_image_path(
+            row.source_pc,
+            dyld_ranges.get(row.pid, []),
+        )
+        if image_path is not None:
+            cpu_counts["darwin-userspace"] += samples
+            darwin_user_images[image_path or "[unnamed dyld image]"] += samples
+            continue
+        cpu_counts["unresolved"] += samples
 
     total_cpu_samples = sum(cpu_counts.values())
     resolved_cpu_samples = total_cpu_samples - cpu_counts["unresolved"]
@@ -467,6 +524,15 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
                 address, jit_ranges.get(row.pid, [])
             ):
                 rendered_frames.append(f"[translated-guest {address:#x}]")
+            elif row.pid is not None and (
+                image_path := _dyld_image_path(
+                    address,
+                    dyld_ranges.get(row.pid, []),
+                )
+            ) is not None:
+                rendered_frames.append(
+                    f"[darwin-userspace {image_path or '[unnamed]'} {address:#x}]"
+                )
             else:
                 rendered_frames.append(f"[unresolved {address:#x}]")
         stacks.append(
@@ -501,8 +567,17 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
             for state in WALL_STATES
         },
         "cpu": {
-            category: _metric_bucket(cpu_counts[category], total_cpu_samples)
-            for category in CPU_CATEGORIES
+            **{
+                category: _metric_bucket(cpu_counts[category], total_cpu_samples)
+                for category in CPU_CATEGORIES
+            },
+            "darwin-user-images": [
+                {
+                    "path": path,
+                    **_metric_bucket(samples, total_cpu_samples),
+                }
+                for path, samples in darwin_user_images.most_common()
+            ],
         },
         "offcpu": {
             "voluntary_ns": voluntary_ns,

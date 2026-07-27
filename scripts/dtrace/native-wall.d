@@ -3,6 +3,7 @@
 #pragma D option bufsize=32m
 #pragma D option aggsize=32m
 #pragma D option ustackframes=24
+#pragma D option strsize=64k
 
 /*
  * Whole-process-tree attribution for the Darwin/AArch64 native lane.
@@ -25,6 +26,7 @@ dtrace:::BEGIN
 	track_pid[$target] = 1;
 	thread_state[$target, 0] = 0;
 	jit_seen[$target] = 0;
+	catalog_seen[$target] = 0;
 	live_pids = 1;
 	on_cpu_threads = 0;
 	runnable_threads = 0;
@@ -148,6 +150,13 @@ carrick*:::host-image-base
 /track_pid[pid]/
 {
 	@image_base["host", arg0, arg1] = count();
+}
+
+carrick*:::host-image-catalog
+/track_pid[pid] && catalog_seen[pid] == 0/
+{
+	catalog_seen[pid] = 1;
+	printf("NWIMAGES1|%s\n", copyinstr(arg0));
 }
 
 carrick*:::guest-image-base

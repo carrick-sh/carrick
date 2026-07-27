@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
@@ -98,6 +98,56 @@ struct StackTraceRecord {
     pid: u64,
     value_ns: u64,
     frames: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct HostImageRangeRecord {
+    start: u64,
+    end: u64,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostImageCatalogRecord {
+    pid: u64,
+    ranges: Vec<HostImageRangeRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum HostImageCatalogEnvelope {
+    Ok { ok: HostImageCatalogRecord },
+    Err { err: String },
+}
+
+impl HostImageCatalogRecord {
+    fn parse(line: &str) -> Result<Self> {
+        let payload = line
+            .strip_prefix("NWIMAGES1|")
+            .ok_or_else(|| anyhow!("invalid native-wall image catalog prefix"))?;
+        let envelope: HostImageCatalogEnvelope =
+            serde_json::from_str(payload).context("invalid image catalog JSON")?;
+        let catalog = match envelope {
+            HostImageCatalogEnvelope::Ok { ok } => ok,
+            HostImageCatalogEnvelope::Err { err } => {
+                bail!("image catalog probe serialization failed: {err}")
+            }
+        };
+        if catalog.ranges.is_empty() {
+            bail!("image catalog for pid {} has no ranges", catalog.pid);
+        }
+        for range in &catalog.ranges {
+            if range.start >= range.end {
+                bail!(
+                    "image catalog for pid {} has invalid range {:#x}..{:#x}",
+                    catalog.pid,
+                    range.start,
+                    range.end
+                );
+            }
+        }
+        Ok(catalog)
+    }
 }
 
 impl StackTraceRecord {
@@ -392,6 +442,10 @@ pub(crate) enum ProfileMetric {
         used: u64,
         capacity: u64,
     },
+    ImageCatalog {
+        pid: u64,
+        ranges: Vec<HostImageRangeRecord>,
+    },
     StackTrace {
         state: String,
         pid: u64,
@@ -473,6 +527,7 @@ impl ProfileSummary {
         let mut grouped = BTreeMap::<ProfileScope, MetricBuilder>::new();
         let mut high_water = BTreeMap::<(ProfileScope, String), (u64, u64)>::new();
         let mut stack_traces = Vec::<StackTraceRecord>::new();
+        let mut image_catalogs = BTreeMap::<u64, Vec<HostImageRangeRecord>>::new();
         let mut open_stack = None::<StackTraceRecord>;
         let mut completion = None;
 
@@ -517,6 +572,19 @@ impl ProfileSummary {
             }
             if line == "NWSTACK1|end" {
                 bail!("native-wall stack end without begin at line {}", index + 1);
+            }
+            if line.starts_with("NWIMAGES1|") {
+                let catalog = HostImageCatalogRecord::parse(line)
+                    .with_context(|| format!("invalid image catalog at line {}", index + 1))?;
+                match image_catalogs.entry(catalog.pid) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(catalog.ranges);
+                    }
+                    Entry::Occupied(_) => {
+                        bail!("duplicate image catalog for pid {}", catalog.pid);
+                    }
+                }
+                continue;
             }
             let record = ProfileRecord::parse(line)
                 .with_context(|| format!("invalid profile record at line {}", index + 1))?;
@@ -605,6 +673,9 @@ impl ProfileSummary {
             completion.ok_or_else(|| anyhow!("profile stream is missing its completion record"))?;
         if !stack_traces.is_empty() && profile != TraceProfileKind::NativeWall {
             bail!("stack records are valid only for the native-wall profile");
+        }
+        if !image_catalogs.is_empty() && profile != TraceProfileKind::NativeWall {
+            bail!("image catalogs are valid only for the native-wall profile");
         }
         if profile == TraceProfileKind::NativeWall {
             validate_native_wall_metrics(&grouped, &stack_traces)?;
@@ -715,6 +786,20 @@ impl ProfileSummary {
                     used,
                     capacity,
                 },
+                sampling_interval: None,
+            });
+        }
+        for (pid, ranges) in image_catalogs {
+            metrics.push(ProfileOutputMetric {
+                scope: ProfileScope {
+                    phase: Some("image-catalog".to_owned()),
+                    pid: Some(pid),
+                    tid: None,
+                    kind: None,
+                    source_pc: None,
+                    target_pc: None,
+                },
+                metric: ProfileMetric::ImageCatalog { pid, ranges },
                 sampling_interval: None,
             });
         }
@@ -954,6 +1039,32 @@ mod tests {
                 value_ns: 900,
                 frames,
             } if state == "voluntary" && frames == &["0x2000", "0x3000"]
+        )));
+    }
+
+    #[test]
+    fn native_wall_profile_parses_host_image_catalog() {
+        let summary = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=120",
+                "DSRPROF1|count|phase=wall-samples|value=120",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=499",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000000",
+                "NWIMAGES1|{\"ok\":{\"pid\":42,\"ranges\":[{\"start\":32768,\"end\":40960,\"path\":\"/usr/lib/libSystem.B.dylib\"}]}}",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("complete native wall profile");
+
+        assert!(summary.metrics.iter().any(|output| matches!(
+            &output.metric,
+            ProfileMetric::ImageCatalog { pid: 42, ranges }
+                if ranges.len() == 1
+                    && ranges[0].start == 32_768
+                    && ranges[0].end == 40_960
+                    && ranges[0].path == "/usr/lib/libSystem.B.dylib"
         )));
     }
 

@@ -232,6 +232,48 @@ class NativeWallAttributionTest(unittest.TestCase):
                 symbol,
             )
 
+    def test_exact_dyld_image_range_resolves_darwin_userspace(self):
+        rows = profile_rows(jit_samples=400)
+        rows.insert(
+            -1,
+            row(
+                "image-catalog",
+                {
+                    "type": "image-catalog",
+                    "pid": 42,
+                    "ranges": [
+                        {
+                            "start": 0x8000,
+                            "end": 0xA000,
+                            "path": "/usr/lib/libSystem.B.dylib",
+                        }
+                    ],
+                },
+                pid=42,
+            ),
+        )
+        rows.insert(
+            -1,
+            row(
+                "cpu-user-pc",
+                exact(count=50),
+                pid=42,
+                source_pc=0x9000,
+            ),
+        )
+
+        summary = native_wall_attribution.summarize(
+            native_wall_attribution.load_profile(self.write_profile(rows)),
+            pathlib.Path("/unused/carrick"),
+        )
+
+        self.assertAlmostEqual(summary["cpu"]["darwin-userspace"]["share"], 50 / 499)
+        self.assertEqual(
+            summary["cpu"]["darwin-user-images"][0]["path"],
+            "/usr/lib/libSystem.B.dylib",
+        )
+        self.assertTrue(summary["accepted"])
+
     def test_accepts_profile_with_no_offcpu_aggregations(self):
         rows = [
             value

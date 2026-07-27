@@ -700,8 +700,11 @@ git commit -m "fix(native): make wall profile reconcile"
 If no correction was required, record the live receipt in the ledger with no
 empty commit.
 
-No correction was required. The container smoke and concurrent-unrelated-tree
-scope check were accepted and recorded in the campaign ledger.
+The initial container smoke and concurrent-unrelated-tree scope check required
+no correction. The first full Go trace later exposed 19.6% unresolved dyld
+shared-cache PCs, so Task 4 was revisited: exact executable dyld ranges now
+flow through a lazy USDT catalog, and an exec smoke proved 391 ranges arrived
+without weakening the acceptance thresholds.
 
 ---
 
