@@ -70,6 +70,19 @@ The workload now has a checked-in runner:
 Profile evidence:
 `scripts/perf/evidence/native-go-build-post-cache-profile-v1.json`.
 
+### Active wall-time attribution campaign
+
+The next campaign is governed by
+`docs/superpowers/specs/2026-07-27-native-wall-time-attribution-campaign-design.md`
+and tracked in `docs/perf-results/native-wall-time-campaign.md`.
+
+Its primary metric is the cold-GOCACHE `go-build` Carrick/Docker wall-time
+ratio. The checked-in 19,485/942 ms pair is a historical 20.68x reference, not
+the official campaign denominator: the first milestone refreshes five
+untraced samples on both sides, in separate phases. Whole-process-tree DTrace
+then partitions elapsed wall state and on-/off-CPU resource time before the
+next optimization is selected. Node and CPython remain guardrails.
+
 ### Portable translation reuse is correct but not a default performance win
 
 The container-scoped design is implemented through image-digest keys, portable
