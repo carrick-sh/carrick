@@ -16,7 +16,12 @@ carrick-dsr = { path = "../carrick-dsr" }
 carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64" }
 getrandom.workspace = true
 libc.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+carrick-guest-mem = { path = "../carrick-guest-mem" }
