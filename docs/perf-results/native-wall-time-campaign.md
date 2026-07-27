@@ -12,10 +12,10 @@
 | Historical Carrick median | 19,485 ms | Five untraced runs at `9c25688d` |
 | Historical Docker result | 942 ms | Handoff datum; refresh required |
 | Historical ratio | 20.68x | Context only, not `R0` |
-| Official `C0` | 19,249 ms | Five fresh untraced Carrick samples |
-| Official `D0` | 1,029 ms | Five fresh native-arm64 Docker samples |
-| Official `R0` | 18.7065x | `C0 / D0` |
-| M2 target | 9.3533x | `R0 / 2` |
+| Official `C0` | 19,375 ms | Five fresh untraced Carrick samples |
+| Official `D0` | 1,007 ms | Five fresh native-arm64 Docker samples |
+| Official `R0` | 19.2403x | `C0 / D0` |
+| M2 target | 9.6202x | `R0 / 2` |
 | Destination | 2.0x | Two independent five-sample campaigns |
 | Destination progress | 0.0% | `(R0 - R) / (R0 - 2.0)` |
 
@@ -46,7 +46,7 @@ Current milestone: **M1 — accounted baseline**. M0 is complete.
 | E003d | `target/perf/native-wall-smoke-d{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Native container smoke printed `TRACE_OK`; 709 rows, natural zero-drop exit, 99.9% wall coverage, 98.3% CPU classification, zero live processes |
 | E003e | `target/perf/native-wall-scope-a{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Concurrent unrelated Carrick PIDs 96365/96381 produced zero scoped CPU, off-CPU, or image rows; traced tree retained 99.8% wall and 97.9% CPU coverage |
 | E003f | `target/perf/native-wall-catalog-smoke-b{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Exec smoke published one 391-range dyld catalog inside the enabled USDT closure; exact ranges classified Darwin userspace while preserving 99.7% wall and 97.3% CPU coverage |
-| E004 | `scripts/perf/evidence/native-go-build-wall-baseline-v1.json` | accepted | Clean, idle-host, serial five-plus-five run: `C0=19,249 ms`, `D0=1,029 ms`, `R0=18.7065x`; Docker image is native arm64 |
+| E004 | `scripts/perf/evidence/native-go-build-wall-baseline-v1.json` | accepted | Clean `3b8aa399`, binary `593acb…`, serial five-plus-five run: `C0=19,375 ms`, `D0=1,007 ms`, `R0=19.2403x`; Docker image is native arm64 |
 | E005 | `target/perf/native-go-build-wall-profile-a-rejected-v1.jsonl` | rejected diagnostic; raw untracked | Natural zero-drop Go build with 100.0% wall coverage, but only 80.375% CPU classification; 19.6% unresolved fails the fixed 90% gate |
 | E006 | whole-tree attribution run B | pending | Stability and dominant-rank replication |
 

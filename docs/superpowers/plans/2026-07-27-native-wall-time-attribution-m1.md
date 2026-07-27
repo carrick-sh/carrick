@@ -738,10 +738,12 @@ Record the commit, dirty state, binary SHA-256, codesign result, and host
 preflight. A dirty tree may be profiled diagnostically but cannot establish
 official `C0`.
 
-The signed binary built and DOF-verified in Task 2 remained byte-identical
-through the Python/documentation-only commits: SHA-256
-`8e505fb18d049ae42494f9bdd0f4be2ed82f54d0f47f5d5c2fd99a2c67def3d6`.
-The paired baseline started from a clean tree with no busy-host override.
+After the dyld-catalog profiler correction, the signed evidence binary was
+rebuilt and DOF-verified at SHA-256
+`593acbaef3e3d15e771f282208bc089833c465a013b44dc42ed2c83233f59e1b`.
+The paired baseline was recollected at clean commit `3b8aa399` with no
+busy-host override so the baseline and accepted traces use the exact same
+binary.
 
 - [x] **Step 2: Collect the paired untraced baseline**
 
