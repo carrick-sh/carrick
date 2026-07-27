@@ -721,7 +721,7 @@ scope check were accepted and recorded in the campaign ledger.
 - Changes one hypothesis from `PROPOSED` to `SPIKING` and records its measured
   ceiling.
 
-- [ ] **Step 1: Rebuild the exact signed evidence binary**
+- [x] **Step 1: Rebuild the exact signed evidence binary**
 
 Run:
 
@@ -735,7 +735,12 @@ Record the commit, dirty state, binary SHA-256, codesign result, and host
 preflight. A dirty tree may be profiled diagnostically but cannot establish
 official `C0`.
 
-- [ ] **Step 2: Collect the paired untraced baseline**
+The signed binary built and DOF-verified in Task 2 remained byte-identical
+through the Python/documentation-only commits: SHA-256
+`8e505fb18d049ae42494f9bdd0f4be2ed82f54d0f47f5d5c2fd99a2c67def3d6`.
+The paired baseline started from a clean tree with no busy-host override.
+
+- [x] **Step 2: Collect the paired untraced baseline**
 
 On an accepted idle host:
 

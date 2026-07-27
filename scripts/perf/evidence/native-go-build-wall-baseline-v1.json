@@ -1,0 +1,128 @@
+{
+  "binary": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+  "binary_sha256": "8e505fb18d049ae42494f9bdd0f4be2ed82f54d0f47f5d5c2fd99a2c67def3d6",
+  "docker": {
+    "architecture": "arm64",
+    "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+    "platform": "linux/arm64",
+    "repo_digests": [
+      "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+    ]
+  },
+  "finished_at": "2026-07-27T15:05:03.023772+00:00",
+  "git_commit": "8090dae8aaa070a1a6df5022c56d6559970feef7",
+  "git_dirty": false,
+  "git_status": [],
+  "host": {
+    "busy_override": false,
+    "load_average": [
+      6.45654296875,
+      4.49267578125,
+      3.587890625
+    ],
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "preflight_reasons": []
+  },
+  "image": "localhost:5005/carrick-go-conformance:1.24",
+  "phases": {
+    "carrick": {
+      "median_ms": 19249,
+      "sample_count": 5,
+      "samples": [
+        {
+          "build_ok": true,
+          "elapsed_ms": 20739,
+          "engine": "carrick",
+          "index": 1,
+          "return_code": 0,
+          "run_id": "native-go-build-carrick-96769-1785164598854914000-1"
+        },
+        {
+          "build_ok": true,
+          "elapsed_ms": 19490,
+          "engine": "carrick",
+          "index": 2,
+          "return_code": 0,
+          "run_id": "native-go-build-carrick-96769-1785164619685050000-2"
+        },
+        {
+          "build_ok": true,
+          "elapsed_ms": 19105,
+          "engine": "carrick",
+          "index": 3,
+          "return_code": 0,
+          "run_id": "native-go-build-carrick-96769-1785164639266178000-3"
+        },
+        {
+          "build_ok": true,
+          "elapsed_ms": 19220,
+          "engine": "carrick",
+          "index": 4,
+          "return_code": 0,
+          "run_id": "native-go-build-carrick-96769-1785164658455898000-4"
+        },
+        {
+          "build_ok": true,
+          "elapsed_ms": 19249,
+          "engine": "carrick",
+          "index": 5,
+          "return_code": 0,
+          "run_id": "native-go-build-carrick-96769-1785164677763713000-5"
+        }
+      ]
+    },
+    "docker": {
+      "median_ms": 1029,
+      "sample_count": 5,
+      "samples": [
+        {
+          "build_ok": true,
+          "elapsed_ms": 1295,
+          "engine": "docker",
+          "index": 1,
+          "return_code": 0,
+          "run_id": "native-go-build-docker-96769-1785164697138481000-1"
+        },
+        {
+          "build_ok": true,
+          "elapsed_ms": 1153,
+          "engine": "docker",
+          "index": 2,
+          "return_code": 0,
+          "run_id": "native-go-build-docker-96769-1785164698504128000-2"
+        },
+        {
+          "build_ok": true,
+          "elapsed_ms": 1004,
+          "engine": "docker",
+          "index": 3,
+          "return_code": 0,
+          "run_id": "native-go-build-docker-96769-1785164699729081000-3"
+        },
+        {
+          "build_ok": true,
+          "elapsed_ms": 996,
+          "engine": "docker",
+          "index": 4,
+          "return_code": 0,
+          "run_id": "native-go-build-docker-96769-1785164700815923000-4"
+        },
+        {
+          "build_ok": true,
+          "elapsed_ms": 1029,
+          "engine": "docker",
+          "index": 5,
+          "return_code": 0,
+          "run_id": "native-go-build-docker-96769-1785164701884592000-5"
+        }
+      ]
+    }
+  },
+  "ratio": {
+    "carrick_over_docker": 18.70651117589893
+  },
+  "schema": "carrick.native-go-build.v2",
+  "started_at": "2026-07-27T15:03:18.854682+00:00"
+}

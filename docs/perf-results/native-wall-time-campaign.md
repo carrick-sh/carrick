@@ -1,7 +1,7 @@
 # Darwin/AArch64 native wall-time campaign ledger
 
 **Updated:** 2026-07-27  
-**Status:** ACTIVE — M1 measurement construction
+**Status:** ACTIVE — M1 evidence collection
 **Primary workload:** cold-GOCACHE `go-build`  
 **Design:** [Darwin native wall-time attribution campaign](../superpowers/specs/2026-07-27-native-wall-time-attribution-campaign-design.md)
 
@@ -12,12 +12,12 @@
 | Historical Carrick median | 19,485 ms | Five untraced runs at `9c25688d` |
 | Historical Docker result | 942 ms | Handoff datum; refresh required |
 | Historical ratio | 20.68x | Context only, not `R0` |
-| Official `C0` | pending | Five fresh untraced Carrick samples |
-| Official `D0` | pending | Five fresh native-arm64 Docker samples |
-| Official `R0` | pending | `C0 / D0` |
-| M2 target | pending | `R0 / 2` |
+| Official `C0` | 19,249 ms | Five fresh untraced Carrick samples |
+| Official `D0` | 1,029 ms | Five fresh native-arm64 Docker samples |
+| Official `R0` | 18.7065x | `C0 / D0` |
+| M2 target | 9.3533x | `R0 / 2` |
 | Destination | 2.0x | Two independent five-sample campaigns |
-| Destination progress | pending | `(R0 - R) / (R0 - 2.0)` |
+| Destination progress | 0.0% | `(R0 - R) / (R0 - 2.0)` |
 
 Current milestone: **M1 — accounted baseline**. M0 is complete.
 
@@ -45,7 +45,7 @@ Current milestone: **M1 — accounted baseline**. M0 is complete.
 | E003c | `target/perf/native-wall-smoke-c-summary.json` | tooling-only; derived untracked | Live analyzer agreement: 99.5% wall-timer coverage, 99.0% CPU classification, zero live processes, accepted without weakening the 99/90/80 thresholds |
 | E003d | `target/perf/native-wall-smoke-d{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Native container smoke printed `TRACE_OK`; 709 rows, natural zero-drop exit, 99.9% wall coverage, 98.3% CPU classification, zero live processes |
 | E003e | `target/perf/native-wall-scope-a{.jsonl,-summary.json}` | tooling-only; raw and derived untracked | Concurrent unrelated Carrick PIDs 96365/96381 produced zero scoped CPU, off-CPU, or image rows; traced tree retained 99.8% wall and 97.9% CPU coverage |
-| E004 | fresh Carrick/Docker baseline | pending | Official `C0`, `D0`, `R0` |
+| E004 | `scripts/perf/evidence/native-go-build-wall-baseline-v1.json` | accepted | Clean, idle-host, serial five-plus-five run: `C0=19,249 ms`, `D0=1,029 ms`, `R0=18.7065x`; Docker image is native arm64 |
 | E005 | whole-tree attribution run A | pending | First reconciled current-state proportions |
 | E006 | whole-tree attribution run B | pending | Stability and dominant-rank replication |
 
@@ -132,5 +132,5 @@ Write and validate the executable M1 plan:
 - [x] Extend the benchmark runner with a semantically identical Docker phase.
 - [x] Build a launch-scoped whole-tree wall-state/on-CPU/off-CPU DTrace profile.
 - [x] Add the fail-closed attribution summarizer.
-- [ ] Collect fresh untraced `C0`/`D0`.
+- [x] Collect fresh untraced `C0`/`D0`.
 - [ ] Collect two complete traced runs and rank H001–H005.
