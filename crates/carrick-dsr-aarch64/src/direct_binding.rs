@@ -250,10 +250,6 @@ pub struct DirectBindingUnitOwner {
 }
 
 /// Reverse edge retained after a successful direct-binding publication.
-#[allow(
-    dead_code,
-    reason = "Task 11 consumes the retained source, cell, and expected pointer during invalidation"
-)]
 pub struct IncomingDirectBinding {
     source: DirectBindingOwnerKey,
     cell: DirectBindingCellVa,
@@ -277,6 +273,15 @@ pub struct DirectBindingCounters {
     pub cas_losses: u64,
     pub stale_winner_clears: u64,
     pub publication_retries: u64,
+}
+
+/// Result of clearing the incoming cells for one exact target generation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirectBindingClearStats {
+    pub visited: u64,
+    pub exact_clears: u64,
+    pub newer_publication_misses: u64,
+    pub bitmap_bits_cleared: u64,
 }
 
 /// Result of one cold-path publication attempt.
@@ -568,6 +573,37 @@ impl DirectBindingRegistry {
         self.incoming.get(&(target, generation)).map_or(0, Vec::len)
     }
 
+    /// Clears cells that still publish this exact target generation.
+    ///
+    /// The reverse key prevents unrelated targets or generations from being
+    /// visited. Descriptors remain pinned so a reader that acquired `expected`
+    /// before the clear can safely reach the target's generation guard.
+    pub fn invalidate_target(
+        &mut self,
+        page: GuestVa,
+        generation: CodeGeneration,
+    ) -> DirectBindingClearStats {
+        let Some(incoming) = self.incoming.remove(&(page, generation)) else {
+            return DirectBindingClearStats::default();
+        };
+        let mut stats = DirectBindingClearStats::default();
+        for record in incoming {
+            stats.visited = stats.visited.saturating_add(1);
+            let cell = DirectBindingCellRef::registered(record.cell);
+            if !cell.clear_if(record.expected) {
+                // A later publisher owns the current pointer and its source
+                // bitmap bit. Exact invalidation must leave both untouched.
+                stats.newer_publication_misses = stats.newer_publication_misses.saturating_add(1);
+                continue;
+            }
+            stats.exact_clears = stats.exact_clears.saturating_add(1);
+            if self.clear_publication_bit(&record.source) {
+                stats.bitmap_bits_cleared = stats.bitmap_bits_cleared.saturating_add(1);
+            }
+        }
+        stats
+    }
+
     pub const fn counters(&self) -> DirectBindingCounters {
         self.counters
     }
@@ -627,6 +663,20 @@ impl DirectBindingRegistry {
         winner.same_complete_target(&self.descriptors[intended_index])
     }
 
+    fn clear_publication_bit(&mut self, source: &DirectBindingOwnerKey) -> bool {
+        let Some(unit) = self.units.iter_mut().find(|unit| unit.key == source.unit) else {
+            return false;
+        };
+        let ordinal = source.ordinal.get() as usize;
+        let Some(word) = unit.published_bitmap.get_mut(ordinal / u64::BITS as usize) else {
+            return false;
+        };
+        let mask = 1_u64 << (ordinal % u64::BITS as usize);
+        let was_published = *word & mask != 0;
+        *word &= !mask;
+        was_published
+    }
+
     fn record_publication(
         &mut self,
         source: DirectBindingOwnerKey,
@@ -665,6 +715,10 @@ pub struct DirectBindingCellRef {
 }
 
 impl DirectBindingCellRef {
+    fn registered(address: DirectBindingCellVa) -> Self {
+        Self { address }
+    }
+
     /// Creates an atomic adapter for a live writable binding cell.
     ///
     /// # Safety

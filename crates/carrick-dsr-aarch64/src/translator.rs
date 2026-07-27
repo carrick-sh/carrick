@@ -1652,6 +1652,7 @@ impl ProcessState {
                 .add_usize(ResolverStat::InvalidatedBlocks, stale_blocks.len());
         }
         for stale in stale_blocks {
+            let _ = self.direct_bindings.invalidate_target(stale.0, stale.1);
             self.blocks.remove(&stale);
             self.shared_blocks.remove(&stale);
             probes::dsr_cache_event(
@@ -3193,12 +3194,12 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicPtr, Ordering};
 
-        struct UnitFixture {
-            storage: Box<[AtomicPtr<DirectBindingTarget>]>,
-            unit: SharedLoadedTranslationUnit,
+        pub(super) struct UnitFixture {
+            pub(super) storage: Box<[AtomicPtr<DirectBindingTarget>]>,
+            pub(super) unit: SharedLoadedTranslationUnit,
         }
 
-        fn key(seed: u8) -> TranslationUnitKey {
+        pub(super) fn key(seed: u8) -> TranslationUnitKey {
             TranslationUnitKey::for_segment(
                 ExecutableIdentity::Digest([seed; 32]),
                 ImageFileOffset::new(u64::from(seed) * 0x1000),
@@ -3211,7 +3212,11 @@ mod tests {
             )
         }
 
-        fn record(source: GuestVa, target: GuestVa, ordinal: u32) -> UnresolvedDirectBindingRecord {
+        pub(super) fn record(
+            source: GuestVa,
+            target: GuestVa,
+            ordinal: u32,
+        ) -> UnresolvedDirectBindingRecord {
             UnresolvedDirectBindingRecord {
                 source,
                 target,
@@ -3222,7 +3227,7 @@ mod tests {
             }
         }
 
-        fn sidecar_unit(
+        pub(super) fn sidecar_unit(
             unit_key: TranslationUnitKey,
             records: Vec<UnresolvedDirectBindingRecord>,
         ) -> UnitFixture {
@@ -3261,14 +3266,14 @@ mod tests {
             UnitFixture { storage, unit }
         }
 
-        fn process_with_direct_bindings() -> ProcessTranslator {
+        pub(super) fn process_with_direct_bindings() -> ProcessTranslator {
             let process =
                 ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
             process.state.write().direct_bindings = DirectBindingRegistry::new(true);
             process
         }
 
-        fn private_target(
+        pub(super) fn private_target(
             target: GuestVa,
             generation: CodeGeneration,
             cache_pc: u64,
@@ -3614,6 +3619,258 @@ mod tests {
                 DirectBindingPublishOutcome::Rejected,
             );
             assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
+        }
+    }
+
+    mod direct_binding_target_generation_invalidation {
+        use super::direct_binding_owner_and_publication::{
+            key, private_target, process_with_direct_bindings, record, sidecar_unit,
+        };
+        use crate::direct_binding::{
+            DirectBindingCellRef, DirectBindingMiss, DirectBindingOrdinal,
+            DirectBindingPublishOutcome, DirectBindingTarget, PrivateJitEpoch,
+        };
+        use crate::types::CodeGeneration;
+        use carrick_dsr::cache::PageGenerationTable;
+        use carrick_guest_mem::GuestVa;
+        use std::sync::atomic::Ordering;
+
+        fn traversal_or_resolve(
+            cell: DirectBindingCellRef,
+            resolver: impl FnOnce(),
+        ) -> *mut DirectBindingTarget {
+            let acquired = cell.load_acquire();
+            if !acquired.is_null() {
+                return acquired;
+            }
+            resolver();
+            let rebound = cell.load_acquire();
+            assert!(
+                !rebound.is_null(),
+                "resolver must publish the rebound target"
+            );
+            rebound
+        }
+
+        #[test]
+        fn target_generation_invalidation_clears_only_the_expected_descriptor() {
+            let first_source = GuestVa(0x41_0100);
+            let second_source = GuestVa(0x41_0200);
+            let target = GuestVa(0x51_0100);
+            let old_generation = CodeGeneration::claimed(1);
+            let new_generation = CodeGeneration::claimed(2);
+            let fixture = sidecar_unit(
+                key(9),
+                vec![
+                    record(first_source, target, 0),
+                    record(second_source, target, 1),
+                ],
+            );
+            let process = process_with_direct_bindings();
+            let epoch = PrivateJitEpoch::process_owner();
+            let first_miss = DirectBindingMiss {
+                cell: fixture.unit.binding_base.expect("binding base"),
+                ordinal: DirectBindingOrdinal::claimed(0),
+            };
+            let second_miss = DirectBindingMiss {
+                cell: crate::direct_binding::DirectBindingCellVa::mapped(
+                    fixture.storage.as_ptr() as usize
+                        + crate::shared_cache::DIRECT_BINDING_CELL_SIZE as usize,
+                )
+                .expect("second cell"),
+                ordinal: DirectBindingOrdinal::claimed(1),
+            };
+            let mut state = process.state.write();
+            let unit_index = state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register owner")
+                .expect("SidecarV1 owner");
+            assert_eq!(
+                state.direct_bindings.publish(
+                    first_miss,
+                    first_source,
+                    target,
+                    private_target(target, old_generation, 0x80_1100, &epoch),
+                ),
+                DirectBindingPublishOutcome::Published,
+            );
+            assert_eq!(
+                state.direct_bindings.publish(
+                    second_miss,
+                    second_source,
+                    target,
+                    private_target(target, old_generation, 0x80_1200, &epoch),
+                ),
+                DirectBindingPublishOutcome::Published,
+            );
+            assert_eq!(
+                state.direct_bindings.publish(
+                    second_miss,
+                    second_source,
+                    target,
+                    private_target(target, new_generation, 0x80_1300, &epoch),
+                ),
+                DirectBindingPublishOutcome::PublishedAfterStale,
+            );
+            let newer = fixture.storage[1].load(Ordering::Acquire);
+
+            let stats = state
+                .direct_bindings
+                .invalidate_target(target, old_generation);
+
+            assert!(
+                fixture.storage[0].load(Ordering::Acquire).is_null(),
+                "the exact old descriptor must be cleared"
+            );
+            assert_eq!(fixture.storage[1].load(Ordering::Acquire), newer);
+            assert!(
+                !state
+                    .direct_bindings
+                    .is_published(unit_index, DirectBindingOrdinal::claimed(0))
+            );
+            assert!(
+                state
+                    .direct_bindings
+                    .is_published(unit_index, DirectBindingOrdinal::claimed(1))
+            );
+            assert_eq!(stats.visited, 2);
+            assert_eq!(stats.exact_clears, 1);
+            assert_eq!(stats.newer_publication_misses, 1);
+            assert_eq!(stats.bitmap_bits_cleared, 1);
+            assert_eq!(
+                state.direct_bindings.incoming_count(target, old_generation),
+                0,
+            );
+            assert_eq!(
+                state.direct_bindings.incoming_count(target, new_generation),
+                1,
+            );
+        }
+
+        #[test]
+        fn a_reader_of_the_old_descriptor_remains_safe_until_generation_guard() {
+            let source = GuestVa(0x42_0100);
+            let target = GuestVa(0x52_0100);
+            let generations = PageGenerationTable::new(16 * 1024).expect("generation table");
+            let old_generation = generations
+                .observe(target)
+                .expect("old target observation")
+                .expected();
+            let fixture = sidecar_unit(key(10), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let epoch = PrivateJitEpoch::process_owner();
+            let miss = DirectBindingMiss {
+                cell: fixture.unit.binding_base.expect("binding base"),
+                ordinal: DirectBindingOrdinal::claimed(0),
+            };
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register owner")
+                .expect("SidecarV1 owner");
+            assert_eq!(
+                state.direct_bindings.publish(
+                    miss,
+                    source,
+                    target,
+                    private_target(target, old_generation, 0x80_2100, &epoch),
+                ),
+                DirectBindingPublishOutcome::Published,
+            );
+            let acquired = fixture.storage[0].load(Ordering::Acquire);
+            assert!(!acquired.is_null());
+            let current_generation = generations
+                .note_guest_code_write(target..GuestVa(target.raw() + 4))
+                .expect("target generation mutation");
+
+            let stats = state
+                .direct_bindings
+                .invalidate_target(target, old_generation);
+
+            assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
+            assert_eq!(stats.exact_clears, 1);
+            assert_eq!(PrivateJitEpoch::live_descriptor_leases(&epoch), 1);
+            // SAFETY: invalidation unpublishes but never reclaims descriptors;
+            // the process-owned registry still pins this acquired pointer.
+            let old_reader = unsafe { &*acquired };
+            assert_eq!(old_reader.target_page(), target);
+            assert_eq!(old_reader.target_generation(), old_generation);
+            assert_eq!(
+                generations
+                    .generation_for_pc(target)
+                    .expect("current target generation"),
+                current_generation
+            );
+            assert_ne!(
+                old_reader.target_generation(),
+                current_generation,
+                "the target entry generation guard must reject the old reader"
+            );
+            assert!(
+                !generations
+                    .is_current(target, old_reader.target_generation())
+                    .expect("generation guard check")
+            );
+        }
+
+        #[test]
+        fn the_next_traversal_rebinds_and_then_stays_out_of_the_resolver() {
+            let source = GuestVa(0x43_0100);
+            let target = GuestVa(0x53_0100);
+            let old_generation = CodeGeneration::claimed(7);
+            let new_generation = CodeGeneration::claimed(8);
+            let fixture = sidecar_unit(key(11), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let epoch = PrivateJitEpoch::process_owner();
+            let miss = DirectBindingMiss {
+                cell: fixture.unit.binding_base.expect("binding base"),
+                ordinal: DirectBindingOrdinal::claimed(0),
+            };
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register owner")
+                .expect("SidecarV1 owner");
+            assert_eq!(
+                state.direct_bindings.publish(
+                    miss,
+                    source,
+                    target,
+                    private_target(target, old_generation, 0x80_3100, &epoch),
+                ),
+                DirectBindingPublishOutcome::Published,
+            );
+            let _ = state
+                .direct_bindings
+                .invalidate_target(target, old_generation);
+            let cell = unsafe {
+                DirectBindingCellRef::from_mapped_address(miss.cell).expect("fixture cell")
+            };
+            let mut resolver_exits = 0_u64;
+
+            let rebound = traversal_or_resolve(cell, || {
+                resolver_exits += 1;
+                assert_eq!(
+                    state.direct_bindings.publish(
+                        miss,
+                        source,
+                        target,
+                        private_target(target, new_generation, 0x80_3200, &epoch),
+                    ),
+                    DirectBindingPublishOutcome::Published,
+                );
+            });
+            let repeated = traversal_or_resolve(cell, || {
+                resolver_exits += 1;
+            });
+
+            assert_eq!(resolver_exits, 1);
+            assert_eq!(repeated, rebound);
+            // SAFETY: the registry pins the rebound descriptor.
+            assert_eq!(unsafe { &*rebound }.target_generation(), new_generation);
         }
     }
 
