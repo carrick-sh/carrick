@@ -173,7 +173,7 @@ Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
 | H001 | PROPOSED | 862,580 residual indirect resolver exits | event count, wall share pending | Classify call/return locality; test one bounded return-target structure | Two variants fail to reduce exits and untraced wall |
 | H002 | PROPOSED | 5.806 s diagnostic emission time across 1.868M translations | stale traced aggregate | Sample and split allocation, relocation, publication and I-cache work; spike only the dominant subphase | No current dominant subphase or two variants fail wall gate |
 | H003 | PROPOSED | Older profile assigned CPU to repeated capsule setup | stale sample | Refresh process-lifetime share and critical-path overlap; reuse only the dominant durable input | Current share is small/non-critical or two variants fail |
-| H004 | DEFER | Shared translations are correct but signed-unit variants take 31–77 s | measured regression | Reconsider only if trace shows translation dominates and a coarse unit can publish before sibling fan-out | Any per-block rebinding, or production/consumption budget cannot beat saved translation |
+| H004 | SPIKING | Full shared-unit mode takes 40.211 s, but publish-only takes 20.74 s and load-without-indexing takes 22.78 s | eager consumer indexing adds about 17.2 s; four units contain 28 MiB code and 49 MiB manifests | Replace eager whole-unit block/PC/recovery registration with demand-indexed immutable metadata; preserve direct-link and recovery correctness | Two lazy-index variants fail to beat the 19.375 s baseline or require per-process code rewriting |
 | H005 | PROPOSED | Scheduling/blocking share is unknown | unmeasured | Partition wall occupancy and rank voluntary blocking stacks | Fully compute-active with no dominant wait mechanism |
 
 The table order is provisional until E005 and E006 exist.
@@ -183,6 +183,11 @@ The table order is provisional until E005 and E006 exist.
 | Date | Hypothesis | Variant | Predicted mechanism / ceiling | Screening | Five-sample result | Decision |
 |---|---|---|---|---|---|---|
 | 2026-07-27 | campaign | measurement first | Account for dominant wall/CPU proportions before selecting code | pending | n/a | measurement construction |
+| 2026-07-27 | H004 | current full shared-unit mode | Reuse repeated compiler translations | 40.211 s vs 19.809 s control | n/a | reject current policy; 2.03x slower |
+| 2026-07-27 | H004 | remove three publication `fsync`s | Test whether durable I/O causes the regression | 39.98 s | n/a | reject; only 0.231 s below full mode |
+| 2026-07-27 | H004 | publish but never load | Isolate producer cost | 20.74 s | n/a | producer adds only 0.93 s; consumer is dominant |
+| 2026-07-27 | H004 | load/parse but skip block indexing | Separate manifest decode/dlopen from eager registration | 22.78 s | n/a | about 17.2 s belongs after load, in eager indexing |
+| 2026-07-27 | H004 | cap each segment unit to 10,000 / 1,000 / 250 / 100 blocks | Test whether bounded hot-prefix units avoid eager amplification | 41.49 / 37.62 / 21.30 / 20.44 s | n/a | size cliff confirmed; no cap beats control |
 
 Prior rejected experiments remain recorded in `handoff.md`; they are not reset
 to `PROPOSED`.
@@ -206,6 +211,9 @@ to `PROPOSED`.
 5. M1 CPU classification accepts 85% rather than 90%; the clean pair already
    has stable dominant categories, while more image mapping does not advance
    the primary wall-clock goal.
+6. H004 is selected over H001 because the cache isolation exposes roughly
+   17.2 seconds of Carrick-owned eager consumer work, while the residual
+   indirect resolver population has a much smaller count-based ceiling.
 
 ## Next action
 
@@ -216,4 +224,5 @@ Write and validate the executable M1 plan:
 - [x] Add the fail-closed attribution summarizer.
 - [x] Collect fresh untraced `C0`/`D0`.
 - [x] Collect two complete traced runs and rank H001–H005.
-- [ ] Select and screen the first step-function cache/reuse hypothesis.
+- [x] Select and screen the current shared-cache implementation.
+- [ ] Replace eager whole-unit metadata registration with demand indexing.

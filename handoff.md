@@ -83,6 +83,39 @@ untraced samples on both sides, in separate phases. Whole-process-tree DTrace
 then partitions elapsed wall state and on-/off-CPU resource time before the
 next optimization is selected. Node and CPython remain guardrails.
 
+The M1 attribution gate is now closed at commit `34ce4c3c`. The user explicitly
+lowered the CPU classification threshold from 90% to 85% so the campaign could
+return to wall-clock work. The clean `688357ef` pair classified 88.3%/89.8% of
+CPU samples, reconciled 100% of wall samples with zero drops, and kept all
+categories above 10% within five percentage points. Translated guest execution
+and Darwin kernel work are about 71% of sampled CPU together.
+
+The first post-M1 cache isolation found a concrete step-function seam:
+
+| untraced one-sample screen | wall |
+|---|---:|
+| default control | 19.809 s |
+| full shared translation | 40.211 s |
+| full shared translation without publication `fsync` | 39.98 s |
+| publish only; never load | 20.74 s |
+| load/parse unit; skip eager block indexing | 22.78 s |
+| cap unit to 10,000 / 1,000 / 250 / 100 blocks | 41.49 / 37.62 / 21.30 / 20.44 s |
+
+The kept full-cache census contained four dylibs (about 28 MiB) and four
+manifests (about 49 MiB). Publication is not the regression: removing all
+durability syncs changed almost nothing, and publishing while translating
+normally adds only about 0.93 s. Roughly 17.2 seconds appears after successful
+load, in eager reconstruction and registration of every block's lookup,
+PC-map, recovery, generation and direct-link authority. A 100-block cap
+collapses the regression but does not beat default, confirming a size cliff.
+
+**Next implementation target:** retain immutable file-backed units but index
+their block/PC/recovery metadata on demand (or in an equivalently compact
+unit-level structure). It must preserve recovery for intra-unit direct links
+and must not rewrite code per process. Screen two untraced runs first; retain
+only after five samples beat the official 19.375 s baseline and correctness
+guardrails pass.
+
 ### Portable translation reuse is correct but not a default performance win
 
 The container-scoped design is implemented through image-digest keys, portable
