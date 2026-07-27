@@ -244,6 +244,17 @@ def validate_docker_image() -> str:
     return str(docker_image_provenance()["architecture"])
 
 
+def combined_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
+    def text(output: str | bytes | None) -> str:
+        if output is None:
+            return ""
+        if isinstance(output, bytes):
+            return output.decode(errors="replace")
+        return output
+
+    return text(stdout) + text(stderr)
+
+
 def run_sample(
     repo: pathlib.Path,
     engine: str,
@@ -258,6 +269,9 @@ def run_sample(
     environment = os.environ.copy()
     environment["CARRICK_RUN_ID"] = run_id
     started = time.monotonic_ns()
+    result: subprocess.CompletedProcess[str] | None = None
+    timeout: subprocess.TimeoutExpired | None = None
+    cleanup_error: Exception | None = None
     try:
         result = subprocess.run(
             command,
@@ -268,21 +282,42 @@ def run_sample(
             timeout=timeout_seconds,
             check=False,
         )
+    except subprocess.TimeoutExpired as error:
+        timeout = error
     finally:
         elapsed_ms = (time.monotonic_ns() - started) // 1_000_000
-        if engine == ENGINE_CARRICK:
-            carrick_cleanup(repo, run_id)
-        else:
-            docker_cleanup(run_id)
-    combined = result.stdout + result.stderr
+        try:
+            if engine == ENGINE_CARRICK:
+                carrick_cleanup(repo, run_id)
+            else:
+                docker_cleanup(run_id)
+        except Exception as error:
+            cleanup_error = error
+    if timeout is not None:
+        combined = combined_output(timeout.stdout, timeout.stderr)
+    else:
+        assert result is not None
+        combined = combined_output(result.stdout, result.stderr)
     if captured_output is not None:
         captured_output.parent.mkdir(parents=True, exist_ok=True)
         captured_output.write_text(combined)
+    if timeout is not None:
+        if cleanup_error is not None:
+            raise timeout from cleanup_error
+        raise timeout
+    assert result is not None
     if result.returncode != 0 or "BUILD_OK" not in combined:
-        raise RuntimeError(
+        sample_error = RuntimeError(
             f"go-build sample {index} failed: run_id={run_id} "
             f"rc={result.returncode}\n{combined[-8000:]}"
         )
+        if cleanup_error is not None:
+            raise sample_error from cleanup_error
+        raise sample_error
+    if cleanup_error is not None:
+        raise RuntimeError(
+            f"go-build sample {index} cleanup failed: run_id={run_id}"
+        ) from cleanup_error
     return {
         "engine": engine,
         "index": index,
