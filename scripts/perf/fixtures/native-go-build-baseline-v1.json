@@ -1,0 +1,8 @@
+{
+  "docker_wall_ms": 942,
+  "git_commit": "26de3c07",
+  "median_ms": 21786,
+  "samples": 5,
+  "schema": "carrick.native-go-build-baseline.v1",
+  "source": "handoff.md 2026-07-26"
+}
