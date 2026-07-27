@@ -4,6 +4,7 @@ use carrick_dsr::address::NativeHostBias;
 use carrick_guest_mem::GuestVa;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 pub const TRANSLATOR_ABI_V1: u32 = 1;
 pub const TRANSLATION_UNIT_SCHEMA_V1: u32 = 1;
@@ -321,6 +322,42 @@ pub enum UnitMissReason {
     DylibDigest,
     ManifestRange,
     Dlopen,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Winner,
+    Existing,
+}
+
+pub struct SharedLoadedTranslationUnit {
+    pub manifest: TranslationUnitManifest,
+    pub base: usize,
+    _lease: Arc<dyn Send + Sync>,
+}
+
+impl SharedLoadedTranslationUnit {
+    pub fn new(
+        manifest: TranslationUnitManifest,
+        base: usize,
+        lease: Arc<dyn Send + Sync>,
+    ) -> Self {
+        Self {
+            manifest,
+            base,
+            _lease: lease,
+        }
+    }
+}
+
+pub trait TranslationUnitStore: Send + Sync {
+    fn load(
+        &self,
+        key: &TranslationUnitKey,
+        source_words: &[u32],
+    ) -> Result<Option<SharedLoadedTranslationUnit>, UnitMissReason>;
+
+    fn publish(&self, pending: &PendingTranslationUnit) -> Result<PublishOutcome, UnitMissReason>;
 }
 
 impl TranslationUnitManifest {

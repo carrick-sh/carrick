@@ -9,6 +9,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+pub use carrick_dsr_aarch64::shared_cache::PublishOutcome;
 use carrick_dsr_aarch64::shared_cache::{
     MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit, TRANSLATION_UNIT_BASE_EXPORT,
     TRANSLATION_UNIT_SCHEMA_V1, TranslationUnitKey, TranslationUnitManifest, UnitMissReason,
@@ -19,12 +20,6 @@ const AUTHORITY_MARKER: &str = ".carrick-authority";
 const AUTHORITY_NONCE_LEN: usize = 16;
 
 static CONTAINER_CACHE: Mutex<Option<ContainerCacheAuthority>> = Mutex::new(None);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PublishOutcome {
-    Winner,
-    Existing,
-}
 
 #[derive(Debug)]
 pub struct UnitStoreError {
@@ -588,6 +583,49 @@ pub fn adopt_container_cache(config: &ContainerCacheReexecConfig) -> std::io::Re
     }
     *active = Some(authority);
     Ok(())
+}
+
+#[derive(Debug, Default)]
+pub struct ActiveContainerUnitStore;
+
+impl carrick_dsr_aarch64::shared_cache::TranslationUnitStore for ActiveContainerUnitStore {
+    fn load(
+        &self,
+        key: &TranslationUnitKey,
+        source_words: &[u32],
+    ) -> Result<
+        Option<carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit>,
+        UnitMissReason,
+    > {
+        let active = CONTAINER_CACHE
+            .lock()
+            .map_err(|_| UnitMissReason::MissingPair)?;
+        let authority = active.as_ref().ok_or(UnitMissReason::MissingPair)?;
+        match authority.load_unit(key, source_words) {
+            Ok(loaded) => {
+                let loaded = std::sync::Arc::new(loaded);
+                let base = loaded.base.as_ptr() as usize;
+                let manifest = loaded.manifest.clone();
+                Ok(Some(
+                    carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit::new(
+                        manifest, base, loaded,
+                    ),
+                ))
+            }
+            Err(error) if error.reason() == UnitMissReason::MissingPair => Ok(None),
+            Err(error) => Err(error.reason()),
+        }
+    }
+
+    fn publish(&self, pending: &PendingTranslationUnit) -> Result<PublishOutcome, UnitMissReason> {
+        let active = CONTAINER_CACHE
+            .lock()
+            .map_err(|_| UnitMissReason::MissingPair)?;
+        let authority = active.as_ref().ok_or(UnitMissReason::MissingPair)?;
+        authority
+            .publish_unit(pending)
+            .map_err(|error| error.reason())
+    }
 }
 
 fn open_directory(path: &Path) -> std::io::Result<File> {
