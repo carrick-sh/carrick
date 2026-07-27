@@ -54,7 +54,7 @@ Darwin `atos`/`otool`, Docker, Carrick's signed native AArch64 runner.
 - Preserves `build_carrick_command()` as a compatibility wrapper for existing
   callers.
 
-- [ ] **Step 1: Add red tests for identical guest scripts and separate engines**
+- [x] **Step 1: Add red tests for identical guest scripts and separate engines**
 
 Add these tests to `scripts/perf/test_native_go_build.py`:
 
@@ -81,7 +81,7 @@ Add these tests to `scripts/perf/test_native_go_build.py`:
         )
 ```
 
-- [ ] **Step 2: Run the focused test and verify red**
+- [x] **Step 2: Run the focused test and verify red**
 
 Run:
 
@@ -92,7 +92,7 @@ python3 -m unittest scripts/perf/test_native_go_build.py -v
 Expected: failures because `build_command`, `requested_engines`, and
 `carrick_over_docker_ratio` do not exist.
 
-- [ ] **Step 3: Extract one guest script and add Docker command construction**
+- [x] **Step 3: Extract one guest script and add Docker command construction**
 
 Implement these exact public helpers in `scripts/perf/native_go_build.py`:
 
@@ -144,7 +144,7 @@ Make `build_carrick_command()` call `build_command(..., ENGINE_CARRICK, ...)`.
 Docker cleanup must use `docker rm -f <run-id>` in a `finally` block; Carrick
 cleanup retains `scripts/sudo/kill.sh <run-id>`.
 
-- [ ] **Step 4: Add phase execution and the v2 artifact**
+- [x] **Step 4: Add phase execution and the v2 artifact**
 
 Add `--engine {carrick,docker,both}` with default `carrick`. Run all requested
 Carrick samples before any Docker sample. Populate:
@@ -168,7 +168,7 @@ Record `docker image inspect --format '{{json .Architecture}}'` and reject a
 Docker phase unless it returns `"arm64"`. Retain commit, binary hash, dirty
 state, host load, and busy-host preflight fields.
 
-- [ ] **Step 5: Run focused tests and a command-only inspection**
+- [x] **Step 5: Run focused tests and a command-only inspection**
 
 Run:
 
@@ -179,7 +179,7 @@ python3 scripts/perf/native_go_build.py --help
 
 Expected: all tests pass; help lists `--engine`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add scripts/perf/native_go_build.py scripts/perf/test_native_go_build.py

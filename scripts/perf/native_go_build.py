@@ -17,39 +17,100 @@ import time
 from collections.abc import Sequence
 
 
-SCHEMA = "carrick.native-go-build.v1"
+SCHEMA = "carrick.native-go-build.v2"
 DEFAULT_IMAGE = "localhost:5005/carrick-go-conformance:1.24"
 DEFAULT_TIMEOUT_SECONDS = 180
+ENGINE_CARRICK = "carrick"
+ENGINE_DOCKER = "docker"
+ENGINE_BOTH = "both"
 
 
-def build_carrick_command(repo: pathlib.Path, run_id: str) -> list[str]:
-    script = (
+def guest_script() -> str:
+    return (
         'set -eu; cd /tmp; rm -rf "gc-$CARRICK_RUN_ID"; '
         'printf "package main\\nfunc main(){println(\\"ok\\")}\\n" > h.go; '
         'GOCACHE="/tmp/gc-$CARRICK_RUN_ID" '
         "/usr/local/go/bin/go build -o h ./h.go; "
         "./h; echo BUILD_OK"
     )
-    return [
-        str(repo / "target/release/carrick"),
-        "run",
-        "--exec-backend",
-        "native",
-        "-e",
-        f"CARRICK_RUN_ID={run_id}",
-        "-w",
-        "/tmp",
-        DEFAULT_IMAGE,
-        "/bin/sh",
-        "-c",
-        script,
-    ]
+
+
+def requested_engines(value: str) -> tuple[str, ...]:
+    if value == ENGINE_BOTH:
+        return (ENGINE_CARRICK, ENGINE_DOCKER)
+    if value in {ENGINE_CARRICK, ENGINE_DOCKER}:
+        return (value,)
+    raise ValueError(f"unknown engine: {value}")
+
+
+def build_command(repo: pathlib.Path, engine: str, run_id: str) -> list[str]:
+    if engine == ENGINE_CARRICK:
+        return [
+            str(repo / "target/release/carrick"),
+            "run",
+            "--exec-backend",
+            "native",
+            "-e",
+            f"CARRICK_RUN_ID={run_id}",
+            "-w",
+            "/tmp",
+            DEFAULT_IMAGE,
+            "/bin/sh",
+            "-c",
+            guest_script(),
+        ]
+    if engine == ENGINE_DOCKER:
+        return [
+            "docker",
+            "run",
+            "--name",
+            run_id,
+            "--platform",
+            "linux/arm64",
+            "-e",
+            f"CARRICK_RUN_ID={run_id}",
+            "-w",
+            "/tmp",
+            DEFAULT_IMAGE,
+            "/bin/sh",
+            "-c",
+            guest_script(),
+        ]
+    raise ValueError(f"unknown engine: {engine}")
+
+
+def build_carrick_command(repo: pathlib.Path, run_id: str) -> list[str]:
+    return build_command(repo, ENGINE_CARRICK, run_id)
 
 
 def median_ms(samples: Sequence[int]) -> int:
     if not samples:
         raise ValueError("at least one sample is required")
     return int(statistics.median(samples))
+
+
+def carrick_over_docker_ratio(
+    carrick_samples: Sequence[int],
+    docker_samples: Sequence[int],
+) -> float:
+    docker_median = median_ms(docker_samples)
+    if docker_median == 0:
+        raise ValueError("Docker median must be nonzero")
+    return median_ms(carrick_samples) / docker_median
+
+
+def summarize_phases(
+    samples_by_engine: dict[str, list[dict[str, object]]],
+) -> dict[str, dict[str, object]]:
+    phases: dict[str, dict[str, object]] = {}
+    for engine, rows in samples_by_engine.items():
+        durations = [int(row["elapsed_ms"]) for row in rows]
+        phases[engine] = {
+            "sample_count": len(rows),
+            "samples": rows,
+            "median_ms": median_ms(durations),
+        }
+    return phases
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -108,7 +169,7 @@ def busy_host_reasons() -> list[str]:
     return reasons
 
 
-def scoped_cleanup(repo: pathlib.Path, run_id: str) -> None:
+def carrick_cleanup(repo: pathlib.Path, run_id: str) -> None:
     subprocess.run(
         [str(repo / "scripts/sudo/kill.sh"), run_id],
         cwd=repo,
@@ -119,13 +180,80 @@ def scoped_cleanup(repo: pathlib.Path, run_id: str) -> None:
     )
 
 
+def docker_cleanup(run_id: str) -> None:
+    subprocess.run(
+        ["docker", "rm", "-f", run_id],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+
+
+def docker_image_provenance() -> dict[str, object]:
+    result = subprocess.run(
+        [
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{json .Architecture}}\n{{json .Id}}\n{{json .RepoDigests}}",
+            DEFAULT_IMAGE,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"failed to inspect Docker image {DEFAULT_IMAGE}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    lines = result.stdout.splitlines()
+    if len(lines) != 3:
+        raise RuntimeError(
+            "Docker image provenance must contain architecture, ID, and digests"
+        )
+    try:
+        architecture = json.loads(lines[0])
+        image_id = json.loads(lines[1])
+        repo_digests = json.loads(lines[2])
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"Docker image provenance is not valid JSON: {result.stdout!r}"
+        ) from error
+    if architecture != "arm64":
+        raise RuntimeError(
+            f"Docker oracle image must be native arm64, got {architecture!r}"
+        )
+    if not isinstance(image_id, str) or not image_id:
+        raise RuntimeError("Docker image ID is missing")
+    if not isinstance(repo_digests, list) or not all(
+        isinstance(digest, str) for digest in repo_digests
+    ):
+        raise RuntimeError("Docker image RepoDigests are malformed")
+    return {
+        "architecture": architecture,
+        "id": image_id,
+        "repo_digests": repo_digests,
+    }
+
+
+def validate_docker_image() -> str:
+    return str(docker_image_provenance()["architecture"])
+
+
 def run_sample(
     repo: pathlib.Path,
+    engine: str,
     index: int,
     timeout_seconds: int,
 ) -> dict[str, object]:
-    run_id = f"native-go-build-{os.getpid()}-{time.time_ns()}-{index}"
-    command = build_carrick_command(repo, run_id)
+    run_id = (
+        f"native-go-build-{engine}-{os.getpid()}-{time.time_ns()}-{index}"
+    )
+    command = build_command(repo, engine, run_id)
     environment = os.environ.copy()
     environment["CARRICK_RUN_ID"] = run_id
     started = time.monotonic_ns()
@@ -141,7 +269,10 @@ def run_sample(
         )
     finally:
         elapsed_ms = (time.monotonic_ns() - started) // 1_000_000
-        scoped_cleanup(repo, run_id)
+        if engine == ENGINE_CARRICK:
+            carrick_cleanup(repo, run_id)
+        else:
+            docker_cleanup(run_id)
     combined = result.stdout + result.stderr
     if result.returncode != 0 or "BUILD_OK" not in combined:
         raise RuntimeError(
@@ -149,6 +280,7 @@ def run_sample(
             f"rc={result.returncode}\n{combined[-8000:]}"
         )
     return {
+        "engine": engine,
         "index": index,
         "run_id": run_id,
         "elapsed_ms": elapsed_ms,
@@ -157,12 +289,32 @@ def run_sample(
     }
 
 
+def run_phase(
+    repo: pathlib.Path,
+    engine: str,
+    samples: int,
+    timeout_seconds: int,
+) -> list[dict[str, object]]:
+    if engine == ENGINE_DOCKER:
+        validate_docker_image()
+    return [
+        run_sample(repo, engine, index + 1, timeout_seconds)
+        for index in range(samples)
+    ]
+
+
 def utc_now() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat()
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--engine",
+        choices=(ENGINE_CARRICK, ENGINE_DOCKER, ENGINE_BOTH),
+        default=ENGINE_CARRICK,
+        help="measure Carrick, native-arm64 Docker, or both in separate phases",
+    )
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument(
         "--output",
@@ -191,7 +343,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     repo = pathlib.Path(__file__).resolve().parents[2]
     binary = repo / "target/release/carrick"
-    if not binary.is_file():
+    engines = requested_engines(args.engine)
+    if ENGINE_CARRICK in engines and not binary.is_file():
         raise SystemExit(f"missing signed release binary: {binary}; run `just build`")
 
     reasons = busy_host_reasons()
@@ -200,11 +353,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit(f"host is not idle enough for a performance claim:\n{rendered}")
 
     started_at = utc_now()
-    sample_rows = [
-        run_sample(repo, index + 1, args.timeout_seconds)
-        for index in range(args.samples)
-    ]
-    durations = [int(sample["elapsed_ms"]) for sample in sample_rows]
+    samples_by_engine = {
+        engine: run_phase(repo, engine, args.samples, args.timeout_seconds)
+        for engine in engines
+    }
+    phases = summarize_phases(samples_by_engine)
     dirty_lines = git_output(repo, "status", "--porcelain").splitlines()
     payload = {
         "schema": SCHEMA,
@@ -213,8 +366,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "git_commit": git_output(repo, "rev-parse", "HEAD"),
         "git_dirty": bool(dirty_lines),
         "git_status": dirty_lines,
-        "binary": str(binary),
-        "binary_sha256": sha256_file(binary),
+        "image": DEFAULT_IMAGE,
         "host": {
             "platform": platform.platform(),
             "machine": platform.machine(),
@@ -223,10 +375,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             "busy_override": bool(args.allow_busy),
             "preflight_reasons": reasons,
         },
-        "sample_count": len(sample_rows),
-        "samples": sample_rows,
-        "median_ms": median_ms(durations),
+        "phases": phases,
     }
+    if ENGINE_CARRICK in engines:
+        payload["binary"] = str(binary)
+        payload["binary_sha256"] = sha256_file(binary)
+    if ENGINE_DOCKER in engines:
+        payload["docker"] = {
+            **docker_image_provenance(),
+            "platform": "linux/arm64",
+        }
+    if engines == (ENGINE_CARRICK, ENGINE_DOCKER):
+        payload["ratio"] = {
+            "carrick_over_docker": carrick_over_docker_ratio(
+                [
+                    int(row["elapsed_ms"])
+                    for row in samples_by_engine[ENGINE_CARRICK]
+                ],
+                [
+                    int(row["elapsed_ms"])
+                    for row in samples_by_engine[ENGINE_DOCKER]
+                ],
+            ),
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(json.dumps(payload, indent=2, sort_keys=True))
