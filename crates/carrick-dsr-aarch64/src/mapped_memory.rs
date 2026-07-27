@@ -26,6 +26,7 @@ use carrick_dsr::test_hooks::{
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{GuestMemory, MappingSharing, MemoryError, RepointPrivateError};
 use carrick_mem::memory::{AddressSpace, MemoryLayout, MemoryRegion};
+use sha2::{Digest, Sha256};
 
 use crate::prepared_image::{
     NativeRelativeRelocation, PreparedImageFileBacking, ValidatedPreparedImage,
@@ -746,6 +747,157 @@ impl NativeMappedMemory {
                 "native DSR process translator is unavailable outside DSR mode".to_string(),
             )
         })
+    }
+
+    pub fn configure_shared_translation(
+        &self,
+        image: &AddressSpace,
+        page_profile: carrick_guest_mem::NativePageProfile,
+        executable_digest: Option<[u8; 32]>,
+        store: Arc<dyn crate::shared_cache::TranslationUnitStore>,
+    ) -> Result<(), NativeMemoryError> {
+        let artifact_enabled = crate::artifact_spike::enabled();
+        let shared_enabled = crate::translator::shared_translation_runtime_enabled();
+        if !artifact_enabled && !shared_enabled {
+            return Ok(());
+        }
+        let translator = self.dsr_process_translator()?;
+        if artifact_enabled && let Some(digest) = executable_digest {
+            translator
+                .configure_artifact_image_digest(digest)
+                .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
+            if !shared_enabled {
+                return Ok(());
+            }
+        }
+        let mut executable_spans = image
+            .ro_spans()
+            .iter()
+            .filter(|span| span.exec)
+            .map(|span| span.start..span.start.saturating_add(span.len))
+            .collect::<Vec<_>>();
+        executable_spans.sort_by_key(|span| span.start);
+        let mut merged = Vec::<std::ops::Range<u64>>::new();
+        for span in executable_spans {
+            if let Some(previous) = merged.last_mut()
+                && previous.end == span.start
+            {
+                previous.end = span.end;
+            } else {
+                merged.push(span);
+            }
+        }
+        let mut segments = shared_enabled.then(|| Vec::with_capacity(merged.len()));
+        let mut identity = executable_digest.is_none().then(|| {
+            let mut identity = Sha256::new();
+            identity.update(b"carrick-mapped-executable-v1");
+            identity
+        });
+        for span in merged {
+            let byte_len = span.end.checked_sub(span.start).ok_or_else(|| {
+                NativeMemoryError::Unsupported(
+                    "shared executable span has inverted bounds".to_string(),
+                )
+            })?;
+            let byte_len_usize = usize::try_from(byte_len).map_err(|_| {
+                NativeMemoryError::Unsupported(
+                    "shared executable span exceeds host usize".to_string(),
+                )
+            })?;
+            if byte_len == 0 || !byte_len.is_multiple_of(4) {
+                return Err(NativeMemoryError::Unsupported(format!(
+                    "shared executable span length is not an instruction multiple: {byte_len}"
+                )));
+            }
+            let bytes = self
+                .read_bytes_raw(span.start, byte_len_usize)
+                .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
+            if let Some(identity) = &mut identity {
+                identity.update(span.start.to_le_bytes());
+                identity.update(byte_len.to_le_bytes());
+                identity.update(&bytes);
+            }
+            if let Some(segments) = &mut segments {
+                let source_words = bytes
+                    .chunks_exact(4)
+                    .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                    .collect::<Vec<_>>();
+                segments.push(crate::shared_cache::SharedExecutableSegment {
+                    // AddressSpace currently exposes page-granular executable
+                    // provenance but not the original PT_LOAD file offset. The
+                    // guest start remains an exact, typed coordinate in the key;
+                    // using it here keeps distinct mapped segments isolated until
+                    // the loader grows an explicit file-offset carrier.
+                    file_offset: crate::shared_cache::ImageFileOffset::new(span.start),
+                    file_len: crate::shared_cache::ImageFileLen::new(byte_len).ok_or_else(
+                        || {
+                            NativeMemoryError::Unsupported(
+                                "shared executable span has zero file length".to_string(),
+                            )
+                        },
+                    )?,
+                    guest_start: carrick_guest_mem::GuestVa(span.start),
+                    guest_len: crate::shared_cache::GuestCodeLen::new(byte_len).ok_or_else(
+                        || {
+                            NativeMemoryError::Unsupported(
+                                "shared executable span has zero guest length".to_string(),
+                            )
+                        },
+                    )?,
+                    source_words: source_words.into(),
+                });
+            }
+        }
+        let digest = if let Some(digest) = executable_digest {
+            digest
+        } else if let Some(identity) = identity {
+            identity.finalize().into()
+        } else {
+            return Err(NativeMemoryError::Unsupported(
+                "shared translation has no executable identity".to_string(),
+            ));
+        };
+        if artifact_enabled && executable_digest.is_none() {
+            translator
+                .configure_artifact_image_digest(digest)
+                .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
+        }
+        if !shared_enabled {
+            return Ok(());
+        }
+        let Some(segments) = segments else {
+            return Err(NativeMemoryError::Unsupported(
+                "shared translation has no segment collector".to_string(),
+            ));
+        };
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let page_profile = match page_profile {
+            carrick_guest_mem::NativePageProfile::Native16k => {
+                crate::shared_cache::NativePageProfileIdentity::Native16k
+            }
+            carrick_guest_mem::NativePageProfile::Linux4kOn16k => {
+                crate::shared_cache::NativePageProfileIdentity::Linux4kOn16k
+            }
+        };
+        let address_mode = match self.address_mode {
+            NativeAddressMode::Direct => crate::shared_cache::AddressModeIdentity::Direct,
+            NativeAddressMode::Biased { host_bias } => {
+                crate::shared_cache::AddressModeIdentity::biased(host_bias)
+            }
+        };
+        translator
+            .configure_shared_image(
+                crate::shared_cache::SharedImageConfig {
+                    executable: crate::shared_cache::ExecutableIdentity::Digest(digest),
+                    page_profile,
+                    address_mode,
+                    segments,
+                },
+                store,
+            )
+            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))
     }
 
     pub fn note_dsr_code_mutation(

@@ -2070,6 +2070,182 @@ fn dsr_indirect_flow_unresolved_return_reports_guest_register_target() {
 }
 
 #[test]
+fn portable_direct_block_exits_through_context_gateway() {
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate portable direct cache");
+    let guest = GuestVa(0x13_800);
+    let target = GuestVa(guest.raw() + 4);
+    let plan = BlockPlan {
+        start: guest,
+        end: target,
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Direct {
+            guest,
+            word: 0x1400_0001,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target,
+                resume: target,
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        },
+    };
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+        .expect("construct portable direct bias");
+    let artifact = super::emit::record_portable_block_artifact(
+        &plan,
+        0,
+        super::emit::EmitAddressMode::Biased { host_bias },
+        vec![0x1400_0001],
+    )
+    .expect("record portable direct block");
+    let words = artifact
+        .template
+        .materialize_immutable_words(Some(host_bias.get()))
+        .expect("materialize portable direct words");
+    let emitted = cache
+        .publish_words(&words)
+        .expect("publish portable direct words");
+    let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
+    let bindings = [super::gateway::GenerationBinding::new(
+        &generation,
+        CodeGeneration::INITIAL,
+    )];
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let mut exit = NativeDsrExit::ResolveDirect {
+        source: guest,
+        target,
+    };
+    super::gateway::enter_translated_with_generation_bindings(
+        emitted.entry(),
+        &mut snapshot,
+        &mut exit,
+        &bindings,
+    )
+    .expect("execute portable direct block");
+    assert_eq!(
+        exit,
+        NativeDsrExit::ResolveDirect {
+            source: guest,
+            target,
+        }
+    );
+}
+
+#[test]
+fn portable_direct_block_uses_resolver_until_unit_pack_links_it() {
+    let mut cache = TranslationCache::new(
+        32 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate portable direct chaining cache");
+    let guest = GuestVa(0x13_a00);
+    let target = GuestVa(guest.raw() + 4);
+    let source_plan = BlockPlan {
+        start: guest,
+        end: target,
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Direct {
+            guest,
+            word: 0x1400_0001,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target,
+                resume: target,
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        },
+    };
+    let target_plan = BlockPlan {
+        start: target,
+        end: GuestVa(target.raw() + 4),
+        generation: CodeGeneration::INITIAL,
+        instructions: Vec::new(),
+        exit: PlannedExit::Syscall {
+            guest: target,
+            resume: GuestVa(target.raw() + 4),
+        },
+    };
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
+        .expect("construct portable direct chaining bias");
+    let source_artifact = super::emit::record_portable_block_artifact(
+        &source_plan,
+        0,
+        super::emit::EmitAddressMode::Biased { host_bias },
+        vec![0x1400_0001],
+    )
+    .expect("record portable direct source");
+    let target_artifact = super::emit::record_portable_block_artifact(
+        &target_plan,
+        1,
+        super::emit::EmitAddressMode::Biased { host_bias },
+        vec![0xd400_0001],
+    )
+    .expect("record portable direct target");
+    let source_words = source_artifact
+        .template
+        .materialize_immutable_words(Some(host_bias.get()))
+        .expect("materialize portable direct source");
+    let target_words = target_artifact
+        .template
+        .materialize_immutable_words(Some(host_bias.get()))
+        .expect("materialize portable direct target");
+    let source = cache
+        .publish_words(&source_words)
+        .expect("publish portable direct source");
+    let target_block = cache
+        .publish_words(&target_words)
+        .expect("publish portable direct target");
+    let generations = [
+        std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get()),
+        std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get()),
+    ];
+    let bindings = [
+        super::gateway::GenerationBinding::new(&generations[0], CodeGeneration::INITIAL),
+        super::gateway::GenerationBinding::new(&generations[1], CodeGeneration::INITIAL),
+    ];
+    let mut indirect = IndirectTargetCache::new();
+    indirect.publish(target, CodeGeneration::INITIAL, target_block.entry());
+    let range = cache.host_range();
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let mut exit = NativeDsrExit::ResolveDirect {
+        source: guest,
+        target,
+    };
+
+    super::gateway::enter_translated_with_cache_range_and_generation_bindings(
+        source.entry(),
+        &mut snapshot,
+        &mut exit,
+        &indirect,
+        range.start,
+        range.end,
+        crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
+        &bindings,
+    )
+    .expect("execute portable direct cache hit");
+
+    assert_eq!(
+        exit,
+        NativeDsrExit::ResolveDirect {
+            source: guest,
+            target,
+        }
+    );
+}
+
+#[test]
 fn dsr_indirect_flow_blr_sets_guest_link_and_alternates_targets() {
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -2209,7 +2385,7 @@ fn dsr_indirect_cache_keeps_old_index_aliases_hot() {
         },
     )
     .expect("emit alias source");
-    let indirect = IndirectTargetCache::new();
+    let mut indirect = IndirectTargetCache::new();
     indirect.publish(first, CodeGeneration::INITIAL, first_block.entry());
     indirect.publish(second, CodeGeneration::INITIAL, second_block.entry());
 
@@ -2282,7 +2458,7 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
         },
     )
     .expect("emit indirect cache-hit source");
-    let indirect = IndirectTargetCache::new();
+    let mut indirect = IndirectTargetCache::new();
     indirect.publish(target_guest, target_generation, target.entry());
 
     let mut stack = vec![0_u8; 16 * 1024];
@@ -2337,6 +2513,121 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
 }
 
 #[test]
+fn dsr_indirect_cache_rejects_target_outside_active_translation_unit() {
+    let source_guest = GuestVa(0x18_240);
+    let target_guest = GuestVa(0x18_280);
+    let mut source_code = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate indirect source unit");
+    let source = emit_block_direct(
+        &mut source_code,
+        &BlockPlan {
+            start: source_guest,
+            end: GuestVa(source_guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Indirect {
+                guest: source_guest,
+                word: 0xd61f_0000, // br x0
+                exit: IndirectExit {
+                    kind: IndirectKind::Branch,
+                    register: bad64::Reg::X0,
+                    resume: GuestVa(source_guest.raw() + 4),
+                },
+            },
+        },
+    )
+    .expect("emit indirect source");
+    let mut target_code = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate separate indirect target unit");
+    let target = emit_block_direct(
+        &mut target_code,
+        &BlockPlan {
+            start: target_guest,
+            end: GuestVa(target_guest.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest: target_guest,
+                resume: GuestVa(target_guest.raw() + 4),
+            },
+        },
+    )
+    .expect("emit separate indirect target");
+    let mut indirect = IndirectTargetCache::new();
+    indirect.publish(target_guest, CodeGeneration::INITIAL, target.entry());
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = target_guest.raw();
+    let expected = NativeDsrExit::ResolveIndirect {
+        source: source_guest,
+        target: target_guest,
+        link: None,
+    };
+    let mut exit = expected;
+    let active_range = source_code.host_range();
+    super::gateway::enter_translated_with_cache_range(
+        source.entry(),
+        &mut snapshot,
+        &mut exit,
+        &indirect,
+        active_range.start,
+        active_range.end,
+        crate::native_darwin::address::NativeAddressMode::Direct,
+    )
+    .expect("execute source with an out-of-unit cached target");
+
+    assert_eq!(
+        exit, expected,
+        "a target owned by another unit must return through prepare_entry"
+    );
+
+    indirect.publish(target_guest, CodeGeneration::INITIAL, target.entry());
+    snapshot.pc = source_guest.raw();
+    snapshot.x[0] = target_guest.raw();
+    exit = expected;
+    super::gateway::enter_translated_with_cache_range(
+        source.entry(),
+        &mut snapshot,
+        &mut exit,
+        &indirect,
+        active_range.start,
+        active_range.end,
+        crate::native_darwin::address::NativeAddressMode::Direct,
+    )
+    .expect("execute source after republishing cross-unit target");
+    assert_eq!(
+        exit, expected,
+        "a cross-unit target must return through prepare_entry even after publication"
+    );
+
+    snapshot.pc = source_guest.raw();
+    snapshot.x[0] = target_guest.raw();
+    exit = expected;
+    super::gateway::enter_translated_with_trusted_private_cache(
+        source.entry(),
+        &mut snapshot,
+        &mut exit,
+        &indirect,
+        crate::native_darwin::address::NativeAddressMode::Direct,
+    )
+    .expect("execute source with a private-only target cache");
+    assert_eq!(
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target_guest.raw() + 4),
+        },
+        "a private-only cache may chain without redundant range checks"
+    );
+}
+
+#[test]
 fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
     let source_guest = GuestVa(0x18_300);
     let target_guest = GuestVa(0x18_400);
@@ -2379,7 +2670,7 @@ fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
         },
     )
     .expect("emit cached BLR source");
-    let indirect = IndirectTargetCache::new();
+    let mut indirect = IndirectTargetCache::new();
     indirect.publish(target_guest, CodeGeneration::INITIAL, target.entry());
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -2946,6 +3237,485 @@ fn binding_generation_guard_exits_stale_after_atomic_changes() {
             target: guest,
         }
     );
+}
+
+#[test]
+fn published_shared_block_prevents_second_process_translation() {
+    use carrick_dsr_aarch64::shared_cache::{
+        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+        NativePageProfileIdentity, PortableBlockRecord, PublishOutcome, SharedExecutableSegment,
+        SharedImageConfig, SharedLoadedTranslationUnit, SourceFingerprint,
+        TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V1, TranslationUnitKey,
+        TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
+    };
+
+    #[derive(Clone)]
+    struct FixtureStore {
+        unit: SharedLoadedTranslationUnit,
+    }
+
+    impl TranslationUnitStore for FixtureStore {
+        fn load(
+            &self,
+            _key: &TranslationUnitKey,
+            _source_words: &[u32],
+        ) -> Result<Option<SharedLoadedTranslationUnit>, UnitMissReason> {
+            Ok(Some(self.unit.clone()))
+        }
+
+        fn publish(
+            &self,
+            _pending: &carrick_dsr_aarch64::shared_cache::PendingTranslationUnit,
+        ) -> Result<PublishOutcome, UnitMissReason> {
+            Ok(PublishOutcome::Existing)
+        }
+    }
+
+    let words = [0x9100_0400, 0xd400_0001]; // add x0,x0,#1 ; svc #0
+    let guest = GuestVa(0x20_0000_0000);
+    let mut fixture = biased_translator_fixture(&words, guest);
+    let generation = fixture
+        .memory
+        .dsr_generation_observation(guest)
+        .expect("observe fixture generation")
+        .expected();
+    let plan = super::block::plan_block(&fixture.memory, guest, generation, 256)
+        .expect("plan fixture block");
+    let cache = std::sync::Arc::new(parking_lot::Mutex::new(
+        TranslationCache::new(
+            64 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate shared fixture cache"),
+    ));
+    let (emitted, record) = super::emit::emit_block_recording_artifact(
+        &mut cache.lock(),
+        &plan,
+        GenerationGuard::binding(0, CodeGeneration::INITIAL),
+        super::emit::EmitAddressMode::Biased {
+            host_bias: fixture.host_bias,
+        },
+        words.to_vec(),
+    )
+    .expect("emit portable shared fixture");
+    let base = emitted.entry().host().raw();
+    let code_len = emitted.len();
+    drop(emitted);
+    let source_fingerprint = SourceFingerprint::from_words(&words);
+    let key = TranslationUnitKey::for_segment(
+        ExecutableIdentity::Digest([0x11; 32]),
+        ImageFileOffset::new(0),
+        ImageFileLen::new(8).expect("nonzero file length"),
+        guest,
+        GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
+        source_fingerprint,
+        NativePageProfileIdentity::Native16k,
+        AddressModeIdentity::biased(fixture.host_bias),
+    );
+    let manifest = TranslationUnitManifest {
+        schema: TRANSLATION_UNIT_SCHEMA_V1,
+        key: key.clone(),
+        dylib_sha256: [0x22; 32],
+        base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+        code_len: code_len as u64,
+        blocks: vec![PortableBlockRecord {
+            guest_start: guest,
+            generation_binding: 0,
+            entry_offset: 0,
+            code_len: code_len as u32,
+            requires_sensitive_metadata: false,
+            template: record.template,
+        }],
+    };
+    let lease: Arc<dyn Send + Sync> = cache;
+    let store = Arc::new(FixtureStore {
+        unit: SharedLoadedTranslationUnit::new(manifest, base, lease),
+    });
+    fixture
+        .translator
+        .process
+        .configure_shared_image(
+            SharedImageConfig {
+                executable: ExecutableIdentity::Digest([0x11; 32]),
+                page_profile: NativePageProfileIdentity::Native16k,
+                address_mode: AddressModeIdentity::biased(fixture.host_bias),
+                segments: vec![SharedExecutableSegment {
+                    file_offset: ImageFileOffset::new(0),
+                    file_len: ImageFileLen::new(8).expect("nonzero file length"),
+                    guest_start: guest,
+                    guest_len: GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
+                    source_words: words.to_vec().into(),
+                }],
+            },
+            store,
+        )
+        .expect("configure shared fixture");
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = guest.raw();
+    let original_x0 = snapshot.x[0];
+    let prepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare shared entry");
+    let exit = fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("execute shared entry");
+    assert_eq!(snapshot.x[0], original_x0 + 1);
+    assert!(matches!(exit.exit, NativeDsrExit::Syscall { .. }));
+    let stats = fixture.translator.resolver_stats();
+    assert_eq!(stats.shared_unit_hits, 1);
+    assert_eq!(stats.shared_translations_avoided, 1);
+    assert_eq!(stats.translations, 0);
+
+    fixture
+        .memory
+        .note_dsr_code_mutation(guest.raw(), 4)
+        .expect("advance executable-page generation");
+    snapshot.pc = guest.raw();
+    snapshot.x[0] = original_x0;
+    let changed = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare changed source through JIT");
+    assert_ne!(
+        changed.entry, prepared.entry,
+        "changed generation reused the immutable entry"
+    );
+    assert_eq!(
+        fixture.translator.resolver_stats().translations,
+        1,
+        "changed generation must fall back to ordinary JIT translation"
+    );
+}
+
+#[test]
+fn shared_unit_indirect_path_chains_through_context_authority() {
+    use carrick_dsr_aarch64::shared_cache::{
+        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+        NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate, PublishOutcome,
+        SharedExecutableSegment, SharedImageConfig, SharedLoadedTranslationUnit, SourceFingerprint,
+        TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V1, TranslationUnitKey,
+        TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
+    };
+
+    struct FixtureStore(SharedLoadedTranslationUnit);
+    impl TranslationUnitStore for FixtureStore {
+        fn load(
+            &self,
+            _key: &TranslationUnitKey,
+            _source_words: &[u32],
+        ) -> Result<Option<SharedLoadedTranslationUnit>, UnitMissReason> {
+            Ok(Some(self.0.clone()))
+        }
+
+        fn publish(
+            &self,
+            _pending: &PendingTranslationUnit,
+        ) -> Result<PublishOutcome, UnitMissReason> {
+            Ok(PublishOutcome::Existing)
+        }
+    }
+
+    let words = [0xd61f_0020, 0xd400_0001]; // br x1 ; svc #0
+    let guest = GuestVa(0x20_0000_0000);
+    let mut fixture = biased_translator_fixture(&words, guest);
+    let generation = fixture
+        .memory
+        .dsr_generation_observation(guest)
+        .expect("observe indirect fixture generation")
+        .expected();
+    let first_plan = super::block::plan_block(&fixture.memory, guest, generation, 256)
+        .expect("plan indirect source");
+    let target = GuestVa(guest.raw() + 4);
+    let second_plan = super::block::plan_block(&fixture.memory, target, generation, 256)
+        .expect("plan indirect target");
+    let first = super::emit::record_portable_block_artifact(
+        &first_plan,
+        0,
+        super::emit::EmitAddressMode::Biased {
+            host_bias: fixture.host_bias,
+        },
+        vec![words[0]],
+    )
+    .expect("record portable indirect source");
+    let second = super::emit::record_portable_block_artifact(
+        &second_plan,
+        1,
+        super::emit::EmitAddressMode::Biased {
+            host_bias: fixture.host_bias,
+        },
+        vec![words[1]],
+    )
+    .expect("record portable indirect target");
+    let key = TranslationUnitKey::for_segment(
+        ExecutableIdentity::Digest([0x77; 32]),
+        ImageFileOffset::new(0),
+        ImageFileLen::new(16 * 1024).expect("nonzero file length"),
+        guest,
+        GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
+        SourceFingerprint::from_words(&words),
+        NativePageProfileIdentity::Native16k,
+        AddressModeIdentity::biased(fixture.host_bias),
+    );
+    let pending = PendingTranslationUnit::pack(
+        key.clone(),
+        vec![
+            PortableBlockCandidate {
+                guest_start: guest,
+                generation_binding: 0,
+                requires_sensitive_metadata: false,
+                template: first.template,
+            },
+            PortableBlockCandidate {
+                guest_start: target,
+                generation_binding: 1,
+                requires_sensitive_metadata: false,
+                template: second.template,
+            },
+        ],
+    )
+    .expect("pack indirect fixture unit");
+    let code_words = pending
+        .code
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect::<Vec<_>>();
+    let cache = Arc::new(parking_lot::Mutex::new(
+        TranslationCache::new(
+            64 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate indirect fixture cache"),
+    ));
+    let emitted = cache
+        .lock()
+        .publish_words(&code_words)
+        .expect("publish indirect fixture unit");
+    let manifest = TranslationUnitManifest {
+        schema: TRANSLATION_UNIT_SCHEMA_V1,
+        key: key.clone(),
+        dylib_sha256: [0x88; 32],
+        base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+        code_len: pending.code.len() as u64,
+        blocks: pending.blocks,
+    };
+    let base = emitted.entry().host().raw();
+    let lease: Arc<dyn Send + Sync> = cache;
+    fixture
+        .translator
+        .process
+        .configure_shared_image(
+            SharedImageConfig {
+                executable: ExecutableIdentity::Digest([0x77; 32]),
+                page_profile: NativePageProfileIdentity::Native16k,
+                address_mode: AddressModeIdentity::biased(fixture.host_bias),
+                segments: vec![SharedExecutableSegment {
+                    file_offset: ImageFileOffset::new(0),
+                    file_len: ImageFileLen::new(16 * 1024).expect("nonzero file length"),
+                    guest_start: guest,
+                    guest_len: GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
+                    source_words: words.to_vec().into(),
+                }],
+            },
+            Arc::new(FixtureStore(SharedLoadedTranslationUnit::new(
+                manifest, base, lease,
+            ))),
+        )
+        .expect("configure indirect fixture");
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = guest.raw();
+    snapshot.x[1] = target.raw();
+    let prepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare shared indirect source");
+    let exit = fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("execute shared indirect miss");
+    assert!(matches!(
+        exit.exit,
+        NativeDsrExit::ResolveIndirect {
+            target: resolved,
+            ..
+        } if resolved == target
+    ));
+    assert!(matches!(
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared, exit)
+            .expect("resolve shared indirect target"),
+        super::ThreadExit::Continue
+    ));
+
+    snapshot.pc = guest.raw();
+    let prepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare shared indirect cache hit");
+    let exit = fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("execute shared indirect cache hit");
+    assert_eq!(
+        exit.exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target.raw() + 4)
+        }
+    );
+}
+
+#[test]
+fn translated_block_is_published_on_retirement_and_reused() {
+    use carrick_dsr_aarch64::shared_cache::{
+        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+        NativePageProfileIdentity, PendingTranslationUnit, PublishOutcome, SharedExecutableSegment,
+        SharedImageConfig, SharedLoadedTranslationUnit, TRANSLATION_UNIT_BASE_EXPORT,
+        TRANSLATION_UNIT_SCHEMA_V1, TranslationUnitKey, TranslationUnitManifest,
+        TranslationUnitStore, UnitMissReason,
+    };
+
+    #[derive(Default)]
+    struct RetirementStore {
+        loaded: std::sync::Mutex<Option<SharedLoadedTranslationUnit>>,
+    }
+
+    impl TranslationUnitStore for RetirementStore {
+        fn load(
+            &self,
+            key: &TranslationUnitKey,
+            source_words: &[u32],
+        ) -> Result<Option<SharedLoadedTranslationUnit>, UnitMissReason> {
+            let loaded = self.loaded.lock().expect("lock retirement fixture");
+            let Some(unit) = loaded.as_ref() else {
+                return Ok(None);
+            };
+            if &unit.manifest.key != key {
+                return Err(UnitMissReason::ImageIdentity);
+            }
+            unit.manifest.validate_source(source_words)?;
+            Ok(Some(unit.clone()))
+        }
+
+        fn publish(
+            &self,
+            pending: &PendingTranslationUnit,
+        ) -> Result<PublishOutcome, UnitMissReason> {
+            let mut loaded = self.loaded.lock().expect("lock retirement fixture");
+            if loaded.is_some() {
+                return Ok(PublishOutcome::Existing);
+            }
+            let words = pending
+                .code
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                .collect::<Vec<_>>();
+            let cache = Arc::new(parking_lot::Mutex::new(
+                TranslationCache::new(
+                    64 * 1024,
+                    crate::native_darwin::darwin_jit::active_host_jit(),
+                )
+                .expect("allocate retirement fixture cache"),
+            ));
+            let emitted = cache
+                .lock()
+                .publish_words(&words)
+                .expect("publish retirement fixture words");
+            let base = emitted.entry().host().raw();
+            let manifest = TranslationUnitManifest {
+                schema: TRANSLATION_UNIT_SCHEMA_V1,
+                key: pending.key.clone(),
+                dylib_sha256: [0x33; 32],
+                base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+                code_len: pending.code.len() as u64,
+                blocks: pending.blocks.clone(),
+            };
+            let lease: Arc<dyn Send + Sync> = cache;
+            *loaded = Some(SharedLoadedTranslationUnit::new(manifest, base, lease));
+            Ok(PublishOutcome::Winner)
+        }
+    }
+
+    fn configure(fixture: &BiasedTranslatorFixture, store: Arc<RetirementStore>, words: &[u32]) {
+        fixture
+            .translator
+            .process
+            .configure_shared_image(
+                SharedImageConfig {
+                    executable: ExecutableIdentity::Digest([0x66; 32]),
+                    page_profile: NativePageProfileIdentity::Native16k,
+                    address_mode: AddressModeIdentity::biased(fixture.host_bias),
+                    segments: vec![SharedExecutableSegment {
+                        file_offset: ImageFileOffset::new(0),
+                        file_len: ImageFileLen::new(16 * 1024).expect("nonzero file length"),
+                        guest_start: fixture.guest_code,
+                        guest_len: GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
+                        source_words: words.to_vec().into(),
+                    }],
+                },
+                store,
+            )
+            .expect("configure retirement fixture");
+    }
+
+    let words = [0xf940_0020, 0xd400_0001]; // ldr x0,[x1] ; svc #0
+    let guest = GuestVa(0x20_0000_0000);
+    let store = Arc::new(RetirementStore::default());
+    {
+        let mut first = biased_translator_fixture(&words, guest);
+        configure(&first, Arc::clone(&store), &words);
+        let expected = 0x1234_5678_9abc_def0_u64;
+        unsafe { std::ptr::write_unaligned(first.data_host.raw() as *mut u64, expected) };
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = guest.raw();
+        snapshot.x[1] = first.guest_data.raw();
+        let prepared = first
+            .translator
+            .prepare_entry::<false>(&first.memory, &snapshot)
+            .expect("translate first-process block");
+        let exit = first
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("execute first-process block");
+        assert_eq!(snapshot.x[0], expected);
+        assert!(matches!(exit.exit, NativeDsrExit::Syscall { .. }));
+        assert_eq!(first.translator.resolver_stats().translations, 1);
+        assert_eq!(
+            first
+                .translator
+                .process
+                .publish_shared_candidates(&first.memory)
+                .expect("publish first-process candidates"),
+            vec![PublishOutcome::Winner]
+        );
+    }
+
+    let mut second = biased_translator_fixture(&words, guest);
+    configure(&second, Arc::clone(&store), &words);
+    let expected = 0x0fed_cba9_8765_4321_u64;
+    unsafe { std::ptr::write_unaligned(second.data_host.raw() as *mut u64, expected) };
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = guest.raw();
+    snapshot.x[1] = second.guest_data.raw();
+    let prepared = second
+        .translator
+        .prepare_entry::<false>(&second.memory, &snapshot)
+        .expect("load second-process shared block");
+    let exit = second
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("execute second-process shared block");
+    assert_eq!(snapshot.x[0], expected);
+    assert!(matches!(exit.exit, NativeDsrExit::Syscall { .. }));
+    assert_eq!(second.translator.resolver_stats().shared_unit_hits, 1);
+    assert_eq!(second.translator.resolver_stats().translations, 0);
 }
 
 #[test]

@@ -4,6 +4,7 @@ use carrick_dsr::address::NativeHostBias;
 use carrick_guest_mem::GuestVa;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub const TRANSLATOR_ABI_V1: u32 = 1;
@@ -196,6 +197,7 @@ pub struct PortableBlockRecord {
     pub generation_binding: u32,
     pub entry_offset: u32,
     pub code_len: u32,
+    pub requires_sensitive_metadata: bool,
     pub template: crate::artifact_spike::ArtifactTemplate,
 }
 
@@ -205,6 +207,7 @@ struct WirePortableBlockRecord {
     generation_binding: u32,
     entry_offset: u32,
     code_len: u32,
+    requires_sensitive_metadata: bool,
     template: crate::artifact_spike::ArtifactTemplate,
 }
 
@@ -218,6 +221,7 @@ impl Serialize for PortableBlockRecord {
             generation_binding: self.generation_binding,
             entry_offset: self.entry_offset,
             code_len: self.code_len,
+            requires_sensitive_metadata: self.requires_sensitive_metadata,
             template: self.template.clone(),
         }
         .serialize(serializer)
@@ -235,6 +239,7 @@ impl<'de> Deserialize<'de> for PortableBlockRecord {
             generation_binding: wire.generation_binding,
             entry_offset: wire.entry_offset,
             code_len: wire.code_len,
+            requires_sensitive_metadata: wire.requires_sensitive_metadata,
             template: wire.template,
         })
     }
@@ -261,6 +266,7 @@ pub struct PendingTranslationUnit {
 pub struct PortableBlockCandidate {
     pub guest_start: GuestVa,
     pub generation_binding: u32,
+    pub requires_sensitive_metadata: bool,
     pub template: crate::artifact_spike::ArtifactTemplate,
 }
 
@@ -271,6 +277,8 @@ impl PendingTranslationUnit {
     ) -> Result<Self, crate::types::DsrError> {
         let mut code = Vec::new();
         let mut blocks = Vec::with_capacity(candidates.len());
+        let mut entries = BTreeMap::new();
+        let mut direct_links = Vec::new();
         for candidate in candidates {
             let words = candidate
                 .template
@@ -290,6 +298,16 @@ impl PendingTranslationUnit {
                     "translation unit exceeds the 64 MiB branch-range cap".to_string(),
                 ));
             }
+            if entries
+                .insert(candidate.guest_start, entry_offset)
+                .is_some()
+            {
+                return Err(crate::types::DsrError::CachePolicy(format!(
+                    "translation unit contains duplicate block 0x{:x}",
+                    candidate.guest_start.raw()
+                )));
+            }
+            direct_links.push((entry_offset, candidate.template.direct_links().to_vec()));
             for word in words {
                 code.extend_from_slice(&word.to_le_bytes());
             }
@@ -298,8 +316,65 @@ impl PendingTranslationUnit {
                 generation_binding: candidate.generation_binding,
                 entry_offset,
                 code_len,
-                template: candidate.template,
+                requires_sensitive_metadata: candidate.requires_sensitive_metadata,
+                template: candidate.template.into_runtime_metadata_only(),
             });
+        }
+        for (source_entry, links) in direct_links {
+            for link in links {
+                let Some(target_entry) = entries.get(&link.target).copied() else {
+                    continue;
+                };
+                let source = source_entry.checked_add(link.slot.get()).ok_or_else(|| {
+                    crate::types::DsrError::CachePolicy(
+                        "translation unit direct-link source overflow".to_string(),
+                    )
+                })?;
+                if !source.is_multiple_of(4) {
+                    return Err(crate::types::DsrError::CachePolicy(format!(
+                        "translation unit direct-link source is unaligned: {source}"
+                    )));
+                }
+                let displacement = i64::from(target_entry) - i64::from(source);
+                if displacement % 4 != 0 {
+                    return Err(crate::types::DsrError::CachePolicy(format!(
+                        "translation unit direct-link displacement is unaligned: {displacement}"
+                    )));
+                }
+                let words = displacement / 4;
+                if !(-(1_i64 << 25)..(1_i64 << 25)).contains(&words) {
+                    return Err(crate::types::DsrError::CachePolicy(format!(
+                        "translation unit direct-link target is out of range: {displacement}"
+                    )));
+                }
+                let offset = usize::try_from(source).map_err(|_| {
+                    crate::types::DsrError::CachePolicy(
+                        "translation unit direct-link offset does not fit usize".to_string(),
+                    )
+                })?;
+                let end = offset.checked_add(4).ok_or_else(|| {
+                    crate::types::DsrError::CachePolicy(
+                        "translation unit direct-link word overflow".to_string(),
+                    )
+                })?;
+                let bytes = code.get_mut(offset..end).ok_or_else(|| {
+                    crate::types::DsrError::CachePolicy(
+                        "translation unit direct-link slot is out of bounds".to_string(),
+                    )
+                })?;
+                let existing = u32::from_le_bytes(bytes.try_into().map_err(|_| {
+                    crate::types::DsrError::CachePolicy(
+                        "translation unit direct-link word is malformed".to_string(),
+                    )
+                })?);
+                if existing & 0xfc00_0000 != 0x1400_0000 {
+                    return Err(crate::types::DsrError::CachePolicy(format!(
+                        "translation unit direct-link slot is not an AArch64 B: 0x{existing:08x}"
+                    )));
+                }
+                let linked = 0x1400_0000 | ((words as i32 as u32) & 0x03ff_ffff);
+                bytes.copy_from_slice(&linked.to_le_bytes());
+            }
         }
         if code.is_empty() {
             return Err(crate::types::DsrError::CachePolicy(
@@ -330,6 +405,7 @@ pub enum PublishOutcome {
     Existing,
 }
 
+#[derive(Clone)]
 pub struct SharedLoadedTranslationUnit {
     pub manifest: TranslationUnitManifest,
     pub base: usize,
@@ -358,6 +434,14 @@ pub trait TranslationUnitStore: Send + Sync {
     ) -> Result<Option<SharedLoadedTranslationUnit>, UnitMissReason>;
 
     fn publish(&self, pending: &PendingTranslationUnit) -> Result<PublishOutcome, UnitMissReason>;
+
+    /// Elect at most one portable-template recorder after a unit has proven
+    /// that it recurs in this container. The default keeps fixture and
+    /// non-Darwin stores simple; Darwin persists the election in the private
+    /// container cache directory.
+    fn claim_recording(&self, _key: &TranslationUnitKey) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -374,10 +458,17 @@ pub struct SharedExecutableSegment {
     pub file_len: ImageFileLen,
     pub guest_start: GuestVa,
     pub guest_len: GuestCodeLen,
-    pub source_words: Vec<u32>,
+    pub source_words: Arc<[u32]>,
 }
 
 impl SharedImageConfig {
+    pub fn executable_digest(&self) -> Option<[u8; 32]> {
+        match &self.executable {
+            ExecutableIdentity::Digest(digest) => Some(*digest),
+            ExecutableIdentity::HostFile { .. } => None,
+        }
+    }
+
     pub fn key_for_segment(&self, segment: &SharedExecutableSegment) -> TranslationUnitKey {
         TranslationUnitKey::for_segment(
             self.executable.clone(),
@@ -519,6 +610,9 @@ impl<'de> Deserialize<'de> for TranslationUnitKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact_spike::{ArtifactBindings, ArtifactTemplate};
+    use crate::emit::{DirectLink, PcMapEntry};
+    use crate::types::CacheOffset;
     use carrick_dsr::address::NativeHostBias;
     use carrick_guest_mem::GuestVa;
 
@@ -558,6 +652,67 @@ mod tests {
         assert_eq!(
             manifest.validate_source(&[0xd280_0020]),
             Err(UnitMissReason::SourceFingerprint)
+        );
+    }
+
+    #[test]
+    fn pack_links_direct_edges_between_blocks_in_the_same_unit() {
+        let bindings = ArtifactBindings::from_values([]).expect("empty bindings");
+        let source = ArtifactTemplate::normalize(
+            vec![0x1400_0001, 0xd503_201f, 0xd503_201f],
+            vec![PcMapEntry {
+                guest: GuestVa(0x400000),
+                cache: CacheOffset::published(0),
+            }],
+            Vec::new(),
+            vec![DirectLink {
+                slot: CacheOffset::published(0),
+                target: GuestVa(0x400100),
+            }],
+            Vec::new(),
+            Vec::new(),
+            &bindings,
+        )
+        .expect("source template");
+        let target = ArtifactTemplate::normalize(
+            vec![0xd503_201f],
+            vec![PcMapEntry {
+                guest: GuestVa(0x400100),
+                cache: CacheOffset::published(0),
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &bindings,
+        )
+        .expect("target template");
+        let pending = PendingTranslationUnit::pack(
+            key(
+                ExecutableIdentity::Digest([0x11; 32]),
+                SourceFingerprint([0xaa; 32]),
+                AddressModeIdentity::Direct,
+            ),
+            vec![
+                PortableBlockCandidate {
+                    guest_start: GuestVa(0x400000),
+                    generation_binding: 0,
+                    requires_sensitive_metadata: false,
+                    template: source,
+                },
+                PortableBlockCandidate {
+                    guest_start: GuestVa(0x400100),
+                    generation_binding: 1,
+                    requires_sensitive_metadata: false,
+                    template: target,
+                },
+            ],
+        )
+        .expect("pack unit");
+
+        assert_eq!(
+            u32::from_le_bytes(pending.code[0..4].try_into().expect("branch word")),
+            0x1400_0003
         );
     }
 

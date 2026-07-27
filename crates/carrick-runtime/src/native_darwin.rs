@@ -1015,7 +1015,8 @@ pub(crate) fn resume_guest_from_capsule(
         carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecDispatcherReady,
     );
     let prepared_image = guest.prepared_image.take();
-    let resumed = select_resumed_image(prepared_image, guest.executable_digest, || {
+    let executable_digest = guest.executable_digest;
+    let resumed = select_resumed_image(prepared_image, executable_digest, || {
         native_reexec_lifecycle(
             carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecImageLoadBegin,
         );
@@ -1055,6 +1056,7 @@ pub(crate) fn resume_guest_from_capsule(
     native_reexec_lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecResetEnd);
     run_image_in_current_process(
         resumed.source,
+        Some(executable_digest),
         dispatcher,
         max_traps,
         &plan,
@@ -1603,6 +1605,7 @@ fn run_image_in_child(
                 image,
                 relative_relocations,
             },
+            None,
             dispatcher,
             max_traps,
             plan,
@@ -1644,6 +1647,7 @@ fn run_image_in_child(
 
 fn run_image_in_current_process(
     source: NativeImageSource,
+    executable_digest: Option<[u8; 32]>,
     dispatcher: SyscallDispatcher,
     max_traps: usize,
     plan: &ExecutionPlan,
@@ -1654,6 +1658,19 @@ fn run_image_in_current_process(
     })?;
     let entry = source.image().entry();
     let (memory, image) = map_current_process_image_source(source, plan, process_entry)?;
+    let native_page_profile = plan.page_geometry.native_profile.ok_or_else(|| {
+        RuntimeError::Unsupported(
+            "native Darwin shared translation configured without a native page profile".to_string(),
+        )
+    })?;
+    memory
+        .configure_shared_translation(
+            &image,
+            native_page_profile,
+            executable_digest,
+            Arc::new(carrick_native_darwin::aot_cache::ActiveContainerUnitStore),
+        )
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
     let memory = Arc::new(NativeMemoryHandle::new(memory));
     let _ = crate::ulock::preinit_waiter_table();
     // PID-namespace launch placement (container path only; `run-elf` never
@@ -1946,12 +1963,33 @@ fn finalize_native_thread_exit(
         // chance to flush" seam as `exit_group`. Drain any straggler sibling
         // slots, then flush this thread's own record last so it owns the
         // process-wide resolver delta.
-        translator.finalize_profile_epoch_at_process_exit();
+        finalize_native_process_exit(translator, memory);
         NativeThreadLoopOutcome::ProcessExit(code)
     } else {
         translator.finalize_profile_epoch();
         NativeThreadLoopOutcome::ThreadDone
     }
+}
+
+fn publish_native_shared_candidates(
+    translator: &dsr::ThreadTranslator,
+    memory: &SharedNativeMemory,
+) {
+    let result = {
+        let memory = memory.read();
+        translator.process.publish_shared_candidates(&memory)
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, "native shared translation publication fell back to JIT");
+    }
+}
+
+fn finalize_native_process_exit(
+    translator: &mut dsr::ThreadTranslator,
+    memory: &SharedNativeMemory,
+) {
+    publish_native_shared_candidates(translator, memory);
+    translator.finalize_profile_epoch_at_process_exit();
 }
 
 fn run_native_thread_loop(
@@ -2100,7 +2138,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
         // the only native instruction engine now.
         if crate::fork_quiesce::exec_replacing_other_thread(thread_runtime.tid()) {
             if thread_runtime.finish_thread(&dispatcher, &memory) {
-                translator.finalize_profile_epoch_at_process_exit();
+                finalize_native_process_exit(&mut translator, &memory);
                 return Ok(NativeThreadLoopOutcome::ProcessExit(0));
             }
             return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
@@ -2466,7 +2504,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 // and instantly at the `libc::_exit()` below, with zero chance
                 // to flush its own NATIVEPERF record -- emit one for each of
                 // them now, before that happens, then this thread's own last.
-                translator.finalize_profile_epoch_at_process_exit();
+                finalize_native_process_exit(&mut translator, &memory);
                 if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                     dispatcher.cleanup_sysv_ipc_on_process_exit();
                     crate::exec_helpers::forked_child_exit(
@@ -2647,7 +2685,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     }
                     NativeForkFlow::RetireForExec => {
                         if thread_runtime.finish_thread(&dispatcher, &memory) {
-                            translator.finalize_profile_epoch_at_process_exit();
+                            finalize_native_process_exit(&mut translator, &memory);
                             return Ok(NativeThreadLoopOutcome::ProcessExit(0));
                         }
                         return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
@@ -2716,6 +2754,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 )?;
                                 continue;
                             }
+                            publish_native_shared_candidates(&translator, &memory);
                             translator.finalize_profile_epoch();
                             if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
                                 &dispatcher,
@@ -2802,12 +2841,13 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             NativeExecTeardownFlow::Proceed => {}
                             NativeExecTeardownFlow::RetireForExec => {
                                 if thread_runtime.finish_thread(&dispatcher, &memory) {
-                                    translator.finalize_profile_epoch_at_process_exit();
+                                    finalize_native_process_exit(&mut translator, &memory);
                                     return Ok(NativeThreadLoopOutcome::ProcessExit(0));
                                 }
                                 return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
                             }
                         }
+                        publish_native_shared_candidates(&translator, &memory);
                         memory
                             .replace_image(
                                 &image,
@@ -2821,6 +2861,24 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                     "native execve failed after retiring the old owned address space: {error}"
                                 )))
                             })?;
+                        {
+                            let memory = memory.read();
+                            memory
+                                .configure_shared_translation(
+                                    &image,
+                                    plan.page_geometry.native_profile.ok_or_else(|| {
+                                        RuntimeError::Unsupported(
+                                            "native exec replacement has no page profile"
+                                                .to_string(),
+                                        )
+                                    })?,
+                                    Some(executable_digest),
+                                    Arc::new(
+                                        carrick_native_darwin::aot_cache::ActiveContainerUnitStore,
+                                    ),
+                                )
+                                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+                        }
                         // Publish process-visible exec state only after the
                         // complete replacement mapping, vvar, relocations, and
                         // translator allocation have succeeded. Before this
@@ -3054,7 +3112,15 @@ fn lower_dsr_fault(
     // immediately drop the guard again.
     let biased_host_fault =
         host_fault && matches!(memory.address_mode(), NativeAddressMode::Biased { .. });
-    let fault_address = lower_dsr_fault_address(&memory.read(), fault_address)?.raw();
+    let fault_address = lower_dsr_fault_address(&memory.read(), fault_address)
+        .map_err(|error| {
+            let resolver = translator.resolver_stats();
+            RuntimeError::Unsupported(format!(
+                "{error}; recovered_guest_pc=0x{:x} shared_unit_hits={} shared_blocks_mapped={}",
+                snapshot.pc, resolver.shared_unit_hits, resolver.shared_blocks_mapped,
+            ))
+        })?
+        .raw();
     if biased_host_fault {
         // Lock-free (Phase 0): the Biased-mode reverse translation only
         // needs `address_mode`/`owned_host_ranges`, both served by the

@@ -12,6 +12,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+bincode.workspace = true
 carrick-dsr = { path = "../carrick-dsr" }
 carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64" }
 getrandom.workspace = true

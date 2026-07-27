@@ -23,6 +23,8 @@ use super::emit::{
 use super::types::{CacheOffset, DsrError};
 use carrick_dsr::cache::TranslationCache;
 
+type RuntimeMetadata = (Vec<PcMapEntry>, Vec<RecoveryEntry>, Vec<DirectLink>);
+
 const MOV_WIDE_IMM16_MASK: u32 = 0x001f_ffe0;
 const ARTIFACT_STORE_SIZE: u64 = 256 * 1024 * 1024;
 const ARTIFACT_CURSOR_OFFSET: u64 = 16;
@@ -30,14 +32,42 @@ const ARTIFACT_GUEST_FILTER_OFFSET: u64 = 4096;
 const ARTIFACT_GUEST_FILTER_WORDS: u64 = 16 * 1024;
 const ARTIFACT_GUEST_FILTER_BITS: u64 = ARTIFACT_GUEST_FILTER_WORDS * 64;
 const ARTIFACT_INDEX_OFFSET: u64 = ARTIFACT_GUEST_FILTER_OFFSET + ARTIFACT_GUEST_FILTER_WORDS * 8;
-const ARTIFACT_INDEX_SLOTS: u64 = 32 * 1024;
+const ARTIFACT_INDEX_SLOTS: u64 = 128 * 1024;
 const ARTIFACT_RECORD_OFFSET: u64 = ARTIFACT_INDEX_OFFSET + ARTIFACT_INDEX_SLOTS * 8;
 const ARTIFACT_MAX_PROBES: u64 = 64;
-const ARTIFACT_RECORD_MAGIC: [u8; 8] = *b"CARTV1\0\0";
-const ARTIFACT_RECORD_HEADER: usize = 8 + 32 + 8 + 32;
+const ARTIFACT_RECORD_MAGIC: [u8; 8] = *b"CARTV4\0\0";
+const ARTIFACT_RECORD_DIGEST_OFFSET: usize = 8;
+const ARTIFACT_RECORD_GUEST_OFFSET: usize = ARTIFACT_RECORD_DIGEST_OFFSET + 32;
+const ARTIFACT_RECORD_MODE_OFFSET: usize = ARTIFACT_RECORD_GUEST_OFFSET + 8;
+const ARTIFACT_RECORD_LENGTH_OFFSET: usize = ARTIFACT_RECORD_MODE_OFFSET + 8;
+const ARTIFACT_RECORD_HEADER: usize = ARTIFACT_RECORD_LENGTH_OFFSET + 8;
 const ARTIFACT_MAX_RECORD: usize = 4 * 1024 * 1024;
+const ARTIFACT_DECODE_LIMIT: usize = ARTIFACT_MAX_RECORD;
 const ARTIFACT_COUNTER_OFFSET: usize = 64;
 static ARTIFACT_AUTHORITY: OnceLock<ArtifactAuthority> = OnceLock::new();
+
+fn encode_artifact_template(template: &ArtifactTemplate) -> Result<Vec<u8>, DsrError> {
+    bincode::serde::encode_to_vec(
+        WireArtifactTemplate::from(template),
+        bincode::config::standard().with_limit::<ARTIFACT_DECODE_LIMIT>(),
+    )
+    .map_err(|error| DsrError::CachePolicy(format!("encode artifact record: {error}")))
+}
+
+fn decode_artifact_template(payload: &[u8]) -> Result<ArtifactTemplate, DsrError> {
+    let (wire, consumed): (WireArtifactTemplate, usize) = bincode::serde::decode_from_slice(
+        payload,
+        bincode::config::standard().with_limit::<ARTIFACT_DECODE_LIMIT>(),
+    )
+    .map_err(|error| DsrError::CachePolicy(format!("decode artifact record: {error}")))?;
+    if consumed != payload.len() {
+        return Err(DsrError::CachePolicy(format!(
+            "artifact record has {} trailing bytes",
+            payload.len().saturating_sub(consumed)
+        )));
+    }
+    Ok(wire.into())
+}
 
 pub fn validate_fresh_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -45,6 +75,20 @@ pub fn validate_fresh_enabled() -> bool {
         std::env::var_os("CARRICK_DSR_ARTIFACT_VALIDATE_FRESH").as_deref()
             == Some(std::ffi::OsStr::new("1"))
     })
+}
+
+pub fn minimum_source_words() -> usize {
+    static MINIMUM: OnceLock<usize> = OnceLock::new();
+    *MINIMUM.get_or_init(|| {
+        std::env::var("CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(16)
+    })
+}
+
+pub fn enabled() -> bool {
+    std::env::var_os("CARRICK_DSR_ARTIFACT_SPIKE").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
 /// Plain serializable carrier for handing the artifact-spike authority
@@ -95,16 +139,39 @@ impl ArtifactKey {
         }
     }
 
+    pub fn from_image_digest(
+        start: carrick_guest_mem::GuestVa,
+        image_digest: [u8; 32],
+        address_mode: EmitAddressMode,
+    ) -> Self {
+        let address_mode_tag = match address_mode {
+            EmitAddressMode::Direct => 0,
+            EmitAddressMode::Biased { .. } => 1,
+        };
+        Self {
+            digest: image_digest,
+            guest: start,
+            address_mode_tag,
+        }
+    }
+
     fn first_slot(self) -> u64 {
-        u64::from_le_bytes(self.digest[..8].try_into().unwrap_or([0; 8])) % ARTIFACT_INDEX_SLOTS
+        let digest = u64::from_le_bytes(self.digest[..8].try_into().unwrap_or([0; 8]));
+        let guest = self
+            .guest
+            .raw()
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .rotate_left(23);
+        (digest ^ guest ^ u64::from(self.address_mode_tag).wrapping_mul(0xd6e8_feb8_6659_fd93))
+            % ARTIFACT_INDEX_SLOTS
     }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WireArtifactTemplate {
     words: Vec<u32>,
-    map: Vec<(u64, u32)>,
-    recovery: Vec<PortableRecoveryEntry>,
+    map_deltas: Vec<(i64, u32)>,
+    recovery_deltas: Vec<(u32, PortableRecoveryAction)>,
     direct_links: Vec<(u32, u64)>,
     relocations: Vec<ArtifactRelocation>,
     source_words: Vec<u32>,
@@ -130,14 +197,38 @@ impl<'de> serde::Deserialize<'de> for ArtifactTemplate {
 
 impl From<&ArtifactTemplate> for WireArtifactTemplate {
     fn from(template: &ArtifactTemplate) -> Self {
+        let mut previous_guest = 0_i64;
+        let mut previous_cache = 0_u32;
+        let map_deltas = template
+            .map
+            .iter()
+            .map(|entry| {
+                let guest = entry.guest.raw() as i64;
+                let cache = entry.cache.get();
+                let delta = (
+                    guest.wrapping_sub(previous_guest),
+                    cache.wrapping_sub(previous_cache),
+                );
+                previous_guest = guest;
+                previous_cache = cache;
+                delta
+            })
+            .collect();
+        let mut previous_recovery = 0_u32;
+        let recovery_deltas = template
+            .recovery
+            .iter()
+            .map(|entry| {
+                let cache = entry.cache.get();
+                let delta = cache.wrapping_sub(previous_recovery);
+                previous_recovery = cache;
+                (delta, entry.action)
+            })
+            .collect();
         Self {
             words: template.words.clone(),
-            map: template
-                .map
-                .iter()
-                .map(|entry| (entry.guest.raw(), entry.cache.get()))
-                .collect(),
-            recovery: template.recovery.clone(),
+            map_deltas,
+            recovery_deltas,
             direct_links: template
                 .direct_links
                 .iter()
@@ -151,17 +242,36 @@ impl From<&ArtifactTemplate> for WireArtifactTemplate {
 
 impl From<WireArtifactTemplate> for ArtifactTemplate {
     fn from(template: WireArtifactTemplate) -> Self {
+        let mut guest = 0_i64;
+        let mut cache = 0_u32;
+        let map = template
+            .map_deltas
+            .into_iter()
+            .map(|(guest_delta, cache_delta)| {
+                guest = guest.wrapping_add(guest_delta);
+                cache = cache.wrapping_add(cache_delta);
+                PcMapEntry {
+                    guest: carrick_guest_mem::GuestVa(guest as u64),
+                    cache: CacheOffset::published(cache),
+                }
+            })
+            .collect();
+        let mut recovery_cache = 0_u32;
+        let recovery = template
+            .recovery_deltas
+            .into_iter()
+            .map(|(cache_delta, action)| {
+                recovery_cache = recovery_cache.wrapping_add(cache_delta);
+                PortableRecoveryEntry {
+                    cache: CacheOffset::published(recovery_cache),
+                    action,
+                }
+            })
+            .collect();
         Self {
             words: template.words,
-            map: template
-                .map
-                .into_iter()
-                .map(|(guest, cache)| PcMapEntry {
-                    guest: carrick_guest_mem::GuestVa(guest),
-                    cache: CacheOffset::published(cache),
-                })
-                .collect(),
-            recovery: template.recovery,
+            map,
+            recovery,
             direct_links: template
                 .direct_links
                 .into_iter()
@@ -205,28 +315,51 @@ unsafe impl Sync for ArtifactStore {}
 
 impl Drop for ArtifactStore {
     fn drop(&mut self) {
-        let _ = unsafe {
-            libc::munmap(
-                self.mapping.as_ptr().cast(),
-                ARTIFACT_RECORD_OFFSET as usize,
-            )
-        };
-    }
-}
-
-struct ArtifactFileLock {
-    fd: i32,
-}
-
-impl Drop for ArtifactFileLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.fd, libc::LOCK_UN);
-        }
+        let _ = unsafe { libc::munmap(self.mapping.as_ptr().cast(), ARTIFACT_STORE_SIZE as usize) };
     }
 }
 
 impl ArtifactStore {
+    fn mapped_range(&self, offset: u64, length: usize) -> Result<&[u8], DsrError> {
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| DsrError::CachePolicy("artifact mapping range overflow".to_string()))?;
+        if end > ARTIFACT_STORE_SIZE {
+            return Err(DsrError::CachePolicy(format!(
+                "artifact mapping range 0x{offset:x}..0x{end:x} exceeds store"
+            )));
+        }
+        // Records are immutable after their index entry is published. Callers
+        // reach this range only after an Acquire load of that entry, so no
+        // writer can still be mutating the returned bytes.
+        Ok(unsafe {
+            std::slice::from_raw_parts(self.mapping.as_ptr().add(offset as usize), length)
+        })
+    }
+
+    fn write_reserved_record_bytes(&self, offset: u64, bytes: &[u8]) -> Result<(), DsrError> {
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| DsrError::CachePolicy("artifact mapping range overflow".to_string()))?;
+        if offset < ARTIFACT_RECORD_OFFSET || end > ARTIFACT_STORE_SIZE {
+            return Err(DsrError::CachePolicy(format!(
+                "artifact record write 0x{offset:x}..0x{end:x} exceeds record arena"
+            )));
+        }
+        // `reserve_record` assigns each writer a disjoint range. The bytes are
+        // copied into that private range before compare_exchange_index_offset
+        // publishes its offset with Release ordering, and are never changed
+        // after publication.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.mapping.as_ptr().add(offset as usize),
+                bytes.len(),
+            );
+        }
+        Ok(())
+    }
+
     fn guest_filter_bits(guest: carrick_guest_mem::GuestVa, address_mode_tag: u8) -> [u64; 2] {
         let tagged = guest.raw() ^ u64::from(address_mode_tag).wrapping_mul(0xd6e8_feb8_6659_fd93);
         let first = tagged.wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -271,10 +404,40 @@ impl ArtifactStore {
         entry.load(Ordering::Acquire)
     }
 
-    fn publish_index_offset(&self, slot: u64, offset: u64) {
+    fn compare_exchange_index_offset(&self, slot: u64, offset: u64) -> Result<(), u64> {
         let byte_offset = ARTIFACT_INDEX_OFFSET as usize + slot as usize * 8;
         let entry = unsafe { &*self.mapping.as_ptr().add(byte_offset).cast::<AtomicU64>() };
-        entry.store(offset, Ordering::Release);
+        entry
+            .compare_exchange(0, offset, Ordering::Release, Ordering::Acquire)
+            .map(|_| ())
+    }
+
+    fn cursor(&self) -> &AtomicU64 {
+        unsafe {
+            &*self
+                .mapping
+                .as_ptr()
+                .add(ARTIFACT_CURSOR_OFFSET as usize)
+                .cast::<AtomicU64>()
+        }
+    }
+
+    fn reserve_record(&self, length: u64) -> Result<Option<u64>, DsrError> {
+        let cursor = self.cursor();
+        let mut start = cursor.load(Ordering::Acquire);
+        loop {
+            let end = start.checked_add(length).ok_or_else(|| {
+                DsrError::CachePolicy("artifact store cursor overflow".to_string())
+            })?;
+            if start < ARTIFACT_RECORD_OFFSET || end > ARTIFACT_STORE_SIZE {
+                self.seal();
+                return Ok(None);
+            }
+            match cursor.compare_exchange_weak(start, end, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(Some(start)),
+                Err(observed) => start = observed,
+            }
+        }
     }
 
     fn counters(&self) -> &SharedArtifactCounters {
@@ -306,18 +469,6 @@ impl ArtifactStore {
             .fetch_add(elapsed, Ordering::Relaxed);
     }
 
-    fn lock(&self, operation: i32) -> Result<ArtifactFileLock, DsrError> {
-        if unsafe { libc::flock(self.file.as_raw_fd(), operation) } != 0 {
-            return Err(DsrError::Host {
-                operation: "lock translation artifact store",
-                error: std::io::Error::last_os_error(),
-            });
-        }
-        Ok(ArtifactFileLock {
-            fd: self.file.as_raw_fd(),
-        })
-    }
-
     pub fn lookup(&self, key: ArtifactKey) -> Result<Option<ArtifactTemplate>, DsrError> {
         self.counters().lookups.fetch_add(1, Ordering::Relaxed);
         let result = self.lookup_index(key)?;
@@ -334,18 +485,23 @@ impl ArtifactStore {
             if offset == 0 {
                 return Ok(None);
             }
-            let mut header = [0_u8; ARTIFACT_RECORD_HEADER];
-            read_store_exact(&self.file, &mut header, offset)?;
+            let header = self.mapped_range(offset, ARTIFACT_RECORD_HEADER)?;
             if header[..8] != ARTIFACT_RECORD_MAGIC {
                 return Err(DsrError::CachePolicy(format!(
                     "artifact record at 0x{offset:x} has invalid magic"
                 )));
             }
-            if header[8..40] != key.digest {
+            if header[ARTIFACT_RECORD_DIGEST_OFFSET..ARTIFACT_RECORD_GUEST_OFFSET] != key.digest
+                || header[ARTIFACT_RECORD_GUEST_OFFSET..ARTIFACT_RECORD_MODE_OFFSET]
+                    != key.guest.raw().to_le_bytes()
+                || header[ARTIFACT_RECORD_MODE_OFFSET] != key.address_mode_tag
+            {
                 continue;
             }
             let length = usize::try_from(u64::from_le_bytes(
-                header[40..48].try_into().unwrap_or([0; 8]),
+                header[ARTIFACT_RECORD_LENGTH_OFFSET..ARTIFACT_RECORD_HEADER]
+                    .try_into()
+                    .unwrap_or([0; 8]),
             ))
             .map_err(|_| DsrError::CachePolicy("artifact record length overflow".to_string()))?;
             if length == 0 || length > ARTIFACT_MAX_RECORD {
@@ -353,22 +509,8 @@ impl ArtifactStore {
                     "artifact record length is invalid: {length}"
                 )));
             }
-            let mut payload = vec![0_u8; length];
-            read_store_exact(
-                &self.file,
-                &mut payload,
-                offset + ARTIFACT_RECORD_HEADER as u64,
-            )?;
-            let checksum: [u8; 32] = Sha256::digest(&payload).into();
-            if header[48..80] != checksum {
-                return Err(DsrError::CachePolicy(
-                    "artifact record checksum mismatch".to_string(),
-                ));
-            }
-            let wire: WireArtifactTemplate = serde_json::from_slice(&payload).map_err(|error| {
-                DsrError::CachePolicy(format!("decode artifact record: {error}"))
-            })?;
-            return Ok(Some(wire.into()));
+            let payload = self.mapped_range(offset + ARTIFACT_RECORD_HEADER as u64, length)?;
+            return decode_artifact_template(payload).map(Some);
         }
         Ok(None)
     }
@@ -377,88 +519,62 @@ impl ArtifactStore {
         if !self.accepting_inserts() {
             return Ok(());
         }
-        let _lock = self.lock(libc::LOCK_EX)?;
-        if !self.accepting_inserts() {
-            return Ok(());
-        }
         if self.lookup_index(key)?.is_some() {
             return Ok(());
         }
-        let mut empty_slot = None;
-        for probe in 0..ARTIFACT_MAX_PROBES {
-            let slot = (key.first_slot() + probe) % ARTIFACT_INDEX_SLOTS;
-            if self.index_offset(slot) == 0 {
-                empty_slot = Some(slot);
-                break;
-            }
-        }
-        let Some(slot) = empty_slot else {
-            self.seal();
-            return Err(DsrError::CachePolicy(
-                "artifact index probe budget exhausted".to_string(),
-            ));
-        };
-        let payload = serde_json::to_vec(&WireArtifactTemplate::from(template))
-            .map_err(|error| DsrError::CachePolicy(format!("encode artifact record: {error}")))?;
+        let payload = encode_artifact_template(template)?;
         if payload.is_empty() || payload.len() > ARTIFACT_MAX_RECORD {
             return Err(DsrError::CachePolicy(format!(
                 "artifact payload length is invalid: {}",
                 payload.len()
             )));
         }
-        let mut cursor_bytes = [0_u8; 8];
-        read_store_exact(&self.file, &mut cursor_bytes, ARTIFACT_CURSOR_OFFSET)?;
-        let cursor = u64::from_le_bytes(cursor_bytes);
-        let end = cursor
-            .checked_add(ARTIFACT_RECORD_HEADER as u64)
-            .and_then(|value| value.checked_add(payload.len() as u64))
-            .ok_or_else(|| DsrError::CachePolicy("artifact store cursor overflow".to_string()))?;
-        if cursor < ARTIFACT_RECORD_OFFSET || end > ARTIFACT_STORE_SIZE {
-            self.seal();
-            return Err(DsrError::CachePolicy("artifact store is full".to_string()));
+        let record_len = (ARTIFACT_RECORD_HEADER as u64)
+            .checked_add(payload.len() as u64)
+            .ok_or_else(|| DsrError::CachePolicy("artifact record length overflow".to_string()))?;
+        let Some(cursor) = self.reserve_record(record_len)? else {
+            return Ok(());
+        };
+        let mut header = [0_u8; ARTIFACT_RECORD_HEADER];
+        header[..8].copy_from_slice(&ARTIFACT_RECORD_MAGIC);
+        header[ARTIFACT_RECORD_DIGEST_OFFSET..ARTIFACT_RECORD_GUEST_OFFSET]
+            .copy_from_slice(&key.digest);
+        header[ARTIFACT_RECORD_GUEST_OFFSET..ARTIFACT_RECORD_MODE_OFFSET]
+            .copy_from_slice(&key.guest.raw().to_le_bytes());
+        header[ARTIFACT_RECORD_MODE_OFFSET] = key.address_mode_tag;
+        header[ARTIFACT_RECORD_LENGTH_OFFSET..ARTIFACT_RECORD_HEADER]
+            .copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        self.write_reserved_record_bytes(cursor + ARTIFACT_RECORD_HEADER as u64, &payload)?;
+        self.write_reserved_record_bytes(cursor, &header)?;
+        for probe in 0..ARTIFACT_MAX_PROBES {
+            let slot = (key.first_slot() + probe) % ARTIFACT_INDEX_SLOTS;
+            match self.compare_exchange_index_offset(slot, cursor) {
+                Ok(()) => {
+                    self.publish_guest_filter(key);
+                    self.counters().inserts.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(existing) => {
+                    let existing_header = self.mapped_range(existing, ARTIFACT_RECORD_HEADER)?;
+                    if existing_header[..8] == ARTIFACT_RECORD_MAGIC
+                        && existing_header
+                            [ARTIFACT_RECORD_DIGEST_OFFSET..ARTIFACT_RECORD_GUEST_OFFSET]
+                            == key.digest
+                        && existing_header
+                            [ARTIFACT_RECORD_GUEST_OFFSET..ARTIFACT_RECORD_MODE_OFFSET]
+                            == key.guest.raw().to_le_bytes()
+                        && existing_header[ARTIFACT_RECORD_MODE_OFFSET] == key.address_mode_tag
+                    {
+                        return Ok(());
+                    }
+                }
+            }
         }
-        let checksum: [u8; 32] = Sha256::digest(&payload).into();
-        let mut header = Vec::with_capacity(ARTIFACT_RECORD_HEADER);
-        header.extend_from_slice(&ARTIFACT_RECORD_MAGIC);
-        header.extend_from_slice(&key.digest);
-        header.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        header.extend_from_slice(&checksum);
-        self.file
-            .write_all_at(&payload, cursor + ARTIFACT_RECORD_HEADER as u64)
-            .and_then(|()| self.file.write_all_at(&header, cursor))
-            .and_then(|()| {
-                self.file
-                    .write_all_at(&end.to_le_bytes(), ARTIFACT_CURSOR_OFFSET)
-            })
-            .map_err(|error| DsrError::Host {
-                operation: "publish translation artifact record",
-                error,
-            })?;
-        self.publish_index_offset(slot, cursor);
-        self.publish_guest_filter(key);
-        self.counters().inserts.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        self.seal();
+        Err(DsrError::CachePolicy(
+            "artifact index probe budget exhausted".to_string(),
+        ))
     }
-}
-
-fn read_store_exact(file: &File, mut bytes: &mut [u8], mut offset: u64) -> Result<(), DsrError> {
-    while !bytes.is_empty() {
-        let read = file
-            .read_at(bytes, offset)
-            .map_err(|error| DsrError::Host {
-                operation: "read translation artifact store",
-                error,
-            })?;
-        if read == 0 {
-            return Err(DsrError::CachePolicy(
-                "translation artifact store ended unexpectedly".to_string(),
-            ));
-        }
-        let (_, rest) = bytes.split_at_mut(read);
-        bytes = rest;
-        offset = offset.saturating_add(read as u64);
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -544,7 +660,7 @@ impl ArtifactAuthority {
         let mapping = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                ARTIFACT_RECORD_OFFSET as usize,
+                ARTIFACT_STORE_SIZE as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 file.as_raw_fd(),
@@ -632,9 +748,7 @@ fn adopt(snapshot: &ArtifactSpikeReexecConfig) -> Result<ArtifactAuthority, DsrE
 }
 
 pub fn ensure_authority_if_enabled() -> Result<(), DsrError> {
-    if std::env::var_os("CARRICK_DSR_ARTIFACT_SPIKE").as_deref() != Some(std::ffi::OsStr::new("1"))
-        || ARTIFACT_AUTHORITY.get().is_some()
-    {
+    if !enabled() || ARTIFACT_AUTHORITY.get().is_some() {
         return Ok(());
     }
     let authority = ArtifactAuthority::create()?;
@@ -1260,8 +1374,45 @@ impl ArtifactTemplate {
         &self.source_words
     }
 
+    pub fn direct_links(&self) -> &[DirectLink] {
+        &self.direct_links
+    }
+
     pub fn matches_source(&self, words: &[u32]) -> bool {
         self.source_words == words
+    }
+
+    /// Drop fields consumed while packing immutable code, retaining only the
+    /// PC/fault metadata needed after dyld maps the finished unit.
+    pub fn into_runtime_metadata_only(mut self) -> Self {
+        self.words.clear();
+        self.direct_links.clear();
+        self.relocations.clear();
+        self.source_words.clear();
+        self
+    }
+
+    pub fn take_runtime_metadata(
+        &mut self,
+        host_bias: Option<u64>,
+    ) -> Result<RuntimeMetadata, DsrError> {
+        let bindings = match host_bias {
+            Some(host_bias) => {
+                ArtifactBindings::from_values([(ProcessValue::HostBias, host_bias)])?
+            }
+            None => ArtifactBindings::from_values([])?,
+        };
+        let map = std::mem::take(&mut self.map);
+        let recovery = std::mem::take(&mut self.recovery)
+            .into_iter()
+            .map(|entry| {
+                Ok(RecoveryEntry {
+                    cache: entry.cache,
+                    action: entry.action.rebind(&bindings)?,
+                })
+            })
+            .collect::<Result<Vec<_>, DsrError>>()?;
+        Ok((map, recovery, std::mem::take(&mut self.direct_links)))
     }
 
     /// Materialize only container-stable relocations for an immutable unit.
@@ -1312,6 +1463,26 @@ impl ArtifactTemplate {
             }
         }
         Ok(words)
+    }
+
+    pub fn runtime_metadata(&self, host_bias: Option<u64>) -> Result<RuntimeMetadata, DsrError> {
+        let bindings = match host_bias {
+            Some(host_bias) => {
+                ArtifactBindings::from_values([(ProcessValue::HostBias, host_bias)])?
+            }
+            None => ArtifactBindings::from_values([])?,
+        };
+        let recovery = self
+            .recovery
+            .iter()
+            .map(|entry| {
+                Ok(RecoveryEntry {
+                    cache: entry.cache,
+                    action: entry.action.rebind(&bindings)?,
+                })
+            })
+            .collect::<Result<Vec<_>, DsrError>>()?;
+        Ok((self.map.clone(), recovery, self.direct_links.clone()))
     }
 
     pub fn mismatch_summary(&self, fresh: &Self) -> Option<String> {
@@ -1446,9 +1617,43 @@ pub fn replay_artifact(
     template: &ArtifactTemplate,
     bindings: &ArtifactBindings,
 ) -> Result<EmittedBlock, DsrError> {
-    let mut words = template.words.clone();
-    let mut consumed = BTreeSet::new();
-    for relocation in &template.relocations {
+    replay_artifact_parts(
+        cache,
+        template.words.clone(),
+        template.map.clone(),
+        template.recovery.clone(),
+        template.direct_links.clone(),
+        &template.relocations,
+        bindings,
+    )
+}
+
+pub fn replay_artifact_owned(
+    cache: &mut TranslationCache,
+    template: ArtifactTemplate,
+    bindings: &ArtifactBindings,
+) -> Result<EmittedBlock, DsrError> {
+    replay_artifact_parts(
+        cache,
+        template.words,
+        template.map,
+        template.recovery,
+        template.direct_links,
+        &template.relocations,
+        bindings,
+    )
+}
+
+fn replay_artifact_parts(
+    cache: &mut TranslationCache,
+    mut words: Vec<u32>,
+    map: Vec<PcMapEntry>,
+    recovery: Vec<PortableRecoveryEntry>,
+    direct_links: Vec<DirectLink>,
+    relocations: &[ArtifactRelocation],
+    bindings: &ArtifactBindings,
+) -> Result<EmittedBlock, DsrError> {
+    for relocation in relocations {
         let first = usize::try_from(relocation.first_word).map_err(|_| {
             DsrError::CachePolicy("artifact replay relocation index overflow".to_string())
         })?;
@@ -1457,11 +1662,6 @@ pub fn replay_artifact(
             let index = first.checked_add(halfword).ok_or_else(|| {
                 DsrError::CachePolicy("artifact replay relocation range overflow".to_string())
             })?;
-            if !consumed.insert(index) {
-                return Err(DsrError::CachePolicy(format!(
-                    "overlapping artifact replay relocation at word {index}"
-                )));
-            }
             let word = words.get_mut(index).ok_or_else(|| {
                 DsrError::CachePolicy(format!(
                     "artifact replay relocation word {index} is out of bounds"
@@ -1479,9 +1679,8 @@ pub fn replay_artifact(
             *word |= immediate << 5;
         }
     }
-    let recovery = template
-        .recovery
-        .iter()
+    let recovery = recovery
+        .into_iter()
         .map(|entry| {
             Ok(RecoveryEntry {
                 cache: entry.cache,
@@ -1490,12 +1689,7 @@ pub fn replay_artifact(
         })
         .collect::<Result<Vec<_>, DsrError>>()?;
     let code = cache.publish_words(&words)?;
-    EmittedBlock::from_artifact_parts(
-        code,
-        template.map.clone(),
-        template.direct_links.clone(),
-        recovery,
-    )
+    EmittedBlock::from_artifact_parts(code, map, direct_links, recovery)
 }
 
 #[cfg(test)]
@@ -1586,6 +1780,22 @@ mod tests {
     }
 
     #[test]
+    fn artifact_store_wire_format_is_compact_and_round_trips() {
+        let (template, _) = emit_artifact_fixture(0x1234_5678, 0x8000_0000);
+        let json = serde_json::to_vec(&WireArtifactTemplate::from(&template)).expect("encode json");
+        let encoded = encode_artifact_template(&template).expect("encode artifact record");
+        let decoded = decode_artifact_template(&encoded).expect("decode artifact record");
+
+        assert_eq!(decoded, template);
+        assert!(
+            encoded.len() * 2 < json.len(),
+            "bincode={} json={}",
+            encoded.len(),
+            json.len()
+        );
+    }
+
+    #[test]
     fn immutable_materialization_rejects_generation_pointer_relocations() {
         let (template, _) = emit_artifact_fixture(0x1234_5678, 0x8000_0000);
         let error = template
@@ -1628,6 +1838,28 @@ mod tests {
 
         assert_ne!(direct, biased_a);
         assert_eq!(biased_a, biased_b);
+    }
+
+    #[test]
+    fn image_key_separates_executables_guest_addresses_and_address_modes() {
+        let guest = GuestVa(0x4000);
+        let digest = [0x11; 32];
+        let direct = ArtifactKey::from_image_digest(guest, digest, EmitAddressMode::Direct);
+        let other_image =
+            ArtifactKey::from_image_digest(guest, [0x22; 32], EmitAddressMode::Direct);
+        let other_guest =
+            ArtifactKey::from_image_digest(GuestVa(0x5000), digest, EmitAddressMode::Direct);
+        let biased = ArtifactKey::from_image_digest(
+            guest,
+            digest,
+            EmitAddressMode::Biased {
+                host_bias: NativeHostBias::new(0x1000_0000, 16 * 1024).expect("aligned bias"),
+            },
+        );
+
+        assert_ne!(direct, other_image);
+        assert_ne!(direct, other_guest);
+        assert_ne!(direct, biased);
     }
 
     #[test]
@@ -1705,6 +1937,48 @@ mod tests {
         assert_eq!(counters.lookups, 1);
         assert_eq!(counters.hits, 1);
         assert_eq!(counters.inserts, 1);
+    }
+
+    #[test]
+    fn concurrent_writers_publish_distinct_artifacts_without_a_global_lock() {
+        const WRITERS: u64 = 8;
+        const RECORDS_PER_WRITER: u64 = 64;
+
+        let authority = ArtifactAuthority::create_for_test().expect("authority");
+        let store = authority.map_store().expect("shared mapping");
+        let (template, _) = emit_artifact_fixture(0x1000_0000, 0x2000_0000);
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let store = &store;
+                let template = &template;
+                scope.spawn(move || {
+                    for record in 0..RECORDS_PER_WRITER {
+                        let ordinal = writer * RECORDS_PER_WRITER + record;
+                        let guest = GuestVa(0x4000 + ordinal * 4);
+                        let key = ArtifactKey::from_source(
+                            guest,
+                            &[ordinal as u32, 0xd65f_03c0],
+                            EmitAddressMode::Direct,
+                        );
+                        store.insert(key, template).expect("insert artifact");
+                    }
+                });
+            }
+        });
+
+        for ordinal in 0..WRITERS * RECORDS_PER_WRITER {
+            let guest = GuestVa(0x4000 + ordinal * 4);
+            let key = ArtifactKey::from_source(
+                guest,
+                &[ordinal as u32, 0xd65f_03c0],
+                EmitAddressMode::Direct,
+            );
+            assert_eq!(
+                store.lookup(key).expect("lookup artifact"),
+                Some(template.clone())
+            );
+        }
+        assert_eq!(store.snapshot().inserts, WRITERS * RECORDS_PER_WRITER);
     }
 
     #[test]

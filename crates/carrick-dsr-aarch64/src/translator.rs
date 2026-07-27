@@ -137,6 +137,14 @@ fn active_host_jit() -> Result<&'static dyn NativeHostJit, types::DsrError> {
 }
 const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
 
+pub fn shared_translation_runtime_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_DSR_SHARED_TRANSLATION").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 /// Encode the AArch64 `B` instruction that links `site` to `target`.
 ///
 /// The guest-ISA half of the pre-extraction `patch_direct_branch`: the
@@ -218,6 +226,8 @@ pub struct PreparedEntry {
     cache_start: usize,
     cache_end: usize,
     address_mode: carrick_dsr::address::NativeAddressMode,
+    generation_bindings: usize,
+    generation_binding_count: usize,
 }
 
 pub struct PreparedExit {
@@ -242,12 +252,12 @@ pub struct ThreadTranslator {
         types::CodeGeneration,
         types::CacheVa,
     )>,
-    indirect_cache: gateway::IndirectTargetCache,
     pub stats: ResolverStats,
     pub budget: profile::ThreadBudget,
     profile_finalized: bool,
     pub nested_translation_ns: u64,
     last_kick: Option<(carrick_guest_mem::GuestVa, Option<emit::RecoveryAction>)>,
+    indirect_cache: gateway::IndirectTargetCache,
 }
 
 pub struct ProcessTranslator {
@@ -293,12 +303,48 @@ pub struct ProcessState {
     pub dependencies: cache::PageBlockDependencies,
     pub publications: cache::ConcurrentPublicationIndex,
     pub profiling: bool,
+    artifact_image_digest: Option<[u8; 32]>,
     shared_translation: Option<SharedTranslationConfiguration>,
+    shared_blocks:
+        BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), SharedBlockAuthority>,
+    loaded_shared_units: Vec<LoadedSharedUnit>,
+    shared_unit_segments_consulted: BTreeSet<carrick_guest_mem::GuestVa>,
+    shared_recording_segments: BTreeSet<carrick_guest_mem::GuestVa>,
+    shared_candidates:
+        BTreeMap<carrick_guest_mem::GuestVa, Vec<crate::shared_cache::PortableBlockCandidate>>,
+    shared_publish_attempted: bool,
 }
 
 struct SharedTranslationConfiguration {
     image: crate::shared_cache::SharedImageConfig,
-    _store: Arc<dyn crate::shared_cache::TranslationUnitStore>,
+    store: Arc<dyn crate::shared_cache::TranslationUnitStore>,
+}
+
+#[derive(Clone, Copy)]
+struct SharedBlockAuthority {
+    generation_bindings: usize,
+    generation_binding_count: usize,
+    cache_start: usize,
+    cache_end: usize,
+}
+
+impl SharedBlockAuthority {
+    fn owns(self, entry: types::CacheVa) -> bool {
+        let address = entry.host().raw();
+        (self.cache_start..self.cache_end).contains(&address)
+    }
+}
+
+struct LoadedSharedUnit {
+    _unit: crate::shared_cache::SharedLoadedTranslationUnit,
+    _generation_bindings: Box<[gateway::GenerationBinding]>,
+}
+
+const fn translation_source_words_required(
+    artifact_store_present: bool,
+    shared_translation_configured: bool,
+) -> bool {
+    artifact_store_present || shared_translation_configured
 }
 
 #[derive(Clone, Copy)]
@@ -310,6 +356,7 @@ pub struct SensitiveMetadata {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TranslationOutcome {
     BlockIndexHit,
+    SharedUnit,
     ArtifactReplay,
     Translated,
 }
@@ -348,6 +395,11 @@ pub struct ResolverStats {
     pub translation_plan_ns: u64,
     pub translation_emit_ns: u64,
     pub translation_publication_ns: u64,
+    pub shared_unit_lookups: u64,
+    pub shared_unit_hits: u64,
+    pub shared_unit_loads: u64,
+    pub shared_blocks_mapped: u64,
+    pub shared_translations_avoided: u64,
     invalid: Option<profile::ProfileError>,
 }
 
@@ -607,12 +659,12 @@ impl ThreadTranslator {
             process,
             tid,
             resume_entry: None,
-            indirect_cache: gateway::IndirectTargetCache::new(),
             stats: ResolverStats::default(),
             budget: profile::ThreadBudget::from_environment(tid),
             profile_finalized: false,
             nested_translation_ns: 0,
             last_kick: None,
+            indirect_cache: gateway::IndirectTargetCache::new(),
         }
     }
 
@@ -628,7 +680,6 @@ impl ThreadTranslator {
         );
         self.process.after_fork_child();
         self.resume_entry = None;
-        self.indirect_cache.clear();
         self.stats = ResolverStats::default();
         self.budget.reset_after_fork_child(tid);
         if self.budget.enabled() {
@@ -663,6 +714,7 @@ impl ThreadTranslator {
         self.profile_finalized = false;
         self.nested_translation_ns = 0;
         self.last_kick = None;
+        self.indirect_cache.clear();
         // Re-register the surviving thread under its (possibly renumbered)
         // child tid with the just-reset budget/stats, querying its mach port
         // fresh -- the child's task port namespace is its own, so the old
@@ -717,9 +769,9 @@ impl ThreadTranslator {
         }
         self.process = next;
         self.resume_entry = None;
-        self.indirect_cache.clear();
         self.start_next_profile_epoch();
         self.last_kick = None;
+        self.indirect_cache.clear();
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
         probes::dsr_cache_lifecycle(
             self.tid,
@@ -1117,7 +1169,14 @@ impl ProcessTranslator {
                 dependencies: cache::PageBlockDependencies::default(),
                 publications: cache::ConcurrentPublicationIndex::default(),
                 profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
+                artifact_image_digest: None,
                 shared_translation: None,
+                shared_blocks: BTreeMap::new(),
+                loaded_shared_units: Vec::new(),
+                shared_unit_segments_consulted: BTreeSet::new(),
+                shared_recording_segments: BTreeSet::new(),
+                shared_candidates: BTreeMap::new(),
+                shared_publish_attempted: false,
             }),
         };
         probes::dsr_cache_capacity(
@@ -1143,11 +1202,75 @@ impl ProcessTranslator {
                 "shared translation image was already configured".to_string(),
             ));
         }
-        state.shared_translation = Some(SharedTranslationConfiguration {
-            image,
-            _store: store,
-        });
+        state.shared_translation = Some(SharedTranslationConfiguration { image, store });
         Ok(())
+    }
+
+    pub fn configure_artifact_image_digest(
+        &self,
+        executable_digest: [u8; 32],
+    ) -> Result<(), types::DsrError> {
+        let mut state = self.state.write();
+        if state
+            .artifact_image_digest
+            .replace(executable_digest)
+            .is_some()
+        {
+            return Err(types::DsrError::CachePolicy(
+                "artifact executable identity was already configured".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn publish_shared_candidates(
+        &self,
+        memory: &NativeMappedMemory,
+    ) -> Result<Vec<crate::shared_cache::PublishOutcome>, types::DsrError> {
+        let (configuration, mut batches) = {
+            let mut state = self.state.write();
+            if state.shared_publish_attempted {
+                return Ok(Vec::new());
+            }
+            state.shared_publish_attempted = true;
+            let Some(configuration) = state.shared_translation.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let configuration = (
+                configuration.image.clone(),
+                Arc::clone(&configuration.store),
+            );
+            let batches = std::mem::take(&mut state.shared_candidates);
+            (configuration, batches)
+        };
+        let (image, store) = configuration;
+        let mut outcomes = Vec::new();
+        for segment in &image.segments {
+            let Some(candidates) = batches.remove(&segment.guest_start) else {
+                continue;
+            };
+            if candidates.is_empty()
+                || candidates.iter().any(|candidate| {
+                    match memory.dsr_generation_observation(candidate.guest_start) {
+                        Ok(observation) => observation.expected() != types::CodeGeneration::INITIAL,
+                        Err(_) => true,
+                    }
+                })
+            {
+                continue;
+            }
+            let pending = crate::shared_cache::PendingTranslationUnit::pack(
+                image.key_for_segment(segment),
+                candidates,
+            )?;
+            let outcome = store.publish(&pending).map_err(|reason| {
+                types::DsrError::CachePolicy(format!(
+                    "shared translation publication failed: {reason:?}"
+                ))
+            })?;
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
     }
 
     #[doc(hidden)]
@@ -1193,10 +1316,177 @@ impl ProcessTranslator {
         state.dependencies = cache::PageBlockDependencies::default();
         state.publications.reset_for_exec();
         state.shared_translation = None;
+        state.shared_blocks.clear();
+        state.loaded_shared_units.clear();
+        state.shared_unit_segments_consulted.clear();
+        state.shared_recording_segments.clear();
+        state.shared_candidates.clear();
+        state.shared_publish_attempted = false;
     }
 }
 
 impl ProcessState {
+    fn try_load_shared_unit(
+        &mut self,
+        memory: &NativeMappedMemory,
+        guest: carrick_guest_mem::GuestVa,
+        generation: types::CodeGeneration,
+    ) -> Result<Option<types::CacheVa>, types::DsrError> {
+        if generation != types::CodeGeneration::INITIAL {
+            return Ok(None);
+        }
+        let Some(configuration) = &self.shared_translation else {
+            return Ok(None);
+        };
+        let Some(segment) = configuration.image.segments.iter().find(|segment| {
+            segment
+                .guest_start
+                .raw()
+                .checked_add(segment.guest_len.get())
+                .is_some_and(|end| (segment.guest_start.raw()..end).contains(&guest.raw()))
+        }) else {
+            return Ok(None);
+        };
+        let segment_start = segment.guest_start;
+        if !self.shared_unit_segments_consulted.insert(segment_start) {
+            return Ok(None);
+        }
+        let key = configuration.image.key_for_segment(segment);
+        let source_words = Arc::clone(&segment.source_words);
+        let store = Arc::clone(&configuration.store);
+        self.stats.shared_unit_lookups = self.stats.shared_unit_lookups.saturating_add(1);
+        let mut unit = match store.load(&key, &source_words) {
+            Ok(Some(unit)) => unit,
+            Ok(None) => {
+                if store.claim_recording(&key) {
+                    self.shared_recording_segments.insert(segment_start);
+                }
+                return Ok(None);
+            }
+            Err(_) => return Ok(None),
+        };
+        self.stats.shared_unit_loads = self.stats.shared_unit_loads.saturating_add(1);
+        let binding_count = unit
+            .manifest
+            .blocks
+            .iter()
+            .map(|block| block.generation_binding as usize)
+            .max()
+            .map_or(0, |index| index.saturating_add(1));
+        if binding_count == 0 || binding_count > unit.manifest.blocks.len() {
+            return Err(types::DsrError::CachePolicy(
+                "shared translation unit has invalid generation bindings".to_string(),
+            ));
+        }
+        let mut bindings = std::iter::repeat_with(|| None)
+            .take(binding_count)
+            .collect::<Vec<_>>();
+        let mut observations = Vec::with_capacity(unit.manifest.blocks.len());
+        for block in &unit.manifest.blocks {
+            let observation = memory.dsr_generation_observation(block.guest_start)?;
+            if observation.expected() != types::CodeGeneration::INITIAL {
+                return Ok(None);
+            }
+            let slot = bindings
+                .get_mut(block.generation_binding as usize)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(
+                        "shared generation binding index is out of range".to_string(),
+                    )
+                })?;
+            if slot.is_some() {
+                return Err(types::DsrError::CachePolicy(
+                    "shared generation binding index is duplicated".to_string(),
+                ));
+            }
+            *slot = Some(gateway::GenerationBinding::new(
+                observation.current_atomic(),
+                types::CodeGeneration::INITIAL,
+            ));
+            observations.push(observation);
+        }
+        let generation_bindings = bindings
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                types::DsrError::CachePolicy(
+                    "shared generation binding table has a hole".to_string(),
+                )
+            })?
+            .into_boxed_slice();
+        let bindings_pointer = generation_bindings.as_ptr() as usize;
+        let cache_start = unit.base;
+        let cache_end = cache_start
+            .checked_add(unit.manifest.code_len as usize)
+            .ok_or_else(|| {
+                types::DsrError::CachePolicy("shared translation range overflow".to_string())
+            })?;
+        let host_bias = unit.manifest.key.host_bias();
+        for (block, observation) in unit.manifest.blocks.iter_mut().zip(observations) {
+            let address = cache_start
+                .checked_add(block.entry_offset as usize)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy("shared block address overflow".to_string())
+                })?;
+            let entry = types::CacheVa::published(carrick_guest_mem::HostVa(address));
+            let (map, recovery, _direct_links) = block.template.take_runtime_metadata(host_bias)?;
+            let block_key = (block.guest_start, types::CodeGeneration::INITIAL);
+            if block.requires_sensitive_metadata {
+                let planned = block::plan_block(
+                    memory,
+                    block.guest_start,
+                    types::CodeGeneration::INITIAL,
+                    256,
+                )?;
+                let block::PlannedExit::Sensitive { exit, fusion, .. } = planned.exit else {
+                    return Err(types::DsrError::CachePolicy(format!(
+                        "shared block 0x{:x} lost sensitive metadata identity",
+                        block.guest_start.raw(),
+                    )));
+                };
+                self.sensitive
+                    .insert(block_key, SensitiveMetadata { exit, fusion });
+            }
+            self.published.push(PublishedBlock {
+                entry,
+                len: block.code_len as usize,
+                map,
+                recovery,
+                _generation: observation.clone(),
+            });
+            self.blocks.insert(block_key, entry);
+            self.dependencies.record(
+                observation.page(),
+                block.guest_start,
+                observation.expected(),
+            );
+            self.shared_blocks.insert(
+                block_key,
+                SharedBlockAuthority {
+                    generation_bindings: bindings_pointer,
+                    generation_binding_count: generation_bindings.len(),
+                    cache_start,
+                    cache_end,
+                },
+            );
+        }
+        self.stats.shared_blocks_mapped = self
+            .stats
+            .shared_blocks_mapped
+            .saturating_add(unit.manifest.blocks.len() as u64);
+        self.loaded_shared_units.push(LoadedSharedUnit {
+            _unit: unit,
+            _generation_bindings: generation_bindings,
+        });
+        let result = self.blocks.get(&(guest, generation)).copied();
+        if result.is_some() {
+            self.stats.shared_unit_hits = self.stats.shared_unit_hits.saturating_add(1);
+            self.stats.shared_translations_avoided =
+                self.stats.shared_translations_avoided.saturating_add(1);
+        }
+        Ok(result)
+    }
+
     pub fn record_exclusive_fusion_site(&mut self, site: types::ExclusiveFusionSite) {
         if !self.profiling {
             return;
@@ -1279,14 +1569,15 @@ impl ProcessState {
                 cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
             });
         }
+        let emitted_len = emitted.len();
+        let (map, links, recovery) = emitted.into_runtime_metadata();
         self.published.push(PublishedBlock {
             entry,
-            len: emitted.len(),
-            map: emitted.map().entries().to_vec(),
-            recovery: emitted.recovery().to_vec(),
+            len: emitted_len,
+            map,
+            recovery,
             _generation: observation,
         });
-        let links = emitted.direct_links().to_vec();
         self.blocks.insert(key, entry);
         self.dependencies.record(source_page, key.0, key.1);
         for link in links {
@@ -1296,7 +1587,9 @@ impl ProcessState {
                 source: entry,
                 slot: link.slot,
             };
-            if let Some(target) = self.blocks.get(&target_key) {
+            if let Some(target) = self.blocks.get(&target_key)
+                && !self.shared_blocks.contains_key(&target_key)
+            {
                 let word = encode_aarch64_direct_branch(site, *target)?;
                 self.cache.patch_code_word(site, word)?;
             } else {
@@ -1335,6 +1628,7 @@ impl ProcessState {
         }
         for stale in stale_blocks {
             self.blocks.remove(&stale);
+            self.shared_blocks.remove(&stale);
             probes::dsr_cache_event(
                 tid,
                 probes::DsrCacheEventKind::Invalidate,
@@ -1366,6 +1660,15 @@ impl ProcessState {
                 cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
             });
         }
+        if let Some(entry) = self.try_load_shared_unit(memory, guest, generation)? {
+            return Ok(TranslationResult {
+                entry,
+                generation,
+                outcome: TranslationOutcome::SharedUnit,
+                emitted_bytes: 0,
+                cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
+            });
+        }
         probes::dsr_cache_event(
             tid,
             probes::DsrCacheEventKind::BlockMiss,
@@ -1376,29 +1679,56 @@ impl ProcessState {
         probes::dsr_translate_begin(tid, guest.raw(), generation.get());
         let translation_started = self.profiling.then(std::time::Instant::now);
         let artifact_address_mode: emit::EmitAddressMode = memory.address_mode().into();
-        let artifact_key_words = self.artifact_store.as_ref().and_then(|store| {
-            if !store.accepting_inserts() && !store.may_contain_guest(guest, artifact_address_mode)
-            {
-                return None;
-            }
-            memory
-                .instruction_fingerprint_words(guest, ARTIFACT_KEY_PREFIX_INSTRUCTIONS)
-                .ok()
-        });
-        let artifact_key = artifact_key_words.as_ref().map(|words| {
-            artifact_spike::ArtifactKey::from_source(guest, words, artifact_address_mode)
+        let artifact_store_present = self.artifact_store.is_some();
+        let artifact_lookup_allowed = self
+            .artifact_store
+            .as_ref()
+            .is_some_and(|store| store.may_contain_guest(guest, artifact_address_mode));
+        let artifact_image_key = artifact_store_present
+            .then(|| {
+                (generation == types::CodeGeneration::INITIAL)
+                    .then_some(self.artifact_image_digest)
+                    .flatten()
+                    .map(|digest| {
+                        artifact_spike::ArtifactKey::from_image_digest(
+                            guest,
+                            digest,
+                            artifact_address_mode,
+                        )
+                    })
+            })
+            .flatten();
+        let artifact_key_words = (artifact_store_present && artifact_image_key.is_none())
+            .then(|| {
+                memory
+                    .instruction_fingerprint_words(guest, ARTIFACT_KEY_PREFIX_INSTRUCTIONS)
+                    .ok()
+            })
+            .flatten();
+        let artifact_key = artifact_image_key.or_else(|| {
+            artifact_key_words.as_ref().map(|words| {
+                artifact_spike::ArtifactKey::from_source(guest, words, artifact_address_mode)
+            })
         });
         let result = (|| -> Result<TranslationResult, types::DsrError> {
-            let artifact_template = artifact_key.and_then(|artifact_key| {
-                self.artifact_store
-                    .as_ref()
-                    .and_then(|store| store.lookup(artifact_key).ok().flatten())
+            let mut artifact_template = if artifact_lookup_allowed {
+                artifact_key.and_then(|artifact_key| {
+                    self.artifact_store
+                        .as_ref()
+                        .and_then(|store| store.lookup(artifact_key).ok().flatten())
+                })
+            } else {
+                None
+            };
+            let artifact_matches = artifact_template.as_ref().is_some_and(|template| {
+                artifact_image_key.is_some()
+                    || memory
+                        .instruction_fingerprint_words(guest, template.source_words().len())
+                        .is_ok_and(|words| template.matches_source(&words))
             });
             if !artifact_spike::validate_fresh_enabled()
-                && let Some(template) = artifact_template.as_ref()
-                && memory
-                    .instruction_fingerprint_words(guest, template.source_words().len())
-                    .is_ok_and(|words| template.matches_source(&words))
+                && artifact_matches
+                && let Some(template) = artifact_template.take()
             {
                 let bindings = artifact_spike::ArtifactBindings::for_replay(
                     observation.current_atomic() as *const std::sync::atomic::AtomicU64 as u64,
@@ -1407,7 +1737,7 @@ impl ProcessState {
                 )?;
                 let replay_started = std::time::Instant::now();
                 if let Ok(emitted) =
-                    artifact_spike::replay_artifact(&mut self.cache, template, &bindings)
+                    artifact_spike::replay_artifact_owned(&mut self.cache, template, &bindings)
                 {
                     if let Some(store) = &self.artifact_store {
                         store.record_replay_ns(
@@ -1460,20 +1790,31 @@ impl ProcessState {
                 generation.get(),
             );
             let block = block_result?;
-            let artifact_source_words = self.artifact_store.as_ref().and_then(|_| {
-                let word_count = usize::try_from(
-                    block
-                        .end
-                        .raw()
-                        .saturating_sub(block.start.raw())
-                        .checked_div(4)?,
-                )
-                .ok()?;
+            let block_word_count = usize::try_from(
+                block
+                    .end
+                    .raw()
+                    .saturating_sub(block.start.raw())
+                    .checked_div(4)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0);
+            let block_source_words = translation_source_words_required(
+                self.artifact_store.is_some(),
+                self.shared_translation.is_some(),
+            )
+            .then(|| {
                 memory
-                    .instruction_fingerprint_words(guest, word_count)
+                    .instruction_fingerprint_words(guest, block_word_count)
                     .ok()
-                    .filter(|words| words.len() == word_count)
-            });
+                    .filter(|words| words.len() == block_word_count)
+            })
+            .flatten();
+            let artifact_source_words = if self.artifact_store.is_some() {
+                block_source_words.clone()
+            } else {
+                None
+            };
 
             probes::dsr_translate_subphase_begin(
                 tid,
@@ -1553,12 +1894,68 @@ impl ProcessState {
             );
             let emit_started = self.profiling.then(std::time::Instant::now);
             let emitted_result = (|| {
+                let portable_segment = self
+                    .shared_translation
+                    .as_ref()
+                    .and_then(|configuration| {
+                        configuration.image.segments.iter().find(|segment| {
+                            let segment_end = segment
+                                .guest_start
+                                .raw()
+                                .checked_add(segment.guest_len.get());
+                            segment_end.is_some_and(|end| {
+                                block.start.raw() >= segment.guest_start.raw()
+                                    && block.end.raw() <= end
+                            })
+                        })
+                    })
+                    .map(|segment| segment.guest_start);
+                let portable_candidate = if generation == types::CodeGeneration::INITIAL
+                    && let Some(segment) = portable_segment
+                    && self.shared_recording_segments.contains(&segment)
+                    && let Some(source_words) = block_source_words.clone()
+                    && matches!(
+                        block.exit,
+                        block::PlannedExit::Syscall { .. }
+                            | block::PlannedExit::Direct { .. }
+                            | block::PlannedExit::Indirect { .. }
+                            | block::PlannedExit::Sensitive { .. }
+                            | block::PlannedExit::Continue { .. }
+                    ) {
+                    let binding = self.shared_candidates.get(&segment).map_or(0, Vec::len);
+                    u32::try_from(binding).ok().and_then(|generation_binding| {
+                        emit::record_portable_block_artifact(
+                            &block,
+                            generation_binding,
+                            memory.address_mode().into(),
+                            source_words,
+                        )
+                        .ok()
+                        .map(|artifact| {
+                            (
+                                segment,
+                                crate::shared_cache::PortableBlockCandidate {
+                                    guest_start: block.start,
+                                    generation_binding,
+                                    requires_sensitive_metadata: matches!(
+                                        block.exit,
+                                        block::PlannedExit::Sensitive { .. }
+                                    ),
+                                    template: artifact.template,
+                                },
+                            )
+                        })
+                    })
+                } else {
+                    None
+                };
                 let artifact_eligible = self
                     .artifact_store
                     .as_ref()
                     .is_some_and(artifact_spike::ArtifactStore::accepting_inserts)
                     && artifact_key.is_some()
                     && artifact_source_words.is_some()
+                    && block_word_count >= artifact_spike::minimum_source_words()
                     && matches!(
                         block.exit,
                         block::PlannedExit::Syscall { .. }
@@ -1638,6 +2035,12 @@ impl ProcessState {
                         expected: generation.get(),
                         observed: observation.current().get(),
                     });
+                }
+                if let Some((segment, candidate)) = portable_candidate {
+                    self.shared_candidates
+                        .entry(segment)
+                        .or_default()
+                        .push(candidate);
                 }
                 if let Some(started) = translation_started {
                     self.stats
@@ -1908,6 +2311,11 @@ impl ThreadTranslator {
             translation_plan_ns: process.translation_plan_ns,
             translation_emit_ns: process.translation_emit_ns,
             translation_publication_ns: process.translation_publication_ns,
+            shared_unit_lookups: process.shared_unit_lookups,
+            shared_unit_hits: process.shared_unit_hits,
+            shared_unit_loads: process.shared_unit_loads,
+            shared_blocks_mapped: process.shared_blocks_mapped,
+            shared_translations_avoided: process.shared_translations_avoided,
             invalid: self.stats.invalid.or(process.invalid),
         }
     }
@@ -2104,6 +2512,7 @@ impl ThreadTranslator {
             self.resume_entry = Some((guest, translated.generation, translated.entry));
             let outcome = match translated.outcome {
                 TranslationOutcome::BlockIndexHit => probes::DsrPrepareOutcome::BlockIndexHit,
+                TranslationOutcome::SharedUnit => probes::DsrPrepareOutcome::BlockIndexHit,
                 TranslationOutcome::ArtifactReplay | TranslationOutcome::Translated => {
                     probes::DsrPrepareOutcome::Translated
                 }
@@ -2125,13 +2534,23 @@ impl ThreadTranslator {
                 return Err(error);
             }
         };
-        let cache_range = self.process.state.read().cache.host_range();
+        let state = self.process.state.read();
+        let shared = state
+            .shared_blocks
+            .get(&(guest, generation))
+            .copied()
+            .filter(|authority| authority.owns(entry));
+        let cache_range = state.cache.host_range();
+        drop(state);
         let prepared = PreparedEntry {
             entry,
             generation,
-            cache_start: cache_range.start,
-            cache_end: cache_range.end,
+            cache_start: shared.map_or(cache_range.start, |authority| authority.cache_start),
+            cache_end: shared.map_or(cache_range.end, |authority| authority.cache_end),
             address_mode: memory.address_mode(),
+            generation_bindings: shared.map_or(0, |authority| authority.generation_bindings),
+            generation_binding_count: shared
+                .map_or(0, |authority| authority.generation_binding_count),
         };
         if PROFILE {
             probes::dsr_prepare_end(
@@ -2172,15 +2591,46 @@ impl ThreadTranslator {
                 prepared.generation.get(),
             );
         }
-        let gateway_result = gateway::enter_translated_with_cache_range(
-            prepared.entry,
-            snapshot,
-            &mut exit,
-            &self.indirect_cache,
-            prepared.cache_start,
-            prepared.cache_end,
-            prepared.address_mode,
-        );
+        let gateway_result =
+            if prepared.generation_binding_count == 0 && !shared_translation_runtime_enabled() {
+                gateway::enter_translated_with_trusted_private_cache(
+                    prepared.entry,
+                    snapshot,
+                    &mut exit,
+                    &self.indirect_cache,
+                    prepared.address_mode,
+                )
+            } else if prepared.generation_binding_count == 0 {
+                gateway::enter_translated_with_cache_range(
+                    prepared.entry,
+                    snapshot,
+                    &mut exit,
+                    &self.indirect_cache,
+                    prepared.cache_start,
+                    prepared.cache_end,
+                    prepared.address_mode,
+                )
+            } else {
+                // SAFETY: `ProcessState::loaded_shared_units` owns the boxed table
+                // for the entire configured image lifetime. Exec reset cannot run
+                // concurrently with an active prepared entry.
+                let bindings = unsafe {
+                    std::slice::from_raw_parts(
+                        prepared.generation_bindings as *const gateway::GenerationBinding,
+                        prepared.generation_binding_count,
+                    )
+                };
+                gateway::enter_translated_with_cache_range_and_generation_bindings(
+                    prepared.entry,
+                    snapshot,
+                    &mut exit,
+                    &self.indirect_cache,
+                    prepared.cache_start,
+                    prepared.cache_end,
+                    prepared.address_mode,
+                    bindings,
+                )
+            };
         if let Err(error) = gateway_result {
             if PROFILE {
                 probes::dsr_run_end(
@@ -2242,16 +2692,28 @@ impl ThreadTranslator {
                     source.raw(),
                     target.raw(),
                 );
-                if let Err(error) = self.translate::<PROFILE>(memory, target) {
-                    probes::dsr_resolve_end(
-                        self.tid,
-                        probes::DsrResolveKind::Direct,
-                        source.raw(),
-                        target.raw(),
-                        error.probe_outcome(),
-                    );
-                    return Err(error);
-                }
+                let translated = match self.translate::<PROFILE>(memory, target) {
+                    Ok(translated) => translated,
+                    Err(error) => {
+                        probes::dsr_resolve_end(
+                            self.tid,
+                            probes::DsrResolveKind::Direct,
+                            source.raw(),
+                            target.raw(),
+                            error.probe_outcome(),
+                        );
+                        return Err(error);
+                    }
+                };
+                self.indirect_cache
+                    .publish(target, translated.generation, translated.entry);
+                probes::dsr_cache_event(
+                    self.tid,
+                    probes::DsrCacheEventKind::TargetPublish,
+                    target.raw(),
+                    translated.generation.get(),
+                    translated.cache_used_bytes,
+                );
                 probes::dsr_resolve_end(
                     self.tid,
                     probes::DsrResolveKind::Direct,
@@ -2495,11 +2957,34 @@ mod tests {
     // projections they exercise; the expected values are now the
     // carrick_dsr::probes mirrors (ordinal-identical to the USDT enums
     // by the mirrored-ordinal tests in carrick-dsr).
-    use super::{DsrErrorProbeExt as _, NativeDsrExitProbeExt as _};
+    use super::{
+        DsrErrorProbeExt as _, NativeDsrExitProbeExt as _, SharedBlockAuthority,
+        translation_source_words_required,
+    };
     use crate::types;
     use carrick_guest_mem::GuestVa;
 
     const PC: GuestVa = GuestVa(0x1000);
+
+    #[test]
+    fn source_words_are_captured_only_for_enabled_reuse_consumers() {
+        assert!(!translation_source_words_required(false, false));
+        assert!(translation_source_words_required(true, false));
+        assert!(translation_source_words_required(false, true));
+        assert!(translation_source_words_required(true, true));
+    }
+
+    #[test]
+    fn shared_authority_only_owns_entries_inside_its_unit() {
+        let authority = SharedBlockAuthority {
+            generation_bindings: 0x7000,
+            generation_binding_count: 3,
+            cache_start: 0x1000,
+            cache_end: 0x2000,
+        };
+        assert!(authority.owns(types::CacheVa::published(carrick_guest_mem::HostVa(0x1800))));
+        assert!(!authority.owns(types::CacheVa::published(carrick_guest_mem::HostVa(0x2800))));
+    }
 
     #[test]
     fn dsr_error_probe_outcomes_cover_every_error_category() {
