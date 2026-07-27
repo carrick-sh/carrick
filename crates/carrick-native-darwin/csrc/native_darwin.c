@@ -58,6 +58,14 @@ struct carrick_native_dsr_signal_context {
     uint64_t host_bias;
     uint64_t biased_guest_fault_address;
     uint64_t biased_fault_pad;
+    /* Gateway exit entry points; see the Rust mirror. Appended, so every
+       offset above is unchanged. */
+    uint64_t exit_syscall_addr;
+    uint64_t exit_direct_addr;
+    uint64_t exit_indirect_addr;
+    uint64_t exit_sensitive_addr;
+    uint64_t exit_unsupported_addr;
+    uint64_t exit_signal_addr;
 };
 
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, host_sp) == 832,
@@ -86,7 +94,9 @@ _Static_assert(offsetof(struct carrick_native_dsr_signal_context, host_bias) == 
                "DSR host bias offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, biased_guest_fault_address) == 1200,
                "DSR biased guest fault address offset");
-_Static_assert(sizeof(struct carrick_native_dsr_signal_context) == 1216,
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_syscall_addr) == 1216,
+               "DSR gateway syscall exit address offset");
+_Static_assert(sizeof(struct carrick_native_dsr_signal_context) == 1264,
                "DSR signal context size");
 
 struct carrick_native_kick_state {
