@@ -1612,13 +1612,17 @@ mod tests {
 
     #[test]
     fn dsr_fork_child_exec_reuses_and_clears_inherited_translator() {
-        let process =
-            super::test_process_translator(16 * 1024).expect("create inherited translator");
+        let process = std::sync::Arc::new(
+            super::test_process_translator(16 * 1024).expect("create inherited translator"),
+        );
         let key = (PC, super::types::CodeGeneration::INITIAL);
         let entry = super::types::CacheVa::published(carrick_guest_mem::HostVa(0x1000));
         process.state.write().blocks.insert(key, entry);
+        let mut thread = super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 42);
 
+        thread.prepare_direct_binding_exec_reset();
         process.reset_after_fork_for_exec();
+        thread.reset_for_exec(std::sync::Arc::clone(&process));
 
         let state = process.state.read();
         assert!(state.blocks.is_empty());

@@ -2867,6 +2867,13 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             }
                         }
                         publish_native_shared_candidates(&translator, &memory);
+                        // Exec quiescence has retired every sibling and no
+                        // translated guest frame remains live. Clear the sole
+                        // surviving thread's cached targets before mapped
+                        // memory retires sidecar cells and their authorities.
+                        // No guest execution resumes until `reset_for_exec`
+                        // installs the replacement process below.
+                        translator.prepare_direct_binding_exec_reset();
                         memory
                             .replace_image(
                                 &image,
