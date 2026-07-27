@@ -1267,6 +1267,11 @@ impl ProcessTranslator {
         };
         let (image, store) = configuration;
         let mut outcomes = Vec::new();
+        let binding_layout = if crate::shared_cache::direct_binding_runtime_enabled() {
+            crate::shared_cache::DirectBindingLayout::SidecarV1
+        } else {
+            crate::shared_cache::DirectBindingLayout::Disabled
+        };
         for segment in &image.segments {
             let Some(candidates) = batches.remove(&segment.guest_start) else {
                 continue;
@@ -1284,6 +1289,7 @@ impl ProcessTranslator {
             let pending = crate::shared_cache::PendingTranslationUnit::pack(
                 image.key_for_segment(segment),
                 candidates,
+                binding_layout,
             )?;
             let outcome = store.publish(&pending).map_err(|reason| {
                 types::DsrError::CachePolicy(format!(
