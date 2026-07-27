@@ -107,17 +107,33 @@ pub struct EmittedBlock {
     recovery: Vec<RecoveryEntry>,
 }
 
-#[derive(Clone, Copy)]
-pub struct GenerationGuard {
-    address: u64,
-    expected: CodeGeneration,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationGuard {
+    Absolute {
+        address: u64,
+        expected: CodeGeneration,
+    },
+    BindingIndex {
+        index: u32,
+        expected: CodeGeneration,
+    },
 }
 
 impl GenerationGuard {
     pub fn new(current: &AtomicU64, expected: CodeGeneration) -> Self {
-        Self {
+        Self::Absolute {
             address: current as *const AtomicU64 as u64,
             expected,
+        }
+    }
+
+    pub const fn binding(index: u32, expected: CodeGeneration) -> Self {
+        Self::BindingIndex { index, expected }
+    }
+
+    pub const fn expected(self) -> CodeGeneration {
+        match self {
+            Self::Absolute { expected, .. } | Self::BindingIndex { expected, .. } => expected,
         }
     }
 }
@@ -3288,27 +3304,61 @@ fn emit_block_inner(
             action: RecoveryAction::RestoreGenerationGuardRegisters,
         });
         let guard_ready = current_offset(&assembler)?;
-        emit_mov_u64(
-            &mut assembler,
-            &mut entries,
-            plan.start,
-            16,
-            MaterializedValue::Process(ProcessValue::GenerationAddress, guard.address),
-            recording.as_deref_mut(),
-        )?;
-        map_next(&assembler, &mut entries, plan.start)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; ldar x16, [x16]
-        );
-        emit_mov_u64(
-            &mut assembler,
-            &mut entries,
-            plan.start,
-            17,
-            MaterializedValue::Process(ProcessValue::GenerationExpected, guard.expected.get()),
-            recording.as_deref_mut(),
-        )?;
+        match guard {
+            GenerationGuard::Absolute { address, expected } => {
+                emit_mov_u64(
+                    &mut assembler,
+                    &mut entries,
+                    plan.start,
+                    16,
+                    MaterializedValue::Process(ProcessValue::GenerationAddress, address),
+                    recording.as_deref_mut(),
+                )?;
+                map_next(&assembler, &mut entries, plan.start)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; ldar x16, [x16]
+                );
+                emit_mov_u64(
+                    &mut assembler,
+                    &mut entries,
+                    plan.start,
+                    17,
+                    MaterializedValue::Process(ProcessValue::GenerationExpected, expected.get()),
+                    recording.as_deref_mut(),
+                )?;
+            }
+            GenerationGuard::BindingIndex { index, .. } => {
+                map_next(&assembler, &mut entries, plan.start)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; ldr x16, [x28, super::gateway::CTX_GENERATION_BINDINGS]
+                );
+                emit_mov_u64(
+                    &mut assembler,
+                    &mut entries,
+                    plan.start,
+                    17,
+                    MaterializedValue::Stable(u64::from(index)),
+                    recording.as_deref_mut(),
+                )?;
+                map_next(&assembler, &mut entries, plan.start)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; add x16, x16, x17, LSL #4
+                );
+                map_next(&assembler, &mut entries, plan.start)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; ldp x16, x17, [x16]
+                );
+                map_next(&assembler, &mut entries, plan.start)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; ldar x16, [x16]
+                );
+            }
+        }
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64

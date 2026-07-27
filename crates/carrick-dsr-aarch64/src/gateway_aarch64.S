@@ -15,6 +15,7 @@
 .equ CTX_EXIT_SOURCE, 1088
 .equ CTX_EXIT_STATUS, 1096
 .equ CTX_GATEWAY_PHASE, 1152
+.equ CTX_GENERATION_BINDINGS, 1264
 
 .globl _carrick_dsr_enter_raw
 _carrick_dsr_enter_raw:
