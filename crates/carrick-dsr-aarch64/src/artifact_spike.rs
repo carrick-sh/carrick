@@ -110,6 +110,24 @@ struct WireArtifactTemplate {
     source_words: Vec<u32>,
 }
 
+impl serde::Serialize for ArtifactTemplate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        WireArtifactTemplate::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ArtifactTemplate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        WireArtifactTemplate::deserialize(deserializer).map(Into::into)
+    }
+}
+
 impl From<&ArtifactTemplate> for WireArtifactTemplate {
     fn from(template: &ArtifactTemplate) -> Self {
         Self {
@@ -1246,6 +1264,56 @@ impl ArtifactTemplate {
         self.source_words == words
     }
 
+    /// Materialize only container-stable relocations for an immutable unit.
+    ///
+    /// Gateway and generation addresses are forbidden: shared blocks reach
+    /// gateways through `DsrContext` and generations through a binding index.
+    /// A biased host mapping is part of the unit key, so it is the sole value
+    /// that may be fixed while packing.
+    pub fn materialize_immutable_words(
+        &self,
+        host_bias: Option<u64>,
+    ) -> Result<Vec<u32>, DsrError> {
+        let mut words = self.words.clone();
+        for relocation in &self.relocations {
+            if relocation.value != ProcessValue::HostBias {
+                return Err(DsrError::CachePolicy(format!(
+                    "immutable unit retains process relocation {:?}",
+                    relocation.value
+                )));
+            }
+            let value = host_bias.ok_or_else(|| {
+                DsrError::CachePolicy(
+                    "immutable unit has a host-bias relocation in direct mode".to_string(),
+                )
+            })?;
+            let first = usize::try_from(relocation.first_word).map_err(|_| {
+                DsrError::CachePolicy("immutable relocation index overflow".to_string())
+            })?;
+            for halfword in 0..4_usize {
+                let index = first.checked_add(halfword).ok_or_else(|| {
+                    DsrError::CachePolicy("immutable relocation range overflow".to_string())
+                })?;
+                let word = words.get_mut(index).ok_or_else(|| {
+                    DsrError::CachePolicy(format!(
+                        "immutable relocation word {index} is out of bounds"
+                    ))
+                })?;
+                if (*word & !MOV_WIDE_IMM16_MASK) != relocation.expected_opcode_mask[halfword]
+                    || (*word & MOV_WIDE_IMM16_MASK) != 0
+                    || (*word & 0x1f) != u32::from(relocation.register)
+                {
+                    return Err(DsrError::CachePolicy(format!(
+                        "immutable relocation opcode mismatch at word {index}"
+                    )));
+                }
+                let immediate = ((value >> (halfword * 16)) & 0xffff) as u32;
+                *word |= immediate << 5;
+            }
+        }
+        Ok(words)
+    }
+
     pub fn mismatch_summary(&self, fresh: &Self) -> Option<String> {
         if let Some((index, (stored, fresh))) = self
             .words
@@ -1506,6 +1574,27 @@ mod tests {
         )
         .expect("normalize fixture");
         (template, bindings)
+    }
+
+    #[test]
+    fn artifact_template_round_trips_through_manifest_serde() {
+        let (template, _) = emit_artifact_fixture(0x1234_5678, 0x8000_0000);
+        let encoded = serde_json::to_vec(&template).expect("encode artifact template");
+        let decoded: ArtifactTemplate =
+            serde_json::from_slice(&encoded).expect("decode artifact template");
+        assert_eq!(decoded, template);
+    }
+
+    #[test]
+    fn immutable_materialization_rejects_generation_pointer_relocations() {
+        let (template, _) = emit_artifact_fixture(0x1234_5678, 0x8000_0000);
+        let error = template
+            .materialize_immutable_words(Some(0x8000_0000))
+            .expect_err("generation pointer must not enter immutable code");
+        assert!(
+            error.to_string().contains("GenerationAddress"),
+            "unexpected rejection: {error}"
+        );
     }
 
     #[test]

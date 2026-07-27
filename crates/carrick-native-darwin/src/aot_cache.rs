@@ -4,14 +4,110 @@ use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use carrick_dsr_aarch64::shared_cache::{
+    MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit, TRANSLATION_UNIT_BASE_EXPORT,
+    TRANSLATION_UNIT_SCHEMA_V1, TranslationUnitKey, TranslationUnitManifest, UnitMissReason,
+};
+use sha2::{Digest, Sha256};
 
 const AUTHORITY_MARKER: &str = ".carrick-authority";
 const AUTHORITY_NONCE_LEN: usize = 16;
 
 static CONTAINER_CACHE: Mutex<Option<ContainerCacheAuthority>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Winner,
+    Existing,
+}
+
+#[derive(Debug)]
+pub struct UnitStoreError {
+    operation: &'static str,
+    reason: UnitMissReason,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl UnitStoreError {
+    fn new(operation: &'static str, reason: UnitMissReason) -> Self {
+        Self {
+            operation,
+            reason,
+            source: None,
+        }
+    }
+
+    fn with_source(
+        operation: &'static str,
+        reason: UnitMissReason,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            operation,
+            reason,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    pub const fn reason(&self) -> UnitMissReason {
+        self.reason
+    }
+}
+
+impl std::fmt::Display for UnitStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: translation unit miss ({:?})",
+            self.operation, self.reason
+        )?;
+        if let Some(source) = &self.source {
+            write!(formatter, ": {source}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UnitStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+#[derive(Debug)]
+pub struct LoadedTranslationUnit {
+    pub manifest: TranslationUnitManifest,
+    pub base: std::ptr::NonNull<u8>,
+    handle: std::ptr::NonNull<libc::c_void>,
+}
+
+// SAFETY: dyld owns the immutable executable mapping for `handle`; `base`
+// points into that read-only mapping, and the manifest is immutable. Drop is
+// the sole `dlclose`, after the last owner releases the loaded unit.
+unsafe impl Send for LoadedTranslationUnit {}
+// SAFETY: see `Send`; no field permits mutation of the dyld mapping.
+unsafe impl Sync for LoadedTranslationUnit {}
+
+impl Drop for LoadedTranslationUnit {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::dlclose(self.handle.as_ptr()) };
+    }
+}
+
+struct UnitFileLock(File);
+
+impl Drop for UnitFileLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 
 /// Identity required to adopt one container's cache directory after host
 /// self-reexec.
@@ -159,10 +255,269 @@ impl ContainerCacheAuthority {
         &self.path
     }
 
+    pub fn publish_unit(
+        &self,
+        pending: &PendingTranslationUnit,
+    ) -> Result<PublishOutcome, UnitStoreError> {
+        if pending.code.is_empty()
+            || pending.code.len() > MAX_TRANSLATION_UNIT_CODE_BYTES
+            || !pending.code.len().is_multiple_of(4)
+        {
+            return Err(UnitStoreError::new(
+                "validate pending unit",
+                UnitMissReason::ManifestRange,
+            ));
+        }
+        let dylib = crate::aot::emit_dylib(
+            &pending.code,
+            &[crate::aot::AotExport {
+                name: TRANSLATION_UNIT_BASE_EXPORT,
+                offset: 0,
+            }],
+        )
+        .map_err(|error| {
+            UnitStoreError::with_source(
+                "emit translation dylib",
+                UnitMissReason::ManifestRange,
+                error,
+            )
+        })?;
+        let mut dylib_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
+            UnitStoreError::with_source(
+                "create dylib temporary",
+                UnitMissReason::MissingPair,
+                error,
+            )
+        })?;
+        dylib_temp.write_all(&dylib).map_err(|error| {
+            UnitStoreError::with_source("write dylib temporary", UnitMissReason::MissingPair, error)
+        })?;
+        dylib_temp.flush().map_err(|error| {
+            UnitStoreError::with_source("flush dylib temporary", UnitMissReason::MissingPair, error)
+        })?;
+        dylib_temp.as_file().sync_all().map_err(|error| {
+            UnitStoreError::with_source("sync dylib temporary", UnitMissReason::MissingPair, error)
+        })?;
+        sign_and_verify(dylib_temp.path())?;
+        dylib_temp.as_file().sync_all().map_err(|error| {
+            UnitStoreError::with_source(
+                "sync signed dylib temporary",
+                UnitMissReason::MissingPair,
+                error,
+            )
+        })?;
+        let signed_dylib = std::fs::read(dylib_temp.path()).map_err(|error| {
+            UnitStoreError::with_source("read signed dylib", UnitMissReason::DylibDigest, error)
+        })?;
+        let manifest = TranslationUnitManifest {
+            schema: TRANSLATION_UNIT_SCHEMA_V1,
+            key: pending.key.clone(),
+            dylib_sha256: Sha256::digest(&signed_dylib).into(),
+            base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+            code_len: pending.code.len() as u64,
+            blocks: pending.blocks.clone(),
+        };
+        manifest
+            .validate_ranges()
+            .map_err(|reason| UnitStoreError::new("validate manifest", reason))?;
+        let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| {
+            UnitStoreError::with_source("encode manifest", UnitMissReason::Schema, error)
+        })?;
+        let mut manifest_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
+            UnitStoreError::with_source(
+                "create manifest temporary",
+                UnitMissReason::MissingPair,
+                error,
+            )
+        })?;
+        manifest_temp.write_all(&manifest_bytes).map_err(|error| {
+            UnitStoreError::with_source(
+                "write manifest temporary",
+                UnitMissReason::MissingPair,
+                error,
+            )
+        })?;
+        manifest_temp.flush().map_err(|error| {
+            UnitStoreError::with_source(
+                "flush manifest temporary",
+                UnitMissReason::MissingPair,
+                error,
+            )
+        })?;
+        manifest_temp.as_file().sync_all().map_err(|error| {
+            UnitStoreError::with_source(
+                "sync manifest temporary",
+                UnitMissReason::MissingPair,
+                error,
+            )
+        })?;
+
+        let stem = pending.key.file_stem().map_err(|error| {
+            UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
+        })?;
+        let _lock = self.lock_unit(&stem)?;
+        let (final_dylib, final_manifest) = self.final_paths(&stem);
+        if final_dylib.is_file() && final_manifest.is_file() {
+            return Ok(PublishOutcome::Existing);
+        }
+        if final_dylib.exists() {
+            std::fs::remove_file(&final_dylib).map_err(|error| {
+                UnitStoreError::with_source(
+                    "remove partial dylib",
+                    UnitMissReason::MissingPair,
+                    error,
+                )
+            })?;
+        }
+        if final_manifest.exists() {
+            std::fs::remove_file(&final_manifest).map_err(|error| {
+                UnitStoreError::with_source(
+                    "remove partial manifest",
+                    UnitMissReason::MissingPair,
+                    error,
+                )
+            })?;
+        }
+        std::fs::rename(dylib_temp.path(), &final_dylib).map_err(|error| {
+            UnitStoreError::with_source("publish dylib", UnitMissReason::MissingPair, error)
+        })?;
+        std::fs::rename(manifest_temp.path(), &final_manifest).map_err(|error| {
+            UnitStoreError::with_source("publish manifest", UnitMissReason::MissingPair, error)
+        })?;
+        Ok(PublishOutcome::Winner)
+    }
+
+    pub fn load_unit(
+        &self,
+        expected_key: &TranslationUnitKey,
+        source_words: &[u32],
+    ) -> Result<LoadedTranslationUnit, UnitStoreError> {
+        let stem = expected_key.file_stem().map_err(|error| {
+            UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
+        })?;
+        let (dylib_path, manifest_path) = self.final_paths(&stem);
+        if !dylib_path.is_file() || !manifest_path.is_file() {
+            return Err(UnitStoreError::new(
+                "locate translation unit",
+                UnitMissReason::MissingPair,
+            ));
+        }
+        let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
+            UnitStoreError::with_source("read manifest", UnitMissReason::Schema, error)
+        })?;
+        let manifest: TranslationUnitManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|error| {
+                UnitStoreError::with_source("decode manifest", UnitMissReason::Schema, error)
+            })?;
+        manifest
+            .validate_ranges()
+            .map_err(|reason| UnitStoreError::new("validate manifest", reason))?;
+        if &manifest.key != expected_key {
+            return Err(UnitStoreError::new(
+                "validate unit identity",
+                UnitMissReason::ImageIdentity,
+            ));
+        }
+        manifest
+            .validate_source(source_words)
+            .map_err(|reason| UnitStoreError::new("validate unit source", reason))?;
+        let dylib = std::fs::read(&dylib_path).map_err(|error| {
+            UnitStoreError::with_source("read dylib", UnitMissReason::DylibDigest, error)
+        })?;
+        let digest: [u8; 32] = Sha256::digest(&dylib).into();
+        if digest != manifest.dylib_sha256 {
+            return Err(UnitStoreError::new(
+                "validate dylib digest",
+                UnitMissReason::DylibDigest,
+            ));
+        }
+        let c_path = CString::new(dylib_path.as_os_str().as_bytes()).map_err(|error| {
+            UnitStoreError::with_source("encode dylib path", UnitMissReason::Dlopen, error)
+        })?;
+        let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        let handle = std::ptr::NonNull::new(handle).ok_or_else(|| {
+            UnitStoreError::new("dlopen translation unit", UnitMissReason::Dlopen)
+        })?;
+        let symbol = CString::new(manifest.base_export.as_bytes()).map_err(|error| {
+            UnitStoreError::with_source("encode base export", UnitMissReason::Dlopen, error)
+        })?;
+        let base = unsafe { libc::dlsym(handle.as_ptr(), symbol.as_ptr()) };
+        let Some(base) = std::ptr::NonNull::new(base.cast::<u8>()) else {
+            let _ = unsafe { libc::dlclose(handle.as_ptr()) };
+            return Err(UnitStoreError::new(
+                "resolve translation unit base",
+                UnitMissReason::Dlopen,
+            ));
+        };
+        Ok(LoadedTranslationUnit {
+            manifest,
+            base,
+            handle,
+        })
+    }
+
+    fn lock_unit(&self, stem: &str) -> Result<UnitFileLock, UnitStoreError> {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(self.path.join(format!("{stem}.lock")))
+            .map_err(|error| {
+                UnitStoreError::with_source("open unit lock", UnitMissReason::MissingPair, error)
+            })?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(UnitStoreError::with_source(
+                "lock unit",
+                UnitMissReason::MissingPair,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(UnitFileLock(lock))
+    }
+
+    fn final_paths(&self, stem: &str) -> (PathBuf, PathBuf) {
+        (
+            self.path.join(format!("{stem}.dylib")),
+            self.path.join(format!("{stem}.json")),
+        )
+    }
+
     #[cfg(test)]
     fn directory(&self) -> &File {
         &self.directory
     }
+}
+
+fn sign_and_verify(path: &Path) -> Result<(), UnitStoreError> {
+    let signed = std::process::Command::new("/usr/bin/codesign")
+        .args(["-s", "-"])
+        .arg(path)
+        .output()
+        .map_err(|error| {
+            UnitStoreError::with_source("run codesign", UnitMissReason::Dlopen, error)
+        })?;
+    if !signed.status.success() {
+        return Err(UnitStoreError::new(
+            "sign translation unit",
+            UnitMissReason::Dlopen,
+        ));
+    }
+    let verified = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict"])
+        .arg(path)
+        .output()
+        .map_err(|error| {
+            UnitStoreError::with_source("run codesign verification", UnitMissReason::Dlopen, error)
+        })?;
+    if !verified.status.success() {
+        return Err(UnitStoreError::new(
+            "verify translation unit signature",
+            UnitMissReason::Dlopen,
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for ContainerCacheAuthority {
@@ -253,8 +608,36 @@ fn owns_cleanup(creator_pid: i32, current_pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carrick_dsr::address::NativeHostBias;
+    use carrick_dsr_aarch64::shared_cache::{
+        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+        NativePageProfileIdentity, SourceFingerprint,
+    };
+    use carrick_guest_mem::GuestVa;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::PermissionsExt;
+
+    const MOV42_RET: [u8; 8] = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
+
+    fn fixture_pending() -> PendingTranslationUnit {
+        let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
+        PendingTranslationUnit {
+            key: TranslationUnitKey::for_segment(
+                ExecutableIdentity::Digest([0x11; 32]),
+                ImageFileOffset::new(0),
+                ImageFileLen::new(8).expect("nonzero file length"),
+                GuestVa(0x400000),
+                GuestCodeLen::new(8).expect("nonzero guest length"),
+                SourceFingerprint::from_words(&source_words),
+                NativePageProfileIdentity::Native16k,
+                AddressModeIdentity::biased(
+                    NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
+                ),
+            ),
+            code: MOV42_RET.to_vec(),
+            blocks: Vec::new(),
+        }
+    }
 
     fn duplicated_snapshot(authority: &ContainerCacheAuthority) -> ContainerCacheReexecConfig {
         let mut snapshot = authority.snapshot().expect("snapshot cache authority");
@@ -362,5 +745,77 @@ mod tests {
         let result = unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_GETFD) };
         std::mem::forget(borrowed);
         assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn concurrent_publishers_converge_on_one_signed_unit() {
+        let authority =
+            std::sync::Arc::new(ContainerCacheAuthority::create().expect("create cache authority"));
+        let pending = fixture_pending();
+        let threads = (0..2)
+            .map(|_| {
+                let authority = std::sync::Arc::clone(&authority);
+                let pending = pending.clone();
+                std::thread::spawn(move || authority.publish_unit(&pending))
+            })
+            .collect::<Vec<_>>();
+        let mut outcomes = threads
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .expect("publisher thread")
+                    .expect("publish unit")
+            })
+            .collect::<Vec<_>>();
+        outcomes.sort_by_key(|outcome| match outcome {
+            PublishOutcome::Winner => 0,
+            PublishOutcome::Existing => 1,
+        });
+        assert_eq!(
+            outcomes,
+            vec![PublishOutcome::Winner, PublishOutcome::Existing]
+        );
+
+        let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
+        let loaded = authority
+            .load_unit(&pending.key, &source_words)
+            .expect("load published unit");
+        let function: extern "C" fn() -> i32 = unsafe { std::mem::transmute(loaded.base.as_ptr()) };
+        assert_eq!(function(), 42);
+        assert!(
+            std::fs::read_dir(authority.path())
+                .expect("read cache directory")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with(".tmp")),
+            "publisher left a temporary file"
+        );
+    }
+
+    #[test]
+    fn partial_publish_pair_is_never_loadable() {
+        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let pending = fixture_pending();
+        let stem = pending.key.file_stem().expect("unit stem");
+        let (dylib, manifest) = authority.final_paths(&stem);
+        let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
+
+        std::fs::write(&manifest, b"{}").expect("write lone manifest");
+        assert_eq!(
+            authority
+                .load_unit(&pending.key, &source_words)
+                .expect_err("lone manifest must miss")
+                .reason(),
+            UnitMissReason::MissingPair
+        );
+        std::fs::remove_file(&manifest).expect("remove lone manifest");
+        std::fs::write(&dylib, MOV42_RET).expect("write lone dylib");
+        assert_eq!(
+            authority
+                .load_unit(&pending.key, &source_words)
+                .expect_err("lone dylib must miss")
+                .reason(),
+            UnitMissReason::MissingPair
+        );
     }
 }
