@@ -37,9 +37,17 @@ pair were not run. No current-branch-tip `just ci`, native smoke, signed
 feasibility, or live mechanism result is claimed.
 
 The current branch also includes `cbac611c`, which repairs deterministic
-recovery after the `8d440b61` rejection. Treat it only as structural repair
-provenance: Task 15's complete structural sequence, signed feasibility, and
-live mechanism pair have not rerun after that commit.
+recovery after the `8d440b61` rejection. Its own focused/full verification is
+structural repair provenance, not a Task 15 gate receipt. The later `b1700108`
+retry below is the first Task 15 structural attempt after that repair.
+
+A fresh retry at `b1700108` passed the two native crate gates but did not
+complete the focused runtime gate. Its first four tests passed, then
+`direct_binding_jittered_sigpipe_stress_preserves_state` consumed about one
+CPU for more than 15 minutes without returning. The controller terminated only
+the exact cargo/test PIDs and verified them gone. Gate 4, the signed rebuild,
+feasibility sample, and mechanism pair were not run. The immediate next work
+is deterministic per-sample synchronization diagnosis, not another live gate.
 
 Reference workload: the conformance `go-build` case — `go build` of a
 hello-world with a cold `GOCACHE`.
@@ -162,11 +170,12 @@ private JIT cache. Restricting it to portable artifacts produced one 24.664 s
 sample, then crashed in Go runtime stack code on replication. Do not resurrect
 that inline family.
 
-**Immediate next action:** review and accept `cbac611c` as the structural
-repair, then rerun the complete Task 15 sequence from clean current HEAD and
-absent single-use artifact paths. The repair commit's own verification is not
-a Task 15 gate receipt. Do not tune the 22-word path or advance to wall
-screening without an accepted mechanism pair.
+**Immediate next action:** diagnose the focused jitter stress's per-sample
+synchronization with a deterministic red-to-green reproducer. The `b1700108`
+retry did not complete structural Gate 3, so do not rerun Task 15 live work,
+tune the 22-word path, or advance to wall screening until the reported
+greater-than-15-minute spin is explained and the complete structural gate
+returns normally.
 
 ### Task 15 mechanism gate stopped at the structural prerequisite
 
@@ -271,9 +280,62 @@ performance result. Variant 1 remains rejected before mechanism evaluation,
 and the 22-word path must not be tuned from this outcome.
 
 Commit `cbac611c` subsequently added deterministic recovery coverage and fixed
-the block-entry guest-`x17` recovery defect. It is structural repair
-provenance only. Task 15's complete structural sequence, signed rebuild and
-feasibility, and live mechanism pair have not rerun after `cbac611c`.
+the block-entry guest-`x17` recovery defect. Its own receipts are structural
+repair provenance only. The later `b1700108` structural retry below does not
+retroactively make those receipts Task 15 authority.
+
+### Task 15 final retry stopped at a focused runtime hang
+
+The final retry started at clean
+`b1700108391058b7d0b18281028236d2e5b56960`. The process and spin-loop
+censuses found no foreign Carrick or benchmark workload. Load averages were
+`3.34 3.13 3.17`, recorded only as preflight context. Docker had only the two
+excluded `registry:2` containers. The native-arm64 image remained ID and repo
+digest
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
+The relevant Carrick environment was empty and all four fixed single-use paths
+were absent. The stale release executable still hashed to
+`sha256:1f55a200175ec19f33f1deed085a68175b164c7f3500cca8165179247258849c`;
+it was not rebuilt, verified, or run.
+
+The final retry's structural vector was:
+
+| Command | Status | Receipt |
+|---|---:|---|
+| `cargo test -p carrick-dsr-aarch64` | 0 | 162 passed, 0 failed; doc tests passed |
+| `cargo test -p carrick-native-darwin` | 0 | 31 passed, 0 failed; doc tests passed |
+| `RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib 'native_darwin::dsr::oracle::direct_binding_'` | terminated / rejected | first four focused tests passed; jitter stress started but did not return |
+| `cargo fmt --all -- --check` | not run | fail-closed stop during Gate 3 |
+
+At 15:07 elapsed, the controller observed cargo parent PID 25354 and test PID
+25370. The test had accumulated 15:05.75 CPU, used about 99.6% of one CPU, and
+was runnable (`R`). This establishes a structural-test hang; it does not reveal
+which sample or synchronization phase was active and is not guest workload
+performance. The controller interrupted the agent and sent `TERM` only to PIDs
+25370 and 25354. A post-termination PID check found both absent, and the
+workload census again found no foreign Carrick or benchmark process.
+
+The prior repair receipt
+`target/task14-fix5-jitter-stress-green.log`
+(`sha256:dde7eb3ef5a9f3d0de148ec1743a51d287e71623b754d357e6954be40cace421`)
+records the exact named stress test completing 10,000 signals and passing in
+8.32 seconds. It is comparison evidence that makes the current spin a
+diagnostic obligation, not authority to call the current Gate 3 green.
+
+Gate 4, `just build`, codesign/entitlement, DOF, marker, feasibility, and
+mechanism-pair commands were not run. The exact feasibility and mechanism
+paths remained absent after termination. There is no current Gate 3 exit
+status, run ID, guest, `BUILD_OK`, cleanup receipt, child CPU, frozen live
+provenance, vector, reconciliation, process-cell bound, validation reason, or
+collapse/reclassification equation. Those values are unobserved, not zero.
+The 95% mechanism gate was not evaluated and no traced or untraced workload
+performance was measured.
+
+Variant 1 remains rejected before mechanism evaluation. Diagnose the focused
+test's per-sample synchronization deterministically before another Task 15
+attempt. Preserve the historical compile and bounded-coverage failures above;
+this third rejection supersedes their restart instructions without erasing
+them.
 
 ### Portable translation reuse is correct but not a default performance win
 
@@ -327,6 +389,8 @@ current-branch-tip Task 15 results.
 | `423895d5` | Container-scoped portable translation reuse plus the default two-way cache and allocation reductions. |
 | `deb9a80e` | Remove redundant AArch64 cold-publication arbitration. |
 | `7cebf638` | Repair direct-binding oracle metadata. |
+| `cbac611c` | Recover guest `x17` at translated block entry and make direct-binding recovery coverage deterministic. |
+| `b1700108` | Correct the deterministic recovery oracle's physical-`x16` model. |
 
 Findings doc:
 `docs/superpowers/specs/2026-07-26-native-cpu-attribution-findings.md`.
@@ -497,15 +561,14 @@ as refuted — the gap is defects, not physics.
 
 ## Next work, ordered by the current gate
 
-1. **Review and accept `cbac611c`.** Treat its focused/full verification as
-   structural repair provenance, not a Task 15 gate receipt.
-2. **Then rerun Task 15 end to end from clean current HEAD.** Re-establish
-   a clean preflight and absent single-use paths, run all four structural
-   commands serially, rebuild signed, verify
-   codesign/DOF/`CARRICK_DSR_DIRECT_BINDINGS`, run the exact one-sample
-   feasibility command, and only if it accepts run the exact fail-closed
-   mechanism pair.
-3. **Advance only on accepted mechanism evidence.** If the pair passes every
+1. **Diagnose the focused jitter-stress hang.** Build a deterministic
+   per-sample synchronization reproducer that can explain the `b1700108`
+   greater-than-15-minute one-CPU spin and distinguish producer, delivery,
+   recovery, and completion handshakes.
+2. **Rerun Task 15 only after a red-to-green structural explanation.** The
+   complete four-command structural sequence must return normally before any
+   signed build, feasibility sample, or live mechanism pair is attempted.
+3. **Advance only on accepted mechanism evidence.** If a later pair passes every
    vector, reconciliation, process-cell bound, cleanup, provenance, and 95%
    collapse/reclassification gate, proceed to the controller's untraced wall
    screen and correctness guardrails. Otherwise stop Variant 1 and do not tune

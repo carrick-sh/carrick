@@ -72,6 +72,7 @@ beaten `C0`.
 | E011 | `target/perf/native-go-build-portable-conditional-v3-populate.json` plus failed replication log | rejected spike; raw untracked | Artifact-only inline conditional caching screened at 24,664 ms, then crashed in Go stack/runtime code; the all-code version exhausted the 64 MiB private JIT cache |
 | E012 | Task 15 structural gate at `c4d54b92` | rejected before live evidence | The first two structural commands passed, but the serialized runtime oracle command failed to compile with 25 `E0308` errors because `binding` fixtures/patterns still use `Option` while `NativeDsrExit` requires `DirectBindingExitMetadata`; no signed candidate, feasibility sample, or trace pair was run |
 | E013 | Task 15 structural retry at `8d440b61` | rejected before live evidence | The metadata repair compiled and eight focused runtime oracles passed, but the 10,000-signal broad control missed required `FinalBranch` coverage; fail-closed execution suppressed formatting Gate 4, signed feasibility, and the trace pair |
+| E014 | Task 15 structural retry at `b1700108` | rejected before live evidence | The first two structural gates passed; Gate 3 passed its first four focused tests, then `direct_binding_jittered_sigpipe_stress_preserves_state` consumed about one CPU for more than 15 minutes without returning and was terminated by the controller; Gate 4, signed feasibility, and the trace pair were not run |
 
 ### Task 15 direct-binding mechanism gate — rejected before live work
 
@@ -186,9 +187,62 @@ identity, publication/clear bound, typed validation reason, and `S/D/G`
 equation is unobserved rather than zero. The 95% mechanism gate was not
 evaluated, and no traced elapsed time exists. Variant 1 remains **rejected
 before mechanism evaluation**; do not tune its 22-word path from this result.
-The current branch includes `cbac611c` only as structural repair provenance;
-no Task 15 structural, signed-feasibility, or live mechanism gate has been
-rerun after that commit.
+At that checkpoint `cbac611c` was structural repair provenance only; no Task 15
+structural, signed-feasibility, or live mechanism gate had rerun after it. The
+later `b1700108` structural retry is recorded below.
+
+### Task 15 final retry — focused runtime hang rejection
+
+The final retry started from clean
+`b1700108391058b7d0b18281028236d2e5b56960`. Preflight again found no
+foreign Carrick, benchmark, or spin-loop workload. Load averages were
+`3.34 3.13 3.17`, which are host context rather than performance evidence.
+Docker contained only the excluded `carrick-registry-5050` and
+`vt-ferry-registry` `registry:2` containers, and the candidate image remained
+native `arm64`, ID and repo digest
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
+No ambient candidate/profile control was present. All four fixed single-use
+paths were absent. The stale, unrebuilt release executable still hashed to
+`sha256:1f55a200175ec19f33f1deed085a68175b164c7f3500cca8165179247258849c`;
+it was not verified or executed.
+
+The final retry's structural vector was:
+
+| Gate | Status | Result |
+|---|---:|---|
+| `cargo test -p carrick-dsr-aarch64` | 0 | 162 passed, 0 failed; doc tests passed |
+| `cargo test -p carrick-native-darwin` | 0 | 31 passed, 0 failed; doc tests passed |
+| `RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib 'native_darwin::dsr::oracle::direct_binding_'` | terminated / rejected | the first four focused tests passed; `direct_binding_jittered_sigpipe_stress_preserves_state` started but did not return |
+| `cargo fmt --all -- --check` | not run | fail-closed stop during Gate 3 |
+
+At 15:07 elapsed, the controller observed cargo parent PID 25354 and test PID
+25370. The test had accumulated 15:05.75 CPU, used about 99.6% of one CPU, and
+was in runnable state `R`. This is evidence of a focused structural-test hang,
+not progress within its 10,000-signal loop and not guest workload performance.
+The controller interrupted the agent and sent `TERM` only to PIDs 25370 and
+25354; both were subsequently absent. A prior authoritative repair receipt,
+`target/task14-fix5-jitter-stress-green.log`
+(`sha256:dde7eb3ef5a9f3d0de148ec1743a51d287e71623b754d357e6954be40cace421`),
+records this exact named stress test completing 10,000 signals and passing in
+8.32 seconds. That older receipt is comparison evidence only, not a substitute
+current-run pass.
+
+After termination the workload census again found no foreign Carrick or
+benchmark process, and the exact feasibility and mechanism paths remained
+absent. Gate 3 has no normal exit receipt. Gate 4, `just build`, signing,
+entitlement, DOF, marker, feasibility, and `capture-pair` were not run. No
+run ID, guest, `BUILD_OK`, cleanup receipt, child CPU, or runner-frozen
+provenance exists. Every live exit/event vector, reconciliation,
+process-cell bound, validation reason, and collapse/reclassification equation
+is unobserved, not zero. The 95% gate was not evaluated and there is no traced
+or untraced workload-performance result.
+
+Variant 1 remains **rejected before mechanism evaluation**. The next action is
+to diagnose the focused test's per-sample synchronization deterministically
+and establish why a test that previously completed in 8.32 seconds can spin
+for more than 15 minutes. Do not rerun Task 15 live gates, tune the 22-word
+path, or advance to wall screening until that structural hang has a
+discriminating red-to-green explanation.
 
 ## Whole-tree attribution
 
@@ -322,6 +376,7 @@ The table order is provisional until E005 and E006 exist.
 | 2026-07-27 | H004 | inline conditional lookup only in portable artifacts | Avoid private-cache expansion while chaining shared conditionals | 24.664 s first sample; replication crashed in Go runtime | n/a | reject and revert; too small and unsafe |
 | 2026-07-27 | H004 | compact direct-binding sidecar Variant 1 mechanism gate | Collapse at least 95% of sidecar-eligible direct resolver exits with matching direct/gateway reclassification | structural gate failed before signed feasibility | n/a | reject before mechanism evaluation; runtime oracle fixtures/patterns do not compile |
 | 2026-07-27 | H004 | compact direct-binding sidecar Variant 1 mechanism retry | Same 95% collapse and reclassification gate after metadata repair | focused runtime oracle ran 9 tests, but the 10,000-signal broad control missed `FinalBranch` | n/a | reject before mechanism evaluation; resolve deterministic recovery coverage before another live retry |
+| 2026-07-27 | H004 | compact direct-binding sidecar Variant 1 final retry | Same mechanism gate after deterministic recovery repairs | focused runtime Gate 3 spun for more than 15 minutes in the jitter stress after four tests passed | n/a | reject before mechanism evaluation; diagnose per-sample synchronization before another gate |
 
 Prior rejected experiments remain recorded in `handoff.md`; they are not reset
 to `PROPOSED`.
@@ -334,6 +389,7 @@ to `PROPOSED`.
 | M1 measurement tooling | 18 Rust + 17 Python tests green | native container smoke printed `TRACE_OK` | n/a | n/a | signed build + DOF present | analyzer accepted container and adversarial scope traces; Go-build evidence pending |
 | Task 15 direct-binding mechanism gate | 162 AArch64 DSR + 31 native-Darwin tests green; runtime oracle compile failed with 25 `E0308` errors | not run | not run | not run | not run | rejected before live work |
 | Task 15 retry at `8d440b61` | 162 AArch64 DSR + 31 native-Darwin tests green; focused runtime oracle 8/9 with missing `FinalBranch` jitter coverage | not run | not run | not run | not run | rejected before live work |
+| Task 15 final retry at `b1700108` | 162 AArch64 DSR + 31 native-Darwin tests green; focused runtime Gate 3 terminated after a greater-than-15-minute jitter-stress spin | not run | not run | not run | not run | rejected before live work |
 
 ## Decisions
 
@@ -358,9 +414,10 @@ to `PROPOSED`.
    recovery. A direct binding must have a stable edge identity, bounded
    sidecar size, publication ordering, authority/version data and a recovery
    oracle before it receives a wall screen.
-8. Task 15 remains stopped before live evaluation. Commit `cbac611c` records
-   deterministic recovery work after the `8d440b61` rejection, but it is
-   structural repair provenance only: no Task 15 gate has rerun after it.
+8. Task 15 remains stopped before live evaluation. The `b1700108` retry proved
+   the two native crate gates but hung in the focused jitter stress before
+   completing Gate 3. Its approximately one-CPU spin is structural test
+   evidence only; it supplies no mechanism or workload-performance result.
 
 ## Next action
 
@@ -378,7 +435,7 @@ Write and validate the executable M1 plan:
 - [x] Falsify full inline conditional caching on code size and recovery.
 - [x] Add compact per-edge mutable binding cells for unresolved shared-unit
       direct edges.
-- [ ] Review and accept `cbac611c` as the structural repair, then rerun the
-      complete Task 15 sequence from clean current HEAD with all single-use
-      evidence paths absent. Do not treat `cbac611c`'s repair verification as
-      a Task 15 gate receipt.
+- [ ] Diagnose the focused jitter stress's per-sample synchronization with a
+      deterministic red-to-green reproducer. Do not rerun Task 15 live gates
+      until the greater-than-15-minute spin is explained and the complete
+      structural sequence returns normally.
