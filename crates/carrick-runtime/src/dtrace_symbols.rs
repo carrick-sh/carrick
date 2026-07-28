@@ -563,8 +563,11 @@ fn snapshot_with_source(
 struct ObjectCallbackContext {
     objects: Vec<KernelObjectRange>,
     error: Option<KernelSymbolError>,
+    callback_panicked: bool,
     #[cfg(test)]
     panic_before_conversion: bool,
+    #[cfg(test)]
+    panic_before_record: bool,
 }
 
 unsafe fn optional_c_bytes<'a>(value: *const c_char) -> Option<&'a [u8]> {
@@ -573,6 +576,52 @@ unsafe fn optional_c_bytes<'a>(value: *const c_char) -> Option<&'a [u8]> {
     } else {
         Some(unsafe { CStr::from_ptr(value) }.to_bytes())
     }
+}
+
+unsafe fn auxiliary_symbol_name_bytes(
+    value: *const c_char,
+    auxiliary: &[u8],
+    address: u64,
+) -> Result<&[u8], KernelSymbolError> {
+    if value.is_null() {
+        return Err(KernelSymbolError::Lookup {
+            address,
+            detail: "libdtrace returned a null auxiliary symbol-name pointer".to_owned(),
+        });
+    }
+    let start = auxiliary.as_ptr() as usize;
+    let end = start
+        .checked_add(auxiliary.len())
+        .ok_or_else(|| KernelSymbolError::Lookup {
+            address,
+            detail: "auxiliary symbol-name buffer address overflows".to_owned(),
+        })?;
+    let pointer = value as usize;
+    if pointer < start || pointer >= end {
+        return Err(KernelSymbolError::Lookup {
+            address,
+            detail: "libdtrace symbol-name pointer is outside the auxiliary buffer".to_owned(),
+        });
+    }
+    let offset = pointer - start;
+    let suffix = &auxiliary[offset..];
+    let nul =
+        suffix
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| KernelSymbolError::Lookup {
+                address,
+                detail: "auxiliary symbol-name buffer lacks a NUL after the returned pointer"
+                    .to_owned(),
+            })?;
+    if nul == 0 || nul == suffix.len() - 1 {
+        return Err(KernelSymbolError::Lookup {
+            address,
+            detail: "auxiliary symbol-name buffer has an empty or truncated terminal NUL"
+                .to_owned(),
+        });
+    }
+    Ok(&suffix[..nul])
 }
 
 extern "C" fn object_callback(
@@ -584,7 +633,7 @@ extern "C" fn object_callback(
         return 0;
     }
     let context = unsafe { &mut *argument.cast::<ObjectCallbackContext>() };
-    if context.error.is_some() {
+    if context.error.is_some() || context.callback_panicked {
         return 0;
     }
     let conversion = catch_unwind(AssertUnwindSafe(|| {
@@ -598,29 +647,49 @@ extern "C" fn object_callback(
             })?
         };
         if info.dto_flags & DTRACE_OBJ_F_KERNEL == 0 {
-            return Ok(None);
+            return Ok(());
         }
-        own_object(BorrowedObject {
+        let object = own_object(BorrowedObject {
             name: unsafe { optional_c_bytes(info.dto_name) },
             file: unsafe { optional_c_bytes(info.dto_file) },
             id: info.dto_id,
             flags: info.dto_flags,
             text_start: info.dto_text_va,
             text_size: info.dto_text_size,
-        })
-        .map(Some)
+        })?;
+        #[cfg(test)]
+        if context.panic_before_record {
+            std::panic::resume_unwind(Box::new("injected callback record panic"));
+        }
+        context.objects.push(object);
+        Ok(())
     }));
     match conversion {
-        Ok(Ok(Some(object))) => context.objects.push(object),
-        Ok(Ok(None)) => {}
+        Ok(Ok(())) => {}
         Ok(Err(error)) => context.error = Some(error),
-        Err(_) => {
-            context.error = Some(KernelSymbolError::ObjectIteration(
-                "object callback panicked".to_owned(),
-            ));
-        }
+        Err(_) => context.callback_panicked = true,
     }
     0
+}
+
+fn finish_object_iteration(
+    context: ObjectCallbackContext,
+    status: c_int,
+) -> Result<Vec<KernelObjectRange>, KernelSymbolError> {
+    if status != 0 {
+        return Err(KernelSymbolError::ObjectIteration(format!(
+            "libdtrace returned status {status}"
+        )));
+    }
+    if context.callback_panicked {
+        return Err(KernelSymbolError::ObjectIteration(
+            "object callback panicked".to_owned(),
+        ));
+    }
+    if let Some(error) = context.error {
+        return Err(error);
+    }
+    Ok(context.objects)
 }
 
 struct LiveSymbolSource {
@@ -646,15 +715,7 @@ impl SymbolSource for LiveSymbolSource {
                 (&mut context as *mut ObjectCallbackContext).cast(),
             )
         };
-        if status != 0 {
-            return Err(KernelSymbolError::ObjectIteration(format!(
-                "libdtrace returned status {status}"
-            )));
-        }
-        if let Some(error) = context.error {
-            return Err(error);
-        }
-        Ok(context.objects)
+        finish_object_iteration(context, status)
     }
 
     fn lookup(&mut self, address: u64) -> Result<KernelSymbolRange, KernelSymbolError> {
@@ -686,7 +747,9 @@ impl SymbolSource for LiveSymbolSource {
             0,
             BorrowedSymbol {
                 object: unsafe { optional_c_bytes(info.dts_object) },
-                symbol: unsafe { optional_c_bytes(info.dts_name) },
+                symbol: Some(unsafe {
+                    auxiliary_symbol_name_bytes(info.dts_name, &auxiliary, address)?
+                }),
                 symbol_id: info.dts_id,
                 symbol_start: symbol.st_value,
                 symbol_size: symbol.st_size,
@@ -765,7 +828,7 @@ impl<'handle> LiveDtraceSymbolizer<'handle> {
     }
 
     pub fn snapshot(
-        &mut self,
+        self,
         addresses: impl IntoIterator<Item = u64>,
     ) -> Result<KernelSymbolSnapshot, KernelSymbolError> {
         let mut source = LiveSymbolSource {
@@ -1199,6 +1262,48 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_symbol_name_requires_a_bounded_nonterminal_c_string() {
+        let auxiliary = b".kernel_fn\0padding";
+        let valid = unsafe {
+            auxiliary_symbol_name_bytes(
+                auxiliary.as_ptr().wrapping_add(1).cast(),
+                auxiliary,
+                0x1018,
+            )
+        }
+        .expect("in-buffer symbol name");
+        assert_eq!(valid, b"kernel_fn");
+
+        let unterminated = b".unterminated";
+        let outside = b"outside\0";
+        assert!(
+            unsafe {
+                auxiliary_symbol_name_bytes(
+                    unterminated.as_ptr().wrapping_add(1).cast(),
+                    unterminated,
+                    0x1018,
+                )
+            }
+            .is_err()
+        );
+        for pointer in [outside.as_ptr().cast(), std::ptr::null()] {
+            assert!(unsafe { auxiliary_symbol_name_bytes(pointer, auxiliary, 0x1018) }.is_err());
+        }
+
+        let terminal = b".terminal\0";
+        assert!(
+            unsafe {
+                auxiliary_symbol_name_bytes(
+                    terminal.as_ptr().wrapping_add(1).cast(),
+                    terminal,
+                    0x1018,
+                )
+            }
+            .is_err()
+        );
+    }
+
+    #[test]
     fn resolver_orders_identity_update_iteration_and_lookups_once() {
         let mut source = MockSource::valid();
         let snapshot =
@@ -1266,10 +1371,72 @@ mod tests {
             (&mut panic_context as *mut ObjectCallbackContext).cast(),
         );
         assert_eq!(status, 0);
-        assert!(matches!(
-            panic_context.error,
-            Some(KernelSymbolError::ObjectIteration(_))
-        ));
+        assert!(panic_context.callback_panicked);
+
+        let mut record_panic_context = ObjectCallbackContext {
+            panic_before_record: true,
+            ..ObjectCallbackContext::default()
+        };
+        let status = object_callback(
+            std::ptr::null_mut(),
+            &DtraceObjInfo {
+                dto_name: b"kernel\0".as_ptr().cast(),
+                dto_file: std::ptr::null(),
+                dto_id: 1,
+                dto_flags: DTRACE_OBJ_F_KERNEL,
+                dto_text_va: 0x1000,
+                dto_text_size: 0x100,
+                dto_data_va: 0,
+                dto_data_size: 0,
+                dto_bss_va: 0,
+                dto_bss_size: 0,
+            },
+            (&mut record_panic_context as *mut ObjectCallbackContext).cast(),
+        );
+        assert_eq!(status, 0);
+        assert!(record_panic_context.callback_panicked);
+        assert!(record_panic_context.objects.is_empty());
+        record_panic_context.panic_before_record = false;
+
+        let status = object_callback(
+            std::ptr::null_mut(),
+            &DtraceObjInfo {
+                dto_name: b"kernel\0".as_ptr().cast(),
+                dto_file: std::ptr::null(),
+                dto_id: 1,
+                dto_flags: DTRACE_OBJ_F_KERNEL,
+                dto_text_va: 0x1000,
+                dto_text_size: 0x100,
+                dto_data_va: 0,
+                dto_data_size: 0,
+                dto_bss_va: 0,
+                dto_bss_size: 0,
+            },
+            (&mut record_panic_context as *mut ObjectCallbackContext).cast(),
+        );
+        assert_eq!(status, 0);
+        assert!(record_panic_context.objects.is_empty());
+
+        let error = finish_object_iteration(
+            ObjectCallbackContext {
+                callback_panicked: true,
+                ..ObjectCallbackContext::default()
+            },
+            0,
+        )
+        .expect_err("record-time panic must become a typed iteration error");
+        assert!(matches!(error, KernelSymbolError::ObjectIteration(_)));
+    }
+
+    fn snapshot_from_owned_symbolizer(
+        symbolizer: LiveDtraceSymbolizer<'_>,
+    ) -> Result<KernelSymbolSnapshot, KernelSymbolError> {
+        symbolizer.snapshot(Vec::new())
+    }
+
+    #[test]
+    fn snapshot_consumes_the_live_symbolizer() {
+        let _ = snapshot_from_owned_symbolizer;
     }
 
     #[test]
