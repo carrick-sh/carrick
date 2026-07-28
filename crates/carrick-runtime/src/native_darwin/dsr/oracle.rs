@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use carrick_dsr_aarch64::direct_binding::DirectBindingExitMetadata;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{GuestVa, HostVa};
 
@@ -1638,7 +1639,7 @@ fn dsr_direct_flow_unresolved_branch_reports_guest_target() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: GuestVa(0x8000),
         target,
-        binding: None,
+        binding: DirectBindingExitMetadata::Absent,
     };
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
         .expect("execute unresolved direct branch");
@@ -1647,7 +1648,7 @@ fn dsr_direct_flow_unresolved_branch_reports_guest_target() {
         NativeDsrExit::ResolveDirect {
             source: GuestVa(0x8000),
             target,
-            binding: None,
+            binding: DirectBindingExitMetadata::Absent,
         }
     );
 }
@@ -1730,7 +1731,7 @@ fn dsr_direct_flow_linked_branch_stays_in_translated_code_and_preserves_x17() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: GuestVa(0xa004),
         target: GuestVa(0xb000),
-        binding: None,
+        binding: DirectBindingExitMetadata::Absent,
     };
     enter_translated(source.entry(), &mut snapshot, &mut exit).expect("execute linked branch");
     assert_eq!(snapshot.x[0], expected_x0);
@@ -1784,7 +1785,7 @@ fn dsr_direct_flow_conditional_edges_select_taken_and_fallthrough_links() {
         let mut exit = NativeDsrExit::ResolveDirect {
             source: GuestVa(0xc000),
             target: GuestVa(0xc100),
-            binding: None,
+            binding: DirectBindingExitMetadata::Absent,
         };
         enter_translated(source.entry(), &mut snapshot, &mut exit)
             .expect("execute linked conditional branch");
@@ -1852,7 +1853,7 @@ fn dsr_direct_flow_linked_call_observes_guest_lr() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: GuestVa(0xd000),
         target: GuestVa(0xe000),
-        binding: None,
+        binding: DirectBindingExitMetadata::Absent,
     };
     enter_translated(call.entry(), &mut snapshot, &mut exit).expect("execute linked call");
     assert_eq!(snapshot.x[30], 0xe004);
@@ -1896,7 +1897,7 @@ fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
         let mut observed = NativeDsrExit::ResolveDirect {
             source: start,
             target: exit.target,
-            binding: None,
+            binding: DirectBindingExitMetadata::Absent,
         };
         enter_translated(emitted.entry(), &mut snapshot, &mut observed)
             .expect("execute conditional edge");
@@ -1906,7 +1907,7 @@ fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
             NativeDsrExit::ResolveDirect {
                 source: start,
                 target: GuestVa(start.raw() + 8),
-                binding: None,
+                binding: DirectBindingExitMetadata::Absent,
             },
             "conditional word 0x{word:08x}"
         );
@@ -2022,7 +2023,7 @@ fn dsr_direct_flow_linked_backward_loop_reaches_fallthrough() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: GuestVa(0xf004),
         target: GuestVa(0xf000),
-        binding: None,
+        binding: DirectBindingExitMetadata::Absent,
     };
     enter_translated(loop_block.entry(), &mut snapshot, &mut exit)
         .expect("execute linked backward loop");
@@ -2130,7 +2131,7 @@ fn portable_direct_block_exits_through_context_gateway() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: guest,
         target,
-        binding: None,
+        binding: DirectBindingExitMetadata::Absent,
     };
     super::gateway::enter_translated_with_generation_bindings(
         emitted.entry(),
@@ -2144,7 +2145,7 @@ fn portable_direct_block_exits_through_context_gateway() {
         NativeDsrExit::ResolveDirect {
             source: guest,
             target,
-            binding: None,
+            binding: DirectBindingExitMetadata::Absent,
         }
     );
 }
@@ -2242,7 +2243,7 @@ fn assert_portable_direct_block_chains_through_published_target_authority(
     let mut exit = NativeDsrExit::ResolveDirect {
         source: guest,
         target,
-        binding: None,
+        binding: DirectBindingExitMetadata::Absent,
     };
 
     super::gateway::enter_translated_with_cache_range_and_generation_bindings(
@@ -2536,7 +2537,7 @@ fn portable_direct_cache_hit_switches_cross_unit_authority_tuple() {
     let mut exit = NativeDsrExit::ResolveDirect {
         source: source_guest,
         target: target_guest,
-        binding: None,
+        binding: DirectBindingExitMetadata::Absent,
     };
 
     super::gateway::enter_translated_with_cache_range_and_generation_bindings(
@@ -2839,7 +2840,7 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
         NativeDsrExit::ResolveDirect {
             source: target_guest,
             target: target_guest,
-            binding: None,
+            binding: DirectBindingExitMetadata::Absent,
         }
     );
 }
@@ -3426,7 +3427,7 @@ fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
         NativeDsrExit::ResolveDirect {
             source: guest,
             target: guest,
-            binding: None,
+            binding: DirectBindingExitMetadata::Absent,
         }
     );
 }
@@ -3598,7 +3599,7 @@ fn binding_generation_guard_exits_stale_after_atomic_changes() {
         NativeDsrExit::ResolveDirect {
             source: guest,
             target: guest,
-            binding: None,
+            binding: DirectBindingExitMetadata::Absent,
         }
     );
 }
@@ -4477,7 +4478,7 @@ fn direct_binding_private_to_shared_switch_executes() {
         NativeDsrExit::ResolveDirect {
             source,
             target,
-            binding: None,
+            binding: DirectBindingExitMetadata::Absent,
         } if source == fixture.source && target == fixture.target
     ));
     assert_eq!(
@@ -4497,7 +4498,7 @@ fn direct_binding_shared_to_shared_switch_executes() {
         NativeDsrExit::ResolveDirect {
             source,
             target,
-            binding: Some(_),
+            binding: DirectBindingExitMetadata::Mapped(_),
         } if source == fixture.source && target == fixture.target
     ));
     assert!(
@@ -4526,7 +4527,7 @@ fn direct_binding_first_miss_then_hit_bypasses_gateway() {
         NativeDsrExit::ResolveDirect {
             source,
             target,
-            binding: Some(_),
+            binding: DirectBindingExitMetadata::Mapped(_),
         } if source == fixture.source && target == fixture.target
     ));
     assert!(!cell.load_acquire().is_null());
@@ -4656,7 +4657,7 @@ fn direct_binding_jittered_sigpipe_recovers_every_preamble_phase() {
         NativeDsrExit::ResolveDirect {
             source,
             target,
-            binding: Some(_),
+            binding: DirectBindingExitMetadata::Mapped(_),
         } if source == fixture.source && target == fixture.target
     ));
     assert!(matches!(
@@ -4664,7 +4665,7 @@ fn direct_binding_jittered_sigpipe_recovers_every_preamble_phase() {
         NativeDsrExit::ResolveDirect {
             source,
             target,
-            binding: Some(_),
+            binding: DirectBindingExitMetadata::Mapped(_),
         } if source == fixture.target && target == fixture.source
     ));
     let source_cell = fixture.source_cell.expect("cyclic source cell");
@@ -5019,7 +5020,7 @@ fn direct_binding_forced_word20_sigpipe_discriminates_catalog() {
         NativeDsrExit::ResolveDirect {
             source,
             target,
-            binding: Some(_),
+            binding: DirectBindingExitMetadata::Mapped(_),
         } if source == fixture.source && target == fixture.target
     ));
     assert!(matches!(
@@ -5027,7 +5028,7 @@ fn direct_binding_forced_word20_sigpipe_discriminates_catalog() {
         NativeDsrExit::ResolveDirect {
             source,
             target,
-            binding: Some(_),
+            binding: DirectBindingExitMetadata::Mapped(_),
         } if source == fixture.target && target == fixture.source
     ));
     let sidecar_starts = [
@@ -5256,7 +5257,7 @@ fn direct_binding_generation_change_clears_and_rebinds() {
         NativeDsrExit::ResolveDirect {
             source: resolved_source,
             target: resolved_target,
-            binding: Some(_),
+            binding: DirectBindingExitMetadata::Mapped(_),
         } if resolved_source == source && resolved_target == target
     ));
     assert!(matches!(
@@ -5304,7 +5305,7 @@ fn direct_binding_generation_change_clears_and_rebinds() {
         NativeDsrExit::ResolveDirect {
             source: stale_source,
             target: stale_target,
-            binding: None,
+            binding: DirectBindingExitMetadata::Absent,
         } if stale_source == target && stale_target == target
     ));
 
@@ -5333,7 +5334,7 @@ fn direct_binding_generation_change_clears_and_rebinds() {
         NativeDsrExit::ResolveDirect {
             source: resolved_source,
             target: resolved_target,
-            binding: Some(_),
+            binding: DirectBindingExitMetadata::Mapped(_),
         } if resolved_source == source && resolved_target == target
     ));
     assert!(matches!(
