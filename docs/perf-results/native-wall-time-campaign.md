@@ -1,7 +1,7 @@
 # Darwin/AArch64 native wall-time campaign ledger
 
-**Updated:** 2026-07-27  
-**Status:** ACTIVE — M1 accepted; compact kernel-attribution execution
+**Updated:** 2026-07-28
+**Status:** ACTIVE — M1 accepted; `MEASUREMENT_REPAIR_REQUIRED`
 **Primary workload:** cold-GOCACHE `go-build`  
 **Design:** [Darwin native wall-time attribution campaign](../superpowers/specs/2026-07-27-native-wall-time-attribution-campaign-design.md)
 
@@ -21,7 +21,8 @@
 
 Current milestone: **M2 — kernel on-CPU attribution and spike selection**. M0 and M1 are
 complete; the first authority-carrying cache family is correct but has not
-beaten `C0`.
+beaten `C0`. The first receipt-bound Task 4 capture was rejected during run A
+by trace command framing, before a profile pair or selection existed.
 
 ## Measurement contract
 
@@ -74,6 +75,88 @@ beaten `C0`.
 | E013 | Task 15 structural retry at `8d440b61` | rejected before live evidence | The metadata repair compiled and eight focused runtime oracles passed, but the 10,000-signal broad control missed required `FinalBranch` coverage; fail-closed execution suppressed formatting Gate 4, signed feasibility, and the trace pair |
 | E014 | Task 15 structural retry at `b1700108` | rejected before live evidence | The first two structural gates passed; Gate 3 passed its first four focused tests, then `direct_binding_jittered_sigpipe_stress_preserves_state` consumed about one CPU for more than 15 minutes without returning and was terminated by the controller; Gate 4, signed feasibility, and the trace pair were not run |
 | E015 | Task 15 live retry at `ece8c497` | structural/build accepted; feasibility rejected | All four structural gates and fresh signed-binary checks passed, but the authorized wrapper-free candidate reached Go compilation and exhausted the 64 MiB DSR translation cache before `BUILD_OK`; the campaign JSON was not written and the mechanism pair was not run |
+| E016 | `scripts/perf/evidence/native-go-build-kernel-attribution-v1.json` plus rejected A receipt under `target/perf/native-kernel-capture-7ec846a5-v1/` | `MEASUREMENT_REPAIR_REQUIRED` | Clean `7ec846a5`, signed binary `385e63d0…`, native-arm64 image, and clean monitor provenance reached run A; trace auto-sudo then treated the repeated Carrick binary path as a subcommand, so A exited 1 without `BUILD_OK`, B and `analysis.json` remained absent, and no family was selected |
+
+### Task 4 kernel attribution — measurement framing rejection
+
+The first authorized live Task 4 attempt started from clean
+`7ec846a5f8ed5ad3fc549e3f54363c69cceb01e8`. The preserved baseline and M1
+attribution evidence retained SHA-256
+`9c9e25f8c7e4f40feb8a86293a2dbd71e3406db3a22a6aeaa9b0dfff23958e13`
+and
+`fdb73ea7880fb2cf957bcbbc9c122ad57d739377eecf0e8e90da0bccb0ad67d8`.
+Focused structural gates passed 34 Rust profile-parser tests, six Rust profile
+integration tests, 17 attribution tests, 43 capture tests, Python compilation,
+and `just fmt-check`.
+
+The conservatively added pre-capture `just ci` was not green. It stopped in
+Clippy with three pre-existing, untouched findings:
+`expect_used` at `direct_binding.rs:274`, `too_many_arguments` at
+`emit.rs:1561`, and `vec_box` at `gateway.rs:58`. A comparison from
+`7c98887c` through `7ec846a5` showed no changes to those files, and the
+controller explicitly allowed the measurement-only gate to proceed. This is
+not a retention waiver: any retained optimization still requires clean
+`just ci`.
+
+`just build` ran exactly once. Strict codesign passed, the Hypervisor
+entitlement was present, the runner fixed the workload to
+`--exec-backend native`, and the native-wall completion marker was bundled.
+The binary was 23,336,272 bytes with SHA-256
+`385e63d05ddf5ccfc55c9264a90f1f23302312c02647ccc23aa84e0844671fc0`.
+The DOF section was present as `__TEXT,__dof_carrick`, not the brief's stale
+`__DATA` spelling; the runner's DOF listing hash was
+`49788cb5195034d9f1354f8a8e0ec86341d75f4bd9e1e06fcc82d6fb8250dfca`.
+
+Every fixed planned path was absent under `lexists` semantics. The image was
+native `arm64`, with image ID and repo digest
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
+The process and real Docker-oracle censuses were empty; Docker contained only
+the two allowed `registry:2` containers.
+
+The runner was invoked once, without a wrapper or `sudo`:
+
+```sh
+python3 scripts/perf/native_kernel_capture.py capture \
+  --repo "$PWD" --binary target/release/carrick \
+  --artifact-dir target/perf/native-kernel-capture-7ec846a5-v1 \
+  --run-id native-kernel-capture-7ec846a5-v1 \
+  --image localhost:5005/carrick-go-conformance:1.24 --timeout 180
+```
+
+Run A exited 1 before the guest workload:
+
+```text
+carrick trace: not root; re-executing under sudo
+error: unrecognized subcommand '/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick'
+Error: native-wall profile has no wall samples
+```
+
+The runner's target argv repeats the Carrick binary after `trace --`; after
+auto-sudo that path was parsed as a Carrick subcommand. A emitted zero
+`BUILD_OK`, no summary, and rejected receipt
+`sha256:b8b17f409241a2f902ce6559e8de85d82fcdb550559ab5f5e162f652e88881f0`.
+Its six available artifact bindings all revalidated. The monitor remained
+uncontaminated for 12 samples, pre/post source, binary, image and host
+provenance were identical, scoped cleanup exited 0, and no owned process
+remained. The receipt's exact errors were:
+
+```text
+trace command failed with status 1
+trace command did not emit exactly one BUILD_OK
+```
+
+All B outputs and `analysis.json` are absent. No second analyzer ran. There
+are no kernel counts, fractions, candidate gates, diffuse reasons, or selected
+family. The raw trace's 10,388,083 ns elapsed field is framing diagnostic data,
+not a workload-performance result. The single-use artifact root is preserved
+unchanged and must never be recycled.
+
+This outcome is **`MEASUREMENT_REPAIR_REQUIRED`**, not `selectable` or
+`diffuse`, and it does not create H006. The immediate next gate is a focused
+red/green repair of trace target framing plus runner tests that exercise the
+real auto-sudo CLI shape. After full focused verification and a clean
+retention-quality `just ci`, authorize a new base and a new single-use
+artifact root/run ID; never rerun `native-kernel-capture-7ec846a5-v1`.
 
 ### Task 15 direct-binding mechanism gate — rejected before live work
 
@@ -483,6 +566,7 @@ to `PROPOSED`.
 | Task 15 retry at `8d440b61` | 162 AArch64 DSR + 31 native-Darwin tests green; focused runtime oracle 8/9 with missing `FinalBranch` jitter coverage | not run | not run | not run | not run | rejected before live work |
 | Task 15 final retry at `b1700108` | 162 AArch64 DSR + 31 native-Darwin tests green; focused runtime Gate 3 terminated after a greater-than-15-minute jitter-stress spin | not run | not run | not run | not run | rejected before live work |
 | Task 15 live retry at `ece8c497` | 162 AArch64 DSR + 31 native-Darwin + 10 focused runtime tests green; format clean | rejected: DSR cache exhaustion, no `BUILD_OK` or JSON | not run | not run | not run | H004 Variant 1 rejected at feasibility; mechanism unrun |
+| Task 4 kernel capture at `7ec846a5` | 34 profile unit + 6 integration + 17 attribution + 43 capture tests green; Python compile and format clean | rejected before guest: auto-sudo trace framing parsed the repeated binary as a subcommand | not run | not run | exit 101 on three pre-existing untouched Clippy findings; not waived for retention | `MEASUREMENT_REPAIR_REQUIRED`; A rejected, B/analysis absent |
 
 ## Decisions
 
@@ -512,6 +596,11 @@ to `PROPOSED`.
    the 64 MiB DSR translation cache before `BUILD_OK`. This rejects H004
    Variant 1 at feasibility; the absent JSON, unrun mechanism pair, and
    unobserved collapse equations supply no workload-performance result.
+9. Task 4 did not reach kernel-family selection. The fixed runner repeated the
+   Carrick binary inside trace target argv, and auto-sudo parsed that path as a
+   subcommand. Preserve the rejected A receipt and root, repair the real CLI
+   framing with a focused red/green test, and allocate a new versioned root
+   before another live attempt. Do not create H006 from zero wall samples.
 
 ## Next action
 
@@ -533,9 +622,10 @@ Write and validate the executable M1 plan:
       the complete four-command structural gate at `ece8c497`.
 - [x] Run the signed one-sample feasibility gate; reject H004 Variant 1 after
       the wrapper-free candidate exhausts the 64 MiB translation cache.
-- [ ] Return to clean default-path attribution and select the next
-      evidence-backed hypothesis through
-      `docs/superpowers/plans/2026-07-28-native-kernel-attribution-compact-execution.md`.
-      The superseded five-round plan is a research record rather than an
-      execution gate. Do not authorize cache-size tuning or rerun the Variant 1
-      mechanism pair from this rejection.
+- [x] Attempt the first receipt-bound default-path kernel pair; preserve its
+      rejected A receipt after trace auto-sudo framing fails before guest work.
+- [ ] Repair trace target framing with focused red/green runner coverage, pass
+      the structural and retention-quality gates, and authorize a new base plus
+      a new single-use root/run ID. Never recycle
+      `native-kernel-capture-7ec846a5-v1`, infer a family, or create H006 from
+      this rejection.
