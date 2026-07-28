@@ -29,15 +29,12 @@ the branch named above. The last-known pre-sidecar checkpoint had a green
 receipts, not current-branch-tip results.
 
 The current branch includes repair `7cebf638` for Task 15's runtime-oracle
-metadata compile failure. That repair commit records both native crate suites,
-the focused direct-binding oracle, the full serialized runtime library suite,
-`cargo fmt`, and `git diff --check` as passing. The complete Task 15 sequence
-has **not** been rerun on the current branch after the repair: fresh preflight,
-signed rebuild and
-codesign/DOF/marker checks, one-sample feasibility, and the fail-closed
-precursor/candidate mechanism pair remain outstanding. No current-branch-tip
-`just ci`, native smoke, signed feasibility, or live mechanism result is
-claimed.
+metadata compile failure. A clean retry at `8d440b61` passed the two native
+crate suites but stopped fail-closed when the focused runtime oracle's
+10,000-signal broad control missed `FinalBranch`. The signed rebuild,
+codesign/DOF/marker checks, one-sample feasibility, and fail-closed mechanism
+pair were not run. No current-branch-tip `just ci`, native smoke, signed
+feasibility, or live mechanism result is claimed.
 
 Reference workload: the conformance `go-build` case — `go build` of a
 hello-world with a cold `GOCACHE`.
@@ -160,14 +157,12 @@ private JIT cache. Restricting it to portable artifacts produced one 24.664 s
 sample, then crashed in Go runtime stack code on replication. Do not resurrect
 that inline family.
 
-**Immediate next action:** rerun the complete Task 15 sequence from clean
-current HEAD, including repair `7cebf638`, and fresh absent single-use artifact
-paths: preflight and the full structural gate, signed rebuild plus
-codesign/DOF/marker verification, the exact one-sample candidate feasibility
-command, then the exact fail-closed precursor/candidate mechanism capture. The
-compact per-edge binding sidecar is implemented; the next decision is evidence
-collection, not another implementation variant. Only an accepted mechanism
-pair may advance to untraced wall screening and correctness guardrails.
+**Immediate next action:** make the focused recovery oracle deterministically
+cover `FinalBranch`, or otherwise resolve its failed 10,000-signal structural
+obligation. Only then restart Task 15 from a clean checkout and absent
+single-use artifact paths. Do not rerun until lucky, do not tune the 22-word
+path, and do not advance to live evidence or wall screening without a complete
+structural pass.
 
 ### Task 15 mechanism gate stopped at the structural prerequisite
 
@@ -222,6 +217,52 @@ Task 15's complete serial gate or any signed/live step. The current branch
 includes the repair; restart Task 15 from clean current HEAD, fresh preflight,
 and fresh absent artifact paths. Do not tune the 22-word path before that
 evidence decision.
+
+### Task 15 retry stopped at bounded recovery coverage
+
+The clean retry started at
+`8d440b616ad163faf446078975d58aeb7788e233`. Repair `7cebf638` is included.
+The process censuses found no foreign Carrick, benchmark, or spin-loop
+workload; Docker had only the two excluded `registry:2` containers. The
+relevant Carrick environment was empty. The native-arm64 image remained ID and
+repo digest
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
+All fixed single-use paths were absent. The unrebuilt executable still hashed
+to `sha256:1f55a200175ec19f33f1deed085a68175b164c7f3500cca8165179247258849c`;
+it was not verified or executed.
+
+The retry's structural vector was:
+
+| Command | Status | Receipt |
+|---|---:|---|
+| `cargo test -p carrick-dsr-aarch64` | 0 | 162 passed, 0 failed; doc tests passed |
+| `cargo test -p carrick-native-darwin` | 0 | 31 passed, 0 failed; doc tests passed |
+| `RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib 'native_darwin::dsr::oracle::direct_binding_'` | 101 | compiled; 8 passed, 1 failed, 1,063 filtered |
+| `cargo fmt --all -- --check` | not run | fail-closed stop after Gate 3 |
+
+`direct_binding_jittered_sigpipe_recovers_every_preamble_phase` exhausted its
+10,000-signal bound with:
+
+```text
+covered=[true, true, true, true, false, true, false, true]
+recovered_words=[11, 152, 818, 26, 212, 54, 3, 17, 1808, 0, 0, 861, 75, 8, 511, 0, 0, 0, 0, 0, 0, 0, 0, 2, 126, 2756, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+signals=10000
+```
+
+The false index 4 is separately forced, assertion-exempt
+`AuthorityInstall`; false index 6 is the required `FinalBranch` coverage that
+rejected the gate. No rerun was substituted, and this checkpoint does not
+decide whether the miss is a runtime defect or a probabilistic false red.
+
+The signed build, codesign/entitlement, DOF, marker, feasibility, and mechanism
+pair commands were not run. No run ID, guest, `BUILD_OK`, cleanup receipt,
+child CPU, or runner-frozen provenance exists. Every feasibility, receipt,
+raw, summary, stdout, stderr, and cleanup path remains absent and has no hash.
+The complete exit/event vectors, reconciliations, process-cell bounds,
+validation reasons, and collapse/reclassification equations are unobserved,
+not zero. The 95% gate was not evaluated; there is no traced or untraced
+performance result. Variant 1 remains rejected before mechanism evaluation,
+and the 22-word path must not be tuned from this outcome.
 
 ### Portable translation reuse is correct but not a default performance win
 
@@ -445,17 +486,20 @@ as refuted — the gap is defects, not physics.
 
 ## Next work, ordered by the current gate
 
-1. **Rerun Task 15 end to end.** Re-establish clean preflight and absent
+1. **Resolve the failed structural oracle.** Make `FinalBranch` coverage
+   deterministic, or otherwise resolve the bounded 10,000-signal failure,
+   before another Task 15 retry. Do not rerun until lucky.
+2. **Then rerun Task 15 end to end.** Re-establish clean preflight and absent
    single-use paths, run all four structural commands serially, rebuild signed,
    verify codesign/DOF/`CARRICK_DSR_DIRECT_BINDINGS`, run the exact one-sample
    feasibility command, and only if it accepts run the exact fail-closed
-   mechanism pair. Preserve and record any rejection.
-2. **Advance only on accepted mechanism evidence.** If the pair passes every
+   mechanism pair.
+3. **Advance only on accepted mechanism evidence.** If the pair passes every
    vector, reconciliation, process-cell bound, cleanup, provenance, and 95%
    collapse/reclassification gate, proceed to the controller's untraced wall
    screen and correctness guardrails. Otherwise stop Variant 1 and do not tune
    the 22-word path.
-3. **Defer unrelated performance directions until Task 15 closes.** Coarse-unit
+4. **Defer unrelated performance directions until Task 15 closes.** Coarse-unit
    publication, the remaining 862k indirect exits, emission-cost attribution,
    and per-process capsule setup remain evidence-backed backlog items, not the
    immediate next work.
