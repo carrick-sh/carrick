@@ -26,15 +26,16 @@ The earlier fusion/gateway work is on `main`; the continuation is committed on
 the branch named above. The last-known pre-sidecar checkpoint had a green
 `just ci` and clean `just conformance-native smoke --workers 4` (including
 `go-sync` 52/52 and `cpython-threading` 193/193). Those are historical
-receipts, not current-HEAD results.
+receipts, not current-branch-tip results.
 
-Current HEAD `7cebf638` repairs Task 15's runtime-oracle metadata compile
-failure. That repair commit records both native crate suites, the focused
-direct-binding oracle, the full serialized runtime library suite, `cargo fmt`,
-and `git diff --check` as passing. The complete Task 15 sequence has **not**
-been rerun after the repair: fresh preflight, signed rebuild and
+The current branch includes repair `7cebf638` for Task 15's runtime-oracle
+metadata compile failure. That repair commit records both native crate suites,
+the focused direct-binding oracle, the full serialized runtime library suite,
+`cargo fmt`, and `git diff --check` as passing. The complete Task 15 sequence
+has **not** been rerun on the current branch after the repair: fresh preflight,
+signed rebuild and
 codesign/DOF/marker checks, one-sample feasibility, and the fail-closed
-precursor/candidate mechanism pair remain outstanding. No current-HEAD
+precursor/candidate mechanism pair remain outstanding. No current-branch-tip
 `just ci`, native smoke, signed feasibility, or live mechanism result is
 claimed.
 
@@ -159,14 +160,14 @@ private JIT cache. Restricting it to portable artifacts produced one 24.664 s
 sample, then crashed in Go runtime stack code on replication. Do not resurrect
 that inline family.
 
-**Immediate next action:** rerun the complete Task 15 sequence from a clean
-`7cebf638` checkout and fresh absent single-use artifact paths: preflight and
-the full structural gate, signed rebuild plus codesign/DOF/marker verification,
-the exact one-sample candidate feasibility command, then the exact fail-closed
-precursor/candidate mechanism capture. The compact per-edge binding sidecar is
-implemented; the next decision is evidence collection, not another
-implementation variant. Only an accepted mechanism pair may advance to
-untraced wall screening and correctness guardrails.
+**Immediate next action:** rerun the complete Task 15 sequence from clean
+current HEAD, including repair `7cebf638`, and fresh absent single-use artifact
+paths: preflight and the full structural gate, signed rebuild plus
+codesign/DOF/marker verification, the exact one-sample candidate feasibility
+command, then the exact fail-closed precursor/candidate mechanism capture. The
+compact per-edge binding sidecar is implemented; the next decision is evidence
+collection, not another implementation variant. Only an accepted mechanism
+pair may advance to untraced wall screening and correctness guardrails.
 
 ### Task 15 mechanism gate stopped at the structural prerequisite
 
@@ -216,10 +217,11 @@ gateway totals, translation attempts, unique `(pid,cell)` identities,
 publication/clear bounds, typed reasons, or `S/D/G` collapse equations are
 unobserved—not zero. Variant 1 is **rejected before mechanism evaluation**.
 Commit `7cebf638` subsequently repaired this exact metadata mismatch and
-records current-HEAD structural verification, but it did not rerun Task 15's
-complete serial gate or any signed/live step. Restart Task 15 from clean
-preflight and fresh absent artifact paths. Do not tune the 22-word path before
-that evidence decision.
+records structural verification at that repair commit, but it did not rerun
+Task 15's complete serial gate or any signed/live step. The current branch
+includes the repair; restart Task 15 from clean current HEAD, fresh preflight,
+and fresh absent artifact paths. Do not tune the 22-word path before that
+evidence decision.
 
 ### Portable translation reuse is correct but not a default performance win
 
@@ -249,8 +251,8 @@ All were reverted. Do not resurrect them without new evidence.
 
 ### Historical verification receipts
 
-These receipts predate the direct-binding sidecar and are not current-HEAD
-Task 15 results.
+These receipts predate the direct-binding sidecar and are not
+current-branch-tip Task 15 results.
 
 - Signed native demo: Linux `aarch64`, Go 1.24.13, compile and execute
   `native-go-ok`.
