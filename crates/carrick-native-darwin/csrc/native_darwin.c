@@ -36,6 +36,16 @@ struct carrick_native_ucontext_snapshot {
     uint64_t far;
 };
 
+struct carrick_native_executable_range_node {
+    uint64_t start;
+    uint64_t end;
+    const struct carrick_native_executable_range_node *next;
+};
+
+struct carrick_native_executable_range_catalog {
+    _Atomic(struct carrick_native_executable_range_node *) head;
+};
+
 struct carrick_native_dsr_signal_context {
     struct carrick_native_ucontext_snapshot snapshot;
     uint64_t host_sp;
@@ -66,8 +76,34 @@ struct carrick_native_dsr_signal_context {
     uint64_t exit_sensitive_addr;
     uint64_t exit_unsupported_addr;
     uint64_t exit_signal_addr;
-};
+    const void *generation_bindings;
+    uint64_t gateway_abi_tail_pad;
+    uint64_t direct_binding_cell;
+    uint32_t direct_binding_ordinal;
+    uint32_t direct_binding_present;
+    uint64_t direct_binding_target;
+    const struct carrick_native_executable_range_catalog
+        *executable_range_catalog;
+} __attribute__((aligned(16)));
 
+_Static_assert(ATOMIC_POINTER_LOCK_FREE == 2,
+               "DSR executable range catalog requires lock-free pointers");
+_Static_assert(sizeof(struct carrick_native_executable_range_catalog) == 8,
+               "DSR executable range catalog header size");
+_Static_assert(_Alignof(struct carrick_native_executable_range_catalog) == 8,
+               "DSR executable range catalog header alignment");
+_Static_assert(offsetof(struct carrick_native_executable_range_catalog, head) == 0,
+               "DSR executable range catalog head offset");
+_Static_assert(sizeof(struct carrick_native_executable_range_node) == 24,
+               "DSR executable range catalog node size");
+_Static_assert(_Alignof(struct carrick_native_executable_range_node) == 8,
+               "DSR executable range catalog node alignment");
+_Static_assert(offsetof(struct carrick_native_executable_range_node, start) == 0,
+               "DSR executable range start offset");
+_Static_assert(offsetof(struct carrick_native_executable_range_node, end) == 8,
+               "DSR executable range end offset");
+_Static_assert(offsetof(struct carrick_native_executable_range_node, next) == 16,
+               "DSR executable range next offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, host_sp) == 832,
                "DSR signal host SP offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_target) == 1080,
@@ -96,8 +132,24 @@ _Static_assert(offsetof(struct carrick_native_dsr_signal_context, biased_guest_f
                "DSR biased guest fault address offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_syscall_addr) == 1216,
                "DSR gateway syscall exit address offset");
-_Static_assert(sizeof(struct carrick_native_dsr_signal_context) == 1264,
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, generation_bindings) == 1264,
+               "DSR generation binding pointer offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, gateway_abi_tail_pad) == 1272,
+               "DSR gateway ABI tail pad offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, direct_binding_cell) == 1280,
+               "DSR direct binding cell offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, direct_binding_ordinal) == 1288,
+               "DSR direct binding ordinal offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, direct_binding_present) == 1292,
+               "DSR direct binding present offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, direct_binding_target) == 1296,
+               "DSR direct binding target offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, executable_range_catalog) == 1304,
+               "DSR executable range catalog pointer offset");
+_Static_assert(sizeof(struct carrick_native_dsr_signal_context) == 1312,
                "DSR signal context size");
+_Static_assert(_Alignof(struct carrick_native_dsr_signal_context) == 16,
+               "DSR signal context alignment");
 
 struct carrick_native_kick_state {
     _Atomic uint64_t requested;
@@ -458,6 +510,23 @@ static void carrick_native_fatal_signal_handler(int sig, siginfo_t *info, void *
     _exit(128 + sig);
 }
 
+static bool carrick_native_executable_range_catalog_contains(
+    const struct carrick_native_executable_range_catalog *catalog,
+    uintptr_t pc) {
+    if (catalog == 0) {
+        return false;
+    }
+    const struct carrick_native_executable_range_node *node =
+        atomic_load_explicit(&catalog->head, memory_order_acquire);
+    while (node != 0) {
+        if (pc >= node->start && pc < node->end) {
+            return true;
+        }
+        node = node->next;
+    }
+    return false;
+}
+
 static void carrick_native_dsr_signal_handler(int sig, siginfo_t *info, void *uap) {
     int32_t event_kind = CARRICK_NATIVE_EVENT_SIGNAL;
     if (sig == SIGPIPE) {
@@ -529,12 +598,16 @@ static void carrick_native_dsr_signal_handler(int sig, siginfo_t *info, void *ua
                    (context->entry_in_progress == 1 ||
                     (context->entry_in_progress == 0 &&
                      (interrupted_pc < context->cache_start ||
-                      interrupted_pc >= context->cache_end)))) {
+                      interrupted_pc >= context->cache_end) &&
+                     !carrick_native_executable_range_catalog_contains(
+                         context->executable_range_catalog,
+                         interrupted_pc)))) {
             // The kick became deliverable while the gateway was still inside
             // pthread_sigmask, or a stale active-context window exposed a host
             // PC while phase zero claimed translated execution. No translated
             // instruction at that PC can be authoritative: DSR executes only
-            // inside the MAP_JIT cache, whose bounds are carried in-context.
+            // inside the current range or another process-catalogued
+            // executable mapping.
             // Preserve the original guest snapshot rather than replacing it
             // with host registers.
             context->exit_target = context->snapshot.pc;

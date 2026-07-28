@@ -2268,6 +2268,148 @@ fn assert_portable_direct_block_chains_through_published_target_authority(
     }
 }
 
+fn direct_binding_reentry_after_partial_authority_install(store_words: &[u32]) {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    let mut partial_cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate partial-authority cache");
+    let mut partial_words = store_words.to_vec();
+    partial_words.push(0xf940_0369); // ldr x9, [x27], with x27=1
+    let partial = partial_cache
+        .publish_words(&partial_words)
+        .expect("publish partial-authority sequence");
+
+    let source_generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
+    let source_bindings = [super::gateway::GenerationBinding::new(
+        &source_generation,
+        CodeGeneration::INITIAL,
+    )];
+    let target_generation = std::sync::atomic::AtomicU64::new(7);
+    let target_bindings = [super::gateway::GenerationBinding::new(
+        &target_generation,
+        CodeGeneration::claimed(7),
+    )];
+    let source_range = partial_cache.host_range();
+    let target_range = (
+        source_range.start.saturating_add(0x100_000),
+        source_range.end.saturating_add(0x200_000),
+    );
+    let partial_descriptor = 0xfeed_0000_dead_0000_u64;
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[15] = target_range.0 as u64;
+    snapshot.x[13] = partial_descriptor;
+    snapshot.x[17] = target_bindings.as_ptr() as usize as u64;
+    snapshot.x[30] = target_range.1 as u64;
+    snapshot.x[27] = 1;
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0x4000),
+    };
+    super::gateway::enter_translated_with_cache_range_and_generation_bindings(
+        partial.entry(),
+        &mut snapshot,
+        &mut exit,
+        &IndirectTargetCache::new(),
+        source_range.start,
+        source_range.end,
+        crate::native_darwin::address::NativeAddressMode::Direct,
+        &source_bindings,
+    )
+    .expect("interrupt partial authority installation");
+    assert!(
+        matches!(exit, NativeDsrExit::Fault { .. }),
+        "partial authority sequence must fault after its requested store: {exit:?}"
+    );
+
+    let mut verifier_cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate authority verifier");
+    let verifier_words = [
+        0xf942_4f80, // ldr x0, [x28, #1176] -- cache_start
+        0xf942_5381, // ldr x1, [x28, #1184] -- cache_end
+        0xf942_7b82, // ldr x2, [x28, #1264] -- generation_bindings
+        0xf942_8b83, // ldr x3, [x28, #1296] -- direct_binding_target
+        0xf942_1b84, // ldr x4, [x28, #1072] -- entry
+        0xd288_0011, // mov x17, #0x4000
+        0xf2a0_0011,
+        0xf2c0_0011,
+        0xf2e0_0011,
+        0xf902_1f91, // str x17, [x28, #1080] -- exit target
+        0x5280_0031, // mov w17, #1 -- syscall exit
+        0xb904_4b91, // str w17, [x28, #1096]
+        0xf942_6391, // ldr x17, [x28, #1216] -- syscall gateway
+        0xd61f_0220, // br x17
+    ];
+    let verifier = verifier_cache
+        .publish_words(&verifier_words)
+        .expect("publish authority verifier");
+    let verifier_range = verifier_cache.host_range();
+    let mut reentry_snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    let mut reentry_exit = exit;
+    super::gateway::enter_translated_with_cache_range_and_generation_bindings(
+        verifier.entry(),
+        &mut reentry_snapshot,
+        &mut reentry_exit,
+        &IndirectTargetCache::new(),
+        verifier_range.start,
+        verifier_range.end,
+        crate::native_darwin::address::NativeAddressMode::Direct,
+        &source_bindings,
+    )
+    .expect("re-enter after partial authority installation");
+
+    assert_eq!(
+        reentry_exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(0x4000),
+        }
+    );
+    assert_eq!(reentry_snapshot.x[0], verifier_range.start as u64);
+    assert_eq!(reentry_snapshot.x[1], verifier_range.end as u64);
+    assert_eq!(
+        reentry_snapshot.x[2],
+        source_bindings.as_ptr() as usize as u64
+    );
+    assert_eq!(
+        reentry_snapshot.x[3], 0,
+        "a fresh source authority must clear the partial target descriptor"
+    );
+    assert_eq!(reentry_snapshot.x[4], verifier.entry().host().raw() as u64);
+    assert_ne!(reentry_snapshot.x[0], target_range.0 as u64);
+    assert_ne!(reentry_snapshot.x[1], target_range.1 as u64);
+    assert_ne!(
+        reentry_snapshot.x[2],
+        target_bindings.as_ptr() as usize as u64
+    );
+    assert_ne!(reentry_snapshot.x[3], partial_descriptor);
+}
+
+#[test]
+fn direct_binding_reentry_after_cache_range_store_discards_partial_target() {
+    direct_binding_reentry_after_partial_authority_install(&[
+        0x9112_638e, // add x14, x28, #1176
+        0xa900_79cf, // stp x15, x30, [x14]
+    ]);
+}
+
+#[test]
+fn direct_binding_reentry_after_generation_store_discards_partial_target() {
+    direct_binding_reentry_after_partial_authority_install(&[
+        0xf902_7b91, // target generation bindings
+    ]);
+}
+
+#[test]
+fn direct_binding_reentry_after_descriptor_store_discards_partial_target() {
+    direct_binding_reentry_after_partial_authority_install(&[
+        0xf902_8b8d, // target descriptor pointer from x13
+    ]);
+}
+
 #[test]
 fn portable_direct_branch_chains_through_published_target_authority() {
     assert_portable_direct_block_chains_through_published_target_authority(
@@ -3787,7 +3929,1218 @@ fn shared_to_private_indirect_cache_hit_installs_target_authority() {
 }
 
 #[test]
-fn stale_target_translation_rebinds_and_then_hits_the_real_sidecar_cell() {
+fn indirect_authority_switch_jittered_sigpipe_never_becomes_entry_kick() {
+    use carrick_dsr_aarch64::shared_cache::{
+        AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
+        ImageFileOffset, NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate,
+        PublishOutcome, SharedExecutableSegment, SharedImageConfig, SharedLoadedTranslationUnit,
+        SourceFingerprint, TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V2,
+        TranslationUnitKey, TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
+    };
+
+    struct FixtureStore(SharedLoadedTranslationUnit);
+    impl TranslationUnitStore for FixtureStore {
+        fn load(
+            &self,
+            _key: &TranslationUnitKey,
+            _source_words: &[u32],
+        ) -> Result<Option<SharedLoadedTranslationUnit>, UnitMissReason> {
+            Ok(Some(self.0.clone()))
+        }
+
+        fn publish(
+            &self,
+            _pending: &PendingTranslationUnit,
+        ) -> Result<PublishOutcome, UnitMissReason> {
+            Ok(PublishOutcome::Existing)
+        }
+    }
+
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    let words = [0xd61f_0020, 0xd61f_0040]; // br x1 ; br x2
+    let source = GuestVa(0x20_0000_0000);
+    let target = GuestVa(source.raw() + 4);
+    let mut fixture = biased_translator_fixture(&words, source);
+    let generation = fixture
+        .memory
+        .dsr_generation_observation(source)
+        .expect("observe indirect authority-switch generation")
+        .expected();
+    let source_plan = super::block::plan_block(&fixture.memory, source, generation, 256)
+        .expect("plan shared indirect source");
+    let artifact = super::emit::record_portable_block_artifact(
+        &source_plan,
+        0,
+        super::emit::EmitAddressMode::Biased {
+            host_bias: fixture.host_bias,
+        },
+        vec![words[0]],
+    )
+    .expect("record shared indirect source");
+    let key = TranslationUnitKey::for_segment(
+        ExecutableIdentity::Digest([0x79; 32]),
+        ImageFileOffset::new(0),
+        ImageFileLen::new(4).expect("nonzero file length"),
+        source,
+        GuestCodeLen::new(4).expect("nonzero guest length"),
+        SourceFingerprint::from_words(&words[..1]),
+        NativePageProfileIdentity::Native16k,
+        AddressModeIdentity::biased(fixture.host_bias),
+    );
+    let pending = PendingTranslationUnit::pack(
+        key.clone(),
+        vec![PortableBlockCandidate {
+            guest_start: source,
+            generation_binding: 0,
+            requires_sensitive_metadata: false,
+            template: artifact.template,
+        }],
+        DirectBindingLayout::Disabled,
+    )
+    .expect("pack shared indirect source");
+    let code_words = pending
+        .code
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect::<Vec<_>>();
+    let cache = Arc::new(parking_lot::Mutex::new(
+        TranslationCache::new(
+            64 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("allocate shared indirect source cache"),
+    ));
+    let emitted = cache
+        .lock()
+        .publish_words(&code_words)
+        .expect("publish shared indirect source");
+    let manifest = TranslationUnitManifest {
+        schema: TRANSLATION_UNIT_SCHEMA_V2,
+        key: key.clone(),
+        dylib_sha256: [0x89; 32],
+        base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+        code_len: pending.code.len() as u64,
+        blocks: pending.blocks,
+        binding_layout: pending.binding_layout,
+        binding_export: pending.binding_export,
+        binding_data_len: pending.binding_data_len,
+        cell_size: pending.cell_size,
+        bindings: pending.bindings,
+        binding_relocations: pending.binding_relocations,
+    };
+    let base = emitted.entry().host().raw();
+    let lease: Arc<dyn Send + Sync> = cache;
+    fixture
+        .translator
+        .process
+        .configure_shared_image(
+            SharedImageConfig {
+                executable: ExecutableIdentity::Digest([0x79; 32]),
+                page_profile: NativePageProfileIdentity::Native16k,
+                address_mode: AddressModeIdentity::biased(fixture.host_bias),
+                segments: vec![SharedExecutableSegment {
+                    file_offset: ImageFileOffset::new(0),
+                    file_len: ImageFileLen::new(4).expect("nonzero file length"),
+                    guest_start: source,
+                    guest_len: GuestCodeLen::new(4).expect("nonzero guest length"),
+                    source_words: words[..1].to_vec().into(),
+                }],
+            },
+            Arc::new(FixtureStore(SharedLoadedTranslationUnit::new(
+                manifest, base, lease,
+            ))),
+        )
+        .expect("configure shared indirect source");
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut warm = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    warm.pc = source.raw();
+    warm.x[1] = target.raw();
+    warm.x[2] = source.raw();
+    let source_prepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &warm)
+        .expect("prepare shared indirect source miss");
+    let source_exit = fixture
+        .translator
+        .enter_prepared::<false>(source_prepared, &mut warm)
+        .expect("execute shared indirect source miss");
+    assert!(matches!(
+        source_exit.exit,
+        NativeDsrExit::ResolveIndirect {
+            source: observed_source,
+            target: observed_target,
+            ..
+        } if observed_source == source && observed_target == target
+    ));
+    assert!(matches!(
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut warm, source_prepared, source_exit,)
+            .expect("publish private indirect target"),
+        super::ThreadExit::Continue
+    ));
+
+    warm.pc = target.raw();
+    let target_prepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &warm)
+        .expect("prepare private indirect target miss");
+    let target_exit = fixture
+        .translator
+        .enter_prepared::<false>(target_prepared, &mut warm)
+        .expect("execute private indirect target miss");
+    assert!(matches!(
+        target_exit.exit,
+        NativeDsrExit::ResolveIndirect {
+            source: observed_source,
+            target: observed_target,
+            ..
+        } if observed_source == target && observed_target == source
+    ));
+    assert!(matches!(
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut warm, target_prepared, target_exit,)
+            .expect("publish shared indirect source target"),
+        super::ThreadExit::Continue
+    ));
+
+    let target_thread = unsafe { libc::pthread_self() };
+    let mut signal_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    let mut old_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    assert_eq!(unsafe { libc::sigemptyset(signal_set.as_mut_ptr()) }, 0);
+    let mut signal_set = unsafe { signal_set.assume_init() };
+    assert_eq!(
+        unsafe { libc::sigaddset(&mut signal_set, libc::SIGPIPE) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signal_set, old_set.as_mut_ptr()) },
+        0
+    );
+    let old_set = unsafe { old_set.assume_init() };
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<usize>();
+    let (delivered_tx, delivered_rx) = std::sync::mpsc::channel::<()>();
+    let sender = std::thread::spawn(move || {
+        while let Ok(signal_index) = request_rx.recv() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            for _ in 0..(signal_index.wrapping_mul(911) % 4096) {
+                std::hint::spin_loop();
+            }
+            assert_eq!(
+                unsafe { libc::pthread_kill(target_thread, libc::SIGPIPE) },
+                0
+            );
+            if delivered_tx.send(()).is_err() {
+                break;
+            }
+        }
+    });
+
+    const SIGNAL_BOUND: usize = 64;
+    for signal_index in 0..SIGNAL_BOUND {
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = source.raw();
+        snapshot.x[1] = target.raw();
+        snapshot.x[2] = source.raw();
+        snapshot.x[15] = 0x1515_1515_1515_1515;
+        snapshot.x[16] = 0x1616_1616_1616_1616;
+        snapshot.x[17] = 0x1717_1717_1717_1717;
+        snapshot.x[30] = 0x3030_3030_3030_3030;
+        snapshot.pstate = 0xa000_0000;
+        let expected = snapshot;
+        let prepared = fixture
+            .translator
+            .prepare_entry::<false>(&fixture.memory, &snapshot)
+            .expect("prepare hot indirect authority-switch loop");
+        request_tx
+            .send(signal_index)
+            .expect("request bounded indirect SIGPIPE");
+        let entered = fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("enter hot indirect authority-switch loop");
+        delivered_rx
+            .recv()
+            .expect("observe bounded indirect SIGPIPE delivery");
+        assert!(
+            matches!(entered.exit, NativeDsrExit::Kick { .. }),
+            "catalogued indirect authority switch became an entry kick: {:?}",
+            entered.exit
+        );
+        assert!(matches!(
+            fixture
+                .translator
+                .finish_exit(&fixture.memory, &mut snapshot, prepared, entered)
+                .expect("recover indirect authority-switch kick"),
+            super::ThreadExit::Kick
+        ));
+        assert!(
+            snapshot.pc == source.raw() || snapshot.pc == target.raw(),
+            "indirect recovery resumed outside an edge owner: 0x{:x}",
+            snapshot.pc
+        );
+        assert_eq!(snapshot.x[15], expected.x[15]);
+        assert_eq!(snapshot.x[16], expected.x[16]);
+        assert_eq!(snapshot.x[17], expected.x[17]);
+        assert_eq!(snapshot.x[30], expected.x[30]);
+        assert_eq!(snapshot.pstate, expected.pstate);
+    }
+
+    drop(request_tx);
+    sender.join().expect("join bounded indirect SIGPIPE sender");
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, std::ptr::null_mut()) },
+        0
+    );
+}
+
+struct DirectBindingLiveFixture {
+    fixture: BiasedTranslatorFixture,
+    source: GuestVa,
+    target: GuestVa,
+    source_cell: Option<carrick_dsr_aarch64::direct_binding::DirectBindingCellRef>,
+    target_cell: Option<carrick_dsr_aarch64::direct_binding::DirectBindingCellRef>,
+    _source_loaded: Option<carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit>,
+    _target_loaded: Option<carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit>,
+    _cache_session: carrick_native_darwin::aot_cache::ContainerCacheSession,
+    stack: Vec<u8>,
+}
+
+impl DirectBindingLiveFixture {
+    fn traverse(&mut self, guest: GuestVa) -> NativeDsrExit {
+        let mut snapshot =
+            seeded_snapshot(self.stack.as_mut_ptr() as u64 + self.stack.len() as u64);
+        snapshot.pc = guest.raw();
+        let prepared = self
+            .fixture
+            .translator
+            .prepare_entry::<false>(&self.fixture.memory, &snapshot)
+            .expect("prepare live direct-binding source");
+        let entered = self
+            .fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("enter live direct-binding source");
+        let observed = entered.exit;
+        if matches!(observed, NativeDsrExit::ResolveDirect { .. }) {
+            assert!(matches!(
+                self.fixture
+                    .translator
+                    .finish_exit(&self.fixture.memory, &mut snapshot, prepared, entered)
+                    .expect("finish live direct-binding miss"),
+                super::ThreadExit::Continue
+            ));
+        }
+        observed
+    }
+
+    fn traverse_source(&mut self) -> NativeDsrExit {
+        self.traverse(self.source)
+    }
+}
+
+fn direct_binding_live_fixture(
+    source_shared: bool,
+    target_shared: bool,
+    cyclic: bool,
+) -> DirectBindingLiveFixture {
+    use carrick_dsr_aarch64::direct_binding::DirectBindingCellRef;
+    use carrick_dsr_aarch64::shared_cache::{
+        AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
+        ImageFileOffset, NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate,
+        PublishOutcome, SharedExecutableSegment, SharedImageConfig, SourceFingerprint,
+        TranslationUnitKey, TranslationUnitStore,
+    };
+
+    const PAGE_SIZE: u64 = 16 * 1024;
+    let source_word = 0x1400_1000; // b +16 KiB
+    let target_word = if cyclic {
+        0x17ff_f000 // b -16 KiB
+    } else {
+        0xd400_0001 // svc #0
+    };
+    let source = GuestVa(0x20_0000_0000);
+    let target = GuestVa(source.raw() + PAGE_SIZE);
+    let mut fixture = biased_translator_fixture(&[source_word], source);
+    fixture.memory.regions[1].guest_writable = false;
+    fixture.memory.regions[1].default_prot =
+        crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC;
+    // SAFETY: `data_host` owns the second live writable fixture page.
+    unsafe { (fixture.data_host.raw() as *mut u32).write(target_word) };
+    fixture.translator.process.enable_direct_bindings_for_test();
+
+    let source_generation = fixture
+        .memory
+        .dsr_generation_observation(source)
+        .expect("observe live source generation")
+        .expected();
+    let target_generation = fixture
+        .memory
+        .dsr_generation_observation(target)
+        .expect("observe live target generation")
+        .expected();
+    let source_plan = super::block::plan_block(&fixture.memory, source, source_generation, 256)
+        .expect("plan live direct-binding source");
+    let target_plan = super::block::plan_block(&fixture.memory, target, target_generation, 256)
+        .expect("plan live direct-binding target");
+    let source_artifact = super::emit::record_portable_block_artifact(
+        &source_plan,
+        0,
+        super::emit::EmitAddressMode::Biased {
+            host_bias: fixture.host_bias,
+        },
+        vec![source_word],
+    )
+    .expect("record live direct-binding source");
+    let target_artifact = super::emit::record_portable_block_artifact(
+        &target_plan,
+        0,
+        super::emit::EmitAddressMode::Biased {
+            host_bias: fixture.host_bias,
+        },
+        vec![target_word],
+    )
+    .expect("record live direct-binding target");
+    let executable = ExecutableIdentity::Digest([0xd1; 32]);
+    let source_key = TranslationUnitKey::for_segment(
+        executable.clone(),
+        ImageFileOffset::new(0),
+        ImageFileLen::new(4).expect("source file length"),
+        source,
+        GuestCodeLen::new(4).expect("source guest length"),
+        SourceFingerprint::from_words(&[source_word]),
+        NativePageProfileIdentity::Native16k,
+        AddressModeIdentity::biased(fixture.host_bias),
+    );
+    let target_key = TranslationUnitKey::for_segment(
+        executable.clone(),
+        ImageFileOffset::new(4),
+        ImageFileLen::new(4).expect("target file length"),
+        target,
+        GuestCodeLen::new(4).expect("target guest length"),
+        SourceFingerprint::from_words(&[target_word]),
+        NativePageProfileIdentity::Native16k,
+        AddressModeIdentity::biased(fixture.host_bias),
+    );
+    let source_pending = PendingTranslationUnit::pack(
+        source_key.clone(),
+        vec![PortableBlockCandidate {
+            guest_start: source,
+            generation_binding: 0,
+            requires_sensitive_metadata: false,
+            template: source_artifact.template,
+        }],
+        DirectBindingLayout::SidecarV1,
+    )
+    .expect("pack live direct-binding source");
+    let target_pending = PendingTranslationUnit::pack(
+        target_key,
+        vec![PortableBlockCandidate {
+            guest_start: target,
+            generation_binding: 0,
+            requires_sensitive_metadata: false,
+            template: target_artifact.template,
+        }],
+        if cyclic {
+            DirectBindingLayout::SidecarV1
+        } else {
+            DirectBindingLayout::Disabled
+        },
+    )
+    .expect("pack live direct-binding target");
+    assert_eq!(source_pending.bindings.len(), 1);
+
+    let cache_session = carrick_native_darwin::aot_cache::begin_container_cache()
+        .expect("begin live sidecar cache");
+    let store = Arc::new(carrick_native_darwin::aot_cache::ActiveContainerUnitStore);
+    if source_shared {
+        assert_eq!(
+            store
+                .publish(&source_pending)
+                .expect("publish live direct-binding source"),
+            PublishOutcome::Winner
+        );
+    }
+    if target_shared {
+        assert_eq!(
+            store
+                .publish(&target_pending)
+                .expect("publish live direct-binding target"),
+            PublishOutcome::Winner
+        );
+    }
+    let source_loaded = if source_shared {
+        Some(
+            store
+                .load(&source_key, &[source_word])
+                .expect("load live direct-binding source")
+                .expect("published live direct-binding source"),
+        )
+    } else {
+        None
+    };
+    let source_cell = source_loaded
+        .as_ref()
+        .and_then(|loaded| loaded.binding_base)
+        .map(|address| {
+            // SAFETY: `_source_loaded` pins the writable mapped sidecar cell for
+            // the lifetime of this fixture and all copied adapters.
+            unsafe {
+                DirectBindingCellRef::from_mapped_address(address)
+                    .expect("adapt live direct-binding cell")
+            }
+        });
+    let target_loaded = if target_shared && cyclic {
+        Some(
+            store
+                .load(
+                    &TranslationUnitKey::for_segment(
+                        executable.clone(),
+                        ImageFileOffset::new(4),
+                        ImageFileLen::new(4).expect("target file length"),
+                        target,
+                        GuestCodeLen::new(4).expect("target guest length"),
+                        SourceFingerprint::from_words(&[target_word]),
+                        NativePageProfileIdentity::Native16k,
+                        AddressModeIdentity::biased(fixture.host_bias),
+                    ),
+                    &[target_word],
+                )
+                .expect("load live cyclic target")
+                .expect("published live cyclic target"),
+        )
+    } else {
+        None
+    };
+    let target_cell = target_loaded
+        .as_ref()
+        .and_then(|loaded| loaded.binding_base)
+        .map(|address| {
+            // SAFETY: `_target_loaded` pins this mapped writable cell.
+            unsafe {
+                DirectBindingCellRef::from_mapped_address(address)
+                    .expect("adapt live cyclic target cell")
+            }
+        });
+    if let Some(cell) = source_cell {
+        assert!(cell.load_acquire().is_null());
+    }
+    fixture
+        .translator
+        .process
+        .configure_shared_image(
+            SharedImageConfig {
+                executable,
+                page_profile: NativePageProfileIdentity::Native16k,
+                address_mode: AddressModeIdentity::biased(fixture.host_bias),
+                segments: vec![
+                    SharedExecutableSegment {
+                        file_offset: ImageFileOffset::new(0),
+                        file_len: ImageFileLen::new(4).expect("source file length"),
+                        guest_start: source,
+                        guest_len: GuestCodeLen::new(4).expect("source guest length"),
+                        source_words: vec![source_word].into(),
+                    },
+                    SharedExecutableSegment {
+                        file_offset: ImageFileOffset::new(4),
+                        file_len: ImageFileLen::new(4).expect("target file length"),
+                        guest_start: target,
+                        guest_len: GuestCodeLen::new(4).expect("target guest length"),
+                        source_words: vec![target_word].into(),
+                    },
+                ],
+            },
+            store,
+        )
+        .expect("configure live direct-binding image");
+
+    DirectBindingLiveFixture {
+        fixture,
+        source,
+        target,
+        source_cell,
+        target_cell,
+        _source_loaded: source_loaded,
+        _target_loaded: target_loaded,
+        _cache_session: cache_session,
+        stack: vec![0_u8; 16 * 1024],
+    }
+}
+
+#[test]
+fn direct_binding_private_to_shared_switch_executes() {
+    let mut fixture = direct_binding_live_fixture(false, true, false);
+    assert!(matches!(
+        fixture.traverse_source(),
+        NativeDsrExit::ResolveDirect {
+            source,
+            target,
+            binding: None,
+        } if source == fixture.source && target == fixture.target
+    ));
+    assert_eq!(
+        fixture.traverse_source(),
+        NativeDsrExit::Syscall {
+            resume: GuestVa(fixture.target.raw() + 4),
+        },
+        "the private source's cached direct edge must install the shared target authority"
+    );
+}
+
+#[test]
+fn direct_binding_shared_to_shared_switch_executes() {
+    let mut fixture = direct_binding_live_fixture(true, true, false);
+    assert!(matches!(
+        fixture.traverse_source(),
+        NativeDsrExit::ResolveDirect {
+            source,
+            target,
+            binding: Some(_),
+        } if source == fixture.source && target == fixture.target
+    ));
+    assert!(
+        !fixture
+            .source_cell
+            .expect("shared source cell")
+            .load_acquire()
+            .is_null()
+    );
+    assert_eq!(
+        fixture.traverse_source(),
+        NativeDsrExit::Syscall {
+            resume: GuestVa(fixture.target.raw() + 4),
+        },
+        "the sidecar hit must install the target shared unit's authority"
+    );
+}
+
+#[test]
+fn direct_binding_first_miss_then_hit_bypasses_gateway() {
+    let mut fixture = direct_binding_live_fixture(true, false, false);
+    let cell = fixture.source_cell.expect("shared source cell");
+    assert!(cell.load_acquire().is_null());
+    assert!(matches!(
+        fixture.traverse_source(),
+        NativeDsrExit::ResolveDirect {
+            source,
+            target,
+            binding: Some(_),
+        } if source == fixture.source && target == fixture.target
+    ));
+    assert!(!cell.load_acquire().is_null());
+    assert_eq!(
+        fixture.traverse_source(),
+        NativeDsrExit::Syscall {
+            resume: GuestVa(fixture.target.raw() + 4),
+        },
+        "the second traversal must bypass the direct resolver gateway"
+    );
+}
+
+fn direct_binding_recovery_for_cache_pc(
+    fixture: &DirectBindingLiveFixture,
+    cache_pc: GuestVa,
+) -> Option<(super::emit::DirectBindingRecoveryPhase, usize)> {
+    let cache_pc = usize::try_from(cache_pc.raw()).ok()?;
+    let state = fixture.fixture.translator.process.state.read();
+    state.published.iter().find_map(|block| {
+        let offset = cache_pc.checked_sub(block.entry.host().raw())?;
+        if offset >= block.len {
+            return None;
+        }
+        let offset = u32::try_from(offset).ok()?;
+        let sidecar_start = block
+            .recovery
+            .iter()
+            .filter_map(|entry| {
+                matches!(
+                    entry.action,
+                    super::emit::RecoveryAction::RestoreDirectBinding { .. }
+                )
+                .then_some(entry.cache.get())
+            })
+            .min()?;
+        block
+            .recovery
+            .iter()
+            .find(|entry| entry.cache.get() == offset)
+            .and_then(|entry| match entry.action {
+                super::emit::RecoveryAction::RestoreDirectBinding { phase, .. } => {
+                    Some((phase, usize::try_from((offset - sidecar_start) / 4).ok()?))
+                }
+                _ => None,
+            })
+    })
+}
+
+fn direct_binding_phase_index(phase: super::emit::DirectBindingRecoveryPhase) -> usize {
+    match phase {
+        super::emit::DirectBindingRecoveryPhase::ScratchCapture => 0,
+        super::emit::DirectBindingRecoveryPhase::CellAddress => 1,
+        super::emit::DirectBindingRecoveryPhase::TargetAcquire => 2,
+        super::emit::DirectBindingRecoveryPhase::AuthorityValidate => 3,
+        super::emit::DirectBindingRecoveryPhase::AuthorityInstall => 4,
+        super::emit::DirectBindingRecoveryPhase::ArchitecturalRestore => 5,
+        super::emit::DirectBindingRecoveryPhase::FinalBranch => 6,
+        super::emit::DirectBindingRecoveryPhase::MissExit => 7,
+    }
+}
+
+fn direct_binding_sigpipe_sample(
+    fixture: &mut DirectBindingLiveFixture,
+    request: &std::sync::mpsc::Sender<usize>,
+    delivered: &std::sync::mpsc::Receiver<()>,
+    entry_override: Option<(super::types::CacheVa, u64, u64)>,
+    signal_index: usize,
+) -> Option<(super::emit::DirectBindingRecoveryPhase, usize)> {
+    let mut snapshot =
+        seeded_snapshot(fixture.stack.as_mut_ptr() as u64 + fixture.stack.len() as u64);
+    snapshot.pc = fixture.source.raw();
+    snapshot.x[15] = 0x1515_1515_1515_1515;
+    snapshot.x[16] = 0x1616_1616_1616_1616;
+    snapshot.x[17] = 0x1717_1717_1717_1717;
+    snapshot.x[30] = 0x3030_3030_3030_3030;
+    snapshot.pstate = 0xa000_0000;
+    let expected = snapshot;
+    let mut prepared = fixture
+        .fixture
+        .translator
+        .prepare_entry::<false>(&fixture.fixture.memory, &snapshot)
+        .expect("prepare jittered sidecar entry");
+    if let Some((entry, x0, x1)) = entry_override {
+        prepared.entry = entry;
+        snapshot.x[0] = x0;
+        snapshot.x[1] = x1;
+    }
+    request.send(signal_index).expect("request bounded SIGPIPE");
+    let entered = fixture
+        .fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("enter jittered sidecar loop");
+    delivered.recv().expect("observe bounded SIGPIPE delivery");
+    let phase = match entered.exit {
+        NativeDsrExit::Kick { resume, .. } => direct_binding_recovery_for_cache_pc(fixture, resume),
+        NativeDsrExit::KickAtEntry { .. } => None,
+        other => panic!("jittered sidecar must exit through a kick: {other:?}"),
+    };
+    assert!(matches!(
+        fixture
+            .fixture
+            .translator
+            .finish_exit(&fixture.fixture.memory, &mut snapshot, prepared, entered,)
+            .expect("finish jittered sidecar kick"),
+        super::ThreadExit::Kick
+    ));
+    assert!(
+        matches!(snapshot.pc, pc if pc == fixture.source.raw() || pc == fixture.target.raw()),
+        "recovery must resume at a guest edge owner, not inside the sidecar: 0x{:x}",
+        snapshot.pc
+    );
+    assert_eq!(snapshot.x[15], expected.x[15]);
+    assert_eq!(snapshot.x[16], expected.x[16]);
+    assert_eq!(snapshot.x[17], expected.x[17]);
+    assert_eq!(snapshot.x[30], expected.x[30]);
+    assert_eq!(snapshot.pstate, expected.pstate);
+    phase
+}
+
+#[test]
+fn direct_binding_jittered_sigpipe_recovers_every_preamble_phase() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    let mut fixture = direct_binding_live_fixture(true, true, true);
+    assert!(matches!(
+        fixture.traverse(fixture.source),
+        NativeDsrExit::ResolveDirect {
+            source,
+            target,
+            binding: Some(_),
+        } if source == fixture.source && target == fixture.target
+    ));
+    assert!(matches!(
+        fixture.traverse(fixture.target),
+        NativeDsrExit::ResolveDirect {
+            source,
+            target,
+            binding: Some(_),
+        } if source == fixture.target && target == fixture.source
+    ));
+    let source_cell = fixture.source_cell.expect("cyclic source cell");
+    let target_cell = fixture.target_cell.expect("cyclic target cell");
+    assert!(!source_cell.load_acquire().is_null());
+    assert!(!target_cell.load_acquire().is_null());
+
+    let target_thread = unsafe { libc::pthread_self() };
+    let mut signal_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    let mut old_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    assert_eq!(unsafe { libc::sigemptyset(signal_set.as_mut_ptr()) }, 0);
+    let mut signal_set = unsafe { signal_set.assume_init() };
+    assert_eq!(
+        unsafe { libc::sigaddset(&mut signal_set, libc::SIGPIPE) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signal_set, old_set.as_mut_ptr()) },
+        0
+    );
+    let old_set = unsafe { old_set.assume_init() };
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<usize>();
+    let (delivered_tx, delivered_rx) = std::sync::mpsc::channel::<()>();
+    let sender = std::thread::spawn(move || {
+        while let Ok(signal_index) = request_rx.recv() {
+            let jitter = signal_index.wrapping_mul(997);
+            std::thread::sleep(std::time::Duration::from_micros(
+                25 + u64::try_from(jitter % 476).expect("bounded delay"),
+            ));
+            for _ in 0..(jitter % 65_536) {
+                std::hint::spin_loop();
+            }
+            assert_eq!(
+                unsafe { libc::pthread_kill(target_thread, libc::SIGPIPE) },
+                0
+            );
+            if delivered_tx.send(()).is_err() {
+                break;
+            }
+        }
+    });
+
+    const SIGNAL_BOUND: usize = 10_000;
+    let mut covered = [false; 8];
+    let mut recovered_words = [0_u32; 64];
+    let mut signals = 0;
+    while !covered[..7].iter().all(|covered| *covered) && signals + 1 < SIGNAL_BOUND {
+        if let Some((phase, word)) =
+            direct_binding_sigpipe_sample(&mut fixture, &request_tx, &delivered_rx, None, signals)
+        {
+            covered[direct_binding_phase_index(phase)] = true;
+            recovered_words[word] = recovered_words[word].saturating_add(1);
+        }
+        signals += 1;
+    }
+
+    source_cell.clear_release();
+    let (source_entry, miss_entry) = {
+        let state = fixture.fixture.translator.process.state.read();
+        let block = state
+            .published
+            .iter()
+            .find(|block| {
+                state
+                    .blocks
+                    .get(&(fixture.source, CodeGeneration::INITIAL))
+                    .is_some_and(|entry| *entry == block.entry)
+            })
+            .expect("published cyclic source block");
+        let miss = block
+            .recovery
+            .iter()
+            .find_map(|entry| match entry.action {
+                super::emit::RecoveryAction::RestoreDirectBinding {
+                    phase: super::emit::DirectBindingRecoveryPhase::MissExit,
+                    ..
+                } => block
+                    .entry
+                    .host()
+                    .raw()
+                    .checked_add(entry.cache.get() as usize),
+                _ => None,
+            })
+            .expect("source sidecar miss entry");
+        (block.entry, miss)
+    };
+    let mut trampoline_cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate miss-loop trampoline");
+    let trampoline = trampoline_cache
+        .publish_words(&[
+            0xf902_6780, // str x0, [x28, #1224] -- redirect direct exit
+            0xd61f_0020, // br x1 -- enter the source sidecar
+        ])
+        .expect("publish miss-loop trampoline");
+    while !covered[direct_binding_phase_index(super::emit::DirectBindingRecoveryPhase::MissExit)]
+        && signals < SIGNAL_BOUND
+    {
+        if let Some((phase, word)) = direct_binding_sigpipe_sample(
+            &mut fixture,
+            &request_tx,
+            &delivered_rx,
+            Some((
+                trampoline.entry(),
+                miss_entry as u64,
+                source_entry.host().raw() as u64,
+            )),
+            signals,
+        ) {
+            covered[direct_binding_phase_index(phase)] = true;
+            recovered_words[word] = recovered_words[word].saturating_add(1);
+        }
+        signals += 1;
+    }
+
+    drop(request_tx);
+    sender.join().expect("join bounded SIGPIPE sender");
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, std::ptr::null_mut()) },
+        0
+    );
+    eprintln!(
+        "direct-binding jitter coverage: covered={covered:?} \
+         recovered_words={recovered_words:?} signals={signals}"
+    );
+    let authority_install =
+        direct_binding_phase_index(super::emit::DirectBindingRecoveryPhase::AuthorityInstall);
+    assert!(
+        covered
+            .iter()
+            .enumerate()
+            .all(|(index, covered)| index == authority_install || *covered),
+        "10,000-signal broad control missed a phase outside the separately forced \
+         AuthorityInstall lane: \
+         covered={covered:?} recovered_words={recovered_words:?} signals={signals}"
+    );
+    assert!(signals <= SIGNAL_BOUND);
+}
+
+struct SuspendedMachThread {
+    port: mach2::mach_types::thread_act_t,
+    active: bool,
+}
+
+impl SuspendedMachThread {
+    fn suspend(port: mach2::mach_types::thread_act_t) -> Result<Self, String> {
+        let status = unsafe { mach2::thread_act::thread_suspend(port) };
+        if status != mach2::kern_return::KERN_SUCCESS {
+            return Err(format!("thread_suspend failed: {status}"));
+        }
+        Ok(Self { port, active: true })
+    }
+
+    fn resume(mut self) -> Result<(), String> {
+        let status = unsafe { mach2::thread_act::thread_resume(self.port) };
+        self.active = false;
+        if status != mach2::kern_return::KERN_SUCCESS {
+            return Err(format!("thread_resume failed: {status}"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SuspendedMachThread {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = unsafe { mach2::thread_act::thread_resume(self.port) };
+        }
+    }
+}
+
+fn direct_binding_sidecar_start(fixture: &DirectBindingLiveFixture, guest: GuestVa) -> usize {
+    let state = fixture.fixture.translator.process.state.read();
+    let block = state
+        .published
+        .iter()
+        .find(|block| {
+            state
+                .blocks
+                .get(&(guest, CodeGeneration::INITIAL))
+                .is_some_and(|entry| *entry == block.entry)
+        })
+        .expect("published direct-binding block");
+    let recovery_start = block
+        .recovery
+        .iter()
+        .filter_map(|entry| {
+            matches!(
+                entry.action,
+                super::emit::RecoveryAction::RestoreDirectBinding { .. }
+            )
+            .then_some(entry.cache.get())
+        })
+        .min()
+        .expect("direct-binding recovery start");
+    block
+        .entry
+        .host()
+        .raw()
+        .checked_add(recovery_start as usize)
+        .expect("direct-binding sidecar address")
+}
+
+fn cmp_nzcv(lhs: u64, rhs: u64) -> u32 {
+    let result = lhs.wrapping_sub(rhs);
+    let negative = u32::from(result >> 63 != 0) << 31;
+    let zero = u32::from(result == 0) << 30;
+    let carry = u32::from(lhs >= rhs) << 29;
+    let overflow = u32::from(((lhs ^ rhs) & (lhs ^ result)) >> 63 != 0) << 28;
+    negative | zero | carry | overflow
+}
+
+fn force_direct_binding_word20_sigpipe(
+    pthread: libc::pthread_t,
+    mach_thread: mach2::mach_types::thread_act_t,
+    sidecar_starts: [usize; 2],
+    remove_catalog: bool,
+) -> Result<usize, String> {
+    const VALIDATE_WORD: usize = 14;
+    const FORCED_WORD: usize = 20;
+    const GENERATION_BINDINGS_OFFSET: usize = 1264;
+    const CACHE_START_OFFSET: usize = 1176;
+    const CACHE_END_OFFSET: usize = 1184;
+    const EXECUTABLE_RANGE_CATALOG_OFFSET: usize = 1304;
+
+    let fail_with_live_kick = |error: String| {
+        let _ = unsafe { libc::pthread_kill(pthread, libc::SIGPIPE) };
+        Err(error)
+    };
+    for attempt in 0_usize..100_000 {
+        let suspended = match SuspendedMachThread::suspend(mach_thread) {
+            Ok(suspended) => suspended,
+            Err(error) => return fail_with_live_kick(error),
+        };
+        let mut state = mach2::structs::arm_thread_state64_t::new();
+        let mut count = mach2::structs::arm_thread_state64_t::count();
+        let get_status = unsafe {
+            mach2::thread_act::thread_get_state(
+                mach_thread,
+                mach2::thread_status::ARM_THREAD_STATE64,
+                std::ptr::from_mut(&mut state).cast(),
+                &mut count,
+            )
+        };
+        if get_status != mach2::kern_return::KERN_SUCCESS {
+            suspended.resume()?;
+            return fail_with_live_kick(format!("thread_get_state failed: {get_status}"));
+        }
+        let Some(sidecar_start) = sidecar_starts
+            .into_iter()
+            .find(|start| state.__pc as usize == start + VALIDATE_WORD * 4)
+        else {
+            suspended.resume()?;
+            if attempt.is_multiple_of(256) {
+                std::thread::yield_now();
+            }
+            continue;
+        };
+
+        let descriptor =
+            state.__x[17] as *const carrick_dsr_aarch64::direct_binding::DirectBindingTargetPrefix;
+        let Some(prefix) = (unsafe { descriptor.as_ref() }) else {
+            suspended.resume()?;
+            return fail_with_live_kick(
+                "word 14 did not retain a live direct-binding descriptor".to_string(),
+            );
+        };
+        if state.__x[15] != prefix.cache_start
+            || state.__lr != prefix.cache_end
+            || state.__x[16] != prefix.target_cache_pc
+            || state.__x[16] < state.__x[15]
+            || state.__x[16] >= state.__lr
+        {
+            suspended.resume()?;
+            return fail_with_live_kick(
+                "word 14 register state did not match validated target authority".to_string(),
+            );
+        }
+
+        // Emulate the unchanged real instructions from pre-word 14 through
+        // pre-word 20 while the live thread is suspended:
+        // 14 `cmp x16, x30`; 15 non-taken `b.hs`; 16 generation-pointer load;
+        // 17 generation-pointer store; 18 cache-pair address; 19 pair store.
+        state.__cpsr = (state.__cpsr & 0x0fff_ffff) | cmp_nzcv(state.__x[16], state.__lr);
+        state.__x[17] = prefix.generation_bindings;
+        let context = state.__x[28] as usize;
+        if context == 0 {
+            suspended.resume()?;
+            return fail_with_live_kick("word 14 lost the live DSR context".to_string());
+        }
+        unsafe {
+            (context
+                .checked_add(GENERATION_BINDINGS_OFFSET)
+                .expect("context generation pointer") as *mut u64)
+                .write(state.__x[17]);
+        }
+        state.__x[17] = context
+            .checked_add(CACHE_START_OFFSET)
+            .expect("context cache range") as u64;
+        unsafe {
+            (context
+                .checked_add(CACHE_START_OFFSET)
+                .expect("context cache start") as *mut u64)
+                .write(state.__x[15]);
+            (context
+                .checked_add(CACHE_END_OFFSET)
+                .expect("context cache end") as *mut u64)
+                .write(state.__lr);
+        }
+        if remove_catalog {
+            unsafe {
+                (context
+                    .checked_add(EXECUTABLE_RANGE_CATALOG_OFFSET)
+                    .expect("context executable catalog") as *mut usize)
+                    .write(0);
+            }
+        }
+        let forced_pc = sidecar_start
+            .checked_add(FORCED_WORD * 4)
+            .expect("forced direct-binding word");
+        state.__pc = forced_pc as u64;
+        let set_status = unsafe {
+            mach2::thread_act::thread_set_state(
+                mach_thread,
+                mach2::thread_status::ARM_THREAD_STATE64,
+                std::ptr::from_mut(&mut state).cast(),
+                count,
+            )
+        };
+        if set_status != mach2::kern_return::KERN_SUCCESS {
+            suspended.resume()?;
+            return fail_with_live_kick(format!("thread_set_state failed: {set_status}"));
+        }
+        let kill_status = unsafe { libc::pthread_kill(pthread, libc::SIGPIPE) };
+        suspended.resume()?;
+        if kill_status != 0 {
+            return Err(format!("pthread_kill(SIGPIPE) failed: {kill_status}"));
+        }
+        return Ok(forced_pc);
+    }
+    fail_with_live_kick("could not suspend the live sidecar at word 14".to_string())
+}
+
+#[test]
+fn direct_binding_forced_word20_sigpipe_discriminates_catalog() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    let mut fixture = direct_binding_live_fixture(true, true, true);
+    assert!(matches!(
+        fixture.traverse(fixture.source),
+        NativeDsrExit::ResolveDirect {
+            source,
+            target,
+            binding: Some(_),
+        } if source == fixture.source && target == fixture.target
+    ));
+    assert!(matches!(
+        fixture.traverse(fixture.target),
+        NativeDsrExit::ResolveDirect {
+            source,
+            target,
+            binding: Some(_),
+        } if source == fixture.target && target == fixture.source
+    ));
+    let sidecar_starts = [
+        direct_binding_sidecar_start(&fixture, fixture.source),
+        direct_binding_sidecar_start(&fixture, fixture.target),
+    ];
+    let pthread = unsafe { libc::pthread_self() };
+    let mach_thread = unsafe { libc::pthread_mach_thread_np(pthread) };
+    let mut signal_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    let mut old_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    assert_eq!(unsafe { libc::sigemptyset(signal_set.as_mut_ptr()) }, 0);
+    let mut signal_set = unsafe { signal_set.assume_init() };
+    assert_eq!(
+        unsafe { libc::sigaddset(&mut signal_set, libc::SIGPIPE) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signal_set, old_set.as_mut_ptr()) },
+        0
+    );
+    let old_set = unsafe { old_set.assume_init() };
+
+    for remove_catalog in [true, false] {
+        let mut snapshot =
+            seeded_snapshot(fixture.stack.as_mut_ptr() as u64 + fixture.stack.len() as u64);
+        snapshot.pc = fixture.source.raw();
+        snapshot.x[15] = 0x1515_1515_1515_1515;
+        snapshot.x[16] = 0x1616_1616_1616_1616;
+        snapshot.x[17] = 0x1717_1717_1717_1717;
+        snapshot.x[30] = 0x3030_3030_3030_3030;
+        snapshot.pstate = 0xa000_0000;
+        let expected = snapshot;
+        let prepared = fixture
+            .fixture
+            .translator
+            .prepare_entry::<false>(&fixture.fixture.memory, &snapshot)
+            .expect("prepare forced word-20 sidecar entry");
+        let sender = std::thread::spawn(move || {
+            force_direct_binding_word20_sigpipe(
+                pthread,
+                mach_thread,
+                sidecar_starts,
+                remove_catalog,
+            )
+        });
+        let entered = fixture
+            .fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("enter forced word-20 sidecar loop");
+        let forced_pc = sender
+            .join()
+            .expect("join forced word-20 sender")
+            .expect("force live word-20 SIGPIPE");
+
+        if remove_catalog {
+            assert!(
+                matches!(entered.exit, NativeDsrExit::KickAtEntry { .. }),
+                "removing source range from the catalog must reproduce the classification red: {:?}",
+                entered.exit
+            );
+            eprintln!(
+                "forced direct-binding word 20 pc=0x{forced_pc:x} \
+                 catalog=absent exit=KickAtEntry"
+            );
+        } else {
+            let NativeDsrExit::Kick { resume, .. } = entered.exit else {
+                panic!(
+                    "catalogued word-20 source PC must be an ordinary kick: {:?}",
+                    entered.exit
+                );
+            };
+            assert_eq!(resume.raw(), forced_pc as u64);
+            assert_eq!(
+                direct_binding_recovery_for_cache_pc(&fixture, resume),
+                Some((
+                    super::emit::DirectBindingRecoveryPhase::AuthorityInstall,
+                    20,
+                ))
+            );
+            eprintln!(
+                "forced direct-binding word 20 pc=0x{forced_pc:x} \
+                 catalog=present exit=Kick phase=AuthorityInstall"
+            );
+        }
+        assert!(matches!(
+            fixture
+                .fixture
+                .translator
+                .finish_exit(&fixture.fixture.memory, &mut snapshot, prepared, entered)
+                .expect("finish forced word-20 sidecar kick"),
+            super::ThreadExit::Kick
+        ));
+        assert!(
+            snapshot.pc == fixture.source.raw() || snapshot.pc == fixture.target.raw(),
+            "forced recovery resumed outside an edge owner: 0x{:x}",
+            snapshot.pc
+        );
+        assert_eq!(snapshot.x[15], expected.x[15]);
+        assert_eq!(snapshot.x[16], expected.x[16]);
+        assert_eq!(snapshot.x[17], expected.x[17]);
+        assert_eq!(snapshot.x[30], expected.x[30]);
+        assert_eq!(snapshot.pstate, expected.pstate);
+    }
+
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, std::ptr::null_mut()) },
+        0
+    );
+}
+
+#[test]
+fn direct_binding_generation_change_clears_and_rebinds() {
     use carrick_dsr_aarch64::direct_binding::DirectBindingCellRef;
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,

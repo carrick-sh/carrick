@@ -16,7 +16,7 @@ use super::types::{CacheVa, CodeGeneration, DsrError, NativeDsrExit};
 use crate::direct_binding::{DirectBindingCellVa, DirectBindingMiss, DirectBindingOrdinal};
 use crate::snapshot::NativeUcontextSnapshot;
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 pub const INDIRECT_CACHE_ENTRIES: usize = 32_768;
 pub const INDIRECT_CACHE_MASK: u64 = (INDIRECT_CACHE_ENTRIES - 1) as u64;
@@ -32,6 +32,121 @@ pub const CTX_DIRECT_BINDING_CELL: u32 = 1280;
 pub const CTX_DIRECT_BINDING_ORDINAL: u32 = 1288;
 pub const CTX_DIRECT_BINDING_PRESENT: u32 = 1292;
 pub const CTX_DIRECT_BINDING_TARGET: u32 = 1296;
+
+#[repr(C)]
+pub struct ExecutableRangeCatalogHeader {
+    head: AtomicPtr<ExecutableRangeCatalogNode>,
+}
+
+#[repr(C)]
+pub struct ExecutableRangeCatalogNode {
+    start: u64,
+    end: u64,
+    next: *const ExecutableRangeCatalogNode,
+}
+
+// SAFETY: nodes are pinned before publication and immutable afterward.
+unsafe impl Send for ExecutableRangeCatalogNode {}
+// SAFETY: see `Send`; readers only traverse immutable nodes.
+unsafe impl Sync for ExecutableRangeCatalogNode {}
+
+pub struct ExecutableRangeCatalog {
+    header: Box<ExecutableRangeCatalogHeader>,
+    private: Box<ExecutableRangeCatalogNode>,
+    shared: Vec<Box<ExecutableRangeCatalogNode>>,
+}
+
+impl ExecutableRangeCatalog {
+    pub fn new(private_start: usize, private_end: usize) -> Result<Self, DsrError> {
+        if private_start >= private_end {
+            return Err(DsrError::CachePolicy(
+                "private executable range is empty or inverted".to_string(),
+            ));
+        }
+        let mut private = Box::new(ExecutableRangeCatalogNode {
+            start: private_start as u64,
+            end: private_end as u64,
+            next: std::ptr::null(),
+        });
+        let header = Box::new(ExecutableRangeCatalogHeader {
+            head: AtomicPtr::new(std::ptr::from_mut(private.as_mut())),
+        });
+        Ok(Self {
+            header,
+            private,
+            shared: Vec::new(),
+        })
+    }
+
+    pub fn prepend(&mut self, start: usize, end: usize) -> Result<(), DsrError> {
+        if start >= end {
+            return Err(DsrError::CachePolicy(
+                "shared executable range is empty or inverted".to_string(),
+            ));
+        }
+        let next = self.header.head.load(Ordering::Acquire);
+        let mut node = Box::new(ExecutableRangeCatalogNode {
+            start: start as u64,
+            end: end as u64,
+            next,
+        });
+        let published = std::ptr::from_mut(node.as_mut());
+        self.shared.push(node);
+        self.header.head.store(published, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn header_ptr(&self) -> *const ExecutableRangeCatalogHeader {
+        self.header.as_ref()
+    }
+
+    pub fn head_ptr(&self) -> *mut ExecutableRangeCatalogNode {
+        self.header.head.load(Ordering::Acquire)
+    }
+
+    pub fn contains(&self, pc: usize) -> bool {
+        // SAFETY: the catalog owns its stable header and all linked nodes.
+        unsafe { executable_range_catalog_contains(self.header_ptr(), pc) }
+    }
+
+    pub fn reset_head_to_private(&mut self) {
+        self.header
+            .head
+            .store(std::ptr::from_mut(self.private.as_mut()), Ordering::Release);
+    }
+
+    pub fn drop_shared_nodes(&mut self) {
+        self.shared.clear();
+    }
+
+    pub fn shared_node_count(&self) -> usize {
+        self.shared.len()
+    }
+}
+
+/// Traverse one stable process catalog using the signal handler's acquire
+/// ordering.
+///
+/// # Safety
+///
+/// `header` and every node reachable from its head must remain alive for the
+/// traversal.
+pub unsafe fn executable_range_catalog_contains(
+    header: *const ExecutableRangeCatalogHeader,
+    pc: usize,
+) -> bool {
+    let Some(header) = (unsafe { header.as_ref() }) else {
+        return false;
+    };
+    let mut node = header.head.load(Ordering::Acquire);
+    while let Some(current) = unsafe { node.as_ref() } {
+        if (current.start..current.end).contains(&(pc as u64)) {
+            return true;
+        }
+        node = current.next.cast_mut();
+    }
+    false
+}
 
 /// Process-local data referenced by an immutable translated block.
 ///
@@ -225,7 +340,7 @@ pub struct DsrContext {
     pub direct_binding_ordinal: u32,
     pub direct_binding_present: u32,
     pub direct_binding_target: u64,
-    pub direct_binding_pad: u64,
+    pub executable_range_catalog: *const ExecutableRangeCatalogHeader,
 }
 
 /// Context byte offset of the gateway exit entry point for `kind`.
@@ -350,7 +465,7 @@ impl DsrContext {
             direct_binding_ordinal: 0,
             direct_binding_present: 0,
             direct_binding_target: 0,
-            direct_binding_pad: 0,
+            executable_range_catalog: std::ptr::null(),
         }
     }
 }
@@ -410,8 +525,17 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_cell) == 1
 const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_ordinal) == 1288);
 const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_present) == 1292);
 const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_target) == 1296);
-const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_pad) == 1304);
+const _: () = assert!(std::mem::offset_of!(DsrContext, executable_range_catalog) == 1304);
 const _: () = assert!(std::mem::size_of::<DsrContext>() == 1312);
+const _: () = assert!(std::mem::align_of::<DsrContext>() == 16);
+const _: () = assert!(std::mem::size_of::<ExecutableRangeCatalogHeader>() == 8);
+const _: () = assert!(std::mem::align_of::<ExecutableRangeCatalogHeader>() == 8);
+const _: () = assert!(std::mem::offset_of!(ExecutableRangeCatalogHeader, head) == 0);
+const _: () = assert!(std::mem::size_of::<ExecutableRangeCatalogNode>() == 24);
+const _: () = assert!(std::mem::align_of::<ExecutableRangeCatalogNode>() == 8);
+const _: () = assert!(std::mem::offset_of!(ExecutableRangeCatalogNode, start) == 0);
+const _: () = assert!(std::mem::offset_of!(ExecutableRangeCatalogNode, end) == 8);
+const _: () = assert!(std::mem::offset_of!(ExecutableRangeCatalogNode, next) == 16);
 const _: () = assert!(std::mem::size_of::<GenerationBinding>() == 16);
 const _: () = assert!(std::mem::offset_of!(GenerationBinding, current) == 0);
 const _: () = assert!(std::mem::offset_of!(GenerationBinding, expected) == 8);
@@ -480,6 +604,7 @@ mod native_gateway {
             usize::MAX,
             carrick_dsr::address::NativeAddressMode::Direct,
             std::ptr::null(),
+            std::ptr::null(),
             true,
         )
     }
@@ -500,6 +625,7 @@ mod native_gateway {
             usize::MAX,
             address_mode,
             std::ptr::null(),
+            std::ptr::null(),
             true,
         )
     }
@@ -519,6 +645,7 @@ mod native_gateway {
             0,
             usize::MAX,
             carrick_dsr::address::NativeAddressMode::Direct,
+            std::ptr::null(),
             std::ptr::null(),
             true,
         )
@@ -543,6 +670,36 @@ mod native_gateway {
             cache_end,
             address_mode,
             std::ptr::null(),
+            std::ptr::null(),
+            true,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "process entry carries its stable executable catalog authority"
+    )]
+    pub fn enter_translated_with_cache_range_and_catalog(
+        entry: CacheVa,
+        snapshot: &mut NativeUcontextSnapshot,
+        exit: &mut NativeDsrExit,
+        indirect_cache: &IndirectTargetCache,
+        cache_start: usize,
+        cache_end: usize,
+        address_mode: carrick_dsr::address::NativeAddressMode,
+        executable_range_catalog: *const ExecutableRangeCatalogHeader,
+    ) -> Result<(), DsrError> {
+        enter_translated_raw(
+            entry,
+            snapshot,
+            exit,
+            indirect_cache.as_ptr(),
+            CodeGeneration::INITIAL,
+            cache_start,
+            cache_end,
+            address_mode,
+            std::ptr::null(),
+            executable_range_catalog,
             true,
         )
     }
@@ -563,6 +720,7 @@ mod native_gateway {
             0,
             usize::MAX,
             address_mode,
+            std::ptr::null(),
             std::ptr::null(),
             false,
         )
@@ -589,6 +747,7 @@ mod native_gateway {
             usize::MAX,
             carrick_dsr::address::NativeAddressMode::Direct,
             generation_bindings.as_ptr(),
+            std::ptr::null(),
             true,
         )
     }
@@ -622,6 +781,42 @@ mod native_gateway {
             cache_end,
             address_mode,
             generation_bindings.as_ptr(),
+            std::ptr::null(),
+            true,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "shared process entry pins cache, generation, and catalog authorities"
+    )]
+    pub fn enter_translated_with_cache_range_and_generation_bindings_and_catalog(
+        entry: CacheVa,
+        snapshot: &mut NativeUcontextSnapshot,
+        exit: &mut NativeDsrExit,
+        indirect_cache: &IndirectTargetCache,
+        cache_start: usize,
+        cache_end: usize,
+        address_mode: carrick_dsr::address::NativeAddressMode,
+        generation_bindings: &[GenerationBinding],
+        executable_range_catalog: *const ExecutableRangeCatalogHeader,
+    ) -> Result<(), DsrError> {
+        if generation_bindings.is_empty() {
+            return Err(DsrError::Gateway(
+                "shared block entered without generation bindings".to_string(),
+            ));
+        }
+        enter_translated_raw(
+            entry,
+            snapshot,
+            exit,
+            indirect_cache.as_ptr(),
+            CodeGeneration::INITIAL,
+            cache_start,
+            cache_end,
+            address_mode,
+            generation_bindings.as_ptr(),
+            executable_range_catalog,
             true,
         )
     }
@@ -640,6 +835,7 @@ mod native_gateway {
         cache_end: usize,
         address_mode: carrick_dsr::address::NativeAddressMode,
         generation_bindings: *const GenerationBinding,
+        executable_range_catalog: *const ExecutableRangeCatalogHeader,
         enforce_cache_authority: bool,
     ) -> Result<(), DsrError> {
         if !matches!(
@@ -667,6 +863,7 @@ mod native_gateway {
             address_mode,
         );
         context.generation_bindings = generation_bindings;
+        context.executable_range_catalog = executable_range_catalog;
         context.enforce_cache_authority = u32::from(enforce_cache_authority);
         let rc = unsafe { carrick_dsr_enter_raw(&mut context) };
         if !matches!(rc, 1..=8) {
@@ -786,6 +983,23 @@ mod native_gateway {
         Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "matches the live process gateway entry signature"
+    )]
+    pub fn enter_translated_with_cache_range_and_catalog(
+        _entry: CacheVa,
+        _snapshot: &mut NativeUcontextSnapshot,
+        _exit: &mut NativeDsrExit,
+        _indirect_cache: &IndirectTargetCache,
+        _cache_start: usize,
+        _cache_end: usize,
+        _address_mode: carrick_dsr::address::NativeAddressMode,
+        _executable_range_catalog: *const ExecutableRangeCatalogHeader,
+    ) -> Result<(), DsrError> {
+        Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
+    }
+
     pub fn enter_translated_with_trusted_private_cache(
         _entry: CacheVa,
         _snapshot: &mut NativeUcontextSnapshot,
@@ -852,6 +1066,24 @@ mod native_gateway {
         _cache_end: usize,
         _address_mode: carrick_dsr::address::NativeAddressMode,
         _generation_bindings: &[GenerationBinding],
+    ) -> Result<(), DsrError> {
+        Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "matches the live shared process gateway entry signature"
+    )]
+    pub fn enter_translated_with_cache_range_and_generation_bindings_and_catalog(
+        _entry: CacheVa,
+        _snapshot: &mut NativeUcontextSnapshot,
+        _exit: &mut NativeDsrExit,
+        _indirect_cache: &IndirectTargetCache,
+        _cache_start: usize,
+        _cache_end: usize,
+        _address_mode: carrick_dsr::address::NativeAddressMode,
+        _generation_bindings: &[GenerationBinding],
+        _executable_range_catalog: *const ExecutableRangeCatalogHeader,
     ) -> Result<(), DsrError> {
         Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
     }
@@ -933,8 +1165,63 @@ mod indirect_cache_tests {
             std::mem::offset_of!(DsrContext, direct_binding_target),
             1296
         );
-        assert_eq!(std::mem::offset_of!(DsrContext, direct_binding_pad), 1304);
+        assert_eq!(
+            std::mem::offset_of!(DsrContext, executable_range_catalog),
+            1304
+        );
         assert_eq!(std::mem::size_of::<DsrContext>(), 1312);
+    }
+
+    #[test]
+    fn executable_range_catalog_layout_matches_the_signal_bridge_abi() {
+        assert_eq!(std::mem::size_of::<ExecutableRangeCatalogHeader>(), 8);
+        assert_eq!(std::mem::align_of::<ExecutableRangeCatalogHeader>(), 8);
+        assert_eq!(std::mem::offset_of!(ExecutableRangeCatalogHeader, head), 0);
+        assert_eq!(std::mem::size_of::<ExecutableRangeCatalogNode>(), 24);
+        assert_eq!(std::mem::align_of::<ExecutableRangeCatalogNode>(), 8);
+        assert_eq!(std::mem::offset_of!(ExecutableRangeCatalogNode, start), 0);
+        assert_eq!(std::mem::offset_of!(ExecutableRangeCatalogNode, end), 8);
+        assert_eq!(std::mem::offset_of!(ExecutableRangeCatalogNode, next), 16);
+    }
+
+    #[test]
+    fn context_created_before_cross_thread_catalog_prepend_sees_the_new_range() {
+        let mut catalog =
+            ExecutableRangeCatalog::new(0x10_000, 0x20_000).expect("private cache range");
+        let mut context = DsrContext::new(
+            NativeUcontextSnapshot::default(),
+            CacheVa::published(carrick_guest_mem::HostVa(0x10_000)),
+            NativeDsrExit::Syscall {
+                resume: carrick_guest_mem::GuestVa(0x4000),
+            },
+            std::ptr::null(),
+            CodeGeneration::INITIAL,
+            0x10_000,
+            0x20_000,
+            carrick_dsr::address::NativeAddressMode::Direct,
+        );
+        context.executable_range_catalog = catalog.header_ptr();
+        let header = context.executable_range_catalog as usize;
+
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    catalog
+                        .prepend(0x30_000, 0x40_000)
+                        .expect("publish shared cache range");
+                })
+                .join()
+                .expect("join catalog publisher");
+        });
+
+        // SAFETY: `catalog` owns the stable header and every immutable node
+        // through this traversal.
+        assert!(unsafe {
+            executable_range_catalog_contains(
+                header as *const ExecutableRangeCatalogHeader,
+                0x38_000,
+            )
+        });
     }
 
     #[test]
@@ -1053,7 +1340,7 @@ mod indirect_cache_tests {
             assert_eq!(context.direct_binding_ordinal, 0, "exit={exit:?}");
             assert_eq!(context.direct_binding_present, 0, "exit={exit:?}");
             assert_eq!(context.direct_binding_target, 0, "exit={exit:?}");
-            assert_eq!(context.direct_binding_pad, 0, "exit={exit:?}");
+            assert!(context.executable_range_catalog.is_null(), "exit={exit:?}");
         }
     }
 }
