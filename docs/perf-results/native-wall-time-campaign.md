@@ -71,6 +71,7 @@ beaten `C0`.
 | E010 | `target/perf/native-go-build-authority-v2-stress-screen.json` | accepted screen; dirty provenance | Three correct untraced samples: 25,169, 25,268 and 25,082 ms; authority switching removes most resolver amplification but remains slower than `C0=19,375 ms` |
 | E011 | `target/perf/native-go-build-portable-conditional-v3-populate.json` plus failed replication log | rejected spike; raw untracked | Artifact-only inline conditional caching screened at 24,664 ms, then crashed in Go stack/runtime code; the all-code version exhausted the 64 MiB private JIT cache |
 | E012 | Task 15 structural gate at `c4d54b92` | rejected before live evidence | The first two structural commands passed, but the serialized runtime oracle command failed to compile with 25 `E0308` errors because `binding` fixtures/patterns still use `Option` while `NativeDsrExit` requires `DirectBindingExitMetadata`; no signed candidate, feasibility sample, or trace pair was run |
+| E013 | Task 15 structural retry at `8d440b61` | rejected before live evidence | The metadata repair compiled and eight focused runtime oracles passed, but the 10,000-signal broad control missed required `FinalBranch` coverage; fail-closed execution suppressed formatting Gate 4, signed feasibility, and the trace pair |
 
 ### Task 15 direct-binding mechanism gate — rejected before live work
 
@@ -128,6 +129,61 @@ process-cell bounds, collapse values `S/D/G`, or reclassification equations to
 report. Variant 1 is **rejected before mechanism evaluation**. Do not tune the
 22-word path; first restore the mandatory runtime oracle gate and rerun Task 15
 from fresh absent artifact paths.
+
+### Task 15 direct-binding mechanism retry — jitter coverage rejection
+
+The retry started from clean
+`8d440b616ad163faf446078975d58aeb7788e233`; repair `7cebf638` is an
+ancestor. The workload and spin-loop censuses found only their own shell and
+`rg`. Preflight load averages were `2.77 3.63 3.62`, which is context rather
+than performance evidence. Docker contained only the excluded
+`carrick-registry-5050` and `vt-ferry-registry` `registry:2` containers. No
+real Docker oracle or ambient `CARRICK_DSR*`, `CARRICK_PERF*`,
+`CARRICK_EXEC_BACKEND`, `CARRICK_NATIVE*`, or `CARRICK_RUN_ID` value was
+present.
+
+The image remained native `arm64`, with image ID
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`
+and matching localhost repo digest. All four fixed single-use paths were
+absent. The stale, unrebuilt executable still hashed to
+`sha256:1f55a200175ec19f33f1deed085a68175b164c7f3500cca8165179247258849c`;
+that is not a signing or source-marker receipt.
+
+The retry's serial structural vector was:
+
+| Gate | Status | Result |
+|---|---:|---|
+| `cargo test -p carrick-dsr-aarch64` | 0 | 162 passed, 0 failed; doc tests passed |
+| `cargo test -p carrick-native-darwin` | 0 | 31 passed, 0 failed; doc tests passed |
+| `RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib 'native_darwin::dsr::oracle::direct_binding_'` | 101 | compiled and ran; 8 passed, 1 failed, 1,063 filtered |
+| `cargo fmt --all -- --check` | not run in gate sequence | fail-closed stop after Gate 3 |
+
+The failure was
+`direct_binding_jittered_sigpipe_recovers_every_preamble_phase`:
+
+```text
+covered=[true, true, true, true, false, true, false, true]
+recovered_words=[11, 152, 818, 26, 212, 54, 3, 17, 1808, 0, 0, 861, 75, 8, 511, 0, 0, 0, 0, 0, 0, 0, 0, 2, 126, 2756, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+signals=10000
+```
+
+Index 4 is the separately forced and assertion-exempt `AuthorityInstall`
+phase. Index 6 is `FinalBranch`; its missing coverage rejected the mandatory
+broad control. This checkpoint does not classify the result as a runtime
+defect or a probabilistic false red: the one required run failed.
+
+Therefore the signed build, codesign/Hypervisor entitlement, DOF, marker,
+feasibility, and `capture-pair` commands were not run. No run ID or guest
+process existed, so command status, `BUILD_OK`, cleanup, descendants, child
+CPU, runner-frozen provenance, and elapsed workload time are not applicable.
+The feasibility and pair paths, both receipts, and all bound artifacts remain
+absent and have no SHA-256 hashes.
+
+Every exit/event vector, reconciliation, translation attempt, `(pid,cell)`
+identity, publication/clear bound, typed validation reason, and `S/D/G`
+equation is unobserved rather than zero. The 95% mechanism gate was not
+evaluated, and no traced elapsed time exists. Variant 1 remains **rejected
+before mechanism evaluation**; do not tune its 22-word path from this result.
 
 ## Whole-tree attribution
 
@@ -260,6 +316,7 @@ The table order is provisional until E005 and E006 exist.
 | 2026-07-27 | H004 | inline conditional target-cache lookup in all code | Collapse the 1.47M hottest fall-through misses | failed: 64 MiB private JIT cache exhausted | n/a | reject; code-size explosion |
 | 2026-07-27 | H004 | inline conditional lookup only in portable artifacts | Avoid private-cache expansion while chaining shared conditionals | 24.664 s first sample; replication crashed in Go runtime | n/a | reject and revert; too small and unsafe |
 | 2026-07-27 | H004 | compact direct-binding sidecar Variant 1 mechanism gate | Collapse at least 95% of sidecar-eligible direct resolver exits with matching direct/gateway reclassification | structural gate failed before signed feasibility | n/a | reject before mechanism evaluation; runtime oracle fixtures/patterns do not compile |
+| 2026-07-27 | H004 | compact direct-binding sidecar Variant 1 mechanism retry | Same 95% collapse and reclassification gate after metadata repair | focused runtime oracle ran 9 tests, but the 10,000-signal broad control missed `FinalBranch` | n/a | reject before mechanism evaluation; resolve deterministic recovery coverage before another live retry |
 
 Prior rejected experiments remain recorded in `handoff.md`; they are not reset
 to `PROPOSED`.
@@ -271,6 +328,7 @@ to `PROPOSED`.
 | historical `9c25688d` | green | green | 23/23 MATCH | Go sync 52/52; CPython threading 193/193; subprocess 278/278 | green | accepted starting implementation |
 | M1 measurement tooling | 18 Rust + 17 Python tests green | native container smoke printed `TRACE_OK` | n/a | n/a | signed build + DOF present | analyzer accepted container and adversarial scope traces; Go-build evidence pending |
 | Task 15 direct-binding mechanism gate | 162 AArch64 DSR + 31 native-Darwin tests green; runtime oracle compile failed with 25 `E0308` errors | not run | not run | not run | not run | rejected before live work |
+| Task 15 retry at `8d440b61` | 162 AArch64 DSR + 31 native-Darwin tests green; focused runtime oracle 8/9 with missing `FinalBranch` jitter coverage | not run | not run | not run | not run | rejected before live work |
 
 ## Decisions
 
@@ -295,6 +353,10 @@ to `PROPOSED`.
    recovery. A direct binding must have a stable edge identity, bounded
    sidecar size, publication ordering, authority/version data and a recovery
    oracle before it receives a wall screen.
+8. Task 15 remains stopped before live evaluation because the mandatory
+   recovery oracle did not cover `FinalBranch` within its 10,000-signal bound.
+   Do not rerun until that structural obligation is made deterministic or its
+   failure is otherwise resolved.
 
 ## Next action
 
@@ -312,6 +374,7 @@ Write and validate the executable M1 plan:
 - [x] Falsify full inline conditional caching on code size and recovery.
 - [x] Add compact per-edge mutable binding cells for unresolved shared-unit
       direct edges.
-- [ ] Repair the runtime direct-binding oracle fixtures/patterns for
-      `DirectBindingExitMetadata`, rerun the complete structural gate, and
-      restart Task 15 with all single-use evidence paths absent.
+- [ ] Make the focused recovery oracle deterministically cover
+      `FinalBranch`, or otherwise resolve the failed structural obligation;
+      then rerun Task 15 from clean state with all single-use evidence paths
+      absent.
