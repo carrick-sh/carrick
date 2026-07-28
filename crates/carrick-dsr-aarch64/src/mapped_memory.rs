@@ -315,11 +315,19 @@ impl NativeMemoryHandle {
         image: &AddressSpace,
         relative_relocations: &[NativeRelativeRelocation],
         geometry: PageGeometry,
-        dsr_tid: Option<i32>,
+        exec_thread: &dsr::ThreadTranslator,
+        reset_token: &mut dsr::DirectBindingExecResetToken,
         prepared: PreparedNativeExecMapping,
     ) -> Result<(), NativeMemoryError> {
         let mut guard = self.memory.write();
-        guard.replace_image(image, relative_relocations, geometry, dsr_tid, prepared)?;
+        guard.replace_image(
+            image,
+            relative_relocations,
+            geometry,
+            exec_thread,
+            reset_token,
+            prepared,
+        )?;
         *self.config.write() = NativeMemoryConfig::from_memory(&guard);
         Ok(())
     }
@@ -1641,13 +1649,13 @@ impl NativeMappedMemory {
         image: &AddressSpace,
         relative_relocations: &[NativeRelativeRelocation],
         geometry: PageGeometry,
-        dsr_tid: Option<i32>,
+        exec_thread: &dsr::ThreadTranslator,
+        reset_token: &mut dsr::DirectBindingExecResetToken,
         mut prepared: PreparedNativeExecMapping,
     ) -> Result<(), NativeMemoryError> {
+        let dsr_tid = exec_thread.tid;
         let lifecycle = |phase| {
-            if let Some(tid) = dsr_tid {
-                carrick_dsr::probes::dsr_cache_lifecycle(tid, phase, 0, 0, 0);
-            }
+            carrick_dsr::probes::dsr_cache_lifecycle(dsr_tid, phase, 0, 0, 0);
         };
         lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecImageUnmapBegin);
         if self.owned_host_ranges.is_empty() {
@@ -1659,6 +1667,9 @@ impl NativeMappedMemory {
         let retained_target_ranges = prepared.native_layout.owned_ranges();
         let retired_ranges = subtract_host_ranges(&self.owned_host_ranges, retained_target_ranges);
         let retiring_translator = self.dsr_process_translator()?;
+        reset_token
+            .validate_for(&retiring_translator, exec_thread)
+            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
         // Everything above remains pre-PONR: it may validate and allocate,
         // and dropping `prepared` must leave the authoritative old image
         // untouched. From here onward replacement may retire or overwrite old
@@ -1667,7 +1678,9 @@ impl NativeMappedMemory {
         // rollback owner for those transferred intervals.
         prepared.native_layout.arm_prepared_adoptions();
         lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecCacheResetBegin);
-        retiring_translator.reset_after_fork_for_exec();
+        retiring_translator
+            .reset_after_fork_for_exec(exec_thread, reset_token)
+            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
         lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecCacheResetEnd);
         for range in &retired_ranges {
             let start = range.start.raw();
@@ -1706,7 +1719,7 @@ impl NativeMappedMemory {
             native_layout,
             NativeMappingOptions {
                 reusable_translator: Some(process_translator),
-                exec_map_dsr_tid: dsr_tid,
+                exec_map_dsr_tid: Some(dsr_tid),
                 relative_relocations,
                 backing: NativeImageBacking::AnonymousBytes,
                 rollback_plan,

@@ -1620,8 +1620,10 @@ mod tests {
         process.state.write().blocks.insert(key, entry);
         let mut thread = super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 42);
 
-        thread.prepare_direct_binding_exec_reset();
-        process.reset_after_fork_for_exec();
+        let mut reset_token = thread.prepare_direct_binding_exec_reset();
+        process
+            .reset_after_fork_for_exec(&thread, &mut reset_token)
+            .expect("consume surviving thread exec reset authority");
         thread.reset_for_exec(std::sync::Arc::clone(&process));
 
         let state = process.state.read();
