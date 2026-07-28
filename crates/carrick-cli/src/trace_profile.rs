@@ -1318,6 +1318,7 @@ mod tests {
                 version: "Darwin Kernel Version 26.0.0".to_owned(),
                 uuid: "01234567-89AB-CDEF-0123-456789ABCDEF".to_owned(),
                 machine: "arm64".to_owned(),
+                bootsessionuuid: "FEDCBA98-7654-3210-FEDC-BA9876543210".to_owned(),
             },
             vec![KernelObjectRange {
                 name: "kernel".to_owned(),
