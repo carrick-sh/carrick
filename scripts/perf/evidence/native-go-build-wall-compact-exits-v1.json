@@ -1,0 +1,61 @@
+{
+  "schema": "carrick.native-go-build-retention.v1",
+  "recorded_at": "2026-07-28",
+  "classification": "RETAIN_CAPACITY_REPAIR_NO_CARRICK_WALL_WIN",
+  "source": {
+    "path": "target/perf/native-go-build-wall-compact-c65f4b0f-v1.json",
+    "sha256": "d151ce9f60917ddd92170da184fc9309de3211c9dec5223c6f3032e00c837619",
+    "captured_logs": {
+      "count": 10,
+      "bytes_each": 12,
+      "sha256_each": "df07942572cf6dd3980404de2ce4592439cb7713aa40e39aabf088398f88a3a1"
+    }
+  },
+  "provenance": {
+    "git_commit": "c65f4b0f6a2483984a9dbf7a1e85bc14a1bc91d2",
+    "git_dirty": false,
+    "binary_sha256": "f8af4e8512879d192454c9d99bb5be43780a6cee5d648d53269f7c6181775886",
+    "image": "localhost:5005/carrick-go-conformance:1.24",
+    "image_id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+    "image_architecture": "arm64",
+    "busy_override": false,
+    "preflight_reasons": []
+  },
+  "carrick": {
+    "samples_ms": [20260, 20698, 21005, 21547, 25209],
+    "median_ms": 21005,
+    "all_build_ok": true,
+    "all_return_code_zero": true,
+    "all_cleanup_status_zero": true,
+    "cache_capacity_bytes": 67108864,
+    "cache_exhaustions": 0
+  },
+  "docker": {
+    "samples_ms": [1258, 1466, 1472, 1367, 1359],
+    "median_ms": 1367,
+    "all_build_ok": true,
+    "all_return_code_zero": true,
+    "all_cleanup_status_zero": true
+  },
+  "ratio": {
+    "carrick_over_docker": 15.365764447695684
+  },
+  "official_baseline_comparison": {
+    "carrick_baseline_ms": 19375,
+    "carrick_delta_ms": 1630,
+    "carrick_delta_percent": 8.412903225806456,
+    "docker_baseline_ms": 1007,
+    "docker_delta_ms": 360,
+    "docker_delta_percent": 35.74975173783515,
+    "ratio_baseline": 19.2403,
+    "ratio_delta": -3.8745355523043177,
+    "ratio_delta_percent": -20.137604675105468
+  },
+  "interpretation": {
+    "retained": true,
+    "reason": "The default path changed from deterministic 64 MiB translation-cache exhaustion to five consecutive clean completions with unchanged capacity.",
+    "carrick_wall_win": false,
+    "ratio_win_claimed": false,
+    "note": "The current same-run ratio is lower, but Carrick wall time is slower than C0 and the Docker oracle slowed more. Do not attribute the ratio change to the code repair."
+  }
+}
