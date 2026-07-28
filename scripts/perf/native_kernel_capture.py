@@ -16,7 +16,7 @@ import sys
 import tempfile
 import threading
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import native_go_build
 import native_kernel_attribution
@@ -335,35 +335,11 @@ def _normalized_command_shape(
     }
 
 
-def _matches_owned_root(
-    command: str,
-    expected_commands: set[tuple[str, ...]],
-    expected_run_tokens: set[str],
-) -> bool:
-    fields = command.split()
-    if not (expected_run_tokens & set(fields)):
-        return False
-    try:
-        actual_boundary = fields.index("--")
-    except ValueError:
-        return False
-    actual_prefix = tuple(fields[:actual_boundary])
-    for expected in expected_commands:
-        try:
-            expected_boundary = expected.index("--")
-        except ValueError:
-            continue
-        if actual_prefix == expected[:expected_boundary]:
-            return True
-    return False
-
-
 def classify_process_snapshot(
     listing: str,
     *,
     self_pid: int | None = None,
-    owned_root_commands: Sequence[Sequence[str]] = (),
-    owned_run_ids: Sequence[str] = (),
+    owned_lineage: set[int] | None = None,
 ) -> dict[str, object]:
     """Resolve launcher ancestry once, then classify only independent peers."""
     rows = _process_rows(listing)
@@ -382,24 +358,7 @@ def classify_process_snapshot(
             )
         raw_ancestry.append(row)
         current = int(row["ppid"])
-    expected_commands = {
-        tuple(str(token) for token in command)
-        for command in owned_root_commands
-    }
-    expected_run_tokens = {
-        f"CARRICK_RUN_ID={run_id}" for run_id in owned_run_ids
-    }
-    owned_roots = {
-        pid
-        for pid, row in rows.items()
-        if int(row["ppid"]) == runner_pid
-        and _matches_owned_root(
-            str(row["command"]),
-            expected_commands,
-            expected_run_tokens,
-        )
-    }
-    owned_tree = set(owned_roots) if len(owned_roots) == 1 else set()
+    owned_tree = set() if owned_lineage is None else set(owned_lineage)
     changed = True
     while changed:
         changed = False
@@ -407,6 +366,8 @@ def classify_process_snapshot(
             if pid not in owned_tree and int(row["ppid"]) in owned_tree:
                 owned_tree.add(pid)
                 changed = True
+    if owned_lineage is not None:
+        owned_lineage.update(owned_tree)
     trusted = seen | owned_tree
     foreign = [
         row
@@ -541,8 +502,7 @@ def _monitor_sample(
     sequence: int,
     phase: str,
     *,
-    owned_root_commands: Sequence[Sequence[str]],
-    owned_run_ids: Sequence[str],
+    owned_lineage: set[int],
 ) -> dict[str, object]:
     process_result = _run(
         ["ps", "-eo", "pid=,ppid=,args="],
@@ -552,8 +512,7 @@ def _monitor_sample(
         raise EvidenceError("process census returned a failure status")
     process_state = classify_process_snapshot(
         process_result.stdout,
-        owned_root_commands=owned_root_commands,
-        owned_run_ids=owned_run_ids,
+        owned_lineage=owned_lineage,
     )
     foreign = process_state["foreign_workloads"]
     if not isinstance(foreign, list):
@@ -602,12 +561,7 @@ def _monitor_sample(
 
 
 class _ContaminationMonitor:
-    def __init__(
-        self,
-        *,
-        owned_root_commands: Sequence[Sequence[str]],
-        owned_run_ids: Sequence[str],
-    ) -> None:
+    def __init__(self) -> None:
         self._stop = threading.Event()
         self._first_poll = threading.Event()
         self._lock = threading.Lock()
@@ -623,11 +577,7 @@ class _ContaminationMonitor:
         self._contaminated = False
         self._samples: list[dict[str, object]] = []
         self._next_sequence = 1
-        self._owned_root_commands = tuple(
-            tuple(str(token) for token in command)
-            for command in owned_root_commands
-        )
-        self._owned_run_ids = tuple(owned_run_ids)
+        self._owned_lineage: set[int] = set()
 
     def start(self) -> None:
         try:
@@ -653,35 +603,57 @@ class _ContaminationMonitor:
         finally:
             self._first_poll.set()
 
+    def _sample_locked(self, phase: str) -> bool:
+        with self._lock:
+            if self._poll_error is not None:
+                return False
+            sequence = self._next_sequence
+        try:
+            sample = _monitor_sample(
+                sequence,
+                phase,
+                owned_lineage=self._owned_lineage,
+            )
+        except Exception:
+            with self._lock:
+                self._poll_error = "monitor poll failed"
+            return False
+        with self._lock:
+            self._samples.append(sample)
+            self._next_sequence += 1
+            if (
+                sample["foreign_workload_count"] != 0
+                or sample["docker_oracle_count"] != 0
+            ):
+                self._contaminated = True
+        return True
+
     def _sample(self, phase: str) -> bool:
         with self._poll_lock:
-            with self._lock:
-                if self._poll_error is not None:
-                    return False
-                sequence = self._next_sequence
-            try:
-                sample = _monitor_sample(
-                    sequence,
-                    phase,
-                    owned_root_commands=self._owned_root_commands,
-                    owned_run_ids=self._owned_run_ids,
-                )
-            except Exception:
-                with self._lock:
-                    self._poll_error = "monitor poll failed"
-                return False
-            with self._lock:
-                self._samples.append(sample)
-                self._next_sequence += 1
-                if (
-                    sample["foreign_workload_count"] != 0
-                    or sample["docker_oracle_count"] != 0
-                ):
-                    self._contaminated = True
-            return True
+            return self._sample_locked(phase)
 
     def sample_launch_boundary(self) -> None:
         self._sample("launch-boundary")
+
+    def launch_owned_process(
+        self,
+        launcher: Callable[[], subprocess.Popen[str]],
+    ) -> subprocess.Popen[str]:
+        with self._poll_lock:
+            process = launcher()
+            if (
+                isinstance(process.pid, bool)
+                or not isinstance(process.pid, int)
+                or process.pid <= 0
+            ):
+                try:
+                    process.kill()
+                finally:
+                    process.wait()
+                raise EvidenceError("trace Popen returned an invalid PID")
+            self._owned_lineage.add(process.pid)
+            self._sample_locked("interval")
+            return process
 
     def stop(self) -> None:
         self._stop.set()
@@ -1107,10 +1079,7 @@ def _capture_one(
     cleanup: dict[str, object]
     cleanup_stdout: str
     cleanup_stderr: str
-    monitor = _ContaminationMonitor(
-        owned_root_commands=(command,),
-        owned_run_ids=(host_run_id, guest_run_id),
-    )
+    monitor = _ContaminationMonitor()
     monitor.start()
     initial_monitor = monitor.evidence()
     initial_monitor_blocked = (
@@ -1126,24 +1095,56 @@ def _capture_one(
         or launch_monitor["contaminated"] is True
         or launch_monitor["started"] is not True
     )
+    process: subprocess.Popen[str] | None = None
     try:
         if not monitor_blocked:
             try:
-                result = subprocess.run(
-                    command,
-                    cwd=config.repo,
-                    env=environment,
-                    capture_output=True,
-                    text=True,
-                    timeout=config.timeout_seconds,
-                    check=False,
+                process = monitor.launch_owned_process(
+                    lambda: subprocess.Popen(
+                        command,
+                        cwd=config.repo,
+                        env=environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
                 )
-                stdout = _text(result.stdout)
-                stderr = _text(result.stderr)
+                execution_monitor = monitor.evidence()
+                execution_blocked = (
+                    execution_monitor["poll_error"] is not None
+                    or execution_monitor["contaminated"] is True
+                )
+                if execution_blocked:
+                    process.kill()
+                    process.communicate()
+                else:
+                    process_stdout, process_stderr = process.communicate(
+                        timeout=config.timeout_seconds
+                    )
+                    stdout = _text(process_stdout)
+                    stderr = _text(process_stderr)
+                    if process.returncode is None:
+                        raise EvidenceError(
+                            "trace process did not return a status"
+                        )
+                    result = subprocess.CompletedProcess(
+                        command,
+                        process.returncode,
+                        stdout,
+                        stderr,
+                    )
             except subprocess.TimeoutExpired as error:
                 timed_out = True
                 stdout = _text(error.stdout)
                 stderr = _text(error.stderr)
+                if process is not None:
+                    try:
+                        process.kill()
+                    finally:
+                        try:
+                            process.communicate()
+                        except Exception:
+                            pass
             except Exception as error:
                 launch_error = error
                 stderr = (
@@ -1550,10 +1551,15 @@ def _validate_monitor(payload: dict[str, Any]) -> None:
         raise EvidenceError("receipt monitor lacks launch boundary")
     if phases.count("post-cleanup-boundary") != 1:
         raise EvidenceError("receipt monitor lacks post-cleanup boundary")
-    if "interval" not in phases:
-        raise EvidenceError("receipt monitor lacks interval sample")
-    if phases.index("launch-boundary") > phases.index("post-cleanup-boundary"):
+    launch_index = phases.index("launch-boundary")
+    cleanup_index = phases.index("post-cleanup-boundary")
+    if launch_index > cleanup_index:
         raise EvidenceError("receipt monitor boundary order is reversed")
+    if not any(
+        phase == "interval"
+        for phase in phases[launch_index + 1 : cleanup_index]
+    ):
+        raise EvidenceError("receipt monitor lacks execution interval sample")
 
 
 def validate_receipt(path: pathlib.Path) -> dict[str, Any]:
