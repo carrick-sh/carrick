@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -496,6 +497,82 @@ class NativeKernelAttributionTests(unittest.TestCase):
         self.assertEqual(
             list(self.root.glob(f".{output.name}.*.tmp")),
             [],
+        )
+
+    def test_cli_replaces_stale_selectable_output_for_one_or_three_profiles(
+        self,
+    ) -> None:
+        profile = self.write_rows(
+            "profile.jsonl",
+            profile_rows("run-a", [("alpha", 100)]),
+        )
+        for count in (1, 3):
+            with self.subTest(profile_count=count):
+                output = self.root / f"cardinality-{count}.json"
+                output.write_text('{"result":"selectable","stale":true}\n')
+                command = [
+                    sys.executable,
+                    str(SCRIPT_DIR / "native_kernel_attribution.py"),
+                ]
+                for _ in range(count):
+                    command.extend(["--profile", str(profile)])
+                command.extend(["--output", str(output)])
+
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertEqual(completed.returncode, 1, completed.stderr)
+                self.assertEqual(
+                    json.loads(output.read_text())["result"],
+                    "rejected",
+                )
+                self.assertEqual(
+                    json.loads(output.read_text())["evidence_errors"],
+                    ["exactly two profiles are required"],
+                )
+                self.assertEqual(
+                    list(self.root.glob(f".{output.name}.*.tmp")),
+                    [],
+                )
+
+    def test_same_profile_twice_rejects_every_duplicate_identity(self) -> None:
+        profile = self.write_rows(
+            "profile.jsonl",
+            profile_rows("run-a", [("alpha", 100)]),
+        )
+
+        document = self.tool.analyze_profiles((profile, profile))
+
+        self.assertEqual(document["result"], "rejected")
+        self.assertEqual(
+            document["evidence_errors"],
+            [
+                "profile paths must be distinct",
+                "profile source hashes must be distinct",
+                "profile run_id values must be distinct",
+            ],
+        )
+
+    def test_duplicate_run_id_rejects_distinct_profile_sources(self) -> None:
+        first = self.write_rows(
+            "first.jsonl",
+            profile_rows("same-run", [("alpha", 100)]),
+        )
+        second_rows = profile_rows("same-run", [("alpha", 100)])
+        for row in second_rows:
+            row["command"] = ["target/release/carrick", "run", "other-fixture"]
+        second = self.write_rows("second.jsonl", second_rows)
+
+        document = self.tool.analyze_profiles((first, second))
+
+        self.assertEqual(document["result"], "rejected")
+        self.assertEqual(
+            document["evidence_errors"],
+            ["profile run_id values must be distinct"],
         )
 
 
