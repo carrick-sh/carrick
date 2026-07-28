@@ -114,6 +114,8 @@ def raw_lines(
             f"DSRPROF1|count|phase=binding-cell|pid=42|cell_va=0x8000|value={eligible}",
             f"DSRPROF1|count|phase=binding-publish-cell|pid=42|cell_va=0x8000|value={publish}",
             f"DSRPROF1|count|phase=binding-clear-cell|pid=42|cell_va=0x8000|kind=1|value={clear}",
+            f"DSRPROF1|count|phase=binding-validation|pid=42|source_pc=0x4000|"
+            f"kind=1|cell_va=0x8000|value={validation}",
             "DSRPROF1|count|phase=binding-unit|pid=42|unit_id=0x1234|"
             "record_count=1|binding_data_bytes=8|value=1",
             "DSRPROF1|complete|profile=dsr-indirect|bounded=0|target_exit_reason=1",
@@ -125,6 +127,12 @@ def raw_lines(
 class MechanismFixture:
     def __init__(self, root: pathlib.Path):
         self.root = root
+        self.repo = root / "repo"
+        self.binary = self.repo / "target/release/carrick"
+        self.binary.parent.mkdir(parents=True)
+        self.binary.write_bytes(b"fixture signed carrick")
+        self.binary_sha256 = mechanism.sha256_file(self.binary)
+        self.image = "localhost:5005/carrick-go-conformance:1.24"
 
     def receipt(
         self,
@@ -145,10 +153,10 @@ class MechanismFixture:
     ) -> mechanism.CaptureReceipt:
         directory = self.root / variant
         directory.mkdir(parents=True, exist_ok=True)
-        run_id = f"mechanism-{variant}-1"
         capture_variant = (
             "precursor" if variant.startswith("precursor") else "candidate"
         )
+        run_id = f"direct-binding-{capture_variant}-fixture-{variant}"
         raw = directory / "trace.log"
         summary = directory / "summary.jsonl"
         stdout = directory / "stdout.log"
@@ -174,10 +182,26 @@ class MechanismFixture:
             raw_rows,
             run_id=run_id,
             git_sha="a" * 40,
-            binary_sha256="b" * 64,
+            binary_sha256=self.binary_sha256,
             host="fixture-host",
             bounded=bounded,
         )
+        run_command = [
+            str(self.binary.resolve()),
+            "run",
+            "--exec-backend",
+            "native",
+            "-e",
+            f"CARRICK_RUN_ID={run_id}",
+            "-w",
+            "/tmp",
+            self.image,
+            "/bin/sh",
+            "-c",
+            mechanism.native_go_build.guest_script(),
+        ]
+        for row in summary_rows:
+            row["command"] = run_command[1:]
         summary.write_text(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in summary_rows)
         )
@@ -223,8 +247,11 @@ class MechanismFixture:
         common = {
             "git_commit": "a" * 40,
             "git_status": [],
-            "binary_sha256": "b" * 64,
+            "repository": str(self.repo.resolve()),
+            "binary_path": str(self.binary.resolve()),
+            "binary_sha256": self.binary_sha256,
             "host": "fixture-host",
+            "image_ref": self.image,
             "image": {
                 "id": "sha256:image",
                 "repo_digests": ["image@sha256:digest"],
@@ -237,7 +264,25 @@ class MechanismFixture:
             "schema": mechanism.RECEIPT_SCHEMA,
             "variant": capture_variant,
             "run_id": run_id,
-            "argv": ["carrick", "trace", "--profile", "dsr-indirect"],
+            "inputs": {
+                "repository": str(self.repo.resolve()),
+                "binary": str(self.binary.resolve()),
+                "image": self.image,
+                "profile": "dsr-indirect",
+                "summary_schema": "carrick.dsr-profile.v1",
+            },
+            "argv": [
+                str(self.binary.resolve()),
+                "trace",
+                "--profile",
+                "dsr-indirect",
+                "--trace-out",
+                str(raw.resolve()),
+                "--summary-jsonl",
+                str(summary.resolve()),
+                "--",
+                *run_command[1:],
+            ],
             "workload": mechanism.native_go_build.guest_script(),
             "provenance": {"pre": common, "post": copy.deepcopy(common)},
             "command": {
@@ -254,8 +299,9 @@ class MechanismFixture:
                 "run_id": run_id,
                 "git_sha": "a" * 40,
                 "git_dirty": False,
-                "binary_sha256": "b" * 64,
+                "binary_sha256": self.binary_sha256,
                 "host": "fixture-host",
+                "command": run_command[1:],
                 "completion": {
                     "complete": not bounded,
                     "bounded": bounded,
@@ -290,6 +336,35 @@ class MechanismFixture:
         receipt_path = directory / "receipt.json"
         mechanism.write_json_atomic(receipt_path, payload)
         return mechanism.parse_receipt(receipt_path)
+
+    def rewrite_raw(
+        self,
+        receipt: mechanism.CaptureReceipt,
+        transform,
+    ) -> mechanism.CaptureReceipt:
+        payload = json.loads(receipt.path.read_text())
+        raw_path = pathlib.Path(payload["artifacts"]["raw_trace"]["path"])
+        raw_rows = transform(raw_path.read_text().splitlines())
+        raw_path.write_text("\n".join(raw_rows) + "\n")
+        summary_path = pathlib.Path(payload["artifacts"]["summary_jsonl"]["path"])
+        summary_rows = mechanism.synthetic_summary_rows(
+            raw_rows,
+            run_id=str(payload["run_id"]),
+            git_sha=str(payload["summary"]["git_sha"]),
+            binary_sha256=str(payload["summary"]["binary_sha256"]),
+            host=str(payload["summary"]["host"]),
+            bounded=False,
+        )
+        for row in summary_rows:
+            row["command"] = payload["summary"]["command"]
+        summary_path.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in summary_rows)
+        )
+        payload["summary"]["completion"] = summary_rows[0]["completion"]
+        payload["artifacts"]["raw_trace"] = mechanism.bind_artifact(raw_path)
+        payload["artifacts"]["summary_jsonl"] = mechanism.bind_artifact(summary_path)
+        mechanism.write_json_atomic(receipt.path, payload)
+        return mechanism.parse_receipt(receipt.path)
 
 
 class DirectBindingMechanismTest(unittest.TestCase):
@@ -328,6 +403,333 @@ class DirectBindingMechanismTest(unittest.TestCase):
         self.assertEqual(
             result["runs"]["candidate"]["binding_events"],
             {str(kind): value for kind, value in [(7, 4), (8, 1), (9, 0), (10, 0), (11, 0), (12, 1)]},
+        )
+        self.assertEqual(
+            result["runs"]["candidate"]["binding_cells"],
+            [{"pid": 42, "cell": 0x8000, "value": 4}],
+        )
+        self.assertEqual(
+            result["runs"]["candidate"]["unit_loads"],
+            [
+                {
+                    "pid": 42,
+                    "unit_id": 0x1234,
+                    "record_count": 1,
+                    "binding_data_bytes": 8,
+                    "value": 1,
+                }
+            ],
+        )
+
+    def test_profile_script_allows_natural_unbounded_completion(self):
+        script = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "scripts/dtrace/dsr-indirect.d"
+        ).read_text()
+
+        self.assertNotIn("bounded = 1", script)
+        self.assertNotRegex(script, r"(?m)^tick-[0-9]+s$")
+
+    def test_capture_environment_rejects_every_foreign_ambient_control(self):
+        for value in ("1", ""):
+            with self.subTest(value=value), mock.patch.dict(
+                mechanism.os.environ,
+                {"PATH": "/bin", "CARRICK_FOREIGN_CONTROL": value},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "CARRICK_FOREIGN_CONTROL"
+                ):
+                    mechanism.capture_environment("candidate")
+
+    def test_receipt_variant_requires_its_exact_effective_environment(self):
+        precursor, candidate = self.good_pair()
+        payload = json.loads(candidate.path.read_text())
+        wrong = mechanism.synthetic_snapshot("precursor")["controlled_environment"]
+        payload["provenance"]["pre"]["controlled_environment"] = wrong
+        payload["provenance"]["post"]["controlled_environment"] = copy.deepcopy(wrong)
+        payload["environment_sha256"] = mechanism.sha256_json(wrong)
+        mechanism.write_json_atomic(candidate.path, payload)
+
+        with self.assertRaisesRegex(
+            mechanism.EvidenceError, "fixed candidate environment"
+        ):
+            mechanism.compare(
+                precursor,
+                mechanism.parse_receipt(candidate.path),
+            )
+
+    def test_receipt_artifacts_and_inputs_are_one_exact_capture(self):
+        mutations = {}
+
+        def alias_artifact(receipt, payload):
+            payload["artifacts"]["raw_trace"] = copy.deepcopy(
+                payload["artifacts"]["command_stdout"]
+            )
+
+        mutations["aliased artifact"] = (
+            alias_artifact,
+            "distinct",
+        )
+
+        def outside_artifact(receipt, payload):
+            source = pathlib.Path(
+                payload["artifacts"]["command_stdout"]["path"]
+            )
+            outside = receipt.path.parent.parent / "outside-stdout.log"
+            outside.write_bytes(source.read_bytes())
+            payload["artifacts"]["command_stdout"] = mechanism.bind_artifact(outside)
+
+        mutations["outside artifact"] = (
+            outside_artifact,
+            "capture directory",
+        )
+
+        def wrong_argv(_receipt, payload):
+            payload["argv"] = ["carrick", "trace", "--profile", "dsr-indirect"]
+
+        mutations["wrong argv"] = (wrong_argv, "exact argv")
+
+        def wrong_workload(_receipt, payload):
+            payload["workload"] = "echo BUILD_OK"
+
+        mutations["wrong workload"] = (wrong_workload, "fixed workload")
+
+        def wrong_inputs(_receipt, payload):
+            payload["inputs"]["image"] = "other/image:latest"
+
+        mutations["wrong inputs"] = (wrong_inputs, "image input")
+
+        for index, (name, (mutate, reason)) in enumerate(mutations.items()):
+            with self.subTest(name=name):
+                receipt = self.fixture.receipt(
+                    f"candidate-authority-{index}",
+                    gateway=100,
+                    direct=4,
+                    indirect=20,
+                    eligible=4,
+                    publish=1,
+                )
+                payload = json.loads(receipt.path.read_text())
+                mutate(receipt, payload)
+                mechanism.write_json_atomic(receipt.path, payload)
+                with self.assertRaisesRegex(mechanism.EvidenceError, reason):
+                    mechanism.validate_receipt(
+                        mechanism.parse_receipt(receipt.path),
+                        require_variant="candidate",
+                    )
+
+    def test_summary_schema_command_and_run_id_match_receipt_authority(self):
+        for index, field in enumerate(("schema", "profile", "command", "run_id")):
+            with self.subTest(field=field):
+                receipt = self.fixture.receipt(
+                    f"candidate-summary-{index}",
+                    gateway=100,
+                    direct=4,
+                    indirect=20,
+                    eligible=4,
+                    publish=1,
+                )
+                payload = json.loads(receipt.path.read_text())
+                summary_path = pathlib.Path(
+                    payload["artifacts"]["summary_jsonl"]["path"]
+                )
+                rows = [
+                    json.loads(line)
+                    for line in summary_path.read_text().splitlines()
+                ]
+                if field == "schema":
+                    for row in rows:
+                        row["schema"] = "other.schema"
+                elif field == "profile":
+                    for row in rows:
+                        row["profile"] = "dsr"
+                elif field == "command":
+                    for row in rows:
+                        row["command"] = ["run", "other-image"]
+                    payload["summary"]["command"] = ["run", "other-image"]
+                else:
+                    wrong_run_id = "direct-binding-candidate-other"
+                    for row in rows:
+                        row["run_id"] = wrong_run_id
+                    payload["run_id"] = wrong_run_id
+                    payload["summary"]["run_id"] = wrong_run_id
+                summary_path.write_text(
+                    "".join(
+                        json.dumps(row, sort_keys=True) + "\n" for row in rows
+                    )
+                )
+                payload["artifacts"]["summary_jsonl"] = mechanism.bind_artifact(
+                    summary_path
+                )
+                mechanism.write_json_atomic(receipt.path, payload)
+
+                with self.assertRaisesRegex(
+                    mechanism.EvidenceError,
+                    "schema|profile|command|run ID",
+                ):
+                    mechanism.parse_trace(
+                        mechanism.parse_receipt(receipt.path)
+                    )
+
+    def test_precursor_rejection_retains_exact_reason_and_parseable_counters(self):
+        precursor, _ = self.good_pair()
+        payload = json.loads(precursor.path.read_text())
+        payload["cleanup"] = {
+            "status": 3,
+            "stdout": "cleanup stdout",
+            "stderr": "cleanup stderr",
+            "descendants": [],
+        }
+        mechanism.write_json_atomic(precursor.path, payload)
+        precursor = mechanism.parse_receipt(precursor.path)
+        output = pathlib.Path(self.temporary.name) / "rejected-pair.json"
+
+        with mock.patch.object(
+            mechanism, "capture_one", return_value=precursor
+        ):
+            result = mechanism.capture_pair(
+                self.fixture.repo,
+                pathlib.Path(self.temporary.name) / "captures",
+                output,
+                5,
+            )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(
+            result["rejection_reasons"],
+            [
+                "cleanup status is nonzero: 3 "
+                "stdout='cleanup stdout' stderr='cleanup stderr'"
+            ],
+        )
+        self.assertEqual(
+            result["available_runs"]["precursor"]["binding_events"]["7"],
+            100,
+        )
+        self.assertEqual(json.loads(output.read_text()), result)
+
+    def test_malformed_numeric_receipt_is_an_atomic_typed_rejection(self):
+        precursor, candidate = self.good_pair()
+        payload = json.loads(candidate.path.read_text())
+        payload["command"]["status"] = "not-a-number"
+        mechanism.write_json_atomic(candidate.path, payload)
+        output = pathlib.Path(self.temporary.name) / "malformed.json"
+
+        status = mechanism.main(
+            [
+                "compare",
+                "--precursor-receipt",
+                str(precursor.path),
+                "--candidate-receipt",
+                str(candidate.path),
+                "--output",
+                str(output),
+            ]
+        )
+
+        self.assertEqual(status, 1)
+        rejected = json.loads(output.read_text())
+        self.assertFalse(rejected["accepted"])
+        self.assertIn("command.status is not an integer", rejected["rejection_reasons"][0])
+
+    def test_specialized_dtrace_rows_reconcile_with_event_vector(self):
+        cases = (
+            ("binding-publish-cell", "kind=8", {"publish": 1}),
+            ("binding-clear-cell", "kind=10", {"clear": 1}),
+            ("binding-validation", "kind=11", {"validation": 1}),
+            ("binding-unit", "kind=12", {}),
+        )
+        for index, (phase, event, options) in enumerate(cases):
+            with self.subTest(phase=phase):
+                receipt = self.fixture.receipt(
+                    f"candidate-specialized-{index}",
+                    gateway=100,
+                    direct=4,
+                    indirect=20,
+                    eligible=4,
+                    publish=options.get("publish", 1),
+                    clear=options.get("clear", 0),
+                    validation=options.get("validation", 0),
+                )
+
+                def zero_specialized(rows):
+                    return [
+                        (
+                            line.rsplit("value=", 1)[0] + "value=0"
+                            if f"phase={phase}|" in line
+                            else line
+                        )
+                        for line in rows
+                    ]
+
+                receipt = self.fixture.rewrite_raw(receipt, zero_specialized)
+                with self.assertRaisesRegex(
+                    mechanism.EvidenceError,
+                    f"{phase}.*{event}|{event}.*{phase}",
+                ):
+                    mechanism.parse_trace(receipt)
+
+    def test_specialized_dtrace_identities_are_nonzero_and_typed(self):
+        candidate = self.fixture.receipt(
+            "candidate-invalid-specialized",
+            gateway=100,
+            direct=4,
+            indirect=20,
+            eligible=4,
+            publish=1,
+        )
+
+        def zero_unit_id(rows):
+            return [
+                line.replace("unit_id=0x1234", "unit_id=0")
+                if "phase=binding-unit|" in line
+                else line
+                for line in rows
+            ]
+
+        candidate = self.fixture.rewrite_raw(candidate, zero_unit_id)
+        with self.assertRaisesRegex(mechanism.EvidenceError, "unit.*zero"):
+            mechanism.parse_trace(candidate)
+
+    def test_task15_explicit_capture_command_and_stable_artifact_layout(self):
+        arguments = [
+            "capture-pair",
+            "--repo",
+            ".",
+            "--binary",
+            "target/release/carrick",
+            "--image",
+            "localhost:5005/carrick-go-conformance:1.24",
+            "--artifact-dir",
+            "target/perf/direct-binding-mechanism-v1",
+            "--output",
+            "target/perf/direct-binding-mechanism-v1.json",
+        ]
+        try:
+            parsed = mechanism.parse_args(arguments)
+        except SystemExit as error:
+            self.fail(f"Task 15 capture command does not compose: {error}")
+
+        self.assertEqual(parsed.repo, pathlib.Path("."))
+        self.assertEqual(parsed.binary, pathlib.Path("target/release/carrick"))
+        self.assertEqual(
+            parsed.image, "localhost:5005/carrick-go-conformance:1.24"
+        )
+        self.assertEqual(
+            parsed.artifact_dir,
+            pathlib.Path("target/perf/direct-binding-mechanism-v1"),
+        )
+        config = mechanism.CaptureConfig(
+            repo=self.fixture.repo,
+            output_dir=pathlib.Path(self.temporary.name) / "artifacts",
+            variant="precursor",
+            run_id="direct-binding-precursor-test",
+        )
+        paths = mechanism._capture_paths(config)
+        self.assertEqual(
+            paths["receipt"],
+            (config.output_dir / "precursor/receipt.json").resolve(),
         )
 
     def test_missing_summary_drop_or_provenance_field_rejects_the_pair(self):
@@ -426,8 +828,16 @@ class DirectBindingMechanismTest(unittest.TestCase):
             descendants=("pid=99",),
         )
         with (
-            mock.patch.object(mechanism, "capture_snapshot", return_value=before),
-            mock.patch.object(mechanism, "_run_trace", return_value=completed),
+            mock.patch.object(
+                mechanism,
+                "capture_snapshot",
+                return_value=before,
+            ) as snapshot,
+            mock.patch.object(
+                mechanism,
+                "_run_trace",
+                return_value=completed,
+            ) as run_trace,
             mock.patch.object(mechanism, "_cleanup", return_value=cleanup),
         ):
             receipt = mechanism.capture_one(config)
@@ -436,6 +846,17 @@ class DirectBindingMechanismTest(unittest.TestCase):
         self.assertEqual(payload["cleanup"]["status"], 3)
         self.assertEqual(payload["cleanup"]["stderr"], "cleanup stderr")
         self.assertFalse(receipt.valid_for_followup)
+        capture = run_trace.call_args.args[2]
+        self.assertTrue(
+            all(call.args[1] is capture for call in snapshot.call_args_list)
+        )
+        self.assertEqual(
+            {
+                key: capture.subprocess.get(key)
+                for key in mechanism.native_go_build.PERFORMANCE_CONTROL_KEYS
+            },
+            capture.controlled,
+        )
 
     def test_capture_rejects_pre_post_drift_or_foreign_census(self):
         precursor, candidate = self.good_pair()

@@ -223,6 +223,16 @@ def run_campaign(
                 environment_overlay=native_go_build.fixed_variant_overlay(variant),
             )
             completed.append({**row, "variant": variant})
+    except native_go_build.SampleEvidenceError as error:
+        failed_variant = order[len(completed)]
+        completed.append({**error.sample, "variant": failed_variant})
+        payload = publish_screen(
+            output,
+            completed,
+            mode=mode,
+            extra_reasons=(f"sample failed: {error}",),
+        )
+        return payload
     except Exception as error:
         payload = publish_screen(
             output,

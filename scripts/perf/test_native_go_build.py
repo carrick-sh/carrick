@@ -124,6 +124,33 @@ class NativeGoBuildTest(unittest.TestCase):
             },
         )
 
+    def test_docker_census_ignores_registry_but_rejects_real_oracle(self):
+        listing = subprocess.CompletedProcess(
+            ["docker", "ps"],
+            0,
+            (
+                "aaa carrick-registry-5050 registry:2\n"
+                "bbb native-go-build-oracle "
+                "localhost:5005/carrick-go-conformance:1.24\n"
+                "ccc unrelated redis:7\n"
+            ),
+            "",
+        )
+        with mock.patch.object(
+            native_go_build.subprocess,
+            "run",
+            return_value=listing,
+        ):
+            oracles = native_go_build.running_docker_oracles()
+
+        self.assertEqual(
+            oracles,
+            [
+                "bbb native-go-build-oracle "
+                "localhost:5005/carrick-go-conformance:1.24"
+            ],
+        )
+
     def test_docker_sample_cleans_only_its_named_container(self):
         directory, log = self.install_fake_docker("arm64")
 
@@ -210,6 +237,45 @@ class NativeGoBuildTest(unittest.TestCase):
 
         self.assertEqual(captured.read_text(), "sample stdout\nsample stderr\n")
         cleanup.assert_called_once_with(run_id)
+
+    def test_failed_current_sample_retains_separate_streams_and_cleanup(self):
+        directory, _ = self.install_fake_docker("arm64")
+        result = subprocess.CompletedProcess(
+            ["docker", "run"],
+            0,
+            "BUILD_OK\nsample stdout\n",
+            "sample stderr\n",
+        )
+        cleanup = {
+            "status": 3,
+            "stdout": "cleanup stdout\n",
+            "stderr": "cleanup stderr\n",
+        }
+        with (
+            mock.patch.object(
+                native_go_build.subprocess,
+                "run",
+                return_value=result,
+            ),
+            mock.patch.object(
+                native_go_build,
+                "docker_cleanup",
+                return_value=cleanup,
+            ),
+            self.assertRaises(native_go_build.SampleEvidenceError) as caught,
+        ):
+            native_go_build.run_sample(
+                directory,
+                "docker",
+                index=1,
+                timeout_seconds=5,
+            )
+
+        row = caught.exception.sample
+        self.assertEqual(row["stdout"], "BUILD_OK\nsample stdout\n")
+        self.assertEqual(row["stderr"], "sample stderr\n")
+        self.assertEqual(row["command"]["status"], 0)
+        self.assertEqual(row["cleanup"], cleanup)
 
     def test_phase_names_each_captured_output_by_engine_and_sample(self):
         directory, _ = self.install_fake_docker("arm64")

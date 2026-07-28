@@ -564,8 +564,17 @@ impl DirectBindingRegistry {
         &mut self,
         source: GuestVa,
         target: GuestVa,
-        miss: Option<DirectBindingMiss>,
+        binding: DirectBindingExitMetadata,
     ) -> Result<DirectBindingEligibility, DirectBindingValidationReason> {
+        let miss = match binding {
+            DirectBindingExitMetadata::Absent => None,
+            DirectBindingExitMetadata::Mapped(miss) => Some(miss),
+            DirectBindingExitMetadata::MappedCellFailure { .. } => {
+                self.counters.owner_validation_failures =
+                    self.counters.owner_validation_failures.saturating_add(1);
+                return Err(DirectBindingValidationReason::MappedCellFailure);
+            }
+        };
         let mut candidates = self
             .units
             .iter()
@@ -1091,6 +1100,32 @@ impl DirectBindingRegistry {
 pub struct DirectBindingMiss {
     pub cell: DirectBindingCellVa,
     pub ordinal: DirectBindingOrdinal,
+}
+
+/// Exit-time direct-binding metadata before cold-path authority validation.
+///
+/// A present-but-invalid mapped-cell value remains distinct from an absent
+/// sidecar binding so the validation probe can report the mapped-cell failure
+/// without guessing at a typed address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectBindingExitMetadata {
+    Absent,
+    Mapped(DirectBindingMiss),
+    MappedCellFailure {
+        raw_cell: u64,
+        ordinal: DirectBindingOrdinal,
+    },
+}
+
+impl DirectBindingExitMetadata {
+    /// Returns the exact exit-time cell field for validation evidence.
+    pub const fn raw_cell(self) -> u64 {
+        match self {
+            Self::Absent => 0,
+            Self::Mapped(miss) => miss.cell.get() as u64,
+            Self::MappedCellFailure { raw_cell, .. } => raw_cell,
+        }
+    }
 }
 
 /// The sole adapter from a validated mapped-cell address to atomic operations.

@@ -3013,6 +3013,7 @@ impl ThreadTranslator {
                 target,
                 binding,
             } => {
+                let binding_cell = binding.raw_cell();
                 probes::dsr_resolve_begin(
                     self.tid,
                     probes::DsrResolveKind::Direct,
@@ -3041,7 +3042,7 @@ impl ThreadTranslator {
                             probes::DsrCacheEventKind::DirectBindingValidationFailure,
                             source.raw(),
                             reason.raw(),
-                            binding.map_or(0, |miss| miss.cell.get() as u64),
+                            binding_cell,
                         );
                     }
                 }
@@ -3482,10 +3483,10 @@ mod tests {
     mod direct_binding_owner_and_publication {
         use super::{ProcessTranslator, TEST_HOST_JIT};
         use crate::direct_binding::{
-            DirectBindingCellRef, DirectBindingCellVa, DirectBindingEligibility, DirectBindingMiss,
-            DirectBindingOrdinal, DirectBindingPublishOutcome, DirectBindingRegistry,
-            DirectBindingTarget, DirectBindingTargetPrefix, DirectBindingValidationReason,
-            PrivateJitEpoch,
+            DirectBindingCellRef, DirectBindingCellVa, DirectBindingEligibility,
+            DirectBindingExitMetadata, DirectBindingMiss, DirectBindingOrdinal,
+            DirectBindingPublishOutcome, DirectBindingRegistry, DirectBindingTarget,
+            DirectBindingTargetPrefix, DirectBindingValidationReason, PrivateJitEpoch,
         };
         use crate::emit::DirectLinkKind;
         use crate::shared_cache::{
@@ -3734,7 +3735,7 @@ mod tests {
                 .classify_cold_exit(
                     b_source,
                     target,
-                    Some(DirectBindingMiss {
+                    DirectBindingExitMetadata::Mapped(DirectBindingMiss {
                         cell: second.unit.binding_base.expect("B cell"),
                         ordinal: DirectBindingOrdinal::claimed(0),
                     }),
@@ -3769,9 +3770,11 @@ mod tests {
                 .expect("register second disabled manifest");
 
             assert_eq!(
-                state
-                    .direct_bindings
-                    .classify_cold_exit(source, target, None),
+                state.direct_bindings.classify_cold_exit(
+                    source,
+                    target,
+                    DirectBindingExitMetadata::Absent
+                ),
                 Err(DirectBindingValidationReason::AmbiguousEligibleRecord),
             );
         }
@@ -3793,7 +3796,7 @@ mod tests {
 
             let selected = state
                 .direct_bindings
-                .classify_cold_exit(source, target, None)
+                .classify_cold_exit(source, target, DirectBindingExitMetadata::Absent)
                 .expect("disabled eligibility remains authoritative");
             assert_eq!(selected.ordinal, DirectBindingOrdinal::claimed(7));
             assert_eq!(selected.cell, None);
@@ -3812,16 +3815,46 @@ mod tests {
                 .expect("register sidecar");
 
             assert_eq!(
-                state
-                    .direct_bindings
-                    .classify_cold_exit(GuestVa(0x40_5004), target, None),
+                state.direct_bindings.classify_cold_exit(
+                    GuestVa(0x40_5004),
+                    target,
+                    DirectBindingExitMetadata::Absent,
+                ),
                 Err(DirectBindingValidationReason::MissingEligibleRecord),
             );
             assert_eq!(
-                state
-                    .direct_bindings
-                    .classify_cold_exit(source, target, None),
+                state.direct_bindings.classify_cold_exit(
+                    source,
+                    target,
+                    DirectBindingExitMetadata::Absent
+                ),
                 Err(DirectBindingValidationReason::MissMetadataMismatch),
+            );
+            assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
+        }
+
+        #[test]
+        fn malformed_present_cell_is_a_mapped_cell_failure() {
+            let source = GuestVa(0x40_6000);
+            let target = GuestVa(0x50_6000);
+            let fixture = sidecar_unit(key(26), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register sidecar");
+
+            assert_eq!(
+                state.direct_bindings.classify_cold_exit(
+                    source,
+                    target,
+                    DirectBindingExitMetadata::MappedCellFailure {
+                        raw_cell: 0x20_001,
+                        ordinal: DirectBindingOrdinal::claimed(0),
+                    },
+                ),
+                Err(DirectBindingValidationReason::MappedCellFailure),
             );
             assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
         }
@@ -4928,7 +4961,7 @@ mod tests {
                 NativeDsrExit::ResolveDirect {
                     source: PC,
                     target,
-                    binding: None,
+                    binding: crate::direct_binding::DirectBindingExitMetadata::Absent,
                 },
                 (DsrExitKind::DirectResolver, PC.raw(), target.raw(), 2),
             ),
