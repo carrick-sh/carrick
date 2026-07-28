@@ -349,6 +349,12 @@ pub struct DirectStubEnvelope {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectExitEmissionPolicy {
+    PrivateGateway,
+    PortableUnitAuthority,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectLink {
     pub slot: CacheOffset,
     pub source: GuestVa,
@@ -1790,6 +1796,46 @@ fn emit_cached_direct_exit(
     )
 }
 
+#[allow(
+    clippy::needless_option_as_deref,
+    clippy::too_many_arguments,
+    reason = "policy chooses the compact private exit or the immutable-unit authority precursor"
+)]
+fn emit_direct_exit(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    map_guest: GuestVa,
+    source_guest: GuestVa,
+    target: GuestVa,
+    committed_link: Option<u64>,
+    recovery: &mut Vec<RecoveryEntry>,
+    policy: DirectExitEmissionPolicy,
+    recording: Option<&mut ArtifactRecording>,
+) -> Result<(), DsrError> {
+    match policy {
+        DirectExitEmissionPolicy::PrivateGateway => emit_gateway_exit(
+            assembler,
+            entries,
+            map_guest,
+            target,
+            Some(source_guest),
+            2,
+            GatewayKind::Direct,
+            recording,
+        ),
+        DirectExitEmissionPolicy::PortableUnitAuthority => emit_cached_direct_exit(
+            assembler,
+            entries,
+            map_guest,
+            source_guest,
+            target,
+            committed_link,
+            recovery,
+            recording,
+        ),
+    }
+}
+
 fn rewritten_virtual_word(
     word: u32,
     guest: GuestVa,
@@ -3040,7 +3086,14 @@ pub fn emit_block(
     plan: &BlockPlan,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    assemble_block_inner(plan, None, mode, None)?.publish(cache)
+    assemble_block_inner(
+        plan,
+        None,
+        mode,
+        DirectExitEmissionPolicy::PrivateGateway,
+        None,
+    )?
+    .publish(cache)
 }
 
 pub fn emit_block_direct(
@@ -3056,7 +3109,14 @@ pub fn emit_block_with_generation(
     guard: GenerationGuard,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    assemble_block_inner(plan, Some(guard), mode, None)?.publish(cache)
+    assemble_block_inner(
+        plan,
+        Some(guard),
+        mode,
+        DirectExitEmissionPolicy::PrivateGateway,
+        None,
+    )?
+    .publish(cache)
 }
 
 pub fn emit_block_recording_artifact(
@@ -3085,7 +3145,13 @@ pub fn emit_block_recording_artifact_optional(
     if let EmitAddressMode::Biased { host_bias } = mode {
         recording.bind(ProcessValue::HostBias, host_bias.get())?;
     }
-    let assembled = assemble_block_inner(plan, Some(guard), mode, Some(&mut recording))?;
+    let assembled = assemble_block_inner(
+        plan,
+        Some(guard),
+        mode,
+        DirectExitEmissionPolicy::PrivateGateway,
+        Some(&mut recording),
+    )?;
     let artifact = recording
         .finish(
             assembled.words.clone(),
@@ -3116,6 +3182,7 @@ pub fn record_portable_block_artifact(
             plan.generation,
         )),
         mode,
+        DirectExitEmissionPolicy::PortableUnitAuthority,
         Some(&mut recording),
     )?;
     recording.finish(
@@ -3158,6 +3225,7 @@ fn emit_region_direct_exit(
     source_guest: GuestVa,
     target: GuestVa,
     clear_monitor: bool,
+    policy: DirectExitEmissionPolicy,
     recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     if clear_monitor {
@@ -3176,7 +3244,7 @@ fn emit_region_direct_exit(
     let slot = current_offset(assembler)?;
     emit_word(assembler, entries, map_guest, 0x1400_0001)?;
     let stub_start = current_offset(assembler)?;
-    emit_cached_direct_exit(
+    emit_direct_exit(
         assembler,
         entries,
         map_guest,
@@ -3184,6 +3252,7 @@ fn emit_region_direct_exit(
         target,
         None,
         recovery,
+        policy,
         recording,
     )?;
     direct_links.push(DirectLink {
@@ -3297,6 +3366,7 @@ fn emit_biased_exclusive_region(
     exit: super::types::ExclusiveRegionExit,
     scratch: super::types::BiasedExclusiveScratch,
     host_bias: carrick_dsr::address::NativeHostBias,
+    policy: DirectExitEmissionPolicy,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     let address = scratch.address.index();
@@ -3726,6 +3796,7 @@ fn emit_biased_exclusive_region(
         retry_pc,
         exit.end,
         false,
+        policy,
         recording.as_deref_mut(),
     )?;
     if let Some((_, tail, branch_guest, target)) = early_exit {
@@ -3742,6 +3813,7 @@ fn emit_biased_exclusive_region(
             branch_guest,
             target,
             false,
+            policy,
             recording.as_deref_mut(),
         )?;
     }
@@ -3793,6 +3865,7 @@ fn emit_exclusive_region(
     exit: super::types::ExclusiveRegionExit,
     fusion: super::types::ExclusiveFusionSite,
     mode: EmitAddressMode,
+    policy: DirectExitEmissionPolicy,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     if let EmitAddressMode::Biased { host_bias } = mode {
@@ -3813,6 +3886,7 @@ fn emit_exclusive_region(
             exit,
             scratch,
             host_bias,
+            policy,
             recording.as_deref_mut(),
         );
     }
@@ -3940,6 +4014,7 @@ fn emit_exclusive_region(
         retry_pc,
         exit.end,
         false,
+        policy,
         recording.as_deref_mut(),
     )?;
 
@@ -3959,6 +4034,7 @@ fn emit_exclusive_region(
             branch_guest,
             target,
             true,
+            policy,
             recording.as_deref_mut(),
         )?;
     }
@@ -3974,6 +4050,7 @@ fn assemble_block_inner(
     plan: &BlockPlan,
     guard: Option<GenerationGuard>,
     mode: EmitAddressMode,
+    direct_exit_policy: DirectExitEmissionPolicy,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<AssembledBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
@@ -4167,6 +4244,7 @@ fn assemble_block_inner(
             exit,
             fusion,
             mode,
+            direct_exit_policy,
             recording.as_deref_mut(),
         )?;
     } else {
@@ -4490,7 +4568,7 @@ fn assemble_block_inner(
                 } else {
                     (DirectLinkKind::Branch, None)
                 };
-                emit_cached_direct_exit(
+                emit_direct_exit(
                     &mut assembler,
                     &mut entries,
                     exit_guest,
@@ -4498,6 +4576,7 @@ fn assemble_block_inner(
                     exit.target,
                     committed_link,
                     &mut recovery,
+                    direct_exit_policy,
                     recording.as_deref_mut(),
                 )?;
                 direct_links.push(DirectLink {
@@ -4545,7 +4624,7 @@ fn assemble_block_inner(
                     ; b =>taken_stub
                 );
                 let fall_stub_start = current_offset(&assembler)?;
-                emit_cached_direct_exit(
+                emit_direct_exit(
                     &mut assembler,
                     &mut entries,
                     exit_guest,
@@ -4553,6 +4632,7 @@ fn assemble_block_inner(
                     exit.resume,
                     None,
                     &mut recovery,
+                    direct_exit_policy,
                     recording.as_deref_mut(),
                 )?;
                 direct_links.push(DirectLink {
@@ -4570,7 +4650,7 @@ fn assemble_block_inner(
                     ; =>taken_stub
                 );
                 let taken_stub_start = current_offset(&assembler)?;
-                emit_cached_direct_exit(
+                emit_direct_exit(
                     &mut assembler,
                     &mut entries,
                     exit_guest,
@@ -4578,6 +4658,7 @@ fn assemble_block_inner(
                     exit.target,
                     None,
                     &mut recovery,
+                    direct_exit_policy,
                     recording.as_deref_mut(),
                 )?;
                 direct_links.push(DirectLink {
@@ -4626,6 +4707,7 @@ fn assemble_block_inner(
                     exit_guest,
                     exit.resume,
                     false,
+                    direct_exit_policy,
                     recording.as_deref_mut(),
                 )?;
             } else {
@@ -4644,7 +4726,7 @@ fn assemble_block_inner(
             let slot = current_offset(&assembler)?;
             emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
             let stub_start = current_offset(&assembler)?;
-            emit_cached_direct_exit(
+            emit_direct_exit(
                 &mut assembler,
                 &mut entries,
                 exit_guest,
@@ -4652,6 +4734,7 @@ fn assemble_block_inner(
                 target,
                 None,
                 &mut recovery,
+                direct_exit_policy,
                 recording.as_deref_mut(),
             )?;
             direct_links.push(DirectLink {
@@ -5439,7 +5522,7 @@ mod tests {
         Ok(())
     }
 
-    fn direct_binding_recovery_cases() -> Vec<(&'static str, AssembledBlock)> {
+    fn direct_edge_cases(policy: DirectExitEmissionPolicy) -> Vec<(&'static str, AssembledBlock)> {
         let branch = direct_plan(PlannedExit::Direct {
             guest: GuestVa(0x4000),
             word: 0x1400_0400,
@@ -5483,22 +5566,22 @@ mod tests {
         vec![
             (
                 "branch",
-                assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
+                assemble_block_inner(&branch, None, EmitAddressMode::Direct, policy, None)
                     .expect("assemble branch recovery fixture"),
             ),
             (
                 "call",
-                assemble_block_inner(&call, None, EmitAddressMode::Direct, None)
+                assemble_block_inner(&call, None, EmitAddressMode::Direct, policy, None)
                     .expect("assemble call recovery fixture"),
             ),
             (
                 "conditional",
-                assemble_block_inner(&conditional, None, EmitAddressMode::Direct, None)
+                assemble_block_inner(&conditional, None, EmitAddressMode::Direct, policy, None)
                     .expect("assemble conditional recovery fixture"),
             ),
             (
                 "continue",
-                assemble_block_inner(&continuation, None, EmitAddressMode::Direct, None)
+                assemble_block_inner(&continuation, None, EmitAddressMode::Direct, policy, None)
                     .expect("assemble continuation recovery fixture"),
             ),
         ]
@@ -5507,7 +5590,7 @@ mod tests {
     #[test]
     fn direct_binding_recovery_covers_every_sidecar_boundary_and_edge_class() {
         let mut kinds = std::collections::BTreeSet::new();
-        for (case, emitted) in direct_binding_recovery_cases() {
+        for (case, emitted) in direct_edge_cases(DirectExitEmissionPolicy::PortableUnitAuthority) {
             for link in &emitted.direct_links {
                 kinds.insert(link.kind as u8);
                 assert_eq!(link.source.raw() & 3, 0, "{case}: exact source PC");
@@ -5527,7 +5610,7 @@ mod tests {
 
     #[test]
     fn direct_binding_recovery_gate_rejects_first_authority_store_hole() {
-        let emitted = direct_binding_recovery_cases()
+        let emitted = direct_edge_cases(DirectExitEmissionPolicy::PortableUnitAuthority)
             .into_iter()
             .next()
             .expect("branch recovery fixture")
@@ -5541,6 +5624,60 @@ mod tests {
         assert!(
             error.contains("expected exactly one"),
             "unexpected coverage failure: {error}"
+        );
+    }
+
+    #[test]
+    fn private_direct_edges_use_compact_gateway_stubs() {
+        const PRIVATE_DIRECT_GATEWAY_STUB_BYTES: u32 = 56;
+
+        let mut kinds = std::collections::BTreeSet::new();
+        for (case, emitted) in direct_edge_cases(DirectExitEmissionPolicy::PrivateGateway) {
+            for link in emitted.direct_links {
+                kinds.insert(link.kind as u8);
+                assert_eq!(
+                    link.stub.end.get() - link.stub.start.get(),
+                    PRIVATE_DIRECT_GATEWAY_STUB_BYTES,
+                    "{case} {:?}: private direct edge must use the compact direct gateway",
+                    link.kind,
+                );
+            }
+        }
+        assert_eq!(
+            kinds.len(),
+            5,
+            "branch, call, conditional taken/fall-through, and Continue must be compact"
+        );
+
+        let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
+        let mut entries = Vec::new();
+        let mut direct_links = Vec::new();
+        let mut recovery = Vec::new();
+        emit_region_direct_exit(
+            &mut assembler,
+            &mut entries,
+            &mut direct_links,
+            &mut recovery,
+            GuestVa(0x7010),
+            GuestVa(0x7008),
+            GuestVa(0x7010),
+            false,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("emit private fused-exclusive continuation");
+        let _ = assembler
+            .finalize()
+            .expect("finalize private fused-exclusive continuation");
+        let link = direct_links
+            .into_iter()
+            .next()
+            .expect("fused-exclusive continuation direct link");
+        assert_eq!(link.kind, DirectLinkKind::Continue);
+        assert_eq!(
+            link.stub.end.get() - link.stub.start.get(),
+            PRIVATE_DIRECT_GATEWAY_STUB_BYTES,
+            "fused-exclusive continuation: private direct edge must use the compact direct gateway"
         );
     }
 
@@ -5590,8 +5727,14 @@ mod tests {
         let cases = [
             (
                 "branch",
-                assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
-                    .expect("assemble branch"),
+                assemble_block_inner(
+                    &branch,
+                    None,
+                    EmitAddressMode::Direct,
+                    DirectExitEmissionPolicy::PortableUnitAuthority,
+                    None,
+                )
+                .expect("assemble branch"),
                 vec![ExpectedDirectLink {
                     source: GuestVa(0x4000),
                     target: GuestVa(0x5000),
@@ -5604,8 +5747,14 @@ mod tests {
             ),
             (
                 "call",
-                assemble_block_inner(&call, None, EmitAddressMode::Direct, None)
-                    .expect("assemble call"),
+                assemble_block_inner(
+                    &call,
+                    None,
+                    EmitAddressMode::Direct,
+                    DirectExitEmissionPolicy::PortableUnitAuthority,
+                    None,
+                )
+                .expect("assemble call"),
                 vec![ExpectedDirectLink {
                     source: GuestVa(0x4000),
                     target: GuestVa(0x5000),
@@ -5618,8 +5767,14 @@ mod tests {
             ),
             (
                 "conditional",
-                assemble_block_inner(&conditional, None, EmitAddressMode::Direct, None)
-                    .expect("assemble conditional"),
+                assemble_block_inner(
+                    &conditional,
+                    None,
+                    EmitAddressMode::Direct,
+                    DirectExitEmissionPolicy::PortableUnitAuthority,
+                    None,
+                )
+                .expect("assemble conditional"),
                 vec![
                     ExpectedDirectLink {
                         source: GuestVa(0x4000),
@@ -5643,8 +5798,14 @@ mod tests {
             ),
             (
                 "continue",
-                assemble_block_inner(&continuation, None, EmitAddressMode::Direct, None)
-                    .expect("assemble continuation"),
+                assemble_block_inner(
+                    &continuation,
+                    None,
+                    EmitAddressMode::Direct,
+                    DirectExitEmissionPolicy::PortableUnitAuthority,
+                    None,
+                )
+                .expect("assemble continuation"),
                 vec![ExpectedDirectLink {
                     source: GuestVa(0x4004),
                     target: GuestVa(0x4004),
@@ -5678,6 +5839,7 @@ mod tests {
             GuestVa(0x7008),
             GuestVa(0x7010),
             false,
+            DirectExitEmissionPolicy::PortableUnitAuthority,
             None,
         )
         .expect("emit fused-exclusive continuation");
@@ -5714,8 +5876,14 @@ mod tests {
                 bit: None,
             },
         });
-        let assembled = assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
-            .expect("assemble direct branch");
+        let assembled = assemble_block_inner(
+            &branch,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PortableUnitAuthority,
+            None,
+        )
+        .expect("assemble direct branch");
         let stub = assembled.direct_links[0].stub;
         let live_x15 = 0x1500_0015;
         let live_x16 = 0x1600_0016;
@@ -5832,8 +6000,14 @@ mod tests {
                 bit: None,
             },
         });
-        let assembled = assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
-            .expect("assemble direct branch");
+        let assembled = assemble_block_inner(
+            &branch,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PortableUnitAuthority,
+            None,
+        )
+        .expect("assemble direct branch");
         let link = assembled.direct_links[0];
         let mut code = assembled
             .words
@@ -5967,8 +6141,14 @@ mod tests {
                 bit: None,
             },
         });
-        let assembled = assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
-            .expect("assemble direct branch");
+        let assembled = assemble_block_inner(
+            &branch,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PortableUnitAuthority,
+            None,
+        )
+        .expect("assemble direct branch");
         let link = assembled.direct_links[0];
         let mut code = assembled
             .words
@@ -6006,8 +6186,14 @@ mod tests {
                 bit: None,
             },
         });
-        let assembled = assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
-            .expect("assemble direct branch");
+        let assembled = assemble_block_inner(
+            &branch,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PortableUnitAuthority,
+            None,
+        )
+        .expect("assemble direct branch");
         let link = assembled.direct_links[0];
         let mut code = assembled
             .words
