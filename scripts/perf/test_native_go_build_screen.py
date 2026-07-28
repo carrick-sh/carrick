@@ -225,6 +225,41 @@ class NativeGoBuildScreenTest(unittest.TestCase):
             self.assertFalse(stored["accepted"])
             self.assertEqual(list(output.parent.glob(f".{output.name}.*")), [])
 
+    def test_failed_current_sample_is_included_in_atomic_rejection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "screen.json"
+            failed_row = {
+                "engine": "carrick",
+                "index": 1,
+                "run_id": "native-go-build-carrick-fixture-1",
+                "elapsed_ms": 12,
+                "stdout": "BUILD_OK\n",
+                "stderr": "diagnostic\n",
+                "command": {"status": 0, "build_ok": True},
+                "cleanup": {
+                    "status": 3,
+                    "stdout": "cleanup stdout\n",
+                    "stderr": "cleanup stderr\n",
+                },
+            }
+            failure = native_go_build.SampleEvidenceError(
+                "cleanup status is nonzero",
+                failed_row,
+            )
+
+            result = native_go_build_screen.run_campaign(
+                pathlib.Path(directory),
+                "screen",
+                output,
+                5,
+                sample_runner=mock.Mock(side_effect=failure),
+            )
+
+            self.assertFalse(result["accepted"])
+            self.assertEqual(result["samples"], [{**failed_row, "variant": "precursor"}])
+            self.assertEqual(json.loads(output.read_text()), result)
+            self.assertEqual(list(output.parent.glob(f".{output.name}.*")), [])
+
 
 if __name__ == "__main__":
     unittest.main()

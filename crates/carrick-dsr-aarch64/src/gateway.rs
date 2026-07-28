@@ -13,7 +13,9 @@
 //! shim's ABI helpers, which live in csrc/native_darwin.c).
 
 use super::types::{CacheVa, CodeGeneration, DsrError, NativeDsrExit};
-use crate::direct_binding::{DirectBindingCellVa, DirectBindingMiss, DirectBindingOrdinal};
+use crate::direct_binding::{
+    DirectBindingCellVa, DirectBindingExitMetadata, DirectBindingMiss, DirectBindingOrdinal,
+};
 use crate::snapshot::NativeUcontextSnapshot;
 
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
@@ -476,16 +478,21 @@ fn decode_direct_exit(context: &DsrContext) -> NativeDsrExit {
     // hit, unlike the `PreparedEntry` that began this translated run. The
     // cold registry classifier combines this exact `(source,target)` with the
     // miss cell/ordinal below and rejects ambiguous loaded-manifest matches.
-    let binding = if context.direct_binding_present == 1 {
-        usize::try_from(context.direct_binding_cell)
-            .ok()
-            .and_then(DirectBindingCellVa::mapped)
-            .map(|cell| DirectBindingMiss {
-                cell,
-                ordinal: DirectBindingOrdinal::claimed(context.direct_binding_ordinal),
-            })
+    let binding = if context.direct_binding_present != 1 {
+        DirectBindingExitMetadata::Absent
+    } else if let Some(cell) = usize::try_from(context.direct_binding_cell)
+        .ok()
+        .and_then(DirectBindingCellVa::mapped)
+    {
+        DirectBindingExitMetadata::Mapped(DirectBindingMiss {
+            cell,
+            ordinal: DirectBindingOrdinal::claimed(context.direct_binding_ordinal),
+        })
     } else {
-        None
+        DirectBindingExitMetadata::MappedCellFailure {
+            raw_cell: context.direct_binding_cell,
+            ordinal: DirectBindingOrdinal::claimed(context.direct_binding_ordinal),
+        }
     };
     NativeDsrExit::ResolveDirect {
         source: carrick_guest_mem::GuestVa(context.exit_source),
@@ -1237,7 +1244,7 @@ mod indirect_cache_tests {
             NativeDsrExit::ResolveDirect {
                 source: carrick_guest_mem::GuestVa(0x4000),
                 target: carrick_guest_mem::GuestVa(0x5000),
-                binding: None,
+                binding: DirectBindingExitMetadata::Absent,
             },
             std::ptr::null(),
             CodeGeneration::INITIAL,
@@ -1254,15 +1261,17 @@ mod indirect_cache_tests {
             NativeDsrExit::ResolveDirect {
                 source: carrick_guest_mem::GuestVa(0x4000),
                 target: carrick_guest_mem::GuestVa(0x5000),
-                binding: Some(crate::direct_binding::DirectBindingMiss {
-                    cell: crate::direct_binding::DirectBindingCellVa::mapped(0x20_000)
-                        .expect("aligned cell"),
-                    ordinal: crate::direct_binding::DirectBindingOrdinal::claimed(7),
-                }),
+                binding: crate::direct_binding::DirectBindingExitMetadata::Mapped(
+                    crate::direct_binding::DirectBindingMiss {
+                        cell: crate::direct_binding::DirectBindingCellVa::mapped(0x20_000)
+                            .expect("aligned cell"),
+                        ordinal: crate::direct_binding::DirectBindingOrdinal::claimed(7),
+                    },
+                ),
             }
         );
 
-        for (present, cell) in [(0, 0x20_000), (2, 0x20_000), (1, 0), (1, 0x20_001)] {
+        for (present, cell) in [(0, 0x20_000), (2, 0x20_000)] {
             context.direct_binding_present = present;
             context.direct_binding_cell = cell;
             assert_eq!(
@@ -1270,7 +1279,22 @@ mod indirect_cache_tests {
                 NativeDsrExit::ResolveDirect {
                     source: carrick_guest_mem::GuestVa(0x4000),
                     target: carrick_guest_mem::GuestVa(0x5000),
-                    binding: None,
+                    binding: crate::direct_binding::DirectBindingExitMetadata::Absent,
+                }
+            );
+        }
+        for cell in [0, 0x20_001] {
+            context.direct_binding_present = 1;
+            context.direct_binding_cell = cell;
+            assert_eq!(
+                decode_direct_exit(&context),
+                NativeDsrExit::ResolveDirect {
+                    source: carrick_guest_mem::GuestVa(0x4000),
+                    target: carrick_guest_mem::GuestVa(0x5000),
+                    binding: crate::direct_binding::DirectBindingExitMetadata::MappedCellFailure {
+                        raw_cell: cell,
+                        ordinal: crate::direct_binding::DirectBindingOrdinal::claimed(7),
+                    },
                 }
             );
         }
@@ -1284,7 +1308,7 @@ mod indirect_cache_tests {
             NativeDsrExit::ResolveDirect {
                 source: guest,
                 target: guest,
-                binding: None,
+                binding: DirectBindingExitMetadata::Absent,
             },
             NativeDsrExit::ResolveIndirect {
                 source: guest,

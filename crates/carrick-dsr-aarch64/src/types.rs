@@ -6,7 +6,7 @@
 
 use carrick_guest_mem::GuestVa;
 
-use crate::direct_binding::DirectBindingMiss;
+use crate::direct_binding::DirectBindingExitMetadata;
 
 // The ISA-neutral halves live in `carrick-dsr`; re-exported here so the
 // AArch64 plan/emit vocabulary keeps presenting one `types::*` surface.
@@ -272,7 +272,7 @@ pub enum NativeDsrExit {
     ResolveDirect {
         source: GuestVa,
         target: GuestVa,
-        binding: Option<DirectBindingMiss>,
+        binding: DirectBindingExitMetadata,
     },
     ResolveIndirect {
         source: GuestVa,

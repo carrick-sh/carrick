@@ -23,6 +23,8 @@ import native_go_build
 SCHEMA = "carrick.direct-binding-mechanism.v1"
 RECEIPT_SCHEMA = "carrick.direct-binding-capture-receipt.v1"
 PAIR_SCHEMA = "carrick.direct-binding-capture-pair.v1"
+SUMMARY_SCHEMA = "carrick.dsr-profile.v1"
+PROFILE = "dsr-indirect"
 BINDING_EVENT_KINDS = frozenset(range(7, 13))
 CLEAR_REASONS = frozenset(range(1, 5))
 VALIDATION_REASONS = frozenset(range(1, 7))
@@ -69,6 +71,29 @@ class CaptureConfig:
     variant: str
     run_id: str
     timeout_seconds: int = native_go_build.DEFAULT_TIMEOUT_SECONDS
+    binary: pathlib.Path | None = None
+    image: str = native_go_build.DEFAULT_IMAGE
+
+    @property
+    def resolved_repo(self) -> pathlib.Path:
+        return self.repo.resolve()
+
+    @property
+    def resolved_binary(self) -> pathlib.Path:
+        binary = (
+            self.repo / "target/release/carrick"
+            if self.binary is None
+            else self.binary
+        )
+        if not binary.is_absolute():
+            binary = self.repo / binary
+        return binary.resolve()
+
+
+@dataclasses.dataclass(frozen=True)
+class CaptureEnvironment:
+    subprocess: dict[str, str]
+    controlled: dict[str, str | None]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,6 +119,7 @@ class MechanismRun:
     publication_cells: dict[tuple[int, int], int]
     clear_cells: dict[tuple[int, int, int], int]
     validation_reasons: dict[int, int]
+    unit_loads: dict[tuple[int, int, int, int], int]
     native_gateway: int
     native_exits: dict[int, int]
 
@@ -203,6 +229,12 @@ def _list(value: object, name: str) -> list[object]:
     return value
 
 
+def _receipt_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise EvidenceError(f"{name} is not an integer")
+    return value
+
+
 def _artifact(receipt: CaptureReceipt, name: str) -> ArtifactBinding:
     artifacts = _mapping(receipt.payload.get("artifacts"), "artifacts")
     expected_names = {
@@ -216,12 +248,32 @@ def _artifact(receipt: CaptureReceipt, name: str) -> ArtifactBinding:
             "receipt artifact set must be exactly "
             + ", ".join(sorted(expected_names))
         )
+    capture_directory = receipt.path.parent.resolve()
+    resolved_paths = []
+    for artifact_name in sorted(expected_names):
+        artifact_row = _mapping(
+            artifacts.get(artifact_name),
+            f"artifact {artifact_name}",
+        )
+        try:
+            artifact_path = pathlib.Path(str(artifact_row["path"])).resolve()
+        except KeyError as error:
+            raise EvidenceError(
+                f"artifact {artifact_name} binding is incomplete"
+            ) from error
+        if artifact_path.parent != capture_directory:
+            raise EvidenceError(
+                f"artifact {artifact_name} is outside the receipt capture directory"
+            )
+        resolved_paths.append(artifact_path)
+    if len(set(resolved_paths)) != len(resolved_paths):
+        raise EvidenceError("receipt artifacts must have distinct paths")
     row = _mapping(artifacts.get(name), f"artifact {name}")
     try:
         path = pathlib.Path(str(row["path"])).resolve()
-        size = int(row["size"])
+        size = _receipt_int(row["size"], f"artifact {name}.size")
         digest = str(row["sha256"])
-    except (KeyError, TypeError, ValueError) as error:
+    except KeyError as error:
         raise EvidenceError(f"artifact {name} binding is incomplete") from error
     if not path.is_file():
         raise EvidenceError(f"bound artifact {name} is missing: {path}")
@@ -236,8 +288,11 @@ def _snapshot(receipt: CaptureReceipt, when: str) -> dict[str, object]:
     required = {
         "git_commit",
         "git_status",
+        "repository",
+        "binary_path",
         "binary_sha256",
         "host",
+        "image_ref",
         "image",
         "controlled_environment",
         "foreign_processes",
@@ -302,6 +357,9 @@ def validate_receipt(
         _artifact(receipt, name)
     if require_variant is not None and receipt.payload.get("variant") != require_variant:
         raise EvidenceError(f"receipt is not the fixed {require_variant} variant")
+    variant = receipt.payload.get("variant")
+    if variant not in {"precursor", "candidate"}:
+        raise EvidenceError("receipt variant is not fixed precursor or candidate")
     pre = _snapshot(receipt, "pre")
     post = _snapshot(receipt, "post")
     if pre != post:
@@ -318,13 +376,71 @@ def validate_receipt(
         raise EvidenceError("controlled environment hash mismatch")
     if receipt.payload.get("image_sha256") != sha256_json(pre["image"]):
         raise EvidenceError("resolved image hash mismatch")
+    controlled = _mapping(
+        pre["controlled_environment"],
+        "controlled environment",
+    )
+    if controlled != _expected_controlled_environment(str(variant)):
+        raise EvidenceError(f"receipt is not the fixed {variant} environment")
+    inputs = _mapping(receipt.payload.get("inputs"), "inputs")
+    if set(inputs) != {
+        "repository",
+        "binary",
+        "image",
+        "profile",
+        "summary_schema",
+    }:
+        raise EvidenceError("receipt inputs are incomplete or contain unknown fields")
+    repository_input = pathlib.Path(str(inputs["repository"]))
+    binary_input = pathlib.Path(str(inputs["binary"]))
+    repository = repository_input.resolve()
+    binary = binary_input.resolve()
+    image = str(inputs["image"])
+    if pathlib.Path(str(pre["repository"])).resolve() != repository:
+        raise EvidenceError("repository input differs from frozen provenance")
+    if pathlib.Path(str(pre["binary_path"])).resolve() != binary:
+        raise EvidenceError("binary input differs from frozen provenance")
+    if str(pre["image_ref"]) != image:
+        raise EvidenceError("image input differs from frozen provenance")
+    if inputs["profile"] != PROFILE or inputs["summary_schema"] != SUMMARY_SCHEMA:
+        raise EvidenceError("profile or summary schema input is not fixed")
+    if not binary.is_file() or sha256_file(binary) != pre["binary_sha256"]:
+        raise EvidenceError("binary input hash differs from frozen provenance")
+    run_id = receipt.payload.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise EvidenceError("receipt run ID is missing")
+    run_command = native_go_build.build_carrick_command(
+        repository_input,
+        run_id,
+        binary=binary_input,
+        image=image,
+    )
+    artifact_rows = _mapping(receipt.payload.get("artifacts"), "artifacts")
+    expected_argv = [
+        str(binary_input),
+        "trace",
+        "--profile",
+        PROFILE,
+        "--trace-out",
+        str(_mapping(artifact_rows["raw_trace"], "raw artifact")["path"]),
+        "--summary-jsonl",
+        str(_mapping(artifact_rows["summary_jsonl"], "summary artifact")["path"]),
+        "--",
+        *run_command[1:],
+    ]
+    if receipt.payload.get("argv") != expected_argv:
+        raise EvidenceError("receipt run ID does not match the exact argv")
+    if receipt.payload.get("workload") != native_go_build.guest_script():
+        raise EvidenceError("receipt does not bind the fixed workload")
     command = _mapping(receipt.payload.get("command"), "command")
-    if int(command.get("status", -1)) != 0:
+    command_status = _receipt_int(command.get("status"), "command.status")
+    if command_status != 0:
         raise EvidenceError(f"command status is nonzero: {command.get('status')}")
     if not _exact_build_ok(receipt) or command.get("build_ok") is not True:
         raise EvidenceError("stdout does not contain exactly one exact BUILD_OK line")
     cleanup = _mapping(receipt.payload.get("cleanup"), "cleanup")
-    if int(cleanup.get("status", -1)) != 0:
+    cleanup_status = _receipt_int(cleanup.get("status"), "cleanup.status")
+    if cleanup_status != 0:
         raise EvidenceError(
             "cleanup status is nonzero: "
             f"{cleanup.get('status')} stdout={cleanup.get('stdout')!r} "
@@ -337,17 +453,23 @@ def validate_receipt(
         raise EvidenceError("bounded capture is truncated evidence")
     if completion["complete"] is not True:
         raise EvidenceError("capture summary is interrupted or incomplete")
-    if int(completion["target_exit_reason"]) != 1:
+    if _receipt_int(
+        completion["target_exit_reason"],
+        "summary completion.target_exit_reason",
+    ) != 1:
         raise EvidenceError("capture target was interrupted")
     if completion["high_cardinality_overflow"] is True:
         raise EvidenceError("capture summary reports high-cardinality overflow")
-    if int(completion["incomplete_pairs"]) != 0:
+    if _receipt_int(
+        completion["incomplete_pairs"],
+        "summary completion.incomplete_pairs",
+    ) != 0:
         raise EvidenceError("capture summary reports incomplete probe pairs")
     drops = _mapping(completion["drops"], "summary completion drops")
     if bool(drops["interrupted"]):
         raise EvidenceError("capture summary reports interruption")
     if any(
-        int(drops[field]) != 0
+        _receipt_int(drops[field], f"summary completion drops.{field}") != 0
         for field in (
             "principal_drops",
             "aggregation_drops",
@@ -365,6 +487,8 @@ def validate_receipt(
         raise EvidenceError("summary binary SHA differs from frozen provenance")
     if summary.get("host") != pre["host"]:
         raise EvidenceError("summary host differs from frozen provenance")
+    if summary.get("command") != run_command[1:]:
+        raise EvidenceError("summary command differs from exact run command")
 
 
 def _parse_protocol_fields(line: str) -> tuple[str, dict[str, str]]:
@@ -469,7 +593,7 @@ def synthetic_summary_rows(
         rows.append(
             {
                 "schema": "carrick.dsr-profile.v1",
-                "profile": "dsr-indirect",
+                "profile": PROFILE,
                 "run_id": run_id,
                 "git_sha": git_sha,
                 "git_dirty": False,
@@ -503,6 +627,10 @@ def _parse_summary(
     if not rows:
         raise EvidenceError("summary JSONL is empty")
     first = rows[0]
+    if first.get("schema") != SUMMARY_SCHEMA:
+        raise EvidenceError("summary schema is not the fixed DSR profile schema")
+    if first.get("profile") != PROFILE:
+        raise EvidenceError("summary profile is not dsr-indirect")
     stable_fields = (
         "schema",
         "profile",
@@ -531,6 +659,8 @@ def _parse_summary(
             raise EvidenceError(f"summary {summary_field} differs from receipt copy")
     if summary_receipt.get("completion") != first.get("completion"):
         raise EvidenceError("summary completion differs from receipt copy")
+    if summary_receipt.get("command") != first.get("command"):
+        raise EvidenceError("summary command differs from receipt copy")
     metrics: dict[tuple[tuple[str, str], ...], int] = {}
     for row in rows:
         metric = _mapping(row.get("metric"), "summary metric")
@@ -539,7 +669,7 @@ def _parse_summary(
         key = _summary_scope_key(row)
         if key in metrics:
             raise EvidenceError("duplicate summary metric scope")
-        metrics[key] = int(metric["count"])
+        metrics[key] = _receipt_int(metric["count"], "summary metric.count")
     return metrics, first
 
 
@@ -580,8 +710,15 @@ def _native_vector(stderr_path: pathlib.Path) -> tuple[int, dict[int, int]]:
     return gateway, exits
 
 
-def parse_trace(receipt: CaptureReceipt) -> MechanismRun:
-    validate_receipt(receipt, require_variant=None)
+def parse_trace(
+    receipt: CaptureReceipt,
+    *,
+    validate_lifecycle: bool = True,
+) -> MechanismRun:
+    if validate_lifecycle:
+        validate_receipt(receipt, require_variant=None)
+    elif sha256_file(receipt.path) != receipt.sha256:
+        raise EvidenceError("receipt hash mismatch after parse")
     raw_path = _artifact(receipt, "raw_trace").path
     metrics: dict[tuple[tuple[str, str], ...], int] = {}
     completion = None
@@ -591,6 +728,7 @@ def parse_trace(receipt: CaptureReceipt) -> MechanismRun:
     publication_cells: dict[tuple[int, int], int] = defaultdict(int)
     clear_cells: dict[tuple[int, int, int], int] = defaultdict(int)
     validation_reasons: dict[int, int] = defaultdict(int)
+    unit_loads: dict[tuple[int, int, int, int], int] = defaultdict(int)
     for line in raw_path.read_text(errors="replace").splitlines():
         if not line.startswith("DSRPROF1|"):
             continue
@@ -621,27 +759,55 @@ def parse_trace(receipt: CaptureReceipt) -> MechanismRun:
             gateway_kinds[kind] += value
         elif phase == "binding-cell":
             cell = _integer(fields.get("cell_va", ""), "binding cell")
-            if cell == 0:
-                raise EvidenceError("binding-cell identity is zero")
+            if pid == 0 or cell == 0 or cell % 8 != 0:
+                raise EvidenceError("binding-cell identity is zero or invalid")
             binding_cells[(pid, cell)] += value
         elif phase == "binding-publish-cell":
             cell = _integer(fields.get("cell_va", ""), "publication cell")
-            if cell == 0:
-                raise EvidenceError("publication cell identity is zero")
+            if pid == 0 or cell == 0 or cell % 8 != 0:
+                raise EvidenceError("publication cell identity is zero or invalid")
             publication_cells[(pid, cell)] += value
         elif phase == "binding-clear-cell":
             cell = _integer(fields.get("cell_va", ""), "clear cell")
+            if pid == 0 or cell == 0 or cell % 8 != 0:
+                raise EvidenceError("clear cell identity is zero or invalid")
             reason = _integer(fields.get("kind", ""), "clear reason")
             if reason not in CLEAR_REASONS:
                 raise EvidenceError(f"clear reason {reason} is zero or unknown")
             clear_cells[(pid, cell, reason)] += value
         elif phase == "binding-validation":
+            source = _integer(
+                fields.get("source_pc", ""),
+                "validation source",
+            )
+            if pid == 0 or source == 0 or source % 4 != 0:
+                raise EvidenceError("validation source identity is zero or invalid")
+            _integer(fields.get("cell_va", ""), "validation cell")
             reason = _integer(fields.get("kind", ""), "validation reason")
             if reason not in VALIDATION_REASONS:
                 raise EvidenceError(
                     f"validation reason {reason} is zero or unknown"
                 )
             validation_reasons[reason] += value
+        elif phase == "binding-unit":
+            unit_id = _integer(fields.get("unit_id", ""), "unit ID")
+            record_count = _integer(
+                fields.get("record_count", ""),
+                "unit record count",
+            )
+            binding_data_bytes = _integer(
+                fields.get("binding_data_bytes", ""),
+                "unit binding data bytes",
+            )
+            if (
+                pid == 0
+                or unit_id == 0
+                or record_count == 0
+                or binding_data_bytes == 0
+                or binding_data_bytes != record_count * 8
+            ):
+                raise EvidenceError("binding unit identity is zero or invalid")
+            unit_loads[(pid, unit_id, record_count, binding_data_bytes)] += value
     if completion is None:
         raise EvidenceError("raw DTrace stream has no completion row")
     if completion.get("profile") != "dsr-indirect":
@@ -653,6 +819,16 @@ def parse_trace(receipt: CaptureReceipt) -> MechanismRun:
     if set(binding_events) != BINDING_EVENT_KINDS:
         missing = sorted(BINDING_EVENT_KINDS - set(binding_events))
         raise EvidenceError(f"binding event vector lacks explicit zero kind(s): {missing}")
+    for phase, event_kind, specialized_total in (
+        ("binding-publish-cell", 8, sum(publication_cells.values())),
+        ("binding-clear-cell", 10, sum(clear_cells.values())),
+        ("binding-validation", 11, sum(validation_reasons.values())),
+        ("binding-unit", 12, sum(unit_loads.values())),
+    ):
+        if specialized_total != binding_events[event_kind]:
+            raise EvidenceError(
+                f"{phase} total does not reconcile with kind={event_kind}"
+            )
     present_phases = {dict(key).get("phase") for key in metrics}
     for required_phase in (
         "gateway-total",
@@ -721,6 +897,7 @@ def parse_trace(receipt: CaptureReceipt) -> MechanismRun:
         publication_cells=dict(publication_cells),
         clear_cells=dict(clear_cells),
         validation_reasons=dict(validation_reasons),
+        unit_loads=dict(unit_loads),
         native_gateway=native_gateway,
         native_exits=native_exits,
     )
@@ -746,6 +923,10 @@ def _run_payload(run: MechanismRun) -> dict[str, object]:
         "direct_total": run.direct_total,
         "indirect_total": run.indirect_total,
         "translation_attempts": run.translation_attempts,
+        "binding_cells": [
+            {"pid": pid, "cell": cell, "value": value}
+            for (pid, cell), value in sorted(run.binding_cells.items())
+        ],
         "publication_cells": [
             {"pid": pid, "cell": cell, "value": value}
             for (pid, cell), value in sorted(run.publication_cells.items())
@@ -758,6 +939,21 @@ def _run_payload(run: MechanismRun) -> dict[str, object]:
             str(reason): value
             for reason, value in sorted(run.validation_reasons.items())
         },
+        "unit_loads": [
+            {
+                "pid": pid,
+                "unit_id": unit_id,
+                "record_count": record_count,
+                "binding_data_bytes": binding_data_bytes,
+                "value": value,
+            }
+            for (
+                pid,
+                unit_id,
+                record_count,
+                binding_data_bytes,
+            ), value in sorted(run.unit_loads.items())
+        ],
     }
 
 
@@ -861,27 +1057,44 @@ def compare(
     }
 
 
+def _expected_controlled_environment(variant: str) -> dict[str, str | None]:
+    controlled = native_go_build.fixed_variant_overlay(variant)
+    controlled["CARRICK_DSR_PROFILE"] = "1"
+    return controlled
+
+
+def _capture_environment(
+    variant: str,
+    *,
+    run_id: str | None,
+) -> CaptureEnvironment:
+    controlled = _expected_controlled_environment(variant)
+    native_go_build.reject_ambient_carrick(os.environ, controlled)
+    environment = dict(os.environ)
+    for key in native_go_build.PERFORMANCE_CONTROL_KEYS:
+        environment.pop(key, None)
+    for key, value in controlled.items():
+        if value is not None:
+            environment[key] = value
+    if run_id is not None:
+        environment["CARRICK_RUN_ID"] = run_id
+    return CaptureEnvironment(environment, controlled)
+
+
 def capture_environment(variant: str) -> dict[str, str]:
-    environment, _ = native_go_build.variant_environment(
-        os.environ,
-        variant,
-        native_go_build.ENGINE_CARRICK,
-        {"CARRICK_DSR_PROFILE": "1"},
-    )
-    environment["CARRICK_DSR_PROFILE"] = "1"
-    return environment
+    return _capture_environment(variant, run_id=None).subprocess
 
 
 def synthetic_snapshot(variant: str) -> dict[str, object]:
-    _, controlled = native_go_build.variant_environment(
-        {}, variant, native_go_build.ENGINE_CARRICK, {"CARRICK_DSR_PROFILE": "1"}
-    )
-    controlled["CARRICK_DSR_PROFILE"] = "1"
+    controlled = _expected_controlled_environment(variant)
     return {
         "git_commit": "a" * 40,
         "git_status": [],
+        "repository": "/fixture/repo",
+        "binary_path": "/fixture/repo/target/release/carrick",
         "binary_sha256": "b" * 64,
         "host": "fixture-host",
+        "image_ref": native_go_build.DEFAULT_IMAGE,
         "image": {"id": "sha256:image", "repo_digests": ["image@sha256:digest"]},
         "controlled_environment": controlled,
         "foreign_processes": [],
@@ -889,55 +1102,61 @@ def synthetic_snapshot(variant: str) -> dict[str, object]:
     }
 
 
-def capture_snapshot(repo: pathlib.Path, variant: str) -> dict[str, object]:
-    environment, controlled = native_go_build.variant_environment(
-        {}, variant, native_go_build.ENGINE_CARRICK, {"CARRICK_DSR_PROFILE": "1"}
-    )
-    del environment
-    controlled["CARRICK_DSR_PROFILE"] = "1"
+def capture_snapshot(
+    config: CaptureConfig,
+    capture: CaptureEnvironment,
+) -> dict[str, object]:
     snapshot = native_go_build.sample_provenance(
-        repo,
+        config.resolved_repo,
         native_go_build.ENGINE_CARRICK,
-        controlled,
+        capture.controlled,
         reject_contamination=False,
+        binary_path=config.resolved_binary,
+        image_ref=config.image,
     )
     return {
         "git_commit": snapshot["git_commit"],
         "git_status": snapshot["git_status"],
+        "repository": str(config.resolved_repo),
+        "binary_path": str(config.resolved_binary),
         "binary_sha256": snapshot["binary_sha256"],
         "host": str(_mapping(snapshot["host"], "host identity")["node"]),
+        "image_ref": config.image,
         "image": snapshot["image"],
-        "controlled_environment": controlled,
+        "controlled_environment": capture.controlled,
         "foreign_processes": snapshot["foreign_processes"],
         "docker_oracles": snapshot["docker_oracles"],
     }
 
 
-def _failed_snapshot(variant: str, error: Exception) -> dict[str, object]:
-    _, controlled = native_go_build.variant_environment(
-        {},
-        variant,
-        native_go_build.ENGINE_CARRICK,
-        {"CARRICK_DSR_PROFILE": "1"},
-    )
-    controlled["CARRICK_DSR_PROFILE"] = "1"
+def _failed_snapshot(
+    config: CaptureConfig,
+    capture: CaptureEnvironment,
+    error: Exception,
+) -> dict[str, object]:
     return {
         "git_commit": "unknown",
         "git_status": [f"snapshot-error: {error}"],
+        "repository": str(config.resolved_repo),
+        "binary_path": str(config.resolved_binary),
         "binary_sha256": "unknown",
         "host": "unknown",
+        "image_ref": config.image,
         "image": {"error": str(error)},
-        "controlled_environment": controlled,
+        "controlled_environment": capture.controlled,
         "foreign_processes": [f"snapshot-error: {error}"],
         "docker_oracles": [],
     }
 
 
-def _snapshot_or_error(repo: pathlib.Path, variant: str) -> dict[str, object]:
+def _snapshot_or_error(
+    config: CaptureConfig,
+    capture: CaptureEnvironment,
+) -> dict[str, object]:
     try:
-        return capture_snapshot(repo, variant)
+        return capture_snapshot(config, capture)
     except Exception as error:
-        return _failed_snapshot(variant, error)
+        return _failed_snapshot(config, capture, error)
 
 
 def _preflight_reasons(snapshot: Mapping[str, object]) -> list[str]:
@@ -957,7 +1176,7 @@ def _preflight_reasons(snapshot: Mapping[str, object]) -> list[str]:
 
 
 def _capture_paths(config: CaptureConfig) -> dict[str, pathlib.Path]:
-    directory = config.output_dir / config.run_id
+    directory = (config.output_dir / config.variant).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     return {
         "raw_trace": directory / "trace.log",
@@ -969,12 +1188,17 @@ def _capture_paths(config: CaptureConfig) -> dict[str, pathlib.Path]:
 
 
 def _trace_command(config: CaptureConfig, paths: Mapping[str, pathlib.Path]) -> list[str]:
-    run = native_go_build.build_carrick_command(config.repo, config.run_id)
+    run = native_go_build.build_carrick_command(
+        config.resolved_repo,
+        config.run_id,
+        binary=config.resolved_binary,
+        image=config.image,
+    )
     return [
-        str(config.repo / "target/release/carrick"),
+        str(config.resolved_binary),
         "trace",
         "--profile",
-        "dsr-indirect",
+        PROFILE,
         "--trace-out",
         str(paths["raw_trace"]),
         "--summary-jsonl",
@@ -987,13 +1211,12 @@ def _trace_command(config: CaptureConfig, paths: Mapping[str, pathlib.Path]) -> 
 def _run_trace(
     config: CaptureConfig,
     paths: Mapping[str, pathlib.Path],
+    capture: CaptureEnvironment,
 ) -> subprocess.CompletedProcess[str]:
-    environment = capture_environment(config.variant)
-    environment["CARRICK_RUN_ID"] = config.run_id
     return subprocess.run(
         _trace_command(config, paths),
-        cwd=config.repo,
-        env=environment,
+        cwd=config.resolved_repo,
+        env=capture.subprocess,
         capture_output=True,
         text=True,
         timeout=config.timeout_seconds,
@@ -1072,6 +1295,7 @@ def _summary_copy(path: pathlib.Path) -> dict[str, object]:
             "git_sha",
             "git_dirty",
             "binary_sha256",
+            "command",
             "host",
             "completion",
         )
@@ -1081,8 +1305,9 @@ def _summary_copy(path: pathlib.Path) -> dict[str, object]:
 def capture_one(config: CaptureConfig) -> CaptureReceipt:
     if config.variant not in {"precursor", "candidate"}:
         raise EvidenceError("capture variant must be fixed precursor or candidate")
+    capture = _capture_environment(config.variant, run_id=config.run_id)
     paths = _capture_paths(config)
-    pre = _snapshot_or_error(config.repo, config.variant)
+    pre = _snapshot_or_error(config, capture)
     command = _trace_command(config, paths)
     preflight_reasons = _preflight_reasons(pre)
     if preflight_reasons:
@@ -1091,7 +1316,7 @@ def capture_one(config: CaptureConfig) -> CaptureReceipt:
         stderr = "preflight rejected capture: " + "; ".join(preflight_reasons) + "\n"
     else:
         try:
-            result = _run_trace(config, paths)
+            result = _run_trace(config, paths, capture)
             status = result.returncode
             stdout = result.stdout or ""
             stderr = result.stderr or ""
@@ -1108,7 +1333,7 @@ def capture_one(config: CaptureConfig) -> CaptureReceipt:
     for name in ("raw_trace", "summary_jsonl"):
         if not paths[name].exists():
             paths[name].write_text("")
-    post = _snapshot_or_error(config.repo, config.variant)
+    post = _snapshot_or_error(config, capture)
     try:
         cleanup = _cleanup(config)
     except Exception as error:
@@ -1122,6 +1347,13 @@ def capture_one(config: CaptureConfig) -> CaptureReceipt:
         "schema": RECEIPT_SCHEMA,
         "variant": config.variant,
         "run_id": config.run_id,
+        "inputs": {
+            "repository": str(config.resolved_repo),
+            "binary": str(config.resolved_binary),
+            "image": config.image,
+            "profile": PROFILE,
+            "summary_schema": SUMMARY_SCHEMA,
+        },
         "argv": command,
         "workload": native_go_build.guest_script(),
         "provenance": {"pre": pre, "post": post},
@@ -1147,42 +1379,52 @@ def capture_one(config: CaptureConfig) -> CaptureReceipt:
     return parse_receipt(paths["receipt"])
 
 
-def capture_pair(
+def _capture_pair(
     repo: pathlib.Path,
     output_dir: pathlib.Path,
     output: pathlib.Path,
     timeout_seconds: int,
+    binary: pathlib.Path | None = None,
+    image: str = native_go_build.DEFAULT_IMAGE,
 ) -> dict[str, object]:
     stamp = f"{os.getpid()}-{time.time_ns()}"
     precursor = capture_one(
         CaptureConfig(
-            repo,
-            output_dir,
-            "precursor",
-            f"direct-binding-precursor-{stamp}",
-            timeout_seconds,
+            repo=repo,
+            output_dir=output_dir,
+            variant="precursor",
+            run_id=f"direct-binding-precursor-{stamp}",
+            timeout_seconds=timeout_seconds,
+            binary=binary,
+            image=image,
         )
     )
-    if not precursor.valid_for_followup:
+    try:
+        validate_receipt(precursor, require_variant="precursor")
+        parse_trace(precursor)
+    except EvidenceError as error:
         payload = {
             "schema": PAIR_SCHEMA,
             "accepted": False,
-            "rejection_reasons": ["precursor receipt is not valid for candidate followup"],
+            "rejection_reasons": [str(error)],
             "precursor": {
                 "path": str(precursor.path),
                 "sha256": precursor.sha256,
             },
             "candidate": None,
+            "available_runs": _available_run_payloads(precursor, None),
         }
         write_json_atomic(output, payload)
         return payload
     candidate = capture_one(
         CaptureConfig(
-            repo,
-            output_dir,
-            "candidate",
-            f"direct-binding-candidate-{stamp}",
-            timeout_seconds,
+            repo=repo,
+            output_dir=output_dir,
+            variant="candidate",
+            run_id=f"direct-binding-candidate-{stamp}",
+            timeout_seconds=timeout_seconds,
+            binary=binary,
+            image=image,
         )
     )
     try:
@@ -1206,6 +1448,36 @@ def capture_pair(
     return payload
 
 
+def capture_pair(
+    repo: pathlib.Path,
+    output_dir: pathlib.Path,
+    output: pathlib.Path,
+    timeout_seconds: int,
+    binary: pathlib.Path | None = None,
+    image: str = native_go_build.DEFAULT_IMAGE,
+) -> dict[str, object]:
+    try:
+        return _capture_pair(
+            repo,
+            output_dir,
+            output,
+            timeout_seconds,
+            binary,
+            image,
+        )
+    except (EvidenceError, OSError, RuntimeError, ValueError) as error:
+        payload = {
+            "schema": PAIR_SCHEMA,
+            "accepted": False,
+            "rejection_reasons": [str(error)],
+            "precursor": None,
+            "candidate": None,
+            "available_runs": {},
+        }
+        write_json_atomic(output, payload)
+        return payload
+
+
 def _available_run_payloads(
     precursor: CaptureReceipt | None,
     candidate: CaptureReceipt | None,
@@ -1215,7 +1487,9 @@ def _available_run_payloads(
         if receipt is None:
             continue
         try:
-            available[name] = _run_payload(parse_trace(receipt))
+            available[name] = _run_payload(
+                parse_trace(receipt, validate_lifecycle=False)
+            )
         except EvidenceError:
             continue
     return available
@@ -1230,10 +1504,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=pathlib.Path("target/perf/direct-binding-mechanism.json"),
     )
     parser.add_argument(
-        "--capture-dir",
+        "--artifact-dir",
         type=pathlib.Path,
         default=pathlib.Path("target/perf/direct-binding-captures"),
     )
+    parser.add_argument("--repo", type=pathlib.Path)
+    parser.add_argument("--binary", type=pathlib.Path)
+    parser.add_argument("--image", default=native_go_build.DEFAULT_IMAGE)
     parser.add_argument("--precursor-receipt", type=pathlib.Path)
     parser.add_argument("--candidate-receipt", type=pathlib.Path)
     parser.add_argument(
@@ -1246,13 +1523,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    repo = pathlib.Path(__file__).resolve().parents[2]
+    repo = (
+        pathlib.Path(__file__).resolve().parents[2]
+        if args.repo is None
+        else args.repo
+    )
     if args.mode == "capture-pair":
         payload = capture_pair(
             repo,
-            args.capture_dir,
+            args.artifact_dir,
             args.output,
             args.timeout_seconds,
+            args.binary,
+            args.image,
         )
     else:
         if args.precursor_receipt is None or args.candidate_receipt is None:

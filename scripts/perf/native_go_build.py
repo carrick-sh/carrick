@@ -63,6 +63,14 @@ VARIANT_OVERLAYS: dict[str, dict[str, str | None]] = {
 }
 
 
+class SampleEvidenceError(RuntimeError):
+    """One failed sample together with all evidence collected for it."""
+
+    def __init__(self, message: str, sample: dict[str, object]):
+        super().__init__(message)
+        self.sample = sample
+
+
 def guest_script() -> str:
     return (
         'set -eu; cd /tmp; rm -rf "gc-$CARRICK_RUN_ID"; '
@@ -81,10 +89,18 @@ def requested_engines(value: str) -> tuple[str, ...]:
     raise ValueError(f"unknown engine: {value}")
 
 
-def build_command(repo: pathlib.Path, engine: str, run_id: str) -> list[str]:
+def build_command(
+    repo: pathlib.Path,
+    engine: str,
+    run_id: str,
+    *,
+    binary: pathlib.Path | None = None,
+    image: str = DEFAULT_IMAGE,
+) -> list[str]:
     if engine == ENGINE_CARRICK:
+        carrick = repo / "target/release/carrick" if binary is None else binary
         return [
-            str(repo / "target/release/carrick"),
+            str(carrick),
             "run",
             "--exec-backend",
             "native",
@@ -92,7 +108,7 @@ def build_command(repo: pathlib.Path, engine: str, run_id: str) -> list[str]:
             f"CARRICK_RUN_ID={run_id}",
             "-w",
             "/tmp",
-            DEFAULT_IMAGE,
+            image,
             "/bin/sh",
             "-c",
             guest_script(),
@@ -109,7 +125,7 @@ def build_command(repo: pathlib.Path, engine: str, run_id: str) -> list[str]:
             f"CARRICK_RUN_ID={run_id}",
             "-w",
             "/tmp",
-            DEFAULT_IMAGE,
+            image,
             "/bin/sh",
             "-c",
             guest_script(),
@@ -117,8 +133,20 @@ def build_command(repo: pathlib.Path, engine: str, run_id: str) -> list[str]:
     raise ValueError(f"unknown engine: {engine}")
 
 
-def build_carrick_command(repo: pathlib.Path, run_id: str) -> list[str]:
-    return build_command(repo, ENGINE_CARRICK, run_id)
+def build_carrick_command(
+    repo: pathlib.Path,
+    run_id: str,
+    *,
+    binary: pathlib.Path | None = None,
+    image: str = DEFAULT_IMAGE,
+) -> list[str]:
+    return build_command(
+        repo,
+        ENGINE_CARRICK,
+        run_id,
+        binary=binary,
+        image=image,
+    )
 
 
 def median_ms(samples: Sequence[int]) -> int:
@@ -221,15 +249,11 @@ def reject_ambient_carrick(
     ambient: os._Environ[str] | dict[str, str],
     selected_overlay: dict[str, str | None],
 ) -> None:
-    allowed = set(HARNESS_CARRICK_ALLOWLIST)
-    for key, value in selected_overlay.items():
-        if value is not None:
-            allowed.add(key)
+    allowed = set(HARNESS_CARRICK_ALLOWLIST) | set(PERFORMANCE_CONTROL_KEYS)
     rejected = sorted(
         key
-        for key, value in ambient.items()
+        for key in ambient
         if key.startswith("CARRICK_")
-        and value
         and key != "CARRICK_RUN_ID"
         and key not in allowed
     )
@@ -314,11 +338,23 @@ def running_docker_oracles() -> list[str]:
             "failed to census running Docker containers: "
             + (result.stderr.strip() or result.stdout.strip())
         )
-    return [
-        line
-        for line in result.stdout.splitlines()
-        if "carrick" in line.lower() or "conformance" in line.lower()
-    ]
+    oracles = []
+    for line in result.stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) != 3:
+            continue
+        _container_id, name, image = fields
+        if image == "registry" or image.startswith("registry:"):
+            continue
+        identifying_text = f"{name} {image}".lower()
+        if (
+            "native-go-build" in identifying_text
+            or "carrick" in identifying_text
+            or "conformance" in identifying_text
+            or "carrick run" in identifying_text
+        ):
+            oracles.append(line)
+    return oracles
 
 
 def sample_provenance(
@@ -327,8 +363,10 @@ def sample_provenance(
     controlled_environment: dict[str, str | None],
     *,
     reject_contamination: bool = True,
+    binary_path: pathlib.Path | None = None,
+    image_ref: str = DEFAULT_IMAGE,
 ) -> dict[str, object]:
-    binary = repo / "target/release/carrick"
+    binary = repo / "target/release/carrick" if binary_path is None else binary_path
     status = git_output(repo, "status", "--porcelain").splitlines()
     if status and reject_contamination:
         raise RuntimeError("performance sample requires a clean git worktree")
@@ -349,7 +387,8 @@ def sample_provenance(
             "machine": platform.machine(),
             "node": platform.node(),
         },
-        "image": docker_image_provenance(),
+        "image_ref": image_ref,
+        "image": docker_image_provenance(image_ref),
         "controlled_environment": controlled_environment,
         "foreign_processes": foreign,
         "docker_oracles": docker_oracles,
@@ -428,7 +467,7 @@ def docker_cleanup(run_id: str) -> dict[str, object]:
     }
 
 
-def docker_image_provenance() -> dict[str, object]:
+def docker_image_provenance(image: str = DEFAULT_IMAGE) -> dict[str, object]:
     result = subprocess.run(
         [
             "docker",
@@ -436,7 +475,7 @@ def docker_image_provenance() -> dict[str, object]:
             "inspect",
             "--format",
             "{{json .Architecture}}\n{{json .Id}}\n{{json .RepoDigests}}",
-            DEFAULT_IMAGE,
+            image,
         ],
         capture_output=True,
         text=True,
@@ -445,7 +484,7 @@ def docker_image_provenance() -> dict[str, object]:
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"failed to inspect Docker image {DEFAULT_IMAGE}: "
+            f"failed to inspect Docker image {image}: "
             f"{result.stderr.strip() or result.stdout.strip()}"
         )
     lines = result.stdout.splitlines()
@@ -546,17 +585,13 @@ def run_sample(
                 cleanup_evidence = docker_cleanup(run_id)
         except Exception as error:
             cleanup_error = error
-    post_provenance = (
-        sample_provenance(repo, engine, normalized) if strict_evidence else None
-    )
-    if strict_evidence and pre_provenance != post_provenance:
-        raise RuntimeError(
-            "sample provenance drifted: "
-            + json.dumps(
-                {"pre": pre_provenance, "post": post_provenance},
-                sort_keys=True,
-            )
-        )
+    post_provenance = None
+    provenance_error: Exception | None = None
+    if strict_evidence:
+        try:
+            post_provenance = sample_provenance(repo, engine, normalized)
+        except Exception as error:
+            provenance_error = error
     if timeout is not None:
         combined = combined_output(timeout.stdout, timeout.stderr)
         stdout = combined_output(timeout.stdout, None)
@@ -575,32 +610,24 @@ def run_sample(
         raise timeout
     assert result is not None
     build_ok = stdout.splitlines().count("BUILD_OK") == 1
-    if result.returncode != 0 or not build_ok:
-        sample_error = RuntimeError(
-            f"go-build sample {index} failed: run_id={run_id} "
-            f"rc={result.returncode}\n{combined[-8000:]}"
-        )
-        if cleanup_error is not None:
-            raise sample_error from cleanup_error
-        raise sample_error
     if cleanup_error is not None:
-        raise RuntimeError(
-            f"go-build sample {index} cleanup failed: run_id={run_id}"
-        ) from cleanup_error
-    if cleanup_evidence is not None and int(cleanup_evidence.get("status", 1)) != 0:
-        raise RuntimeError(
-            f"go-build sample {index} cleanup failed: run_id={run_id} "
-            f"status={cleanup_evidence.get('status')} "
-            f"stdout={cleanup_evidence.get('stdout', '')!r} "
-            f"stderr={cleanup_evidence.get('stderr', '')!r}"
-        )
-    return {
+        cleanup_evidence = {
+            "status": 125,
+            "stdout": "",
+            "stderr": f"cleanup launch failed: {cleanup_error}",
+        }
+    sample = {
         "engine": engine,
         "index": index,
         "run_id": run_id,
         "elapsed_ms": elapsed_ms,
         "return_code": result.returncode,
         "build_ok": build_ok,
+        "command": {
+            "argv": command,
+            "status": result.returncode,
+            "build_ok": build_ok,
+        },
         "environment_overlay": normalized,
         "controlled_environment": {
             key: environment.get(key) for key in PERFORMANCE_CONTROL_KEYS
@@ -610,9 +637,50 @@ def run_sample(
             "post": post_provenance,
         },
         "cleanup": cleanup_evidence,
+        "stdout": stdout,
+        "stderr": stderr,
         "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
         "stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
     }
+    if result.returncode != 0 or not build_ok:
+        sample_error = SampleEvidenceError(
+            f"go-build sample {index} failed: run_id={run_id} "
+            f"rc={result.returncode}\n{combined[-8000:]}",
+            sample,
+        )
+        if cleanup_error is not None:
+            raise sample_error from cleanup_error
+        raise sample_error
+    if cleanup_error is not None:
+        raise SampleEvidenceError(
+            f"go-build sample {index} cleanup failed: run_id={run_id}",
+            sample,
+        ) from cleanup_error
+    if cleanup_evidence is not None and int(cleanup_evidence.get("status", 1)) != 0:
+        raise SampleEvidenceError(
+            (
+                f"go-build sample {index} cleanup failed: run_id={run_id} "
+                f"status={cleanup_evidence.get('status')} "
+                f"stdout={cleanup_evidence.get('stdout', '')!r} "
+                f"stderr={cleanup_evidence.get('stderr', '')!r}"
+            ),
+            sample,
+        )
+    if provenance_error is not None:
+        raise SampleEvidenceError(
+            f"go-build sample {index} post-provenance failed: {provenance_error}",
+            sample,
+        ) from provenance_error
+    if strict_evidence and pre_provenance != post_provenance:
+        raise SampleEvidenceError(
+            "sample provenance drifted: "
+            + json.dumps(
+                {"pre": pre_provenance, "post": post_provenance},
+                sort_keys=True,
+            ),
+            sample,
+        )
+    return sample
 
 
 def run_phase(

@@ -133,18 +133,6 @@ carrick*:::dsr-resolve-end
     @outcome[pid, arg4] = count();
 }
 
-tick-1s
-{
-    secs++;
-}
-
-tick-1s
-/secs >= 45/
-{
-    bounded = 1;
-    exit(0);
-}
-
 END
 {
     printa("DSRPROF1|count|phase=direct-source|pid=%d|source_pc=%#x|value=%@d\n", @direct_source);
