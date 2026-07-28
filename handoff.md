@@ -47,7 +47,17 @@ complete the focused runtime gate. Its first four tests passed, then
 CPU for more than 15 minutes without returning. The controller terminated only
 the exact cargo/test PIDs and verified them gone. Gate 4, the signed rebuild,
 feasibility sample, and mechanism pair were not run. The immediate next work
-is deterministic per-sample synchronization diagnosis, not another live gate.
+was deterministic per-sample synchronization diagnosis.
+
+That synchronization repair is now present at clean starting commit
+`ece8c497`. The complete four-command structural gate passed, and `just build`
+produced a fresh signed binary with the entitlement, DOF section, and direct
+binding marker. The authorized wrapper-free feasibility candidate reached Go
+compilation but exhausted the 64 MiB DSR translation cache before `BUILD_OK`.
+The feasibility JSON is absent, the captured error log is preserved, and the
+mechanism pair was not run. H004 Variant 1 is rejected at feasibility; there
+is still no current-branch-tip `just ci`, native smoke, mechanism vector, or
+valid elapsed-performance result.
 
 Reference workload: the conformance `go-build` case — `go build` of a
 hello-world with a cold `GOCACHE`.
@@ -148,14 +158,15 @@ near enough to repay roughly 260 million additional exits. Filtering to a
 transitively closed direct-target subset made things worse (55.24 s) and was
 also reverted.
 
-**H004 is selected as `SPIKING`:** the first immutable-code-compatible
-late-binding precursor now carries exact
+**At that checkpoint H004 was selected as `SPIKING`:** the first
+immutable-code-compatible late-binding precursor carries exact
 target authority through the two-way per-thread cache. It is correct across
 private/shared and cross-unit targets, and translator ABI 2 rejects the old
 16-byte cache population. Three untraced samples were stable at 25.169,
 25.268 and 25.082 s. That recovers much of the 40.2 s shared-mode regression,
 but it is still slower than the 19.375 s official baseline and is not a
-retained primary-goal win.
+retained primary-goal win. The later signed feasibility evidence below moves
+H004 Variant 1 to `REJECT`.
 
 A natural resolver-only DTrace run measured 941,784 remaining indirect misses.
 Although 82,266/124,947 source sites were monomorphic, the top one/two targets
@@ -170,12 +181,11 @@ private JIT cache. Restricting it to portable artifacts produced one 24.664 s
 sample, then crashed in Go runtime stack code on replication. Do not resurrect
 that inline family.
 
-**Immediate next action:** diagnose the focused jitter stress's per-sample
-synchronization with a deterministic red-to-green reproducer. The `b1700108`
-retry did not complete structural Gate 3, so do not rerun Task 15 live work,
-tune the 22-word path, or advance to wall screening until the reported
-greater-than-15-minute spin is explained and the complete structural gate
-returns normally.
+**Immediate next action:** return to clean default-path attribution and choose
+the next evidence-backed hypothesis. The live Variant 1 feasibility command
+exhausted the 64 MiB translation cache before `BUILD_OK`; do not promote an
+elapsed result, enlarge the cache, tune the 22-word path, run the mechanism
+pair, or start Task 16 from this rejection.
 
 ### Task 15 mechanism gate stopped at the structural prerequisite
 
@@ -336,6 +346,73 @@ test's per-sample synchronization deterministically before another Task 15
 attempt. Preserve the historical compile and bounded-coverage failures above;
 this third rejection supersedes their restart instructions without erasing
 them.
+
+### Task 15 live retry passed structure but failed feasibility
+
+The live retry started from clean
+`ece8c49769ecf3420915dfa4215ab56e7f082852`. Preflight found no ambient
+Carrick controls, foreign workload, or real Docker oracle; only the two
+excluded `registry:2` containers were running. The candidate image remained
+native `arm64`, with image ID and localhost repo digest
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
+
+The serialized structural vector completed normally:
+
+| Command | Status | Receipt |
+|---|---:|---|
+| `cargo test -p carrick-dsr-aarch64` | 0 | 162 passed; log `sha256:ad888ea14f7bf02d90f8a2ab07668e0ccb12d6e6428e48856445652682c7c308` |
+| `cargo test -p carrick-native-darwin` | 0 | 31 passed; log `sha256:a6980c18dc68dcc0679d6d0735cd70aca2aac63137e008c3f4fd85adb29ba69d` |
+| `RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib 'native_darwin::dsr::oracle::direct_binding_'` | 0 | 10 passed; log `sha256:97e52e6d8ed3f883b069e7d4a55760abac36cbd80d0022db4ce6e5b84cea8de3` |
+| `cargo fmt --all -- --check` | 0 | clean; empty-log SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+
+`just build` passed and produced release binary
+`sha256:231afeda1ff693dd73f425143dc05c1f28265da897010c23bdd87a7a018c70bc`.
+`codesign --verify` passed; the Hypervisor entitlement was true; the
+`__TEXT,__dof_carrick` section and `CARRICK_DSR_DIRECT_BINDINGS` marker were
+present.
+
+The first feasibility invocation is preserved separately as invalid controller
+evidence. Its outer `gtimeout ... | tee` wrapper appeared as foreign workload
+to the runner's own census, so no guest launched and no official v1 JSON or
+captured-output directory was created. The invalid log is
+`target/task15-live-gate-ece8c497/11-feasibility-command.log`
+(`sha256:0c87b605c813706d60db1061510d27a9325edfbbeb28fe2717f49b2c8e5d5a72`).
+Those v1 names were never reused.
+
+The explicitly authorized wrapper-free v2 recovery used shell process
+replacement and fresh paths. It reached the workload under run ID
+`native-go-build-carrick-50399-1785219847221505000-1` and exited 1:
+
+```text
+native Darwin guest thread 50572 error: unsupported in this backend: DSR translation cache exhausted: requested=696 used=67108188 capacity=67108864
+runtime: /usr/local/go/pkg/tool/linux_arm64/compile: exit status 125
+```
+
+There was no exact `BUILD_OK`. The exception occurred before the runner wrote
+`target/perf/direct-binding-feasibility-v2.json`, so that JSON is absent. The
+captured workload error exists at
+`target/perf/direct-binding-feasibility-v2-logs/carrick-1.log`
+(`sha256:02ec397ab3c528d6a8fcd12e52569d76299c88623a2126b709d5c8179b6dbe4f`);
+the v2 command log hashes to
+`2b551358aaf66646229dc88ce69cac1458a233e9a4ca9d6b1591978e4e3192f5`.
+No elapsed value from the failed command is valid performance evidence.
+
+The runner entered its run-ID cleanup `finally` path, no cleanup exception
+surfaced, and a post-stop census found no surviving guest or descendant. The
+exception prevented serialization of exact cleanup status/output and the
+in-memory provenance snapshots, so neither is claimed as accepted evidence.
+Source remained clean and the release-binary hash remained stable.
+
+The mechanism pair was not run. Its v2 JSON, directories, receipts, raw and
+summary traces, stdout/stderr, exit and binding-event vectors, translation
+counts, reconciliation/drop counts, process-cell bounds, publication/clear
+reasons, and `S/D/G` collapse/reclassification equations are absent or
+unobserved, not zero. The 95% gate was not evaluated.
+
+H004 Variant 1 is **rejected at feasibility**. Return to current clean
+default-path attribution and hypothesis selection. This result does not
+authorize translation-cache-size changes, more Variant 1 tuning, the mechanism
+pair, or Task 16.
 
 ### Portable translation reuse is correct but not a default performance win
 
@@ -561,22 +638,19 @@ as refuted — the gap is defects, not physics.
 
 ## Next work, ordered by the current gate
 
-1. **Diagnose the focused jitter-stress hang.** Build a deterministic
-   per-sample synchronization reproducer that can explain the `b1700108`
-   greater-than-15-minute one-CPU spin and distinguish producer, delivery,
-   recovery, and completion handshakes.
-2. **Rerun Task 15 only after a red-to-green structural explanation.** The
-   complete four-command structural sequence must return normally before any
-   signed build, feasibility sample, or live mechanism pair is attempted.
-3. **Advance only on accepted mechanism evidence.** If a later pair passes every
-   vector, reconciliation, process-cell bound, cleanup, provenance, and 95%
-   collapse/reclassification gate, proceed to the controller's untraced wall
-   screen and correctness guardrails. Otherwise stop Variant 1 and do not tune
-   the 22-word path.
-4. **Defer unrelated performance directions until Task 15 closes.** Coarse-unit
-   publication, the remaining 862k indirect exits, emission-cost attribution,
-   and per-process capsule setup remain evidence-backed backlog items, not the
-   immediate next work.
+1. **Return to default-path attribution.** H004 Variant 1 is rejected at
+   feasibility after the signed candidate exhausted the 64 MiB DSR translation
+   cache before `BUILD_OK`; select the next hypothesis from clean default-path
+   evidence.
+2. **Do not reinterpret the failed command as a screen.** The feasibility JSON
+   is absent, the error log exists, and no elapsed workload-performance result
+   was accepted.
+3. **Do not tune the rejected mechanism.** Cache-size changes, the 22-word
+   direct-binding path, another Variant 1 mechanism pair, and Task 16 require a
+   new controller decision; none is authorized by this handoff.
+4. **Keep the evidence-backed backlog visible.** Coarse-unit publication, the
+   remaining 862k indirect exits, emission-cost attribution, and per-process
+   capsule setup remain candidates for fresh hypothesis selection.
 
 ---
 
