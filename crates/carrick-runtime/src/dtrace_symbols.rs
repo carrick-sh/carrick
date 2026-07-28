@@ -11,8 +11,10 @@ use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const KERNEL_SYMBOL_SCHEMA: &str = "carrick.kernel-symbols.v1";
+pub const SAMPLED_KERNEL_SYMBOL_SCHEMA: &str = "carrick.sampled-kernel-symbols.v1";
 pub const DTRACE_OBJ_F_KERNEL: c_uint = 0x1;
 
 const AUXILIARY_SYMBOL_NAME_CAPACITY: usize = 4096;
@@ -99,6 +101,7 @@ pub struct KernelIdentity {
     pub version: String,
     pub uuid: String,
     pub machine: String,
+    pub bootsessionuuid: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -129,6 +132,36 @@ pub struct KernelSymbolSnapshot {
     pub identity: KernelIdentity,
     pub objects: Vec<KernelObjectRange>,
     pub symbols: Vec<KernelSymbolRange>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SampledKernelSymbol {
+    pub address: u64,
+    pub symbol: String,
+    pub symbol_start: u64,
+    pub symbol_size: u64,
+    pub offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UnresolvedKernelAddress {
+    pub address: u64,
+    pub status: c_int,
+    pub dtrace_errno: c_int,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SampledKernelSymbolOverlay {
+    pub schema: String,
+    pub identity: KernelIdentity,
+    pub requested_sha256: String,
+    pub requested_count: u64,
+    pub resolved_sha256: String,
+    pub resolved_count: u64,
+    pub unresolved_sha256: String,
+    pub unresolved_count: u64,
+    pub symbols: Vec<SampledKernelSymbol>,
+    pub unresolved: Vec<UnresolvedKernelAddress>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -764,14 +797,27 @@ fn validate_identity(identity: &KernelIdentity) -> Result<(), KernelSymbolError>
         ("kern.version", identity.version.as_str()),
         ("kern.uuid", identity.uuid.as_str()),
         ("hw.machine", identity.machine.as_str()),
+        ("kern.bootsessionuuid", identity.bootsessionuuid.as_str()),
     ] {
-        if value.is_empty() || value.contains('\0') {
+        if value.trim().is_empty() || value.contains('\0') {
             return Err(KernelSymbolError::InvalidIdentity(format!(
                 "{field} is empty or contains NUL"
             )));
         }
     }
-    let bytes = identity.uuid.as_bytes();
+    validate_uuid("kern.uuid", &identity.uuid)?;
+    validate_uuid("kern.bootsessionuuid", &identity.bootsessionuuid)?;
+    if identity.machine != "arm64" {
+        return Err(KernelSymbolError::InvalidIdentity(format!(
+            "hw.machine is {:?}, expected \"arm64\"",
+            identity.machine
+        )));
+    }
+    Ok(())
+}
+
+fn validate_uuid(field: &str, value: &str) -> Result<(), KernelSymbolError> {
+    let bytes = value.as_bytes();
     if bytes.len() != 36
         || [8, 13, 18, 23].iter().any(|index| bytes[*index] != b'-')
         || bytes
@@ -780,14 +826,7 @@ fn validate_identity(identity: &KernelIdentity) -> Result<(), KernelSymbolError>
             .any(|(index, value)| ![8, 13, 18, 23].contains(&index) && !value.is_ascii_hexdigit())
     {
         return Err(KernelSymbolError::InvalidIdentity(format!(
-            "kern.uuid {:?} is not canonical 8-4-4-4-12 hexadecimal",
-            identity.uuid
-        )));
-    }
-    if identity.machine != "arm64" {
-        return Err(KernelSymbolError::InvalidIdentity(format!(
-            "hw.machine is {:?}, expected \"arm64\"",
-            identity.machine
+            "{field} {value:?} is not canonical 8-4-4-4-12 hexadecimal"
         )));
     }
     Ok(())
@@ -864,6 +903,170 @@ fn validate_symbol(symbol: &KernelSymbolRange) -> Result<u64, KernelSymbolError>
         )));
     }
     Ok(end)
+}
+
+fn validate_sampled_symbol(symbol: &SampledKernelSymbol) -> Result<u64, KernelSymbolError> {
+    if symbol.symbol.is_empty() || symbol.symbol.contains('\0') {
+        return Err(KernelSymbolError::InvalidSymbol(
+            "sampled symbol name is empty or contains NUL".to_owned(),
+        ));
+    }
+    if symbol.symbol_size == 0 {
+        return Err(KernelSymbolError::InvalidSymbol(format!(
+            "{:?} has zero size",
+            symbol.symbol
+        )));
+    }
+    let end = symbol
+        .symbol_start
+        .checked_add(symbol.symbol_size)
+        .ok_or_else(|| {
+            KernelSymbolError::InvalidSymbol(format!("{:?} range overflows", symbol.symbol))
+        })?;
+    if !(symbol.symbol_start..end).contains(&symbol.address) {
+        return Err(KernelSymbolError::InvalidSymbol(format!(
+            "address {:#x} is outside {:?} range",
+            symbol.address, symbol.symbol
+        )));
+    }
+    if symbol.offset != symbol.address - symbol.symbol_start {
+        return Err(KernelSymbolError::InvalidSymbol(format!(
+            "{:?} offset {} does not match address/start",
+            symbol.symbol, symbol.offset
+        )));
+    }
+    Ok(end)
+}
+
+fn address_set_sha256(addresses: impl IntoIterator<Item = u64>) -> String {
+    let mut digest = Sha256::new();
+    for address in addresses {
+        digest.update(address.to_be_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+impl SampledKernelSymbolOverlay {
+    pub fn from_parts(
+        identity: KernelIdentity,
+        requested: impl IntoIterator<Item = u64>,
+        symbols: Vec<SampledKernelSymbol>,
+        unresolved: Vec<UnresolvedKernelAddress>,
+    ) -> Result<Self, KernelSymbolError> {
+        validate_identity(&identity)?;
+
+        let mut requested_addresses = BTreeSet::new();
+        for address in requested {
+            if !requested_addresses.insert(address) {
+                return Err(KernelSymbolError::AddressMismatch(format!(
+                    "duplicate requested kernel address {address:#x}"
+                )));
+            }
+        }
+
+        let mut symbols_by_address = BTreeMap::new();
+        for symbol in symbols {
+            validate_sampled_symbol(&symbol)?;
+            let address = symbol.address;
+            if symbols_by_address.insert(address, symbol).is_some() {
+                return Err(KernelSymbolError::AddressMismatch(format!(
+                    "duplicate resolved kernel address {address:#x}"
+                )));
+            }
+        }
+
+        let mut unresolved_by_address = BTreeMap::new();
+        for unresolved in unresolved {
+            let address = unresolved.address;
+            if unresolved_by_address.insert(address, unresolved).is_some() {
+                return Err(KernelSymbolError::AddressMismatch(format!(
+                    "duplicate unresolved kernel address {address:#x}"
+                )));
+            }
+        }
+
+        let resolved_addresses = symbols_by_address.keys().copied().collect::<BTreeSet<_>>();
+        let unresolved_addresses = unresolved_by_address
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let overlap = resolved_addresses
+            .intersection(&unresolved_addresses)
+            .copied()
+            .collect::<Vec<_>>();
+        if !overlap.is_empty() {
+            return Err(KernelSymbolError::AddressMismatch(format!(
+                "resolved and unresolved kernel addresses overlap: {overlap:#x?}"
+            )));
+        }
+        let actual_addresses = resolved_addresses
+            .union(&unresolved_addresses)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if requested_addresses != actual_addresses {
+            let missing = requested_addresses
+                .difference(&actual_addresses)
+                .copied()
+                .collect::<Vec<_>>();
+            let extra = actual_addresses
+                .difference(&requested_addresses)
+                .copied()
+                .collect::<Vec<_>>();
+            return Err(KernelSymbolError::AddressMismatch(format!(
+                "missing={missing:#x?}, extra={extra:#x?}"
+            )));
+        }
+
+        let requested_count = u64::try_from(requested_addresses.len()).map_err(|_| {
+            KernelSymbolError::AddressMismatch("requested address count exceeds u64".to_owned())
+        })?;
+        let resolved_count = u64::try_from(resolved_addresses.len()).map_err(|_| {
+            KernelSymbolError::AddressMismatch("resolved address count exceeds u64".to_owned())
+        })?;
+        let unresolved_count = u64::try_from(unresolved_addresses.len()).map_err(|_| {
+            KernelSymbolError::AddressMismatch("unresolved address count exceeds u64".to_owned())
+        })?;
+
+        Ok(Self {
+            schema: SAMPLED_KERNEL_SYMBOL_SCHEMA.to_owned(),
+            identity,
+            requested_sha256: address_set_sha256(requested_addresses.iter().copied()),
+            requested_count,
+            resolved_sha256: address_set_sha256(resolved_addresses.iter().copied()),
+            resolved_count,
+            unresolved_sha256: address_set_sha256(unresolved_addresses.iter().copied()),
+            unresolved_count,
+            symbols: symbols_by_address.into_values().collect(),
+            unresolved: unresolved_by_address.into_values().collect(),
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), KernelSymbolError> {
+        if self.schema != SAMPLED_KERNEL_SYMBOL_SCHEMA {
+            return Err(KernelSymbolError::AddressMismatch(format!(
+                "schema is {:?}, expected {SAMPLED_KERNEL_SYMBOL_SCHEMA:?}",
+                self.schema
+            )));
+        }
+        let requested = self
+            .symbols
+            .iter()
+            .map(|symbol| symbol.address)
+            .chain(self.unresolved.iter().map(|unresolved| unresolved.address))
+            .collect::<Vec<_>>();
+        let rebuilt = Self::from_parts(
+            self.identity.clone(),
+            requested,
+            self.symbols.clone(),
+            self.unresolved.clone(),
+        )?;
+        if &rebuilt != self {
+            return Err(KernelSymbolError::AddressMismatch(
+                "sampled overlay is not canonical or has invalid counts/hashes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl KernelSymbolSnapshot {
@@ -1025,17 +1228,70 @@ fn identity_value(bytes: Vec<u8>, name: &'static str) -> Result<String, KernelSy
         .map_err(|_| KernelSymbolError::InvalidIdentity(format!("{name} is not strict UTF-8")))
 }
 
-fn snapshot_with_source(
-    source: &mut impl SymbolSource,
-    requested: impl IntoIterator<Item = u64>,
-) -> Result<KernelSymbolSnapshot, KernelSymbolError> {
+fn read_identity(source: &mut impl SymbolSource) -> Result<KernelIdentity, KernelSymbolError> {
     let identity = KernelIdentity {
         osversion: identity_value(source.sysctl("kern.osversion")?, "kern.osversion")?,
         version: identity_value(source.sysctl("kern.version")?, "kern.version")?,
         uuid: identity_value(source.sysctl("kern.uuid")?, "kern.uuid")?,
         machine: identity_value(source.sysctl("hw.machine")?, "hw.machine")?,
+        bootsessionuuid: identity_value(
+            source.sysctl("kern.bootsessionuuid")?,
+            "kern.bootsessionuuid",
+        )?,
     };
     validate_identity(&identity)?;
+    Ok(identity)
+}
+
+fn sampled_overlay_with_source(
+    source: &mut impl SymbolSource,
+    requested: Vec<u64>,
+) -> Result<SampledKernelSymbolOverlay, KernelSymbolError> {
+    let mut requested_addresses = BTreeSet::new();
+    for address in &requested {
+        if !requested_addresses.insert(*address) {
+            return Err(KernelSymbolError::AddressMismatch(format!(
+                "duplicate requested kernel address {address:#x}"
+            )));
+        }
+    }
+
+    let identity = read_identity(source)?;
+    source.update()?;
+    let mut symbols = Vec::new();
+    let mut unresolved = Vec::new();
+    for address in &requested_addresses {
+        match source.census_lookup(*address) {
+            Ok(outcome) => {
+                let symbol = outcome.symbol;
+                symbols.push(SampledKernelSymbol {
+                    address: symbol.address,
+                    symbol: symbol.symbol,
+                    symbol_start: symbol.symbol_start,
+                    symbol_size: symbol.symbol_size,
+                    offset: symbol.offset,
+                });
+            }
+            Err(failure) => match (failure.class, failure.status_key) {
+                (CensusFailureClass::Status, Some((status, dtrace_errno))) => {
+                    unresolved.push(UnresolvedKernelAddress {
+                        address: *address,
+                        status,
+                        dtrace_errno,
+                    });
+                }
+                _ => return Err(failure.into_error()),
+            },
+        }
+    }
+    SampledKernelSymbolOverlay::from_parts(identity, requested, symbols, unresolved)
+}
+
+fn snapshot_with_source(
+    source: &mut impl SymbolSource,
+    requested: impl IntoIterator<Item = u64>,
+) -> Result<KernelSymbolSnapshot, KernelSymbolError> {
+    let identity = read_identity(source)?;
     source.update()?;
     let provisional_objects = source.objects()?;
     if has_observed_unresolved_mach_kernel(&provisional_objects) {
@@ -1395,6 +1651,16 @@ impl<'handle> LiveDtraceSymbolizer<'handle> {
         };
         snapshot_with_source(&mut source, addresses)
     }
+
+    pub fn sampled_overlay(
+        &mut self,
+        requested: Vec<u64>,
+    ) -> Result<SampledKernelSymbolOverlay, KernelSymbolError> {
+        let mut source = LiveSymbolSource {
+            hdl: self.hdl.cast(),
+        };
+        sampled_overlay_with_source(&mut source, requested)
+    }
 }
 
 #[cfg(test)]
@@ -1435,6 +1701,7 @@ mod tests {
             version: "Darwin Kernel Version 26.0.0".to_owned(),
             uuid: "01234567-89AB-CDEF-0123-456789ABCDEF".to_owned(),
             machine: "arm64".to_owned(),
+            bootsessionuuid: "FEDCBA98-7654-3210-FEDC-BA9876543210".to_owned(),
         }
     }
 
@@ -1483,6 +1750,267 @@ mod tests {
         CensusLookupOutcome {
             symbol,
             name_provenance,
+        }
+    }
+
+    fn sampled_symbol(address: u64, name: &str, start: u64, size: u64) -> SampledKernelSymbol {
+        SampledKernelSymbol {
+            address,
+            symbol: name.to_owned(),
+            symbol_start: start,
+            symbol_size: size,
+            offset: address - start,
+        }
+    }
+
+    #[test]
+    fn sampled_overlay_exact_partition_is_sorted_hashed_and_identity_free() {
+        let requested = vec![0x3018, 0x1018, 0x2018];
+        let mut first = OverlaySource::new([
+            (
+                0x1018,
+                OverlayLookup::Resolved(symbol(0x1018, "opaque-first", "kernel_fn", 0x1010, 0x20)),
+            ),
+            (
+                0x2018,
+                OverlayLookup::Resolved(symbol(
+                    0x2018,
+                    "opaque-driver-first",
+                    "driver_fn",
+                    0x2010,
+                    0x20,
+                )),
+            ),
+            (0x3018, OverlayLookup::Status(-1, 1015)),
+        ]);
+        let mut second = OverlaySource::new([
+            (
+                0x1018,
+                OverlayLookup::Resolved(symbol(0x1018, "opaque-second", "kernel_fn", 0x1010, 0x20)),
+            ),
+            (
+                0x2018,
+                OverlayLookup::Resolved(symbol(
+                    0x2018,
+                    "opaque-driver-second",
+                    "driver_fn",
+                    0x2010,
+                    0x20,
+                )),
+            ),
+            (0x3018, OverlayLookup::Status(-1, 1015)),
+        ]);
+
+        let overlay = sampled_overlay_with_source(&mut first, requested.clone())
+            .expect("mixed sampled overlay");
+        let opaque_variant =
+            sampled_overlay_with_source(&mut second, requested).expect("opaque object variant");
+
+        assert_eq!(overlay, opaque_variant);
+        assert_eq!(overlay.schema, SAMPLED_KERNEL_SYMBOL_SCHEMA);
+        assert_eq!(overlay.requested_count, 3);
+        assert_eq!(
+            overlay.requested_sha256,
+            "a2181a1f562115d3d4ac720e41123754e69ed8704219cdfca1527f5722547972"
+        );
+        assert_eq!(overlay.resolved_count, 2);
+        assert_eq!(
+            overlay.resolved_sha256,
+            "f8910f09f6203dc870c9d4a6d0f9f86781de88608f2dafe40869d871533a5f47"
+        );
+        assert_eq!(overlay.unresolved_count, 1);
+        assert_eq!(
+            overlay.unresolved_sha256,
+            "a19400073da4d5f7ebf9401b4b0123c3fbe5e6f666262b37529e38469d6ee7cf"
+        );
+        assert_eq!(
+            overlay.symbols,
+            vec![
+                sampled_symbol(0x1018, "kernel_fn", 0x1010, 0x20),
+                sampled_symbol(0x2018, "driver_fn", 0x2010, 0x20),
+            ]
+        );
+        assert_eq!(
+            overlay.unresolved,
+            vec![UnresolvedKernelAddress {
+                address: 0x3018,
+                status: -1,
+                dtrace_errno: 1015,
+            }]
+        );
+        assert_eq!(
+            first.calls,
+            vec![
+                "sysctl:kern.osversion",
+                "sysctl:kern.version",
+                "sysctl:kern.uuid",
+                "sysctl:hw.machine",
+                "sysctl:kern.bootsessionuuid",
+                "update",
+                "census:0x1018",
+                "census:0x2018",
+                "census:0x3018",
+            ]
+        );
+        assert_eq!(
+            serde_json::to_vec(&overlay).expect("serialize overlay"),
+            serde_json::to_vec(&opaque_variant).expect("serialize opaque variant")
+        );
+        overlay.validate().expect("valid sampled overlay");
+    }
+
+    #[test]
+    fn sampled_overlay_preserves_non_census_status_for_frame_role_rejection() {
+        let mut source = OverlaySource::new([(0x1018, OverlayLookup::Status(-2, 999))]);
+        let overlay =
+            sampled_overlay_with_source(&mut source, vec![0x1018]).expect("status overlay");
+        assert_eq!(
+            overlay.unresolved,
+            vec![UnresolvedKernelAddress {
+                address: 0x1018,
+                status: -2,
+                dtrace_errno: 999,
+            }]
+        );
+    }
+
+    #[test]
+    fn sampled_overlay_empty_set_uses_sha256_of_empty_bytes() {
+        let mut source = OverlaySource::new([]);
+        let overlay = sampled_overlay_with_source(&mut source, Vec::new()).expect("empty overlay");
+        let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(overlay.requested_sha256, empty_hash);
+        assert_eq!(overlay.resolved_sha256, empty_hash);
+        assert_eq!(overlay.unresolved_sha256, empty_hash);
+        assert_eq!(overlay.requested_count, 0);
+        assert_eq!(overlay.resolved_count, 0);
+        assert_eq!(overlay.unresolved_count, 0);
+        assert!(overlay.symbols.is_empty());
+        assert!(overlay.unresolved.is_empty());
+    }
+
+    #[test]
+    fn sampled_overlay_rejects_duplicate_requested_addresses() {
+        let mut source = OverlaySource::new([(0x1018, OverlayLookup::Status(-1, 1015))]);
+        let error = sampled_overlay_with_source(&mut source, vec![0x1018, 0x1018])
+            .expect_err("duplicate requested address must fail");
+        assert!(matches!(error, KernelSymbolError::AddressMismatch(_)));
+        assert!(source.calls.is_empty());
+    }
+
+    #[test]
+    fn sampled_overlay_rejects_duplicate_and_overlapping_results() {
+        let valid = sampled_symbol(0x1018, "kernel_fn", 0x1010, 0x20);
+        let unresolved = UnresolvedKernelAddress {
+            address: 0x2018,
+            status: -1,
+            dtrace_errno: 1015,
+        };
+        for (label, symbols, unresolved) in [
+            (
+                "duplicate resolved",
+                vec![valid.clone(), valid.clone()],
+                Vec::new(),
+            ),
+            (
+                "duplicate unresolved",
+                Vec::new(),
+                vec![unresolved, unresolved],
+            ),
+            (
+                "resolved/unresolved overlap",
+                vec![valid.clone()],
+                vec![UnresolvedKernelAddress {
+                    address: valid.address,
+                    status: -1,
+                    dtrace_errno: 1015,
+                }],
+            ),
+        ] {
+            let error = SampledKernelSymbolOverlay::from_parts(
+                identity(),
+                vec![0x1018, 0x2018],
+                symbols,
+                unresolved,
+            )
+            .expect_err(label);
+            assert!(matches!(error, KernelSymbolError::AddressMismatch(_)));
+        }
+    }
+
+    #[test]
+    fn sampled_overlay_rejects_missing_and_extra_results() {
+        for (label, requested, symbols) in [
+            (
+                "missing",
+                vec![0x1018, 0x2018],
+                vec![sampled_symbol(0x1018, "kernel_fn", 0x1010, 0x20)],
+            ),
+            (
+                "extra",
+                vec![0x1018],
+                vec![
+                    sampled_symbol(0x1018, "kernel_fn", 0x1010, 0x20),
+                    sampled_symbol(0x2018, "driver_fn", 0x2010, 0x20),
+                ],
+            ),
+        ] {
+            let error =
+                SampledKernelSymbolOverlay::from_parts(identity(), requested, symbols, Vec::new())
+                    .expect_err(label);
+            assert!(matches!(error, KernelSymbolError::AddressMismatch(_)));
+        }
+    }
+
+    #[test]
+    fn sampled_overlay_rejects_invalid_symbol_ranges_and_offsets() {
+        let valid = sampled_symbol(0x1018, "kernel_fn", 0x1010, 0x20);
+        let mut cases = Vec::new();
+        let mut zero = valid.clone();
+        zero.symbol_size = 0;
+        cases.push(zero);
+        let mut overflow = valid.clone();
+        overflow.symbol_start = u64::MAX - 1;
+        overflow.symbol_size = 2;
+        overflow.address = u64::MAX - 1;
+        overflow.offset = 0;
+        cases.push(overflow);
+        let mut outside = valid.clone();
+        outside.address = 0x1030;
+        outside.offset = 0x20;
+        cases.push(outside);
+        let mut wrong_offset = valid;
+        wrong_offset.offset = 7;
+        cases.push(wrong_offset);
+
+        for invalid in cases {
+            let error = SampledKernelSymbolOverlay::from_parts(
+                identity(),
+                vec![invalid.address],
+                vec![invalid],
+                Vec::new(),
+            )
+            .expect_err("invalid sampled range");
+            assert!(matches!(error, KernelSymbolError::InvalidSymbol(_)));
+        }
+    }
+
+    #[test]
+    fn sampled_overlay_rejects_each_empty_identity_field() {
+        for field in ["osversion", "version", "uuid", "machine", "bootsessionuuid"] {
+            let mut invalid = identity();
+            match field {
+                "osversion" => invalid.osversion.clear(),
+                "version" => invalid.version.clear(),
+                "uuid" => invalid.uuid.clear(),
+                "machine" => invalid.machine.clear(),
+                "bootsessionuuid" => invalid.bootsessionuuid.clear(),
+                _ => unreachable!(),
+            }
+            let error =
+                SampledKernelSymbolOverlay::from_parts(invalid, Vec::new(), Vec::new(), Vec::new())
+                    .expect_err(field);
+            assert!(matches!(error, KernelSymbolError::InvalidIdentity(_)));
         }
     }
 
@@ -1884,6 +2412,7 @@ objects=[\"alpha\", \"mach_kernel\"]"
                 "sysctl:kern.version",
                 "sysctl:kern.uuid",
                 "sysctl:hw.machine",
+                "sysctl:kern.bootsessionuuid",
                 "update",
                 "objects",
                 "lookup:0x1018",
@@ -1937,6 +2466,7 @@ objects=[\"alpha\", \"mach_kernel\"]"
                 "sysctl:kern.version",
                 "sysctl:kern.uuid",
                 "sysctl:hw.machine",
+                "sysctl:kern.bootsessionuuid",
                 "update",
                 "objects",
                 "object-info:other_kernel",
@@ -2513,6 +3043,7 @@ objects=[\"alpha\", \"mach_kernel\"]"
                 "sysctl:kern.version",
                 "sysctl:kern.uuid",
                 "sysctl:hw.machine",
+                "sysctl:kern.bootsessionuuid",
                 "update",
                 "objects",
                 "lookup:0x1018",
@@ -2564,6 +3095,7 @@ objects=[\"alpha\", \"mach_kernel\"]"
                 "sysctl:kern.version",
                 "sysctl:kern.uuid",
                 "sysctl:hw.machine",
+                "sysctl:kern.bootsessionuuid",
                 "update",
                 "objects",
                 "lookup:0x1018",
@@ -2680,6 +3212,91 @@ objects=[\"alpha\", \"mach_kernel\"]"
         link_only_apple_symbols();
     }
 
+    enum OverlayLookup {
+        Resolved(KernelSymbolRange),
+        Status(c_int, c_int),
+    }
+
+    struct OverlaySource {
+        calls: Vec<String>,
+        lookups: BTreeMap<u64, OverlayLookup>,
+    }
+
+    impl OverlaySource {
+        fn new(lookups: impl IntoIterator<Item = (u64, OverlayLookup)>) -> Self {
+            Self {
+                calls: Vec::new(),
+                lookups: lookups.into_iter().collect(),
+            }
+        }
+    }
+
+    impl SymbolSource for OverlaySource {
+        fn sysctl(&mut self, name: &'static str) -> Result<Vec<u8>, KernelSymbolError> {
+            self.calls.push(format!("sysctl:{name}"));
+            let value = match name {
+                "kern.osversion" => b"26A5388g\0".as_slice(),
+                "kern.version" => b"Darwin Kernel Version 26.0.0\0".as_slice(),
+                "kern.uuid" => b"01234567-89AB-CDEF-0123-456789ABCDEF\0".as_slice(),
+                "hw.machine" => b"arm64\0".as_slice(),
+                "kern.bootsessionuuid" => b"FEDCBA98-7654-3210-FEDC-BA9876543210\0".as_slice(),
+                _ => return Err(KernelSymbolError::InvalidIdentity(name.to_owned())),
+            };
+            Ok(value.to_vec())
+        }
+
+        fn update(&mut self) -> Result<(), KernelSymbolError> {
+            self.calls.push("update".to_owned());
+            Ok(())
+        }
+
+        fn objects(&mut self) -> Result<Vec<ProvisionalObject>, KernelSymbolError> {
+            Err(KernelSymbolError::ObjectIteration(
+                "sampled overlay must not iterate objects".to_owned(),
+            ))
+        }
+
+        fn object_info(&mut self, _name: &str) -> Result<ProvisionalObject, KernelSymbolError> {
+            Err(KernelSymbolError::ObjectIteration(
+                "sampled overlay must not query object info".to_owned(),
+            ))
+        }
+
+        fn lookup(&mut self, address: u64) -> Result<KernelSymbolRange, KernelSymbolError> {
+            Err(KernelSymbolError::Lookup {
+                address,
+                detail: "sampled overlay must use census lookup".to_owned(),
+            })
+        }
+
+        fn census_lookup(
+            &mut self,
+            address: u64,
+        ) -> Result<CensusLookupOutcome, CensusLookupFailure> {
+            self.calls.push(format!("census:{address:#x}"));
+            match self.lookups.get(&address) {
+                Some(OverlayLookup::Resolved(symbol)) => Ok(CensusLookupOutcome {
+                    symbol: symbol.clone(),
+                    name_provenance: SymbolNameProvenance::Private,
+                }),
+                Some(OverlayLookup::Status(status, errno)) => Err(CensusLookupFailure::status(
+                    KernelSymbolError::Lookup {
+                        address,
+                        detail: format!(
+                            "libdtrace returned status {status} with dtrace errno {errno}"
+                        ),
+                    },
+                    *status,
+                    *errno,
+                )),
+                None => Err(CensusLookupFailure::unexpected(KernelSymbolError::Lookup {
+                    address,
+                    detail: "missing overlay mock lookup".to_owned(),
+                })),
+            }
+        }
+    }
+
     struct MockSource {
         calls: Vec<String>,
         objects: Vec<ProvisionalObject>,
@@ -2717,6 +3334,7 @@ objects=[\"alpha\", \"mach_kernel\"]"
                 "kern.version" => b"Darwin Kernel Version 26.0.0\0".as_slice(),
                 "kern.uuid" => b"01234567-89AB-CDEF-0123-456789ABCDEF\0".as_slice(),
                 "hw.machine" => b"arm64\0".as_slice(),
+                "kern.bootsessionuuid" => b"FEDCBA98-7654-3210-FEDC-BA9876543210\0".as_slice(),
                 _ => return Err(KernelSymbolError::InvalidIdentity(name.to_owned())),
             };
             Ok(value.to_vec())
