@@ -4589,10 +4589,87 @@ fn direct_binding_phase_index(phase: super::emit::DirectBindingRecoveryPhase) ->
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DirectBindingSigpipeRequest {
+    iteration: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirectBindingSigpipeCompletion {
+    iteration: usize,
+}
+
+#[derive(Debug)]
+enum DirectBindingSigpipeOutcome {
+    Completed {
+        kill_status: libc::c_int,
+        completion_iteration: usize,
+    },
+    TimedOut {
+        evidence: String,
+    },
+}
+
+#[derive(Debug)]
+struct DirectBindingSigpipeResult {
+    iteration: usize,
+    requested: bool,
+    requested_generation: u64,
+    acknowledged_generation: u64,
+    outcome: DirectBindingSigpipeOutcome,
+}
+
+struct BoundNativeKickState<'a>(&'a super::super::NativeKickState);
+
+impl Drop for BoundNativeKickState<'_> {
+    fn drop(&mut self) {
+        self.0.unbind_current();
+    }
+}
+
+struct RestoreSignalMask(Option<libc::sigset_t>);
+
+impl RestoreSignalMask {
+    fn restore(&mut self) -> libc::c_int {
+        let Some(original) = self.0.take() else {
+            return 0;
+        };
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &original, std::ptr::null_mut()) }
+    }
+}
+
+impl Drop for RestoreSignalMask {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn capture_direct_binding_jitter_thread(
+    mach_thread: mach2::mach_types::thread_act_t,
+) -> Result<(u64, u64), String> {
+    let suspended = SuspendedMachThread::suspend(mach_thread)?;
+    let mut state = mach2::structs::arm_thread_state64_t::new();
+    let mut count = mach2::structs::arm_thread_state64_t::count();
+    let status = unsafe {
+        mach2::thread_act::thread_get_state(
+            mach_thread,
+            mach2::thread_status::ARM_THREAD_STATE64,
+            std::ptr::from_mut(&mut state).cast(),
+            &mut count,
+        )
+    };
+    suspended.resume()?;
+    if status != mach2::kern_return::KERN_SUCCESS {
+        return Err(format!("thread_get_state failed: {status}"));
+    }
+    Ok((state.__pc, state.__x[28]))
+}
+
 fn direct_binding_sigpipe_sample(
     fixture: &mut DirectBindingLiveFixture,
-    request: &std::sync::mpsc::Sender<usize>,
-    delivered: &std::sync::mpsc::Receiver<()>,
+    request: &std::sync::mpsc::Sender<DirectBindingSigpipeRequest>,
+    completion: &std::sync::mpsc::Sender<DirectBindingSigpipeCompletion>,
+    result: &std::sync::mpsc::Receiver<DirectBindingSigpipeResult>,
     signal_index: usize,
 ) -> Option<(super::emit::DirectBindingRecoveryPhase, usize)> {
     let mut snapshot =
@@ -4609,24 +4686,70 @@ fn direct_binding_sigpipe_sample(
         .translator
         .prepare_entry::<false>(&fixture.fixture.memory, &snapshot)
         .expect("prepare jittered sidecar entry");
-    request.send(signal_index).expect("request bounded SIGPIPE");
+    request
+        .send(DirectBindingSigpipeRequest {
+            iteration: signal_index,
+        })
+        .expect("request bounded SIGPIPE");
     let entered = fixture
         .fixture
         .translator
         .enter_prepared::<false>(prepared, &mut snapshot)
-        .expect("enter jittered sidecar loop");
-    delivered.recv().expect("observe bounded SIGPIPE delivery");
-    let phase = match entered.exit {
-        NativeDsrExit::Kick { resume, .. } => direct_binding_recovery_for_cache_pc(fixture, resume),
-        NativeDsrExit::KickAtEntry { .. } => None,
-        other => panic!("jittered sidecar must exit through a kick: {other:?}"),
+        .map_err(|error| format!("enter jittered sidecar loop: {error}"));
+    completion
+        .send(DirectBindingSigpipeCompletion {
+            iteration: signal_index,
+        })
+        .expect("publish jittered sidecar completion");
+    let sender_result = result
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("observe bounded SIGPIPE sender result");
+    let entered = entered.expect("enter jittered sidecar loop");
+    let (phase, unexpected_exit) = match entered.exit {
+        NativeDsrExit::Kick { resume, .. } => {
+            (direct_binding_recovery_for_cache_pc(fixture, resume), None)
+        }
+        NativeDsrExit::KickAtEntry { .. } => (None, None),
+        other => (None, Some(other)),
     };
+    let finished = fixture.fixture.translator.finish_exit(
+        &fixture.fixture.memory,
+        &mut snapshot,
+        prepared,
+        entered,
+    );
+    let timeout_evidence = match &sender_result.outcome {
+        DirectBindingSigpipeOutcome::TimedOut { evidence } => Some(evidence.as_str()),
+        DirectBindingSigpipeOutcome::Completed { .. } => None,
+    };
+    assert!(
+        timeout_evidence.is_none(),
+        "iteration {signal_index} timed out after its requested kick; \
+         sender={timeout_evidence:?}; finish_exit={finished:?}"
+    );
+    if let DirectBindingSigpipeOutcome::Completed {
+        kill_status,
+        completion_iteration,
+    } = sender_result.outcome
+    {
+        assert_eq!(sender_result.iteration, signal_index);
+        assert_eq!(completion_iteration, signal_index);
+        assert!(
+            sender_result.requested,
+            "kick request must be newly pending"
+        );
+        assert_eq!(kill_status, 0, "pthread_kill(SIGPIPE)");
+        assert_eq!(
+            sender_result.requested_generation, sender_result.acknowledged_generation,
+            "iteration {signal_index} completed without acknowledging its requested kick"
+        );
+    }
+    assert!(
+        unexpected_exit.is_none(),
+        "jittered sidecar must exit through a kick: {unexpected_exit:?}"
+    );
     assert!(matches!(
-        fixture
-            .fixture
-            .translator
-            .finish_exit(&fixture.fixture.memory, &mut snapshot, prepared, entered,)
-            .expect("finish jittered sidecar kick"),
+        finished.expect("finish jittered sidecar kick"),
         super::ThreadExit::Kick
     ));
     assert!(
@@ -4641,7 +4764,13 @@ fn direct_binding_sigpipe_sample(
         "jittered recovery x17 mismatch for sampled phase {phase:?}"
     );
     assert_eq!(snapshot.x[30], expected.x[30]);
-    assert_eq!(snapshot.pstate, expected.pstate);
+    // A requested kick delivered in the host window can surface Darwin's
+    // host-only PSTATE.D mask; the guest architectural contract is exact NZCV.
+    assert_eq!(
+        snapshot.pstate & 0xf000_0000,
+        expected.pstate & 0xf000_0000,
+        "iteration {signal_index} phase {phase:?}"
+    );
     phase
 }
 
@@ -4670,7 +4799,14 @@ fn direct_binding_jittered_sigpipe_stress_preserves_state() {
     assert!(!source_cell.load_acquire().is_null());
     assert!(!target_cell.load_acquire().is_null());
 
+    let kick_state =
+        Arc::new(super::super::NativeKickState::new().expect("create jitter kick state"));
+    kick_state
+        .bind_current()
+        .expect("bind jitter kick state to target");
+    let kick_binding = BoundNativeKickState(&kick_state);
     let target_thread = unsafe { libc::pthread_self() };
+    let target_mach_thread = unsafe { libc::pthread_mach_thread_np(target_thread) };
     let mut signal_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
     let mut old_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
     assert_eq!(unsafe { libc::sigemptyset(signal_set.as_mut_ptr()) }, 0);
@@ -4684,45 +4820,116 @@ fn direct_binding_jittered_sigpipe_stress_preserves_state() {
         0
     );
     let old_set = unsafe { old_set.assume_init() };
-    let (request_tx, request_rx) = std::sync::mpsc::channel::<usize>();
-    let (delivered_tx, delivered_rx) = std::sync::mpsc::channel::<()>();
+    let mut signal_mask = RestoreSignalMask(Some(old_set));
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<DirectBindingSigpipeRequest>();
+    let (completion_tx, completion_rx) =
+        std::sync::mpsc::channel::<DirectBindingSigpipeCompletion>();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<DirectBindingSigpipeResult>();
+    let (sender_done_tx, sender_done_rx) = std::sync::mpsc::channel::<()>();
+    let sender_kick_state = Arc::clone(&kick_state);
     let sender = std::thread::spawn(move || {
-        while let Ok(signal_index) = request_rx.recv() {
-            let jitter = signal_index.wrapping_mul(997);
-            std::thread::sleep(std::time::Duration::from_micros(
-                25 + u64::try_from(jitter % 476).expect("bounded delay"),
-            ));
+        while let Ok(request) = request_rx.recv() {
+            let jitter = request.iteration.wrapping_mul(997);
+            std::thread::sleep(std::time::Duration::from_micros(25 + (jitter % 476) as u64));
             for _ in 0..(jitter % 65_536) {
                 std::hint::spin_loop();
             }
-            assert_eq!(
-                unsafe { libc::pthread_kill(target_thread, libc::SIGPIPE) },
-                0
-            );
-            if delivered_tx.send(()).is_err() {
+
+            let requested = sender_kick_state.request();
+            let requested_generation = sender_kick_state.requested_generation();
+            let kill_status = unsafe { libc::pthread_kill(target_thread, libc::SIGPIPE) };
+            let completion = completion_rx.recv_timeout(std::time::Duration::from_secs(1));
+            let outcome = match completion {
+                Ok(completion) => DirectBindingSigpipeOutcome::Completed {
+                    kill_status,
+                    completion_iteration: completion.iteration,
+                },
+                Err(wait) => {
+                    let (pc, x28, capture_error) =
+                        match capture_direct_binding_jitter_thread(target_mach_thread) {
+                            Ok((pc, x28)) => (Some(pc), Some(x28), None),
+                            Err(error) => (None, None, Some(error)),
+                        };
+                    let requested_at_timeout = sender_kick_state.requested_generation();
+                    let acknowledged_at_timeout = sender_kick_state.acknowledged_generation();
+                    let rescue_requested = if requested_at_timeout == acknowledged_at_timeout {
+                        sender_kick_state.request()
+                    } else {
+                        false
+                    };
+                    let rescue_generation = sender_kick_state.requested_generation();
+                    let rescue_kill_status =
+                        unsafe { libc::pthread_kill(target_thread, libc::SIGPIPE) };
+                    let completion_after_rescue =
+                        match completion_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                            Ok(completion) => Ok(completion.iteration),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                Err("timed out after rescue")
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                Err("completion channel disconnected after rescue")
+                            }
+                        };
+                    let wait_error = match wait {
+                        std::sync::mpsc::RecvTimeoutError::Timeout => "timed out before rescue",
+                        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                            "completion channel disconnected before rescue"
+                        }
+                    };
+                    let final_requested = sender_kick_state.requested_generation();
+                    let final_acknowledged = sender_kick_state.acknowledged_generation();
+                    DirectBindingSigpipeOutcome::TimedOut {
+                        evidence: format!(
+                            "first_kill={kill_status} wait={wait_error} pc={pc:#x?} \
+                             x28={x28:#x?} capture_error={capture_error:?} \
+                             timeout_req={requested_at_timeout} \
+                             timeout_ack={acknowledged_at_timeout} \
+                             rescue_requested={rescue_requested} \
+                             rescue_generation={rescue_generation} \
+                             rescue_kill={rescue_kill_status} \
+                             completion_after_rescue={completion_after_rescue:?} \
+                             final_req={final_requested} final_ack={final_acknowledged}"
+                        ),
+                    }
+                }
+            };
+            let sender_result = DirectBindingSigpipeResult {
+                iteration: request.iteration,
+                requested,
+                requested_generation,
+                acknowledged_generation: sender_kick_state.acknowledged_generation(),
+                outcome,
+            };
+            if result_tx.send(sender_result).is_err() {
                 break;
             }
         }
+        let _ = sender_done_tx.send(());
     });
 
     const SIGNAL_BOUND: usize = 10_000;
     let mut covered = [false; 8];
     let mut recovered_words = [0_u32; 64];
     for signal_index in 0..SIGNAL_BOUND {
-        if let Some((phase, word)) =
-            direct_binding_sigpipe_sample(&mut fixture, &request_tx, &delivered_rx, signal_index)
-        {
+        if let Some((phase, word)) = direct_binding_sigpipe_sample(
+            &mut fixture,
+            &request_tx,
+            &completion_tx,
+            &result_rx,
+            signal_index,
+        ) {
             covered[direct_binding_phase_index(phase)] = true;
             recovered_words[word] = recovered_words[word].saturating_add(1);
         }
     }
 
     drop(request_tx);
-    sender.join().expect("join bounded SIGPIPE sender");
-    assert_eq!(
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, std::ptr::null_mut()) },
-        0
-    );
+    sender_done_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("bounded SIGPIPE sender shutdown");
+    drop(sender);
+    drop(kick_binding);
+    assert_eq!(signal_mask.restore(), 0);
     eprintln!(
         "direct-binding jitter coverage: covered={covered:?} \
          recovered_words={recovered_words:?} signals={SIGNAL_BOUND}"
