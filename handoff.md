@@ -23,10 +23,20 @@ from **21,786 ms to 19,485 ms** (−10.56%). This is meaningful progress, but it
 is not close to the 2x destination and must not be presented as completion.
 
 The earlier fusion/gateway work is on `main`; the continuation is committed on
-the branch named above. `just ci` is green and
-`just conformance-native smoke --workers 4` is clean (no regressions, including
-`go-sync` 52/52 and `cpython-threading` 193/193 — the suites that would break
-first if fused atomics or shared generation authority were wrong).
+the branch named above. The last-known pre-sidecar checkpoint had a green
+`just ci` and clean `just conformance-native smoke --workers 4` (including
+`go-sync` 52/52 and `cpython-threading` 193/193). Those are historical
+receipts, not current-HEAD results.
+
+Current HEAD `7cebf638` repairs Task 15's runtime-oracle metadata compile
+failure. That repair commit records both native crate suites, the focused
+direct-binding oracle, the full serialized runtime library suite, `cargo fmt`,
+and `git diff --check` as passing. The complete Task 15 sequence has **not**
+been rerun after the repair: fresh preflight, signed rebuild and
+codesign/DOF/marker checks, one-sample feasibility, and the fail-closed
+precursor/candidate mechanism pair remain outstanding. No current-HEAD
+`just ci`, native smoke, signed feasibility, or live mechanism result is
+claimed.
 
 Reference workload: the conformance `go-build` case — `go build` of a
 hello-world with a cold `GOCACHE`.
@@ -149,12 +159,14 @@ private JIT cache. Restricting it to portable artifacts produced one 24.664 s
 sample, then crashed in Go runtime stack code on replication. Do not resurrect
 that inline family.
 
-**Next implementation target:** an immutable-code-compatible, compact per-edge
-binding sidecar. Each loaded unit should own mutable cells keyed by stable edge
-identity; the cell must publish target PC plus executable authority/version,
-and the short immutable edge stub must have explicit asynchronous recovery
-coverage. Screen two untraced runs first, then require five samples to beat the
-official 19.375 s baseline and pass correctness guardrails.
+**Immediate next action:** rerun the complete Task 15 sequence from a clean
+`7cebf638` checkout and fresh absent single-use artifact paths: preflight and
+the full structural gate, signed rebuild plus codesign/DOF/marker verification,
+the exact one-sample candidate feasibility command, then the exact fail-closed
+precursor/candidate mechanism capture. The compact per-edge binding sidecar is
+implemented; the next decision is evidence collection, not another
+implementation variant. Only an accepted mechanism pair may advance to
+untraced wall screening and correctness guardrails.
 
 ### Task 15 mechanism gate stopped at the structural prerequisite
 
@@ -203,8 +215,11 @@ precursor/candidate vectors to reconcile: all seven `NATIVEPERF1` exit kinds
 gateway totals, translation attempts, unique `(pid,cell)` identities,
 publication/clear bounds, typed reasons, or `S/D/G` collapse equations are
 unobserved—not zero. Variant 1 is **rejected before mechanism evaluation**.
-Repair the mandatory runtime oracle gate, then restart Task 15 from fresh
-absent artifact paths. Do not tune the 22-word path on this result.
+Commit `7cebf638` subsequently repaired this exact metadata mismatch and
+records current-HEAD structural verification, but it did not rerun Task 15's
+complete serial gate or any signed/live step. Restart Task 15 from clean
+preflight and fresh absent artifact paths. Do not tune the 22-word path before
+that evidence decision.
 
 ### Portable translation reuse is correct but not a default performance win
 
@@ -218,9 +233,9 @@ unit-scoped generation bindings and cross-unit fail-closed chaining.
 - signed shared-unit variants: 31–77 s, depending on unit policy.
 
 The correctness seam is worth keeping, but enabling it by default would be a
-regression. The next design must amortize signing/dlopen at a much coarser
-granularity and publish early enough for sibling compiler processes to reuse
-the code.
+regression. A later coarse-unit design, deferred until Task 15 closes, would
+need to amortize signing/dlopen at a much coarser granularity and publish early
+enough for sibling compiler processes to reuse the code.
 
 ### Experiments stopped
 
@@ -232,7 +247,10 @@ the code.
 
 All were reverted. Do not resurrect them without new evidence.
 
-### Verification receipts
+### Historical verification receipts
+
+These receipts predate the direct-binding sidecar and are not current-HEAD
+Task 15 results.
 
 - Signed native demo: Linux `aarch64`, Go 1.24.13, compile and execute
   `native-go-ok`.
@@ -254,6 +272,7 @@ All were reverted. Do not resurrect them without new evidence.
 | `26de3c07` | **Gateway exit addresses moved into `DsrContext`** — smaller win, and the prerequisite for sharing translations. |
 | `423895d5` | Container-scoped portable translation reuse plus the default two-way cache and allocation reductions. |
 | `deb9a80e` | Remove redundant AArch64 cold-publication arbitration. |
+| `7cebf638` | Repair direct-binding oracle metadata. |
 
 Findings doc:
 `docs/superpowers/specs/2026-07-26-native-cpu-attribution-findings.md`.
@@ -422,24 +441,22 @@ Published same-ISA DBT (AArch32→AArch64, MAMBO, PLDI'16) runs under **7.5%**
 overhead. We are far above that, so treat "translation is inherently expensive"
 as refuted — the gap is defects, not physics.
 
-## Next work, ranked by current evidence
+## Next work, ordered by the current gate
 
-1. **Make coarse portable units cheap enough to win.** The correctness path is
-   present, but signing/dlopen and late publication overwhelm saved
-   translations. Measure unit production/consumption by executable and publish
-   one immutable unit before sibling fan-out; do not reintroduce per-block
-   rebinding.
-2. **Reduce the remaining 862k indirect exits.** The two-way cache proved
-   collision pressure was real. The residual is now the next chaining target:
-   classify return/call-site locality and test a bounded return-target strategy,
-   retaining only a five-run win.
-3. **Reduce emission cost.** The clean profile spends 5.806 s in emission for
-   1.868M translations. Attribute assembler allocation, relocation recording,
-   cache publication and icache work separately before changing code.
-4. **Revisit per-process capsule setup only with a process-lifetime trace.** The
-   attempted Clap/bincode shortcut was noise. Digest and mountpoint reuse may
-   still matter, but the old ~18% sample needs fresh attribution after the
-   translation changes.
+1. **Rerun Task 15 end to end.** Re-establish clean preflight and absent
+   single-use paths, run all four structural commands serially, rebuild signed,
+   verify codesign/DOF/`CARRICK_DSR_DIRECT_BINDINGS`, run the exact one-sample
+   feasibility command, and only if it accepts run the exact fail-closed
+   mechanism pair. Preserve and record any rejection.
+2. **Advance only on accepted mechanism evidence.** If the pair passes every
+   vector, reconciliation, process-cell bound, cleanup, provenance, and 95%
+   collapse/reclassification gate, proceed to the controller's untraced wall
+   screen and correctness guardrails. Otherwise stop Variant 1 and do not tune
+   the 22-word path.
+3. **Defer unrelated performance directions until Task 15 closes.** Coarse-unit
+   publication, the remaining 862k indirect exits, emission-cost attribution,
+   and per-process capsule setup remain evidence-backed backlog items, not the
+   immediate next work.
 
 ---
 
