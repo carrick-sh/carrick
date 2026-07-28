@@ -290,17 +290,46 @@ fn published_object(object: ProvisionalObject) -> Result<KernelObjectRange, Kern
     })
 }
 
-fn matching_nonzero_scalars(original: &ProvisionalObject, resolved: &ProvisionalObject) -> bool {
-    [
-        (original.text_start, resolved.text_start),
-        (original.text_size, resolved.text_size),
-        (original.data_start, resolved.data_start),
-        (original.data_size, resolved.data_size),
-        (original.bss_start, resolved.bss_start),
-        (original.bss_size, resolved.bss_size),
-    ]
-    .into_iter()
-    .all(|(original, resolved)| original == 0 || original == resolved)
+fn object_info_mismatch_fields(
+    original: &ProvisionalObject,
+    resolved: &ProvisionalObject,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if resolved.name != original.name {
+        fields.push("name");
+    }
+    if original.file.is_some() && original.file != resolved.file {
+        fields.push("file");
+    }
+    if resolved.id != original.id {
+        fields.push("id");
+    }
+    if resolved.flags != original.flags {
+        fields.push("flags");
+    }
+    if resolved.flags & DTRACE_OBJ_F_KERNEL == 0 {
+        fields.push("kernel-bit");
+    }
+    if original.text_start != 0 && original.text_start != resolved.text_start {
+        fields.push("text-start");
+    }
+    if original.text_size != 0 && original.text_size != resolved.text_size {
+        fields.push("text-size");
+    }
+    if resolved.text_size == 0 {
+        fields.push("unresolved-text-size");
+    }
+    for (original, resolved, field) in [
+        (original.data_start, resolved.data_start, "data-start"),
+        (original.data_size, resolved.data_size, "data-size"),
+        (original.bss_start, resolved.bss_start, "bss-start"),
+        (original.bss_size, resolved.bss_size, "bss-size"),
+    ] {
+        if original != 0 && original != resolved {
+            fields.push(field);
+        }
+    }
+    fields
 }
 
 fn refine_kernel_objects(
@@ -330,16 +359,11 @@ fn refine_kernel_objects(
             .ok_or_else(|| {
                 KernelSymbolError::InvalidObject(format!("missing zero-size object {name:?}"))
             })?;
-        if resolved.name != original.name
-            || resolved.id != original.id
-            || resolved.flags != original.flags
-            || resolved.flags & DTRACE_OBJ_F_KERNEL == 0
-            || (original.file.is_some() && original.file != resolved.file)
-            || !matching_nonzero_scalars(original, &resolved)
-            || resolved.text_size == 0
-        {
+        let mismatches = object_info_mismatch_fields(original, &resolved);
+        if !mismatches.is_empty() {
             return Err(KernelSymbolError::InvalidObject(format!(
-                "object-info mismatch for {name:?}"
+                "object-info mismatch for {name:?}: {}",
+                mismatches.join(", ")
             )));
         }
         *original = resolved;
@@ -1315,6 +1339,99 @@ mod tests {
         overflow.text_start = u64::MAX;
         overflow.text_size = 1;
         assert!(refine_kernel_objects(vec![original], |_| Ok(overflow.clone())).is_err());
+    }
+
+    #[test]
+    fn refinement_mismatch_diagnostics_name_every_changed_field_in_stable_order() {
+        let mut original = provisional_object("mach_kernel", 7, 0);
+        original.file = Some("/System/mach_kernel".to_owned());
+
+        let mut resolved = original.clone();
+        resolved.name = "other_kernel".to_owned();
+        resolved.file = Some("/System/other_kernel".to_owned());
+        resolved.id += 1;
+        resolved.flags = 0;
+        resolved.text_start += 1;
+        resolved.data_start += 1;
+        resolved.data_size += 1;
+        resolved.bss_start += 1;
+        resolved.bss_size += 1;
+        let error = refine_kernel_objects(vec![original], |_| Ok(resolved.clone()))
+            .expect_err("all changed fields must reject");
+        assert_eq!(
+            error.to_string(),
+            "invalid kernel object: object-info mismatch for \"mach_kernel\": \
+name, file, id, flags, kernel-bit, text-start, unresolved-text-size, \
+data-start, data-size, bss-start, bss-size"
+        );
+    }
+
+    #[test]
+    fn refinement_mismatch_diagnostics_report_only_the_changed_fields() {
+        let mut original = provisional_object("mach_kernel", 7, 0);
+        original.file = Some("/System/mach_kernel".to_owned());
+        let mut cases: Vec<(&str, ProvisionalObject)> = Vec::new();
+
+        let mut name = original.clone();
+        name.name = "other_kernel".to_owned();
+        cases.push(("name", name));
+        let mut file = original.clone();
+        file.file = Some("/System/other_kernel".to_owned());
+        cases.push(("file", file));
+        let mut id = original.clone();
+        id.id += 1;
+        cases.push(("id", id));
+        let mut flags = original.clone();
+        flags.flags |= 0x2;
+        cases.push(("flags", flags));
+        let mut kernel_bit = original.clone();
+        kernel_bit.flags = 0;
+        cases.push(("flags, kernel-bit", kernel_bit));
+        let mut text_start = original.clone();
+        text_start.text_start += 1;
+        cases.push(("text-start", text_start));
+        let mut data_start = original.clone();
+        data_start.data_start += 1;
+        cases.push(("data-start", data_start));
+        let mut data_size = original.clone();
+        data_size.data_size += 1;
+        cases.push(("data-size", data_size));
+        let mut bss_start = original.clone();
+        bss_start.bss_start += 1;
+        cases.push(("bss-start", bss_start));
+        let mut bss_size = original.clone();
+        bss_size.bss_size += 1;
+        cases.push(("bss-size", bss_size));
+
+        for (expected_fields, mut resolved) in cases {
+            resolved.text_size = 0x1000;
+            let error = refine_kernel_objects(vec![original.clone()], |_| Ok(resolved.clone()))
+                .expect_err("changed field must reject");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid kernel object: object-info mismatch for \"mach_kernel\": {expected_fields}"
+                )
+            );
+        }
+
+        let error = refine_kernel_objects(vec![original.clone()], |_| Ok(original.clone()))
+            .expect_err("zero text must remain unresolved");
+        assert_eq!(
+            error.to_string(),
+            "invalid kernel object: object-info mismatch for \"mach_kernel\": unresolved-text-size"
+        );
+    }
+
+    #[test]
+    fn refinement_mismatch_diagnostic_preserves_the_valid_none_file_policy() {
+        let original = provisional_object("mach_kernel", 7, 0);
+        let mut resolved = original.clone();
+        resolved.file = Some("/System/mach_kernel".to_owned());
+        resolved.text_size = 0x1000;
+        let objects = refine_kernel_objects(vec![original], |_| Ok(resolved.clone()))
+            .expect("an unknown iterator file may be enriched");
+        assert_eq!(objects[0].file.as_deref(), Some("/System/mach_kernel"));
     }
 
     #[test]
