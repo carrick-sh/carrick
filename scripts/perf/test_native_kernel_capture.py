@@ -694,6 +694,36 @@ class NativeKernelCaptureTests(unittest.TestCase):
             timeout_seconds=1,
         )
 
+    def test_trace_command_forwards_fixed_run_subcommand(self) -> None:
+        paths = native_kernel_capture.planned_paths(
+            self.artifacts
+        ).runs["a"]
+
+        trace_argv, target_argv = native_kernel_capture._trace_command(
+            self.config,
+            paths,
+            "kernel-fixture-a-guest",
+        )
+
+        expected_target = [
+            "run",
+            "--exec-backend",
+            "native",
+            "-e",
+            "CARRICK_RUN_ID=kernel-fixture-a-guest",
+            "-w",
+            "/tmp",
+            "localhost:5005/carrick-go-conformance:1.24",
+            "/bin/sh",
+            "-c",
+            native_kernel_capture.native_go_build.guest_script(),
+        ]
+        self.assertEqual(target_argv, expected_target)
+        self.assertEqual(trace_argv[0], str(self.binary))
+        separator = trace_argv.index("--")
+        self.assertEqual(trace_argv[separator + 1], "run")
+        self.assertEqual(trace_argv[separator + 1 :], expected_target)
+
     @contextlib.contextmanager
     def record_watchdog_threads(
         self,
@@ -1800,6 +1830,14 @@ class NativeKernelCaptureTests(unittest.TestCase):
             payload["cleanup"]["argv"][-1],
             payload["host_run_id"],
         )
+        for receipt in (receipt_a, receipt_b):
+            receipt_payload = native_kernel_capture.validate_receipt(receipt)
+            separator = receipt_payload["trace_argv"].index("--")
+            self.assertEqual(receipt_payload["target_argv"][0], "run")
+            self.assertEqual(
+                receipt_payload["trace_argv"][separator + 1 :],
+                receipt_payload["target_argv"],
+            )
 
         expected_artifacts = {
             "raw_trace",
@@ -1827,6 +1865,38 @@ class NativeKernelCaptureTests(unittest.TestCase):
             payload["cleanup"]["stderr_sha256"],
             payload["artifacts"]["cleanup_stderr"]["sha256"],
         )
+
+    def test_receipt_rejects_legacy_duplicate_binary_target(self) -> None:
+        _, receipt_a, _, _ = self.capture_success()
+        payload = json.loads(receipt_a.read_text())
+        binary = payload["provenance"]["pre"]["binary"]["path"]
+        separator = payload["trace_argv"].index("--")
+        forwarded = [
+            "run",
+            "--exec-backend",
+            "native",
+            "-e",
+            f"CARRICK_RUN_ID={payload['guest_run_id']}",
+            "-w",
+            "/tmp",
+            payload["provenance"]["pre"]["image_ref"],
+            "/bin/sh",
+            "-c",
+            native_kernel_capture.native_go_build.guest_script(),
+        ]
+        payload["target_argv"] = [binary, *forwarded]
+        payload["trace_argv"] = [
+            *payload["trace_argv"][: separator + 1],
+            binary,
+            *forwarded,
+        ]
+        receipt_a.write_text(json.dumps(payload))
+
+        with self.assertRaisesRegex(
+            native_kernel_capture.EvidenceError,
+            "receipt target invocation is not fixed",
+        ):
+            native_kernel_capture.validate_receipt(receipt_a)
 
     def test_cleanup_runs_in_finally_for_every_command_outcome(self) -> None:
         for outcome, fragment in (

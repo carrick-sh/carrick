@@ -829,7 +829,6 @@ def _target_command(
     guest_run_id: str,
 ) -> list[str]:
     return [
-        str(config.binary),
         "run",
         "--exec-backend",
         "native",
@@ -1954,7 +1953,6 @@ def validate_receipt(path: pathlib.Path) -> dict[str, Any]:
         raise EvidenceError("receipt acceptance hash differs from current analyzer")
 
     expected_target = [
-        str(binary.get("path")),
         "run",
         "--exec-backend",
         "native",
