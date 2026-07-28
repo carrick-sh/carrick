@@ -4593,7 +4593,6 @@ fn direct_binding_sigpipe_sample(
     fixture: &mut DirectBindingLiveFixture,
     request: &std::sync::mpsc::Sender<usize>,
     delivered: &std::sync::mpsc::Receiver<()>,
-    entry_override: Option<(super::types::CacheVa, u64, u64)>,
     signal_index: usize,
 ) -> Option<(super::emit::DirectBindingRecoveryPhase, usize)> {
     let mut snapshot =
@@ -4605,16 +4604,11 @@ fn direct_binding_sigpipe_sample(
     snapshot.x[30] = 0x3030_3030_3030_3030;
     snapshot.pstate = 0xa000_0000;
     let expected = snapshot;
-    let mut prepared = fixture
+    let prepared = fixture
         .fixture
         .translator
         .prepare_entry::<false>(&fixture.fixture.memory, &snapshot)
         .expect("prepare jittered sidecar entry");
-    if let Some((entry, x0, x1)) = entry_override {
-        prepared.entry = entry;
-        snapshot.x[0] = x0;
-        snapshot.x[1] = x1;
-    }
     request.send(signal_index).expect("request bounded SIGPIPE");
     let entered = fixture
         .fixture
@@ -4642,14 +4636,17 @@ fn direct_binding_sigpipe_sample(
     );
     assert_eq!(snapshot.x[15], expected.x[15]);
     assert_eq!(snapshot.x[16], expected.x[16]);
-    assert_eq!(snapshot.x[17], expected.x[17]);
+    assert_eq!(
+        snapshot.x[17], expected.x[17],
+        "jittered recovery x17 mismatch for sampled phase {phase:?}"
+    );
     assert_eq!(snapshot.x[30], expected.x[30]);
     assert_eq!(snapshot.pstate, expected.pstate);
     phase
 }
 
 #[test]
-fn direct_binding_jittered_sigpipe_recovers_every_preamble_phase() {
+fn direct_binding_jittered_sigpipe_stress_preserves_state() {
     let _signal_oracle = install_signal_handlers_for_oracle();
     let mut fixture = direct_binding_live_fixture(true, true, true);
     assert!(matches!(
@@ -4711,76 +4708,13 @@ fn direct_binding_jittered_sigpipe_recovers_every_preamble_phase() {
     const SIGNAL_BOUND: usize = 10_000;
     let mut covered = [false; 8];
     let mut recovered_words = [0_u32; 64];
-    let mut signals = 0;
-    while !covered[..7].iter().all(|covered| *covered) && signals + 1 < SIGNAL_BOUND {
+    for signal_index in 0..SIGNAL_BOUND {
         if let Some((phase, word)) =
-            direct_binding_sigpipe_sample(&mut fixture, &request_tx, &delivered_rx, None, signals)
+            direct_binding_sigpipe_sample(&mut fixture, &request_tx, &delivered_rx, signal_index)
         {
             covered[direct_binding_phase_index(phase)] = true;
             recovered_words[word] = recovered_words[word].saturating_add(1);
         }
-        signals += 1;
-    }
-
-    source_cell.clear_release();
-    let (source_entry, miss_entry) = {
-        let state = fixture.fixture.translator.process.state.read();
-        let block = state
-            .published
-            .iter()
-            .find(|block| {
-                state
-                    .blocks
-                    .get(&(fixture.source, CodeGeneration::INITIAL))
-                    .is_some_and(|entry| *entry == block.entry)
-            })
-            .expect("published cyclic source block");
-        let miss = block
-            .recovery
-            .iter()
-            .find_map(|entry| match entry.action {
-                super::emit::RecoveryAction::RestoreDirectBinding {
-                    phase: super::emit::DirectBindingRecoveryPhase::MissExit,
-                    ..
-                } => block
-                    .entry
-                    .host()
-                    .raw()
-                    .checked_add(entry.cache.get() as usize),
-                _ => None,
-            })
-            .expect("source sidecar miss entry");
-        (block.entry, miss)
-    };
-    let mut trampoline_cache = TranslationCache::new(
-        16 * 1024,
-        crate::native_darwin::darwin_jit::active_host_jit(),
-    )
-    .expect("allocate miss-loop trampoline");
-    let trampoline = trampoline_cache
-        .publish_words(&[
-            0xf902_6780, // str x0, [x28, #1224] -- redirect direct exit
-            0xd61f_0020, // br x1 -- enter the source sidecar
-        ])
-        .expect("publish miss-loop trampoline");
-    while !covered[direct_binding_phase_index(super::emit::DirectBindingRecoveryPhase::MissExit)]
-        && signals < SIGNAL_BOUND
-    {
-        if let Some((phase, word)) = direct_binding_sigpipe_sample(
-            &mut fixture,
-            &request_tx,
-            &delivered_rx,
-            Some((
-                trampoline.entry(),
-                miss_entry as u64,
-                source_entry.host().raw() as u64,
-            )),
-            signals,
-        ) {
-            covered[direct_binding_phase_index(phase)] = true;
-            recovered_words[word] = recovered_words[word].saturating_add(1);
-        }
-        signals += 1;
     }
 
     drop(request_tx);
@@ -4791,20 +4725,8 @@ fn direct_binding_jittered_sigpipe_recovers_every_preamble_phase() {
     );
     eprintln!(
         "direct-binding jitter coverage: covered={covered:?} \
-         recovered_words={recovered_words:?} signals={signals}"
+         recovered_words={recovered_words:?} signals={SIGNAL_BOUND}"
     );
-    let authority_install =
-        direct_binding_phase_index(super::emit::DirectBindingRecoveryPhase::AuthorityInstall);
-    assert!(
-        covered
-            .iter()
-            .enumerate()
-            .all(|(index, covered)| index == authority_install || *covered),
-        "10,000-signal broad control missed a phase outside the separately forced \
-         AuthorityInstall lane: \
-         covered={covered:?} recovered_words={recovered_words:?} signals={signals}"
-    );
-    assert!(signals <= SIGNAL_BOUND);
 }
 
 struct SuspendedMachThread {
@@ -4880,17 +4802,75 @@ fn cmp_nzcv(lhs: u64, rhs: u64) -> u32 {
     negative | zero | carry | overflow
 }
 
-fn force_direct_binding_word20_sigpipe(
+#[derive(Clone, Copy, Debug)]
+enum ForcedDirectBindingSite {
+    ScratchCapture,
+    CellAddress,
+    TargetAcquire,
+    AuthorityValidate,
+    AuthorityInstall,
+    ArchitecturalRestore,
+    FinalBranch,
+    MissExit,
+    BlockEntry,
+}
+
+impl ForcedDirectBindingSite {
+    const fn phase_and_word(self) -> Option<(super::emit::DirectBindingRecoveryPhase, usize)> {
+        use super::emit::DirectBindingRecoveryPhase;
+
+        match self {
+            Self::ScratchCapture => Some((DirectBindingRecoveryPhase::ScratchCapture, 0)),
+            Self::CellAddress => Some((DirectBindingRecoveryPhase::CellAddress, 5)),
+            Self::TargetAcquire => Some((DirectBindingRecoveryPhase::TargetAcquire, 10)),
+            Self::AuthorityValidate => Some((DirectBindingRecoveryPhase::AuthorityValidate, 14)),
+            Self::AuthorityInstall => Some((DirectBindingRecoveryPhase::AuthorityInstall, 20)),
+            Self::ArchitecturalRestore => {
+                Some((DirectBindingRecoveryPhase::ArchitecturalRestore, 25))
+            }
+            Self::FinalBranch => Some((DirectBindingRecoveryPhase::FinalBranch, 26)),
+            Self::MissExit => Some((DirectBindingRecoveryPhase::MissExit, 27)),
+            Self::BlockEntry => None,
+        }
+    }
+}
+
+fn direct_binding_cell_addresses(fixture: &DirectBindingLiveFixture) -> [usize; 2] {
+    [
+        fixture
+            ._source_loaded
+            .as_ref()
+            .and_then(|loaded| loaded.binding_base)
+            .expect("source binding cell")
+            .get(),
+        fixture
+            ._target_loaded
+            .as_ref()
+            .and_then(|loaded| loaded.binding_base)
+            .expect("target binding cell")
+            .get(),
+    ]
+}
+
+fn force_direct_binding_sigpipe(
     pthread: libc::pthread_t,
     mach_thread: mach2::mach_types::thread_act_t,
     sidecar_starts: [usize; 2],
+    binding_cells: [usize; 2],
+    site: ForcedDirectBindingSite,
     remove_catalog: bool,
 ) -> Result<usize, String> {
     const VALIDATE_WORD: usize = 14;
-    const FORCED_WORD: usize = 20;
+    const ENTRY_OFFSET: usize = 1072;
+    const SAVED_NZCV_OFFSET: usize = 936;
+    const SAVED_X16_OFFSET: usize = 1120;
+    const SAVED_X17_OFFSET: usize = 1128;
+    const SAVED_X15_OFFSET: usize = 1160;
+    const SAVED_X30_OFFSET: usize = 1168;
     const GENERATION_BINDINGS_OFFSET: usize = 1264;
     const CACHE_START_OFFSET: usize = 1176;
     const CACHE_END_OFFSET: usize = 1184;
+    const DIRECT_BINDING_TARGET_OFFSET: usize = 1296;
     const EXECUTABLE_RANGE_CATALOG_OFFSET: usize = 1304;
 
     let fail_with_live_kick = |error: String| {
@@ -4916,9 +4896,10 @@ fn force_direct_binding_word20_sigpipe(
             suspended.resume()?;
             return fail_with_live_kick(format!("thread_get_state failed: {get_status}"));
         }
-        let Some(sidecar_start) = sidecar_starts
+        let Some((sidecar_index, sidecar_start)) = sidecar_starts
             .into_iter()
-            .find(|start| state.__pc as usize == start + VALIDATE_WORD * 4)
+            .enumerate()
+            .find(|(_, start)| state.__pc as usize == start + VALIDATE_WORD * 4)
         else {
             suspended.resume()?;
             if attempt.is_multiple_of(256) {
@@ -4947,36 +4928,115 @@ fn force_direct_binding_word20_sigpipe(
             );
         }
 
-        // Emulate the unchanged real instructions from pre-word 14 through
-        // pre-word 20 while the live thread is suspended:
-        // 14 `cmp x16, x30`; 15 non-taken `b.hs`; 16 generation-pointer load;
-        // 17 generation-pointer store; 18 cache-pair address; 19 pair store.
-        state.__cpsr = (state.__cpsr & 0x0fff_ffff) | cmp_nzcv(state.__x[16], state.__lr);
-        state.__x[17] = prefix.generation_bindings;
         let context = state.__x[28] as usize;
         if context == 0 {
             suspended.resume()?;
             return fail_with_live_kick("word 14 lost the live DSR context".to_string());
         }
-        unsafe {
-            (context
-                .checked_add(GENERATION_BINDINGS_OFFSET)
-                .expect("context generation pointer") as *mut u64)
-                .write(state.__x[17]);
-        }
-        state.__x[17] = context
-            .checked_add(CACHE_START_OFFSET)
-            .expect("context cache range") as u64;
-        unsafe {
-            (context
+        let context_u64 = |offset: usize| unsafe {
+            (context.checked_add(offset).expect("context field") as *const u64).read()
+        };
+        let write_context_u64 = |offset: usize, value: u64| unsafe {
+            (context.checked_add(offset).expect("context field") as *mut u64).write(value);
+        };
+        let saved_x15 = context_u64(SAVED_X15_OFFSET);
+        let saved_x16 = context_u64(SAVED_X16_OFFSET);
+        let saved_x17 = context_u64(SAVED_X17_OFFSET);
+        let saved_x30 = context_u64(SAVED_X30_OFFSET);
+        let saved_nzcv = context_u64(SAVED_NZCV_OFFSET);
+        let binding_cell = binding_cells[sidecar_index] as u64;
+
+        let restore_original_registers = |state: &mut mach2::structs::arm_thread_state64_t| {
+            state.__x[15] = saved_x15;
+            state.__x[16] = saved_x16;
+            state.__x[17] = saved_x17;
+            state.__lr = saved_x30;
+            state.__cpsr = saved_nzcv as u32;
+        };
+        let emulate_authority_install = |state: &mut mach2::structs::arm_thread_state64_t| {
+            // Emulate words 14 through 19 from the live validated state:
+            // the two authority checks, generation-pointer install, and
+            // target cache-range install.
+            state.__cpsr = (state.__cpsr & 0x0fff_ffff) | cmp_nzcv(state.__x[16], state.__lr);
+            state.__x[17] = prefix.generation_bindings;
+            write_context_u64(GENERATION_BINDINGS_OFFSET, state.__x[17]);
+            state.__x[17] = context
                 .checked_add(CACHE_START_OFFSET)
-                .expect("context cache start") as *mut u64)
-                .write(state.__x[15]);
-            (context
-                .checked_add(CACHE_END_OFFSET)
-                .expect("context cache end") as *mut u64)
-                .write(state.__lr);
-        }
+                .expect("context cache range") as u64;
+            write_context_u64(CACHE_START_OFFSET, state.__x[15]);
+            write_context_u64(CACHE_END_OFFSET, state.__lr);
+        };
+
+        let forced_pc = match site {
+            ForcedDirectBindingSite::ScratchCapture => {
+                restore_original_registers(&mut state);
+                write_context_u64(DIRECT_BINDING_TARGET_OFFSET, 0);
+                sidecar_start
+            }
+            ForcedDirectBindingSite::CellAddress => {
+                restore_original_registers(&mut state);
+                write_context_u64(DIRECT_BINDING_TARGET_OFFSET, 0);
+                sidecar_start
+                    .checked_add(5 * 4)
+                    .expect("cell-address recovery PC")
+            }
+            ForcedDirectBindingSite::TargetAcquire => {
+                restore_original_registers(&mut state);
+                state.__x[15] = binding_cell;
+                state.__x[17] = descriptor as usize as u64;
+                write_context_u64(DIRECT_BINDING_TARGET_OFFSET, state.__x[17]);
+                sidecar_start
+                    .checked_add(10 * 4)
+                    .expect("target-acquire recovery PC")
+            }
+            ForcedDirectBindingSite::AuthorityValidate => sidecar_start
+                .checked_add(VALIDATE_WORD * 4)
+                .expect("authority-validation recovery PC"),
+            ForcedDirectBindingSite::AuthorityInstall => {
+                emulate_authority_install(&mut state);
+                sidecar_start
+                    .checked_add(20 * 4)
+                    .expect("authority-install recovery PC")
+            }
+            ForcedDirectBindingSite::ArchitecturalRestore
+            | ForcedDirectBindingSite::FinalBranch
+            | ForcedDirectBindingSite::BlockEntry => {
+                emulate_authority_install(&mut state);
+                // Word 20 commits the target cache PC. Words 21 through 24
+                // then restore NZCV, x15, x30, and x16.
+                write_context_u64(ENTRY_OFFSET, prefix.target_cache_pc);
+                restore_original_registers(&mut state);
+                state.__x[17] = context
+                    .checked_add(CACHE_START_OFFSET)
+                    .expect("context cache range") as u64;
+                match site {
+                    ForcedDirectBindingSite::ArchitecturalRestore => sidecar_start
+                        .checked_add(25 * 4)
+                        .expect("architectural-restore recovery PC"),
+                    ForcedDirectBindingSite::FinalBranch => {
+                        state.__x[17] = prefix.target_cache_pc;
+                        sidecar_start
+                            .checked_add(26 * 4)
+                            .expect("final-branch recovery PC")
+                    }
+                    ForcedDirectBindingSite::BlockEntry => {
+                        state.__x[17] = prefix.target_cache_pc;
+                        usize::try_from(prefix.target_cache_pc)
+                            .map_err(|_| "target block entry does not fit usize".to_string())?
+                    }
+                    _ => unreachable!("outer match restricts authority-restored sites"),
+                }
+            }
+            ForcedDirectBindingSite::MissExit => {
+                restore_original_registers(&mut state);
+                state.__x[15] = binding_cell;
+                state.__x[17] = 0;
+                write_context_u64(DIRECT_BINDING_TARGET_OFFSET, 0);
+                sidecar_start
+                    .checked_add(27 * 4)
+                    .expect("miss-exit recovery PC")
+            }
+        };
         if remove_catalog {
             unsafe {
                 (context
@@ -4985,9 +5045,6 @@ fn force_direct_binding_word20_sigpipe(
                     .write(0);
             }
         }
-        let forced_pc = sidecar_start
-            .checked_add(FORCED_WORD * 4)
-            .expect("forced direct-binding word");
         state.__pc = forced_pc as u64;
         let set_status = unsafe {
             mach2::thread_act::thread_set_state(
@@ -5009,6 +5066,144 @@ fn force_direct_binding_word20_sigpipe(
         return Ok(forced_pc);
     }
     fail_with_live_kick("could not suspend the live sidecar at word 14".to_string())
+}
+
+#[test]
+fn direct_binding_forced_sigpipe_recovers_every_phase_and_block_entry() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    let mut fixture = direct_binding_live_fixture(true, true, true);
+    assert!(matches!(
+        fixture.traverse(fixture.source),
+        NativeDsrExit::ResolveDirect {
+            source,
+            target,
+            binding: DirectBindingExitMetadata::Mapped(_),
+        } if source == fixture.source && target == fixture.target
+    ));
+    assert!(matches!(
+        fixture.traverse(fixture.target),
+        NativeDsrExit::ResolveDirect {
+            source,
+            target,
+            binding: DirectBindingExitMetadata::Mapped(_),
+        } if source == fixture.target && target == fixture.source
+    ));
+    let sidecar_starts = [
+        direct_binding_sidecar_start(&fixture, fixture.source),
+        direct_binding_sidecar_start(&fixture, fixture.target),
+    ];
+    let binding_cells = direct_binding_cell_addresses(&fixture);
+    let pthread = unsafe { libc::pthread_self() };
+    let mach_thread = unsafe { libc::pthread_mach_thread_np(pthread) };
+    let mut signal_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    let mut old_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    assert_eq!(unsafe { libc::sigemptyset(signal_set.as_mut_ptr()) }, 0);
+    let mut signal_set = unsafe { signal_set.assume_init() };
+    assert_eq!(
+        unsafe { libc::sigaddset(&mut signal_set, libc::SIGPIPE) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signal_set, old_set.as_mut_ptr()) },
+        0
+    );
+    let old_set = unsafe { old_set.assume_init() };
+
+    let sites = [
+        ForcedDirectBindingSite::ScratchCapture,
+        ForcedDirectBindingSite::CellAddress,
+        ForcedDirectBindingSite::TargetAcquire,
+        ForcedDirectBindingSite::AuthorityValidate,
+        ForcedDirectBindingSite::AuthorityInstall,
+        ForcedDirectBindingSite::ArchitecturalRestore,
+        ForcedDirectBindingSite::FinalBranch,
+        ForcedDirectBindingSite::MissExit,
+        ForcedDirectBindingSite::BlockEntry,
+    ];
+    let mut covered = [false; 8];
+    for site in sites {
+        let mut snapshot =
+            seeded_snapshot(fixture.stack.as_mut_ptr() as u64 + fixture.stack.len() as u64);
+        snapshot.pc = fixture.source.raw();
+        snapshot.x[15] = 0x1515_1515_1515_1515;
+        snapshot.x[16] = 0x1616_1616_1616_1616;
+        snapshot.x[17] = 0x1717_1717_1717_1717;
+        snapshot.x[30] = 0x3030_3030_3030_3030;
+        snapshot.pstate = 0xa000_0000;
+        let expected = snapshot;
+        let prepared = fixture
+            .fixture
+            .translator
+            .prepare_entry::<false>(&fixture.fixture.memory, &snapshot)
+            .expect("prepare forced sidecar entry");
+        let sender = std::thread::spawn(move || {
+            force_direct_binding_sigpipe(
+                pthread,
+                mach_thread,
+                sidecar_starts,
+                binding_cells,
+                site,
+                false,
+            )
+        });
+        let entered = fixture
+            .fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("enter forced sidecar loop");
+        let forced_pc = sender
+            .join()
+            .expect("join forced sidecar sender")
+            .unwrap_or_else(|error| panic!("force live {site:?} SIGPIPE: {error}"));
+        let NativeDsrExit::Kick { resume, .. } = entered.exit else {
+            panic!(
+                "forced {site:?} source PC must be an ordinary kick: {:?}",
+                entered.exit
+            );
+        };
+        assert_eq!(resume.raw(), forced_pc as u64, "{site:?}: interrupted PC");
+        if let Some((phase, word)) = site.phase_and_word() {
+            assert_eq!(
+                direct_binding_recovery_for_cache_pc(&fixture, resume),
+                Some((phase, word)),
+                "{site:?}: typed recovery point"
+            );
+            covered[direct_binding_phase_index(phase)] = true;
+        } else {
+            assert_eq!(
+                direct_binding_recovery_for_cache_pc(&fixture, resume),
+                None,
+                "block entry is outside the direct-binding sidecar"
+            );
+        }
+        assert!(matches!(
+            fixture
+                .fixture
+                .translator
+                .finish_exit(&fixture.fixture.memory, &mut snapshot, prepared, entered)
+                .expect("finish forced sidecar kick"),
+            super::ThreadExit::Kick
+        ));
+        assert!(
+            snapshot.pc == fixture.source.raw() || snapshot.pc == fixture.target.raw(),
+            "{site:?}: recovery resumed outside an edge owner: 0x{:x}",
+            snapshot.pc
+        );
+        assert_eq!(snapshot.x[15], expected.x[15], "{site:?}: x15");
+        assert_eq!(snapshot.x[16], expected.x[16], "{site:?}: x16");
+        assert_eq!(snapshot.x[17], expected.x[17], "{site:?}: x17");
+        assert_eq!(snapshot.x[30], expected.x[30], "{site:?}: x30");
+        assert_eq!(snapshot.pstate, expected.pstate, "{site:?}: NZCV");
+    }
+    assert_eq!(
+        covered, [true; 8],
+        "every direct-binding recovery phase must be forced"
+    );
+
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, std::ptr::null_mut()) },
+        0
+    );
 }
 
 #[test]
@@ -5035,6 +5230,7 @@ fn direct_binding_forced_word20_sigpipe_discriminates_catalog() {
         direct_binding_sidecar_start(&fixture, fixture.source),
         direct_binding_sidecar_start(&fixture, fixture.target),
     ];
+    let binding_cells = direct_binding_cell_addresses(&fixture);
     let pthread = unsafe { libc::pthread_self() };
     let mach_thread = unsafe { libc::pthread_mach_thread_np(pthread) };
     let mut signal_set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
@@ -5067,10 +5263,12 @@ fn direct_binding_forced_word20_sigpipe_discriminates_catalog() {
             .prepare_entry::<false>(&fixture.fixture.memory, &snapshot)
             .expect("prepare forced word-20 sidecar entry");
         let sender = std::thread::spawn(move || {
-            force_direct_binding_word20_sigpipe(
+            force_direct_binding_sigpipe(
                 pthread,
                 mach_thread,
                 sidecar_starts,
+                binding_cells,
+                ForcedDirectBindingSite::AuthorityInstall,
                 remove_catalog,
             )
         });
