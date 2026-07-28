@@ -156,6 +156,56 @@ and the short immutable edge stub must have explicit asynchronous recovery
 coverage. Screen two untraced runs first, then require five samples to beat the
 official 19.375 s baseline and pass correctness guardrails.
 
+### Task 15 mechanism gate stopped at the structural prerequisite
+
+Task 15 was attempted from a clean
+`c4d54b92f45f091e39966fe9a856b93e352da8b0` checkout. Preflight found no
+foreign Carrick/benchmark workload or real Docker oracle; only the
+`carrick-registry-5050` and `vt-ferry-registry` `registry:2` containers were
+running. The candidate image remained native `arm64`, ID and repo digest
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
+The relevant ambient Carrick environment was empty. The unrebuilt stale
+release binary remained
+`sha256:1f55a200175ec19f33f1deed085a68175b164c7f3500cca8165179247258849c`.
+
+The serial structural result was:
+
+| Command | Status | Receipt |
+|---|---:|---|
+| `cargo test -p carrick-dsr-aarch64` | 0 | 162 passed, 0 failed; doc tests passed |
+| `cargo test -p carrick-native-darwin` | 0 | 31 passed, 0 failed; doc tests passed |
+| `RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib 'native_darwin::dsr::oracle::direct_binding_'` | 101 | 25 compile-time `E0308` mismatches |
+| `cargo fmt --all -- --check` | not run in gate sequence | stopped fail-closed; the required pre-commit hook later ran it and passed |
+
+`native_darwin/dsr/oracle.rs` still constructs and matches `binding` with
+`Option` (`None`/`Some(_)`) at 25 sites from line 1641 through 5336, while the
+current `NativeDsrExit` field requires `DirectBindingExitMetadata`. The signed
+build, codesign/DOF/`CARRICK_DSR_DIRECT_BINDINGS` marker checks, feasibility
+sample, and fail-closed mechanism capture were therefore not run. No workload
+or run ID existed and no cleanup was invoked; command status, exact
+`BUILD_OK`, cleanup output/status, surviving descendants, child CPU, and
+runner-frozen pre/post provenance are **not applicable**. There is no
+performance or traced-timing result.
+
+The following single-use paths remain absent and have no hashes:
+
+- `target/perf/direct-binding-feasibility-v1.json`
+- `target/perf/direct-binding-feasibility-v1-logs/`
+- `target/perf/direct-binding-mechanism-v1.json`
+- `target/perf/direct-binding-mechanism-v1/precursor/{trace.log,summary.jsonl,stdout.log,stderr.log,receipt.json}`
+- `target/perf/direct-binding-mechanism-v1/candidate/{trace.log,summary.jsonl,stdout.log,stderr.log,receipt.json}`
+
+Accordingly there are no receipt or bound-artifact SHA-256 values and no
+precursor/candidate vectors to reconcile: all seven `NATIVEPERF1` exit kinds
+(`syscall`, `direct`, `indirect`, `fault`, `kick`, `sensitive`,
+`unsupported`), the six binding event kinds (`eligible`, `publish`,
+`CAS loss`, `clear`, `validation failure`, `unit loaded`), raw-DTrace overlap,
+gateway totals, translation attempts, unique `(pid,cell)` identities,
+publication/clear bounds, typed reasons, or `S/D/G` collapse equations are
+unobserved—not zero. Variant 1 is **rejected before mechanism evaluation**.
+Repair the mandatory runtime oracle gate, then restart Task 15 from fresh
+absent artifact paths. Do not tune the 22-word path on this result.
+
 ### Portable translation reuse is correct but not a default performance win
 
 The container-scoped design is implemented through image-digest keys, portable

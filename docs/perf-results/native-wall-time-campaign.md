@@ -70,6 +70,64 @@ beaten `C0`.
 | E009 | `target/perf/native-edge-shape-authority-v2-c.raw` | bounded diagnostic; raw untracked | First 45 traced seconds contain 17,155,262 direct resolver events; the hottest edge (`0x1a748 → 0x1a74c`) accounts for 1,473,595 and is the fall-through of Go `compile`'s `CBZ R1` |
 | E010 | `target/perf/native-go-build-authority-v2-stress-screen.json` | accepted screen; dirty provenance | Three correct untraced samples: 25,169, 25,268 and 25,082 ms; authority switching removes most resolver amplification but remains slower than `C0=19,375 ms` |
 | E011 | `target/perf/native-go-build-portable-conditional-v3-populate.json` plus failed replication log | rejected spike; raw untracked | Artifact-only inline conditional caching screened at 24,664 ms, then crashed in Go stack/runtime code; the all-code version exhausted the 64 MiB private JIT cache |
+| E012 | Task 15 structural gate at `c4d54b92` | rejected before live evidence | The first two structural commands passed, but the serialized runtime oracle command failed to compile with 25 `E0308` errors because `binding` fixtures/patterns still use `Option` while `NativeDsrExit` requires `DirectBindingExitMetadata`; no signed candidate, feasibility sample, or trace pair was run |
+
+### Task 15 direct-binding mechanism gate — rejected before live work
+
+The frozen preflight was clean at
+`c4d54b92f45f091e39966fe9a856b93e352da8b0`: `git status --porcelain=v1`
+was empty, the only workload-census matches were the census shell and `rg`
+itself, and Docker contained only `carrick-registry-5050` and
+`vt-ferry-registry`, both using `registry:2`. No ambient
+`CARRICK_DSR*`, `CARRICK_PERF*`, `CARRICK_EXEC_BACKEND`,
+`CARRICK_NATIVE*`, or `CARRICK_RUN_ID` variable was present. The frozen image
+was native `arm64`, ID
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`,
+with repo digest
+`localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
+The expected stale pre-Task-15 release binary remained
+`sha256:1f55a200175ec19f33f1deed085a68175b164c7f3500cca8165179247258849c`;
+it was not rebuilt or used.
+
+The exact serial structural status vector was:
+
+| Gate | Status | Result |
+|---|---:|---|
+| `cargo test -p carrick-dsr-aarch64` | 0 | 162 passed, 0 failed; doc tests passed |
+| `cargo test -p carrick-native-darwin` | 0 | 31 passed, 0 failed; doc tests passed |
+| `RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib 'native_darwin::dsr::oracle::direct_binding_'` | 101 | compile failed with 25 `E0308` mismatches in `native_darwin/dsr/oracle.rs` |
+| `cargo fmt --all -- --check` | not run in gate sequence | fail-closed stop after the preceding structural failure; the required pre-commit hook later ran the same command and passed |
+
+The first error is at `oracle.rs:1641`; further construction sites and match
+patterns through `oracle.rs:5336` pass or expect `None`/`Some(_)` for
+`binding`, but the field now has type `DirectBindingExitMetadata`. This is a
+structural rejection, not a measured mechanism result.
+
+Consequently `just build`, signing/DOF/marker verification, the exact
+one-sample feasibility command, and `direct_binding_mechanism.py capture-pair`
+were not run. No run ID or guest process existed, so command status,
+`BUILD_OK`, scoped cleanup status/output, descendants, child CPU, elapsed
+workload time, pre/post runner snapshots, and timing claims are all **not
+applicable**, not measured zeroes.
+
+Every single-use evidence path remained absent and therefore has no SHA-256:
+
+- `target/perf/direct-binding-feasibility-v1.json`
+- `target/perf/direct-binding-feasibility-v1-logs/`
+- `target/perf/direct-binding-mechanism-v1.json`
+- `target/perf/direct-binding-mechanism-v1/precursor/{trace.log,summary.jsonl,stdout.log,stderr.log,receipt.json}`
+- `target/perf/direct-binding-mechanism-v1/candidate/{trace.log,summary.jsonl,stdout.log,stderr.log,receipt.json}`
+
+Because neither receipt exists, there are no bound raw/summary/profile/stdout/
+stderr hashes, cleanup receipts, precursor/candidate gateway vectors
+(`syscall`, `direct`, `indirect`, `fault`, `kick`, `sensitive`,
+`unsupported`), binding-event vectors (`eligible`, `publish`, `CAS loss`,
+`clear`, `validation failure`, `unit loaded`), translation attempts,
+unique `(pid,cell)` pairs, clear/validation reasons, reconciliations,
+process-cell bounds, collapse values `S/D/G`, or reclassification equations to
+report. Variant 1 is **rejected before mechanism evaluation**. Do not tune the
+22-word path; first restore the mandatory runtime oracle gate and rerun Task 15
+from fresh absent artifact paths.
 
 ## Whole-tree attribution
 
@@ -201,6 +259,7 @@ The table order is provisional until E005 and E006 exist.
 | 2026-07-27 | H004 | authority-carrying two-way target cache for direct/indirect edges | Permit safe cross-unit chaining without mutating signed code | 25.169 s median across three correct samples | n/a | keep as correctness precursor, not a wall win |
 | 2026-07-27 | H004 | inline conditional target-cache lookup in all code | Collapse the 1.47M hottest fall-through misses | failed: 64 MiB private JIT cache exhausted | n/a | reject; code-size explosion |
 | 2026-07-27 | H004 | inline conditional lookup only in portable artifacts | Avoid private-cache expansion while chaining shared conditionals | 24.664 s first sample; replication crashed in Go runtime | n/a | reject and revert; too small and unsafe |
+| 2026-07-27 | H004 | compact direct-binding sidecar Variant 1 mechanism gate | Collapse at least 95% of sidecar-eligible direct resolver exits with matching direct/gateway reclassification | structural gate failed before signed feasibility | n/a | reject before mechanism evaluation; runtime oracle fixtures/patterns do not compile |
 
 Prior rejected experiments remain recorded in `handoff.md`; they are not reset
 to `PROPOSED`.
@@ -211,6 +270,7 @@ to `PROPOSED`.
 |---|---|---|---|---|---|---|
 | historical `9c25688d` | green | green | 23/23 MATCH | Go sync 52/52; CPython threading 193/193; subprocess 278/278 | green | accepted starting implementation |
 | M1 measurement tooling | 18 Rust + 17 Python tests green | native container smoke printed `TRACE_OK` | n/a | n/a | signed build + DOF present | analyzer accepted container and adversarial scope traces; Go-build evidence pending |
+| Task 15 direct-binding mechanism gate | 162 AArch64 DSR + 31 native-Darwin tests green; runtime oracle compile failed with 25 `E0308` errors | not run | not run | not run | not run | rejected before live work |
 
 ## Decisions
 
@@ -250,5 +310,8 @@ Write and validate the executable M1 plan:
 - [x] Prove authority-carrying cross-unit direct/indirect cache hits.
 - [x] Measure direct-edge heat and indirect miss entropy.
 - [x] Falsify full inline conditional caching on code size and recovery.
-- [ ] Add compact per-edge mutable binding cells for unresolved shared-unit
+- [x] Add compact per-edge mutable binding cells for unresolved shared-unit
       direct edges.
+- [ ] Repair the runtime direct-binding oracle fixtures/patterns for
+      `DirectBindingExitMetadata`, rerun the complete structural gate, and
+      restart Task 15 with all single-use evidence paths absent.
