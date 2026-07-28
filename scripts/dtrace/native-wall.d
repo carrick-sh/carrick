@@ -171,6 +171,7 @@ profile-499
 /track_pid[pid] && arg0 != 0/
 {
 	@cpu_kernel[arg0] = count();
+	@cpu_kernel_stack[stack(24)] = count();
 }
 
 carrick*:::host-image-base
@@ -213,6 +214,8 @@ dtrace:::END
 	    @cpu_user);
 	printa("DSRPROF1|count|phase=cpu-kernel-pc|source_pc=0x%x|value=%@d\n",
 	    @cpu_kernel);
+	printa("NWSTACK1|begin|state=kernel-oncpu|value=%@d\n%kNWSTACK1|end\n",
+	    @cpu_kernel_stack);
 	printa("DSRPROF1|count|phase=offcpu-%s-pc|pid=%d|source_pc=0x%x|value=%@d\n",
 	    @off_count);
 	printa("DSRPROF1|total|phase=offcpu-%s-pc|pid=%d|source_pc=0x%x|value_ns=%@d\n",

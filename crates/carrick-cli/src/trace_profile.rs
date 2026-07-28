@@ -92,11 +92,17 @@ struct ProfileRecord {
     fields: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StackTraceValue {
+    Count(u64),
+    DurationNs(u64),
+}
+
 #[derive(Debug)]
 struct StackTraceRecord {
     state: String,
-    pid: u64,
-    value_ns: u64,
+    pid: Option<u64>,
+    value: StackTraceValue,
     frames: Vec<String>,
 }
 
@@ -177,10 +183,48 @@ impl StackTraceRecord {
                 .map(String::as_str)
                 .ok_or_else(|| anyhow!("stack record is missing {key:?}"))
         };
+        let state = required("state")?.to_owned();
+        let (pid, value) = match state.as_str() {
+            "kernel-oncpu"
+                if fields
+                    .keys()
+                    .map(String::as_str)
+                    .eq(["state", "value"].into_iter()) =>
+            {
+                (
+                    None,
+                    StackTraceValue::Count(
+                        parse_u64(required("value")?).context("invalid stack count")?,
+                    ),
+                )
+            }
+            "voluntary"
+                if fields
+                    .keys()
+                    .map(String::as_str)
+                    .eq(["pid", "state", "value_ns"].into_iter()) =>
+            {
+                (
+                    Some(parse_u64(required("pid")?).context("invalid stack pid")?),
+                    StackTraceValue::DurationNs(
+                        parse_u64(required("value_ns")?).context("invalid stack duration")?,
+                    ),
+                )
+            }
+            _ => bail!("stack record has an invalid state/field/value contract"),
+        };
+        if pid == Some(0) {
+            bail!("stack pid must be positive");
+        }
+        match value {
+            StackTraceValue::Count(0) => bail!("stack count must be positive"),
+            StackTraceValue::DurationNs(0) => bail!("stack duration must be positive"),
+            StackTraceValue::Count(_) | StackTraceValue::DurationNs(_) => {}
+        }
         Ok(Self {
-            state: required("state")?.to_owned(),
-            pid: parse_u64(required("pid")?).context("invalid stack pid")?,
-            value_ns: parse_u64(required("value_ns")?).context("invalid stack duration")?,
+            state,
+            pid,
+            value,
             frames: Vec::new(),
         })
     }
@@ -371,6 +415,25 @@ fn summed_count(
     found.then_some(total)
 }
 
+fn checked_summed_count(
+    grouped: &BTreeMap<ProfileScope, MetricBuilder>,
+    phase: &str,
+) -> Result<Option<u64>> {
+    let mut found = false;
+    let mut total = 0_u64;
+    for (scope, metric) in grouped {
+        if scope.phase.as_deref() == Some(phase)
+            && let Some(value) = metric.count
+        {
+            found = true;
+            total = total
+                .checked_add(value)
+                .ok_or_else(|| anyhow!("native-wall {phase} population overflow"))?;
+        }
+    }
+    Ok(found.then_some(total))
+}
+
 fn summed_total_ns(grouped: &BTreeMap<ProfileScope, MetricBuilder>, phase: &str) -> Option<u64> {
     let mut found = false;
     let mut total = 0_u64;
@@ -405,14 +468,33 @@ fn validate_native_wall_metrics(
     if live_at_end != 0 {
         bail!("native-wall profile ended with {live_at_end} tracked process(es)");
     }
-    let cpu_samples = summed_count(grouped, "cpu-user-pc", None)
-        .unwrap_or(0)
-        .saturating_add(summed_count(grouped, "cpu-kernel-pc", None).unwrap_or(0));
-    if cpu_samples == 0 {
+    let kernel_samples = checked_summed_count(grouped, "cpu-kernel-pc")?.unwrap_or(0);
+    let mut kernel_stack_samples = 0_u64;
+    let mut has_kernel_stacks = false;
+    let mut has_voluntary_stacks = false;
+    for stack in stack_traces {
+        match stack.value {
+            StackTraceValue::Count(value) => {
+                has_kernel_stacks = true;
+                kernel_stack_samples = kernel_stack_samples
+                    .checked_add(value)
+                    .ok_or_else(|| anyhow!("native-wall kernel stack population overflow"))?;
+            }
+            StackTraceValue::DurationNs(_) => {
+                has_voluntary_stacks = true;
+            }
+        }
+    }
+    if has_kernel_stacks && kernel_stack_samples != kernel_samples {
+        bail!(
+            "native-wall kernel stack samples total {kernel_stack_samples}, expected {kernel_samples}"
+        );
+    }
+    if summed_count(grouped, "cpu-user-pc", None).unwrap_or(0) == 0 && kernel_samples == 0 {
         bail!("native-wall profile has no CPU samples");
     }
     let voluntary_ns = summed_total_ns(grouped, "offcpu-voluntary-total").unwrap_or(0);
-    if voluntary_ns != 0 && stack_traces.is_empty() {
+    if voluntary_ns != 0 && !has_voluntary_stacks {
         bail!("native-wall profile has voluntary off-CPU time but no blocking stacks");
     }
     Ok(())
@@ -448,8 +530,12 @@ pub(crate) enum ProfileMetric {
     },
     StackTrace {
         state: String,
-        pid: u64,
-        value_ns: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pid: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value_ns: Option<u64>,
         frames: Vec<String>,
     },
     Completion,
@@ -608,8 +694,19 @@ impl ProfileSummary {
             match record.record_type {
                 RecordType::Count => {
                     let value = record.required_u64("value")?;
+                    let is_kernel_pc = scope.phase.as_deref() == Some("cpu-kernel-pc");
                     let builder = grouped.entry(scope).or_default();
-                    builder.count = Some(builder.count.unwrap_or(0).saturating_add(value));
+                    let previous = builder.count.unwrap_or(0);
+                    builder.count = Some(if is_kernel_pc {
+                        previous.checked_add(value).ok_or_else(|| {
+                            anyhow!(
+                                "native-wall cpu-kernel-pc population overflow at line {}",
+                                index + 1
+                            )
+                        })?
+                    } else {
+                        previous.saturating_add(value)
+                    });
                 }
                 RecordType::Total => {
                     let value = record.required_u64("value_ns")?;
@@ -804,10 +901,27 @@ impl ProfileSummary {
             });
         }
         for stack in stack_traces {
+            let (phase, scope_pid, metric_pid, count, value_ns) = match stack.value {
+                StackTraceValue::Count(samples) => {
+                    ("cpu-kernel-stack", None, None, Some(samples), None)
+                }
+                StackTraceValue::DurationNs(duration_ns) => {
+                    let pid = stack
+                        .pid
+                        .ok_or_else(|| anyhow!("voluntary stack lost its pid"))?;
+                    (
+                        "offcpu-voluntary-stack",
+                        Some(pid),
+                        Some(pid),
+                        None,
+                        Some(duration_ns),
+                    )
+                }
+            };
             metrics.push(ProfileOutputMetric {
                 scope: ProfileScope {
-                    phase: Some("offcpu-voluntary-stack".to_owned()),
-                    pid: Some(stack.pid),
+                    phase: Some(phase.to_owned()),
+                    pid: scope_pid,
                     tid: None,
                     kind: Some(stack.state.clone()),
                     source_pc: None,
@@ -815,8 +929,9 @@ impl ProfileSummary {
                 },
                 metric: ProfileMetric::StackTrace {
                     state: stack.state,
-                    pid: stack.pid,
-                    value_ns: stack.value_ns,
+                    pid: metric_pid,
+                    count,
+                    value_ns,
                     frames: stack.frames,
                 },
                 sampling_interval: None,
@@ -1031,15 +1146,266 @@ mod tests {
             .require_profile(TraceProfileKind::NativeWall)
             .expect("matching profile");
         assert!(summary.completion.complete);
-        assert!(summary.metrics.iter().any(|metric| matches!(
-            &metric.metric,
-            ProfileMetric::StackTrace {
-                state,
-                pid: 42,
-                value_ns: 900,
-                frames,
-            } if state == "voluntary" && frames == &["0x2000", "0x3000"]
-        )));
+        let rows = summary
+            .json_rows()
+            .into_iter()
+            .map(|row| serde_json::to_value(row).expect("serialize row"))
+            .collect::<Vec<_>>();
+        let voluntary = rows
+            .iter()
+            .find(|row| row["scope"]["phase"] == "offcpu-voluntary-stack")
+            .expect("voluntary stack row");
+        assert_eq!(voluntary["scope"]["pid"], 42);
+        assert_eq!(voluntary["metric"]["state"], "voluntary");
+        assert_eq!(voluntary["metric"]["pid"], 42);
+        assert_eq!(voluntary["metric"]["value_ns"], 900);
+        assert_eq!(voluntary["metric"].get("count"), None);
+        assert_eq!(
+            voluntary["metric"]["frames"],
+            serde_json::json!(["0x2000", "0x3000"])
+        );
+    }
+
+    #[test]
+    fn native_wall_kernel_stacks_serialize_as_reconciled_counts() {
+        // Catches rejecting count-valued kernel stacks or serializing pid/value_ns on them.
+        let summary = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-kernel-pc|source_pc=0xfffffe0012345000|value=3",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "NWSTACK1|begin|state=kernel-oncpu|value=2",
+                "kernel`foo",
+                "NWSTACK1|end",
+                "NWSTACK1|begin|state=kernel-oncpu|value=1",
+                "kernel`bar",
+                "NWSTACK1|end",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("complete native wall profile");
+
+        let rows = summary
+            .json_rows()
+            .into_iter()
+            .map(|row| serde_json::to_value(row).expect("serialize row"))
+            .collect::<Vec<_>>();
+        let kernel = rows
+            .iter()
+            .filter(|row| row["scope"]["phase"] == "cpu-kernel-stack")
+            .collect::<Vec<_>>();
+        assert_eq!(kernel.len(), 2);
+        assert_eq!(kernel[0]["scope"].get("pid"), None);
+        assert_eq!(kernel[0]["metric"].get("pid"), None);
+        assert_eq!(kernel[0]["metric"]["count"], 2);
+        assert_eq!(kernel[0]["metric"].get("value_ns"), None);
+        assert_eq!(kernel[1]["metric"]["count"], 1);
+    }
+
+    #[test]
+    fn native_wall_kernel_stacks_must_reconcile_with_kernel_pcs() {
+        // Catches accepting a kernel stack population (2) unlike the kernel PC population (3).
+        let error = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-kernel-pc|source_pc=0xfffffe0012345000|value=3",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "NWSTACK1|begin|state=kernel-oncpu|value=2",
+                "kernel`foo",
+                "NWSTACK1|end",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect_err("kernel PC/stack mismatch must reject");
+        assert!(
+            error.to_string().contains("kernel stack samples"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn native_wall_stack_headers_enforce_state_dependent_fields() {
+        let cases = [
+            (
+                "accepts both value and value_ns",
+                "NWSTACK1|begin|state=kernel-oncpu|value=1|value_ns=1",
+                true,
+            ),
+            (
+                "accepts neither value nor value_ns",
+                "NWSTACK1|begin|state=kernel-oncpu",
+                true,
+            ),
+            (
+                "accepts a pid on kernel-oncpu",
+                "NWSTACK1|begin|state=kernel-oncpu|pid=42|value=1",
+                true,
+            ),
+            (
+                "accepts an unknown field",
+                "NWSTACK1|begin|state=kernel-oncpu|unknown=1|value=1",
+                true,
+            ),
+            (
+                "accepts a duplicate field",
+                "NWSTACK1|begin|state=kernel-oncpu|value=1|value=1",
+                true,
+            ),
+            ("accepts a missing state", "NWSTACK1|begin|value=1", true),
+            (
+                "accepts zero kernel samples",
+                "NWSTACK1|begin|state=kernel-oncpu|value=0",
+                true,
+            ),
+            (
+                "accepts voluntary stack without pid",
+                "NWSTACK1|begin|state=voluntary|value_ns=1",
+                true,
+            ),
+            (
+                "accepts count-valued voluntary stack",
+                "NWSTACK1|begin|state=voluntary|pid=42|value=1",
+                true,
+            ),
+            (
+                "accepts zero voluntary pid",
+                "NWSTACK1|begin|state=voluntary|pid=0|value_ns=1",
+                true,
+            ),
+            (
+                "accepts zero voluntary duration",
+                "NWSTACK1|begin|state=voluntary|pid=42|value_ns=0",
+                true,
+            ),
+            (
+                "accepts empty kernel frames",
+                "NWSTACK1|begin|state=kernel-oncpu|value=1",
+                false,
+            ),
+        ];
+
+        for (mutation, header, include_frame) in cases {
+            let mut lines = vec![
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-kernel-pc|source_pc=0xfffffe0012345000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                header,
+            ];
+            if include_frame {
+                lines.push("kernel`foo");
+            }
+            lines.extend([
+                "NWSTACK1|end",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ]);
+            assert!(
+                ProfileSummary::from_lines(lines, ProfileCaptureStatus::default()).is_err(),
+                "production mutation {mutation:?} was not caught"
+            );
+        }
+    }
+
+    #[test]
+    fn native_wall_historical_kernel_pcs_without_stacks_remain_valid() {
+        // Catches requiring new kernel stack rows in historical profile streams.
+        let summary = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-kernel-pc|source_pc=0xfffffe0012345000|value=3",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("historical kernel-only native wall profile");
+        assert!(
+            summary
+                .json_rows()
+                .iter()
+                .all(|row| row.scope.phase.as_deref() != Some("cpu-kernel-stack"))
+        );
+    }
+
+    #[test]
+    fn native_wall_zero_kernel_historical_input_remains_valid() {
+        // Catches treating absent kernel samples/stacks as an evidence mismatch.
+        let summary = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("historical user-only native wall profile");
+        assert!(
+            summary
+                .json_rows()
+                .iter()
+                .all(|row| row.scope.phase.as_deref() != Some("cpu-kernel-stack"))
+        );
+    }
+
+    #[test]
+    fn native_wall_kernel_pc_population_overflow_rejects() {
+        // Catches saturating or wrapping u64::MAX + 1 while accumulating kernel PCs.
+        let error = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-kernel-pc|source_pc=0xfffffe0012345000|value=18446744073709551615",
+                "DSRPROF1|count|phase=cpu-kernel-pc|source_pc=0xfffffe0012345000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect_err("kernel PC overflow must reject");
+        assert!(
+            error.to_string().contains("overflow"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn native_wall_kernel_stack_population_overflow_rejects() {
+        // Catches saturating, wrapping, or panicking on u64::MAX + 1 kernel stacks.
+        let error = ProfileSummary::from_lines(
+            [
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-kernel-pc|source_pc=0xfffffe0012345000|value=18446744073709551615",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "NWSTACK1|begin|state=kernel-oncpu|value=18446744073709551615",
+                "kernel`foo",
+                "NWSTACK1|end",
+                "NWSTACK1|begin|state=kernel-oncpu|value=1",
+                "kernel`bar",
+                "NWSTACK1|end",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            ProfileCaptureStatus::default(),
+        )
+        .expect_err("kernel stack overflow must reject");
+        assert!(
+            error.to_string().contains("overflow"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
