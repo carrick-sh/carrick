@@ -206,7 +206,9 @@ pub(crate) enum DirectBindingResetEvent {
     ThreadCachesCleared,
     IndexesCleared,
     DescriptorsDropped,
+    ExecutableRangeHeadReset,
     UnitsDropped,
+    ExecutableRangeNodesDropped,
     PrivateCursorReset,
 }
 
@@ -305,6 +307,7 @@ pub struct PreparedEntry {
     address_mode: carrick_dsr::address::NativeAddressMode,
     generation_bindings: usize,
     generation_binding_count: usize,
+    executable_range_catalog: *const gateway::ExecutableRangeCatalogHeader,
 }
 
 pub struct PreparedExit {
@@ -395,6 +398,7 @@ pub struct ProcessState {
         BTreeMap<carrick_guest_mem::GuestVa, Vec<crate::shared_cache::PortableBlockCandidate>>,
     shared_publish_attempted: bool,
     direct_bindings: crate::direct_binding::DirectBindingRegistry,
+    executable_ranges: gateway::ExecutableRangeCatalog,
 }
 
 struct SharedTranslationConfiguration {
@@ -1302,6 +1306,10 @@ impl ProcessTranslator {
                 direct_bindings: crate::direct_binding::DirectBindingRegistry::new(
                     crate::shared_cache::direct_binding_runtime_enabled(),
                 ),
+                executable_ranges: gateway::ExecutableRangeCatalog::new(
+                    cache_range.start,
+                    cache_range.end,
+                )?,
             }),
         };
         probes::dsr_cache_capacity(
@@ -1492,9 +1500,13 @@ impl ProcessTranslator {
                     );
                 }
             });
+        state.executable_ranges.reset_head_to_private();
+        recorder(DirectBindingResetEvent::ExecutableRangeHeadReset);
         state.shared_blocks.clear();
         state.loaded_shared_units.clear();
         recorder(DirectBindingResetEvent::UnitsDropped);
+        state.executable_ranges.drop_shared_nodes();
+        recorder(DirectBindingResetEvent::ExecutableRangeNodesDropped);
         state.published.clear();
         state.blocks.clear();
         state.pending.clear();
@@ -1684,6 +1696,7 @@ impl ProcessState {
             _target_authority: target_authority,
             _direct_binding_unit_index: direct_binding_unit_index,
         });
+        self.executable_ranges.prepend(cache_start, cache_end)?;
         let result = self.blocks.get(&(guest, generation)).copied();
         if result.is_some() {
             self.stats.shared_unit_hits = self.stats.shared_unit_hits.saturating_add(1);
@@ -2806,6 +2819,7 @@ impl ThreadTranslator {
             .copied()
             .filter(|authority| authority.owns(entry));
         let cache_range = state.cache.host_range();
+        let executable_range_catalog = state.executable_ranges.header_ptr();
         drop(state);
         let prepared = PreparedEntry {
             entry,
@@ -2816,6 +2830,7 @@ impl ThreadTranslator {
             generation_bindings: shared.map_or(0, |authority| authority.generation_bindings),
             generation_binding_count: shared
                 .map_or(0, |authority| authority.generation_binding_count),
+            executable_range_catalog,
         };
         if PROFILE {
             probes::dsr_prepare_end(
@@ -2866,7 +2881,7 @@ impl ThreadTranslator {
                     prepared.address_mode,
                 )
             } else if prepared.generation_binding_count == 0 {
-                gateway::enter_translated_with_cache_range(
+                gateway::enter_translated_with_cache_range_and_catalog(
                     prepared.entry,
                     snapshot,
                     &mut exit,
@@ -2874,6 +2889,7 @@ impl ThreadTranslator {
                     prepared.cache_start,
                     prepared.cache_end,
                     prepared.address_mode,
+                    prepared.executable_range_catalog,
                 )
             } else {
                 // SAFETY: `ProcessState::loaded_shared_units` owns the boxed table
@@ -2885,7 +2901,7 @@ impl ThreadTranslator {
                         prepared.generation_binding_count,
                     )
                 };
-                gateway::enter_translated_with_cache_range_and_generation_bindings(
+                gateway::enter_translated_with_cache_range_and_generation_bindings_and_catalog(
                     prepared.entry,
                     snapshot,
                     &mut exit,
@@ -2894,6 +2910,7 @@ impl ThreadTranslator {
                     prepared.cache_end,
                     prepared.address_mode,
                     bindings,
+                    prepared.executable_range_catalog,
                 )
             };
         if let Err(error) = gateway_result {
@@ -3991,6 +4008,56 @@ mod tests {
                 "the child's new descriptor must stay private to its COW image"
             );
         }
+
+        #[test]
+        fn fork_child_retains_inherited_catalog_and_publishes_through_cow() {
+            let process = process_with_direct_bindings();
+            let inherited = 0x90_0000..0x91_0000;
+            process
+                .state
+                .write()
+                .executable_ranges
+                .prepend(inherited.start, inherited.end)
+                .expect("publish inherited executable range");
+            let parent_head = process.state.read().executable_ranges.head_ptr();
+
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                process.after_fork_child();
+                let child_only = 0xa0_0000..0xa1_0000;
+                let mut state = process.state.write();
+                let inherited_visible = state.executable_ranges.contains(inherited.start + 0x100);
+                state
+                    .executable_ranges
+                    .prepend(child_only.start, child_only.end)
+                    .expect("publish child-only executable range");
+                let child_visible = state.executable_ranges.contains(child_only.start + 0x100);
+                let child_head_changed = state.executable_ranges.head_ptr() != parent_head;
+                unsafe {
+                    libc::_exit(i32::from(
+                        !(inherited_visible && child_visible && child_head_changed),
+                    ))
+                };
+            }
+
+            assert_eq!(
+                child_exit_status(pid),
+                0,
+                "child did not retain and extend its inherited catalog"
+            );
+            let state = process.state.read();
+            assert_eq!(
+                state.executable_ranges.head_ptr(),
+                parent_head,
+                "child catalog publication must not mutate the parent COW header"
+            );
+            assert!(state.executable_ranges.contains(inherited.start + 0x100));
+            assert!(
+                !state.executable_ranges.contains(0xa0_0100),
+                "child-only executable range leaked into the parent catalog"
+            );
+        }
     }
 
     mod direct_binding_exec_reset {
@@ -4000,14 +4067,35 @@ mod tests {
         use carrick_guest_mem::{GuestVa, HostVa};
         use std::sync::Arc;
 
-        const EXPECTED_ORDER: [DirectBindingResetEvent; 6] = [
+        const EXPECTED_ORDER: [DirectBindingResetEvent; 8] = [
             DirectBindingResetEvent::CellsCleared,
             DirectBindingResetEvent::ThreadCachesCleared,
             DirectBindingResetEvent::IndexesCleared,
             DirectBindingResetEvent::DescriptorsDropped,
+            DirectBindingResetEvent::ExecutableRangeHeadReset,
             DirectBindingResetEvent::UnitsDropped,
+            DirectBindingResetEvent::ExecutableRangeNodesDropped,
             DirectBindingResetEvent::PrivateCursorReset,
         ];
+
+        fn publish_catalog_range(
+            process: &super::super::ProcessTranslator,
+            seed: usize,
+        ) -> std::ops::Range<usize> {
+            let start = 0xb0_0000 + seed * 0x20_000;
+            let range = start..start + 0x10_000;
+            process
+                .state
+                .write()
+                .executable_ranges
+                .prepend(range.start, range.end)
+                .expect("publish test executable range");
+            range
+        }
+
+        fn catalog_head(process: &super::super::ProcessTranslator) -> usize {
+            process.state.read().executable_ranges.head_ptr() as usize
+        }
 
         fn prepare_thread(
             process: &Arc<super::super::ProcessTranslator>,
@@ -4048,9 +4136,10 @@ mod tests {
         }
 
         #[test]
-        fn valid_exec_reset_token_yields_exact_six_stage_order() {
+        fn valid_exec_reset_token_yields_exact_catalog_lifecycle_order() {
             let (fixture, process, _, _) = one_published_binding(23);
             let process = Arc::new(process);
+            let shared_range = publish_catalog_range(&process, 23);
             let (thread, mut token) = prepare_thread(&process);
             let mut events = Vec::new();
 
@@ -4061,6 +4150,13 @@ mod tests {
                 .expect("valid exec reset authority");
 
             assert_eq!(events, EXPECTED_ORDER);
+            let state = process.state.read();
+            assert_eq!(state.executable_ranges.shared_node_count(), 0);
+            assert!(
+                !state.executable_ranges.contains(shared_range.start + 0x100),
+                "authorized exec reset retained a shared executable range"
+            );
+            drop(state);
             assert!(
                 fixture.storage[0]
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -4105,11 +4201,18 @@ mod tests {
             let (_authority_thread, mut token) = prepare_thread(&authority_process);
             let (victim_fixture, victim_process, _, _) = one_published_binding(26);
             let victim_process = Arc::new(victim_process);
+            let _shared_range = publish_catalog_range(&victim_process, 26);
+            let catalog_before = catalog_head(&victim_process);
             let victim_thread = ThreadTranslator::for_process(Arc::clone(&victim_process), 43);
 
             let outcome = victim_process.reset_after_fork_for_exec(&victim_thread, &mut token);
 
             assert!(outcome.is_err(), "foreign process token must fail");
+            assert_eq!(
+                catalog_head(&victim_process),
+                catalog_before,
+                "foreign exec-reset authority mutated the executable catalog"
+            );
             assert!(
                 !victim_fixture.storage[0]
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -4122,6 +4225,8 @@ mod tests {
         fn exec_reset_authority_from_another_thread_is_rejected() {
             let (fixture, process, _, _) = one_published_binding(27);
             let process = Arc::new(process);
+            let _shared_range = publish_catalog_range(&process, 27);
+            let catalog_before = catalog_head(&process);
             let (_other_thread, mut token) = prepare_thread(&process);
             let surviving_thread = ThreadTranslator::for_process(Arc::clone(&process), 43);
             assert!(surviving_thread.resume_entry.is_none());
@@ -4131,6 +4236,11 @@ mod tests {
             assert!(
                 outcome.is_err(),
                 "a different surviving thread must not inherit reset authority"
+            );
+            assert_eq!(
+                catalog_head(&process),
+                catalog_before,
+                "foreign-thread exec-reset authority mutated the executable catalog"
             );
             assert!(
                 !fixture.storage[0]
@@ -4144,20 +4254,29 @@ mod tests {
         fn reused_exec_reset_authority_is_rejected() {
             let (_fixture, process, _, _) = one_published_binding(28);
             let process = Arc::new(process);
+            let _shared_range = publish_catalog_range(&process, 28);
             let (thread, mut token) = prepare_thread(&process);
 
             process
                 .reset_after_fork_for_exec(&thread, &mut token)
                 .expect("first token consumption");
+            let catalog_before_reuse = catalog_head(&process);
             let second = process.reset_after_fork_for_exec(&thread, &mut token);
 
             assert!(second.is_err(), "exec reset authority must be single-use");
+            assert_eq!(
+                catalog_head(&process),
+                catalog_before_reuse,
+                "reused exec-reset authority mutated the executable catalog"
+            );
         }
 
         #[test]
         fn failed_exec_reset_validation_leaves_published_cell_intact() {
             let (fixture, process, _, _) = one_published_binding(29);
             let process = Arc::new(process);
+            let _shared_range = publish_catalog_range(&process, 29);
+            let catalog_before = catalog_head(&process);
             let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 42);
             let mut stale = thread.prepare_direct_binding_exec_reset();
             let _current = thread.prepare_direct_binding_exec_reset();
@@ -4165,6 +4284,11 @@ mod tests {
             let outcome = process.reset_after_fork_for_exec(&thread, &mut stale);
 
             assert!(outcome.is_err(), "stale reset authority must fail");
+            assert_eq!(
+                catalog_head(&process),
+                catalog_before,
+                "stale exec-reset authority mutated the executable catalog"
+            );
             assert!(
                 !fixture.storage[0]
                     .load(std::sync::atomic::Ordering::Acquire)

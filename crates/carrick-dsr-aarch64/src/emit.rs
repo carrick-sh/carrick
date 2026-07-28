@@ -1317,6 +1317,52 @@ const DIRECT_BINDING_CAPTURE_WORDS: usize = 5;
 const DIRECT_BINDING_HIT_WORDS: usize = 22;
 const DIRECT_BINDING_MISS_WORD: usize = DIRECT_BINDING_CAPTURE_WORDS + DIRECT_BINDING_HIT_WORDS;
 
+fn record_direct_binding_sidecar_phases(
+    recovery: &mut Vec<RecoveryEntry>,
+    start: CacheOffset,
+    end: CacheOffset,
+    committed_link: Option<u64>,
+) -> Result<(), DsrError> {
+    let expected_end = start
+        .get()
+        .checked_add((DIRECT_BINDING_STUB_WORDS * 4) as u32)
+        .ok_or_else(|| DsrError::CachePolicy("direct-binding recovery envelope overflow".into()))?;
+    if end.get() != expected_end {
+        return Err(DsrError::CachePolicy(format!(
+            "direct-binding recovery envelope is {}..{}, expected {} bytes",
+            start.get(),
+            end.get(),
+            DIRECT_BINDING_STUB_WORDS * 4
+        )));
+    }
+    for (first_word, end_word, phase) in [
+        (5, 7, DirectBindingRecoveryPhase::CellAddress),
+        (7, 11, DirectBindingRecoveryPhase::TargetAcquire),
+        (11, 17, DirectBindingRecoveryPhase::AuthorityValidate),
+        (17, 21, DirectBindingRecoveryPhase::AuthorityInstall),
+        (21, 26, DirectBindingRecoveryPhase::ArchitecturalRestore),
+        (26, 27, DirectBindingRecoveryPhase::FinalBranch),
+        (27, 64, DirectBindingRecoveryPhase::MissExit),
+    ] {
+        let phase_start = start
+            .get()
+            .checked_add(first_word * 4)
+            .map(CacheOffset::published)
+            .ok_or_else(|| {
+                DsrError::CachePolicy("direct-binding recovery phase start overflow".into())
+            })?;
+        let phase_end = start
+            .get()
+            .checked_add(end_word * 4)
+            .map(CacheOffset::published)
+            .ok_or_else(|| {
+                DsrError::CachePolicy("direct-binding recovery phase end overflow".into())
+            })?;
+        record_direct_binding_phase(recovery, phase_start, phase_end, phase, committed_link)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn rewrite_direct_binding_stub(
     code: &mut [u8],
     link: DirectLink,
@@ -1579,7 +1625,6 @@ fn emit_cached_direct_exit(
         ; .arch aarch64
         ; str x16, [x28, #936]
     );
-    let cell_address_start = current_offset(assembler)?;
     emit_mov_u64(
         assembler,
         entries,
@@ -1621,14 +1666,6 @@ fn emit_cached_direct_exit(
         ; .arch aarch64
         ; add x15, x15, x16, LSL #super::gateway::INDIRECT_CACHE_ENTRY_SHIFT
     );
-    record_direct_binding_phase(
-        recovery,
-        cell_address_start,
-        current_offset(assembler)?,
-        DirectBindingRecoveryPhase::CellAddress,
-        committed_link,
-    )?;
-    let target_acquire_start = current_offset(assembler)?;
     map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -1675,35 +1712,13 @@ fn emit_cached_direct_exit(
         ; .arch aarch64
         ; cbz x17, =>miss
     );
-    record_direct_binding_phase(
-        recovery,
-        target_acquire_start,
-        current_offset(assembler)?,
-        DirectBindingRecoveryPhase::TargetAcquire,
-        committed_link,
-    )?;
-    let authority_validate_start = current_offset(assembler)?;
     let authority = emit_target_authority_switch(assembler, entries, map_guest, miss)?;
-    record_direct_binding_phase(
-        recovery,
-        authority_validate_start,
-        authority.install_start,
-        DirectBindingRecoveryPhase::AuthorityValidate,
-        committed_link,
-    )?;
+    let _ = authority.install_start;
     map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x17, [x28, #1072]
     );
-    record_direct_binding_phase(
-        recovery,
-        authority.install_start,
-        current_offset(assembler)?,
-        DirectBindingRecoveryPhase::AuthorityInstall,
-        committed_link,
-    )?;
-    let architectural_restore_start = current_offset(assembler)?;
     map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -1730,28 +1745,12 @@ fn emit_cached_direct_exit(
         ; .arch aarch64
         ; ldr x17, [x28, #1072]
     );
-    record_direct_binding_phase(
-        recovery,
-        architectural_restore_start,
-        current_offset(assembler)?,
-        DirectBindingRecoveryPhase::ArchitecturalRestore,
-        committed_link,
-    )?;
-    let final_branch_start = current_offset(assembler)?;
     map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; br x17
         ; =>miss
     );
-    record_direct_binding_phase(
-        recovery,
-        final_branch_start,
-        current_offset(assembler)?,
-        DirectBindingRecoveryPhase::FinalBranch,
-        committed_link,
-    )?;
-    let miss_exit_start = current_offset(assembler)?;
     map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -1783,11 +1782,10 @@ fn emit_cached_direct_exit(
         GatewayKind::Direct,
         recording,
     )?;
-    record_direct_binding_phase(
+    record_direct_binding_sidecar_phases(
         recovery,
-        miss_exit_start,
+        scratch_capture_start,
         current_offset(assembler)?,
-        DirectBindingRecoveryPhase::MissExit,
         committed_link,
     )
 }
@@ -5289,6 +5287,261 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn expected_sidecar_recovery_phase(word: u32) -> DirectBindingRecoveryPhase {
+        match word {
+            0..=4 => DirectBindingRecoveryPhase::ScratchCapture,
+            5..=6 => DirectBindingRecoveryPhase::CellAddress,
+            7..=10 => DirectBindingRecoveryPhase::TargetAcquire,
+            11..=16 => DirectBindingRecoveryPhase::AuthorityValidate,
+            17..=20 => DirectBindingRecoveryPhase::AuthorityInstall,
+            21..=25 => DirectBindingRecoveryPhase::ArchitecturalRestore,
+            26 => DirectBindingRecoveryPhase::FinalBranch,
+            27..=63 => DirectBindingRecoveryPhase::MissExit,
+            _ => panic!("sidecar recovery word is outside the fixed envelope: {word}"),
+        }
+    }
+
+    fn check_direct_binding_recovery(
+        link: DirectLink,
+        recovery: &[RecoveryEntry],
+        committed_link: Option<u64>,
+    ) -> Result<(), String> {
+        let original = crate::snapshot::NativeUcontextSnapshot {
+            x: std::array::from_fn(|index| 0x1000_0000_0000_0000 | index as u64),
+            pstate: 0xa000_0000,
+            ..crate::snapshot::NativeUcontextSnapshot::default()
+        };
+        for offset in (link.stub.start.get()..link.stub.end.get()).step_by(4) {
+            let actions = recovery
+                .iter()
+                .filter(|entry| entry.cache.get() == offset)
+                .map(|entry| entry.action)
+                .collect::<Vec<_>>();
+            if actions.len() != 1 {
+                return Err(format!(
+                    "offset {offset} has {} recovery entries, expected exactly one",
+                    actions.len()
+                ));
+            }
+            let RecoveryAction::RestoreDirectBinding {
+                phase,
+                capture_progress,
+                committed_link: action_link,
+            } = actions[0]
+            else {
+                return Err(format!(
+                    "offset {offset} is not direct-binding recovery: {:?}",
+                    actions[0]
+                ));
+            };
+            let word = (offset - link.stub.start.get()) / 4;
+            let expected_phase = expected_sidecar_recovery_phase(word);
+            if phase != expected_phase {
+                return Err(format!(
+                    "offset {offset} word {word} has phase {phase:?}, expected {expected_phase:?}"
+                ));
+            }
+            if action_link != committed_link {
+                return Err(format!(
+                    "offset {offset} has committed link {action_link:?}, expected {committed_link:?}"
+                ));
+            }
+
+            let mut interrupted = original;
+            interrupted.x[15] = 0xdead_0000_0000_0015;
+            interrupted.x[16] = 0xdead_0000_0000_0016;
+            interrupted.x[17] = 0xdead_0000_0000_0017;
+            interrupted.x[30] = 0xdead_0000_0000_0030;
+            interrupted.pstate = 0x5000_0000;
+            let (saved_x15, saved_x16, saved_x30, saved_nzcv) = match capture_progress {
+                DirectBindingCaptureProgress::None => (
+                    0xdead_1000_0000_0015,
+                    0xdead_1000_0000_0016,
+                    0xdead_1000_0000_0030,
+                    0xdead_1000_0000_0000,
+                ),
+                DirectBindingCaptureProgress::X15 => (
+                    original.x[15],
+                    0xdead_1000_0000_0016,
+                    0xdead_1000_0000_0030,
+                    0xdead_1000_0000_0000,
+                ),
+                DirectBindingCaptureProgress::X15X16 => (
+                    original.x[15],
+                    original.x[16],
+                    0xdead_1000_0000_0030,
+                    0xdead_1000_0000_0000,
+                ),
+                DirectBindingCaptureProgress::X15X16X30 => (
+                    original.x[15],
+                    original.x[16],
+                    original.x[30],
+                    0xdead_1000_0000_0000,
+                ),
+                DirectBindingCaptureProgress::Complete => (
+                    original.x[15],
+                    original.x[16],
+                    original.x[30],
+                    original.pstate,
+                ),
+            };
+            if capture_progress == DirectBindingCaptureProgress::None {
+                interrupted.x[15] = original.x[15];
+            }
+            if matches!(
+                capture_progress,
+                DirectBindingCaptureProgress::None | DirectBindingCaptureProgress::X15
+            ) {
+                interrupted.x[16] = original.x[16];
+            }
+            if !matches!(
+                capture_progress,
+                DirectBindingCaptureProgress::X15X16X30 | DirectBindingCaptureProgress::Complete
+            ) {
+                interrupted.x[30] = original.x[30];
+            }
+            if capture_progress != DirectBindingCaptureProgress::Complete {
+                interrupted.pstate = original.pstate;
+            }
+
+            recover_rewrite_state(
+                &mut interrupted,
+                actions[0],
+                saved_x16,
+                original.x[17],
+                saved_nzcv,
+                saved_x15,
+                saved_x30,
+            )
+            .map_err(|error| format!("offset {offset} recovery failed: {error}"))?;
+            let expected_x30 = committed_link.unwrap_or(original.x[30]);
+            if interrupted.x[15] != original.x[15]
+                || interrupted.x[16] != original.x[16]
+                || interrupted.x[17] != original.x[17]
+                || interrupted.x[30] != expected_x30
+                || interrupted.pstate != original.pstate
+            {
+                return Err(format!(
+                    "offset {offset} did not recover x15/x16/x17/x30/NZCV exactly"
+                ));
+            }
+            let resume = recovery_resume_pc(link.source, Some(actions[0]))
+                .map_err(|error| format!("offset {offset} resume failed: {error}"))?;
+            if resume != link.source.raw() {
+                return Err(format!(
+                    "offset {offset} resumes at 0x{resume:x}, expected source 0x{:x}",
+                    link.source.raw()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn direct_binding_recovery_cases() -> Vec<(&'static str, AssembledBlock)> {
+        let branch = direct_plan(PlannedExit::Direct {
+            guest: GuestVa(0x4000),
+            word: 0x1400_0400,
+            exit: DirectExit {
+                kind: DirectKind::Branch,
+                target: GuestVa(0x5000),
+                resume: GuestVa(0x4004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        });
+        let call = direct_plan(PlannedExit::Direct {
+            guest: GuestVa(0x4000),
+            word: 0x9400_0400,
+            exit: DirectExit {
+                kind: DirectKind::Call,
+                target: GuestVa(0x5000),
+                resume: GuestVa(0x4004),
+                condition: None,
+                register: None,
+                bit: None,
+            },
+        });
+        let conditional = direct_plan(PlannedExit::Direct {
+            guest: GuestVa(0x4000),
+            word: 0x5400_8000,
+            exit: DirectExit {
+                kind: DirectKind::Conditional,
+                target: GuestVa(0x5000),
+                resume: GuestVa(0x4004),
+                condition: Some(bad64::Condition::EQ),
+                register: None,
+                bit: None,
+            },
+        });
+        let continuation = direct_plan(PlannedExit::Continue {
+            target: GuestVa(0x4004),
+            limit: super::super::block::BlockLimit::InstructionLimit,
+        });
+        vec![
+            (
+                "branch",
+                assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
+                    .expect("assemble branch recovery fixture"),
+            ),
+            (
+                "call",
+                assemble_block_inner(&call, None, EmitAddressMode::Direct, None)
+                    .expect("assemble call recovery fixture"),
+            ),
+            (
+                "conditional",
+                assemble_block_inner(&conditional, None, EmitAddressMode::Direct, None)
+                    .expect("assemble conditional recovery fixture"),
+            ),
+            (
+                "continue",
+                assemble_block_inner(&continuation, None, EmitAddressMode::Direct, None)
+                    .expect("assemble continuation recovery fixture"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn direct_binding_recovery_covers_every_sidecar_boundary_and_edge_class() {
+        let mut kinds = std::collections::BTreeSet::new();
+        for (case, emitted) in direct_binding_recovery_cases() {
+            for link in &emitted.direct_links {
+                kinds.insert(link.kind as u8);
+                assert_eq!(link.source.raw() & 3, 0, "{case}: exact source PC");
+                assert_eq!(link.target.raw() & 3, 0, "{case}: exact target PC");
+                let committed_link = (link.kind == DirectLinkKind::Call)
+                    .then_some(link.source.raw().checked_add(4).expect("call link"));
+                check_direct_binding_recovery(*link, &emitted.recovery, committed_link)
+                    .unwrap_or_else(|error| panic!("{case} {:?}: {error}", link.kind));
+            }
+        }
+        assert_eq!(
+            kinds.len(),
+            5,
+            "branch, call, conditional taken/fall-through, and Continue must all be covered"
+        );
+    }
+
+    #[test]
+    fn direct_binding_recovery_gate_rejects_first_authority_store_hole() {
+        let emitted = direct_binding_recovery_cases()
+            .into_iter()
+            .next()
+            .expect("branch recovery fixture")
+            .1;
+        let link = emitted.direct_links[0];
+        let first_authority_store = link.stub.start.get() + 17 * 4;
+        let mut recovery = emitted.recovery.to_vec();
+        recovery.retain(|entry| entry.cache.get() != first_authority_store);
+        let error = check_direct_binding_recovery(link, &recovery, None)
+            .expect_err("missing first authority-store recovery entry must fail");
+        assert!(
+            error.contains("expected exactly one"),
+            "unexpected coverage failure: {error}"
+        );
     }
 
     #[test]
