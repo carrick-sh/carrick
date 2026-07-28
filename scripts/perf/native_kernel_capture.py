@@ -9,10 +9,12 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -20,8 +22,10 @@ import native_go_build
 import native_kernel_attribution
 
 
-RECEIPT_SCHEMA = "carrick.native-kernel-capture.v1"
+RECEIPT_SCHEMA = "carrick.native-kernel-capture.v2"
 PROFILE = "native-wall"
+MONITOR_INTERVAL_SECONDS = 0.01
+MONITOR_INTERVAL_MILLISECONDS = 10
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,39}")
 ARTIFACT_NAMES = (
     "raw_trace",
@@ -209,25 +213,126 @@ def _process_rows(listing: str) -> dict[int, dict[str, object]]:
     return rows
 
 
+def _safe_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return []
+
+
+def _basename(token: str) -> str:
+    return pathlib.PurePath(token).name.lower()
+
+
+def _is_python(executable: str) -> bool:
+    return re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable) is not None
+
+
+def _python_target(arguments: list[str]) -> tuple[str, str] | None:
+    options_with_values = {"-W", "-X"}
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "-m":
+            if index + 1 < len(arguments):
+                return ("module", arguments[index + 1])
+            return None
+        if argument == "-c":
+            return None
+        if argument in options_with_values:
+            index += 2
+            continue
+        if argument.startswith("-"):
+            index += 1
+            continue
+        return ("script", argument)
+    return None
+
+
+def _foreign_workload_category(command: str) -> str | None:
+    tokens = _safe_tokens(command)
+    if not tokens:
+        return None
+    executable = _basename(tokens[0])
+    arguments = tokens[1:]
+    native_go_scripts = {
+        "native_go_build.py",
+        "native_go_build_screen.py",
+    }
+    if executable in native_go_scripts:
+        return "native-go-build"
+    if _is_python(executable):
+        target = _python_target(arguments)
+        if target is not None:
+            target_kind, target_value = target
+            if (
+                target_kind == "module"
+                and target_value
+                in {
+                    "native_go_build",
+                    "scripts.perf.native_go_build",
+                    "scripts.perf.native_go_build_screen",
+                }
+            ) or (
+                target_kind == "script"
+                and _basename(target_value) in native_go_scripts
+            ):
+                return "native-go-build"
+    if executable == "go" and arguments[:1] == ["build"]:
+        return "go-build"
+    if executable == "carrick" and arguments[:1] in (["run"], ["trace"]):
+        return "carrick"
+    if executable == "dtrace":
+        for index, argument in enumerate(arguments):
+            if (
+                argument == "-s"
+                and index + 1 < len(arguments)
+                and _basename(arguments[index + 1]) == "native-wall.d"
+            ):
+                return "native-wall"
+    for index, argument in enumerate(arguments):
+        if argument in {"--profile=native-wall", "profile=native-wall"}:
+            return "native-wall"
+        if (
+            argument == "--profile"
+            and index + 1 < len(arguments)
+            and arguments[index + 1] == "native-wall"
+        ):
+            return "native-wall"
+    return None
+
+
 def _looks_like_foreign_workload(command: str) -> bool:
-    lowered = command.lower()
-    carrick_launch = (
-        re.search(r"(?:^|[/\s])carrick(?:\s|$)", lowered) is not None
-        and re.search(r"\s(?:run|trace)(?:\s|$)", lowered) is not None
-    )
-    native_wall = (
-        "--profile native-wall" in lowered
-        or "profile=native-wall" in lowered
-        or "native-wall.d" in lowered
-    )
-    go_build = re.search(r"(?:^|[/\s])go\s+build(?:\s|$)", lowered) is not None
-    return (
-        carrick_launch
-        or native_wall
-        or "scripts/perf/native_go_build.py" in lowered
-        or "scripts/perf/native_go_build_screen.py" in lowered
-        or go_build
-    )
+    return _foreign_workload_category(command) is not None
+
+
+def _normalized_command_shape(
+    command: str,
+    *,
+    depth: int,
+) -> dict[str, object]:
+    tokens = _safe_tokens(command)
+    if not tokens:
+        return {
+            "depth": depth,
+            "executable": "<unparseable>",
+            "script": None,
+        }
+    executable = _basename(tokens[0])
+    script: str | None = None
+    if _is_python(executable):
+        target = _python_target(tokens[1:])
+        if target is not None:
+            target_kind, target_value = target
+            if target_kind == "module":
+                script = target_value.rsplit(".", 1)[-1]
+            elif target_value.lower().endswith(".py"):
+                script = pathlib.PurePath(target_value).name
+    return {
+        "depth": depth,
+        "executable": executable,
+        "script": script,
+    }
 
 
 def classify_process_snapshot(
@@ -238,7 +343,7 @@ def classify_process_snapshot(
     """Resolve launcher ancestry once, then classify only independent peers."""
     rows = _process_rows(listing)
     current = os.getpid() if self_pid is None else self_pid
-    ancestry: list[dict[str, object]] = []
+    raw_ancestry: list[dict[str, object]] = []
     seen: set[int] = set()
     while current:
         if current in seen:
@@ -249,15 +354,31 @@ def classify_process_snapshot(
             raise EvidenceError(
                 f"broken launcher ancestry in process snapshot at pid {current}"
             )
-        ancestry.append(row)
+        raw_ancestry.append(row)
         current = int(row["ppid"])
+    descendants = {os.getpid() if self_pid is None else self_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, row in rows.items():
+            if pid not in descendants and int(row["ppid"]) in descendants:
+                descendants.add(pid)
+                changed = True
+    trusted = seen | descendants
     foreign = [
         row
         for pid, row in sorted(rows.items())
-        if pid not in seen and _looks_like_foreign_workload(str(row["command"]))
+        if pid not in trusted
+        and _looks_like_foreign_workload(str(row["command"]))
     ]
     return {
-        "launcher_ancestry": ancestry,
+        "launcher_ancestry": [
+            _normalized_command_shape(
+                str(row["command"]),
+                depth=depth,
+            )
+            for depth, row in enumerate(raw_ancestry)
+        ],
         "foreign_workloads": foreign,
     }
 
@@ -371,6 +492,139 @@ def _capture_snapshot(config: CaptureConfig) -> dict[str, object]:
         "foreign_workloads": foreign,
         "docker_oracles": docker_oracles,
     }
+
+
+def _monitor_sample(sequence: int) -> dict[str, object]:
+    process_result = _run(
+        ["ps", "-eo", "pid=,ppid=,args="],
+        timeout=5,
+    )
+    if process_result.returncode != 0:
+        raise EvidenceError("process census returned a failure status")
+    process_state = classify_process_snapshot(process_result.stdout)
+    foreign = process_state["foreign_workloads"]
+    if not isinstance(foreign, list):
+        raise EvidenceError("process census returned malformed evidence")
+    categories = sorted(
+        {
+            category
+            for row in foreign
+            if isinstance(row, dict)
+            for category in [
+                _foreign_workload_category(str(row.get("command", "")))
+            ]
+            if category is not None
+        }
+    )
+
+    docker_result = _run(
+        ["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Image}}"],
+        timeout=5,
+    )
+    if docker_result.returncode != 0:
+        raise EvidenceError("Docker census returned a failure status")
+    docker_count = 0
+    for line in docker_result.stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) != 3:
+            continue
+        _container_id, name, image = fields
+        if image == "registry" or image.startswith("registry:"):
+            continue
+        identifying_text = f"{name} {image}".lower()
+        if (
+            "native-go-build" in identifying_text
+            or "carrick" in identifying_text
+            or "conformance" in identifying_text
+            or "carrick run" in identifying_text
+        ):
+            docker_count += 1
+    return {
+        "sequence": sequence,
+        "foreign_workload_count": len(foreign),
+        "foreign_workload_categories": categories,
+        "docker_oracle_count": docker_count,
+    }
+
+
+class _ContaminationMonitor:
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._first_poll = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="native-kernel-contamination-monitor",
+            daemon=True,
+        )
+        self._started = False
+        self._stopped = False
+        self._poll_error: str | None = None
+        self._contaminated = False
+        self._samples: list[dict[str, object]] = []
+
+    def start(self) -> None:
+        try:
+            self._thread.start()
+            self._started = True
+        except Exception:
+            self._poll_error = "monitor launch failed"
+            self._first_poll.set()
+            return
+        if not self._first_poll.wait(timeout=6):
+            with self._lock:
+                self._poll_error = "initial monitor poll did not complete"
+            self._stop.set()
+
+    def _loop(self) -> None:
+        sequence = 1
+        try:
+            while not self._stop.is_set():
+                try:
+                    sample = _monitor_sample(sequence)
+                except Exception:
+                    with self._lock:
+                        self._poll_error = "monitor poll failed"
+                    break
+                with self._lock:
+                    self._samples.append(sample)
+                    if (
+                        sample["foreign_workload_count"] != 0
+                        or sample["docker_oracle_count"] != 0
+                    ):
+                        self._contaminated = True
+                self._first_poll.set()
+                sequence += 1
+                if self._stop.wait(MONITOR_INTERVAL_SECONDS):
+                    break
+        finally:
+            self._first_poll.set()
+            with self._lock:
+                self._stopped = True
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._started:
+            self._thread.join(timeout=6)
+            if self._thread.is_alive():
+                with self._lock:
+                    self._poll_error = "monitor did not stop"
+        else:
+            with self._lock:
+                self._stopped = True
+
+    def evidence(self) -> dict[str, object]:
+        with self._lock:
+            samples = [dict(sample) for sample in self._samples]
+            return {
+                "started": self._started,
+                "stopped": self._stopped,
+                "interval_milliseconds": MONITOR_INTERVAL_MILLISECONDS,
+                "sample_count": len(samples),
+                "contaminated": self._contaminated,
+                "poll_error": self._poll_error,
+                "samples": samples,
+            }
 
 
 def _controlled_environment(
@@ -510,7 +764,9 @@ def _cleanup(
 
 
 def _natural_number(value: object, description: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise EvidenceError(f"{description} must be an integer")
+    if value < 0:
         raise EvidenceError(f"{description} must be a natural integer")
     return value
 
@@ -685,6 +941,8 @@ def _available_artifacts(
 
 def _receipt_payload(
     *,
+    capture_id: str,
+    capture_root: pathlib.Path,
     lane: str,
     host_run_id: str,
     guest_run_id: str,
@@ -697,6 +955,7 @@ def _receipt_payload(
     post: dict[str, object] | None,
     determinants: dict[str, object],
     summary: dict[str, object] | None,
+    monitor: dict[str, object],
     errors: list[str],
 ) -> dict[str, object]:
     artifacts = _available_artifacts(paths)
@@ -720,6 +979,8 @@ def _receipt_payload(
     return {
         "schema": RECEIPT_SCHEMA,
         "outcome": "accepted" if accepted else "rejected",
+        "capture_id": capture_id,
+        "capture_root": str(capture_root),
         "lane": lane,
         "host_run_id": host_run_id,
         "guest_run_id": guest_run_id,
@@ -736,6 +997,7 @@ def _receipt_payload(
         "reconciliation": (
             None if summary is None else summary["reconciliation"]
         ),
+        "monitor": monitor,
         "artifacts": artifacts,
         "evidence_errors": errors,
     }
@@ -763,28 +1025,41 @@ def _capture_one(
     cleanup: dict[str, object]
     cleanup_stdout: str
     cleanup_stderr: str
+    monitor = _ContaminationMonitor()
+    monitor.start()
+    initial_monitor = monitor.evidence()
+    monitor_blocked = (
+        initial_monitor["poll_error"] is not None
+        or initial_monitor["contaminated"] is True
+        or initial_monitor["started"] is not True
+    )
     try:
-        try:
-            result = subprocess.run(
-                command,
-                cwd=config.repo,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=config.timeout_seconds,
-                check=False,
-            )
-            stdout = _text(result.stdout)
-            stderr = _text(result.stderr)
-        except subprocess.TimeoutExpired as error:
-            timed_out = True
-            stdout = _text(error.stdout)
-            stderr = _text(error.stderr)
-        except Exception as error:
-            launch_error = error
-            stderr = f"trace command raised: {type(error).__name__}: {error}\n"
+        if not monitor_blocked:
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=config.repo,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=config.timeout_seconds,
+                    check=False,
+                )
+                stdout = _text(result.stdout)
+                stderr = _text(result.stderr)
+            except subprocess.TimeoutExpired as error:
+                timed_out = True
+                stdout = _text(error.stdout)
+                stderr = _text(error.stderr)
+            except Exception as error:
+                launch_error = error
+                stderr = (
+                    f"trace command raised: {type(error).__name__}: {error}\n"
+                )
     finally:
         cleanup, cleanup_stdout, cleanup_stderr = _cleanup(config, host_run_id)
+        monitor.stop()
+    monitor_evidence = monitor.evidence()
 
     _write_bytes_exclusive(paths["command_stdout"], stdout.encode())
     _write_bytes_exclusive(paths["command_stderr"], stderr.encode())
@@ -805,11 +1080,15 @@ def _capture_one(
     _write_json_exclusive(paths["command_status"], command_status)
 
     errors: list[str] = []
+    if monitor_evidence["poll_error"] is not None:
+        errors.append("contamination monitor poll failed")
+    if monitor_evidence["contaminated"] is True:
+        errors.append("contamination monitor observed overlap")
     if timed_out:
         errors.append("trace command timed out")
     elif launch_error is not None:
         errors.append(f"trace command raised: {launch_error}")
-    elif result is None:
+    elif result is None and not monitor_blocked:
         errors.append("trace command did not return a status")
     elif result.returncode != 0:
         errors.append(f"trace command failed with status {result.returncode}")
@@ -861,6 +1140,8 @@ def _capture_one(
                 errors.append(f"summary {field} differs from frozen capture")
 
     payload = _receipt_payload(
+        capture_id=config.run_id,
+        capture_root=config.artifact_dir,
         lane=lane,
         host_run_id=host_run_id,
         guest_run_id=guest_run_id,
@@ -873,6 +1154,7 @@ def _capture_one(
         post=post,
         determinants=determinants,
         summary=summary,
+        monitor=monitor_evidence,
         errors=errors,
     )
     _write_json_exclusive(paths["receipt"], payload)
@@ -922,9 +1204,14 @@ def _validate_artifacts(
     validated: dict[str, dict[str, Any]] = {}
     for name in ARTIFACT_NAMES:
         binding = _mapping(artifacts.get(name), f"artifact {name}")
+        if set(binding) != {"path", "size", "sha256"}:
+            raise EvidenceError(f"artifact {name} binding is malformed")
         raw_path = binding.get("path")
         if not isinstance(raw_path, str) or not pathlib.Path(raw_path).is_absolute():
             raise EvidenceError(f"artifact {name} path must be absolute")
+        _natural_number(binding.get("size"), f"artifact {name}.size")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(binding.get("sha256", ""))):
+            raise EvidenceError(f"artifact {name} SHA-256 is malformed")
         path = pathlib.Path(raw_path)
         if path != expected[name]:
             raise EvidenceError(f"artifact {name} path differs from fixed layout")
@@ -963,11 +1250,20 @@ def _validate_completion(payload: dict[str, Any]) -> None:
     if set(drops) != {"interrupted", *DROP_FIELDS}:
         raise EvidenceError("receipt completion has an unknown drop counter")
     for field in DROP_FIELDS:
-        if _natural_number(drops.get(field), f"receipt drops.{field}") != 0:
+        if (
+            _natural_number(
+                drops.get(field),
+                f"completion drops.{field}",
+            )
+            != 0
+        ):
             raise EvidenceError("receipt completion/drop state is not accepted")
 
 
-def _validate_snapshot(snapshot: dict[str, Any]) -> None:
+def _validate_snapshot(
+    snapshot: dict[str, Any],
+    description: str,
+) -> None:
     if set(snapshot) != {
         "repo",
         "head",
@@ -1003,7 +1299,11 @@ def _validate_snapshot(snapshot: dict[str, Any]) -> None:
         }
         or not isinstance(binary_path, str)
         or not pathlib.Path(binary_path).is_absolute()
-        or _natural_number(binary.get("size"), "receipt binary size") <= 0
+        or _natural_number(
+            binary.get("size"),
+            f"{description}.binary.size",
+        )
+        <= 0
         or not re.fullmatch(r"[0-9a-f]{64}", str(binary.get("sha256", "")))
         or binary.get("codesign_verified") is not True
         or binary.get("dof_present") is not True
@@ -1040,19 +1340,109 @@ def _validate_snapshot(snapshot: dict[str, Any]) -> None:
         for row in ancestry
     ]
     for index, row in enumerate(ancestry_rows):
-        if set(row) != {"pid", "ppid", "command"}:
+        if set(row) != {"depth", "executable", "script"}:
             raise EvidenceError("receipt launcher ancestry is malformed")
-        pid = _natural_number(row.get("pid"), "receipt ancestry pid")
-        ppid = _natural_number(row.get("ppid"), "receipt ancestry ppid")
-        if pid <= 0 or not isinstance(row.get("command"), str):
-            raise EvidenceError("receipt launcher ancestry is malformed")
-        expected_parent = (
-            0
-            if index + 1 == len(ancestry_rows)
-            else ancestry_rows[index + 1].get("pid")
+        depth = _natural_number(
+            row.get("depth"),
+            f"{description}.launcher_ancestry[{index}].depth",
         )
-        if ppid != expected_parent:
-            raise EvidenceError("receipt launcher ancestry is broken")
+        executable = row.get("executable")
+        script = row.get("script")
+        if (
+            depth != index
+            or not isinstance(executable, str)
+            or not executable
+            or "/" in executable
+            or (script is not None and not isinstance(script, str))
+            or (isinstance(script, str) and "/" in script)
+        ):
+            raise EvidenceError("receipt launcher ancestry is malformed")
+
+
+def _validate_monitor(payload: dict[str, Any]) -> None:
+    monitor = _mapping(payload.get("monitor"), "receipt monitor")
+    if set(monitor) != {
+        "started",
+        "stopped",
+        "interval_milliseconds",
+        "sample_count",
+        "contaminated",
+        "poll_error",
+        "samples",
+    }:
+        raise EvidenceError("receipt monitor fields are malformed")
+    interval = _natural_number(
+        monitor.get("interval_milliseconds"),
+        "monitor.interval_milliseconds",
+    )
+    sample_count = _natural_number(
+        monitor.get("sample_count"),
+        "monitor.sample_count",
+    )
+    samples = monitor.get("samples")
+    if not isinstance(samples, list):
+        raise EvidenceError("receipt monitor samples are malformed")
+    if (
+        monitor.get("started") is not True
+        or monitor.get("stopped") is not True
+        or interval != MONITOR_INTERVAL_MILLISECONDS
+        or sample_count == 0
+        or sample_count != len(samples)
+        or monitor.get("contaminated") is not False
+        or monitor.get("poll_error") is not None
+    ):
+        raise EvidenceError("receipt monitor did not remain clean and active")
+    allowed_categories = {
+        "native-go-build",
+        "go-build",
+        "carrick",
+        "native-wall",
+    }
+    for index, value in enumerate(samples):
+        sample = _mapping(value, f"monitor.samples[{index}]")
+        if set(sample) != {
+            "sequence",
+            "foreign_workload_count",
+            "foreign_workload_categories",
+            "docker_oracle_count",
+        }:
+            raise EvidenceError(f"monitor.samples[{index}] is malformed")
+        sequence = _natural_number(
+            sample.get("sequence"),
+            f"monitor.samples[{index}].sequence",
+        )
+        foreign_count = _natural_number(
+            sample.get("foreign_workload_count"),
+            f"monitor.samples[{index}].foreign_workload_count",
+        )
+        docker_count = _natural_number(
+            sample.get("docker_oracle_count"),
+            f"monitor.samples[{index}].docker_oracle_count",
+        )
+        categories = sample.get("foreign_workload_categories")
+        categories_are_strings = isinstance(categories, list) and all(
+            isinstance(category, str) for category in categories
+        )
+        if (
+            sequence != index + 1
+            or foreign_count != 0
+            or docker_count != 0
+            or not categories_are_strings
+            or (
+                categories_are_strings
+                and categories != sorted(set(categories))
+            )
+            or (
+                categories_are_strings
+                and any(
+                    category not in allowed_categories
+                    for category in categories
+                )
+            )
+        ):
+            raise EvidenceError(
+                f"monitor.samples[{index}] contains contaminated evidence"
+            )
 
 
 def validate_receipt(path: pathlib.Path) -> dict[str, Any]:
@@ -1060,6 +1450,27 @@ def validate_receipt(path: pathlib.Path) -> dict[str, Any]:
     payload = _read_receipt(receipt_path)
     if payload.get("outcome") != "accepted":
         raise EvidenceError("receipt outcome is not accepted")
+    lane = payload.get("lane")
+    capture_id = payload.get("capture_id")
+    capture_root = payload.get("capture_root")
+    if lane not in {"a", "b"}:
+        raise EvidenceError("receipt lane must be a or b")
+    if (
+        not isinstance(capture_id, str)
+        or not RUN_ID_PATTERN.fullmatch(capture_id)
+    ):
+        raise EvidenceError("receipt capture identifier is malformed")
+    if (
+        not isinstance(capture_root, str)
+        or not pathlib.Path(capture_root).is_absolute()
+        or pathlib.Path(capture_root) != receipt_path.parent
+    ):
+        raise EvidenceError("receipt capture root differs from receipt layout")
+    if (
+        payload.get("host_run_id") != f"{capture_id}-{lane}-host"
+        or payload.get("guest_run_id") != f"{capture_id}-{lane}-guest"
+    ):
+        raise EvidenceError("receipt run IDs do not use exact capture derivation")
     artifacts = _validate_artifacts(receipt_path, payload)
     command = _mapping(payload.get("command"), "receipt command")
     command_status = _integer(command.get("status"), "command.status")
@@ -1108,8 +1519,8 @@ def validate_receipt(path: pathlib.Path) -> dict[str, Any]:
     provenance = _mapping(payload.get("provenance"), "receipt provenance")
     pre = _mapping(provenance.get("pre"), "receipt pre provenance")
     post = _mapping(provenance.get("post"), "receipt post provenance")
-    _validate_snapshot(pre)
-    _validate_snapshot(post)
+    _validate_snapshot(pre, "provenance.pre")
+    _validate_snapshot(post, "provenance.post")
     cleanup = _mapping(payload.get("cleanup"), "receipt cleanup")
     argv = cleanup.get("argv")
     cleanup_status = _integer(cleanup.get("status"), "cleanup.status")
@@ -1193,9 +1604,13 @@ def validate_receipt(path: pathlib.Path) -> dict[str, Any]:
     )
     timeout_seconds = _natural_number(
         timeout_policy.get("seconds"),
-        "receipt timeout seconds",
+        "determinants.timeout_policy.seconds",
     )
-    if timeout_seconds <= 0 or timeout_policy.get("cleanup_seconds") != 30:
+    cleanup_seconds = _natural_number(
+        timeout_policy.get("cleanup_seconds"),
+        "determinants.timeout_policy.cleanup_seconds",
+    )
+    if timeout_seconds <= 0 or cleanup_seconds != 30:
         raise EvidenceError("receipt timeout policy is not fixed")
     if determinants.get("producer_sha256") != sha256_file(pathlib.Path(__file__)):
         raise EvidenceError("receipt producer hash differs from current producer")
@@ -1235,7 +1650,38 @@ def validate_receipt(path: pathlib.Path) -> dict[str, Any]:
     if payload.get("trace_argv") != expected_trace:
         raise EvidenceError("receipt trace invocation is not fixed")
 
+    _validate_monitor(payload)
     _validate_completion(payload)
+    descendant_census = _mapping(
+        payload.get("descendant_census"),
+        "receipt descendant_census",
+    )
+    if set(descendant_census) != {"create", "exit", "live-at-end"}:
+        raise EvidenceError("receipt descendant census is malformed")
+    for field in ("create", "exit", "live-at-end"):
+        _natural_number(
+            descendant_census.get(field),
+            f"descendant_census.{field}",
+        )
+    reconciliation = _mapping(
+        payload.get("reconciliation"),
+        "receipt reconciliation",
+    )
+    if set(reconciliation) != {
+        "completion_rows",
+        "kernel_pc_count",
+        "kernel_stack_count",
+    }:
+        raise EvidenceError("receipt reconciliation is malformed")
+    for field in (
+        "completion_rows",
+        "kernel_pc_count",
+        "kernel_stack_count",
+    ):
+        _natural_number(
+            reconciliation.get(field),
+            f"reconciliation.{field}",
+        )
     summary = _read_summary(pathlib.Path(artifacts["summary_jsonl"]["path"]))
     if payload.get("completion") != summary["completion"]:
         raise EvidenceError("receipt completion differs from summary")
@@ -1286,6 +1732,18 @@ def compare_receipts(
         "receipt determinants",
     )
     comparisons = (
+        (
+            "capture identifier",
+            raw[0].get("capture_id"),
+            raw[1].get("capture_id"),
+        ),
+        (
+            "capture root",
+            raw[0].get("capture_root"),
+            raw[1].get("capture_root"),
+        ),
+        ("repository", first_pre.get("repo"), second_pre.get("repo")),
+        ("host", first_pre.get("host"), second_pre.get("host")),
         (
             "ancestry",
             first_pre.get("launcher_ancestry"),

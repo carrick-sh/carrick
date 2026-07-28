@@ -5,10 +5,13 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -157,7 +160,10 @@ class ExternalBoundary:
         *,
         trace_outcome: str = "success",
         process_listing: str | None = None,
+        process_listings: tuple[str, ...] | None = None,
         docker_listing: str = "",
+        transient_overlap: str | None = None,
+        monitor_poll_failure: bool = False,
     ) -> None:
         self.binary = binary
         self.binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -167,9 +173,17 @@ class ExternalBoundary:
             "500 1 zsh task-launcher\n"
             "1 0 /sbin/launchd\n"
         )
+        self.process_listings = process_listings
+        self.process_poll_count = 0
         self.docker_listing = docker_listing
+        self.transient_overlap = transient_overlap
+        self.monitor_poll_failure = monitor_poll_failure
         self.events: list[tuple[str, str]] = []
         self.trace_index = 0
+        self.trace_active = threading.Event()
+        self.active_process_polls = 0
+        self.active_docker_polls = 0
+        self.lock = threading.Lock()
 
     @staticmethod
     def _result(
@@ -200,9 +214,49 @@ class ExternalBoundary:
                 ),
             )
         if rendered[:2] == ["docker", "ps"]:
+            if self.trace_active.is_set():
+                with self.lock:
+                    self.active_docker_polls += 1
+                    active_poll = self.active_docker_polls
+                if self.transient_overlap == "docker" and active_poll == 2:
+                    return self._result(
+                        rendered,
+                        stdout=(
+                            "abc transient-oracle "
+                            "localhost:5005/carrick-go-conformance:1.24\n"
+                        ),
+                    )
             return self._result(rendered, stdout=self.docker_listing)
         if rendered[:3] == ["ps", "-eo", "pid=,ppid=,args="]:
-            return self._result(rendered, stdout=self.process_listing)
+            if self.trace_active.is_set():
+                with self.lock:
+                    self.active_process_polls += 1
+                    active_poll = self.active_process_polls
+                if self.monitor_poll_failure and active_poll == 2:
+                    return self._result(
+                        rendered,
+                        status=9,
+                        stderr="fixture ps failure\n",
+                    )
+                if self.transient_overlap == "foreign" and active_poll == 2:
+                    return self._result(
+                        rendered,
+                        stdout=(
+                            self.process_listing
+                            + "900 1 /usr/local/bin/carrick run transient\n"
+                        ),
+                    )
+            if self.process_listings is not None:
+                with self.lock:
+                    index = min(
+                        self.process_poll_count,
+                        len(self.process_listings) - 1,
+                    )
+                    self.process_poll_count += 1
+                listing = self.process_listings[index]
+            else:
+                listing = self.process_listing
+            return self._result(rendered, stdout=listing)
         if len(rendered) > 2 and rendered[1:3] == ["trace", "--profile"]:
             environment = kwargs["env"]
             assert isinstance(environment, dict)
@@ -212,7 +266,11 @@ class ExternalBoundary:
             raw_path = Path(rendered[rendered.index("--trace-out") + 1])
             summary_path = Path(rendered[rendered.index("--summary-jsonl") + 1])
             target = rendered[rendered.index("--") + 1 :]
+            self.trace_active.set()
+            if self.transient_overlap is not None or self.monitor_poll_failure:
+                time.sleep(0.08)
             if self.trace_outcome == "timeout":
+                self.trace_active.clear()
                 raise subprocess.TimeoutExpired(
                     rendered,
                     kwargs["timeout"],
@@ -220,6 +278,7 @@ class ExternalBoundary:
                     stderr="partial stderr\n",
                 )
             if self.trace_outcome == "exception":
+                self.trace_active.clear()
                 raise OSError("fixture launch failed")
             raw_path.write_text(f"raw trace {host_run_id}\n")
             rows = summary_rows(
@@ -236,6 +295,7 @@ class ExternalBoundary:
                 )
             )
             status = 7 if self.trace_outcome == "nonzero" else 0
+            self.trace_active.clear()
             return self._result(
                 rendered,
                 status=status,
@@ -448,13 +508,80 @@ class NativeKernelCaptureTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [row["pid"] for row in snapshot["launcher_ancestry"]],
-            [100, 50, 1],
+            snapshot["launcher_ancestry"],
+            [
+                {
+                    "depth": 0,
+                    "executable": "python3",
+                    "script": "native_kernel_capture.py",
+                },
+                {
+                    "depth": 1,
+                    "executable": "python3",
+                    "script": "native_go_build.py",
+                },
+                {
+                    "depth": 2,
+                    "executable": "launchd",
+                    "script": None,
+                },
+            ],
         )
         self.assertEqual(
             [row["pid"] for row in snapshot["foreign_workloads"]],
             [400, 401, 402, 403, 404],
         )
+
+    def test_go_build_classification_tokenizes_basenames_without_shell_eval(
+        self,
+    ) -> None:
+        cases = (
+            ("bare script", "native_go_build.py capture", True),
+            (
+                "absolute script",
+                "/opt/perf/native_go_build.py capture",
+                True,
+            ),
+            (
+                "interpreter script",
+                "/usr/bin/python3 /repo/scripts/perf/native_go_build.py",
+                True,
+            ),
+            (
+                "module",
+                "python3 -m scripts.perf.native_go_build capture",
+                True,
+            ),
+            ("bare go", "go build -o h ./h.go", True),
+            (
+                "absolute go",
+                "/usr/local/go/bin/go build -o h ./h.go",
+                True,
+            ),
+            ("echo near miss", "echo native_go_build.py", False),
+            (
+                "module near miss",
+                "python3 -m scripts.perf.native_go_builder capture",
+                False,
+            ),
+            (
+                "suffix near miss",
+                "/opt/perf/native_go_build.py.backup capture",
+                False,
+            ),
+            (
+                "python argument near miss",
+                "python3 -c 'print(1)' native_go_build.py",
+                False,
+            ),
+            ("go near miss", "gofmt build ./...", False),
+        )
+        for label, command, expected in cases:
+            with self.subTest(label=label):
+                self.assertIs(
+                    native_kernel_capture._looks_like_foreign_workload(command),
+                    expected,
+                )
 
     def test_broken_or_cyclic_launcher_ancestry_rejects(self) -> None:
         for label, listing, fragment in (
@@ -480,6 +607,49 @@ class NativeKernelCaptureTests(unittest.TestCase):
                     listing,
                     self_pid=100,
                 )
+
+    def test_receipts_redact_volatile_ancestry_pids_paths_and_arguments(
+        self,
+    ) -> None:
+        secret = "secret-like-value-must-not-persist"
+        listings = (
+            (
+                f"{os.getpid()} 500 python3 native_kernel_capture.py "
+                f"--run-id first --token {secret}\n"
+                "500 1 zsh /private/tmp/first-artifact\n"
+                "1 0 /sbin/launchd\n"
+            ),
+            (
+                f"{os.getpid()} 600 python3 native_kernel_capture.py "
+                "--run-id second --token another-secret\n"
+                "600 1 zsh /private/tmp/second-artifact\n"
+                "1 0 /sbin/launchd\n"
+            ),
+        )
+        boundary = ExternalBoundary(
+            self.binary,
+            process_listings=listings,
+        )
+        with mock.patch.object(
+            native_kernel_capture.subprocess,
+            "run",
+            side_effect=boundary,
+        ):
+            native_kernel_capture.capture_pair(self.config)
+
+        receipt = native_kernel_capture.planned_paths(
+            self.artifacts
+        ).runs["a"]["receipt"]
+        payload = json.loads(receipt.read_text())
+        serialized = receipt.read_text()
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("another-secret", serialized)
+        self.assertNotIn("/private/tmp", serialized)
+        self.assertNotIn('"pid"', serialized)
+        self.assertEqual(
+            payload["provenance"]["pre"]["launcher_ancestry"],
+            payload["provenance"]["post"]["launcher_ancestry"],
+        )
 
     def test_foreign_workload_and_real_docker_oracle_reject_before_capture(
         self,
@@ -548,6 +718,123 @@ class NativeKernelCaptureTests(unittest.TestCase):
             analysis,
         )
 
+    def test_pair_rejects_receipts_from_different_capture_roots(self) -> None:
+        _, receipt_a, _, _ = self.capture_success()
+        other_artifacts = self.root / "other-artifacts"
+        other_config = native_kernel_capture.CaptureConfig(
+            repo=self.repo,
+            binary=self.binary,
+            artifact_dir=other_artifacts,
+            run_id="kernel-fixture",
+            image=self.config.image,
+            timeout_seconds=self.config.timeout_seconds,
+        )
+        boundary = ExternalBoundary(self.binary)
+        with mock.patch.object(
+            native_kernel_capture.subprocess,
+            "run",
+            side_effect=boundary,
+        ):
+            native_kernel_capture.capture_pair(other_config)
+        receipt_b = native_kernel_capture.planned_paths(
+            other_artifacts
+        ).runs["b"]["receipt"]
+
+        with self.assertRaisesRegex(
+            native_kernel_capture.EvidenceError,
+            "receipt determinant changed: capture root",
+        ):
+            native_kernel_capture.compare_receipts((receipt_a, receipt_b))
+
+    def test_pair_rejects_changed_capture_identifier_and_run_derivation(
+        self,
+    ) -> None:
+        _, receipt_a, receipt_b, _ = self.capture_success()
+        originals = {
+            receipt_a: receipt_a.read_bytes(),
+            receipt_b: receipt_b.read_bytes(),
+        }
+
+        payload_a = json.loads(originals[receipt_a])
+        payload_b = json.loads(originals[receipt_b])
+        payload_a["capture_id"] = "first-base"
+        payload_b["capture_id"] = "second-base"
+        receipt_a.write_text(json.dumps(payload_a))
+        receipt_b.write_text(json.dumps(payload_b))
+        with self.assertRaisesRegex(
+            native_kernel_capture.EvidenceError,
+            "receipt determinant changed: capture identifier",
+        ):
+            native_kernel_capture.compare_receipts((receipt_a, receipt_b))
+
+        for path, raw in originals.items():
+            path.write_bytes(raw)
+        payload_b = json.loads(originals[receipt_b])
+        payload_b["host_run_id"] = "wrong-b-host"
+        receipt_b.write_text(json.dumps(payload_b))
+        with self.assertRaisesRegex(
+            native_kernel_capture.EvidenceError,
+            "receipt run IDs do not use exact capture derivation",
+        ):
+            native_kernel_capture.validate_receipt(receipt_b)
+
+    def test_continuous_monitor_rejects_transient_overlap(self) -> None:
+        for overlap in ("foreign", "docker"):
+            with self.subTest(overlap=overlap):
+                shutil.rmtree(self.artifacts, ignore_errors=True)
+                boundary = ExternalBoundary(
+                    self.binary,
+                    transient_overlap=overlap,
+                )
+                with (
+                    mock.patch.object(
+                        native_kernel_capture.subprocess,
+                        "run",
+                        side_effect=boundary,
+                    ),
+                    self.assertRaisesRegex(
+                        native_kernel_capture.EvidenceError,
+                        "contamination monitor observed overlap",
+                    ),
+                ):
+                    native_kernel_capture.capture_pair(self.config)
+
+                receipt = native_kernel_capture.planned_paths(
+                    self.artifacts
+                ).runs["a"]["receipt"]
+                payload = json.loads(receipt.read_text())
+                self.assertEqual(payload["outcome"], "rejected")
+                self.assertTrue(payload["monitor"]["contaminated"])
+                self.assertGreaterEqual(payload["monitor"]["sample_count"], 2)
+                serialized = receipt.read_text()
+                self.assertNotIn("transient-oracle", serialized)
+                self.assertNotIn("carrick run transient", serialized)
+
+    def test_contamination_monitor_poll_failure_is_receipt_bound(self) -> None:
+        boundary = ExternalBoundary(
+            self.binary,
+            monitor_poll_failure=True,
+        )
+        with (
+            mock.patch.object(
+                native_kernel_capture.subprocess,
+                "run",
+                side_effect=boundary,
+            ),
+            self.assertRaisesRegex(
+                native_kernel_capture.EvidenceError,
+                "contamination monitor poll failed",
+            ),
+        ):
+            native_kernel_capture.capture_pair(self.config)
+
+        planned = native_kernel_capture.planned_paths(self.artifacts)
+        payload = json.loads(planned.runs["a"]["receipt"].read_text())
+        self.assertEqual(payload["outcome"], "rejected")
+        self.assertIsNotNone(payload["monitor"]["poll_error"])
+        self.assertTrue(payload["monitor"]["stopped"])
+        self.assertFalse(planned.analysis.exists())
+
     def test_success_captures_serial_bound_receipts_then_atomic_analysis(
         self,
     ) -> None:
@@ -575,8 +862,10 @@ class NativeKernelCaptureTests(unittest.TestCase):
         self.assertEqual(list(self.artifacts.glob(f".{analysis.name}.*.tmp")), [])
 
         payload = json.loads(receipt_a.read_text())
-        self.assertEqual(payload["schema"], "carrick.native-kernel-capture.v1")
+        self.assertEqual(payload["schema"], "carrick.native-kernel-capture.v2")
         self.assertEqual(payload["outcome"], "accepted")
+        self.assertEqual(payload["capture_id"], "kernel-fixture")
+        self.assertEqual(payload["capture_root"], str(self.artifacts))
         self.assertEqual(payload["host_run_id"], "kernel-fixture-a-host")
         self.assertEqual(payload["guest_run_id"], "kernel-fixture-a-guest")
         self.assertEqual(payload["command"]["status"], 0)
@@ -595,6 +884,15 @@ class NativeKernelCaptureTests(unittest.TestCase):
             },
         )
         self.assertEqual(payload["provenance"]["pre"], payload["provenance"]["post"])
+        self.assertTrue(payload["monitor"]["started"])
+        self.assertTrue(payload["monitor"]["stopped"])
+        self.assertFalse(payload["monitor"]["contaminated"])
+        self.assertIsNone(payload["monitor"]["poll_error"])
+        self.assertGreaterEqual(payload["monitor"]["sample_count"], 1)
+        self.assertEqual(
+            payload["monitor"]["sample_count"],
+            len(payload["monitor"]["samples"]),
+        )
         self.assertEqual(
             payload["cleanup"]["argv"][-1],
             payload["host_run_id"],
@@ -801,10 +1099,14 @@ class NativeKernelCaptureTests(unittest.TestCase):
                     "launcher_ancestry",
                     [
                         {
-                            "pid": 999,
-                            "ppid": 1,
-                            "command": "different launcher",
-                        }
+                            **payload["provenance"][when][
+                                "launcher_ancestry"
+                            ][0],
+                            "executable": "different-python",
+                        },
+                        *payload["provenance"][when][
+                            "launcher_ancestry"
+                        ][1:],
                     ],
                 )
                 for when in ("pre", "post")
@@ -844,6 +1146,48 @@ class NativeKernelCaptureTests(unittest.TestCase):
                 "acceptance_sha256",
                 "c" * 64,
             ),
+            "host": lambda payload: [
+                payload["provenance"][when]["host"].__setitem__(
+                    "nodename",
+                    "different-host",
+                )
+                for when in ("pre", "post")
+            ],
+            "repository": lambda payload: [
+                payload["provenance"][when].__setitem__(
+                    "repo",
+                    str(self.root / "different-repo"),
+                )
+                for when in ("pre", "post")
+            ]
+            + [
+                payload["cleanup"].__setitem__(
+                    "argv",
+                    [
+                        str(
+                            self.root
+                            / "different-repo/scripts/sudo/kill.sh"
+                        ),
+                        payload["host_run_id"],
+                    ],
+                ),
+                payload["cleanup"].__setitem__(
+                    "argv_sha256",
+                    hashlib.sha256(
+                        json.dumps(
+                            [
+                                str(
+                                    self.root
+                                    / "different-repo/scripts/sudo/kill.sh"
+                                ),
+                                payload["host_run_id"],
+                            ],
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest(),
+                ),
+            ],
         }
         for label, mutate in mutations.items():
             with self.subTest(label=label):
@@ -989,6 +1333,134 @@ class NativeKernelCaptureTests(unittest.TestCase):
             "completion target_exit_reason must be an integer",
         ):
             native_kernel_capture.validate_receipt(receipt_a)
+
+    def test_every_numeric_receipt_field_rejects_boolean_values(self) -> None:
+        _, receipt_a, _, _ = self.capture_success()
+        original = receipt_a.read_bytes()
+        payload = json.loads(original)
+
+        cases: list[tuple[str, tuple[object, ...]]] = [
+            (
+                f"artifact {name}.size",
+                ("artifacts", name, "size"),
+            )
+            for name in sorted(payload["artifacts"])
+        ]
+        cases.extend(
+            [
+                ("command.status", ("command", "status")),
+                ("command.build_ok_count", ("command", "build_ok_count")),
+                ("cleanup.status", ("cleanup", "status")),
+                (
+                    "completion target_exit_reason",
+                    ("completion", "target_exit_reason"),
+                ),
+                (
+                    "completion incomplete_pairs",
+                    ("completion", "incomplete_pairs"),
+                ),
+                *[
+                    (
+                        f"completion drops.{name}",
+                        ("completion", "drops", name),
+                    )
+                    for name in (
+                        "principal_drops",
+                        "aggregation_drops",
+                        "dynamic_drops",
+                        "other_drops",
+                    )
+                ],
+                *[
+                    (
+                        f"descendant_census.{name}",
+                        ("descendant_census", name),
+                    )
+                    for name in ("create", "exit", "live-at-end")
+                ],
+                *[
+                    (
+                        f"reconciliation.{name}",
+                        ("reconciliation", name),
+                    )
+                    for name in (
+                        "completion_rows",
+                        "kernel_pc_count",
+                        "kernel_stack_count",
+                    )
+                ],
+                (
+                    "provenance.pre.binary.size",
+                    ("provenance", "pre", "binary", "size"),
+                ),
+                (
+                    "provenance.post.binary.size",
+                    ("provenance", "post", "binary", "size"),
+                ),
+                (
+                    "provenance.pre.launcher_ancestry[0].depth",
+                    (
+                        "provenance",
+                        "pre",
+                        "launcher_ancestry",
+                        0,
+                        "depth",
+                    ),
+                ),
+                (
+                    "provenance.post.launcher_ancestry[0].depth",
+                    (
+                        "provenance",
+                        "post",
+                        "launcher_ancestry",
+                        0,
+                        "depth",
+                    ),
+                ),
+                (
+                    "determinants.timeout_policy.seconds",
+                    ("determinants", "timeout_policy", "seconds"),
+                ),
+                (
+                    "determinants.timeout_policy.cleanup_seconds",
+                    ("determinants", "timeout_policy", "cleanup_seconds"),
+                ),
+                (
+                    "monitor.interval_milliseconds",
+                    ("monitor", "interval_milliseconds"),
+                ),
+                ("monitor.sample_count", ("monitor", "sample_count")),
+                (
+                    "monitor.samples[0].sequence",
+                    ("monitor", "samples", 0, "sequence"),
+                ),
+                (
+                    "monitor.samples[0].docker_oracle_count",
+                    ("monitor", "samples", 0, "docker_oracle_count"),
+                ),
+                (
+                    "monitor.samples[0].foreign_workload_count",
+                    ("monitor", "samples", 0, "foreign_workload_count"),
+                ),
+            ]
+        )
+
+        for fragment, path in cases:
+            with self.subTest(field=fragment):
+                try:
+                    mutated = json.loads(original)
+                    parent: object = mutated
+                    for part in path[:-1]:
+                        parent = parent[part]
+                    parent[path[-1]] = True
+                    receipt_a.write_text(json.dumps(mutated))
+                    with self.assertRaisesRegex(
+                        native_kernel_capture.EvidenceError,
+                        re.escape(f"{fragment} must be an integer"),
+                    ):
+                        native_kernel_capture.validate_receipt(receipt_a)
+                finally:
+                    receipt_a.write_bytes(original)
 
     def test_unknown_drop_counter_cannot_hide_unaccepted_loss(self) -> None:
         _, receipt_a, _, _ = self.capture_success()
