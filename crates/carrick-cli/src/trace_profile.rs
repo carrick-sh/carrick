@@ -10,6 +10,11 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::perf_stats::{Summary, summarize};
+#[cfg(target_os = "macos")]
+use carrick_runtime::dtrace_symbols::{
+    KERNEL_SYMBOL_SCHEMA, KernelIdentity, KernelObjectRange, KernelSymbolRange,
+    KernelSymbolSnapshot,
+};
 
 const PROTOCOL_PREFIX: &str = "DSRPROF1";
 const JSON_SCHEMA: &str = "carrick.dsr-profile.v1";
@@ -324,6 +329,82 @@ fn parse_u64(value: &str) -> Result<u64> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn raw_kernel_address(frame: &str) -> Result<u64> {
+    let digits = frame
+        .strip_prefix("0x")
+        .filter(|digits| !digits.is_empty())
+        .ok_or_else(|| anyhow!("kernel stack frame {frame:?} is not raw hexadecimal"))?;
+    if !digits.bytes().all(|value| value.is_ascii_hexdigit()) {
+        bail!("kernel stack frame {frame:?} is not raw hexadecimal");
+    }
+    u64::from_str_radix(digits, 16)
+        .with_context(|| format!("kernel stack frame {frame:?} is outside u64"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn kernel_stack_addresses_from_path(path: &Path) -> Result<Vec<u64>> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read native-wall raw stream {}", path.display()))?;
+    kernel_stack_addresses_from_lines(contents.lines())
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_stack_addresses_from_lines<I, S>(lines: I) -> Result<Vec<u64>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut addresses = std::collections::BTreeSet::new();
+    let mut open_stack = None::<StackTraceRecord>;
+    for (index, raw_line) in lines.into_iter().enumerate() {
+        let line = raw_line.as_ref().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(stack) = open_stack.as_mut() {
+            if line == "NWSTACK1|end" {
+                if stack.frames.is_empty() {
+                    bail!("native-wall stack at line {} has no frames", index + 1);
+                }
+                let stack = open_stack
+                    .take()
+                    .ok_or_else(|| anyhow!("native-wall stack state disappeared"))?;
+                if stack.state == "kernel-oncpu" {
+                    for frame in stack.frames {
+                        addresses.insert(raw_kernel_address(&frame)?);
+                    }
+                }
+            } else if line.starts_with("NWSTACK1|begin") {
+                bail!("nested native-wall stack at line {}", index + 1);
+            } else if line.starts_with("DSRPROF1|") || line.starts_with("NWIMAGES1|") {
+                bail!(
+                    "profile record interrupted native-wall stack at line {}",
+                    index + 1
+                );
+            } else {
+                stack.frames.push(line.to_owned());
+            }
+            continue;
+        }
+        if line.starts_with("NWSTACK1|begin") {
+            open_stack = Some(
+                StackTraceRecord::begin(line)
+                    .with_context(|| format!("invalid stack at line {}", index + 1))?,
+            );
+        } else if line == "NWSTACK1|end" {
+            bail!("native-wall stack end without begin at line {}", index + 1);
+        }
+    }
+    if open_stack.is_some() {
+        bail!("profile stream ended inside a native-wall stack");
+    }
+    if addresses.is_empty() {
+        bail!("native-wall stream has no raw kernel stack addresses");
+    }
+    Ok(addresses.into_iter().collect())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct ProfileCaptureStatus {
     pub(crate) principal_drops: u64,
@@ -510,6 +591,21 @@ pub(crate) enum ProfileMetric {
     ImageCatalog {
         pid: u64,
         ranges: Vec<HostImageRangeRecord>,
+    },
+    #[cfg(target_os = "macos")]
+    KernelIdentity {
+        snapshot_schema: &'static str,
+        identity: KernelIdentity,
+    },
+    #[cfg(target_os = "macos")]
+    KernelObjectCatalog {
+        snapshot_schema: &'static str,
+        objects: Vec<KernelObjectRange>,
+    },
+    #[cfg(target_os = "macos")]
+    KernelSymbolMap {
+        snapshot_schema: &'static str,
+        symbols: Vec<KernelSymbolRange>,
     },
     StackTrace {
         state: String,
@@ -941,6 +1037,90 @@ impl ProfileSummary {
         self.provenance = provenance;
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn attach_kernel_symbol_snapshot(
+        &mut self,
+        snapshot: KernelSymbolSnapshot,
+    ) -> Result<()> {
+        if self.profile != TraceProfileKind::NativeWall {
+            bail!("kernel symbol snapshots are valid only for native-wall profiles");
+        }
+        if self.metrics.iter().any(|metric| {
+            matches!(
+                metric.metric,
+                ProfileMetric::KernelIdentity { .. }
+                    | ProfileMetric::KernelObjectCatalog { .. }
+                    | ProfileMetric::KernelSymbolMap { .. }
+            )
+        }) {
+            bail!("kernel symbol snapshot is already attached");
+        }
+        snapshot
+            .validate()
+            .context("invalid kernel symbol snapshot")?;
+        if snapshot.schema != KERNEL_SYMBOL_SCHEMA {
+            bail!(
+                "kernel symbol snapshot schema is {:?}, expected {KERNEL_SYMBOL_SCHEMA:?}",
+                snapshot.schema
+            );
+        }
+        let mut addresses = std::collections::BTreeSet::new();
+        for metric in &self.metrics {
+            if let ProfileMetric::StackTrace { state, frames, .. } = &metric.metric
+                && state == "kernel-oncpu"
+            {
+                for frame in frames {
+                    addresses.insert(raw_kernel_address(frame)?);
+                }
+            }
+        }
+        snapshot
+            .reconcile_addresses(addresses)
+            .context("kernel symbol snapshot does not match raw kernel stacks")?;
+        let completion_index = self
+            .metrics
+            .iter()
+            .position(|metric| matches!(metric.metric, ProfileMetric::Completion))
+            .ok_or_else(|| anyhow!("profile summary lost its completion row"))?;
+        let empty_scope = || ProfileScope {
+            phase: None,
+            pid: None,
+            tid: None,
+            kind: None,
+            source_pc: None,
+            target_pc: None,
+        };
+        let metadata = [
+            ProfileOutputMetric {
+                scope: empty_scope(),
+                metric: ProfileMetric::KernelIdentity {
+                    snapshot_schema: KERNEL_SYMBOL_SCHEMA,
+                    identity: snapshot.identity,
+                },
+                sampling_interval: None,
+            },
+            ProfileOutputMetric {
+                scope: empty_scope(),
+                metric: ProfileMetric::KernelObjectCatalog {
+                    snapshot_schema: KERNEL_SYMBOL_SCHEMA,
+                    objects: snapshot.objects,
+                },
+                sampling_interval: None,
+            },
+            ProfileOutputMetric {
+                scope: empty_scope(),
+                metric: ProfileMetric::KernelSymbolMap {
+                    snapshot_schema: KERNEL_SYMBOL_SCHEMA,
+                    symbols: snapshot.symbols,
+                },
+                sampling_interval: None,
+            },
+        ];
+        self.metrics
+            .splice(completion_index..completion_index, metadata);
+        Ok(())
+    }
+
     pub(crate) fn require_profile(&self, expected: TraceProfileKind) -> Result<()> {
         if self.profile != expected {
             bail!(
@@ -1077,6 +1257,248 @@ pub(crate) fn write_summary_atomic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use carrick_runtime::dtrace_symbols::{
+        DTRACE_OBJ_F_KERNEL, KERNEL_SYMBOL_SCHEMA, KernelIdentity, KernelObjectRange,
+        KernelSymbolRange, KernelSymbolSnapshot,
+    };
+
+    #[cfg(target_os = "macos")]
+    fn kernel_snapshot(addresses: &[u64]) -> KernelSymbolSnapshot {
+        KernelSymbolSnapshot::from_parts(
+            KernelIdentity {
+                osversion: "26A5388g".to_owned(),
+                version: "Darwin Kernel Version 26.0.0".to_owned(),
+                uuid: "01234567-89AB-CDEF-0123-456789ABCDEF".to_owned(),
+                machine: "arm64".to_owned(),
+            },
+            vec![KernelObjectRange {
+                name: "kernel".to_owned(),
+                file: Some("/System/kernel".to_owned()),
+                id: 1,
+                flags: DTRACE_OBJ_F_KERNEL,
+                text_start: 0x1000,
+                text_size: 0x1000,
+            }],
+            addresses
+                .iter()
+                .map(|address| KernelSymbolRange {
+                    address: *address,
+                    object: "kernel".to_owned(),
+                    symbol: format!("fn_{address:x}"),
+                    symbol_id: *address,
+                    symbol_start: *address,
+                    symbol_size: 1,
+                    offset: 0,
+                })
+                .collect(),
+            addresses.iter().copied(),
+        )
+        .expect("snapshot")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn raw_native_wall_lines() -> Vec<&'static str> {
+        vec![
+            "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=3",
+            "DSRPROF1|count|phase=wall-samples|value=3",
+            "DSRPROF1|count|phase=cpu-kernel-pc|source_pc=0x1018|value=3",
+            "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+            "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+            "NWSTACK1|begin|state=kernel-oncpu|value=2",
+            "0x1018",
+            "0x1028",
+            "NWSTACK1|end",
+            "NWSTACK1|begin|state=kernel-oncpu|value=1",
+            "0x1018",
+            "0x1038",
+            "NWSTACK1|end",
+            "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+        ]
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_wall_raw_address_extraction_includes_all_frames_and_deduplicates() {
+        assert_eq!(
+            kernel_stack_addresses_from_lines(raw_native_wall_lines()).expect("addresses"),
+            [0x1018, 0x1028, 0x1038]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_wall_raw_address_extraction_rejects_missing_malformed_and_symbolic_frames() {
+        for lines in [
+            vec![
+                "NWSTACK1|begin|state=kernel-oncpu|value=1",
+                "kernel`symbol",
+                "NWSTACK1|end",
+            ],
+            vec![
+                "NWSTACK1|begin|state=kernel-oncpu|value=1",
+                "0xnothex",
+                "NWSTACK1|end",
+            ],
+            vec!["NWSTACK1|begin|state=kernel-oncpu|value=1", "0x1018"],
+            vec!["NWSTACK1|end"],
+            vec![
+                "NWSTACK1|begin|state=voluntary|pid=1|value_ns=1",
+                "0x1018",
+                "NWSTACK1|end",
+            ],
+        ] {
+            assert!(kernel_stack_addresses_from_lines(lines).is_err());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_wall_attachment_reconciles_and_serializes_exact_metadata_rows_before_completion() {
+        let lines = raw_native_wall_lines();
+        let mut summary =
+            ProfileSummary::from_lines(lines, ProfileCaptureStatus::default()).expect("summary");
+        summary
+            .attach_kernel_symbol_snapshot(kernel_snapshot(&[0x1018, 0x1028, 0x1038]))
+            .expect("attach");
+        let rows = summary
+            .json_rows()
+            .into_iter()
+            .map(|row| serde_json::to_value(row).expect("serialize"))
+            .collect::<Vec<_>>();
+        let types = rows
+            .iter()
+            .map(|row| row["metric"]["type"].as_str().expect("metric type"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &types[types.len() - 4..],
+            [
+                "kernel-identity",
+                "kernel-object-catalog",
+                "kernel-symbol-map",
+                "completion",
+            ]
+        );
+        for expected in [
+            "kernel-identity",
+            "kernel-object-catalog",
+            "kernel-symbol-map",
+        ] {
+            let matching = rows
+                .iter()
+                .filter(|row| row["metric"]["type"] == expected)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(
+                matching[0]["metric"]["snapshot_schema"],
+                KERNEL_SYMBOL_SCHEMA
+            );
+        }
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["metric"]["type"] == "completion")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows,
+            summary
+                .json_rows()
+                .into_iter()
+                .map(|row| serde_json::to_value(row).expect("serialize"))
+                .collect::<Vec<_>>()
+        );
+        let identity = rows
+            .iter()
+            .find(|row| row["metric"]["type"] == "kernel-identity")
+            .expect("identity row");
+        assert!(identity["metric"].get("identity").is_some());
+        assert!(identity["metric"].get("objects").is_none());
+        assert!(identity["metric"].get("symbols").is_none());
+        let catalog = rows
+            .iter()
+            .find(|row| row["metric"]["type"] == "kernel-object-catalog")
+            .expect("catalog row");
+        assert!(catalog["metric"].get("identity").is_none());
+        assert!(catalog["metric"].get("objects").is_some());
+        assert!(catalog["metric"].get("symbols").is_none());
+        let symbol_map = rows
+            .iter()
+            .find(|row| row["metric"]["type"] == "kernel-symbol-map")
+            .expect("symbol-map row");
+        assert!(symbol_map["metric"].get("identity").is_none());
+        assert!(symbol_map["metric"].get("objects").is_none());
+        assert!(symbol_map["metric"].get("symbols").is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_wall_attachment_rejects_twice_and_address_or_range_mismatch() {
+        let lines = raw_native_wall_lines();
+        let mut summary =
+            ProfileSummary::from_lines(&lines, ProfileCaptureStatus::default()).expect("summary");
+        summary
+            .attach_kernel_symbol_snapshot(kernel_snapshot(&[0x1018, 0x1028, 0x1038]))
+            .expect("first attachment");
+        assert!(
+            summary
+                .attach_kernel_symbol_snapshot(kernel_snapshot(&[0x1018, 0x1028, 0x1038]))
+                .is_err()
+        );
+
+        for addresses in [vec![0x1018, 0x1028], vec![0x1018, 0x1028, 0x1038, 0x1048]] {
+            let mut summary = ProfileSummary::from_lines(&lines, ProfileCaptureStatus::default())
+                .expect("summary");
+            assert!(
+                summary
+                    .attach_kernel_symbol_snapshot(kernel_snapshot(&addresses))
+                    .is_err()
+            );
+        }
+
+        let mut invalid_snapshots = Vec::new();
+        let mut duplicate = kernel_snapshot(&[0x1018, 0x1028, 0x1038]);
+        duplicate.symbols.push(duplicate.symbols[0].clone());
+        invalid_snapshots.push(duplicate);
+        let mut bad_offset = kernel_snapshot(&[0x1018, 0x1028, 0x1038]);
+        bad_offset.symbols[0].offset = 1;
+        invalid_snapshots.push(bad_offset);
+        let mut bad_symbol_range = kernel_snapshot(&[0x1018, 0x1028, 0x1038]);
+        bad_symbol_range.symbols[0].symbol_start = 0x2000;
+        invalid_snapshots.push(bad_symbol_range);
+        let mut bad_object_range = kernel_snapshot(&[0x1018, 0x1028, 0x1038]);
+        bad_object_range.objects[0].text_size = 1;
+        invalid_snapshots.push(bad_object_range);
+        let mut bad_schema = kernel_snapshot(&[0x1018, 0x1028, 0x1038]);
+        bad_schema.schema = "carrick.kernel-symbols.v0".to_owned();
+        invalid_snapshots.push(bad_schema);
+
+        for snapshot in invalid_snapshots {
+            let mut summary = ProfileSummary::from_lines(&lines, ProfileCaptureStatus::default())
+                .expect("summary");
+            assert!(summary.attach_kernel_symbol_snapshot(snapshot).is_err());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kernel_snapshot_cannot_attach_to_another_profile_and_non_native_json_is_unchanged() {
+        let mut summary = ProfileSummary::from_lines(
+            ["DSRPROF1|complete|profile=dsr-fork|bounded=0"],
+            ProfileCaptureStatus::default(),
+        )
+        .expect("summary");
+        let before = serde_json::to_value(summary.json_rows()).expect("before");
+        assert!(
+            summary
+                .attach_kernel_symbol_snapshot(kernel_snapshot(&[0x1018]))
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(summary.json_rows()).expect("after"),
+            before
+        );
+    }
 
     #[test]
     fn parses_sample_and_completion() {
