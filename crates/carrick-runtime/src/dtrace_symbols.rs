@@ -198,10 +198,10 @@ fn required_symbol_string(value: Option<&[u8]>, field: &str) -> Result<String, K
 
 fn own_object(record: BorrowedObject<'_>) -> Result<KernelObjectRange, KernelSymbolError> {
     let name = required_string(record.name, "object name")?;
-    let file = record
-        .file
-        .map(|value| required_string(Some(value), "object file"))
-        .transpose()?;
+    let file = match record.file {
+        None | Some([]) => None,
+        Some(value) => Some(required_string(Some(value), "object file")?),
+    };
     if record.text_size == 0 {
         return Err(KernelSymbolError::InvalidObject(format!(
             "{name:?} has zero text size"
@@ -970,6 +970,47 @@ mod tests {
         aux.fill(0xff);
         assert_eq!(owned.symbol, "machine_startup");
         assert_eq!(owned.offset, 8);
+    }
+
+    #[test]
+    fn optional_object_file_normalizes_empty_but_rejects_invalid_values() {
+        for file in [None, Some(b"".as_slice())] {
+            let owned = own_object(BorrowedObject {
+                name: Some(b"kernel"),
+                file,
+                id: 1,
+                flags: DTRACE_OBJ_F_KERNEL,
+                text_start: 0x1000,
+                text_size: 0x100,
+            })
+            .expect("optional file");
+            assert_eq!(owned.file, None);
+        }
+
+        let owned = own_object(BorrowedObject {
+            name: Some(b"kernel"),
+            file: Some(b"/System/kernel"),
+            id: 1,
+            flags: DTRACE_OBJ_F_KERNEL,
+            text_start: 0x1000,
+            text_size: 0x100,
+        })
+        .expect("valid file");
+        assert_eq!(owned.file.as_deref(), Some("/System/kernel"));
+
+        for file in [Some(&[0xff][..]), Some(b"bad\0file".as_slice())] {
+            assert!(
+                own_object(BorrowedObject {
+                    name: Some(b"kernel"),
+                    file,
+                    id: 1,
+                    flags: DTRACE_OBJ_F_KERNEL,
+                    text_start: 0x1000,
+                    text_size: 0x100,
+                })
+                .is_err()
+            );
+        }
     }
 
     #[test]
