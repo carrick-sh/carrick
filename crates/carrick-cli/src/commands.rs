@@ -117,7 +117,7 @@ use crate::trace_cli::{
     TraceSudoInvocation, current_supplementary_groups, trace_drop_credentials, trace_sudo_argv,
 };
 #[cfg(target_os = "macos")]
-use crate::trace_profile::kernel_stack_addresses_from_path;
+use crate::trace_profile::kernel_sample_addresses_from_path;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::trace_profile::{ProfileSummary, capture_provenance, write_summary_atomic};
 
@@ -1166,31 +1166,41 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     print_remaining_aggregates: profile.is_none(),
                 };
                 #[cfg(target_os = "macos")]
-                let (report, kernel_symbol_snapshot) =
-                    if profile.is_some_and(uses_live_kernel_symbols) {
-                        let raw_path = output_path
-                            .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
-                        let (report, snapshot) =
+                let (report, sampled_kernel_overlay) = if profile
+                    .is_some_and(uses_live_kernel_symbols)
+                {
+                    let raw_path = output_path
+                        .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
+                    let (report, overlay) =
                             carrick_runtime::dtrace_consumer::run_child_under_dtrace_with_post_stop(
                                 &me,
                                 &command,
                                 &opts,
-                                |symbolizer| -> anyhow::Result<_> {
-                                    let addresses = kernel_stack_addresses_from_path(raw_path)?;
-                                    symbolizer.snapshot(addresses).map_err(anyhow::Error::from)
+                                |mut symbolizer| -> anyhow::Result<_> {
+                                    let addresses = kernel_sample_addresses_from_path(raw_path)?;
+                                    if addresses.weighted_leaves.iter().any(|address| {
+                                        addresses.requested.binary_search(address).is_err()
+                                    }) {
+                                        bail!(
+                                            "native-wall weighted kernel leaves escaped the requested address set"
+                                        );
+                                    }
+                                    symbolizer
+                                        .sampled_overlay(addresses.requested)
+                                        .map_err(anyhow::Error::from)
                                 },
                             )
                             .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?;
-                        (report, Some(snapshot))
-                    } else {
-                        (
-                            carrick_runtime::dtrace_consumer::run_child_under_dtrace(
-                                &me, &command, &opts,
-                            )
-                            .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?,
-                            None,
+                    (report, Some(overlay))
+                } else {
+                    (
+                        carrick_runtime::dtrace_consumer::run_child_under_dtrace(
+                            &me, &command, &opts,
                         )
-                    };
+                        .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?,
+                        None,
+                    )
+                };
                 #[cfg(target_os = "freebsd")]
                 let report =
                     carrick_runtime::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
@@ -1201,8 +1211,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     let mut summary = ProfileSummary::from_path(raw_path, report.into())?;
                     summary.require_profile(requested_profile)?;
                     #[cfg(target_os = "macos")]
-                    if let Some(snapshot) = kernel_symbol_snapshot {
-                        summary.attach_kernel_symbol_snapshot(snapshot)?;
+                    if let Some(overlay) = sampled_kernel_overlay {
+                        summary.attach_sampled_kernel_overlay(overlay)?;
                     }
                     summary.set_provenance(capture_provenance(&me, &command)?);
                     eprintln!("{}", summary.render_human());
@@ -2156,14 +2166,14 @@ fn kaniko_run_argv(
 }
 
 #[cfg(test)]
-mod build_tests {
+mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
     use crate::trace_profile::TraceProfileKind;
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn only_native_wall_uses_the_live_kernel_symbol_callback() {
+    fn live_kernel_symbols_only_use_the_native_wall_callback() {
         assert!(uses_live_kernel_symbols(TraceProfileKind::NativeWall));
         for profile in [
             TraceProfileKind::Dsr,
