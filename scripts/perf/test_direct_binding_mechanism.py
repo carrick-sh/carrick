@@ -366,6 +366,23 @@ class MechanismFixture:
         mechanism.write_json_atomic(receipt.path, payload)
         return mechanism.parse_receipt(receipt.path)
 
+    def rewrite_bound_artifact(
+        self,
+        receipt: mechanism.CaptureReceipt,
+        artifact_name: str,
+        transform,
+    ) -> mechanism.CaptureReceipt:
+        payload = json.loads(receipt.path.read_text())
+        artifact_path = pathlib.Path(
+            payload["artifacts"][artifact_name]["path"]
+        )
+        artifact_path.write_text(transform(artifact_path.read_text()))
+        payload["artifacts"][artifact_name] = mechanism.bind_artifact(
+            artifact_path
+        )
+        mechanism.write_json_atomic(receipt.path, payload)
+        return mechanism.parse_receipt(receipt.path)
+
 
 class DirectBindingMechanismTest(unittest.TestCase):
     def setUp(self):
@@ -660,6 +677,218 @@ class DirectBindingMechanismTest(unittest.TestCase):
             },
         )
         self.assertEqual(json.loads(output.read_text()), result)
+
+    def test_rejected_run_retains_valid_summary_siblings_and_field_error(self):
+        precursor, candidate = self.good_pair()
+        malformed_line = None
+
+        def corrupt_one_count(text):
+            nonlocal malformed_line
+            rows = text.splitlines()
+            for index, line in enumerate(rows):
+                row = json.loads(line)
+                if row["scope"].get("phase") == "binding-unit":
+                    row["metric"]["count"] = "bad"
+                    rows[index] = json.dumps(row, sort_keys=True)
+                    malformed_line = index + 1
+                    break
+            return "\n".join(rows) + "\n"
+
+        candidate = self.fixture.rewrite_bound_artifact(
+            candidate,
+            "summary_jsonl",
+            corrupt_one_count,
+        )
+        output = pathlib.Path(self.temporary.name) / "summary-partial.json"
+
+        status = mechanism.main(
+            [
+                "compare",
+                "--precursor-receipt",
+                str(precursor.path),
+                "--candidate-receipt",
+                str(candidate.path),
+                "--output",
+                str(output),
+            ]
+        )
+
+        self.assertEqual(status, 1)
+        available = json.loads(output.read_text())["available_runs"]["candidate"]
+        direct_summaries = [
+            row
+            for row in available["summary_metrics"]
+            if row["scope"].get("phase") == "direct-total"
+        ]
+        self.assertEqual(len(direct_summaries), 1)
+        self.assertEqual(direct_summaries[0]["count"], 4)
+        self.assertEqual(
+            available["evidence_errors"]["summary"],
+            [
+                f"summary line {malformed_line}.metric.count: "
+                "summary metric.count is not an integer"
+            ],
+        )
+
+    def test_rejected_run_retains_valid_native_records_and_sibling_counters(self):
+        precursor, candidate = self.good_pair()
+
+        def corrupt_one_native_counter(text):
+            return text.replace("exit_fault=0", "exit_fault=bad", 1)
+
+        candidate = self.fixture.rewrite_bound_artifact(
+            candidate,
+            "command_stderr",
+            corrupt_one_native_counter,
+        )
+        output = pathlib.Path(self.temporary.name) / "native-partial.json"
+
+        status = mechanism.main(
+            [
+                "compare",
+                "--precursor-receipt",
+                str(precursor.path),
+                "--candidate-receipt",
+                str(candidate.path),
+                "--output",
+                str(output),
+            ]
+        )
+
+        self.assertEqual(status, 1)
+        available = json.loads(output.read_text())["available_runs"]["candidate"]
+        self.assertEqual(available["native_gateway"], 100)
+        self.assertEqual(available["native_exits"]["2"], 4)
+        core = next(
+            row for row in available["native_records"] if row.get("frame") == "core"
+        )
+        exits = next(
+            row for row in available["native_records"] if row.get("frame") == "exits"
+        )
+        self.assertEqual(core["counters"]["gateway_entries"], 100)
+        self.assertEqual(exits["counters"]["exit_resolve_indirect"], 20)
+        self.assertNotIn("exit_fault", exits["counters"])
+        self.assertEqual(
+            available["evidence_errors"]["nativeperf"],
+            [
+                "NATIVEPERF1 line 3.thread.exits.exit_fault: "
+                "profile field exit_fault is not an unsigned decimal integer"
+            ],
+        )
+
+    def test_rejected_run_publishes_complete_partial_raw_metric_map(self):
+        precursor, candidate = self.good_pair()
+
+        def corrupt_one_raw_value(text):
+            return text.replace(
+                "phase=translation-attempts|pid=42|value=4",
+                "phase=translation-attempts|pid=42|value=bad",
+                1,
+            )
+
+        candidate = self.fixture.rewrite_bound_artifact(
+            candidate,
+            "raw_trace",
+            corrupt_one_raw_value,
+        )
+        output = pathlib.Path(self.temporary.name) / "raw-partial.json"
+
+        status = mechanism.main(
+            [
+                "compare",
+                "--precursor-receipt",
+                str(precursor.path),
+                "--candidate-receipt",
+                str(candidate.path),
+                "--output",
+                str(output),
+            ]
+        )
+
+        self.assertEqual(status, 1)
+        available = json.loads(output.read_text())["available_runs"]["candidate"]
+        self.assertIn("raw_metrics", available)
+        self.assertEqual(len(available["raw_metrics"]), 21)
+        gateway = next(
+            row
+            for row in available["raw_metrics"]
+            if row["key"].get("phase") == "gateway-total"
+        )
+        self.assertEqual(
+            gateway,
+            {
+                "key": {
+                    "record_type": "count",
+                    "phase": "gateway-total",
+                    "pid": 42,
+                },
+                "value": 100,
+            },
+        )
+        self.assertEqual(available["binding_events"]["7"], 4)
+        self.assertEqual(
+            available["evidence_errors"]["raw_aggregates"],
+            [
+                "raw line 2.value: invalid integer value='bad'",
+                "raw trace is missing required translation-attempts metric",
+            ],
+        )
+
+    def test_malformed_summary_scope_cannot_escape_atomic_rejection_projection(self):
+        precursor, candidate = self.good_pair()
+        malformed_line = None
+
+        def corrupt_one_scope(text):
+            nonlocal malformed_line
+            rows = text.splitlines()
+            for index, line in enumerate(rows):
+                row = json.loads(line)
+                if row["scope"].get("phase") == "binding-unit":
+                    row["scope"]["pid"] = "not-a-number"
+                    rows[index] = json.dumps(row, sort_keys=True)
+                    malformed_line = index + 1
+                    break
+            return "\n".join(rows) + "\n"
+
+        candidate = self.fixture.rewrite_bound_artifact(
+            candidate,
+            "summary_jsonl",
+            corrupt_one_scope,
+        )
+        output = pathlib.Path(self.temporary.name) / "summary-scope-partial.json"
+
+        try:
+            status = mechanism.main(
+                [
+                    "compare",
+                    "--precursor-receipt",
+                    str(precursor.path),
+                    "--candidate-receipt",
+                    str(candidate.path),
+                    "--output",
+                    str(output),
+                ]
+            )
+        except (mechanism.EvidenceError, ValueError) as error:
+            self.fail(f"rejection projector escaped instead of publishing: {error}")
+
+        self.assertEqual(status, 1)
+        rejected = json.loads(output.read_text())
+        self.assertFalse(rejected["accepted"])
+        available = rejected["available_runs"]["candidate"]
+        direct_summary = next(
+            row
+            for row in available["summary_metrics"]
+            if row["scope"].get("phase") == "direct-total"
+        )
+        self.assertEqual(direct_summary["count"], 4)
+        self.assertEqual(
+            available["evidence_errors"]["summary"],
+            [
+                f"summary line {malformed_line}.scope.pid: "
+                "invalid integer pid='not-a-number'"
+            ],
+        )
 
     def test_malformed_numeric_receipt_is_an_atomic_typed_rejection(self):
         precursor, candidate = self.good_pair()

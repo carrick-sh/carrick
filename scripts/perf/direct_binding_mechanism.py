@@ -1007,24 +1007,341 @@ def _run_payload(run: MechanismRun) -> dict[str, object]:
     }
 
 
-def _summary_metrics_payload(
-    metrics: Mapping[tuple[tuple[str, str], ...], int],
-) -> list[dict[str, object]]:
+def _metric_key_payload(
+    key: tuple[tuple[str, str], ...],
+    *,
+    include_record_type: bool,
+) -> dict[str, object]:
     numeric_scope = {"pid", "tid", "source_pc", "target_pc"}
+    payload: dict[str, object] = {}
+    for field, value in key:
+        if field == "record_type" and not include_record_type:
+            continue
+        payload[field] = (
+            int(value, 0) if field in numeric_scope else value
+        )
+    return payload
+
+
+def _metrics_payload(
+    metrics: Mapping[tuple[tuple[str, str], ...], int],
+    *,
+    key_name: str,
+    value_name: str,
+    include_record_type: bool,
+) -> list[dict[str, object]]:
     rows = []
-    for key, count in sorted(metrics.items()):
-        scope: dict[str, object] = {}
-        for field, value in key:
-            if field == "record_type":
-                continue
-            scope[field] = (
-                _integer(value, field) if field in numeric_scope else value
-            )
-        rows.append({"scope": scope, "count": count})
+    for key, value in sorted(metrics.items()):
+        rows.append(
+            {
+                key_name: _metric_key_payload(
+                    key,
+                    include_record_type=include_record_type,
+                ),
+                value_name: value,
+            }
+        )
     return rows
 
 
-def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
+def _partial_summary_metrics(
+    receipt: CaptureReceipt,
+) -> tuple[
+    dict[tuple[tuple[str, str], ...], int],
+    list[str],
+]:
+    errors: list[str] = []
+    metrics: dict[tuple[tuple[str, str], ...], int] = {}
+    try:
+        path = _artifact(receipt, "summary_jsonl").path
+        lines = path.read_text(errors="replace").splitlines()
+    except Exception as error:
+        return metrics, [str(error)]
+    rows: list[tuple[int, dict[str, object]]] = []
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception as error:
+            errors.append(f"summary line {number}: invalid JSON: {error}")
+            continue
+        if not isinstance(row, dict):
+            errors.append(f"summary line {number}: row must be an object")
+            continue
+        rows.append((number, row))
+    if not rows:
+        errors.append("summary JSONL is empty")
+        return metrics, errors
+
+    first_number, first = rows[0]
+    if first.get("schema") != SUMMARY_SCHEMA:
+        errors.append(
+            f"summary line {first_number}.schema: "
+            "summary schema is not the fixed DSR profile schema"
+        )
+    if first.get("profile") != PROFILE:
+        errors.append(
+            f"summary line {first_number}.profile: "
+            "summary profile is not dsr-indirect"
+        )
+    stable_fields = (
+        "schema",
+        "profile",
+        "run_id",
+        "git_sha",
+        "git_dirty",
+        "binary_sha256",
+        "command",
+        "host",
+        "completion",
+    )
+    for number, row in rows:
+        for field in stable_fields:
+            if row.get(field) != first.get(field):
+                errors.append(
+                    f"summary line {number}.{field}: "
+                    f"differs from summary line {first_number}"
+                )
+    try:
+        summary_receipt = _mapping(
+            receipt.payload.get("summary"),
+            "summary",
+        )
+        if first.get("run_id") != receipt.payload.get("run_id"):
+            errors.append(
+                f"summary line {first_number}.run_id: "
+                "summary run ID differs from receipt"
+            )
+        for summary_field, row_field in (
+            ("run_id", "run_id"),
+            ("git_sha", "git_sha"),
+            ("git_dirty", "git_dirty"),
+            ("binary_sha256", "binary_sha256"),
+            ("host", "host"),
+        ):
+            if summary_receipt.get(summary_field) != first.get(row_field):
+                errors.append(
+                    f"summary line {first_number}.{row_field}: "
+                    f"summary {summary_field} differs from receipt copy"
+                )
+        if summary_receipt.get("completion") != first.get("completion"):
+            errors.append(
+                f"summary line {first_number}.completion: "
+                "summary completion differs from receipt copy"
+            )
+        if summary_receipt.get("command") != first.get("command"):
+            errors.append(
+                f"summary line {first_number}.command: "
+                "summary command differs from receipt copy"
+            )
+    except Exception as error:
+        errors.append(f"summary receipt copy: {error}")
+
+    numeric_scope = {"pid", "tid", "source_pc", "target_pc"}
+    for number, row in rows:
+        try:
+            metric = _mapping(row.get("metric"), "summary metric")
+        except Exception as error:
+            errors.append(f"summary line {number}.metric: {error}")
+            continue
+        if metric.get("type") != "exact" or "count" not in metric:
+            continue
+        try:
+            scope = _mapping(row.get("scope"), "summary scope")
+        except Exception as error:
+            errors.append(f"summary line {number}.scope: {error}")
+            continue
+        key_items = [("record_type", "count")]
+        scope_valid = True
+        for field, value in scope.items():
+            if field in numeric_scope:
+                try:
+                    value = str(_integer(str(value), field))
+                except Exception as error:
+                    errors.append(
+                        f"summary line {number}.scope.{field}: {error}"
+                    )
+                    scope_valid = False
+                    continue
+            else:
+                value = str(value)
+            key_items.append((field, value))
+        try:
+            count = _receipt_int(
+                metric["count"],
+                "summary metric.count",
+            )
+        except Exception as error:
+            errors.append(
+                f"summary line {number}.metric.count: {error}"
+            )
+            continue
+        if not scope_valid:
+            continue
+        key = tuple(sorted(key_items))
+        if key in metrics:
+            errors.append(
+                f"summary line {number}.scope: duplicate summary metric scope"
+            )
+            continue
+        metrics[key] = count
+    return metrics, errors
+
+
+def _partial_nativeperf(
+    receipt: CaptureReceipt,
+) -> tuple[int | None, dict[int, int], list[dict[str, object]], list[str]]:
+    errors: list[str] = []
+    records: list[dict[str, object]] = []
+    gateway_values: list[int] = []
+    exit_fields = {
+        "exit_syscall": 1,
+        "exit_resolve_direct": 2,
+        "exit_resolve_indirect": 3,
+        "exit_fault": 4,
+        "exit_kick": 5,
+        "exit_sensitive": 6,
+        "exit_unsupported": 7,
+    }
+    exit_values: dict[int, list[int]] = defaultdict(list)
+    try:
+        path = _artifact(receipt, "command_stderr").path
+        lines = path.read_text(errors="replace").splitlines()
+    except Exception as error:
+        return None, {}, records, [str(error)]
+    saw_protocol = False
+    for number, line in enumerate(lines, start=1):
+        if not line.startswith(native_compiler_budget.PROTOCOL_PREFIX + "|"):
+            continue
+        saw_protocol = True
+        prefix = f"NATIVEPERF1 line {number}"
+        try:
+            kind, fields = native_compiler_budget._protocol_fields(line)
+        except Exception as error:
+            errors.append(f"{prefix}: {error}")
+            continue
+        if kind == "invalid":
+            errors.append(
+                f"{prefix}.invalid.reason: "
+                f"invalid native profile record: {fields.get('reason', 'malformed')}"
+            )
+            continue
+        if kind == "supervisor":
+            counters: dict[str, int] = {}
+            for field in sorted(native_compiler_budget.SUPERVISOR_FIELDS):
+                if field not in fields:
+                    errors.append(
+                        f"{prefix}.supervisor.{field}: missing field"
+                    )
+                    continue
+                try:
+                    counters[field] = native_compiler_budget._parse_decimal(
+                        fields[field],
+                        field,
+                    )
+                except Exception as error:
+                    errors.append(
+                        f"{prefix}.supervisor.{field}: {error}"
+                    )
+            for field in sorted(
+                set(fields) - native_compiler_budget.SUPERVISOR_FIELDS
+            ):
+                errors.append(
+                    f"{prefix}.supervisor.{field}: unknown field"
+                )
+            records.append(
+                {
+                    "line": number,
+                    "kind": kind,
+                    "counters": counters,
+                }
+            )
+            continue
+        if kind != "thread":
+            errors.append(
+                f"{prefix}.{kind}: unknown native profile record kind"
+            )
+            continue
+        identity: dict[str, int] = {}
+        for field in ("pid", "tid", "era"):
+            if field not in fields:
+                errors.append(f"{prefix}.thread.{field}: missing field")
+                continue
+            try:
+                identity[field] = native_compiler_budget._parse_decimal(
+                    fields[field],
+                    field,
+                )
+            except Exception as error:
+                errors.append(f"{prefix}.thread.{field}: {error}")
+        if fields.get("complete") != "1":
+            errors.append(
+                f"{prefix}.thread.complete: incomplete native profile record"
+            )
+        frame = fields.get("frame")
+        counters: dict[str, int] = {}
+        if frame is None:
+            errors.append(f"{prefix}.thread.frame: missing field")
+        else:
+            common = {"complete", "pid", "tid", "era", "frame"}
+            extras = set(fields) - common
+            try:
+                _, frame_fields = native_compiler_budget._frame_contract(
+                    frame,
+                    extras,
+                )
+            except Exception as error:
+                errors.append(f"{prefix}.thread.{frame}: {error}")
+                frame_fields = (
+                    native_compiler_budget.FRAME_FIELDS.get(frame, set())
+                    | native_compiler_budget.FRAME_FIELDS_V2.get(frame, set())
+                    | native_compiler_budget.FRAME_FIELDS_V3.get(frame, set())
+                )
+            for field in sorted(frame_fields & set(fields)):
+                try:
+                    value = native_compiler_budget._parse_decimal(
+                        fields[field],
+                        field,
+                    )
+                except Exception as error:
+                    errors.append(
+                        f"{prefix}.thread.{frame}.{field}: {error}"
+                    )
+                    continue
+                counters[field] = value
+                if frame == "core" and field == "gateway_entries":
+                    gateway_values.append(value)
+                if frame == "exits" and field in exit_fields:
+                    exit_values[exit_fields[field]].append(value)
+        records.append(
+            {
+                "line": number,
+                "kind": kind,
+                "identity": identity,
+                "frame": frame,
+                "counters": counters,
+            }
+        )
+    if not saw_protocol:
+        errors.append("no NATIVEPERF1 records found")
+    if not errors:
+        try:
+            strict_gateway, strict_exits = _native_vector(path)
+        except Exception as error:
+            errors.append(str(error))
+        else:
+            return strict_gateway, strict_exits, records, errors
+    gateway = sum(gateway_values) if gateway_values else None
+    exits = {
+        kind: sum(values)
+        for kind, values in sorted(exit_values.items())
+        if values
+    }
+    return gateway, exits, records, errors
+
+
+def _project_partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
     errors: dict[str, list[str]] = {
         "raw_aggregates": [],
         "specialized": [],
@@ -1047,13 +1364,15 @@ def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
     except (EvidenceError, OSError) as error:
         errors["raw_aggregates"].append(str(error))
         raw_lines = []
-    for line in raw_lines:
+    for number, line in enumerate(raw_lines, start=1):
         if not line.startswith("DSRPROF1|"):
             continue
         try:
             record_type, fields = _parse_protocol_fields(line)
-        except EvidenceError as error:
-            errors["raw_aggregates"].append(str(error))
+        except Exception as error:
+            errors["raw_aggregates"].append(
+                f"raw line {number}: {error}"
+            )
             continue
         if record_type == "complete":
             if completion is not None:
@@ -1067,16 +1386,20 @@ def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
             continue
         try:
             value = _integer(fields["value"], "value")
-        except EvidenceError as error:
-            errors["raw_aggregates"].append(str(error))
+        except Exception as error:
+            errors["raw_aggregates"].append(
+                f"raw line {number}.value: {error}"
+            )
             continue
         try:
             key = _raw_metric_key(record_type, fields)
             if key in metrics:
                 raise EvidenceError("duplicate raw DTrace metric")
             metrics[key] = value
-        except EvidenceError as error:
-            errors["raw_aggregates"].append(str(error))
+        except Exception as error:
+            errors["raw_aggregates"].append(
+                f"raw line {number}: {error}"
+            )
         try:
             _record_specialized_metric(
                 fields,
@@ -1089,7 +1412,7 @@ def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
                 validation_reasons=validation_reasons,
                 unit_loads=unit_loads,
             )
-        except EvidenceError as error:
+        except Exception as error:
             errors["specialized"].append(str(error))
     if completion is None:
         errors["raw_aggregates"].append(
@@ -1105,7 +1428,7 @@ def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
                 errors["raw_aggregates"].append(
                     "raw DTrace stream is bounded"
                 )
-        except EvidenceError as error:
+        except Exception as error:
             errors["raw_aggregates"].append(str(error))
         try:
             if (
@@ -1118,7 +1441,7 @@ def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
                 errors["raw_aggregates"].append(
                     "raw DTrace target was interrupted"
                 )
-        except EvidenceError as error:
+        except Exception as error:
             errors["raw_aggregates"].append(str(error))
     if set(binding_events) != BINDING_EVENT_KINDS:
         missing = sorted(BINDING_EVENT_KINDS - set(binding_events))
@@ -1157,11 +1480,8 @@ def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
     indirect_total = partial_phase_total("indirect-total")
     translation_attempts = partial_phase_total("translation-attempts")
 
-    summary_metrics: dict[tuple[tuple[str, str], ...], int] = {}
-    try:
-        summary_metrics, _ = _parse_summary(receipt)
-    except (EvidenceError, OSError) as error:
-        errors["summary"].append(str(error))
+    summary_metrics, summary_errors = _partial_summary_metrics(receipt)
+    errors["summary"].extend(summary_errors)
     if not errors["raw_aggregates"] and not errors["summary"]:
         raw_aggregated: dict[tuple[tuple[str, str], ...], int] = defaultdict(int)
         for key, value in metrics.items():
@@ -1171,14 +1491,13 @@ def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
                 "raw/summary overlapping metrics do not reconcile"
             )
 
-    native_gateway = None
-    native_exits: dict[int, int] = {}
-    try:
-        native_gateway, native_exits = _native_vector(
-            _artifact(receipt, "command_stderr").path
-        )
-    except (EvidenceError, OSError) as error:
-        errors["nativeperf"].append(str(error))
+    (
+        native_gateway,
+        native_exits,
+        native_records,
+        native_errors,
+    ) = _partial_nativeperf(receipt)
+    errors["nativeperf"].extend(native_errors)
     if (
         native_gateway is not None
         and gateway_total is not None
@@ -1213,6 +1532,12 @@ def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
 
     return {
         "run_id": receipt.payload.get("run_id"),
+        "raw_metrics": _metrics_payload(
+            metrics,
+            key_name="key",
+            value_name="value",
+            include_record_type=True,
+        ),
         "binding_events": {
             str(kind): value
             for kind, value in sorted(binding_events.items())
@@ -1255,13 +1580,56 @@ def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
                 binding_data_bytes,
             ), value in sorted(unit_loads.items())
         ],
-        "summary_metrics": _summary_metrics_payload(summary_metrics),
+        "summary_metrics": _metrics_payload(
+            summary_metrics,
+            key_name="scope",
+            value_name="count",
+            include_record_type=False,
+        ),
         "native_gateway": native_gateway,
         "native_exits": {
             str(kind): value for kind, value in sorted(native_exits.items())
         },
+        "native_records": native_records,
         "evidence_errors": errors,
     }
+
+
+def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
+    try:
+        payload = _project_partial_run_payload(receipt)
+        json.dumps(payload)
+        return payload
+    except Exception as error:
+        return {
+            "run_id": receipt.payload.get("run_id"),
+            "raw_metrics": [],
+            "binding_events": {},
+            "gateway_kinds": {},
+            "gateway_total": None,
+            "direct_total": None,
+            "indirect_total": None,
+            "translation_attempts": None,
+            "binding_cells": [],
+            "publication_cells": [],
+            "clear_cells": [],
+            "validation_reasons": {},
+            "unit_loads": [],
+            "summary_metrics": [],
+            "native_gateway": None,
+            "native_exits": {},
+            "native_records": [],
+            "evidence_errors": {
+                "raw_aggregates": [
+                    "rejection projection failed: "
+                    f"{type(error).__name__}: {error}"
+                ],
+                "specialized": [],
+                "summary": [],
+                "nativeperf": [],
+                "reconciliation": [],
+            },
+        }
 
 
 def compare(
