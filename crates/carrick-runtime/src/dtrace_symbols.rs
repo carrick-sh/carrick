@@ -16,6 +16,7 @@ pub const KERNEL_SYMBOL_SCHEMA: &str = "carrick.kernel-symbols.v1";
 pub const DTRACE_OBJ_F_KERNEL: c_uint = 0x1;
 
 const AUXILIARY_SYMBOL_NAME_CAPACITY: usize = 4096;
+const PERSISTENT_SYMBOL_NAME_CAPACITY: usize = 4096;
 const MAX_SYSCTL_VALUE_SIZE: usize = 1024 * 1024;
 
 #[repr(C)]
@@ -82,6 +83,7 @@ unsafe extern "C" {
         symbol: *mut GElfSym,
         info: *mut DtraceSymInfo,
     ) -> c_int;
+    fn dtrace_errno(hdl: *mut DtraceHdl) -> c_int;
     #[allow(dead_code)]
     fn dtrace_addr2str(
         hdl: *mut DtraceHdl,
@@ -143,11 +145,70 @@ pub enum KernelSymbolError {
     Lookup { address: u64, detail: String },
     #[error("kernel symbol snapshot address mismatch: {0}")]
     AddressMismatch(String),
+    #[error(
+        "kernel symbol lookup census passed but schema publication is disabled: requested={requested}, resolved={resolved}, name-private-valid={name_private_valid}, name-aux-valid={name_aux_valid}, objects={objects:?}"
+    )]
+    LookupCensusPassed {
+        requested: usize,
+        resolved: usize,
+        name_private_valid: usize,
+        name_aux_valid: usize,
+        objects: Vec<String>,
+    },
+    #[error("{0}")]
+    LookupCensusFailed(Box<LookupCensusFailureSummary>),
     #[error("sysctl {name:?} failed: {source}")]
     Sysctl {
         name: &'static str,
         source: std::io::Error,
     },
+}
+
+#[derive(Debug)]
+pub struct LookupCensusFailureSummary {
+    requested: usize,
+    resolved: usize,
+    status: usize,
+    status_histogram: Vec<(c_int, c_int, usize)>,
+    name_private_valid: usize,
+    name_aux_valid: usize,
+    name_invalid: usize,
+    raw_address_fallback: usize,
+    zero_or_overflow: usize,
+    range: usize,
+    owner: usize,
+    duplicate: usize,
+    address_set: usize,
+    unexpected: usize,
+    accounting: usize,
+}
+
+impl std::fmt::Display for LookupCensusFailureSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "kernel symbol lookup census failed: requested={}, resolved={}, status={}, \
+             status-histogram={:?}, name-private-valid={}, name-aux-valid={}, \
+             name-invalid={}, raw-address-fallback={}, zero-or-overflow={}, \
+             containment-or-offset={}, owner={}, duplicate={}, address-set={}, unexpected={}, \
+             accounting={}",
+            self.requested,
+            self.resolved,
+            self.status,
+            self.status_histogram,
+            self.name_private_valid,
+            self.name_aux_valid,
+            self.name_invalid,
+            self.raw_address_fallback,
+            self.zero_or_overflow,
+            self.range,
+            self.owner,
+            self.duplicate,
+            self.address_set,
+            self.unexpected,
+            self.accounting,
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -167,7 +228,6 @@ struct BorrowedSymbol<'a> {
     symbol_id: c_ulong,
     symbol_start: u64,
     symbol_size: u64,
-    auxiliary: &'a [u8],
 }
 
 /// A copied `dtrace_object_iter`/`dtrace_object_info` record that has not yet
@@ -332,6 +392,252 @@ fn object_info_mismatch_fields(
     fields
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CensusFailureClass {
+    Status,
+    Name,
+    RawAddressFallback,
+    ZeroOrOverflow,
+    ContainmentOrOffset,
+    Unexpected,
+}
+
+#[derive(Debug)]
+struct CensusLookupFailure {
+    class: CensusFailureClass,
+    error: KernelSymbolError,
+    status_key: Option<(c_int, c_int)>,
+}
+
+impl CensusLookupFailure {
+    fn new(class: CensusFailureClass, error: KernelSymbolError) -> Self {
+        Self {
+            class,
+            error,
+            status_key: None,
+        }
+    }
+
+    fn status(error: KernelSymbolError, status: c_int, errno: c_int) -> Self {
+        Self {
+            class: CensusFailureClass::Status,
+            error,
+            status_key: Some((status, errno)),
+        }
+    }
+
+    fn unexpected(error: KernelSymbolError) -> Self {
+        Self::new(CensusFailureClass::Unexpected, error)
+    }
+
+    fn into_error(self) -> KernelSymbolError {
+        self.error
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SymbolNameProvenance {
+    Private,
+    Auxiliary,
+}
+
+struct CensusLookupOutcome {
+    symbol: KernelSymbolRange,
+    name_provenance: SymbolNameProvenance,
+}
+
+#[derive(Default)]
+struct LookupCensusCounts {
+    status: usize,
+    status_histogram: BTreeMap<(c_int, c_int), usize>,
+    name_private_valid: usize,
+    name_aux_valid: usize,
+    name_invalid: usize,
+    raw_address_fallback: usize,
+    zero_or_overflow: usize,
+    range: usize,
+    unexpected: usize,
+    owner: usize,
+    duplicate: usize,
+    address_set: usize,
+    accounting: usize,
+}
+
+impl LookupCensusCounts {
+    fn record_failure(&mut self, failure: CensusLookupFailure) {
+        match failure.class {
+            CensusFailureClass::Status => {
+                self.status += 1;
+                if let Some(key) = failure.status_key {
+                    *self.status_histogram.entry(key).or_default() += 1;
+                } else {
+                    self.unexpected += 1;
+                }
+            }
+            CensusFailureClass::Name => self.name_invalid += 1,
+            CensusFailureClass::RawAddressFallback => self.raw_address_fallback += 1,
+            CensusFailureClass::ZeroOrOverflow => self.zero_or_overflow += 1,
+            CensusFailureClass::ContainmentOrOffset => self.range += 1,
+            CensusFailureClass::Unexpected => self.unexpected += 1,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.status == 0
+            && self.name_invalid == 0
+            && self.raw_address_fallback == 0
+            && self.zero_or_overflow == 0
+            && self.range == 0
+            && self.unexpected == 0
+            && self.owner == 0
+            && self.duplicate == 0
+            && self.address_set == 0
+            && self.accounting == 0
+    }
+
+    fn finalize_reconciliation(&mut self, requested: usize, resolved: usize) {
+        let histogram_total = self
+            .status_histogram
+            .values()
+            .try_fold(0_usize, |total, count| total.checked_add(*count));
+        let provenance_total = self.name_private_valid.checked_add(self.name_aux_valid);
+        let terminal_total = [
+            resolved,
+            self.status,
+            self.name_invalid,
+            self.raw_address_fallback,
+            self.zero_or_overflow,
+            self.range,
+            self.unexpected,
+            self.owner,
+            self.address_set,
+        ]
+        .into_iter()
+        .try_fold(0_usize, usize::checked_add);
+        self.accounting = usize::from(histogram_total != Some(self.status))
+            + usize::from(provenance_total != Some(resolved))
+            + usize::from(terminal_total != Some(requested));
+    }
+
+    fn into_error(mut self, requested: usize, resolved: usize) -> KernelSymbolError {
+        self.finalize_reconciliation(requested, resolved);
+        KernelSymbolError::LookupCensusFailed(Box::new(LookupCensusFailureSummary {
+            requested,
+            resolved,
+            status: self.status,
+            status_histogram: self
+                .status_histogram
+                .into_iter()
+                .map(|((status, errno), count)| (status, errno, count))
+                .collect(),
+            name_private_valid: self.name_private_valid,
+            name_aux_valid: self.name_aux_valid,
+            name_invalid: self.name_invalid,
+            raw_address_fallback: self.raw_address_fallback,
+            zero_or_overflow: self.zero_or_overflow,
+            range: self.range,
+            owner: self.owner,
+            duplicate: self.duplicate,
+            address_set: self.address_set,
+            unexpected: self.unexpected,
+            accounting: self.accounting,
+        }))
+    }
+}
+
+fn has_observed_unresolved_mach_kernel(objects: &[ProvisionalObject]) -> bool {
+    let kernel = objects
+        .iter()
+        .filter(|object| object.flags & DTRACE_OBJ_F_KERNEL != 0)
+        .collect::<Vec<_>>();
+    let unresolved = kernel
+        .iter()
+        .filter(|object| object.text_size == 0)
+        .copied()
+        .collect::<Vec<_>>();
+    unresolved.len() == 1
+        && unresolved[0].name == "mach_kernel"
+        && kernel
+            .iter()
+            .filter(|object| object.name == "mach_kernel")
+            .count()
+            == 1
+}
+
+fn lookup_census(
+    objects: &[ProvisionalObject],
+    requested: &BTreeSet<u64>,
+    mut lookup: impl FnMut(u64) -> Result<CensusLookupOutcome, CensusLookupFailure>,
+) -> KernelSymbolError {
+    let owners = objects
+        .iter()
+        .filter(|object| object.flags & DTRACE_OBJ_F_KERNEL != 0)
+        .fold(BTreeMap::<&str, usize>::new(), |mut owners, object| {
+            *owners.entry(&object.name).or_default() += 1;
+            owners
+        });
+    let mut counts = LookupCensusCounts::default();
+    let mut symbols = Vec::with_capacity(requested.len());
+    let mut names = BTreeSet::new();
+    for address in requested {
+        match lookup(*address) {
+            Ok(outcome) => {
+                let symbol = outcome.symbol;
+                if symbol.address != *address {
+                    counts.address_set += 1;
+                    continue;
+                }
+                if let Err(failure) =
+                    validate_symbol(&symbol).map_err(CensusLookupFailure::unexpected)
+                {
+                    counts.record_failure(failure);
+                    continue;
+                }
+                if owners.get(symbol.object.as_str()) != Some(&1) {
+                    counts.owner += 1;
+                    continue;
+                }
+                match outcome.name_provenance {
+                    SymbolNameProvenance::Private => counts.name_private_valid += 1,
+                    SymbolNameProvenance::Auxiliary => counts.name_aux_valid += 1,
+                }
+                names.insert(symbol.object.clone());
+                symbols.push(symbol);
+            }
+            Err(error) => counts.record_failure(error),
+        }
+    }
+    let addresses = symbols
+        .iter()
+        .map(|symbol| symbol.address)
+        .collect::<BTreeSet<_>>();
+    counts.duplicate += symbols.len().saturating_sub(addresses.len());
+    if counts.status == 0
+        && counts.name_invalid == 0
+        && counts.raw_address_fallback == 0
+        && counts.zero_or_overflow == 0
+        && counts.range == 0
+        && counts.unexpected == 0
+        && counts.owner == 0
+        && counts.duplicate == 0
+        && counts.address_set == 0
+        && addresses != *requested
+    {
+        counts.address_set = 1;
+    }
+    counts.finalize_reconciliation(requested.len(), symbols.len());
+    if counts.is_empty() {
+        return KernelSymbolError::LookupCensusPassed {
+            requested: requested.len(),
+            resolved: symbols.len(),
+            name_private_valid: counts.name_private_valid,
+            name_aux_valid: counts.name_aux_valid,
+            objects: names.into_iter().collect(),
+        };
+    }
+    counts.into_error(requested.len(), symbols.len())
+}
+
 fn refine_kernel_objects(
     mut objects: Vec<ProvisionalObject>,
     mut query: impl FnMut(&str) -> Result<ProvisionalObject, KernelSymbolError>,
@@ -384,39 +690,62 @@ fn finish_object_info(
     own_provisional_object(info)
 }
 
+#[cfg(test)]
 fn own_symbol(
     address: u64,
     status: c_int,
     record: BorrowedSymbol<'_>,
 ) -> Result<KernelSymbolRange, KernelSymbolError> {
+    dtrace_lookup_status(address, status).map_err(CensusLookupFailure::into_error)?;
+    own_symbol_for_census(address, record).map_err(CensusLookupFailure::into_error)
+}
+
+#[cfg(test)]
+fn dtrace_lookup_status(address: u64, status: c_int) -> Result<(), CensusLookupFailure> {
     if status != 0 {
-        return Err(KernelSymbolError::Lookup {
-            address,
-            detail: format!("libdtrace returned status {status}"),
-        });
+        return Err(CensusLookupFailure::status(
+            KernelSymbolError::Lookup {
+                address,
+                detail: format!("libdtrace returned status {status}"),
+            },
+            status,
+            0,
+        ));
     }
-    if !record.auxiliary.contains(&0) {
-        return Err(KernelSymbolError::Lookup {
-            address,
-            detail: "auxiliary symbol-name buffer lacks a NUL terminator".to_owned(),
-        });
-    }
-    let object = required_symbol_string(record.object, "symbol object")?;
-    let symbol = required_symbol_string(record.symbol, "symbol name")?;
+    Ok(())
+}
+
+fn own_symbol_for_census(
+    address: u64,
+    record: BorrowedSymbol<'_>,
+) -> Result<KernelSymbolRange, CensusLookupFailure> {
+    let object = required_symbol_string(record.object, "symbol object")
+        .map_err(|error| CensusLookupFailure::new(CensusFailureClass::Name, error))?;
+    let symbol = required_symbol_string(record.symbol, "symbol name")
+        .map_err(|error| CensusLookupFailure::new(CensusFailureClass::Name, error))?;
     if record.symbol_size == 0 {
-        return Err(KernelSymbolError::InvalidSymbol(format!(
-            "{symbol:?} has zero size"
-        )));
+        return Err(CensusLookupFailure::new(
+            CensusFailureClass::ZeroOrOverflow,
+            KernelSymbolError::InvalidSymbol(format!("{symbol:?} has zero size")),
+        ));
     }
     let symbol_end = record
         .symbol_start
         .checked_add(record.symbol_size)
-        .ok_or_else(|| KernelSymbolError::InvalidSymbol(format!("{symbol:?} range overflows")))?;
+        .ok_or_else(|| {
+            CensusLookupFailure::new(
+                CensusFailureClass::ZeroOrOverflow,
+                KernelSymbolError::InvalidSymbol(format!("{symbol:?} range overflows")),
+            )
+        })?;
     if !(record.symbol_start..symbol_end).contains(&address) {
-        return Err(KernelSymbolError::InvalidSymbol(format!(
-            "address {address:#x} is outside {symbol:?} range {:#x}..{symbol_end:#x}",
-            record.symbol_start
-        )));
+        return Err(CensusLookupFailure::new(
+            CensusFailureClass::ContainmentOrOffset,
+            KernelSymbolError::InvalidSymbol(format!(
+                "address {address:#x} is outside {symbol:?} range {:#x}..{symbol_end:#x}",
+                record.symbol_start
+            )),
+        ));
     }
     Ok(KernelSymbolRange {
         address,
@@ -682,6 +1011,7 @@ trait SymbolSource {
     fn objects(&mut self) -> Result<Vec<ProvisionalObject>, KernelSymbolError>;
     fn object_info(&mut self, name: &str) -> Result<ProvisionalObject, KernelSymbolError>;
     fn lookup(&mut self, address: u64) -> Result<KernelSymbolRange, KernelSymbolError>;
+    fn census_lookup(&mut self, address: u64) -> Result<CensusLookupOutcome, CensusLookupFailure>;
 }
 
 fn identity_value(bytes: Vec<u8>, name: &'static str) -> Result<String, KernelSymbolError> {
@@ -707,7 +1037,19 @@ fn snapshot_with_source(
     };
     validate_identity(&identity)?;
     source.update()?;
-    let objects = refine_kernel_objects(source.objects()?, |name| source.object_info(name))?;
+    let provisional_objects = source.objects()?;
+    if has_observed_unresolved_mach_kernel(&provisional_objects) {
+        let requested = requested.into_iter().collect::<BTreeSet<_>>();
+        if requested.is_empty() {
+            return Err(KernelSymbolError::AddressMismatch(
+                "requested kernel address set is empty".to_owned(),
+            ));
+        }
+        return Err(lookup_census(&provisional_objects, &requested, |address| {
+            source.census_lookup(address)
+        }));
+    }
+    let objects = refine_kernel_objects(provisional_objects, |name| source.object_info(name))?;
     let requested = requested.into_iter().collect::<BTreeSet<_>>();
     if requested.is_empty() {
         return Err(KernelSymbolError::AddressMismatch(
@@ -740,50 +1082,80 @@ unsafe fn optional_c_bytes<'a>(value: *const c_char) -> Option<&'a [u8]> {
     }
 }
 
-unsafe fn auxiliary_symbol_name_bytes(
+unsafe fn copy_live_symbol_string(
+    value: *const c_char,
+    field: &str,
+) -> Result<String, CensusLookupFailure> {
+    if value.is_null() {
+        return Err(CensusLookupFailure::new(
+            CensusFailureClass::Name,
+            KernelSymbolError::InvalidSymbol(format!("{field} is null")),
+        ));
+    }
+    let length = unsafe { libc::strnlen(value, PERSISTENT_SYMBOL_NAME_CAPACITY) };
+    if length == PERSISTENT_SYMBOL_NAME_CAPACITY {
+        return Err(CensusLookupFailure::new(
+            CensusFailureClass::Name,
+            KernelSymbolError::InvalidSymbol(format!("{field} lacks a bounded NUL terminator")),
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(value.cast::<u8>(), length) };
+    required_symbol_string(Some(bytes), field)
+        .map_err(|error| CensusLookupFailure::new(CensusFailureClass::Name, error))
+}
+
+unsafe fn copy_live_dtrace_name(
     value: *const c_char,
     auxiliary: &[u8],
-    address: u64,
-) -> Result<&[u8], KernelSymbolError> {
+) -> Result<(String, SymbolNameProvenance), CensusLookupFailure> {
     if value.is_null() {
-        return Err(KernelSymbolError::Lookup {
-            address,
-            detail: "libdtrace returned a null auxiliary symbol-name pointer".to_owned(),
-        });
+        return Err(CensusLookupFailure::new(
+            CensusFailureClass::Name,
+            KernelSymbolError::InvalidSymbol("symbol name is null".to_owned()),
+        ));
     }
     let start = auxiliary.as_ptr() as usize;
-    let end = start
-        .checked_add(auxiliary.len())
-        .ok_or_else(|| KernelSymbolError::Lookup {
-            address,
-            detail: "auxiliary symbol-name buffer address overflows".to_owned(),
-        })?;
+    let end = start.checked_add(auxiliary.len()).ok_or_else(|| {
+        CensusLookupFailure::new(
+            CensusFailureClass::Name,
+            KernelSymbolError::InvalidSymbol(
+                "auxiliary symbol-name buffer address overflows".to_owned(),
+            ),
+        )
+    })?;
     let pointer = value as usize;
-    if pointer < start || pointer >= end {
-        return Err(KernelSymbolError::Lookup {
-            address,
-            detail: "libdtrace symbol-name pointer is outside the auxiliary buffer".to_owned(),
-        });
+    let (name, provenance) = if (start..end).contains(&pointer) {
+        let suffix = &auxiliary[pointer - start..];
+        let nul = suffix.iter().position(|byte| *byte == 0).ok_or_else(|| {
+            CensusLookupFailure::new(
+                CensusFailureClass::Name,
+                KernelSymbolError::Lookup {
+                    address: 0,
+                    detail: "auxiliary symbol name lacks NUL".to_owned(),
+                },
+            )
+        })?;
+        let bytes = &suffix[..nul];
+        let name = required_symbol_string(Some(bytes), "symbol name")
+            .map_err(|error| CensusLookupFailure::new(CensusFailureClass::Name, error))?;
+        (name, SymbolNameProvenance::Auxiliary)
+    } else {
+        (
+            unsafe { copy_live_symbol_string(value, "symbol name") }?,
+            SymbolNameProvenance::Private,
+        )
+    };
+    let bytes = name.as_bytes();
+    if (bytes.len() == 10 || bytes.len() == 18)
+        && bytes.starts_with(b"0x")
+        && bytes[2..].iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(CensusLookupFailure::new(
+            CensusFailureClass::RawAddressFallback,
+            KernelSymbolError::InvalidSymbol("raw-address symbol fallback".to_owned()),
+        ));
     }
-    let offset = pointer - start;
-    let suffix = &auxiliary[offset..];
-    let nul =
-        suffix
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or_else(|| KernelSymbolError::Lookup {
-                address,
-                detail: "auxiliary symbol-name buffer lacks a NUL after the returned pointer"
-                    .to_owned(),
-            })?;
-    if nul == 0 || nul == suffix.len() - 1 {
-        return Err(KernelSymbolError::Lookup {
-            address,
-            detail: "auxiliary symbol-name buffer has an empty or truncated terminal NUL"
-                .to_owned(),
-        });
-    }
-    Ok(&suffix[..nul])
+    Ok((name, provenance))
 }
 
 extern "C" fn object_callback(
@@ -893,6 +1265,12 @@ impl SymbolSource for LiveSymbolSource {
     }
 
     fn lookup(&mut self, address: u64) -> Result<KernelSymbolRange, KernelSymbolError> {
+        self.census_lookup(address)
+            .map(|outcome| outcome.symbol)
+            .map_err(CensusLookupFailure::into_error)
+    }
+
+    fn census_lookup(&mut self, address: u64) -> Result<CensusLookupOutcome, CensusLookupFailure> {
         let mut auxiliary = vec![0xff_u8; AUXILIARY_SYMBOL_NAME_CAPACITY];
         let mut symbol = GElfSym::default();
         let mut info = DtraceSymInfo {
@@ -911,25 +1289,32 @@ impl SymbolSource for LiveSymbolSource {
             )
         };
         if status != 0 {
-            return Err(KernelSymbolError::Lookup {
-                address,
-                detail: format!("libdtrace returned status {status}"),
-            });
+            let errno = unsafe { dtrace_errno(self.hdl) };
+            return Err(CensusLookupFailure::status(
+                KernelSymbolError::Lookup {
+                    address,
+                    detail: format!("libdtrace lookup status={status} errno={errno}"),
+                },
+                status,
+                errno,
+            ));
         }
-        own_symbol(
+        let object = unsafe { copy_live_symbol_string(info.dts_object, "symbol object") }?;
+        let (name, name_provenance) = unsafe { copy_live_dtrace_name(info.dts_name, &auxiliary) }?;
+        let symbol = own_symbol_for_census(
             address,
-            0,
             BorrowedSymbol {
-                object: unsafe { optional_c_bytes(info.dts_object) },
-                symbol: Some(unsafe {
-                    auxiliary_symbol_name_bytes(info.dts_name, &auxiliary, address)?
-                }),
+                object: Some(object.as_bytes()),
+                symbol: Some(name.as_bytes()),
                 symbol_id: info.dts_id,
                 symbol_start: symbol.st_value,
                 symbol_size: symbol.st_size,
-                auxiliary: &auxiliary,
             },
-        )
+        )?;
+        Ok(CensusLookupOutcome {
+            symbol,
+            name_provenance,
+        })
     }
 }
 
@@ -1033,9 +1418,10 @@ fn link_only_apple_symbols() {
         *mut GElfSym,
         *mut DtraceSymInfo,
     ) -> c_int = dtrace_lookup_by_addr;
+    let errno: unsafe extern "C" fn(*mut DtraceHdl) -> c_int = dtrace_errno;
     let addr2str: unsafe extern "C" fn(*mut DtraceHdl, u64, *mut c_char, c_int) -> c_int =
         dtrace_addr2str;
-    std::hint::black_box((update, object_iter, object_info, lookup, addr2str));
+    std::hint::black_box((update, object_iter, object_info, lookup, errno, addr2str));
 }
 
 #[cfg(test)]
@@ -1090,6 +1476,16 @@ mod tests {
         }
     }
 
+    fn census_symbol(
+        symbol: KernelSymbolRange,
+        name_provenance: SymbolNameProvenance,
+    ) -> CensusLookupOutcome {
+        CensusLookupOutcome {
+            symbol,
+            name_provenance,
+        }
+    }
+
     #[test]
     fn apple_public_abi_layouts_are_exact() {
         assert_eq!(size_of::<DtraceObjInfo>(), 72);
@@ -1141,7 +1537,6 @@ mod tests {
         assert_eq!(owned.file.as_deref(), Some("/System/kernel"));
 
         let mut symbol_name = b"machine_startup".to_vec();
-        let mut aux = b"machine_startup\0".to_vec();
         let owned = own_symbol(
             0x1018,
             0,
@@ -1151,12 +1546,10 @@ mod tests {
                 symbol_id: 9,
                 symbol_start: 0x1010,
                 symbol_size: 0x20,
-                auxiliary: &aux,
             },
         )
         .expect("owned symbol");
         symbol_name.fill(b'z');
-        aux.fill(0xff);
         assert_eq!(owned.symbol, "machine_startup");
         assert_eq!(owned.offset, 8);
     }
@@ -1435,6 +1828,419 @@ data-start, data-size, bss-start, bss-size"
     }
 
     #[test]
+    fn unresolved_text_runs_a_sorted_lookup_census_but_never_publishes() {
+        let mut alpha = provisional_object("alpha", 2, 0x100);
+        alpha.text_start = 0x2000;
+        let objects = vec![provisional_object("mach_kernel", 1, 0), alpha];
+        let requested = BTreeSet::from([0x1018, 0x2018]);
+        let mut calls = Vec::new();
+        let error = lookup_census(&objects, &requested, |address| {
+            calls.push(address);
+            let symbol = match address {
+                0x1018 => symbol(0x1018, "mach_kernel", "startup", 0x1010, 0x20),
+                0x2018 => symbol(0x2018, "alpha", "alpha_fn", 0x2010, 0x20),
+                _ => unreachable!("requested set is fixed"),
+            };
+            let provenance = if address == 0x1018 {
+                SymbolNameProvenance::Private
+            } else {
+                SymbolNameProvenance::Auxiliary
+            };
+            Ok(census_symbol(symbol, provenance))
+        });
+        assert_eq!(calls, [0x1018, 0x2018]);
+        assert_eq!(
+            error.to_string(),
+            "kernel symbol lookup census passed but schema publication is disabled: \
+requested=2, resolved=2, name-private-valid=1, name-aux-valid=1, \
+objects=[\"alpha\", \"mach_kernel\"]"
+        );
+        assert!(!error.to_string().contains("0x"));
+    }
+
+    #[test]
+    fn unresolved_text_census_skips_object_info_after_one_update_and_iteration() {
+        let mut alpha = provisional_object("alpha", 2, 0x100);
+        alpha.text_start = 0x2000;
+        let mut source = MockSource {
+            calls: Vec::new(),
+            objects: vec![provisional_object("mach_kernel", 1, 0), alpha],
+            resolutions: BTreeMap::new(),
+            symbols: vec![
+                symbol(0x1018, "mach_kernel", "startup", 0x1010, 0x20),
+                symbol(0x2018, "alpha", "alpha_fn", 0x2010, 0x20),
+            ],
+        };
+        let error = snapshot_with_source(&mut source, [0x2018, 0x1018, 0x2018])
+            .expect_err("the census cannot publish a schema v1 snapshot");
+        assert!(matches!(
+            error,
+            KernelSymbolError::LookupCensusPassed { .. }
+        ));
+        assert_eq!(
+            source.calls,
+            [
+                "sysctl:kern.osversion",
+                "sysctl:kern.version",
+                "sysctl:kern.uuid",
+                "sysctl:hw.machine",
+                "update",
+                "objects",
+                "lookup:0x1018",
+                "lookup:0x2018",
+            ]
+        );
+    }
+
+    #[test]
+    fn census_trigger_matches_only_the_observed_mach_kernel_shape() {
+        assert!(has_observed_unresolved_mach_kernel(&[provisional_object(
+            "mach_kernel",
+            1,
+            0,
+        )]));
+        assert!(!has_observed_unresolved_mach_kernel(&[provisional_object(
+            "other_kernel",
+            1,
+            0,
+        )]));
+        assert!(!has_observed_unresolved_mach_kernel(&[
+            provisional_object("mach_kernel", 1, 0),
+            provisional_object("other_kernel", 2, 0),
+        ]));
+        assert!(!has_observed_unresolved_mach_kernel(&[
+            provisional_object("mach_kernel", 1, 0),
+            provisional_object("mach_kernel", 2, 0x100),
+        ]));
+    }
+
+    #[test]
+    fn other_zero_text_kernel_object_still_refines_and_publishes() {
+        let mut provisional = provisional_object("other_kernel", 1, 0);
+        provisional.text_start = 0x1000;
+        let resolved = ProvisionalObject {
+            text_size: 0x100,
+            ..provisional.clone()
+        };
+        let mut source = MockSource {
+            calls: Vec::new(),
+            objects: vec![provisional],
+            resolutions: BTreeMap::from([("other_kernel".to_owned(), resolved)]),
+            symbols: vec![symbol(0x1018, "other_kernel", "other_fn", 0x1010, 0x20)],
+        };
+        snapshot_with_source(&mut source, [0x1018])
+            .expect("a non-mach zero range must retain object-info refinement");
+        assert_eq!(
+            source.calls,
+            [
+                "sysctl:kern.osversion",
+                "sysctl:kern.version",
+                "sysctl:kern.uuid",
+                "sysctl:hw.machine",
+                "update",
+                "objects",
+                "object-info:other_kernel",
+                "lookup:0x1018",
+            ]
+        );
+    }
+
+    #[test]
+    fn lookup_census_rejects_swapped_results_without_address_values() {
+        let objects = vec![provisional_object("mach_kernel", 1, 0)];
+        let requested = BTreeSet::from([0x1018, 0x2018]);
+        let error = lookup_census(&objects, &requested, |requested| {
+            let symbol = match requested {
+                0x1018 => symbol(0x2018, "mach_kernel", "fn", 0x2010, 0x20),
+                0x2018 => symbol(0x1018, "mach_kernel", "fn", 0x1010, 0x20),
+                _ => unreachable!("requested set is fixed"),
+            };
+            Ok(census_symbol(symbol, SymbolNameProvenance::Private))
+        });
+        assert!(error.to_string().contains("address-set=2"));
+        assert!(!error.to_string().contains("0x"));
+    }
+
+    #[test]
+    fn lookup_census_reports_owner_duplicate_and_address_set_counts() {
+        let objects = vec![provisional_object("mach_kernel", 1, 0)];
+        let requested = BTreeSet::from([0x1018]);
+        let error = lookup_census(&objects, &requested, |_| {
+            Ok(census_symbol(
+                symbol(0x1018, "missing", "fn", 0x1010, 0x20),
+                SymbolNameProvenance::Private,
+            ))
+        });
+        assert!(error.to_string().contains("owner=1"));
+
+        let duplicate_identities = vec![
+            provisional_object("mach_kernel", 1, 0),
+            provisional_object("mach_kernel", 2, 0x100),
+        ];
+        let error = lookup_census(&duplicate_identities, &requested, |_| {
+            Ok(census_symbol(
+                symbol(0x1018, "mach_kernel", "fn", 0x1010, 0x20),
+                SymbolNameProvenance::Private,
+            ))
+        });
+        assert!(error.to_string().contains("owner=1"));
+        assert!(!error.to_string().contains("0x"));
+
+        let requested = BTreeSet::from([0x1018, 0x2018]);
+        let error = lookup_census(&objects, &requested, |_| {
+            Ok(census_symbol(
+                symbol(0x1018, "mach_kernel", "fn", 0x1010, 0x20),
+                SymbolNameProvenance::Private,
+            ))
+        });
+        assert!(error.to_string().contains("duplicate=0"));
+        assert!(error.to_string().contains("address-set=1"));
+
+        let error = lookup_census(&objects, &requested, |address| {
+            let symbol = match address {
+                0x1018 => symbol(0x1018, "mach_kernel", "fn", 0x1010, 0x20),
+                0x2018 => symbol(0x2019, "mach_kernel", "fn", 0x2010, 0x20),
+                _ => unreachable!("requested set is fixed"),
+            };
+            Ok(census_symbol(symbol, SymbolNameProvenance::Private))
+        });
+        assert!(error.to_string().contains("address-set=1"));
+        assert!(!error.to_string().contains("0x"));
+    }
+
+    #[test]
+    fn census_failure_classes_come_from_actual_lookup_validation_sources() {
+        let record = BorrowedSymbol {
+            object: Some(b"mach_kernel"),
+            symbol: Some(b"startup"),
+            symbol_id: 1,
+            symbol_start: 0x1010,
+            symbol_size: 0x20,
+        };
+        assert_eq!(
+            dtrace_lookup_status(0x1018, 1)
+                .expect_err("status must classify")
+                .class,
+            CensusFailureClass::Status
+        );
+        assert_eq!(
+            own_symbol_for_census(
+                0x1018,
+                BorrowedSymbol {
+                    object: None,
+                    ..record
+                }
+            )
+            .expect_err("missing object must classify")
+            .class,
+            CensusFailureClass::Name
+        );
+        assert_eq!(
+            own_symbol_for_census(
+                0x1018,
+                BorrowedSymbol {
+                    symbol_size: 0,
+                    ..record
+                }
+            )
+            .expect_err("zero size must classify")
+            .class,
+            CensusFailureClass::ZeroOrOverflow
+        );
+        assert_eq!(
+            own_symbol_for_census(0x1040, BorrowedSymbol { ..record })
+                .expect_err("containment must classify")
+                .class,
+            CensusFailureClass::ContainmentOrOffset
+        );
+        let failures = [
+            (
+                "status",
+                dtrace_lookup_status(0x1018, 1).expect_err("status must fail"),
+            ),
+            (
+                "name-invalid",
+                own_symbol_for_census(
+                    0x1018,
+                    BorrowedSymbol {
+                        object: None,
+                        ..record
+                    },
+                )
+                .expect_err("missing object must fail"),
+            ),
+            (
+                "zero-or-overflow",
+                own_symbol_for_census(
+                    0x1018,
+                    BorrowedSymbol {
+                        symbol_size: 0,
+                        ..record
+                    },
+                )
+                .expect_err("zero size must fail"),
+            ),
+            (
+                "containment-or-offset",
+                own_symbol_for_census(0x1040, BorrowedSymbol { ..record })
+                    .expect_err("containment must fail"),
+            ),
+            (
+                "unexpected",
+                CensusLookupFailure::unexpected(KernelSymbolError::AddressMismatch(
+                    "injected unexpected census failure".to_owned(),
+                )),
+            ),
+        ];
+        let objects = vec![provisional_object("mach_kernel", 1, 0)];
+        let requested = BTreeSet::from([0x1018]);
+        for (class, failure) in failures {
+            let mut failure = Some(failure);
+            let error = lookup_census(&objects, &requested, |_| {
+                Err(failure
+                    .take()
+                    .expect("one requested address consumes one failure"))
+            });
+            let text = error.to_string();
+            assert!(text.contains(&format!("{class}=1")));
+            assert!(!text.contains("0x"));
+            assert!(!text.contains("1018"));
+        }
+    }
+
+    #[test]
+    fn live_name_copy_accepts_bounded_private_and_aux_names_but_rejects_raw_fallback() {
+        let auxiliary = vec![0xff_u8; 64];
+        let mut private = b"private_symbol\0".to_vec();
+        let (copied, provenance) = unsafe {
+            copy_live_dtrace_name(private.as_ptr().cast(), auxiliary.as_slice())
+                .expect("bounded persistent name")
+        };
+        private.fill(b'x');
+        assert_eq!(copied, "private_symbol");
+        assert_eq!(provenance, SymbolNameProvenance::Private);
+
+        let auxiliary = b"aux_symbol\0".to_vec();
+        let (copied, provenance) = unsafe {
+            copy_live_dtrace_name(auxiliary.as_ptr().cast(), auxiliary.as_slice())
+                .expect("a final-byte NUL is a complete auxiliary name")
+        };
+        assert_eq!(copied, "aux_symbol");
+        assert_eq!(provenance, SymbolNameProvenance::Auxiliary);
+
+        for raw in [b"0x01234567\0".as_slice(), b"0x0123456789abcdef\0"] {
+            let auxiliary = raw.to_vec();
+            let failure = unsafe { copy_live_dtrace_name(auxiliary.as_ptr().cast(), &auxiliary) }
+                .expect_err("raw auxiliary address text is not symbol evidence");
+            assert_eq!(failure.class, CensusFailureClass::RawAddressFallback);
+
+            let private = raw.to_vec();
+            let auxiliary = vec![0xff_u8; 64];
+            let failure = unsafe { copy_live_dtrace_name(private.as_ptr().cast(), &auxiliary) }
+                .expect_err("raw private address text is not symbol evidence");
+            assert_eq!(failure.class, CensusFailureClass::RawAddressFallback);
+        }
+
+        let empty = b"\0";
+        let invalid_utf8 = [0xff_u8, 0];
+        let no_nul = vec![b'x'; PERSISTENT_SYMBOL_NAME_CAPACITY];
+        for pointer in [
+            std::ptr::null(),
+            empty.as_ptr().cast(),
+            invalid_utf8.as_ptr().cast(),
+            no_nul.as_ptr().cast(),
+        ] {
+            let failure = unsafe { copy_live_dtrace_name(pointer, &auxiliary) }
+                .expect_err("invalid private name must fail closed");
+            assert_eq!(failure.class, CensusFailureClass::Name);
+        }
+
+        let auxiliary_without_nul = b"aux_without_nul".to_vec();
+        let failure = unsafe {
+            copy_live_dtrace_name(
+                auxiliary_without_nul.as_ptr().cast(),
+                &auxiliary_without_nul,
+            )
+        }
+        .expect_err("unterminated auxiliary name must fail closed");
+        assert_eq!(failure.class, CensusFailureClass::Name);
+    }
+
+    #[test]
+    fn census_status_histogram_and_raw_fallback_are_aggregate_only() {
+        let objects = vec![provisional_object("mach_kernel", 1, 0)];
+        let requested = BTreeSet::from([0x1018]);
+        let mut failure = Some(CensusLookupFailure::status(
+            KernelSymbolError::Lookup {
+                address: 0x1018,
+                detail: "private status detail".to_owned(),
+            },
+            -1,
+            123,
+        ));
+        let error = lookup_census(&objects, &requested, |_| {
+            Err(failure.take().expect("one status result"))
+        });
+        let text = error.to_string();
+        assert!(text.contains("requested=1, resolved=0, status=1"));
+        assert!(text.contains("status-histogram=[(-1, 123, 1)]"));
+        assert!(!text.contains("0x"));
+        assert!(!text.contains("private status detail"));
+
+        let raw = b"0x0123456789abcdef\0".to_vec();
+        let mut failure = Some(
+            unsafe { copy_live_dtrace_name(raw.as_ptr().cast(), raw.as_slice()) }
+                .expect_err("raw fallback must classify"),
+        );
+        let error = lookup_census(&objects, &requested, |_| {
+            Err(failure.take().expect("one raw fallback result"))
+        });
+        let text = error.to_string();
+        assert!(text.contains("raw-address-fallback=1"));
+        assert!(!text.contains("0x0123456789abcdef"));
+
+        let requested = BTreeSet::from([0x1018, 0x2018, 0x3018]);
+        let error = lookup_census(&objects, &requested, |address| match address {
+            0x1018 => Err(CensusLookupFailure::status(
+                KernelSymbolError::Lookup {
+                    address,
+                    detail: "first private status detail".to_owned(),
+                },
+                -1,
+                456,
+            )),
+            0x2018 => Ok(census_symbol(
+                symbol(address, "mach_kernel", "fn", 0x2010, 0x20),
+                SymbolNameProvenance::Private,
+            )),
+            0x3018 => Err(CensusLookupFailure::status(
+                KernelSymbolError::Lookup {
+                    address,
+                    detail: "second private status detail".to_owned(),
+                },
+                -1,
+                123,
+            )),
+            _ => unreachable!("requested set is fixed"),
+        });
+        let text = error.to_string();
+        assert!(text.contains("requested=3, resolved=1, status=2"));
+        assert!(text.contains("status-histogram=[(-1, 123, 1), (-1, 456, 1)]"));
+        assert!(text.contains("name-private-valid=1, name-aux-valid=0"));
+        assert!(text.contains("accounting=0"));
+        assert!(!text.contains("0x"));
+    }
+
+    #[test]
+    fn census_aggregate_reconciliation_detects_internal_drift() {
+        let counts = LookupCensusCounts {
+            status: 1,
+            ..LookupCensusCounts::default()
+        };
+        assert!(counts.into_error(1, 0).to_string().contains("accounting=1"));
+    }
+
+    #[test]
     fn object_info_status_does_not_decode_poisoned_output_and_copies_buffers() {
         let poisoned = DtraceObjInfo {
             dto_name: std::ptr::NonNull::<c_char>::dangling().as_ptr(),
@@ -1564,7 +2370,7 @@ data-start, data-size, bss-start, bss-size"
     }
 
     #[test]
-    fn borrowed_conversion_rejects_bad_strings_ranges_lookup_and_auxiliary_buffer() {
+    fn borrowed_conversion_rejects_bad_strings_ranges_and_lookup_results() {
         let object_cases = [
             BorrowedObject {
                 name: None,
@@ -1621,7 +2427,6 @@ data-start, data-size, bss-start, bss-size"
                     symbol_id: 1,
                     symbol_start: 0x1010,
                     symbol_size: 0x20,
-                    auxiliary: b"fn\0",
                 },
             ),
             (
@@ -1633,7 +2438,6 @@ data-start, data-size, bss-start, bss-size"
                     symbol_id: 1,
                     symbol_start: 0x1010,
                     symbol_size: 0x20,
-                    auxiliary: b"fn\0",
                 },
             ),
             (
@@ -1645,7 +2449,6 @@ data-start, data-size, bss-start, bss-size"
                     symbol_id: 1,
                     symbol_start: 0x1010,
                     symbol_size: 0x20,
-                    auxiliary: b"fn\0",
                 },
             ),
             (
@@ -1657,7 +2460,6 @@ data-start, data-size, bss-start, bss-size"
                     symbol_id: 1,
                     symbol_start: 0x1010,
                     symbol_size: 0x20,
-                    auxiliary: b"fn\0",
                 },
             ),
             (
@@ -1669,7 +2471,6 @@ data-start, data-size, bss-start, bss-size"
                     symbol_id: 1,
                     symbol_start: 0x1010,
                     symbol_size: 0,
-                    auxiliary: b"fn\0",
                 },
             ),
             (
@@ -1681,7 +2482,6 @@ data-start, data-size, bss-start, bss-size"
                     symbol_id: 1,
                     symbol_start: u64::MAX,
                     symbol_size: 2,
-                    auxiliary: b"fn\0",
                 },
             ),
             (
@@ -1693,67 +2493,12 @@ data-start, data-size, bss-start, bss-size"
                     symbol_id: 1,
                     symbol_start: 0x1020,
                     symbol_size: 0x20,
-                    auxiliary: b"fn\0",
-                },
-            ),
-            (
-                0x1018,
-                0,
-                BorrowedSymbol {
-                    object: Some(b"kernel"),
-                    symbol: Some(b"fn"),
-                    symbol_id: 1,
-                    symbol_start: 0x1010,
-                    symbol_size: 0x20,
-                    auxiliary: b"unterminated",
                 },
             ),
         ];
         for (address, status, record) in symbol_cases {
             assert!(own_symbol(address, status, record).is_err());
         }
-    }
-
-    #[test]
-    fn auxiliary_symbol_name_requires_a_bounded_nonterminal_c_string() {
-        let auxiliary = b".kernel_fn\0padding";
-        let valid = unsafe {
-            auxiliary_symbol_name_bytes(
-                auxiliary.as_ptr().wrapping_add(1).cast(),
-                auxiliary,
-                0x1018,
-            )
-        }
-        .expect("in-buffer symbol name");
-        assert_eq!(valid, b"kernel_fn");
-
-        let unterminated = b".unterminated";
-        let outside = b"outside\0";
-        assert!(
-            unsafe {
-                auxiliary_symbol_name_bytes(
-                    unterminated.as_ptr().wrapping_add(1).cast(),
-                    unterminated,
-                    0x1018,
-                )
-            }
-            .is_err()
-        );
-        for pointer in [outside.as_ptr().cast(), std::ptr::null()] {
-            assert!(unsafe { auxiliary_symbol_name_bytes(pointer, auxiliary, 0x1018) }.is_err());
-        }
-
-        let terminal = b".terminal\0";
-        assert!(
-            unsafe {
-                auxiliary_symbol_name_bytes(
-                    terminal.as_ptr().wrapping_add(1).cast(),
-                    terminal,
-                    0x1018,
-                )
-            }
-            .is_err()
-        );
     }
 
     #[test]
@@ -1790,15 +2535,13 @@ data-start, data-size, bss-start, bss-size"
     }
 
     #[test]
-    fn resolver_refines_zero_objects_in_name_id_order_before_lookups() {
-        let mut alpha = provisional_object("alpha", 2, 0);
+    fn resolver_preserves_nonzero_object_publication_before_lookups() {
+        let mut alpha = provisional_object("alpha", 2, 0x100);
         alpha.text_start = 0x1000;
-        let mut zeta = provisional_object("zeta", 1, 0);
+        let mut zeta = provisional_object("zeta", 1, 0x100);
         zeta.text_start = 0x2000;
-        let mut resolved_alpha = alpha.clone();
-        resolved_alpha.text_size = 0x100;
-        let mut resolved_zeta = zeta.clone();
-        resolved_zeta.text_size = 0x100;
+        let resolved_alpha = alpha.clone();
+        let resolved_zeta = zeta.clone();
         let mut source = MockSource {
             calls: Vec::new(),
             objects: vec![zeta, alpha],
@@ -1813,7 +2556,7 @@ data-start, data-size, bss-start, bss-size"
                 symbol(0x2018, "zeta", "zeta_fn", 0x2010, 0x20),
             ],
         };
-        snapshot_with_source(&mut source, [0x2018, 0x1018]).expect("refined snapshot");
+        snapshot_with_source(&mut source, [0x2018, 0x1018]).expect("published snapshot");
         assert_eq!(
             source.calls,
             [
@@ -1823,8 +2566,6 @@ data-start, data-size, bss-start, bss-size"
                 "sysctl:hw.machine",
                 "update",
                 "objects",
-                "object-info:alpha",
-                "object-info:zeta",
                 "lookup:0x1018",
                 "lookup:0x2018",
             ]
@@ -2008,6 +2749,18 @@ data-start, data-size, bss-start, bss-size"
                     address,
                     detail: "missing mock symbol".to_owned(),
                 })
+        }
+
+        fn census_lookup(
+            &mut self,
+            address: u64,
+        ) -> Result<CensusLookupOutcome, CensusLookupFailure> {
+            self.lookup(address)
+                .map(|symbol| CensusLookupOutcome {
+                    symbol,
+                    name_provenance: SymbolNameProvenance::Private,
+                })
+                .map_err(|error| CensusLookupFailure::status(error, -1, 0))
         }
     }
 }

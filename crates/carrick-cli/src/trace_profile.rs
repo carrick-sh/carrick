@@ -346,6 +346,9 @@ fn raw_kernel_address(frame: &str) -> Result<u64> {
 pub(crate) fn kernel_stack_addresses_from_path(path: &Path) -> Result<Vec<u64>> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read native-wall raw stream {}", path.display()))?;
+    let summary = ProfileSummary::from_lines(contents.lines(), ProfileCaptureStatus::default())
+        .context("validate native-wall raw stream before kernel symbol lookup")?;
+    summary.require_profile(TraceProfileKind::NativeWall)?;
     kernel_stack_addresses_from_lines(contents.lines())
 }
 
@@ -356,6 +359,8 @@ where
     S: AsRef<str>,
 {
     let mut addresses = std::collections::BTreeSet::new();
+    let mut kernel_pc_leaves = BTreeMap::<u64, u64>::new();
+    let mut kernel_stack_leaves = BTreeMap::<u64, u64>::new();
     let mut open_stack = None::<StackTraceRecord>;
     for (index, raw_line) in lines.into_iter().enumerate() {
         let line = raw_line.as_ref().trim();
@@ -371,6 +376,22 @@ where
                     .take()
                     .ok_or_else(|| anyhow!("native-wall stack state disappeared"))?;
                 if stack.state == "kernel-oncpu" {
+                    let samples = match stack.value {
+                        StackTraceValue::Count(samples) => samples,
+                        StackTraceValue::DurationNs(_) => {
+                            bail!("kernel-oncpu stack lost its count")
+                        }
+                    };
+                    let leaf = raw_kernel_address(
+                        stack
+                            .frames
+                            .first()
+                            .ok_or_else(|| anyhow!("kernel-oncpu stack lost its leaf"))?,
+                    )?;
+                    let count = kernel_stack_leaves.entry(leaf).or_default();
+                    *count = count
+                        .checked_add(samples)
+                        .ok_or_else(|| anyhow!("native-wall stack leaf population overflow"))?;
                     for frame in stack.frames {
                         addresses.insert(raw_kernel_address(&frame)?);
                     }
@@ -404,6 +425,19 @@ where
                 "unrecognized native-wall stack marker at line {}",
                 index + 1
             );
+        } else if line.starts_with("DSRPROF1|") {
+            let record = ProfileRecord::parse(line)
+                .with_context(|| format!("invalid profile record at line {}", index + 1))?;
+            if record.record_type == RecordType::Count
+                && record.fields.get("phase").map(String::as_str) == Some("cpu-kernel-pc")
+            {
+                let leaf = record.required_u64("source_pc")?;
+                let samples = record.required_u64("value")?;
+                let count = kernel_pc_leaves.entry(leaf).or_default();
+                *count = count
+                    .checked_add(samples)
+                    .ok_or_else(|| anyhow!("native-wall kernel PC population overflow"))?;
+            }
         }
     }
     if open_stack.is_some() {
@@ -411,6 +445,9 @@ where
     }
     if addresses.is_empty() {
         bail!("native-wall stream has no raw kernel stack addresses");
+    }
+    if kernel_pc_leaves != kernel_stack_leaves {
+        bail!("native-wall kernel PC and exact stack leaf populations differ");
     }
     Ok(addresses.into_iter().collect())
 }
@@ -1334,6 +1371,25 @@ mod tests {
             kernel_stack_addresses_from_lines(raw_native_wall_lines()).expect("addresses"),
             [0x1018, 0x1028, 0x1038]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_wall_raw_address_extraction_rejects_exact_leaf_population_mismatch() {
+        let lines = [
+            "DSRPROF1|count|phase=cpu-kernel-pc|source_pc=0x1018|value=3",
+            "NWSTACK1|begin|state=kernel-oncpu|value=2",
+            "0x1018",
+            "0x1028",
+            "NWSTACK1|end",
+            "NWSTACK1|begin|state=kernel-oncpu|value=1",
+            "0x2018",
+            "0x1038",
+            "NWSTACK1|end",
+        ];
+        let error = kernel_stack_addresses_from_lines(lines)
+            .expect_err("kernel PC rows must match exact weighted stack leaves");
+        assert!(error.to_string().contains("leaf populations"));
     }
 
     #[cfg(target_os = "macos")]
