@@ -1,7 +1,7 @@
 # Darwin/AArch64 native wall-time campaign ledger
 
 **Updated:** 2026-07-27  
-**Status:** ACTIVE — M1 attribution accepted; step-function spike selection
+**Status:** ACTIVE — M1 accepted; compact kernel-attribution execution
 **Primary workload:** cold-GOCACHE `go-build`  
 **Design:** [Darwin native wall-time attribution campaign](../superpowers/specs/2026-07-27-native-wall-time-attribution-campaign-design.md)
 
@@ -19,7 +19,7 @@
 | Destination | 2.0x | Two independent five-sample campaigns |
 | Destination progress | 0.0% | `(R0 - R) / (R0 - 2.0)` |
 
-Current milestone: **M2 — compact immutable-edge binding**. M0 and M1 are
+Current milestone: **M2 — kernel on-CPU attribution and spike selection**. M0 and M1 are
 complete; the first authority-carrying cache family is correct but has not
 beaten `C0`.
 
@@ -534,5 +534,8 @@ Write and validate the executable M1 plan:
 - [x] Run the signed one-sample feasibility gate; reject H004 Variant 1 after
       the wrapper-free candidate exhausts the 64 MiB translation cache.
 - [ ] Return to clean default-path attribution and select the next
-      evidence-backed hypothesis. Do not authorize cache-size tuning, rerun the
-      Variant 1 mechanism pair, or start Task 16 from this rejection.
+      evidence-backed hypothesis through
+      `docs/superpowers/plans/2026-07-28-native-kernel-attribution-compact-execution.md`.
+      The superseded five-round plan is a research record rather than an
+      execution gate. Do not authorize cache-size tuning or rerun the Variant 1
+      mechanism pair from this rejection.

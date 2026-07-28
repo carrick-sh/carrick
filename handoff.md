@@ -181,11 +181,14 @@ private JIT cache. Restricting it to portable artifacts produced one 24.664 s
 sample, then crashed in Go runtime stack code on replication. Do not resurrect
 that inline family.
 
-**Immediate next action:** return to clean default-path attribution and choose
-the next evidence-backed hypothesis. The live Variant 1 feasibility command
-exhausted the 64 MiB translation cache before `BUILD_OK`; do not promote an
-elapsed result, enlarge the cache, tune the 22-word path, run the mechanism
-pair, or start Task 16 from this rejection.
+**Immediate next action:** execute the user-approved compact kernel-attribution
+controller at
+`docs/superpowers/plans/2026-07-28-native-kernel-attribution-compact-execution.md`.
+The five-round predecessor is retained as a research record, not an execution
+gate. First add exact same-firing kernel PC/stack evidence, then collect the
+receipt-bound A/B pair and select one bounded mechanism. The live Variant 1
+feasibility command exhausted the 64 MiB translation cache before `BUILD_OK`;
+do not promote an elapsed result, enlarge the cache, or resume that variant.
 
 ### Task 15 mechanism gate stopped at the structural prerequisite
 
