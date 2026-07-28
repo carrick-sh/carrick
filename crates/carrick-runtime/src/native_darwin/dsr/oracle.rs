@@ -4764,8 +4764,8 @@ fn direct_binding_sigpipe_sample(
         "jittered recovery x17 mismatch for sampled phase {phase:?}"
     );
     assert_eq!(snapshot.x[30], expected.x[30]);
-    // A requested kick delivered in the host window can surface Darwin's
-    // host-only PSTATE.D mask; the guest architectural contract is exact NZCV.
+    // A requested kick delivered in the host window can surface host-only
+    // Darwin CPSR residue; the guest architectural contract is exact NZCV.
     assert_eq!(
         snapshot.pstate & 0xf000_0000,
         expected.pstate & 0xf000_0000,
@@ -4907,33 +4907,51 @@ fn direct_binding_jittered_sigpipe_stress_preserves_state() {
         let _ = sender_done_tx.send(());
     });
 
-    const SIGNAL_BOUND: usize = 10_000;
-    let mut covered = [false; 8];
-    let mut recovered_words = [0_u32; 64];
-    for signal_index in 0..SIGNAL_BOUND {
-        if let Some((phase, word)) = direct_binding_sigpipe_sample(
-            &mut fixture,
-            &request_tx,
-            &completion_tx,
-            &result_rx,
-            signal_index,
-        ) {
-            covered[direct_binding_phase_index(phase)] = true;
-            recovered_words[word] = recovered_words[word].saturating_add(1);
+    let stress = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        const SIGNAL_BOUND: usize = 10_000;
+        let mut covered = [false; 8];
+        let mut recovered_words = [0_u32; 64];
+        for signal_index in 0..SIGNAL_BOUND {
+            if let Some((phase, word)) = direct_binding_sigpipe_sample(
+                &mut fixture,
+                &request_tx,
+                &completion_tx,
+                &result_rx,
+                signal_index,
+            ) {
+                covered[direct_binding_phase_index(phase)] = true;
+                recovered_words[word] = recovered_words[word].saturating_add(1);
+            }
+        }
+        (covered, recovered_words)
+    }));
+    drop(request_tx);
+    let sender_done = sender_done_rx.recv_timeout(std::time::Duration::from_secs(1));
+    let sender_join = sender.join();
+    let signal_mask_status = signal_mask.restore();
+    drop(kick_binding);
+
+    match stress {
+        Err(payload) => {
+            if sender_done.is_err() || sender_join.is_err() || signal_mask_status != 0 {
+                eprintln!(
+                    "direct-binding jitter cleanup after panic: sender_done={sender_done:?} \
+                     sender_joined={} signal_mask_status={signal_mask_status}",
+                    sender_join.is_ok()
+                );
+            }
+            std::panic::resume_unwind(payload);
+        }
+        Ok((covered, recovered_words)) => {
+            sender_done.expect("bounded SIGPIPE sender shutdown");
+            sender_join.expect("join bounded SIGPIPE sender");
+            assert_eq!(signal_mask_status, 0);
+            eprintln!(
+                "direct-binding jitter coverage: covered={covered:?} \
+                 recovered_words={recovered_words:?} signals=10000"
+            );
         }
     }
-
-    drop(request_tx);
-    sender_done_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("bounded SIGPIPE sender shutdown");
-    drop(sender);
-    drop(kick_binding);
-    assert_eq!(signal_mask.restore(), 0);
-    eprintln!(
-        "direct-binding jitter coverage: covered={covered:?} \
-         recovered_words={recovered_words:?} signals={SIGNAL_BOUND}"
-    );
 }
 
 struct SuspendedMachThread {
@@ -4952,10 +4970,10 @@ impl SuspendedMachThread {
 
     fn resume(mut self) -> Result<(), String> {
         let status = unsafe { mach2::thread_act::thread_resume(self.port) };
-        self.active = false;
         if status != mach2::kern_return::KERN_SUCCESS {
             return Err(format!("thread_resume failed: {status}"));
         }
+        self.active = false;
         Ok(())
     }
 }
