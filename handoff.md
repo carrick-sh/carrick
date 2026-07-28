@@ -36,6 +36,11 @@ codesign/DOF/marker checks, one-sample feasibility, and fail-closed mechanism
 pair were not run. No current-branch-tip `just ci`, native smoke, signed
 feasibility, or live mechanism result is claimed.
 
+The current branch also includes `cbac611c`, which repairs deterministic
+recovery after the `8d440b61` rejection. Treat it only as structural repair
+provenance: Task 15's complete structural sequence, signed feasibility, and
+live mechanism pair have not rerun after that commit.
+
 Reference workload: the conformance `go-build` case — `go build` of a
 hello-world with a cold `GOCACHE`.
 
@@ -157,12 +162,11 @@ private JIT cache. Restricting it to portable artifacts produced one 24.664 s
 sample, then crashed in Go runtime stack code on replication. Do not resurrect
 that inline family.
 
-**Immediate next action:** make the focused recovery oracle deterministically
-cover `FinalBranch`, or otherwise resolve its failed 10,000-signal structural
-obligation. Only then restart Task 15 from a clean checkout and absent
-single-use artifact paths. Do not rerun until lucky, do not tune the 22-word
-path, and do not advance to live evidence or wall screening without a complete
-structural pass.
+**Immediate next action:** review and accept `cbac611c` as the structural
+repair, then rerun the complete Task 15 sequence from clean current HEAD and
+absent single-use artifact paths. The repair commit's own verification is not
+a Task 15 gate receipt. Do not tune the 22-word path or advance to wall
+screening without an accepted mechanism pair.
 
 ### Task 15 mechanism gate stopped at the structural prerequisite
 
@@ -214,9 +218,11 @@ unobserved—not zero. Variant 1 is **rejected before mechanism evaluation**.
 Commit `7cebf638` subsequently repaired this exact metadata mismatch and
 records structural verification at that repair commit, but it did not rerun
 Task 15's complete serial gate or any signed/live step. The current branch
-includes the repair; restart Task 15 from clean current HEAD, fresh preflight,
-and fresh absent artifact paths. Do not tune the 22-word path before that
-evidence decision.
+includes that repair. At this historical checkpoint the instruction was to
+restart Task 15 from clean current HEAD, fresh preflight, and fresh absent
+artifact paths. That instruction is superseded by the later `8d440b61` retry
+and deterministic recovery work at `cbac611c`. Do not tune the 22-word path
+before an accepted mechanism decision.
 
 ### Task 15 retry stopped at bounded recovery coverage
 
@@ -263,6 +269,11 @@ validation reasons, and collapse/reclassification equations are unobserved,
 not zero. The 95% gate was not evaluated; there is no traced or untraced
 performance result. Variant 1 remains rejected before mechanism evaluation,
 and the 22-word path must not be tuned from this outcome.
+
+Commit `cbac611c` subsequently added deterministic recovery coverage and fixed
+the block-entry guest-`x17` recovery defect. It is structural repair
+provenance only. Task 15's complete structural sequence, signed rebuild and
+feasibility, and live mechanism pair have not rerun after `cbac611c`.
 
 ### Portable translation reuse is correct but not a default performance win
 
@@ -486,12 +497,12 @@ as refuted — the gap is defects, not physics.
 
 ## Next work, ordered by the current gate
 
-1. **Resolve the failed structural oracle.** Make `FinalBranch` coverage
-   deterministic, or otherwise resolve the bounded 10,000-signal failure,
-   before another Task 15 retry. Do not rerun until lucky.
-2. **Then rerun Task 15 end to end.** Re-establish clean preflight and absent
-   single-use paths, run all four structural commands serially, rebuild signed,
-   verify codesign/DOF/`CARRICK_DSR_DIRECT_BINDINGS`, run the exact one-sample
+1. **Review and accept `cbac611c`.** Treat its focused/full verification as
+   structural repair provenance, not a Task 15 gate receipt.
+2. **Then rerun Task 15 end to end from clean current HEAD.** Re-establish
+   a clean preflight and absent single-use paths, run all four structural
+   commands serially, rebuild signed, verify
+   codesign/DOF/`CARRICK_DSR_DIRECT_BINDINGS`, run the exact one-sample
    feasibility command, and only if it accepts run the exact fail-closed
    mechanism pair.
 3. **Advance only on accepted mechanism evidence.** If the pair passes every

@@ -127,8 +127,10 @@ stderr hashes, cleanup receipts, precursor/candidate gateway vectors
 unique `(pid,cell)` pairs, clear/validation reasons, reconciliations,
 process-cell bounds, collapse values `S/D/G`, or reclassification equations to
 report. Variant 1 is **rejected before mechanism evaluation**. Do not tune the
-22-word path; first restore the mandatory runtime oracle gate and rerun Task 15
-from fresh absent artifact paths.
+22-word path. At that checkpoint, the next instruction was to restore the
+mandatory runtime oracle gate and rerun Task 15 from fresh absent artifact
+paths. That instruction is historical and superseded by the later `8d440b61`
+retry and subsequent deterministic recovery work at `cbac611c`.
 
 ### Task 15 direct-binding mechanism retry — jitter coverage rejection
 
@@ -184,6 +186,9 @@ identity, publication/clear bound, typed validation reason, and `S/D/G`
 equation is unobserved rather than zero. The 95% mechanism gate was not
 evaluated, and no traced elapsed time exists. Variant 1 remains **rejected
 before mechanism evaluation**; do not tune its 22-word path from this result.
+The current branch includes `cbac611c` only as structural repair provenance;
+no Task 15 structural, signed-feasibility, or live mechanism gate has been
+rerun after that commit.
 
 ## Whole-tree attribution
 
@@ -353,10 +358,9 @@ to `PROPOSED`.
    recovery. A direct binding must have a stable edge identity, bounded
    sidecar size, publication ordering, authority/version data and a recovery
    oracle before it receives a wall screen.
-8. Task 15 remains stopped before live evaluation because the mandatory
-   recovery oracle did not cover `FinalBranch` within its 10,000-signal bound.
-   Do not rerun until that structural obligation is made deterministic or its
-   failure is otherwise resolved.
+8. Task 15 remains stopped before live evaluation. Commit `cbac611c` records
+   deterministic recovery work after the `8d440b61` rejection, but it is
+   structural repair provenance only: no Task 15 gate has rerun after it.
 
 ## Next action
 
@@ -374,7 +378,7 @@ Write and validate the executable M1 plan:
 - [x] Falsify full inline conditional caching on code size and recovery.
 - [x] Add compact per-edge mutable binding cells for unresolved shared-unit
       direct edges.
-- [ ] Make the focused recovery oracle deterministically cover
-      `FinalBranch`, or otherwise resolve the failed structural obligation;
-      then rerun Task 15 from clean state with all single-use evidence paths
-      absent.
+- [ ] Review and accept `cbac611c` as the structural repair, then rerun the
+      complete Task 15 sequence from clean current HEAD with all single-use
+      evidence paths absent. Do not treat `cbac611c`'s repair verification as
+      a Task 15 gate receipt.
