@@ -41,12 +41,13 @@ recovery after the `8d440b61` rejection. Its own focused/full verification is
 structural repair provenance, not a Task 15 gate receipt. The later `b1700108`
 retry below is the first Task 15 structural attempt after that repair.
 
-The compact default-path kernel-attribution wave reached its first authorized
-live Task 4 attempt at clean `7ec846a5`, but run A was rejected before guest
-work. `carrick trace` auto-sudo parsed the runner's repeated absolute Carrick
-binary path as a subcommand. A has a receipt-bound rejection, while B and the
-selection analysis are absent. This is `MEASUREMENT_REPAIR_REQUIRED`: no
-kernel family, fraction, performance result, or H006 exists.
+Task 5 repaired the compact kernel-attribution runner's trace framing, and the
+single authorized v2 attempt at clean `3fb91b09` reached Go compilation using
+the unchanged signed binary. Run A then exhausted the 64 MiB DSR translation
+cache before `BUILD_OK`; B and selection analysis are absent. A's partial
+zero-drop profile reconciles 9,610 kernel PCs/stacks but has zero symbolized
+leaves. This remains `MEASUREMENT_REPAIR_REQUIRED`: no kernel family,
+performance result, or H006 exists.
 
 A fresh retry at `b1700108` passed the two native crate gates but did not
 complete the focused runtime gate. Its first four tests passed, then
@@ -188,14 +189,55 @@ private JIT cache. Restricting it to portable artifacts produced one 24.664 s
 sample, then crashed in Go runtime stack code on replication. Do not resurrect
 that inline family.
 
-**Immediate next action:** repair the compact kernel-capture runner's real
-auto-sudo trace target framing with focused red/green coverage. Pass the
-focused gates and retention-quality `just ci`, then authorize a new base and
-new versioned single-use root/run ID. Preserve and never rerun
-`target/perf/native-kernel-capture-7ec846a5-v1`. The five-round predecessor is
-retained as a research record, not an execution gate. Do not promote any
-elapsed result, infer a kernel family, create H006, enlarge the translation
-cache, or resume rejected H004 Variant 1.
+**Immediate next action:** repair measurement before another live
+authorization. Prove the intended default implementation completes the frozen
+cold-Go workload within the existing 64 MiB cache bound, and restore at least
+95% symbolized kernel-leaf coverage. Preserve and never rerun either
+`target/perf/native-kernel-capture-7ec846a5-v1` or
+`target/perf/native-kernel-capture-3fb91b09-v2`. Do not promote traced elapsed
+time, infer a kernel family, create H006, enlarge the cache, or resume rejected
+H004 Variant 1.
+
+### Task 6 default-path kernel capture rejected during Go compilation
+
+Task 5 removed the duplicate Carrick binary from the forwarded trace target and
+passed 45 capture plus 17 attribution tests; independent review found no scoped
+finding. Task 6 held the existing signed binary and native-arm64 image fixed.
+Preflight at clean `3fb91b09afe0ec7e0aa240bcfc853f724abe166b`
+matched binary SHA-256
+`385e63d05ddf5ccfc55c9264a90f1f23302312c02647ccc23aa84e0844671fc0`,
+v1 receipt SHA-256
+`b8b17f409241a2f902ce6559e8de85d82fcdb550559ab5f5e162f652e88881f0`,
+and v1 durable evidence SHA-256
+`c09be20989146acbb018fa8bbe8171e89ed951cfa25579c3fc2d714eb9fa78af`.
+Codesign, the native-wall marker, and `__TEXT,__dof_carrick` passed. Every v2
+path was `lexists`-absent; the process, busy-host, and Docker-oracle censuses
+were empty, with only two allowed `registry:2` containers.
+
+The exact Task 6 controller command ran once. Repaired framing reached Go
+compilation, then DSR cache allocation reported 1,080 bytes requested,
+67,108,272 bytes used, and 67,108,864 bytes capacity. The compiler exited 125,
+`BUILD_OK` count was zero, and the controller exited 1 after an observed
+51.2214 seconds. No elapsed value from this trace is a performance result.
+
+A nevertheless produced a complete natural zero-drop partial profile: 54
+creates, 54 exits, zero live descendants, and 9,610 kernel PC samples exactly
+matched by 9,610 kernel stack samples. Its 24,676 total CPU samples make the
+partial diagnostic kernel fraction 155/398. Zero kernel leaves were
+symbolized, so the 95% gate would also need repair after workload completion.
+
+Receipt
+`target/perf/native-kernel-capture-3fb91b09-v2/a.receipt.json` hashes to
+`278f58ec3cefc4a55c6e5a6f9fbc3417798af08ba8274c1c7284389ff7193627`.
+All seven bound artifact hashes revalidated, all 499 monitor samples were
+uncontaminated, pre/post provenance matched, cleanup exited 0, and no owned
+process survived. Every B path and `analysis.json` is absent; no analyzer was
+run separately. Durable derived evidence is
+`scripts/perf/evidence/native-go-build-kernel-attribution-v2.json`, SHA-256
+`938052ebeefb0e34075e054fe1da2702c86b8e8e9f68fbdde3e68d941037e5c0`.
+
+Outcome: **`MEASUREMENT_REPAIR_REQUIRED`**. The partial counts do not establish
+`selectable` or `diffuse`, and no H006 or wall-clock win may be claimed.
 
 ### Task 4 default-path kernel capture rejected by trace framing
 
@@ -714,19 +756,18 @@ as refuted — the gap is defects, not physics.
 
 ## Next work, ordered by the current gate
 
-1. **Return to default-path attribution.** H004 Variant 1 is rejected at
-   feasibility after the signed candidate exhausted the 64 MiB DSR translation
-   cache before `BUILD_OK`; select the next hypothesis from clean default-path
-   evidence.
-2. **Do not reinterpret the failed command as a screen.** The feasibility JSON
-   is absent, the error log exists, and no elapsed workload-performance result
-   was accepted.
-3. **Do not tune the rejected mechanism.** Cache-size changes, the 22-word
+1. **Repair measurement before another capture.** Prove the intended default
+   cold-Go workload completes inside the existing 64 MiB cache bound, and
+   restore at least 95% symbolized kernel-leaf coverage.
+2. **Preserve both single-use roots.** Neither v1 nor v2 may be rerun, deleted,
+   or recycled. The v2 A receipt and raw artifacts are the authority for this
+   rejection; B and analysis are absent, not zero.
+3. **Do not reinterpret partial A as selection.** Its 9,610/9,610
+   reconciliation is real, but the workload did not finish and symbolized-leaf
+   coverage is zero. There is no selectable/diffuse result or H006.
+4. **Do not tune the rejected mechanism.** Cache-size changes, the 22-word
    direct-binding path, another Variant 1 mechanism pair, and Task 16 require a
    new controller decision; none is authorized by this handoff.
-4. **Keep the evidence-backed backlog visible.** Coarse-unit publication, the
-   remaining 862k indirect exits, emission-cost attribution, and per-process
-   capsule setup remain candidates for fresh hypothesis selection.
 
 ---
 

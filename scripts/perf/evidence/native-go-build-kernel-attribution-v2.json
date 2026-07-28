@@ -1,0 +1,194 @@
+{
+  "schema": "carrick.native-go-build-kernel-attribution.v2",
+  "recorded_at": "2026-07-28T17:04:15Z",
+  "measurement_state": "MEASUREMENT_REPAIR_REQUIRED",
+  "selection_document": null,
+  "selection": {
+    "result": "rejected",
+    "reason": "capture-a-dsr-translation-cache-exhausted-before-build-ok",
+    "selected_family": null,
+    "diffuse_reasons": [],
+    "analysis_emitted": false,
+    "evidence_errors": [
+      "trace command did not emit exactly one BUILD_OK"
+    ],
+    "counts_and_fractions": {
+      "scope": "partial run A diagnostic only",
+      "kernel_pc_count": 9610,
+      "kernel_stack_count": 9610,
+      "kernel_pc_stack_reconciled": true,
+      "cpu_user_count": 15066,
+      "cpu_total_count": 24676,
+      "kernel_cpu_share": {
+        "numerator": 155,
+        "denominator": 398
+      },
+      "symbolized_leaf_count": 0,
+      "symbolized_leaf_share": {
+        "numerator": 0,
+        "denominator": 1
+      },
+      "eligible_for_selection": false
+    }
+  },
+  "source": {
+    "git_commit": "3fb91b09afe0ec7e0aa240bcfc853f724abe166b",
+    "git_dirty": false,
+    "producer_sha256": "696a26cc068372217c8bf51b6510e7726891f9369a2139c4a2346e55a2b98a21",
+    "acceptance_sha256": "38538a92429cc948c6f0f817aeb5b74029b480381d95d6bcf47a627fd34a29dc",
+    "preserved_v1": {
+      "artifact_root": "target/perf/native-kernel-capture-7ec846a5-v1",
+      "a_receipt_sha256": "b8b17f409241a2f902ce6559e8de85d82fcdb550559ab5f5e162f652e88881f0",
+      "durable_evidence_sha256": "c09be20989146acbb018fa8bbe8171e89ed951cfa25579c3fc2d714eb9fa78af"
+    }
+  },
+  "capture": {
+    "artifact_root": "target/perf/native-kernel-capture-3fb91b09-v2",
+    "base_run_id": "native-kernel-capture-3fb91b09-v2",
+    "image_ref": "localhost:5005/carrick-go-conformance:1.24",
+    "timeout_seconds": 180,
+    "controller_command_status": 1,
+    "controller_observed_wall_seconds": 51.2214,
+    "controller_observed_wall_is_performance_result": false,
+    "runner_error": "native kernel capture rejected: trace command did not emit exactly one BUILD_OK",
+    "invocation_count": 1
+  },
+  "binary": {
+    "path": "target/release/carrick",
+    "sha256": "385e63d05ddf5ccfc55c9264a90f1f23302312c02647ccc23aa84e0844671fc0",
+    "size": 23336272,
+    "codesign_verified": true,
+    "dof_present": true,
+    "dof_segment": "__TEXT",
+    "dof_section": "__dof_carrick",
+    "dof_listing_sha256": "49788cb5195034d9f1354f8a8e0ec86341d75f4bd9e1e06fcc82d6fb8250dfca",
+    "bundled_native_wall_marker_present": true,
+    "exec_backend": "native"
+  },
+  "image": {
+    "architecture": "arm64",
+    "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+    "repo_digests": [
+      "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+    ]
+  },
+  "receipts": {
+    "a": {
+      "state": "rejected",
+      "schema": "carrick.native-kernel-capture.v2",
+      "path": "target/perf/native-kernel-capture-3fb91b09-v2/a.receipt.json",
+      "sha256": "278f58ec3cefc4a55c6e5a6f9fbc3417798af08ba8274c1c7284389ff7193627",
+      "capture_root": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/perf/native-kernel-capture-3fb91b09-v2",
+      "host_run_id": "native-kernel-capture-3fb91b09-v2-a-host",
+      "guest_run_id": "native-kernel-capture-3fb91b09-v2-a-guest",
+      "command": {
+        "status": 0,
+        "timed_out": false,
+        "launch_error": null,
+        "build_ok_count": 0
+      },
+      "cleanup": {
+        "status": 0,
+        "launch_error": null,
+        "surviving_processes": 0
+      },
+      "monitor": {
+        "started": true,
+        "stopped": true,
+        "contaminated": false,
+        "poll_error": null,
+        "sample_count": 499,
+        "foreign_workload_count": 0,
+        "docker_oracle_count": 0,
+        "launch_boundary_count": 1,
+        "post_cleanup_boundary_count": 1
+      },
+      "pre_post_provenance_equal": true,
+      "completion": {
+        "complete": true,
+        "bounded": false,
+        "target_exit_reason": 1,
+        "high_cardinality_overflow": false,
+        "incomplete_pairs": 0,
+        "drops": {
+          "principal": 0,
+          "aggregation": 0,
+          "dynamic": 0,
+          "other": 0,
+          "interrupted": false
+        }
+      },
+      "descendant_census": {
+        "create": 54,
+        "exit": 54,
+        "live_at_end": 0
+      },
+      "artifacts": {
+        "command_stdout": {
+          "size": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "command_stderr": {
+          "size": 471,
+          "sha256": "ed487e683c784e374c60ae654a77075ae73990ce7450293d635df10c282f6dab"
+        },
+        "command_status": {
+          "size": 87,
+          "sha256": "75c687d36f16673018d60bbd85c659c6a45602a46b84a9c1cc4f1830a7779d4d"
+        },
+        "raw_trace": {
+          "size": 7167359,
+          "sha256": "f4129acf2654c04249bc97384b00b111256b82c5d79d5942729f6f61ff025c02"
+        },
+        "summary_jsonl": {
+          "size": 54308219,
+          "sha256": "787e851abadeb9a70d0e2cef76be9f69abca62f4551d0328baebf61798a81d08"
+        },
+        "cleanup_stdout": {
+          "size": 78,
+          "sha256": "3b6036286946a087b293c716290bbf01013f05b9f1f4fe87c6a675d88ce7f364"
+        },
+        "cleanup_stderr": {
+          "size": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    },
+    "b": {
+      "state": "absent",
+      "path": "target/perf/native-kernel-capture-3fb91b09-v2/b.receipt.json",
+      "sha256": null
+    }
+  },
+  "analysis": {
+    "state": "absent",
+    "path": "target/perf/native-kernel-capture-3fb91b09-v2/analysis.json",
+    "sha256": null
+  },
+  "rejection_detail": {
+    "category": "dsr-translation-cache-exhausted",
+    "requested_bytes": 1080,
+    "used_bytes": 67108272,
+    "capacity_bytes": 67108864,
+    "compiler_exit_status": 125,
+    "summary_state": "present",
+    "summary_rows": 48229,
+    "diagnostic_elapsed_ns": 21340483208,
+    "diagnostic_elapsed_is_performance_result": false,
+    "wall_samples": 4202,
+    "wall_state_counts": {
+      "on_cpu": 2576,
+      "runnable_descheduled": 1238,
+      "all_sleeping": 0,
+      "transition": 388
+    },
+    "kernel_symbolization_is_usable": false,
+    "selection_blockers": [
+      "cold Go build did not complete",
+      "BUILD_OK count is zero",
+      "run B is absent",
+      "analysis is absent",
+      "symbolized kernel leaf coverage is zero"
+    ]
+  }
+}
