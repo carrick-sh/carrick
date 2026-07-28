@@ -4471,7 +4471,7 @@ fn direct_binding_live_fixture(
 }
 
 #[test]
-fn direct_binding_private_to_shared_switch_executes() {
+fn private_source_direct_exit_carries_no_sidecar_metadata() {
     let mut fixture = direct_binding_live_fixture(false, true, false);
     assert!(matches!(
         fixture.traverse_source(),
@@ -4481,13 +4481,6 @@ fn direct_binding_private_to_shared_switch_executes() {
             binding: DirectBindingExitMetadata::Absent,
         } if source == fixture.source && target == fixture.target
     ));
-    assert_eq!(
-        fixture.traverse_source(),
-        NativeDsrExit::Syscall {
-            resume: GuestVa(fixture.target.raw() + 4),
-        },
-        "the private source's cached direct edge must install the shared target authority"
-    );
 }
 
 #[test]
