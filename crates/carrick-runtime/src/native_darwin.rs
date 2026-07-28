@@ -79,7 +79,9 @@ use crate::page_profile::ExecutionPlan;
 // Typed fork-lifecycle ordinals for THIS lane. The raw `role`/`phase` integers
 // the `fork-lifecycle` USDT probe carries are produced only inside
 // `probes::native_fork_lifecycle{,_as}`; nothing on the fork path names one.
-use crate::probes::{NativeForkPhase, NativeForkRole};
+use crate::probes::{
+    NativeForkPhase, NativeForkRole, NativeSyscallBranchKind, NativeSyscallServiceOutcome,
+};
 use crate::runtime::{RunResult, RuntimeError, maybe_dump_debug_state};
 use carrick_guest_mem::RepointPrivateError;
 use carrick_guest_mem::protections::MemoryProtections;
@@ -1888,6 +1890,144 @@ struct NativeCloneThreadRequest {
     parent_tid_addr: u64,
     child_tid_addr: u64,
     clear_child_tid_addr: u64,
+    service_number: u64,
+    service_name: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSyscallServiceState {
+    Open,
+    TerminalHandoff,
+    Closed,
+}
+
+struct NativeSyscallServiceSpan {
+    number: u64,
+    name: &'static str,
+    state: NativeSyscallServiceState,
+}
+
+impl NativeSyscallServiceSpan {
+    fn open(number: u64, name: &'static str) -> Self {
+        crate::probes::native_syscall_service_entry(number, name);
+        #[cfg(test)]
+        record_native_syscall_service_probe_event(NativeSyscallServiceProbeEvent::Entry {
+            number,
+            name,
+        });
+        Self {
+            number,
+            name,
+            state: NativeSyscallServiceState::Open,
+        }
+    }
+
+    fn inherited_open(number: u64, name: &'static str) -> Self {
+        Self {
+            number,
+            name,
+            state: NativeSyscallServiceState::Open,
+        }
+    }
+
+    fn branch(&mut self, kind: NativeSyscallBranchKind) -> bool {
+        if self.state != NativeSyscallServiceState::Open {
+            return false;
+        }
+        crate::probes::native_syscall_service_branch(kind);
+        #[cfg(test)]
+        record_native_syscall_service_probe_event(NativeSyscallServiceProbeEvent::Branch(kind));
+        true
+    }
+
+    fn end(&mut self, outcome: NativeSyscallServiceOutcome) -> bool {
+        if self.state != NativeSyscallServiceState::Open {
+            return false;
+        }
+        crate::probes::native_syscall_service_end(self.number, self.name, outcome);
+        #[cfg(test)]
+        record_native_syscall_service_probe_event(NativeSyscallServiceProbeEvent::End {
+            number: self.number,
+            name: self.name,
+            outcome,
+        });
+        self.state = NativeSyscallServiceState::Closed;
+        true
+    }
+
+    fn terminal_handoff(&mut self) -> bool {
+        if self.state != NativeSyscallServiceState::Open {
+            return false;
+        }
+        self.state = NativeSyscallServiceState::TerminalHandoff;
+        true
+    }
+
+    fn reopen_after_failed_terminal_handoff(&mut self) -> bool {
+        if self.state != NativeSyscallServiceState::TerminalHandoff {
+            return false;
+        }
+        self.state = NativeSyscallServiceState::Open;
+        true
+    }
+
+    #[cfg(test)]
+    fn state(&self) -> NativeSyscallServiceState {
+        self.state
+    }
+}
+
+fn require_native_syscall_service_transition(
+    completed: bool,
+    transition: &'static str,
+) -> Result<(), RuntimeError> {
+    if completed {
+        Ok(())
+    } else {
+        Err(RuntimeError::Unsupported(format!(
+            "native syscall service span rejected duplicate {transition} transition"
+        )))
+    }
+}
+
+impl Drop for NativeSyscallServiceSpan {
+    fn drop(&mut self) {
+        if self.state == NativeSyscallServiceState::Open {
+            let _ = self.end(NativeSyscallServiceOutcome::Aborted);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NativeSyscallServiceProbeEvent {
+    Entry {
+        number: u64,
+        name: &'static str,
+    },
+    Branch(NativeSyscallBranchKind),
+    End {
+        number: u64,
+        name: &'static str,
+        outcome: NativeSyscallServiceOutcome,
+    },
+}
+
+#[cfg(test)]
+thread_local! {
+    static NATIVE_SYSCALL_SERVICE_PROBE_EVENTS:
+        std::cell::RefCell<Vec<NativeSyscallServiceProbeEvent>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_native_syscall_service_probe_event(event: NativeSyscallServiceProbeEvent) {
+    NATIVE_SYSCALL_SERVICE_PROBE_EVENTS.with(|events| events.borrow_mut().push(event));
+}
+
+#[cfg(test)]
+fn take_native_syscall_service_probe_events() -> Vec<NativeSyscallServiceProbeEvent> {
+    NATIVE_SYSCALL_SERVICE_PROBE_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }
 
 /// Outcome of [`NativeThreadRuntime::acquire_fork_token`].
@@ -2415,6 +2555,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
             ]),
         )
         .with_current_guest_sp(Some(snapshot.sp));
+        let service_number = request.number.raw();
+        let service_name = carrick_abi::syscall::lookup_aarch64(service_number)
+            .map_or("unknown", |syscall| syscall.name);
+        let mut service = NativeSyscallServiceSpan::open(service_number, service_name);
         if trace_syscalls {
             child_write_stderr(
                 format!(
@@ -2494,6 +2638,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     resume,
                     &mut translator,
                 )?;
+                require_native_syscall_service_transition(
+                    service.end(NativeSyscallServiceOutcome::Resume),
+                    "resume end",
+                )?;
             }
             DispatchOutcome::Errno { errno } => {
                 snapshot = complete_dsr_syscall(
@@ -2506,6 +2654,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     resume,
                     &mut translator,
                 )?;
+                require_native_syscall_service_transition(
+                    service.end(NativeSyscallServiceOutcome::Resume),
+                    "errno resume end",
+                )?;
             }
             DispatchOutcome::SigReturn => {
                 snapshot = complete_dsr_sigreturn(
@@ -2515,8 +2667,16 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     thread_runtime.tid(),
                     &mut translator,
                 )?;
+                require_native_syscall_service_transition(
+                    service.end(NativeSyscallServiceOutcome::Resume),
+                    "signal return end",
+                )?;
             }
             DispatchOutcome::Exit { code } => {
+                require_native_syscall_service_transition(
+                    service.terminal_handoff(),
+                    "process-exit terminal handoff",
+                )?;
                 // Fire before anything below: the forked-child arm ends in
                 // `_exit(2)`, so a probe placed after it never runs and every
                 // guest process that is not the container's pid 1 would be
@@ -2540,13 +2700,33 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                 return Ok(NativeThreadLoopOutcome::ProcessExit(code));
             }
             DispatchOutcome::ThreadExit { code } => {
-                return Ok(finalize_native_thread_exit(
+                let outcome = finalize_native_thread_exit(
                     &mut translator,
                     thread_runtime,
                     &dispatcher,
                     &memory,
                     code,
-                ));
+                );
+                match outcome {
+                    NativeThreadLoopOutcome::ProcessExit(_) => {
+                        require_native_syscall_service_transition(
+                            service.terminal_handoff(),
+                            "last-thread terminal handoff",
+                        )?;
+                    }
+                    NativeThreadLoopOutcome::ThreadDone => {
+                        require_native_syscall_service_transition(
+                            service.end(NativeSyscallServiceOutcome::ThreadExit),
+                            "thread-exit end",
+                        )?;
+                    }
+                    NativeThreadLoopOutcome::ExecReplacedThread => {
+                        return Err(RuntimeError::Unsupported(
+                            "native thread exit unexpectedly reported exec replacement".to_string(),
+                        ));
+                    }
+                }
+                return Ok(outcome);
             }
             DispatchOutcome::CloneThread {
                 stack,
@@ -2579,8 +2759,16 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         resume,
                         &mut translator,
                     )?;
+                    require_native_syscall_service_transition(
+                        service.end(NativeSyscallServiceOutcome::Resume),
+                        "rejected clone resume end",
+                    )?;
                     continue;
                 }
+                require_native_syscall_service_transition(
+                    service.branch(NativeSyscallBranchKind::Thread),
+                    "thread branch",
+                )?;
                 let tid = thread_runtime.spawn_clone_thread(
                     &dispatcher,
                     &memory,
@@ -2596,6 +2784,8 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         parent_tid_addr,
                         child_tid_addr,
                         clear_child_tid_addr,
+                        service_number,
+                        service_name,
                     },
                 )?;
                 snapshot = complete_dsr_syscall(
@@ -2607,6 +2797,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     i64::from(tid.raw()),
                     resume,
                     &mut translator,
+                )?;
+                require_native_syscall_service_transition(
+                    service.end(NativeSyscallServiceOutcome::Resume),
+                    "clone parent resume end",
                 )?;
             }
             DispatchOutcome::Fork {
@@ -2644,6 +2838,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         resume,
                         &mut translator,
                     )?;
+                    require_native_syscall_service_transition(
+                        service.end(NativeSyscallServiceOutcome::Resume),
+                        "rejected fork resume end",
+                    )?;
                     continue;
                 }
                 let syscall_nr = request.number.raw();
@@ -2664,6 +2862,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     thread_runtime,
                     &mut vfork_completion,
                     fork_request,
+                    &mut service,
                 )? {
                     NativeForkFlow::Resume {
                         value,
@@ -2706,12 +2905,24 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             resume,
                             &mut translator,
                         )?;
+                        require_native_syscall_service_transition(
+                            service.end(NativeSyscallServiceOutcome::Resume),
+                            "fork branch resume end",
+                        )?;
                     }
                     NativeForkFlow::RetireForExec => {
                         if thread_runtime.finish_thread(&dispatcher, &memory) {
                             finalize_native_process_exit(&mut translator, &memory);
+                            require_native_syscall_service_transition(
+                                service.terminal_handoff(),
+                                "fork retirement terminal handoff",
+                            )?;
                             return Ok(NativeThreadLoopOutcome::ProcessExit(0));
                         }
+                        require_native_syscall_service_transition(
+                            service.end(NativeSyscallServiceOutcome::ThreadExit),
+                            "fork retirement thread end",
+                        )?;
                         return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
                     }
                 }
@@ -2777,10 +2988,18 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                     resume,
                                     &mut translator,
                                 )?;
+                                require_native_syscall_service_transition(
+                                    service.end(NativeSyscallServiceOutcome::Resume),
+                                    "rejected host self-exec resume end",
+                                )?;
                                 continue;
                             }
                             publish_native_shared_candidates(&translator, &memory);
                             translator.finalize_profile_epoch();
+                            require_native_syscall_service_transition(
+                                service.terminal_handoff(),
+                                "host self-exec terminal handoff",
+                            )?;
                             if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
                                 &dispatcher,
                                 &image,
@@ -2792,6 +3011,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 max_traps,
                                 &plan,
                             ) {
+                                require_native_syscall_service_transition(
+                                    service.reopen_after_failed_terminal_handoff(),
+                                    "failed host self-exec reopen",
+                                )?;
                                 translator.start_next_profile_era_same_image();
                                 tracing::warn!(
                                     %error,
@@ -2808,8 +3031,16 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                     resume,
                                     &mut translator,
                                 )?;
+                                require_native_syscall_service_transition(
+                                    service.end(NativeSyscallServiceOutcome::Resume),
+                                    "failed host self-exec resume end",
+                                )?;
                                 continue;
                             }
+                            require_native_syscall_service_transition(
+                                service.reopen_after_failed_terminal_handoff(),
+                                "unexpected host self-exec return reopen",
+                            )?;
                             return Err(RuntimeError::Unsupported(
                                 "native host self-reexec unexpectedly returned successfully"
                                     .to_owned(),
@@ -2826,6 +3057,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 crate::linux_abi::LINUX_ENOEXEC.guest_retval(),
                                 resume,
                                 &mut translator,
+                            )?;
+                            require_native_syscall_service_transition(
+                                service.end(NativeSyscallServiceOutcome::Resume),
+                                "invalid exec image resume end",
                             )?;
                             continue;
                         };
@@ -2855,6 +3090,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                     resume,
                                     &mut translator,
                                 )?;
+                                require_native_syscall_service_transition(
+                                    service.end(NativeSyscallServiceOutcome::Resume),
+                                    "rejected exec mapping resume end",
+                                )?;
                                 continue;
                             }
                         };
@@ -2867,8 +3106,16 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             NativeExecTeardownFlow::RetireForExec => {
                                 if thread_runtime.finish_thread(&dispatcher, &memory) {
                                     finalize_native_process_exit(&mut translator, &memory);
+                                    require_native_syscall_service_transition(
+                                        service.terminal_handoff(),
+                                        "exec retirement terminal handoff",
+                                    )?;
                                     return Ok(NativeThreadLoopOutcome::ProcessExit(0));
                                 }
+                                require_native_syscall_service_transition(
+                                    service.end(NativeSyscallServiceOutcome::ThreadExit),
+                                    "exec retirement thread end",
+                                )?;
                                 return Ok(NativeThreadLoopOutcome::ExecReplacedThread);
                             }
                         }
@@ -2944,6 +3191,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             ..NativeUcontextSnapshot::default()
                         };
                         crate::exec_helpers::stop_after_traced_exec(&dispatcher);
+                        require_native_syscall_service_transition(
+                            service.end(NativeSyscallServiceOutcome::InProcessExec),
+                            "in-process exec end",
+                        )?;
                     }
                     Err(errno) => {
                         snapshot = complete_dsr_syscall(
@@ -2955,6 +3206,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             errno.guest_retval(),
                             resume,
                             &mut translator,
+                        )?;
+                        require_native_syscall_service_transition(
+                            service.end(NativeSyscallServiceOutcome::Resume),
+                            "exec error resume end",
                         )?;
                     }
                 }
@@ -3015,6 +3270,10 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     resume,
                     &mut translator,
                 )?;
+                require_native_syscall_service_transition(
+                    service.end(NativeSyscallServiceOutcome::Resume),
+                    "mapped alias resume end",
+                )?;
             }
             DispatchOutcome::SignalThread {
                 tid: target,
@@ -3031,8 +3290,16 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     resume,
                     &mut translator,
                 )?;
+                require_native_syscall_service_transition(
+                    service.end(NativeSyscallServiceOutcome::Resume),
+                    "signal-thread resume end",
+                )?;
             }
             DispatchOutcome::SignalDeath { signum } => {
+                require_native_syscall_service_transition(
+                    service.terminal_handoff(),
+                    "signal-death terminal handoff",
+                )?;
                 native_die_by_signal(&dispatcher, &mut translator, signum);
             }
             other => {
@@ -3570,10 +3837,14 @@ impl NativeThreadRuntime {
         let child_reporter = Arc::clone(reporter);
         let child_plan = Arc::clone(plan);
         let mut child_runtime = self.sibling(tid);
+        let service_number = request.service_number;
+        let service_name = request.service_name;
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let spawn_result = std::thread::Builder::new()
             .name(format!("native-guest-tid-{tid}"))
             .spawn(move || {
+                let mut inherited_service =
+                    NativeSyscallServiceSpan::inherited_open(service_number, service_name);
                 let mut ready = Some(ready_tx);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     child_runtime
@@ -3594,6 +3865,10 @@ impl NativeThreadRuntime {
                             "native Darwin clone parent dropped readiness channel".to_string(),
                         )
                     })?;
+                    require_native_syscall_service_transition(
+                        inherited_service.end(NativeSyscallServiceOutcome::Resume),
+                        "clone child resume end",
+                    )?;
                     run_native_thread_loop(
                         Arc::clone(&child_dispatcher),
                         Arc::clone(&child_memory),
@@ -5344,6 +5619,7 @@ fn handle_native_fork(
     thread_runtime: &mut NativeThreadRuntime,
     vfork_completion: &mut Option<NativeVforkCompletion>,
     request: NativeForkRequest,
+    service: &mut NativeSyscallServiceSpan,
 ) -> Result<NativeForkFlow, RuntimeError> {
     if request.clone_parent {
         return Err(RuntimeError::Unsupported(
@@ -5643,6 +5919,10 @@ fn handle_native_fork(
         i64::from(vfork_pipe.is_some()),
     );
     let host_fork_start = Instant::now();
+    require_native_syscall_service_transition(
+        service.branch(NativeSyscallBranchKind::Process),
+        "process branch",
+    )?;
     let child = unsafe { libc::fork() };
     // Both branches: drop the prepare bundle before any signal-static use.
     // The parent releases its guards normally; the child publishes a fresh
@@ -6275,6 +6555,134 @@ fn last_io_error(context: &str) -> RuntimeError {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn native_syscall_service_normal_and_terminal_outcomes_close_once() {
+        take_native_syscall_service_probe_events();
+        for outcome in [
+            crate::probes::NativeSyscallServiceOutcome::Resume,
+            crate::probes::NativeSyscallServiceOutcome::ThreadExit,
+            crate::probes::NativeSyscallServiceOutcome::InProcessExec,
+        ] {
+            let mut service = NativeSyscallServiceSpan::open(63, "read");
+            assert_eq!(service.state(), NativeSyscallServiceState::Open);
+            assert!(service.end(outcome));
+            assert_eq!(service.state(), NativeSyscallServiceState::Closed);
+            assert!(!service.end(outcome));
+            assert!(!service.branch(crate::probes::NativeSyscallBranchKind::Process));
+        }
+        let events = take_native_syscall_service_probe_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, NativeSyscallServiceProbeEvent::Entry { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, NativeSyscallServiceProbeEvent::End { .. }))
+                .count(),
+            3
+        );
+
+        let mut process_exit = NativeSyscallServiceSpan::open(94, "exit_group");
+        assert!(process_exit.terminal_handoff());
+        assert_eq!(
+            process_exit.state(),
+            NativeSyscallServiceState::TerminalHandoff
+        );
+        assert!(!process_exit.terminal_handoff());
+        assert!(!process_exit.branch(crate::probes::NativeSyscallBranchKind::Process));
+        drop(process_exit);
+        assert!(
+            take_native_syscall_service_probe_events()
+                .iter()
+                .all(|event| !matches!(event, NativeSyscallServiceProbeEvent::End { .. }))
+        );
+
+        let mut failed_self_exec = NativeSyscallServiceSpan::open(221, "execve");
+        assert!(failed_self_exec.terminal_handoff());
+        assert!(failed_self_exec.reopen_after_failed_terminal_handoff());
+        assert_eq!(failed_self_exec.state(), NativeSyscallServiceState::Open);
+        assert!(failed_self_exec.end(NativeSyscallServiceOutcome::Resume));
+        assert!(matches!(
+            take_native_syscall_service_probe_events().as_slice(),
+            [
+                NativeSyscallServiceProbeEvent::Entry {
+                    number: 221,
+                    name: "execve"
+                },
+                NativeSyscallServiceProbeEvent::End {
+                    number: 221,
+                    name: "execve",
+                    outcome: NativeSyscallServiceOutcome::Resume
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn native_syscall_service_branches_only_while_open() {
+        take_native_syscall_service_probe_events();
+        let mut service = NativeSyscallServiceSpan::open(220, "clone");
+        assert!(service.branch(crate::probes::NativeSyscallBranchKind::Process));
+        assert!(service.branch(crate::probes::NativeSyscallBranchKind::Thread));
+        assert!(service.end(crate::probes::NativeSyscallServiceOutcome::Resume));
+        assert!(!service.branch(crate::probes::NativeSyscallBranchKind::Thread));
+        assert_eq!(
+            take_native_syscall_service_probe_events()
+                .iter()
+                .filter(|event| matches!(event, NativeSyscallServiceProbeEvent::Branch(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn native_syscall_service_drop_reports_aborted_only_while_open() {
+        take_native_syscall_service_probe_events();
+        drop(NativeSyscallServiceSpan::open(63, "read"));
+        assert!(matches!(
+            take_native_syscall_service_probe_events().as_slice(),
+            [
+                NativeSyscallServiceProbeEvent::Entry { .. },
+                NativeSyscallServiceProbeEvent::End {
+                    outcome: crate::probes::NativeSyscallServiceOutcome::Aborted,
+                    ..
+                }
+            ]
+        ));
+
+        let mut inherited = NativeSyscallServiceSpan::inherited_open(220, "clone");
+        assert!(inherited.end(crate::probes::NativeSyscallServiceOutcome::Resume));
+        assert!(matches!(
+            take_native_syscall_service_probe_events().as_slice(),
+            [NativeSyscallServiceProbeEvent::End {
+                outcome: crate::probes::NativeSyscallServiceOutcome::Resume,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn native_syscall_service_clone_request_carries_inherited_identity() {
+        let request = NativeCloneThreadRequest {
+            context: NativeUcontextSnapshot::default(),
+            resume_pc: 0,
+            parent_guest_tpidr_el0: 0,
+            stack: 0,
+            tls: None,
+            parent_tid_addr: 0,
+            child_tid_addr: 0,
+            clear_child_tid_addr: 0,
+            service_number: 220,
+            service_name: "clone",
+        };
+        assert_eq!(request.service_number, 220);
+        assert_eq!(request.service_name, "clone");
+    }
 
     fn fork_test(test: impl FnOnce()) {
         let pid = unsafe { libc::fork() };
