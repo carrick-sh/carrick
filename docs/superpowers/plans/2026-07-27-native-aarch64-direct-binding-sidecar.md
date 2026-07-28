@@ -1384,6 +1384,8 @@ the deliberate red-first metadata hole.
 - Modify: `crates/carrick-dsr/src/probes.rs`
 - Modify: `crates/carrick-observability/src/probes.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin.rs`
+- Modify: `crates/carrick-dsr-aarch64/src/direct_binding.rs`
+- Modify: `crates/carrick-dsr-aarch64/src/gateway.rs`
 - Modify: `crates/carrick-dsr-aarch64/src/translator.rs`
 - Modify: `scripts/dtrace/dsr-indirect.d`
 - Modify: `scripts/perf/native_go_build.py`
@@ -1405,9 +1407,41 @@ DirectBindingValidationFailure = 11,
 DirectBindingUnitLoaded = 12,
 ```
 
-For `DirectBindingEligible`, probe fields are
-`guest_pc=source`, `generation=ordinal`, and `used_bytes=cell_va`.
-Other values are documented per event. No event fires on a hit.
+Append mirrored, typed, nonzero reason enums:
+
+```rust
+enum DirectBindingClearReason {
+    TargetInvalidation = 1,
+    StaleWinnerRemoval = 2,
+    ForkReset = 3,
+    ExecReset = 4,
+}
+
+enum DirectBindingValidationReason {
+    MissingEligibleRecord = 1,
+    AmbiguousEligibleRecord = 2,
+    MissMetadataMismatch = 3,
+    OwnerMismatch = 4,
+    AuthorityMismatch = 5,
+    MappedCellFailure = 6,
+}
+```
+
+The existing three generic probe fields have this complete ABI:
+
+| Event | `guest_pc` | `generation` | `used_bytes` |
+|---|---|---|---|
+| `Eligible` | source PC | ordinal | cell VA, zero when disabled |
+| `Publish` | source PC | ordinal | cell VA |
+| `CasLoss` | source PC | ordinal | cell VA |
+| `Clear` | cell VA | typed clear reason | target generation, zero for lifecycle reset |
+| `ValidationFailure` | source PC | typed validation reason | cell VA, zero if unavailable |
+| `UnitLoaded` | stable 64-bit unit-key digest | record count | binding-data bytes |
+
+`Publish` fires only after a successful CAS. `Clear` fires only after an actual
+non-null-to-null clear. “No event fires on a hit” means no new direct-binding
+event fires; the existing `BlockHit` cache event remains valid. Sidecar V1's
+22-word hit sequence and no-hit-event contract do not change.
 
 The screen artifact schema is `carrick.native-go-build-screen.v1`.
 The mechanism artifact schema is `carrick.direct-binding-mechanism.v1`.
@@ -1422,33 +1456,46 @@ def test_default_drift_over_five_percent_discards_the_screen()
 def test_candidate_must_beat_c0_both_defaults_and_precursor()
 def test_candidate_default_median_ratio_must_be_at_most_point_97()
 def test_retention_bootstrap_is_seeded_and_reproducible()
+def test_retention_requires_candidate_median_below_c0()
 def test_variant_environment_removes_control_variables_for_default()
+def test_profile_and_container_cache_cannot_leak_into_default()
+def test_drift_formula_pairs_and_nearest_rank_are_exact()
+def test_rejected_screen_is_written_atomically_with_samples()
 ```
 
 - [ ] **Step 2: Add red fail-closed mechanism-summary tests**
 
 `test_direct_binding_mechanism.py` supplies complete synthetic precursor and
-candidate `DSRPROF1` streams plus complete `NATIVEPERF1` supervisor records.
-It asserts:
+candidate `DSRPROF1` streams, trace-summary JSONL, stdout/status artifacts, and
+complete `NATIVEPERF1` records. It asserts:
 
 ```python
 def test_complete_vector_and_eligible_collapse_are_published()
-def test_missing_gateway_translation_or_child_cpu_rejects_the_pair()
+def test_missing_summary_drop_or_provenance_field_rejects_the_pair()
+def test_bounded_interrupted_or_nonzero_status_rejects_the_pair()
+def test_build_ok_must_be_an_exact_stdout_line()
+def test_missing_gateway_translation_or_complete_nativeperf_rejects_the_pair()
+def test_raw_dtrace_and_nativeperf_exit_vectors_must_reconcile()
 def test_reclassification_into_indirect_or_other_gateway_exits_rejects()
-def test_publications_cannot_exceed_unique_reached_cells_without_clears()
-def test_validation_failures_require_an_explicit_nonzero_explanation()
+def test_publications_are_bounded_per_pid_cell_and_globally()
+def test_zero_vectors_are_explicit_and_unknown_kinds_reject()
+def test_clear_and_validation_reasons_are_nonzero_and_known()
+def test_active_source_after_cross_unit_hit_selects_exit_time_authority()
+def test_duplicate_source_target_never_guesses_active_source()
 ```
 
 Expose:
 
 ```python
-def parse_trace(path: pathlib.Path) -> MechanismRun
+def parse_trace(inputs: MechanismInputs) -> MechanismRun
 def compare(precursor: MechanismRun, candidate: MechanismRun) -> dict[str, object]
 ```
 
 `compare` publishes every Gate 2 field, calculates eligible direct-exit
-collapse, and exits nonzero rather than writing an accepted artifact when a
-required field or invariant is missing.
+collapse, and reconciles the complete DTrace and `NATIVEPERF1` evidence
+planes. A rejected run is written atomically with `accepted=false`, every
+available sample/counter, and exact rejection reasons before the tool exits
+nonzero; no rejected or partial artifact can be mistaken for accepted evidence.
 
 - [ ] **Step 3: Run focused tests and verify red**
 
@@ -1473,21 +1520,55 @@ Fire:
 - `Publish`, `CasLoss`, `Clear`, and `ValidationFailure` only on those cold
   events.
 
-For disabled units, `Eligible` reports the record ordinal and a zero cell
-address. For Sidecar V1, it additionally verifies that miss metadata names the
-record's exact cell. Extend `dsr-indirect.d` with
-`@binding_event[kind]`, `@binding_cell[cell_va]`, a gateway count on
-`dsr-run-begin`, and a translation count on `dsr-translate-begin`. Emit
-versioned rows and retain existing total direct, indirect, outcome, pair, and
-source rows. Enable `CARRICK_DSR_PROFILE=1` only for this diagnostic mechanism
-pair and obtain child CPU from its reconciled `NATIVEPERF1|supervisor` record;
-do not compare traced wall times.
+At each cold `ResolveDirect` exit, classify `(source,target)` against an exact
+index of loaded manifests before translation starts or its outcome is known.
+The selected record must belong to the source authority active at that exact
+gateway exit. Initial `PreparedEntry` identity is explicitly not authority:
+a preceding cache/direct hit can install another unit and branch onward
+without returning to Rust. The implementation may propagate exact authority
+or resolve it from the manifest index, but it must satisfy these red tests:
 
-Carry `source_unit_index: Option<usize>` in `PreparedEntry`. Disabled units
-classify against the selected source unit's serialized records; Sidecar V1
-requires the miss-carried ordinal and cell to match that same record. This
-metadata is diagnostic/validation authority, never a translated hit-path
-lookup.
+- a direct/cache hit from unit A into unit B followed by a cold direct exit
+  selects B's record;
+- duplicate `(source,target)` records in loaded units are either disambiguated
+  by exact exit-time authority or emit `AmbiguousEligibleRecord` and reject;
+- missing authority/record emits its typed validation failure before any
+  eligibility or publication event.
+
+For disabled units, `Eligible` reports the exact record ordinal and a zero cell
+address. For Sidecar V1, miss-carried ordinal and cell must match that same
+record. This is cold diagnostic/validation authority, never a translated
+hit-path lookup.
+
+Extend `dsr-indirect.d` as follows:
+
+- seed event kinds 7 through 12 in `BEGIN` with `sum(0)`, then count with
+  `sum(1)`, so legitimate zero vectors are explicit;
+- capture every `arg1 >= 7`; Python rejects values above 12;
+- emit `binding-cell` keyed by `(pid,cell_va)` for nonzero eligible cells;
+- emit `binding-publish-cell` keyed by `(pid,cell_va)`;
+- emit `binding-clear-cell` keyed by `(pid,cell_va,reason)`;
+- emit `binding-unit` keyed by
+  `(pid,unit_id,record_count,binding_data_bytes)`;
+- explicitly seed gateway and translation totals, while retaining all existing
+  direct, indirect, outcome, pair, and source rows.
+
+The publication invariant is per process:
+
+```text
+successful_publishes(pid, cell) <= 1 + successful_clears(pid, cell)
+successful_publishes_total <= unique_process_cells + successful_clears_total
+```
+
+Forked COW processes reuse virtual addresses, so cell identity without `pid`
+is invalid. `dsr-translate-begin` is reported as translation attempts, not
+completed translations.
+
+Use the built-in `--profile dsr-indirect` capture with `--trace-out` and
+`--summary-jsonl`; do not use `--script`, because only profile mode supplies
+authoritative completion, drop, and provenance metadata. Enable
+`CARRICK_DSR_PROFILE=1` only for this diagnostic mechanism pair. Traced wall
+time is never a performance result.
 
 - [ ] **Step 5: Make benchmark samples accept explicit environment overlays**
 
@@ -1506,6 +1587,39 @@ def run_sample(
 
 A `None` value removes the key. Record the normalized overlay in every sample
 row. Docker rejects Carrick-only overlays.
+
+Define one complete performance-control set. Every variant removes each key
+unless it deliberately sets it:
+
+```text
+CARRICK_DSR_ARTIFACT_SPIKE
+CARRICK_DSR_SHARED_TRANSLATION
+CARRICK_DSR_DIRECT_BINDINGS
+CARRICK_DSR_PROFILE
+CARRICK_DSR_ARTIFACT_REPORT
+CARRICK_DSR_ARTIFACT_VALIDATE_FRESH
+CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS
+CARRICK_DSR_KEEP_CONTAINER_CACHE
+CARRICK_ARTIFACT
+CARRICK_DISABLE_VDSO
+CARRICK_VDSO_MODE
+CARRICK_NATIVE_TRACE_SYSCALLS
+CARRICK_NATIVE_REFUSE_POSTFORK_THREADS
+CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS
+```
+
+Before every sample, reject inherited `CARRICK_*` variables outside the
+explicit variant overlay and fixed harness allowlist. Record the effective
+controlled environment. `CARRICK_RUN_ID` is generated by the harness, not
+accepted from ambient state.
+
+Make cleanup and provenance fail closed. A nonzero `carrick_cleanup` result is
+fatal and its output is retained. Before every sample, reject foreign Carrick
+or benchmark processes and any running Docker oracle container. Freeze clean
+git SHA, binary SHA-256, host identity, image identity, and controlled
+environment immediately before the sample, re-read them immediately after,
+and reject any drift. Store that frozen provenance in each sample rather than
+only once for the campaign.
 
 - [ ] **Step 6: Implement the palindromic and retention runner**
 
@@ -1536,15 +1650,56 @@ PALINDROMIC = (
 `--mode screen` executes `PALINDROMIC`. `--mode retention` alternates five
 default and five candidate samples. The seeded bootstrap resamples each
 five-sample group independently for 100,000 draws with seed 0, computes the
-candidate/control median ratio for each draw, and records the 95th percentile.
+candidate/control median ratio for each draw, and records the one-sided 95%
+nearest-rank value (sorted draw 95,000, one-indexed). Pin an exact fixture
+value.
+
+Default drift is exactly
+`max(default_wall_ms) / min(default_wall_ms) <= 1.05`. Contemporaneous screen
+pairs are candidate position 3 with default position 2 and candidate position
+4 with default position 5. Candidate-versus-precursor uses the two medians.
+Screen and retention artifacts are atomic. Drifted, contaminated, or otherwise
+rejected campaigns retain every completed sample with `accepted=false`.
+Retention additionally requires the candidate median to remain below official
+`C0=19,375 ms`; the ratio and bootstrap gates compare against its five
+contemporaneous controls.
 
 - [ ] **Step 7: Implement the mechanism summarizer**
 
-Parse only versioned `DSRPROF1` rows and the reconciled supervisor CPU record.
-Require natural or declared bounded completion, zero DTrace drops from the
-trace footer, both full event vectors, and matching binary/source provenance.
-Write the output atomically only after all completeness and mechanism rules
-pass.
+Parse only versioned `DSRPROF1` rows. Read completion, interruption, drops,
+source/binary SHA, host, and image provenance from each profile-mode summary
+JSONL. Require identical clean git SHA, binary SHA-256, host, image, and
+controlled environment; `completion.complete=true`, `bounded=false`, zero
+interruptions, zero DTrace drops, command status zero, and an exact `BUILD_OK`
+stdout line. Bounded capture is truncated evidence and is always rejected,
+though preserved atomically.
+
+Reuse `native_compiler_budget.parse_nativeperf()` and `validate_profile()`.
+Require exactly one supervisor record, reconciled child CPU, and the complete
+`NATIVEPERF1` gateway-exit vector. Raw DTrace gateway/direct/indirect totals
+must equal the corresponding `NATIVEPERF1` totals. Require both full
+direct-binding event vectors, including explicit zeros.
+
+Use integer arithmetic for the collapse/reclassification decision:
+
+```text
+S = precursor_eligible - candidate_eligible
+D = precursor_direct - candidate_direct
+G = precursor_gateway - candidate_gateway
+
+precursor_eligible > 0
+100 * candidate_eligible <= 5 * precursor_eligible
+100 * D >= 95 * S
+100 * G >= 95 * D
+100 * max(0, candidate_indirect - precursor_indirect) <= 5 * D
+100 * total_positive_non_direct_growth <= 5 * D
+candidate_fault == 0
+candidate_unsupported == 0
+```
+
+Publish indirect and every other gateway-kind delta separately. Write the
+artifact atomically in both acceptance and rejection cases; only accepted
+artifacts exit zero.
 
 - [ ] **Step 8: Run tests and commit**
 
@@ -1561,6 +1716,8 @@ git add \
   crates/carrick-dsr/src/probes.rs \
   crates/carrick-observability/src/probes.rs \
   crates/carrick-runtime/src/native_darwin.rs \
+  crates/carrick-dsr-aarch64/src/direct_binding.rs \
+  crates/carrick-dsr-aarch64/src/gateway.rs \
   crates/carrick-dsr-aarch64/src/translator.rs \
   scripts/dtrace/dsr-indirect.d \
   scripts/perf/native_go_build.py \
@@ -1623,7 +1780,9 @@ python3 scripts/perf/native_go_build.py \
 ```
 
 Expected: `BUILD_OK`, no crash/hang/cache exhaustion, and the output marker
-executes.
+executes as an exact stdout line. The sample is accepted only when command
+status and stamped cleanup are both zero, the pre/post provenance snapshot is
+identical, and no foreign Carrick process or running Docker oracle is present.
 
 - [ ] **Step 4: Collect disabled and enabled mechanism traces serially**
 
@@ -1640,8 +1799,9 @@ CARRICK_DSR_ARTIFACT_SPIKE=1 \
 CARRICK_DSR_SHARED_TRANSLATION=1 \
 CARRICK_DSR_PROFILE=1 \
 target/release/carrick trace \
-  --script scripts/dtrace/dsr-indirect.d \
+  --profile dsr-indirect \
   --trace-out target/perf/direct-binding-mechanism-off-v1.trace \
+  --summary-jsonl target/perf/direct-binding-mechanism-off-v1.summary.jsonl \
   -- run --exec-backend native \
   -e "CARRICK_RUN_ID=$precursor_run_id" \
   -w /tmp \
@@ -1649,6 +1809,9 @@ target/release/carrick trace \
   /bin/sh -c "$guest_script" \
   >target/perf/direct-binding-mechanism-off-v1.stdout \
   2>target/perf/direct-binding-mechanism-off-v1.stderr
+precursor_status=$?
+printf '%s\n' "$precursor_status" \
+  >target/perf/direct-binding-mechanism-off-v1.status
 scripts/sudo/kill.sh "$precursor_run_id"
 
 CARRICK_RUN_ID="$candidate_run_id" \
@@ -1657,8 +1820,9 @@ CARRICK_DSR_SHARED_TRANSLATION=1 \
 CARRICK_DSR_DIRECT_BINDINGS=1 \
 CARRICK_DSR_PROFILE=1 \
 target/release/carrick trace \
-  --script scripts/dtrace/dsr-indirect.d \
+  --profile dsr-indirect \
   --trace-out target/perf/direct-binding-mechanism-on-v1.trace \
+  --summary-jsonl target/perf/direct-binding-mechanism-on-v1.summary.jsonl \
   -- run --exec-backend native \
   -e "CARRICK_RUN_ID=$candidate_run_id" \
   -w /tmp \
@@ -1666,39 +1830,60 @@ target/release/carrick trace \
   /bin/sh -c "$guest_script" \
   >target/perf/direct-binding-mechanism-on-v1.stdout \
   2>target/perf/direct-binding-mechanism-on-v1.stderr
+candidate_status=$?
+printf '%s\n' "$candidate_status" \
+  >target/perf/direct-binding-mechanism-on-v1.status
 scripts/sudo/kill.sh "$candidate_run_id"
 
 python3 scripts/perf/direct_binding_mechanism.py \
   --precursor-trace target/perf/direct-binding-mechanism-off-v1.trace \
+  --precursor-summary target/perf/direct-binding-mechanism-off-v1.summary.jsonl \
   --precursor-profile target/perf/direct-binding-mechanism-off-v1.stderr \
+  --precursor-stdout target/perf/direct-binding-mechanism-off-v1.stdout \
+  --precursor-status target/perf/direct-binding-mechanism-off-v1.status \
   --candidate-trace target/perf/direct-binding-mechanism-on-v1.trace \
+  --candidate-summary target/perf/direct-binding-mechanism-on-v1.summary.jsonl \
   --candidate-profile target/perf/direct-binding-mechanism-on-v1.stderr \
+  --candidate-stdout target/perf/direct-binding-mechanism-on-v1.stdout \
+  --candidate-status target/perf/direct-binding-mechanism-on-v1.status \
   --output target/perf/direct-binding-mechanism-v1.json
 ```
 
 `carrick trace` auto-sudos; do not prefix either command with `sudo`. If a
-command exits early, run its exact stamped cleanup command before continuing.
+command exits early, still write its numeric status and run its exact stamped
+cleanup. Cleanup failure is fatal: retain the rejected artifacts and do not
+start the next sample. Before each trace, require clean/frozen source and
+binary provenance, no foreign Carrick or benchmark process, and no running
+Docker oracle. Do not substitute `--script`: the profile-mode summary is the
+authority for drops, completion, and provenance.
 
 Record for both:
 
 - sidecar-eligible and total direct resolver exits;
-- indirect resolver exits;
-- total gateway entries;
-- unique reached cells;
+- the complete `NATIVEPERF1` exit vector, with indirect and every other
+  gateway kind reported separately;
+- raw-DTrace versus `NATIVEPERF1` gateway/direct/indirect reconciliation;
+- total gateway entries and translation attempts;
+- unique reached `(pid,cell)` pairs;
 - publications, CAS losses, clears, and validation failures;
-- translations;
+- per-`(pid,cell)` and global publication/clear invariants;
 - child CPU.
 
-Reject Variant 1 immediately if eligible repeated direct exits do not fall by
-at least 95%, if the reduction moves into another gateway class, if
-publications are not bounded by reached cells absent generation changes, or if
-validation failures are unexplained.
+Reject Variant 1 immediately unless the Step 7 integer collapse and
+reclassification equations pass, candidate fault/unsupported exits are zero,
+all six event kinds are explicit (including zero vectors), every kind/reason
+is known, publications satisfy both process-scoped bounds, and every
+validation failure has a typed nonzero reason. Nonzero command status, a
+missing exact `BUILD_OK` line, bounded/interrupted capture, DTrace drops,
+evidence-plane mismatch, provenance drift, or cleanup failure also rejects.
 
 - [ ] **Step 5: Update the controller with exact evidence**
 
-Add artifact paths, SHA-256 hashes, binary hash, commit, dirty state, feature
-environment, event vector, and pass/reject decision to the ledger and handoff.
-Do not use traced elapsed time as a performance result.
+Add raw/summary/stdout/status/artifact paths and SHA-256 hashes, frozen
+per-sample source/binary/host/image/environment provenance, the complete event
+and exit vectors, reconciliation, process-cell bounds, and pass/reject decision
+to the ledger and handoff. Preserve bounded or otherwise rejected captures as
+`accepted=false`. Do not use traced elapsed time as a performance result.
 
 - [ ] **Step 6: Commit the evidence checkpoint**
 
@@ -1727,9 +1912,12 @@ Stop here on a mechanism failure. Do not tune the 22-instruction path.
 ```bash
 python3 scripts/perf/native_go_build_screen.py --help
 ps -eo pid=,args= | rg 'target/release/carrick|native-go-build' || true
+docker ps --format '{{.ID}} {{.Image}} {{.Names}}'
 ```
 
-Reap only known stamped run IDs with `scripts/sudo/kill.sh`.
+Reap only known stamped run IDs with `scripts/sudo/kill.sh`; cleanup failure is
+fatal. Reject a running Docker oracle, a foreign Carrick/benchmark process,
+dirty source, or an unexpected ambient `CARRICK_*` variable before sampling.
 
 - [ ] **Step 2: Run the exact two-triplet screen**
 
@@ -1746,17 +1934,22 @@ The artifact must contain:
 precursor, default, candidate, candidate, default, precursor
 ```
 
-Discard and rerun if default controls differ by more than 5%.
+The runner freezes and rechecks clean git SHA, binary SHA-256, host, image, and
+the fully controlled environment around every sample. If
+`max(defaults)/min(defaults) > 1.05`, retain the atomic artifact and samples as
+`accepted=false`; rerun only after identifying and recording the instability.
 
 - [ ] **Step 3: Apply all four promotion rules**
 
 Promote only when:
 
 - both candidates are below 19,375 ms;
-- both candidates beat their contemporaneous defaults;
+- candidate position 3 beats default position 2 and candidate position 4
+  beats default position 5;
 - candidate/default median ratio is at most 0.97;
-- candidate median beats precursor median;
-- every sample completes and executes `BUILD_OK`.
+- candidate median beats the precursor median;
+- every sample has zero command and cleanup status, exact `BUILD_OK`, identical
+  pre/post provenance, and no foreign Carrick or Docker-oracle contamination.
 
 If resolver exits collapsed but the wall screen fails, collect one new
 whole-tree `native-wall` profile. Authorize exactly one Variant 2 design
@@ -1768,7 +1961,9 @@ to default-path attribution. Do not combine Variant 2 refinements.
 
 Update H004 to `RETAIN`, `REJECT`, or keep it `SPIKING` only when the
 profile-authorized Variant 2 amendment is written. Record every sample,
-controls, ratios, drift, artifact hashes, and the reason.
+controls, exact contemporaneous pairs, medians, ratios, the exact drift
+formula, frozen provenance, artifact hashes, and the reason. A rejected screen
+remains an atomic `accepted=false` evidence artifact.
 
 ```bash
 git add docs/perf-results/native-wall-time-campaign.md handoff.md
@@ -1801,7 +1996,11 @@ python3 scripts/perf/native_go_build_screen.py \
 ```
 
 Retain only if candidate/control median ratio is at most 0.97 and the seeded
-bootstrap 95% upper bound is below 1.0.
+bootstrap one-sided nearest-rank 95% upper bound is below 1.0. The candidate
+median must also remain below official `C0=19,375 ms`. Every sample must retain
+identical pre/post clean git SHA, binary SHA-256, host, image, controlled
+environment, exact `BUILD_OK`, zero command/cleanup status, and a clean
+Carrick/Docker-oracle census.
 
 - [ ] **Step 2: Refresh Docker and the campaign ratio serially**
 
@@ -1814,8 +2013,11 @@ python3 scripts/perf/native_go_build.py \
   --output target/perf/direct-binding-docker-v1.json
 ```
 
-Refresh `C`, `D`, and `R` only when image, host, binary, and idle-state
-provenance are valid. State explicitly whether `R<=9.6202x` has been reached.
+Refresh `C`, `D`, and `R` only when each sample's frozen image, host, clean
+source, binary, controlled-environment, cleanup, and idle-state provenance is
+valid. Docker remains serial with Carrick and rejects Carrick-only overlays.
+State explicitly how retained candidate `C` relates to both `C0=19,375 ms`
+and the five current controls, and whether `R<=9.6202x` has been reached.
 
 - [ ] **Step 3: Run guardrails and the signed native closure**
 
