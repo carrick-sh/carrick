@@ -170,6 +170,22 @@ struct BorrowedSymbol<'a> {
     auxiliary: &'a [u8],
 }
 
+/// A copied `dtrace_object_iter`/`dtrace_object_info` record that has not yet
+/// passed the published `KernelObjectRange` text-range invariant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProvisionalObject {
+    name: String,
+    file: Option<String>,
+    id: c_int,
+    flags: c_uint,
+    text_start: u64,
+    text_size: u64,
+    data_start: u64,
+    data_size: u64,
+    bss_start: u64,
+    bss_size: u64,
+}
+
 fn required_string(value: Option<&[u8]>, field: &str) -> Result<String, KernelSymbolError> {
     let value =
         value.ok_or_else(|| KernelSymbolError::InvalidObject(format!("{field} is null")))?;
@@ -221,6 +237,127 @@ fn own_object(record: BorrowedObject<'_>) -> Result<KernelObjectRange, KernelSym
         text_start: record.text_start,
         text_size: record.text_size,
     })
+}
+
+fn own_provisional_object(info: &DtraceObjInfo) -> Result<ProvisionalObject, KernelSymbolError> {
+    let name = required_string(unsafe { optional_c_bytes(info.dto_name) }, "object name")?;
+    let file = match unsafe { optional_c_bytes(info.dto_file) } {
+        None | Some([]) => None,
+        Some(value) => Some(required_string(Some(value), "object file")?),
+    };
+    let object = ProvisionalObject {
+        name,
+        file,
+        id: info.dto_id,
+        flags: info.dto_flags,
+        text_start: info.dto_text_va,
+        text_size: info.dto_text_size,
+        data_start: info.dto_data_va,
+        data_size: info.dto_data_size,
+        bss_start: info.dto_bss_va,
+        bss_size: info.dto_bss_size,
+    };
+    validate_provisional_ranges(&object)?;
+    Ok(object)
+}
+
+fn validate_provisional_ranges(object: &ProvisionalObject) -> Result<(), KernelSymbolError> {
+    for (start, size, range) in [
+        (object.text_start, object.text_size, "text"),
+        (object.data_start, object.data_size, "data"),
+        (object.bss_start, object.bss_size, "bss"),
+    ] {
+        if size != 0 {
+            start.checked_add(size).ok_or_else(|| {
+                KernelSymbolError::InvalidObject(format!(
+                    "{:?} {range} range overflows",
+                    object.name
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn published_object(object: ProvisionalObject) -> Result<KernelObjectRange, KernelSymbolError> {
+    own_object(BorrowedObject {
+        name: Some(object.name.as_bytes()),
+        file: object.file.as_deref().map(str::as_bytes),
+        id: object.id,
+        flags: object.flags,
+        text_start: object.text_start,
+        text_size: object.text_size,
+    })
+}
+
+fn matching_nonzero_scalars(original: &ProvisionalObject, resolved: &ProvisionalObject) -> bool {
+    [
+        (original.text_start, resolved.text_start),
+        (original.text_size, resolved.text_size),
+        (original.data_start, resolved.data_start),
+        (original.data_size, resolved.data_size),
+        (original.bss_start, resolved.bss_start),
+        (original.bss_size, resolved.bss_size),
+    ]
+    .into_iter()
+    .all(|(original, resolved)| original == 0 || original == resolved)
+}
+
+fn refine_kernel_objects(
+    mut objects: Vec<ProvisionalObject>,
+    mut query: impl FnMut(&str) -> Result<ProvisionalObject, KernelSymbolError>,
+) -> Result<Vec<KernelObjectRange>, KernelSymbolError> {
+    for object in &objects {
+        validate_provisional_ranges(object)?;
+    }
+    let mut queries = objects
+        .iter()
+        .filter(|object| object.text_size == 0)
+        .map(|object| (object.name.clone(), object.id))
+        .collect::<Vec<_>>();
+    queries.sort();
+    for (name, id) in queries {
+        if objects.iter().filter(|object| object.name == name).count() != 1 {
+            return Err(KernelSymbolError::InvalidObject(format!(
+                "object-info name-only query for {name:?} is ambiguous"
+            )));
+        }
+        let resolved = query(&name)?;
+        validate_provisional_ranges(&resolved)?;
+        let original = objects
+            .iter_mut()
+            .find(|object| object.name == name && object.id == id)
+            .ok_or_else(|| {
+                KernelSymbolError::InvalidObject(format!("missing zero-size object {name:?}"))
+            })?;
+        if resolved.name != original.name
+            || resolved.id != original.id
+            || resolved.flags != original.flags
+            || resolved.flags & DTRACE_OBJ_F_KERNEL == 0
+            || (original.file.is_some() && original.file != resolved.file)
+            || !matching_nonzero_scalars(original, &resolved)
+            || resolved.text_size == 0
+        {
+            return Err(KernelSymbolError::InvalidObject(format!(
+                "object-info mismatch for {name:?}"
+            )));
+        }
+        *original = resolved;
+    }
+    objects.into_iter().map(published_object).collect()
+}
+
+fn finish_object_info(
+    name: &str,
+    status: c_int,
+    info: &DtraceObjInfo,
+) -> Result<ProvisionalObject, KernelSymbolError> {
+    if status != 0 {
+        return Err(KernelSymbolError::ObjectIteration(format!(
+            "object-info {name:?} returned status {status}"
+        )));
+    }
+    own_provisional_object(info)
 }
 
 fn own_symbol(
@@ -518,7 +655,8 @@ impl KernelSymbolSnapshot {
 trait SymbolSource {
     fn sysctl(&mut self, name: &'static str) -> Result<Vec<u8>, KernelSymbolError>;
     fn update(&mut self) -> Result<(), KernelSymbolError>;
-    fn objects(&mut self) -> Result<Vec<KernelObjectRange>, KernelSymbolError>;
+    fn objects(&mut self) -> Result<Vec<ProvisionalObject>, KernelSymbolError>;
+    fn object_info(&mut self, name: &str) -> Result<ProvisionalObject, KernelSymbolError>;
     fn lookup(&mut self, address: u64) -> Result<KernelSymbolRange, KernelSymbolError>;
 }
 
@@ -545,7 +683,7 @@ fn snapshot_with_source(
     };
     validate_identity(&identity)?;
     source.update()?;
-    let objects = source.objects()?;
+    let objects = refine_kernel_objects(source.objects()?, |name| source.object_info(name))?;
     let requested = requested.into_iter().collect::<BTreeSet<_>>();
     if requested.is_empty() {
         return Err(KernelSymbolError::AddressMismatch(
@@ -561,7 +699,7 @@ fn snapshot_with_source(
 
 #[derive(Default)]
 struct ObjectCallbackContext {
-    objects: Vec<KernelObjectRange>,
+    objects: Vec<ProvisionalObject>,
     error: Option<KernelSymbolError>,
     callback_panicked: bool,
     #[cfg(test)]
@@ -649,14 +787,7 @@ extern "C" fn object_callback(
         if info.dto_flags & DTRACE_OBJ_F_KERNEL == 0 {
             return Ok(());
         }
-        let object = own_object(BorrowedObject {
-            name: unsafe { optional_c_bytes(info.dto_name) },
-            file: unsafe { optional_c_bytes(info.dto_file) },
-            id: info.dto_id,
-            flags: info.dto_flags,
-            text_start: info.dto_text_va,
-            text_size: info.dto_text_size,
-        })?;
+        let object = own_provisional_object(info)?;
         #[cfg(test)]
         if context.panic_before_record {
             std::panic::resume_unwind(Box::new("injected callback record panic"));
@@ -675,7 +806,7 @@ extern "C" fn object_callback(
 fn finish_object_iteration(
     context: ObjectCallbackContext,
     status: c_int,
-) -> Result<Vec<KernelObjectRange>, KernelSymbolError> {
+) -> Result<Vec<ProvisionalObject>, KernelSymbolError> {
     if status != 0 {
         return Err(KernelSymbolError::ObjectIteration(format!(
             "libdtrace returned status {status}"
@@ -706,7 +837,7 @@ impl SymbolSource for LiveSymbolSource {
         Ok(())
     }
 
-    fn objects(&mut self) -> Result<Vec<KernelObjectRange>, KernelSymbolError> {
+    fn objects(&mut self) -> Result<Vec<ProvisionalObject>, KernelSymbolError> {
         let mut context = ObjectCallbackContext::default();
         let status = unsafe {
             dtrace_object_iter(
@@ -716,6 +847,25 @@ impl SymbolSource for LiveSymbolSource {
             )
         };
         finish_object_iteration(context, status)
+    }
+
+    fn object_info(&mut self, name: &str) -> Result<ProvisionalObject, KernelSymbolError> {
+        let copied_name = CString::new(name)
+            .map_err(|_| KernelSymbolError::InvalidObject("object name contains NUL".to_owned()))?;
+        let mut info = DtraceObjInfo {
+            dto_name: std::ptr::null(),
+            dto_file: std::ptr::null(),
+            dto_id: 0,
+            dto_flags: 0,
+            dto_text_va: 0,
+            dto_text_size: 0,
+            dto_data_va: 0,
+            dto_data_size: 0,
+            dto_bss_va: 0,
+            dto_bss_size: 0,
+        };
+        let status = unsafe { dtrace_object_info(self.hdl, copied_name.as_ptr(), &mut info) };
+        finish_object_info(name, status, &info)
     }
 
     fn lookup(&mut self, address: u64) -> Result<KernelSymbolRange, KernelSymbolError> {
@@ -889,6 +1039,21 @@ mod tests {
         }
     }
 
+    fn provisional_object(name: &str, id: c_int, text_size: u64) -> ProvisionalObject {
+        ProvisionalObject {
+            name: name.to_owned(),
+            file: None,
+            id,
+            flags: DTRACE_OBJ_F_KERNEL,
+            text_start: 0x1000,
+            text_size,
+            data_start: 0x2000,
+            data_size: 0x20,
+            bss_start: 0x3000,
+            bss_size: 0x30,
+        }
+    }
+
     fn symbol(address: u64, object: &str, name: &str, start: u64, size: u64) -> KernelSymbolRange {
         KernelSymbolRange {
             address,
@@ -1057,6 +1222,136 @@ mod tests {
                 .reconcile_addresses([0x1018, 0x2018, 0x3018])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn zero_text_kernel_object_is_refined_once_before_symbol_lookup() {
+        let provisional = provisional_object("mach_kernel", 1, 0);
+        let mut queries = Vec::new();
+        let objects = refine_kernel_objects(vec![provisional.clone()], |name| {
+            queries.push(name.to_owned());
+            Ok(ProvisionalObject {
+                text_size: 0x1000,
+                ..provisional.clone()
+            })
+        })
+        .expect("refined kernel object");
+        assert_eq!(queries, ["mach_kernel"]);
+        assert_eq!(objects[0].text_size, 0x1000);
+    }
+
+    #[test]
+    fn refinement_never_queries_nonzero_objects_and_rejects_ambiguous_names() {
+        let published = provisional_object("already-sized", 1, 0x1000);
+        let objects = refine_kernel_objects(vec![published.clone()], |_| {
+            panic!("nonzero object must not be queried")
+        })
+        .expect("published object needs no query");
+        assert_eq!(objects[0].name, published.name);
+
+        let zero = provisional_object("mach_kernel", 1, 0);
+        let nonzero = provisional_object("mach_kernel", 2, 0x1000);
+        let error = refine_kernel_objects(vec![zero, nonzero], |_| {
+            panic!("ambiguous name must be rejected before a query")
+        })
+        .expect_err("zero plus nonzero duplicate name is ambiguous");
+        assert!(matches!(error, KernelSymbolError::InvalidObject(_)));
+    }
+
+    #[test]
+    fn refinement_rejects_mismatched_records_and_unresolved_ranges() {
+        let original = provisional_object("mach_kernel", 7, 0);
+        let mut cases = Vec::new();
+        let mut name = original.clone();
+        name.name = "other".to_owned();
+        cases.push(name);
+        let mut id = original.clone();
+        id.id += 1;
+        cases.push(id);
+        let mut flags = original.clone();
+        flags.flags = 0;
+        cases.push(flags);
+        let mut file = original.clone();
+        file.file = Some("/System/mach_kernel".to_owned());
+        let mut known_file = original.clone();
+        known_file.file = Some("/System/known".to_owned());
+        let mut changed_known_file = known_file.clone();
+        changed_known_file.file = Some("/System/other".to_owned());
+        let mut text_start = original.clone();
+        text_start.text_start += 1;
+        cases.push(text_start);
+        let mut data_start = original.clone();
+        data_start.data_start += 1;
+        cases.push(data_start);
+        let mut data_size = original.clone();
+        data_size.data_size += 1;
+        cases.push(data_size);
+        let mut bss_start = original.clone();
+        bss_start.bss_start += 1;
+        cases.push(bss_start);
+        let mut bss_size = original.clone();
+        bss_size.bss_size += 1;
+        cases.push(bss_size);
+
+        for mut resolved in cases {
+            resolved.text_size = 0x1000;
+            assert!(
+                refine_kernel_objects(vec![original.clone()], |_| Ok(resolved.clone())).is_err()
+            );
+        }
+        assert!(
+            refine_kernel_objects(vec![known_file], |_| Ok(changed_known_file.clone())).is_err()
+        );
+        assert!(refine_kernel_objects(vec![original.clone()], |_| Ok(original.clone())).is_err());
+
+        let mut enriched_file = original.clone();
+        enriched_file.file = Some("/System/mach_kernel".to_owned());
+        enriched_file.text_size = 0x1000;
+        let enriched = refine_kernel_objects(vec![original.clone()], |_| Ok(enriched_file.clone()))
+            .expect("unknown iterator file may be enriched by object-info");
+        assert_eq!(enriched[0].file.as_deref(), Some("/System/mach_kernel"));
+
+        let mut overflow = original.clone();
+        overflow.text_start = u64::MAX;
+        overflow.text_size = 1;
+        assert!(refine_kernel_objects(vec![original], |_| Ok(overflow.clone())).is_err());
+    }
+
+    #[test]
+    fn object_info_status_does_not_decode_poisoned_output_and_copies_buffers() {
+        let poisoned = DtraceObjInfo {
+            dto_name: std::ptr::NonNull::<c_char>::dangling().as_ptr(),
+            dto_file: std::ptr::NonNull::<c_char>::dangling().as_ptr(),
+            dto_id: 1,
+            dto_flags: DTRACE_OBJ_F_KERNEL,
+            dto_text_va: 0,
+            dto_text_size: 0,
+            dto_data_va: 0,
+            dto_data_size: 0,
+            dto_bss_va: 0,
+            dto_bss_size: 0,
+        };
+        assert!(finish_object_info("mach_kernel", 1, &poisoned).is_err());
+
+        let mut name = b"mach_kernel\0".to_vec();
+        let mut file = b"/System/mach_kernel\0".to_vec();
+        let info = DtraceObjInfo {
+            dto_name: name.as_ptr().cast(),
+            dto_file: file.as_ptr().cast(),
+            dto_id: 1,
+            dto_flags: DTRACE_OBJ_F_KERNEL,
+            dto_text_va: 0x1000,
+            dto_text_size: 0,
+            dto_data_va: 0,
+            dto_data_size: 0,
+            dto_bss_va: 0,
+            dto_bss_size: 0,
+        };
+        let copied = finish_object_info("mach_kernel", 0, &info).expect("copy object-info");
+        name.fill(b'x');
+        file.fill(b'y');
+        assert_eq!(copied.name, "mach_kernel");
+        assert_eq!(copied.file.as_deref(), Some("/System/mach_kernel"));
     }
 
     #[test]
@@ -1378,6 +1673,48 @@ mod tests {
     }
 
     #[test]
+    fn resolver_refines_zero_objects_in_name_id_order_before_lookups() {
+        let mut alpha = provisional_object("alpha", 2, 0);
+        alpha.text_start = 0x1000;
+        let mut zeta = provisional_object("zeta", 1, 0);
+        zeta.text_start = 0x2000;
+        let mut resolved_alpha = alpha.clone();
+        resolved_alpha.text_size = 0x100;
+        let mut resolved_zeta = zeta.clone();
+        resolved_zeta.text_size = 0x100;
+        let mut source = MockSource {
+            calls: Vec::new(),
+            objects: vec![zeta, alpha],
+            resolutions: [
+                ("alpha".to_owned(), resolved_alpha),
+                ("zeta".to_owned(), resolved_zeta),
+            ]
+            .into_iter()
+            .collect(),
+            symbols: vec![
+                symbol(0x1018, "alpha", "alpha_fn", 0x1010, 0x20),
+                symbol(0x2018, "zeta", "zeta_fn", 0x2010, 0x20),
+            ],
+        };
+        snapshot_with_source(&mut source, [0x2018, 0x1018]).expect("refined snapshot");
+        assert_eq!(
+            source.calls,
+            [
+                "sysctl:kern.osversion",
+                "sysctl:kern.version",
+                "sysctl:kern.uuid",
+                "sysctl:hw.machine",
+                "update",
+                "objects",
+                "object-info:alpha",
+                "object-info:zeta",
+                "lookup:0x1018",
+                "lookup:0x2018",
+            ]
+        );
+    }
+
+    #[test]
     fn object_callback_captures_conversion_error_and_always_returns_zero() {
         let bad_name = [0xff_u8, 0];
         let info = DtraceObjInfo {
@@ -1487,18 +1824,25 @@ mod tests {
 
     struct MockSource {
         calls: Vec<String>,
-        objects: Vec<KernelObjectRange>,
+        objects: Vec<ProvisionalObject>,
+        resolutions: BTreeMap<String, ProvisionalObject>,
         symbols: Vec<KernelSymbolRange>,
     }
 
     impl MockSource {
         fn valid() -> Self {
+            let mut driver = provisional_object("com.apple.driver", 2, 0x100);
+            driver.text_start = 0x2000;
+            let kernel = provisional_object("kernel", 1, 0x100);
+            let objects = vec![driver, kernel];
             Self {
                 calls: Vec::new(),
-                objects: vec![
-                    object("com.apple.driver", 2, 0x2000, 0x100),
-                    object("kernel", 1, 0x1000, 0x100),
-                ],
+                resolutions: objects
+                    .iter()
+                    .cloned()
+                    .map(|object| (object.name.clone(), object))
+                    .collect(),
+                objects,
                 symbols: vec![
                     symbol(0x1018, "kernel", "kernel_fn", 0x1010, 0x20),
                     symbol(0x2018, "com.apple.driver", "driver_fn", 0x2010, 0x20),
@@ -1525,9 +1869,16 @@ mod tests {
             Ok(())
         }
 
-        fn objects(&mut self) -> Result<Vec<KernelObjectRange>, KernelSymbolError> {
+        fn objects(&mut self) -> Result<Vec<ProvisionalObject>, KernelSymbolError> {
             self.calls.push("objects".to_owned());
             Ok(self.objects.clone())
+        }
+
+        fn object_info(&mut self, name: &str) -> Result<ProvisionalObject, KernelSymbolError> {
+            self.calls.push(format!("object-info:{name}"));
+            self.resolutions.get(name).cloned().ok_or_else(|| {
+                KernelSymbolError::InvalidObject(format!("missing mock object {name:?}"))
+            })
         }
 
         fn lookup(&mut self, address: u64) -> Result<KernelSymbolRange, KernelSymbolError> {
