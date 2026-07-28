@@ -19,7 +19,6 @@
 //!   `carrick_host::host_proc::ThreadPort` (the mach port on Darwin).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
 use carrick_dsr::probes;
@@ -211,6 +210,70 @@ pub(crate) enum DirectBindingResetEvent {
     PrivateCursorReset,
 }
 
+#[derive(Debug)]
+struct DirectBindingExecProcessIdentity;
+
+#[derive(Debug)]
+struct DirectBindingExecThreadIdentity;
+
+/// Single-use authority to clear one retiring process translator for exec.
+///
+/// The fields are deliberately private: only the surviving thread's
+/// [`ThreadTranslator::prepare_direct_binding_exec_reset`] can mint this
+/// capability after clearing its local translated-resume state.
+#[doc(hidden)]
+pub struct DirectBindingExecResetToken {
+    process_identity: Arc<DirectBindingExecProcessIdentity>,
+    thread_identity: Arc<DirectBindingExecThreadIdentity>,
+    thread_epoch: u64,
+    consumed: bool,
+}
+
+impl DirectBindingExecResetToken {
+    pub(crate) fn validate_for(
+        &self,
+        process: &ProcessTranslator,
+        thread: &ThreadTranslator,
+    ) -> Result<(), types::DsrError> {
+        if self.consumed {
+            return Err(types::DsrError::CachePolicy(
+                "direct-binding exec reset token was already consumed".to_string(),
+            ));
+        }
+        if !Arc::ptr_eq(&self.process_identity, &process.exec_reset_identity)
+            || !Arc::ptr_eq(
+                &thread.process.exec_reset_identity,
+                &process.exec_reset_identity,
+            )
+        {
+            return Err(types::DsrError::CachePolicy(
+                "direct-binding exec reset token belongs to another process".to_string(),
+            ));
+        }
+        if !Arc::ptr_eq(&self.thread_identity, &thread.exec_reset_identity) {
+            return Err(types::DsrError::CachePolicy(
+                "direct-binding exec reset token belongs to another thread".to_string(),
+            ));
+        }
+        if self.thread_epoch != thread.exec_reset_epoch {
+            return Err(types::DsrError::CachePolicy(
+                "direct-binding exec reset token is stale".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn consume_for(
+        &mut self,
+        process: &ProcessTranslator,
+        thread: &ThreadTranslator,
+    ) -> Result<(), types::DsrError> {
+        self.validate_for(process, thread)?;
+        self.consumed = true;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum ThreadFault {
     Host { signal: i32, code: i32 },
@@ -272,6 +335,8 @@ pub struct ThreadTranslator {
     pub nested_translation_ns: u64,
     last_kick: Option<(carrick_guest_mem::GuestVa, Option<emit::RecoveryAction>)>,
     indirect_cache: gateway::IndirectTargetCache,
+    exec_reset_identity: Arc<DirectBindingExecThreadIdentity>,
+    exec_reset_epoch: u64,
 }
 
 pub struct ProcessTranslator {
@@ -279,7 +344,7 @@ pub struct ProcessTranslator {
     pub state: RwLock<ProcessState>,
     private_target_authority: Box<gateway::TargetCacheAuthority>,
     private_jit_epoch: Arc<crate::direct_binding::PrivateJitEpoch>,
-    exec_thread_caches_cleared: AtomicBool,
+    exec_reset_identity: Arc<DirectBindingExecProcessIdentity>,
 }
 
 impl Drop for ProcessTranslator {
@@ -686,6 +751,8 @@ impl ThreadTranslator {
             nested_translation_ns: 0,
             last_kick: None,
             indirect_cache: gateway::IndirectTargetCache::new(),
+            exec_reset_identity: Arc::new(DirectBindingExecThreadIdentity),
+            exec_reset_epoch: 0,
         }
     }
 
@@ -701,6 +768,7 @@ impl ThreadTranslator {
         );
         self.process.after_fork_child();
         self.resume_entry = None;
+        self.exec_reset_epoch = self.exec_reset_epoch.wrapping_add(1);
         self.stats = ResolverStats::default();
         self.budget.reset_after_fork_child(tid);
         if self.budget.enabled() {
@@ -778,12 +846,16 @@ impl ThreadTranslator {
     /// The runtime calls this after sibling retirement and before mapped
     /// memory starts retiring the old image. No translated execution may
     /// resume until `reset_for_exec` installs the replacement process.
-    pub fn prepare_direct_binding_exec_reset(&mut self) {
+    pub fn prepare_direct_binding_exec_reset(&mut self) -> DirectBindingExecResetToken {
         self.resume_entry = None;
         self.indirect_cache.clear();
-        self.process
-            .exec_thread_caches_cleared
-            .store(true, AtomicOrdering::Release);
+        self.exec_reset_epoch = self.exec_reset_epoch.wrapping_add(1);
+        DirectBindingExecResetToken {
+            process_identity: Arc::clone(&self.process.exec_reset_identity),
+            thread_identity: Arc::clone(&self.exec_reset_identity),
+            thread_epoch: self.exec_reset_epoch,
+            consumed: false,
+        }
     }
 
     pub fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) {
@@ -803,9 +875,7 @@ impl ThreadTranslator {
         }
         self.process = next;
         self.resume_entry = None;
-        self.process
-            .exec_thread_caches_cleared
-            .store(false, AtomicOrdering::Release);
+        self.exec_reset_epoch = self.exec_reset_epoch.wrapping_add(1);
         self.start_next_profile_epoch();
         self.last_kick = None;
         self.indirect_cache.clear();
@@ -1207,7 +1277,7 @@ impl ProcessTranslator {
                 std::ptr::null(),
             )),
             private_jit_epoch: crate::direct_binding::PrivateJitEpoch::process_owner(),
-            exec_thread_caches_cleared: AtomicBool::new(false),
+            exec_reset_identity: Arc::new(DirectBindingExecProcessIdentity),
             state: RwLock::new(ProcessState {
                 cache,
                 artifact_store: artifact_spike::store_if_enabled()?,
@@ -1371,44 +1441,43 @@ impl ProcessTranslator {
         state.cache.after_fork_child();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
-        self.exec_thread_caches_cleared
-            .store(false, AtomicOrdering::Release);
         let capacity = u64::try_from(state.cache.capacity_bytes()).unwrap_or(u64::MAX);
         drop(state);
         probes::dsr_cache_capacity(probes::DsrCacheRole::Child, capacity);
         direct_binding_stats
     }
 
-    pub fn reset_after_fork_for_exec(&self) -> crate::direct_binding::ExecBindingClearStats {
-        self.reset_after_fork_for_exec_inner(|_| {})
+    pub fn reset_after_fork_for_exec(
+        &self,
+        thread: &ThreadTranslator,
+        token: &mut DirectBindingExecResetToken,
+    ) -> Result<crate::direct_binding::ExecBindingClearStats, types::DsrError> {
+        self.reset_after_fork_for_exec_inner(thread, token, |_| {})
     }
 
     #[cfg(test)]
     pub(crate) fn reset_after_fork_for_exec_with_recorder(
         &self,
+        thread: &ThreadTranslator,
+        token: &mut DirectBindingExecResetToken,
         recorder: impl FnMut(DirectBindingResetEvent),
-    ) -> crate::direct_binding::ExecBindingClearStats {
-        self.reset_after_fork_for_exec_inner(recorder)
+    ) -> Result<crate::direct_binding::ExecBindingClearStats, types::DsrError> {
+        self.reset_after_fork_for_exec_inner(thread, token, recorder)
     }
 
     fn reset_after_fork_for_exec_inner(
         &self,
+        thread: &ThreadTranslator,
+        token: &mut DirectBindingExecResetToken,
         mut recorder: impl FnMut(DirectBindingResetEvent),
-    ) -> crate::direct_binding::ExecBindingClearStats {
+    ) -> Result<crate::direct_binding::ExecBindingClearStats, types::DsrError> {
+        token.consume_for(self, thread)?;
         let mut state = self.state.write();
-        let direct_bindings_enabled = state.direct_bindings.enabled();
-        let thread_caches_cleared = self
-            .exec_thread_caches_cleared
-            .load(AtomicOrdering::Acquire);
         let clear_stats = state
             .direct_bindings
             .clear_all_before_exec_with_recorder(|phase| match phase {
                 crate::direct_binding::DirectBindingExecClearPhase::Cells => {
                     recorder(DirectBindingResetEvent::CellsCleared);
-                    assert!(
-                        thread_caches_cleared || !direct_bindings_enabled,
-                        "direct-binding exec reset requires quiesced thread caches"
-                    );
                     recorder(DirectBindingResetEvent::ThreadCachesCleared);
                 }
                 crate::direct_binding::DirectBindingExecClearPhase::Indexes => {
@@ -1441,7 +1510,7 @@ impl ProcessTranslator {
         state.shared_publish_attempted = false;
         state.cache.reset_after_fork_for_exec();
         recorder(DirectBindingResetEvent::PrivateCursorReset);
-        clear_stats
+        Ok(clear_stats)
     }
 
     #[cfg(test)]
@@ -3940,7 +4009,9 @@ mod tests {
             DirectBindingResetEvent::PrivateCursorReset,
         ];
 
-        fn prepare_thread(process: &Arc<super::super::ProcessTranslator>) -> ThreadTranslator {
+        fn prepare_thread(
+            process: &Arc<super::super::ProcessTranslator>,
+        ) -> (ThreadTranslator, super::super::DirectBindingExecResetToken) {
             let guest = GuestVa(0x60_0000);
             let entry = CacheVa::published(HostVa(process.cache_host_range().start as usize));
             let mut thread = ThreadTranslator::for_process(Arc::clone(process), 42);
@@ -3961,7 +4032,7 @@ mod tests {
             };
             assert!(words_before.iter().any(|word| *word != 0));
 
-            thread.prepare_direct_binding_exec_reset();
+            let token = thread.prepare_direct_binding_exec_reset();
 
             assert!(thread.resume_entry.is_none());
             // SAFETY: as above; preparation completed synchronously while
@@ -3973,17 +4044,21 @@ mod tests {
                 )
             };
             assert!(words_after.iter().all(|word| *word == 0));
-            thread
+            (thread, token)
         }
 
         #[test]
-        fn exec_clears_cells_before_descriptors_units_and_private_cursor() {
+        fn valid_exec_reset_token_yields_exact_six_stage_order() {
             let (fixture, process, _, _) = one_published_binding(23);
             let process = Arc::new(process);
-            let _thread = prepare_thread(&process);
+            let (thread, mut token) = prepare_thread(&process);
             let mut events = Vec::new();
 
-            process.reset_after_fork_for_exec_with_recorder(|event| events.push(event));
+            process
+                .reset_after_fork_for_exec_with_recorder(&thread, &mut token, |event| {
+                    events.push(event);
+                })
+                .expect("valid exec reset authority");
 
             assert_eq!(events, EXPECTED_ORDER);
             assert!(
@@ -3998,20 +4073,104 @@ mod tests {
         fn private_cursor_reuse_requires_the_last_descriptor_epoch_lease_to_drop() {
             let (_fixture, process, _, _) = one_published_binding(24);
             let process = Arc::new(process);
-            let mut thread = prepare_thread(&process);
+            let (mut thread, mut token) = prepare_thread(&process);
             assert_eq!(process.private_epoch_leases_for_test(), 1);
             let mut first = Vec::new();
 
-            process.reset_after_fork_for_exec_with_recorder(|event| first.push(event));
+            process
+                .reset_after_fork_for_exec_with_recorder(&thread, &mut token, |event| {
+                    first.push(event);
+                })
+                .expect("first authorized reset");
 
             assert_eq!(process.private_epoch_leases_for_test(), 0);
             assert_eq!(first, EXPECTED_ORDER);
+            let mut second_token = thread.prepare_direct_binding_exec_reset();
             let mut second = Vec::new();
-            process.reset_after_fork_for_exec_with_recorder(|event| second.push(event));
+            process
+                .reset_after_fork_for_exec_with_recorder(&thread, &mut second_token, |event| {
+                    second.push(event)
+                })
+                .expect("fresh authority keeps successful reset idempotent");
             assert_eq!(second, EXPECTED_ORDER, "exec reset must be idempotent");
             assert_eq!(process.private_epoch_leases_for_test(), 0);
             thread.reset_for_exec(Arc::clone(&process));
             assert!(thread.resume_entry.is_none());
+        }
+
+        #[test]
+        fn foreign_process_exec_reset_authority_is_rejected() {
+            let (_authority_fixture, authority_process, _, _) = one_published_binding(25);
+            let authority_process = Arc::new(authority_process);
+            let (_authority_thread, mut token) = prepare_thread(&authority_process);
+            let (victim_fixture, victim_process, _, _) = one_published_binding(26);
+            let victim_process = Arc::new(victim_process);
+            let victim_thread = ThreadTranslator::for_process(Arc::clone(&victim_process), 43);
+
+            let outcome = victim_process.reset_after_fork_for_exec(&victim_thread, &mut token);
+
+            assert!(outcome.is_err(), "foreign process token must fail");
+            assert!(
+                !victim_fixture.storage[0]
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .is_null(),
+                "failed validation must precede every published-cell mutation"
+            );
+        }
+
+        #[test]
+        fn exec_reset_authority_from_another_thread_is_rejected() {
+            let (fixture, process, _, _) = one_published_binding(27);
+            let process = Arc::new(process);
+            let (_other_thread, mut token) = prepare_thread(&process);
+            let surviving_thread = ThreadTranslator::for_process(Arc::clone(&process), 43);
+            assert!(surviving_thread.resume_entry.is_none());
+
+            let outcome = process.reset_after_fork_for_exec(&surviving_thread, &mut token);
+
+            assert!(
+                outcome.is_err(),
+                "a different surviving thread must not inherit reset authority"
+            );
+            assert!(
+                !fixture.storage[0]
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .is_null(),
+                "foreign-thread rejection must leave published cells intact"
+            );
+        }
+
+        #[test]
+        fn reused_exec_reset_authority_is_rejected() {
+            let (_fixture, process, _, _) = one_published_binding(28);
+            let process = Arc::new(process);
+            let (thread, mut token) = prepare_thread(&process);
+
+            process
+                .reset_after_fork_for_exec(&thread, &mut token)
+                .expect("first token consumption");
+            let second = process.reset_after_fork_for_exec(&thread, &mut token);
+
+            assert!(second.is_err(), "exec reset authority must be single-use");
+        }
+
+        #[test]
+        fn failed_exec_reset_validation_leaves_published_cell_intact() {
+            let (fixture, process, _, _) = one_published_binding(29);
+            let process = Arc::new(process);
+            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 42);
+            let mut stale = thread.prepare_direct_binding_exec_reset();
+            let _current = thread.prepare_direct_binding_exec_reset();
+
+            let outcome = process.reset_after_fork_for_exec(&thread, &mut stale);
+
+            assert!(outcome.is_err(), "stale reset authority must fail");
+            assert!(
+                !fixture.storage[0]
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .is_null(),
+                "validation must complete before the first cell clear"
+            );
         }
     }
 

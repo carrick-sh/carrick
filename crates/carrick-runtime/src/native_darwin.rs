@@ -2873,13 +2873,14 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         // memory retires sidecar cells and their authorities.
                         // No guest execution resumes until `reset_for_exec`
                         // installs the replacement process below.
-                        translator.prepare_direct_binding_exec_reset();
+                        let mut exec_reset_token = translator.prepare_direct_binding_exec_reset();
                         memory
                             .replace_image(
                                 &image,
                                 &relative_relocations,
                                 plan.page_geometry,
-                                Some(thread_runtime.tid().raw()),
+                                &translator,
+                                &mut exec_reset_token,
                                 prepared_mapping,
                             )
                             .map_err(|error| {
@@ -6281,6 +6282,17 @@ mod tests {
         assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
+    fn prepare_exec_reset_authority(
+        memory: &NativeMappedMemory,
+    ) -> (dsr::ThreadTranslator, dsr::DirectBindingExecResetToken) {
+        let process = memory
+            .dsr_process_translator()
+            .expect("retiring process translator");
+        let mut thread = dsr::ThreadTranslator::for_process(process, 42);
+        let token = thread.prepare_direct_binding_exec_reset();
+        (thread, token)
+    }
+
     #[test]
     fn profile_off_blocked_measurement_is_pass_through() {
         // The PROFILE=false monomorph must stay the specialized no-timer path:
@@ -7929,9 +7941,17 @@ mod tests {
                 .expect("preselect replacement layout");
             let prepared_mode = prepared.native_layout.address_mode();
             let prepared_process = Arc::clone(&prepared.process_translator);
+            let (exec_thread, mut reset_token) = prepare_exec_reset_authority(&memory);
 
             memory
-                .replace_image(&target_image, &[], plan.page_geometry, None, prepared)
+                .replace_image(
+                    &target_image,
+                    &[],
+                    plan.page_geometry,
+                    &exec_thread,
+                    &mut reset_token,
+                    prepared,
+                )
                 .expect("replace lifecycle image");
 
             let expected_target_biased = matches!(target, LifecycleImageKind::LowExec);
@@ -8038,9 +8058,17 @@ mod tests {
                 .read()
                 .prepare_exec_mapping(&target_image, plan.page_geometry)
                 .expect("preselect replacement layout");
+            let (exec_thread, mut reset_token) = prepare_exec_reset_authority(&shared.read());
 
             shared
-                .replace_image(&target_image, &[], plan.page_geometry, None, prepared)
+                .replace_image(
+                    &target_image,
+                    &[],
+                    plan.page_geometry,
+                    &exec_thread,
+                    &mut reset_token,
+                    prepared,
+                )
                 .expect("replace lifecycle image");
 
             // The execve-updated fields must be visible through the
@@ -8233,8 +8261,16 @@ mod tests {
                 if !reused {
                     unsafe { libc::_exit(2) };
                 }
+                let (exec_thread, mut reset_token) = prepare_exec_reset_authority(&memory);
                 if memory
-                    .replace_image(&target, &[], plan.page_geometry, None, prepared)
+                    .replace_image(
+                        &target,
+                        &[],
+                        plan.page_geometry,
+                        &exec_thread,
+                        &mut reset_token,
+                        prepared,
+                    )
                     .is_err()
                 {
                     unsafe { libc::_exit(3) };
@@ -12988,12 +13024,14 @@ mod tests {
                 .clone();
             assert!(take_native_test_supplemental_rollbacks().is_empty());
             NATIVE_TEST_FAIL_EXEC_AFTER_SETUP.with(|failpoint| failpoint.set(true));
+            let (exec_thread, mut reset_token) = prepare_exec_reset_authority(&memory);
             let error = memory
                 .replace_image(
                     &target,
                     &[],
                     plan.page_geometry,
-                    Some(crate::thread::ThreadId::main_from_host_pid().raw()),
+                    &exec_thread,
+                    &mut reset_token,
                     prepared,
                 )
                 .expect_err("Direct replacement late failpoint must fail");
@@ -13047,11 +13085,13 @@ mod tests {
             let owned = prepared.native_layout.owned_ranges().to_vec();
             assert!(take_native_test_supplemental_rollbacks().is_empty());
             NATIVE_TEST_FAIL_EXEC_AFTER_SETUP.with(|failpoint| failpoint.set(true));
+            let (exec_thread, mut reset_token) = prepare_exec_reset_authority(&memory);
             let error = match memory.replace_image(
                 &target,
                 &[],
                 plan.page_geometry,
-                Some(crate::thread::ThreadId::main_from_host_pid().raw()),
+                &exec_thread,
+                &mut reset_token,
                 prepared,
             ) {
                 Ok(()) => panic!("biased replacement late failpoint must fail"),
