@@ -175,6 +175,12 @@ dsr_ordinal_enum! {
         Invalidate = 4,
         BlockPublish = 5,
         CapacityFailure = 6,
+        DirectBindingEligible = 7,
+        DirectBindingPublish = 8,
+        DirectBindingCasLoss = 9,
+        DirectBindingClear = 10,
+        DirectBindingValidationFailure = 11,
+        DirectBindingUnitLoaded = 12,
     }
 }
 
@@ -646,6 +652,12 @@ mod tests {
         for (index, kind) in DsrCacheEventKind::ALL.iter().enumerate() {
             assert_eq!(kind.raw() as usize, index + 1);
         }
+        assert_eq!(DsrCacheEventKind::DirectBindingEligible.raw(), 7);
+        assert_eq!(DsrCacheEventKind::DirectBindingPublish.raw(), 8);
+        assert_eq!(DsrCacheEventKind::DirectBindingCasLoss.raw(), 9);
+        assert_eq!(DsrCacheEventKind::DirectBindingClear.raw(), 10);
+        assert_eq!(DsrCacheEventKind::DirectBindingValidationFailure.raw(), 11);
+        assert_eq!(DsrCacheEventKind::DirectBindingUnitLoaded.raw(), 12);
         for (index, subphase) in DsrTranslationSubphase::ALL.iter().enumerate() {
             assert_eq!(subphase.raw() as usize, index + 1);
         }

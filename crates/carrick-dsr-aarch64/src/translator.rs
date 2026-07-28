@@ -1445,7 +1445,17 @@ impl ProcessTranslator {
 
     pub fn after_fork_child(&self) -> crate::direct_binding::ForkBindingClearStats {
         let mut state = self.state.write();
-        let direct_binding_stats = state.direct_bindings.clear_inherited_after_fork();
+        let direct_binding_stats = state
+            .direct_bindings
+            .clear_inherited_after_fork_with_recorder(|cell| {
+                probes::dsr_cache_event(
+                    0,
+                    probes::DsrCacheEventKind::DirectBindingClear,
+                    cell.get() as u64,
+                    crate::direct_binding::DirectBindingClearReason::ForkReset.raw(),
+                    0,
+                );
+            });
         state.cache.after_fork_child();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
@@ -1481,9 +1491,8 @@ impl ProcessTranslator {
     ) -> Result<crate::direct_binding::ExecBindingClearStats, types::DsrError> {
         token.consume_for(self, thread)?;
         let mut state = self.state.write();
-        let clear_stats = state
-            .direct_bindings
-            .clear_all_before_exec_with_recorder(|phase| match phase {
+        let clear_stats = state.direct_bindings.clear_all_before_exec_with_evidence(
+            |phase| match phase {
                 crate::direct_binding::DirectBindingExecClearPhase::Cells => {
                     recorder(DirectBindingResetEvent::CellsCleared);
                     recorder(DirectBindingResetEvent::ThreadCachesCleared);
@@ -1499,7 +1508,17 @@ impl ProcessTranslator {
                         "private JIT cursor cannot reset while a descriptor epoch lease survives"
                     );
                 }
-            });
+            },
+            |cell| {
+                probes::dsr_cache_event(
+                    thread.tid,
+                    probes::DsrCacheEventKind::DirectBindingClear,
+                    cell.get() as u64,
+                    crate::direct_binding::DirectBindingClearReason::ExecReset.raw(),
+                    0,
+                );
+            },
+        );
         state.executable_ranges.reset_head_to_private();
         recorder(DirectBindingResetEvent::ExecutableRangeHeadReset);
         state.shared_blocks.clear();
@@ -1534,6 +1553,7 @@ impl ProcessTranslator {
 impl ProcessState {
     fn try_load_shared_unit(
         &mut self,
+        tid: i32,
         memory: &NativeMappedMemory,
         guest: carrick_guest_mem::GuestVa,
         generation: types::CodeGeneration,
@@ -1635,6 +1655,11 @@ impl ProcessState {
         let target_authority_pointer = target_authority.as_ref() as *const _;
         let loaded_unit_index = self.loaded_shared_units.len();
         let direct_binding_unit_index = self.direct_bindings.register_loaded_unit(&unit)?;
+        let direct_binding_unit_digest =
+            crate::direct_binding::direct_binding_unit_digest(&unit.manifest.key)?;
+        let direct_binding_record_count =
+            u64::try_from(unit.manifest.bindings.len()).unwrap_or(u64::MAX);
+        let direct_binding_data_bytes = unit.manifest.binding_data_len;
         let host_bias = unit.manifest.key.host_bias();
         for (block, observation) in unit.manifest.blocks.iter_mut().zip(observations) {
             let address = cache_start
@@ -1697,6 +1722,13 @@ impl ProcessState {
             _direct_binding_unit_index: direct_binding_unit_index,
         });
         self.executable_ranges.prepend(cache_start, cache_end)?;
+        probes::dsr_cache_event(
+            tid,
+            probes::DsrCacheEventKind::DirectBindingUnitLoaded,
+            direct_binding_unit_digest,
+            direct_binding_record_count,
+            direct_binding_data_bytes,
+        );
         let result = self.blocks.get(&(guest, generation)).copied();
         if result.is_some() {
             self.stats.shared_unit_hits = self.stats.shared_unit_hits.saturating_add(1);
@@ -1825,7 +1857,16 @@ impl ProcessState {
                 .add_usize(ResolverStat::InvalidatedBlocks, stale_blocks.len());
         }
         for stale in stale_blocks {
-            let _ = self.direct_bindings.invalidate_target(stale.0, stale.1);
+            self.direct_bindings
+                .invalidate_target_with_recorder(stale.0, stale.1, |cell| {
+                    probes::dsr_cache_event(
+                        tid,
+                        probes::DsrCacheEventKind::DirectBindingClear,
+                        cell.get() as u64,
+                        crate::direct_binding::DirectBindingClearReason::TargetInvalidation.raw(),
+                        stale.1.get(),
+                    );
+                });
             self.blocks.remove(&stale);
             self.shared_blocks.remove(&stale);
             probes::dsr_cache_event(
@@ -1859,7 +1900,7 @@ impl ProcessState {
                 cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
             });
         }
-        if let Some(entry) = self.try_load_shared_unit(memory, guest, generation)? {
+        if let Some(entry) = self.try_load_shared_unit(tid, memory, guest, generation)? {
             return Ok(TranslationResult {
                 entry,
                 generation,
@@ -2978,6 +3019,32 @@ impl ThreadTranslator {
                     source.raw(),
                     target.raw(),
                 );
+                let binding_eligibility = self
+                    .process
+                    .state
+                    .write()
+                    .direct_bindings
+                    .classify_cold_exit(source, target, binding);
+                match &binding_eligibility {
+                    Ok(eligibility) => {
+                        probes::dsr_cache_event(
+                            self.tid,
+                            probes::DsrCacheEventKind::DirectBindingEligible,
+                            source.raw(),
+                            u64::from(eligibility.ordinal.get()),
+                            eligibility.cell.map_or(0, |cell| cell.get() as u64),
+                        );
+                    }
+                    Err(reason) => {
+                        probes::dsr_cache_event(
+                            self.tid,
+                            probes::DsrCacheEventKind::DirectBindingValidationFailure,
+                            source.raw(),
+                            reason.raw(),
+                            binding.map_or(0, |miss| miss.cell.get() as u64),
+                        );
+                    }
+                }
                 let translated = match self.translate::<PROFILE>(memory, target) {
                     Ok(translated) => translated,
                     Err(error) => {
@@ -2999,18 +3066,78 @@ impl ThreadTranslator {
                     translated.entry,
                     authority,
                 );
-                let direct_bindings_enabled = self.process.state.read().direct_bindings.enabled();
-                if let Some(binding) = binding
-                    && direct_bindings_enabled
-                    && let Ok(descriptor) =
-                        self.direct_binding_target(target, translated.generation, translated.entry)
+                if let Ok(eligibility) = binding_eligibility
+                    && let Some(cell) = eligibility.cell
                 {
-                    let _ = self
-                        .process
-                        .state
-                        .write()
-                        .direct_bindings
-                        .publish(binding, source, target, descriptor);
+                    let binding = crate::direct_binding::DirectBindingMiss {
+                        cell,
+                        ordinal: eligibility.ordinal,
+                    };
+                    match self.direct_binding_target(
+                        target,
+                        translated.generation,
+                        translated.entry,
+                    ) {
+                        Ok(descriptor) => {
+                            let evidence = self
+                                .process
+                                .state
+                                .write()
+                                .direct_bindings
+                                .publish_with_evidence(binding, source, target, descriptor);
+                            for _ in 0..evidence.cas_losses {
+                                probes::dsr_cache_event(
+                                    self.tid,
+                                    probes::DsrCacheEventKind::DirectBindingCasLoss,
+                                    source.raw(),
+                                    u64::from(eligibility.ordinal.get()),
+                                    cell.get() as u64,
+                                );
+                            }
+                            if let Some(generation) = evidence.stale_clear_generation {
+                                probes::dsr_cache_event(
+                                    self.tid,
+                                    probes::DsrCacheEventKind::DirectBindingClear,
+                                    cell.get() as u64,
+                                    crate::direct_binding::DirectBindingClearReason::StaleWinnerRemoval
+                                        .raw(),
+                                    generation.get(),
+                                );
+                            }
+                            if matches!(
+                                evidence.outcome,
+                                crate::direct_binding::DirectBindingPublishOutcome::Published
+                                    | crate::direct_binding::DirectBindingPublishOutcome::PublishedAfterStale
+                            ) {
+                                probes::dsr_cache_event(
+                                    self.tid,
+                                    probes::DsrCacheEventKind::DirectBindingPublish,
+                                    source.raw(),
+                                    u64::from(eligibility.ordinal.get()),
+                                    cell.get() as u64,
+                                );
+                            }
+                            if let Some(reason) = evidence.validation_failure {
+                                probes::dsr_cache_event(
+                                    self.tid,
+                                    probes::DsrCacheEventKind::DirectBindingValidationFailure,
+                                    source.raw(),
+                                    reason.raw(),
+                                    cell.get() as u64,
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            probes::dsr_cache_event(
+                                self.tid,
+                                probes::DsrCacheEventKind::DirectBindingValidationFailure,
+                                source.raw(),
+                                crate::direct_binding::DirectBindingValidationReason::AuthorityMismatch
+                                    .raw(),
+                                cell.get() as u64,
+                            );
+                        }
+                    }
                 }
                 probes::dsr_cache_event(
                     self.tid,
@@ -3355,9 +3482,10 @@ mod tests {
     mod direct_binding_owner_and_publication {
         use super::{ProcessTranslator, TEST_HOST_JIT};
         use crate::direct_binding::{
-            DirectBindingCellRef, DirectBindingCellVa, DirectBindingMiss, DirectBindingOrdinal,
-            DirectBindingPublishOutcome, DirectBindingRegistry, DirectBindingTarget,
-            DirectBindingTargetPrefix, PrivateJitEpoch,
+            DirectBindingCellRef, DirectBindingCellVa, DirectBindingEligibility, DirectBindingMiss,
+            DirectBindingOrdinal, DirectBindingPublishOutcome, DirectBindingRegistry,
+            DirectBindingTarget, DirectBindingTargetPrefix, DirectBindingValidationReason,
+            PrivateJitEpoch,
         };
         use crate::emit::DirectLinkKind;
         use crate::shared_cache::{
@@ -3441,6 +3569,31 @@ mod tests {
                 Arc::new(()),
             );
             UnitFixture { storage, unit }
+        }
+
+        fn disabled_unit(
+            unit_key: TranslationUnitKey,
+            records: Vec<UnresolvedDirectBindingRecord>,
+        ) -> SharedLoadedTranslationUnit {
+            SharedLoadedTranslationUnit::new_with_binding_base(
+                TranslationUnitManifest {
+                    schema: TRANSLATION_UNIT_SCHEMA_V2,
+                    key: unit_key,
+                    dylib_sha256: [0x66; 32],
+                    base_export: "test_code".to_string(),
+                    code_len: 0x1000,
+                    blocks: Vec::new(),
+                    binding_layout: DirectBindingLayout::Disabled,
+                    binding_export: String::new(),
+                    binding_data_len: 0,
+                    cell_size: 0,
+                    bindings: records,
+                    binding_relocations: Vec::new(),
+                },
+                0x20_0000,
+                None,
+                Arc::new(()),
+            )
         }
 
         pub(super) fn process_with_direct_bindings() -> ProcessTranslator {
@@ -3556,6 +3709,121 @@ mod tests {
 
             assert_eq!(owner.unit, first.unit.manifest.key);
             assert_ne!(owner.unit, second.unit.manifest.key);
+        }
+
+        #[test]
+        fn active_source_after_cross_unit_hit_selects_exit_time_authority() {
+            let a_source = GuestVa(0x40_1000);
+            let b_source = GuestVa(0x40_2000);
+            let target = GuestVa(0x50_1000);
+            let first = sidecar_unit(key(20), vec![record(a_source, b_source, 0)]);
+            let second = sidecar_unit(key(21), vec![record(b_source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&first.unit)
+                .expect("register A");
+            state
+                .direct_bindings
+                .register_loaded_unit(&second.unit)
+                .expect("register B");
+
+            let selected = state
+                .direct_bindings
+                .classify_cold_exit(
+                    b_source,
+                    target,
+                    Some(DirectBindingMiss {
+                        cell: second.unit.binding_base.expect("B cell"),
+                        ordinal: DirectBindingOrdinal::claimed(0),
+                    }),
+                )
+                .expect("B is the exact exit-time source");
+
+            assert_eq!(
+                selected,
+                DirectBindingEligibility {
+                    unit: second.unit.manifest.key.clone(),
+                    ordinal: DirectBindingOrdinal::claimed(0),
+                    cell: second.unit.binding_base,
+                }
+            );
+        }
+
+        #[test]
+        fn duplicate_source_target_never_guesses_active_source() {
+            let source = GuestVa(0x40_3000);
+            let target = GuestVa(0x50_3000);
+            let first = disabled_unit(key(22), vec![record(source, target, 0)]);
+            let second = disabled_unit(key(23), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&first)
+                .expect("register first disabled manifest");
+            state
+                .direct_bindings
+                .register_loaded_unit(&second)
+                .expect("register second disabled manifest");
+
+            assert_eq!(
+                state
+                    .direct_bindings
+                    .classify_cold_exit(source, target, None),
+                Err(DirectBindingValidationReason::AmbiguousEligibleRecord),
+            );
+        }
+
+        #[test]
+        fn disabled_unit_retains_manifest_ordinal_with_zero_cell() {
+            let source = GuestVa(0x40_4000);
+            let target = GuestVa(0x50_4000);
+            let unit = disabled_unit(key(24), vec![record(source, target, 7)]);
+            let process = process_with_direct_bindings();
+            let mut state = process.state.write();
+            assert_eq!(
+                state
+                    .direct_bindings
+                    .register_loaded_unit(&unit)
+                    .expect("retain disabled manifest"),
+                None,
+            );
+
+            let selected = state
+                .direct_bindings
+                .classify_cold_exit(source, target, None)
+                .expect("disabled eligibility remains authoritative");
+            assert_eq!(selected.ordinal, DirectBindingOrdinal::claimed(7));
+            assert_eq!(selected.cell, None);
+        }
+
+        #[test]
+        fn missing_or_mismatched_cold_authority_fails_before_publication() {
+            let source = GuestVa(0x40_5000);
+            let target = GuestVa(0x50_5000);
+            let fixture = sidecar_unit(key(25), vec![record(source, target, 0)]);
+            let process = process_with_direct_bindings();
+            let mut state = process.state.write();
+            state
+                .direct_bindings
+                .register_loaded_unit(&fixture.unit)
+                .expect("register sidecar");
+
+            assert_eq!(
+                state
+                    .direct_bindings
+                    .classify_cold_exit(GuestVa(0x40_5004), target, None),
+                Err(DirectBindingValidationReason::MissingEligibleRecord),
+            );
+            assert_eq!(
+                state
+                    .direct_bindings
+                    .classify_cold_exit(source, target, None),
+                Err(DirectBindingValidationReason::MissMetadataMismatch),
+            );
+            assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
         }
 
         #[test]

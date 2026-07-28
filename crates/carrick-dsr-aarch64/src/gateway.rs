@@ -471,6 +471,11 @@ impl DsrContext {
 }
 
 fn decode_direct_exit(context: &DsrContext) -> NativeDsrExit {
+    // `exit_source` is written by the stub that actually returned to Rust.
+    // It is therefore exit-time evidence after any preceding cache/direct
+    // hit, unlike the `PreparedEntry` that began this translated run. The
+    // cold registry classifier combines this exact `(source,target)` with the
+    // miss cell/ordinal below and rejects ambiguous loaded-manifest matches.
     let binding = if context.direct_binding_present == 1 {
         usize::try_from(context.direct_binding_cell)
             .ok()
