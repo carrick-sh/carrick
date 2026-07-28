@@ -123,6 +123,8 @@ pub mod deadlock_watchdog;
 pub mod dispatch;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub mod dtrace_consumer;
+#[cfg(target_os = "macos")]
+pub mod dtrace_symbols;
 pub mod event_mux;
 pub mod event_ring;
 pub(crate) mod eventfd_shm;

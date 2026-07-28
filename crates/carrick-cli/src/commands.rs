@@ -116,8 +116,15 @@ use crate::runtime_util::{
 use crate::trace_cli::{
     TraceSudoInvocation, current_supplementary_groups, trace_drop_credentials, trace_sudo_argv,
 };
+#[cfg(target_os = "macos")]
+use crate::trace_profile::kernel_stack_addresses_from_path;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::trace_profile::{ProfileSummary, capture_provenance, write_summary_atomic};
+
+#[cfg(target_os = "macos")]
+fn uses_live_kernel_symbols(profile: crate::trace_profile::TraceProfileKind) -> bool {
+    profile == crate::trace_profile::TraceProfileKind::NativeWall
+}
 
 pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let Cli { store, command } = cli;
@@ -1158,14 +1165,45 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     drop_credentials: drop_credentials.clone(),
                     print_remaining_aggregates: profile.is_none(),
                 };
+                #[cfg(target_os = "macos")]
+                let (report, kernel_symbol_snapshot) =
+                    if profile.is_some_and(uses_live_kernel_symbols) {
+                        let raw_path = output_path
+                            .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
+                        let (report, snapshot) =
+                            carrick_runtime::dtrace_consumer::run_child_under_dtrace_with_post_stop(
+                                &me,
+                                &command,
+                                &opts,
+                                |mut symbolizer| -> anyhow::Result<_> {
+                                    let addresses = kernel_stack_addresses_from_path(raw_path)?;
+                                    symbolizer.snapshot(addresses).map_err(anyhow::Error::from)
+                                },
+                            )
+                            .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?;
+                        (report, Some(snapshot))
+                    } else {
+                        (
+                            carrick_runtime::dtrace_consumer::run_child_under_dtrace(
+                                &me, &command, &opts,
+                            )
+                            .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?,
+                            None,
+                        )
+                    };
+                #[cfg(target_os = "freebsd")]
                 let report =
                     carrick_runtime::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
-                        .map_err(|e| anyhow::anyhow!("trace failed: {}", e))?;
+                        .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?;
                 if let Some(requested_profile) = profile {
                     let raw_path = output_path
                         .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
                     let mut summary = ProfileSummary::from_path(raw_path, report.into())?;
                     summary.require_profile(requested_profile)?;
+                    #[cfg(target_os = "macos")]
+                    if let Some(snapshot) = kernel_symbol_snapshot {
+                        summary.attach_kernel_symbol_snapshot(snapshot)?;
+                    }
                     summary.set_provenance(capture_provenance(&me, &command)?);
                     eprintln!("{}", summary.render_human());
                     if let Some(summary_path) = summary_jsonl.as_deref() {
@@ -2120,6 +2158,21 @@ fn kaniko_run_argv(
 #[cfg(test)]
 mod build_tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::trace_profile::TraceProfileKind;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_native_wall_uses_the_live_kernel_symbol_callback() {
+        assert!(uses_live_kernel_symbols(TraceProfileKind::NativeWall));
+        for profile in [
+            TraceProfileKind::Dsr,
+            TraceProfileKind::DsrIndirect,
+            TraceProfileKind::DsrFork,
+        ] {
+            assert!(!uses_live_kernel_symbols(profile));
+        }
+    }
 
     #[test]
     fn parse_network_mode_accepts_custom_bridge_name() {
