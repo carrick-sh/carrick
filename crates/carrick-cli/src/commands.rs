@@ -1175,7 +1175,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 &me,
                                 &command,
                                 &opts,
-                                |mut symbolizer| -> anyhow::Result<_> {
+                                |symbolizer| -> anyhow::Result<_> {
                                     let addresses = kernel_stack_addresses_from_path(raw_path)?;
                                     symbolizer.snapshot(addresses).map_err(anyhow::Error::from)
                                 },

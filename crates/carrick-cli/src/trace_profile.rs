@@ -377,6 +377,11 @@ where
                 }
             } else if line.starts_with("NWSTACK1|begin") {
                 bail!("nested native-wall stack at line {}", index + 1);
+            } else if line.starts_with("NWSTACK1|") {
+                bail!(
+                    "unrecognized native-wall stack marker at line {}",
+                    index + 1
+                );
             } else if line.starts_with("DSRPROF1|") || line.starts_with("NWIMAGES1|") {
                 bail!(
                     "profile record interrupted native-wall stack at line {}",
@@ -394,6 +399,11 @@ where
             );
         } else if line == "NWSTACK1|end" {
             bail!("native-wall stack end without begin at line {}", index + 1);
+        } else if line.starts_with("NWSTACK1|") {
+            bail!(
+                "unrecognized native-wall stack marker at line {}",
+                index + 1
+            );
         }
     }
     if open_stack.is_some() {
@@ -1344,6 +1354,30 @@ mod tests {
             vec!["NWSTACK1|end"],
             vec![
                 "NWSTACK1|begin|state=voluntary|pid=1|value_ns=1",
+                "0x1018",
+                "NWSTACK1|end",
+            ],
+        ] {
+            assert!(kernel_stack_addresses_from_lines(lines).is_err());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_wall_raw_address_extraction_rejects_unknown_stack_markers() {
+        for lines in [
+            vec![
+                "NWSTACK1|unknown",
+                "NWSTACK1|begin|state=kernel-oncpu|value=1",
+                "0x1018",
+                "NWSTACK1|end",
+            ],
+            vec![
+                "NWSTACK1|begin|state=voluntary|pid=1|value_ns=1",
+                "NWSTACK1|unknown",
+                "0x1018",
+                "NWSTACK1|end",
+                "NWSTACK1|begin|state=kernel-oncpu|value=1",
                 "0x1018",
                 "NWSTACK1|end",
             ],
