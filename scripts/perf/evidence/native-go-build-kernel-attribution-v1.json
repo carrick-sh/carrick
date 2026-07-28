@@ -1,0 +1,129 @@
+{
+  "schema": "carrick.native-go-build-kernel-attribution.v1",
+  "recorded_at": "2026-07-28T16:18:46Z",
+  "measurement_state": "MEASUREMENT_REPAIR_REQUIRED",
+  "selection_document": null,
+  "selection": {
+    "result": "rejected",
+    "reason": "capture-a-rejected-before-pair-analysis",
+    "selected_family": null,
+    "diffuse_reasons": [],
+    "counts_and_fractions": null,
+    "analysis_emitted": false,
+    "evidence_errors": [
+      "trace command failed with status 1",
+      "trace command did not emit exactly one BUILD_OK"
+    ]
+  },
+  "source": {
+    "git_commit": "7ec846a5f8ed5ad3fc549e3f54363c69cceb01e8",
+    "git_dirty": false,
+    "preserved_evidence": {
+      "scripts/perf/evidence/native-go-build-wall-baseline-v1.json": "9c9e25f8c7e4f40feb8a86293a2dbd71e3406db3a22a6aeaa9b0dfff23958e13",
+      "scripts/perf/evidence/native-go-build-wall-attribution-v1.json": "fdb73ea7880fb2cf957bcbbc9c122ad57d739377eecf0e8e90da0bccb0ad67d8"
+    }
+  },
+  "capture": {
+    "artifact_root": "target/perf/native-kernel-capture-7ec846a5-v1",
+    "base_run_id": "native-kernel-capture-7ec846a5-v1",
+    "image_ref": "localhost:5005/carrick-go-conformance:1.24",
+    "timeout_seconds": 180,
+    "command_status": 1,
+    "runner_error": "native kernel capture rejected: trace command failed with status 1"
+  },
+  "binary": {
+    "path": "target/release/carrick",
+    "sha256": "385e63d05ddf5ccfc55c9264a90f1f23302312c02647ccc23aa84e0844671fc0",
+    "size": 23336272,
+    "codesign_verified": true,
+    "dof_present": true,
+    "dof_segment": "__TEXT",
+    "dof_section": "__dof_carrick",
+    "dof_listing_sha256": "49788cb5195034d9f1354f8a8e0ec86341d75f4bd9e1e06fcc82d6fb8250dfca",
+    "bundled_native_wall_marker_present": true,
+    "exec_backend": "native"
+  },
+  "image": {
+    "architecture": "arm64",
+    "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+    "repo_digests": [
+      "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+    ]
+  },
+  "receipts": {
+    "a": {
+      "state": "rejected",
+      "schema": "carrick.native-kernel-capture.v2",
+      "path": "target/perf/native-kernel-capture-7ec846a5-v1/a.receipt.json",
+      "sha256": "b8b17f409241a2f902ce6559e8de85d82fcdb550559ab5f5e162f652e88881f0",
+      "capture_root": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/perf/native-kernel-capture-7ec846a5-v1",
+      "host_run_id": "native-kernel-capture-7ec846a5-v1-a-host",
+      "guest_run_id": "native-kernel-capture-7ec846a5-v1-a-guest",
+      "command": {
+        "status": 1,
+        "timed_out": false,
+        "launch_error": null,
+        "build_ok_count": 0
+      },
+      "cleanup": {
+        "status": 0,
+        "launch_error": null
+      },
+      "monitor": {
+        "started": true,
+        "stopped": true,
+        "contaminated": false,
+        "poll_error": null,
+        "sample_count": 12,
+        "foreign_workload_count": 0,
+        "docker_oracle_count": 0
+      },
+      "pre_post_provenance_equal": true,
+      "artifacts": {
+        "command_stdout": {
+          "size": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "command_stderr": {
+          "size": 347,
+          "sha256": "b3e04a51c04129da7240940d894b4fae0b27b100c2488e685bf8be8e8b3a4ddb"
+        },
+        "command_status": {
+          "size": 87,
+          "sha256": "6862864705811a9ee3ed7d4cc6eabb7f05306c5f41cea559cccad41a58985345"
+        },
+        "raw_trace": {
+          "size": 222,
+          "sha256": "e4c669769d6d6df56d73042e436d3a258a57fdf04e3622a2320939110c01986d"
+        },
+        "cleanup_stdout": {
+          "size": 78,
+          "sha256": "518bc859aedb197bd72fe840a3b82147c6b6380495f6180d1e2db251cf157ca3"
+        },
+        "cleanup_stderr": {
+          "size": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    },
+    "b": {
+      "state": "absent",
+      "path": "target/perf/native-kernel-capture-7ec846a5-v1/b.receipt.json",
+      "sha256": null
+    }
+  },
+  "analysis": {
+    "state": "absent",
+    "path": "target/perf/native-kernel-capture-7ec846a5-v1/analysis.json",
+    "sha256": null
+  },
+  "rejection_detail": {
+    "trace_framing_error": "error: unrecognized subcommand '/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick'",
+    "profile_error": "Error: native-wall profile has no wall samples",
+    "summary_state": "absent",
+    "completion": null,
+    "reconciliation": null,
+    "diagnostic_elapsed_ns": 10388083,
+    "diagnostic_elapsed_is_performance_result": false
+  }
+}
