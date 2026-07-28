@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -164,6 +165,8 @@ class ExternalBoundary:
         docker_listing: str = "",
         transient_overlap: str | None = None,
         monitor_poll_failure: bool = False,
+        initial_monitor_failure: bool = False,
+        runner_children: str | None = None,
     ) -> None:
         self.binary = binary
         self.binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -178,11 +181,15 @@ class ExternalBoundary:
         self.docker_listing = docker_listing
         self.transient_overlap = transient_overlap
         self.monitor_poll_failure = monitor_poll_failure
+        self.initial_monitor_failure = initial_monitor_failure
+        self.runner_children = runner_children
         self.events: list[tuple[str, str]] = []
         self.trace_index = 0
         self.trace_active = threading.Event()
+        self.active_trace_command: list[str] | None = None
         self.active_process_polls = 0
         self.active_docker_polls = 0
+        self.total_process_polls = 0
         self.lock = threading.Lock()
 
     @staticmethod
@@ -228,10 +235,41 @@ class ExternalBoundary:
                     )
             return self._result(rendered, stdout=self.docker_listing)
         if rendered[:3] == ["ps", "-eo", "pid=,ppid=,args="]:
+            with self.lock:
+                self.total_process_polls += 1
+                total_poll = self.total_process_polls
+            if self.initial_monitor_failure and total_poll == 2:
+                return self._result(
+                    rendered,
+                    status=9,
+                    stderr="fixture initial monitor failure\n",
+                )
             if self.trace_active.is_set():
                 with self.lock:
                     self.active_process_polls += 1
                     active_poll = self.active_process_polls
+                if self.runner_children is not None:
+                    assert self.active_trace_command is not None
+                    guest_run_id = next(
+                        token.removeprefix("CARRICK_RUN_ID=")
+                        for token in self.active_trace_command
+                        if token.startswith("CARRICK_RUN_ID=")
+                    )
+                    children = (
+                        f"700 {os.getpid()} "
+                        f"{shlex.join(self.active_trace_command)}\n"
+                        "701 700 /usr/local/bin/carrick run "
+                        f"-e CARRICK_RUN_ID={guest_run_id} fixture\n"
+                    )
+                    if self.runner_children == "owned-and-foreign":
+                        children += (
+                            f"900 {os.getpid()} "
+                            "/usr/local/go/bin/go build -o foreign ./foreign.go\n"
+                        )
+                    return self._result(
+                        rendered,
+                        stdout=self.process_listing + children,
+                    )
                 if self.monitor_poll_failure and active_poll == 2:
                     return self._result(
                         rendered,
@@ -266,8 +304,13 @@ class ExternalBoundary:
             raw_path = Path(rendered[rendered.index("--trace-out") + 1])
             summary_path = Path(rendered[rendered.index("--summary-jsonl") + 1])
             target = rendered[rendered.index("--") + 1 :]
+            self.active_trace_command = rendered
             self.trace_active.set()
-            if self.transient_overlap is not None or self.monitor_poll_failure:
+            if (
+                self.transient_overlap is not None
+                or self.monitor_poll_failure
+                or self.runner_children is not None
+            ):
                 time.sleep(0.08)
             if self.trace_outcome == "timeout":
                 self.trace_active.clear()
@@ -530,6 +573,52 @@ class NativeKernelCaptureTests(unittest.TestCase):
         self.assertEqual(
             [row["pid"] for row in snapshot["foreign_workloads"]],
             [400, 401, 402, 403, 404],
+        )
+
+    def test_monitor_allows_owned_trace_tree_but_rejects_unrelated_runner_child(
+        self,
+    ) -> None:
+        owned = ExternalBoundary(
+            self.binary,
+            runner_children="owned",
+        )
+        with mock.patch.object(
+            native_kernel_capture.subprocess,
+            "run",
+            side_effect=owned,
+        ):
+            native_kernel_capture.capture_pair(self.config)
+
+        shutil.rmtree(self.artifacts)
+        mixed = ExternalBoundary(
+            self.binary,
+            runner_children="owned-and-foreign",
+        )
+        caught: Exception | None = None
+        with mock.patch.object(
+            native_kernel_capture.subprocess,
+            "run",
+            side_effect=mixed,
+        ):
+            try:
+                native_kernel_capture.capture_pair(self.config)
+            except Exception as error:
+                caught = error
+
+        self.assertIs(type(caught), native_kernel_capture.EvidenceError)
+        self.assertIn("contamination monitor observed overlap", str(caught))
+        receipt = native_kernel_capture.planned_paths(
+            self.artifacts
+        ).runs["a"]["receipt"]
+        payload = json.loads(receipt.read_text())
+        self.assertTrue(payload["monitor"]["contaminated"])
+        self.assertEqual(
+            {
+                category
+                for sample in payload["monitor"]["samples"]
+                for category in sample["foreign_workload_categories"]
+            },
+            {"go-build"},
         )
 
     def test_go_build_classification_tokenizes_basenames_without_shell_eval(
@@ -834,6 +923,86 @@ class NativeKernelCaptureTests(unittest.TestCase):
         self.assertIsNotNone(payload["monitor"]["poll_error"])
         self.assertTrue(payload["monitor"]["stopped"])
         self.assertFalse(planned.analysis.exists())
+
+    def test_initial_monitor_failure_rejects_without_command_result(self) -> None:
+        boundary = ExternalBoundary(
+            self.binary,
+            initial_monitor_failure=True,
+        )
+        caught: Exception | None = None
+        with mock.patch.object(
+            native_kernel_capture.subprocess,
+            "run",
+            side_effect=boundary,
+        ):
+            try:
+                native_kernel_capture.capture_pair(self.config)
+            except Exception as error:
+                caught = error
+
+        self.assertIs(type(caught), native_kernel_capture.EvidenceError)
+        self.assertIn("contamination monitor poll failed", str(caught))
+        self.assertEqual(
+            boundary.events,
+            [("cleanup", "kernel-fixture-a-host")],
+        )
+        planned = native_kernel_capture.planned_paths(self.artifacts)
+        payload = json.loads(planned.runs["a"]["receipt"].read_text())
+        self.assertEqual(payload["outcome"], "rejected")
+        self.assertIsNone(payload["command"]["status"])
+        self.assertEqual(
+            payload["monitor"]["poll_error"],
+            "monitor poll failed",
+        )
+        self.assertFalse(planned.analysis.exists())
+
+    def test_fast_trace_binds_launch_and_post_cleanup_monitor_boundaries(
+        self,
+    ) -> None:
+        _, receipt_a, _, _ = self.capture_success()
+        monitor = json.loads(receipt_a.read_text())["monitor"]
+        phases = [sample.get("phase") for sample in monitor["samples"]]
+
+        self.assertEqual(phases.count("launch-boundary"), 1)
+        self.assertEqual(phases.count("post-cleanup-boundary"), 1)
+        self.assertLess(
+            phases.index("launch-boundary"),
+            phases.index("post-cleanup-boundary"),
+        )
+        self.assertIn("interval", phases)
+
+    def test_receipt_rejects_missing_monitor_boundary_phase(self) -> None:
+        _, receipt_a, _, _ = self.capture_success()
+        original = receipt_a.read_bytes()
+        for phase, fragment in (
+            ("launch-boundary", "receipt monitor lacks launch boundary"),
+            (
+                "post-cleanup-boundary",
+                "receipt monitor lacks post-cleanup boundary",
+            ),
+        ):
+            with self.subTest(phase=phase):
+                payload = json.loads(original)
+                payload["monitor"]["samples"] = [
+                    sample
+                    for sample in payload["monitor"]["samples"]
+                    if sample.get("phase") != phase
+                ]
+                for sequence, sample in enumerate(
+                    payload["monitor"]["samples"],
+                    1,
+                ):
+                    sample["sequence"] = sequence
+                payload["monitor"]["sample_count"] = len(
+                    payload["monitor"]["samples"]
+                )
+                receipt_a.write_text(json.dumps(payload))
+                with self.assertRaisesRegex(
+                    native_kernel_capture.EvidenceError,
+                    fragment,
+                ):
+                    native_kernel_capture.validate_receipt(receipt_a)
+                receipt_a.write_bytes(original)
 
     def test_success_captures_serial_bound_receipts_then_atomic_analysis(
         self,
