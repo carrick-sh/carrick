@@ -295,6 +295,71 @@ dsr_ordinal_enum! {
     }
 }
 
+dsr_ordinal_enum! {
+    /// Native syscall service branch whose child inherits the open operation.
+    pub enum NativeSyscallBranchKind {
+        Process = 1,
+        Thread = 2,
+    }
+}
+
+dsr_ordinal_enum! {
+    /// Terminal outcome of one full native guest syscall service operation.
+    pub enum NativeSyscallServiceOutcome {
+        Resume = 1,
+        ThreadExit = 2,
+        InProcessExec = 3,
+        Aborted = 4,
+    }
+}
+
+#[cfg(test)]
+mod native_syscall_service_probe_abi {
+    use super::{NativeSyscallBranchKind, NativeSyscallServiceOutcome};
+
+    fn assert_unique(values: &[u32]) {
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), values.len());
+    }
+
+    #[test]
+    fn native_syscall_service_ordinals_are_stable_and_unique() {
+        assert_eq!(NativeSyscallBranchKind::Process.raw(), 1);
+        assert_eq!(NativeSyscallBranchKind::Thread.raw(), 2);
+        assert_unique(&NativeSyscallBranchKind::ALL.map(NativeSyscallBranchKind::raw));
+
+        assert_eq!(NativeSyscallServiceOutcome::Resume.raw(), 1);
+        assert_eq!(NativeSyscallServiceOutcome::ThreadExit.raw(), 2);
+        assert_eq!(NativeSyscallServiceOutcome::InProcessExec.raw(), 3);
+        assert_eq!(NativeSyscallServiceOutcome::Aborted.raw(), 4);
+        assert_unique(&NativeSyscallServiceOutcome::ALL.map(NativeSyscallServiceOutcome::raw));
+    }
+
+    #[test]
+    fn native_syscall_service_wrappers_have_typed_real_or_stub_signatures() {
+        let _: fn(u64, &str) = super::native_syscall_service_entry;
+        let _: fn(NativeSyscallBranchKind) = super::native_syscall_service_branch;
+        let _: fn(u64, &str, NativeSyscallServiceOutcome) = super::native_syscall_service_end;
+    }
+
+    #[test]
+    fn native_syscall_service_provider_declarations_keep_dtrace_names() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn native__syscall__service__entry(_: u64, _: &str) {}",
+            "fn native__syscall__service__branch(_: u32) {}",
+            "fn native__syscall__service__end(_: u64, _: &str, _: u32) {}",
+        ] {
+            assert!(
+                source.contains(declaration),
+                "missing provider declaration {declaration:?}"
+            );
+        }
+    }
+}
+
 /// Which side of a native (DSR) fork a `fork-lifecycle` sample describes.
 ///
 /// Deliberately the SAME role convention the HVF lane and
@@ -816,6 +881,11 @@ mod real {
         // `vcpu__trap`.
         fn syscall__entry(_: u64, _: &str, _: u64) {}
         fn syscall__return(_: u64, _: &str, _: i64, _: i32) {}
+        /// Full native guest syscall service boundaries. Unlike dispatcher
+        /// entry/return, these span waits, outcome lowering, and completion.
+        fn native__syscall__service__entry(_: u64, _: &str) {}
+        fn native__syscall__service__branch(_: u32) {}
+        fn native__syscall__service__end(_: u64, _: &str, _: u32) {}
         /// HVF syscall-transport attribution. `transport`: 0=legacy, 1=mailbox;
         /// `phase`: 0=request decode, 1=ordinary return publication. The final
         /// three counters are actual HVF register/sysreg API operations in that
@@ -1230,6 +1300,25 @@ mod real {
         /// configured subrange. Kept separate because macOS DTrace drops a sixth
         /// USDT argument at some probe sites.
         fn guest__mem__subcount(_: u32, _: u64, _: u64, _: u64) {}
+    }
+
+    #[inline(always)]
+    pub fn native_syscall_service_entry(number: u64, name: &str) {
+        carrick_usdt::native__syscall__service__entry!(|| (number, name));
+    }
+
+    #[inline(always)]
+    pub fn native_syscall_service_branch(kind: super::NativeSyscallBranchKind) {
+        carrick_usdt::native__syscall__service__branch!(|| kind.raw());
+    }
+
+    #[inline(always)]
+    pub fn native_syscall_service_end(
+        number: u64,
+        name: &str,
+        outcome: super::NativeSyscallServiceOutcome,
+    ) {
+        carrick_usdt::native__syscall__service__end!(|| (number, name, outcome.raw()));
     }
 
     #[inline(always)]
@@ -2630,6 +2719,9 @@ mod stub {
     }
 
     stub!(dsr_prepare_begin(tid: i32, guest_pc: u64));
+    stub!(native_syscall_service_entry(number: u64, name: &str));
+    stub!(native_syscall_service_branch(kind: super::NativeSyscallBranchKind));
+    stub!(native_syscall_service_end(number: u64, name: &str, outcome: super::NativeSyscallServiceOutcome));
     stub!(hvf_syscall_transport(transport: u32, phase: u32, register_reads: u32, sysreg_reads: u32, register_writes: u32));
     stub!(dsr_prepare_end(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64, outcome: super::DsrPrepareOutcome));
     stub!(dsr_run_begin(tid: i32, guest_pc: u64, cache_pc: u64, generation: u64));
