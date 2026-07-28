@@ -3988,7 +3988,7 @@ fn assemble_block_inner(
     );
     recovery.push(RecoveryEntry {
         cache: entry_marker,
-        action: RecoveryAction::Noop,
+        action: RecoveryAction::RestoreGuestX17,
     });
     // x17 is the internal indirect-edge register. Its guest value is saved at
     // every block exit and restored before either the generation guard or the
