@@ -4833,6 +4833,15 @@ impl ForcedDirectBindingSite {
             Self::BlockEntry => None,
         }
     }
+
+    const fn retains_captured_nzcv_in_physical_x16(self) -> bool {
+        // Word 3 captures NZCV in physical x16 and word 4 only stores it.
+        // These forced pre-instruction sites have not overwritten x16 since.
+        matches!(
+            self,
+            Self::CellAddress | Self::TargetAcquire | Self::MissExit
+        )
+    }
 }
 
 fn direct_binding_cell_addresses(fixture: &DirectBindingLiveFixture) -> [usize; 2] {
@@ -4975,6 +4984,7 @@ fn force_direct_binding_sigpipe(
             }
             ForcedDirectBindingSite::CellAddress => {
                 restore_original_registers(&mut state);
+                state.__x[16] = saved_nzcv;
                 write_context_u64(DIRECT_BINDING_TARGET_OFFSET, 0);
                 sidecar_start
                     .checked_add(5 * 4)
@@ -4982,6 +4992,7 @@ fn force_direct_binding_sigpipe(
             }
             ForcedDirectBindingSite::TargetAcquire => {
                 restore_original_registers(&mut state);
+                state.__x[16] = saved_nzcv;
                 state.__x[15] = binding_cell;
                 state.__x[17] = descriptor as usize as u64;
                 write_context_u64(DIRECT_BINDING_TARGET_OFFSET, state.__x[17]);
@@ -5029,6 +5040,7 @@ fn force_direct_binding_sigpipe(
             }
             ForcedDirectBindingSite::MissExit => {
                 restore_original_registers(&mut state);
+                state.__x[16] = saved_nzcv;
                 state.__x[15] = binding_cell;
                 state.__x[17] = 0;
                 write_context_u64(DIRECT_BINDING_TARGET_OFFSET, 0);
@@ -5037,6 +5049,13 @@ fn force_direct_binding_sigpipe(
                     .expect("miss-exit recovery PC")
             }
         };
+        if site.retains_captured_nzcv_in_physical_x16() && state.__x[16] != saved_nzcv {
+            suspended.resume()?;
+            return fail_with_live_kick(format!(
+                "{site:?} forced pre-instruction x16 was 0x{:x}, expected captured NZCV 0x{saved_nzcv:x}",
+                state.__x[16]
+            ));
+        }
         if remove_catalog {
             unsafe {
                 (context
