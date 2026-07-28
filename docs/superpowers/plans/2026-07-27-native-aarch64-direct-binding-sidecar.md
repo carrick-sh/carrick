@@ -1445,6 +1445,10 @@ event fires; the existing `BlockHit` cache event remains valid. Sidecar V1's
 
 The screen artifact schema is `carrick.native-go-build-screen.v1`.
 The mechanism artifact schema is `carrick.direct-binding-mechanism.v1`.
+Each mechanism trace has an atomic
+`carrick.direct-binding-capture-receipt.v1` receipt. The receipt is the only
+input accepted by mechanism comparison; loose raw, summary, stderr, stdout, or
+status paths are not comparison authority.
 
 - [ ] **Step 1: Add red enum and screen-policy tests**
 
@@ -1459,6 +1463,7 @@ def test_retention_bootstrap_is_seeded_and_reproducible()
 def test_retention_requires_candidate_median_below_c0()
 def test_variant_environment_removes_control_variables_for_default()
 def test_profile_and_container_cache_cannot_leak_into_default()
+def test_candidate_cli_uses_only_the_fixed_candidate_overlay()
 def test_drift_formula_pairs_and_nearest_rank_are_exact()
 def test_rejected_screen_is_written_atomically_with_samples()
 ```
@@ -1474,8 +1479,14 @@ def test_complete_vector_and_eligible_collapse_are_published()
 def test_missing_summary_drop_or_provenance_field_rejects_the_pair()
 def test_bounded_interrupted_or_nonzero_status_rejects_the_pair()
 def test_build_ok_must_be_an_exact_stdout_line()
+def test_capture_receipt_binds_artifact_hashes_and_frozen_provenance()
+def test_compare_recomputes_hashes_and_rejects_receipt_mismatch()
+def test_cleanup_failure_records_output_and_suppresses_candidate()
+def test_capture_rejects_pre_post_drift_or_foreign_census()
+def test_capture_pair_uses_fixed_variants_not_ambient_features()
 def test_missing_gateway_translation_or_complete_nativeperf_rejects_the_pair()
 def test_raw_dtrace_and_nativeperf_exit_vectors_must_reconcile()
+def test_raw_and_summary_overlapping_metrics_must_reconcile()
 def test_reclassification_into_indirect_or_other_gateway_exits_rejects()
 def test_publications_are_bounded_per_pid_cell_and_globally()
 def test_zero_vectors_are_explicit_and_unknown_kinds_reject()
@@ -1487,14 +1498,21 @@ def test_duplicate_source_target_never_guesses_active_source()
 Expose:
 
 ```python
-def parse_trace(inputs: MechanismInputs) -> MechanismRun
-def compare(precursor: MechanismRun, candidate: MechanismRun) -> dict[str, object]
+def capture_one(config: CaptureConfig) -> CaptureReceipt
+def parse_receipt(path: pathlib.Path) -> CaptureReceipt
+def parse_trace(receipt: CaptureReceipt) -> MechanismRun
+def compare(
+    precursor: CaptureReceipt,
+    candidate: CaptureReceipt,
+) -> dict[str, object]
 ```
 
 `compare` publishes every Gate 2 field, calculates eligible direct-exit
 collapse, and reconciles the complete DTrace and `NATIVEPERF1` evidence
-planes. A rejected run is written atomically with `accepted=false`, every
-available sample/counter, and exact rejection reasons before the tool exits
+planes. It recomputes the receipt file's SHA-256 plus every bound artifact
+SHA-256 and rejects a missing, changed, duplicated, or cross-run artifact.
+A rejected run is written atomically with `accepted=false`, every available
+receipt/sample/counter, and exact rejection reasons before the tool exits
 nonzero; no rejected or partial artifact can be mistaken for accepted evidence.
 
 - [ ] **Step 3: Run focused tests and verify red**
@@ -1566,9 +1584,12 @@ completed translations.
 
 Use the built-in `--profile dsr-indirect` capture with `--trace-out` and
 `--summary-jsonl`; do not use `--script`, because only profile mode supplies
-authoritative completion, drop, and provenance metadata. Enable
-`CARRICK_DSR_PROFILE=1` only for this diagnostic mechanism pair. Traced wall
-time is never a performance result.
+authoritative completion/drop metadata and the source/binary/host provenance
+subset. The capture receipt supplies and binds image identity, controlled
+environment, census, command result, cleanup result, and the pre/post
+provenance snapshots that summary JSONL does not contain. Enable
+`CARRICK_DSR_PROFILE=1` only inside the diagnostic capture orchestrator.
+Traced wall time is never a performance result.
 
 - [ ] **Step 5: Make benchmark samples accept explicit environment overlays**
 
@@ -1587,6 +1608,19 @@ def run_sample(
 
 A `None` value removes the key. Record the normalized overlay in every sample
 row. Docker rejects Carrick-only overlays.
+
+Add an explicit CLI selection:
+
+```text
+--variant {default,precursor,candidate}
+```
+
+For Carrick, this selects exactly one of the fixed overlays below after first
+scrubbing the complete control set. Docker accepts only `--variant default`.
+The CLI rejects ambient assignments that attempt to enable a feature outside
+the selected overlay. Add a CLI-level test proving `--variant candidate`
+enables all and only the three candidate keys while ambient profile/container
+cache knobs are removed.
 
 Define one complete performance-control set. Every variant removes each key
 unless it deliberately sets it:
@@ -1666,13 +1700,52 @@ contemporaneous controls.
 
 - [ ] **Step 7: Implement the mechanism summarizer**
 
-Parse only versioned `DSRPROF1` rows. Read completion, interruption, drops,
-source/binary SHA, host, and image provenance from each profile-mode summary
-JSONL. Require identical clean git SHA, binary SHA-256, host, image, and
-controlled environment; `completion.complete=true`, `bounded=false`, zero
-interruptions, zero DTrace drops, command status zero, and an exact `BUILD_OK`
-stdout line. Bounded capture is truncated evidence and is always rejected,
-though preserved atomically.
+Add a `capture-pair` CLI mode to `direct_binding_mechanism.py`. It owns both
+traces and invokes `capture_one` serially with fixed precursor/candidate
+overlays, the built-in `dsr-indirect` profile, generated stamped run IDs, and
+the fixed Go build-and-run workload. Callers cannot inject feature variables
+through ambient shell assignments.
+
+Before each trace, `capture_one` snapshots:
+
+- clean git SHA and exact porcelain status;
+- signed binary path and SHA-256;
+- host identity;
+- resolved image identity/digest;
+- normalized controlled environment and rejected ambient `CARRICK_*` census;
+- foreign Carrick/benchmark process census and running Docker-oracle census.
+
+After the trace it repeats every snapshot, runs stamped cleanup while capturing
+numeric status, stdout, stderr, and a descendants census, and then atomically
+writes the per-trace receipt. The receipt contains the variant, run ID, exact
+argv/workload, both provenance snapshots/censuses, command status, exact
+`BUILD_OK` result, cleanup evidence, and path/size/SHA-256 for raw trace,
+summary JSONL, profile stderr, workload stdout, and command stderr. It also
+copies the summary's run ID, git SHA/dirty flag, binary SHA, host, and
+completion/bounded/interruption/drop fields. The receipt itself—not summary
+JSONL—adds hashes of the normalized controlled environment and resolved image
+identity.
+
+The candidate capture may start only after the precursor receipt proves
+command status zero, exact `BUILD_OK`, stable provenance/census, natural
+unbounded completion, zero drops, cleanup status zero, and no stamped
+descendants. On any precursor or cleanup failure, write the precursor receipt
+and an atomic pair artifact with `accepted=false` and `candidate=null`, then
+exit nonzero. No manual shell sequence is an accepted evidence path.
+
+Parse only versioned `DSRPROF1` rows named by a verified receipt. Require
+identical clean git SHA, binary SHA-256, host, image, and controlled environment
+across both receipts; `completion.complete=true`, `bounded=false`, zero
+interruptions, zero DTrace drops, command status zero, an exact `BUILD_OK`
+stdout line, and successful evidenced cleanup. Bounded capture is truncated
+evidence and is always rejected, though preserved atomically.
+
+The receipt cryptographically binds the raw trace and summary by SHA-256 and
+run ID. `compare` recomputes both hashes and requires every metric emitted in
+both raw trace and summary JSONL to match exactly before using either. This
+overlap reconciliation is separate from the DTrace/`NATIVEPERF1`
+reconciliation below; a stale clean summary paired with another raw trace
+cannot pass.
 
 Reuse `native_compiler_budget.parse_nativeperf()` and `validate_profile()`.
 Require exactly one supervisor record, reconciled child CPU, and the complete
@@ -1769,11 +1842,9 @@ the binary.
 - [ ] **Step 3: Run one untraced signed feasibility sample**
 
 ```bash
-CARRICK_DSR_ARTIFACT_SPIKE=1 \
-CARRICK_DSR_SHARED_TRANSLATION=1 \
-CARRICK_DSR_DIRECT_BINDINGS=1 \
 python3 scripts/perf/native_go_build.py \
   --engine carrick \
+  --variant candidate \
   --samples 1 \
   --output target/perf/direct-binding-feasibility-v1.json \
   --captured-output-dir target/perf/direct-binding-feasibility-v1-logs
@@ -1783,79 +1854,31 @@ Expected: `BUILD_OK`, no crash/hang/cache exhaustion, and the output marker
 executes as an exact stdout line. The sample is accepted only when command
 status and stamped cleanup are both zero, the pre/post provenance snapshot is
 identical, and no foreign Carrick process or running Docker oracle is present.
+The recorded effective environment must equal the fixed candidate overlay;
+ambient shell assignments are not an accepted way to enable the candidate.
 
 - [ ] **Step 4: Collect disabled and enabled mechanism traces serially**
 
-Run the precursor trace with direct bindings absent, clean up, then run the
-candidate trace:
+Run the fail-closed pair orchestrator. It captures the precursor receipt,
+requires a complete successful cleanup gate, then and only then starts the
+candidate:
 
 ```bash
-precursor_run_id="direct-binding-mechanism-off-v1-$$"
-candidate_run_id="direct-binding-mechanism-on-v1-$$"
-guest_script='set -eu; cd /tmp; rm -rf "gc-$CARRICK_RUN_ID"; printf "package main\nfunc main(){println(\"ok\")}\n" > h.go; GOCACHE="/tmp/gc-$CARRICK_RUN_ID" /usr/local/go/bin/go build -o h ./h.go; ./h; echo BUILD_OK'
-
-CARRICK_RUN_ID="$precursor_run_id" \
-CARRICK_DSR_ARTIFACT_SPIKE=1 \
-CARRICK_DSR_SHARED_TRANSLATION=1 \
-CARRICK_DSR_PROFILE=1 \
-target/release/carrick trace \
-  --profile dsr-indirect \
-  --trace-out target/perf/direct-binding-mechanism-off-v1.trace \
-  --summary-jsonl target/perf/direct-binding-mechanism-off-v1.summary.jsonl \
-  -- run --exec-backend native \
-  -e "CARRICK_RUN_ID=$precursor_run_id" \
-  -w /tmp \
-  localhost:5005/carrick-go-conformance:1.24 \
-  /bin/sh -c "$guest_script" \
-  >target/perf/direct-binding-mechanism-off-v1.stdout \
-  2>target/perf/direct-binding-mechanism-off-v1.stderr
-precursor_status=$?
-printf '%s\n' "$precursor_status" \
-  >target/perf/direct-binding-mechanism-off-v1.status
-scripts/sudo/kill.sh "$precursor_run_id"
-
-CARRICK_RUN_ID="$candidate_run_id" \
-CARRICK_DSR_ARTIFACT_SPIKE=1 \
-CARRICK_DSR_SHARED_TRANSLATION=1 \
-CARRICK_DSR_DIRECT_BINDINGS=1 \
-CARRICK_DSR_PROFILE=1 \
-target/release/carrick trace \
-  --profile dsr-indirect \
-  --trace-out target/perf/direct-binding-mechanism-on-v1.trace \
-  --summary-jsonl target/perf/direct-binding-mechanism-on-v1.summary.jsonl \
-  -- run --exec-backend native \
-  -e "CARRICK_RUN_ID=$candidate_run_id" \
-  -w /tmp \
-  localhost:5005/carrick-go-conformance:1.24 \
-  /bin/sh -c "$guest_script" \
-  >target/perf/direct-binding-mechanism-on-v1.stdout \
-  2>target/perf/direct-binding-mechanism-on-v1.stderr
-candidate_status=$?
-printf '%s\n' "$candidate_status" \
-  >target/perf/direct-binding-mechanism-on-v1.status
-scripts/sudo/kill.sh "$candidate_run_id"
-
-python3 scripts/perf/direct_binding_mechanism.py \
-  --precursor-trace target/perf/direct-binding-mechanism-off-v1.trace \
-  --precursor-summary target/perf/direct-binding-mechanism-off-v1.summary.jsonl \
-  --precursor-profile target/perf/direct-binding-mechanism-off-v1.stderr \
-  --precursor-stdout target/perf/direct-binding-mechanism-off-v1.stdout \
-  --precursor-status target/perf/direct-binding-mechanism-off-v1.status \
-  --candidate-trace target/perf/direct-binding-mechanism-on-v1.trace \
-  --candidate-summary target/perf/direct-binding-mechanism-on-v1.summary.jsonl \
-  --candidate-profile target/perf/direct-binding-mechanism-on-v1.stderr \
-  --candidate-stdout target/perf/direct-binding-mechanism-on-v1.stdout \
-  --candidate-status target/perf/direct-binding-mechanism-on-v1.status \
+python3 scripts/perf/direct_binding_mechanism.py capture-pair \
+  --repo . \
+  --binary target/release/carrick \
+  --image localhost:5005/carrick-go-conformance:1.24 \
+  --artifact-dir target/perf/direct-binding-mechanism-v1 \
   --output target/perf/direct-binding-mechanism-v1.json
 ```
 
-`carrick trace` auto-sudos; do not prefix either command with `sudo`. If a
-command exits early, still write its numeric status and run its exact stamped
-cleanup. Cleanup failure is fatal: retain the rejected artifacts and do not
-start the next sample. Before each trace, require clean/frozen source and
-binary provenance, no foreign Carrick or benchmark process, and no running
-Docker oracle. Do not substitute `--script`: the profile-mode summary is the
-authority for drops, completion, and provenance.
+The orchestrator invokes `carrick trace --profile dsr-indirect` internally;
+`carrick trace` auto-sudos and the orchestrator must not prefix it with `sudo`.
+The artifact directory contains immutable `precursor/receipt.json` and, only
+after the precursor cleanup gate, `candidate/receipt.json`, plus every
+hash-bound raw/summary/stdout/stderr/cleanup artifact. Failure still produces
+an atomic rejected pair artifact. There is no supported manual trace/cleanup
+sequence for Gate 2.
 
 Record for both:
 
@@ -1879,10 +1902,12 @@ evidence-plane mismatch, provenance drift, or cleanup failure also rejects.
 
 - [ ] **Step 5: Update the controller with exact evidence**
 
-Add raw/summary/stdout/status/artifact paths and SHA-256 hashes, frozen
-per-sample source/binary/host/image/environment provenance, the complete event
-and exit vectors, reconciliation, process-cell bounds, and pass/reject decision
-to the ledger and handoff. Preserve bounded or otherwise rejected captures as
+Add both receipt paths and SHA-256 hashes; their bound
+raw/summary/profile/stdout/stderr/cleanup artifact hashes; frozen pre/post
+source/binary/host/image/environment/census provenance; command and cleanup
+status/output; the complete event and exit vectors; both overlap
+reconciliations; process-cell bounds; and the pass/reject decision to the ledger
+and handoff. Preserve bounded or otherwise rejected captures as
 `accepted=false`. Do not use traced elapsed time as a performance result.
 
 - [ ] **Step 6: Commit the evidence checkpoint**
@@ -1939,7 +1964,7 @@ the fully controlled environment around every sample. If
 `max(defaults)/min(defaults) > 1.05`, retain the atomic artifact and samples as
 `accepted=false`; rerun only after identifying and recording the instability.
 
-- [ ] **Step 3: Apply all four promotion rules**
+- [ ] **Step 3: Apply all five promotion rules**
 
 Promote only when:
 
