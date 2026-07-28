@@ -1227,6 +1227,12 @@ fn native_dsr_cache_event_kind(
         Seam::Invalidate => Usdt::Invalidate,
         Seam::BlockPublish => Usdt::BlockPublish,
         Seam::CapacityFailure => Usdt::CapacityFailure,
+        Seam::DirectBindingEligible => Usdt::DirectBindingEligible,
+        Seam::DirectBindingPublish => Usdt::DirectBindingPublish,
+        Seam::DirectBindingCasLoss => Usdt::DirectBindingCasLoss,
+        Seam::DirectBindingClear => Usdt::DirectBindingClear,
+        Seam::DirectBindingValidationFailure => Usdt::DirectBindingValidationFailure,
+        Seam::DirectBindingUnitLoaded => Usdt::DirectBindingUnitLoaded,
     }
 }
 

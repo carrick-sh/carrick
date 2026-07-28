@@ -13,6 +13,7 @@ import platform
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Sequence
 
@@ -23,6 +24,43 @@ DEFAULT_TIMEOUT_SECONDS = 180
 ENGINE_CARRICK = "carrick"
 ENGINE_DOCKER = "docker"
 ENGINE_BOTH = "both"
+VARIANT_DEFAULT = "default"
+VARIANT_PRECURSOR = "precursor"
+VARIANT_CANDIDATE = "candidate"
+PERFORMANCE_CONTROL_KEYS = (
+    "CARRICK_DSR_ARTIFACT_SPIKE",
+    "CARRICK_DSR_SHARED_TRANSLATION",
+    "CARRICK_DSR_DIRECT_BINDINGS",
+    "CARRICK_DSR_PROFILE",
+    "CARRICK_DSR_ARTIFACT_REPORT",
+    "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH",
+    "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS",
+    "CARRICK_DSR_KEEP_CONTAINER_CACHE",
+    "CARRICK_ARTIFACT",
+    "CARRICK_DISABLE_VDSO",
+    "CARRICK_VDSO_MODE",
+    "CARRICK_NATIVE_TRACE_SYSCALLS",
+    "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS",
+    "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS",
+)
+HARNESS_CARRICK_ALLOWLIST = frozenset()
+VARIANT_OVERLAYS: dict[str, dict[str, str | None]] = {
+    VARIANT_DEFAULT: {
+        "CARRICK_DSR_ARTIFACT_SPIKE": None,
+        "CARRICK_DSR_SHARED_TRANSLATION": None,
+        "CARRICK_DSR_DIRECT_BINDINGS": None,
+    },
+    VARIANT_PRECURSOR: {
+        "CARRICK_DSR_ARTIFACT_SPIKE": "1",
+        "CARRICK_DSR_SHARED_TRANSLATION": "1",
+        "CARRICK_DSR_DIRECT_BINDINGS": None,
+    },
+    VARIANT_CANDIDATE: {
+        "CARRICK_DSR_ARTIFACT_SPIKE": "1",
+        "CARRICK_DSR_SHARED_TRANSLATION": "1",
+        "CARRICK_DSR_DIRECT_BINDINGS": "1",
+    },
+}
 
 
 def guest_script() -> str:
@@ -132,6 +170,193 @@ def git_output(repo: pathlib.Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def normalized_overlay(
+    overlay: dict[str, str | None] | None,
+) -> dict[str, str | None]:
+    supplied = {} if overlay is None else dict(overlay)
+    unknown = set(supplied) - set(PERFORMANCE_CONTROL_KEYS)
+    if unknown:
+        raise ValueError(
+            "unknown performance-control key(s): " + ", ".join(sorted(unknown))
+        )
+    return {
+        key: supplied.get(key)
+        for key in PERFORMANCE_CONTROL_KEYS
+    }
+
+
+def fixed_variant_overlay(variant: str) -> dict[str, str | None]:
+    try:
+        selected = VARIANT_OVERLAYS[variant]
+    except KeyError as error:
+        raise ValueError(f"unknown variant: {variant}") from error
+    return normalized_overlay(selected)
+
+
+def variant_environment(
+    ambient: os._Environ[str] | dict[str, str],
+    variant: str,
+    engine: str,
+    extra_overlay: dict[str, str | None] | None = None,
+) -> tuple[dict[str, str], dict[str, str | None]]:
+    selected = fixed_variant_overlay(variant)
+    if extra_overlay is not None:
+        for key, value in normalized_overlay(extra_overlay).items():
+            if value is not None:
+                selected[key] = value
+    if engine == ENGINE_DOCKER and any(
+        value is not None for value in selected.values()
+    ):
+        raise ValueError("Docker accepts only the default variant without Carrick overlays")
+    environment = dict(ambient)
+    for key in PERFORMANCE_CONTROL_KEYS:
+        environment.pop(key, None)
+    for key, value in selected.items():
+        if value is not None:
+            environment[key] = value
+    return environment, selected
+
+
+def reject_ambient_carrick(
+    ambient: os._Environ[str] | dict[str, str],
+    selected_overlay: dict[str, str | None],
+) -> None:
+    allowed = set(HARNESS_CARRICK_ALLOWLIST)
+    for key, value in selected_overlay.items():
+        if value is not None:
+            allowed.add(key)
+    rejected = sorted(
+        key
+        for key, value in ambient.items()
+        if key.startswith("CARRICK_")
+        and value
+        and key != "CARRICK_RUN_ID"
+        and key not in allowed
+    )
+    if "CARRICK_RUN_ID" in ambient:
+        rejected.append("CARRICK_RUN_ID")
+    if rejected:
+        raise RuntimeError(
+            "ambient Carrick controls are not accepted: " + ", ".join(rejected)
+        )
+
+
+def write_json_atomic(path: pathlib.Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as temporary:
+        temporary_path = pathlib.Path(temporary.name)
+        json.dump(payload, temporary, indent=2, sort_keys=True)
+        temporary.write("\n")
+        temporary.flush()
+        os.fsync(temporary.fileno())
+    os.replace(temporary_path, path)
+
+
+def repository_is_git(repo: pathlib.Path) -> bool:
+    if not (repo / ".git").exists():
+        return False
+    result = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def foreign_workload_census() -> list[str]:
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,args="],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    own_pid = os.getpid()
+    foreign = []
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) != 2:
+            continue
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            continue
+        if pid == own_pid:
+            continue
+        command = fields[1]
+        if (
+            "target/release/carrick run" in command
+            or "scripts/perf/native_go_build.py" in command
+            or "scripts/perf/native_go_build_screen.py" in command
+            or "scripts/perf/direct_binding_mechanism.py" in command
+        ):
+            foreign.append(f"pid={pid} command={command}")
+    return foreign
+
+
+def running_docker_oracles() -> list[str]:
+    result = subprocess.run(
+        ["docker", "ps", "--format", "{{.ID}} {{.Names}} {{.Image}}"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "failed to census running Docker containers: "
+            + (result.stderr.strip() or result.stdout.strip())
+        )
+    return [
+        line
+        for line in result.stdout.splitlines()
+        if "carrick" in line.lower() or "conformance" in line.lower()
+    ]
+
+
+def sample_provenance(
+    repo: pathlib.Path,
+    engine: str,
+    controlled_environment: dict[str, str | None],
+    *,
+    reject_contamination: bool = True,
+) -> dict[str, object]:
+    binary = repo / "target/release/carrick"
+    status = git_output(repo, "status", "--porcelain").splitlines()
+    if status and reject_contamination:
+        raise RuntimeError("performance sample requires a clean git worktree")
+    foreign = foreign_workload_census()
+    docker_oracles = running_docker_oracles()
+    if (foreign or docker_oracles) and reject_contamination:
+        raise RuntimeError(
+            "foreign workload census is not empty: "
+            + json.dumps({"processes": foreign, "docker": docker_oracles})
+        )
+    return {
+        "git_commit": git_output(repo, "rev-parse", "HEAD"),
+        "git_status": status,
+        "binary_path": str(binary),
+        "binary_sha256": sha256_file(binary) if binary.is_file() else None,
+        "host": {
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "node": platform.node(),
+        },
+        "image": docker_image_provenance(),
+        "controlled_environment": controlled_environment,
+        "foreign_processes": foreign,
+        "docker_oracles": docker_oracles,
+        "engine": engine,
+    }
+
+
 def busy_host_reasons() -> list[str]:
     reasons: list[str] = []
     process_list = subprocess.run(
@@ -169,25 +394,38 @@ def busy_host_reasons() -> list[str]:
     return reasons
 
 
-def carrick_cleanup(repo: pathlib.Path, run_id: str) -> None:
-    subprocess.run(
+def carrick_cleanup(repo: pathlib.Path, run_id: str) -> dict[str, object]:
+    result = subprocess.run(
         [str(repo / "scripts/sudo/kill.sh"), run_id],
         cwd=repo,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
         timeout=30,
         check=False,
     )
+    return {
+        "status": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
 
 
-def docker_cleanup(run_id: str) -> None:
-    subprocess.run(
+def docker_cleanup(run_id: str) -> dict[str, object]:
+    result = subprocess.run(
         ["docker", "rm", "-f", run_id],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
         timeout=30,
         check=False,
     )
+    # Docker returns nonzero when a naturally exited `--rm`-style container
+    # is already absent; this harness does not use `--rm`, so retain it as a
+    # fatal cleanup result.
+    return {
+        "status": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
 
 
 def docker_image_provenance() -> dict[str, object]:
@@ -261,17 +499,32 @@ def run_sample(
     index: int,
     timeout_seconds: int,
     captured_output: pathlib.Path | None = None,
+    environment_overlay: dict[str, str | None] | None = None,
 ) -> dict[str, object]:
-    run_id = (
-        f"native-go-build-{engine}-{os.getpid()}-{time.time_ns()}-{index}"
-    )
+    run_id = f"native-go-build-{engine}-{os.getpid()}-{time.time_ns()}-{index}"
     command = build_command(repo, engine, run_id)
-    environment = os.environ.copy()
+    normalized = normalized_overlay(environment_overlay)
+    if engine == ENGINE_DOCKER and any(value is not None for value in normalized.values()):
+        raise ValueError("Docker samples reject Carrick-only environment overlays")
+    reject_ambient_carrick(os.environ, normalized)
+    environment = dict(os.environ)
+    for key in PERFORMANCE_CONTROL_KEYS:
+        environment.pop(key, None)
+    for key, value in normalized.items():
+        if value is not None:
+            environment[key] = value
     environment["CARRICK_RUN_ID"] = run_id
+    # Task 14's exact screen is a Carrick-only gate. The legacy Docker phase
+    # retains its image provenance at campaign scope and accepts no overlay.
+    strict_evidence = engine == ENGINE_CARRICK and repository_is_git(repo)
+    pre_provenance = (
+        sample_provenance(repo, engine, normalized) if strict_evidence else None
+    )
     started = time.monotonic_ns()
     result: subprocess.CompletedProcess[str] | None = None
     timeout: subprocess.TimeoutExpired | None = None
     cleanup_error: Exception | None = None
+    cleanup_evidence: dict[str, object] | None = None
     try:
         result = subprocess.run(
             command,
@@ -288,16 +541,31 @@ def run_sample(
         elapsed_ms = (time.monotonic_ns() - started) // 1_000_000
         try:
             if engine == ENGINE_CARRICK:
-                carrick_cleanup(repo, run_id)
+                cleanup_evidence = carrick_cleanup(repo, run_id)
             else:
-                docker_cleanup(run_id)
+                cleanup_evidence = docker_cleanup(run_id)
         except Exception as error:
             cleanup_error = error
+    post_provenance = (
+        sample_provenance(repo, engine, normalized) if strict_evidence else None
+    )
+    if strict_evidence and pre_provenance != post_provenance:
+        raise RuntimeError(
+            "sample provenance drifted: "
+            + json.dumps(
+                {"pre": pre_provenance, "post": post_provenance},
+                sort_keys=True,
+            )
+        )
     if timeout is not None:
         combined = combined_output(timeout.stdout, timeout.stderr)
+        stdout = combined_output(timeout.stdout, None)
+        stderr = combined_output(None, timeout.stderr)
     else:
         assert result is not None
         combined = combined_output(result.stdout, result.stderr)
+        stdout = combined_output(result.stdout, None)
+        stderr = combined_output(None, result.stderr)
     if captured_output is not None:
         captured_output.parent.mkdir(parents=True, exist_ok=True)
         captured_output.write_text(combined)
@@ -306,7 +574,8 @@ def run_sample(
             raise timeout from cleanup_error
         raise timeout
     assert result is not None
-    if result.returncode != 0 or "BUILD_OK" not in combined:
+    build_ok = stdout.splitlines().count("BUILD_OK") == 1
+    if result.returncode != 0 or not build_ok:
         sample_error = RuntimeError(
             f"go-build sample {index} failed: run_id={run_id} "
             f"rc={result.returncode}\n{combined[-8000:]}"
@@ -318,13 +587,31 @@ def run_sample(
         raise RuntimeError(
             f"go-build sample {index} cleanup failed: run_id={run_id}"
         ) from cleanup_error
+    if cleanup_evidence is not None and int(cleanup_evidence.get("status", 1)) != 0:
+        raise RuntimeError(
+            f"go-build sample {index} cleanup failed: run_id={run_id} "
+            f"status={cleanup_evidence.get('status')} "
+            f"stdout={cleanup_evidence.get('stdout', '')!r} "
+            f"stderr={cleanup_evidence.get('stderr', '')!r}"
+        )
     return {
         "engine": engine,
         "index": index,
         "run_id": run_id,
         "elapsed_ms": elapsed_ms,
         "return_code": result.returncode,
-        "build_ok": True,
+        "build_ok": build_ok,
+        "environment_overlay": normalized,
+        "controlled_environment": {
+            key: environment.get(key) for key in PERFORMANCE_CONTROL_KEYS
+        },
+        "provenance": {
+            "pre": pre_provenance,
+            "post": post_provenance,
+        },
+        "cleanup": cleanup_evidence,
+        "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
     }
 
 
@@ -334,6 +621,7 @@ def run_phase(
     samples: int,
     timeout_seconds: int,
     captured_output_dir: pathlib.Path | None = None,
+    environment_overlay: dict[str, str | None] | None = None,
 ) -> list[dict[str, object]]:
     if engine == ENGINE_DOCKER:
         validate_docker_image()
@@ -348,6 +636,7 @@ def run_phase(
                 if captured_output_dir is not None
                 else None
             ),
+            environment_overlay,
         )
         for index in range(samples)
     ]
@@ -366,6 +655,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="measure Carrick, native-arm64 Docker, or both in separate phases",
     )
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument(
+        "--variant",
+        choices=(VARIANT_DEFAULT, VARIANT_PRECURSOR, VARIANT_CANDIDATE),
+        default=VARIANT_DEFAULT,
+        help="select one fixed, scrubbed Carrick feature overlay",
+    )
     parser.add_argument(
         "--output",
         type=pathlib.Path,
@@ -402,6 +697,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     repo = pathlib.Path(__file__).resolve().parents[2]
     binary = repo / "target/release/carrick"
     engines = requested_engines(args.engine)
+    if ENGINE_DOCKER in engines and args.variant != VARIANT_DEFAULT:
+        raise SystemExit("Docker accepts only --variant default")
+    selected_overlay = fixed_variant_overlay(args.variant)
+    reject_ambient_carrick(os.environ, selected_overlay)
     if ENGINE_CARRICK in engines and not binary.is_file():
         raise SystemExit(f"missing signed release binary: {binary}; run `just build`")
 
@@ -418,6 +717,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.samples,
             args.timeout_seconds,
             args.captured_output_dir,
+            selected_overlay,
         )
         for engine in engines
     }
@@ -462,8 +762,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ],
             ),
         }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    payload["variant"] = args.variant
+    payload["environment_overlay"] = selected_overlay
+    write_json_atomic(args.output, payload)
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 

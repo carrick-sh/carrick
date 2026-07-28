@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::{Duration, Instant};
 
 use carrick_guest_mem::GuestVa;
+use sha2::{Digest, Sha256};
 
 use crate::shared_cache::{
     DIRECT_BINDING_CELL_SIZE, DirectBindingLayout, SharedLoadedTranslationUnit, TranslationUnitKey,
@@ -219,6 +220,63 @@ pub struct DirectBindingOwnerKey {
     pub ordinal: DirectBindingOrdinal,
 }
 
+/// Typed reason for an actual non-null-to-null direct-binding clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum DirectBindingClearReason {
+    TargetInvalidation = 1,
+    StaleWinnerRemoval = 2,
+    ForkReset = 3,
+    ExecReset = 4,
+}
+
+impl DirectBindingClearReason {
+    pub const fn raw(self) -> u64 {
+        self as u64
+    }
+}
+
+/// Typed reason a cold direct-binding authority check failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum DirectBindingValidationReason {
+    MissingEligibleRecord = 1,
+    AmbiguousEligibleRecord = 2,
+    MissMetadataMismatch = 3,
+    OwnerMismatch = 4,
+    AuthorityMismatch = 5,
+    MappedCellFailure = 6,
+}
+
+impl DirectBindingValidationReason {
+    pub const fn raw(self) -> u64 {
+        self as u64
+    }
+}
+
+/// Exact manifest record selected at one cold direct-resolver exit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectBindingEligibility {
+    pub unit: TranslationUnitKey,
+    pub ordinal: DirectBindingOrdinal,
+    pub cell: Option<DirectBindingCellVa>,
+}
+
+/// Stable 64-bit diagnostic digest of one translation-unit key.
+pub fn direct_binding_unit_digest(key: &TranslationUnitKey) -> Result<u64, DsrError> {
+    let encoded = serde_json::to_vec(key).map_err(|error| {
+        DsrError::CachePolicy(format!(
+            "direct-binding unit key cannot be serialized for evidence: {error}"
+        ))
+    })?;
+    let digest: [u8; 32] = Sha256::digest(encoded).into();
+    Ok(u64::from_le_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 prefix has exactly eight bytes"),
+    ))
+}
+
 impl PartialOrd for DirectBindingOwnerKey {
     fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
         Some(self.cmp(other))
@@ -246,7 +304,8 @@ pub struct DirectBindingOwner {
 /// Process-owned metadata and source lease for one loaded sidecar unit.
 pub struct DirectBindingUnitOwner {
     key: TranslationUnitKey,
-    binding_base: DirectBindingCellVa,
+    binding_base: Option<DirectBindingCellVa>,
+    binding_layout: DirectBindingLayout,
     records: Box<[UnresolvedDirectBindingRecord]>,
     published_bitmap: Box<[u64]>,
     source_lease: SharedLoadedTranslationUnit,
@@ -321,6 +380,15 @@ pub enum DirectBindingPublishOutcome {
     Rejected,
 }
 
+/// Cold-path evidence produced by one publication attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectBindingPublishEvidence {
+    pub outcome: DirectBindingPublishOutcome,
+    pub cas_losses: u64,
+    pub stale_clear_generation: Option<CodeGeneration>,
+    pub validation_failure: Option<DirectBindingValidationReason>,
+}
+
 /// Sole process-owned index for loaded sidecar cells and retained descriptors.
 pub struct DirectBindingRegistry {
     enabled: bool,
@@ -373,7 +441,24 @@ impl DirectBindingRegistry {
         &mut self,
         unit: &SharedLoadedTranslationUnit,
     ) -> Result<Option<usize>, DsrError> {
+        if self
+            .units
+            .iter()
+            .any(|owner| owner.key == unit.manifest.key)
+        {
+            return Err(DsrError::CachePolicy(
+                "direct-binding unit owner is duplicated".to_string(),
+            ));
+        }
         if !self.enabled || unit.manifest.binding_layout == DirectBindingLayout::Disabled {
+            self.units.push(DirectBindingUnitOwner {
+                key: unit.manifest.key.clone(),
+                binding_base: None,
+                binding_layout: DirectBindingLayout::Disabled,
+                records: unit.manifest.bindings.clone().into_boxed_slice(),
+                published_bitmap: Box::new([]),
+                source_lease: unit.clone(),
+            });
             return Ok(None);
         }
         if unit.manifest.binding_layout != DirectBindingLayout::SidecarV1
@@ -386,15 +471,6 @@ impl DirectBindingRegistry {
         let binding_base = unit.binding_base.ok_or_else(|| {
             DsrError::CachePolicy("direct-binding unit has no mapped cell base".to_string())
         })?;
-        if self
-            .units
-            .iter()
-            .any(|owner| owner.key == unit.manifest.key)
-        {
-            return Err(DsrError::CachePolicy(
-                "direct-binding unit owner is duplicated".to_string(),
-            ));
-        }
         let records = unit.manifest.bindings.clone().into_boxed_slice();
         let expected_len = records
             .len()
@@ -467,7 +543,8 @@ impl DirectBindingRegistry {
         let published_bitmap = vec![0; bitmap_words].into_boxed_slice();
         self.units.push(DirectBindingUnitOwner {
             key: unit.manifest.key.clone(),
-            binding_base,
+            binding_base: Some(binding_base),
+            binding_layout: DirectBindingLayout::SidecarV1,
             records,
             published_bitmap,
             source_lease: unit.clone(),
@@ -476,6 +553,106 @@ impl DirectBindingRegistry {
             self.owners_by_cell.insert(owner.cell, owner);
         }
         Ok(Some(unit_index))
+    }
+
+    /// Selects the exact predeclared manifest record for one cold direct exit.
+    ///
+    /// This deliberately does not accept the initially prepared unit as
+    /// authority: a cache or direct-binding hit may have crossed unit
+    /// boundaries before the gateway returned to Rust.
+    pub fn classify_cold_exit(
+        &mut self,
+        source: GuestVa,
+        target: GuestVa,
+        miss: Option<DirectBindingMiss>,
+    ) -> Result<DirectBindingEligibility, DirectBindingValidationReason> {
+        let mut candidates = self
+            .units
+            .iter()
+            .enumerate()
+            .flat_map(|(unit_index, unit)| {
+                unit.records
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, record)| record.source == source && record.target == target)
+                    .map(move |(record_index, _)| (unit_index, record_index))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            self.counters.owner_validation_failures =
+                self.counters.owner_validation_failures.saturating_add(1);
+            return Err(DirectBindingValidationReason::MissingEligibleRecord);
+        }
+        if candidates.len() > 1
+            && let Some(exact_miss) = miss
+        {
+            candidates.retain(|(unit_index, record_index)| {
+                let Some(unit) = self.units.get(*unit_index) else {
+                    return false;
+                };
+                let Some(record) = unit.records.get(*record_index) else {
+                    return false;
+                };
+                record.ordinal == exact_miss.ordinal
+                    && self
+                        .owners_by_cell
+                        .get(&exact_miss.cell)
+                        .is_some_and(|owner| {
+                            owner.unit_index == *unit_index
+                                && owner.record == *record
+                                && owner.cell == exact_miss.cell
+                        })
+            });
+        }
+        if candidates.len() != 1 {
+            self.counters.owner_validation_failures =
+                self.counters.owner_validation_failures.saturating_add(1);
+            return Err(DirectBindingValidationReason::AmbiguousEligibleRecord);
+        }
+        let (unit_index, record_index) = candidates[0];
+        let unit = &self.units[unit_index];
+        let record = &unit.records[record_index];
+        let cell = match unit.binding_layout {
+            DirectBindingLayout::Disabled => {
+                if miss.is_some() {
+                    self.counters.owner_validation_failures =
+                        self.counters.owner_validation_failures.saturating_add(1);
+                    return Err(DirectBindingValidationReason::MissMetadataMismatch);
+                }
+                None
+            }
+            DirectBindingLayout::SidecarV1 => {
+                let Some(miss) = miss else {
+                    self.counters.owner_validation_failures =
+                        self.counters.owner_validation_failures.saturating_add(1);
+                    return Err(DirectBindingValidationReason::MissMetadataMismatch);
+                };
+                if miss.ordinal != record.ordinal {
+                    self.counters.owner_validation_failures =
+                        self.counters.owner_validation_failures.saturating_add(1);
+                    return Err(DirectBindingValidationReason::MissMetadataMismatch);
+                }
+                let Some(owner) = self.owners_by_cell.get(&miss.cell) else {
+                    self.counters.owner_validation_failures =
+                        self.counters.owner_validation_failures.saturating_add(1);
+                    return Err(DirectBindingValidationReason::OwnerMismatch);
+                };
+                if owner.unit_index != unit_index
+                    || owner.record != *record
+                    || owner.cell != miss.cell
+                {
+                    self.counters.owner_validation_failures =
+                        self.counters.owner_validation_failures.saturating_add(1);
+                    return Err(DirectBindingValidationReason::OwnerMismatch);
+                }
+                Some(miss.cell)
+            }
+        };
+        Ok(DirectBindingEligibility {
+            unit: unit.key.clone(),
+            ordinal: record.ordinal,
+            cell,
+        })
     }
 
     /// Returns the one exact loaded owner matching a miss-carried cell.
@@ -504,6 +681,41 @@ impl DirectBindingRegistry {
         descriptor: DirectBindingTarget,
     ) -> DirectBindingPublishOutcome {
         self.publish_with_stale_observer(miss, source, target, descriptor, |_, _| {})
+    }
+
+    /// Publishes while retaining exact cold-path evidence for probes.
+    pub fn publish_with_evidence(
+        &mut self,
+        miss: DirectBindingMiss,
+        source: GuestVa,
+        target: GuestVa,
+        descriptor: DirectBindingTarget,
+    ) -> DirectBindingPublishEvidence {
+        let before = self.counters;
+        let existing = DirectBindingCellRef::registered(miss.cell).load_acquire();
+        let stale_generation = self
+            .descriptors
+            .iter()
+            .find(|candidate| std::ptr::eq(candidate.as_ref(), existing.cast_const()))
+            .map(|candidate| candidate.target_generation);
+        let outcome = self.publish_with_stale_observer(miss, source, target, descriptor, |_, _| {});
+        let after = self.counters;
+        let validation_failure =
+            if after.authority_validation_failures > before.authority_validation_failures {
+                Some(DirectBindingValidationReason::AuthorityMismatch)
+            } else if after.owner_validation_failures > before.owner_validation_failures {
+                Some(DirectBindingValidationReason::OwnerMismatch)
+            } else {
+                None
+            };
+        DirectBindingPublishEvidence {
+            outcome,
+            cas_losses: after.cas_losses.saturating_sub(before.cas_losses),
+            stale_clear_generation: (after.stale_winner_clears > before.stale_winner_clears)
+                .then_some(stale_generation)
+                .flatten(),
+            validation_failure,
+        }
     }
 
     #[cfg(test)]
@@ -626,6 +838,15 @@ impl DirectBindingRegistry {
         page: GuestVa,
         generation: CodeGeneration,
     ) -> DirectBindingClearStats {
+        self.invalidate_target_with_recorder(page, generation, |_| {})
+    }
+
+    pub fn invalidate_target_with_recorder(
+        &mut self,
+        page: GuestVa,
+        generation: CodeGeneration,
+        mut recorder: impl FnMut(DirectBindingCellVa),
+    ) -> DirectBindingClearStats {
         let Some(incoming) = self.incoming.remove(&(page, generation)) else {
             return DirectBindingClearStats::default();
         };
@@ -640,6 +861,7 @@ impl DirectBindingRegistry {
                 continue;
             }
             stats.exact_clears = stats.exact_clears.saturating_add(1);
+            recorder(record.cell);
             if self.clear_publication_bit(&record.source) {
                 stats.bitmap_bits_cleared = stats.bitmap_bits_cleared.saturating_add(1);
             }
@@ -657,8 +879,15 @@ impl DirectBindingRegistry {
     /// array, bitmap words, and record arrays, and retains every descriptor,
     /// reverse edge, owner, and unit arena for safe child-side rebinding.
     pub fn clear_inherited_after_fork(&mut self) -> ForkBindingClearStats {
+        self.clear_inherited_after_fork_with_recorder(|_| {})
+    }
+
+    pub fn clear_inherited_after_fork_with_recorder(
+        &mut self,
+        recorder: impl FnMut(DirectBindingCellVa),
+    ) -> ForkBindingClearStats {
         let started = Instant::now();
-        let (cells_cleared, pages_touched) = self.clear_published_cells();
+        let (cells_cleared, pages_touched) = self.clear_published_cells(recorder);
         self.counters = DirectBindingCounters::default();
         ForkBindingClearStats {
             cells_cleared,
@@ -674,10 +903,18 @@ impl DirectBindingRegistry {
 
     pub(crate) fn clear_all_before_exec_with_recorder(
         &mut self,
+        recorder: impl FnMut(DirectBindingExecClearPhase),
+    ) -> ExecBindingClearStats {
+        self.clear_all_before_exec_with_evidence(recorder, |_| {})
+    }
+
+    pub(crate) fn clear_all_before_exec_with_evidence(
+        &mut self,
         mut recorder: impl FnMut(DirectBindingExecClearPhase),
+        cell_recorder: impl FnMut(DirectBindingCellVa),
     ) -> ExecBindingClearStats {
         let started = Instant::now();
-        let (cells_cleared, pages_touched) = self.clear_published_cells();
+        let (cells_cleared, pages_touched) = self.clear_published_cells(cell_recorder);
         recorder(DirectBindingExecClearPhase::Cells);
 
         self.incoming.clear();
@@ -739,12 +976,12 @@ impl DirectBindingRegistry {
         let offset = usize::try_from(miss.ordinal.get())
             .ok()?
             .checked_mul(DIRECT_BINDING_CELL_SIZE as usize)?;
-        let expected_cell =
-            DirectBindingCellVa::mapped(unit.binding_base.get().checked_add(offset)?)?;
+        let binding_base = unit.binding_base?;
+        let expected_cell = DirectBindingCellVa::mapped(binding_base.get().checked_add(offset)?)?;
         if record != &owner.record
             || expected_cell != miss.cell
             || unit.source_lease.manifest.key != unit.key
-            || unit.source_lease.binding_base != Some(unit.binding_base)
+            || unit.source_lease.binding_base != Some(binding_base)
             || unit.source_lease.manifest.bindings.as_slice() != unit.records.as_ref()
         {
             return None;
@@ -809,10 +1046,16 @@ impl DirectBindingRegistry {
         self.counters.cas_wins = self.counters.cas_wins.saturating_add(1);
     }
 
-    fn clear_published_cells(&mut self) -> (u64, u64) {
+    fn clear_published_cells(
+        &mut self,
+        mut recorder: impl FnMut(DirectBindingCellVa),
+    ) -> (u64, u64) {
         let mut cells_cleared = 0_u64;
         let mut pages_touched = 0_u64;
         for unit in &mut self.units {
+            let Some(binding_base) = unit.binding_base else {
+                continue;
+            };
             let mut last_page = None;
             for (word_index, word) in unit.published_bitmap.iter_mut().enumerate() {
                 let mut published = *word;
@@ -824,10 +1067,12 @@ impl DirectBindingRegistry {
                     if ordinal >= unit.records.len() {
                         continue;
                     }
-                    let address =
-                        unit.binding_base.get() + ordinal * DIRECT_BINDING_CELL_SIZE as usize;
+                    let address = binding_base.get() + ordinal * DIRECT_BINDING_CELL_SIZE as usize;
                     let cell = DirectBindingCellVa(address);
-                    DirectBindingCellRef::registered(cell).clear_release();
+                    if !DirectBindingCellRef::registered(cell).clear_release() {
+                        continue;
+                    }
+                    recorder(cell);
                     cells_cleared = cells_cleared.saturating_add(1);
                     let page = address & !(DARWIN_HOST_PAGE_SIZE - 1);
                     if last_page != Some(page) {
@@ -910,8 +1155,12 @@ impl DirectBindingCellRef {
     }
 
     /// Release-clears the cell after callers have established quiescence.
-    pub fn clear_release(self) {
+    pub fn clear_release(self) -> bool {
+        if self.load_acquire().is_null() {
+            return false;
+        }
         self.cell().store(std::ptr::null_mut(), Ordering::Release);
+        true
     }
 
     fn cell(self) -> &'static AtomicPtr<DirectBindingTarget> {
@@ -919,5 +1168,47 @@ impl DirectBindingCellRef {
         // live initialized `AtomicPtr` for the lifetime of every copied
         // adapter. All mapped-cell access is centralized in this adapter.
         unsafe { &*(self.address.get() as *const AtomicPtr<DirectBindingTarget>) }
+    }
+}
+
+#[cfg(test)]
+mod evidence_reason_tests {
+    use super::{DirectBindingClearReason, DirectBindingValidationReason};
+
+    #[test]
+    fn direct_binding_evidence_reasons_are_nonzero_stable_and_unique() {
+        let clear = [
+            DirectBindingClearReason::TargetInvalidation.raw(),
+            DirectBindingClearReason::StaleWinnerRemoval.raw(),
+            DirectBindingClearReason::ForkReset.raw(),
+            DirectBindingClearReason::ExecReset.raw(),
+        ];
+        assert_eq!(clear, [1, 2, 3, 4]);
+        assert_eq!(
+            clear
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            clear.len()
+        );
+
+        let validation = [
+            DirectBindingValidationReason::MissingEligibleRecord.raw(),
+            DirectBindingValidationReason::AmbiguousEligibleRecord.raw(),
+            DirectBindingValidationReason::MissMetadataMismatch.raw(),
+            DirectBindingValidationReason::OwnerMismatch.raw(),
+            DirectBindingValidationReason::AuthorityMismatch.raw(),
+            DirectBindingValidationReason::MappedCellFailure.raw(),
+        ];
+        assert_eq!(validation, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            validation
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            validation.len()
+        );
     }
 }

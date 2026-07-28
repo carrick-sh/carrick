@@ -205,6 +205,12 @@ dsr_ordinal_enum! {
         Invalidate = 4,
         BlockPublish = 5,
         CapacityFailure = 6,
+        DirectBindingEligible = 7,
+        DirectBindingPublish = 8,
+        DirectBindingCasLoss = 9,
+        DirectBindingClear = 10,
+        DirectBindingValidationFailure = 11,
+        DirectBindingUnitLoaded = 12,
     }
 }
 
@@ -612,6 +618,12 @@ mod dsr_probe_abi {
         assert_eq!(DsrCacheEventKind::Invalidate.raw(), 4);
         assert_eq!(DsrCacheEventKind::BlockPublish.raw(), 5);
         assert_eq!(DsrCacheEventKind::CapacityFailure.raw(), 6);
+        assert_eq!(DsrCacheEventKind::DirectBindingEligible.raw(), 7);
+        assert_eq!(DsrCacheEventKind::DirectBindingPublish.raw(), 8);
+        assert_eq!(DsrCacheEventKind::DirectBindingCasLoss.raw(), 9);
+        assert_eq!(DsrCacheEventKind::DirectBindingClear.raw(), 10);
+        assert_eq!(DsrCacheEventKind::DirectBindingValidationFailure.raw(), 11);
+        assert_eq!(DsrCacheEventKind::DirectBindingUnitLoaded.raw(), 12);
         assert_unique(&DsrCacheEventKind::ALL.map(DsrCacheEventKind::raw));
 
         assert_eq!(DsrCacheRole::Common.raw(), 0);
