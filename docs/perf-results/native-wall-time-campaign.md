@@ -1,7 +1,7 @@
 # Darwin/AArch64 native wall-time campaign ledger
 
 **Updated:** 2026-07-28
-**Status:** ACTIVE — M1 accepted; `MEASUREMENT_REPAIR_REQUIRED`
+**Status:** ACTIVE — M1 accepted; cache repair retained; kernel symbolization required
 **Primary workload:** cold-GOCACHE `go-build`  
 **Design:** [Darwin native wall-time attribution campaign](../superpowers/specs/2026-07-27-native-wall-time-attribution-campaign-design.md)
 
@@ -15,16 +15,27 @@
 | Official `C0` | 19,375 ms | Five fresh untraced Carrick samples |
 | Official `D0` | 1,007 ms | Five fresh native-arm64 Docker samples |
 | Official `R0` | 19.2403x | `C0 / D0` |
+| Current Carrick median | 21,005 ms | Five clean completions at `c65f4b0f`; 1,630 ms / 8.4% slower than `C0` |
+| Current Docker median | 1,367 ms | Same serial campaign; 360 ms / 35.7% slower than `D0` |
+| Current same-run ratio | 15.3658x | Numerically 20.1% below `R0`, but not a code win because Carrick seconds regressed and Docker drifted more |
 | M2 target | 9.6202x | `R0 / 2` |
 | Destination | 2.0x | Two independent five-sample campaigns |
-| Destination progress | 0.0% | `(R0 - R) / (R0 - 2.0)` |
+| Ratio progress | 22.5% | `(R0 - R) / (R0 - 2.0)`; wall-seconds progress remains 0% |
 
 Current milestone: **M2 — kernel on-CPU attribution and spike selection**. M0
-and M1 are complete; the first authority-carrying cache family is correct but
-has not beaten `C0`. Task 5 repaired the first receipt-bound capture's trace
-framing, but the single-use v2 attempt then exhausted the 64 MiB DSR
-translation cache during run A before `BUILD_OK`. Run B and analysis remain
-absent, so no kernel family exists.
+and M1 are complete. The exact first-bad commit for the later capacity
+regression was `98e2f0d6`: it put a 256-byte portable authority precursor on
+ordinary private direct exits. Commit `c65f4b0f` restores the compact 56-byte
+private gateway while retaining the authority precursor for immutable portable
+units. The unchanged 64 MiB cache now completes five consecutive cold-Go
+builds, so the capacity repair is retained. It is not a Carrick wall-speed win:
+the accepted current median is 21,005 ms versus `C0=19,375 ms`. The current
+same-run ratio fell only because the Docker median drifted even more.
+
+The single-use v2 DTrace attempt remains rejected and preserved. A future
+capture still requires live libdtrace symbolization because v2 reconciled all
+9,610 raw kernel PCs/stacks but preserved no runtime kernel slide and resolved
+zero leaves. No kernel family or H006 exists yet.
 
 ## Measurement contract
 
@@ -79,6 +90,47 @@ absent, so no kernel family exists.
 | E015 | Task 15 live retry at `ece8c497` | structural/build accepted; feasibility rejected | All four structural gates and fresh signed-binary checks passed, but the authorized wrapper-free candidate reached Go compilation and exhausted the 64 MiB DSR translation cache before `BUILD_OK`; the campaign JSON was not written and the mechanism pair was not run |
 | E016 | `scripts/perf/evidence/native-go-build-kernel-attribution-v1.json` plus rejected A receipt under `target/perf/native-kernel-capture-7ec846a5-v1/` | `MEASUREMENT_REPAIR_REQUIRED` | Clean `7ec846a5`, signed binary `385e63d0…`, native-arm64 image, and clean monitor provenance reached run A; trace auto-sudo then treated the repeated Carrick binary path as a subcommand, so A exited 1 without `BUILD_OK`, B and `analysis.json` remained absent, and no family was selected |
 | E017 | `scripts/perf/evidence/native-go-build-kernel-attribution-v2.json` plus rejected A receipt under `target/perf/native-kernel-capture-3fb91b09-v2/` | `MEASUREMENT_REPAIR_REQUIRED` | Clean `3fb91b09`, the unchanged signed binary/image, and repaired `trace -- run` framing reached Go compilation; A then exhausted the 64 MiB DSR translation cache before `BUILD_OK`. Its natural zero-drop partial profile reconciles 9,610 kernel PCs/stacks but has zero symbolized leaves; B and analysis are absent and no family was selected |
+| E018 | Task 9 signed bracket plus `c65f4b0f` red/green/live gate | accepted capacity repair | Immediate parent `de05a11a` completes and `98e2f0d6` exhausts the unchanged cache; typed compact-private/portable-authority policy passes 163 crate tests, independent review, and a fresh signed `BUILD_OK` runtime gate |
+| E019 | `scripts/perf/evidence/native-go-build-wall-compact-exits-v1.json` | accepted retention measurement | Five Carrick completions at 20,260/20,698/21,005/21,547/25,209 ms and five serial Docker completions at 1,258/1,466/1,472/1,367/1,359 ms; current medians 21,005/1,367 ms and ratio 15.3658x; retain failure-to-completion repair, claim no Carrick wall win |
+
+### Tasks 7–11 — capacity root cause, repair, and retention
+
+An untraced current-default discriminator independently reproduced the v2
+capacity failure, proving DTrace was not its cause. A freshly signed source
+bracket then established the exact first-bad boundary:
+
+- `de05a11a`: `BUILD_OK`, exit 0;
+- immediate successor `98e2f0d6`: no `BUILD_OK`,
+  `requested=296 used=67108692 capacity=67108864`.
+
+The causal source delta changed ordinary private branch/call exits from the
+compact gateway to a fixed 256-byte authority-aware precursor without a feature
+gate. `2c53a210` later extended the same precursor to conditional,
+continuation, and region exits; one conditional block carried 512 bytes of
+precursors.
+
+Commit `c65f4b0f6a2483984a9dbf7a1e85bc14a1bc91d2` introduces a typed
+emission policy. Ordinary private JIT and artifact-store templates emit exact
+56-byte direct gateways. Immutable portable-unit recording explicitly retains
+the exact 256-byte authority-aware precursor, rich direct-link identity,
+recovery coverage, and sidecar-rewrite geometry. The change increases no cache,
+changes no target-cache ABI or unit schema, and passed red-first structural
+coverage, 163/163 crate library tests, formatting, and an independent review
+with no findings.
+
+A fresh signed binary
+(`f8af4e8512879d192454c9d99bb5be43780a6cee5d648d53269f7c6181775886`)
+then completed exactly one diagnostic sample and five clean retention samples
+inside the unchanged cache. Every run produced one `BUILD_OK`, exit 0, cleanup
+status 0, and zero scoped survivors. The accepted serial five-plus-five raw
+artifact hashes to
+`d151ce9f60917ddd92170da184fc9309de3211c9dec5223c6f3032e00c837619`.
+
+The retained result is a durable capacity/correctness step, not a wall-speed
+claim. Carrick's 21,005 ms median is 1,630 ms (8.4%) slower than `C0`; Docker's
+1,367 ms median is 360 ms (35.7%) slower than `D0`. Consequently the 15.3658x
+same-run ratio is numerically lower but cannot be attributed to the code
+repair. The next retained optimization must reduce Carrick wall seconds.
 
 ### Task 6 kernel attribution — runtime-capacity rejection
 
@@ -699,7 +751,8 @@ Write and validate the executable M1 plan:
       independent review at `3fb91b09`.
 - [x] Invoke the repaired single-use v2 controller exactly once; preserve its
       rejected A receipt after Go compilation exhausts the 64 MiB DSR cache.
-- [ ] Repair measurement before another authorization: prove the frozen
-      default workload reaches `BUILD_OK` inside the existing cache bound and
-      restore at least 95% symbolized kernel-leaf coverage. Never recycle v1 or
-      v2, infer a family, create H006, or claim a performance result.
+- [x] Prove the frozen default workload reaches `BUILD_OK` inside the existing
+      cache bound; retain `c65f4b0f` after five clean completions.
+- [ ] Restore at least 95% symbolized kernel-leaf coverage before another
+      capture. Never recycle v1 or v2, infer a family, or create H006 from the
+      rejected partial run.

@@ -28,6 +28,25 @@ the branch named above. The last-known pre-sidecar checkpoint had a green
 `go-sync` 52/52 and `cpython-threading` 193/193). Those are historical
 receipts, not current-branch-tip results.
 
+The current branch now includes `c65f4b0f`, which repairs the exact
+default-path translation-cache regression introduced by `98e2f0d6`. Ordinary
+private direct exits are compact 56-byte gateways again; immutable portable
+translation units retain the 256-byte authority-aware precursor and
+direct-binding recovery geometry. A freshly signed binary completed one
+diagnostic sample and five clean retention samples inside the unchanged
+64 MiB cache. The accepted current Carrick median is 21,005 ms, however, versus
+`C0=19,375 ms`; keep the durable failure-to-completion repair, but do not call
+it a Carrick wall-time win. The same serial campaign's Docker median drifted
+to 1,367 ms, producing a 15.3658x ratio that must not be attributed to the
+code change. Evidence:
+`scripts/perf/evidence/native-go-build-wall-compact-exits-v1.json`.
+
+The remaining measurement blocker is live kernel symbolization. The preserved
+v2 partial profile reconciles 9,610 raw kernel PCs/stacks but omitted the
+current boot runtime slide and has zero symbolized leaves. The public Apple
+libdtrace object/symbol APIs are available; implement post-stop,
+pre-handle-close deep-copy symbolization before authorizing a new capture.
+
 The current branch includes repair `7cebf638` for Task 15's runtime-oracle
 metadata compile failure. A clean retry at `8d440b61` passed the two native
 crate suites but stopped fail-closed when the focused runtime oracle's
@@ -756,16 +775,21 @@ as refuted — the gap is defects, not physics.
 
 ## Next work, ordered by the current gate
 
-1. **Repair measurement before another capture.** Prove the intended default
-   cold-Go workload completes inside the existing 64 MiB cache bound, and
-   restore at least 95% symbolized kernel-leaf coverage.
+1. **Repair kernel symbolization before another capture.** Default cold-Go now
+   completes five times inside the existing 64 MiB cache. Implement live
+   post-stop/pre-handle-close libdtrace symbolization and prove at least 95%
+   exact kernel-leaf coverage.
 2. **Preserve both single-use roots.** Neither v1 nor v2 may be rerun, deleted,
    or recycled. The v2 A receipt and raw artifacts are the authority for this
    rejection; B and analysis are absent, not zero.
 3. **Do not reinterpret partial A as selection.** Its 9,610/9,610
    reconciliation is real, but the workload did not finish and symbolized-leaf
    coverage is zero. There is no selectable/diffuse result or H006.
-4. **Do not tune the rejected mechanism.** Cache-size changes, the 22-word
+4. **Keep `c65f4b0f`, but do not overclaim it.** It is a reviewed,
+   five-completion capacity repair. Current Carrick wall seconds are slower
+   than `C0`; the lower ratio reflects larger Docker drift, not a proven speed
+   win.
+5. **Do not tune the rejected mechanism.** Cache-size changes, the 22-word
    direct-binding path, another Variant 1 mechanism pair, and Task 16 require a
    new controller decision; none is authorized by this handoff.
 
