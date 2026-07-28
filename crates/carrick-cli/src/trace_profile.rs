@@ -400,7 +400,7 @@ fn summed_count(
     grouped: &BTreeMap<ProfileScope, MetricBuilder>,
     phase: &str,
     kind: Option<&str>,
-) -> Option<u64> {
+) -> Result<Option<u64>> {
     let mut found = false;
     let mut total = 0_u64;
     for (scope, metric) in grouped {
@@ -409,26 +409,9 @@ fn summed_count(
             && let Some(value) = metric.count
         {
             found = true;
-            total = total.saturating_add(value);
-        }
-    }
-    found.then_some(total)
-}
-
-fn checked_summed_count(
-    grouped: &BTreeMap<ProfileScope, MetricBuilder>,
-    phase: &str,
-) -> Result<Option<u64>> {
-    let mut found = false;
-    let mut total = 0_u64;
-    for (scope, metric) in grouped {
-        if scope.phase.as_deref() == Some(phase)
-            && let Some(value) = metric.count
-        {
-            found = true;
             total = total
                 .checked_add(value)
-                .ok_or_else(|| anyhow!("native-wall {phase} population overflow"))?;
+                .ok_or_else(|| anyhow!("native-wall {phase} count population overflow"))?;
         }
     }
     Ok(found.then_some(total))
@@ -452,10 +435,10 @@ fn validate_native_wall_metrics(
     grouped: &BTreeMap<ProfileScope, MetricBuilder>,
     stack_traces: &[StackTraceRecord],
 ) -> Result<()> {
-    let wall_samples = summed_count(grouped, "wall-samples", None)
+    let wall_samples = summed_count(grouped, "wall-samples", None)?
         .filter(|value| *value != 0)
         .ok_or_else(|| anyhow!("native-wall profile has no wall samples"))?;
-    let wall_buckets = summed_count(grouped, "wall-state", None)
+    let wall_buckets = summed_count(grouped, "wall-state", None)?
         .ok_or_else(|| anyhow!("native-wall profile has no wall-state buckets"))?;
     if wall_buckets != wall_samples {
         bail!("native-wall wall-state buckets sum to {wall_buckets}, expected {wall_samples}");
@@ -463,12 +446,12 @@ fn validate_native_wall_metrics(
     summed_total_ns(grouped, "elapsed")
         .filter(|value| *value != 0)
         .ok_or_else(|| anyhow!("native-wall profile has no elapsed duration"))?;
-    let live_at_end = summed_count(grouped, "process-lifecycle", Some("live-at-end"))
+    let live_at_end = summed_count(grouped, "process-lifecycle", Some("live-at-end"))?
         .ok_or_else(|| anyhow!("native-wall profile has no live-at-end count"))?;
     if live_at_end != 0 {
         bail!("native-wall profile ended with {live_at_end} tracked process(es)");
     }
-    let kernel_samples = checked_summed_count(grouped, "cpu-kernel-pc")?.unwrap_or(0);
+    let kernel_samples = summed_count(grouped, "cpu-kernel-pc", None)?.unwrap_or(0);
     let mut kernel_stack_samples = 0_u64;
     let mut has_kernel_stacks = false;
     let mut has_voluntary_stacks = false;
@@ -490,7 +473,7 @@ fn validate_native_wall_metrics(
             "native-wall kernel stack samples total {kernel_stack_samples}, expected {kernel_samples}"
         );
     }
-    if summed_count(grouped, "cpu-user-pc", None).unwrap_or(0) == 0 && kernel_samples == 0 {
+    if summed_count(grouped, "cpu-user-pc", None)?.unwrap_or(0) == 0 && kernel_samples == 0 {
         bail!("native-wall profile has no CPU samples");
     }
     let voluntary_ns = summed_total_ns(grouped, "offcpu-voluntary-total").unwrap_or(0);
@@ -694,19 +677,15 @@ impl ProfileSummary {
             match record.record_type {
                 RecordType::Count => {
                     let value = record.required_u64("value")?;
-                    let is_kernel_pc = scope.phase.as_deref() == Some("cpu-kernel-pc");
+                    let phase = scope.phase.as_deref().unwrap_or("<unscoped>").to_owned();
                     let builder = grouped.entry(scope).or_default();
                     let previous = builder.count.unwrap_or(0);
-                    builder.count = Some(if is_kernel_pc {
-                        previous.checked_add(value).ok_or_else(|| {
-                            anyhow!(
-                                "native-wall cpu-kernel-pc population overflow at line {}",
-                                index + 1
-                            )
-                        })?
-                    } else {
-                        previous.saturating_add(value)
-                    });
+                    builder.count = Some(previous.checked_add(value).ok_or_else(|| {
+                        anyhow!(
+                            "profile count population overflow for phase {phase:?} at line {}",
+                            index + 1
+                        )
+                    })?);
                 }
                 RecordType::Total => {
                     let value = record.required_u64("value_ns")?;
@@ -1405,6 +1384,152 @@ mod tests {
         assert!(
             error.to_string().contains("overflow"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    fn assert_native_wall_count_overflow(lines: Vec<&str>, phase: &str, mutation: &str) {
+        let error = ProfileSummary::from_lines(lines, ProfileCaptureStatus::default())
+            .expect_err("validation count overflow must reject");
+        let message = error.to_string();
+        assert!(
+            message.contains(phase) && message.contains("overflow"),
+            "production mutation {mutation:?} produced unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn native_wall_cpu_user_pc_per_scope_overflow_rejects() {
+        assert_native_wall_count_overflow(
+            vec![
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=18446744073709551615",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            "cpu-user-pc",
+            "saturates one cpu-user-pc scope",
+        );
+    }
+
+    #[test]
+    fn native_wall_wall_samples_per_scope_overflow_rejects() {
+        assert_native_wall_count_overflow(
+            vec![
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=18446744073709551615",
+                "DSRPROF1|count|phase=wall-samples|value=18446744073709551615",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            "wall-samples",
+            "saturates one wall-samples scope",
+        );
+    }
+
+    #[test]
+    fn native_wall_wall_state_per_scope_overflow_rejects() {
+        assert_native_wall_count_overflow(
+            vec![
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=18446744073709551615",
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=18446744073709551615",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            "wall-state",
+            "saturates one wall-state scope",
+        );
+    }
+
+    #[test]
+    fn native_wall_process_lifecycle_per_scope_overflow_rejects() {
+        assert_native_wall_count_overflow(
+            vec![
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=18446744073709551615",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=1",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            "process-lifecycle",
+            "saturates one process-lifecycle scope",
+        );
+    }
+
+    #[test]
+    fn native_wall_cpu_user_pc_population_overflow_rejects() {
+        assert_native_wall_count_overflow(
+            vec![
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=18446744073709551615",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=43|source_pc=0x2000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            "cpu-user-pc",
+            "saturates the cpu-user-pc population across scopes",
+        );
+    }
+
+    #[test]
+    fn native_wall_wall_samples_population_overflow_rejects() {
+        assert_native_wall_count_overflow(
+            vec![
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=18446744073709551615",
+                "DSRPROF1|count|phase=wall-samples|kind=first|value=18446744073709551615",
+                "DSRPROF1|count|phase=wall-samples|kind=second|value=1",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            "wall-samples",
+            "saturates the wall-samples population across scopes",
+        );
+    }
+
+    #[test]
+    fn native_wall_wall_state_population_overflow_rejects() {
+        assert_native_wall_count_overflow(
+            vec![
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=18446744073709551615",
+                "DSRPROF1|count|phase=wall-state|kind=transition|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=18446744073709551615",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|value=0",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            "wall-state",
+            "saturates the wall-state population across scopes",
+        );
+    }
+
+    #[test]
+    fn native_wall_process_lifecycle_population_overflow_rejects() {
+        assert_native_wall_count_overflow(
+            vec![
+                "DSRPROF1|count|phase=wall-state|kind=on-cpu|value=1",
+                "DSRPROF1|count|phase=wall-samples|value=1",
+                "DSRPROF1|count|phase=cpu-user-pc|pid=42|source_pc=0x1000|value=1",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|pid=42|value=18446744073709551615",
+                "DSRPROF1|count|phase=process-lifecycle|kind=live-at-end|pid=43|value=1",
+                "DSRPROF1|total|phase=elapsed|value_ns=1000000",
+                "DSRPROF1|complete|profile=native-wall|bounded=0|target_exit_reason=1",
+            ],
+            "process-lifecycle",
+            "saturates the process-lifecycle population across scopes",
         );
     }
 
