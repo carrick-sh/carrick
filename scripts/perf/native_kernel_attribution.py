@@ -474,6 +474,16 @@ def analyze_profiles(paths: Sequence[pathlib.Path]) -> dict[str, object]:
         return document
 
     paired_runs = (runs[0], runs[1])
+    if normalized_paths[0] == normalized_paths[1]:
+        errors.append("profile paths must be distinct")
+    if paired_runs[0].sha256 == paired_runs[1].sha256:
+        errors.append("profile source hashes must be distinct")
+    if paired_runs[0].provenance["run_id"] == paired_runs[1].provenance["run_id"]:
+        errors.append("profile run_id values must be distinct")
+    if errors:
+        document["evidence_errors"] = errors
+        return document
+
     for run_number, run in enumerate(paired_runs, 1):
         coverage = Fraction(
             run.symbolized_leaf_count,
@@ -605,14 +615,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--profile",
         action="append",
-        required=True,
+        default=[],
         type=pathlib.Path,
         help="completed native-wall JSONL profile; pass exactly twice",
     )
     parser.add_argument("--output", required=True, type=pathlib.Path)
     args = parser.parse_args(argv)
-    if len(args.profile) != 2:
-        parser.error("--profile must be passed exactly twice")
     document = analyze_profiles(args.profile)
     try:
         _write_atomic(args.output, document)
