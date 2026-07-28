@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
@@ -26,6 +27,8 @@ RECEIPT_SCHEMA = "carrick.native-kernel-capture.v2"
 PROFILE = "native-wall"
 MONITOR_INTERVAL_SECONDS = 0.01
 MONITOR_INTERVAL_MILLISECONDS = 10
+WATCHDOG_JOIN_SECONDS = 1
+WATCHDOG_THREAD_NAME = "native-kernel-trace-deadline-watchdog"
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,39}")
 ARTIFACT_NAMES = (
     "raw_trace",
@@ -560,6 +563,118 @@ def _monitor_sample(
     }
 
 
+class _TraceDeadlineWatchdog:
+    def __init__(
+        self,
+        process: subprocess.Popen[str],
+        deadline: float,
+    ) -> None:
+        self._process = process
+        self._deadline = deadline
+        self._cancel = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._started = False
+        self._timed_out = False
+        self._completed_in_budget = False
+        self._failed = False
+
+    def _record_failure(self) -> None:
+        with self._lock:
+            self._failed = True
+
+    def _kill_fail_closed(self) -> None:
+        try:
+            self._process.kill()
+        except Exception:
+            self._record_failure()
+
+    def start(self) -> None:
+        try:
+            thread = threading.Thread(
+                target=self._run,
+                name=WATCHDOG_THREAD_NAME,
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+        except Exception:
+            self._record_failure()
+            self._cancel.set()
+            self._kill_fail_closed()
+            return
+        with self._lock:
+            self._started = True
+
+    def _run(self) -> None:
+        try:
+            remaining = max(0.0, self._deadline - time.monotonic())
+            try:
+                self._process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                if self._cancel.is_set():
+                    return
+                with self._lock:
+                    self._timed_out = True
+                self._kill_fail_closed()
+                return
+            except Exception:
+                self._record_failure()
+                self._kill_fail_closed()
+                return
+            observed_at = time.monotonic()
+            if self._cancel.is_set():
+                return
+            with self._lock:
+                if observed_at < self._deadline:
+                    self._completed_in_budget = True
+                else:
+                    self._timed_out = True
+        except Exception:
+            self._record_failure()
+            self._kill_fail_closed()
+
+    def remaining_seconds(self) -> float:
+        return max(0.0, self._deadline - time.monotonic())
+
+    def _join(self) -> None:
+        with self._lock:
+            started = self._started
+            thread = self._thread
+        if not started or thread is None:
+            return
+        try:
+            thread.join(timeout=WATCHDOG_JOIN_SECONDS)
+            if thread.is_alive():
+                self._record_failure()
+        except Exception:
+            self._record_failure()
+
+    def join_after_deadline(self) -> None:
+        self._join()
+
+    def cancel_and_join(self) -> None:
+        self._cancel.set()
+        self._join()
+
+    @property
+    def timed_out(self) -> bool:
+        with self._lock:
+            return self._timed_out
+
+    @property
+    def failed(self) -> bool:
+        with self._lock:
+            return self._failed
+
+    def completion_exceeded_deadline(self, observed_at: float) -> bool:
+        with self._lock:
+            return (
+                observed_at >= self._deadline
+                and not self._completed_in_budget
+            )
+
+
 class _ContaminationMonitor:
     def __init__(self) -> None:
         self._stop = threading.Event()
@@ -638,9 +753,11 @@ class _ContaminationMonitor:
     def launch_owned_process(
         self,
         launcher: Callable[[], subprocess.Popen[str]],
+        on_launch: Callable[[subprocess.Popen[str], float], None],
     ) -> subprocess.Popen[str]:
         with self._poll_lock:
             process = launcher()
+            launched_at = time.monotonic()
             if (
                 isinstance(process.pid, bool)
                 or not isinstance(process.pid, int)
@@ -652,6 +769,7 @@ class _ContaminationMonitor:
                     process.wait()
                 raise EvidenceError("trace Popen returned an invalid PID")
             self._owned_lineage.add(process.pid)
+            on_launch(process, launched_at)
             self._sample_locked("interval")
             return process
 
@@ -780,6 +898,28 @@ def _text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode(errors="replace")
     return value
+
+
+def _terminate_and_collect(
+    process: subprocess.Popen[str],
+) -> tuple[str, str, Exception | None]:
+    failure: Exception | None = None
+    try:
+        if process.poll() is None:
+            process.kill()
+    except Exception as error:
+        failure = error
+    try:
+        stdout, stderr = process.communicate(timeout=WATCHDOG_JOIN_SECONDS)
+        return _text(stdout), _text(stderr), failure
+    except subprocess.TimeoutExpired as error:
+        if failure is None:
+            failure = EvidenceError("trace process did not terminate")
+        return _text(error.stdout), _text(error.stderr), failure
+    except Exception as error:
+        if failure is None:
+            failure = error
+        return "", "", failure
 
 
 def _cleanup(
@@ -1096,6 +1236,20 @@ def _capture_one(
         or launch_monitor["started"] is not True
     )
     process: subprocess.Popen[str] | None = None
+    watchdog: _TraceDeadlineWatchdog | None = None
+
+    def trace_launched(
+        candidate: subprocess.Popen[str],
+        launched_at: float,
+    ) -> None:
+        nonlocal process, watchdog
+        process = candidate
+        watchdog = _TraceDeadlineWatchdog(
+            candidate,
+            launched_at + config.timeout_seconds,
+        )
+        watchdog.start()
+
     try:
         if not monitor_blocked:
             try:
@@ -1107,7 +1261,8 @@ def _capture_one(
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
-                    )
+                    ),
+                    trace_launched,
                 )
                 execution_monitor = monitor.evidence()
                 execution_blocked = (
@@ -1115,14 +1270,40 @@ def _capture_one(
                     or execution_monitor["contaminated"] is True
                 )
                 if execution_blocked:
-                    process.kill()
-                    process.communicate()
-                else:
-                    process_stdout, process_stderr = process.communicate(
-                        timeout=config.timeout_seconds
+                    collected_stdout, collected_stderr, termination_error = (
+                        _terminate_and_collect(process)
                     )
+                    stdout = collected_stdout
+                    stderr = collected_stderr
+                    if termination_error is not None:
+                        launch_error = termination_error
+                else:
+                    if watchdog is None:
+                        raise EvidenceError(
+                            "trace deadline watchdog failed"
+                        )
+                    remaining = watchdog.remaining_seconds()
+                    if remaining <= 0:
+                        watchdog.join_after_deadline()
+                        remaining = WATCHDOG_JOIN_SECONDS
+                    process_stdout, process_stderr = process.communicate(
+                        timeout=remaining
+                    )
+                    communicate_finished_at = time.monotonic()
+                    watchdog.cancel_and_join()
                     stdout = _text(process_stdout)
                     stderr = _text(process_stderr)
+                    if (
+                        watchdog.timed_out
+                        or watchdog.completion_exceeded_deadline(
+                            communicate_finished_at
+                        )
+                    ):
+                        timed_out = True
+                    if watchdog.failed:
+                        launch_error = EvidenceError(
+                            "trace deadline watchdog failed"
+                        )
                     if process.returncode is None:
                         raise EvidenceError(
                             "trace process did not return a status"
@@ -1138,19 +1319,55 @@ def _capture_one(
                 stdout = _text(error.stdout)
                 stderr = _text(error.stderr)
                 if process is not None:
-                    try:
-                        process.kill()
-                    finally:
-                        try:
-                            process.communicate()
-                        except Exception:
-                            pass
+                    collected_stdout, collected_stderr, termination_error = (
+                        _terminate_and_collect(process)
+                    )
+                    if collected_stdout:
+                        stdout = collected_stdout
+                    if collected_stderr:
+                        stderr = collected_stderr
+                    if termination_error is not None:
+                        launch_error = termination_error
+                    if process.returncode is not None:
+                        result = subprocess.CompletedProcess(
+                            command,
+                            process.returncode,
+                            stdout,
+                            stderr,
+                        )
             except Exception as error:
                 launch_error = error
                 stderr = (
                     f"trace command raised: {type(error).__name__}: {error}\n"
                 )
+                if process is not None:
+                    (
+                        collected_stdout,
+                        collected_stderr,
+                        termination_error,
+                    ) = _terminate_and_collect(process)
+                    if collected_stdout:
+                        stdout = collected_stdout
+                    if collected_stderr:
+                        stderr = collected_stderr
+                    if termination_error is not None:
+                        launch_error = termination_error
+                    if process.returncode is not None:
+                        result = subprocess.CompletedProcess(
+                            command,
+                            process.returncode,
+                            stdout,
+                            stderr,
+                        )
     finally:
+        if watchdog is not None:
+            watchdog.cancel_and_join()
+            if watchdog.timed_out:
+                timed_out = True
+            if watchdog.failed:
+                launch_error = EvidenceError(
+                    "trace deadline watchdog failed"
+                )
         cleanup, cleanup_stdout, cleanup_stderr = _cleanup(config, host_run_id)
         monitor.stop()
     monitor_evidence = monitor.evidence()

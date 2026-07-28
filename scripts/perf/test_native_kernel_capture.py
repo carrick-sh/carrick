@@ -167,6 +167,9 @@ class ExternalBoundary:
         monitor_poll_failure: bool = False,
         initial_monitor_failure: bool = False,
         runner_children: str | None = None,
+        monitor_delay_seconds: float = 0.0,
+        trace_duration_seconds: float | None = None,
+        watchdog_poll_delay_seconds: float = 0.0,
     ) -> None:
         self.binary = binary
         self.binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -183,6 +186,9 @@ class ExternalBoundary:
         self.monitor_poll_failure = monitor_poll_failure
         self.initial_monitor_failure = initial_monitor_failure
         self.runner_children = runner_children
+        self.monitor_delay_seconds = monitor_delay_seconds
+        self.trace_duration_seconds = trace_duration_seconds
+        self.watchdog_poll_delay_seconds = watchdog_poll_delay_seconds
         self.after_trace: object = None
         self.events: list[tuple[str, str]] = []
         self.trace_index = 0
@@ -191,6 +197,8 @@ class ExternalBoundary:
         self.active_process_polls = 0
         self.active_docker_polls = 0
         self.total_process_polls = 0
+        self.delayed_trace_indices: set[int] = set()
+        self.trace_processes: list[FakeTraceProcess] = []
         self.lock = threading.Lock()
 
     def popen(
@@ -198,7 +206,13 @@ class ExternalBoundary:
         command: list[str],
         **kwargs: object,
     ) -> FakeTraceProcess:
-        return FakeTraceProcess(self, command, kwargs)
+        process: FakeTraceProcess
+        if self.trace_duration_seconds is None:
+            process = FakeTraceProcess(self, command, kwargs)
+        else:
+            process = DelayedTraceProcess(self, command, kwargs)
+        self.trace_processes.append(process)
+        return process
 
     @staticmethod
     def _result(
@@ -256,6 +270,15 @@ class ExternalBoundary:
                 with self.lock:
                     self.active_process_polls += 1
                     active_poll = self.active_process_polls
+                    trace_index = self.trace_index
+                    should_delay = (
+                        self.monitor_delay_seconds > 0
+                        and trace_index not in self.delayed_trace_indices
+                    )
+                    if should_delay:
+                        self.delayed_trace_indices.add(trace_index)
+                if should_delay:
+                    time.sleep(self.monitor_delay_seconds)
                 if self.runner_children is not None:
                     assert self.active_trace_command is not None
                     guest_run_id = next(
@@ -471,11 +494,145 @@ class FakeTraceProcess:
 
     terminate = kill
 
-    def wait(self, timeout: int | None = None) -> int:
-        del timeout
+    def wait(self, timeout: float | None = None) -> int:
+        if (
+            self.boundary.trace_outcome == "timeout"
+            and not self._killed
+        ):
+            raise subprocess.TimeoutExpired(self.args, timeout)
         if self.returncode is None:
-            self.returncode = -9 if self._killed else 0
+            if self._killed:
+                self.returncode = -9
+            elif self.boundary.trace_outcome == "nonzero":
+                self.returncode = 7
+            else:
+                self.returncode = 0
         return self.returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+class DelayedTraceProcess(FakeTraceProcess):
+    def __init__(
+        self,
+        boundary: ExternalBoundary,
+        command: list[str],
+        kwargs: dict[str, object],
+    ) -> None:
+        super().__init__(boundary, command, kwargs)
+        assert boundary.trace_duration_seconds is not None
+        self.duration_seconds = boundary.trace_duration_seconds
+        self.launched_at = time.monotonic()
+        self.killed_at: float | None = None
+        self.communicate_timeouts: list[float | None] = []
+        self._killed_event = threading.Event()
+        self._state_lock = threading.Lock()
+
+    def _complete_locked(self) -> None:
+        if self._completed or self._killed:
+            return
+        self.raw_path.write_text(f"raw trace {self.host_run_id}\n")
+        rows = summary_rows(
+            self.host_run_id,
+            self.boundary.HEAD,
+            self.boundary.binary_sha256,
+            self.target,
+            source_pc=(
+                0xFFFFFE0000000000 + self.boundary.trace_index
+            ),
+        )
+        self.summary_path.write_text(
+            "".join(
+                json.dumps(
+                    row,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+                for row in rows
+            )
+        )
+        self.returncode = 0
+        self._completed = True
+        self.boundary.trace_active.clear()
+
+    def _complete_if_due_locked(self) -> None:
+        if time.monotonic() - self.launched_at >= self.duration_seconds:
+            self._complete_locked()
+
+    def communicate(
+        self,
+        input: object = None,
+        timeout: float | None = None,
+    ) -> tuple[str, str]:
+        del input
+        self.communicate_timeouts.append(timeout)
+        with self._state_lock:
+            self._complete_if_due_locked()
+            if self._completed:
+                return ("BUILD_OK\n", "trace diagnostic\n")
+            if self._killed:
+                return ("partial stdout\n", "partial stderr\n")
+            remaining = max(
+                0.0,
+                self.duration_seconds - (time.monotonic() - self.launched_at),
+            )
+        wait_seconds = remaining if timeout is None else min(remaining, timeout)
+        killed = self._killed_event.wait(wait_seconds)
+        with self._state_lock:
+            self._complete_if_due_locked()
+            if self._completed:
+                return ("BUILD_OK\n", "trace diagnostic\n")
+            if killed or self._killed:
+                return ("partial stdout\n", "partial stderr\n")
+        raise subprocess.TimeoutExpired(
+            self.args,
+            timeout,
+            output="partial stdout\n",
+            stderr="partial stderr\n",
+        )
+
+    def kill(self) -> None:
+        with self._state_lock:
+            self._complete_if_due_locked()
+            if self._completed or self._killed:
+                return
+            self._killed = True
+            self.returncode = -9
+            self.killed_at = time.monotonic()
+            self.boundary.trace_active.clear()
+            self._killed_event.set()
+
+    terminate = kill
+
+    def wait(self, timeout: float | None = None) -> int:
+        with self._state_lock:
+            self._complete_if_due_locked()
+            if self.returncode is not None:
+                return self.returncode
+            remaining = max(
+                0.0,
+                self.duration_seconds - (time.monotonic() - self.launched_at),
+            )
+        wait_seconds = remaining if timeout is None else min(remaining, timeout)
+        self._killed_event.wait(wait_seconds)
+        with self._state_lock:
+            self._complete_if_due_locked()
+            if self.returncode is not None:
+                return self.returncode
+        raise subprocess.TimeoutExpired(self.args, timeout)
+
+    def poll(self) -> int | None:
+        if (
+            threading.current_thread().name
+            == "native-kernel-trace-deadline-watchdog"
+            and self.boundary.watchdog_poll_delay_seconds > 0
+        ):
+            time.sleep(self.boundary.watchdog_poll_delay_seconds)
+        with self._state_lock:
+            self._complete_if_due_locked()
+            return self.returncode
 
 
 class NativeKernelCaptureTests(unittest.TestCase):
@@ -526,6 +683,36 @@ class NativeKernelCaptureTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def timeout_config(self) -> native_kernel_capture.CaptureConfig:
+        return native_kernel_capture.CaptureConfig(
+            repo=self.repo,
+            binary=self.binary,
+            artifact_dir=self.artifacts,
+            run_id="kernel-fixture",
+            image=self.config.image,
+            timeout_seconds=1,
+        )
+
+    @contextlib.contextmanager
+    def record_watchdog_threads(
+        self,
+    ):
+        real_thread = threading.Thread
+        created: list[threading.Thread] = []
+
+        def build_thread(*args: object, **kwargs: object) -> threading.Thread:
+            thread = real_thread(*args, **kwargs)
+            if kwargs.get("name") == "native-kernel-trace-deadline-watchdog":
+                created.append(thread)
+            return thread
+
+        with mock.patch.object(
+            native_kernel_capture.threading,
+            "Thread",
+            side_effect=build_thread,
+        ):
+            yield created
 
     def test_evidence_error_is_a_runtime_error(self) -> None:
         self.assertTrue(issubclass(native_kernel_capture.EvidenceError, RuntimeError))
@@ -1153,6 +1340,313 @@ class NativeKernelCaptureTests(unittest.TestCase):
                 phase == "interval"
                 for phase in phases[launch_index + 1 : cleanup_index]
             )
+        )
+
+    def test_monitor_census_delay_consumes_trace_timeout(self) -> None:
+        boundary = ExternalBoundary(
+            self.binary,
+            monitor_delay_seconds=0.3,
+            trace_duration_seconds=1.1,
+        )
+        with (
+            mock.patch.object(
+                native_kernel_capture.subprocess,
+                "run",
+                side_effect=boundary,
+            ),
+            self.assertRaisesRegex(
+                native_kernel_capture.EvidenceError,
+                "trace command timed out",
+            ),
+        ):
+            native_kernel_capture.capture_pair(self.timeout_config())
+
+        process = boundary.trace_processes[0]
+        self.assertIsInstance(process, DelayedTraceProcess)
+        assert isinstance(process, DelayedTraceProcess)
+        self.assertTrue(process.communicate_timeouts)
+        remaining = process.communicate_timeouts[0]
+        self.assertIsNotNone(remaining)
+        assert remaining is not None
+        self.assertGreater(remaining, 0.0)
+        self.assertLess(remaining, 0.95)
+        payload = json.loads(
+            native_kernel_capture.planned_paths(self.artifacts)
+            .runs["a"]["receipt"]
+            .read_text()
+        )
+        self.assertTrue(payload["command"]["timed_out"])
+
+    def test_process_finishing_after_deadline_rejects_natural_communicate(
+        self,
+    ) -> None:
+        boundary = ExternalBoundary(
+            self.binary,
+            monitor_delay_seconds=1.25,
+            trace_duration_seconds=1.1,
+        )
+        with (
+            mock.patch.object(
+                native_kernel_capture.subprocess,
+                "run",
+                side_effect=boundary,
+            ),
+            self.assertRaisesRegex(
+                native_kernel_capture.EvidenceError,
+                "trace command timed out",
+            ),
+        ):
+            native_kernel_capture.capture_pair(self.timeout_config())
+
+        process = boundary.trace_processes[0]
+        self.assertIsInstance(process, DelayedTraceProcess)
+        assert isinstance(process, DelayedTraceProcess)
+        self.assertEqual(len(process.communicate_timeouts), 1)
+        payload = json.loads(
+            native_kernel_capture.planned_paths(self.artifacts)
+            .runs["a"]["receipt"]
+            .read_text()
+        )
+        self.assertEqual(payload["outcome"], "rejected")
+        self.assertTrue(payload["command"]["timed_out"])
+        self.assertEqual(payload["command"]["status"], -9)
+        self.assertEqual(
+            Path(payload["artifacts"]["command_stdout"]["path"]).read_text(),
+            "partial stdout\n",
+        )
+        self.assertEqual(
+            Path(payload["artifacts"]["command_stderr"]["path"]).read_text(),
+            "partial stderr\n",
+        )
+        self.assertEqual(
+            boundary.events,
+            [
+                ("trace", "kernel-fixture-a-host"),
+                ("cleanup", "kernel-fixture-a-host"),
+            ],
+        )
+
+    def test_watchdog_scheduling_gap_cannot_accept_post_deadline_exit(
+        self,
+    ) -> None:
+        boundary = ExternalBoundary(
+            self.binary,
+            monitor_delay_seconds=1.25,
+            trace_duration_seconds=1.05,
+            watchdog_poll_delay_seconds=0.1,
+        )
+        with (
+            mock.patch.object(
+                native_kernel_capture.subprocess,
+                "run",
+                side_effect=boundary,
+            ),
+            self.assertRaisesRegex(
+                native_kernel_capture.EvidenceError,
+                "trace command timed out",
+            ),
+        ):
+            native_kernel_capture.capture_pair(self.timeout_config())
+
+        process = boundary.trace_processes[0]
+        self.assertIsInstance(process, DelayedTraceProcess)
+        assert isinstance(process, DelayedTraceProcess)
+        payload = json.loads(
+            native_kernel_capture.planned_paths(self.artifacts)
+            .runs["a"]["receipt"]
+            .read_text()
+        )
+        self.assertEqual(payload["outcome"], "rejected")
+        self.assertTrue(payload["command"]["timed_out"])
+        self.assertFalse(
+            native_kernel_capture.planned_paths(
+                self.artifacts
+            ).analysis.exists()
+        )
+
+    def test_watchdog_kills_running_trace_at_launch_deadline(self) -> None:
+        boundary = ExternalBoundary(
+            self.binary,
+            monitor_delay_seconds=1.5,
+            trace_duration_seconds=10.0,
+        )
+        with (
+            mock.patch.object(
+                native_kernel_capture.subprocess,
+                "run",
+                side_effect=boundary,
+            ),
+            self.assertRaisesRegex(
+                native_kernel_capture.EvidenceError,
+                "trace command timed out",
+            ),
+        ):
+            native_kernel_capture.capture_pair(self.timeout_config())
+
+        process = boundary.trace_processes[0]
+        self.assertIsInstance(process, DelayedTraceProcess)
+        assert isinstance(process, DelayedTraceProcess)
+        self.assertIsNotNone(process.killed_at)
+        assert process.killed_at is not None
+        self.assertGreaterEqual(process.killed_at - process.launched_at, 0.9)
+        self.assertLess(process.killed_at - process.launched_at, 1.35)
+
+    def test_fast_in_budget_process_accepts_with_launch_watchdog(self) -> None:
+        boundary = ExternalBoundary(
+            self.binary,
+            monitor_delay_seconds=0.02,
+            trace_duration_seconds=0.05,
+        )
+        with (
+            self.record_watchdog_threads() as watchdog_threads,
+            mock.patch.object(
+                native_kernel_capture.subprocess,
+                "run",
+                side_effect=boundary,
+            ),
+        ):
+            analysis = native_kernel_capture.capture_pair(self.timeout_config())
+
+        self.assertTrue(analysis.is_file())
+        self.assertEqual(len(watchdog_threads), 2)
+        self.assertTrue(all(not thread.is_alive() for thread in watchdog_threads))
+        planned = native_kernel_capture.planned_paths(self.artifacts)
+        for lane in ("a", "b"):
+            payload = json.loads(planned.runs[lane]["receipt"].read_text())
+            self.assertEqual(payload["outcome"], "accepted")
+            self.assertFalse(payload["command"]["timed_out"])
+            self.assertEqual(payload["command"]["status"], 0)
+
+    def test_fast_in_budget_process_accepts_after_delayed_census(self) -> None:
+        boundary = ExternalBoundary(
+            self.binary,
+            monitor_delay_seconds=1.25,
+            trace_duration_seconds=0.05,
+        )
+        caught: Exception | None = None
+        analysis: Path | None = None
+        with (
+            self.record_watchdog_threads() as watchdog_threads,
+            mock.patch.object(
+                native_kernel_capture.subprocess,
+                "run",
+                side_effect=boundary,
+            ),
+        ):
+            try:
+                analysis = native_kernel_capture.capture_pair(
+                    self.timeout_config()
+                )
+            except Exception as error:
+                caught = error
+
+        self.assertIsNone(caught)
+        assert analysis is not None
+        self.assertTrue(analysis.is_file())
+        self.assertEqual(len(watchdog_threads), 2)
+        self.assertTrue(all(not thread.is_alive() for thread in watchdog_threads))
+        self.assertTrue(
+            all(
+                isinstance(process, DelayedTraceProcess)
+                and process.killed_at is None
+                for process in boundary.trace_processes
+            )
+        )
+        planned = native_kernel_capture.planned_paths(self.artifacts)
+        for lane in ("a", "b"):
+            payload = json.loads(planned.runs[lane]["receipt"].read_text())
+            self.assertEqual(payload["outcome"], "accepted")
+            self.assertFalse(payload["command"]["timed_out"])
+            self.assertEqual(payload["command"]["status"], 0)
+            self.assertEqual(payload["command"]["build_ok_count"], 1)
+
+    def test_trace_deadline_watchdog_threads_are_always_joined(self) -> None:
+        boundary = ExternalBoundary(
+            self.binary,
+            trace_duration_seconds=10.0,
+        )
+        with (
+            self.record_watchdog_threads() as watchdog_threads,
+            mock.patch.object(
+                native_kernel_capture.subprocess,
+                "run",
+                side_effect=boundary,
+            ),
+            self.assertRaisesRegex(
+                native_kernel_capture.EvidenceError,
+                "trace command timed out",
+            ),
+        ):
+            native_kernel_capture.capture_pair(self.timeout_config())
+
+        self.assertEqual(len(watchdog_threads), 1)
+        self.assertTrue(all(not thread.is_alive() for thread in watchdog_threads))
+        self.assertFalse(
+            any(
+                thread.name == "native-kernel-trace-deadline-watchdog"
+                for thread in threading.enumerate()
+            )
+        )
+
+    def test_trace_deadline_watchdog_start_failure_is_receipt_bound(
+        self,
+    ) -> None:
+        real_thread = threading.Thread
+
+        class FailingWatchdogThread:
+            def start(self) -> None:
+                raise RuntimeError("fixture watchdog start failure")
+
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+
+            def is_alive(self) -> bool:
+                return False
+
+        def build_thread(*args: object, **kwargs: object):
+            if kwargs.get("name") == "native-kernel-trace-deadline-watchdog":
+                return FailingWatchdogThread()
+            return real_thread(*args, **kwargs)
+
+        boundary = ExternalBoundary(
+            self.binary,
+            trace_duration_seconds=0.05,
+        )
+        caught: Exception | None = None
+        with (
+            mock.patch.object(
+                native_kernel_capture.threading,
+                "Thread",
+                side_effect=build_thread,
+            ),
+            mock.patch.object(
+                native_kernel_capture.subprocess,
+                "run",
+                side_effect=boundary,
+            ),
+        ):
+            try:
+                native_kernel_capture.capture_pair(self.timeout_config())
+            except Exception as error:
+                caught = error
+
+        self.assertIs(type(caught), native_kernel_capture.EvidenceError)
+        self.assertIn("trace deadline watchdog failed", str(caught))
+        process = boundary.trace_processes[0]
+        self.assertTrue(process._killed)
+        planned = native_kernel_capture.planned_paths(self.artifacts)
+        payload = json.loads(planned.runs["a"]["receipt"].read_text())
+        self.assertEqual(payload["outcome"], "rejected")
+        self.assertIn(
+            "trace deadline watchdog failed",
+            payload["command"]["launch_error"],
+        )
+        self.assertEqual(
+            boundary.events,
+            [
+                ("trace", "kernel-fixture-a-host"),
+                ("cleanup", "kernel-fixture-a-host"),
+            ],
         )
 
     def test_receipt_rejects_missing_or_reordered_execution_interval(
