@@ -609,6 +609,58 @@ class DirectBindingMechanismTest(unittest.TestCase):
         )
         self.assertEqual(json.loads(output.read_text()), result)
 
+    def test_rejected_run_retains_independent_planes_after_specialized_error(self):
+        precursor, candidate = self.good_pair()
+
+        def malformed_unit(rows):
+            return [
+                line.replace("unit_id=0x1234", "unit_id=bad")
+                if "phase=binding-unit|" in line
+                else line
+                for line in rows
+            ]
+
+        candidate = self.fixture.rewrite_raw(candidate, malformed_unit)
+        output = pathlib.Path(self.temporary.name) / "partial-evidence.json"
+        with mock.patch.object(
+            mechanism,
+            "capture_one",
+            side_effect=(precursor, candidate),
+        ):
+            result = mechanism.capture_pair(
+                self.fixture.repo,
+                pathlib.Path(self.temporary.name) / "captures",
+                output,
+                5,
+            )
+
+        self.assertFalse(result["accepted"])
+        self.assertIn("candidate", result["available_runs"])
+        available = result["available_runs"]["candidate"]
+        self.assertEqual(available["gateway_total"], 100)
+        self.assertEqual(available["binding_events"]["12"], 1)
+        self.assertEqual(available["native_gateway"], 100)
+        self.assertEqual(available["native_exits"]["2"], 4)
+        direct_summary = next(
+            row
+            for row in available["summary_metrics"]
+            if row["scope"].get("phase") == "direct-total"
+        )
+        self.assertEqual(direct_summary["count"], 4)
+        self.assertEqual(
+            available["evidence_errors"],
+            {
+                "raw_aggregates": [],
+                "specialized": ["invalid integer unit ID='bad'"],
+                "summary": [],
+                "nativeperf": [],
+                "reconciliation": [
+                    "binding-unit total does not reconcile with kind=12"
+                ],
+            },
+        )
+        self.assertEqual(json.loads(output.read_text()), result)
+
     def test_malformed_numeric_receipt_is_an_atomic_typed_rejection(self):
         precursor, candidate = self.good_pair()
         payload = json.loads(candidate.path.read_text())
@@ -692,6 +744,63 @@ class DirectBindingMechanismTest(unittest.TestCase):
         with self.assertRaisesRegex(mechanism.EvidenceError, "unit.*zero"):
             mechanism.parse_trace(candidate)
 
+    def test_unit_loaded_accepts_zero_and_disabled_binding_declarations(self):
+        candidate = self.fixture.receipt(
+            "candidate-valid-unit-shapes",
+            gateway=100,
+            direct=4,
+            indirect=20,
+            eligible=4,
+            publish=1,
+        )
+
+        def valid_zero_and_disabled_units(rows):
+            rewritten = []
+            for line in rows:
+                if "phase=binding-event|pid=42|kind=12|" in line:
+                    line = line.rsplit("value=", 1)[0] + "value=3"
+                if "phase=binding-unit|" in line:
+                    line = line.replace(
+                        "record_count=1|binding_data_bytes=8|value=1",
+                        "record_count=0|binding_data_bytes=0|value=1",
+                    )
+                    rewritten.append(line)
+                    rewritten.append(
+                        "DSRPROF1|count|phase=binding-unit|pid=42|"
+                        "unit_id=0x5678|record_count=3|"
+                        "binding_data_bytes=0|value=2"
+                    )
+                    continue
+                rewritten.append(line)
+            return rewritten
+
+        candidate = self.fixture.rewrite_raw(
+            candidate,
+            valid_zero_and_disabled_units,
+        )
+        run = mechanism.parse_trace(candidate)
+
+        self.assertEqual(
+            mechanism._run_payload(run)["unit_loads"],
+            [
+                {
+                    "pid": 42,
+                    "unit_id": 0x1234,
+                    "record_count": 0,
+                    "binding_data_bytes": 0,
+                    "value": 1,
+                },
+                {
+                    "pid": 42,
+                    "unit_id": 0x5678,
+                    "record_count": 3,
+                    "binding_data_bytes": 0,
+                    "value": 2,
+                },
+            ],
+        )
+        self.assertEqual(run.binding_events[12], 3)
+
     def test_task15_explicit_capture_command_and_stable_artifact_layout(self):
         arguments = [
             "capture-pair",
@@ -730,6 +839,91 @@ class DirectBindingMechanismTest(unittest.TestCase):
         self.assertEqual(
             paths["receipt"],
             (config.output_dir / "precursor/receipt.json").resolve(),
+        )
+
+    def test_capture_pair_rejects_existing_slots_without_overwriting_evidence(self):
+        artifact_dir = pathlib.Path(self.temporary.name) / "stable-captures"
+        output = pathlib.Path(self.temporary.name) / "stable-pair.json"
+        precursor, candidate = self.good_pair()
+        with mock.patch.object(
+            mechanism,
+            "capture_one",
+            side_effect=(precursor, candidate),
+        ):
+            first = mechanism.capture_pair(
+                self.fixture.repo,
+                artifact_dir,
+                output,
+                5,
+            )
+        self.assertTrue(first["accepted"])
+
+        retained_paths = [output]
+        for variant, receipt in (
+            ("precursor", precursor),
+            ("candidate", candidate),
+        ):
+            directory = artifact_dir / variant
+            directory.mkdir(parents=True)
+            payload = receipt.payload
+            for artifact_name, filename in (
+                ("raw_trace", "trace.log"),
+                ("summary_jsonl", "summary.jsonl"),
+                ("command_stdout", "stdout.log"),
+                ("command_stderr", "stderr.log"),
+            ):
+                destination = directory / filename
+                destination.write_bytes(
+                    pathlib.Path(
+                        payload["artifacts"][artifact_name]["path"]
+                    ).read_bytes()
+                )
+                retained_paths.append(destination)
+            stable_receipt = directory / "receipt.json"
+            stable_receipt.write_bytes(receipt.path.read_bytes())
+            retained_paths.append(stable_receipt)
+        before = {
+            path: mechanism.sha256_file(path)
+            for path in retained_paths
+        }
+        repeat_precursor = self.fixture.receipt(
+            "precursor-repeat",
+            gateway=200,
+            direct=100,
+            indirect=20,
+            eligible=100,
+            publish=1,
+        )
+        repeat_candidate = self.fixture.receipt(
+            "candidate-repeat",
+            gateway=100,
+            direct=4,
+            indirect=20,
+            eligible=4,
+            publish=1,
+        )
+
+        with mock.patch.object(
+            mechanism,
+            "capture_one",
+            side_effect=(repeat_precursor, repeat_candidate),
+        ) as capture:
+            second = mechanism.capture_pair(
+                self.fixture.repo,
+                artifact_dir,
+                output,
+                5,
+            )
+
+        self.assertFalse(second["accepted"])
+        self.assertIn("already exists", second["rejection_reasons"][0])
+        capture.assert_not_called()
+        self.assertEqual(
+            {
+                path: mechanism.sha256_file(path)
+                for path in retained_paths
+            },
+            before,
         )
 
     def test_missing_summary_drop_or_provenance_field_rejects_the_pair(self):
@@ -875,18 +1069,26 @@ class DirectBindingMechanismTest(unittest.TestCase):
         with self.assertRaisesRegex(mechanism.EvidenceError, "foreign"):
             mechanism.compare(mechanism.parse_receipt(precursor.path), candidate)
 
-    def test_capture_pair_uses_fixed_variants_not_ambient_features(self):
+    def test_harness_rejects_inherited_known_controls_before_fixed_overlay(self):
+        for key in (
+            "CARRICK_DSR_DIRECT_BINDINGS",
+            "CARRICK_DSR_PROFILE",
+        ):
+            for value in ("ambient", ""):
+                with self.subTest(key=key, value=value), mock.patch.dict(
+                    mechanism.os.environ,
+                    {"PATH": "/bin", key: value},
+                    clear=True,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, key):
+                        mechanism.capture_environment("candidate")
         with mock.patch.dict(
             mechanism.os.environ,
-            {
-                "CARRICK_DSR_DIRECT_BINDINGS": "ambient",
-                "CARRICK_DSR_PROFILE": "ambient",
-            },
-            clear=False,
+            {"PATH": "/bin"},
+            clear=True,
         ):
             precursor = mechanism.capture_environment("precursor")
             candidate = mechanism.capture_environment("candidate")
-
         self.assertNotIn("CARRICK_DSR_DIRECT_BINDINGS", precursor)
         self.assertEqual(candidate["CARRICK_DSR_DIRECT_BINDINGS"], "1")
         self.assertEqual(precursor["CARRICK_DSR_PROFILE"], "1")

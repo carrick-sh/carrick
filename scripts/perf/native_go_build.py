@@ -249,16 +249,14 @@ def reject_ambient_carrick(
     ambient: os._Environ[str] | dict[str, str],
     selected_overlay: dict[str, str | None],
 ) -> None:
-    allowed = set(HARNESS_CARRICK_ALLOWLIST) | set(PERFORMANCE_CONTROL_KEYS)
+    # The harness applies selected_overlay only after this check. Even known
+    # controls are contamination when inherited from the caller.
+    allowed = set(HARNESS_CARRICK_ALLOWLIST)
     rejected = sorted(
         key
         for key in ambient
-        if key.startswith("CARRICK_")
-        and key != "CARRICK_RUN_ID"
-        and key not in allowed
+        if key.startswith("CARRICK_") and key not in allowed
     )
-    if "CARRICK_RUN_ID" in ambient:
-        rejected.append("CARRICK_RUN_ID")
     if rejected:
         raise RuntimeError(
             "ambient Carrick controls are not accepted: " + ", ".join(rejected)

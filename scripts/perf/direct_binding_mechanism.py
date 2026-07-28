@@ -191,6 +191,29 @@ def write_json_atomic(path: pathlib.Path, payload: dict[str, object]) -> None:
     native_go_build.write_json_atomic(path, payload)
 
 
+def write_json_atomic_exclusive(
+    path: pathlib.Path,
+    payload: dict[str, object],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as temporary:
+        temporary_path = pathlib.Path(temporary.name)
+        json.dump(payload, temporary, indent=2, sort_keys=True)
+        temporary.write("\n")
+        temporary.flush()
+        os.fsync(temporary.fileno())
+    try:
+        os.link(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def _strict_json(path: pathlib.Path) -> dict[str, object]:
     def reject_duplicates(pairs):
         result = {}
@@ -710,6 +733,85 @@ def _native_vector(stderr_path: pathlib.Path) -> tuple[int, dict[int, int]]:
     return gateway, exits
 
 
+def _record_specialized_metric(
+    fields: Mapping[str, str],
+    value: int,
+    *,
+    binding_events: dict[int, int],
+    gateway_kinds: dict[int, int],
+    binding_cells: dict[tuple[int, int], int],
+    publication_cells: dict[tuple[int, int], int],
+    clear_cells: dict[tuple[int, int, int], int],
+    validation_reasons: dict[int, int],
+    unit_loads: dict[tuple[int, int, int, int], int],
+) -> None:
+    phase = fields.get("phase")
+    pid = _integer(fields.get("pid", "0"), "pid")
+    if phase == "binding-event":
+        kind = _integer(fields.get("kind", ""), "binding event kind")
+        if kind not in BINDING_EVENT_KINDS:
+            raise EvidenceError(f"unknown binding event kind {kind}")
+        binding_events[kind] = binding_events.get(kind, 0) + value
+    elif phase == "gateway-kind":
+        kind = _integer(fields.get("kind", ""), "gateway kind")
+        if kind not in range(1, 8):
+            raise EvidenceError(f"unknown gateway kind {kind}")
+        gateway_kinds[kind] = gateway_kinds.get(kind, 0) + value
+    elif phase == "binding-cell":
+        cell = _integer(fields.get("cell_va", ""), "binding cell")
+        if pid == 0 or cell == 0 or cell % 8 != 0:
+            raise EvidenceError("binding-cell identity is zero or invalid")
+        identity = (pid, cell)
+        binding_cells[identity] = binding_cells.get(identity, 0) + value
+    elif phase == "binding-publish-cell":
+        cell = _integer(fields.get("cell_va", ""), "publication cell")
+        if pid == 0 or cell == 0 or cell % 8 != 0:
+            raise EvidenceError("publication cell identity is zero or invalid")
+        identity = (pid, cell)
+        publication_cells[identity] = (
+            publication_cells.get(identity, 0) + value
+        )
+    elif phase == "binding-clear-cell":
+        cell = _integer(fields.get("cell_va", ""), "clear cell")
+        if pid == 0 or cell == 0 or cell % 8 != 0:
+            raise EvidenceError("clear cell identity is zero or invalid")
+        reason = _integer(fields.get("kind", ""), "clear reason")
+        if reason not in CLEAR_REASONS:
+            raise EvidenceError(f"clear reason {reason} is zero or unknown")
+        identity = (pid, cell, reason)
+        clear_cells[identity] = clear_cells.get(identity, 0) + value
+    elif phase == "binding-validation":
+        source = _integer(
+            fields.get("source_pc", ""),
+            "validation source",
+        )
+        if pid == 0 or source == 0 or source % 4 != 0:
+            raise EvidenceError("validation source identity is zero or invalid")
+        _integer(fields.get("cell_va", ""), "validation cell")
+        reason = _integer(fields.get("kind", ""), "validation reason")
+        if reason not in VALIDATION_REASONS:
+            raise EvidenceError(
+                f"validation reason {reason} is zero or unknown"
+            )
+        validation_reasons[reason] = (
+            validation_reasons.get(reason, 0) + value
+        )
+    elif phase == "binding-unit":
+        unit_id = _integer(fields.get("unit_id", ""), "unit ID")
+        record_count = _integer(
+            fields.get("record_count", ""),
+            "unit record count",
+        )
+        binding_data_bytes = _integer(
+            fields.get("binding_data_bytes", ""),
+            "unit binding data bytes",
+        )
+        if pid == 0 or unit_id == 0:
+            raise EvidenceError("binding unit identity is zero or invalid")
+        identity = (pid, unit_id, record_count, binding_data_bytes)
+        unit_loads[identity] = unit_loads.get(identity, 0) + value
+
+
 def parse_trace(
     receipt: CaptureReceipt,
     *,
@@ -745,69 +847,17 @@ def parse_trace(
             raise EvidenceError("duplicate raw DTrace metric")
         value = _integer(fields["value"], "value")
         metrics[key] = value
-        phase = fields.get("phase")
-        pid = _integer(fields.get("pid", "0"), "pid")
-        if phase == "binding-event":
-            kind = _integer(fields.get("kind", ""), "binding event kind")
-            if kind not in BINDING_EVENT_KINDS:
-                raise EvidenceError(f"unknown binding event kind {kind}")
-            binding_events[kind] = binding_events.get(kind, 0) + value
-        elif phase == "gateway-kind":
-            kind = _integer(fields.get("kind", ""), "gateway kind")
-            if kind not in range(1, 8):
-                raise EvidenceError(f"unknown gateway kind {kind}")
-            gateway_kinds[kind] += value
-        elif phase == "binding-cell":
-            cell = _integer(fields.get("cell_va", ""), "binding cell")
-            if pid == 0 or cell == 0 or cell % 8 != 0:
-                raise EvidenceError("binding-cell identity is zero or invalid")
-            binding_cells[(pid, cell)] += value
-        elif phase == "binding-publish-cell":
-            cell = _integer(fields.get("cell_va", ""), "publication cell")
-            if pid == 0 or cell == 0 or cell % 8 != 0:
-                raise EvidenceError("publication cell identity is zero or invalid")
-            publication_cells[(pid, cell)] += value
-        elif phase == "binding-clear-cell":
-            cell = _integer(fields.get("cell_va", ""), "clear cell")
-            if pid == 0 or cell == 0 or cell % 8 != 0:
-                raise EvidenceError("clear cell identity is zero or invalid")
-            reason = _integer(fields.get("kind", ""), "clear reason")
-            if reason not in CLEAR_REASONS:
-                raise EvidenceError(f"clear reason {reason} is zero or unknown")
-            clear_cells[(pid, cell, reason)] += value
-        elif phase == "binding-validation":
-            source = _integer(
-                fields.get("source_pc", ""),
-                "validation source",
-            )
-            if pid == 0 or source == 0 or source % 4 != 0:
-                raise EvidenceError("validation source identity is zero or invalid")
-            _integer(fields.get("cell_va", ""), "validation cell")
-            reason = _integer(fields.get("kind", ""), "validation reason")
-            if reason not in VALIDATION_REASONS:
-                raise EvidenceError(
-                    f"validation reason {reason} is zero or unknown"
-                )
-            validation_reasons[reason] += value
-        elif phase == "binding-unit":
-            unit_id = _integer(fields.get("unit_id", ""), "unit ID")
-            record_count = _integer(
-                fields.get("record_count", ""),
-                "unit record count",
-            )
-            binding_data_bytes = _integer(
-                fields.get("binding_data_bytes", ""),
-                "unit binding data bytes",
-            )
-            if (
-                pid == 0
-                or unit_id == 0
-                or record_count == 0
-                or binding_data_bytes == 0
-                or binding_data_bytes != record_count * 8
-            ):
-                raise EvidenceError("binding unit identity is zero or invalid")
-            unit_loads[(pid, unit_id, record_count, binding_data_bytes)] += value
+        _record_specialized_metric(
+            fields,
+            value,
+            binding_events=binding_events,
+            gateway_kinds=gateway_kinds,
+            binding_cells=binding_cells,
+            publication_cells=publication_cells,
+            clear_cells=clear_cells,
+            validation_reasons=validation_reasons,
+            unit_loads=unit_loads,
+        )
     if completion is None:
         raise EvidenceError("raw DTrace stream has no completion row")
     if completion.get("profile") != "dsr-indirect":
@@ -954,6 +1004,263 @@ def _run_payload(run: MechanismRun) -> dict[str, object]:
                 binding_data_bytes,
             ), value in sorted(run.unit_loads.items())
         ],
+    }
+
+
+def _summary_metrics_payload(
+    metrics: Mapping[tuple[tuple[str, str], ...], int],
+) -> list[dict[str, object]]:
+    numeric_scope = {"pid", "tid", "source_pc", "target_pc"}
+    rows = []
+    for key, count in sorted(metrics.items()):
+        scope: dict[str, object] = {}
+        for field, value in key:
+            if field == "record_type":
+                continue
+            scope[field] = (
+                _integer(value, field) if field in numeric_scope else value
+            )
+        rows.append({"scope": scope, "count": count})
+    return rows
+
+
+def _partial_run_payload(receipt: CaptureReceipt) -> dict[str, object]:
+    errors: dict[str, list[str]] = {
+        "raw_aggregates": [],
+        "specialized": [],
+        "summary": [],
+        "nativeperf": [],
+        "reconciliation": [],
+    }
+    metrics: dict[tuple[tuple[str, str], ...], int] = {}
+    completion = None
+    binding_events: dict[int, int] = {}
+    gateway_kinds: dict[int, int] = {}
+    binding_cells: dict[tuple[int, int], int] = {}
+    publication_cells: dict[tuple[int, int], int] = {}
+    clear_cells: dict[tuple[int, int, int], int] = {}
+    validation_reasons: dict[int, int] = {}
+    unit_loads: dict[tuple[int, int, int, int], int] = {}
+    try:
+        raw_path = _artifact(receipt, "raw_trace").path
+        raw_lines = raw_path.read_text(errors="replace").splitlines()
+    except (EvidenceError, OSError) as error:
+        errors["raw_aggregates"].append(str(error))
+        raw_lines = []
+    for line in raw_lines:
+        if not line.startswith("DSRPROF1|"):
+            continue
+        try:
+            record_type, fields = _parse_protocol_fields(line)
+        except EvidenceError as error:
+            errors["raw_aggregates"].append(str(error))
+            continue
+        if record_type == "complete":
+            if completion is not None:
+                errors["raw_aggregates"].append(
+                    "duplicate raw DTrace completion row"
+                )
+            else:
+                completion = fields
+            continue
+        if record_type != "count" or "value" not in fields:
+            continue
+        try:
+            value = _integer(fields["value"], "value")
+        except EvidenceError as error:
+            errors["raw_aggregates"].append(str(error))
+            continue
+        try:
+            key = _raw_metric_key(record_type, fields)
+            if key in metrics:
+                raise EvidenceError("duplicate raw DTrace metric")
+            metrics[key] = value
+        except EvidenceError as error:
+            errors["raw_aggregates"].append(str(error))
+        try:
+            _record_specialized_metric(
+                fields,
+                value,
+                binding_events=binding_events,
+                gateway_kinds=gateway_kinds,
+                binding_cells=binding_cells,
+                publication_cells=publication_cells,
+                clear_cells=clear_cells,
+                validation_reasons=validation_reasons,
+                unit_loads=unit_loads,
+            )
+        except EvidenceError as error:
+            errors["specialized"].append(str(error))
+    if completion is None:
+        errors["raw_aggregates"].append(
+            "raw DTrace stream has no completion row"
+        )
+    else:
+        if completion.get("profile") != PROFILE:
+            errors["raw_aggregates"].append(
+                "raw DTrace stream has the wrong profile"
+            )
+        try:
+            if bool(_integer(completion.get("bounded", "1"), "bounded")):
+                errors["raw_aggregates"].append(
+                    "raw DTrace stream is bounded"
+                )
+        except EvidenceError as error:
+            errors["raw_aggregates"].append(str(error))
+        try:
+            if (
+                _integer(
+                    completion.get("target_exit_reason", "0"),
+                    "target exit reason",
+                )
+                != 1
+            ):
+                errors["raw_aggregates"].append(
+                    "raw DTrace target was interrupted"
+                )
+        except EvidenceError as error:
+            errors["raw_aggregates"].append(str(error))
+    if set(binding_events) != BINDING_EVENT_KINDS:
+        missing = sorted(BINDING_EVENT_KINDS - set(binding_events))
+        errors["raw_aggregates"].append(
+            f"binding event vector lacks explicit zero kind(s): {missing}"
+        )
+    for phase, event_kind, specialized_total in (
+        ("binding-publish-cell", 8, sum(publication_cells.values())),
+        ("binding-clear-cell", 10, sum(clear_cells.values())),
+        ("binding-validation", 11, sum(validation_reasons.values())),
+        ("binding-unit", 12, sum(unit_loads.values())),
+    ):
+        if (
+            event_kind in binding_events
+            and specialized_total != binding_events[event_kind]
+        ):
+            errors["reconciliation"].append(
+                f"{phase} total does not reconcile with kind={event_kind}"
+            )
+
+    def partial_phase_total(phase: str) -> int | None:
+        values = [
+            value
+            for key, value in metrics.items()
+            if dict(key).get("phase") == phase
+        ]
+        if not values:
+            errors["raw_aggregates"].append(
+                f"raw trace is missing required {phase} metric"
+            )
+            return None
+        return sum(values)
+
+    gateway_total = partial_phase_total("gateway-total")
+    direct_total = partial_phase_total("direct-total")
+    indirect_total = partial_phase_total("indirect-total")
+    translation_attempts = partial_phase_total("translation-attempts")
+
+    summary_metrics: dict[tuple[tuple[str, str], ...], int] = {}
+    try:
+        summary_metrics, _ = _parse_summary(receipt)
+    except (EvidenceError, OSError) as error:
+        errors["summary"].append(str(error))
+    if not errors["raw_aggregates"] and not errors["summary"]:
+        raw_aggregated: dict[tuple[tuple[str, str], ...], int] = defaultdict(int)
+        for key, value in metrics.items():
+            raw_aggregated[_summary_aggregate_key(key)] += value
+        if raw_aggregated != summary_metrics:
+            errors["reconciliation"].append(
+                "raw/summary overlapping metrics do not reconcile"
+            )
+
+    native_gateway = None
+    native_exits: dict[int, int] = {}
+    try:
+        native_gateway, native_exits = _native_vector(
+            _artifact(receipt, "command_stderr").path
+        )
+    except (EvidenceError, OSError) as error:
+        errors["nativeperf"].append(str(error))
+    if (
+        native_gateway is not None
+        and gateway_total is not None
+        and direct_total is not None
+        and indirect_total is not None
+        and not errors["nativeperf"]
+        and (
+            gateway_total != native_gateway
+            or direct_total != native_exits[2]
+            or indirect_total != native_exits[3]
+            or gateway_kinds != native_exits
+        )
+    ):
+        errors["reconciliation"].append(
+            "raw DTrace and NATIVEPERF gateway exit vectors do not reconcile"
+        )
+
+    clear_by_cell: dict[tuple[int, int], int] = defaultdict(int)
+    for (pid, cell, _reason), value in clear_cells.items():
+        clear_by_cell[(pid, cell)] += value
+    for identity, publishes in publication_cells.items():
+        if publishes > 1 + clear_by_cell.get(identity, 0):
+            errors["reconciliation"].append(
+                f"publication invariant failed for pid/cell {identity}"
+            )
+    if sum(publication_cells.values()) > len(binding_cells) + sum(
+        clear_cells.values()
+    ):
+        errors["reconciliation"].append(
+            "global publication invariant failed"
+        )
+
+    return {
+        "run_id": receipt.payload.get("run_id"),
+        "binding_events": {
+            str(kind): value
+            for kind, value in sorted(binding_events.items())
+        },
+        "gateway_kinds": {
+            str(kind): value for kind, value in sorted(gateway_kinds.items())
+        },
+        "gateway_total": gateway_total,
+        "direct_total": direct_total,
+        "indirect_total": indirect_total,
+        "translation_attempts": translation_attempts,
+        "binding_cells": [
+            {"pid": pid, "cell": cell, "value": value}
+            for (pid, cell), value in sorted(binding_cells.items())
+        ],
+        "publication_cells": [
+            {"pid": pid, "cell": cell, "value": value}
+            for (pid, cell), value in sorted(publication_cells.items())
+        ],
+        "clear_cells": [
+            {"pid": pid, "cell": cell, "reason": reason, "value": value}
+            for (pid, cell, reason), value in sorted(clear_cells.items())
+        ],
+        "validation_reasons": {
+            str(reason): value
+            for reason, value in sorted(validation_reasons.items())
+        },
+        "unit_loads": [
+            {
+                "pid": pid,
+                "unit_id": unit_id,
+                "record_count": record_count,
+                "binding_data_bytes": binding_data_bytes,
+                "value": value,
+            }
+            for (
+                pid,
+                unit_id,
+                record_count,
+                binding_data_bytes,
+            ), value in sorted(unit_loads.items())
+        ],
+        "summary_metrics": _summary_metrics_payload(summary_metrics),
+        "native_gateway": native_gateway,
+        "native_exits": {
+            str(kind): value for kind, value in sorted(native_exits.items())
+        },
+        "evidence_errors": errors,
     }
 
 
@@ -1177,7 +1484,7 @@ def _preflight_reasons(snapshot: Mapping[str, object]) -> list[str]:
 
 def _capture_paths(config: CaptureConfig) -> dict[str, pathlib.Path]:
     directory = (config.output_dir / config.variant).resolve()
-    directory.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=False)
     return {
         "raw_trace": directory / "trace.log",
         "summary_jsonl": directory / "summary.jsonl",
@@ -1414,7 +1721,7 @@ def _capture_pair(
             "candidate": None,
             "available_runs": _available_run_payloads(precursor, None),
         }
-        write_json_atomic(output, payload)
+        write_json_atomic_exclusive(output, payload)
         return payload
     candidate = capture_one(
         CaptureConfig(
@@ -1444,8 +1751,36 @@ def _capture_pair(
             },
             "available_runs": _available_run_payloads(precursor, candidate),
         }
-    write_json_atomic(output, payload)
+    write_json_atomic_exclusive(output, payload)
     return payload
+
+
+def _capture_collisions(
+    output_dir: pathlib.Path,
+    output: pathlib.Path,
+) -> list[pathlib.Path]:
+    targets = (
+        output.resolve(),
+        (output_dir / "precursor").resolve(),
+        (output_dir / "candidate").resolve(),
+    )
+    return [path for path in targets if os.path.lexists(path)]
+
+
+def _collision_rejection(
+    collisions: Sequence[pathlib.Path],
+) -> dict[str, object]:
+    return {
+        "schema": PAIR_SCHEMA,
+        "accepted": False,
+        "rejection_reasons": [
+            "capture evidence already exists: "
+            + ", ".join(str(path) for path in collisions)
+        ],
+        "precursor": None,
+        "candidate": None,
+        "available_runs": {},
+    }
 
 
 def capture_pair(
@@ -1456,6 +1791,9 @@ def capture_pair(
     binary: pathlib.Path | None = None,
     image: str = native_go_build.DEFAULT_IMAGE,
 ) -> dict[str, object]:
+    collisions = _capture_collisions(output_dir, output)
+    if collisions:
+        return _collision_rejection(collisions)
     try:
         return _capture_pair(
             repo,
@@ -1466,15 +1804,21 @@ def capture_pair(
             image,
         )
     except (EvidenceError, OSError, RuntimeError, ValueError) as error:
-        payload = {
-            "schema": PAIR_SCHEMA,
-            "accepted": False,
-            "rejection_reasons": [str(error)],
-            "precursor": None,
-            "candidate": None,
-            "available_runs": {},
-        }
-        write_json_atomic(output, payload)
+        collisions = _capture_collisions(output_dir, output)
+        if isinstance(error, FileExistsError) or output.resolve() in collisions:
+            payload = _collision_rejection(collisions)
+            if output.resolve() in collisions:
+                return payload
+        else:
+            payload = {
+                "schema": PAIR_SCHEMA,
+                "accepted": False,
+                "rejection_reasons": [str(error)],
+                "precursor": None,
+                "candidate": None,
+                "available_runs": {},
+            }
+        write_json_atomic_exclusive(output, payload)
         return payload
 
 
@@ -1486,12 +1830,7 @@ def _available_run_payloads(
     for name, receipt in (("precursor", precursor), ("candidate", candidate)):
         if receipt is None:
             continue
-        try:
-            available[name] = _run_payload(
-                parse_trace(receipt, validate_lifecycle=False)
-            )
-        except EvidenceError:
-            continue
+        available[name] = _partial_run_payload(receipt)
     return available
 
 
