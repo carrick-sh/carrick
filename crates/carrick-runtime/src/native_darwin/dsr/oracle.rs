@@ -4926,24 +4926,29 @@ fn direct_binding_jittered_sigpipe_stress_preserves_state() {
         (covered, recovered_words)
     }));
     drop(request_tx);
-    let sender_done = sender_done_rx.recv_timeout(std::time::Duration::from_secs(1));
+    if let Err(error) = sender_done_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+        eprintln!(
+            "direct-binding jitter sender shutdown failed: sender_done={error:?}; \
+             aborting before join"
+        );
+        std::process::abort();
+    }
     let sender_join = sender.join();
     let signal_mask_status = signal_mask.restore();
     drop(kick_binding);
 
     match stress {
         Err(payload) => {
-            if sender_done.is_err() || sender_join.is_err() || signal_mask_status != 0 {
+            if sender_join.is_err() || signal_mask_status != 0 {
                 eprintln!(
-                    "direct-binding jitter cleanup after panic: sender_done={sender_done:?} \
-                     sender_joined={} signal_mask_status={signal_mask_status}",
+                    "direct-binding jitter cleanup after panic: sender_joined={} \
+                     signal_mask_status={signal_mask_status}",
                     sender_join.is_ok()
                 );
             }
             std::panic::resume_unwind(payload);
         }
         Ok((covered, recovered_words)) => {
-            sender_done.expect("bounded SIGPIPE sender shutdown");
             sender_join.expect("join bounded SIGPIPE sender");
             assert_eq!(signal_mask_status, 0);
             eprintln!(
