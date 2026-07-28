@@ -19,10 +19,12 @@
 | Destination | 2.0x | Two independent five-sample campaigns |
 | Destination progress | 0.0% | `(R0 - R) / (R0 - 2.0)` |
 
-Current milestone: **M2 — kernel on-CPU attribution and spike selection**. M0 and M1 are
-complete; the first authority-carrying cache family is correct but has not
-beaten `C0`. The first receipt-bound Task 4 capture was rejected during run A
-by trace command framing, before a profile pair or selection existed.
+Current milestone: **M2 — kernel on-CPU attribution and spike selection**. M0
+and M1 are complete; the first authority-carrying cache family is correct but
+has not beaten `C0`. Task 5 repaired the first receipt-bound capture's trace
+framing, but the single-use v2 attempt then exhausted the 64 MiB DSR
+translation cache during run A before `BUILD_OK`. Run B and analysis remain
+absent, so no kernel family exists.
 
 ## Measurement contract
 
@@ -76,6 +78,69 @@ by trace command framing, before a profile pair or selection existed.
 | E014 | Task 15 structural retry at `b1700108` | rejected before live evidence | The first two structural gates passed; Gate 3 passed its first four focused tests, then `direct_binding_jittered_sigpipe_stress_preserves_state` consumed about one CPU for more than 15 minutes without returning and was terminated by the controller; Gate 4, signed feasibility, and the trace pair were not run |
 | E015 | Task 15 live retry at `ece8c497` | structural/build accepted; feasibility rejected | All four structural gates and fresh signed-binary checks passed, but the authorized wrapper-free candidate reached Go compilation and exhausted the 64 MiB DSR translation cache before `BUILD_OK`; the campaign JSON was not written and the mechanism pair was not run |
 | E016 | `scripts/perf/evidence/native-go-build-kernel-attribution-v1.json` plus rejected A receipt under `target/perf/native-kernel-capture-7ec846a5-v1/` | `MEASUREMENT_REPAIR_REQUIRED` | Clean `7ec846a5`, signed binary `385e63d0…`, native-arm64 image, and clean monitor provenance reached run A; trace auto-sudo then treated the repeated Carrick binary path as a subcommand, so A exited 1 without `BUILD_OK`, B and `analysis.json` remained absent, and no family was selected |
+| E017 | `scripts/perf/evidence/native-go-build-kernel-attribution-v2.json` plus rejected A receipt under `target/perf/native-kernel-capture-3fb91b09-v2/` | `MEASUREMENT_REPAIR_REQUIRED` | Clean `3fb91b09`, the unchanged signed binary/image, and repaired `trace -- run` framing reached Go compilation; A then exhausted the 64 MiB DSR translation cache before `BUILD_OK`. Its natural zero-drop partial profile reconciles 9,610 kernel PCs/stacks but has zero symbolized leaves; B and analysis are absent and no family was selected |
+
+### Task 6 kernel attribution — runtime-capacity rejection
+
+The single authorized v2 attempt started from clean
+`3fb91b09afe0ec7e0aa240bcfc853f724abe166b`. The unchanged signed binary
+retained SHA-256
+`385e63d05ddf5ccfc55c9264a90f1f23302312c02647ccc23aa84e0844671fc0`;
+strict codesign, the bundled native-wall completion marker, and
+`__TEXT,__dof_carrick` passed. The preserved v1 A receipt and durable evidence
+retained SHA-256 `b8b17f409241a2f902ce6559e8de85d82fcdb550559ab5f5e162f652e88881f0`
+and `c09be20989146acbb018fa8bbe8171e89ed951cfa25579c3fc2d714eb9fa78af`.
+
+Every v2 path was absent under `lexists` semantics. The image remained native
+`arm64`, ID and repo digest
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
+There were no ambient `CARRICK_*` controls, foreign workloads, busy-host
+reasons, or Docker oracles; Docker contained only the two allowed `registry:2`
+containers.
+
+The controller was invoked exactly once, without rebuilding, a wrapper, or
+manual `sudo`:
+
+```sh
+python3 scripts/perf/native_kernel_capture.py capture \
+  --repo /Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache \
+  --binary target/release/carrick \
+  --artifact-dir target/perf/native-kernel-capture-3fb91b09-v2 \
+  --run-id native-kernel-capture-3fb91b09-v2 \
+  --image localhost:5005/carrick-go-conformance:1.24 \
+  --timeout 180
+```
+
+The repaired target vector began with `run` and reached the cold Go compile.
+Run A then reported DSR translation-cache exhaustion with 1,080 bytes
+requested, 67,108,272 bytes used, and 67,108,864 bytes capacity. The compiler
+exited 125, `BUILD_OK` count was zero, and the controller exited 1 after an
+observed 51.2214 seconds. That duration and the profile's 21,340,483,208 ns
+elapsed field are traced diagnostics, not performance results.
+
+The trace command itself returned 0 and emitted a complete natural profile:
+zero principal/aggregation/dynamic/other drops, zero incomplete pairs, 54
+creates and exits, and zero live descendants. Its 4,202 wall samples split
+2,576 on-CPU, 1,238 runnable-descheduled, and 388 transition. The partial CPU
+census has 9,610 kernel and 15,066 user samples, so the diagnostic kernel share
+is exactly 155/398. Kernel PC and stack totals reconcile exactly at
+9,610, but zero of 9,610 leaves are symbolized. These partial-workload counts
+cannot select or reject a kernel family.
+
+The rejected A receipt hashes to
+`278f58ec3cefc4a55c6e5a6f9fbc3417798af08ba8274c1c7284389ff7193627`.
+All seven artifact size/hash bindings revalidated; its 499-sample monitor was
+uncontaminated with one launch and one post-cleanup boundary, pre/post
+provenance matched, scoped cleanup exited 0, and no owned process survived.
+Every B output and `analysis.json` is absent. The v2 root is preserved
+unchanged. The secret-safe derived evidence hashes to
+`938052ebeefb0e34075e054fe1da2702c86b8e8e9f68fbdde3e68d941037e5c0`.
+
+Outcome: **`MEASUREMENT_REPAIR_REQUIRED`**. Do not rerun v2, call this diffuse
+or selectable, infer H006, enlarge the cache, or claim a wall-clock result.
+Before authorizing another root, prove that the intended default implementation
+completes the frozen cold-Go workload within the existing cache bound and
+repair kernel-leaf symbolization enough to satisfy the fixed 95% gate.
 
 ### Task 4 kernel attribution — measurement framing rejection
 
@@ -567,6 +632,7 @@ to `PROPOSED`.
 | Task 15 final retry at `b1700108` | 162 AArch64 DSR + 31 native-Darwin tests green; focused runtime Gate 3 terminated after a greater-than-15-minute jitter-stress spin | not run | not run | not run | not run | rejected before live work |
 | Task 15 live retry at `ece8c497` | 162 AArch64 DSR + 31 native-Darwin + 10 focused runtime tests green; format clean | rejected: DSR cache exhaustion, no `BUILD_OK` or JSON | not run | not run | not run | H004 Variant 1 rejected at feasibility; mechanism unrun |
 | Task 4 kernel capture at `7ec846a5` | 34 profile unit + 6 integration + 17 attribution + 43 capture tests green; Python compile and format clean | rejected before guest: auto-sudo trace framing parsed the repeated binary as a subcommand | not run | not run | exit 101 on three pre-existing untouched Clippy findings; not waived for retention | `MEASUREMENT_REPAIR_REQUIRED`; A rejected, B/analysis absent |
+| Task 6 kernel capture at `3fb91b09` | Task 5: 45 capture + 17 attribution tests green; independent review clean | rejected during Go compile: 64 MiB DSR cache exhausted, zero `BUILD_OK` | not run | not run | not rerun for evidence-only Task 6 | `MEASUREMENT_REPAIR_REQUIRED`; A partial profile preserved, B/analysis absent |
 
 ## Decisions
 
@@ -601,6 +667,11 @@ to `PROPOSED`.
    subcommand. Preserve the rejected A receipt and root, repair the real CLI
    framing with a focused red/green test, and allocate a new versioned root
    before another live attempt. Do not create H006 from zero wall samples.
+10. Task 5 repaired and independently verified the target framing. Task 6 then
+    reached Go compilation exactly once, but the unchanged signed binary
+    exhausted the 64 MiB DSR translation cache before `BUILD_OK`. Preserve v2
+    unchanged. Its exact 9,610/9,610 kernel reconciliation and zero symbolized
+    leaves are partial diagnostics only; no pair, selection, or H006 exists.
 
 ## Next action
 
@@ -624,8 +695,11 @@ Write and validate the executable M1 plan:
       the wrapper-free candidate exhausts the 64 MiB translation cache.
 - [x] Attempt the first receipt-bound default-path kernel pair; preserve its
       rejected A receipt after trace auto-sudo framing fails before guest work.
-- [ ] Repair trace target framing with focused red/green runner coverage, pass
-      the structural and retention-quality gates, and authorize a new base plus
-      a new single-use root/run ID. Never recycle
-      `native-kernel-capture-7ec846a5-v1`, infer a family, or create H006 from
-      this rejection.
+- [x] Repair trace target framing with focused red/green runner coverage and
+      independent review at `3fb91b09`.
+- [x] Invoke the repaired single-use v2 controller exactly once; preserve its
+      rejected A receipt after Go compilation exhausts the 64 MiB DSR cache.
+- [ ] Repair measurement before another authorization: prove the frozen
+      default workload reaches `BUILD_OK` inside the existing cache bound and
+      restore at least 95% symbolized kernel-leaf coverage. Never recycle v1 or
+      v2, infer a family, create H006, or claim a performance result.
