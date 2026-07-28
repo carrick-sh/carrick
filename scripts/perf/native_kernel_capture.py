@@ -335,14 +335,40 @@ def _normalized_command_shape(
     }
 
 
+def _matches_owned_root(
+    command: str,
+    expected_commands: set[tuple[str, ...]],
+    expected_run_tokens: set[str],
+) -> bool:
+    fields = command.split()
+    if not (expected_run_tokens & set(fields)):
+        return False
+    try:
+        actual_boundary = fields.index("--")
+    except ValueError:
+        return False
+    actual_prefix = tuple(fields[:actual_boundary])
+    for expected in expected_commands:
+        try:
+            expected_boundary = expected.index("--")
+        except ValueError:
+            continue
+        if actual_prefix == expected[:expected_boundary]:
+            return True
+    return False
+
+
 def classify_process_snapshot(
     listing: str,
     *,
     self_pid: int | None = None,
+    owned_root_commands: Sequence[Sequence[str]] = (),
+    owned_run_ids: Sequence[str] = (),
 ) -> dict[str, object]:
     """Resolve launcher ancestry once, then classify only independent peers."""
     rows = _process_rows(listing)
-    current = os.getpid() if self_pid is None else self_pid
+    runner_pid = os.getpid() if self_pid is None else self_pid
+    current = runner_pid
     raw_ancestry: list[dict[str, object]] = []
     seen: set[int] = set()
     while current:
@@ -356,15 +382,32 @@ def classify_process_snapshot(
             )
         raw_ancestry.append(row)
         current = int(row["ppid"])
-    descendants = {os.getpid() if self_pid is None else self_pid}
+    expected_commands = {
+        tuple(str(token) for token in command)
+        for command in owned_root_commands
+    }
+    expected_run_tokens = {
+        f"CARRICK_RUN_ID={run_id}" for run_id in owned_run_ids
+    }
+    owned_roots = {
+        pid
+        for pid, row in rows.items()
+        if int(row["ppid"]) == runner_pid
+        and _matches_owned_root(
+            str(row["command"]),
+            expected_commands,
+            expected_run_tokens,
+        )
+    }
+    owned_tree = set(owned_roots) if len(owned_roots) == 1 else set()
     changed = True
     while changed:
         changed = False
         for pid, row in rows.items():
-            if pid not in descendants and int(row["ppid"]) in descendants:
-                descendants.add(pid)
+            if pid not in owned_tree and int(row["ppid"]) in owned_tree:
+                owned_tree.add(pid)
                 changed = True
-    trusted = seen | descendants
+    trusted = seen | owned_tree
     foreign = [
         row
         for pid, row in sorted(rows.items())
@@ -494,14 +537,24 @@ def _capture_snapshot(config: CaptureConfig) -> dict[str, object]:
     }
 
 
-def _monitor_sample(sequence: int) -> dict[str, object]:
+def _monitor_sample(
+    sequence: int,
+    phase: str,
+    *,
+    owned_root_commands: Sequence[Sequence[str]],
+    owned_run_ids: Sequence[str],
+) -> dict[str, object]:
     process_result = _run(
         ["ps", "-eo", "pid=,ppid=,args="],
         timeout=5,
     )
     if process_result.returncode != 0:
         raise EvidenceError("process census returned a failure status")
-    process_state = classify_process_snapshot(process_result.stdout)
+    process_state = classify_process_snapshot(
+        process_result.stdout,
+        owned_root_commands=owned_root_commands,
+        owned_run_ids=owned_run_ids,
+    )
     foreign = process_state["foreign_workloads"]
     if not isinstance(foreign, list):
         raise EvidenceError("process census returned malformed evidence")
@@ -541,6 +594,7 @@ def _monitor_sample(sequence: int) -> dict[str, object]:
             docker_count += 1
     return {
         "sequence": sequence,
+        "phase": phase,
         "foreign_workload_count": len(foreign),
         "foreign_workload_categories": categories,
         "docker_oracle_count": docker_count,
@@ -548,10 +602,16 @@ def _monitor_sample(sequence: int) -> dict[str, object]:
 
 
 class _ContaminationMonitor:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        owned_root_commands: Sequence[Sequence[str]],
+        owned_run_ids: Sequence[str],
+    ) -> None:
         self._stop = threading.Event()
         self._first_poll = threading.Event()
         self._lock = threading.Lock()
+        self._poll_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._loop,
             name="native-kernel-contamination-monitor",
@@ -562,6 +622,12 @@ class _ContaminationMonitor:
         self._poll_error: str | None = None
         self._contaminated = False
         self._samples: list[dict[str, object]] = []
+        self._next_sequence = 1
+        self._owned_root_commands = tuple(
+            tuple(str(token) for token in command)
+            for command in owned_root_commands
+        )
+        self._owned_run_ids = tuple(owned_run_ids)
 
     def start(self) -> None:
         try:
@@ -577,30 +643,45 @@ class _ContaminationMonitor:
             self._stop.set()
 
     def _loop(self) -> None:
-        sequence = 1
         try:
             while not self._stop.is_set():
-                try:
-                    sample = _monitor_sample(sequence)
-                except Exception:
-                    with self._lock:
-                        self._poll_error = "monitor poll failed"
+                if not self._sample("interval"):
                     break
-                with self._lock:
-                    self._samples.append(sample)
-                    if (
-                        sample["foreign_workload_count"] != 0
-                        or sample["docker_oracle_count"] != 0
-                    ):
-                        self._contaminated = True
                 self._first_poll.set()
-                sequence += 1
                 if self._stop.wait(MONITOR_INTERVAL_SECONDS):
                     break
         finally:
             self._first_poll.set()
+
+    def _sample(self, phase: str) -> bool:
+        with self._poll_lock:
             with self._lock:
-                self._stopped = True
+                if self._poll_error is not None:
+                    return False
+                sequence = self._next_sequence
+            try:
+                sample = _monitor_sample(
+                    sequence,
+                    phase,
+                    owned_root_commands=self._owned_root_commands,
+                    owned_run_ids=self._owned_run_ids,
+                )
+            except Exception:
+                with self._lock:
+                    self._poll_error = "monitor poll failed"
+                return False
+            with self._lock:
+                self._samples.append(sample)
+                self._next_sequence += 1
+                if (
+                    sample["foreign_workload_count"] != 0
+                    or sample["docker_oracle_count"] != 0
+                ):
+                    self._contaminated = True
+            return True
+
+    def sample_launch_boundary(self) -> None:
+        self._sample("launch-boundary")
 
     def stop(self) -> None:
         self._stop.set()
@@ -609,9 +690,10 @@ class _ContaminationMonitor:
             if self._thread.is_alive():
                 with self._lock:
                     self._poll_error = "monitor did not stop"
-        else:
-            with self._lock:
-                self._stopped = True
+            else:
+                self._sample("post-cleanup-boundary")
+        with self._lock:
+            self._stopped = True
 
     def evidence(self) -> dict[str, object]:
         with self._lock:
@@ -1025,13 +1107,24 @@ def _capture_one(
     cleanup: dict[str, object]
     cleanup_stdout: str
     cleanup_stderr: str
-    monitor = _ContaminationMonitor()
+    monitor = _ContaminationMonitor(
+        owned_root_commands=(command,),
+        owned_run_ids=(host_run_id, guest_run_id),
+    )
     monitor.start()
     initial_monitor = monitor.evidence()
-    monitor_blocked = (
+    initial_monitor_blocked = (
         initial_monitor["poll_error"] is not None
         or initial_monitor["contaminated"] is True
         or initial_monitor["started"] is not True
+    )
+    if not initial_monitor_blocked:
+        monitor.sample_launch_boundary()
+    launch_monitor = monitor.evidence()
+    monitor_blocked = (
+        launch_monitor["poll_error"] is not None
+        or launch_monitor["contaminated"] is True
+        or launch_monitor["started"] is not True
     )
     try:
         if not monitor_blocked:
@@ -1088,7 +1181,7 @@ def _capture_one(
         errors.append("trace command timed out")
     elif launch_error is not None:
         errors.append(f"trace command raised: {launch_error}")
-    elif result is None and not monitor_blocked:
+    elif result is None:
         errors.append("trace command did not return a status")
     elif result.returncode != 0:
         errors.append(f"trace command failed with status {result.returncode}")
@@ -1398,10 +1491,17 @@ def _validate_monitor(payload: dict[str, Any]) -> None:
         "carrick",
         "native-wall",
     }
+    allowed_phases = {
+        "interval",
+        "launch-boundary",
+        "post-cleanup-boundary",
+    }
+    phases: list[str] = []
     for index, value in enumerate(samples):
         sample = _mapping(value, f"monitor.samples[{index}]")
         if set(sample) != {
             "sequence",
+            "phase",
             "foreign_workload_count",
             "foreign_workload_categories",
             "docker_oracle_count",
@@ -1423,8 +1523,10 @@ def _validate_monitor(payload: dict[str, Any]) -> None:
         categories_are_strings = isinstance(categories, list) and all(
             isinstance(category, str) for category in categories
         )
+        phase = sample.get("phase")
         if (
             sequence != index + 1
+            or phase not in allowed_phases
             or foreign_count != 0
             or docker_count != 0
             or not categories_are_strings
@@ -1443,6 +1545,15 @@ def _validate_monitor(payload: dict[str, Any]) -> None:
             raise EvidenceError(
                 f"monitor.samples[{index}] contains contaminated evidence"
             )
+        phases.append(str(phase))
+    if phases.count("launch-boundary") != 1:
+        raise EvidenceError("receipt monitor lacks launch boundary")
+    if phases.count("post-cleanup-boundary") != 1:
+        raise EvidenceError("receipt monitor lacks post-cleanup boundary")
+    if "interval" not in phases:
+        raise EvidenceError("receipt monitor lacks interval sample")
+    if phases.index("launch-boundary") > phases.index("post-cleanup-boundary"):
+        raise EvidenceError("receipt monitor boundary order is reversed")
 
 
 def validate_receipt(path: pathlib.Path) -> dict[str, Any]:
