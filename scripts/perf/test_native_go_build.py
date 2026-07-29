@@ -349,6 +349,20 @@ class NativeGoBuildTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 native_go_build.workload_ns_from_stdout(stdout)
 
+    def test_census_skips_own_ancestors_but_keeps_foreign_matches(self):
+        rows = [
+            (10, "/bin/zsh -c eval 'python3 scripts/perf/native_go_build.py'"),
+            (20, "python3 scripts/perf/native_go_build.py --engine both"),
+            (30, "target/release/carrick run --exec-backend native sh"),
+        ]
+
+        foreign = native_go_build.foreign_rows(
+            rows, own_pid=20, ancestor_pids={10, 1}
+        )
+
+        self.assertEqual(len(foreign), 1)
+        self.assertIn("pid=30", foreign[0])
+
     def test_phase_summary_reports_workload_median(self):
         summary = native_go_build.summarize_phases(
             {
