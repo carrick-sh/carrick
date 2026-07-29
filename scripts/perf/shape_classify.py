@@ -227,9 +227,13 @@ def main() -> int:
         )
         for reg in range(31):
             print(f"  x{reg:<2} {used[reg]:>7}")
+        # Rank over the full register file, not `used.items()`: a Counter omits
+        # keys it never incremented, so sorting its items silently DROPS every
+        # register with zero weight — precisely the ones being looked for.
+        ranked = sorted(range(31), key=lambda reg: (used[reg], reg))
         print(
             "\nleast-used allocatable GPRs:",
-            [f"x{r}" for r, _ in sorted(used.items(), key=lambda kv: kv[1])[:6]],
+            [f"x{reg} ({used[reg]})" for reg in ranked[:8]],
         )
     return 0
 
