@@ -18,7 +18,7 @@ import time
 from collections.abc import Sequence
 
 
-SCHEMA = "carrick.native-go-build.v2"
+SCHEMA = "carrick.native-go-build.v3"
 DEFAULT_IMAGE = "localhost:5005/carrick-go-conformance:1.24"
 DEFAULT_TIMEOUT_SECONDS = 180
 ENGINE_CARRICK = "carrick"
@@ -72,13 +72,41 @@ class SampleEvidenceError(RuntimeError):
 
 
 def guest_script() -> str:
+    # The workload window brackets only the guest work (compile plus execute)
+    # with in-guest clock reads, so engine-side container setup and teardown
+    # stay outside it on both engines. The 2026-07-28 direction makes this
+    # window the primary overhead metric; full process wall time remains a
+    # secondary diagnostic.
     return (
         'set -eu; cd /tmp; rm -rf "gc-$CARRICK_RUN_ID"; '
         'printf "package main\\nfunc main(){println(\\"ok\\")}\\n" > h.go; '
+        "w0=$(date +%s%N); "
         'GOCACHE="/tmp/gc-$CARRICK_RUN_ID" '
         "/usr/local/go/bin/go build -o h ./h.go; "
-        "./h; echo BUILD_OK"
+        "./h; "
+        "w1=$(date +%s%N); "
+        'echo "WORKLOAD_NS=$((w1-w0))"; '
+        "echo BUILD_OK"
     )
+
+
+def workload_ns_from_stdout(stdout: str) -> int:
+    markers = [
+        line.strip()
+        for line in stdout.splitlines()
+        if line.strip().startswith("WORKLOAD_NS=")
+    ]
+    if len(markers) != 1:
+        raise ValueError(
+            f"expected exactly one WORKLOAD_NS marker, found {len(markers)}"
+        )
+    value = markers[0].removeprefix("WORKLOAD_NS=")
+    if not value.isdigit():
+        raise ValueError(f"WORKLOAD_NS is not a nonnegative integer: {value!r}")
+    workload_ns = int(value)
+    if workload_ns <= 0:
+        raise ValueError(f"WORKLOAD_NS must be positive: {workload_ns}")
+    return workload_ns
 
 
 def requested_engines(value: str) -> tuple[str, ...]:
@@ -171,10 +199,12 @@ def summarize_phases(
     phases: dict[str, dict[str, object]] = {}
     for engine, rows in samples_by_engine.items():
         durations = [int(row["elapsed_ms"]) for row in rows]
+        workloads = [int(row["workload_ms"]) for row in rows]
         phases[engine] = {
             "sample_count": len(rows),
             "samples": rows,
             "median_ms": median_ms(durations),
+            "workload_median_ms": median_ms(workloads),
         }
     return phases
 
@@ -608,6 +638,12 @@ def run_sample(
         raise timeout
     assert result is not None
     build_ok = stdout.splitlines().count("BUILD_OK") == 1
+    workload_ns: int | None = None
+    workload_error: str | None = None
+    try:
+        workload_ns = workload_ns_from_stdout(stdout)
+    except ValueError as error:
+        workload_error = str(error)
     if cleanup_error is not None:
         cleanup_evidence = {
             "status": 125,
@@ -619,6 +655,10 @@ def run_sample(
         "index": index,
         "run_id": run_id,
         "elapsed_ms": elapsed_ms,
+        "workload_ns": workload_ns,
+        "workload_ms": (
+            workload_ns // 1_000_000 if workload_ns is not None else None
+        ),
         "return_code": result.returncode,
         "build_ok": build_ok,
         "command": {
@@ -649,6 +689,12 @@ def run_sample(
         if cleanup_error is not None:
             raise sample_error from cleanup_error
         raise sample_error
+    if workload_error is not None:
+        raise SampleEvidenceError(
+            f"go-build sample {index} workload window is invalid: "
+            f"run_id={run_id} {workload_error}",
+            sample,
+        )
     if cleanup_error is not None:
         raise SampleEvidenceError(
             f"go-build sample {index} cleanup failed: run_id={run_id}",
@@ -824,6 +870,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ],
                 [
                     int(row["elapsed_ms"])
+                    for row in samples_by_engine[ENGINE_DOCKER]
+                ],
+            ),
+            # Primary overhead metric: the in-guest workload window, which
+            # excludes engine container setup and teardown on both sides.
+            "carrick_over_docker_workload": carrick_over_docker_ratio(
+                [
+                    int(row["workload_ms"])
+                    for row in samples_by_engine[ENGINE_CARRICK]
+                ],
+                [
+                    int(row["workload_ms"])
                     for row in samples_by_engine[ENGINE_DOCKER]
                 ],
             ),
