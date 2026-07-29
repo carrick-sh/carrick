@@ -851,6 +851,13 @@ to `PROPOSED`.
     service) stays in scope because it occurs inside the window. Official
     `C0`/`D0`/`R0` remain valid only for the old convention; the next
     idle-host campaign freezes `W0`/`DW0`/`RW0` under the new one.
+14. On 2026-07-28 the user accepted that this host will not reach a fully
+    quiet state and directed that testing proceed in ambient desktop noise.
+    Absolute medians against any frozen anchor therefore carry reduced
+    weight; contemporaneous paired alternating candidate/control screens
+    are the decision instrument, and the runner's built-in preflight
+    (no foreign workloads, no compilers, load below the logical CPU count)
+    remains the only idleness gate.
 
 ## Next action
 
@@ -890,8 +897,17 @@ Write and validate the executable M1 plan:
       after clearing five workspace clippy findings, `just ci` is green
       (2,663 tests) and `just conformance-native smoke --workers 4` reports
       23/23 MATCH with no regressions.
-- [ ] Freeze `W0`/`DW0`/`RW0` under the 2026-07-28 workload-window convention
-      (Decision 13) with a fresh idle-host five-sample campaign.
+- [x] Freeze `W0`/`DW0`/`RW0` under the 2026-07-28 workload-window convention
+      (Decision 13): `W0=18,321 ms` (18,321/18,457/18,140/18,286/18,622),
+      `DW0=842 ms` (946/832/842/839/901), `RW0=21.7589x`, five strict-preflight
+      samples per engine in separate phases at the committed runner tip.
+      Ambient desktop load was ~2.2 at phase start (recorded in the evidence
+      JSON); candidate decisions therefore continue to ride on paired
+      alternating screens, never on isolated medians against this anchor.
+      Evidence: `scripts/perf/evidence/native-go-build-workload-w0-v1.json`.
+      The full-wall medians in the same run were 20,260 ms and 1,021 ms
+      (19.84x); the excluded engine lifecycle is ~1.9 s for Carrick and
+      ~0.18 s for Docker per run.
 - [ ] Re-census post-change open callers and spike H007 only if one remaining
       resolver/final-open rewalk family is still dominant inside the workload
       window.
