@@ -1,7 +1,7 @@
 # Darwin/AArch64 native wall-time campaign ledger
 
 **Updated:** 2026-07-28
-**Status:** ACTIVE — syscall reframe selected host-filesystem amplification
+**Status:** ACTIVE — locating the remaining pre-open filesystem amplification
 **Primary workload:** cold-GOCACHE `go-build`  
 **Design:** [Darwin native wall-time attribution campaign](../superpowers/specs/2026-07-27-native-wall-time-attribution-campaign-design.md)
 
@@ -22,7 +22,7 @@
 | Destination | 2.0x | Two independent five-sample campaigns |
 | Ratio progress | 22.5% | `(R0 - R) / (R0 - 2.0)`; wall-seconds progress remains 0% |
 
-Current milestone: **M2 — host-filesystem amplification spike**. M0 and M1 are
+Current milestone: **M2 — pre-open filesystem attribution**. M0 and M1 are
 complete. A syscall-state sampler removed the need to wait for kernel-leaf
 symbolization before selecting a mechanism: private guest futex waits own only
 0.30% of sampled kernel CPU, while Darwin `openat` + `unlinkat` own 24.22%.
@@ -34,6 +34,13 @@ units. The unchanged 64 MiB cache now completes five consecutive cold-Go
 builds, so the capacity repair is retained. It is not a Carrick wall-speed win:
 the accepted current median is 21,005 ms versus `C0=19,375 ms`. The current
 same-run ratio fell only because the Docker median drifted even more.
+
+The terminal `open_raw_fd` contained-parent spike is now rejected: it removed
+24.0% of the host `openat` calls joined to guest opens, but its five-sample
+median improved only 0.7% and it won one of five paired positions. The remaining
+24.7 host opens per guest open sit mostly in lookup, metadata, and DAC
+preparation before the final raw open; a call-site stack census is the next
+selection gate.
 
 The single-use v2 DTrace attempt remains rejected and preserved. Kernel-leaf
 symbolization is still required for a symbol-family claim, but the approved
@@ -101,6 +108,7 @@ bounded implementation spike, not yet a retained wall win.
 | E021 | `target/perf/native-syscall-cpu-v2/b.raw` plus `docs/perf-results/native-syscall-cpu.jsonl` | accepted diagnostic | Natural `BUILD_OK`, 19,525 kernel and 64,512 user samples: private-futex cvwait is 0.30% of kernel / 0.069% total CPU; `openat` + `unlinkat` are 24.22% kernel / 5.63% total |
 | E022 | `target/perf/native-fs-amplification-v1/a.raw` plus `docs/perf-results/native-fs-amplification.jsonl` | accepted diagnostic | Carrick guest 2,521 `openat` calls drive 79,282 joined and 116,925 total Darwin `openat`; teardown contributes 38,809 Carrick-only `unlinkat` |
 | E023 | `target/perf/oracle-fs-syscalls-v1/{oracle.raw,workload.log}` plus `docs/perf-results/native-fs-amplification.jsonl` | accepted Docker-only diagnostic | Native-arm64 Linux `bpftrace` process-tree census completes `BUILD_OK`; mutation counts closely match Carrick guest counts, proving the 35.8x host `openat` / 249.7x host `unlinkat` excess is Carrick amplification |
+| E024 | `target/perf/fs-open-spike/` plus `docs/perf-results/native-fs-amplification.jsonl` | rejected implementation spike | Five controls median 20.95 s versus candidate 20.80 s (0.7%); the candidate won 1/5 pairs. A typed mechanism trace confirms real but insufficient movement: joined host opens fell 24.0%, leaving 24.7 host opens per guest open |
 
 ### H005a rejection and filesystem syscall reframe
 
@@ -132,9 +140,19 @@ owner scratch deletion exercised the intended teardown seam but produced a
 noisier 23.73 s sample versus a 20.34 s control; it is rejected as a wall
 candidate from this screen. The exact generated scratch
 `/Volumes/carrick/.tmplT2eqC` was verified by its run-id cache and moved to
-Trash. The next bounded spike targets the reusable contained-parent seam in
-`HostFsBackend::open_raw_fd`; promotion still requires a correct cold build and
-then the normal five-sample wall gate.
+Trash.
+
+The contained-parent `HostFsBackend::open_raw_fd` spike passed focused escape,
+symlink, and fd-mode tests, then completed all ten alternating measurements
+with exact `BUILD_OK` and zero cleanup failures. Controls were
+20.95/19.89/20.49/23.55/27.26 s; candidates were
+20.23/20.15/20.80/26.35/27.69 s. Their 20.95/20.80 s medians amount to only a
+0.7% candidate improvement, below the fixed 3% gate, and the candidate won one
+of five paired positions. A follow-up candidate trace proves the mechanism was
+live: host `openat` during guest `openat` fell 79,282→60,243 (24.0%) and total
+host `openat` fell 116,925→97,395 (16.7%), but traced joined-open duration fell
+only 246 ms. The source spike is reverted. The next attribution targets the
+remaining 24.7 host opens per guest open before the final raw open.
 
 ### Tasks 7–11 — capacity root cause, repair, and retention
 
@@ -717,7 +735,8 @@ Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
 | H002 | PROPOSED | 5.806 s diagnostic emission time across 1.868M translations | stale traced aggregate | Sample and split allocation, relocation, publication and I-cache work; spike only the dominant subphase | No current dominant subphase or two variants fail wall gate |
 | H003 | PROPOSED | Older profile assigned CPU to repeated capsule setup | stale sample | Refresh process-lifetime share and critical-path overlap; reuse only the dominant durable input | Current share is small/non-critical or two variants fail |
 | H004 | REJECT | Authority caching leaves at least 17.16M bounded direct misses, led by one conditional fall-through edge at 1.47M | signed Variant 1 feasibility exhausts the 64 MiB DSR translation cache before `BUILD_OK` | Compact per-edge mutable binding cells were the bounded proof; the mechanism pair was not run | Rejected at feasibility; no cache increase, sidecar tuning, or Task 16 is authorized |
-| H005 | SPIKING | Typed translation locks explain only 7.22% of joined `psynch_cvwait` duration; 92.78% is untyped | 62.262 aggregate thread-seconds under DTrace | Name the untyped outer wait boundaries, starting from child lifecycle and guest-futex critical-path evidence | Two bounded outer-boundary spikes fail untraced wall or a different mechanism dominates |
+| H005 | DEFER | Private futex owns 50.4% of blocked thread-time but only 0.069% of sampled total CPU | 58/84,037 sampled CPU ticks | Revisit only if critical-path evidence shows waking earlier removes runnable work | Filesystem work currently has materially larger measured CPU share |
+| H006 | SPIKING | After a live terminal-open fast path, guest `openat` still drives 24.7 host opens and 742.5 ms traced open duration | 60,243 joined host opens / 2,438 guest opens | Census deep host `openat` stacks during guest-open service; spike only the dominant repeated lookup/metadata/DAC call site | No stable dominant call site or two bounded call-site spikes miss the 3% wall gate |
 
 The table order is provisional until E005 and E006 exist.
 
@@ -745,6 +764,7 @@ The table order is provisional until E005 and E006 exist.
 | 2026-07-28 | H005 | process-state reader barging | Reduce the largest typed condvar reason without changing cache ownership | 22.48 s vs 21.06 s control | n/a | reject and revert; +6.7% wall |
 | 2026-07-28 | H005 | private translator per guest thread | Remove process-state contention completely; tolerate duplicate translation only as a feasibility spike | 29.53 s vs 21.06 s control | n/a | reject and revert; +40.2% wall and 70.46 user-s |
 | 2026-07-28 | H005 | bypass disabled-feature process-state locks | Remove direct-binding/shared-metadata lock work when both features are off | 21.14 s vs 21.06 s control | n/a | reject and revert; no wall win |
+| 2026-07-28 | H006 | contained-parent terminal `open_raw_fd` | Remove cap-std component walks from the final host-file open | first pair 20.23 s vs 20.95 s control | 20.80 s vs 20.95 s medians; 1/5 paired wins | reject and revert; real 24% joined-call reduction has only a 0.7% wall median |
 
 Prior rejected experiments remain recorded in `handoff.md`; they are not reset
 to `PROPOSED`.
