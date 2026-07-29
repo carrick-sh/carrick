@@ -2632,6 +2632,227 @@ fn emit_biased_effective_guest_address(
     clippy::too_many_arguments,
     reason = "biased memory lowering keeps emission and recovery metadata together"
 )]
+/// One guest memory access the compact aperture-disjoint lowering accepts.
+struct CompactBiasedForm {
+    /// `(immr, imms)` of the bias as a 64-bit ORR logical immediate (N=1).
+    bias_orr: (u32, u32),
+    base: BiasedBase,
+    /// Non-negative byte displacement of the access from its base.
+    immediate: u64,
+}
+
+/// The compact lowering applies only when the bias is aperture-disjoint and
+/// ORR-encodable (so `guest | bias == guest + bias` for every in-aperture
+/// address) and the access shape keeps a base-register-only aperture check
+/// sound: an immediate displacement is bounded by the reserved guard windows
+/// above the aperture and below the bias, while register offsets are
+/// unbounded and negative immediates would need the underflow window's
+/// host-to-guest fault conversion (deferred), so both stay general.
+fn compact_biased_form(
+    memory: super::types::MemoryAccess,
+    base: BiasedBase,
+    host_bias: carrick_dsr::address::NativeHostBias,
+) -> Option<CompactBiasedForm> {
+    let bias_orr = host_bias.aperture_disjoint_orr_immediate()?;
+    if memory.virtualization != super::types::MemoryVirtualization::None {
+        return None;
+    }
+    let writeback = memory.writeback != super::types::MemoryWriteback::None;
+    match base {
+        BiasedBase::Register(_) => {}
+        // Stack-pointer bases take one extra base-copy word and never write
+        // back in this slice; virtual x18/x28 bases keep the general path.
+        BiasedBase::StackPointer if !writeback => {}
+        _ => return None,
+    }
+    let immediate = match memory.effective_address {
+        super::types::MemoryEffectiveAddress::Base => 0,
+        super::types::MemoryEffectiveAddress::Immediate(immediate) => {
+            if immediate < 0 {
+                return None;
+            }
+            let immediate = immediate as u64;
+            if immediate >= carrick_dsr::address::BIASED_GUEST_UNDERFLOW_WINDOW {
+                return None;
+            }
+            immediate
+        }
+        super::types::MemoryEffectiveAddress::RegisterOffset { .. } => return None,
+    };
+    Some(CompactBiasedForm {
+        bias_orr,
+        base,
+        immediate,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_compact_biased_memory(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    memory: super::types::MemoryAccess,
+    host_bias: carrick_dsr::address::NativeHostBias,
+    recovery: &mut Vec<RecoveryEntry>,
+    form: CompactBiasedForm,
+) -> Result<(), DsrError> {
+    let scratch = biased_scratch_registers(memory.word, guest, &[], 1)
+        .and_then(|registers| registers.first().copied())
+        .ok_or_else(|| {
+            unsupported_action(plan, guest, memory.word, "no safe compact biased scratch")
+        })?;
+    let (immr, imms) = form.bias_orr;
+
+    // Spill the single scratch. Its guest value now lives in slot 1120, so
+    // re-executing from the instruction start stays idempotent and no
+    // recovery action is needed until a word can clobber guest state.
+    emit_word(
+        assembler,
+        entries,
+        guest,
+        0xf900_0000 | ((BIASED_SCRATCH_CONTEXT_OFFSETS[0] / 8) << 10) | (28 << 5) | scratch,
+    )?;
+    let mut action = BiasedMemoryRecovery {
+        scratch_registers: [scratch, 0, 0, 0],
+        scratch_count: 1,
+        base_scratch: scratch,
+        base: form.base,
+        base_coordinate: BiasedBaseCoordinate::Guest,
+        commit_base: false,
+        virtual_x18_scratch: None,
+        virtual_x28_scratch: None,
+        host_bias,
+        instruction_complete: false,
+    };
+
+    // The register whose value is the guest base for the aperture check and
+    // the ORR: the base register itself, or the scratch after copying SP.
+    let checked_base = match form.base {
+        BiasedBase::Register(register) => register,
+        BiasedBase::StackPointer => {
+            emit_with_biased_recovery(
+                assembler,
+                entries,
+                recovery,
+                guest,
+                0x9100_03e0 | scratch, // add xS, sp, #0
+                action,
+            )?;
+            scratch
+        }
+        _ => {
+            return Err(unsupported_action(
+                plan,
+                guest,
+                memory.word,
+                "compact biased memory accepted a non-register base",
+            ));
+        }
+    };
+
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (checked_base << 5) | 18,
+        action,
+    )?; // lsr x18, base, #BIASED_FAST_ADDRESS_BITS
+
+    // Slow path: publish the guest effective address for fault reporting,
+    // then tag the base so the access faults on an unmappable host address.
+    let immediate_low = u32::try_from(form.immediate & 0xfff).map_err(|_| {
+        DsrError::BlockPolicy("compact biased immediate low bits exceed u32".to_string())
+    })?;
+    let immediate_high = u32::try_from(form.immediate >> 12).map_err(|_| {
+        DsrError::BlockPolicy("compact biased immediate high bits exceed u32".to_string())
+    })?;
+    let mut slow: Vec<u32> = Vec::with_capacity(5);
+    if form.immediate == 0 {
+        slow.push(0xaa00_03e0 | (checked_base << 16) | 18); // mov x18, base
+    } else if immediate_high != 0 {
+        // add x18, base, #high, lsl #12 — first stage reads the base.
+        slow.push(0x9140_0000 | (immediate_high << 10) | (checked_base << 5) | 18);
+        slow.push(0x9100_0000 | (immediate_low << 10) | (18 << 5) | 18);
+    } else {
+        slow.push(0x9100_0000 | (immediate_low << 10) | (checked_base << 5) | 18);
+    }
+    slow.push(0xf900_0000 | ((1200 / 8) << 10) | (28 << 5) | 18); // str x18, [x28, #1200]
+    slow.push(0xb251_0000 | (checked_base << 5) | scratch); // orr xS, base, #1<<47
+    slow.push(0x1400_0002); // b +8, over the fast orr
+
+    let skip = u32::try_from(slow.len() + 1).map_err(|_| {
+        DsrError::BlockPolicy("compact biased slow path exceeds cbz range".to_string())
+    })?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb400_0000 | (skip << 5) | 18, // cbz x18, past the slow path
+        action,
+    )?;
+    for word in slow {
+        emit_with_biased_recovery(assembler, entries, recovery, guest, word, action)?;
+    }
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb240_0000 | (immr << 16) | (imms << 10) | (checked_base << 5) | scratch,
+        action,
+    )?; // orr xS, base, #bias
+
+    let rewritten = (memory.word & !(0x1f << 5)) | (scratch << 5);
+    emit_with_biased_recovery(assembler, entries, recovery, guest, rewritten, action)?;
+    action.instruction_complete = true;
+
+    if memory.writeback != super::types::MemoryWriteback::None {
+        // The access wrote the updated HOST address back into the scratch;
+        // recovery (and the emitted commit) rebuild the guest base with a
+        // full-width subtract, which is exact for every wrap and overhang.
+        action.base_coordinate = BiasedBaseCoordinate::Host;
+        action.commit_base = true;
+        emit_biased_materialize_u64(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            18,
+            host_bias.get(),
+            action,
+        )?;
+        let BiasedBase::Register(base_register) = form.base else {
+            return Err(unsupported_action(
+                plan,
+                guest,
+                memory.word,
+                "compact biased writeback requires a register base",
+            ));
+        };
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xcb00_0000 | (18 << 16) | (scratch << 5) | base_register,
+            action,
+        )?; // sub xBASE, xS, x18
+    }
+
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf940_0000 | ((BIASED_SCRATCH_CONTEXT_OFFSETS[0] / 8) << 10) | (28 << 5) | scratch,
+        action,
+    )?; // restore the scratch
+    Ok(())
+}
+
 fn emit_biased_memory(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
@@ -2712,6 +2933,11 @@ fn emit_biased_memory(
     }
 
     let base = biased_base(memory)?;
+    if let Some(form) = compact_biased_form(memory, base, host_bias) {
+        return emit_compact_biased_memory(
+            assembler, entries, plan, guest, memory, host_bias, recovery, form,
+        );
+    }
     let (mut rewritten, virtual_x18_scratch, virtual_x28_scratch) =
         rewritten_biased_virtual_word(memory, guest)?;
     let mut scratch_registers = [0_u32; 4];
@@ -5261,6 +5487,155 @@ mod tests {
                 resume: GuestVa(0x400c),
             },
         }
+    }
+
+    fn biased_memory_plan(memory: super::super::types::MemoryAccess) -> BlockPlan {
+        BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4004),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action: InstAction::Memory(memory),
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0x4004),
+                resume: GuestVa(0x4008),
+            },
+        }
+    }
+
+    fn assemble_biased_words(memory: super::super::types::MemoryAccess, bias: u64) -> Vec<u32> {
+        let host_bias =
+            carrick_dsr::address::NativeHostBias::new(bias, 0x4000).expect("aligned test bias");
+        let assembled = assemble_block_inner(
+            &biased_memory_plan(memory),
+            None,
+            EmitAddressMode::Biased { host_bias },
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble biased memory fixture");
+        assembled.words
+    }
+
+    fn subsequence_at(words: &[u32], first: u32) -> Option<usize> {
+        words.iter().position(|word| *word == first)
+    }
+
+    fn contains_general_bias_load(words: &[u32]) -> bool {
+        // The general lowering always loads the host bias from context slot
+        // 1192 into some scratch; any 64-bit load from that slot marks it.
+        words
+            .iter()
+            .any(|word| (word & 0xFFC0_03E0) == 0xF940_0380 && ((word >> 10) & 0xFFF) == 1192 / 8)
+    }
+
+    #[test]
+    fn compact_biased_immediate_store_emits_the_orr_form() {
+        // str x0, [x1, #8] under the aperture-disjoint 1<<41 bias.
+        let words = assemble_biased_words(
+            super::super::types::MemoryAccess {
+                word: 0xf900_0420,
+                op: bad64::Op::STR,
+                base: super::super::types::MemoryBase::Register(bad64::Reg::X1),
+                effective_address: super::super::types::MemoryEffectiveAddress::Immediate(8),
+                writeback: super::super::types::MemoryWriteback::None,
+                class: super::super::types::MemoryClass::Scalar,
+                virtualization: super::super::types::MemoryVirtualization::None,
+            },
+            0x200_0000_0000,
+        );
+
+        let start = subsequence_at(&words, 0xf902_3391).expect("compact scratch spill");
+        assert_eq!(
+            &words[start..start + 10],
+            &[
+                0xf902_3391, // str x17, [x28, #1120]
+                0xd369_fc32, // lsr x18, x1, #41
+                0xb400_00b2, // cbz x18, +20 (to the fast orr)
+                0x9100_2032, // add x18, x1, #8 (slow: guest effective address)
+                0xf902_5b92, // str x18, [x28, #1200] (publish guest fault addr)
+                0xb251_0031, // orr x17, x1, #(1 << 47) (tagged invalid host)
+                0x1400_0002, // b +8 (over the fast orr)
+                0xb257_0031, // orr x17, x1, #(1 << 41) (host address)
+                0xf900_0620, // str x0, [x17, #8]
+                0xf942_3391, // ldr x17, [x28, #1120]
+            ],
+            "compact immediate store shape"
+        );
+        assert!(
+            !contains_general_bias_load(&words),
+            "compact form must not load the bias from context"
+        );
+    }
+
+    #[test]
+    fn compact_biased_postindex_writeback_commits_with_full_width_sub() {
+        // stp xzr, xzr, [x1], #16 — the memclr shape.
+        let words = assemble_biased_words(
+            super::super::types::MemoryAccess {
+                word: 0xa881_7c3f,
+                op: bad64::Op::STP,
+                base: super::super::types::MemoryBase::Register(bad64::Reg::X1),
+                effective_address: super::super::types::MemoryEffectiveAddress::Base,
+                writeback: super::super::types::MemoryWriteback::PostIndex,
+                class: super::super::types::MemoryClass::Pair,
+                virtualization: super::super::types::MemoryVirtualization::None,
+            },
+            0x200_0000_0000,
+        );
+
+        let start = subsequence_at(&words, 0xf902_3391).expect("compact scratch spill");
+        assert_eq!(
+            &words[start..start + 12],
+            &[
+                0xf902_3391, // str x17, [x28, #1120]
+                0xd369_fc32, // lsr x18, x1, #41
+                0xb400_00b2, // cbz x18, +20 (to the fast orr)
+                0xaa01_03f2, // mov x18, x1 (slow: guest effective address)
+                0xf902_5b92, // str x18, [x28, #1200]
+                0xb251_0031, // orr x17, x1, #(1 << 47)
+                0x1400_0002, // b +8
+                0xb257_0031, // orr x17, x1, #(1 << 41)
+                0xa881_7e3f, // stp xzr, xzr, [x17], #16
+                0xd2c0_4012, // movz x18, #0x200, lsl #32 (the bias)
+                0xcb12_0221, // sub x1, x17, x18 (exact un-bias commit)
+                0xf942_3391, // ldr x17, [x28, #1120]
+            ],
+            "compact post-index writeback shape"
+        );
+    }
+
+    #[test]
+    fn negative_immediates_and_sub_aperture_biases_keep_the_general_form() {
+        let negative = super::super::types::MemoryAccess {
+            word: 0xf85f_8020, // ldur x0, [x1, #-8]
+            op: bad64::Op::LDUR,
+            base: super::super::types::MemoryBase::Register(bad64::Reg::X1),
+            effective_address: super::super::types::MemoryEffectiveAddress::Immediate(-8),
+            writeback: super::super::types::MemoryWriteback::None,
+            class: super::super::types::MemoryClass::Scalar,
+            virtualization: super::super::types::MemoryVirtualization::None,
+        };
+        assert!(
+            contains_general_bias_load(&assemble_biased_words(negative, 0x200_0000_0000)),
+            "negative immediates stay on the general path"
+        );
+
+        let positive = super::super::types::MemoryAccess {
+            word: 0xf900_0420,
+            op: bad64::Op::STR,
+            base: super::super::types::MemoryBase::Register(bad64::Reg::X1),
+            effective_address: super::super::types::MemoryEffectiveAddress::Immediate(8),
+            writeback: super::super::types::MemoryWriteback::None,
+            class: super::super::types::MemoryClass::Scalar,
+            virtualization: super::super::types::MemoryVirtualization::None,
+        };
+        assert!(
+            contains_general_bias_load(&assemble_biased_words(positive, 0x80_0000_0000)),
+            "sub-aperture biases stay on the general path"
+        );
     }
 
     #[test]
