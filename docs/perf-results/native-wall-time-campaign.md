@@ -739,7 +739,7 @@ Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
 | H004 | REJECT | Authority caching leaves at least 17.16M bounded direct misses, led by one conditional fall-through edge at 1.47M | signed Variant 1 feasibility exhausts the 64 MiB DSR translation cache before `BUILD_OK` | Compact per-edge mutable binding cells were the bounded proof; the mechanism pair was not run | Rejected at feasibility; no cache increase, sidecar tuning, or Task 16 is authorized |
 | H005 | DEFER | Private futex owns 50.4% of blocked thread-time but only 0.069% of sampled total CPU | 58/84,037 sampled CPU ticks | Revisit only if critical-path evidence shows waking earlier removes runnable work | Filesystem work currently has materially larger measured CPU share |
 | H006 | RETAIN | Exact caller stacks assigned 33.3% of joined opens to `lookup_kind` and another 10.8% to unconditional `read_link` | paired candidate: 46,493 joined host opens / 2,363 guest opens; 19.163 s median. Clean isolated median 19.680 s does not beat `C0` | Keep descriptor-contained lookup-kind and no-follow metadata with cap-std fallback; finish correctness closeout but claim no official `C1` win | Revert only for correctness failure or a future contemporaneous paired regression; isolated baseline drift does not override the 5/5 paired result and explicit retain direction |
-| H007 | SPIKING | The retained path still drives 19.68 host opens per guest open; pre-change stacks ranked `resolve_following` and terminal open next | post-change caller census pending | Re-census exact Carrick frames, then carry one contained descriptor/metadata authority bundle through ordinary open dispatch if resolver/final-open rewalks still dominate | No remaining stable dominant rewalk, or the bounded combined primitive fails mechanism and wall screens; then pivot to Carrick-only teardown unlink amplification |
+| H007 | REJECT | Post-wave census at the branch tip: 48,927 joined opens / 549 ms traced; `lookup_kind` collapsed to 4.8% and `read_link` to 1.6%; the remaining walk families are `open_raw_fd` 24.0% and `resolve_following` 20.3% | 242 ms traced ≈ ~1% of the 18,321 ms `W0` window | The remaining families are real but their combined wall ceiling fails the value bar; the H006 terminal-open spike already showed a 24% call cut returns 0.7% wall | Rejected on ceiling 2026-07-28; the teardown-unlink pivot left scope with Decision 13. Next size translated-guest execution by sampled-instruction shape |
 
 The table order is provisional until E005 and E006 exist.
 
@@ -908,9 +908,15 @@ Write and validate the executable M1 plan:
       The full-wall medians in the same run were 20,260 ms and 1,021 ms
       (19.84x); the excluded engine lifecycle is ~1.9 s for Carrick and
       ~0.18 s for Docker per run.
-- [ ] Re-census post-change open callers and spike H007 only if one remaining
-      resolver/final-open rewalk family is still dominant inside the workload
-      window.
+- [x] Re-census post-change open callers: the wave held (`lookup_kind` 35,235
+      to 2,363; `read_link` 11,435 to 772), the remaining walk families'
+      combined traced duration is ~242 ms, and H007 is rejected on its ~1%
+      wall ceiling (`native-fs-amplification.jsonl`, record
+      `openat-caller-census-post-wave`).
+- [ ] Attribute translated-guest execution (36.7% of sampled CPU) by sampled
+      instruction shape: profile-tick `copyin` of the interrupted word,
+      bucketed into context-slot traffic, guard loads, window checks, probe
+      sequences, and plain guest work; join against JIT-range residency.
 - [ ] Restore at least 95% symbolized kernel-leaf coverage before any future
       broad kernel capture. Never recycle v1 or v2 or infer a family from the
       rejected partial run.
