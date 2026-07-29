@@ -129,28 +129,36 @@ traced ceiling rejected H007 (`native-fs-amplification.jsonl`).
    (`3a6ab083`, `fce32ea0`) behind `CARRICK_DSR_RESERVED_SCRATCH=1`,
    DEFAULT OFF, with 170 dsr + 162 runtime oracle tests green.
 
-   **Measured, switch ON:** one clean cold go-build at **16,137 ms** against
-   the frozen `W0` of 18,321 ms — **~12% faster**. That is the first real
-   evidence the codegen direction pays.
+   **Measured — read the caveat before quoting any number.** A dedicated
+   five-pair screen faulted **5 of 5** with the switch on; across all
+   attempts the record is **1 success in 7**. The single completing run was
+   16,137 ms against the frozen `W0` of 18,321 ms (11.9% under), which is
+   suggestive that removing the spill pays — but with six of seven runs
+   faulting it is a selection-biased sample, **not** a measured speedup.
+   Do not cite 12% as the phase's result; the phase is unmeasurable until
+   it completes reliably.
 
-   **Blocker:** it faults on roughly three of four runs with
-   `unexpected fault address 0xffff00a0...`. The arithmetic is exact and is
-   the lead: **fault address == guest address − 2^48**, and 2^48 is the
-   invalid-host tag bit (2^47) applied TWICE and then subtracted. Observed
-   values `0xffff00a04882f900`, `0xffff00a05207d2d0`, `0xffff00a0513d97f0`
-   are all valid Go stack addresses minus 2^48. Look first at any path that
-   can apply `orr #1<<47` twice to one address, or that un-biases a
-   double-tagged value — the tagged slow path and the writeback commit are
-   the two places the tag and a subtract meet.
+   The switch-OFF arm, by contrast, is a clean 5/5: 17,593 / 17,807 /
+   17,952 / 17,969 / 18,236 ms, median **17,952 ms**, 2.0% under `W0`.
+   That is most plausibly the gateway now saving one fewer register per
+   transition (an unconditional side effect of reserving x19), and it is
+   worth confirming and keeping on its own merits.
+
+   **Blocker:** the fault signature is exact and is the lead.
+   `unexpected fault address` is always **guest address − 2^48**, and 2^48
+   is the invalid-host tag bit (2^47) applied TWICE and then subtracted.
+   Observed: `0xffff00a04882f900`, `0xffff00a05207d2d0`,
+   `0xffff00a0513d97f0`, `0xffff00a04fa4f900` — all valid Go stack
+   addresses under that transform. Look first at any path that can apply
+   `orr #1<<47` twice to one address, or that un-biases a double-tagged
+   value; the tagged slow path and the writeback commit are the two places
+   a tag and a subtract meet.
 
    **Also fix before measuring again:** the reservation is currently
    UNCONDITIONAL — the `gateway_aarch64.S` register save/restore change and
-   the x19 decode classification are not behind the switch. So the "off" arm
-   is not the untouched baseline, and a paired screen through the switch
-   measures only the lowering, not the phase. Interestingly the off arm is
-   itself ~3-4% faster than `W0` (17,593 / 17,807 ms), most likely because
-   the gateway now saves one fewer register per transition — worth
-   confirming and keeping on its own merits.
+   the x19 decode classification are not behind the switch — so the "off"
+   arm is not the untouched baseline and a screen through the switch
+   measures only the lowering, not the phase.
 
 2. **Re-run the shape census after any H008 spike** — the census is now one
    command pair (see Methods) and is the mechanism gate.
