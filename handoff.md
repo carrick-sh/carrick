@@ -116,6 +116,42 @@ traced ceiling rejected H007 (`native-fs-amplification.jsonl`).
 
 ## Next work, ranked
 
+0. **Superblock formation is BUILT, live-verified and mechanism-gated; its
+   wall screen is the open item.** Switch `CARRICK_DSR_SUPERBLOCK`
+   (`off` | `on` | `<segments>`), default **off** until the paired screen
+   rules. A conditional branch splits a guest block today, so its
+   fall-through — literally the next instruction — pays a second entry
+   prologue: generation guard with an `ldar` acquire, the `entry_in_progress`
+   store, the guest-x17 reload, plus the predecessor's two guest-x17 stores.
+   Fusing that edge costs **2 emitted words** and removes **~11 executed**
+   ones, and moves the x17 saves onto the cold taken path.
+
+   Measured mechanism (`ls -la /usr/bin` ×3, native backend,
+   `CARRICK_DSR_PROFILE=1`, each figure identical across the run's frames):
+
+   | counter | off | on (8 segments) | delta |
+   |---|---|---|---|
+   | `translations` | 5,323 | 3,287 | **−38.2%** |
+   | `direct_resolver_exits` | 4,189 | 2,153 | **−48.6%** |
+   | `gateway_entries` | 19,753 | 17,716 | −10.3% |
+
+   Live correctness, through the production translator in biased mode: a
+   fault two guest instructions past a fused conditional reports the right
+   guest address and guest PC with x17 intact — and that test is red-first
+   verified, because with `segments=1` the load is never reached in one
+   entry (it returns `Continue`), so it cannot pass vacuously.
+
+   **Open:** the paired wall screen. `native_go_build.py` refuses a dirty
+   worktree, so run it against the commit:
+   `python3 scripts/perf/native_go_build.py --engine carrick --samples 1
+   --superblock off|8 --allow-busy`, alternating arms per Decision 14. Flip
+   the default in a separate commit only if the screen wins.
+
+   **Deliberate scope boundaries** (campaign Decision 15) — fall-through
+   edges only, never across a guest page, no fusing of exclusive regions,
+   and superblocks excluded from the artifact/shared caches whose templates
+   are keyed on one block's source words.
+
 1. **Phase A is MEASURED and worth ~10%; finish its two remaining gates.**
    Removing the per-access scratch spill (the 33.5% census category) by
    reserving x19 measures, after the x18 displacement fix (`ff61ab9`):

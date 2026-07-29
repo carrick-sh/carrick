@@ -148,6 +148,7 @@ mod tests {
                 guest: GuestVa(0x4008),
                 resume: GuestVa(0x400c),
             },
+            extensions: Vec::new(),
         }
     }
 
@@ -493,6 +494,7 @@ mod tests {
                 guest: GuestVa(0x4004),
                 resume: GuestVa(0x4008),
             },
+            extensions: Vec::new(),
         };
         let mut cache = TranslationCache::new(
             16 * 1024,
@@ -591,6 +593,7 @@ mod tests {
                 },
                 fusion: None,
             },
+            extensions: Vec::new(),
         };
         let host_bias = carrick_dsr::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
             .expect("valid bias");
@@ -818,6 +821,7 @@ mod tests {
                 guest: GuestVa(0x4004),
                 resume: GuestVa(0x4008),
             },
+            extensions: Vec::new(),
         };
         let host_bias =
             crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
@@ -952,6 +956,7 @@ mod tests {
                 guest: GuestVa(0x4004),
                 resume: GuestVa(0x4008),
             },
+            extensions: Vec::new(),
         };
         let mut cache = TranslationCache::new(
             16 * 1024,
@@ -987,6 +992,7 @@ mod tests {
                 guest: GuestVa(0x4004),
                 resume: GuestVa(0x4008),
             },
+            extensions: Vec::new(),
         };
         let mut cache = TranslationCache::new(
             16 * 1024,
@@ -1335,6 +1341,7 @@ mod tests {
                         biased_scratch: None,
                     },
                 },
+                extensions: Vec::new(),
             }
         }
 

@@ -91,6 +91,7 @@ pub(super) fn execute_virtual_counter_for_test() -> Result<u64, types::DsrError>
             guest: carrick_guest_mem::GuestVa(guest.raw() + 4),
             resume: carrick_guest_mem::GuestVa(guest.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let mut cache = cache::TranslationCache::new(
         16 * 1024,

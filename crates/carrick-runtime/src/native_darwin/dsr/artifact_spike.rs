@@ -173,6 +173,7 @@ mod tests {
                 guest: GuestVa(guest.raw() + 4),
                 resume: GuestVa(guest.raw() + 8),
             },
+            extensions: Vec::new(),
         };
         let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
         let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);

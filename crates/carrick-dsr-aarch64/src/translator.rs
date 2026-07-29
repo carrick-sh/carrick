@@ -416,6 +416,10 @@ pub struct ProcessState {
     shared_publish_attempted: bool,
     direct_bindings: crate::direct_binding::DirectBindingRegistry,
     executable_ranges: gateway::ExecutableRangeCatalog,
+    /// Guest blocks one emitted block may fuse (1 = no superblock formation).
+    /// Resolved once from `block::superblock_segment_limit()`; the only site
+    /// that reads the switch, so planner and emitter tests stay deterministic.
+    superblock_segments: usize,
 }
 
 struct SharedTranslationConfiguration {
@@ -1338,6 +1342,7 @@ impl ProcessTranslator {
                     cache_range.start,
                     cache_range.end,
                 )?,
+                superblock_segments: block::superblock_segment_limit(),
             }),
         };
         probes::dsr_cache_capacity(
@@ -2070,7 +2075,13 @@ impl ProcessState {
                 generation.get(),
             );
             let decode_started = self.profiling.then(std::time::Instant::now);
-            let block_result = block::plan_block(memory, guest, generation, 256);
+            let block_result = block::plan_block_with_segments(
+                memory,
+                guest,
+                generation,
+                256,
+                self.superblock_segments,
+            );
             if let Some(started) = decode_started {
                 self.stats
                     .add_elapsed(ResolverStat::TranslationDecodeNs, started.elapsed());
@@ -2123,7 +2134,13 @@ impl ProcessState {
                         observed: observation.current().get(),
                     });
                 }
-                match block.exit {
+                // The TERMINAL exit, not `block.exit`: superblock formation
+                // makes `block.exit` the first segment's exit, which for a
+                // fused plan is an internal conditional edge. Only the last
+                // segment can carry sensitive/unsupported metadata, because
+                // extension stops at anything that is not a conditional
+                // branch.
+                match block.terminal_exit() {
                     block::PlannedExit::Sensitive {
                         guest: sensitive_guest,
                         exit,
@@ -2159,7 +2176,7 @@ impl ProcessState {
                     guest: unsupported_guest,
                     word,
                     op,
-                } = block.exit
+                } = block.terminal_exit()
                 {
                     self.unsupported
                         .insert((unsupported_guest, generation), (word, op));
@@ -2206,8 +2223,15 @@ impl ProcessState {
                     && let Some(segment) = portable_segment
                     && self.shared_recording_segments.contains(&segment)
                     && let Some(source_words) = block_source_words.clone()
+                    // Superblocks are deliberately out of scope for the shared
+                    // and artifact caches in this slice: both key a template on
+                    // one block's source words and replay it byte-for-byte, and
+                    // neither has been proven against a plan whose emitted unit
+                    // spans several guest blocks. A fused block simply takes the
+                    // plain emit path -- a lost cache hit, never wrong code.
+                    && block.extensions.is_empty()
                     && matches!(
-                        block.exit,
+                        block.terminal_exit(),
                         block::PlannedExit::Syscall { .. }
                             | block::PlannedExit::Direct { .. }
                             | block::PlannedExit::Indirect { .. }
@@ -2230,7 +2254,7 @@ impl ProcessState {
                                     guest_start: block.start,
                                     generation_binding,
                                     requires_sensitive_metadata: matches!(
-                                        block.exit,
+                                        block.terminal_exit(),
                                         block::PlannedExit::Sensitive { .. }
                                     ),
                                     template: artifact.template,
@@ -2248,8 +2272,9 @@ impl ProcessState {
                     && artifact_key.is_some()
                     && artifact_source_words.is_some()
                     && block_word_count >= artifact_spike::minimum_source_words()
+                    && block.extensions.is_empty()
                     && matches!(
-                        block.exit,
+                        block.terminal_exit(),
                         block::PlannedExit::Syscall { .. }
                             | block::PlannedExit::Direct { .. }
                             | block::PlannedExit::Indirect { .. }
@@ -2782,6 +2807,18 @@ impl ThreadTranslator {
             })?;
         self.patch_recovery_word_for_test(cache_pc, word)?;
         Ok(cache_pc.host())
+    }
+
+    /// Force superblock formation on for this translator, whatever
+    /// `CARRICK_DSR_SUPERBLOCK` says.
+    ///
+    /// The switch resolves once per process, so a test binary cannot flip it by
+    /// setting the variable. Without this hook the fused path would be
+    /// unreachable from the production translator in tests -- which is how a
+    /// feature behind an opt-in switch ends up shipping unexercised.
+    #[doc(hidden)]
+    pub fn set_superblock_segments_for_test(&self, segments: usize) {
+        self.process.state.write().superblock_segments = segments.max(1);
     }
 
     #[doc(hidden)]

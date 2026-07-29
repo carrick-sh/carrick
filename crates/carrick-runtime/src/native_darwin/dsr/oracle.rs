@@ -134,6 +134,79 @@ fn biased_translator_fixture_with(
     }
 }
 
+/// A fault inside a FUSED continuation segment, through the production
+/// translator, in biased mode.
+///
+/// This is the claim fusion rests on: a continuation segment never re-saves
+/// guest x17, because physical x17 still holds the guest value across the
+/// internal edge. So a fault two guest instructions past the fused conditional
+/// must report the right guest PC AND leave x17 exactly as the guest wrote it.
+///
+/// The test cannot pass vacuously. With fusion off, one `enter_prepared` stops
+/// at the conditional with a `ResolveDirect`, and the load in the second
+/// segment is never reached in this entry -- so a fault AT that load is itself
+/// the proof that the two guest blocks were emitted as one.
+#[test]
+fn biased_live_fault_inside_a_fused_segment_reports_guest_pc_and_keeps_x17() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+
+    let guest_code = GuestVa(0x20_0800_0000);
+    let mut fixture = biased_translator_fixture(
+        &[
+            0x9100_0631, // add x17, x17, #1
+            0xb400_0800, // cbz x0, +0x100 (out of block; not taken below)
+            0xf940_0020, // ldr x0, [x1]   -- faults in the fused segment
+            0xd400_0001, // svc #0
+        ],
+        guest_code,
+    );
+    fixture.translator.set_superblock_segments_for_test(4);
+    let invalid_guest = GuestVa(0x10_0000);
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = guest_code.raw();
+    snapshot.x[0] = 7;
+    snapshot.x[1] = invalid_guest.raw();
+    let expected_x16 = snapshot.x[16];
+    let expected_x17 = snapshot.x[17].wrapping_add(1);
+
+    let prepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare fused-segment fault");
+    let prepared_exit = fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("enter fused-segment fault");
+    let exit = fixture
+        .translator
+        .finish_exit(&fixture.memory, &mut snapshot, prepared, prepared_exit)
+        .expect("finish fused-segment fault");
+
+    assert!(
+        matches!(
+            exit,
+            super::ThreadExit::Fault {
+                kind: super::ThreadFault::Host { signal, .. },
+                address: super::ThreadFaultAddress::Host(address),
+            } if matches!(signal, libc::SIGSEGV | libc::SIGBUS)
+                && address == HostVa((fixture.host_bias.get() + invalid_guest.raw()) as usize)
+        ),
+        "expected a guest-address fault from the fused segment, got {exit:?}"
+    );
+    assert_eq!(
+        snapshot.pc,
+        guest_code.raw() + 8,
+        "the fault must resume at the faulting guest instruction in segment 1"
+    );
+    assert_eq!(
+        snapshot.x[17], expected_x17,
+        "segment 0's `add x17, x17, #1` must survive the fused edge"
+    );
+    assert_eq!(snapshot.x[16], expected_x16);
+    assert_eq!(snapshot.x[1], invalid_guest.raw());
+}
+
 #[test]
 fn biased_live_signal_gateway_recovers_pre_and_post_operation_faults() {
     let _signal_oracle = install_signal_handlers_for_oracle();
@@ -653,6 +726,7 @@ fn biased_memory_families_access_guest_data_at(bias: u64) {
                 guest: GuestVa(0x4004),
                 resume: GuestVa(0x4008),
             },
+            extensions: Vec::new(),
         };
         let mut cache = TranslationCache::new(
             16 * 1024,
@@ -751,6 +825,7 @@ fn biased_memory_preserves_nzcv_at(bias: u64) {
             guest: GuestVa(0x5008),
             resume: GuestVa(0x500c),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -803,6 +878,7 @@ fn run_biased_single_memory(
             guest: GuestVa(guest_pc.raw() + 4),
             resume: GuestVa(guest_pc.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -997,6 +1073,7 @@ fn biased_memequal_vector_sequence_compares_equal_blocks() {
             guest: syscall,
             resume: GuestVa(syscall.raw() + 4),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -1066,6 +1143,7 @@ fn biased_literal_load_commits_virtual_x18() {
             guest: GuestVa(0xd004),
             resume: GuestVa(0xd008),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -1218,6 +1296,7 @@ fn virtual_counter_plan(guest: GuestVa, destination: CounterDestination) -> Bloc
             guest: GuestVa(guest.raw() + 4),
             resume: GuestVa(guest.raw() + 8),
         },
+        extensions: Vec::new(),
     }
 }
 
@@ -1467,6 +1546,7 @@ fn run_full_state_oracle() -> Result<(), DsrError> {
             guest: GuestVa(0x4004),
             resume: GuestVa(0x4008),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -1557,6 +1637,7 @@ fn dsr_pc_relative_adr_materializes_guest_target() {
             guest: GuestVa(0x4004),
             resume: GuestVa(0x4008),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -1594,6 +1675,7 @@ fn dsr_pc_relative_literal_load_reads_guest_address() {
             guest: GuestVa(0x5004),
             resume: GuestVa(0x5008),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -1662,6 +1744,7 @@ fn dsr_pc_relative_literals_cover_integer_simd_prefetch_and_virtual_x18() {
             guest: exit_pc,
             resume: GuestVa(exit_pc.raw() + 4),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -1714,6 +1797,7 @@ fn dsr_pc_relative_adrp_writes_virtual_guest_x18_without_clobbering_x17() {
             guest: GuestVa(0x7004),
             resume: GuestVa(0x7008),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -1751,6 +1835,7 @@ fn dsr_direct_flow_unresolved_branch_reports_guest_target() {
                 bit: None,
             },
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -1810,6 +1895,7 @@ fn syscall_plan(start: GuestVa, word: u32) -> BlockPlan {
             guest: GuestVa(start.raw() + 4),
             resume: GuestVa(start.raw() + 8),
         },
+        extensions: Vec::new(),
     }
 }
 
@@ -1840,6 +1926,7 @@ fn dsr_direct_flow_linked_branch_stays_in_translated_code_and_preserves_x17() {
                 bit: None,
             },
         },
+        extensions: Vec::new(),
     };
     let source = emit_block_direct(&mut cache, &source_plan).expect("emit linked source");
     let target = emit_block_direct(&mut cache, &syscall_plan(GuestVa(0xb000), 0x9100_0400))
@@ -1890,6 +1977,7 @@ fn dsr_direct_flow_conditional_edges_select_taken_and_fallthrough_links() {
                 bit: None,
             },
         },
+        extensions: Vec::new(),
     };
     let source = emit_block_direct(&mut cache, &source_plan).expect("emit conditional source");
     let fallthrough = emit_block_direct(&mut cache, &syscall_plan(GuestVa(0xc004), 0x9100_0821))
@@ -1945,6 +2033,7 @@ fn dsr_direct_flow_linked_call_observes_guest_lr() {
                 bit: None,
             },
         },
+        extensions: Vec::new(),
     };
     let call = emit_block_direct(&mut cache, &call_plan).expect("emit linked call");
     let nested_plan = BlockPlan {
@@ -1964,6 +2053,7 @@ fn dsr_direct_flow_linked_call_observes_guest_lr() {
                 bit: None,
             },
         },
+        extensions: Vec::new(),
     };
     let nested = emit_block_direct(&mut cache, &nested_plan).expect("emit nested call");
     let callee = emit_block_direct(&mut cache, &syscall_plan(GuestVa(0xe100), 0x9100_03c0))
@@ -2005,6 +2095,7 @@ fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
                 word,
                 exit,
             },
+            extensions: Vec::new(),
         };
         let mut cache = TranslationCache::new(
             16 * 1024,
@@ -2036,6 +2127,207 @@ fn dsr_direct_flow_condition_codes_and_virtual_x18_bits_choose_guest_edges() {
     }
 }
 
+/// A guarded two-segment superblock:
+///
+/// ```text
+///   0xd000  add x17, x17, #1     segment 0 body
+///   0xd004  cbz x0, 0xd100       fused conditional; fall-through is internal
+///   0xd008  add x17, x17, #1     segment 1 body
+///   0xd00c  svc #0               terminal exit
+/// ```
+///
+/// x17 is the subject on purpose. It is the register a fused fall-through stops
+/// saving to context slot 136, on the claim that physical x17 still holds the
+/// guest value across the internal edge because nothing between the segments
+/// touches it. Both guest instructions mutate it, so a broken claim shows up as
+/// a wrong x17 rather than as a silent equality.
+fn fused_superblock_plan() -> BlockPlan {
+    let start = GuestVa(0xd000);
+    let word = 0xb400_0800; // cbz x0, +0x100
+    let exit = DirectExit {
+        kind: DirectKind::CompareZero { nonzero: false },
+        target: GuestVa(0xd104),
+        resume: GuestVa(0xd008),
+        condition: None,
+        register: Some(bad64::Reg::X0),
+        bit: None,
+    };
+    debug_assert_eq!(
+        super::decode::classify(word, GuestVa(0xd004)).ok(),
+        Some(InstAction::Direct(exit)),
+        "the fixture's hand-built exit must match what decode produces"
+    );
+    BlockPlan {
+        start,
+        end: GuestVa(0xd010),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: start,
+            action: InstAction::Copy(0x9100_0631), // add x17, x17, #1
+        }],
+        exit: PlannedExit::Direct {
+            guest: GuestVa(0xd004),
+            word,
+            exit,
+        },
+        extensions: vec![carrick_dsr_aarch64::block::PlanExtension {
+            entry: GuestVa(0xd008),
+            instructions: vec![PlannedInst {
+                guest: GuestVa(0xd008),
+                action: InstAction::Copy(0x9100_0631), // add x17, x17, #1
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0xd00c),
+                resume: GuestVa(0xd010),
+            },
+        }],
+    }
+}
+
+#[test]
+fn dsr_fused_superblock_runs_both_segments_and_preserves_guest_x17() {
+    use std::sync::atomic::AtomicU64;
+
+    let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+    let plan = fused_superblock_plan();
+    let taken_guest = GuestVa(0xd104);
+    let mut cache = TranslationCache::new(
+        64 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate fused-superblock cache");
+    let source = super::emit::emit_block_with_generation_direct(
+        &mut cache,
+        &plan,
+        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+    )
+    .expect("emit fused superblock");
+    // `mov x0, x17` so the taken block reports the x17 the superblock left it.
+    let taken_plan = BlockPlan {
+        start: taken_guest,
+        end: GuestVa(taken_guest.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest: taken_guest,
+            action: InstAction::Copy(0xaa11_03e0),
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(taken_guest.raw() + 4),
+            resume: GuestVa(taken_guest.raw() + 8),
+        },
+        extensions: Vec::new(),
+    };
+    let taken = super::emit::emit_block_with_generation_direct(
+        &mut cache,
+        &taken_plan,
+        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+    )
+    .expect("emit taken target");
+    patch_direct_target(&mut cache, &source, taken_guest, &taken);
+
+    // x0 != 0: the branch is not taken, so BOTH segments run inside one
+    // emitted block and the syscall resumes past the second one.
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = 7;
+    let fallthrough_x17 = snapshot.x[17].wrapping_add(2);
+    let mut exit = NativeDsrExit::ResolveDirect {
+        source: GuestVa(0xd004),
+        target: taken_guest,
+        binding: DirectBindingExitMetadata::Absent,
+    };
+    enter_translated(source.entry(), &mut snapshot, &mut exit).expect("execute fused fall-through");
+    assert_eq!(
+        snapshot.x[17], fallthrough_x17,
+        "both segments' `add x17, x17, #1` must have run"
+    );
+    assert_eq!(
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(0xd010)
+        },
+        "the fall-through must reach the SECOND segment's syscall"
+    );
+
+    // x0 == 0: the branch is taken, so only the first segment ran and the
+    // taken edge left through the linked block -- which reads guest x17 back
+    // out of the register file, proving the taken path published it.
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = 0;
+    let taken_x17 = snapshot.x[17].wrapping_add(1);
+    let mut exit = NativeDsrExit::ResolveDirect {
+        source: GuestVa(0xd004),
+        target: taken_guest,
+        binding: DirectBindingExitMetadata::Absent,
+    };
+    enter_translated(source.entry(), &mut snapshot, &mut exit).expect("execute fused taken edge");
+    assert_eq!(
+        snapshot.x[17], taken_x17,
+        "only the first segment's increment must have run"
+    );
+    assert_eq!(
+        snapshot.x[0], taken_x17,
+        "the linked block's `mov x0, x17` must observe the guest x17"
+    );
+    assert_eq!(
+        exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(taken_guest.raw() + 8)
+        }
+    );
+}
+
+/// A stale generation must be caught ONCE, at the fused block's single entry,
+/// and must unwind to the same guest state a non-fused block would.
+#[test]
+fn dsr_fused_superblock_stale_generation_exits_before_either_segment() {
+    use std::sync::atomic::AtomicU64;
+
+    let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+    let plan = fused_superblock_plan();
+    let mut cache = TranslationCache::new(
+        64 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate fused-stale cache");
+    let source = super::emit::emit_block_with_generation_direct(
+        &mut cache,
+        &plan,
+        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+    )
+    .expect("emit fused superblock");
+    generation.store(
+        CodeGeneration::INITIAL.get() + 1,
+        std::sync::atomic::Ordering::Release,
+    );
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[0] = 7;
+    let untouched_x17 = snapshot.x[17];
+    let mut exit = NativeDsrExit::ResolveDirect {
+        source: GuestVa(0xd004),
+        target: GuestVa(0xd104),
+        binding: DirectBindingExitMetadata::Absent,
+    };
+    enter_translated(source.entry(), &mut snapshot, &mut exit).expect("execute stale fused block");
+    assert_eq!(
+        snapshot.x[17], untouched_x17,
+        "no segment may run once the guard fails"
+    );
+    assert_eq!(
+        exit,
+        // The same exit a stale NON-fused block produces: re-resolve the
+        // block's own start, so the caller re-translates at the new generation.
+        NativeDsrExit::ResolveDirect {
+            source: GuestVa(0xd000),
+            target: GuestVa(0xd000),
+            binding: DirectBindingExitMetadata::Absent,
+        }
+    );
+}
+
 #[test]
 fn dsr_guarded_link_after_virtual_x18_condition_preserves_guest_x17() {
     use std::sync::atomic::AtomicU64;
@@ -2059,6 +2351,7 @@ fn dsr_guarded_link_after_virtual_x18_condition_preserves_guest_x17() {
             word,
             exit,
         },
+        extensions: Vec::new(),
     };
     let target_plan = BlockPlan {
         start: target_guest,
@@ -2072,6 +2365,7 @@ fn dsr_guarded_link_after_virtual_x18_condition_preserves_guest_x17() {
             guest: GuestVa(target_guest.raw() + 4),
             resume: GuestVa(target_guest.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         32 * 1024,
@@ -2133,6 +2427,7 @@ fn dsr_direct_flow_linked_backward_loop_reaches_fallthrough() {
                 bit: None,
             },
         },
+        extensions: Vec::new(),
     };
     let loop_block = emit_block_direct(&mut cache, &loop_plan).expect("emit linked loop");
     let done = emit_block_direct(&mut cache, &syscall_plan(GuestVa(0xf008), 0xd503_201f))
@@ -2179,6 +2474,7 @@ fn dsr_indirect_flow_unresolved_return_reports_guest_register_target() {
                 resume: GuestVa(0x13_004),
             },
         },
+        extensions: Vec::new(),
     };
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit unresolved return");
     let mut stack = vec![0_u8; 16 * 1024];
@@ -2226,6 +2522,7 @@ fn portable_direct_block_exits_through_context_gateway() {
                 bit: None,
             },
         },
+        extensions: Vec::new(),
     };
     let host_bias = crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
         .expect("construct portable direct bias");
@@ -2301,6 +2598,7 @@ fn assert_portable_direct_block_chains_through_published_target_authority(
                 bit: None,
             },
         },
+        extensions: Vec::new(),
     };
     let target_plan = BlockPlan {
         start: target,
@@ -2311,6 +2609,7 @@ fn assert_portable_direct_block_chains_through_published_target_authority(
             guest: target,
             resume: GuestVa(target.raw() + 4),
         },
+        extensions: Vec::new(),
     };
     let host_bias = crate::native_darwin::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
         .expect("construct portable direct chaining bias");
@@ -2583,6 +2882,7 @@ fn portable_direct_cache_hit_switches_cross_unit_authority_tuple() {
                     bit: None,
                 },
             },
+            extensions: Vec::new(),
         },
         0,
         super::emit::EmitAddressMode::Biased { host_bias },
@@ -2599,6 +2899,7 @@ fn portable_direct_cache_hit_switches_cross_unit_authority_tuple() {
                 guest: target_guest,
                 resume: GuestVa(target_guest.raw() + 4),
             },
+            extensions: Vec::new(),
         },
         1,
         super::emit::EmitAddressMode::Biased { host_bias },
@@ -2704,6 +3005,7 @@ fn dsr_indirect_flow_blr_sets_guest_link_and_alternates_targets() {
                 resume: GuestVa(0x15_004),
             },
         },
+        extensions: Vec::new(),
     };
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit BLR");
     for target in [GuestVa(0x16_000), GuestVa(0x17_000), GuestVa(0x16_000)] {
@@ -2749,6 +3051,7 @@ fn dsr_indirect_flow_branch_reads_virtual_guest_x18() {
                 resume: GuestVa(0x18_004),
             },
         },
+        extensions: Vec::new(),
     };
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit virtual x18 branch");
     let mut stack = vec![0_u8; 16 * 1024];
@@ -2794,6 +3097,7 @@ fn dsr_indirect_cache_keeps_old_index_aliases_hot() {
             guest: target,
             resume: GuestVa(target.raw() + 4),
         },
+        extensions: Vec::new(),
     };
     let mut code = TranslationCache::new(
         32 * 1024,
@@ -2820,6 +3124,7 @@ fn dsr_indirect_cache_keeps_old_index_aliases_hot() {
                     resume: GuestVa(source_guest.raw() + 4),
                 },
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit alias source");
@@ -2886,6 +3191,7 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
                 guest: target_guest,
                 resume: GuestVa(target_guest.raw() + 4),
             },
+            extensions: Vec::new(),
         },
         super::emit::GenerationGuard::new(&generation, target_generation),
     )
@@ -2906,6 +3212,7 @@ fn dsr_indirect_flow_cache_hit_stays_in_translated_code() {
                     resume: GuestVa(source_guest.raw() + 4),
                 },
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit indirect cache-hit source");
@@ -2992,6 +3299,7 @@ fn dsr_indirect_cache_installs_target_outside_active_translation_unit() {
                     resume: GuestVa(source_guest.raw() + 4),
                 },
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit indirect source");
@@ -3011,6 +3319,7 @@ fn dsr_indirect_cache_installs_target_outside_active_translation_unit() {
                 guest: target_guest,
                 resume: GuestVa(target_guest.raw() + 4),
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit separate indirect target");
@@ -3125,6 +3434,7 @@ fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
                 guest: target_guest,
                 resume: GuestVa(target_guest.raw() + 4),
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit cached BLR target");
@@ -3144,6 +3454,7 @@ fn dsr_indirect_flow_cached_blr_sets_guest_link_register() {
                     resume: resume_guest,
                 },
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit cached BLR source");
@@ -3199,6 +3510,7 @@ fn dsr_sensitive_flow_reports_guest_pc_and_resume() {
             },
             fusion: None,
         },
+        extensions: Vec::new(),
     };
     let emitted = emit_block_with_generation_direct(
         &mut cache,
@@ -3251,6 +3563,7 @@ fn dsr_virtual_x18_rewrites_destination_and_distinct_x17_operand() {
             guest: GuestVa(0x1b_008),
             resume: GuestVa(0x1b_00c),
         },
+        extensions: Vec::new(),
     };
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit x18 rewrites");
     let mut stack = vec![0_u8; 16 * 1024];
@@ -3303,6 +3616,7 @@ fn dsr_virtual_reserved_scratch_rewrites_destination_and_survives_the_gateway() 
             guest: GuestVa(0x1b_408),
             resume: GuestVa(0x1b_40c),
         },
+        extensions: Vec::new(),
     };
     assert!(
         plan.instructions.iter().all(|instruction| matches!(
@@ -3361,6 +3675,7 @@ fn dsr_virtual_x18_madd_then_aliasing_loads_preserve_computed_address() {
             guest: GuestVa(0x1b_08c),
             resume: GuestVa(0x1b_090),
         },
+        extensions: Vec::new(),
     };
     let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
     let emitted = super::emit::emit_block_with_generation_direct(
@@ -3413,6 +3728,7 @@ fn dsr_virtual_x28_rewrites_destination_and_distinct_x17_operand() {
             guest: GuestVa(0x1b_108),
             resume: GuestVa(0x1b_10c),
         },
+        extensions: Vec::new(),
     };
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit x28 rewrites");
     let mut stack = vec![0_u8; 16 * 1024];
@@ -3450,6 +3766,7 @@ fn dsr_dual_virtual_read_only_store_uses_guest_x18_and_x28() {
             guest: GuestVa(guest.raw() + 8),
             resume: GuestVa(guest.raw() + 12),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -3496,6 +3813,7 @@ fn dsr_dual_virtual_add_commits_guest_x18_from_guest_x28() {
             guest: GuestVa(guest.raw() + 4),
             resume: GuestVa(guest.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -3537,6 +3855,7 @@ fn dsr_dual_virtual_load_commits_guest_x18_and_ordinary_destination() {
             guest: GuestVa(guest.raw() + 4),
             resume: GuestVa(guest.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -3579,6 +3898,7 @@ fn dsr_generation_guard_rejects_stale_block_before_guest_instruction() {
             guest: GuestVa(guest.raw() + 4),
             resume: GuestVa(guest.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -3638,6 +3958,7 @@ fn binding_generation_guard_contains_no_process_pointer() {
             guest: GuestVa(guest.raw() + 4),
             resume: GuestVa(guest.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -3754,6 +4075,7 @@ fn binding_generation_guard_exits_stale_after_atomic_changes() {
             guest: GuestVa(guest.raw() + 4),
             resume: GuestVa(guest.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -3838,6 +4160,7 @@ fn generation_guard_preserves_guest_scratch_registers_and_flags() {
             guest: GuestVa(guest.raw() + 4),
             resume: GuestVa(guest.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let mut cache = TranslationCache::new(
         16 * 1024,
@@ -6307,6 +6630,7 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
             guest: GuestVa(0x1c_004),
             resume: GuestVa(0x1c_008),
         },
+        extensions: Vec::new(),
     };
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit faulting block");
     let mut stack = vec![0_u8; 16 * 1024];
@@ -6374,6 +6698,7 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
                 guest: GuestVa(guest.raw() + 4),
                 resume: GuestVa(guest.raw() + 8),
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit physical x18 corruption oracle");
@@ -6452,6 +6777,7 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
                     bit: None,
                 },
             },
+            extensions: Vec::new(),
         },
         super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
     )
@@ -7916,6 +8242,7 @@ fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
                 guest,
                 resume: GuestVa(guest.raw() + 4),
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit entry-kick block");
@@ -7976,6 +8303,7 @@ fn dsr_host_window_kick_is_deferred_to_next_gateway_entry() {
                 guest,
                 resume: GuestVa(guest.raw() + 4),
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit host-window block");
@@ -8063,6 +8391,7 @@ fn dsr_reinstall_clears_inherited_host_window_kick() {
                 guest,
                 resume: GuestVa(guest.raw() + 4),
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit reinstall block");
@@ -8110,6 +8439,7 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
                 guest,
                 resume: GuestVa(guest.raw() + 4),
             },
+            extensions: Vec::new(),
         },
     )
     .expect("emit host-kick block");
@@ -8165,6 +8495,7 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
             guest: GuestVa(guest_pc.raw() + 4),
             resume: GuestVa(guest_pc.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit expanded x18 load");
     let mut stack = vec![0_u8; 16 * 1024];
@@ -8257,6 +8588,7 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
             guest: GuestVa(guest_pc.raw() + 4),
             resume: GuestVa(guest_pc.raw() + 8),
         },
+        extensions: Vec::new(),
     };
     let emitted = emit_block_direct(&mut cache, &plan).expect("emit expanded literal fault");
     let mut stack = vec![0_u8; 16 * 1024];
