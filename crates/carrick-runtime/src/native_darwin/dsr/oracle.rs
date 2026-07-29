@@ -498,13 +498,22 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn biased_memory_families_access_guest_data() {
-    const BIAS: u64 = 0x80_0000_0000;
-    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+    // The sub-aperture bias exercises the general lowering; the
+    // aperture-disjoint bias exercises the compact ORR lowering. Both must
+    // read and write the same guest data with identical guest-visible state.
+    for bias in [0x80_0000_0000_u64, 0x200_0000_0000] {
+        biased_memory_families_access_guest_data_at(bias);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn biased_memory_families_access_guest_data_at(bias: u64) {
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(bias, 16 * 1024)
         .expect("construct host bias");
     let mode = super::emit::EmitAddressMode::Biased { host_bias };
     const GUEST: u64 = 0x4_0000_0000;
     let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
-        HostVa((BIAS + GUEST) as usize),
+        HostVa((bias + GUEST) as usize),
         16 * 1024,
         libc::PROT_READ | libc::PROT_WRITE,
         libc::MAP_ANON | libc::MAP_PRIVATE,
@@ -572,9 +581,18 @@ fn biased_memory_families_access_guest_data() {
             crate::native_darwin::address::NativeAddressMode::Biased { host_bias },
         )
         .expect("execute biased fixture");
-        assert_eq!(snapshot.x[16], expected_x16, "word=0x{word:08x}");
-        assert_eq!(snapshot.x[17], expected_x17, "word=0x{word:08x}");
-        assert_eq!(snapshot.pstate, expected_pstate, "word=0x{word:08x}");
+        assert_eq!(
+            snapshot.x[16], expected_x16,
+            "bias=0x{bias:x} word=0x{word:08x}"
+        );
+        assert_eq!(
+            snapshot.x[17], expected_x17,
+            "bias=0x{bias:x} word=0x{word:08x}"
+        );
+        assert_eq!(
+            snapshot.pstate, expected_pstate,
+            "bias=0x{bias:x} word=0x{word:08x}"
+        );
         match class {
             MemoryClass::Pair => {
                 assert_eq!(snapshot.x[0], words[0]);
@@ -596,12 +614,18 @@ fn biased_memory_families_access_guest_data() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn biased_memory_preserves_nzcv_for_the_following_conditional_instruction() {
-    const BIAS: u64 = 0x80_0000_0000;
+    for bias in [0x80_0000_0000_u64, 0x200_0000_0000] {
+        biased_memory_preserves_nzcv_at(bias);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn biased_memory_preserves_nzcv_at(bias: u64) {
     const GUEST: u64 = 0xb_0000_0000;
-    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, 16 * 1024)
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(bias, 16 * 1024)
         .expect("construct host bias");
     let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
-        HostVa((BIAS + GUEST) as usize),
+        HostVa((bias + GUEST) as usize),
         16 * 1024,
         libc::PROT_READ | libc::PROT_WRITE,
         libc::MAP_ANON | libc::MAP_PRIVATE,

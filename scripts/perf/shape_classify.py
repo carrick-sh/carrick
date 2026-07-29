@@ -36,8 +36,13 @@ def classify(word: int) -> str:
         return "dsr:guard-ldar"
     if (word & 0xFFC0001F) == 0xD3400012:
         return "dsr:window-ubfm-x18"
-    if word == 0xB4000052:
+    if (word & 0xFF00001F) == 0xB4000012:
         return "dsr:window-cbz-x18"
+    # Compact biased addressing: `orr xS, xB, #bias` with the aperture-
+    # disjoint single-run bias (immr=23, imms=0 for 1<<41), and the tagged
+    # invalid form (immr=17 for 1<<47).
+    if (word & 0xFFFFFC00) in (0xB2570000, 0xB2510000):
+        return "dsr:bias-orr"
     if (word & 0xFFFFFFE0) == 0xD51B4200:
         return "dsr:nzcv-msr"
     if (word & 0xFFFFFFE0) == 0xD53B4200:
