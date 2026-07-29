@@ -72,7 +72,8 @@ is the largest single lever found all campaign and is consistent with
 published same-ISA DBT overhead (<7.5%, MAMBO) being achievable — the gap is
 addressing/register-pressure lowering, not physics.
 
-**H008 (PROPOSED, top of backlog): register-resident biased addressing.**
+**H008 (SPIKING — compact lowering implemented in `406b7bfe`, with an open
+correctness leak; see "Next work"): register-resident biased addressing.**
 Stop round-tripping guest `x16`/`x17` values and the host bias through
 context slots on every guest memory access. Candidate shapes, in increasing
 ambition: per-block dead-register scratch selection (liveness over the
@@ -102,7 +103,9 @@ internal indirect-edge register (comment near `emit.rs:4071`).
 | `5ffb5cd0` | `W0`/`DW0`/`RW0` freeze + Decisions 13/14. |
 | `919a7f77` | H007 rejected on ceiling after the post-wave open-caller census. |
 | `de945e19` | Shape census: dtrace PC histogram + `ProcessTranslator::code_snapshot` + `CARRICK_DSR_CODE_SNAPSHOT_DIR` dump + offline classifier + the H008 evidence. |
-| (tip) | H008 design doc + selection prerequisites: aperture-disjoint ORR-encodable first bias candidate `0x200_0000_0000`, underflow-window reservation, `aperture_disjoint_orr_immediate()`; 17/17 layout tests, four live go-builds green on the rebuilt binary. The compact emission itself is NOT yet implemented. |
+| `a104aff1` | H008 selection prerequisites: aperture-disjoint ORR-encodable first bias candidate `0x200_0000_0000`, underflow-window reservation, `aperture_disjoint_orr_immediate()`; 17/17 layout tests. |
+| `406b7bfe` | **The compact biased lowering** for immediate/base forms plus writeback — ~6 words replacing ~13-15. Red-first exact-sequence tests. **Carries the open host-address leak below.** |
+| `d131ac92` | The three instruments that bound the leak, plus `CARRICK_DSR_COMPACT_BIASED=0\|nowriteback`. |
 
 Campaign authority lives in
 `docs/perf-results/native-wall-time-campaign.md` (hypothesis backlog H001-H008
@@ -113,39 +116,53 @@ traced ceiling rejected H007 (`native-fs-amplification.jsonl`).
 
 ## Next work, ranked
 
-1. **Fix the compact WRITEBACK double-bias bug — attributed, signature in
-   hand.** The compact lowering (`406b7bfe`) is implemented with every
-   structural and live gate green, but alternating crash sampling pins an
-   intermittent guest SIGSEGV on its writeback path: tip 2/17 runs, the
-   selection-only `a104aff1` 0/12 (`/tmp/carrick-a104` holds that build).
-   The captured crash (`target/perf/compact-writeback-crash-attr-tip-7.log`)
-   faults in Go's `duffcopy` (post-index pair writeback) at guest
-   `addr = bias + guest_stack_addr` — host FAR was two biases — so some
-   interrupt/fault window in the compact writeback sequence commits the
-   biased scratch into the guest base register WITHOUT the un-bias.
-   Procedure: build the deterministic reproducer FIRST — a compact
-   post-index kick sweep modeled exactly on
-   `live_biased_exclusive_kick_sweep` (oracle.rs ~6364): self-linked
-   memclr-style loop, jittered SIGPIPE sender, per-word landing coverage,
-   exact base-progression/memory assertions — show it red, find the
-   window, fix, show green, rerun the sampling. Audit candidates, in
-   order: (a) the compact writeback path NEVER flips `commit_base` off —
-   the general path sets `commit_base = false` after its commit word
-   (emit.rs ~2924) before emitting restores, while compact leaves
-   `(commit=true, coordinate=Host)` on the restore word and, if
-   `guest_pc_for_cache` recovery lookup is nearest-preceding rather than
-   exact-match, on every un-entried word after the sequence (the next
-   op's spill, following copy words) — a kick there would commit
-   `x[scratch] − bias` or worse into the base register long after the
-   instruction finished; (b) whether the recovery lookup IS exact-match
-   or nearest-preceding — this decides if un-entried words (both paths'
-   spill words rely on it) are safe; (c) the access-word
-   `instruction_complete` boundary and the movz/sub commit entries;
-   (d) what the gateway's kick capture publishes for slots
-   1120/1128/1160/1168 between those exact words.
-   No wall screen or W-series claim until then. After that:
-   register-offset compact forms, then Spike 2 (trusted-entry chaining)
-   pending the link-invalidation soundness read.
+1. **Fix the compact-lowering host-address leak — instrumented, still
+   open, and LOAD-DEPENDENT.** The compact lowering (`406b7bfe`) is
+   implemented with every structural gate green, but it intermittently
+   leaves a HOST address in a guest register. Two captured production
+   faults (`target/perf/compact-writeback-crash-attr-tip-7.log` and the
+   session's diagnostic runs) show a base register holding
+   `bias + guest_ptr` — `x0` = bias + `0x6d0dd0`, `x20` = bias +
+   `0xa048095dc0` — each reported through the tagged slow path with
+   `host_far == slot1200 | (1<<47)`. The window check is therefore the
+   DETECTOR, not the defect, and both victims are consumers
+   (`commit_base: false`), not the producer.
+
+   **What is ruled out** (`d131ac92`, all green at BOTH biases, so do not
+   re-search here): every recovery point of a single compact access
+   including post-index PAIR shapes; every recovery point of two CHAINED
+   compact writebacks in `duffcopy`'s exact shape, where each access
+   borrows the other's live pointer as scratch (`ldp ... [x16]` takes
+   x17, `stp ... [x17]` takes x16), verified by recover → un-patch →
+   resume → byte-identical final state; and 360 live jittered-SIGPIPE
+   landings over a megabyte walk asserting no bias bits in any register,
+   exact 16-byte stride, and a zeroed-prefix/untouched-suffix split
+   exactly at the base.
+
+   **The one coverage gap, and the leading hypothesis:** across 360 live
+   landings the core NEVER reported an interrupted PC on the commit
+   window's arithmetic words (`movz`/`sub`) — only on the sequence's
+   memory words. So a real gateway kick capture inside the commit window
+   is the single path no instrument reaches; the matrix covers it only
+   through a SYNTHESIZED kick exit. Attack that next.
+
+   **Measurement discipline for the hunt:** the crash is load-dependent.
+   A same-binary A/B (`CARRICK_DSR_COMPACT_BIASED=1` vs `0`, identical
+   bias and layout) produced 0/8 vs 0/16 on a quiet machine, against
+   ~14% (3/22) observed while the machine was compiling. Run that A/B
+   UNDER INJECTED LOAD (`scripts`-free harness kept at
+   `.../scratchpad/loaded_ab.sh`, whose load generators are wrapped in
+   `timeout` so they cannot orphan). It is the only experiment that
+   separates the compact emission from the bias selection: the earlier
+   tip-vs-`a104aff1` comparison changes both, and its 0/12 carries a
+   ~21% chance of missing a 14% rate — that attribution was weaker than
+   first recorded.
+
+   **Mitigation available now:** `CARRICK_DSR_COMPACT_BIASED=0` forces
+   the general lowering from the same binary; `=nowriteback` keeps
+   compact for non-writeback forms only, which bisects the writeback
+   specifically. No wall-time or W-series claim until the leak is fixed.
+
 2. **Re-run the shape census after any H008 spike** — the census is now one
    command pair (see Methods) and is the mechanism gate.
 3. **Root-cause the dtrace copyin kill** (spawned as a separate task chip):
