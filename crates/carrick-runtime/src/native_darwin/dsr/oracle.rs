@@ -373,6 +373,10 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
     }
 }
 
+#[allow(
+    clippy::panic,
+    reason = "test-oracle helper extracted from a #[test] fn; an unrecognized skipped word must abort the matrix loudly"
+)]
 fn biased_recovery_matrix_at(bias: u64) {
     let shapes = [
         BiasedRecoveryMatrixShape::ScalarPre,
@@ -486,9 +490,12 @@ fn biased_recovery_matrix_at(bias: u64) {
                 // base leaves those words unexecuted too. The general lowering
                 // computes it before the window check, so it has no such word
                 // and the assertion below keeps this leniency off that path.
+                // ADD(immediate) keeps its shift flag in bit 22, so the mask
+                // must preserve it: 0xff80_001f clears bit 22 and made the
+                // `lsl #12` arm unmatchable dead code.
                 let compact_slow_address = original_word & 0xffe0_03ff == 0xaa00_03f2
-                    || original_word & 0xff80_001f == 0x9100_0012
-                    || original_word & 0xff80_001f == 0x9140_0012;
+                    || original_word & 0xffc0_001f == 0x9100_0012
+                    || original_word & 0xffc0_001f == 0x9140_0012;
                 if original_word & !0x1f == publication_store {
                     skipped_invalid_publication = true;
                 } else if original_word & !0x3ff == 0xb251_0000 {
@@ -6667,6 +6674,10 @@ impl CompactWritebackKickSweep {
 /// instrument: it fails if the committed base ever disagrees with the stores
 /// that actually happened, which is what a stale or double-applied writeback
 /// commit produces.
+#[allow(
+    clippy::panic,
+    reason = "test-oracle helper; an unexpected gateway exit must abort the sweep rather than be counted"
+)]
 fn live_compact_writeback_kick_sweep(
     guest_code: GuestVa,
     body_len: usize,
