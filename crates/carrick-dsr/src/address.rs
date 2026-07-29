@@ -22,7 +22,14 @@ use carrick_mem::memory::MemoryLayout;
 pub const NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE: u64 = 0x7_0000_0000;
 pub const NATIVE_DARWIN_HARD_PAGEZERO_END: u64 = 0x1_0000_0000;
 
-pub const BIAS_CANDIDATES: [u64; 4] = [
+pub const BIAS_CANDIDATES: [u64; 5] = [
+    // First choice: exactly the aperture end. Every in-aperture guest address
+    // is disjoint from this bias's bits, so `guest + bias == guest | bias`
+    // and the bias encodes as one AArch64 logical immediate — the compact
+    // biased-memory lowering (H008) depends on selecting it. The remaining
+    // candidates keep the historical fallback order for hosts or layouts
+    // where [2 TiB, 4 TiB) cannot be reserved.
+    0x200_0000_0000,
     0x80_0000_0000,
     0xc0_0000_0000,
     0x100_0000_0000,
@@ -41,6 +48,12 @@ pub const BIASED_GUEST_APERTURE_END: u64 = 0x200_0000_0000;
 const BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW: u64 = 1024 * 1024;
 pub const BIASED_GUEST_LITERAL_TARGET_END: u64 =
     BIASED_GUEST_APERTURE_END + BIASED_GUEST_LITERAL_DISPLACEMENT_WINDOW;
+// The compact biased lowering validates only the BASE register against the
+// aperture, so a bounded negative immediate displacement can reach below
+// guest zero — i.e. below the bias in host coordinates. Owning one literal
+// window below the bias keeps those accesses faulting inside Carrick-owned
+// PROT_NONE space instead of aliasing an unrelated host mapping.
+pub const BIASED_GUEST_UNDERFLOW_WINDOW: u64 = 1024 * 1024;
 pub const INVALID_BIASED_HOST_ADDRESS_BIT: u64 = 1 << 47;
 
 pub struct OwnedHostMapping {
@@ -251,8 +264,18 @@ impl CandidateLayout {
                     end: host.end.raw(),
                 });
             }
+            // Extend the reservation one underflow window below guest zero
+            // (see `BIASED_GUEST_UNDERFLOW_WINDOW`). Every candidate bias is
+            // far larger than the window; the saturating fallback would pull
+            // the range into the hard page-zero region, where `try_map`
+            // rejects the candidate rather than mapping it.
+            let start = HostVa(
+                host.start
+                    .raw()
+                    .saturating_sub(BIASED_GUEST_UNDERFLOW_WINDOW as usize),
+            );
             ranges.clear();
-            ranges.push(host);
+            ranges.push(start..host.end);
         }
         ranges.sort_unstable_by_key(|range| range.start.raw());
         let mut merged: Vec<Range<HostVa>> = Vec::with_capacity(ranges.len());
@@ -668,6 +691,31 @@ impl NativeHostBias {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// `(immr, imms)` fields (N=1) of the single AArch64 64-bit logical
+    /// immediate encoding this bias — but only when the bias also sits
+    /// entirely at or above `BIASED_GUEST_APERTURE_END`, so that
+    /// `guest | bias == guest + bias` for every in-aperture guest address.
+    /// `None` means the compact biased-memory lowering must not be used
+    /// for this bias.
+    pub fn aperture_disjoint_orr_immediate(self) -> Option<(u32, u32)> {
+        let bias = self.0;
+        if bias & (BIASED_GUEST_APERTURE_END - 1) != 0 {
+            return None;
+        }
+        let shift = bias.trailing_zeros();
+        let run = bias >> shift;
+        let len = run.trailing_ones();
+        let contiguous = if len >= 64 {
+            run == u64::MAX
+        } else {
+            run == (1u64 << len) - 1
+        };
+        if len == 0 || !contiguous {
+            return None;
+        }
+        Some(((64 - shift) % 64, len - 1))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -890,6 +938,40 @@ mod tests {
     }
 
     #[test]
+    fn aperture_disjoint_orr_immediates_are_recognized() {
+        let orr = |bias: u64| {
+            NativeHostBias::new(bias, 0x4000)
+                .unwrap()
+                .aperture_disjoint_orr_immediate()
+        };
+        // Single bit at the aperture end: shift 41 -> immr 23, one-bit run.
+        assert_eq!(orr(0x200_0000_0000), Some((23, 0)));
+        // Single bit one above: shift 42 -> immr 22.
+        assert_eq!(orr(0x400_0000_0000), Some((22, 0)));
+        // Contiguous two-bit run at shift 41 -> immr 23, imms len-1 = 1.
+        assert_eq!(orr(0x600_0000_0000), Some((23, 1)));
+        // Encodable but below the aperture end: guest bits can overlap.
+        assert_eq!(orr(0x80_0000_0000), None);
+        assert_eq!(orr(0x140_0000_0000), None);
+        // Bit 40 overlaps the aperture even though bit 42 clears it.
+        assert_eq!(orr(0x500_0000_0000), None);
+        // Aperture-disjoint but not one contiguous run.
+        assert_eq!(orr(0xa00_0000_0000), None);
+    }
+
+    #[test]
+    fn first_bias_candidate_supports_the_compact_lowering() {
+        let first = super::BIAS_CANDIDATES[0];
+        assert_eq!(first & (super::BIASED_GUEST_APERTURE_END - 1), 0);
+        assert!(
+            NativeHostBias::new(first, 0x4000)
+                .unwrap()
+                .aperture_disjoint_orr_immediate()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn biased_mode_round_trips_guest_addresses() {
         let bias = NativeHostBias::new(0x20_0000_0000, 0x4000).unwrap();
         let mode = NativeAddressMode::Biased { host_bias: bias };
@@ -987,7 +1069,11 @@ mod tests {
         fork_test(|| {
             let page_size = TEST_PAGE_SIZE as u64;
             let guest_start = GuestVa(0x40_0000);
-            let first_host = HostVa((0x80_0000_0000 + guest_start.raw()) as usize);
+            // Candidate spans are aperture-wide (2 TiB) and overlap each
+            // other, so the collision must sit in the FIRST candidate's span
+            // only: above the second candidate's span end (~0x280_0010_4000)
+            // and inside the first's (ends ~0x400_0010_4000).
+            let first_host = HostVa(0x390_0000_0000);
             let collision = OwnedHostMapping::map_exact(
                 first_host,
                 TEST_PAGE_SIZE,
@@ -1019,10 +1105,56 @@ mod tests {
                 .expect("select collision-free bias");
             assert_eq!(
                 selected.address_mode().to_host(guest_start).unwrap(),
-                HostVa((0xc0_0000_0000 + guest_start.raw()) as usize)
+                HostVa((0x80_0000_0000 + guest_start.raw()) as usize)
             );
             drop(selected);
             drop(collision);
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")] // exact-mmap-hint semantics; see note above `vacant_test_ranges`
+    fn vacant_host_selects_the_orr_encodable_bias_with_the_underflow_window() {
+        fork_test(|| {
+            let page_size = TEST_PAGE_SIZE as u64;
+            let guest_start = GuestVa(0x40_0000);
+            let image = AddressSpace::from_segments(
+                guest_start.raw(),
+                [(
+                    guest_start.raw(),
+                    carrick_mem::elf::SegmentPerms {
+                        read: true,
+                        write: false,
+                        execute: true,
+                    },
+                    vec![0; TEST_PAGE_SIZE],
+                    page_size,
+                )],
+            )
+            .expect("build low test image");
+            let layout = MemoryLayout {
+                heap_base: 0x8_0000_0000,
+                heap_size: page_size,
+                mmap_base: 0xa0_0000_0000,
+                mmap_size: page_size,
+            };
+            let selected =
+                NativeLayout::for_image(&image, layout, page_size).expect("select first bias");
+            assert_eq!(
+                selected.address_mode().to_host(guest_start).unwrap(),
+                HostVa((0x200_0000_0000 + guest_start.raw()) as usize),
+                "a vacant host must select the ORR-encodable first candidate"
+            );
+            let owned = selected
+                .owned_ranges()
+                .first()
+                .expect("biased selection owns one merged range")
+                .clone();
+            assert_eq!(
+                owned.start,
+                HostVa((0x200_0000_0000 - super::BIASED_GUEST_UNDERFLOW_WINDOW) as usize),
+                "the reservation must extend one underflow window below guest zero"
+            );
         });
     }
 
@@ -1032,14 +1164,18 @@ mod tests {
         fork_test(|| {
             let page_size = TEST_PAGE_SIZE as u64;
             let guest_start = GuestVa(0x40_0000);
-            let first_null_host = HostVa(0x80_0000_0000);
+            // A span-1-exclusive sentinel (see the span-overlap note in
+            // `low_image_skips_a_colliding_bias_candidate`): it rejects only
+            // the first candidate, and selection must fall to the second
+            // without replacing or unmapping this pre-existing page.
+            let first_null_host = HostVa(0x390_0000_0000);
             let sentinel = OwnedHostMapping::map_exact(
                 first_null_host,
                 TEST_PAGE_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,
             )
-            .expect("occupy first candidate's translated null page");
+            .expect("occupy a page inside the first candidate's span");
             unsafe {
                 std::ptr::write_bytes(first_null_host.raw() as *mut u8, 0x5a, TEST_PAGE_SIZE);
             }
@@ -1068,7 +1204,7 @@ mod tests {
                 .expect("select collision-free guarded aperture");
             assert_eq!(
                 selected.address_mode().to_host(GuestVa(0)).unwrap(),
-                HostVa(0xc0_0000_0000),
+                HostVa(0x80_0000_0000),
                 "the pre-existing null-page collision must reject the first bias"
             );
             assert_eq!(unsafe { *(first_null_host.raw() as *const u8) }, 0x5a);
