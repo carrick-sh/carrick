@@ -739,6 +739,7 @@ Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
 | H004 | REJECT | Authority caching leaves at least 17.16M bounded direct misses, led by one conditional fall-through edge at 1.47M | signed Variant 1 feasibility exhausts the 64 MiB DSR translation cache before `BUILD_OK` | Compact per-edge mutable binding cells were the bounded proof; the mechanism pair was not run | Rejected at feasibility; no cache increase, sidecar tuning, or Task 16 is authorized |
 | H005 | DEFER | Private futex owns 50.4% of blocked thread-time but only 0.069% of sampled total CPU | 58/84,037 sampled CPU ticks | Revisit only if critical-path evidence shows waking earlier removes runnable work | Filesystem work currently has materially larger measured CPU share |
 | H006 | RETAIN | Exact caller stacks assigned 33.3% of joined opens to `lookup_kind` and another 10.8% to unconditional `read_link` | paired candidate: 46,493 joined host opens / 2,363 guest opens; 19.163 s median. Clean isolated median 19.680 s does not beat `C0` | Keep descriptor-contained lookup-kind and no-follow metadata with cap-std fallback; finish correctness closeout but claim no official `C1` win | Revert only for correctness failure or a future contemporaneous paired regression; isolated baseline drift does not override the 5/5 paired result and explicit retain direction |
+| H008 | PROPOSED | Sampled-instruction-shape census: DSR-inserted words are 81.3% of matched JIT-code residency (ctx-slot stores 43.2%, ctx-slot loads 20.4%, x17 materialization 13.9%), the generation guard is 0.1%, and the hot memclr-style guest loop expands 3 words to ~22 per iteration | inserted overhead is ~56% of all user-mode CPU on the 18,321 ms `W0` window | Register-resident biased addressing: stop round-tripping guest `x16`/`x17` and the host bias through context slots on every memory op (per-block dead-register scratch selection, block-resident bias, loop-aware self-link entry) with a mechanism gate on the ctx-slot sample share | Two variants fail the mechanism gate (ctx-slot share does not drop materially) or fail paired wall screens |
 | H007 | REJECT | Post-wave census at the branch tip: 48,927 joined opens / 549 ms traced; `lookup_kind` collapsed to 4.8% and `read_link` to 1.6%; the remaining walk families are `open_raw_fd` 24.0% and `resolve_following` 20.3% | 242 ms traced ≈ ~1% of the 18,321 ms `W0` window | The remaining families are real but their combined wall ceiling fails the value bar; the H006 terminal-open spike already showed a 24% call cut returns 0.7% wall | Rejected on ceiling 2026-07-28; the teardown-unlink pivot left scope with Decision 13. Next size translated-guest execution by sampled-instruction shape |
 
 The table order is provisional until E005 and E006 exist.
@@ -913,10 +914,18 @@ Write and validate the executable M1 plan:
       combined traced duration is ~242 ms, and H007 is rejected on its ~1%
       wall ceiling (`native-fs-amplification.jsonl`, record
       `openat-caller-census-post-wave`).
-- [ ] Attribute translated-guest execution (36.7% of sampled CPU) by sampled
-      instruction shape: profile-tick `copyin` of the interrupted word,
-      bucketed into context-slot traffic, guard loads, window checks, probe
-      sequences, and plain guest work; join against JIT-range residency.
+- [x] Attribute translated-guest execution by sampled instruction shape:
+      probe-context copyin proved hazardous (killed the guest 2/2; recorded
+      in the script header and spun off for root-cause), so the pipeline is
+      a pure PC histogram joined offline against per-process JIT snapshots
+      (`CARRICK_DSR_CODE_SNAPSHOT_DIR`). Result: DSR-inserted words own
+      81.3% of matched JIT residency — context-slot traffic 63.6%,
+      x17 materialization 13.9%, window checks ~3%, generation guard 0.1% —
+      and the hot guest zeroing loop runs ~22 emitted words per 3-word
+      iteration (`native-dsr-shape-census.jsonl`).
+- [ ] Design and spike H008 register-resident biased addressing with a
+      red-first recovery story, a ctx-slot mechanism gate, and paired wall
+      screens.
 - [ ] Restore at least 95% symbolized kernel-leaf coverage before any future
       broad kernel capture. Never recycle v1 or v2 or infer a family from the
       rejected partial run.

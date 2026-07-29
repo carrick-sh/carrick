@@ -2163,7 +2163,39 @@ fn finalize_native_process_exit(
     memory: &SharedNativeMemory,
 ) {
     publish_native_shared_candidates(translator, memory);
+    maybe_dump_code_snapshot(translator);
     translator.finalize_profile_epoch_at_process_exit();
+}
+
+/// Diagnostic-only: when `CARRICK_DSR_CODE_SNAPSHOT_DIR` names a directory,
+/// dump this process's published JIT bytes and guest-to-cache block index at
+/// the last-thread exit seam, so an offline sampled-PC census can classify
+/// emitted words after the (short-lived) process is gone. Never enabled on a
+/// measurement path; failures only warn.
+fn maybe_dump_code_snapshot(translator: &dsr::ThreadTranslator) {
+    let Some(dir) = std::env::var_os("CARRICK_DSR_CODE_SNAPSHOT_DIR") else {
+        return;
+    };
+    let snapshot = translator.process.code_snapshot();
+    let pid = std::process::id();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let base = std::path::PathBuf::from(&dir);
+    let code_path = base.join(format!("{pid}-{stamp}.bin"));
+    let index_path = base.join(format!("{pid}-{stamp}.json"));
+    let index = serde_json::json!({
+        "pid": pid,
+        "cache_base": snapshot.cache_base,
+        "code_len": snapshot.code.len(),
+        "blocks": snapshot.blocks,
+    });
+    let written = std::fs::write(&code_path, &snapshot.code)
+        .and_then(|_| std::fs::write(&index_path, serde_json::to_vec(&index).unwrap_or_default()));
+    if let Err(error) = written {
+        tracing::warn!(%error, "code snapshot dump failed");
+    }
 }
 
 fn run_native_thread_loop(
