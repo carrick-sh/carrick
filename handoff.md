@@ -102,6 +102,7 @@ internal indirect-edge register (comment near `emit.rs:4071`).
 | `5ffb5cd0` | `W0`/`DW0`/`RW0` freeze + Decisions 13/14. |
 | `919a7f77` | H007 rejected on ceiling after the post-wave open-caller census. |
 | `de945e19` | Shape census: dtrace PC histogram + `ProcessTranslator::code_snapshot` + `CARRICK_DSR_CODE_SNAPSHOT_DIR` dump + offline classifier + the H008 evidence. |
+| (tip) | H008 design doc + selection prerequisites: aperture-disjoint ORR-encodable first bias candidate `0x200_0000_0000`, underflow-window reservation, `aperture_disjoint_orr_immediate()`; 17/17 layout tests, four live go-builds green on the rebuilt binary. The compact emission itself is NOT yet implemented. |
 
 Campaign authority lives in
 `docs/perf-results/native-wall-time-campaign.md` (hypothesis backlog H001-H008
@@ -112,9 +113,16 @@ traced ceiling rejected H007 (`native-fs-amplification.jsonl`).
 
 ## Next work, ranked
 
-1. **H008 design + first spike** (above). Expected value dwarfs everything
-   else measured: even a 2/3 reduction of ctx-slot + materialization traffic
-   is worth roughly a third of user CPU.
+1. **H008 Spike 1 emission** — the design
+   (`docs/superpowers/specs/2026-07-28-h008-register-resident-biased-addressing-design.md`)
+   and its selection prerequisites are landed; what remains is the compact
+   lowering in `emit_biased_memory` (immediate/base forms first, writeback
+   via `movz x18, #bias-chunk` + full-width `sub` commit), red-first
+   `bad64`-asserted sequences, recovery entries per word, then the
+   shape-census mechanism gate and paired screens. Note the per-entry guard
+   preamble finding in the design doc: trusted-entry chaining (Spike 2) is
+   back on the table AFTER Spike 1, pending the link-invalidation soundness
+   read.
 2. **Re-run the shape census after any H008 spike** — the census is now one
    command pair (see Methods) and is the mechanism gate.
 3. **Root-cause the dtrace copyin kill** (spawned as a separate task chip):
@@ -174,6 +182,12 @@ python3 scripts/perf/shape_classify.py raw --snapshots target/perf/snaps
   worktree is `.worktrees/codex-native-aarch64-cache`. A stash
   (`wip joined native parser fixtures`, `trace_profile.rs` +445) belongs to
   the previous agent and was left untouched.
+- **The agent shell's cwd can silently reset to the MAIN checkout**
+  (`/Volumes/CaseSensitive/carrick`) between commands. Relative-path reads
+  then hit main's files — same content only where the branch never diverged
+  — and relative git/cargo commands hit the wrong tree entirely. Check
+  `pwd` before any relative-path work; absolute paths into the worktree are
+  immune (every Edit/Write this session used them and landed correctly).
 - **Adversarially verify agent-written tests** — a tautological test burned
   this campaign before; red-first with a shown-red control is the standard.
 
