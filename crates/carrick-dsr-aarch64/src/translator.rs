@@ -342,6 +342,15 @@ pub struct ThreadTranslator {
     exec_reset_epoch: u64,
 }
 
+/// One process's published JIT code plus its guest-to-cache block index,
+/// copied out for offline diagnostics (see `ProcessTranslator::code_snapshot`).
+pub struct CodeSnapshot {
+    pub cache_base: u64,
+    pub code: Vec<u8>,
+    /// `(guest_va, cache_entry_host_va)` for every published private block.
+    pub blocks: Vec<(u64, u64)>,
+}
+
 pub struct ProcessTranslator {
     // `pub` for the runtime's still-resident test suites (see ThreadTranslator).
     pub state: RwLock<ProcessState>,
@@ -1322,6 +1331,31 @@ impl ProcessTranslator {
     pub fn cache_host_range(&self) -> std::ops::Range<u64> {
         let range = self.state.read().cache.host_range();
         range.start as u64..range.end as u64
+    }
+
+    /// Copy the published JIT code and the guest-to-cache block index for
+    /// offline diagnostics (the sampled-PC shape census). Callers must hold
+    /// no writer expectations: the read guard excludes emitters, and at the
+    /// process-exit seam where this runs no sibling thread is left to patch
+    /// direct links.
+    pub fn code_snapshot(&self) -> CodeSnapshot {
+        let state = self.state.read();
+        let range = state.cache.host_range();
+        let used = state.cache.used_bytes().min(range.end - range.start);
+        // SAFETY: `[range.start, range.start + used)` is this process's own
+        // live JIT mapping (readable for the process lifetime), and the state
+        // read guard held above excludes every cache writer.
+        let code = unsafe { std::slice::from_raw_parts(range.start as *const u8, used) }.to_vec();
+        let blocks = state
+            .blocks
+            .iter()
+            .map(|((guest, _generation), entry)| (guest.raw(), entry.host().0 as u64))
+            .collect();
+        CodeSnapshot {
+            cache_base: range.start as u64,
+            code,
+            blocks,
+        }
     }
 
     pub fn configure_shared_image(
@@ -3468,6 +3502,43 @@ mod tests {
 
         assert!(range.start < range.end);
         assert_eq!(range.end - range.start, 64 * 1024);
+    }
+
+    #[test]
+    fn code_snapshot_captures_published_words_and_block_index() {
+        let translator =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let entry = {
+            let mut state = translator.state.write();
+            let published = state
+                .cache
+                .publish_words(&[0xd503_201f, 0xd65f_03c0])
+                .expect("publish");
+            state.blocks.insert(
+                (
+                    carrick_guest_mem::GuestVa(0x40_0000),
+                    types::CodeGeneration::INITIAL,
+                ),
+                published.entry(),
+            );
+            published.entry()
+        };
+
+        let snapshot = translator.code_snapshot();
+
+        let base = translator.cache_host_range().start;
+        assert_eq!(snapshot.cache_base, base);
+        let offset = (entry.host().0 as u64 - base) as usize;
+        assert!(snapshot.code.len() >= offset + 8);
+        assert_eq!(
+            &snapshot.code[offset..offset + 4],
+            &0xd503_201f_u32.to_le_bytes()
+        );
+        assert_eq!(
+            &snapshot.code[offset + 4..offset + 8],
+            &0xd65f_03c0_u32.to_le_bytes()
+        );
+        assert_eq!(snapshot.blocks, vec![(0x40_0000, entry.host().0 as u64)]);
     }
 
     #[test]
