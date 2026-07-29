@@ -109,6 +109,8 @@ bounded implementation spike, not yet a retained wall win.
 | E022 | `target/perf/native-fs-amplification-v1/a.raw` plus `docs/perf-results/native-fs-amplification.jsonl` | accepted diagnostic | Carrick guest 2,521 `openat` calls drive 79,282 joined and 116,925 total Darwin `openat`; teardown contributes 38,809 Carrick-only `unlinkat` |
 | E023 | `target/perf/oracle-fs-syscalls-v1/{oracle.raw,workload.log}` plus `docs/perf-results/native-fs-amplification.jsonl` | accepted Docker-only diagnostic | Native-arm64 Linux `bpftrace` process-tree census completes `BUILD_OK`; mutation counts closely match Carrick guest counts, proving the 35.8x host `openat` / 249.7x host `unlinkat` excess is Carrick amplification |
 | E024 | `target/perf/fs-open-spike/` plus `docs/perf-results/native-fs-amplification.jsonl` | rejected implementation spike | Five controls median 20.95 s versus candidate 20.80 s (0.7%); the candidate won 1/5 pairs. A typed mechanism trace confirms real but insufficient movement: joined host opens fell 24.0%, leaving 24.7 host opens per guest open |
+| E025 | `target/perf/native-openat-callers-v1/b.raw` plus `docs/perf-results/native-fs-amplification.jsonl` | accepted diagnostic | Exact image-base-keyed `ustack(64)` accounts for 80.3% of call count in the top 128 stacks; `lookup_kind`, `open_raw_fd`, `read_link`, and `resolve_following` are the dominant Carrick semantic frames |
+| E026 | `564dd281`, `target/perf/lookup-kind-spike/`, and `docs/perf-results/native-fs-amplification.jsonl` | retained implementation; clean closeout pending | Five controls median 19.660 s versus candidate 19.163 s (−2.53%), candidate wins 5/5 with non-overlapping populations and one-sided 95% bootstrap ratio 0.9885; joined host opens fall 41.4% to 19.68 per guest open |
 
 ### H005a rejection and filesystem syscall reframe
 
@@ -736,7 +738,8 @@ Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
 | H003 | PROPOSED | Older profile assigned CPU to repeated capsule setup | stale sample | Refresh process-lifetime share and critical-path overlap; reuse only the dominant durable input | Current share is small/non-critical or two variants fail |
 | H004 | REJECT | Authority caching leaves at least 17.16M bounded direct misses, led by one conditional fall-through edge at 1.47M | signed Variant 1 feasibility exhausts the 64 MiB DSR translation cache before `BUILD_OK` | Compact per-edge mutable binding cells were the bounded proof; the mechanism pair was not run | Rejected at feasibility; no cache increase, sidecar tuning, or Task 16 is authorized |
 | H005 | DEFER | Private futex owns 50.4% of blocked thread-time but only 0.069% of sampled total CPU | 58/84,037 sampled CPU ticks | Revisit only if critical-path evidence shows waking earlier removes runnable work | Filesystem work currently has materially larger measured CPU share |
-| H006 | SPIKING | After a live terminal-open fast path, guest `openat` still drives 24.7 host opens and 742.5 ms traced open duration | 60,243 joined host opens / 2,438 guest opens | Census deep host `openat` stacks during guest-open service; spike only the dominant repeated lookup/metadata/DAC call site | No stable dominant call site or two bounded call-site spikes miss the 3% wall gate |
+| H006 | RETAIN | Exact caller stacks assigned 33.3% of joined opens to `lookup_kind` and another 10.8% to unconditional `read_link` | retained candidate: 46,493 joined host opens / 2,363 guest opens; 19.163 s median | Keep descriptor-contained lookup-kind and no-follow metadata with cap-std fallback; finish clean closeout | Revert only for correctness failure or if clean five-sample replication loses the wall improvement |
+| H007 | SPIKING | The retained path still drives 19.68 host opens per guest open; pre-change stacks ranked `resolve_following` and terminal open next | post-change caller census pending | Re-census exact Carrick frames, then carry one contained descriptor/metadata authority bundle through ordinary open dispatch if resolver/final-open rewalks still dominate | No remaining stable dominant rewalk, or the bounded combined primitive fails mechanism and wall screens; then pivot to Carrick-only teardown unlink amplification |
 
 The table order is provisional until E005 and E006 exist.
 
@@ -765,6 +768,8 @@ The table order is provisional until E005 and E006 exist.
 | 2026-07-28 | H005 | private translator per guest thread | Remove process-state contention completely; tolerate duplicate translation only as a feasibility spike | 29.53 s vs 21.06 s control | n/a | reject and revert; +40.2% wall and 70.46 user-s |
 | 2026-07-28 | H005 | bypass disabled-feature process-state locks | Remove direct-binding/shared-metadata lock work when both features are off | 21.14 s vs 21.06 s control | n/a | reject and revert; no wall win |
 | 2026-07-28 | H006 | contained-parent terminal `open_raw_fd` | Remove cap-std component walks from the final host-file open | first pair 20.23 s vs 20.95 s control | 20.80 s vs 20.95 s medians; 1/5 paired wins | reject and revert; real 24% joined-call reduction has only a 0.7% wall median |
+| 2026-07-28 | H006 | contained `lookup_kind` only | Remove the largest exact caller family before changing no-follow ordering | 19.91 s vs 20.22 s control | n/a | mechanism live (−23.7% joined host opens), but 1.5% one-pair wall movement is insufficient alone; combine only with separately attributed no-follow work |
+| 2026-07-28 | H006 | contained lookup-kind plus no-follow metadata | Skip ordinary-file `read_link` and metadata component walks while preserving symlink and exceptional fallback | 19.210 s vs 20.253 s first pair | 19.163 s vs 19.660 s medians; 5/5 paired wins; all candidates below all controls | retain at `564dd281` by explicit user direction; clean committed replication and closeout gates pending |
 
 Prior rejected experiments remain recorded in `handoff.md`; they are not reset
 to `PROPOSED`.
@@ -781,6 +786,7 @@ to `PROPOSED`.
 | Task 15 live retry at `ece8c497` | 162 AArch64 DSR + 31 native-Darwin + 10 focused runtime tests green; format clean | rejected: DSR cache exhaustion, no `BUILD_OK` or JSON | not run | not run | not run | H004 Variant 1 rejected at feasibility; mechanism unrun |
 | Task 4 kernel capture at `7ec846a5` | 34 profile unit + 6 integration + 17 attribution + 43 capture tests green; Python compile and format clean | rejected before guest: auto-sudo trace framing parsed the repeated binary as a subcommand | not run | not run | exit 101 on three pre-existing untouched Clippy findings; not waived for retention | `MEASUREMENT_REPAIR_REQUIRED`; A rejected, B/analysis absent |
 | Task 6 kernel capture at `3fb91b09` | Task 5: 45 capture + 17 attribution tests green; independent review clean | rejected during Go compile: 64 MiB DSR cache exhausted, zero `BUILD_OK` | not run | not run | not rerun for evidence-only Task 6 | `MEASUREMENT_REPAIR_REQUIRED`; A partial profile preserved, B/analysis absent |
+| H006 contained metadata at `564dd281` | four focused filesystem tests green; serialized runtime suite 1,110 passed and one unrelated probabilistic DSR landing-coverage test failed | ten paired spike samples printed `BUILD_OK` with zero cleanup failures | pending | pending | pending | retained implementation; official clean `C1` and closeout remain unproved |
 
 ## Decisions
 
@@ -825,6 +831,13 @@ to `PROPOSED`.
     `psynch_cvwait` duration, and three progressively stronger screens produced
     no wall win. Continue H005 by naming the untyped 92.78% at outer wait
     boundaries; do not infer criticality from condvar event counts alone.
+12. Exact open-boundary user stacks validate the syscall reframe: cap-std
+    component walks in `lookup_kind`, `read_link`, `resolve_following`, and
+    `open_raw_fd` dominate guest-open-driven host calls. The first retained
+    demotion keeps cap-std as an explicit semantic fallback rather than removing
+    the dependency. Its 2.53% median wall win is below the old conservative 3%
+    screen, but all five candidate samples beat all five controls and the user
+    explicitly approved retaining durable filesystem improvements.
 
 ## Next action
 
@@ -854,6 +867,14 @@ Write and validate the executable M1 plan:
       rejected A receipt after Go compilation exhausts the 64 MiB DSR cache.
 - [x] Prove the frozen default workload reaches `BUILD_OK` inside the existing
       cache bound; retain `c65f4b0f` after five clean completions.
-- [ ] Restore at least 95% symbolized kernel-leaf coverage before another
-      capture. Never recycle v1 or v2, infer a family, or create H006 from the
+- [x] Reframe the dominant Darwin-kernel work around guest-driven filesystem
+      amplification using a serial native-arm64 Docker syscall census.
+- [x] Attribute joined host opens to exact Carrick callers at a synchronous
+      syscall boundary and retain the contained lookup/no-follow wave.
+- [ ] Publish five clean committed candidate samples and close signed runtime,
+      native smoke, and `just ci` gates for `564dd281`.
+- [ ] Re-census post-change open callers and spike H007 only if one remaining
+      resolver/final-open rewalk family is still dominant.
+- [ ] Restore at least 95% symbolized kernel-leaf coverage before any future
+      broad kernel capture. Never recycle v1 or v2 or infer a family from the
       rejected partial run.
