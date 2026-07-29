@@ -19,7 +19,7 @@ samples (21,935 samples, 87.6% of them DSR-inserted):
 |---|---:|---|
 | **per-access scratch spill** | **33.5%** | `rewrite_scratch` 1120 (17.4%), `rewrite_context_scratch` 1128 (15.2%), 1160/1168 |
 | **per-block-transition bookkeeping** | **~20%** | `entry_in_progress` 1152 (12.0%), `exit_target` 1080 (3.7%), `entry` 1072 (2.2%), `generation` 1144, guest x17 restore 136 |
-| **exit target materialization** | **13.9%** | `movz`/`movk` into x17 per direct exit |
+| **generation-guard materialization** | **13.9%** | `movz`/`movk` into x17. CORRECTED 2026-07-29: this is the GUARD's expected value, NOT exit targets — direct exits are patched and that stub is dead code (re-derived: 15.69% guard vs 0.01% exit_target) |
 | NZCV save/restore | 5.8% | slot 936, forced by the guard's `cmp` |
 | host bias load | 2.6% | slot 1192 |
 | aperture window check | ~3% | `lsr`/`cbz` |
