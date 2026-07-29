@@ -394,6 +394,14 @@ pub struct ProcessState {
     pub unsupported:
         BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), (u32, bad64::Op)>,
     pub published: Vec<PublishedBlock>,
+    /// `published` indices for blocks emitted into the private bump-allocated
+    /// code cache, ascending by cache entry address.
+    private_published_index: Vec<PublishedIndexEntry>,
+    /// `published` indices for blocks mapped from shared translation units,
+    /// ascending by cache entry address. Kept apart from the private index
+    /// because a unit's own mapping can sit anywhere relative to the private
+    /// cursor -- see [`ProcessState::push_published`].
+    shared_published_index: Vec<PublishedIndexEntry>,
     pub dependencies: cache::PageBlockDependencies,
     pub profiling: bool,
     artifact_image_digest: Option<[u8; 32]>,
@@ -475,6 +483,15 @@ pub struct PublishedBlock {
     pub map: Vec<emit::PcMapEntry>,
     pub recovery: Vec<emit::RecoveryEntry>,
     pub _generation: cache::PageGenerationObservation,
+}
+
+/// One entry of an address-ordered index over [`ProcessState::published`]:
+/// where a block's emitted code starts, and where the block itself sits in
+/// publication order.
+#[derive(Clone, Copy)]
+struct PublishedIndexEntry {
+    start: carrick_guest_mem::HostVa,
+    block: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1302,6 +1319,8 @@ impl ProcessTranslator {
                 exclusive_fusion_sites: std::array::from_fn(|_| BTreeSet::new()),
                 unsupported: BTreeMap::new(),
                 published: Vec::new(),
+                private_published_index: Vec::new(),
+                shared_published_index: Vec::new(),
                 dependencies: cache::PageBlockDependencies::default(),
                 profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
                 artifact_image_digest: None,
@@ -1560,7 +1579,7 @@ impl ProcessTranslator {
         recorder(DirectBindingResetEvent::UnitsDropped);
         state.executable_ranges.drop_shared_nodes();
         recorder(DirectBindingResetEvent::ExecutableRangeNodesDropped);
-        state.published.clear();
+        state.clear_published();
         state.blocks.clear();
         state.pending.clear();
         state.stats = ResolverStats::default();
@@ -1720,7 +1739,7 @@ impl ProcessState {
                 self.sensitive
                     .insert(block_key, SensitiveMetadata { exit, fusion });
             }
-            self.published.push(PublishedBlock {
+            self.push_published(PublishedBlock {
                 entry,
                 len: block.code_len as usize,
                 map,
@@ -1835,7 +1854,7 @@ impl ProcessState {
         // recording zero duplicate publications in production profiles.
         let emitted_len = emitted.len();
         let (map, links, recovery) = emitted.into_runtime_metadata();
-        self.published.push(PublishedBlock {
+        self.push_published(PublishedBlock {
             entry,
             len: emitted_len,
             map,
@@ -2384,6 +2403,73 @@ impl ProcessState {
         result
     }
 
+    /// Record one published block. THE publication point: both the private
+    /// translation path and the shared-unit load path go through here so the
+    /// block list and every index over it are updated together.
+    ///
+    /// `published` itself stays in publication order -- the fault diagnostic
+    /// reports its bounds, and the block-index consumers walk it -- so the
+    /// address ordering `guest_pc_for_cache` needs lives in the two side
+    /// indexes instead.
+    fn push_published(&mut self, block: PublishedBlock) {
+        let entry = PublishedIndexEntry {
+            start: block.entry.host(),
+            block: self.published.len(),
+        };
+        // The private cache is a bump allocator: `begin_write` hands out
+        // strictly increasing extents, and the one cursor rewind
+        // (`reset_after_fork_for_exec`) clears `published` with it, so a
+        // private block appends. A shared translation unit is dlopen'd into
+        // its OWN mapping at a base unrelated to that cursor, so its blocks
+        // can land below everything published so far -- they get their own
+        // list rather than breaking the append the private list relies on.
+        let index = if self.cache.host_range().contains(&entry.start.raw()) {
+            &mut self.private_published_index
+        } else {
+            &mut self.shared_published_index
+        };
+        let at = match index.last() {
+            Some(last) if last.start > entry.start => {
+                index.partition_point(|indexed| indexed.start <= entry.start)
+            }
+            _ => index.len(),
+        };
+        index.insert(at, entry);
+        self.published.push(block);
+    }
+
+    /// Drop every published block together with the indexes over them.
+    fn clear_published(&mut self) {
+        self.published.clear();
+        self.private_published_index.clear();
+        self.shared_published_index.clear();
+    }
+
+    /// The published block whose emitted extent contains `cache_pc`, if any.
+    ///
+    /// Each index is sorted by cache entry address and published extents are
+    /// disjoint -- the private cache bump-allocates, and a shared unit owns
+    /// its own mapping -- so the only candidate in an index is the last block
+    /// starting at or below `cache_pc`. That makes this two binary searches
+    /// rather than a scan of every block the process has ever translated
+    /// (~132k after a cold `go build`), on a path every guest fault and every
+    /// asynchronous kick runs.
+    ///
+    /// Resolves through `get` rather than indexing: an index that ever fell
+    /// out of step with `published` must degrade into this function's existing
+    /// "outside published DSR blocks" diagnostic, not panic a guest fault.
+    fn published_block_containing(&self, cache_pc: usize) -> Option<&PublishedBlock> {
+        [&self.private_published_index, &self.shared_published_index]
+            .into_iter()
+            .find_map(|index| {
+                let at = index.partition_point(|indexed| indexed.start.raw() <= cache_pc);
+                let block = self.published.get(index.get(at.checked_sub(1)?)?.block)?;
+                let start = block.entry.host().raw();
+                let end = start.checked_add(block.len)?;
+                (start..end).contains(&cache_pc).then_some(block)
+            })
+    }
+
     fn guest_pc_for_cache(
         &self,
         cache_pc: carrick_guest_mem::GuestVa,
@@ -2394,14 +2480,8 @@ impl ProcessState {
                 cache_pc.raw()
             ))
         })?;
-        for block in &self.published {
+        if let Some(block) = self.published_block_containing(cache_pc) {
             let start = block.entry.host().raw();
-            let Some(end) = start.checked_add(block.len) else {
-                continue;
-            };
-            if !(start..end).contains(&cache_pc) {
-                continue;
-            }
             let offset = u32::try_from(cache_pc - start).map_err(|_| {
                 types::DsrError::CachePolicy("cache PC offset exceeds u32".to_string())
             })?;
@@ -3553,6 +3633,238 @@ mod tests {
         };
         assert!(authority.owns(types::CacheVa::published(carrick_guest_mem::HostVa(0x1800))));
         assert!(!authority.owns(types::CacheVa::published(carrick_guest_mem::HostVa(0x2800))));
+    }
+
+    /// `ProcessState::guest_pc_for_cache` lowers a cache PC back to the guest
+    /// PC that produced it, and every guest fault and asynchronous kick runs
+    /// it. These pin the answers it must keep giving as its cost model
+    /// changes: the same `(guest, recovery)` tuple for a PC in the first,
+    /// middle and last published block, the same tuple for a block whose code
+    /// lives OUTSIDE the private bump cache (the shape a shared translation
+    /// unit publishes), and the same diagnostic payload -- reported in
+    /// publication order -- for a PC in no block at all.
+    mod guest_pc_lowering {
+        use super::TEST_HOST_JIT;
+        use crate::translator::{ProcessState, ProcessTranslator, PublishedBlock};
+        use crate::{emit, gateway, types};
+        use carrick_dsr::cache::PageGenerationTable;
+        use carrick_guest_mem::{GuestVa, HostVa};
+
+        const NOP: u32 = 0xd503_201f;
+        const WORDS: u32 = 4;
+        const BLOCK_LEN: usize = WORDS as usize * 4;
+
+        /// A block whose PC map covers one guest word per emitted word and
+        /// whose single recovery point sits on the SECOND word, so a lookup
+        /// that lands on the wrong block cannot accidentally agree.
+        fn published_block(
+            generations: &PageGenerationTable,
+            entry: types::CacheVa,
+            guest: GuestVa,
+            words: u32,
+        ) -> PublishedBlock {
+            PublishedBlock {
+                entry,
+                len: words as usize * 4,
+                map: (0..words)
+                    .map(|word| emit::PcMapEntry {
+                        guest: GuestVa(guest.raw() + u64::from(word) * 4),
+                        cache: types::CacheOffset::published(word * 4),
+                    })
+                    .collect(),
+                recovery: vec![emit::RecoveryEntry {
+                    cache: types::CacheOffset::published(4),
+                    action: emit::RecoveryAction::RestoreGuestX17,
+                }],
+                _generation: generations.observe(guest).expect("generation observation"),
+            }
+        }
+
+        /// Publish real code through the bump-allocated private cache, then
+        /// index the extent it handed back.
+        fn publish_private_sized(
+            state: &mut ProcessState,
+            generations: &PageGenerationTable,
+            guest: GuestVa,
+            words: u32,
+        ) -> types::CacheVa {
+            let entry = state
+                .cache
+                .publish_words(&vec![NOP; words as usize])
+                .expect("publish words")
+                .entry();
+            state.push_published(published_block(generations, entry, guest, words));
+            entry
+        }
+
+        fn publish_private(
+            state: &mut ProcessState,
+            generations: &PageGenerationTable,
+            guest: GuestVa,
+        ) -> types::CacheVa {
+            publish_private_sized(state, generations, guest, WORDS)
+        }
+
+        /// Index a block whose code is NOT in the private cache. A shared
+        /// translation unit is dlopen'd into its own mapping, so
+        /// `try_load_shared_unit` publishes entries at a base that bears no
+        /// relation to the bump cursor -- including below every private block
+        /// published so far.
+        fn publish_foreign(
+            state: &mut ProcessState,
+            generations: &PageGenerationTable,
+            entry: types::CacheVa,
+            guest: GuestVa,
+        ) {
+            state.push_published(published_block(generations, entry, guest, WORDS));
+        }
+
+        /// The second word of `entry` -- the word the recovery point is on.
+        fn recovery_pc(entry: types::CacheVa) -> GuestVa {
+            GuestVa((entry.host().raw() + 4) as u64)
+        }
+
+        #[test]
+        fn lowers_a_pc_in_the_first_middle_and_last_published_block() {
+            let translator =
+                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+            let generations = PageGenerationTable::new(4096).expect("generation table");
+            let mut state = translator.state.write();
+
+            const BLOCKS: u32 = 512;
+            let entries = (0..BLOCKS)
+                .map(|block| {
+                    publish_private(
+                        &mut state,
+                        &generations,
+                        GuestVa(0x40_0000 + u64::from(block) * 0x100),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            for block in [0, BLOCKS / 2, BLOCKS - 1] {
+                let (guest, recovery) = state
+                    .guest_pc_for_cache(recovery_pc(entries[block as usize]))
+                    .unwrap_or_else(|error| panic!("block {block} lowering: {error}"));
+
+                assert_eq!(guest, GuestVa(0x40_0000 + u64::from(block) * 0x100 + 4));
+                assert_eq!(recovery, Some(emit::RecoveryAction::RestoreGuestX17));
+            }
+        }
+
+        #[test]
+        fn lowers_a_pc_in_a_block_published_below_the_private_cache() {
+            let translator =
+                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+            let generations = PageGenerationTable::new(4096).expect("generation table");
+            let mut state = translator.state.write();
+            let below_cache = state.cache.host_range().start - 0x10_0000;
+
+            let first = publish_private(&mut state, &generations, GuestVa(0x40_0000));
+            let foreign = types::CacheVa::published(HostVa(below_cache));
+            publish_foreign(&mut state, &generations, foreign, GuestVa(0x50_0000));
+            let last = publish_private(&mut state, &generations, GuestVa(0x60_0000));
+
+            for (entry, guest_base) in [(first, 0x40_0000), (foreign, 0x50_0000), (last, 0x60_0000)]
+            {
+                let (guest, recovery) = state
+                    .guest_pc_for_cache(recovery_pc(entry))
+                    .unwrap_or_else(|error| {
+                        panic!("entry 0x{:x} lowering: {error}", entry.host().raw())
+                    });
+
+                assert_eq!(guest, GuestVa(guest_base + 4));
+                assert_eq!(recovery, Some(emit::RecoveryAction::RestoreGuestX17));
+            }
+        }
+
+        #[test]
+        fn lowers_a_recycled_cache_address_through_the_block_republished_there() {
+            // `reset_after_fork_for_exec` drops the published blocks and
+            // rewinds the bump cursor together, so the exec'd image
+            // republishes over the exact addresses the pre-exec image used --
+            // with its own block layout. A lookup that still knew the retired
+            // blocks would lower a fault through the PREVIOUS image.
+            let translator =
+                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+            let generations = PageGenerationTable::new(4096).expect("generation table");
+            let mut state = translator.state.write();
+
+            let retired = (0..4u32)
+                .map(|block| {
+                    publish_private(
+                        &mut state,
+                        &generations,
+                        GuestVa(0x40_0000 + u64::from(block) * 0x100),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            state.clear_published();
+            state.cache.reset_after_fork_for_exec();
+
+            // One 16-word block over the span the four retired 4-word blocks
+            // covered, so a PC that fell in the middle of a retired block now
+            // falls in the MIDDLE of the block that replaced them.
+            let republished =
+                publish_private_sized(&mut state, &generations, GuestVa(0x70_0000), 4 * WORDS);
+            assert_eq!(
+                republished, retired[0],
+                "the exec'd image must recycle the cache base"
+            );
+
+            let cache_pc = GuestVa((retired[1].host().raw() + 4) as u64);
+            let (guest, _) = state
+                .guest_pc_for_cache(cache_pc)
+                .expect("a recycled address lowers through the live block");
+
+            assert_eq!(guest, GuestVa(0x70_0000 + BLOCK_LEN as u64 + 4));
+        }
+
+        #[test]
+        fn reports_publication_order_bounds_for_a_pc_in_no_published_block() {
+            let translator =
+                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+            let generations = PageGenerationTable::new(4096).expect("generation table");
+            let mut state = translator.state.write();
+            let below_cache = state.cache.host_range().start - 0x10_0000;
+
+            let first = publish_private(&mut state, &generations, GuestVa(0x40_0000));
+            publish_foreign(
+                &mut state,
+                &generations,
+                types::CacheVa::published(HostVa(below_cache)),
+                GuestVa(0x50_0000),
+            );
+            let last = publish_private(&mut state, &generations, GuestVa(0x60_0000));
+
+            let stray = GuestVa((below_cache - 0x10_0000) as u64);
+            let error = state
+                .guest_pc_for_cache(stray)
+                .expect_err("a PC in no block cannot lower");
+
+            let types::DsrError::CachePolicy(message) = error else {
+                panic!("lowering a stray PC must stay a cache-policy error");
+            };
+            // Byte-identical to the shipped diagnostic. `first`/`last` are the
+            // bounds in PUBLICATION order -- the foreign block sits between
+            // them. The gateway addresses are the crate-test placeholders (see
+            // the `exit_address!` note in `gateway`), read from the same
+            // getters the diagnostic reads.
+            assert_eq!(
+                message,
+                format!(
+                    "cache PC 0x{:x} is outside published DSR blocks \
+                     (in_cache=false, published=3, first={:?}, last={:?}, \
+                     signal_gateway=0x{:x}, common_gateway=0x{:x})",
+                    stray.raw(),
+                    Some((first.host().raw(), BLOCK_LEN)),
+                    Some((last.host().raw(), BLOCK_LEN)),
+                    gateway::signal_exit_address(),
+                    gateway::direct_exit_address(),
+                )
+            );
+        }
     }
 
     mod direct_binding_owner_and_publication {
