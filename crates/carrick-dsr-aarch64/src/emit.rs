@@ -2940,7 +2940,7 @@ const fn add_extended_uxtx(destination: u32, base: BiasedBase, addend: u32) -> O
 /// the invalid-host tag -- the same two the recovery matrix audits.
 ///
 /// ```text
-///   <effective guest address> -> x19      ; x18 is the immediate temp
+///   <effective guest address> -> x19      ; x19 is also the immediate temp
 ///   lsr x18, x19, #41                     ; aperture flag
 ///   cbz x18, +8                           ; in aperture: skip the publish
 ///   str x19, [x28, #1200]                 ; publish the guest fault address
@@ -2994,16 +2994,27 @@ fn emit_reserved_biased_memory(
             emit_with_biased_recovery(assembler, entries, recovery, guest, load_base, action)?;
         }
         super::types::MemoryEffectiveAddress::Immediate(offset) => {
+            // Stage the displacement in the RESERVED register, never in
+            // physical x18. Darwin's custom-x18 ABI loses that register
+            // asynchronously — measured ~897 zeroings per CPU-second, always
+            // to 0 — so a four-word movz/movk chain there is a liveness
+            // window wide enough to be hit constantly. A loss landing just
+            // before the `lsl #48` chunk of a NEGATIVE displacement leaves
+            // 0xffff_0000_0000_0000, i.e. an effective address of
+            // `base - 2**48`, which is the exact fault signature this fixes.
+            // `ldur x29, [sp, #-8]` sits in every Go arm64 epilogue, which is
+            // why it reproduced constantly. The reserved register is dead
+            // here and already carries the bias add below in the same form.
             emit_biased_materialize_u64(
                 assembler,
                 entries,
                 recovery,
                 guest,
-                18,
+                address,
                 offset as u64,
                 action,
             )?;
-            let word = add_extended_uxtx(address, base, 18).ok_or_else(|| {
+            let word = add_extended_uxtx(address, base, address).ok_or_else(|| {
                 unsupported_action(
                     plan,
                     guest,
