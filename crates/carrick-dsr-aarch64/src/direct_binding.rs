@@ -270,11 +270,8 @@ pub fn direct_binding_unit_digest(key: &TranslationUnitKey) -> Result<u64, DsrEr
         ))
     })?;
     let digest: [u8; 32] = Sha256::digest(encoded).into();
-    Ok(u64::from_le_bytes(
-        digest[..8]
-            .try_into()
-            .expect("SHA-256 prefix has exactly eight bytes"),
-    ))
+    let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = digest;
+    Ok(u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]))
 }
 
 impl PartialOrd for DirectBindingOwnerKey {

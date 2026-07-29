@@ -55,6 +55,10 @@ unsafe impl Sync for ExecutableRangeCatalogNode {}
 pub struct ExecutableRangeCatalog {
     header: Box<ExecutableRangeCatalogHeader>,
     private: Box<ExecutableRangeCatalogNode>,
+    // Each node's address is published into the lock-free `next`/head chain
+    // before insertion, so nodes must never move; `Vec<Node>` would relocate
+    // them on growth and dangle every published pointer.
+    #[allow(clippy::vec_box)]
     shared: Vec<Box<ExecutableRangeCatalogNode>>,
 }
 

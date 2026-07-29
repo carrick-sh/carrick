@@ -1564,6 +1564,7 @@ fn decode_mov_wide_x17(words: &[u32]) -> Option<u64> {
     Some(value)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_cached_direct_exit(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
