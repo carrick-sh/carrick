@@ -933,9 +933,25 @@ Write and validate the executable M1 plan:
       `NativeHostBias::aperture_disjoint_orr_immediate()` gates the compact
       lowering. 17/17 layout tests green; four live go-builds BUILD_OK on
       the rebuilt binary.
-- [ ] Implement the compact biased-memory emission (Spike 1 lowering) with
-      red-first `bad64`-asserted sequence tests and recovery entries, then
-      the shape-census mechanism gate and paired wall screens.
+- [x] Implement the compact biased-memory emission for immediate/base forms
+      (`406b7bfe`): red-first exact-sequence tests (shown red with the
+      predicate disabled via file-copy mutation), recovery entries per word
+      through the unchanged consumer, live memory-family + NZCV oracles at
+      both biases, 167 dsr + 1,111 serialized runtime tests green, cold
+      go-build BUILD_OK with compact words (including the memclr
+      `0xa881_7e3f`) sampled hot in production.
+- [ ] ATTRIBUTE the intermittent guest crash seen once at the tip (Go
+      compiler fatal during a screen sample, `asyncPreempt` in frame,
+      ~1 in 10 runs; 0/6 direct repro): alternating crash-rate sampling
+      of `406b7bfe` (compact) vs `a104aff1` (selection-only), then a
+      compact-word kick-sweep oracle modeled on
+      `live_biased_exclusive_kick_sweep` if the compact commit owns it.
+      No wall screen is claimable until the crash is attributed.
+- [ ] Extend the compact form to register-offset addressing (opcode
+      rewrite to the imm-0 counterpart) and negative immediates (underflow
+      window fault conversion) — the census shows compact applied but
+      ctx-slot share persists, partly from remaining general-path forms
+      and the untouched per-entry guard preamble (Spike 2).
 - [ ] Verify direct-link invalidation discipline, then spike trusted-entry
       chaining (Spike 2) against the same gates.
 - [ ] Restore at least 95% symbolized kernel-leaf coverage before any future
