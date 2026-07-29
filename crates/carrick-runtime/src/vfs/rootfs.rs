@@ -128,18 +128,10 @@ impl RootFsVfs {
     /// `AT_SYMLINK_NOFOLLOW` and the writable backend can't answer a
     /// `real_stat` (e.g. the in-memory backend).
     pub fn lookup_nofollow(&self, path: &str) -> Result<Metadata, VfsError> {
-        // A symlink materialised in the writable overlay.
-        if let Some(target) = self.overlay.read_link(path) {
-            return Ok(Metadata {
-                kind: EntryKind::Symlink,
-                mode: 0o777,
-                size: target.len() as u64,
-                uid: 0,
-                gid: 0,
-                mtime_secs: 0,
-                mtime_nanos: 0,
-            });
-        }
+        // Ask backends that can cheaply prove "not a symlink" first. The Darwin
+        // host backend answers regular files/directories from one contained fd
+        // and returns None for symlinks and exceptional file types, preserving
+        // the exact readlink/lstat fallback below.
         if let Some(metadata) = self.overlay.fast_nofollow_metadata(path) {
             let kind = match metadata.kind {
                 RootFsEntryKind::File => EntryKind::File,
@@ -153,6 +145,18 @@ impl RootFsVfs {
                 kind,
                 mode: metadata.mode,
                 size: metadata.size as u64,
+                uid: 0,
+                gid: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            });
+        }
+        // A symlink materialised in the writable overlay.
+        if let Some(target) = self.overlay.read_link(path) {
+            return Ok(Metadata {
+                kind: EntryKind::Symlink,
+                mode: 0o777,
+                size: target.len() as u64,
                 uid: 0,
                 gid: 0,
                 mtime_secs: 0,
@@ -1021,6 +1025,8 @@ impl Vfs for RootFsVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::fs_backend::HostFsBackend;
     use crate::fs_backend::{BackendError, OverlayEntryKind};
     use crate::rootfs::LayerSource;
     use std::os::fd::IntoRawFd;
@@ -1056,6 +1062,29 @@ mod tests {
             builder.finish().unwrap();
         }
         RootFs::from_layers(std::iter::once(LayerSource::Tar(buf))).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_lookup_nofollow_fast_path_preserves_symlink_and_fifo_types() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        std::fs::write(scratch.path().join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink("file", scratch.path().join("link")).unwrap();
+        let fifo = scratch.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .unwrap();
+        let mut vfs = RootFsVfs::new();
+        vfs.set_overlay(Box::new(HostFsBackend::from_existing_dir(dir)));
+
+        assert_eq!(vfs.lookup_nofollow("/file").unwrap().kind, EntryKind::File);
+        assert_eq!(
+            vfs.lookup_nofollow("/link").unwrap().kind,
+            EntryKind::Symlink
+        );
+        assert_eq!(vfs.lookup_nofollow("/fifo").unwrap().kind, EntryKind::Fifo);
     }
 
     struct MetadataOnlyBackend {
