@@ -116,52 +116,41 @@ traced ceiling rejected H007 (`native-fs-amplification.jsonl`).
 
 ## Next work, ranked
 
-1. **Fix the compact-lowering host-address leak — instrumented, still
-   open, and LOAD-DEPENDENT.** The compact lowering (`406b7bfe`) is
-   implemented with every structural gate green, but it intermittently
-   leaves a HOST address in a guest register. Two captured production
-   faults (`target/perf/compact-writeback-crash-attr-tip-7.log` and the
-   session's diagnostic runs) show a base register holding
-   `bias + guest_ptr` — `x0` = bias + `0x6d0dd0`, `x20` = bias +
-   `0xa048095dc0` — each reported through the tagged slow path with
-   `host_far == slot1200 | (1<<47)`. The window check is therefore the
-   DETECTOR, not the defect, and both victims are consumers
-   (`commit_base: false`), not the producer.
+1. **Fix the Phase A reserved-scratch fault — the mechanism is proven and
+   worth ~12%.** Goal restated 2026-07-28: translated execution within 2x of
+   the guest's own work (16.1 CPU-s today against 3.0 CPU-s real guest
+   computation). Design:
+   `docs/superpowers/specs/2026-07-28-native-codegen-2x-design.md`; plan:
+   `docs/superpowers/plans/2026-07-28-native-codegen-phase-a.md`.
 
-   **What is ruled out** (`d131ac92`, all green at BOTH biases, so do not
-   re-search here): every recovery point of a single compact access
-   including post-index PAIR shapes; every recovery point of two CHAINED
-   compact writebacks in `duffcopy`'s exact shape, where each access
-   borrows the other's live pointer as scratch (`ldp ... [x16]` takes
-   x17, `stp ... [x17]` takes x16), verified by recover → un-patch →
-   resume → byte-identical final state; and 360 live jittered-SIGPIPE
-   landings over a megabyte walk asserting no bias bits in any register,
-   exact 16-byte stride, and a zeroed-prefix/untouched-suffix split
-   exactly at the base.
+   Phase A reserves x19 (chosen by a sample-weighted guest-register census:
+   zero hot-path weight, tied with x21-x25) so the biased-address lowering
+   needs no per-access spill — the 33.5% category. It is implemented
+   (`3a6ab083`, `fce32ea0`) behind `CARRICK_DSR_RESERVED_SCRATCH=1`,
+   DEFAULT OFF, with 170 dsr + 162 runtime oracle tests green.
 
-   **The one coverage gap, and the leading hypothesis:** across 360 live
-   landings the core NEVER reported an interrupted PC on the commit
-   window's arithmetic words (`movz`/`sub`) — only on the sequence's
-   memory words. So a real gateway kick capture inside the commit window
-   is the single path no instrument reaches; the matrix covers it only
-   through a SYNTHESIZED kick exit. Attack that next.
+   **Measured, switch ON:** one clean cold go-build at **16,137 ms** against
+   the frozen `W0` of 18,321 ms — **~12% faster**. That is the first real
+   evidence the codegen direction pays.
 
-   **Measurement discipline for the hunt:** the crash is load-dependent.
-   A same-binary A/B (`CARRICK_DSR_COMPACT_BIASED=1` vs `0`, identical
-   bias and layout) produced 0/8 vs 0/16 on a quiet machine, against
-   ~14% (3/22) observed while the machine was compiling. Run that A/B
-   UNDER INJECTED LOAD (`scripts`-free harness kept at
-   `.../scratchpad/loaded_ab.sh`, whose load generators are wrapped in
-   `timeout` so they cannot orphan). It is the only experiment that
-   separates the compact emission from the bias selection: the earlier
-   tip-vs-`a104aff1` comparison changes both, and its 0/12 carries a
-   ~21% chance of missing a 14% rate — that attribution was weaker than
-   first recorded.
+   **Blocker:** it faults on roughly three of four runs with
+   `unexpected fault address 0xffff00a0...`. The arithmetic is exact and is
+   the lead: **fault address == guest address − 2^48**, and 2^48 is the
+   invalid-host tag bit (2^47) applied TWICE and then subtracted. Observed
+   values `0xffff00a04882f900`, `0xffff00a05207d2d0`, `0xffff00a0513d97f0`
+   are all valid Go stack addresses minus 2^48. Look first at any path that
+   can apply `orr #1<<47` twice to one address, or that un-biases a
+   double-tagged value — the tagged slow path and the writeback commit are
+   the two places the tag and a subtract meet.
 
-   **Mitigation available now:** `CARRICK_DSR_COMPACT_BIASED=0` forces
-   the general lowering from the same binary; `=nowriteback` keeps
-   compact for non-writeback forms only, which bisects the writeback
-   specifically. No wall-time or W-series claim until the leak is fixed.
+   **Also fix before measuring again:** the reservation is currently
+   UNCONDITIONAL — the `gateway_aarch64.S` register save/restore change and
+   the x19 decode classification are not behind the switch. So the "off" arm
+   is not the untouched baseline, and a paired screen through the switch
+   measures only the lowering, not the phase. Interestingly the off arm is
+   itself ~3-4% faster than `W0` (17,593 / 17,807 ms), most likely because
+   the gateway now saves one fewer register per transition — worth
+   confirming and keeping on its own merits.
 
 2. **Re-run the shape census after any H008 spike** — the census is now one
    command pair (see Methods) and is the mechanism gate.
