@@ -1,7 +1,7 @@
 # Darwin/AArch64 native wall-time campaign ledger
 
 **Updated:** 2026-07-28
-**Status:** ACTIVE — M1 accepted; cache repair retained; kernel symbolization required
+**Status:** ACTIVE — syscall reframe selected host-filesystem amplification
 **Primary workload:** cold-GOCACHE `go-build`  
 **Design:** [Darwin native wall-time attribution campaign](../superpowers/specs/2026-07-27-native-wall-time-attribution-campaign-design.md)
 
@@ -22,8 +22,11 @@
 | Destination | 2.0x | Two independent five-sample campaigns |
 | Ratio progress | 22.5% | `(R0 - R) / (R0 - 2.0)`; wall-seconds progress remains 0% |
 
-Current milestone: **M2 — kernel on-CPU attribution and spike selection**. M0
-and M1 are complete. The exact first-bad commit for the later capacity
+Current milestone: **M2 — host-filesystem amplification spike**. M0 and M1 are
+complete. A syscall-state sampler removed the need to wait for kernel-leaf
+symbolization before selecting a mechanism: private guest futex waits own only
+0.30% of sampled kernel CPU, while Darwin `openat` + `unlinkat` own 24.22%.
+The exact first-bad commit for the later capacity
 regression was `98e2f0d6`: it put a 256-byte portable authority precursor on
 ordinary private direct exits. Commit `c65f4b0f` restores the compact 56-byte
 private gateway while retaining the authority precursor for immutable portable
@@ -32,10 +35,12 @@ builds, so the capacity repair is retained. It is not a Carrick wall-speed win:
 the accepted current median is 21,005 ms versus `C0=19,375 ms`. The current
 same-run ratio fell only because the Docker median drifted even more.
 
-The single-use v2 DTrace attempt remains rejected and preserved. A future
-capture still requires live libdtrace symbolization because v2 reconciled all
-9,610 raw kernel PCs/stacks but preserved no runtime kernel slide and resolved
-zero leaves. No kernel family or H006 exists yet.
+The single-use v2 DTrace attempt remains rejected and preserved. Kernel-leaf
+symbolization is still required for a symbol-family claim, but the approved
+syscall reframe now supplies a typed mechanism selection without guessing from
+raw kernel addresses. H005a (private-futex ulock replacement) is rejected as a
+major wall target. The selected filesystem hypothesis is supported for a
+bounded implementation spike, not yet a retained wall win.
 
 ## Measurement contract
 
@@ -92,6 +97,44 @@ zero leaves. No kernel family or H006 exists yet.
 | E017 | `scripts/perf/evidence/native-go-build-kernel-attribution-v2.json` plus rejected A receipt under `target/perf/native-kernel-capture-3fb91b09-v2/` | `MEASUREMENT_REPAIR_REQUIRED` | Clean `3fb91b09`, the unchanged signed binary/image, and repaired `trace -- run` framing reached Go compilation; A then exhausted the 64 MiB DSR translation cache before `BUILD_OK`. Its natural zero-drop partial profile reconciles 9,610 kernel PCs/stacks but has zero symbolized leaves; B and analysis are absent and no family was selected |
 | E018 | Task 9 signed bracket plus `c65f4b0f` red/green/live gate | accepted capacity repair | Immediate parent `de05a11a` completes and `98e2f0d6` exhausts the unchanged cache; typed compact-private/portable-authority policy passes 163 crate tests, independent review, and a fresh signed `BUILD_OK` runtime gate |
 | E019 | `scripts/perf/evidence/native-go-build-wall-compact-exits-v1.json` | accepted retention measurement | Five Carrick completions at 20,260/20,698/21,005/21,547/25,209 ms and five serial Docker completions at 1,258/1,466/1,472/1,367/1,359 ms; current medians 21,005/1,367 ms and ratio 15.3658x; retain failure-to-completion repair, claim no Carrick wall win |
+| E020 | `target/perf/deep-wait-stacks-v3/c.raw` plus `docs/perf-results/native-syscall-cpu.jsonl` | accepted diagnostic | Deep syscall stacks cross from `libsystem_kernel` into anonymous native JIT ranges; existing `futex-route` joins identify private futex without false host symbolication |
+| E021 | `target/perf/native-syscall-cpu-v2/b.raw` plus `docs/perf-results/native-syscall-cpu.jsonl` | accepted diagnostic | Natural `BUILD_OK`, 19,525 kernel and 64,512 user samples: private-futex cvwait is 0.30% of kernel / 0.069% total CPU; `openat` + `unlinkat` are 24.22% kernel / 5.63% total |
+| E022 | `target/perf/native-fs-amplification-v1/a.raw` plus `docs/perf-results/native-fs-amplification.jsonl` | accepted diagnostic | Carrick guest 2,521 `openat` calls drive 79,282 joined and 116,925 total Darwin `openat`; teardown contributes 38,809 Carrick-only `unlinkat` |
+| E023 | `target/perf/oracle-fs-syscalls-v1/{oracle.raw,workload.log}` plus `docs/perf-results/native-fs-amplification.jsonl` | accepted Docker-only diagnostic | Native-arm64 Linux `bpftrace` process-tree census completes `BUILD_OK`; mutation counts closely match Carrick guest counts, proving the 35.8x host `openat` / 249.7x host `unlinkat` excess is Carrick amplification |
+
+### H005a rejection and filesystem syscall reframe
+
+Deep `ustack(64)` at Darwin wait boundaries proved useful but not sufficient
+for Carrick caller identity: after the `libsystem_kernel` leaf, the native DSR
+stack commonly crosses into anonymous MAP_JIT code. Pairing such addresses with
+Carrick's symbol table produces plausible nonsense. The corrected capture keys
+each stack by its contemporaneous host image base and uses the existing typed
+`futex-route` probe to name guest futex waits without making that mistake.
+
+Private futex waits account for 1,747/19,636 `psynch_cvwait` calls and 113.87 of
+226.09 aggregate blocked thread-seconds, but a separate sampled kernel-CPU
+capture shows only 58/19,525 kernel samples there: 0.30% of kernel CPU and
+0.069% of all sampled CPU. The apparent dominance is idle resource time, not
+recoverable host work. H005a is rejected before an invasive ulock spike.
+
+The same capture assigns 2,302 kernel samples to `openat` and 2,427 to
+`unlinkat`: together 24.22% of kernel CPU and 5.63% of all sampled CPU.
+Carrick-side joins then measured 2,521 guest `openat` calls driving 79,282
+Darwin `openat` calls during those services and 116,925 overall. A serial
+Docker-only `bpftrace` census observed 3,263 Linux `openat`, 156 `unlinkat`,
+282 `mkdirat`, 3,956 `newfstatat`, and 71 `execve`, close to Carrick's guest
+population (2,521/156/282/3,827/67). The excess is therefore Carrick host
+re-resolution, not a different Go workload.
+
+Two mechanism screens do not count as wins. `--fs memory` cannot survive native
+self-reexec because that backend is intentionally not fork-coherent. Skipping
+owner scratch deletion exercised the intended teardown seam but produced a
+noisier 23.73 s sample versus a 20.34 s control; it is rejected as a wall
+candidate from this screen. The exact generated scratch
+`/Volumes/carrick/.tmplT2eqC` was verified by its run-id cache and moved to
+Trash. The next bounded spike targets the reusable contained-parent seam in
+`HostFsBackend::open_raw_fd`; promotion still requires a correct cold build and
+then the normal five-sample wall gate.
 
 ### Tasks 7–11 — capacity root cause, repair, and retention
 

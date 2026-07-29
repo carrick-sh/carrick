@@ -1,0 +1,114 @@
+/*
+ * Count Linux filesystem syscalls for one already-stopped Docker process tree.
+ *
+ * Usage inside the privileged LTP oracle container:
+ *   bpftrace oracle-fs-syscalls.bt <host-pid>
+ *
+ * The caller resumes the stopped workload only after bpftrace prints
+ * ORACLEFS1|ready. The root shell retains its pid across exec and its fork
+ * descendants are admitted through sched_process_fork.
+ */
+
+BEGIN
+{
+	@tracked[$1] = 1;
+	printf("ORACLEFS1|ready|root=%d\n", $1);
+}
+
+tracepoint:sched:sched_process_fork
+/@tracked[args->parent_pid]/
+{
+	@tracked[args->child_pid] = 1;
+}
+
+tracepoint:syscalls:sys_enter_openat
+/@tracked[pid]/
+{
+	@calls["openat"] = count();
+}
+
+tracepoint:syscalls:sys_enter_unlinkat
+/@tracked[pid]/
+{
+	@calls["unlinkat"] = count();
+}
+
+tracepoint:syscalls:sys_enter_mkdirat
+/@tracked[pid]/
+{
+	@calls["mkdirat"] = count();
+}
+
+tracepoint:syscalls:sys_enter_newfstatat
+/@tracked[pid]/
+{
+	@calls["newfstatat"] = count();
+}
+
+tracepoint:syscalls:sys_enter_renameat
+/@tracked[pid]/
+{
+	@calls["renameat"] = count();
+}
+
+tracepoint:syscalls:sys_enter_execve
+/@tracked[pid]/
+{
+	@calls["execve"] = count();
+}
+
+tracepoint:syscalls:sys_enter_close
+/@tracked[pid]/
+{
+	@calls["close"] = count();
+}
+
+tracepoint:syscalls:sys_enter_getdents64
+/@tracked[pid]/
+{
+	@calls["getdents64"] = count();
+}
+
+tracepoint:syscalls:sys_enter_read
+/@tracked[pid]/
+{
+	@calls["read"] = count();
+}
+
+tracepoint:syscalls:sys_enter_write
+/@tracked[pid]/
+{
+	@calls["write"] = count();
+}
+
+tracepoint:syscalls:sys_enter_pread64
+/@tracked[pid]/
+{
+	@calls["pread64"] = count();
+}
+
+tracepoint:syscalls:sys_enter_pwrite64
+/@tracked[pid]/
+{
+	@calls["pwrite64"] = count();
+}
+
+tracepoint:sched:sched_process_exit
+/@tracked[pid] && pid != $1/
+{
+	delete(@tracked[pid]);
+}
+
+tracepoint:sched:sched_process_exit
+/pid == $1/
+{
+	printf("ORACLEFS1|complete|root=%d\n", $1);
+	print(@calls);
+	clear(@calls);
+	exit();
+}
+
+END
+{
+	clear(@tracked);
+}
