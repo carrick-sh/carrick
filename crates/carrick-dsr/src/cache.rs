@@ -161,9 +161,11 @@ impl PageGenerationTable {
 
     pub fn observe(&self, pc: GuestVa) -> Result<PageGenerationObservation, CacheError> {
         let page = GuestVa(pc.raw() & !(self.page_size - 1));
-        let current = self
-            .pages
-            .write()
+        let mut pages = crate::probes::acquire_with_synchronization_reason(
+            crate::probes::DsrSynchronizationKind::GenerationTableWrite,
+            || self.pages.write(),
+        );
+        let current = pages
             .entry(page)
             .or_insert_with(|| Arc::new(AtomicU64::new(CodeGeneration::INITIAL.get())))
             .clone();

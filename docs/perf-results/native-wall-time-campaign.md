@@ -629,10 +629,40 @@ guest setup or descendant forks. This lifted the next full-workload spike to
 
 | Rank | Blocking mechanism / stack | Share | Critical-path evidence |
 |---:|---|---:|---|
-| 1 | pending | pending | pending |
-| 2 | pending | pending | pending |
-| 3 | pending | pending | pending |
-| top-stack coverage | pending | must be at least 80% | |
+| 1 | untyped `psynch_cvwait` population | 92.78% of joined wait duration | current reason capture; outer boundary still pending |
+| 2 | process-state read acquisition | 4.26% of joined wait duration | typed USDT acquisition join |
+| 3 | process-state write + generation-table write acquisition | 3.07% combined | typed USDT acquisition join |
+| top-stack coverage | not accepted | DSR user-stack unwinding exposed guest state; reason probes replaced stacks | |
+
+### 2026-07-28 condvar-reason loop
+
+Two low-detail captures replicated the coarse result: 97.06% and 97.26% of
+the observed condvar calls occurred outside the current thread's guest syscall
+service window. Raw `ustack()` aggregation was rejected because native DSR can
+expose guest stack state to the unwinder. The replacement capture joins
+`psynch_*` syscall entry/return durations to typed, acquisition-only USDT
+boundaries.
+
+The joined capture measured 62.262 thread-seconds in `psynch_cvwait`.
+Generation-table write, process-state write, and process-state read
+acquisitions explain 0.892 s, 0.956 s, and 2.649 s respectively: 4.497 s
+combined, or 7.22%. The untyped population owns 57.765 s (92.78%) and the
+longest individual wait (3.744 s). These are aggregate thread durations under
+DTrace, not elapsed wall time.
+
+Three correct single-sample screens then tested increasingly strong versions
+of the translation-lock hypothesis against a contemporaneous 21.06 s control:
+
+| Spike | Wall | Result |
+|---|---:|---|
+| allow process-state readers to barge | 22.48 s | reject and revert (+6.7%) |
+| give every guest thread a private process translator | 29.53 s | reject and revert (+40.2%) |
+| bypass disabled direct-binding/shared-metadata locks | 21.14 s | reject and revert (no win) |
+
+All three printed `BUILD_OK` and `ok`. They are busy-host screens, sufficient
+only to reject negative or absent movement. None is promotion evidence. The
+durable evidence is
+[`native-condvar-reasons.jsonl`](native-condvar-reasons.jsonl).
 
 ## Hypothesis backlog
 
@@ -644,7 +674,7 @@ Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
 | H002 | PROPOSED | 5.806 s diagnostic emission time across 1.868M translations | stale traced aggregate | Sample and split allocation, relocation, publication and I-cache work; spike only the dominant subphase | No current dominant subphase or two variants fail wall gate |
 | H003 | PROPOSED | Older profile assigned CPU to repeated capsule setup | stale sample | Refresh process-lifetime share and critical-path overlap; reuse only the dominant durable input | Current share is small/non-critical or two variants fail |
 | H004 | REJECT | Authority caching leaves at least 17.16M bounded direct misses, led by one conditional fall-through edge at 1.47M | signed Variant 1 feasibility exhausts the 64 MiB DSR translation cache before `BUILD_OK` | Compact per-edge mutable binding cells were the bounded proof; the mechanism pair was not run | Rejected at feasibility; no cache increase, sidecar tuning, or Task 16 is authorized |
-| H005 | PROPOSED | Scheduling/blocking share is unknown | unmeasured | Partition wall occupancy and rank voluntary blocking stacks | Fully compute-active with no dominant wait mechanism |
+| H005 | SPIKING | Typed translation locks explain only 7.22% of joined `psynch_cvwait` duration; 92.78% is untyped | 62.262 aggregate thread-seconds under DTrace | Name the untyped outer wait boundaries, starting from child lifecycle and guest-futex critical-path evidence | Two bounded outer-boundary spikes fail untraced wall or a different mechanism dominates |
 
 The table order is provisional until E005 and E006 exist.
 
@@ -669,6 +699,9 @@ The table order is provisional until E005 and E006 exist.
 | 2026-07-27 | H004 | compact direct-binding sidecar Variant 1 mechanism retry | Same 95% collapse and reclassification gate after metadata repair | focused runtime oracle ran 9 tests, but the 10,000-signal broad control missed `FinalBranch` | n/a | reject before mechanism evaluation; resolve deterministic recovery coverage before another live retry |
 | 2026-07-27 | H004 | compact direct-binding sidecar Variant 1 final retry | Same mechanism gate after deterministic recovery repairs | focused runtime Gate 3 spun for more than 15 minutes in the jitter stress after four tests passed | n/a | reject before mechanism evaluation; diagnose per-sample synchronization before another gate |
 | 2026-07-27 | H004 | compact direct-binding sidecar Variant 1 live feasibility | Same 95% mechanism gate after the jitter synchronization repair | structural and signed-binary gates passed; wrapper-free Go build exhausted the 64 MiB DSR translation cache before `BUILD_OK` | n/a | reject Variant 1 at feasibility; mechanism unrun, return to default-path attribution |
+| 2026-07-28 | H005 | process-state reader barging | Reduce the largest typed condvar reason without changing cache ownership | 22.48 s vs 21.06 s control | n/a | reject and revert; +6.7% wall |
+| 2026-07-28 | H005 | private translator per guest thread | Remove process-state contention completely; tolerate duplicate translation only as a feasibility spike | 29.53 s vs 21.06 s control | n/a | reject and revert; +40.2% wall and 70.46 user-s |
+| 2026-07-28 | H005 | bypass disabled-feature process-state locks | Remove direct-binding/shared-metadata lock work when both features are off | 21.14 s vs 21.06 s control | n/a | reject and revert; no wall win |
 
 Prior rejected experiments remain recorded in `handoff.md`; they are not reset
 to `PROPOSED`.
@@ -724,6 +757,11 @@ to `PROPOSED`.
     exhausted the 64 MiB DSR translation cache before `BUILD_OK`. Preserve v2
     unchanged. Its exact 9,610/9,610 kernel reconciliation and zero symbolized
     leaves are partial diagnostics only; no pair, selection, or H006 exists.
+11. The 2026-07-28 reason join rejects translation-lock tuning as the next wall
+    target. Its three typed lock reasons own only 7.22% of aggregate
+    `psynch_cvwait` duration, and three progressively stronger screens produced
+    no wall win. Continue H005 by naming the untyped 92.78% at outer wait
+    boundaries; do not infer criticality from condvar event counts alone.
 
 ## Next action
 

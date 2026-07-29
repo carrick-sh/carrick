@@ -206,6 +206,17 @@ dsr_ordinal_enum! {
     }
 }
 
+dsr_ordinal_enum! {
+    /// Host synchronization boundary whose kernel waits need a stable reason.
+    /// Mirrors `carrick_observability::probes::DsrSynchronizationKind`
+    /// exactly.
+    pub enum DsrSynchronizationKind {
+        GenerationTableWrite = 1,
+        ProcessStateRead = 2,
+        ProcessStateWrite = 3,
+    }
+}
+
 /// Receiver for the probe families the DSR memory model and translator
 /// orchestration fire. Argument lists are exactly the observability
 /// functions' (`dsr_cache_lifecycle` / `dsr_exec_map_detail` /
@@ -272,6 +283,10 @@ pub trait DsrProbeSink: Send + Sync {
         guest_pc: u64,
         generation: u64,
     );
+
+    fn dsr_synchronization_begin(&self, kind: DsrSynchronizationKind);
+
+    fn dsr_synchronization_end(&self, kind: DsrSynchronizationKind);
 
     fn dsr_resolve_begin(&self, tid: i32, kind: DsrResolveKind, source_pc: u64, target_pc: u64);
 
@@ -430,6 +445,39 @@ pub fn dsr_translate_subphase_end(
     }
 }
 
+/// Fire the `dsr__synchronization__begin` probe through the installed sink;
+/// no-op when no sink is installed.
+#[inline(always)]
+pub fn dsr_synchronization_begin(kind: DsrSynchronizationKind) {
+    if let Some(sink) = SINK.get() {
+        sink.dsr_synchronization_begin(kind);
+    }
+}
+
+/// Fire the `dsr__synchronization__end` probe through the installed sink;
+/// no-op when no sink is installed.
+#[inline(always)]
+pub fn dsr_synchronization_end(kind: DsrSynchronizationKind) {
+    if let Some(sink) = SINK.get() {
+        sink.dsr_synchronization_end(kind);
+    }
+}
+
+/// Acquire one host synchronization primitive while bracketing only the
+/// acquisition itself. Work performed under the returned guard is outside
+/// the probe span, so a joined DTrace syscall is evidence of blocking during
+/// acquisition rather than merely holding the lock.
+#[inline(always)]
+pub fn acquire_with_synchronization_reason<T>(
+    kind: DsrSynchronizationKind,
+    acquire: impl FnOnce() -> T,
+) -> T {
+    dsr_synchronization_begin(kind);
+    let acquired = acquire();
+    dsr_synchronization_end(kind);
+    acquired
+}
+
 /// Fire the `dsr__resolve__begin` probe through the installed sink; no-op
 /// when no sink is installed.
 #[inline(always)]
@@ -486,6 +534,7 @@ mod tests {
     struct CountingSink {
         lifecycle: AtomicU64,
         detail: AtomicU64,
+        synchronization: AtomicU64,
     }
 
     impl DsrProbeSink for CountingSink {
@@ -595,6 +644,14 @@ mod tests {
         }
 
         fn dsr_cache_capacity(&self, _role: DsrCacheRole, _capacity_bytes: u64) {}
+
+        fn dsr_synchronization_begin(&self, _kind: DsrSynchronizationKind) {
+            self.synchronization.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn dsr_synchronization_end(&self, _kind: DsrSynchronizationKind) {
+            self.synchronization.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // One test on purpose: the sink is a process-global OnceLock, so the
@@ -605,10 +662,12 @@ mod tests {
         static FIRST: CountingSink = CountingSink {
             lifecycle: AtomicU64::new(0),
             detail: AtomicU64::new(0),
+            synchronization: AtomicU64::new(0),
         };
         static SECOND: CountingSink = CountingSink {
             lifecycle: AtomicU64::new(0),
             detail: AtomicU64::new(0),
+            synchronization: AtomicU64::new(0),
         };
 
         // No sink installed: helpers must be a silent no-op.
@@ -620,8 +679,14 @@ mod tests {
         install_probe_sink(&FIRST);
         dsr_cache_lifecycle(1, DsrCacheLifecyclePhase::ExecImageMapEnd, 1, 2, 3);
         dsr_exec_map_detail(1, DsrExecMapDetailKind::Copy, 4, 5, 6);
+        let generations =
+            crate::cache::PageGenerationTable::new(16 * 1024).expect("valid generation table");
+        generations
+            .observe(carrick_guest_mem::GuestVa(0x1_0000))
+            .expect("generation observation");
         assert_eq!(FIRST.lifecycle.load(Ordering::Relaxed), 1);
         assert_eq!(FIRST.detail.load(Ordering::Relaxed), 1);
+        assert_eq!(FIRST.synchronization.load(Ordering::Relaxed), 2);
 
         // Second install is ignored (first-install-wins) and does not error.
         install_probe_sink(&SECOND);
@@ -629,6 +694,7 @@ mod tests {
         assert_eq!(FIRST.lifecycle.load(Ordering::Relaxed), 2);
         assert_eq!(SECOND.lifecycle.load(Ordering::Relaxed), 0);
         assert_eq!(SECOND.detail.load(Ordering::Relaxed), 0);
+        assert_eq!(SECOND.synchronization.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -660,6 +726,9 @@ mod tests {
         assert_eq!(DsrCacheEventKind::DirectBindingUnitLoaded.raw(), 12);
         for (index, subphase) in DsrTranslationSubphase::ALL.iter().enumerate() {
             assert_eq!(subphase.raw() as usize, index + 1);
+        }
+        for (index, kind) in DsrSynchronizationKind::ALL.iter().enumerate() {
+            assert_eq!(kind.raw() as usize, index + 1);
         }
         // These two families start at zero (`Success` / `Common` are ordinal
         // 0 in the observability originals).
