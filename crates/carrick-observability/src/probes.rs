@@ -296,6 +296,15 @@ dsr_ordinal_enum! {
 }
 
 dsr_ordinal_enum! {
+    /// Host synchronization boundary whose kernel waits need a stable reason.
+    pub enum DsrSynchronizationKind {
+        GenerationTableWrite = 1,
+        ProcessStateRead = 2,
+        ProcessStateWrite = 3,
+    }
+}
+
+dsr_ordinal_enum! {
     /// Native syscall service branch whose child inherits the open operation.
     pub enum NativeSyscallBranchKind {
         Process = 1,
@@ -622,7 +631,8 @@ mod native_fork_probe_abi {
 mod dsr_probe_abi {
     use super::{
         DsrCacheEventKind, DsrCacheLifecyclePhase, DsrCacheRole, DsrExecMapDetailKind, DsrExitKind,
-        DsrOperationOutcome, DsrPrepareOutcome, DsrResolveKind, DsrTranslationSubphase,
+        DsrOperationOutcome, DsrPrepareOutcome, DsrResolveKind, DsrSynchronizationKind,
+        DsrTranslationSubphase,
     };
 
     fn assert_unique(values: &[u32]) {
@@ -785,6 +795,11 @@ mod dsr_probe_abi {
         assert_eq!(DsrTranslationSubphase::PublicationIndex.raw(), 4);
         assert_eq!(DsrTranslationSubphase::DuplicateWait.raw(), 5);
         assert_unique(&DsrTranslationSubphase::ALL.map(DsrTranslationSubphase::raw));
+
+        assert_eq!(DsrSynchronizationKind::GenerationTableWrite.raw(), 1);
+        assert_eq!(DsrSynchronizationKind::ProcessStateRead.raw(), 2);
+        assert_eq!(DsrSynchronizationKind::ProcessStateWrite.raw(), 3);
+        assert_unique(&DsrSynchronizationKind::ALL.map(DsrSynchronizationKind::raw));
     }
 
     #[test]
@@ -797,6 +812,8 @@ mod dsr_probe_abi {
         let _: fn(i32, u64, u64, u64, DsrOperationOutcome) = super::dsr_translate_end;
         let _: fn(i32, DsrTranslationSubphase, u64, u64) = super::dsr_translate_subphase_begin;
         let _: fn(i32, DsrTranslationSubphase, u64, u64) = super::dsr_translate_subphase_end;
+        let _: fn(DsrSynchronizationKind) = super::dsr_synchronization_begin;
+        let _: fn(DsrSynchronizationKind) = super::dsr_synchronization_end;
         let _: fn(i32, DsrResolveKind, u64, u64) = super::dsr_resolve_begin;
         let _: fn(i32, DsrResolveKind, u64, u64, DsrOperationOutcome) = super::dsr_resolve_end;
         let _: fn(i32, DsrCacheEventKind, u64, u64, u64) = super::dsr_cache_event;
@@ -907,6 +924,9 @@ mod real {
         fn dsr__translate__end(_: i32, _: u64, _: u64, _: u64, _: u32) {}
         fn dsr__translate__subphase__begin(_: i32, _: u32, _: u64, _: u64) {}
         fn dsr__translate__subphase__end(_: i32, _: u32, _: u64, _: u64) {}
+        /// Host synchronization acquisition boundaries.
+        fn dsr__synchronization__begin(_: u32) {}
+        fn dsr__synchronization__end(_: u32) {}
         /// Direct and indirect translated-control-flow resolution boundaries.
         fn dsr__resolve__begin(_: i32, _: u32, _: u64, _: u64) {}
         fn dsr__resolve__end(_: i32, _: u32, _: u64, _: u64, _: u32) {}
@@ -1412,6 +1432,16 @@ mod real {
         carrick_usdt::dsr__translate__subphase__end!(|| {
             (tid, subphase.raw(), guest_pc, generation)
         });
+    }
+
+    #[inline(always)]
+    pub fn dsr_synchronization_begin(kind: super::DsrSynchronizationKind) {
+        carrick_usdt::dsr__synchronization__begin!(|| kind.raw());
+    }
+
+    #[inline(always)]
+    pub fn dsr_synchronization_end(kind: super::DsrSynchronizationKind) {
+        carrick_usdt::dsr__synchronization__end!(|| kind.raw());
     }
 
     #[inline(always)]
@@ -2730,6 +2760,8 @@ mod stub {
     stub!(dsr_translate_end(tid: i32, guest_pc: u64, cache_pc: u64, emitted_bytes: u64, outcome: super::DsrOperationOutcome));
     stub!(dsr_translate_subphase_begin(tid: i32, subphase: super::DsrTranslationSubphase, guest_pc: u64, generation: u64));
     stub!(dsr_translate_subphase_end(tid: i32, subphase: super::DsrTranslationSubphase, guest_pc: u64, generation: u64));
+    stub!(dsr_synchronization_begin(kind: super::DsrSynchronizationKind));
+    stub!(dsr_synchronization_end(kind: super::DsrSynchronizationKind));
     stub!(dsr_resolve_begin(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64));
     stub!(dsr_resolve_end(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64, outcome: super::DsrOperationOutcome));
     stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64));

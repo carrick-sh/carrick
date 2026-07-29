@@ -2438,7 +2438,10 @@ impl ThreadTranslator {
             // Scoped so the read guard is dropped before any write-path
             // fallback tries to acquire the write lock (RwLock is not
             // reentrant: read-then-write on the same thread would deadlock).
-            let state = self.process.state.read();
+            let state = probes::acquire_with_synchronization_reason(
+                probes::DsrSynchronizationKind::ProcessStateRead,
+                || self.process.state.read(),
+            );
             if let Some(entry) = state.cached_block(guest, generation) {
                 let cache_used_bytes = u64::try_from(state.cache.used_bytes()).unwrap_or(u64::MAX);
                 drop(state);
@@ -2464,10 +2467,11 @@ impl ThreadTranslator {
         // page hasn't changed), so a block another thread inserted in the
         // read-drop-to-write-acquire gap is found there -- no duplicate
         // translation -- and a genuine miss is translated exactly as before.
-        self.process
-            .state
-            .write()
-            .translate(self.tid, memory, guest)
+        let mut state = probes::acquire_with_synchronization_reason(
+            probes::DsrSynchronizationKind::ProcessStateWrite,
+            || self.process.state.write(),
+        );
+        state.translate(self.tid, memory, guest)
     }
 
     fn translate<const PROFILE: bool>(

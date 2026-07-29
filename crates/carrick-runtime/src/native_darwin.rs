@@ -1262,6 +1262,18 @@ fn native_dsr_translation_subphase(
     }
 }
 
+fn native_dsr_synchronization_kind(
+    kind: carrick_dsr::probes::DsrSynchronizationKind,
+) -> crate::probes::DsrSynchronizationKind {
+    use crate::probes::DsrSynchronizationKind as Usdt;
+    use carrick_dsr::probes::DsrSynchronizationKind as Seam;
+    match kind {
+        Seam::GenerationTableWrite => Usdt::GenerationTableWrite,
+        Seam::ProcessStateRead => Usdt::ProcessStateRead,
+        Seam::ProcessStateWrite => Usdt::ProcessStateWrite,
+    }
+}
+
 impl carrick_dsr::probes::DsrProbeSink for NativeDsrProbeForwarder {
     fn dsr_cache_lifecycle(
         &self,
@@ -1382,6 +1394,14 @@ impl carrick_dsr::probes::DsrProbeSink for NativeDsrProbeForwarder {
             guest_pc,
             generation,
         );
+    }
+
+    fn dsr_synchronization_begin(&self, kind: carrick_dsr::probes::DsrSynchronizationKind) {
+        crate::probes::dsr_synchronization_begin(native_dsr_synchronization_kind(kind));
+    }
+
+    fn dsr_synchronization_end(&self, kind: carrick_dsr::probes::DsrSynchronizationKind) {
+        crate::probes::dsr_synchronization_end(native_dsr_synchronization_kind(kind));
     }
 
     fn dsr_resolve_begin(
