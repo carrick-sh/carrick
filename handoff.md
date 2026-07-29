@@ -128,10 +128,21 @@ traced ceiling rejected H007 (`native-fs-amplification.jsonl`).
    `live_biased_exclusive_kick_sweep` (oracle.rs ~6364): self-linked
    memclr-style loop, jittered SIGPIPE sender, per-word landing coverage,
    exact base-progression/memory assertions — show it red, find the
-   window (audit candidates: the access-word entry's
-   `instruction_complete` boundary, the movz/sub commit entries, the
-   restore word's inherited action, and what the gateway's kick capture
-   does between those exact words), fix, show green, rerun the sampling.
+   window, fix, show green, rerun the sampling. Audit candidates, in
+   order: (a) the compact writeback path NEVER flips `commit_base` off —
+   the general path sets `commit_base = false` after its commit word
+   (emit.rs ~2924) before emitting restores, while compact leaves
+   `(commit=true, coordinate=Host)` on the restore word and, if
+   `guest_pc_for_cache` recovery lookup is nearest-preceding rather than
+   exact-match, on every un-entried word after the sequence (the next
+   op's spill, following copy words) — a kick there would commit
+   `x[scratch] − bias` or worse into the base register long after the
+   instruction finished; (b) whether the recovery lookup IS exact-match
+   or nearest-preceding — this decides if un-entried words (both paths'
+   spill words rely on it) are safe; (c) the access-word
+   `instruction_complete` boundary and the movz/sub commit entries;
+   (d) what the gateway's kick capture publishes for slots
+   1120/1128/1160/1168 between those exact words.
    No wall screen or W-series claim until then. After that:
    register-offset compact forms, then Spike 2 (trusted-entry chaining)
    pending the link-invalidation soundness read.
