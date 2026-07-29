@@ -2889,9 +2889,14 @@ enum CompactBiasedPolicy {
 /// sufficient (see H008 Spike 1).
 fn reserved_scratch_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // ON by default since the paired screen measured 9.7% against a
+    // contemporaneous control (5/5 pairs, non-overlapping populations, zero
+    // faults). `CARRICK_DSR_RESERVED_SCRATCH=0` is the escape hatch and
+    // still forces the general lowering; note it does NOT undo the x19
+    // reservation itself, which is unconditional.
     *ENABLED.get_or_init(|| {
         std::env::var_os("CARRICK_DSR_RESERVED_SCRATCH").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
+            != Some(std::ffi::OsStr::new("0"))
     })
 }
 
