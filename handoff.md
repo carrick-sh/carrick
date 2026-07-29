@@ -113,16 +113,24 @@ traced ceiling rejected H007 (`native-fs-amplification.jsonl`).
 
 ## Next work, ranked
 
-1. **H008 Spike 1 emission** — the design
-   (`docs/superpowers/specs/2026-07-28-h008-register-resident-biased-addressing-design.md`)
-   and its selection prerequisites are landed; what remains is the compact
-   lowering in `emit_biased_memory` (immediate/base forms first, writeback
-   via `movz x18, #bias-chunk` + full-width `sub` commit), red-first
-   `bad64`-asserted sequences, recovery entries per word, then the
-   shape-census mechanism gate and paired screens. Note the per-entry guard
-   preamble finding in the design doc: trusted-entry chaining (Spike 2) is
-   back on the table AFTER Spike 1, pending the link-invalidation soundness
-   read.
+1. **ATTRIBUTE the intermittent tip crash before anything else.** The
+   compact lowering for immediate/base forms is IMPLEMENTED and committed
+   (`406b7bfe`, after the selection prerequisites in `a104aff1`), with
+   every structural and live gate green (exact-sequence red-first tests,
+   both-bias memory-family/NZCV oracles, 167 dsr + 1,111 runtime tests,
+   cold go-build BUILD_OK). But one screen sample crashed in Go's
+   compiler (`asyncPreempt` in frame, ~1-in-10; 0/6 direct repro) and is
+   UNATTRIBUTED between `406b7bfe`, `a104aff1`, and pre-existing rare
+   flakiness. Alternating crash-rate sampling of the two binaries was in
+   flight at session end (`/tmp/carrick-a104` throwaway worktree holds the
+   selection-only build). If compact owns it, the deterministic instrument
+   is a compact-word kick sweep modeled exactly on
+   `live_biased_exclusive_kick_sweep` (oracle.rs) — self-linked memclr
+   loop, SIGPIPE sender with phase jitter, per-word landing coverage,
+   exact state assertions. No wall screen or W-series claim until this is
+   resolved. After that: register-offset compact forms (opcode rewrite to
+   imm-0 counterparts), then Spike 2 (trusted-entry chaining) pending the
+   link-invalidation soundness read.
 2. **Re-run the shape census after any H008 spike** — the census is now one
    command pair (see Methods) and is the mechanism gate.
 3. **Root-cause the dtrace copyin kill** (spawned as a separate task chip):
