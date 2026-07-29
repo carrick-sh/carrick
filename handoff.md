@@ -205,6 +205,19 @@ python3 scripts/perf/shape_classify.py raw --snapshots target/perf/snaps
 
 ## Traps — read before measuring or debugging here
 
+- **`CARRICK_DSR_LEAN_GUARD` is measured at 26.4% and MUST NOT be defaulted
+  on yet.** It removes three block-prologue stores (slots 1120/1128/936) by
+  spending carrick's own dead registers, and the win is real and decomposed
+  (spill removal ~25%, flags-free compare ~2.75%). But it has now failed BOTH
+  of its two full `--workers 4` gate runs, in two DIFFERENT suites —
+  `cpython-threading` 192/193, then `cpython-math` 70/71 as a CARRICK_CRASH —
+  while standalone runs of both suites pass and the control gate passed 23/23.
+  Two unrelated suites failing only under concurrency points at a general
+  signal/recovery path that still expects those slots populated. The recovery
+  matrix cannot see it: it injects faults AT recovery points rather than
+  racing real signal delivery. Firm up the control arm (n=1 at that load) and
+  then instrument concurrent signal delivery directly.
+
 - **`cpython-subprocess` is LOAD-COUPLED and it gates merges.** Under
   `--workers 4` it failed three times with three different counts —
   277/278, 277/278, and 275/278 with the reserved-scratch switch OFF —
