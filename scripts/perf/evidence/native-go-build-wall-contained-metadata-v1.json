@@ -1,0 +1,773 @@
+{
+  "binary": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+  "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+  "environment_overlay": {
+    "CARRICK_ARTIFACT": null,
+    "CARRICK_DISABLE_VDSO": null,
+    "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+    "CARRICK_DSR_ARTIFACT_REPORT": null,
+    "CARRICK_DSR_ARTIFACT_SPIKE": null,
+    "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+    "CARRICK_DSR_DIRECT_BINDINGS": null,
+    "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+    "CARRICK_DSR_PROFILE": null,
+    "CARRICK_DSR_SHARED_TRANSLATION": null,
+    "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+    "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+    "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+    "CARRICK_VDSO_MODE": null
+  },
+  "finished_at": "2026-07-29T01:57:04.534483+00:00",
+  "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+  "git_dirty": false,
+  "git_status": [],
+  "host": {
+    "busy_override": false,
+    "load_average": [
+      5.7900390625,
+      4.6865234375,
+      4.1005859375
+    ],
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "preflight_reasons": []
+  },
+  "image": "localhost:5005/carrick-go-conformance:1.24",
+  "phases": {
+    "carrick": {
+      "median_ms": 19680,
+      "sample_count": 5,
+      "samples": [
+        {
+          "build_ok": true,
+          "cleanup": {
+            "status": 0,
+            "stderr": "",
+            "stdout": "remaining carrick procs (run-id native-go-build-carrick-60406-1785290124727652000-1) = 0\n"
+          },
+          "command": {
+            "argv": [
+              "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "run",
+              "--exec-backend",
+              "native",
+              "-e",
+              "CARRICK_RUN_ID=native-go-build-carrick-60406-1785290124727652000-1",
+              "-w",
+              "/tmp",
+              "localhost:5005/carrick-go-conformance:1.24",
+              "/bin/sh",
+              "-c",
+              "set -eu; cd /tmp; rm -rf \"gc-$CARRICK_RUN_ID\"; printf \"package main\\nfunc main(){println(\\\"ok\\\")}\\n\" > h.go; GOCACHE=\"/tmp/gc-$CARRICK_RUN_ID\" /usr/local/go/bin/go build -o h ./h.go; ./h; echo BUILD_OK"
+            ],
+            "build_ok": true,
+            "status": 0
+          },
+          "controlled_environment": {
+            "CARRICK_ARTIFACT": null,
+            "CARRICK_DISABLE_VDSO": null,
+            "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+            "CARRICK_DSR_ARTIFACT_REPORT": null,
+            "CARRICK_DSR_ARTIFACT_SPIKE": null,
+            "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+            "CARRICK_DSR_DIRECT_BINDINGS": null,
+            "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+            "CARRICK_DSR_PROFILE": null,
+            "CARRICK_DSR_SHARED_TRANSLATION": null,
+            "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+            "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+            "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+            "CARRICK_VDSO_MODE": null
+          },
+          "elapsed_ms": 19953,
+          "engine": "carrick",
+          "environment_overlay": {
+            "CARRICK_ARTIFACT": null,
+            "CARRICK_DISABLE_VDSO": null,
+            "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+            "CARRICK_DSR_ARTIFACT_REPORT": null,
+            "CARRICK_DSR_ARTIFACT_SPIKE": null,
+            "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+            "CARRICK_DSR_DIRECT_BINDINGS": null,
+            "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+            "CARRICK_DSR_PROFILE": null,
+            "CARRICK_DSR_SHARED_TRANSLATION": null,
+            "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+            "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+            "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+            "CARRICK_VDSO_MODE": null
+          },
+          "index": 1,
+          "provenance": {
+            "post": {
+              "binary_path": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+              "controlled_environment": {
+                "CARRICK_ARTIFACT": null,
+                "CARRICK_DISABLE_VDSO": null,
+                "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+                "CARRICK_DSR_ARTIFACT_REPORT": null,
+                "CARRICK_DSR_ARTIFACT_SPIKE": null,
+                "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+                "CARRICK_DSR_DIRECT_BINDINGS": null,
+                "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+                "CARRICK_DSR_PROFILE": null,
+                "CARRICK_DSR_SHARED_TRANSLATION": null,
+                "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+                "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+                "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+                "CARRICK_VDSO_MODE": null
+              },
+              "docker_oracles": [],
+              "engine": "carrick",
+              "foreign_processes": [],
+              "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+              "git_status": [],
+              "host": {
+                "machine": "arm64",
+                "node": "Timothys-Air-2.localdomain",
+                "platform": "macOS-27.0-arm64-arm-64bit-Mach-O"
+              },
+              "image": {
+                "architecture": "arm64",
+                "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+                "repo_digests": [
+                  "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+                ]
+              },
+              "image_ref": "localhost:5005/carrick-go-conformance:1.24"
+            },
+            "pre": {
+              "binary_path": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+              "controlled_environment": {
+                "CARRICK_ARTIFACT": null,
+                "CARRICK_DISABLE_VDSO": null,
+                "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+                "CARRICK_DSR_ARTIFACT_REPORT": null,
+                "CARRICK_DSR_ARTIFACT_SPIKE": null,
+                "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+                "CARRICK_DSR_DIRECT_BINDINGS": null,
+                "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+                "CARRICK_DSR_PROFILE": null,
+                "CARRICK_DSR_SHARED_TRANSLATION": null,
+                "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+                "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+                "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+                "CARRICK_VDSO_MODE": null
+              },
+              "docker_oracles": [],
+              "engine": "carrick",
+              "foreign_processes": [],
+              "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+              "git_status": [],
+              "host": {
+                "machine": "arm64",
+                "node": "Timothys-Air-2.localdomain",
+                "platform": "macOS-27.0-arm64-arm-64bit-Mach-O"
+              },
+              "image": {
+                "architecture": "arm64",
+                "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+                "repo_digests": [
+                  "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+                ]
+              },
+              "image_ref": "localhost:5005/carrick-go-conformance:1.24"
+            }
+          },
+          "return_code": 0,
+          "run_id": "native-go-build-carrick-60406-1785290124727652000-1",
+          "stderr": "ok\n",
+          "stderr_sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+          "stdout": "BUILD_OK\n",
+          "stdout_sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7"
+        },
+        {
+          "build_ok": true,
+          "cleanup": {
+            "status": 0,
+            "stderr": "",
+            "stdout": "remaining carrick procs (run-id native-go-build-carrick-60406-1785290145037487000-2) = 0\n"
+          },
+          "command": {
+            "argv": [
+              "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "run",
+              "--exec-backend",
+              "native",
+              "-e",
+              "CARRICK_RUN_ID=native-go-build-carrick-60406-1785290145037487000-2",
+              "-w",
+              "/tmp",
+              "localhost:5005/carrick-go-conformance:1.24",
+              "/bin/sh",
+              "-c",
+              "set -eu; cd /tmp; rm -rf \"gc-$CARRICK_RUN_ID\"; printf \"package main\\nfunc main(){println(\\\"ok\\\")}\\n\" > h.go; GOCACHE=\"/tmp/gc-$CARRICK_RUN_ID\" /usr/local/go/bin/go build -o h ./h.go; ./h; echo BUILD_OK"
+            ],
+            "build_ok": true,
+            "status": 0
+          },
+          "controlled_environment": {
+            "CARRICK_ARTIFACT": null,
+            "CARRICK_DISABLE_VDSO": null,
+            "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+            "CARRICK_DSR_ARTIFACT_REPORT": null,
+            "CARRICK_DSR_ARTIFACT_SPIKE": null,
+            "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+            "CARRICK_DSR_DIRECT_BINDINGS": null,
+            "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+            "CARRICK_DSR_PROFILE": null,
+            "CARRICK_DSR_SHARED_TRANSLATION": null,
+            "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+            "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+            "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+            "CARRICK_VDSO_MODE": null
+          },
+          "elapsed_ms": 19313,
+          "engine": "carrick",
+          "environment_overlay": {
+            "CARRICK_ARTIFACT": null,
+            "CARRICK_DISABLE_VDSO": null,
+            "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+            "CARRICK_DSR_ARTIFACT_REPORT": null,
+            "CARRICK_DSR_ARTIFACT_SPIKE": null,
+            "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+            "CARRICK_DSR_DIRECT_BINDINGS": null,
+            "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+            "CARRICK_DSR_PROFILE": null,
+            "CARRICK_DSR_SHARED_TRANSLATION": null,
+            "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+            "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+            "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+            "CARRICK_VDSO_MODE": null
+          },
+          "index": 2,
+          "provenance": {
+            "post": {
+              "binary_path": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+              "controlled_environment": {
+                "CARRICK_ARTIFACT": null,
+                "CARRICK_DISABLE_VDSO": null,
+                "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+                "CARRICK_DSR_ARTIFACT_REPORT": null,
+                "CARRICK_DSR_ARTIFACT_SPIKE": null,
+                "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+                "CARRICK_DSR_DIRECT_BINDINGS": null,
+                "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+                "CARRICK_DSR_PROFILE": null,
+                "CARRICK_DSR_SHARED_TRANSLATION": null,
+                "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+                "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+                "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+                "CARRICK_VDSO_MODE": null
+              },
+              "docker_oracles": [],
+              "engine": "carrick",
+              "foreign_processes": [],
+              "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+              "git_status": [],
+              "host": {
+                "machine": "arm64",
+                "node": "Timothys-Air-2.localdomain",
+                "platform": "macOS-27.0-arm64-arm-64bit-Mach-O"
+              },
+              "image": {
+                "architecture": "arm64",
+                "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+                "repo_digests": [
+                  "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+                ]
+              },
+              "image_ref": "localhost:5005/carrick-go-conformance:1.24"
+            },
+            "pre": {
+              "binary_path": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+              "controlled_environment": {
+                "CARRICK_ARTIFACT": null,
+                "CARRICK_DISABLE_VDSO": null,
+                "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+                "CARRICK_DSR_ARTIFACT_REPORT": null,
+                "CARRICK_DSR_ARTIFACT_SPIKE": null,
+                "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+                "CARRICK_DSR_DIRECT_BINDINGS": null,
+                "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+                "CARRICK_DSR_PROFILE": null,
+                "CARRICK_DSR_SHARED_TRANSLATION": null,
+                "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+                "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+                "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+                "CARRICK_VDSO_MODE": null
+              },
+              "docker_oracles": [],
+              "engine": "carrick",
+              "foreign_processes": [],
+              "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+              "git_status": [],
+              "host": {
+                "machine": "arm64",
+                "node": "Timothys-Air-2.localdomain",
+                "platform": "macOS-27.0-arm64-arm-64bit-Mach-O"
+              },
+              "image": {
+                "architecture": "arm64",
+                "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+                "repo_digests": [
+                  "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+                ]
+              },
+              "image_ref": "localhost:5005/carrick-go-conformance:1.24"
+            }
+          },
+          "return_code": 0,
+          "run_id": "native-go-build-carrick-60406-1785290145037487000-2",
+          "stderr": "ok\n",
+          "stderr_sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+          "stdout": "BUILD_OK\n",
+          "stdout_sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7"
+        },
+        {
+          "build_ok": true,
+          "cleanup": {
+            "status": 0,
+            "stderr": "",
+            "stdout": "remaining carrick procs (run-id native-go-build-carrick-60406-1785290164701522000-3) = 0\n"
+          },
+          "command": {
+            "argv": [
+              "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "run",
+              "--exec-backend",
+              "native",
+              "-e",
+              "CARRICK_RUN_ID=native-go-build-carrick-60406-1785290164701522000-3",
+              "-w",
+              "/tmp",
+              "localhost:5005/carrick-go-conformance:1.24",
+              "/bin/sh",
+              "-c",
+              "set -eu; cd /tmp; rm -rf \"gc-$CARRICK_RUN_ID\"; printf \"package main\\nfunc main(){println(\\\"ok\\\")}\\n\" > h.go; GOCACHE=\"/tmp/gc-$CARRICK_RUN_ID\" /usr/local/go/bin/go build -o h ./h.go; ./h; echo BUILD_OK"
+            ],
+            "build_ok": true,
+            "status": 0
+          },
+          "controlled_environment": {
+            "CARRICK_ARTIFACT": null,
+            "CARRICK_DISABLE_VDSO": null,
+            "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+            "CARRICK_DSR_ARTIFACT_REPORT": null,
+            "CARRICK_DSR_ARTIFACT_SPIKE": null,
+            "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+            "CARRICK_DSR_DIRECT_BINDINGS": null,
+            "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+            "CARRICK_DSR_PROFILE": null,
+            "CARRICK_DSR_SHARED_TRANSLATION": null,
+            "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+            "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+            "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+            "CARRICK_VDSO_MODE": null
+          },
+          "elapsed_ms": 19688,
+          "engine": "carrick",
+          "environment_overlay": {
+            "CARRICK_ARTIFACT": null,
+            "CARRICK_DISABLE_VDSO": null,
+            "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+            "CARRICK_DSR_ARTIFACT_REPORT": null,
+            "CARRICK_DSR_ARTIFACT_SPIKE": null,
+            "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+            "CARRICK_DSR_DIRECT_BINDINGS": null,
+            "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+            "CARRICK_DSR_PROFILE": null,
+            "CARRICK_DSR_SHARED_TRANSLATION": null,
+            "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+            "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+            "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+            "CARRICK_VDSO_MODE": null
+          },
+          "index": 3,
+          "provenance": {
+            "post": {
+              "binary_path": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+              "controlled_environment": {
+                "CARRICK_ARTIFACT": null,
+                "CARRICK_DISABLE_VDSO": null,
+                "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+                "CARRICK_DSR_ARTIFACT_REPORT": null,
+                "CARRICK_DSR_ARTIFACT_SPIKE": null,
+                "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+                "CARRICK_DSR_DIRECT_BINDINGS": null,
+                "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+                "CARRICK_DSR_PROFILE": null,
+                "CARRICK_DSR_SHARED_TRANSLATION": null,
+                "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+                "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+                "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+                "CARRICK_VDSO_MODE": null
+              },
+              "docker_oracles": [],
+              "engine": "carrick",
+              "foreign_processes": [],
+              "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+              "git_status": [],
+              "host": {
+                "machine": "arm64",
+                "node": "Timothys-Air-2.localdomain",
+                "platform": "macOS-27.0-arm64-arm-64bit-Mach-O"
+              },
+              "image": {
+                "architecture": "arm64",
+                "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+                "repo_digests": [
+                  "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+                ]
+              },
+              "image_ref": "localhost:5005/carrick-go-conformance:1.24"
+            },
+            "pre": {
+              "binary_path": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+              "controlled_environment": {
+                "CARRICK_ARTIFACT": null,
+                "CARRICK_DISABLE_VDSO": null,
+                "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+                "CARRICK_DSR_ARTIFACT_REPORT": null,
+                "CARRICK_DSR_ARTIFACT_SPIKE": null,
+                "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+                "CARRICK_DSR_DIRECT_BINDINGS": null,
+                "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+                "CARRICK_DSR_PROFILE": null,
+                "CARRICK_DSR_SHARED_TRANSLATION": null,
+                "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+                "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+                "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+                "CARRICK_VDSO_MODE": null
+              },
+              "docker_oracles": [],
+              "engine": "carrick",
+              "foreign_processes": [],
+              "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+              "git_status": [],
+              "host": {
+                "machine": "arm64",
+                "node": "Timothys-Air-2.localdomain",
+                "platform": "macOS-27.0-arm64-arm-64bit-Mach-O"
+              },
+              "image": {
+                "architecture": "arm64",
+                "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+                "repo_digests": [
+                  "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+                ]
+              },
+              "image_ref": "localhost:5005/carrick-go-conformance:1.24"
+            }
+          },
+          "return_code": 0,
+          "run_id": "native-go-build-carrick-60406-1785290164701522000-3",
+          "stderr": "ok\n",
+          "stderr_sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+          "stdout": "BUILD_OK\n",
+          "stdout_sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7"
+        },
+        {
+          "build_ok": true,
+          "cleanup": {
+            "status": 0,
+            "stderr": "",
+            "stdout": "remaining carrick procs (run-id native-go-build-carrick-60406-1785290184711268000-4) = 0\n"
+          },
+          "command": {
+            "argv": [
+              "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "run",
+              "--exec-backend",
+              "native",
+              "-e",
+              "CARRICK_RUN_ID=native-go-build-carrick-60406-1785290184711268000-4",
+              "-w",
+              "/tmp",
+              "localhost:5005/carrick-go-conformance:1.24",
+              "/bin/sh",
+              "-c",
+              "set -eu; cd /tmp; rm -rf \"gc-$CARRICK_RUN_ID\"; printf \"package main\\nfunc main(){println(\\\"ok\\\")}\\n\" > h.go; GOCACHE=\"/tmp/gc-$CARRICK_RUN_ID\" /usr/local/go/bin/go build -o h ./h.go; ./h; echo BUILD_OK"
+            ],
+            "build_ok": true,
+            "status": 0
+          },
+          "controlled_environment": {
+            "CARRICK_ARTIFACT": null,
+            "CARRICK_DISABLE_VDSO": null,
+            "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+            "CARRICK_DSR_ARTIFACT_REPORT": null,
+            "CARRICK_DSR_ARTIFACT_SPIKE": null,
+            "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+            "CARRICK_DSR_DIRECT_BINDINGS": null,
+            "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+            "CARRICK_DSR_PROFILE": null,
+            "CARRICK_DSR_SHARED_TRANSLATION": null,
+            "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+            "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+            "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+            "CARRICK_VDSO_MODE": null
+          },
+          "elapsed_ms": 19465,
+          "engine": "carrick",
+          "environment_overlay": {
+            "CARRICK_ARTIFACT": null,
+            "CARRICK_DISABLE_VDSO": null,
+            "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+            "CARRICK_DSR_ARTIFACT_REPORT": null,
+            "CARRICK_DSR_ARTIFACT_SPIKE": null,
+            "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+            "CARRICK_DSR_DIRECT_BINDINGS": null,
+            "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+            "CARRICK_DSR_PROFILE": null,
+            "CARRICK_DSR_SHARED_TRANSLATION": null,
+            "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+            "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+            "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+            "CARRICK_VDSO_MODE": null
+          },
+          "index": 4,
+          "provenance": {
+            "post": {
+              "binary_path": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+              "controlled_environment": {
+                "CARRICK_ARTIFACT": null,
+                "CARRICK_DISABLE_VDSO": null,
+                "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+                "CARRICK_DSR_ARTIFACT_REPORT": null,
+                "CARRICK_DSR_ARTIFACT_SPIKE": null,
+                "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+                "CARRICK_DSR_DIRECT_BINDINGS": null,
+                "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+                "CARRICK_DSR_PROFILE": null,
+                "CARRICK_DSR_SHARED_TRANSLATION": null,
+                "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+                "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+                "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+                "CARRICK_VDSO_MODE": null
+              },
+              "docker_oracles": [],
+              "engine": "carrick",
+              "foreign_processes": [],
+              "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+              "git_status": [],
+              "host": {
+                "machine": "arm64",
+                "node": "Timothys-Air-2.localdomain",
+                "platform": "macOS-27.0-arm64-arm-64bit-Mach-O"
+              },
+              "image": {
+                "architecture": "arm64",
+                "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+                "repo_digests": [
+                  "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+                ]
+              },
+              "image_ref": "localhost:5005/carrick-go-conformance:1.24"
+            },
+            "pre": {
+              "binary_path": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+              "controlled_environment": {
+                "CARRICK_ARTIFACT": null,
+                "CARRICK_DISABLE_VDSO": null,
+                "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+                "CARRICK_DSR_ARTIFACT_REPORT": null,
+                "CARRICK_DSR_ARTIFACT_SPIKE": null,
+                "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+                "CARRICK_DSR_DIRECT_BINDINGS": null,
+                "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+                "CARRICK_DSR_PROFILE": null,
+                "CARRICK_DSR_SHARED_TRANSLATION": null,
+                "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+                "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+                "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+                "CARRICK_VDSO_MODE": null
+              },
+              "docker_oracles": [],
+              "engine": "carrick",
+              "foreign_processes": [],
+              "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+              "git_status": [],
+              "host": {
+                "machine": "arm64",
+                "node": "Timothys-Air-2.localdomain",
+                "platform": "macOS-27.0-arm64-arm-64bit-Mach-O"
+              },
+              "image": {
+                "architecture": "arm64",
+                "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+                "repo_digests": [
+                  "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+                ]
+              },
+              "image_ref": "localhost:5005/carrick-go-conformance:1.24"
+            }
+          },
+          "return_code": 0,
+          "run_id": "native-go-build-carrick-60406-1785290184711268000-4",
+          "stderr": "ok\n",
+          "stderr_sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+          "stdout": "BUILD_OK\n",
+          "stdout_sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7"
+        },
+        {
+          "build_ok": true,
+          "cleanup": {
+            "status": 0,
+            "stderr": "",
+            "stdout": "remaining carrick procs (run-id native-go-build-carrick-60406-1785290204500495000-5) = 0\n"
+          },
+          "command": {
+            "argv": [
+              "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "run",
+              "--exec-backend",
+              "native",
+              "-e",
+              "CARRICK_RUN_ID=native-go-build-carrick-60406-1785290204500495000-5",
+              "-w",
+              "/tmp",
+              "localhost:5005/carrick-go-conformance:1.24",
+              "/bin/sh",
+              "-c",
+              "set -eu; cd /tmp; rm -rf \"gc-$CARRICK_RUN_ID\"; printf \"package main\\nfunc main(){println(\\\"ok\\\")}\\n\" > h.go; GOCACHE=\"/tmp/gc-$CARRICK_RUN_ID\" /usr/local/go/bin/go build -o h ./h.go; ./h; echo BUILD_OK"
+            ],
+            "build_ok": true,
+            "status": 0
+          },
+          "controlled_environment": {
+            "CARRICK_ARTIFACT": null,
+            "CARRICK_DISABLE_VDSO": null,
+            "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+            "CARRICK_DSR_ARTIFACT_REPORT": null,
+            "CARRICK_DSR_ARTIFACT_SPIKE": null,
+            "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+            "CARRICK_DSR_DIRECT_BINDINGS": null,
+            "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+            "CARRICK_DSR_PROFILE": null,
+            "CARRICK_DSR_SHARED_TRANSLATION": null,
+            "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+            "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+            "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+            "CARRICK_VDSO_MODE": null
+          },
+          "elapsed_ms": 19680,
+          "engine": "carrick",
+          "environment_overlay": {
+            "CARRICK_ARTIFACT": null,
+            "CARRICK_DISABLE_VDSO": null,
+            "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+            "CARRICK_DSR_ARTIFACT_REPORT": null,
+            "CARRICK_DSR_ARTIFACT_SPIKE": null,
+            "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+            "CARRICK_DSR_DIRECT_BINDINGS": null,
+            "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+            "CARRICK_DSR_PROFILE": null,
+            "CARRICK_DSR_SHARED_TRANSLATION": null,
+            "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+            "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+            "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+            "CARRICK_VDSO_MODE": null
+          },
+          "index": 5,
+          "provenance": {
+            "post": {
+              "binary_path": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+              "controlled_environment": {
+                "CARRICK_ARTIFACT": null,
+                "CARRICK_DISABLE_VDSO": null,
+                "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+                "CARRICK_DSR_ARTIFACT_REPORT": null,
+                "CARRICK_DSR_ARTIFACT_SPIKE": null,
+                "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+                "CARRICK_DSR_DIRECT_BINDINGS": null,
+                "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+                "CARRICK_DSR_PROFILE": null,
+                "CARRICK_DSR_SHARED_TRANSLATION": null,
+                "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+                "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+                "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+                "CARRICK_VDSO_MODE": null
+              },
+              "docker_oracles": [],
+              "engine": "carrick",
+              "foreign_processes": [],
+              "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+              "git_status": [],
+              "host": {
+                "machine": "arm64",
+                "node": "Timothys-Air-2.localdomain",
+                "platform": "macOS-27.0-arm64-arm-64bit-Mach-O"
+              },
+              "image": {
+                "architecture": "arm64",
+                "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+                "repo_digests": [
+                  "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+                ]
+              },
+              "image_ref": "localhost:5005/carrick-go-conformance:1.24"
+            },
+            "pre": {
+              "binary_path": "/Volumes/CaseSensitive/carrick/.worktrees/codex-native-aarch64-cache/target/release/carrick",
+              "binary_sha256": "16d9b92d11634892b8db8e8f5c79a83800ff4207c74bbe8e2ee9e419f60b9385",
+              "controlled_environment": {
+                "CARRICK_ARTIFACT": null,
+                "CARRICK_DISABLE_VDSO": null,
+                "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS": null,
+                "CARRICK_DSR_ARTIFACT_REPORT": null,
+                "CARRICK_DSR_ARTIFACT_SPIKE": null,
+                "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH": null,
+                "CARRICK_DSR_DIRECT_BINDINGS": null,
+                "CARRICK_DSR_KEEP_CONTAINER_CACHE": null,
+                "CARRICK_DSR_PROFILE": null,
+                "CARRICK_DSR_SHARED_TRANSLATION": null,
+                "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS": null,
+                "CARRICK_NATIVE_TRACE_SYSCALLS": null,
+                "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS": null,
+                "CARRICK_VDSO_MODE": null
+              },
+              "docker_oracles": [],
+              "engine": "carrick",
+              "foreign_processes": [],
+              "git_commit": "8ef69bb9e56359ba1e5aefe4a99b240fd9edb8f3",
+              "git_status": [],
+              "host": {
+                "machine": "arm64",
+                "node": "Timothys-Air-2.localdomain",
+                "platform": "macOS-27.0-arm64-arm-64bit-Mach-O"
+              },
+              "image": {
+                "architecture": "arm64",
+                "id": "sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6",
+                "repo_digests": [
+                  "localhost:5005/carrick-go-conformance@sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6"
+                ]
+              },
+              "image_ref": "localhost:5005/carrick-go-conformance:1.24"
+            }
+          },
+          "return_code": 0,
+          "run_id": "native-go-build-carrick-60406-1785290204500495000-5",
+          "stderr": "ok\n",
+          "stderr_sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+          "stdout": "BUILD_OK\n",
+          "stdout_sha256": "f1442cb880a74e4b1de1d178c5fd94b9f63149191c757d5cd429d653fead95f7"
+        }
+      ]
+    }
+  },
+  "schema": "carrick.native-go-build.v2",
+  "started_at": "2026-07-29T01:55:24.727402+00:00",
+  "variant": "default"
+}

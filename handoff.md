@@ -30,8 +30,10 @@ escapes, and errors retain the cap-std path. Five alternating untraced spike
 pairs moved the contemporaneous median **19,660 → 19,163 ms** (−497 ms,
 −2.53%); the candidate won 5/5 and every candidate sample beat every control.
 The user explicitly approved retaining durable filesystem improvements below
-the earlier conservative 3% screen. This is not official `C1` yet: five clean
-committed samples, native smoke, and `just ci` remain pending.
+the earlier conservative 3% screen. A subsequent clean committed five-sample
+campaign measured **19,680 ms** (19,953/19,313/19,688/19,465/19,680), 305 ms
+slower than frozen `C0=19,375 ms`; it is valid evidence but supplies **no
+official `C1` or ratio win**. Native smoke and `just ci` remain pending.
 
 The mechanism is independently live. Exact image-base-keyed `ustack(64)`
 attributed the pre-change host-open population to `lookup_kind` (35,235
