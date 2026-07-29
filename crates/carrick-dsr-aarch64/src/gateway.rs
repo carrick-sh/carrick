@@ -389,8 +389,10 @@ pub const fn exit_address_offset(kind: crate::artifact_spike::GatewayKind) -> u3
     }
 }
 
-#[cfg(not(test))]
 fn gateway_exit_addresses() -> [u64; 6] {
+    // Each getter is itself a `cfg(test)` placeholder in a crate test build
+    // (see the `exit_address!` note in `native_gateway`), so this stays [0; 6]
+    // there and carries the real addresses in a runtime build.
     [
         syscall_exit_address(),
         direct_exit_address(),
@@ -399,14 +401,6 @@ fn gateway_exit_addresses() -> [u64; 6] {
         unsupported_exit_address(),
         signal_exit_address(),
     ]
-}
-
-#[cfg(test)]
-fn gateway_exit_addresses() -> [u64; 6] {
-    // Standalone crate tests do not link the runtime C ABI helpers reached by
-    // the assembled gateway. Context-construction tests need only deterministic
-    // placeholders; runtime builds continue to install the real addresses.
-    [0; 6]
 }
 
 impl DsrContext {
@@ -616,29 +610,35 @@ mod native_gateway {
         fn carrick_dsr_exit_signal();
     }
 
-    pub fn syscall_exit_address() -> u64 {
-        carrick_dsr_exit_syscall as *const () as usize as u64
+    // The six exit labels are assembled into the SAME object as
+    // `carrick_dsr_enter_raw`, which calls the runtime's C ABI helpers
+    // (`carrick_native_dsr_enter_{guest,host}_abi`). Standalone crate tests do
+    // not link those helpers, so taking any one of these addresses drags the
+    // gateway object -- and its unresolvable calls -- into this crate's test
+    // binary. Placeholders under `cfg(test)` keep every caller reachable from a
+    // crate test linkable; runtime builds install the real addresses. This is
+    // the same substitution `gateway_exit_addresses` used to make on its own,
+    // now made once at the leaves so a test may call the getters directly.
+    macro_rules! exit_address {
+        ($name:ident, $symbol:ident) => {
+            #[cfg(not(test))]
+            pub fn $name() -> u64 {
+                $symbol as *const () as usize as u64
+            }
+
+            #[cfg(test)]
+            pub fn $name() -> u64 {
+                0
+            }
+        };
     }
 
-    pub fn direct_exit_address() -> u64 {
-        carrick_dsr_exit_direct as *const () as usize as u64
-    }
-
-    pub fn indirect_exit_address() -> u64 {
-        carrick_dsr_exit_indirect as *const () as usize as u64
-    }
-
-    pub fn sensitive_exit_address() -> u64 {
-        carrick_dsr_exit_sensitive as *const () as usize as u64
-    }
-
-    pub fn unsupported_exit_address() -> u64 {
-        carrick_dsr_exit_unsupported as *const () as usize as u64
-    }
-
-    pub fn signal_exit_address() -> u64 {
-        carrick_dsr_exit_signal as *const () as usize as u64
-    }
+    exit_address!(syscall_exit_address, carrick_dsr_exit_syscall);
+    exit_address!(direct_exit_address, carrick_dsr_exit_direct);
+    exit_address!(indirect_exit_address, carrick_dsr_exit_indirect);
+    exit_address!(sensitive_exit_address, carrick_dsr_exit_sensitive);
+    exit_address!(unsupported_exit_address, carrick_dsr_exit_unsupported);
+    exit_address!(signal_exit_address, carrick_dsr_exit_signal);
 
     pub fn enter_translated(
         entry: CacheVa,
