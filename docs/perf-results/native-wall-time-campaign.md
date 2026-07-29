@@ -110,7 +110,7 @@ bounded implementation spike, not yet a retained wall win.
 | E023 | `target/perf/oracle-fs-syscalls-v1/{oracle.raw,workload.log}` plus `docs/perf-results/native-fs-amplification.jsonl` | accepted Docker-only diagnostic | Native-arm64 Linux `bpftrace` process-tree census completes `BUILD_OK`; mutation counts closely match Carrick guest counts, proving the 35.8x host `openat` / 249.7x host `unlinkat` excess is Carrick amplification |
 | E024 | `target/perf/fs-open-spike/` plus `docs/perf-results/native-fs-amplification.jsonl` | rejected implementation spike | Five controls median 20.95 s versus candidate 20.80 s (0.7%); the candidate won 1/5 pairs. A typed mechanism trace confirms real but insufficient movement: joined host opens fell 24.0%, leaving 24.7 host opens per guest open |
 | E025 | `target/perf/native-openat-callers-v1/b.raw` plus `docs/perf-results/native-fs-amplification.jsonl` | accepted diagnostic | Exact image-base-keyed `ustack(64)` accounts for 80.3% of call count in the top 128 stacks; `lookup_kind`, `open_raw_fd`, `read_link`, and `resolve_following` are the dominant Carrick semantic frames |
-| E026 | `564dd281`, `target/perf/lookup-kind-spike/`, and `docs/perf-results/native-fs-amplification.jsonl` | retained implementation; clean closeout pending | Five controls median 19.660 s versus candidate 19.163 s (−2.53%), candidate wins 5/5 with non-overlapping populations and one-sided 95% bootstrap ratio 0.9885; joined host opens fall 41.4% to 19.68 per guest open |
+| E026 | `564dd281`, `target/perf/lookup-kind-spike/`, and `docs/perf-results/native-fs-amplification.jsonl` | retained implementation; no official `C1` win | Five controls median 19.660 s versus candidate 19.163 s (−2.53%), candidate wins 5/5 with non-overlapping populations and one-sided 95% bootstrap ratio 0.9885; joined host opens fall 41.4% to 19.68 per guest open. A separate clean committed campaign median is 19.680 s, 305 ms slower than frozen `C0`, so it supplies no official ratio progress |
 
 ### H005a rejection and filesystem syscall reframe
 
@@ -738,7 +738,7 @@ Status values: `PROPOSED`, `SPIKING`, `RETAIN`, `REJECT`, `DEFER`.
 | H003 | PROPOSED | Older profile assigned CPU to repeated capsule setup | stale sample | Refresh process-lifetime share and critical-path overlap; reuse only the dominant durable input | Current share is small/non-critical or two variants fail |
 | H004 | REJECT | Authority caching leaves at least 17.16M bounded direct misses, led by one conditional fall-through edge at 1.47M | signed Variant 1 feasibility exhausts the 64 MiB DSR translation cache before `BUILD_OK` | Compact per-edge mutable binding cells were the bounded proof; the mechanism pair was not run | Rejected at feasibility; no cache increase, sidecar tuning, or Task 16 is authorized |
 | H005 | DEFER | Private futex owns 50.4% of blocked thread-time but only 0.069% of sampled total CPU | 58/84,037 sampled CPU ticks | Revisit only if critical-path evidence shows waking earlier removes runnable work | Filesystem work currently has materially larger measured CPU share |
-| H006 | RETAIN | Exact caller stacks assigned 33.3% of joined opens to `lookup_kind` and another 10.8% to unconditional `read_link` | retained candidate: 46,493 joined host opens / 2,363 guest opens; 19.163 s median | Keep descriptor-contained lookup-kind and no-follow metadata with cap-std fallback; finish clean closeout | Revert only for correctness failure or if clean five-sample replication loses the wall improvement |
+| H006 | RETAIN | Exact caller stacks assigned 33.3% of joined opens to `lookup_kind` and another 10.8% to unconditional `read_link` | paired candidate: 46,493 joined host opens / 2,363 guest opens; 19.163 s median. Clean isolated median 19.680 s does not beat `C0` | Keep descriptor-contained lookup-kind and no-follow metadata with cap-std fallback; finish correctness closeout but claim no official `C1` win | Revert only for correctness failure or a future contemporaneous paired regression; isolated baseline drift does not override the 5/5 paired result and explicit retain direction |
 | H007 | SPIKING | The retained path still drives 19.68 host opens per guest open; pre-change stacks ranked `resolve_following` and terminal open next | post-change caller census pending | Re-census exact Carrick frames, then carry one contained descriptor/metadata authority bundle through ordinary open dispatch if resolver/final-open rewalks still dominate | No remaining stable dominant rewalk, or the bounded combined primitive fails mechanism and wall screens; then pivot to Carrick-only teardown unlink amplification |
 
 The table order is provisional until E005 and E006 exist.
@@ -786,7 +786,7 @@ to `PROPOSED`.
 | Task 15 live retry at `ece8c497` | 162 AArch64 DSR + 31 native-Darwin + 10 focused runtime tests green; format clean | rejected: DSR cache exhaustion, no `BUILD_OK` or JSON | not run | not run | not run | H004 Variant 1 rejected at feasibility; mechanism unrun |
 | Task 4 kernel capture at `7ec846a5` | 34 profile unit + 6 integration + 17 attribution + 43 capture tests green; Python compile and format clean | rejected before guest: auto-sudo trace framing parsed the repeated binary as a subcommand | not run | not run | exit 101 on three pre-existing untouched Clippy findings; not waived for retention | `MEASUREMENT_REPAIR_REQUIRED`; A rejected, B/analysis absent |
 | Task 6 kernel capture at `3fb91b09` | Task 5: 45 capture + 17 attribution tests green; independent review clean | rejected during Go compile: 64 MiB DSR cache exhausted, zero `BUILD_OK` | not run | not run | not rerun for evidence-only Task 6 | `MEASUREMENT_REPAIR_REQUIRED`; A partial profile preserved, B/analysis absent |
-| H006 contained metadata at `564dd281` | four focused filesystem tests green; serialized runtime suite 1,110 passed and one unrelated probabilistic DSR landing-coverage test failed | ten paired spike samples printed `BUILD_OK` with zero cleanup failures | pending | pending | pending | retained implementation; official clean `C1` and closeout remain unproved |
+| H006 contained metadata at `564dd281` | four focused filesystem tests green; serialized runtime suite 1,110 passed and one unrelated probabilistic DSR landing-coverage test failed | ten paired spike samples and five clean committed samples printed `BUILD_OK` with zero cleanup failures | pending | pending | pending | retained implementation; clean median 19.680 s supplies no official `C1` win; smoke and CI remain |
 
 ## Decisions
 
@@ -871,8 +871,9 @@ Write and validate the executable M1 plan:
       amplification using a serial native-arm64 Docker syscall census.
 - [x] Attribute joined host opens to exact Carrick callers at a synchronous
       syscall boundary and retain the contained lookup/no-follow wave.
-- [ ] Publish five clean committed candidate samples and close signed runtime,
-      native smoke, and `just ci` gates for `564dd281`.
+- [x] Publish five clean committed candidate samples; record the valid
+      19,680 ms median as no official `C1` win.
+- [ ] Close native smoke and `just ci` gates for `564dd281`.
 - [ ] Re-census post-change open callers and spike H007 only if one remaining
       resolver/final-open rewalk family is still dominant.
 - [ ] Restore at least 95% symbolized kernel-leaf coverage before any future
