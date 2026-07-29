@@ -22,6 +22,34 @@ CPU-overhead convention. The continuation on
 from **21,786 ms to 19,485 ms** (−10.56%). This is meaningful progress, but it
 is not close to the 2x destination and must not be presented as completion.
 
+The current implementation tip is `564dd281`. It retains the first
+syscall-reframe filesystem wave: ordinary Darwin host-backed `lookup_kind` and
+no-follow metadata probes use one descriptor-contained open plus `F_GETPATH`
+and exact-name validation, while symlinks, non-regular host types, aliases,
+escapes, and errors retain the cap-std path. Five alternating untraced spike
+pairs moved the contemporaneous median **19,660 → 19,163 ms** (−497 ms,
+−2.53%); the candidate won 5/5 and every candidate sample beat every control.
+The user explicitly approved retaining durable filesystem improvements below
+the earlier conservative 3% screen. This is not official `C1` yet: five clean
+committed samples, native smoke, and `just ci` remain pending.
+
+The mechanism is independently live. Exact image-base-keyed `ustack(64)`
+attributed the pre-change host-open population to `lookup_kind` (35,235
+calls), `open_raw_fd` (12,877), `read_link` (11,435), and
+`resolve_following` (9,944). The retained wave reduced guest-open-driven Darwin
+`openat` **79,282 → 46,493** (−41.4%), total host opens **116,925 → 83,290**
+(−28.8%), and amplification **31.45 → 19.68** opens per guest open. Durable
+evidence and decisions live in
+`docs/perf-results/native-fs-amplification.jsonl` and
+`docs/perf-results/native-wall-time-campaign.md`.
+
+The next hypothesis is H007: ordinary opens still recompute the same path
+authority through resolver and final-open work. First re-run the exact caller
+census on `564dd281`; only if `resolve_following`/final-open rewalks dominate,
+spike one combined contained descriptor/metadata bundle through open dispatch.
+If they do not dominate, pivot to the measured Carrick-only teardown
+`unlinkat` population instead of forcing the hypothesis.
+
 The earlier fusion/gateway work is on `main`; the continuation is committed on
 the branch named above. The last-known pre-sidecar checkpoint had a green
 `just ci` and clean `just conformance-native smoke --workers 4` (including
@@ -41,11 +69,14 @@ to 1,367 ms, producing a 15.3658x ratio that must not be attributed to the
 code change. Evidence:
 `scripts/perf/evidence/native-go-build-wall-compact-exits-v1.json`.
 
-The remaining measurement blocker is live kernel symbolization. The preserved
-v2 partial profile reconciles 9,610 raw kernel PCs/stacks but omitted the
-current boot runtime slide and has zero symbolized leaves. The public Apple
-libdtrace object/symbol APIs are available; implement post-stop,
-pre-handle-close deep-copy symbolization before authorizing a new capture.
+Broad sampled-kernel attribution still has a live-symbolization blocker. The
+preserved v2 partial profile reconciles 9,610 raw kernel PCs/stacks but omitted
+the current boot runtime slide and has zero symbolized leaves. That no longer
+blocks the syscall-reframe loop: synchronous Darwin syscall boundaries restore
+the Carrick host stack, and exact image-base-keyed `ustack(64)` resolved the
+dominant host callers. Restore post-stop, pre-handle-close deep-copy
+symbolization before any future broad kernel capture, but do not pause H007 on
+it.
 
 The current branch includes repair `7cebf638` for Task 15's runtime-oracle
 metadata compile failure. A clean retry at `8d440b61` passed the two native
