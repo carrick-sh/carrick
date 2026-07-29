@@ -1817,6 +1817,37 @@ impl HostFsBackend {
             .map(|(_fd, st, kind)| (st, kind))
     }
 
+    /// Build guest-facing metadata from the already-contained fd fast path.
+    ///
+    /// This is deliberately limited to the regular-file/directory shapes
+    /// accepted by `fast_open_contained`. A symlink, non-regular host file
+    /// type, Unicode alias, or escape returns `None` so callers retain the
+    /// exact cap-std fallback instead of broadening the fast path's semantics.
+    #[cfg(target_os = "macos")]
+    fn fast_metadata_contained(&self, normalized: &Path, rel: &Path) -> Option<RootFsMetadata> {
+        use std::os::fd::AsRawFd;
+
+        let (fd, st, kind) = self.fast_open_contained(rel, false)?;
+        if !self.name_matches_on_disk(rel) {
+            return None;
+        }
+        let is_dir = kind == RootFsEntryKind::Directory;
+        let (override_mode, _uid, _gid, is_socket) = fd_carrick_meta(fd.as_raw_fd());
+        let kind = if !is_dir && is_socket {
+            RootFsEntryKind::Socket
+        } else {
+            kind
+        };
+        let on_disk = st.st_mode as u32 & 0o7777;
+        let default = if is_dir { 0o755 } else { 0o644 };
+        Some(RootFsMetadata {
+            path: normalized.to_path_buf(),
+            kind,
+            mode: override_mode.unwrap_or(if on_disk == 0 { default } else { on_disk }),
+            size: if is_dir { 0 } else { st.st_size as usize },
+        })
+    }
+
     #[cfg(target_os = "macos")]
     fn fast_real_stat(&self, normalized: &Path, follow: bool) -> Option<RealStat> {
         use std::os::fd::AsRawFd;
@@ -3034,6 +3065,25 @@ impl FsBackend for HostFsBackend {
             return Some(OverlayEntryKind::Dir);
         }
         let rel = Self::rel_path(&normalized)?;
+        // `lookup_kind` is the first overlay probe in every ordinary
+        // `open_for_dispatch`. On Darwin, cap-std's `symlink_metadata` walks
+        // each component with multiple `openat` calls; the cold-Go workload
+        // measured 35,235 host opens in this function alone. Use the same
+        // one-open + F_GETPATH containment path as `lookup`/`metadata` for the
+        // common regular-file and directory cases. Symlinks, non-regular host
+        // file types, Unicode aliases, and escapes return `None` from the fast
+        // helper and retain the cap-std path below.
+        #[cfg(target_os = "macos")]
+        if let Some((_, kind)) = self.fast_lstat_contained(rel, false) {
+            if !self.name_matches_on_disk(rel) {
+                return None;
+            }
+            return match kind {
+                RootFsEntryKind::Directory => Some(OverlayEntryKind::Dir),
+                RootFsEntryKind::File => Some(OverlayEntryKind::File),
+                _ => None,
+            };
+        }
         let (dir, at_rel) = self.at(rel).ok()?;
         let meta = dir.symlink_metadata(&at_rel).ok()?;
         // Reject a host-aliased (Unicode-normalized) name (see `lookup`).
@@ -3062,6 +3112,28 @@ impl FsBackend for HostFsBackend {
         None
     }
 
+    fn fast_nofollow_metadata(&self, path: &str) -> Option<RootFsMetadata> {
+        let normalized = normalize(path)?;
+        if normalized.as_os_str().is_empty() {
+            return Some(RootFsMetadata {
+                path: std::path::Path::new("/").to_path_buf(),
+                kind: RootFsEntryKind::Directory,
+                mode: 0o755,
+                size: 0,
+            });
+        }
+        let rel = Self::rel_path(&normalized)?;
+        #[cfg(target_os = "macos")]
+        {
+            self.fast_metadata_contained(&normalized, rel)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = rel;
+            None
+        }
+    }
+
     fn metadata(&self, path: &str) -> Option<RootFsMetadata> {
         let normalized = normalize(path)?;
         // The sandbox root ("/") is always a directory. rel_path refuses
@@ -3083,26 +3155,8 @@ impl FsBackend for HostFsBackend {
         // FIFOs fall through to cap-std below. macOS-only (the non-macOS fast
         // path is a no-op), so the fd-centric core is used directly.
         #[cfg(target_os = "macos")]
-        if let Some((fd, st, kind)) = self.fast_open_contained(rel, false) {
-            use std::os::fd::AsRawFd;
-            if !self.name_matches_on_disk(rel) {
-                return None;
-            }
-            let is_dir = kind == RootFsEntryKind::Directory;
-            let (override_mode, _uid, _gid, is_socket) = fd_carrick_meta(fd.as_raw_fd());
-            let kind = if !is_dir && is_socket {
-                RootFsEntryKind::Socket
-            } else {
-                kind
-            };
-            let on_disk = st.st_mode as u32 & 0o7777;
-            let default = if is_dir { 0o755 } else { 0o644 };
-            return Some(RootFsMetadata {
-                path: normalized,
-                kind,
-                mode: override_mode.unwrap_or(if on_disk == 0 { default } else { on_disk }),
-                size: if is_dir { 0 } else { st.st_size as usize },
-            });
+        if let Some(metadata) = self.fast_metadata_contained(&normalized, rel) {
+            return Some(metadata);
         }
         let (dir, at_rel) = self.at(rel).ok()?;
         let meta = dir.symlink_metadata(&at_rel).ok()?;
@@ -5353,6 +5407,37 @@ mod tests {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         assert_eq!(flags & libc::O_ACCMODE, libc::O_RDWR);
         unsafe { libc::close(fd) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_lookup_kind_fast_cases_preserve_symlink_fallback() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        std::fs::write(scratch.path().join("file"), b"x").unwrap();
+        std::fs::create_dir(scratch.path().join("dir")).unwrap();
+        std::os::unix::fs::symlink("file", scratch.path().join("link")).unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .unwrap();
+        let b = HostFsBackend::from_existing_dir(dir);
+
+        assert_eq!(b.lookup_kind("/file"), Some(OverlayEntryKind::File));
+        assert_eq!(b.lookup_kind("/dir"), Some(OverlayEntryKind::Dir));
+        assert_eq!(b.lookup_kind("/link"), Some(OverlayEntryKind::File));
+        assert_eq!(b.lookup_kind("/missing"), None);
+        assert_eq!(b.lookup_kind("/../file"), None);
+        assert_eq!(
+            b.fast_nofollow_metadata("/file").map(|md| md.kind),
+            Some(RootFsEntryKind::File)
+        );
+        assert_eq!(
+            b.fast_nofollow_metadata("/dir").map(|md| md.kind),
+            Some(RootFsEntryKind::Directory)
+        );
+        assert_eq!(
+            b.fast_nofollow_metadata("/link"),
+            None,
+            "leaf symlinks must retain the exact readlink/lstat fallback"
+        );
     }
 
     #[cfg(target_os = "macos")]
