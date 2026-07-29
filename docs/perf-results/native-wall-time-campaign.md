@@ -951,13 +951,40 @@ Write and validate the executable M1 plan:
       (host FAR `0x4ff…` = two biases), and reported after one bias
       subtraction. Some interrupt/fault window in the compact writeback
       sequence commits the biased scratch without the un-bias.
-- [ ] Build the deterministic reproducer BEFORE any fix: a compact
-      post-index kick sweep modeled on `live_biased_exclusive_kick_sweep`
-      (self-linked memclr loop, jittered SIGPIPE sender, per-word landing
-      coverage, exact base-progression and memory assertions), shown red;
-      then fix the recovery/commit window and show it green. No wall
-      screen until then. `/tmp/carrick-a104` holds the selection-only
-      comparison build.
+- [x] Build the deterministic reproducers (`d131ac92`). Three instruments
+      now bound the defect, and ALL are green at both biases, so the leak
+      is NOT in any of them: (a) the recovery matrix extended to the
+      aperture-disjoint bias and to post-index PAIR shapes, fault-injected
+      at every recovery point; (b) a chained-writeback test in `duffcopy`'s
+      exact shape, where each compact access borrows the other's live
+      pointer as scratch (`ldp ... [x16]` takes x17, `stp ... [x17]` takes
+      x16), which recovers, un-patches, resumes and requires byte-identical
+      final state; (c) a live jittered-SIGPIPE sweep over a megabyte walk
+      asserting no bias bits in any register, exact 16-byte stride, and a
+      zeroed-prefix/untouched-suffix split exactly at the base — 360 live
+      landings.
+- [x] Capture the defect in production. Two independent faults show a HOST
+      address in a guest base register (`x0` = bias + `0x6d0dd0`; `x20` =
+      bias + `0xa048095dc0`), both reported through the tagged slow path
+      with `host_far == slot1200 | (1<<47)` — the window check is the
+      DETECTOR, not the defect, and both victims are consumers
+      (`commit_base: false`), not the producer.
+- [ ] The crash is LOAD-DEPENDENT and that is now the main lever on it.
+      An unloaded same-binary A/B (`CARRICK_DSR_COMPACT_BIASED=1` vs `0`,
+      identical bias and layout) produced zero crashes in either arm over
+      24 runs, against ~14% (3/22) observed earlier while the machine was
+      compiling. Re-run that A/B under injected load — it is the only
+      experiment that separates the compact emission from the bias
+      selection, and the earlier tip-vs-`a104aff1` comparison cannot,
+      both because it changes both things and because 0/12 carries a ~21%
+      chance of missing a 14% rate.
+- [ ] Leading hypothesis after the above: an asynchronous kick landing in
+      the compact commit window. The core never reported an interrupted PC
+      on the commit window's arithmetic words across 360 live landings, so
+      that window is exercised only through the matrix's SYNTHESIZED kick
+      exit, never a real gateway capture — the one coverage gap the
+      instruments leave. Mitigation available now:
+      `CARRICK_DSR_COMPACT_BIASED=0`.
 - [ ] Extend the compact form to register-offset addressing (opcode
       rewrite to the imm-0 counterpart) and negative immediates (underflow
       window fault conversion) — the census shows compact applied but
