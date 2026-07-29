@@ -49,14 +49,23 @@ struct BiasedTranslatorFixture {
 }
 
 fn biased_translator_fixture(words: &[u32], guest_code: GuestVa) -> BiasedTranslatorFixture {
-    const BIAS: u64 = 0x80_0000_0000;
+    biased_translator_fixture_with(0x80_0000_0000, 16 * 1024, words, guest_code)
+}
+
+fn biased_translator_fixture_with(
+    bias: u64,
+    data_len: u64,
+    words: &[u32],
+    guest_code: GuestVa,
+) -> BiasedTranslatorFixture {
     const PAGE_SIZE: u64 = 16 * 1024;
-    const MAPPING_LEN: usize = 2 * PAGE_SIZE as usize;
-    let host_bias = crate::native_darwin::address::NativeHostBias::new(BIAS, PAGE_SIZE)
+    assert_eq!(data_len % PAGE_SIZE, 0, "fixture data length is page-sized");
+    let mapping_len = usize::try_from(PAGE_SIZE + data_len).expect("fixture mapping length");
+    let host_bias = crate::native_darwin::address::NativeHostBias::new(bias, PAGE_SIZE)
         .expect("construct live biased host bias");
     let mapping = crate::native_darwin::address::OwnedHostMapping::map_exact(
-        HostVa((BIAS + guest_code.raw()) as usize),
-        MAPPING_LEN,
+        HostVa((bias + guest_code.raw()) as usize),
+        mapping_len,
         libc::PROT_READ | libc::PROT_WRITE,
         libc::MAP_ANON | libc::MAP_PRIVATE,
     )
@@ -92,7 +101,7 @@ fn biased_translator_fixture(words: &[u32], guest_code: GuestVa) -> BiasedTransl
             },
             super::super::NativeMappedRegion {
                 start: guest_data.raw(),
-                end: guest_data.raw() + PAGE_SIZE,
+                end: guest_data.raw() + data_len,
                 host_protects: false,
                 shared_futex: false,
                 guest_writable: true,
@@ -255,6 +264,12 @@ fn biased_wrapped_negative_literal_fault_reports_guest_address() {
 enum BiasedRecoveryMatrixShape {
     ScalarPre,
     ScalarPost,
+    /// `stp xzr, xzr, [x1], #16` — the post-index PAIR writeback Go's
+    /// `duffcopy`/memclr runs and the production compact-lowering crash
+    /// faulted in.
+    PairStorePost,
+    /// `ldp x2, x3, [x1], #16` — its load counterpart.
+    PairLoadPost,
     Literal,
     VirtualX18,
     VirtualX28,
@@ -266,6 +281,8 @@ impl BiasedRecoveryMatrixShape {
         match self {
             Self::ScalarPre => vec![0xf81f_8c20, 0xd400_0001],
             Self::ScalarPost => vec![0xf840_8420, 0xd400_0001],
+            Self::PairStorePost => vec![0xa881_7c3f, 0xd400_0001],
+            Self::PairLoadPost => vec![0xa8c1_0c22, 0xd400_0001],
             Self::Literal => vec![0x5800_0040, 0xd400_0001, 0x5566_7788, 0x1122_3344],
             Self::VirtualX18 => vec![0xf940_0240, 0xd400_0001],
             Self::VirtualX28 => vec![0xf940_0380, 0xd400_0001],
@@ -284,6 +301,13 @@ impl BiasedRecoveryMatrixShape {
             }
             Self::ScalarPost => {
                 unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
+                snapshot.x[1] = fixture.guest_data.raw();
+            }
+            Self::PairStorePost | Self::PairLoadPost => {
+                unsafe {
+                    *(fixture.data_host.raw() as *mut u64) = VALUE;
+                    *((fixture.data_host.raw() + 8) as *mut u64) = INITIAL;
+                }
                 snapshot.x[1] = fixture.guest_data.raw();
             }
             Self::Literal => {}
@@ -307,9 +331,23 @@ impl BiasedRecoveryMatrixShape {
 #[test]
 fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
     let _signal_oracle = install_signal_handlers_for_oracle();
+    // The sub-aperture bias exercises the general lowering; the
+    // aperture-disjoint bias exercises the compact ORR lowering. Live kicks
+    // never land on the compact commit window (the core reports interrupted
+    // PCs at the sequence's memory words, not its arithmetic), so this
+    // deterministic per-recovery-point fault injection is the only instrument
+    // that covers the un-bias commit.
+    for bias in [0x80_0000_0000_u64, 0x200_0000_0000] {
+        biased_recovery_matrix_at(bias);
+    }
+}
+
+fn biased_recovery_matrix_at(bias: u64) {
     let shapes = [
         BiasedRecoveryMatrixShape::ScalarPre,
         BiasedRecoveryMatrixShape::ScalarPost,
+        BiasedRecoveryMatrixShape::PairStorePost,
+        BiasedRecoveryMatrixShape::PairLoadPost,
         BiasedRecoveryMatrixShape::Literal,
         BiasedRecoveryMatrixShape::VirtualX18,
         BiasedRecoveryMatrixShape::VirtualX28,
@@ -318,7 +356,8 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
     for (shape_index, shape) in shapes.into_iter().enumerate() {
         let guest_code = GuestVa(0x20_0010_0000 + shape_index as u64 * 0x10_0000);
         let expected = {
-            let mut fixture = biased_translator_fixture(&shape.words(), guest_code);
+            let mut fixture =
+                biased_translator_fixture_with(bias, 16 * 1024, &shape.words(), guest_code);
             let mut stack = vec![0_u8; 16 * 1024];
             let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
             snapshot.pc = guest_code.raw();
@@ -343,7 +382,8 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
         };
 
         let recovery_count = {
-            let mut fixture = biased_translator_fixture(&shape.words(), guest_code);
+            let mut fixture =
+                biased_translator_fixture_with(bias, 16 * 1024, &shape.words(), guest_code);
             let mut stack = vec![0_u8; 16 * 1024];
             let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
             snapshot.pc = guest_code.raw();
@@ -357,12 +397,14 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
                 .recovery_points_for_test(guest_code)
                 .len()
         };
-        assert!(recovery_count > 0, "shape={shape:?}");
+        assert!(recovery_count > 0, "bias=0x{bias:x} shape={shape:?}");
 
         let mut skipped_invalid_publication = false;
         let mut skipped_invalid_tag = false;
+        let mut skipped_compact_slow_address = false;
         for point_index in 0..recovery_count {
-            let mut fixture = biased_translator_fixture(&shape.words(), guest_code);
+            let mut fixture =
+                biased_translator_fixture_with(bias, 16 * 1024, &shape.words(), guest_code);
             let mut stack = vec![0_u8; 16 * 1024];
             let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
             snapshot.pc = guest_code.raw();
@@ -402,16 +444,26 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
             else {
                 assert!(
                     matches!(fault_exit, super::types::NativeDsrExit::Syscall { .. }),
-                    "shape={shape:?} point={point_index} expected fault or an audited skipped invalid-path instruction, got {fault_exit:?}"
+                    "bias=0x{bias:x} shape={shape:?} point={point_index} expected fault or an audited skipped invalid-path instruction, got {fault_exit:?}"
                 );
                 let publication_store = 0xf900_0000 | ((1200 / 8) << 10) | (28 << 5);
+                // The compact lowering computes the guest effective address
+                // for fault reporting INSIDE its slow path, so an in-window
+                // base leaves those words unexecuted too. The general lowering
+                // computes it before the window check, so it has no such word
+                // and the assertion below keeps this leniency off that path.
+                let compact_slow_address = original_word & 0xffe0_03ff == 0xaa00_03f2
+                    || original_word & 0xff80_001f == 0x9100_0012
+                    || original_word & 0xff80_001f == 0x9140_0012;
                 if original_word & !0x1f == publication_store {
                     skipped_invalid_publication = true;
                 } else if original_word & !0x3ff == 0xb251_0000 {
                     skipped_invalid_tag = true;
+                } else if compact_slow_address || original_word == 0x1400_0002 {
+                    skipped_compact_slow_address = true;
                 } else {
                     panic!(
-                        "shape={shape:?} point={point_index} unexpectedly skipped word 0x{original_word:08x}"
+                        "bias=0x{bias:x} shape={shape:?} point={point_index} unexpectedly skipped word 0x{original_word:08x}"
                     );
                 }
                 continue;
@@ -459,15 +511,15 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
                 assert_eq!(
                     recovered.pc,
                     guest_code.raw() + if completed { 4 } else { 0 },
-                    "shape={shape:?} point={point_index} kind={kind} PC"
+                    "bias=0x{bias:x} shape={shape:?} point={point_index} kind={kind} PC"
                 );
                 assert_eq!(
                     recovered.x, expected_snapshot.x,
-                    "shape={shape:?} point={point_index} kind={kind} registers"
+                    "bias=0x{bias:x} shape={shape:?} point={point_index} kind={kind} registers"
                 );
                 assert_eq!(
                     recovered.sp, original_sp,
-                    "shape={shape:?} point={point_index} kind={kind} SP"
+                    "bias=0x{bias:x} shape={shape:?} point={point_index} kind={kind} SP"
                 );
             }
             let observed_data = unsafe { *(fixture.data_host.raw() as *const u64) };
@@ -479,18 +531,23 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
                     } else {
                         0xaabb_ccdd_eeff_0011
                     },
-                    "shape={shape:?} point={point_index} store completion"
+                    "bias=0x{bias:x} shape={shape:?} point={point_index} store completion"
                 );
             }
         }
+        assert!(
+            !skipped_compact_slow_address || bias & (0x200_0000_0000 - 1) == 0,
+            "bias=0x{bias:x} shape={shape:?} general lowering must not skip a \
+             compact slow-path word"
+        );
         let has_checked_nonliteral_address = !matches!(shape, BiasedRecoveryMatrixShape::Literal);
         assert_eq!(
             skipped_invalid_publication, has_checked_nonliteral_address,
-            "shape={shape:?} invalid-address publication path"
+            "bias=0x{bias:x} shape={shape:?} invalid-address publication path"
         );
         assert_eq!(
             skipped_invalid_tag, has_checked_nonliteral_address,
-            "shape={shape:?} invalid-host tagging path"
+            "bias=0x{bias:x} shape={shape:?} invalid-host tagging path"
         );
     }
 }
@@ -6274,6 +6331,681 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
         observed_instruction_bound <= 100_000,
         "kick required more than 100000 translated instructions from request to exit: \
          observed upper bound {observed_instruction_bound}"
+    );
+}
+
+/// duffcopy's shape: two chained post-index pair accesses whose scratch
+/// registers are each other's LIVE base pointers.
+///
+///   ldp x2, x3, [x16], #16
+///   stp x2, x3, [x17], #16
+///
+/// Compact scratch selection picks the first GPR the instruction does not
+/// mention, so instruction 1 borrows `x17` — instruction 2's destination
+/// pointer — and instruction 2 borrows `x16`. Any interruption window that
+/// fails to restore the borrowed register leaves a HOST address in the other
+/// pointer, which is exactly the shape the production crash reported. This
+/// injects a fault at every recovery point of both instructions, recovers,
+/// restores the patched word, resumes, and requires the run to finish with
+/// byte-identical state.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn compact_chained_writeback_scratch_survives_every_recovery_point() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    for bias in [0x80_0000_0000_u64, 0x200_0000_0000] {
+        chained_writeback_recovery_at(bias);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn chained_writeback_recovery_at(bias: u64) {
+    const LDP_X2_X3_X16_POST16: u32 = 0xa8c1_0e02;
+    const STP_X2_X3_X17_POST16: u32 = 0xa881_0e22;
+    const SVC: u32 = 0xd400_0001;
+    const SRC_FILL: u64 = 0x1122_3344_5566_7788;
+    const DST_FILL: u64 = 0xaabb_ccdd_eeff_0011;
+
+    let guest_code = GuestVa(0x24_0000_0000);
+    let words = [LDP_X2_X3_X16_POST16, STP_X2_X3_X17_POST16, SVC];
+    let data_len = 32 * 1024;
+
+    // src occupies the first page of the data region, dst the second.
+    let seed = |fixture: &BiasedTranslatorFixture, snapshot: &mut NativeUcontextSnapshot| {
+        unsafe {
+            let base = fixture.data_host.raw() as *mut u64;
+            *base = SRC_FILL;
+            *base.add(1) = SRC_FILL ^ 0xffff;
+            *((fixture.data_host.raw() + 16 * 1024) as *mut u64) = DST_FILL;
+            *((fixture.data_host.raw() + 16 * 1024 + 8) as *mut u64) = DST_FILL;
+        }
+        snapshot.x[16] = fixture.guest_data.raw();
+        snapshot.x[17] = fixture.guest_data.raw() + 16 * 1024;
+        // The injected fault is a load through x27; hold it at an unmapped
+        // constant in EVERY run so the reference and recovered states stay
+        // comparable.
+        snapshot.x[27] = 1;
+    };
+
+    let read_dst = |fixture: &BiasedTranslatorFixture| -> (u64, u64) {
+        unsafe {
+            (
+                *((fixture.data_host.raw() + 16 * 1024) as *const u64),
+                *((fixture.data_host.raw() + 16 * 1024 + 8) as *const u64),
+            )
+        }
+    };
+
+    // 1. Uninterrupted reference run.
+    let (expected_snapshot, expected_dst) = {
+        let mut fixture = biased_translator_fixture_with(bias, data_len, &words, guest_code);
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = guest_code.raw();
+        seed(&fixture, &mut snapshot);
+        let prepared = fixture
+            .translator
+            .prepare_entry::<false>(&fixture.memory, &snapshot)
+            .expect("prepare chained reference");
+        let exit = fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("enter chained reference");
+        assert!(matches!(
+            fixture
+                .translator
+                .finish_exit(&fixture.memory, &mut snapshot, prepared, exit)
+                .expect("finish chained reference"),
+            super::ThreadExit::Syscall { .. }
+        ));
+        (snapshot, read_dst(&fixture))
+    };
+    assert_eq!(
+        expected_dst,
+        (SRC_FILL, SRC_FILL ^ 0xffff),
+        "bias=0x{bias:x} the reference run must copy the pair"
+    );
+
+    let recovery_count = {
+        let mut fixture = biased_translator_fixture_with(bias, data_len, &words, guest_code);
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = guest_code.raw();
+        seed(&fixture, &mut snapshot);
+        fixture
+            .translator
+            .prepare_entry::<false>(&fixture.memory, &snapshot)
+            .expect("prepare chained count");
+        fixture
+            .translator
+            .recovery_points_for_test(guest_code)
+            .len()
+    };
+    assert!(recovery_count > 0, "bias=0x{bias:x}");
+
+    // 2. Fault at every recovery point, recover, un-patch, resume, finish.
+    for point_index in 0..recovery_count {
+        let mut fixture = biased_translator_fixture_with(bias, data_len, &words, guest_code);
+        let mut stack = vec![0_u8; 16 * 1024];
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = guest_code.raw();
+        seed(&fixture, &mut snapshot);
+        let prepared = fixture
+            .translator
+            .prepare_entry::<false>(&fixture.memory, &snapshot)
+            .expect("prepare chained point");
+        let (cache_pc, _action) = fixture
+            .translator
+            .recovery_points_for_test(guest_code)
+            .get(point_index)
+            .copied()
+            .expect("chained recovery point");
+        let original_word =
+            unsafe { std::ptr::read_unaligned(cache_pc.host().raw() as *const u32) };
+        fixture
+            .translator
+            .patch_recovery_word_for_test(cache_pc, 0xf940_0369)
+            .expect("patch chained point");
+        let faulted = fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .expect("enter chained fault");
+        if !matches!(faulted.exit, super::types::NativeDsrExit::Fault { .. }) {
+            // An unexecuted slow-path word; nothing to recover from.
+            continue;
+        }
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared, faulted)
+            .expect("finish chained fault");
+
+        // No guest register may carry a host address after recovery.
+        for (index, value) in snapshot.x.iter().enumerate() {
+            assert!(
+                !(*value >= bias && *value < bias + 0x200_0000_0000),
+                "bias=0x{bias:x} point={point_index} x{index} carries host address 0x{value:x}"
+            );
+        }
+
+        fixture
+            .translator
+            .patch_recovery_word_for_test(cache_pc, original_word)
+            .expect("restore chained point");
+
+        // 3. Resume from the recovered state; the run must finish identically.
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(
+                guard < 8,
+                "bias=0x{bias:x} point={point_index} resume looped"
+            );
+            let resumed = fixture
+                .translator
+                .prepare_entry::<false>(&fixture.memory, &snapshot)
+                .expect("prepare chained resume");
+            let exit = fixture
+                .translator
+                .enter_prepared::<false>(resumed, &mut snapshot)
+                .expect("enter chained resume");
+            let finished = fixture
+                .translator
+                .finish_exit(&fixture.memory, &mut snapshot, resumed, exit)
+                .expect("finish chained resume");
+            if matches!(finished, super::ThreadExit::Syscall { .. }) {
+                break;
+            }
+        }
+        assert_eq!(
+            snapshot.x, expected_snapshot.x,
+            "bias=0x{bias:x} point={point_index} registers diverged after resume"
+        );
+        assert_eq!(
+            read_dst(&fixture),
+            expected_dst,
+            "bias=0x{bias:x} point={point_index} copied data diverged after resume"
+        );
+    }
+}
+
+/// What one `live_compact_writeback_kick_sweep` run observed.
+#[derive(Debug)]
+struct CompactWritebackKickSweep {
+    landings: BTreeSet<usize>,
+    access_indices: BTreeSet<usize>,
+    movz_indices: BTreeSet<usize>,
+    sub_indices: BTreeSet<usize>,
+    restore_indices: BTreeSet<usize>,
+    in_block_kicks: u64,
+    faults: u64,
+    entry_kicks: u64,
+    advanced_landings: u64,
+}
+
+impl CompactWritebackKickSweep {
+    /// Every word of the compact commit window was actually interrupted at
+    /// least once: the access carrying the post-index writeback, the bias
+    /// materialization, the un-bias commit, and the scratch restore.
+    fn covered_commit_window(&self) -> bool {
+        [
+            &self.access_indices,
+            &self.movz_indices,
+            &self.sub_indices,
+            &self.restore_indices,
+        ]
+        .iter()
+        .all(|class| class.intersection(&self.landings).next().is_some())
+    }
+}
+
+/// Drive the COMPACT biased post-index lowering — the `duffcopy`/memclr shape
+/// the production crash faulted in — as a native self-loop under live
+/// asynchronous kicks, walking a multi-page guest region until it runs off the
+/// end and faults.
+///
+/// Every interruption asserts the invariants a missed or doubled un-bias
+/// breaks: the guest base never carries bias bits, it advances in exact
+/// 16-byte steps inside its own mapping, and the zeroed prefix/untouched
+/// suffix of the region split EXACTLY at the base. That last one is the
+/// instrument: it fails if the committed base ever disagrees with the stores
+/// that actually happened, which is what a stale or double-applied writeback
+/// commit produces.
+fn live_compact_writeback_kick_sweep(
+    guest_code: GuestVa,
+    body_len: usize,
+    data_len: u64,
+    rounds: u64,
+) -> CompactWritebackKickSweep {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    const COMPACT_BIAS: u64 = 0x200_0000_0000;
+    // stp xzr, xzr, [x5], #16  — post-index pair store, the crash's shape.
+    const STP_XZR_XZR_X5_POST16: u32 = 0xa881_7cbf;
+    const B_BACK_ONE: u32 = 0x17ff_ffff; // b .-4
+    const GUEST_X16: u64 = 0x1616_1616_1616_1616;
+    const GUEST_X17: u64 = 0x1717_1717_1717_1717;
+    const FILL: u8 = 0x5a;
+
+    // `body_len` post-index stores per block, so the compact sequences —
+    // not the block's entry preamble — own most of the emitted words a kick
+    // can land on. A one-store loop returns to the entry every 16 bytes and
+    // never samples the commit window.
+    let _ = B_BACK_ONE;
+    let branch_back = 0x1400_0000 | ((-(body_len as i32) as u32) & 0x03ff_ffff);
+    let mut words = vec![STP_XZR_XZR_X5_POST16; body_len];
+    words.push(branch_back);
+    let fixture = biased_translator_fixture_with(COMPACT_BIAS, data_len, &words, guest_code);
+    let plan = super::block::plan_block(&fixture.memory, guest_code, CodeGeneration::INITIAL, 256)
+        .expect("plan the compact writeback loop");
+
+    let mut cache = TranslationCache::new(
+        64 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate compact writeback cache");
+    let emitted = emit_block(
+        &mut cache,
+        &plan,
+        super::emit::EmitAddressMode::Biased {
+            host_bias: fixture.host_bias,
+        },
+    )
+    .expect("emit the compact writeback loop");
+
+    // Turn the backward branch into a native self-loop so one entry walks the
+    // whole region without returning to Rust between iterations.
+    assert_eq!(
+        emitted.direct_links().len(),
+        1,
+        "the loop leaves through exactly one direct link"
+    );
+    let link = emitted.direct_links()[0];
+    let site = super::cache::LinkSite {
+        source: emitted.entry(),
+        slot: link.slot,
+    };
+    let self_link = super::encode_aarch64_direct_branch(site, emitted.entry())
+        .expect("encode the compact loop self-link");
+    cache
+        .patch_code_word(site, self_link)
+        .expect("re-point the compact loop at its own entry");
+
+    // Pin the emitted layout: the commit-window indices below are an
+    // independent statement about the lowering, not a restatement of the map.
+    let emitted_words = (0..emitted.len() / 4)
+        .map(|index| unsafe {
+            std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
+        })
+        .collect::<Vec<_>>();
+    let scratch = 17_u32;
+    let access_word = (STP_XZR_XZR_X5_POST16 & !(0x1f << 5)) | (scratch << 5);
+    let movz_word = 0xd2c0_0012 | (((COMPACT_BIAS >> 32) as u32) << 5);
+    let sub_word = 0xcb00_0000 | (18 << 16) | (scratch << 5) | 5;
+    let restore_word = 0xf940_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch;
+    let indices_of = |needle: u32, what: &str| -> BTreeSet<usize> {
+        let found = emitted_words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| **word == needle)
+            .map(|(index, _)| index)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            found.len(),
+            body_len,
+            "expected one {what} per body store (0x{needle:08x})"
+        );
+        found
+    };
+    let access_indices = indices_of(access_word, "rewritten access");
+    let movz_indices = indices_of(movz_word, "bias materialization");
+    let sub_indices = indices_of(sub_word, "un-bias commit");
+    let restore_indices = indices_of(restore_word, "scratch restore");
+    assert!(
+        access_indices.first() < movz_indices.first()
+            && movz_indices.first() < sub_indices.first()
+            && sub_indices.first() < restore_indices.first(),
+        "compact commit window is ordered"
+    );
+
+    let data_start = fixture.guest_data.raw();
+    let data_end = data_start + data_len;
+    let host_data = fixture.data_host.raw() as *mut u8;
+    let data_len_usize = usize::try_from(data_len).expect("region length fits usize");
+
+    // SIGPIPE must be deliverable on this thread for a kick to land.
+    let mut unblock: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut original_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::sigemptyset(&mut unblock) }, 0);
+    assert_eq!(unsafe { libc::sigaddset(&mut unblock, libc::SIGPIPE) }, 0);
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, &mut original_mask) },
+        0
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let armed = Arc::new(AtomicU64::new(0));
+
+    struct SweepSender {
+        stop: Arc<AtomicBool>,
+        armed: Arc<AtomicU64>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for SweepSender {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.armed.store(0, Ordering::Release);
+            if let Some(join) = self.join.take() {
+                drop(join.join());
+            }
+        }
+    }
+
+    let target = unsafe { libc::pthread_self() };
+    let sender_stop = Arc::clone(&stop);
+    let sender_armed = Arc::clone(&armed);
+    let sender = std::thread::spawn(move || {
+        while !sender_stop.load(Ordering::Acquire) {
+            let request = sender_armed.load(Ordering::Acquire);
+            if request == 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            // Smear the delivery phase so the landing point sweeps the emitted
+            // words instead of phase-locking to one offset in the walk.
+            let jitter = request.wrapping_mul(2_654_435_761) % 4_099;
+            for _ in 0..jitter {
+                std::hint::spin_loop();
+            }
+            while sender_armed.load(Ordering::Acquire) == request {
+                assert_eq!(unsafe { libc::pthread_kill(target, libc::SIGPIPE) }, 0);
+                let retry_at = Instant::now() + Duration::from_millis(20);
+                while sender_armed.load(Ordering::Acquire) == request && Instant::now() < retry_at {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    });
+    let _sender = SweepSender {
+        stop: Arc::clone(&stop),
+        armed: Arc::clone(&armed),
+        join: Some(sender),
+    };
+
+    let indirect = IndirectTargetCache::new();
+    let cache_start = emitted.entry().host().raw();
+    let cache_end = cache_start + emitted.len();
+    let mut stack = vec![0_u8; 64 * 1024];
+    let mut sweep = CompactWritebackKickSweep {
+        landings: BTreeSet::new(),
+        access_indices,
+        movz_indices,
+        sub_indices,
+        restore_indices,
+        in_block_kicks: 0,
+        faults: 0,
+        entry_kicks: 0,
+        advanced_landings: 0,
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut round = 0_u64;
+    while round < rounds && Instant::now() < deadline && !sweep.covered_commit_window() {
+        round += 1;
+        unsafe {
+            std::ptr::write_bytes(
+                host_data,
+                FILL,
+                usize::try_from(data_len).expect("data len"),
+            );
+        }
+        let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+        snapshot.pc = guest_code.raw();
+        snapshot.x[5] = data_start;
+        snapshot.x[16] = GUEST_X16;
+        snapshot.x[17] = GUEST_X17;
+        snapshot.pstate = 0xa000_0000;
+        let mut exit = NativeDsrExit::Kick {
+            resume: guest_code,
+            rewrite_scratch: 0,
+            rewrite_context_scratch: 0,
+            generation_pstate_scratch: 0,
+            indirect_x15_scratch: 0,
+            indirect_x30_scratch: 0,
+        };
+
+        armed.store(round, Ordering::Release);
+        super::gateway::enter_translated_with_cache_range(
+            emitted.entry(),
+            &mut snapshot,
+            &mut exit,
+            &indirect,
+            cache_start,
+            cache_end,
+            crate::native_darwin::address::NativeAddressMode::Biased {
+                host_bias: fixture.host_bias,
+            },
+        )
+        .expect("execute the compact writeback loop");
+        armed.store(0, Ordering::Release);
+
+        // Recover, then assert the guest-visible contract at the landing.
+        // Returns whether the walk had actually advanced at this landing, so
+        // the caller counts non-vacuous observations without this closure
+        // needing to borrow `sweep`.
+        let assert_at = |snapshot: &NativeUcontextSnapshot,
+                         index: Option<usize>,
+                         recovery: &Option<super::emit::RecoveryAction>|
+         -> bool {
+            let base = snapshot.x[5];
+            let label = match index {
+                Some(index) => format!("word {index} (0x{:08x})", emitted_words[index]),
+                None => "entry".to_string(),
+            };
+            assert_eq!(
+                base >> 41,
+                0,
+                "guest base carries bias bits at {label}: 0x{base:x} (recovery {recovery:?})"
+            );
+            assert!(
+                base >= data_start && base <= data_end,
+                "guest base 0x{base:x} left its mapping at {label} (recovery {recovery:?})"
+            );
+            assert_eq!(
+                (base - data_start) % 16,
+                0,
+                "guest base 0x{base:x} lost its 16-byte stride at {label}"
+            );
+            assert_eq!(snapshot.x[16], GUEST_X16, "x16 clobbered at {label}");
+            assert_eq!(snapshot.x[17], GUEST_X17, "x17 clobbered at {label}");
+            // No guest register may carry a HOST address. Anything inside
+            // [bias, bias + aperture) is a translated pointer that leaked back
+            // into guest state — the exact shape the production crash reported
+            // (a slow-path publication of an already-biased base).
+            for (index, value) in snapshot.x.iter().enumerate() {
+                assert!(
+                    !(*value >= COMPACT_BIAS && *value < COMPACT_BIAS + 0x200_0000_0000),
+                    "x{index} carries a host address 0x{value:x} at {label} \
+                     (recovery {recovery:?})"
+                );
+            }
+            assert!(
+                !(snapshot.sp >= COMPACT_BIAS && snapshot.sp < COMPACT_BIAS + 0x200_0000_0000),
+                "SP carries a host address 0x{:x} at {label}",
+                snapshot.sp
+            );
+            assert_eq!(
+                snapshot.pstate & 0xf000_0000,
+                0xa000_0000,
+                "NZCV mutated at {label}"
+            );
+            // The instrument: stores that happened and the committed base must
+            // agree exactly. A stale commit leaves a zeroed word past the base;
+            // a doubled one leaves a FILL hole before it.
+            let done = base - data_start;
+            let bytes = unsafe { std::slice::from_raw_parts(host_data, data_len_usize) };
+            let done_usize = usize::try_from(done).expect("prefix fits usize");
+            assert!(
+                bytes[..done_usize].iter().all(|byte| *byte == 0),
+                "zeroed prefix has a hole below the base 0x{base:x} at {label}"
+            );
+            assert!(
+                bytes[done_usize..].iter().all(|byte| *byte == FILL),
+                "a store landed at or past the committed base 0x{base:x} at {label}"
+            );
+            done > 0
+        };
+
+        match exit {
+            NativeDsrExit::Kick {
+                resume,
+                rewrite_scratch,
+                rewrite_context_scratch,
+                generation_pstate_scratch,
+                indirect_x15_scratch,
+                indirect_x30_scratch,
+            } => {
+                sweep.in_block_kicks += 1;
+                let raw = resume.raw();
+                assert!(
+                    raw >= cache_start as u64 && raw < cache_end as u64,
+                    "kick resume 0x{raw:x} is outside the published block"
+                );
+                let offset = u32::try_from(raw - cache_start as u64).expect("kick offset");
+                assert_eq!(offset % 4, 0, "kick landed off an instruction boundary");
+                let cache_offset = super::types::CacheOffset::published(offset);
+                let guest_pc = emitted
+                    .map()
+                    .guest_for_cache(cache_offset)
+                    .expect("landing word maps to a guest PC");
+                let recovery = emitted
+                    .recovery()
+                    .iter()
+                    .find(|entry| entry.cache == cache_offset)
+                    .map(|entry| entry.action);
+                if let Some(action) = recovery {
+                    super::recover_rewrite_state(
+                        &mut snapshot,
+                        action,
+                        rewrite_scratch,
+                        rewrite_context_scratch,
+                        generation_pstate_scratch,
+                        indirect_x15_scratch,
+                        indirect_x30_scratch,
+                    )
+                    .expect("recover the interrupted compact writeback");
+                }
+                snapshot.pc =
+                    super::recovery_resume_pc(guest_pc, recovery).expect("compact resume PC");
+                let index = offset as usize / 4;
+                if assert_at(&snapshot, Some(index), &recovery) {
+                    sweep.advanced_landings += 1;
+                }
+                sweep.landings.insert(index);
+            }
+            NativeDsrExit::Fault {
+                guest_pc,
+                rewrite_scratch,
+                rewrite_context_scratch,
+                generation_pstate_scratch,
+                indirect_x15_scratch,
+                indirect_x30_scratch,
+                ..
+            } => {
+                sweep.faults += 1;
+                let raw = guest_pc.raw();
+                assert!(
+                    raw >= cache_start as u64 && raw < cache_end as u64,
+                    "fault PC 0x{raw:x} is outside the published block"
+                );
+                let offset = u32::try_from(raw - cache_start as u64).expect("fault offset");
+                let cache_offset = super::types::CacheOffset::published(offset);
+                let guest_pc = emitted
+                    .map()
+                    .guest_for_cache(cache_offset)
+                    .expect("fault word maps to a guest PC");
+                let recovery = emitted
+                    .recovery()
+                    .iter()
+                    .find(|entry| entry.cache == cache_offset)
+                    .map(|entry| entry.action);
+                if let Some(action) = recovery {
+                    super::recover_rewrite_state(
+                        &mut snapshot,
+                        action,
+                        rewrite_scratch,
+                        rewrite_context_scratch,
+                        generation_pstate_scratch,
+                        indirect_x15_scratch,
+                        indirect_x30_scratch,
+                    )
+                    .expect("recover the faulted compact writeback");
+                }
+                snapshot.pc =
+                    super::recovery_resume_pc(guest_pc, recovery).expect("compact fault resume PC");
+                let index = offset as usize / 4;
+                if assert_at(&snapshot, Some(index), &recovery) {
+                    sweep.advanced_landings += 1;
+                }
+                // Running off the end is the loop's natural terminator.
+                assert_eq!(
+                    snapshot.x[5], data_end,
+                    "the walk faulted before reaching the end of its region"
+                );
+            }
+            NativeDsrExit::KickAtEntry { .. } => {
+                sweep.entry_kicks += 1;
+            }
+            other => panic!("compact writeback loop must not exit through {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &original_mask, std::ptr::null_mut()) },
+        0
+    );
+    sweep
+}
+
+#[test]
+fn dsr_live_kick_inside_compact_biased_writeback_keeps_the_base_unbiased() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    // 64 KiB of region is 4,096 post-index iterations per round: long enough
+    // that a jittered kick lands somewhere in the walk, short enough that a
+    // round that misses still terminates promptly on the end-of-region fault.
+    // 16 stores per block keeps the compact sequences dominant among the
+    // words a kick can land on; 1 MiB of region is 65,536 iterations, long
+    // enough that a jittered kick lands mid-walk rather than at the entry.
+    let sweep = live_compact_writeback_kick_sweep(GuestVa(0x22_0000_0000), 16, 1024 * 1024, 400);
+
+    eprintln!(
+        "compact writeback kick sweep: {} in-block kicks, {} faults, {} entry kicks, \
+         {} distinct landing words, {} landings with an advanced base; \
+         commit window covered={}",
+        sweep.in_block_kicks,
+        sweep.faults,
+        sweep.entry_kicks,
+        sweep.landings.len(),
+        sweep.advanced_landings,
+        sweep.covered_commit_window(),
+    );
+    eprintln!(
+        "  access={:?}\n  movz={:?}\n  sub={:?}\n  restore={:?}\n  landings={:?}",
+        sweep.access_indices,
+        sweep.movz_indices,
+        sweep.sub_indices,
+        sweep.restore_indices,
+        sweep.landings,
+    );
+
+    assert!(
+        sweep.in_block_kicks > 0,
+        "no kick landed inside the compact writeback loop"
+    );
+    // Without landings where the walk had actually advanced, the base
+    // assertions above would hold vacuously.
+    assert!(
+        sweep.advanced_landings > 0,
+        "no landing observed an advanced base"
     );
 }
 

@@ -2648,16 +2648,48 @@ struct CompactBiasedForm {
 /// above the aperture and below the bias, while register offsets are
 /// unbounded and negative immediates would need the underflow window's
 /// host-to-guest fault conversion (deferred), so both stay general.
+/// Diagnostic escape hatch: `CARRICK_DSR_COMPACT_BIASED=0` forces every guest
+/// memory access back onto the general lowering while keeping the identical
+/// binary, bias and layout. That isolates the compact emission from the bias
+/// selection when bisecting a fault, which comparing two builds cannot do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompactBiasedPolicy {
+    /// Every accepted shape, including pre/post-index writeback.
+    All,
+    /// Writeback forms fall back to the general lowering.
+    NoWriteback,
+    /// Nothing is lowered compactly.
+    Off,
+}
+
+fn compact_biased_policy() -> CompactBiasedPolicy {
+    static POLICY: std::sync::OnceLock<CompactBiasedPolicy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(
+        || match std::env::var("CARRICK_DSR_COMPACT_BIASED").as_deref() {
+            Ok("0") => CompactBiasedPolicy::Off,
+            Ok("nowriteback") => CompactBiasedPolicy::NoWriteback,
+            _ => CompactBiasedPolicy::All,
+        },
+    )
+}
+
 fn compact_biased_form(
     memory: super::types::MemoryAccess,
     base: BiasedBase,
     host_bias: carrick_dsr::address::NativeHostBias,
 ) -> Option<CompactBiasedForm> {
+    let policy = compact_biased_policy();
+    if policy == CompactBiasedPolicy::Off {
+        return None;
+    }
     let bias_orr = host_bias.aperture_disjoint_orr_immediate()?;
     if memory.virtualization != super::types::MemoryVirtualization::None {
         return None;
     }
     let writeback = memory.writeback != super::types::MemoryWriteback::None;
+    if writeback && policy == CompactBiasedPolicy::NoWriteback {
+        return None;
+    }
     match base {
         BiasedBase::Register(_) => {}
         // Stack-pointer bases take one extra base-copy word and never write
