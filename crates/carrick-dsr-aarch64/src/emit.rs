@@ -5054,8 +5054,20 @@ fn assemble_block_inner(
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<AssembledBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
-    let mut entries = Vec::with_capacity(plan.instructions.len() + 8);
-    let mut direct_links = Vec::new();
+    // Count the fused segments too: a superblock maps several segments' worth
+    // of words, and translation time is a real cost here -- deep fusion already
+    // taxes it (see `block::SUPERBLOCK_SEGMENT_LIMIT`), so do not add
+    // reallocation on top of that.
+    let mut entries = Vec::with_capacity(
+        plan.instructions.len()
+            + plan
+                .extensions
+                .iter()
+                .map(|extension| extension.instructions.len() + 6)
+                .sum::<usize>()
+            + 8,
+    );
+    let mut direct_links = Vec::with_capacity(plan.extensions.len() + 2);
     let mut recovery = Vec::new();
     let entry_marker = current_offset(&assembler)?;
     map_next(&assembler, &mut entries, plan.start)?;

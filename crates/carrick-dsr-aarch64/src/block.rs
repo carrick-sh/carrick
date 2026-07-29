@@ -208,10 +208,28 @@ pub fn plan_with_reader_for_counter_plan(
 /// taken-edge patch slot) against ~11 executed words -- the next block's
 /// prologue, its generation guard including an `ldar` acquire, its
 /// `entry_in_progress` store, its guest-x17 reload, and the predecessor's two
-/// guest-x17 stores. The cap exists because extension is speculative: the
-/// fall-through of a mostly-taken branch is cold, so past some depth we are
-/// emitting code that never runs.
-pub const SUPERBLOCK_SEGMENT_LIMIT: usize = 8;
+/// guest-x17 stores.
+///
+/// The cap is 2 because that is where the MEASURED cost turns. Extension is
+/// speculative -- the fall-through of a mostly-taken branch is cold -- and a
+/// fused segment is also TAIL-DUPLICATED, since the same guest PC still gets a
+/// standalone block whenever something branches to it. Both show up as
+/// translation work, which the executed-word model above does not price.
+/// Measured on `ls -la /usr/bin` x3 (native, `CARRICK_DSR_PROFILE=1`):
+///
+/// | cap | translations | emitted bytes | translate ns | resolver exits |
+/// |-----|--------------|---------------|--------------|----------------|
+/// | 1   | 5,323        | 1,480,844     | 19,469,167   | 4,189          |
+/// | 2   | 3,897        | 1,338,972     | 19,389,933   | 2,763          |
+/// | 4   | 3,402        | 1,369,560     | 20,910,297   | 2,268          |
+/// | 8   | 3,287        | 1,440,476     | 22,345,884   | 2,153          |
+///
+/// At 2 the emitted code SHRINKS 9.6% and translation time is flat; past it the
+/// bytes come back and translation time rises 7.4% then 14.8%, buying steadily
+/// less exit reduction. On a workload of short-lived processes with cold caches
+/// that tax is paid in full, so depth beyond 2 must earn its way back on a wall
+/// screen before the cap moves.
+pub const SUPERBLOCK_SEGMENT_LIMIT: usize = 2;
 
 /// The default when superblock formation is on, and the value
 /// `CARRICK_DSR_SUPERBLOCK=on` selects.
