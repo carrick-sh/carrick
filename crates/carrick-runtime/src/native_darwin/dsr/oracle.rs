@@ -3703,17 +3703,31 @@ fn binding_generation_guard_contains_no_process_pointer() {
                 .op()
         })
         .collect::<Vec<_>>();
+    // The lean guard compares with EOR/CBNZ precisely so it writes no flags;
+    // the shipped guard still uses CMP/B.NE and brackets it with a PSTATE
+    // round trip. Spell out both arms: the switch is read once per process.
+    let (tail, name): (&[bad64::Op], &str) =
+        if std::env::var_os("CARRICK_DSR_LEAN_GUARD").as_deref() == Some(std::ffi::OsStr::new("1"))
+        {
+            (&[bad64::Op::EOR, bad64::Op::CBNZ], "lean")
+        } else {
+            (&[bad64::Op::CMP, bad64::Op::B_NE], "spilling")
+        };
+    let expected = [bad64::Op::ADD, bad64::Op::LDP, bad64::Op::LDAR]
+        .into_iter()
+        .chain(tail.iter().copied())
+        .collect::<Vec<_>>();
     assert!(
-        operations.windows(4).any(|window| {
-            window
-                == [
-                    bad64::Op::ADD,
-                    bad64::Op::LDP,
-                    bad64::Op::LDAR,
-                    bad64::Op::CMP,
-                ]
-        }),
-        "binding guard must index the process table then atomically compare its binding"
+        operations
+            .windows(expected.len())
+            .any(|window| window == expected),
+        "{name} binding guard must index the process table then atomically \
+         compare its binding"
+    );
+    assert_eq!(
+        operations.contains(&bad64::Op::MRS),
+        name == "spilling",
+        "only the spilling guard may round-trip guest NZCV"
     );
 }
 
@@ -3787,6 +3801,128 @@ fn binding_generation_guard_exits_stale_after_atomic_changes() {
             target: guest,
             binding: DirectBindingExitMetadata::Absent,
         }
+    );
+}
+
+/// The generation guard spends physical x17 and physical x19 and writes no
+/// flags. Those are architectural claims, so assert them live: guest x16,
+/// guest x17, guest x19 and guest NZCV must come back byte-identical from a
+/// guarded block on BOTH the current edge and the stale edge.
+///
+/// x19 is the load-bearing one. `gateway::RESERVED_SCRATCH` makes physical x19
+/// carrick's for the whole of translated execution -- `_carrick_dsr_enter_raw`
+/// deliberately skips snapshot slot 152 when it loads the guest register file,
+/// and `carrick_native_snapshot_mcontext` never captures x19 back -- so the
+/// guard can clobber it with no spill. If that reservation did not hold, the
+/// guest would read back the guard's arithmetic instead of its own value.
+///
+/// The flags claim is what replaced the guard's PSTATE save/restore pair: the
+/// comparison is EOR/CBNZ, and `cset x2, eq` below is the guest instruction
+/// that would notice if it were not.
+#[test]
+fn generation_guard_preserves_guest_scratch_registers_and_flags() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+    let guest = GuestVa(0x1b_500);
+    let plan = BlockPlan {
+        start: guest,
+        end: GuestVa(guest.raw() + 8),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![PlannedInst {
+            guest,
+            action: InstAction::Copy(0x9a9f_17e2), // cset x2, eq
+        }],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(guest.raw() + 4),
+            resume: GuestVa(guest.raw() + 8),
+        },
+    };
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate guard scratch cache");
+    let emitted = super::emit::emit_block_with_generation_direct(
+        &mut cache,
+        &plan,
+        super::emit::GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+    )
+    .expect("emit guarded block");
+
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    // N and C, deliberately NOT seeded_snapshot's Z|C: a matching generation
+    // compared with CMP would leave exactly Z|C behind, so seeding Z would make
+    // the current edge blind to a guard that writes flags and never restores
+    // them. With Z clear, `cset x2, eq` reads back 0 unless the guard wrote it.
+    const GUEST_NZCV: u64 = 0xa000_0000;
+    snapshot.pstate = GUEST_NZCV;
+    let expected_x16 = snapshot.x[16];
+    let expected_x17 = snapshot.x[17];
+    let expected_x19 = snapshot.x[carrick_dsr_aarch64::gateway::RESERVED_SCRATCH as usize];
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(guest.raw() + 8),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("execute current block");
+
+    assert_eq!(
+        snapshot.x[2], 0,
+        "the guard disturbed guest NZCV before cset"
+    );
+    assert_eq!(
+        snapshot.x[16], expected_x16,
+        "the guard clobbered guest x16"
+    );
+    assert_eq!(
+        snapshot.x[17], expected_x17,
+        "the guard clobbered guest x17"
+    );
+    assert_eq!(
+        snapshot.x[carrick_dsr_aarch64::gateway::RESERVED_SCRATCH as usize],
+        expected_x19,
+        "the guard clobbered the guest value of the reserved register"
+    );
+    assert_eq!(
+        snapshot.pstate & 0xf000_0000,
+        GUEST_NZCV,
+        "the guard did not return guest NZCV"
+    );
+
+    // The stale edge unwinds nothing, so it must return the same state.
+    generation.store(1, Ordering::Release);
+    snapshot.x[2] = 0xffff;
+    snapshot.pc = guest.raw();
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit).expect("reject stale block");
+    assert_eq!(
+        exit,
+        NativeDsrExit::ResolveDirect {
+            source: guest,
+            target: guest,
+            binding: DirectBindingExitMetadata::Absent,
+        }
+    );
+    assert_eq!(
+        snapshot.x[2], 0xffff,
+        "the stale block executed its guest cset"
+    );
+    assert_eq!(
+        snapshot.x[16], expected_x16,
+        "the stale edge clobbered guest x16"
+    );
+    assert_eq!(
+        snapshot.x[17], expected_x17,
+        "the stale edge clobbered guest x17"
+    );
+    assert_eq!(
+        snapshot.x[carrick_dsr_aarch64::gateway::RESERVED_SCRATCH as usize],
+        expected_x19,
+        "the stale edge clobbered the guest value of the reserved register"
+    );
+    assert_eq!(
+        snapshot.pstate & 0xf000_0000,
+        GUEST_NZCV,
+        "the stale edge did not return guest NZCV"
     );
 }
 

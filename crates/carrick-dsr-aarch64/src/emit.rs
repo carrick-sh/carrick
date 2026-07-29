@@ -2900,6 +2900,43 @@ fn reserved_scratch_enabled() -> bool {
     })
 }
 
+/// May the generation guard spend the two registers that are ALREADY carrick's
+/// at block entry instead of borrowing guest state?
+///
+/// The guard has to compare two 64-bit generations, so it needs two scratch
+/// registers. It used to borrow guest x16 and guest x17 and spill both, plus
+/// NZCV for its `cmp` -- three stores and four reloads on the entry path of
+/// every block, and the prologue is store-throughput-bound. Neither borrow is
+/// necessary:
+///
+/// - physical x17 is DEAD at block entry (every exit stores guest x17 to
+///   `snapshot.x[17]` and slot 1128; the prologue reloads it after the guard);
+/// - physical x19 is host-owned for the whole of translated execution
+///   (`gateway::RESERVED_SCRATCH`) -- `_carrick_dsr_enter_raw` never loads the
+///   guest value into it and `carrick_native_snapshot_mcontext` never captures
+///   it back;
+/// - comparing with `eor`/`cbnz` rather than `cmp`/`b.ne` writes no flags.
+///
+/// The guard itself is unchanged in AUTHORITY: it still runs on every block
+/// entry and still reads the generation cell with `ldar`. Only what it spends
+/// changes.
+///
+/// **OPT-IN, and deliberately so.** The structural sequence test, the recovery
+/// matrix's fault injection at every recovery point, the live jittered-kick
+/// sweeps, `just clippy`/`just fmt-check` and a signed live guest run are all
+/// green, and two adversarial reverts (borrow guest x16; compare with `cmp`)
+/// each turn the live gate red. But the paired wall-time screen has NOT been
+/// run, and structural green is necessary, never sufficient (see H008 Spike 1
+/// and the reserved-scratch note above). It ships off until measured;
+/// `CARRICK_DSR_LEAN_GUARD=1` selects it, so both arms of a screen come from
+/// one binary.
+fn lean_generation_guard_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_DSR_LEAN_GUARD").as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 /// Can this access compute its host address entirely in the reserved register,
 /// with no borrowed guest register at all?
 ///
@@ -4871,21 +4908,26 @@ fn assemble_block_inner(
         cache: entry_marker,
         action: RecoveryAction::RestoreGuestX17,
     });
-    // x17 is the internal indirect-edge register. Its guest value is saved at
-    // every block exit and restored before either the generation guard or the
-    // first guest instruction executes.
-    let restore_x17 = current_offset(&assembler)?;
-    map_next(&assembler, &mut entries, plan.start)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x17, [x28, #136]
-    );
-    recovery.push(RecoveryEntry {
-        cache: restore_x17,
-        action: RecoveryAction::RestoreGuestX17,
-    });
+    let lean_guard = lean_generation_guard_enabled();
     let stale = guard.map(|_| assembler.new_dynamic_label());
-    if let (Some(guard), Some(stale)) = (guard, stale) {
+    if !lean_guard {
+        // x17 is the internal indirect-edge register. Its guest value is saved
+        // at every block exit and restored before either the generation guard
+        // or the first guest instruction executes.
+        let restore_x17 = current_offset(&assembler)?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x17, [x28, #136]
+        );
+        recovery.push(RecoveryEntry {
+            cache: restore_x17,
+            action: RecoveryAction::RestoreGuestX17,
+        });
+    }
+    if let (Some(guard), Some(stale)) = (guard, stale)
+        && !lean_guard
+    {
         let guard_start = current_offset(&assembler)?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
@@ -5030,6 +5072,125 @@ fn assemble_block_inner(
                 action: RecoveryAction::RestoreGenerationGuard,
             });
         }
+    }
+    if let (Some(guard), Some(stale)) = (guard, stale)
+        && lean_guard
+    {
+        // The guard is the authoritative stale-code check, so it runs on every
+        // block entry -- but it borrows NOTHING from the guest to do so.
+        //
+        // Physical x17 is dead here: every exit stores guest x17 to
+        // `snapshot.x[17]` (and to slot 1128, which recovery reads), and the
+        // reload below re-establishes it before the first guest instruction.
+        // Physical x19 belongs to carrick for the whole of translated
+        // execution (`gateway::RESERVED_SCRATCH`) -- `_carrick_dsr_enter_raw`
+        // never loads the guest's value into it and the signal handler's
+        // snapshot deliberately never captures it. Comparing with EOR/CBNZ
+        // rather than CMP/B.NE writes no flags, so guest NZCV is untouched
+        // too.
+        //
+        // Together those delete the guard's three spills and their four
+        // reloads: the prologue is store-throughput-bound, and five stores
+        // become two (the gateway phase, and the guard's own generation
+        // publish).
+        const _: () = assert!(crate::gateway::RESERVED_SCRATCH == 19);
+        let guard_start = current_offset(&assembler)?;
+        match guard {
+            GenerationGuard::Absolute { address, expected } => {
+                emit_mov_u64(
+                    &mut assembler,
+                    &mut entries,
+                    plan.start,
+                    crate::gateway::RESERVED_SCRATCH,
+                    MaterializedValue::Process(ProcessValue::GenerationAddress, address),
+                    recording.as_deref_mut(),
+                )?;
+                map_next(&assembler, &mut entries, plan.start)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; ldar x19, [x19]
+                );
+                emit_mov_u64(
+                    &mut assembler,
+                    &mut entries,
+                    plan.start,
+                    17,
+                    MaterializedValue::Process(ProcessValue::GenerationExpected, expected.get()),
+                    recording.as_deref_mut(),
+                )?;
+            }
+            GenerationGuard::BindingIndex { index, .. } => {
+                map_next(&assembler, &mut entries, plan.start)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; ldr x19, [x28, super::gateway::CTX_GENERATION_BINDINGS]
+                );
+                emit_mov_u64(
+                    &mut assembler,
+                    &mut entries,
+                    plan.start,
+                    17,
+                    MaterializedValue::Stable(u64::from(index)),
+                    recording.as_deref_mut(),
+                )?;
+                map_next(&assembler, &mut entries, plan.start)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; add x19, x19, x17, LSL #4
+                );
+                map_next(&assembler, &mut entries, plan.start)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; ldp x19, x17, [x19]
+                );
+                map_next(&assembler, &mut entries, plan.start)?;
+                dynasmrt::dynasm!(assembler
+                    ; .arch aarch64
+                    ; ldar x19, [x19]
+                );
+            }
+        }
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; eor x19, x19, x17
+        );
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; cbnz x19, =>stale
+        );
+        // A direct-linked chain can enter the gateway from a different block
+        // than the one that began this translated run. Publish this block's
+        // generation so sensitive-exit metadata is resolved against the block
+        // that actually produced the exit.
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x17, [x28, super::gateway::CTX_GENERATION]
+        );
+        let guard_end = current_offset(&assembler)?;
+        for offset in (guard_start.get()..guard_end.get()).step_by(4) {
+            recovery.push(RecoveryEntry {
+                cache: CacheOffset::published(offset),
+                action: RecoveryAction::RestoreGuestX17,
+            });
+        }
+    }
+    if lean_guard {
+        // x17 is the internal indirect-edge register, and the guard above
+        // spends it. Its guest value is saved at every block exit and is
+        // restored here, before the first guest instruction executes.
+        let restore_x17 = current_offset(&assembler)?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldr x17, [x28, #136]
+        );
+        recovery.push(RecoveryEntry {
+            cache: restore_x17,
+            action: RecoveryAction::RestoreGuestX17,
+        });
     }
     if let PlannedExit::ExclusiveRegion { exit, fusion, .. } = plan.exit {
         // A fused exclusive region (LDXR/LDAXR .. STXR/STLXR CAS/RMW retry loop)
@@ -5650,35 +5811,45 @@ fn assemble_block_inner(
             ; .arch aarch64
             ; =>stale
         );
+        // Under the lean guard there is nothing to unwind: it spent only
+        // registers that are already carrick's at block entry -- dead x17 and
+        // host-owned x19 -- and wrote no flags, so guest x16, guest NZCV and
+        // the guest x17 in `snapshot.x[17]` are exactly what the common
+        // gateway expects to find. Reloading slots 936/1120/1128 there would
+        // be actively WRONG: the lean prologue never writes them, so they hold
+        // whatever a previous memory lowering or gateway entry left behind.
         let stale_start = current_offset(&assembler)?;
-        map_next(&assembler, &mut entries, plan.start)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; ldr x16, [x28, #936]
-        );
-        emit_word(
-            &mut assembler,
-            &mut entries,
-            plan.start,
-            0xd51b_4210, // msr nzcv, x16
-        )?;
-        map_next(&assembler, &mut entries, plan.start)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; ldr x16, [x28, #1120]
-        );
-        map_next(&assembler, &mut entries, plan.start)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; ldr x17, [x28, #1128]
-        );
-        let stale_end = current_offset(&assembler)?;
-        for offset in (stale_start.get()..stale_end.get()).step_by(4) {
-            recovery.push(RecoveryEntry {
-                cache: CacheOffset::published(offset),
-                action: RecoveryAction::RestoreGenerationGuard,
-            });
+        if !lean_guard {
+            map_next(&assembler, &mut entries, plan.start)?;
+            dynasmrt::dynasm!(assembler
+                ; .arch aarch64
+                ; ldr x16, [x28, #936]
+            );
+            emit_word(
+                &mut assembler,
+                &mut entries,
+                plan.start,
+                0xd51b_4210, // msr nzcv, x16
+            )?;
+            map_next(&assembler, &mut entries, plan.start)?;
+            dynasmrt::dynasm!(assembler
+                ; .arch aarch64
+                ; ldr x16, [x28, #1120]
+            );
+            map_next(&assembler, &mut entries, plan.start)?;
+            dynasmrt::dynasm!(assembler
+                ; .arch aarch64
+                ; ldr x17, [x28, #1128]
+            );
+            let stale_end = current_offset(&assembler)?;
+            for offset in (stale_start.get()..stale_end.get()).step_by(4) {
+                recovery.push(RecoveryEntry {
+                    cache: CacheOffset::published(offset),
+                    action: RecoveryAction::RestoreGenerationGuard,
+                });
+            }
         }
+        let exit_start = current_offset(&assembler)?;
         emit_gateway_exit(
             &mut assembler,
             &mut entries,
@@ -5689,6 +5860,17 @@ fn assemble_block_inner(
             GatewayKind::Direct,
             recording.as_deref_mut(),
         )?;
+        if lean_guard {
+            // The stale edge builds its typed exit in x17, so a kick landing
+            // in it still needs guest x17 rebuilt from slot 1128.
+            let exit_end = current_offset(&assembler)?;
+            for offset in (exit_start.get()..exit_end.get()).step_by(4) {
+                recovery.push(RecoveryEntry {
+                    cache: CacheOffset::published(offset),
+                    action: RecoveryAction::RestoreGuestX17,
+                });
+            }
+        }
     }
     let bytes = assembler
         .finalize()
@@ -6211,6 +6393,176 @@ mod tests {
                 guest: GuestVa(0x4008),
                 resume: GuestVa(0x400c),
             },
+        }
+    }
+
+    /// Every word a guarded block emits before its first copied guest
+    /// instruction: the gateway-phase publish, the generation guard, and the
+    /// guest-x17 restore.
+    ///
+    /// The cut is the first emitted `nop`, which is `copy_plan`'s first guest
+    /// instruction. A guest-PC filter could not make the cut: the prologue is
+    /// deliberately mapped to `plan.start`, the same guest PC the first copied
+    /// instruction carries.
+    fn guarded_prologue_words(guard: GenerationGuard) -> Vec<u32> {
+        let assembled = assemble_block_inner(
+            &copy_plan(),
+            Some(guard),
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble guarded block");
+        let first_guest = assembled
+            .words
+            .iter()
+            .position(|word| *word == 0xd503_201f)
+            .expect("first copied guest instruction");
+        assembled.words[..first_guest].to_vec()
+    }
+
+    /// The context byte slot a 64-bit `str Xt, [x28, #imm]` writes.
+    fn context_store_slot(word: u32) -> Option<u32> {
+        ((word & 0xFFC0_03E0) == 0xF900_0380).then(|| ((word >> 10) & 0xFFF) * 8)
+    }
+
+    /// The context byte slot a 64-bit `ldr Xt, [x28, #imm]` reads.
+    fn context_load_slot(word: u32) -> Option<u32> {
+        ((word & 0xFFC0_03E0) == 0xF940_0380).then(|| ((word >> 10) & 0xFFF) * 8)
+    }
+
+    /// Anything that writes memory: the prologue is store-throughput-bound, so
+    /// the store COUNT is the quantity under test, not any one opcode.
+    fn is_store(word: u32) -> bool {
+        bad64::decode(word, 0x4000).is_ok_and(|instruction| {
+            matches!(
+                instruction.op(),
+                bad64::Op::STR
+                    | bad64::Op::STUR
+                    | bad64::Op::STP
+                    | bad64::Op::STLR
+                    | bad64::Op::STRB
+                    | bad64::Op::STRH
+            )
+        })
+    }
+
+    /// The generation guard is the authoritative stale-code check and there is
+    /// no link severing anywhere in the tree, so it must keep running on every
+    /// block entry. What it need NOT do is spill guest state to reach two
+    /// scratch registers: physical x17 is dead at block entry (its guest value
+    /// lives in `snapshot.x[17]` and slot 1128, and the prologue reloads it)
+    /// and physical x19 is host-owned for the whole of translated execution
+    /// (`gateway::RESERVED_SCRATCH`), so the guard has two free registers
+    /// without touching guest x16 or NZCV.
+    ///
+    /// Both arms are spelled out: the switch is read once per process, so one
+    /// test binary can only observe the configuration it was started in, and a
+    /// test that asserted nothing in the shipped configuration would be
+    /// vacuous.
+    #[test]
+    fn generation_guard_spills_no_guest_register() {
+        use std::sync::atomic::AtomicU64;
+
+        let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+        for (name, guard) in [
+            (
+                "absolute",
+                GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+            ),
+            (
+                "binding",
+                GenerationGuard::binding(3, CodeGeneration::INITIAL),
+            ),
+        ] {
+            let words = guarded_prologue_words(guard);
+            let stores = words.iter().copied().filter(|word| is_store(*word)).count();
+
+            // Invariant in BOTH arms: the guard runs, reads the generation
+            // cell with acquire ordering, and publishes the generation it
+            // matched.
+            assert!(
+                words.iter().any(|word| (word & 0xFFFF_FC00) == 0xC8DF_FC00),
+                "{name} guard must ldar the generation cell: {words:08x?}"
+            );
+            assert!(
+                words
+                    .iter()
+                    .any(|word| context_store_slot(*word) == Some(crate::gateway::CTX_GENERATION)),
+                "{name} guard must publish its generation: {words:08x?}"
+            );
+
+            if crate::emit::lean_generation_guard_enabled() {
+                // The spill slots the guard used to borrow: guest x16 (1120),
+                // guest x17 (1128) and the guard's NZCV save (936).
+                for slot in [936_u32, 1120, 1128] {
+                    assert!(
+                        !words
+                            .iter()
+                            .any(|word| context_store_slot(*word) == Some(slot)),
+                        "{name} guard still spills to context slot {slot}: {words:08x?}"
+                    );
+                    assert!(
+                        !words
+                            .iter()
+                            .any(|word| context_load_slot(*word) == Some(slot)),
+                        "{name} guard still reloads context slot {slot}: {words:08x?}"
+                    );
+                }
+                // A flags-free comparison leaves guest NZCV untouched, so
+                // neither half of the PSTATE round trip may survive.
+                assert!(
+                    !words.contains(&0xd53b_4210) && !words.contains(&0xd51b_4210),
+                    "{name} guard still round-trips NZCV: {words:08x?}"
+                );
+                // Two stores remain and both are load-bearing: the gateway
+                // phase publish and the guard's own generation publish.
+                assert_eq!(stores, 2, "{name} lean prologue store count: {words:08x?}");
+                // Its scratch is the host-owned reserved register, and guest
+                // x16 is never named at all.
+                assert!(
+                    words
+                        .iter()
+                        .any(|word| word & 0x1f == crate::gateway::RESERVED_SCRATCH),
+                    "{name} guard must compute in the reserved register: {words:08x?}"
+                );
+                assert!(
+                    !words.iter().any(|word| word & 0x1f == 16),
+                    "{name} guard must not write guest x16: {words:08x?}"
+                );
+            } else {
+                // The inverse, so the shipped configuration still asserts
+                // exactly what it does: two borrowed guest registers spilled
+                // and reloaded, a PSTATE round trip, and five stores.
+                for slot in [936_u32, 1120, 1128] {
+                    assert!(
+                        words
+                            .iter()
+                            .any(|word| context_store_slot(*word) == Some(slot)),
+                        "{name} guard must spill context slot {slot}: {words:08x?}"
+                    );
+                    assert!(
+                        words
+                            .iter()
+                            .any(|word| context_load_slot(*word) == Some(slot)),
+                        "{name} guard must reload context slot {slot}: {words:08x?}"
+                    );
+                }
+                assert!(
+                    words.contains(&0xd53b_4210) && words.contains(&0xd51b_4210),
+                    "{name} guard must round-trip NZCV: {words:08x?}"
+                );
+                assert_eq!(
+                    stores, 5,
+                    "{name} spilling prologue store count: {words:08x?}"
+                );
+                assert!(
+                    !words
+                        .iter()
+                        .any(|word| word & 0x1f == crate::gateway::RESERVED_SCRATCH),
+                    "{name} guard must leave the reserved register alone: {words:08x?}"
+                );
+            }
         }
     }
 
