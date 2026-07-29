@@ -3706,13 +3706,14 @@ fn binding_generation_guard_contains_no_process_pointer() {
     // The lean guard compares with EOR/CBNZ precisely so it writes no flags;
     // the shipped guard still uses CMP/B.NE and brackets it with a PSTATE
     // round trip. Spell out both arms: the switch is read once per process.
-    let (tail, name): (&[bad64::Op], &str) =
-        if std::env::var_os("CARRICK_DSR_LEAN_GUARD").as_deref() == Some(std::ffi::OsStr::new("1"))
-        {
-            (&[bad64::Op::EOR, bad64::Op::CBNZ], "lean")
-        } else {
-            (&[bad64::Op::CMP, bad64::Op::B_NE], "spilling")
-        };
+    // Ask the production predicate rather than re-deriving the switch's
+    // default here: an earlier copy of that logic went stale the moment the
+    // default flipped, turning a passing test into a false failure.
+    let (tail, name): (&[bad64::Op], &str) = if super::emit::lean_generation_guard_enabled() {
+        (&[bad64::Op::EOR, bad64::Op::CBNZ], "lean")
+    } else {
+        (&[bad64::Op::CMP, bad64::Op::B_NE], "spilling")
+    };
     let expected = [bad64::Op::ADD, bad64::Op::LDP, bad64::Op::LDAR]
         .into_iter()
         .chain(tail.iter().copied())

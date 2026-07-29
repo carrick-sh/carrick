@@ -2873,7 +2873,8 @@ enum CompactBiasedPolicy {
 /// default differ in exactly the spill this phase exists to delete, and both
 /// arms of a wall screen come from one binary.
 ///
-/// **OPT-IN, and deliberately so.** Every structural gate is green -- the
+/// **DEFAULT ON since 2026-07-29, after measurement and attribution.**
+/// Previously opt-in; the note below is retained because it records why. Every structural gate is green -- the
 /// `bad64`-asserted sequence tests, the recovery matrix's fault injection at
 /// every recovery point of eight access shapes (including the reserved base,
 /// negative-immediate and register-offset forms), the live compact-writeback
@@ -2930,10 +2931,14 @@ fn reserved_scratch_enabled() -> bool {
 /// and the reserved-scratch note above). It ships off until measured;
 /// `CARRICK_DSR_LEAN_GUARD=1` selects it, so both arms of a screen come from
 /// one binary.
-fn lean_generation_guard_enabled() -> bool {
+pub fn lean_generation_guard_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("CARRICK_DSR_LEAN_GUARD").as_deref() == Some(std::ffi::OsStr::new("1"))
+        // ON by default: 26.4% on a paired screen (6/6 wins, non-overlapping),
+        // and the gate failures that once looked lean-specific reproduced in
+        // the CONTROL arm — see the attribution note above.
+        // `CARRICK_DSR_LEAN_GUARD=0` is the escape hatch.
+        std::env::var_os("CARRICK_DSR_LEAN_GUARD").as_deref() != Some(std::ffi::OsStr::new("0"))
     })
 }
 
