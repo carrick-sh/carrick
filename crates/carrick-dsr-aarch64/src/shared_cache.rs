@@ -1086,6 +1086,7 @@ mod tests {
                         bit: None,
                     },
                 },
+                extensions: Vec::new(),
             },
             0,
             crate::emit::EmitAddressMode::Direct,

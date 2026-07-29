@@ -42,6 +42,7 @@ PERFORMANCE_CONTROL_KEYS = (
     "CARRICK_NATIVE_TRACE_SYSCALLS",
     "CARRICK_NATIVE_REFUSE_POSTFORK_THREADS",
     "CARRICK_NATIVE_UNSAFE_POSTFORK_THREADS",
+    "CARRICK_DSR_SUPERBLOCK",
 )
 HARNESS_CARRICK_ALLOWLIST = frozenset()
 VARIANT_OVERLAYS: dict[str, dict[str, str | None]] = {
@@ -827,6 +828,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=DEFAULT_TIMEOUT_SECONDS,
     )
     parser.add_argument(
+        "--superblock",
+        help=(
+            "CARRICK_DSR_SUPERBLOCK overlay for the Carrick phase: "
+            "'off', 'on', or a segment count. Omitted leaves the binary default, "
+            "so a paired screen must set it EXPLICITLY on both arms"
+        ),
+    )
+    parser.add_argument(
         "--allow-busy",
         action="store_true",
         help="run despite active compilers, Carrick processes, spin loops, or load",
@@ -855,6 +864,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if ENGINE_DOCKER in engines and args.variant != VARIANT_DEFAULT:
         raise SystemExit("Docker accepts only --variant default")
     selected_overlay = fixed_variant_overlay(args.variant)
+    if args.superblock is not None:
+        if ENGINE_DOCKER in engines:
+            raise SystemExit("--superblock is a Carrick control; Docker takes no overlay")
+        selected_overlay["CARRICK_DSR_SUPERBLOCK"] = args.superblock
     reject_ambient_carrick(os.environ, selected_overlay)
     if ENGINE_CARRICK in engines and not binary.is_file():
         raise SystemExit(f"missing signed release binary: {binary}; run `just build`")

@@ -859,6 +859,39 @@ to `PROPOSED`.
     are the decision instrument, and the runner's built-in preflight
     (no foreign workloads, no compilers, load below the logical CPU count)
     remains the only idleness gate.
+15. Phase B's second lever is **single-page superblock formation**, and it
+    extends along the conditional **fall-through only**. A conditional branch
+    splits a guest block today, so its fall-through pays a whole second entry
+    prologue — generation guard including an `ldar` acquire, the
+    `entry_in_progress` store, the guest-x17 reload — plus the predecessor's
+    two guest-x17 stores, to reach code that is simply the next instruction.
+    Fusing that edge costs 2 emitted words and removes ~11 executed ones.
+    Three boundaries are deliberate, not provisional:
+    - **Fall-through only.** Fusing a taken edge would admit an arbitrary
+      in-page target, making the block's guest range non-contiguous and
+      invalidating the `[start, end)` source-word fingerprint that the
+      artifact and shared-cache keys are built from.
+    - **Never across a guest page.** A block records exactly one
+      invalidation dependency (`dependencies.record(source_page, …)`) and its
+      generation guard is page-keyed, so a two-page block would miss writes
+      to its second page.
+    - **Loops keep their per-iteration guard.** Only forward fall-throughs
+      fuse, so a backward branch still leaves through a direct link into a
+      block entry — code invalidation is still observed once per iteration,
+      exactly as before.
+    Measured mechanism on `ls -la /usr/bin` ×3 under the native backend:
+    translations 5323 → 3287 (−38.2%), direct resolver exits 4189 → 2153
+    (−48.6%), gateway entries 19753 → 17716 (−10.3%), each figure repeated
+    identically across the run's profile frames.
+16. The superblock switch is read at exactly ONE site — the translator
+    resolves `block::superblock_segment_limit()` once per process into a field
+    — and the emitter is not gated on it at all: it renders whatever segments
+    the planner hands it. That is a direct consequence of `19dc0580`, where a
+    feature behind an opt-in switch had its default arm as the only tested
+    one, so flipping the default broke a stale test. Here the planner tests
+    pass an explicit segment limit, and
+    `set_superblock_segments_for_test` reaches the production translator, so
+    fusion is exercised under either default.
 
 ## Next action
 

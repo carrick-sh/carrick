@@ -99,6 +99,25 @@ impl PlannedExit {
     }
 }
 
+/// One guest basic block fused into a preceding one by superblock formation.
+///
+/// A segment is reached ONLY through its predecessor's conditional
+/// fall-through, and that edge is an internal `b` inside one emitted block --
+/// never a patched direct-link slot and never a gateway crossing. So the whole
+/// chain pays ONE entry prologue (generation guard, `entry_in_progress` store,
+/// guest-x17 reload) and one guest-x17 save, instead of one per guest block.
+///
+/// `entry` is redundant with the preceding segment's `end` -- the chain is
+/// contiguous by construction, because the only edge we extend along is the
+/// fall-through. It is carried explicitly so the emitter maps words to guest
+/// PCs without re-deriving the arithmetic, and so a violation is assertable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanExtension {
+    pub entry: GuestVa,
+    pub instructions: Vec<PlannedInst>,
+    pub exit: PlannedExit,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockPlan {
     pub start: GuestVa,
@@ -106,6 +125,21 @@ pub struct BlockPlan {
     pub generation: CodeGeneration,
     pub instructions: Vec<PlannedInst>,
     pub exit: PlannedExit,
+    /// Guest blocks fused after this one (see [`PlanExtension`]). Empty for a
+    /// plain single-block plan, which is what every non-extending caller and
+    /// the whole pre-superblock emitter path see.
+    pub extensions: Vec<PlanExtension>,
+}
+
+impl BlockPlan {
+    /// The exit that actually terminates the emitted block: the last
+    /// segment's. `self.exit` is the FIRST segment's exit, which for an
+    /// extended plan is an internal conditional edge, not a terminator.
+    pub fn terminal_exit(&self) -> PlannedExit {
+        self.extensions
+            .last()
+            .map_or(self.exit, |extension| extension.exit)
+    }
 }
 
 fn checked_next(pc: GuestVa) -> Result<GuestVa, DsrError> {
@@ -148,6 +182,154 @@ pub fn plan_with_reader(
 }
 
 pub fn plan_with_reader_for_counter_plan(
+    start: GuestVa,
+    generation: CodeGeneration,
+    max_instructions: usize,
+    page_size: u64,
+    fusion_policy: ExclusiveFusionPolicy,
+    counter_plan: HostCounterPlan,
+    read: impl FnMut(GuestVa) -> Result<u32, DsrError>,
+) -> Result<BlockPlan, DsrError> {
+    plan_superblock_with_reader_for_counter_plan(
+        start,
+        generation,
+        max_instructions,
+        page_size,
+        fusion_policy,
+        counter_plan,
+        1,
+        read,
+    )
+}
+
+/// How many guest blocks one emitted block may fuse (1 = no fusion).
+///
+/// Every fused edge trades 2 emitted words (the fall-through hop and the
+/// taken-edge patch slot) against ~11 executed words -- the next block's
+/// prologue, its generation guard including an `ldar` acquire, its
+/// `entry_in_progress` store, its guest-x17 reload, and the predecessor's two
+/// guest-x17 stores. The cap exists because extension is speculative: the
+/// fall-through of a mostly-taken branch is cold, so past some depth we are
+/// emitting code that never runs.
+pub const SUPERBLOCK_SEGMENT_LIMIT: usize = 8;
+
+/// The default when superblock formation is on, and the value
+/// `CARRICK_DSR_SUPERBLOCK=on` selects.
+pub const SUPERBLOCK_DEFAULT_SEGMENTS: usize = 1;
+
+/// Production segment limit, resolved once per process.
+///
+/// `CARRICK_DSR_SUPERBLOCK` accepts `on` (= [`SUPERBLOCK_SEGMENT_LIMIT`]), `off`
+/// (= 1), or a segment count. Anything else -- including a typo -- resolves to
+/// [`SUPERBLOCK_DEFAULT_SEGMENTS`], so a mistyped value cannot quietly select
+/// some other depth than the one being measured.
+pub fn superblock_segment_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| match std::env::var("CARRICK_DSR_SUPERBLOCK") {
+        Ok(value) => match value.trim() {
+            "on" => SUPERBLOCK_SEGMENT_LIMIT,
+            "off" => 1,
+            other => other
+                .parse::<usize>()
+                .map_or(SUPERBLOCK_DEFAULT_SEGMENTS, |segments| segments.max(1)),
+        },
+        // OFF until the wall gate rules. The EMITTER's fused path is not gated
+        // on this -- it renders whatever segments the planner hands it, and the
+        // translator's `set_superblock_segments_for_test` reaches the planner's
+        // -- so the fusion tests exercise fusion under either default. An
+        // opt-in switch whose default arm is the only one tested is how
+        // `19dc0580` shipped a test that broke the moment its default flipped.
+        Err(_) => SUPERBLOCK_DEFAULT_SEGMENTS,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "block policy is a flat parameter list; a struct would only move it"
+)]
+pub fn plan_superblock_with_reader_for_counter_plan(
+    start: GuestVa,
+    generation: CodeGeneration,
+    max_instructions: usize,
+    page_size: u64,
+    fusion_policy: ExclusiveFusionPolicy,
+    counter_plan: HostCounterPlan,
+    segment_limit: usize,
+    mut read: impl FnMut(GuestVa) -> Result<u32, DsrError>,
+) -> Result<BlockPlan, DsrError> {
+    let mut plan = plan_segment_with_reader(
+        start,
+        generation,
+        max_instructions,
+        page_size,
+        fusion_policy,
+        counter_plan,
+        &mut read,
+    )?;
+    if segment_limit <= 1 {
+        return Ok(plan);
+    }
+    let boundary = page_end(start, page_size)?;
+    let mut planned = plan.instructions.len();
+    while plan.extensions.len() + 1 < segment_limit
+        && let Some(entry) = superblock_fallthrough(plan.terminal_exit(), boundary)
+        && planned < max_instructions
+    {
+        let segment = plan_segment_with_reader(
+            entry,
+            generation,
+            max_instructions - planned,
+            page_size,
+            fusion_policy,
+            counter_plan,
+            &mut read,
+        )?;
+        // A fused exclusive region is lowered by a dedicated emitter path that
+        // owns the whole block (the load and its store must share one emitted
+        // block with no context store between them). Refuse to swallow one as a
+        // continuation rather than teach that path to be a segment: dropping
+        // the segment leaves the fall-through a direct link to a block that
+        // starts AT the load, which is exactly what fuses today.
+        if matches!(segment.exit, PlannedExit::ExclusiveRegion { .. }) {
+            break;
+        }
+        planned += segment.instructions.len();
+        let end = segment.end;
+        plan.extensions.push(PlanExtension {
+            entry,
+            instructions: segment.instructions,
+            exit: segment.exit,
+        });
+        plan.end = end;
+    }
+    Ok(plan)
+}
+
+/// The guest PC a conditional direct exit falls through to, when fusing it is
+/// legal.
+///
+/// The fall-through is the ONLY edge superblock formation extends along, and
+/// that is what keeps the fused block single-page and contiguous: the
+/// fall-through of an in-page branch is the next instruction, so it can only
+/// leave the page by BEING the page end -- which this rejects. Fusing a taken
+/// edge would admit an arbitrary in-page target, making the block's guest range
+/// non-contiguous and invalidating the `[start, end)` source-word fingerprint
+/// the artifact and shared-cache keys are built from.
+fn superblock_fallthrough(exit: PlannedExit, boundary: GuestVa) -> Option<GuestVa> {
+    let PlannedExit::Direct { exit, .. } = exit else {
+        return None;
+    };
+    match exit.kind {
+        DirectKind::Conditional | DirectKind::CompareZero { .. } | DirectKind::TestBit { .. } => {
+            (exit.resume.raw() < boundary.raw()).then_some(exit.resume)
+        }
+        // An unconditional branch or call has no fall-through. Its target is
+        // reachable in principle, but not contiguously.
+        DirectKind::Branch | DirectKind::Call => None,
+    }
+}
+
+fn plan_segment_with_reader(
     start: GuestVa,
     generation: CodeGeneration,
     max_instructions: usize,
@@ -244,6 +426,7 @@ pub fn plan_with_reader_for_counter_plan(
                                     exit: region_exit,
                                     fusion,
                                 },
+                                extensions: Vec::new(),
                             });
                         }
                         return Ok(BlockPlan {
@@ -255,6 +438,7 @@ pub fn plan_with_reader_for_counter_plan(
                                 target: pc,
                                 limit: BlockLimit::ExclusiveRegionSplit,
                             },
+                            extensions: Vec::new(),
                         });
                     }
                     if exclusive_fusion.is_none() {
@@ -376,6 +560,7 @@ pub fn plan_with_reader_for_counter_plan(
                 generation,
                 instructions,
                 exit,
+                extensions: Vec::new(),
             });
         }
         pc = next;
@@ -826,13 +1011,32 @@ pub fn plan_block(
     // already run and FAILED -- an iteration boundary. A blanket
     // restart-from-load would be UNSOUND, because the accepted body may contain
     // a non-re-derivable update (`add w9, w9, #1`) that restarting double-applies.
+    plan_block_with_segments(memory, start, generation, max_instructions, 1)
+}
+
+/// [`plan_block`] with superblock formation: `segment_limit` guest blocks may
+/// be fused into one emitted block (1 = no fusion).
+///
+/// The limit is a caller's decision, never an environment read down here. The
+/// translator resolves it once per process from
+/// [`superblock_segment_limit`], which keeps every planner test deterministic
+/// and keeps the switch to a single site.
+pub fn plan_block_with_segments(
+    memory: &crate::mapped_memory::NativeMappedMemory,
+    start: carrick_guest_mem::GuestVa,
+    generation: crate::types::CodeGeneration,
+    max_instructions: usize,
+    segment_limit: usize,
+) -> Result<BlockPlan, crate::types::DsrError> {
     let fusion_policy = fusion_policy_for(memory.address_mode());
-    plan_with_reader(
+    plan_superblock_with_reader_for_counter_plan(
         start,
         generation,
         max_instructions,
         memory.linux_page_size,
         fusion_policy,
+        counter::host_counter_plan(),
+        segment_limit,
         |pc| {
             memory
                 .read_u32(pc.raw())
@@ -876,6 +1080,208 @@ mod tests {
         )
         .expect("plan test block");
         (plan, reads)
+    }
+
+    /// Encode `b.<cond> target` at `pc`. Verified against the real
+    /// `b.ne` word cited by the exclusive-access diagnosis
+    /// (`.superpowers/sdd/exclusive-diagnosis.md`): encoding a
+    /// compare-failure branch 3 instructions ahead with `cond=NE`
+    /// reproduces its exact `0x54000061`.
+    fn encode_b_cond(pc: GuestVa, target: GuestVa, cond: u32) -> u32 {
+        let offset = (target.raw() as i64 - pc.raw() as i64) / 4;
+        let imm19 = (offset as u32) & 0x7_ffff;
+        0x5400_0000 | (imm19 << 5) | cond
+    }
+
+    /// Plan with an EXPLICIT segment limit rather than the production one.
+    /// `plan_words` goes through `superblock_segment_limit()`, so it would make
+    /// every fusion assertion depend on an environment variable -- the shape of
+    /// bug that turned a passing guard test into a false failure the moment a
+    /// default flipped.
+    fn plan_words_fused(
+        words: &[u32],
+        start: GuestVa,
+        page_size: u64,
+        max_instructions: usize,
+        segment_limit: usize,
+    ) -> BlockPlan {
+        plan_superblock_with_reader_for_counter_plan(
+            start,
+            CodeGeneration::INITIAL,
+            max_instructions,
+            page_size,
+            ExclusiveFusionPolicy::BiasedDisabled,
+            counter::host_counter_plan(),
+            segment_limit,
+            |pc| {
+                let offset = usize::try_from((pc.raw() - start.raw()) / 4)
+                    .map_err(|_| DsrError::BlockPolicy("test offset overflow".to_string()))?;
+                words
+                    .get(offset)
+                    .copied()
+                    .ok_or_else(|| DsrError::MemoryRead {
+                        pc: pc.raw(),
+                        detail: "test region exhausted".to_string(),
+                    })
+            },
+        )
+        .expect("plan fused test block")
+    }
+
+    /// `cmp w0, w1` / `b.ne <out of block>` / `nop` / `svc #0`: the conditional
+    /// splits a guest block today, and fusing its fall-through makes the four
+    /// instructions one emitted unit.
+    fn conditional_then_syscall(target: GuestVa, start: GuestVa) -> [u32; 4] {
+        [
+            0x6b01_001f,
+            encode_b_cond(GuestVa(start.raw() + 4), target, 1),
+            0xd503_201f,
+            0xd400_0001,
+        ]
+    }
+
+    #[test]
+    fn superblock_fuses_the_fall_through_of_a_conditional_branch() {
+        let start = GuestVa(0x4000);
+        let words = conditional_then_syscall(GuestVa(0x4400), start);
+        let plan = plan_words_fused(&words, start, 0x1000, 16, 2);
+
+        assert_eq!(plan.extensions.len(), 1, "one fused fall-through segment");
+        let extension = &plan.extensions[0];
+        assert_eq!(
+            extension.entry,
+            GuestVa(0x4008),
+            "the segment starts at the conditional's fall-through"
+        );
+        assert!(matches!(
+            plan.exit,
+            PlannedExit::Direct {
+                exit: DirectExit {
+                    kind: DirectKind::Conditional,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(plan.terminal_exit(), PlannedExit::Syscall { .. }));
+        assert_eq!(plan.end, GuestVa(0x4010), "the plan covers both segments");
+        assert_eq!(plan.instructions.len(), 1, "the leading cmp");
+        assert_eq!(extension.instructions.len(), 1, "the trailing nop");
+    }
+
+    #[test]
+    fn superblock_is_disabled_at_a_segment_limit_of_one() {
+        let start = GuestVa(0x4000);
+        let words = conditional_then_syscall(GuestVa(0x4400), start);
+        let plan = plan_words_fused(&words, start, 0x1000, 16, 1);
+
+        assert!(plan.extensions.is_empty());
+        assert_eq!(plan.end, GuestVa(0x4008), "one guest block only");
+    }
+
+    #[test]
+    fn superblock_chain_stays_contiguous_and_respects_the_segment_limit() {
+        // Four conditionals in a row: every fall-through is another
+        // conditional, so the chain is bounded only by the limit.
+        let start = GuestVa(0x4000);
+        let words: Vec<u32> = (0..6)
+            .map(|index| encode_b_cond(GuestVa(start.raw() + index * 4), GuestVa(0x4400), 1))
+            .collect();
+        let plan = plan_words_fused(&words, start, 0x1000, 64, 3);
+
+        assert_eq!(plan.extensions.len(), 2, "limit 3 = 1 head + 2 extensions");
+        let mut previous_end = GuestVa(start.raw() + 4);
+        for extension in &plan.extensions {
+            assert_eq!(
+                extension.entry, previous_end,
+                "fused segments are contiguous by construction"
+            );
+            previous_end = GuestVa(extension.entry.raw() + 4);
+        }
+        assert_eq!(plan.end, previous_end);
+    }
+
+    #[test]
+    fn superblock_does_not_cross_a_page_boundary() {
+        // The conditional is the page's last instruction, so its fall-through
+        // is the first instruction of the NEXT page -- a different generation
+        // key and a different invalidation dependency.
+        let start = GuestVa(0x4ff8);
+        let words = [
+            0x6b01_001f,
+            encode_b_cond(GuestVa(0x4ffc), GuestVa(0x4400), 1),
+            0xd503_201f,
+        ];
+        let plan = plan_words_fused(&words, start, 0x1000, 16, 8);
+
+        assert!(
+            plan.extensions.is_empty(),
+            "fusing would have pulled in a second guest page"
+        );
+        assert_eq!(plan.end, GuestVa(0x5000));
+    }
+
+    #[test]
+    fn superblock_does_not_fuse_an_unconditional_branch_or_call() {
+        let start = GuestVa(0x4000);
+        for (word, name) in [(0x1400_0010_u32, "b"), (0x9400_0010, "bl")] {
+            let plan = plan_words_fused(&[word, 0xd503_201f], start, 0x1000, 16, 8);
+            assert!(
+                plan.extensions.is_empty(),
+                "{name} has no fall-through to fuse"
+            );
+        }
+    }
+
+    #[test]
+    fn superblock_stops_at_the_instruction_budget() {
+        // `nop` / `b.ne` repeated: each segment carries one real instruction,
+        // so the budget -- not the segment cap -- is what binds here.
+        let start = GuestVa(0x4000);
+        let words: Vec<u32> = (0..8)
+            .map(|index| {
+                let pc = GuestVa(start.raw() + index * 4);
+                if index.is_multiple_of(2) {
+                    0xd503_201f
+                } else {
+                    encode_b_cond(pc, GuestVa(0x4400), 1)
+                }
+            })
+            .collect();
+        let plan = plan_words_fused(&words, start, 0x1000, 2, 8);
+
+        let planned = plan.instructions.len()
+            + plan
+                .extensions
+                .iter()
+                .map(|extension| extension.instructions.len())
+                .sum::<usize>();
+        assert!(
+            planned <= 2,
+            "budget of 2 admitted {planned} planned instructions"
+        );
+        assert!(
+            plan.extensions.len() < 3,
+            "the budget must bound the chain, not just the segment cap"
+        );
+    }
+
+    #[test]
+    fn superblock_of_bare_conditionals_is_bounded_by_the_segment_cap() {
+        // A run of back-to-back conditional branches plans ZERO instructions
+        // per segment (the branch is the exit, not a body instruction), so the
+        // instruction budget cannot bound it. The segment cap is the real
+        // decode-time bound -- pin that, so a future budget change cannot
+        // silently make this chain unbounded.
+        let start = GuestVa(0x4000);
+        let words: Vec<u32> = (0..16)
+            .map(|index| encode_b_cond(GuestVa(start.raw() + index * 4), GuestVa(0x4400), 1))
+            .collect();
+        let plan = plan_words_fused(&words, start, 0x1000, 256, 4);
+
+        assert!(plan.instructions.is_empty());
+        assert_eq!(plan.extensions.len(), 3, "4 segments = 1 head + 3 fused");
+        assert_eq!(plan.end, GuestVa(0x4010));
     }
 
     #[test]
@@ -1107,17 +1513,6 @@ mod tests {
         // ldr x0, [x1] -- an ordinary (non-exclusive) memory access.
         const LDR_X0_X1: u32 = 0xf940_0020;
         const COND_NE: u32 = 1;
-
-        /// Encode `b.<cond> target` at `pc`. Verified against the real
-        /// `b.ne` word cited by the exclusive-access diagnosis
-        /// (`.superpowers/sdd/exclusive-diagnosis.md`): encoding a
-        /// compare-failure branch 3 instructions ahead with `cond=NE`
-        /// reproduces its exact `0x54000061`.
-        fn encode_b_cond(pc: GuestVa, target: GuestVa, cond: u32) -> u32 {
-            let offset = (target.raw() as i64 - pc.raw() as i64) / 4;
-            let imm19 = (offset as u32) & 0x7_ffff;
-            0x5400_0000 | (imm19 << 5) | cond
-        }
 
         /// Encode `cbnz w<rt>, target` at `pc`. Verified the same way: a
         /// retry branch 4 instructions back with `rt=3` reproduces the
@@ -1811,6 +2206,51 @@ mod tests {
                 },
             )
             .expect("plan production block")
+        }
+
+        #[test]
+        fn superblock_refuses_to_fuse_a_leading_exclusive_region_as_a_segment() {
+            // `cmp` / `b.ne` and then, at the fall-through, a canonical CAS
+            // retry loop. The region is fusible AND starts exactly where the
+            // fall-through lands, which is the one case where a naive extension
+            // would swallow it -- and the region emitter owns the whole emitted
+            // block, so it cannot be a segment. Extension must stop, leaving
+            // the fall-through an ordinary direct link into a block that starts
+            // at the load and fuses on its own.
+            let start = GuestVa(0x4000);
+            let region = canonical_cas(GuestVa(0x4008));
+            let mut words = vec![
+                CMP_W0_W2,
+                encode_b_cond(GuestVa(0x4004), GuestVa(0x4400), COND_NE),
+            ];
+            words.extend_from_slice(&region);
+            let plan = plan_superblock_with_reader_for_counter_plan(
+                start,
+                CodeGeneration::INITIAL,
+                256,
+                0x1000,
+                ExclusiveFusionPolicy::Direct,
+                counter::host_counter_plan(),
+                8,
+                |pc| {
+                    let offset = usize::try_from((pc.raw() - start.raw()) / 4)
+                        .map_err(|_| DsrError::BlockPolicy("test offset overflow".to_string()))?;
+                    words
+                        .get(offset)
+                        .copied()
+                        .ok_or_else(|| DsrError::MemoryRead {
+                            pc: pc.raw(),
+                            detail: "test region exhausted".to_string(),
+                        })
+                },
+            )
+            .expect("plan superblock over a fusible region");
+
+            assert!(
+                plan.extensions.is_empty(),
+                "a fused exclusive region must not become a segment"
+            );
+            assert_eq!(plan.end, GuestVa(0x4008));
         }
 
         fn canonical_cas(start: GuestVa) -> [u32; 6] {

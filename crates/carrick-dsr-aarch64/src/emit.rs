@@ -1838,6 +1838,160 @@ fn emit_cached_direct_exit(
     )
 }
 
+/// One item of a fused block's emission stream: either a guest instruction
+/// from some segment's body, or the internal edge joining two segments.
+///
+/// A flat stream rather than a loop per segment, so every `continue` in the
+/// copy-stream match keeps targeting the loop that consumes the stream.
+enum EmitItem<'plan> {
+    Instruction(&'plan super::block::PlannedInst),
+    InternalEdge(PlannedExit),
+}
+
+/// A fused conditional's taken edge, held back until the whole fused body is
+/// emitted.
+///
+/// The patch slot goes down inline (it has to: the conditional reaches it with
+/// a fixed displacement), but the stub it branches to is emitted after the
+/// terminal exit. Interleaving ~10 words of cold gateway stub between every
+/// pair of segments is exactly the I-cache dilution superblock formation exists
+/// to avoid.
+struct PendingTakenEdge {
+    guest: GuestVa,
+    target: GuestVa,
+    slot: CacheOffset,
+    stub: dynasmrt::DynamicLabel,
+}
+
+/// Emit the internal edge of a fused conditional branch.
+///
+/// The guest's fall-through continues inline in the next segment; the guest's
+/// taken edge leaves the block through an ordinary direct-link slot. The three
+/// leading words are the same ones a non-fused conditional exit emits -- the
+/// relocated conditional (taken displacement 2), then the hop, then the slot --
+/// so the encoding of the guest's own branch is untouched.
+fn emit_internal_fallthrough_edge(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    exit: PlannedExit,
+) -> Result<PendingTakenEdge, DsrError> {
+    let PlannedExit::Direct {
+        guest, word, exit, ..
+    } = exit
+    else {
+        return Err(DsrError::BlockPolicy(format!(
+            "fused segment edge is not a direct branch: {exit:?}"
+        )));
+    };
+    if !matches!(
+        exit.kind,
+        super::types::DirectKind::Conditional
+            | super::types::DirectKind::CompareZero { .. }
+            | super::types::DirectKind::TestBit { .. }
+    ) {
+        return Err(DsrError::BlockPolicy(format!(
+            "fused segment edge is not conditional at guest PC 0x{:x}",
+            guest.raw()
+        )));
+    }
+    let fallthrough = assembler.new_dynamic_label();
+    let stub = assembler.new_dynamic_label();
+    let virtual_offset = exit
+        .register
+        .and_then(gpr_index)
+        .and_then(virtual_snapshot_offset);
+    if let Some(offset) = virtual_offset {
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 18,
+        )?;
+    }
+    emit_word(
+        assembler,
+        entries,
+        guest,
+        relocated_direct_word(word, exit, virtual_offset.map(|_| 18))?,
+    )?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b =>fallthrough
+    );
+    // Taken path. Publish guest x17 before the slot, never after it: a linked
+    // slot branches straight into the target block's prologue, which reloads
+    // x17 from slot 136 and whose recovery entries read slot 1128. On the
+    // fall-through these two stores do not run at all -- that, plus the entry
+    // prologue they no longer reach, is the fusion's whole saving.
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #136]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #1128]
+    );
+    let slot = current_offset(assembler)?;
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b =>stub
+    );
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>fallthrough
+    );
+    Ok(PendingTakenEdge {
+        guest,
+        target: exit.target,
+        slot,
+        stub,
+    })
+}
+
+/// Emit the deferred stub for one fused conditional's taken edge and register
+/// its direct link.
+fn emit_internal_taken_stub(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    direct_links: &mut Vec<DirectLink>,
+    recovery: &mut Vec<RecoveryEntry>,
+    edge: PendingTakenEdge,
+    direct_exit_policy: DirectExitEmissionPolicy,
+    recording: Option<&mut ArtifactRecording>,
+) -> Result<(), DsrError> {
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>edge.stub
+    );
+    let stub_start = current_offset(assembler)?;
+    emit_direct_exit(
+        assembler,
+        entries,
+        edge.guest,
+        edge.guest,
+        edge.target,
+        None,
+        recovery,
+        direct_exit_policy,
+        recording,
+    )?;
+    direct_links.push(DirectLink {
+        slot: edge.slot,
+        source: edge.guest,
+        target: edge.target,
+        kind: DirectLinkKind::ConditionalTaken,
+        stub: DirectStubEnvelope {
+            start: stub_start,
+            end: current_offset(assembler)?,
+        },
+    });
+    Ok(())
+}
+
 #[allow(
     clippy::needless_option_as_deref,
     clippy::too_many_arguments,
@@ -5197,6 +5351,16 @@ fn assemble_block_inner(
             action: RecoveryAction::RestoreGuestX17,
         });
     }
+    if !plan.extensions.is_empty() && matches!(plan.exit, PlannedExit::ExclusiveRegion { .. }) {
+        // The planner never builds this (it refuses to fuse across or into a
+        // fused exclusive region), and the region emitter owns the whole block,
+        // so silently dropping the segments would emit a block that claims a
+        // guest range it never translated. Fail closed instead.
+        return Err(DsrError::BlockPolicy(format!(
+            "fused segments cannot follow an exclusive region at guest PC 0x{:x}",
+            plan.start.raw()
+        )));
+    }
     if let PlannedExit::ExclusiveRegion { exit, fusion, .. } = plan.exit {
         // A fused exclusive region (LDXR/LDAXR .. STXR/STLXR CAS/RMW retry loop)
         // is lowered to native code that executes in-guest without a gateway
@@ -5218,7 +5382,39 @@ fn assemble_block_inner(
             recording.as_deref_mut(),
         )?;
     } else {
-        for instruction in &plan.instructions {
+        // Superblock formation: `plan.extensions` are guest blocks fused after
+        // this one, each entered through its predecessor's conditional
+        // fall-through (see `block::PlanExtension`). They are emitted as ONE
+        // stream so the prologue above, and the guest-x17 save below, are paid
+        // once for the whole chain instead of once per guest block.
+        let mut items: Vec<EmitItem<'_>> = Vec::with_capacity(
+            plan.instructions.len()
+                + plan
+                    .extensions
+                    .iter()
+                    .map(|extension| extension.instructions.len() + 1)
+                    .sum::<usize>(),
+        );
+        items.extend(plan.instructions.iter().map(EmitItem::Instruction));
+        let mut previous_exit = plan.exit;
+        for extension in &plan.extensions {
+            items.push(EmitItem::InternalEdge(previous_exit));
+            items.extend(extension.instructions.iter().map(EmitItem::Instruction));
+            previous_exit = extension.exit;
+        }
+        let mut pending_taken = Vec::with_capacity(plan.extensions.len());
+        for item in items {
+            let instruction = match item {
+                EmitItem::Instruction(instruction) => instruction,
+                EmitItem::InternalEdge(exit) => {
+                    pending_taken.push(emit_internal_fallthrough_edge(
+                        &mut assembler,
+                        &mut entries,
+                        exit,
+                    )?);
+                    continue;
+                }
+            };
             let word = match instruction.action {
             InstAction::Copy(word) => word,
             // Direct register-based emission remains byte-identical; biased
@@ -5570,7 +5766,10 @@ fn assemble_block_inner(
             assembler.push_u32(word);
         }
 
-        let exit_guest = plan.exit.guest_pc();
+        // The LAST segment's exit terminates the emitted block; every earlier
+        // segment's exit was consumed above as an internal edge.
+        let terminal = plan.terminal_exit();
+        let exit_guest = terminal.guest_pc();
         map_next(&assembler, &mut entries, exit_guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
@@ -5581,7 +5780,7 @@ fn assemble_block_inner(
             ; .arch aarch64
             ; str x17, [x28, #1128]
         );
-        if let PlannedExit::Syscall { resume, .. } = plan.exit {
+        if let PlannedExit::Syscall { resume, .. } = terminal {
             emit_gateway_exit(
                 &mut assembler,
                 &mut entries,
@@ -5592,7 +5791,7 @@ fn assemble_block_inner(
                 GatewayKind::Syscall,
                 recording.as_deref_mut(),
             )?;
-        } else if let PlannedExit::Direct { word, exit, .. } = plan.exit {
+        } else if let PlannedExit::Direct { word, exit, .. } = terminal {
             if exit.kind == super::types::DirectKind::Call {
                 emit_mov_u64(
                     &mut assembler,
@@ -5719,7 +5918,7 @@ fn assemble_block_inner(
                     },
                 });
             }
-        } else if let PlannedExit::Indirect { exit, .. } = plan.exit {
+        } else if let PlannedExit::Indirect { exit, .. } = terminal {
             emit_indirect_exit(
                 &mut assembler,
                 &mut entries,
@@ -5729,7 +5928,7 @@ fn assemble_block_inner(
                 &mut recovery,
                 recording.as_deref_mut(),
             )?;
-        } else if let PlannedExit::Sensitive { word, exit, .. } = plan.exit {
+        } else if let PlannedExit::Sensitive { word, exit, .. } = terminal {
             if let EmitAddressMode::Biased { host_bias } = mode
                 && exit.kind == super::types::SensitiveKind::DcZva
                 && let Some(register) = exit.register
@@ -5769,7 +5968,7 @@ fn assemble_block_inner(
                     recording.as_deref_mut(),
                 )?;
             }
-        } else if let PlannedExit::Continue { target, .. } = plan.exit {
+        } else if let PlannedExit::Continue { target, .. } = terminal {
             let slot = current_offset(&assembler)?;
             emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
             let stub_start = current_offset(&assembler)?;
@@ -5794,7 +5993,7 @@ fn assemble_block_inner(
                     end: current_offset(&assembler)?,
                 },
             });
-        } else if let PlannedExit::Unsupported { .. } = plan.exit {
+        } else if let PlannedExit::Unsupported { .. } = terminal {
             emit_gateway_exit(
                 &mut assembler,
                 &mut entries,
@@ -5809,6 +6008,19 @@ fn assemble_block_inner(
             return Err(DsrError::BlockPolicy(
                 "virtualized register action escaped the DSR copy stream".to_string(),
             ));
+        }
+        // Held-back taken-edge stubs for the fused conditionals, out of line
+        // past the terminal exit so the fall-through stream stays dense.
+        for edge in pending_taken {
+            emit_internal_taken_stub(
+                &mut assembler,
+                &mut entries,
+                &mut direct_links,
+                &mut recovery,
+                edge,
+                direct_exit_policy,
+                recording.as_deref_mut(),
+            )?;
         }
     }
     if let Some(stale) = stale {
@@ -6398,6 +6610,7 @@ mod tests {
                 guest: GuestVa(0x4008),
                 resume: GuestVa(0x400c),
             },
+            extensions: Vec::new(),
         }
     }
 
@@ -6584,6 +6797,7 @@ mod tests {
                 guest: GuestVa(0x4004),
                 resume: GuestVa(0x4008),
             },
+            extensions: Vec::new(),
         }
     }
 
@@ -6878,6 +7092,7 @@ mod tests {
             generation: CodeGeneration::INITIAL,
             instructions: Vec::new(),
             exit,
+            extensions: Vec::new(),
         }
     }
 
@@ -7244,6 +7459,186 @@ mod tests {
             link.stub.end.get() - link.stub.start.get(),
             PRIVATE_DIRECT_GATEWAY_STUB_BYTES,
             "fused-exclusive continuation: private direct edge must use the compact direct gateway"
+        );
+    }
+
+    /// A two-segment fused plan: `nop` / `b.ne 0x5000` / `nop` / `svc #0`.
+    fn fused_two_segment_plan() -> BlockPlan {
+        BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4010),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action: InstAction::Copy(0xd503_201f),
+            }],
+            exit: PlannedExit::Direct {
+                guest: GuestVa(0x4004),
+                // b.ne +0xffc (0x4004 -> 0x5000)
+                word: 0x5400_7fe1,
+                exit: DirectExit {
+                    kind: DirectKind::Conditional,
+                    target: GuestVa(0x5000),
+                    resume: GuestVa(0x4008),
+                    condition: Some(bad64::Condition::NE),
+                    register: None,
+                    bit: None,
+                },
+            },
+            extensions: vec![super::super::block::PlanExtension {
+                entry: GuestVa(0x4008),
+                instructions: vec![PlannedInst {
+                    guest: GuestVa(0x4008),
+                    action: InstAction::Copy(0xd503_201f),
+                }],
+                exit: PlannedExit::Syscall {
+                    guest: GuestVa(0x400c),
+                    resume: GuestVa(0x4010),
+                },
+            }],
+        }
+    }
+
+    /// The fused fall-through must cost exactly two executed words, and must
+    /// NOT save guest x17 -- that save, and the whole entry prologue it feeds,
+    /// is what fusion removes.
+    #[test]
+    fn fused_segment_edge_falls_through_in_two_words_without_saving_guest_x17() {
+        let plan = fused_two_segment_plan();
+        let assembled = assemble_block_inner(
+            &plan,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble fused block");
+        let words = &assembled.words;
+
+        // Anchor on the relocated conditional rather than a fixed index: the
+        // entry prologue's length is the lean/spilling guard's business, and
+        // this test is about the EDGE.
+        let edge = words
+            .iter()
+            // The guest's own conditional, relocated to a taken displacement of
+            // 2 -- byte-identical to what a non-fused conditional exit emits.
+            .position(|word| *word == 0x5400_0041)
+            .expect("relocated conditional, taken -> +2");
+        assert_eq!(words[edge - 1], 0xd503_201f, "segment 0 body precedes it");
+        // Fall-through hop, then the taken path: two x17 stores and the patch
+        // slot. The hop must clear all three.
+        assert_eq!(
+            words[edge + 1],
+            0x1400_0004,
+            "fall-through must branch over the taken prologue and the slot"
+        );
+        assert_eq!(
+            &words[edge + 2..edge + 4],
+            [0xf900_4791, 0xf902_3791],
+            "the x17 saves belong to the TAKEN path only"
+        );
+        assert_eq!(
+            words[edge + 4] & 0xfc00_0000,
+            0x1400_0000,
+            "taken patch slot is a `b`"
+        );
+        // ... and the hop lands on segment 1's copied `nop`.
+        assert_eq!(
+            words[edge + 5],
+            0xd503_201f,
+            "segment 1 body follows the edge"
+        );
+        // Only then the terminal exit's own x17 saves.
+        assert_eq!(
+            words[edge + 6],
+            0xf900_4791,
+            "terminal exit saves guest x17"
+        );
+
+        // One fused edge, one link, and NO fall-through link: the fall-through
+        // is an internal branch that must never be patched.
+        let kinds: Vec<DirectLinkKind> = assembled
+            .direct_links
+            .iter()
+            .map(|link| link.kind)
+            .collect();
+        assert_eq!(kinds, vec![DirectLinkKind::ConditionalTaken]);
+        let link = assembled.direct_links[0];
+        assert_eq!(
+            link.slot.get() as usize,
+            (edge + 4) * 4,
+            "the link's slot is the emitted patch-slot word"
+        );
+        assert_eq!(link.source, GuestVa(0x4004));
+        assert_eq!(link.target, GuestVa(0x5000));
+        assert!(
+            link.stub.start.get() as usize > (edge + 7) * 4,
+            "the taken stub is deferred past the terminal exit, not inlined \
+             between the segments (stub starts at {})",
+            link.stub.start.get()
+        );
+    }
+
+    /// The point of the whole exercise: N guest blocks, ONE generation guard.
+    #[test]
+    fn fused_block_emits_a_single_generation_guard() {
+        let guard = GenerationGuard::BindingIndex {
+            index: 3,
+            expected: CodeGeneration::INITIAL,
+        };
+        let count_acquires = |plan: &BlockPlan| {
+            let assembled = assemble_block_inner(
+                plan,
+                Some(guard),
+                EmitAddressMode::Direct,
+                DirectExitEmissionPolicy::PrivateGateway,
+                None,
+            )
+            .expect("assemble guarded block");
+            assembled
+                .words
+                .iter()
+                // `ldar x19, [x19]` / `ldar x16, [x16]`: the guard's acquire.
+                .filter(|word| (*word & 0xffff_fc00) == 0xc8df_fc00)
+                .count()
+        };
+        let mut unfused = fused_two_segment_plan();
+        unfused.extensions.clear();
+        unfused.end = GuestVa(0x4008);
+        assert_eq!(count_acquires(&unfused), 1);
+        assert_eq!(
+            count_acquires(&fused_two_segment_plan()),
+            1,
+            "a fused block must pay ONE guard for both guest blocks"
+        );
+    }
+
+    /// The planner never builds this, and the region emitter owns the whole
+    /// block, so a fused plan carrying one must fail rather than silently drop
+    /// the segments and publish a guest range it never translated.
+    #[test]
+    fn fused_segments_after_an_exclusive_region_are_rejected() {
+        let mut plan = fused_two_segment_plan();
+        let PlannedExit::Direct { guest, word, .. } = plan.exit else {
+            unreachable!("fixture exit is a direct branch")
+        };
+        plan.exit = PlannedExit::Unsupported {
+            guest,
+            word,
+            op: bad64::Op::B_NE,
+        };
+        let error = assemble_block_inner(
+            &plan,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .err()
+        .expect("a non-conditional fused edge must be rejected");
+        assert!(
+            format!("{error:?}").contains("not a direct branch"),
+            "unexpected error: {error:?}"
         );
     }
 
