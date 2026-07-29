@@ -95,11 +95,48 @@ def coarse_family(word: int) -> str:
     return "guest:other"
 
 
+def guest_registers(word: int) -> set[int] | None:
+    """GPRs named by a verbatim guest word, or None if the shape is unmodelled.
+
+    Rd/Rn/Rm sit at fixed positions for data-processing and load/store forms,
+    which is what `coarse_family` already classifies as guest work. Returning
+    None (rather than an empty set) keeps unmodelled encodings out of the
+    tally instead of biasing it toward "register unused".
+    """
+    top = word >> 24
+    regs: set[int] = set()
+    # Unconditional/conditional branches and system: no GPR operands.
+    if (word & 0x7C000000) == 0x14000000 or top == 0x54:
+        return regs
+    # Compare-and-branch / test-and-branch name Rt only.
+    if top in (0x34, 0x35, 0xB4, 0xB5, 0x36, 0x37):
+        return {word & 0x1F}
+    # Load/store (imm, unscaled, pair, reg-offset) and data-processing.
+    if (word & 0x0A000000) == 0x08000000 or (word & 0x1C000000) == 0x08000000:
+        regs |= {word & 0x1F, (word >> 5) & 0x1F}
+        if (word & 0x3A000000) == 0x28000000:  # pair: Rt2
+            regs.add((word >> 10) & 0x1F)
+        if (word & 0x3B200C00) == 0x38200800:  # register offset: Rm
+            regs.add((word >> 16) & 0x1F)
+        return regs
+    if (word & 0x1F000000) in (0x11000000, 0x0B000000, 0x0A000000, 0x1B000000):
+        regs |= {word & 0x1F, (word >> 5) & 0x1F}
+        if (word & 0x1F000000) in (0x0B000000, 0x0A000000, 0x1B000000):
+            regs.add((word >> 16) & 0x1F)
+        return regs
+    if (word & 0x1F800000) in (0x12800000, 0x12000000):  # mov/logic immediate
+        return {word & 0x1F}
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("raw", type=pathlib.Path)
     parser.add_argument("--snapshots", type=pathlib.Path, required=True)
     parser.add_argument("--top", type=int, default=24)
+    parser.add_argument(
+        "--registers", action="store_true", help="report sample-weighted guest GPR usage"
+    )
     args = parser.parse_args()
 
     snapshots = []
@@ -169,6 +206,31 @@ def main() -> int:
             continue
         seen.add(family)
         print(f"{count:>8}  {family}  word=0x{word:08x}")
+
+    if args.registers:
+        used: collections.Counter[int] = collections.Counter()
+        modelled = unmodelled = 0
+        for (family, word), count in hot_words.items():
+            if not family.startswith("guest:"):
+                continue
+            regs = guest_registers(word)
+            if regs is None:
+                unmodelled += count
+                continue
+            modelled += count
+            for reg in regs:
+                if reg != 31:  # 31 is xzr/sp, never allocatable
+                    used[reg] += count
+        print(
+            f"\n== guest register use (weighted; modelled {modelled}, "
+            f"unmodelled {unmodelled}) =="
+        )
+        for reg in range(31):
+            print(f"  x{reg:<2} {used[reg]:>7}")
+        print(
+            "\nleast-used allocatable GPRs:",
+            [f"x{r}" for r, _ in sorted(used.items(), key=lambda kv: kv[1])[:6]],
+        )
     return 0
 
 
