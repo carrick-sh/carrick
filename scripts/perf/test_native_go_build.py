@@ -34,6 +34,7 @@ class NativeGoBuildTest(unittest.TestCase):
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = "run" ]; then\n'
+            "  echo WORKLOAD_NS=1200000000\n"
             "  echo BUILD_OK\n"
             "  exit 0\n"
             "fi\n"
@@ -175,7 +176,9 @@ class NativeGoBuildTest(unittest.TestCase):
             captured_output=captured,
         )
 
-        self.assertEqual(captured.read_text(), "BUILD_OK\n")
+        self.assertEqual(
+            captured.read_text(), "WORKLOAD_NS=1200000000\nBUILD_OK\n"
+        )
 
     def test_timeout_retains_partial_stdout_and_stderr_before_reraising(self):
         directory, _ = self.install_fake_docker("arm64")
@@ -299,14 +302,14 @@ class NativeGoBuildTest(unittest.TestCase):
         summary = native_go_build.summarize_phases(
             {
                 "carrick": [
-                    {"elapsed_ms": 20},
-                    {"elapsed_ms": 18},
-                    {"elapsed_ms": 19},
+                    {"elapsed_ms": 20, "workload_ms": 15},
+                    {"elapsed_ms": 18, "workload_ms": 13},
+                    {"elapsed_ms": 19, "workload_ms": 14},
                 ],
                 "docker": [
-                    {"elapsed_ms": 2},
-                    {"elapsed_ms": 1},
-                    {"elapsed_ms": 3},
+                    {"elapsed_ms": 2, "workload_ms": 1},
+                    {"elapsed_ms": 1, "workload_ms": 1},
+                    {"elapsed_ms": 3, "workload_ms": 2},
                 ],
             }
         )
@@ -316,7 +319,50 @@ class NativeGoBuildTest(unittest.TestCase):
         self.assertEqual(summary["carrick"]["sample_count"], 3)
         self.assertEqual(summary["docker"]["sample_count"], 3)
 
-    def test_docker_cli_writes_v2_phase_artifact(self):
+    def test_guest_script_brackets_the_workload_window(self):
+        script = native_go_build.guest_script()
+
+        self.assertEqual(script.count("date +%s%N"), 2)
+        start = script.index("date +%s%N")
+        build = script.index("go build")
+        end = script.rindex("date +%s%N")
+        marker = script.index("WORKLOAD_NS=")
+        self.assertLess(start, build)
+        self.assertLess(build, end)
+        self.assertLess(end, marker)
+        self.assertLess(marker, script.index("BUILD_OK"))
+
+    def test_workload_window_requires_exactly_one_positive_marker(self):
+        self.assertEqual(
+            native_go_build.workload_ns_from_stdout(
+                "hello\nWORKLOAD_NS=1500000000\nBUILD_OK\n"
+            ),
+            1_500_000_000,
+        )
+        for stdout in (
+            "BUILD_OK\n",
+            "WORKLOAD_NS=1\nWORKLOAD_NS=2\nBUILD_OK\n",
+            "WORKLOAD_NS=12N34\nBUILD_OK\n",
+            "WORKLOAD_NS=0\nBUILD_OK\n",
+            "WORKLOAD_NS=-5\nBUILD_OK\n",
+        ):
+            with self.assertRaises(ValueError):
+                native_go_build.workload_ns_from_stdout(stdout)
+
+    def test_phase_summary_reports_workload_median(self):
+        summary = native_go_build.summarize_phases(
+            {
+                "carrick": [
+                    {"elapsed_ms": 20, "workload_ms": 15},
+                    {"elapsed_ms": 18, "workload_ms": 13},
+                    {"elapsed_ms": 19, "workload_ms": 14},
+                ],
+            }
+        )
+
+        self.assertEqual(summary["carrick"]["workload_median_ms"], 14)
+
+    def test_docker_cli_writes_v3_phase_artifact(self):
         directory, _ = self.install_fake_docker("arm64")
         output = directory / "result.json"
 
@@ -335,9 +381,10 @@ class NativeGoBuildTest(unittest.TestCase):
 
         payload = json.loads(output.read_text())
         self.assertEqual(return_code, 0)
-        self.assertEqual(payload["schema"], "carrick.native-go-build.v2")
+        self.assertEqual(payload["schema"], "carrick.native-go-build.v3")
         self.assertEqual(list(payload["phases"]), ["docker"])
         self.assertEqual(payload["phases"]["docker"]["sample_count"], 1)
+        self.assertIn("workload_median_ms", payload["phases"]["docker"])
         self.assertNotIn("ratio", payload)
 
 

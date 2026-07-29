@@ -838,6 +838,19 @@ to `PROPOSED`.
     the dependency. Its 2.53% median wall win is below the old conservative 3%
     screen, but all five candidate samples beat all five controls and the user
     explicitly approved retaining durable filesystem improvements.
+13. On 2026-07-28 the user directed that the campaign stop measuring engine
+    container setup and teardown: the primary metric is now the guest
+    workload window alone. `native_go_build.py` v3 brackets the compile and
+    execute steps with in-guest clock reads and reports
+    `workload_median_ms` per phase plus `carrick_over_docker_workload`;
+    the same script runs on both engines, so Docker's container lifecycle
+    is excluded symmetrically. Full process wall time remains recorded as
+    a secondary diagnostic. Consequences: per-run rootfs seeding, orphan
+    sweeping, and scratch teardown leave the optimization queue; per
+    guest-process exec overhead (capsule adoption, translation, syscall
+    service) stays in scope because it occurs inside the window. Official
+    `C0`/`D0`/`R0` remain valid only for the old convention; the next
+    idle-host campaign freezes `W0`/`DW0`/`RW0` under the new one.
 
 ## Next action
 
@@ -873,9 +886,15 @@ Write and validate the executable M1 plan:
       syscall boundary and retain the contained lookup/no-follow wave.
 - [x] Publish five clean committed candidate samples; record the valid
       19,680 ms median as no official `C1` win.
-- [ ] Close native smoke and `just ci` gates for `564dd281`.
+- [x] Close native smoke and `just ci` gates for the retained filesystem wave:
+      after clearing five workspace clippy findings, `just ci` is green
+      (2,663 tests) and `just conformance-native smoke --workers 4` reports
+      23/23 MATCH with no regressions.
+- [ ] Freeze `W0`/`DW0`/`RW0` under the 2026-07-28 workload-window convention
+      (Decision 13) with a fresh idle-host five-sample campaign.
 - [ ] Re-census post-change open callers and spike H007 only if one remaining
-      resolver/final-open rewalk family is still dominant.
+      resolver/final-open rewalk family is still dominant inside the workload
+      window.
 - [ ] Restore at least 95% symbolized kernel-leaf coverage before any future
       broad kernel capture. Never recycle v1 or v2 or infer a family from the
       rejected partial run.
