@@ -205,6 +205,19 @@ python3 scripts/perf/shape_classify.py raw --snapshots target/perf/snaps
 
 ## Traps — read before measuring or debugging here
 
+- **`cpython-subprocess` is LOAD-COUPLED and it gates merges.** Under
+  `--workers 4` it failed three times with three different counts —
+  277/278, 277/278, and 275/278 with the reserved-scratch switch OFF —
+  while standalone serial runs pass 297/297. It is NOT attributable to the
+  spill-free lowering: the control arm failed worse. LIMITATION worth
+  knowing before any bisect: that A/B did not isolate the x19
+  RESERVATION, because the `gateway_aarch64.S` save/restore change and the
+  decode classification are unconditional and present in both arms, and a
+  green smoke earlier in the session predates them. Re-run serially on a
+  quiet machine first; only if it persists, bisect the reservation. Do not
+  debug it inside the per-access lowering, which larger-block codegen
+  replaces anyway.
+
 - **Never `copyin` from dtrace probe context against a native guest** (see
   above). PC histograms + retirement snapshots replace it.
 - **Never time a hot path by bracketing its own probes** — sample instead.
