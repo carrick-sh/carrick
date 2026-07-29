@@ -940,13 +940,24 @@ Write and validate the executable M1 plan:
       both biases, 167 dsr + 1,111 serialized runtime tests green, cold
       go-build BUILD_OK with compact words (including the memclr
       `0xa881_7e3f`) sampled hot in production.
-- [ ] ATTRIBUTE the intermittent guest crash seen once at the tip (Go
-      compiler fatal during a screen sample, `asyncPreempt` in frame,
-      ~1 in 10 runs; 0/6 direct repro): alternating crash-rate sampling
-      of `406b7bfe` (compact) vs `a104aff1` (selection-only), then a
-      compact-word kick-sweep oracle modeled on
-      `live_biased_exclusive_kick_sweep` if the compact commit owns it.
-      No wall screen is claimable until the crash is attributed.
+- [x] ATTRIBUTED: the intermittent crash belongs to the compact commit's
+      WRITEBACK path. Alternating sampling: `406b7bfe` 1/8 crashes (2/17
+      cumulative today) vs `a104aff1` 0/8 (0/12 cumulative). The captured
+      SIGSEGV (`compact-writeback-crash-attr-tip-7.log`, SHA-256
+      `0bc98cdd…`) faults in Go's `duffcopy` — post-index pair writeback —
+      at guest-reported `addr=0x2ff_fffe_f318` with the guest stack at
+      `0xff_fffe_f2xx`: exactly `bias + guest`, i.e. a HOST-biased address
+      was committed into the guest base register once, re-dereferenced
+      (host FAR `0x4ff…` = two biases), and reported after one bias
+      subtraction. Some interrupt/fault window in the compact writeback
+      sequence commits the biased scratch without the un-bias.
+- [ ] Build the deterministic reproducer BEFORE any fix: a compact
+      post-index kick sweep modeled on `live_biased_exclusive_kick_sweep`
+      (self-linked memclr loop, jittered SIGPIPE sender, per-word landing
+      coverage, exact base-progression and memory assertions), shown red;
+      then fix the recovery/commit window and show it green. No wall
+      screen until then. `/tmp/carrick-a104` holds the selection-only
+      comparison build.
 - [ ] Extend the compact form to register-offset addressing (opcode
       rewrite to the imm-0 counterpart) and negative immediates (underflow
       window fault conversion) — the census shows compact applied but
