@@ -880,21 +880,27 @@ mod tests {
         .expect("allocate dual cache");
         let emitted = emit_block(&mut cache, &plan, EmitAddressMode::Biased { host_bias })
             .expect("emit dual virtual load");
-        let final_actions = emitted
+        let actions = emitted
             .recovery()
             .iter()
             .filter_map(|entry| match entry.action {
                 RecoveryAction::RecoverBiasedMemory(recovery) => Some(recovery),
                 _ => None,
             })
-            .rev()
-            .take(4)
             .collect::<Vec<_>>();
-        assert_eq!(final_actions.len(), 4);
+        // The epilogue restores exactly the spilled scratch registers, so the
+        // last `scratch_count` words are the restores -- derived rather than
+        // hardcoded, because how many registers this lowering borrows depends
+        // on whether it owns the reserved address scratch.
+        let restores = usize::from(actions.last().expect("last recovery").scratch_count);
+        assert!(restores > 0, "the dual-virtual lowering must spill");
+        let final_actions = actions.iter().rev().take(restores).collect::<Vec<_>>();
+        assert_eq!(final_actions.len(), restores);
         assert!(final_actions.iter().all(|action| {
             action.instruction_complete
                 && action.virtual_x18_scratch.is_none()
                 && action.virtual_x28_scratch.is_none()
+                && action.virtual_reserved_scratch.is_none()
         }));
     }
 

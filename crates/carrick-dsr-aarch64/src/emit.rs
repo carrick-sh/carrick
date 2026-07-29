@@ -215,6 +215,17 @@ pub enum RecoveryAction {
         virtual_register: u32,
         virtual_scratch: u32,
     },
+    /// Both virtualized registers are written by the instruction and neither
+    /// has been committed yet. Recorded at the FIRST of the two commit stores;
+    /// the second store's own action commits only what remains, because the
+    /// first store already wrote its context slot (which is the snapshot slot).
+    CommitDualVirtualPairAndRestore {
+        x18_scratch: u32,
+        x28_scratch: u32,
+        context_scratch: u32,
+        first_register: u32,
+        second_register: u32,
+    },
     RecoverCounterRead(CounterReadRecovery),
     RecoverBiasedMemory(BiasedMemoryRecovery),
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
@@ -290,7 +301,8 @@ impl RecoveryAction {
             | Self::RestoreDualVirtualReadOnlyCompleted { .. }
             | Self::CommitVirtualizedAndRestoreScratch { .. }
             | Self::CommitVirtualizedAndRestoreScratchAndContext { .. }
-            | Self::CommitDualVirtualAndRestore { .. } => true,
+            | Self::CommitDualVirtualAndRestore { .. }
+            | Self::CommitDualVirtualPairAndRestore { .. } => true,
             Self::RecoverCounterRead(recovery) => recovery.instruction_complete,
             Self::RecoverBiasedMemory(recovery) => recovery.instruction_complete,
             _ => false,
@@ -509,6 +521,27 @@ const fn virtual_snapshot_offset(register: u32) -> Option<u32> {
         crate::gateway::RESERVED_SCRATCH => Some(crate::gateway::CTX_GUEST_RESERVED_SCRATCH),
         _ => None,
     }
+}
+
+/// `(register, context slot)` for the reserved address scratch.
+const fn reserved_virtual_slot() -> (u32, u32) {
+    (
+        crate::gateway::RESERVED_SCRATCH,
+        crate::gateway::CTX_GUEST_RESERVED_SCRATCH,
+    )
+}
+
+/// `(register, context slot)` for a host-owned register, or a typed
+/// unsupported-action error if the register has no slot.
+fn virtual_slot(
+    plan: &BlockPlan,
+    guest: GuestVa,
+    word: u32,
+    register: u32,
+) -> Result<(u32, u32), DsrError> {
+    virtual_snapshot_offset(register)
+        .map(|offset| (register, offset))
+        .ok_or_else(|| unsupported_action(plan, guest, word, "virtualized register has no slot"))
 }
 
 fn emit_pc_relative_address(
@@ -1895,9 +1928,18 @@ fn rewritten_virtual_word(
     None
 }
 
+/// Rewrite one instruction that names TWO host-owned registers onto scratch
+/// registers, returning `(first_scratch, second_scratch, context_scratch,
+/// rewritten_word)`.
+///
+/// Parameterized by the register pair rather than pinned to x18/x28: the
+/// reserved address scratch is a third host-owned register, so `(18, 19)` and
+/// `(19, 28)` pairs need exactly this search too.
 fn rewritten_dual_virtual_read_only_word(
     word: u32,
     guest: GuestVa,
+    first: u32,
+    second: u32,
 ) -> Option<(u32, u32, u32, u32)> {
     let original = bad64::decode(word, guest.raw()).ok()?;
     let free = (9_u32..=17)
@@ -1905,51 +1947,60 @@ fn rewritten_dual_virtual_read_only_word(
         .filter(|register| !super::decode::decoded_operands_mention_gpr(word, guest, *register))
         .collect::<Vec<_>>();
     let fields = [0_u32, 5, 10, 16];
-    let x18_fields = fields
+    let first_fields = fields
         .into_iter()
-        .filter(|shift| ((word >> shift) & 0x1f) == 18)
+        .filter(|shift| ((word >> shift) & 0x1f) == first)
         .collect::<Vec<_>>();
-    let x28_fields = fields
+    let second_fields = fields
         .into_iter()
-        .filter(|shift| ((word >> shift) & 0x1f) == 28)
+        .filter(|shift| ((word >> shift) & 0x1f) == second)
         .collect::<Vec<_>>();
-    for &x18_scratch in &free {
-        for &x28_scratch in free.iter().filter(|candidate| **candidate != x18_scratch) {
+    for &first_scratch in &free {
+        for &second_scratch in free.iter().filter(|candidate| **candidate != first_scratch) {
             let context_scratch = *free
                 .iter()
-                .find(|candidate| **candidate != x18_scratch && **candidate != x28_scratch)?;
-            for x18_mask in 1_u32..(1_u32 << x18_fields.len()) {
-                for x28_mask in 1_u32..(1_u32 << x28_fields.len()) {
+                .find(|candidate| **candidate != first_scratch && **candidate != second_scratch)?;
+            for first_mask in 1_u32..(1_u32 << first_fields.len()) {
+                for second_mask in 1_u32..(1_u32 << second_fields.len()) {
                     let mut candidate_word = word;
-                    for (index, shift) in x18_fields.iter().copied().enumerate() {
-                        if x18_mask & (1 << index) != 0 {
+                    for (index, shift) in first_fields.iter().copied().enumerate() {
+                        if first_mask & (1 << index) != 0 {
                             candidate_word =
-                                (candidate_word & !(0x1f << shift)) | (x18_scratch << shift);
+                                (candidate_word & !(0x1f << shift)) | (first_scratch << shift);
                         }
                     }
-                    for (index, shift) in x28_fields.iter().copied().enumerate() {
-                        if x28_mask & (1 << index) != 0 {
+                    for (index, shift) in second_fields.iter().copied().enumerate() {
+                        if second_mask & (1 << index) != 0 {
                             candidate_word =
-                                (candidate_word & !(0x1f << shift)) | (x28_scratch << shift);
+                                (candidate_word & !(0x1f << shift)) | (second_scratch << shift);
                         }
                     }
                     let Ok(candidate) = bad64::decode(candidate_word, guest.raw()) else {
                         continue;
                     };
                     if candidate.op() != original.op()
-                        || super::decode::decoded_operands_mention_gpr(candidate_word, guest, 18)
-                        || super::decode::decoded_operands_mention_gpr(candidate_word, guest, 28)
+                        || super::decode::decoded_operands_mention_gpr(candidate_word, guest, first)
+                        || super::decode::decoded_operands_mention_gpr(
+                            candidate_word,
+                            guest,
+                            second,
+                        )
                     {
                         continue;
                     }
                     let normalized = candidate
                         .to_string()
-                        .replace(&format!("x{x18_scratch}"), "x18")
-                        .replace(&format!("w{x18_scratch}"), "w18")
-                        .replace(&format!("x{x28_scratch}"), "x28")
-                        .replace(&format!("w{x28_scratch}"), "w28");
+                        .replace(&format!("x{first_scratch}"), &format!("x{first}"))
+                        .replace(&format!("w{first_scratch}"), &format!("w{first}"))
+                        .replace(&format!("x{second_scratch}"), &format!("x{second}"))
+                        .replace(&format!("w{second_scratch}"), &format!("w{second}"));
                     if normalized == original.to_string() {
-                        return Some((x18_scratch, x28_scratch, context_scratch, candidate_word));
+                        return Some((
+                            first_scratch,
+                            second_scratch,
+                            context_scratch,
+                            candidate_word,
+                        ));
                     }
                 }
             }
@@ -1958,19 +2009,50 @@ fn rewritten_dual_virtual_read_only_word(
     None
 }
 
+/// Which of a dual-virtualized instruction's two host-owned registers it
+/// writes, and therefore which context slots the emitter commits after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DualCommit {
+    None,
+    First,
+    Second,
+    /// The instruction writes both. Used for pairs involving the reserved
+    /// address scratch, where committing a register the instruction did not
+    /// write is a no-op anyway (its scratch still holds the loaded value), so
+    /// no per-shape destination analysis is needed to stay correct.
+    Both,
+}
+
+/// Emit one instruction that names two host-owned registers, reading both
+/// guest values out of their context slots and optionally committing one back.
+///
+/// `first`/`second` are `(register, context slot)`; the recovery actions this
+/// records are already register-agnostic (they name the scratch registers and
+/// the committed register, not x18/x28), so only this emitter and the rewrite
+/// search had to be parameterized to cover pairs involving the reserved
+/// address scratch.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "dual virtualization carries both register/slot pairs plus its recovery contract"
+)]
 fn emit_dual_virtual(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     plan: &BlockPlan,
     guest: GuestVa,
     word: u32,
-    commit_virtual: Option<u32>,
+    first: (u32, u32),
+    second: (u32, u32),
+    commit_virtual: DualCommit,
     recovery: &mut Vec<RecoveryEntry>,
 ) -> Result<(), DsrError> {
+    let (first_register, first_offset) = first;
+    let (second_register, second_offset) = second;
     let (x18_scratch, x28_scratch, context_scratch, rewritten) =
-        rewritten_dual_virtual_read_only_word(word, guest).ok_or_else(|| {
-            unsupported_action(plan, guest, word, "unrewritable x18/x28 instruction")
-        })?;
+        rewritten_dual_virtual_read_only_word(word, guest, first_register, second_register)
+            .ok_or_else(|| {
+                unsupported_action(plan, guest, word, "unrewritable dual-virtual instruction")
+            })?;
     for save in [
         0xf900_0000 | ((1160 / 8) << 10) | (28 << 5) | x18_scratch,
         0xf900_0000 | ((1120 / 8) << 10) | (28 << 5) | x28_scratch,
@@ -1990,8 +2072,8 @@ fn emit_dual_virtual(
     };
     for instruction in [
         0xaa1c_03e0 | context_scratch,
-        0xf940_0000 | ((144 / 8) << 10) | (context_scratch << 5) | x18_scratch,
-        0xf940_0000 | ((224 / 8) << 10) | (context_scratch << 5) | x28_scratch,
+        0xf940_0000 | ((first_offset / 8) << 10) | (context_scratch << 5) | x18_scratch,
+        0xf940_0000 | ((second_offset / 8) << 10) | (context_scratch << 5) | x28_scratch,
         rewritten,
     ] {
         recovery.push(RecoveryEntry {
@@ -2000,28 +2082,48 @@ fn emit_dual_virtual(
         });
         emit_word(assembler, entries, guest, instruction)?;
     }
-    if let Some(virtual_register) = commit_virtual {
-        let (virtual_scratch, snapshot_offset) = match virtual_register {
-            18 => (x18_scratch, 144),
-            28 => (x28_scratch, 224),
-            _ => {
-                return Err(unsupported_action(
-                    plan,
-                    guest,
-                    word,
-                    "invalid dual virtual destination",
-                ));
-            }
+    let commits: &[u32] = match commit_virtual {
+        DualCommit::None => &[],
+        DualCommit::First => std::slice::from_ref(&first_register),
+        DualCommit::Second => std::slice::from_ref(&second_register),
+        DualCommit::Both => &[first_register, second_register],
+    };
+    for (index, virtual_register) in commits.iter().copied().enumerate() {
+        let (virtual_scratch, snapshot_offset) = if virtual_register == first_register {
+            (x18_scratch, first_offset)
+        } else if virtual_register == second_register {
+            (x28_scratch, second_offset)
+        } else {
+            return Err(unsupported_action(
+                plan,
+                guest,
+                word,
+                "invalid dual virtual destination",
+            ));
         };
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::CommitDualVirtualAndRestore {
+        // Only the FIRST of a two-register commit still owes both slots; by
+        // the second store the first slot (a snapshot slot) already holds the
+        // architectural value.
+        let action = if commits.len() == 2 && index == 0 {
+            RecoveryAction::CommitDualVirtualPairAndRestore {
+                x18_scratch,
+                x28_scratch,
+                context_scratch,
+                first_register,
+                second_register,
+            }
+        } else {
+            RecoveryAction::CommitDualVirtualAndRestore {
                 x18_scratch,
                 x28_scratch,
                 context_scratch,
                 virtual_register,
                 virtual_scratch,
-            },
+            }
+        };
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action,
         });
         emit_word(
             assembler,
@@ -2521,14 +2623,43 @@ fn rewritten_biased_virtual_word(
                 ..plain
             })
         }
+        super::types::MemoryVirtualization::ReservedPair { other } => {
+            // Both host-owned operands are rewritten onto scratch registers,
+            // exactly as for an x18/x28 pair; which slot each scratch carries
+            // is decided by the caller's `virtual_snapshot_offset` lookup.
+            let (reserved, other_scratch, _, word) = rewritten_dual_virtual_read_only_word(
+                memory.word,
+                guest,
+                crate::gateway::RESERVED_SCRATCH,
+                other,
+            )
+            .ok_or_else(|| {
+                DsrError::BlockPolicy(
+                    "biased reserved-pair memory operands are not rewritable".to_string(),
+                )
+            })?;
+            let mut rewrite = BiasedVirtualRewrite {
+                word,
+                reserved: Some(reserved),
+                ..plain
+            };
+            if other == 18 {
+                rewrite.x18 = Some(other_scratch);
+            } else {
+                rewrite.x28 = Some(other_scratch);
+            }
+            Ok(rewrite)
+        }
         super::types::MemoryVirtualization::X18X28ReadOnly
         | super::types::MemoryVirtualization::X18WriteX28Read => {
-            let (x18, x28, _, word) = rewritten_dual_virtual_read_only_word(memory.word, guest)
-                .ok_or_else(|| {
-                    DsrError::BlockPolicy(
-                        "biased x18/x28 memory operands are not rewritable".to_string(),
-                    )
-                })?;
+            let (x18, x28, _, word) =
+                rewritten_dual_virtual_read_only_word(memory.word, guest, 18, 28).ok_or_else(
+                    || {
+                        DsrError::BlockPolicy(
+                            "biased x18/x28 memory operands are not rewritable".to_string(),
+                        )
+                    },
+                )?;
             Ok(BiasedVirtualRewrite {
                 word,
                 x18: Some(x18),
@@ -2731,6 +2862,266 @@ enum CompactBiasedPolicy {
     Off,
 }
 
+/// Is the memory lowering allowed to use `gateway::RESERVED_SCRATCH` as its
+/// address register?
+///
+/// The RESERVATION itself is unconditional -- decode virtualizes every guest
+/// mention of the register and the gateway keeps its guest value in a context
+/// slot -- because the assembly and C halves of that contract cannot be
+/// switched at emit time. This switch controls only whether the lowering
+/// SPENDS the freed register, so `CARRICK_DSR_RESERVED_SCRATCH=1` and the
+/// default differ in exactly the spill this phase exists to delete, and both
+/// arms of a wall screen come from one binary.
+///
+/// **OPT-IN, and deliberately so.** Every structural gate is green -- the
+/// `bad64`-asserted sequence tests, the recovery matrix's fault injection at
+/// every recovery point of eight access shapes (including the reserved base,
+/// negative-immediate and register-offset forms), the live compact-writeback
+/// kick sweep and `just test` -- and a `/bin/sh` guest runs clean. But
+/// `just conformance-native smoke` REGRESSES `go-build` with the switch on:
+/// the Go toolchain faults at a wrapped address (`0xffff00a0_xxxxxxxx`, the
+/// guest address less 2^48) within seconds, reproducibly but not
+/// deterministically -- a first bisect over effective-address forms converged
+/// on register offsets and was then refuted by re-sampling, which is the
+/// signature of an asynchronous, kick-coupled failure rather than a bad
+/// address computation. Shipping it on would break the default backend, so it
+/// ships off until that is root-caused. Structural green is necessary, never
+/// sufficient (see H008 Spike 1).
+fn reserved_scratch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_DSR_RESERVED_SCRATCH").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Can this access compute its host address entirely in the reserved register,
+/// with no borrowed guest register at all?
+///
+/// Two exclusions, both about recovery rather than register pressure:
+///
+/// - A WRITEBACK form leaves the updated base in the address register after
+///   the access, and the guest base is committed from there one word later.
+///   The reserved register is deliberately absent from the fault/kick snapshot
+///   (it is carrick's, not the guest's), so recovery at that one word could not
+///   reconstruct the committed base. Writeback forms keep a borrowed,
+///   snapshot-visible base scratch and their existing commit sequence.
+/// - A VIRTUALIZED access needs a rewrite scratch that is spilled and restored
+///   anyway, and one that names the reserved register cannot use it as the
+///   address at all.
+///
+/// The base must also be readable as a register operand after the aperture
+/// check, which rules out the context-slot bases (`x18`/`x28`/reserved) but
+/// includes SP, whose `add`/extended-register forms accept `Rn = SP`.
+fn reserved_biased_eligible(memory: super::types::MemoryAccess, base: BiasedBase) -> bool {
+    memory.virtualization == super::types::MemoryVirtualization::None
+        && memory.writeback == super::types::MemoryWriteback::None
+        && matches!(base, BiasedBase::Register(_) | BiasedBase::StackPointer)
+}
+
+/// `add Xd, <Rn|SP>, Xm, uxtx #0` -- the extended-register form, so the same
+/// encoder covers a GPR base and SP (which the shifted-register `add` cannot).
+const fn add_extended_uxtx(destination: u32, base: BiasedBase, addend: u32) -> Option<u32> {
+    let rn = match base {
+        BiasedBase::Register(register) => register,
+        BiasedBase::StackPointer => 31,
+        _ => return None,
+    };
+    Some(0x8b20_0000 | (addend << 16) | (3 << 13) | (rn << 5) | destination)
+}
+
+/// The spill-free biased lowering: the whole address computation lives in the
+/// reserved register plus physical x18, so the access costs no context store
+/// and no restore.
+///
+/// The word sequence deliberately mirrors the general lowering's branch-free
+/// two-`cbz` shape rather than branching around a slow block, so the only
+/// words an in-aperture access skips remain the guest-address publication and
+/// the invalid-host tag -- the same two the recovery matrix audits.
+///
+/// ```text
+///   <effective guest address> -> x19      ; x18 is the immediate temp
+///   lsr x18, x19, #41                     ; aperture flag
+///   cbz x18, +8                           ; in aperture: skip the publish
+///   str x19, [x28, #1200]                 ; publish the guest fault address
+///   ldr x19, [x28, #1192]                 ; host bias
+///   add x19, <base>, x19                  ; host base (base was never clobbered)
+///   cbz x18, +8                           ; in aperture: skip the tag
+///   orr x19, x19, #1 << 47                ; unmappable host address
+///   <access, base = x19>
+/// ```
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the spill-free lowering carries the same emission and recovery context as the general one"
+)]
+fn emit_reserved_biased_memory(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    memory: super::types::MemoryAccess,
+    base: BiasedBase,
+    host_bias: carrick_dsr::address::NativeHostBias,
+    recovery: &mut Vec<RecoveryEntry>,
+) -> Result<(), DsrError> {
+    let address = crate::gateway::RESERVED_SCRATCH;
+    // Nothing is spilled, so there is no scratch to restore and no base to
+    // commit; every recovery point below reduces to "resume the instruction".
+    let action = BiasedMemoryRecovery {
+        scratch_registers: [0; 4],
+        scratch_count: 0,
+        base_scratch: address,
+        base,
+        base_coordinate: BiasedBaseCoordinate::Guest,
+        commit_base: false,
+        virtual_x18_scratch: None,
+        virtual_x28_scratch: None,
+        virtual_reserved_scratch: None,
+        host_bias,
+        instruction_complete: false,
+    };
+
+    let load_base = biased_base_load_word(base, address).ok_or_else(|| {
+        unsupported_action(
+            plan,
+            guest,
+            memory.word,
+            "reserved biased memory has no base",
+        )
+    })?;
+    match memory.effective_address {
+        super::types::MemoryEffectiveAddress::Base => {
+            emit_with_biased_recovery(assembler, entries, recovery, guest, load_base, action)?;
+        }
+        super::types::MemoryEffectiveAddress::Immediate(offset) => {
+            emit_biased_materialize_u64(
+                assembler,
+                entries,
+                recovery,
+                guest,
+                18,
+                offset as u64,
+                action,
+            )?;
+            let word = add_extended_uxtx(address, base, 18).ok_or_else(|| {
+                unsupported_action(
+                    plan,
+                    guest,
+                    memory.word,
+                    "reserved biased immediate has no register base",
+                )
+            })?;
+            emit_with_biased_recovery(assembler, entries, recovery, guest, word, action)?;
+        }
+        super::types::MemoryEffectiveAddress::RegisterOffset { extend, shift } => {
+            if shift > 4 {
+                return Err(DsrError::BlockPolicy(format!(
+                    "biased register offset shift {shift} exceeds ADD extended range at guest PC 0x{:x}",
+                    guest.raw()
+                )));
+            }
+            let option = match extend {
+                super::types::MemoryIndexExtend::Uxtw => 2,
+                super::types::MemoryIndexExtend::Uxtx => 3,
+                super::types::MemoryIndexExtend::Sxtw => 6,
+                super::types::MemoryIndexExtend::Sxtx => 7,
+            };
+            let index = (memory.word >> 16) & 0x1f;
+            let rn = match base {
+                BiasedBase::Register(register) => register,
+                BiasedBase::StackPointer => 31,
+                _ => {
+                    return Err(unsupported_action(
+                        plan,
+                        guest,
+                        memory.word,
+                        "reserved biased register offset has no register base",
+                    ));
+                }
+            };
+            emit_with_biased_recovery(
+                assembler,
+                entries,
+                recovery,
+                guest,
+                0x8b20_0000
+                    | (index << 16)
+                    | (option << 13)
+                    | (u32::from(shift) << 10)
+                    | (rn << 5)
+                    | address,
+                action,
+            )?;
+        }
+    }
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (address << 5) | 18,
+        action,
+    )?; // lsr x18, effective, #BIASED_FAST_ADDRESS_BITS
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb400_0052, // cbz x18, +8
+        action,
+    )?;
+    // Keeping the valid path store-free is part of the DSR hot-path contract:
+    // only an address outside the flags-neutral fast window is published, and
+    // recovery reports that guest value instead of the deliberately invalid
+    // host FAR the tagged access below produces.
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf900_0000 | ((1200 / 8) << 10) | (28 << 5) | address,
+        action,
+    )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf940_0000 | ((1192 / 8) << 10) | (28 << 5) | address,
+        action,
+    )?; // ldr x19, [x28, #1192]
+    let bias_add = add_extended_uxtx(address, base, address).ok_or_else(|| {
+        unsupported_action(
+            plan,
+            guest,
+            memory.word,
+            "reserved biased memory has no register base",
+        )
+    })?;
+    emit_with_biased_recovery(assembler, entries, recovery, guest, bias_add, action)?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb400_0052, // cbz x18, +8
+        action,
+    )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb251_0000 | (address << 5) | address,
+        action,
+    )?; // orr x19, x19, #1 << 47
+    let rewritten = (memory.word & !(0x1f << 5)) | (address << 5);
+    // The access is the last emitted word: there is no restore epilogue and
+    // therefore no recovery point that has to report the instruction complete.
+    emit_with_biased_recovery(assembler, entries, recovery, guest, rewritten, action)?;
+    Ok(())
+}
+
 fn compact_biased_policy() -> CompactBiasedPolicy {
     static POLICY: std::sync::OnceLock<CompactBiasedPolicy> = std::sync::OnceLock::new();
     *POLICY.get_or_init(
@@ -2798,25 +3189,39 @@ fn emit_compact_biased_memory(
     recovery: &mut Vec<RecoveryEntry>,
     form: CompactBiasedForm,
 ) -> Result<(), DsrError> {
-    let scratch = biased_scratch_registers(memory.word, guest, &[], 1)
-        .and_then(|registers| registers.first().copied())
-        .ok_or_else(|| {
-            unsupported_action(plan, guest, memory.word, "no safe compact biased scratch")
-        })?;
+    // A writeback form leaves the updated base in the scratch after the
+    // access and commits the guest base from there, which recovery
+    // reconstructs by reading the scratch out of the fault snapshot. The
+    // reserved register is deliberately absent from that snapshot, so only
+    // non-writeback accesses can own it outright; the rest keep borrowing.
+    let reserved =
+        reserved_scratch_enabled() && memory.writeback == super::types::MemoryWriteback::None;
+    let scratch = if reserved {
+        crate::gateway::RESERVED_SCRATCH
+    } else {
+        biased_scratch_registers(memory.word, guest, &[], 1)
+            .and_then(|registers| registers.first().copied())
+            .ok_or_else(|| {
+                unsupported_action(plan, guest, memory.word, "no safe compact biased scratch")
+            })?
+    };
     let (immr, imms) = form.bias_orr;
 
-    // Spill the single scratch. Its guest value now lives in slot 1120, so
-    // re-executing from the instruction start stays idempotent and no
-    // recovery action is needed until a word can clobber guest state.
-    emit_word(
-        assembler,
-        entries,
-        guest,
-        0xf900_0000 | ((BIASED_SCRATCH_CONTEXT_OFFSETS[0] / 8) << 10) | (28 << 5) | scratch,
-    )?;
+    // Spill the single borrowed scratch. Its guest value now lives in slot
+    // 1120, so re-executing from the instruction start stays idempotent and no
+    // recovery action is needed until a word can clobber guest state. The
+    // reserved register holds no guest value and is never spilled.
+    if !reserved {
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf900_0000 | ((BIASED_SCRATCH_CONTEXT_OFFSETS[0] / 8) << 10) | (28 << 5) | scratch,
+        )?;
+    }
     let mut action = BiasedMemoryRecovery {
-        scratch_registers: [scratch, 0, 0, 0],
-        scratch_count: 1,
+        scratch_registers: if reserved { [0; 4] } else { [scratch, 0, 0, 0] },
+        scratch_count: u8::from(!reserved),
         base_scratch: scratch,
         base: form.base,
         base_coordinate: BiasedBaseCoordinate::Guest,
@@ -2944,14 +3349,16 @@ fn emit_compact_biased_memory(
         )?; // sub xBASE, xS, x18
     }
 
-    emit_with_biased_recovery(
-        assembler,
-        entries,
-        recovery,
-        guest,
-        0xf940_0000 | ((BIASED_SCRATCH_CONTEXT_OFFSETS[0] / 8) << 10) | (28 << 5) | scratch,
-        action,
-    )?; // restore the scratch
+    if !reserved {
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0xf940_0000 | ((BIASED_SCRATCH_CONTEXT_OFFSETS[0] / 8) << 10) | (28 << 5) | scratch,
+            action,
+        )?; // restore the borrowed scratch
+    }
     Ok(())
 }
 
@@ -3040,6 +3447,11 @@ fn emit_biased_memory(
             assembler, entries, plan, guest, memory, host_bias, recovery, form,
         );
     }
+    if reserved_scratch_enabled() && reserved_biased_eligible(memory, base) {
+        return emit_reserved_biased_memory(
+            assembler, entries, plan, guest, memory, base, host_bias, recovery,
+        );
+    }
     let BiasedVirtualRewrite {
         word: mut rewritten,
         x18: virtual_x18_scratch,
@@ -3061,13 +3473,25 @@ fn emit_biased_memory(
             scratch_count += 1;
         }
     }
-    let extra =
-        biased_scratch_registers(memory.word, guest, &scratch_registers[..scratch_count], 2)
-            .ok_or_else(|| {
-                unsupported_action(plan, guest, memory.word, "no safe biased memory scratch")
-            })?;
+    // The bias scratch holds the guest effective address and then the host
+    // bias; it is dead at every recovery point, so the reserved register can
+    // take that role even in the forms that still need a snapshot-visible base
+    // scratch (writeback commits read the base scratch out of the snapshot).
+    // That halves what this path spills.
+    let borrowed = usize::from(!reserved_scratch_enabled()) + 1;
+    let extra = biased_scratch_registers(
+        memory.word,
+        guest,
+        &scratch_registers[..scratch_count],
+        borrowed,
+    )
+    .ok_or_else(|| unsupported_action(plan, guest, memory.word, "no safe biased memory scratch"))?;
     let base_scratch = extra[0];
-    let bias_scratch = extra[1];
+    let bias_scratch = if reserved_scratch_enabled() {
+        crate::gateway::RESERVED_SCRATCH
+    } else {
+        extra[1]
+    };
     for register in extra {
         if scratch_count >= scratch_registers.len() {
             return Err(unsupported_action(
@@ -4665,7 +5089,9 @@ fn assemble_block_inner(
                             plan,
                             instruction.guest,
                             memory.word,
-                            None,
+                            (18, 144),
+                            (28, 224),
+                            DualCommit::None,
                             &mut recovery,
                         )?;
                         continue;
@@ -4677,7 +5103,9 @@ fn assemble_block_inner(
                             plan,
                             instruction.guest,
                             memory.word,
-                            Some(18),
+                            (18, 144),
+                            (28, 224),
+                            DualCommit::First,
                             &mut recovery,
                         )?;
                         continue;
@@ -4691,6 +5119,20 @@ fn assemble_block_inner(
                             memory.word,
                             crate::gateway::RESERVED_SCRATCH,
                             crate::gateway::CTX_GUEST_RESERVED_SCRATCH,
+                            &mut recovery,
+                        )?;
+                        continue;
+                    }
+                    super::types::MemoryVirtualization::ReservedPair { other } => {
+                        emit_dual_virtual(
+                            &mut assembler,
+                            &mut entries,
+                            plan,
+                            instruction.guest,
+                            memory.word,
+                            reserved_virtual_slot(),
+                            virtual_slot(plan, instruction.guest, memory.word, other)?,
+                            DualCommit::Both,
                             &mut recovery,
                         )?;
                         continue;
@@ -4799,7 +5241,9 @@ fn assemble_block_inner(
                     plan,
                     instruction.guest,
                     word,
-                    None,
+                    (18, 144),
+                    (28, 224),
+                    DualCommit::None,
                     &mut recovery,
                 )?;
                 continue;
@@ -4811,7 +5255,9 @@ fn assemble_block_inner(
                     plan,
                     instruction.guest,
                     word,
-                    Some(18),
+                    (18, 144),
+                    (28, 224),
+                    DualCommit::First,
                     &mut recovery,
                 )?;
                 continue;
@@ -4823,7 +5269,9 @@ fn assemble_block_inner(
                     plan,
                     instruction.guest,
                     word,
-                    Some(28),
+                    (18, 144),
+                    (28, 224),
+                    DualCommit::Second,
                     &mut recovery,
                 )?;
                 continue;
@@ -4837,6 +5285,20 @@ fn assemble_block_inner(
                     word,
                     crate::gateway::RESERVED_SCRATCH,
                     crate::gateway::CTX_GUEST_RESERVED_SCRATCH,
+                    &mut recovery,
+                )?;
+                continue;
+            }
+            InstAction::VirtualizedReservedPair { word, other, .. } => {
+                emit_dual_virtual(
+                    &mut assembler,
+                    &mut entries,
+                    plan,
+                    instruction.guest,
+                    word,
+                    reserved_virtual_slot(),
+                    virtual_slot(plan, instruction.guest, word, other)?,
+                    DualCommit::Both,
                     &mut recovery,
                 )?;
                 continue;
@@ -5571,6 +6033,58 @@ pub fn recover_rewrite_state(
             }
             return Ok(());
         }
+        RecoveryAction::CommitDualVirtualPairAndRestore {
+            x18_scratch,
+            x28_scratch,
+            context_scratch,
+            first_register,
+            second_register,
+        } => {
+            // Read both results BEFORE the scratch restore below overwrites
+            // them, then commit both, mirroring the single-register arm.
+            let mut committed = [(first_register, 0_u64); 2];
+            for (slot, (virtual_register, scratch)) in committed.iter_mut().zip([
+                (first_register, x18_scratch),
+                (second_register, x28_scratch),
+            ]) {
+                let index = usize::try_from(scratch)
+                    .ok()
+                    .filter(|index| *index < snapshot.x.len())
+                    .ok_or_else(|| {
+                        crate::types::DsrError::CachePolicy(format!(
+                            "dual virtual result x{scratch} is outside snapshot"
+                        ))
+                    })?;
+                *slot = (virtual_register, snapshot.x[index]);
+            }
+            for (register, value) in [
+                (x18_scratch, saved_indirect_x15),
+                (x28_scratch, saved_scratch),
+                (context_scratch, saved_context_scratch),
+            ] {
+                let index = usize::try_from(register)
+                    .ok()
+                    .filter(|index| *index < snapshot.x.len())
+                    .ok_or_else(|| {
+                        crate::types::DsrError::CachePolicy(format!(
+                            "dual virtual scratch x{register} is outside snapshot"
+                        ))
+                    })?;
+                snapshot.x[index] = value;
+            }
+            for (virtual_register, value) in committed {
+                let index = usize::try_from(virtual_register)
+                    .ok()
+                    .filter(|index| *index < snapshot.x.len())
+                    .ok_or_else(|| {
+                        crate::types::DsrError::CachePolicy(format!(
+                            "dual virtual destination x{virtual_register} is outside snapshot"
+                        ))
+                    })?;
+                snapshot.x[index] = value;
+            }
+            return Ok(());
+        }
         RecoveryAction::RestoreScratch { register }
         | RecoveryAction::RestoreScratchInvalidBiasedLiteral { register }
         | RecoveryAction::RestoreScratchCompleted { register }
@@ -5684,7 +6198,7 @@ mod tests {
         }
     }
 
-    fn biased_memory_plan(memory: super::super::types::MemoryAccess) -> BlockPlan {
+    pub(crate) fn biased_memory_plan(memory: super::super::types::MemoryAccess) -> BlockPlan {
         BlockPlan {
             start: GuestVa(0x4000),
             end: GuestVa(0x4004),
@@ -5712,6 +6226,39 @@ mod tests {
         )
         .expect("assemble biased memory fixture");
         assembled.words
+    }
+
+    /// Only the words emitted for the memory access itself. The block's
+    /// syscall exit afterwards legitimately saves guest x17 to slot 1128, so a
+    /// whole-block scan could never distinguish that from a lowering spill.
+    fn assemble_biased_access_words(
+        memory: super::super::types::MemoryAccess,
+        bias: u64,
+    ) -> Vec<u32> {
+        let host_bias =
+            carrick_dsr::address::NativeHostBias::new(bias, 0x4000).expect("aligned test bias");
+        let plan = biased_memory_plan(memory);
+        let access = plan.start;
+        let assembled = assemble_block_inner(
+            &plan,
+            None,
+            EmitAddressMode::Biased { host_bias },
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble biased memory fixture");
+        let words = assembled
+            .map
+            .entries()
+            .iter()
+            .filter(|entry| entry.guest == access)
+            .map(|entry| {
+                let index = entry.cache.get() as usize / 4;
+                assembled.words[index]
+            })
+            .collect::<Vec<_>>();
+        assert!(!words.is_empty(), "the access emitted no words");
+        words
     }
 
     fn subsequence_at(words: &[u32], first: u32) -> Option<usize> {
@@ -5742,23 +6289,47 @@ mod tests {
             0x200_0000_0000,
         );
 
-        let start = subsequence_at(&words, 0xf902_3391).expect("compact scratch spill");
-        assert_eq!(
-            &words[start..start + 10],
-            &[
-                0xf902_3391, // str x17, [x28, #1120]
-                0xd369_fc32, // lsr x18, x1, #41
-                0xb400_00b2, // cbz x18, +20 (to the fast orr)
-                0x9100_2032, // add x18, x1, #8 (slow: guest effective address)
-                0xf902_5b92, // str x18, [x28, #1200] (publish guest fault addr)
-                0xb251_0031, // orr x17, x1, #(1 << 47) (tagged invalid host)
-                0x1400_0002, // b +8 (over the fast orr)
-                0xb257_0031, // orr x17, x1, #(1 << 41) (host address)
-                0xf900_0620, // str x0, [x17, #8]
-                0xf942_3391, // ldr x17, [x28, #1120]
-            ],
-            "compact immediate store shape"
-        );
+        // No writeback, so the address register is the reserved one: no spill
+        // prologue and no restore epilogue bracket the sequence.
+        // Both arms are spelled out exactly; see
+        // `reserved_scratch_lowering_emits_no_context_spill` for why.
+        if crate::emit::reserved_scratch_enabled() {
+            // No writeback, so the address register is the reserved one: no
+            // spill prologue and no restore epilogue bracket the sequence.
+            let start = subsequence_at(&words, 0xd369_fc32).expect("compact aperture check");
+            assert_eq!(
+                &words[start..start + 8],
+                &[
+                    0xd369_fc32, // lsr x18, x1, #41
+                    0xb400_00b2, // cbz x18, +20 (to the fast orr)
+                    0x9100_2032, // add x18, x1, #8 (slow: guest effective address)
+                    0xf902_5b92, // str x18, [x28, #1200] (publish guest fault addr)
+                    0xb251_0033, // orr x19, x1, #(1 << 47) (tagged invalid host)
+                    0x1400_0002, // b +8 (over the fast orr)
+                    0xb257_0033, // orr x19, x1, #(1 << 41) (host address)
+                    0xf900_0660, // str x0, [x19, #8]
+                ],
+                "compact immediate store shape (reserved scratch)"
+            );
+        } else {
+            let start = subsequence_at(&words, 0xf902_3391).expect("compact scratch spill");
+            assert_eq!(
+                &words[start..start + 10],
+                &[
+                    0xf902_3391, // str x17, [x28, #1120]
+                    0xd369_fc32, // lsr x18, x1, #41
+                    0xb400_00b2, // cbz x18, +20 (to the fast orr)
+                    0x9100_2032, // add x18, x1, #8 (slow: guest effective address)
+                    0xf902_5b92, // str x18, [x28, #1200] (publish guest fault addr)
+                    0xb251_0031, // orr x17, x1, #(1 << 47) (tagged invalid host)
+                    0x1400_0002, // b +8 (over the fast orr)
+                    0xb257_0031, // orr x17, x1, #(1 << 41) (host address)
+                    0xf900_0620, // str x0, [x17, #8]
+                    0xf942_3391, // ldr x17, [x28, #1120]
+                ],
+                "compact immediate store shape (borrowed scratch)"
+            );
+        }
         assert!(
             !contains_general_bias_load(&words),
             "compact form must not load the bias from context"
@@ -5800,6 +6371,57 @@ mod tests {
             ],
             "compact post-index writeback shape"
         );
+    }
+
+    #[test]
+    fn reserved_scratch_lowering_emits_no_context_spill() {
+        use crate::gateway::RESERVED_SCRATCH;
+
+        let words = assemble_biased_access_words(
+            super::super::types::MemoryAccess {
+                word: 0xf900_0420, // str x0, [x1, #8]
+                op: bad64::Op::STR,
+                base: super::super::types::MemoryBase::Register(bad64::Reg::X1),
+                effective_address: super::super::types::MemoryEffectiveAddress::Immediate(8),
+                writeback: super::super::types::MemoryWriteback::None,
+                class: super::super::types::MemoryClass::Scalar,
+                virtualization: super::super::types::MemoryVirtualization::None,
+            },
+            0x80_0000_0000,
+        );
+        let spills = words
+            .iter()
+            .filter(|word| {
+                let is_ctx =
+                    (*word & 0xFFC0_03E0) == 0xF900_0380 || (*word & 0xFFC0_03E0) == 0xF940_0380;
+                let slot = ((*word >> 10) & 0xFFF) * 8;
+                is_ctx && matches!(slot, 1120 | 1128 | 1160 | 1168)
+            })
+            .count();
+        // Both arms are spelled out: the reserved switch is read once per
+        // process, so one test binary can only observe the configuration it
+        // was started in, and a test that asserted nothing in the default
+        // configuration would be vacuous.
+        if crate::emit::reserved_scratch_enabled() {
+            // No store or load targeting the memory-scratch slots may remain.
+            assert_eq!(spills, 0, "scratch spill survived: {words:08x?}");
+            assert!(
+                words.iter().any(|word| word & 0x1F == RESERVED_SCRATCH),
+                "the lowering must compute into the reserved register"
+            );
+        } else {
+            // The inverse, so the default configuration still asserts exactly
+            // what it does: one borrowed base scratch, spilled and restored,
+            // and no use of the reserved register as an address.
+            assert_eq!(
+                spills, 4,
+                "two borrowed scratches must each spill and restore"
+            );
+            assert!(
+                !words.iter().any(|word| word & 0x1F == RESERVED_SCRATCH),
+                "the reserved register must stay unused while the switch is off"
+            );
+        }
     }
 
     #[test]

@@ -127,6 +127,10 @@ pub enum MemoryVirtualization {
     /// also the lowering's own address scratch: an access naming it can never
     /// take the spill-free or compact paths.
     Reserved,
+    /// The access names the reserved register AND one of x18/x28.
+    ReservedPair {
+        other: u32,
+    },
     Unsupported,
 }
 
@@ -260,6 +264,15 @@ pub enum InstAction {
     VirtualizedReserved {
         word: u32,
         op: bad64::Op,
+    },
+    /// An instruction naming `gateway::RESERVED_SCRATCH` AND one of x18/x28.
+    /// Both guest values live in context slots, so both operands are rewritten
+    /// onto scratch registers by the dual emitter. `commit` names whichever of
+    /// the two the instruction writes, if any.
+    VirtualizedReservedPair {
+        word: u32,
+        op: bad64::Op,
+        other: u32,
     },
     PcRelative(PcRelativeInst),
     Direct(DirectExit),

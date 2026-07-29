@@ -270,9 +270,18 @@ enum BiasedRecoveryMatrixShape {
     PairStorePost,
     /// `ldp x2, x3, [x1], #16` — its load counterpart.
     PairLoadPost,
+    /// `ldur x0, [x1, #-8]` -- a negative displacement, which the compact
+    /// lowering rejects, so it exercises the general/spill-free path.
+    ScalarNegativeImmediate,
+    /// `ldr x0, [x1, x2, lsl #3]` -- a register offset, likewise general-only.
+    ScalarRegisterOffset,
     Literal,
     VirtualX18,
     VirtualX28,
+    /// `ldr x0, [x19]` -- a base in the reserved address scratch, whose guest
+    /// value lives in a context slot while the physical register belongs to
+    /// the memory lowering.
+    VirtualReserved,
     X16X17Collision,
 }
 
@@ -283,9 +292,15 @@ impl BiasedRecoveryMatrixShape {
             Self::ScalarPost => vec![0xf840_8420, 0xd400_0001],
             Self::PairStorePost => vec![0xa881_7c3f, 0xd400_0001],
             Self::PairLoadPost => vec![0xa8c1_0c22, 0xd400_0001],
+            Self::ScalarNegativeImmediate => vec![0xf85f_8020, 0xd400_0001],
+            Self::ScalarRegisterOffset => vec![0xf862_7820, 0xd400_0001],
             Self::Literal => vec![0x5800_0040, 0xd400_0001, 0x5566_7788, 0x1122_3344],
             Self::VirtualX18 => vec![0xf940_0240, 0xd400_0001],
             Self::VirtualX28 => vec![0xf940_0380, 0xd400_0001],
+            Self::VirtualReserved => vec![
+                0xf940_0000 | (carrick_dsr_aarch64::gateway::RESERVED_SCRATCH << 5),
+                0xd400_0001,
+            ],
             Self::X16X17Collision => vec![0xf940_0211, 0xd400_0001],
         }
     }
@@ -310,6 +325,17 @@ impl BiasedRecoveryMatrixShape {
                 }
                 snapshot.x[1] = fixture.guest_data.raw();
             }
+            Self::ScalarNegativeImmediate => {
+                unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
+                snapshot.x[1] = fixture.guest_data.raw() + 8;
+            }
+            Self::ScalarRegisterOffset => {
+                // A NON-ZERO index: with x2 = 0 the effective address equals
+                // the base and any index mishandling stays invisible.
+                unsafe { *((fixture.data_host.raw() + 8) as *mut u64) = VALUE };
+                snapshot.x[1] = fixture.guest_data.raw();
+                snapshot.x[2] = 1;
+            }
             Self::Literal => {}
             Self::VirtualX18 => {
                 unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
@@ -318,6 +344,11 @@ impl BiasedRecoveryMatrixShape {
             Self::VirtualX28 => {
                 unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
                 snapshot.x[28] = fixture.guest_data.raw();
+            }
+            Self::VirtualReserved => {
+                unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
+                snapshot.x[carrick_dsr_aarch64::gateway::RESERVED_SCRATCH as usize] =
+                    fixture.guest_data.raw();
             }
             Self::X16X17Collision => {
                 unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
@@ -348,9 +379,12 @@ fn biased_recovery_matrix_at(bias: u64) {
         BiasedRecoveryMatrixShape::ScalarPost,
         BiasedRecoveryMatrixShape::PairStorePost,
         BiasedRecoveryMatrixShape::PairLoadPost,
+        BiasedRecoveryMatrixShape::ScalarNegativeImmediate,
+        BiasedRecoveryMatrixShape::ScalarRegisterOffset,
         BiasedRecoveryMatrixShape::Literal,
         BiasedRecoveryMatrixShape::VirtualX18,
         BiasedRecoveryMatrixShape::VirtualX28,
+        BiasedRecoveryMatrixShape::VirtualReserved,
         BiasedRecoveryMatrixShape::X16X17Collision,
     ];
     for (shape_index, shape) in shapes.into_iter().enumerate() {
@@ -7654,7 +7688,7 @@ fn dsr_live_kick_inside_fused_biased_exclusive_region_restores_both_scratch_gprs
     // their UNION covers every required word. `4` reaches all of them on its
     // own most runs; the rest are the fallback.
     let mut sweeps: Vec<FusedRegionKickSweep> = Vec::new();
-    for (index, body_len) in [4_usize, 2, 16, 1].into_iter().enumerate() {
+    for (index, body_len) in [4_usize, 2, 16, 1, 8, 3, 6, 12].into_iter().enumerate() {
         sweeps.push(live_biased_exclusive_kick_sweep(
             GuestVa(0x21_0000_0000 + (index as u64) * 0x10_0000),
             body_len,

@@ -310,7 +310,8 @@ pub fn plan_with_reader_for_counter_plan(
             | InstAction::VirtualizedX18X28ReadOnly { .. }
             | InstAction::VirtualizedX18WriteX28Read { .. }
             | InstAction::VirtualizedX28WriteX18Read { .. }
-            | InstAction::VirtualizedReserved { .. } => {
+            | InstAction::VirtualizedReserved { .. }
+            | InstAction::VirtualizedReservedPair { .. } => {
                 instructions.push(PlannedInst { guest: pc, action });
                 if next == boundary {
                     Some(PlannedExit::Continue {
@@ -663,7 +664,8 @@ fn analyze_exclusive_region(
                 | InstAction::VirtualizedX18X28ReadOnly { .. }
                 | InstAction::VirtualizedX18WriteX28Read { .. }
                 | InstAction::VirtualizedX28WriteX18Read { .. }
-                | InstAction::VirtualizedReserved { .. } => {
+                | InstAction::VirtualizedReserved { .. }
+                | InstAction::VirtualizedReservedPair { .. } => {
                     return Ok(ExclusiveRegionAnalysis::Rejected(
                         ExclusiveFusionRejection::UnsupportedBodyMemoryOrSensitive,
                     ));
