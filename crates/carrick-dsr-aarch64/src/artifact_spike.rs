@@ -1160,6 +1160,13 @@ enum PortableRecoveryAction {
         virtual_register: u32,
         virtual_scratch: u32,
     },
+    CommitDualVirtualPairAndRestore {
+        x18_scratch: u32,
+        x28_scratch: u32,
+        context_scratch: u32,
+        first_register: u32,
+        second_register: u32,
+    },
     RecoverCounterRead(super::emit::CounterReadRecovery),
     RecoverBiasedMemory(PortableBiasedMemoryRecovery),
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
@@ -1248,6 +1255,19 @@ impl PortableRecoveryAction {
                 context_scratch,
                 virtual_register,
                 virtual_scratch,
+            },
+            RecoveryAction::CommitDualVirtualPairAndRestore {
+                x18_scratch,
+                x28_scratch,
+                context_scratch,
+                first_register,
+                second_register,
+            } => Self::CommitDualVirtualPairAndRestore {
+                x18_scratch,
+                x28_scratch,
+                context_scratch,
+                first_register,
+                second_register,
             },
             RecoveryAction::RecoverCounterRead(recovery) => Self::RecoverCounterRead(recovery),
             RecoveryAction::RecoverBiasedMemory(recovery) => {
@@ -1363,6 +1383,19 @@ impl PortableRecoveryAction {
                 context_scratch,
                 virtual_register,
                 virtual_scratch,
+            },
+            Self::CommitDualVirtualPairAndRestore {
+                x18_scratch,
+                x28_scratch,
+                context_scratch,
+                first_register,
+                second_register,
+            } => RecoveryAction::CommitDualVirtualPairAndRestore {
+                x18_scratch,
+                x28_scratch,
+                context_scratch,
+                first_register,
+                second_register,
             },
             Self::RecoverCounterRead(recovery) => RecoveryAction::RecoverCounterRead(recovery),
             Self::RecoverBiasedMemory(recovery) => {

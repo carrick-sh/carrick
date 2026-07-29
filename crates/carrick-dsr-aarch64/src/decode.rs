@@ -972,11 +972,21 @@ pub fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
 
     let virtualized = || {
         if mentions_reserved {
-            return if mentions_x18 || mentions_x28 {
-                InstAction::Unsupported { word, op }
-            } else {
-                InstAction::VirtualizedReserved { word, op }
+            let other = match (mentions_x18, mentions_x28) {
+                // Three host-owned registers in one instruction would need
+                // three simultaneous rewrite scratches and three context
+                // slots; the dual emitter cannot express it, so fail closed.
+                (true, true) => return InstAction::Unsupported { word, op },
+                (true, false) => 18,
+                (false, true) => 28,
+                (false, false) => return InstAction::VirtualizedReserved { word, op },
             };
+            // No per-shape destination analysis: the emitter commits BOTH
+            // slots, and committing a register the instruction did not write
+            // is a no-op because its scratch still holds the loaded guest
+            // value. Whether the rewrite is legal at all is decided by the
+            // emitter's re-decode-and-compare search, not by an opcode list.
+            return InstAction::VirtualizedReservedPair { word, op, other };
         }
         if mentions_x18 && mentions_x28 {
             // Every ALU family in this allowlist has one explicit destination
@@ -1065,6 +1075,9 @@ pub fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
             let action = virtualized();
             memory.virtualization = match action {
                 InstAction::VirtualizedReserved { .. } => MemoryVirtualization::Reserved,
+                InstAction::VirtualizedReservedPair { other, .. } => {
+                    MemoryVirtualization::ReservedPair { other }
+                }
                 InstAction::VirtualizedX18 { .. } => MemoryVirtualization::X18,
                 InstAction::VirtualizedX28 { .. } => MemoryVirtualization::X28,
                 InstAction::VirtualizedX18X28ReadOnly { .. } => {
@@ -1380,6 +1393,27 @@ mod tests {
         assert!(
             matches!(action, InstAction::Memory(memory)
                 if memory.virtualization == MemoryVirtualization::Reserved),
+            "got {action:?}"
+        );
+    }
+
+    /// `add x28, x19, #0x370` is the shape Ubuntu's dynamic loader executes
+    /// within the first few hundred guest instructions: it names TWO
+    /// host-owned registers, so neither the single-virtual emitter nor a
+    /// verbatim copy is correct. Failing this closed crashed every guest.
+    #[test]
+    fn instructions_naming_the_reserved_scratch_and_x28_are_dually_virtualized() {
+        let word = 0x910d_c27c;
+        assert_eq!(
+            bad64::decode(word, PC.raw()).expect("decode").to_string(),
+            "add x28, x19, #0x370"
+        );
+        let action = classify(word, PC).expect("classify");
+        assert!(
+            matches!(
+                action,
+                InstAction::VirtualizedReservedPair { other: 28, .. }
+            ),
             "got {action:?}"
         );
     }
