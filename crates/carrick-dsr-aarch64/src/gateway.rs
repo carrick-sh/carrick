@@ -24,6 +24,34 @@ pub const INDIRECT_CACHE_ENTRIES: usize = 32_768;
 pub const INDIRECT_CACHE_MASK: u64 = (INDIRECT_CACHE_ENTRIES - 1) as u64;
 pub const INDIRECT_CACHE_INDEX_BITS: u32 = 15;
 pub const INDIRECT_CACHE_ENTRY_SHIFT: u32 = 6;
+/// The GPR carrick reserves for the biased-address computation, chosen by the
+/// sample-weighted guest-register census in
+/// `docs/perf-results/native-dsr-shape-census.jsonl` (record
+/// `guest-register-census`): x19 carried zero sampled weight in translated
+/// guest code, tied with x21-x25, and x18/x28 are already host-owned.
+///
+/// Inside translated code the physical register belongs to carrick, exactly
+/// like physical x18 (Darwin's platform register) and physical x28 (the
+/// context pointer). The guest's architectural value therefore lives in the
+/// snapshot slot below for the lifetime of translated execution, and every
+/// guest instruction naming the register is virtualized through it.
+///
+/// Changing this constant is NOT a one-line edit: `gateway_aarch64.S` and
+/// `csrc/native_darwin.c` both name the skipped register numerically (the
+/// assembler and the C signal handler cannot read a Rust const), so the
+/// assertion below fails the build until they are updated together.
+pub const RESERVED_SCRATCH: u32 = 19;
+const _: () = assert!(RESERVED_SCRATCH == 19);
+
+/// Context byte offset of the reserved scratch's guest value.
+///
+/// This is `snapshot.x[RESERVED_SCRATCH]` -- the same slot the gateway would
+/// otherwise use for the register -- so the guest register file stays
+/// architecturally correct for every consumer (fault recovery, emulation,
+/// fork, signal delivery) with no separate round-trip, exactly like guest x18
+/// (slot 144) and guest x28 (slot 224).
+pub const CTX_GUEST_RESERVED_SCRATCH: u32 = 152;
+
 pub const CTX_INDIRECT_CACHE: u32 = 1136;
 pub const CTX_GENERATION: u32 = 1144;
 pub const CTX_ENFORCE_CACHE_AUTHORITY: u32 = 1156;
@@ -507,6 +535,13 @@ fn decode_direct_exit(context: &DsrContext) -> NativeDsrExit {
 
 const _: () = assert!(std::mem::size_of::<NativeUcontextSnapshot>() == 832);
 const _: () = assert!(std::mem::offset_of!(DsrContext, snapshot) == 0);
+// The reserved scratch's guest value is the snapshot slot the gateway would
+// otherwise hold in the physical register; pin the two together so the
+// emitter's context offset can never drift from the register it virtualizes.
+const _: () = assert!(
+    std::mem::offset_of!(DsrContext, snapshot) + (RESERVED_SCRATCH as usize) * 8
+        == CTX_GUEST_RESERVED_SCRATCH as usize
+);
 const _: () = assert!(std::mem::offset_of!(DsrContext, host_sp) == 832);
 const _: () = assert!(std::mem::offset_of!(DsrContext, host_x19_x30) == 840);
 const _: () = assert!(std::mem::offset_of!(DsrContext, generation_pstate_scratch) == 936);

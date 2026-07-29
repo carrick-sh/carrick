@@ -304,6 +304,7 @@ pub enum BiasedBase {
     StackPointer,
     VirtualX18,
     VirtualX28,
+    VirtualReserved,
     None,
 }
 
@@ -323,6 +324,10 @@ pub struct BiasedMemoryRecovery {
     pub commit_base: bool,
     pub virtual_x18_scratch: Option<u32>,
     pub virtual_x28_scratch: Option<u32>,
+    /// Set while the rewrite scratch holds the guest value of
+    /// `gateway::RESERVED_SCRATCH`, so recovery commits it back to the
+    /// register's context slot instead of leaving it in the scratch.
+    pub virtual_reserved_scratch: Option<u32>,
     pub host_bias: carrick_dsr::address::NativeHostBias,
     pub instruction_complete: bool,
 }
@@ -495,10 +500,13 @@ fn gpr_index(register: bad64::Reg) -> Option<u32> {
     }
 }
 
+/// Context byte offset holding the guest value of a host-owned register, or
+/// `None` for the ordinary guest registers that live in the physical file.
 const fn virtual_snapshot_offset(register: u32) -> Option<u32> {
     match register {
         18 => Some(144),
         28 => Some(224),
+        crate::gateway::RESERVED_SCRATCH => Some(crate::gateway::CTX_GUEST_RESERVED_SCRATCH),
         _ => None,
     }
 }
@@ -2423,6 +2431,7 @@ fn biased_base(memory: super::types::MemoryAccess) -> Result<BiasedBase, DsrErro
         }
         super::types::MemoryBase::VirtualX18 => Ok(BiasedBase::VirtualX18),
         super::types::MemoryBase::VirtualX28 => Ok(BiasedBase::VirtualX28),
+        super::types::MemoryBase::VirtualReserved => Ok(BiasedBase::VirtualReserved),
         super::types::MemoryBase::Literal(_) => Ok(BiasedBase::None),
     }
 }
@@ -2433,29 +2442,84 @@ fn biased_base_load_word(base: BiasedBase, destination: u32) -> Option<u32> {
         BiasedBase::StackPointer => Some(0x9100_03e0 | destination),
         BiasedBase::VirtualX18 => Some(0xf940_0000 | ((144 / 8) << 10) | (28 << 5) | destination),
         BiasedBase::VirtualX28 => Some(0xf940_0000 | ((224 / 8) << 10) | (28 << 5) | destination),
+        BiasedBase::VirtualReserved => Some(
+            0xf940_0000
+                | ((crate::gateway::CTX_GUEST_RESERVED_SCRATCH / 8) << 10)
+                | (28 << 5)
+                | destination,
+        ),
         BiasedBase::None => None,
     }
+}
+
+/// The rewrite scratches a biased access needs for its virtualized operands.
+/// Each `Some(scratch)` names a register the lowering spills, loads the guest
+/// value into, and stores back after the access.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BiasedVirtualRewrite {
+    word: u32,
+    x18: Option<u32>,
+    x28: Option<u32>,
+    reserved: Option<u32>,
 }
 
 fn rewritten_biased_virtual_word(
     memory: super::types::MemoryAccess,
     guest: GuestVa,
-) -> Result<(u32, Option<u32>, Option<u32>), DsrError> {
+) -> Result<BiasedVirtualRewrite, DsrError> {
+    let plain = BiasedVirtualRewrite {
+        word: memory.word,
+        ..BiasedVirtualRewrite::default()
+    };
     match memory.virtualization {
-        super::types::MemoryVirtualization::None => Ok((memory.word, None, None)),
+        super::types::MemoryVirtualization::None => Ok(plain),
         super::types::MemoryVirtualization::X18 => {
             let (scratch, _, word) =
                 rewritten_virtual_word(memory.word, guest, 18).ok_or_else(|| {
                     DsrError::BlockPolicy("biased x18 memory operand is not rewritable".to_string())
                 })?;
-            Ok((word, Some(scratch), None))
+            Ok(BiasedVirtualRewrite {
+                word,
+                x18: Some(scratch),
+                ..plain
+            })
         }
         super::types::MemoryVirtualization::X28 => {
             let (scratch, _, word) =
                 rewritten_virtual_word(memory.word, guest, 28).ok_or_else(|| {
                     DsrError::BlockPolicy("biased x28 memory operand is not rewritable".to_string())
                 })?;
-            Ok((word, None, Some(scratch)))
+            Ok(BiasedVirtualRewrite {
+                word,
+                x28: Some(scratch),
+                ..plain
+            })
+        }
+        super::types::MemoryVirtualization::Reserved => {
+            // `Reserved` is set for a base-only mention too (the physical
+            // register is the lowering's address scratch). A base mention is
+            // already carried by `BiasedBase::VirtualReserved` and overwritten
+            // with the address register, so only a mention OUTSIDE the base
+            // needs an operand rewrite.
+            if !super::decode::decoded_operands_mention_gpr_outside_memory_base(
+                memory.word,
+                guest,
+                crate::gateway::RESERVED_SCRATCH,
+            ) {
+                return Ok(plain);
+            }
+            let (scratch, _, word) =
+                rewritten_virtual_word(memory.word, guest, crate::gateway::RESERVED_SCRATCH)
+                    .ok_or_else(|| {
+                        DsrError::BlockPolicy(
+                            "biased reserved-scratch memory operand is not rewritable".to_string(),
+                        )
+                    })?;
+            Ok(BiasedVirtualRewrite {
+                word,
+                reserved: Some(scratch),
+                ..plain
+            })
         }
         super::types::MemoryVirtualization::X18X28ReadOnly
         | super::types::MemoryVirtualization::X18WriteX28Read => {
@@ -2465,10 +2529,15 @@ fn rewritten_biased_virtual_word(
                         "biased x18/x28 memory operands are not rewritable".to_string(),
                     )
                 })?;
-            Ok((word, Some(x18), Some(x28)))
+            Ok(BiasedVirtualRewrite {
+                word,
+                x18: Some(x18),
+                x28: Some(x28),
+                ..plain
+            })
         }
         super::types::MemoryVirtualization::Unsupported => Err(DsrError::BlockPolicy(
-            "biased memory has unsupported x18/x28 virtualization".to_string(),
+            "biased memory has unsupported virtualization".to_string(),
         )),
     }
 }
@@ -2754,6 +2823,7 @@ fn emit_compact_biased_memory(
         commit_base: false,
         virtual_x18_scratch: None,
         virtual_x28_scratch: None,
+        virtual_reserved_scratch: None,
         host_bias,
         instruction_complete: false,
     };
@@ -2970,13 +3040,21 @@ fn emit_biased_memory(
             assembler, entries, plan, guest, memory, host_bias, recovery, form,
         );
     }
-    let (mut rewritten, virtual_x18_scratch, virtual_x28_scratch) =
-        rewritten_biased_virtual_word(memory, guest)?;
+    let BiasedVirtualRewrite {
+        word: mut rewritten,
+        x18: virtual_x18_scratch,
+        x28: virtual_x28_scratch,
+        reserved: virtual_reserved_scratch,
+    } = rewritten_biased_virtual_word(memory, guest)?;
     let mut scratch_registers = [0_u32; 4];
     let mut scratch_count = 0_usize;
-    for register in [virtual_x18_scratch, virtual_x28_scratch]
-        .into_iter()
-        .flatten()
+    for register in [
+        virtual_x18_scratch,
+        virtual_x28_scratch,
+        virtual_reserved_scratch,
+    ]
+    .into_iter()
+    .flatten()
     {
         if !scratch_registers[..scratch_count].contains(&register) {
             scratch_registers[scratch_count] = register;
@@ -3026,23 +3104,33 @@ fn emit_biased_memory(
         commit_base: false,
         virtual_x18_scratch: None,
         virtual_x28_scratch: None,
+        virtual_reserved_scratch: None,
         host_bias,
         instruction_complete: false,
     };
-    for (virtual_register, scratch) in [(18_u32, virtual_x18_scratch), (28, virtual_x28_scratch)] {
+    for (virtual_register, scratch) in [
+        (18_u32, virtual_x18_scratch),
+        (28, virtual_x28_scratch),
+        (crate::gateway::RESERVED_SCRATCH, virtual_reserved_scratch),
+    ] {
         if let Some(scratch) = scratch {
+            let offset = virtual_snapshot_offset(virtual_register).ok_or_else(|| {
+                DsrError::BlockPolicy(format!(
+                    "biased memory virtualized x{virtual_register} has no context slot"
+                ))
+            })?;
             emit_with_biased_recovery(
                 assembler,
                 entries,
                 recovery,
                 guest,
-                0xf940_0000 | (((virtual_register * 8) / 8) << 10) | (28 << 5) | scratch,
+                0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | scratch,
                 action,
             )?;
-            if virtual_register == 18 {
-                action.virtual_x18_scratch = Some(scratch);
-            } else {
-                action.virtual_x28_scratch = Some(scratch);
+            match virtual_register {
+                18 => action.virtual_x18_scratch = Some(scratch),
+                28 => action.virtual_x28_scratch = Some(scratch),
+                _ => action.virtual_reserved_scratch = Some(scratch),
             }
         }
     }
@@ -3137,20 +3225,29 @@ fn emit_biased_memory(
         action.base_coordinate = BiasedBaseCoordinate::Host;
         action.commit_base = true;
     }
-    for (virtual_register, scratch) in [(18_u32, virtual_x18_scratch), (28, virtual_x28_scratch)] {
+    for (virtual_register, scratch) in [
+        (18_u32, virtual_x18_scratch),
+        (28, virtual_x28_scratch),
+        (crate::gateway::RESERVED_SCRATCH, virtual_reserved_scratch),
+    ] {
         if let Some(scratch) = scratch {
+            let offset = virtual_snapshot_offset(virtual_register).ok_or_else(|| {
+                DsrError::BlockPolicy(format!(
+                    "biased memory virtualized x{virtual_register} has no context slot"
+                ))
+            })?;
             emit_with_biased_recovery(
                 assembler,
                 entries,
                 recovery,
                 guest,
-                0xf900_0000 | (((virtual_register * 8) / 8) << 10) | (28 << 5) | scratch,
+                0xf900_0000 | ((offset / 8) << 10) | (28 << 5) | scratch,
                 action,
             )?;
-            if virtual_register == 18 {
-                action.virtual_x18_scratch = None;
-            } else {
-                action.virtual_x28_scratch = None;
+            match virtual_register {
+                18 => action.virtual_x18_scratch = None,
+                28 => action.virtual_x28_scratch = None,
+                _ => action.virtual_reserved_scratch = None,
             }
         }
     }
@@ -3169,6 +3266,12 @@ fn emit_biased_memory(
             BiasedBase::StackPointer => 0x9100_001f | (base_scratch << 5),
             BiasedBase::VirtualX18 => 0xf900_0000 | ((144 / 8) << 10) | (28 << 5) | base_scratch,
             BiasedBase::VirtualX28 => 0xf900_0000 | ((224 / 8) << 10) | (28 << 5) | base_scratch,
+            BiasedBase::VirtualReserved => {
+                0xf900_0000
+                    | ((crate::gateway::CTX_GUEST_RESERVED_SCRATCH / 8) << 10)
+                    | (28 << 5)
+                    | base_scratch
+            }
             BiasedBase::None => {
                 return Err(unsupported_action(
                     plan,
@@ -3205,6 +3308,7 @@ fn biased_dc_zva_base(register: bad64::Reg) -> Option<BiasedBase> {
     Some(match register {
         18 => BiasedBase::VirtualX18,
         28 => BiasedBase::VirtualX28,
+        crate::gateway::RESERVED_SCRATCH => BiasedBase::VirtualReserved,
         _ => BiasedBase::Register(register),
     })
 }
@@ -3250,6 +3354,7 @@ fn emit_biased_dc_zva(
         commit_base: false,
         virtual_x18_scratch: None,
         virtual_x28_scratch: None,
+        virtual_reserved_scratch: None,
         host_bias,
         instruction_complete: false,
     };
@@ -4577,6 +4682,19 @@ fn assemble_block_inner(
                         )?;
                         continue;
                     }
+                    super::types::MemoryVirtualization::Reserved => {
+                        emit_virtualized_register(
+                            &mut assembler,
+                            &mut entries,
+                            plan,
+                            instruction.guest,
+                            memory.word,
+                            crate::gateway::RESERVED_SCRATCH,
+                            crate::gateway::CTX_GUEST_RESERVED_SCRATCH,
+                            &mut recovery,
+                        )?;
+                        continue;
+                    }
                     super::types::MemoryVirtualization::Unsupported => {
                         return Err(unsupported_action(
                             plan,
@@ -4585,6 +4703,19 @@ fn assemble_block_inner(
                             "unsupported memory virtualization",
                         ));
                     }
+                }
+                if memory.base == super::types::MemoryBase::VirtualReserved {
+                    emit_virtualized_register(
+                        &mut assembler,
+                        &mut entries,
+                        plan,
+                        instruction.guest,
+                        memory.word,
+                        crate::gateway::RESERVED_SCRATCH,
+                        crate::gateway::CTX_GUEST_RESERVED_SCRATCH,
+                        &mut recovery,
+                    )?;
+                    continue;
                 }
                 if memory.base == super::types::MemoryBase::VirtualX18 {
                     emit_virtualized_register(
@@ -4693,6 +4824,19 @@ fn assemble_block_inner(
                     instruction.guest,
                     word,
                     Some(28),
+                    &mut recovery,
+                )?;
+                continue;
+            }
+            InstAction::VirtualizedReserved { word, .. } => {
+                emit_virtualized_register(
+                    &mut assembler,
+                    &mut entries,
+                    plan,
+                    instruction.guest,
+                    word,
+                    crate::gateway::RESERVED_SCRATCH,
+                    crate::gateway::CTX_GUEST_RESERVED_SCRATCH,
                     &mut recovery,
                 )?;
                 continue;
@@ -5245,6 +5389,19 @@ pub fn recover_rewrite_state(
                     })
             })
             .transpose()?;
+        let virtual_reserved = recovery
+            .virtual_reserved_scratch
+            .map(|register| {
+                usize::try_from(register)
+                    .ok()
+                    .and_then(|index| snapshot.x.get(index).copied())
+                    .ok_or_else(|| {
+                        crate::types::DsrError::CachePolicy(format!(
+                            "biased virtual reserved scratch x{register} is outside snapshot"
+                        ))
+                    })
+            })
+            .transpose()?;
         let scratch_count = usize::from(recovery.scratch_count);
         if scratch_count > recovery.scratch_registers.len() {
             return Err(crate::types::DsrError::CachePolicy(format!(
@@ -5272,6 +5429,9 @@ pub fn recover_rewrite_state(
         if let Some(value) = virtual_x28 {
             snapshot.x[28] = value;
         }
+        if let Some(value) = virtual_reserved {
+            snapshot.x[crate::gateway::RESERVED_SCRATCH as usize] = value;
+        }
         if let Some(value) = base_value {
             match recovery.base {
                 BiasedBase::Register(register) => {
@@ -5290,6 +5450,9 @@ pub fn recover_rewrite_state(
                 BiasedBase::StackPointer => snapshot.sp = value,
                 BiasedBase::VirtualX18 => snapshot.x[18] = value,
                 BiasedBase::VirtualX28 => snapshot.x[28] = value,
+                BiasedBase::VirtualReserved => {
+                    snapshot.x[crate::gateway::RESERVED_SCRATCH as usize] = value;
+                }
                 BiasedBase::None => {
                     return Err(crate::types::DsrError::CachePolicy(
                         "biased recovery attempted to commit a missing base".to_string(),

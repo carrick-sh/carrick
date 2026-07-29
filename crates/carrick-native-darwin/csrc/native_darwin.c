@@ -419,12 +419,22 @@ int carrick_native_dsr_benchmark_custom_x18_pair(void) {
     return 0;
 }
 
+// The GPRs carrick owns inside translated code, whose guest values therefore
+// live in snapshot.x[] rather than the physical register: Darwin's platform
+// register x18, the DSR context pointer x28, and the memory lowering's
+// reserved address scratch (carrick-dsr-aarch64's gateway::RESERVED_SCRATCH,
+// pinned to 19 by a Rust-side const assert because this file and
+// gateway_aarch64.S cannot read it).
+#define CARRICK_NATIVE_DSR_RESERVED_SCRATCH 19
+
 static void carrick_native_snapshot_mcontext(
     struct carrick_native_ucontext_snapshot *out,
     const struct __darwin_mcontext64 *mc,
     bool preserve_virtual_registers) {
     for (int i = 0; i < 29; i++) {
-        if (!preserve_virtual_registers || (i != 18 && i != 28)) {
+        if (!preserve_virtual_registers ||
+            (i != 18 && i != 28 &&
+             i != CARRICK_NATIVE_DSR_RESERVED_SCRATCH)) {
             out->x[i] = mc->__ss.__x[i];
         }
     }

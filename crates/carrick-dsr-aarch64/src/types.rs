@@ -72,6 +72,9 @@ pub enum MemoryBase {
     Register(bad64::Reg),
     VirtualX18,
     VirtualX28,
+    /// The base is `gateway::RESERVED_SCRATCH`, whose physical register the
+    /// memory lowering owns; the guest value comes from its context slot.
+    VirtualReserved,
     Literal(GuestVa),
 }
 
@@ -118,6 +121,12 @@ pub enum MemoryVirtualization {
     X28,
     X18X28ReadOnly,
     X18WriteX28Read,
+    /// The access names `gateway::RESERVED_SCRATCH` somewhere -- as its base,
+    /// as a transfer/index register, or both. Unlike the x18/x28 variants this
+    /// is set for a base-only mention too, because the reserved register is
+    /// also the lowering's own address scratch: an access naming it can never
+    /// take the spill-free or compact paths.
+    Reserved,
     Unsupported,
 }
 
@@ -242,6 +251,13 @@ pub enum InstAction {
         op: bad64::Op,
     },
     VirtualizedX28WriteX18Read {
+        word: u32,
+        op: bad64::Op,
+    },
+    /// A non-memory instruction naming `gateway::RESERVED_SCRATCH`. Emitted
+    /// through the same parameterized virtualization the x18/x28 variants use,
+    /// against `gateway::CTX_GUEST_RESERVED_SCRATCH`.
+    VirtualizedReserved {
         word: u32,
         op: bad64::Op,
     },

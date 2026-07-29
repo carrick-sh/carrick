@@ -271,6 +271,8 @@ fn memory_base(
         Ok(MemoryBase::VirtualX18)
     } else if register_matches_gpr(register, 28) {
         Ok(MemoryBase::VirtualX28)
+    } else if register_matches_gpr(register, crate::gateway::RESERVED_SCRATCH) {
+        Ok(MemoryBase::VirtualReserved)
     } else {
         Ok(MemoryBase::Register(register))
     }
@@ -785,6 +787,29 @@ pub fn decoded_operands_mention_x28(word: u32, pc: GuestVa) -> bool {
     decoded_operands_mention_gpr(word, pc, 28)
 }
 
+/// Does the instruction name `gateway::RESERVED_SCRATCH`, whose physical
+/// register carrick owns inside translated code?
+pub fn decoded_operands_mention_reserved_scratch(word: u32, pc: GuestVa) -> bool {
+    decoded_operands_mention_gpr(word, pc, crate::gateway::RESERVED_SCRATCH)
+}
+
+/// Does the instruction name `index` anywhere OTHER than a memory operand's
+/// base register? The biased lowering rewrites the base separately, so an
+/// access that only uses a virtualized register as its base needs no operand
+/// rewrite at all.
+pub fn decoded_operands_mention_gpr_outside_memory_base(
+    word: u32,
+    pc: GuestVa,
+    index: u32,
+) -> bool {
+    bad64::decode(word, pc.raw()).is_ok_and(|instruction| {
+        instruction
+            .operands()
+            .iter()
+            .any(|operand| operand_mentions_gpr_outside_memory_base(operand, index))
+    })
+}
+
 pub fn decoded_writeback_destination_overlaps_base(word: u32, pc: GuestVa) -> bool {
     bad64::decode(word, pc.raw()).is_ok_and(|instruction| {
         let operands = instruction.operands();
@@ -937,8 +962,22 @@ pub fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
     let mentions_x28_outside_base = operands
         .iter()
         .any(|operand| operand_mentions_gpr_outside_memory_base(operand, 28));
+    // The third host-owned register. It carries no dual-virtualization
+    // machinery: an instruction naming it together with x18 or x28 needs two
+    // simultaneous rewrite scratches with different context slots, which the
+    // single-virtual emitter cannot express, so it fails closed instead.
+    let mentions_reserved = operands
+        .iter()
+        .any(|operand| operand_mentions_gpr(operand, crate::gateway::RESERVED_SCRATCH));
 
     let virtualized = || {
+        if mentions_reserved {
+            return if mentions_x18 || mentions_x28 {
+                InstAction::Unsupported { word, op }
+            } else {
+                InstAction::VirtualizedReserved { word, op }
+            };
+        }
         if mentions_x18 && mentions_x28 {
             // Every ALU family in this allowlist has one explicit destination
             // as its first operand and otherwise only reads its operands. This
@@ -1015,11 +1054,17 @@ pub fn classify(word: u32, pc: GuestVa) -> Result<InstAction, DsrError> {
         if memory.class == MemoryClass::Exclusive {
             return sensitive(pc, SensitiveKind::Exclusive(word), None);
         }
+        // A base-only x18/x28 mention is carried by `MemoryBase` alone, but a
+        // base-only mention of the reserved register must ALSO be visible as a
+        // virtualization: the lowering computes its host address into that
+        // physical register, so such an access can never take the spill-free
+        // or compact paths that assume the register is free.
         if memory.class != MemoryClass::Literal
-            && (mentions_x18_outside_base || mentions_x28_outside_base)
+            && (mentions_x18_outside_base || mentions_x28_outside_base || mentions_reserved)
         {
             let action = virtualized();
             memory.virtualization = match action {
+                InstAction::VirtualizedReserved { .. } => MemoryVirtualization::Reserved,
                 InstAction::VirtualizedX18 { .. } => MemoryVirtualization::X18,
                 InstAction::VirtualizedX28 { .. } => MemoryVirtualization::X28,
                 InstAction::VirtualizedX18X28ReadOnly { .. } => {
@@ -1324,6 +1369,19 @@ mod tests {
                 if memory.class == MemoryClass::Literal
                     && memory.base == MemoryBase::Literal(GuestVa(0x4008))
         ));
+    }
+
+    #[test]
+    fn instructions_naming_the_reserved_scratch_are_virtualized() {
+        // ldr x0, [xR] where R is the reserved scratch: must not classify as a
+        // plain memory access, because the physical register is host-owned.
+        let word = 0xf940_0000 | (crate::gateway::RESERVED_SCRATCH << 5);
+        let action = classify(word, GuestVa(0x4000)).expect("classify");
+        assert!(
+            matches!(action, InstAction::Memory(memory)
+                if memory.virtualization == MemoryVirtualization::Reserved),
+            "got {action:?}"
+        );
     }
 
     #[test]
