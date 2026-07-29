@@ -187,24 +187,17 @@ impl StackTraceRecord {
         };
         let state = required("state")?.to_owned();
         let (pid, value) = match state.as_str() {
-            "kernel-oncpu"
-                if fields
-                    .keys()
-                    .map(String::as_str)
-                    .eq(["state", "value"].into_iter()) =>
-            {
-                (
-                    None,
-                    StackTraceValue::Count(
-                        parse_u64(required("value")?).context("invalid stack count")?,
-                    ),
-                )
-            }
+            "kernel-oncpu" if fields.keys().map(String::as_str).eq(["state", "value"]) => (
+                None,
+                StackTraceValue::Count(
+                    parse_u64(required("value")?).context("invalid stack count")?,
+                ),
+            ),
             "voluntary"
                 if fields
                     .keys()
                     .map(String::as_str)
-                    .eq(["pid", "state", "value_ns"].into_iter()) =>
+                    .eq(["pid", "state", "value_ns"]) =>
             {
                 (
                     Some(parse_u64(required("pid")?).context("invalid stack pid")?),

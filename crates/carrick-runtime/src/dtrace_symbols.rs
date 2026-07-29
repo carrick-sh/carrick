@@ -3148,7 +3148,7 @@ objects=[\"alpha\", \"mach_kernel\"]"
         let status = object_callback(
             std::ptr::null_mut(),
             &DtraceObjInfo {
-                dto_name: b"kernel\0".as_ptr().cast(),
+                dto_name: c"kernel".as_ptr(),
                 dto_file: std::ptr::null(),
                 dto_id: 1,
                 dto_flags: DTRACE_OBJ_F_KERNEL,
@@ -3169,7 +3169,7 @@ objects=[\"alpha\", \"mach_kernel\"]"
         let status = object_callback(
             std::ptr::null_mut(),
             &DtraceObjInfo {
-                dto_name: b"kernel\0".as_ptr().cast(),
+                dto_name: c"kernel".as_ptr(),
                 dto_file: std::ptr::null(),
                 dto_id: 1,
                 dto_flags: DTRACE_OBJ_F_KERNEL,
