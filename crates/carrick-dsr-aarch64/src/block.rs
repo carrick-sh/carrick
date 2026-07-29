@@ -231,9 +231,12 @@ pub fn plan_with_reader_for_counter_plan(
 /// screen before the cap moves.
 pub const SUPERBLOCK_SEGMENT_LIMIT: usize = 2;
 
-/// The default when superblock formation is on, and the value
-/// `CARRICK_DSR_SUPERBLOCK=on` selects.
-pub const SUPERBLOCK_DEFAULT_SEGMENTS: usize = 1;
+/// The production default.
+///
+/// ON, at the measured cap: 7 of 8 paired alternating wall screens won on the
+/// guest workload window, median paired ratio 0.9264 (7.4% faster), sign-test
+/// p = 0.035. The single loss landed on the highest-load pair of the eight.
+pub const SUPERBLOCK_DEFAULT_SEGMENTS: usize = SUPERBLOCK_SEGMENT_LIMIT;
 
 /// Production segment limit, resolved once per process.
 ///
@@ -251,12 +254,12 @@ pub fn superblock_segment_limit() -> usize {
                 .parse::<usize>()
                 .map_or(SUPERBLOCK_DEFAULT_SEGMENTS, |segments| segments.max(1)),
         },
-        // OFF until the wall gate rules. The EMITTER's fused path is not gated
-        // on this -- it renders whatever segments the planner hands it, and the
-        // translator's `set_superblock_segments_for_test` reaches the planner's
-        // -- so the fusion tests exercise fusion under either default. An
-        // opt-in switch whose default arm is the only one tested is how
-        // `19dc0580` shipped a test that broke the moment its default flipped.
+        // The EMITTER's fused path is not gated on this -- it renders whatever
+        // segments the planner hands it, and `plan_with_reader`/`plan_block`
+        // stay explicitly UNFUSED whatever the default is -- so both arms are
+        // tested either way. An opt-in switch whose default arm is the only one
+        // tested is how `19dc0580` shipped a test that broke the moment its
+        // default flipped.
         Err(_) => SUPERBLOCK_DEFAULT_SEGMENTS,
     })
 }

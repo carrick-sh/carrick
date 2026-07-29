@@ -893,6 +893,31 @@ to `PROPOSED`.
     `set_superblock_segments_for_test` reaches the production translator, so
     fusion is exercised under either default.
 
+17. Superblock formation's cap is **2 segments, chosen by measurement, not by
+    the executed-word model** — and that model was wrong in a way worth
+    recording. It priced translation work at zero. A fused segment is also
+    tail-duplicated (the same guest PC still gets a standalone block whenever
+    anything branches to it), so depth costs decode and emit time:
+
+    | cap | translations | emitted bytes | translate ns | resolver exits |
+    |---|---|---|---|---|
+    | 1 | 5,323 | 1,480,844 | 19,469,167 | 4,189 |
+    | **2** | 3,897 | **1,338,972** | **19,389,933** | 2,763 |
+    | 4 | 3,402 | 1,369,560 | 20,910,297 | 2,268 |
+    | 8 | 3,287 | 1,440,476 | 22,345,884 | 2,153 |
+
+    At 2 the emitted code shrinks 9.6% with translation time flat, and 34 of
+    the 49 available points of resolver-exit reduction are already taken. Cap 8
+    pays +14.8% translation time for the last 15 points — a tax that a workload
+    of short-lived processes with cold caches pays in full.
+
+    The **first wall screen ran at cap 8 and came back flat** (median paired
+    ratio 1.0161, 3/5 pairs) with `spotlightknowledged` concurrently at 219%
+    CPU. That result is not excused as noise: it is what sent the cap table to
+    be measured. **Re-screened at cap 2: 7 of 8 paired wins, median paired
+    ratio 0.9264 (7.4% faster), sign-test p = 0.035**, single loss on the
+    highest-load pair. Default flipped ON at cap 2.
+
 ## Next action
 
 Write and validate the executable M1 plan:
