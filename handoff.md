@@ -116,10 +116,9 @@ traced ceiling rejected H007 (`native-fs-amplification.jsonl`).
 
 ## Next work, ranked
 
-0. **Superblock formation is BUILT, live-verified and mechanism-gated; its
-   wall screen is the open item.** Switch `CARRICK_DSR_SUPERBLOCK`
-   (`off` | `on` | `<segments>`), default **off** until the paired screen
-   rules. A conditional branch splits a guest block today, so its
+0. **Superblock formation is LANDED and ON by default at cap 2 — 7.4%.**
+   Switch `CARRICK_DSR_SUPERBLOCK` (`off` | `on` | `<segments>`) is the
+   escape hatch. A conditional branch splits a guest block today, so its
    fall-through — literally the next instruction — pays a second entry
    prologue: generation guard with an `ldar` acquire, the `entry_in_progress`
    store, the guest-x17 reload, plus the predecessor's two guest-x17 stores.
@@ -141,16 +140,27 @@ traced ceiling rejected H007 (`native-fs-amplification.jsonl`).
    verified, because with `segments=1` the load is never reached in one
    entry (it returns `Continue`), so it cannot pass vacuously.
 
-   **Open:** the paired wall screen. `native_go_build.py` refuses a dirty
-   worktree, so run it against the commit:
-   `python3 scripts/perf/native_go_build.py --engine carrick --samples 1
-   --superblock off|8 --allow-busy`, alternating arms per Decision 14. Flip
-   the default in a separate commit only if the screen wins.
+   **Wall gate PASSED at cap 2**: 7 of 8 paired alternating screens won,
+   median paired ratio 0.9264 (**7.4% faster**), sign-test p = 0.035; the
+   single loss landed on the highest-load pair of the eight.
+
+   **The cap is 2 because that is where the cost turns, and my first cost
+   model was wrong** — it priced translation work at zero. Fused segments are
+   tail-duplicated, so depth costs decode/emit time: at cap 8 translation
+   time rises 14.8% and the byte saving comes back, which is the most likely
+   reason the first screen (run at cap 8) came back flat. Campaign Decision
+   17 carries the full table. Do not raise the cap without re-screening.
 
    **Deliberate scope boundaries** (campaign Decision 15) — fall-through
    edges only, never across a guest page, no fusing of exclusive regions,
    and superblocks excluded from the artifact/shared caches whose templates
    are keyed on one block's source words.
+
+   **Measuring here:** `native_go_build.py` refuses a dirty worktree AND
+   flags any non-ancestor process whose argv contains its own path — so drive
+   it from a script FILE, not an inline shell command, or the census rejects
+   your own invoking shell. Both arms must set `--superblock` explicitly;
+   omitting it silently measures the default twice.
 
 1. **Phase A is MEASURED and worth ~10%; finish its two remaining gates.**
    Removing the per-access scratch spill (the 33.5% census category) by
