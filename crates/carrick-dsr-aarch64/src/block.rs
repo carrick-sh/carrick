@@ -309,7 +309,8 @@ pub fn plan_with_reader_for_counter_plan(
             | InstAction::VirtualizedX28 { .. }
             | InstAction::VirtualizedX18X28ReadOnly { .. }
             | InstAction::VirtualizedX18WriteX28Read { .. }
-            | InstAction::VirtualizedX28WriteX18Read { .. } => {
+            | InstAction::VirtualizedX28WriteX18Read { .. }
+            | InstAction::VirtualizedReserved { .. } => {
                 instructions.push(PlannedInst { guest: pc, action });
                 if next == boundary {
                     Some(PlannedExit::Continue {
@@ -422,6 +423,12 @@ fn biased_exclusive_scratch(
         .chain((0_u32..=8).rev())
         .chain([30, 29, 27])
     {
+        // The reserved address scratch is carrick's, not the guest's: borrowing
+        // it would spill a value that is not the guest's and restore it over
+        // the lowering's own address.
+        if index == crate::gateway::RESERVED_SCRATCH {
+            continue;
+        }
         let used = instructions.iter().any(|inst| match inst.action {
             InstAction::Copy(word) => {
                 decode::copied_instruction_mentions_gpr(word, inst.guest, index).unwrap_or(true)
@@ -496,7 +503,7 @@ fn analyze_exclusive_region(
         };
         if matches!(
             load_memory.base,
-            MemoryBase::VirtualX18 | MemoryBase::VirtualX28
+            MemoryBase::VirtualX18 | MemoryBase::VirtualX28 | MemoryBase::VirtualReserved
         ) {
             return Ok(ExclusiveRegionAnalysis::Rejected(
                 ExclusiveFusionRejection::VirtualizedBase,
@@ -517,6 +524,7 @@ fn analyze_exclusive_region(
         // reads the spill slots correctly.
         if decode::decoded_operands_mention_x18(load_word, start)
             || decode::decoded_operands_mention_x28(load_word, start)
+            || decode::decoded_operands_mention_reserved_scratch(load_word, start)
         {
             return Ok(ExclusiveRegionAnalysis::Rejected(
                 ExclusiveFusionRejection::VirtualizedOperand,
@@ -568,7 +576,8 @@ fn analyze_exclusive_region(
                 // The store's transfer/status registers must likewise avoid x18/x28
                 // (see the load check above).
                 let store_uses_reserved = decode::decoded_operands_mention_x18(word, pc)
-                    || decode::decoded_operands_mention_x28(word, pc);
+                    || decode::decoded_operands_mention_x28(word, pc)
+                    || decode::decoded_operands_mention_reserved_scratch(word, pc);
                 if store_uses_reserved {
                     return Ok(ExclusiveRegionAnalysis::Rejected(
                         ExclusiveFusionRejection::VirtualizedOperand,
@@ -576,7 +585,12 @@ fn analyze_exclusive_region(
                 }
                 let is_matching_store = kind == decode::ExclusiveKind::Store
                     && memory.base == load_memory.base
-                    && !matches!(memory.base, MemoryBase::VirtualX18 | MemoryBase::VirtualX28)
+                    && !matches!(
+                        memory.base,
+                        MemoryBase::VirtualX18
+                            | MemoryBase::VirtualX28
+                            | MemoryBase::VirtualReserved
+                    )
                     && shape_matches
                     && width_matches;
                 if !is_matching_store {
@@ -606,6 +620,7 @@ fn analyze_exclusive_region(
                 InstAction::Direct(exit) => {
                     if decode::decoded_operands_mention_x18(word, pc)
                         || decode::decoded_operands_mention_x28(word, pc)
+                        || decode::decoded_operands_mention_reserved_scratch(word, pc)
                     {
                         return Ok(ExclusiveRegionAnalysis::Rejected(
                             ExclusiveFusionRejection::VirtualizedOperand,
@@ -647,7 +662,8 @@ fn analyze_exclusive_region(
                 | InstAction::VirtualizedX28 { .. }
                 | InstAction::VirtualizedX18X28ReadOnly { .. }
                 | InstAction::VirtualizedX18WriteX28Read { .. }
-                | InstAction::VirtualizedX28WriteX18Read { .. } => {
+                | InstAction::VirtualizedX28WriteX18Read { .. }
+                | InstAction::VirtualizedReserved { .. } => {
                     return Ok(ExclusiveRegionAnalysis::Rejected(
                         ExclusiveFusionRejection::UnsupportedBodyMemoryOrSensitive,
                     ));
@@ -688,6 +704,7 @@ fn analyze_exclusive_region(
         };
         if decode::decoded_operands_mention_x18(retry_word, retry_pc)
             || decode::decoded_operands_mention_x28(retry_word, retry_pc)
+            || decode::decoded_operands_mention_reserved_scratch(retry_word, retry_pc)
         {
             return Ok(ExclusiveRegionAnalysis::Rejected(
                 ExclusiveFusionRejection::VirtualizedOperand,

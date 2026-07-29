@@ -157,6 +157,7 @@ mod tests {
             commit_base: true,
             virtual_x18_scratch: None,
             virtual_x28_scratch: None,
+            virtual_reserved_scratch: None,
             host_bias: super::super::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
                 .expect("construct host bias"),
             instruction_complete: complete,
@@ -246,6 +247,7 @@ mod tests {
             super::emit::BiasedBase::StackPointer,
             super::emit::BiasedBase::VirtualX18,
             super::emit::BiasedBase::VirtualX28,
+            super::emit::BiasedBase::VirtualReserved,
         ] {
             let action =
                 biased_recovery_fixture(base, super::emit::BiasedBaseCoordinate::Host, true);
@@ -258,6 +260,10 @@ mod tests {
                 super::emit::BiasedBase::StackPointer => assert_eq!(snapshot.sp, guest),
                 super::emit::BiasedBase::VirtualX18 => assert_eq!(snapshot.x[18], guest),
                 super::emit::BiasedBase::VirtualX28 => assert_eq!(snapshot.x[28], guest),
+                super::emit::BiasedBase::VirtualReserved => assert_eq!(
+                    snapshot.x[carrick_dsr_aarch64::gateway::RESERVED_SCRATCH as usize],
+                    guest
+                ),
                 super::emit::BiasedBase::Register(_) | super::emit::BiasedBase::None => {
                     panic!("unexpected recovery base")
                 }

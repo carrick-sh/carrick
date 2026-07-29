@@ -1105,6 +1105,7 @@ struct PortableBiasedMemoryRecovery {
     commit_base: bool,
     virtual_x18_scratch: Option<u32>,
     virtual_x28_scratch: Option<u32>,
+    virtual_reserved_scratch: Option<u32>,
     instruction_complete: bool,
 }
 
@@ -1266,6 +1267,7 @@ impl PortableRecoveryAction {
                     commit_base: recovery.commit_base,
                     virtual_x18_scratch: recovery.virtual_x18_scratch,
                     virtual_x28_scratch: recovery.virtual_x28_scratch,
+                    virtual_reserved_scratch: recovery.virtual_reserved_scratch,
                     instruction_complete: recovery.instruction_complete,
                 })
             }
@@ -1380,6 +1382,7 @@ impl PortableRecoveryAction {
                     commit_base: recovery.commit_base,
                     virtual_x18_scratch: recovery.virtual_x18_scratch,
                     virtual_x28_scratch: recovery.virtual_x28_scratch,
+                    virtual_reserved_scratch: recovery.virtual_reserved_scratch,
                     host_bias,
                     instruction_complete: recovery.instruction_complete,
                 })
@@ -1795,6 +1798,7 @@ mod tests {
                     commit_base: false,
                     virtual_x18_scratch: None,
                     virtual_x28_scratch: None,
+                    virtual_reserved_scratch: None,
                     host_bias: bias,
                     instruction_complete: false,
                 }),

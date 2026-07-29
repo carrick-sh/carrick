@@ -95,6 +95,7 @@ mod tests {
                 commit_base: false,
                 virtual_x18_scratch: None,
                 virtual_x28_scratch: None,
+                virtual_reserved_scratch: None,
                 host_bias: bias,
                 instruction_complete: false,
             }),

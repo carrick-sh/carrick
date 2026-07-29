@@ -3224,6 +3224,70 @@ fn dsr_virtual_x18_rewrites_destination_and_distinct_x17_operand() {
     assert_eq!(snapshot.x[17], expected_x17);
 }
 
+/// The reserved address scratch is host-owned inside translated code, so a
+/// guest instruction naming it must be virtualized through its context slot
+/// AND must survive the gateway's register round-trip: `enter_translated`
+/// neither loads the slot into the physical register on entry nor stores the
+/// physical register back over it on exit. Reinstating either half of that
+/// `stp`/`ldp` pair in `gateway_aarch64.S` overwrites the computed guest value
+/// with the stale entry value and fails this test.
+#[test]
+fn dsr_virtual_reserved_scratch_rewrites_destination_and_survives_the_gateway() {
+    let mut cache = TranslationCache::new(
+        16 * 1024,
+        crate::native_darwin::darwin_jit::active_host_jit(),
+    )
+    .expect("allocate reserved-scratch rewrite cache");
+    let reserved = carrick_dsr_aarch64::gateway::RESERVED_SCRATCH;
+    // `and xR, x1, #0x100` then `add xR, xR, x17`, with R the reserved scratch.
+    let and_word = 0x9278_0020 | reserved;
+    let add_word = 0x8b11_0200 | (reserved << 5) | reserved;
+    let plan = BlockPlan {
+        start: GuestVa(0x1b_400),
+        end: GuestVa(0x1b_40c),
+        generation: CodeGeneration::INITIAL,
+        instructions: vec![
+            PlannedInst {
+                guest: GuestVa(0x1b_400),
+                action: super::decode::classify(and_word, GuestVa(0x1b_400))
+                    .expect("classify reserved AND"),
+            },
+            PlannedInst {
+                guest: GuestVa(0x1b_404),
+                action: super::decode::classify(add_word, GuestVa(0x1b_404))
+                    .expect("classify reserved plus x17"),
+            },
+        ],
+        exit: PlannedExit::Syscall {
+            guest: GuestVa(0x1b_408),
+            resume: GuestVa(0x1b_40c),
+        },
+    };
+    assert!(
+        plan.instructions.iter().all(|instruction| matches!(
+            instruction.action,
+            super::types::InstAction::VirtualizedReserved { .. }
+        )),
+        "the reserved scratch must not be copied verbatim: {:?}",
+        plan.instructions,
+    );
+    let emitted = emit_block_direct(&mut cache, &plan).expect("emit reserved-scratch rewrites");
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.x[1] = 0x123;
+    let expected_x17 = snapshot.x[17];
+    let mut exit = NativeDsrExit::Syscall {
+        resume: GuestVa(0x1b_40c),
+    };
+    enter_translated(emitted.entry(), &mut snapshot, &mut exit)
+        .expect("execute reserved-scratch rewrites");
+    assert_eq!(
+        snapshot.x[reserved as usize],
+        0x100_u64.wrapping_add(expected_x17)
+    );
+    assert_eq!(snapshot.x[17], expected_x17);
+}
+
 #[test]
 fn dsr_virtual_x18_madd_then_aliasing_loads_preserve_computed_address() {
     let mut cache = TranslationCache::new(

@@ -19,8 +19,13 @@
 
 .globl _carrick_dsr_enter_raw
 _carrick_dsr_enter_raw:
-    // Physical x28 is the translated-thread context pointer. Guest x18 and
-    // guest x28 stay virtualized in snapshot.x[] throughout translation.
+    // Physical x28 is the translated-thread context pointer and physical x19
+    // is the memory lowering's reserved address scratch (gateway.rs's
+    // RESERVED_SCRATCH). Guest x18, guest x19 and guest x28 therefore stay
+    // virtualized in snapshot.x[] throughout translation: this routine neither
+    // loads them into nor stores them from their physical registers, and a
+    // Rust-side `assert!(RESERVED_SCRATCH == 19)` fails the build if the
+    // register this file names numerically ever changes.
     mov x9, sp
     str x9, [x0, #CTX_HOST_SP]
     add x10, x0, #CTX_HOST_X19
@@ -73,7 +78,7 @@ _carrick_dsr_enter_raw:
     ldp x12, x13, [x28, #96]
     ldp x14, x15, [x28, #112]
     ldr x16, [x28, #128]
-    ldp x19, x20, [x28, #152]
+    ldr x20, [x28, #160]
     ldp x21, x22, [x28, #168]
     ldp x23, x24, [x28, #184]
     ldp x25, x26, [x28, #200]
@@ -151,7 +156,7 @@ carrick_dsr_exit_common:
     stp x12, x13, [x28, #96]
     stp x14, x15, [x28, #112]
     str x16, [x28, #128]
-    stp x19, x20, [x28, #152]
+    str x20, [x28, #160]
     stp x21, x22, [x28, #168]
     stp x23, x24, [x28, #184]
     stp x25, x26, [x28, #200]
