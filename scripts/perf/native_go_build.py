@@ -323,26 +323,46 @@ def repository_is_git(repo: pathlib.Path) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
-def foreign_workload_census() -> list[str]:
+def own_ancestor_pids() -> set[int]:
+    """PIDs on this process's ancestry chain (shells, terminals, agents).
+
+    A launching shell's argv quotes this script's own path, which the
+    workload census would otherwise misread as a concurrent harness. The
+    ancestry chain is the launcher, never a foreign workload.
+    """
     result = subprocess.run(
-        ["ps", "-eo", "pid=,args="],
+        ["ps", "-eo", "pid=,ppid="],
         check=True,
         capture_output=True,
         text=True,
     )
-    own_pid = os.getpid()
-    foreign = []
+    parent_of: dict[int, int] = {}
     for line in result.stdout.splitlines():
-        fields = line.strip().split(maxsplit=1)
+        fields = line.split()
         if len(fields) != 2:
             continue
         try:
-            pid = int(fields[0])
+            parent_of[int(fields[0])] = int(fields[1])
         except ValueError:
             continue
-        if pid == own_pid:
+    ancestors: set[int] = set()
+    cursor = os.getpid()
+    while cursor in parent_of and cursor not in ancestors and cursor > 1:
+        cursor = parent_of[cursor]
+        ancestors.add(cursor)
+    return ancestors
+
+
+def foreign_rows(
+    rows: Sequence[tuple[int, str]],
+    *,
+    own_pid: int,
+    ancestor_pids: set[int],
+) -> list[str]:
+    foreign = []
+    for pid, command in rows:
+        if pid == own_pid or pid in ancestor_pids:
             continue
-        command = fields[1]
         if (
             "target/release/carrick run" in command
             or "scripts/perf/native_go_build.py" in command
@@ -351,6 +371,29 @@ def foreign_workload_census() -> list[str]:
         ):
             foreign.append(f"pid={pid} command={command}")
     return foreign
+
+
+def foreign_workload_census() -> list[str]:
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,args="],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows: list[tuple[int, str]] = []
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) != 2:
+            continue
+        try:
+            rows.append((int(fields[0]), fields[1]))
+        except ValueError:
+            continue
+    return foreign_rows(
+        rows,
+        own_pid=os.getpid(),
+        ancestor_pids=own_ancestor_pids(),
+    )
 
 
 def running_docker_oracles() -> list[str]:
