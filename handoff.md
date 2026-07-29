@@ -116,49 +116,53 @@ traced ceiling rejected H007 (`native-fs-amplification.jsonl`).
 
 ## Next work, ranked
 
-1. **Fix the Phase A reserved-scratch fault — the mechanism is proven and
-   worth ~12%.** Goal restated 2026-07-28: translated execution within 2x of
-   the guest's own work (16.1 CPU-s today against 3.0 CPU-s real guest
-   computation). Design:
-   `docs/superpowers/specs/2026-07-28-native-codegen-2x-design.md`; plan:
-   `docs/superpowers/plans/2026-07-28-native-codegen-phase-a.md`.
+1. **Phase A is MEASURED and worth ~10%; finish its two remaining gates.**
+   Removing the per-access scratch spill (the 33.5% census category) by
+   reserving x19 measures, after the x18 displacement fix (`ff61ab9`):
 
-   Phase A reserves x19 (chosen by a sample-weighted guest-register census:
-   zero hot-path weight, tied with x21-x25) so the biased-address lowering
-   needs no per-access spill — the 33.5% category. It is implemented
-   (`3a6ab083`, `fce32ea0`) behind `CARRICK_DSR_RESERVED_SCRATCH=1`,
-   DEFAULT OFF, with 170 dsr + 162 runtime oracle tests green.
+   | arm | samples (ms) | median |
+   |---|---|---|
+   | candidate (`CARRICK_DSR_RESERVED_SCRATCH=1`) | 16,574 / 16,398 / 16,349 / 16,422 / 16,152 | **16,398** |
+   | control (`=0`) | 18,040 / 17,846 / 18,160 / 18,865 / 18,357 | 18,160 |
 
-   **Measured — read the caveat before quoting any number.** A dedicated
-   five-pair screen faulted **5 of 5** with the switch on; across all
-   attempts the record is **1 success in 7**. The single completing run was
-   16,137 ms against the frozen `W0` of 18,321 ms (11.9% under), which is
-   suggestive that removing the spill pays — but with six of seven runs
-   faulting it is a selection-biased sample, **not** a measured speedup.
-   Do not cite 12% as the phase's result; the phase is unmeasurable until
-   it completes reliably.
+   **5 of 5 paired wins, populations non-overlapping** (every candidate
+   sample below every control sample), **zero faults in either arm** —
+   against 6-of-7 faulting before the fix. That is 9.7% against the
+   contemporaneous control and 10.5% against the frozen `W0`.
 
-   The switch-OFF arm, by contrast, is a clean 5/5: 17,593 / 17,807 /
-   17,952 / 17,969 / 18,236 ms, median **17,952 ms**, 2.0% under `W0`.
-   That is most plausibly the gateway now saving one fewer register per
-   transition (an unconditional side effect of reserving x19), and it is
-   worth confirming and keeping on its own merits.
+   The root cause was NOT in the addressing logic: the lowering staged the
+   access displacement in physical **x18**, which Darwin's custom-x18 ABI
+   zeroes asynchronously (measured ~897/CPU-s). Only a negative
+   displacement needs the `lsl #48` chunk, so a zeroing just before it
+   yields `base - 2**48` — the exact observed signature, always on
+   `ldur x29, [sp, #-8]`, the Go epilogue.
 
-   **Blocker:** the fault signature is exact and is the lead.
-   `unexpected fault address` is always **guest address − 2^48**, and 2^48
-   is the invalid-host tag bit (2^47) applied TWICE and then subtracted.
-   Observed: `0xffff00a04882f900`, `0xffff00a05207d2d0`,
-   `0xffff00a0513d97f0`, `0xffff00a04fa4f900` — all valid Go stack
-   addresses under that transform. Look first at any path that can apply
-   `orr #1<<47` twice to one address, or that un-biases a double-tagged
-   value; the tagged slow path and the writeback commit are the two places
-   a tag and a subtract meet.
+   **Remaining before the default flips ON:**
+   - `just conformance-native smoke --workers 4` with the switch on
+     (go-sync and cpython-threading break first on register-allocation
+     errors);
+   - the census mechanism gate — slots 1120/1128/1160/1168 must actually
+     fall from 33.5%, or the win is coming from somewhere unintended;
+   - gate the x19 reservation itself behind the switch. It is currently
+     unconditional (`gateway_aarch64.S` save/restore and the decode
+     classification), so the control arm is not a true baseline and the
+     measured 9.7% is the LOWER bound of the phase — the control already
+     carries part of the change.
 
-   **Also fix before measuring again:** the reservation is currently
-   UNCONDITIONAL — the `gateway_aarch64.S` register save/restore change and
-   the x19 decode classification are not behind the switch — so the "off"
-   arm is not the untouched baseline and a screen through the switch
-   measures only the lowering, not the phase.
+   **Same root cause, two more sites — fix before reviving anything:**
+   - the parked compact lowering stages the host BIAS in x18 across a
+     movz/movk chain; a zeroing there commits a raw host address into a
+     guest base register with no fault. That is almost certainly the
+     unexplained H008 Spike 1 host-address leak.
+   - the aperture flag lives in x18 in BOTH arms, so a zeroing between the
+     `lsr` and the second `cbz` lets a genuinely out-of-aperture access
+     execute UNTAGGED against `base + bias`. Latent (in-aperture accesses
+     are unaffected) but it is a real hardening gap.
+
+   **Phase B lever failed its audit:** trusted-entry chaining is UNSOUND
+   as proposed — the safety claim's second half is false. Re-design before
+   any implementation. Phase C's flags-free guard was sized at 4.3-5.6%
+   and is the next clean win.
 
 2. **Re-run the shape census after any H008 spike** — the census is now one
    command pair (see Methods) and is the mechanism gate.
