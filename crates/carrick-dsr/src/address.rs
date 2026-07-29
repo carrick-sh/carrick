@@ -22,14 +22,19 @@ use carrick_mem::memory::MemoryLayout;
 pub const NATIVE_DARWIN_SIGRETURN_TRAMPOLINE_BASE: u64 = 0x7_0000_0000;
 pub const NATIVE_DARWIN_HARD_PAGEZERO_END: u64 = 0x1_0000_0000;
 
-pub const BIAS_CANDIDATES: [u64; 5] = [
-    // First choice: exactly the aperture end. Every in-aperture guest address
-    // is disjoint from this bias's bits, so `guest + bias == guest | bias`
-    // and the bias encodes as one AArch64 logical immediate — the compact
-    // biased-memory lowering (H008) depends on selecting it. The remaining
-    // candidates keep the historical fallback order for hosts or layouts
-    // where [2 TiB, 4 TiB) cannot be reserved.
-    0x200_0000_0000,
+/// The aperture-disjoint, ORR-encodable bias the compact biased-memory
+/// lowering (H008 Spike 1) requires: `guest | bias == guest + bias` for every
+/// in-aperture guest address, and the bias is one AArch64 logical immediate.
+///
+/// It is deliberately NOT a production candidate. Selecting it activates the
+/// compact lowering, which a paired screen measured at 3.76% SLOWER than the
+/// general lowering (losing 5 of 6 pairs) while carrying an unfixed
+/// host-address leak. The constant is retained so the emitter's tests can
+/// still construct that bias explicitly; see
+/// `docs/perf-results/native-wall-time-campaign.md` H008.
+pub const APERTURE_DISJOINT_ORR_BIAS: u64 = 0x200_0000_0000;
+
+pub const BIAS_CANDIDATES: [u64; 4] = [
     0x80_0000_0000,
     0xc0_0000_0000,
     0x100_0000_0000,
@@ -960,11 +965,23 @@ mod tests {
     }
 
     #[test]
-    fn first_bias_candidate_supports_the_compact_lowering() {
-        let first = super::BIAS_CANDIDATES[0];
-        assert_eq!(first & (super::BIASED_GUEST_APERTURE_END - 1), 0);
+    fn no_production_bias_candidate_activates_the_compact_lowering() {
+        // H008 Spike 1 measured 3.76% SLOWER than the general lowering and
+        // still leaks a host address, so no candidate the selector can pick
+        // may satisfy the compact predicate.
+        for candidate in super::BIAS_CANDIDATES {
+            assert!(
+                NativeHostBias::new(candidate, 0x4000)
+                    .unwrap()
+                    .aperture_disjoint_orr_immediate()
+                    .is_none(),
+                "candidate 0x{candidate:x} would activate the compact lowering"
+            );
+        }
+        // The retained constant still satisfies it, so the emitter's tests can
+        // construct that bias explicitly.
         assert!(
-            NativeHostBias::new(first, 0x4000)
+            NativeHostBias::new(super::APERTURE_DISJOINT_ORR_BIAS, 0x4000)
                 .unwrap()
                 .aperture_disjoint_orr_immediate()
                 .is_some()
@@ -1069,11 +1086,7 @@ mod tests {
         fork_test(|| {
             let page_size = TEST_PAGE_SIZE as u64;
             let guest_start = GuestVa(0x40_0000);
-            // Candidate spans are aperture-wide (2 TiB) and overlap each
-            // other, so the collision must sit in the FIRST candidate's span
-            // only: above the second candidate's span end (~0x280_0010_4000)
-            // and inside the first's (ends ~0x400_0010_4000).
-            let first_host = HostVa(0x390_0000_0000);
+            let first_host = HostVa((0x80_0000_0000 + guest_start.raw()) as usize);
             let collision = OwnedHostMapping::map_exact(
                 first_host,
                 TEST_PAGE_SIZE,
@@ -1105,7 +1118,7 @@ mod tests {
                 .expect("select collision-free bias");
             assert_eq!(
                 selected.address_mode().to_host(guest_start).unwrap(),
-                HostVa((0x80_0000_0000 + guest_start.raw()) as usize)
+                HostVa((0xc0_0000_0000 + guest_start.raw()) as usize)
             );
             drop(selected);
             drop(collision);
@@ -1114,7 +1127,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")] // exact-mmap-hint semantics; see note above `vacant_test_ranges`
-    fn vacant_host_selects_the_orr_encodable_bias_with_the_underflow_window() {
+    fn vacant_host_reserves_the_underflow_window_below_the_selected_bias() {
         fork_test(|| {
             let page_size = TEST_PAGE_SIZE as u64;
             let guest_start = GuestVa(0x40_0000);
@@ -1142,8 +1155,8 @@ mod tests {
                 NativeLayout::for_image(&image, layout, page_size).expect("select first bias");
             assert_eq!(
                 selected.address_mode().to_host(guest_start).unwrap(),
-                HostVa((0x200_0000_0000 + guest_start.raw()) as usize),
-                "a vacant host must select the ORR-encodable first candidate"
+                HostVa((0x80_0000_0000 + guest_start.raw()) as usize),
+                "a vacant host must select the first candidate"
             );
             let owned = selected
                 .owned_ranges()
@@ -1152,7 +1165,7 @@ mod tests {
                 .clone();
             assert_eq!(
                 owned.start,
-                HostVa((0x200_0000_0000 - super::BIASED_GUEST_UNDERFLOW_WINDOW) as usize),
+                HostVa((0x80_0000_0000 - super::BIASED_GUEST_UNDERFLOW_WINDOW) as usize),
                 "the reservation must extend one underflow window below guest zero"
             );
         });
@@ -1164,18 +1177,14 @@ mod tests {
         fork_test(|| {
             let page_size = TEST_PAGE_SIZE as u64;
             let guest_start = GuestVa(0x40_0000);
-            // A span-1-exclusive sentinel (see the span-overlap note in
-            // `low_image_skips_a_colliding_bias_candidate`): it rejects only
-            // the first candidate, and selection must fall to the second
-            // without replacing or unmapping this pre-existing page.
-            let first_null_host = HostVa(0x390_0000_0000);
+            let first_null_host = HostVa(0x80_0000_0000);
             let sentinel = OwnedHostMapping::map_exact(
                 first_null_host,
                 TEST_PAGE_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,
             )
-            .expect("occupy a page inside the first candidate's span");
+            .expect("occupy first candidate's translated null page");
             unsafe {
                 std::ptr::write_bytes(first_null_host.raw() as *mut u8, 0x5a, TEST_PAGE_SIZE);
             }
@@ -1204,7 +1213,7 @@ mod tests {
                 .expect("select collision-free guarded aperture");
             assert_eq!(
                 selected.address_mode().to_host(GuestVa(0)).unwrap(),
-                HostVa(0x80_0000_0000),
+                HostVa(0xc0_0000_0000),
                 "the pre-existing null-page collision must reject the first bias"
             );
             assert_eq!(unsafe { *(first_null_host.raw() as *const u8) }, 0x5a);
