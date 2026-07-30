@@ -1320,8 +1320,10 @@ fn dsr_virtual_counter_tracks_suspend_excluding_uptime() {
     .expect("emit virtual counter");
     assert_eq!(
         emitted.map().entries().len(),
-        emitted.len() / std::mem::size_of::<u32>(),
-        "every emitted word must have a guest-PC mapping"
+        // `instruction_bytes`, not `len`: a trailing literal pool is data and
+        // carries no mapping by design (see `emit::AssembledBlock`).
+        emitted.instruction_bytes() / std::mem::size_of::<u32>(),
+        "every emitted INSTRUCTION must have a guest-PC mapping"
     );
     let exit_offset = emitted
         .map()
@@ -3972,7 +3974,12 @@ fn binding_generation_guard_contains_no_process_pointer() {
     )
     .expect("emit binding generation guard");
     let bytes = unsafe {
-        std::slice::from_raw_parts(emitted.entry().host().raw() as *const u8, emitted.len())
+        // `instruction_bytes`, not `len`: this test disassembles every word, and a
+        // trailing literal pool is DATA that no disassembler can read.
+        std::slice::from_raw_parts(
+            emitted.entry().host().raw() as *const u8,
+            emitted.instruction_bytes(),
+        )
     };
     let words = bytes
         .chunks_exact(std::mem::size_of::<u32>())
