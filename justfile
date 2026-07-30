@@ -97,6 +97,29 @@ lint-domains:
 deny:
     cargo deny check licenses bans sources
 
+# Frame pointers must actually reach rustc, or `dtrace`'s `ustack()` silently
+# fabricates call stacks (see the rationale in `.cargo/config.toml`). A
+# `RUSTFLAGS` environment variable REPLACES `[build] rustflags` wholesale rather
+# than appending, so exporting it is the one way to lose them without noticing.
+check-frame-pointers:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! grep -q 'force-frame-pointers' .cargo/config.toml; then
+        echo "error: .cargo/config.toml no longer sets -C force-frame-pointers" >&2
+        echo "       dtrace ustack() cannot walk carrick without it, and it fails" >&2
+        echo "       by inventing plausible-looking stacks rather than erroring." >&2
+        exit 1
+    fi
+    if [ -n "${RUSTFLAGS:-}" ] && ! printf '%s' "${RUSTFLAGS}" | grep -q 'force-frame-pointers'; then
+        echo "error: RUSTFLAGS is set and omits -C force-frame-pointers" >&2
+        echo "       RUSTFLAGS REPLACES [build] rustflags in .cargo/config.toml," >&2
+        echo "       so this build would silently drop frame pointers:" >&2
+        echo "         RUSTFLAGS=${RUSTFLAGS}" >&2
+        echo "       Add -C force-frame-pointers=yes, or unset RUSTFLAGS." >&2
+        exit 1
+    fi
+    echo "frame pointers: enforced"
+
 # Formatting check (matches CI).
 fmt-check:
     cargo fmt --all -- --check
@@ -173,6 +196,7 @@ ci:
     #!/usr/bin/env bash
     set -euo pipefail
     j() { just --justfile {{justfile()}} "$@"; }
+    j check-frame-pointers
     j fmt-check
     j clippy
     j lint-domains
