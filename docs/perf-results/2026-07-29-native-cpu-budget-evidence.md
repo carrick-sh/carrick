@@ -1015,3 +1015,44 @@ has two independent reasons to land.
 
 **Method note for the campaign: re-measure a rejected change whenever the
 instrument improves by more than the effect that rejected it.**
+
+## Run 17 — the context explanation is dead; it is register state
+
+Rather than attempt a fourth fix by inspection, the fault was made to report the
+live `host_bias` alongside the unlowerable address, and the minimal repro (lift
+the exclusion only) was run:
+
+```
+native DSR fault lies outside guest-owned host memory: 0x20
+(host_bias=0x8000000000)
+```
+
+**`host_bias` is correct.** The context did not lose its address mode. And `0x20`
+is five orders of magnitude below the bias, so the faulting access did not
+compute `guest | bias` from a valid guest pointer — the guest BASE REGISTER held
+~0x20 when it executed.
+
+That closes the branch of the search this document has spent runs 13-15 on:
+
+| explanation | status |
+|---|---|
+| missing per-unit context field (`generation_bindings`) | necessary but insufficient (run 14) |
+| context lost its address mode / `host_bias` | **REFUTED — bias is correct** |
+| wrong guest register state at the target's entry | **the surviving explanation** |
+
+### What the next attempt needs, and it is not more reading
+
+The surviving explanation is a register/slot convention, and identifying WHICH
+register needs the faulting CACHE pc — the emitted instruction — not the guest
+PC the error currently reports. The guest PC says which guest instruction was
+being emulated; the cache PC says which emitted word ran and therefore which
+lowering produced the bad base.
+
+So the next step is: report `snapshot.pc` (the cache address) at the fault,
+disassemble the emitted words around it from the code snapshot, and read the
+base register out of the faulting instruction directly. That is one run and it
+names the register, where three rounds of source inspection have named the wrong
+thing three times.
+
+Recorded as a hard rule for this problem: **do not propose another A1 fix without
+the faulting cache PC and the decoded instruction in hand.**
