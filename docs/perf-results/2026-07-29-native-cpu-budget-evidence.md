@@ -762,3 +762,75 @@ private -> shared round-trips disappear, which is 99.4% of all resolver exits in
 the sharing-ON arm. That is the whole of gate A1, and it is what makes A2's
 translation-reuse win (1,046,467 -> target 400,000 translations) collectable
 rather than swamped.
+
+## Run 13 — the A1 one-line fix is REFUTED by a live experiment
+
+Run 12 found the exclusion that produces the whole amplification, in
+`ProcessState::publish_emitted`:
+
+```rust
+if let Some(target) = self.blocks.get(&target_key)
+    && !self.shared_blocks.contains_key(&target_key)   // <- shared targets refused
+{
+    let word = encode_aarch64_direct_branch(site, *target)?;
+    self.cache.patch_code_word(site, word)?;
+} else {
+    self.pending.entry(target_key).or_default().push(site);
+}
+```
+
+Every private -> shared call edge takes the `else`, is queued in `pending`, and —
+because the shared-unit load path inserts into `blocks` without draining
+`pending` — is never patched. It re-resolves through the gateway forever.
+
+Removing the exclusion and draining `pending` at unit load **crashes the guest
+immediately**:
+
+```
+Error: unsupported in this backend: native DSR fault lies outside
+guest-owned host memory: 0x20; recovered_guest_pc=0x97ed0
+shared_unit_hits=1 shared_blocks_mapped=3706
+```
+
+### Why, and what it means
+
+A fault at `0x20` is a null dereference at a small offset. A loaded unit's block
+reads **unit-specific state from the `DsrContext`** — its `generation_bindings`
+table (`ldr x19, [x28, #CTX_GENERATION_BINDINGS]`, then
+`ldp x19, x17, [x19, #index*16]`), plus the unit's cache range and target
+authority. The gateway installs that state when it enters a unit
+(`enter_translated_with_cache_range_and_generation_bindings_and_catalog`); the
+private context carries `generation_bindings: std::ptr::null()`. A direct branch
+bypasses the installation, so the shared block's own generation guard
+dereferences NULL and faults.
+
+**The exclusion is load-bearing, not an oversight.** Reverted, and the guest is
+BUILD_OK again. The condition now carries this reason in a comment so it is not
+removed a second time.
+
+### What the real fix has to do
+
+A private -> shared edge cannot be a bare `b`; it must first install the target
+unit's context state. Two shapes, both bounded:
+
+1. **Per-edge trampoline.** Each `DirectLink` already reserves a 256-byte stub
+   envelope. Patch the slot to branch into a trampoline that stores the unit's
+   `generation_bindings`, cache range and authority into the context, then
+   branches to the target. ~74,726 edges x a few words is on the order of 1-2 MB
+   of extra emitted code — which lands in Workstream B's budget, so the two
+   interact and must be measured together.
+2. **Make the state not per-unit.** One process-wide binding table and executable
+   range covering private code and every loaded unit removes the switch
+   entirely, so a bare `b` becomes correct. Larger change, no per-edge cost, and
+   it also deletes the gateway's per-entry installation work.
+
+Shape 2 is the better end state and shape 1 is the cheaper probe of whether the
+win is real. Either way the earlier estimate stands: binding these 74,726 edges
+removes ~99.95% of 136 M gateway round-trips.
+
+### Kept from the failed attempt
+
+`patch_direct_link_if_reachable` replaces a hard error with a graceful fallback
+when a target is outside `B` range: the unpatched site still holds its
+`b`-to-next-instruction into the gateway stub, which is correct and merely
+slower. Turning a placement accident into a failed translation was never right.

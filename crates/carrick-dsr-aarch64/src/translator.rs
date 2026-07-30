@@ -2164,19 +2164,27 @@ impl ProcessState {
                 source: entry,
                 slot: link.slot,
             };
-            if let Some(target) = self.blocks.get(&target_key)
+            // A SHARED target must NOT be patched, and this is load-bearing.
+            // A loaded unit's block reads unit-specific state from the context --
+            // its `generation_bindings` table, cache range and target authority --
+            // which only the gateway installs when it enters that unit. A direct
+            // branch bypasses that installation, so the block's guard dereferences
+            // the private context's NULL `generation_bindings` and faults at a
+            // small offset. MEASURED by removing this condition: the go-build
+            // guest dies immediately with "native DSR fault lies outside
+            // guest-owned host memory: 0x20"
+            // (docs/perf-results/2026-07-29-native-cpu-budget-evidence.md run 13).
+            if let Some(target) = self.blocks.get(&target_key).copied()
                 && !self.shared_blocks.contains_key(&target_key)
             {
-                let word = encode_aarch64_direct_branch(site, *target)?;
-                self.cache.patch_code_word(site, word)?;
+                self.patch_direct_link_if_reachable(site, target)?;
             } else {
                 self.pending.entry(target_key).or_default().push(site);
             }
         }
         if let Some(sites) = self.pending.remove(&key) {
             for site in sites {
-                let word = encode_aarch64_direct_branch(site, entry)?;
-                self.cache.patch_code_word(site, word)?;
+                self.patch_direct_link_if_reachable(site, entry)?;
             }
         }
         Ok(TranslationResult {
@@ -2725,6 +2733,41 @@ impl ProcessState {
     /// reports its bounds, and the block-index consumers walk it -- so the
     /// address ordering `guest_pc_for_cache` needs lives in the two side
     /// indexes instead.
+    /// Patch one direct-link site to branch straight at `target`, or leave the
+    /// site alone when the target is out of `B` range.
+    ///
+    /// Out-of-range is NOT an error: the unpatched site still holds the
+    /// `b`-to-next-instruction that falls into the gateway exit stub, which is
+    /// correct, merely slower. Propagating an error here would turn a placement
+    /// accident into a failed translation. Measured placement on this host puts
+    /// every loaded unit within 2.0 MiB of the private cache (53/53), so the
+    /// fallback is a safety net rather than the common path.
+    ///
+    /// Safe without an un-patching path on invalidation for the same reason the
+    /// pre-existing private->private patching is: the target block opens with its
+    /// own generation guard, so a branch that lands in a stale target is detected
+    /// there and exits. That is the same net `DirectBindingTable::invalidate_target`
+    /// relies on when it pins descriptors so "a reader that acquired `expected`
+    /// can safely reach the target's generation guard".
+    fn patch_direct_link_if_reachable(
+        &mut self,
+        site: cache::LinkSite,
+        target: types::CacheVa,
+    ) -> Result<(), types::DsrError> {
+        match encode_aarch64_direct_branch(site, target) {
+            Ok(word) => {
+                self.cache.patch_code_word(site, word)?;
+                Ok(())
+            }
+            Err(types::DsrError::CachePolicy(reason))
+                if reason.contains("outside AArch64 B range") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn push_published(&mut self, block: PublishedBlock) {
         let entry = PublishedIndexEntry {
             start: block.entry.host(),
