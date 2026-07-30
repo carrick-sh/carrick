@@ -1401,3 +1401,37 @@ confirming the same mechanism.
 carries `generation_binding_count == 0` while owning blocks whose guards index a
 table, and re-run the fault with the register dump restored so `far = 0` is
 attributed rather than assumed. Both are single runs.
+
+### Run 21e — fourth construction, and a process failure worth recording
+
+A fourth construction added a safe point: `ProcessTranslator::entries_without_bindings`,
+an atomic count of threads inside a gateway entry whose context carries no
+binding table, incremented/decremented around `enter_prepared`, with the patch
+allowed only when this thread carries the table AND that count reads zero. The
+reasoning was that a unit loads lazily, so another thread could be mid-entry with
+a NULL table and take a freshly armed branch — and once installed, no NEW entry
+can lack the table, so a zero reading is durable.
+
+Same outcome as the previous three: amplification eliminated
+(`resolve_src_private_tgt_shared` 135,715,237 -> **44**, `direct_resolver_exits`
+136,489,314 -> **53,045**), still faulting at `far=0`.
+
+**The process failure.** Run 21d explicitly recorded: `far = 0` matches binding
+index 0 but equally matches any other null dereference, so it must be attributed
+before being acted on — and stated the next step as re-running with the register
+dump restored. Two further fixes were then attempted WITHOUT doing that. Both
+"fixed" a cause that had not been shown to be the current one.
+
+So the honest position is not "the fourth gate failed"; it is that the last three
+attempts were aimed at an unverified target. The measured facts remain:
+
+* the amplification is 74,726 private -> shared call edges at ~1,822 traversals
+  each, and patching them removes it — reproduced four times;
+* the ORIGINAL faults at `far=0x20` and `far=0x60` matched `index * 16` for
+  indices 2 and 6, which is real evidence for the NULL-binding-table mechanism;
+* the CURRENT fault at `far=0` is unattributed.
+
+**Do not write a fifth construction.** Restore the register dump from run 20
+(`snapshot.x[]`, `esr`, `far` at the unlowerable-fault site), reproduce, and read
+what `far = 0` actually is. Everything else about this fix is already known to
+work.
