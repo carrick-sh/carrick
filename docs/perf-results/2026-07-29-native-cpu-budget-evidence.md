@@ -1619,3 +1619,71 @@ Two candidates, cheapest first:
 **A1 not met (1.114 vs <=1.00). A2 not attempted. Primary metric unmoved: the
 shipped default is still sharing OFF, so `cpu_median_s` vs `0686248a` is
 unchanged.**
+
+## Run 24 — A1's residual is the shared-cache LOOKUP path, not the trampoline
+
+Run 23 hypothesised the residual 11% was the trampoline's own execution. That is
+now measured FALSE, and the arithmetic should have killed it first: 74,726 edges
+x 1,822 traversals x 6 words is ~817 M instructions, which is ~0.2 CPU-s at this
+machine's rates, not the ~3.2 CPU-s observed. I wrote the estimate down without
+dividing by a clock rate.
+
+Matched JIT-aware profile arms (`--variant shared` config; both BUILD_OK, off
+13.00 s / on 13.71 s).
+
+**First, a tooling defect this exposed.** Bucket totals are NOT comparable
+between the arms:
+
+| bucket | off | on |
+|---|---|---|
+| jit | 10,119 | 1,682 |
+| host | 10,737 | 21,290 |
+
+JIT execution did not fall by 83%. The profiler classifies a PC as `jit` by the
+PRIVATE cache bounds, and shared units are `dlopen`ed into their own mapping
+outside those bounds, so shared-unit code is misfiled as `host`. Bucket-level
+and unresolved-address comparisons are unusable across a sharing boundary; only
+NAMED leaves are. (Fixing the classifier to take the shared ranges -- which
+`shared_guest_ranges` already tracks -- is follow-up work.)
+
+**Named-leaf deltas, on - off** (total samples 29,188 -> 31,754, +8.8%):
+
+| delta | off | on | leaf |
+|---|---|---|---|
+| +143 | 105 | 248 | `sha2::sha256::compress256` |
+| +124 | 332 | 456 | `_platform_memmove` |
+| +113 | 0 | 113 | `SlicePartialEq::equal_same_length` |
+| +54 | 3 | 57 | `<deduplicated_symbol>` |
+| +45 | 118 | 163 | `emit::assemble_block_inner` |
+| +43 | 177 | 220 | `decode_spec` |
+| +43 | 0 | 43 | `artifact_spike::PortableRecoveryAction::rebind` |
+| +39 | 4 | 43 | `ThreadTranslator::target_cache_authority` |
+| +36 | 96 | 132 | `ProcessState::publish_emitted` |
+| +35 | 0 | 35 | bincode `deserialize_tuple` |
+| +34 | 89 | 123 | `PageGenerationTable::observe` |
+| +29 | 38 | 67 | `BTreeMap::insert` |
+
+Positive named deltas total +1,511 samples = **+5.2% of the OFF arm**, roughly
+half the measured regression; the remainder is unsymbolicated and not
+attributable while the classifier is broken.
+
+**`publish_emitted` -- which contains ALL trampoline emission -- moved +36
+samples, 0.11% of total.** The trampoline is not the residual, and neither
+optimisation proposed in run 23 would have chased more than ~0.1%. Both are
+withdrawn.
+
+What the residual actually is: the shared-cache LOOKUP and unit-LOAD path.
+Hashing block source words to form the key (`compress256`), then verifying a
+candidate by full source comparison (`equal_same_length`, 0 -> 113), plus
+artifact deserialisation (bincode), recovery rebinding, and map insertion.
+
+Two leads follow directly, both to be sized before building:
+
+1. The full `equal_same_length` verify after a 256-bit digest match looks
+   redundant -- a SHA-256 match is already the identity check. Worth ~0.36%
+   alone, so only worth doing alongside 2.
+2. The fingerprint is computed per BLOCK. ~800,000 translations per build over
+   a much smaller set of guest pages suggests hashing per (page, generation)
+   and reusing it, which would cut both `compress256` and the compare.
+
+**A1 still NOT met at 1.114x. Primary metric unmoved -- sharing ships OFF.**
