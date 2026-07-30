@@ -86,6 +86,23 @@ _carrick_dsr_enter_raw:
     ldp x29, x30, [x28, #232]
     ldr x17, [x28, #SNAP_SP]
     mov sp, x17
+    // Claim phase zero HERE rather than in every translated block's prologue.
+    //
+    // Blocks used to open with `str wzr, [x28, #CTX_GATEWAY_PHASE]`, and that
+    // store measured at 15.1% of all sampled JIT instructions -- one per block
+    // ENTRY, while a direct-linked chain runs many blocks per gateway entry. The
+    // phase is a property of "the gateway has handed control to translated
+    // code", so it belongs to the single place that does the handing over.
+    //
+    // The window this opens -- phase zero while the PC is still these last two
+    // instructions of the gateway -- is already handled, and was before this
+    // change. `carrick_native_dsr_signal_handler` does not trust phase zero on
+    // its own: its phase-zero arm additionally requires the interrupted PC to be
+    // inside `cache_start..cache_end` or in the executable-range catalog, and
+    // treats anything else as a non-authoritative host PC (status 8, preserving
+    // the guest snapshot). A gateway PC fails that test, which is exactly the
+    // right answer for a kick that lands mid-entry.
+    str wzr, [x28, #CTX_GATEWAY_PHASE]
     // Branch through physical x17, which every translated block restores from
     // snapshot.x[17] at entry. Do not stage the cache entry in custom x18:
     // Darwin can lose that register across asynchronous signal/TLS traffic,
