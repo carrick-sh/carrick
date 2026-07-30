@@ -321,17 +321,104 @@ impl PreparedExit {
     }
 }
 
+/// Per-thread block cache: the read-side fast path in front of the process-wide
+/// block index.
+///
+/// This generalizes a ONE-entry `resume_entry`. A single slot hit often enough on
+/// straight-line resumption to be worth keeping, but any control flow alternating
+/// between more than one hot block thrashed it, and EVERY miss then took
+/// `ProcessState`'s `RwLock`. Profiling measured
+/// `parking_lot::RawRwLock::lock_shared_slow` as the single largest leaf at 8.2%
+/// of all on-CPU time -- reached from `translate_read_mostly`, which every
+/// gateway exit calls (`docs/perf-results/2026-07-29-native-cpu-budget-evidence.md`,
+/// run 8).
+///
+/// **Invalidation contract, unchanged from the single slot it replaces.** Both
+/// paths that remove blocks stay covered:
+///
+/// * PER-PAGE invalidation (`ProcessState::translate`'s `blocks.remove(&stale)`)
+///   ADVANCES that page's generation. Entries are keyed `(guest, generation)` and
+///   the generation is re-observed on every lookup, so a stale entry simply stops
+///   matching. Nothing to do.
+/// * WHOLE-INDEX resets (`blocks.clear()` plus `cache.reset_after_fork_for_exec()`
+///   on fork-child adoption and exec) move no generation, so they must clear this
+///   cache explicitly. They do, at exactly the three points that cleared
+///   `resume_entry`.
+///
+/// Direct-mapped rather than associative: the lookup has to be cheaper than the
+/// lock it avoids, and a single indexed slot compare is. A colliding pair of hot
+/// blocks degrades to the old one-entry behaviour, never to anything worse.
+struct ThreadBlockCache {
+    slots: Box<
+        [Option<(
+            carrick_guest_mem::GuestVa,
+            types::CodeGeneration,
+            types::CacheVa,
+        )>],
+    >,
+}
+
+impl ThreadBlockCache {
+    /// 1024 slots is ~24 KiB per thread, and the whole array is cleared only on
+    /// fork/exec.
+    const SLOTS: usize = 1024;
+    const SHIFT: u32 = 64 - Self::SLOTS.trailing_zeros();
+
+    fn new() -> Self {
+        Self {
+            slots: vec![None; Self::SLOTS].into_boxed_slice(),
+        }
+    }
+
+    /// Fibonacci hash of the word-aligned guest VA. Block entries are 4-byte
+    /// aligned, so the low two bits carry no information.
+    #[inline]
+    fn index(guest: carrick_guest_mem::GuestVa) -> usize {
+        let mixed = (guest.raw() >> 2).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (mixed >> Self::SHIFT) as usize
+    }
+
+    #[inline]
+    fn get(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Option<(types::CodeGeneration, types::CacheVa)> {
+        match self.slots[Self::index(guest)] {
+            Some((cached, generation, entry)) if cached == guest => Some((generation, entry)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn insert(
+        &mut self,
+        guest: carrick_guest_mem::GuestVa,
+        generation: types::CodeGeneration,
+        entry: types::CacheVa,
+    ) {
+        self.slots[Self::index(guest)] = Some((guest, generation, entry));
+    }
+
+    fn clear(&mut self) {
+        self.slots.fill(None);
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+}
+
 pub struct ThreadTranslator {
     // Fields are `pub` + doc(hidden)-by-convention: the runtime's
     // still-resident, JIT-entangled test suites (and the oracle) reach into
     // them until the host-seam slice moves those tests too.
     pub process: Arc<ProcessTranslator>,
     pub tid: i32,
-    resume_entry: Option<(
-        carrick_guest_mem::GuestVa,
-        types::CodeGeneration,
-        types::CacheVa,
-    )>,
+    block_cache: ThreadBlockCache,
+    /// Last `cache.used_bytes()` seen under the lock. The per-thread fast path
+    /// reports this rather than taking the lock for a diagnostic gauge.
+    last_cache_used_bytes: u64,
     pub stats: ResolverStats,
     pub budget: profile::ThreadBudget,
     profile_finalized: bool,
@@ -807,7 +894,8 @@ impl ThreadTranslator {
         Self {
             process,
             tid,
-            resume_entry: None,
+            block_cache: ThreadBlockCache::new(),
+            last_cache_used_bytes: 0,
             stats: ResolverStats::default(),
             budget: profile::ThreadBudget::from_environment(tid),
             profile_finalized: false,
@@ -830,7 +918,7 @@ impl ThreadTranslator {
             generation_count,
         );
         self.process.after_fork_child();
-        self.resume_entry = None;
+        self.block_cache.clear();
         self.exec_reset_epoch = self.exec_reset_epoch.wrapping_add(1);
         self.stats = ResolverStats::default();
         self.budget.reset_after_fork_child(tid);
@@ -910,7 +998,7 @@ impl ThreadTranslator {
     /// memory starts retiring the old image. No translated execution may
     /// resume until `reset_for_exec` installs the replacement process.
     pub fn prepare_direct_binding_exec_reset(&mut self) -> DirectBindingExecResetToken {
-        self.resume_entry = None;
+        self.block_cache.clear();
         self.indirect_cache.clear();
         self.exec_reset_epoch = self.exec_reset_epoch.wrapping_add(1);
         DirectBindingExecResetToken {
@@ -937,7 +1025,7 @@ impl ThreadTranslator {
             sink(&frames);
         }
         self.process = next;
-        self.resume_entry = None;
+        self.block_cache.clear();
         self.exec_reset_epoch = self.exec_reset_epoch.wrapping_add(1);
         self.start_next_profile_epoch();
         self.last_kick = None;
@@ -2673,6 +2761,33 @@ impl ThreadTranslator {
         guest: carrick_guest_mem::GuestVa,
     ) -> Result<TranslationResult, types::DsrError> {
         let generation = memory.dsr_generation_observation(guest)?.expected();
+        // Per-thread fast path, taken BEFORE any lock. Every gateway exit reaches
+        // this function, and the shared read guard below was measured as the
+        // largest single leaf in the profile (`lock_shared_slow`, 8.2% of all
+        // on-CPU time). The generation was just re-observed above, so a hit here
+        // is exactly as fresh as one taken under the lock; see
+        // `ThreadBlockCache`'s invalidation contract.
+        if let Some((cached_generation, entry)) = self.block_cache.get(guest)
+            && cached_generation == generation
+        {
+            self.stats.add(ResolverStat::OneEntryHits, 1);
+            probes::dsr_cache_event(
+                self.tid,
+                probes::DsrCacheEventKind::BlockHit,
+                guest.raw(),
+                generation.get(),
+                // Deliberately the LAST OBSERVED value, not a fresh read: fetching
+                // it is what the lock is for, and this gauge is diagnostic only.
+                self.last_cache_used_bytes,
+            );
+            return Ok(TranslationResult {
+                entry,
+                generation,
+                outcome: TranslationOutcome::BlockIndexHit,
+                emitted_bytes: 0,
+                cache_used_bytes: self.last_cache_used_bytes,
+            });
+        }
         {
             // Scoped so the read guard is dropped before any write-path
             // fallback tries to acquire the write lock (RwLock is not
@@ -2684,6 +2799,8 @@ impl ThreadTranslator {
             if let Some(entry) = state.cached_block(guest, generation) {
                 let cache_used_bytes = u64::try_from(state.cache.used_bytes()).unwrap_or(u64::MAX);
                 drop(state);
+                self.last_cache_used_bytes = cache_used_bytes;
+                self.block_cache.insert(guest, generation, entry);
                 probes::dsr_cache_event(
                     self.tid,
                     probes::DsrCacheEventKind::BlockHit,
@@ -2710,7 +2827,12 @@ impl ThreadTranslator {
             probes::DsrSynchronizationKind::ProcessStateWrite,
             || self.process.state.write(),
         );
-        state.translate(self.tid, memory, guest)
+        let translated = state.translate(self.tid, memory, guest)?;
+        drop(state);
+        self.last_cache_used_bytes = translated.cache_used_bytes;
+        self.block_cache
+            .insert(guest, translated.generation, translated.entry);
+        Ok(translated)
     }
 
     fn translate<const PROFILE: bool>(
@@ -3073,17 +3195,16 @@ impl ThreadTranslator {
             probes::dsr_prepare_begin(self.tid, guest.raw());
         }
         let selection = (|| -> Result<_, types::DsrError> {
-            if let Some((cached_guest, generation, entry)) = self.resume_entry {
-                if cached_guest == guest
-                    && memory.dsr_generation_observation(guest)?.expected() == generation
-                {
-                    self.stats.add(ResolverStat::OneEntryHits, 1);
-                    return Ok((entry, generation, probes::DsrPrepareOutcome::ResumeEntryHit));
-                }
-                self.resume_entry = None;
+            if let Some((generation, entry)) = self.block_cache.get(guest)
+                && memory.dsr_generation_observation(guest)?.expected() == generation
+            {
+                self.stats.add(ResolverStat::OneEntryHits, 1);
+                return Ok((entry, generation, probes::DsrPrepareOutcome::ResumeEntryHit));
             }
+            // No explicit eviction on a generation mismatch: the slot is keyed by
+            // guest VA and `translate` overwrites it below with the fresh
+            // generation.
             let translated = self.translate::<PROFILE>(memory, guest)?;
-            self.resume_entry = Some((guest, translated.generation, translated.entry));
             let outcome = match translated.outcome {
                 TranslationOutcome::BlockIndexHit => probes::DsrPrepareOutcome::BlockIndexHit,
                 TranslationOutcome::SharedUnit => probes::DsrPrepareOutcome::BlockIndexHit,
@@ -3478,7 +3599,7 @@ impl ThreadTranslator {
                     target.raw(),
                     probes::DsrOperationOutcome::Success,
                 );
-                self.resume_entry = Some((target, target_generation, entry));
+                self.block_cache.insert(target, target_generation, entry);
                 snapshot.pc = target.raw();
                 ThreadExit::Continue
             }
@@ -4928,7 +5049,9 @@ mod tests {
             let guest = GuestVa(0x60_0000);
             let entry = CacheVa::published(HostVa(process.cache_host_range().start as usize));
             let mut thread = ThreadTranslator::for_process(Arc::clone(process), 42);
-            thread.resume_entry = Some((guest, CodeGeneration::INITIAL, entry));
+            thread
+                .block_cache
+                .insert(guest, CodeGeneration::INITIAL, entry);
             thread.indirect_cache.publish(
                 guest,
                 CodeGeneration::INITIAL,
@@ -4947,7 +5070,7 @@ mod tests {
 
             let token = thread.prepare_direct_binding_exec_reset();
 
-            assert!(thread.resume_entry.is_none());
+            assert!(thread.block_cache.is_empty());
             // SAFETY: as above; preparation completed synchronously while
             // this test retains exclusive access to the thread translator.
             let words_after = unsafe {
@@ -5016,7 +5139,7 @@ mod tests {
             assert_eq!(second, EXPECTED_ORDER, "exec reset must be idempotent");
             assert_eq!(process.private_epoch_leases_for_test(), 0);
             thread.reset_for_exec(Arc::clone(&process));
-            assert!(thread.resume_entry.is_none());
+            assert!(thread.block_cache.is_empty());
         }
 
         #[test]
@@ -5054,7 +5177,7 @@ mod tests {
             let catalog_before = catalog_head(&process);
             let (_other_thread, mut token) = prepare_thread(&process);
             let surviving_thread = ThreadTranslator::for_process(Arc::clone(&process), 43);
-            assert!(surviving_thread.resume_entry.is_none());
+            assert!(surviving_thread.block_cache.is_empty());
 
             let outcome = process.reset_after_fork_for_exec(&surviving_thread, &mut token);
 
