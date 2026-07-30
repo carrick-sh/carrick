@@ -1896,3 +1896,56 @@ and it should come before any pre-faulting or arena work -- pre-faulting memory
 that is about to be decommitted again would measure as noise.
 
 **Primary metric unmoved. C untouched beyond this baseline.**
+
+## Run 29 — two Workstream C hypotheses refuted; the residual is a 4x fault ratio
+
+Run 28 proposed that the zfod term was decommit-and-re-fault from Go's
+scavenger. **Refuted.** Host calls that can decommit a page, against zfod, same
+run (BUILD_OK):
+
+| call | count |
+|---|---|
+| `zfod` | **1,716,964** |
+| `madvise` (all advice) | **328** |
+| `munmap` | 635 |
+| `mmap` | 2,177 |
+
+~1,000 decommits against 1.7 M zero-fill faults, a ratio of 1:5000. Nothing in
+the `madvise` lowering is responsible. (Advice values seen: 7 x113, 11 x215.)
+
+Second hypothesis, that the term is per-process address-space SETUP paid 50
+times. **Also refuted.** A trivial guest (`/bin/sh -c echo`) on the same image:
+
+| | trivial | go build |
+|---|---|---|
+| processes | 3 | 50 |
+| `as_fault` total | 3,992 | 2,098,739 |
+| `zfod` total | 2,752 | 1,716,964 |
+| per process | ~1,650-2,336 | ~34,000 |
+
+Startup costs ~2,000 faults per process, not 34,000. Guest process startup is
+not the story either; the faults are taken doing actual compile work.
+
+### What the arithmetic now says
+
+34,000 zfod x 16 KB host pages = 564 MB first-touched per compile process. If
+the Go compiler genuinely touches ~141 MB (the same 34,000 pages at the GUEST's
+4 KB page size), the host should take 141 MB / 16 KB = **~8,800** faults, not
+34,000. The observed count is ~4x the number of distinct host pages -- exactly
+the ratio expected if each 16 KB host page is faulted once per 4 KB guest page
+inside it.
+
+The candidate is guest-granularity protection tracking: carrick tracks and
+applies guest page protections at the guest's 4 KB granularity on a 16 KB host
+page, and `NativeMappedMemory::native_host_prot_for_page` is independently
+visible in the leaf profile (144 samples in the ON arm, run 24) with `mprotect`
+at 0.72% of CPU.
+
+**This is arithmetic, not a measurement.** It predicts a specific, falsifiable
+thing: distinct host pages touched per process should be ~1/4 of the zfod count.
+Measuring `as_fault` against DISTINCT faulting addresses per process settles it
+in one probe, and that must come before any change -- the last two hypotheses in
+this workstream both died on first contact with a counter.
+
+**Primary metric unmoved. C's mechanism still unattributed, but two of three
+candidates are now eliminated.**
