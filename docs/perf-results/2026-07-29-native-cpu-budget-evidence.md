@@ -1855,3 +1855,44 @@ real latent bug, and it is the prerequisite for any future coverage work. But it
 does not advance the goal, and Workstream A should not receive more effort until
 the locality hypothesis is tested -- which needs the profiler classifier fixed
 first.
+
+## Run 28 — Workstream C baseline: the fault term is uniform, and implausibly large
+
+With Workstream A closed by run 27's falsification, C is primary. First
+attribution of the fault term, `vminfo` per process (BUILD_OK, superblock=8):
+
+| | |
+|---|---|
+| `as_fault` | 2,101,884 (baseline said 2,204,683 -- reproduces) |
+| `zfod` | 1,719,684 (**82%**) |
+| `cow_fault` | 106,747 |
+| carrick processes that faulted | **50** |
+| mean | **42,038 faults/process** |
+
+The distribution is FLAT -- every process lands in 31,000-39,000 `as_fault`.
+There is no outlier process to attack; this is structural, paid by each forked
+guest alike. So the lever is per-process fault count, not the process count.
+
+### The number does not make sense, which is the lead
+
+Host page size is 16 KB (`hw.pagesize`). 34,394 zfod per process x 16 KB is
+**564 MB first-touched per process**, 28 GB across the build. A `go` compile of
+one small package does not touch 564 MB of distinct anonymous memory.
+
+`zfod` is FIRST touch of a zero page. Counting it 34,000 times per process means
+the same addresses are being faulted repeatedly -- the mapping is torn down and
+re-established within a process's life, not merely populated once.
+
+The obvious candidate is Go's scavenger returning memory (`MADV_FREE` /
+`MADV_DONTNEED`) and re-touching it. On Linux that is cheap; if carrick lowers it
+to something that decommits host pages, every re-touch is a fresh zero-fill
+fault, and Go's allocator does this continuously. That would make the fault term
+an artifact of one syscall's lowering rather than of guest address-space size.
+
+**Not yet verified.** The next step is to count guest `madvise` calls and their
+advice values against zfod, which distinguishes "guest genuinely touches this
+much memory" from "we decommit and re-fault the same pages". That is one probe,
+and it should come before any pre-faulting or arena work -- pre-faulting memory
+that is about to be decommitted again would measure as noise.
+
+**Primary metric unmoved. C untouched beyond this baseline.**
