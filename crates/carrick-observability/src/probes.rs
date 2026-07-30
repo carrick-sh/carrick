@@ -818,6 +818,7 @@ mod dsr_probe_abi {
         let _: fn(i32, DsrResolveKind, u64, u64, DsrOperationOutcome) = super::dsr_resolve_end;
         let _: fn(i32, DsrCacheEventKind, u64, u64, u64) = super::dsr_cache_event;
         let _: fn(DsrCacheRole, u64) = super::dsr_cache_capacity;
+        let _: fn(u64, u64) = super::dsr_cache_bounds;
         let _: fn(i32, DsrCacheLifecyclePhase, u64, u64, u64) = super::dsr_cache_lifecycle;
         let _: fn(i32, DsrExecMapDetailKind, u64, u64, u64) = super::dsr_exec_map_detail;
     }
@@ -933,6 +934,7 @@ mod real {
         /// Translation-cache activity and fork/exec lifecycle boundaries.
         fn dsr__cache__event(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         fn dsr__cache__capacity(_: u32, _: u64) {}
+        fn dsr__cache__bounds(_: u64, _: u64) {}
         fn dsr__cache__lifecycle(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         fn dsr__exec__map__detail(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6]); DTrace copyin's 48
@@ -1483,6 +1485,11 @@ mod real {
     #[inline(always)]
     pub fn dsr_cache_capacity(role: super::DsrCacheRole, capacity_bytes: u64) {
         carrick_usdt::dsr__cache__capacity!(|| (role.raw(), capacity_bytes));
+    }
+
+    #[inline(always)]
+    pub fn dsr_cache_bounds(base: u64, end: u64) {
+        carrick_usdt::dsr__cache__bounds!(|| (base, end));
     }
 
     #[inline(always)]
@@ -2766,6 +2773,7 @@ mod stub {
     stub!(dsr_resolve_end(tid: i32, kind: super::DsrResolveKind, source_pc: u64, target_pc: u64, outcome: super::DsrOperationOutcome));
     stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64));
     stub!(dsr_cache_capacity(role: super::DsrCacheRole, capacity_bytes: u64));
+    stub!(dsr_cache_bounds(base: u64, end: u64));
     stub!(dsr_cache_lifecycle(tid: i32, phase: super::DsrCacheLifecyclePhase, used_bytes: u64, block_count: u64, generation_count: u64));
     stub!(dsr_exec_map_detail(tid: i32, kind: super::DsrExecMapDetailKind, duration_ns: u64, bytes: u64, operations: u64));
     stub!(fork_pre(pc: u64, elr: u64, cpsr: u64));

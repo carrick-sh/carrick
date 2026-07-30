@@ -309,6 +309,14 @@ pub trait DsrProbeSink: Send + Sync {
     );
 
     fn dsr_cache_capacity(&self, role: DsrCacheRole, capacity_bytes: u64);
+
+    /// Host-VA bounds of this process's JIT code cache, fired once at
+    /// creation. This exists so a `dtrace` script can tell a JIT program
+    /// counter from a host one WITHOUT unwinding: `ustack()` cannot walk
+    /// translated frames (they use x29 as a guest register), and it fails by
+    /// FABRICATING plausible stacks rather than erroring, so a profiler has to
+    /// classify the PC before deciding to unwind at all.
+    fn dsr_cache_bounds(&self, base: u64, end: u64);
 }
 
 static SINK: OnceLock<&'static dyn DsrProbeSink> = OnceLock::new();
@@ -526,6 +534,15 @@ pub fn dsr_cache_capacity(role: DsrCacheRole, capacity_bytes: u64) {
     }
 }
 
+/// Fire the `dsr__cache__bounds` probe through the installed sink; no-op when
+/// no sink is installed.
+#[inline(always)]
+pub fn dsr_cache_bounds(base: u64, end: u64) {
+    if let Some(sink) = SINK.get() {
+        sink.dsr_cache_bounds(base, end);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +661,8 @@ mod tests {
         }
 
         fn dsr_cache_capacity(&self, _role: DsrCacheRole, _capacity_bytes: u64) {}
+
+        fn dsr_cache_bounds(&self, _base: u64, _end: u64) {}
 
         fn dsr_synchronization_begin(&self, _kind: DsrSynchronizationKind) {
             self.synchronization.fetch_add(1, Ordering::Relaxed);
