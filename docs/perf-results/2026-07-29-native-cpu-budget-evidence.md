@@ -1737,3 +1737,54 @@ miss. That measurement, not another cost optimisation, is the path to A1.
 
 **A1 not met (1.114x) and NOT reachable at 12.9% coverage. A2 is now the
 blocking gate. Primary metric unmoved -- sharing ships OFF.**
+
+## Run 26 — A2's coverage ceiling is the superblock exclusion (measured 2.2x)
+
+Run 25 named the next measurement: why a unit covers ~11% of what a process
+translates. The answer is in the recording predicate, and it is deliberate:
+
+    // Superblocks are deliberately out of scope for the shared
+    // and artifact caches in this slice ...
+    && block.extensions.is_empty()
+
+A fused block is never recorded into a unit. The reference workload runs
+`CARRICK_DSR_SUPERBLOCK=8`, so fusion is ON and most blocks carry extensions.
+
+Same binary, same sharing config, only `CARRICK_DSR_SUPERBLOCK` differs. Two
+passes per arm because pass 1 RECORDS and pass 2 CONSUMES -- coverage is only
+meaningful once units exist:
+
+| superblock | pass | translations | mapped | coverage | loads |
+|---|---|---|---|---|---|
+| 8 (shipped) | record | 1,045,403 | 175,702 | 14.4% | 54 |
+| 8 (shipped) | CONSUME | 1,045,248 | 175,200 | **14.4%** | 54 |
+| 1 (no fusion) | record | 1,287,936 | 594,201 | 31.6% | 52 |
+| 1 (no fusion) | CONSUME | 1,276,759 | 603,497 | **32.1%** | 53 |
+
+All four BUILD_OK. Coverage is stable across record/consume in both arms, so
+this is not a cold-cache artifact.
+
+**Fusion costs 2.2x of shared-block coverage (14.4% vs 32.1%).** That is far
+above the 5% guardrail and is the single largest lever found in Workstream A.
+
+### The two mechanisms are in direct conflict
+
+Fusion cuts gateway exits 76% and is a shipped win. Sharing needs unfused blocks
+because a unit keys a template on ONE block's source words and replays it
+byte-for-byte. Every fused block is a lost cache hit -- correct, but unshared.
+Turning fusion off to buy coverage is not a trade worth making: it raises
+translations 1,045,248 -> 1,276,759 (+22%) because blocks stop being merged.
+
+So neither setting reaches A2's >=60%: fusion-on is capped at 14.4%, and
+fusion-off only reaches 32.1% while making the thing being avoided more
+expensive. **A2 cannot be met by configuration. It requires the shared cache to
+template a plan spanning several guest blocks** -- the work the code comment
+defers as "not been proven".
+
+That is a real implementation with a real risk surface (multi-block guest
+extents, per-block generation guards across a fused unit, recovery mapping), and
+it is now the blocking item for the entire goal: A2 gates A1 (run 25), and A1
+gates the primary metric.
+
+**Primary metric unmoved. A0 met. A1 1.114x and unreachable at this coverage.
+A2 14.4% vs >=60%, blocked on superblock templating.**
