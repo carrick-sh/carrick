@@ -458,6 +458,10 @@ class NativeGoBuildTest(unittest.TestCase):
             (105, "/var/tmp/native-m1/arm/carrick run --exec-backend native"),
             (106, "python3 -c 'print(\"carrick is just text\")'"),
             (107, "python3 scripts/perf/native_go_build.py --engine carrick"),
+            (108, "/Volumes/carrick/target/release/carrick run native"),
+            (109, "./target/release/carrick run native"),
+            (110, "/Volumes/carrick/scripts/perf/native_go_build.py --engine carrick"),
+            (111, "./scripts/perf/native_go_build.py --engine carrick"),
         ]
 
         foreign = native_go_build.foreign_rows(
@@ -479,6 +483,13 @@ class NativeGoBuildTest(unittest.TestCase):
                     "--exec-backend native"
                 ),
                 "pid=107 command=python3 scripts/perf/native_go_build.py --engine carrick",
+                "pid=108 command=/Volumes/carrick/target/release/carrick run native",
+                "pid=109 command=./target/release/carrick run native",
+                (
+                    "pid=110 command=/Volumes/carrick/scripts/perf/"
+                    "native_go_build.py --engine carrick"
+                ),
+                "pid=111 command=./scripts/perf/native_go_build.py --engine carrick",
             ],
         )
 
