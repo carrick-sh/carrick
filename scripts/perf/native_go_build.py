@@ -11,6 +11,7 @@ import os
 import pathlib
 import platform
 import resource
+import re
 import statistics
 import subprocess
 import sys
@@ -28,6 +29,13 @@ ENGINE_BOTH = "both"
 VARIANT_DEFAULT = "default"
 VARIANT_PRECURSOR = "precursor"
 VARIANT_CANDIDATE = "candidate"
+KNOWN_PERFORMANCE_COMMANDS = (
+    "target/release/carrick",
+    "scripts/perf/native_go_build.py",
+    "scripts/perf/native_go_build_screen.py",
+    "scripts/perf/direct_binding_mechanism.py",
+)
+REWRITTEN_PROCTITLE = re.compile(r"carrick:[^:]+:")
 # Container-lifetime sharing WITHOUT the artifact spike: the configuration the
 # A0/A1 gates are stated against (the 779,874 -> 135,259,579 exit amplification
 # was measured here, not under the spike).
@@ -382,24 +390,44 @@ def foreign_rows(
     *,
     own_pid: int,
     ancestor_pids: set[int],
+    current_run_id: str | None = None,
+    known_receipt_binaries: tuple[pathlib.Path, ...] = (),
 ) -> list[str]:
+    current_title = (
+        f"carrick:{current_run_id}:" if current_run_id is not None else None
+    )
+    receipt_binaries = tuple(
+        candidate
+        for binary in known_receipt_binaries
+        for candidate in (str(binary), str(binary.resolve()))
+    )
     foreign = []
     for pid, command in rows:
         if pid == own_pid or pid in ancestor_pids:
             continue
-        if (
-            "target/release/carrick run" in command
-            or "scripts/perf/native_go_build.py" in command
-            or "scripts/perf/native_go_build_screen.py" in command
-            or "scripts/perf/direct_binding_mechanism.py" in command
-        ):
+        if current_title is not None and current_title in command:
+            continue
+        is_known_command = any(
+            command == known
+            or command.startswith(f"{known} ")
+            or f" {known} " in command
+            or command.endswith(f" {known}")
+            for known in KNOWN_PERFORMANCE_COMMANDS
+        )
+        executable = command.split(maxsplit=1)[0]
+        is_receipt_binary = executable in receipt_binaries
+        if is_known_command or is_receipt_binary or REWRITTEN_PROCTITLE.search(command):
             foreign.append(f"pid={pid} command={command}")
     return foreign
 
 
-def foreign_workload_census() -> list[str]:
+def foreign_workload_census(
+    *,
+    current_run_id: str | None = None,
+    known_receipt_binaries: tuple[pathlib.Path, ...] = (),
+) -> list[str]:
     result = subprocess.run(
-        ["ps", "-eo", "pid=,args="],
+        ["ps", "-axww", "-o", "pid=", "-o", "command="],
         check=True,
         capture_output=True,
         text=True,
@@ -417,6 +445,8 @@ def foreign_workload_census() -> list[str]:
         rows,
         own_pid=os.getpid(),
         ancestor_pids=own_ancestor_pids(),
+        current_run_id=current_run_id,
+        known_receipt_binaries=known_receipt_binaries,
     )
 
 
@@ -460,12 +490,19 @@ def sample_provenance(
     reject_contamination: bool = True,
     binary_path: pathlib.Path | None = None,
     image_ref: str = DEFAULT_IMAGE,
+    current_run_id: str | None = None,
+    known_receipt_binaries: tuple[pathlib.Path, ...] = (),
 ) -> dict[str, object]:
-    binary = repo / "target/release/carrick" if binary_path is None else binary_path
+    binary = (
+        repo / "target/release/carrick" if binary_path is None else binary_path
+    ).resolve()
     status = git_output(repo, "status", "--porcelain").splitlines()
     if status and reject_contamination:
         raise RuntimeError("performance sample requires a clean git worktree")
-    foreign = foreign_workload_census()
+    foreign = foreign_workload_census(
+        current_run_id=current_run_id,
+        known_receipt_binaries=known_receipt_binaries,
+    )
     docker_oracles = running_docker_oracles()
     if (foreign or docker_oracles) and reject_contamination:
         raise RuntimeError(
@@ -476,7 +513,7 @@ def sample_provenance(
         "git_commit": git_output(repo, "rev-parse", "HEAD"),
         "git_status": status,
         "binary_path": str(binary),
-        "binary_sha256": sha256_file(binary) if binary.is_file() else None,
+        "binary_sha256": sha256_file(binary),
         "host": {
             "platform": platform.platform(),
             "machine": platform.machine(),
@@ -628,15 +665,35 @@ def combined_output(stdout: str | bytes | None, stderr: str | bytes | None) -> s
 
 
 def run_sample(
-    repo: pathlib.Path,
+    harness_repo: pathlib.Path,
     engine: str,
     index: int,
     timeout_seconds: int,
     captured_output: pathlib.Path | None = None,
     environment_overlay: dict[str, str | None] | None = None,
+    *,
+    binary: pathlib.Path | None = None,
+    image: str = DEFAULT_IMAGE,
+    current_run_id: str | None = None,
+    known_receipt_binaries: tuple[pathlib.Path, ...] = (),
 ) -> dict[str, object]:
-    run_id = f"native-go-build-{engine}-{os.getpid()}-{time.time_ns()}-{index}"
-    command = build_command(repo, engine, run_id)
+    resolved_binary = (
+        harness_repo / "target/release/carrick" if binary is None else binary
+    ).resolve()
+    binary_sha256 = (
+        sha256_file(resolved_binary)
+        if engine == ENGINE_CARRICK or resolved_binary.is_file()
+        else None
+    )
+    generated_run_id = f"native-go-build-{engine}-{os.getpid()}-{time.time_ns()}-{index}"
+    run_id = current_run_id or generated_run_id
+    command = build_command(
+        harness_repo,
+        engine,
+        run_id,
+        binary=resolved_binary,
+        image=image,
+    )
     normalized = normalized_overlay(environment_overlay)
     if engine == ENGINE_DOCKER and any(value is not None for value in normalized.values()):
         raise ValueError("Docker samples reject Carrick-only environment overlays")
@@ -650,9 +707,19 @@ def run_sample(
     environment["CARRICK_RUN_ID"] = run_id
     # Task 14's exact screen is a Carrick-only gate. The legacy Docker phase
     # retains its image provenance at campaign scope and accepts no overlay.
-    strict_evidence = engine == ENGINE_CARRICK and repository_is_git(repo)
+    strict_evidence = engine == ENGINE_CARRICK and repository_is_git(harness_repo)
     pre_provenance = (
-        sample_provenance(repo, engine, normalized) if strict_evidence else None
+        sample_provenance(
+            harness_repo,
+            engine,
+            normalized,
+            binary_path=resolved_binary,
+            image_ref=image,
+            current_run_id=run_id,
+            known_receipt_binaries=known_receipt_binaries,
+        )
+        if strict_evidence
+        else None
     )
     # Taken after `sample_provenance`'s git calls and before the workload, so the
     # delta below contains only the measured child. RUSAGE_CHILDREN accumulates
@@ -667,7 +734,7 @@ def run_sample(
     try:
         result = subprocess.run(
             command,
-            cwd=repo,
+            cwd=harness_repo,
             env=environment,
             capture_output=True,
             text=True,
@@ -685,7 +752,7 @@ def run_sample(
         cpu_sys_s = rusage_after.ru_stime - rusage_before.ru_stime
         try:
             if engine == ENGINE_CARRICK:
-                cleanup_evidence = carrick_cleanup(repo, run_id)
+                cleanup_evidence = carrick_cleanup(harness_repo, run_id)
             else:
                 cleanup_evidence = docker_cleanup(run_id)
         except Exception as error:
@@ -694,7 +761,15 @@ def run_sample(
     provenance_error: Exception | None = None
     if strict_evidence:
         try:
-            post_provenance = sample_provenance(repo, engine, normalized)
+            post_provenance = sample_provenance(
+                harness_repo,
+                engine,
+                normalized,
+                binary_path=resolved_binary,
+                image_ref=image,
+                current_run_id=run_id,
+                known_receipt_binaries=known_receipt_binaries,
+            )
         except Exception as error:
             provenance_error = error
     if timeout is not None:
@@ -731,6 +806,8 @@ def run_sample(
         "engine": engine,
         "index": index,
         "run_id": run_id,
+        "binary_path": str(resolved_binary),
+        "binary_sha256": binary_sha256,
         "elapsed_ms": elapsed_ms,
         "cpu_user_s": round(cpu_user_s, 6),
         "cpu_sys_s": round(cpu_sys_s, 6),
