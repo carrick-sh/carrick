@@ -194,3 +194,57 @@ process, and by kernel faults, not by how tight the emitted code is.
    cycle-reducing codegen on this workload.
 4. carrick host user code, ~14%, starting with `sha256::compress256` at 2.0%.
 5. Named syscalls, 9.3% total, nothing above 2%.
+
+## Run 4 — why shared translation loses: a 171x gateway-exit explosion
+
+The rank-1 item above assumed the blocker was slow unit LOADING (task #19 took a
+worst case from >300 s to 64–76 s by indexing direct-binding records by edge).
+That assumption is wrong. A four-arm bisect of the three env flags, one profiled
+run each, same binary, `CARRICK_DSR_SUPERBLOCK=8`, all BUILD_OK:
+
+| arm | wall s | translations | `direct_resolver_exits` | gw entries / translation | thread CPU s |
+|---|---|---|---|---|---|
+| `ARTIFACT_SPIKE=1` | 13.8 | 1,196,909 | 778,739 | 1.5 | 30.6 |
+| `DIRECT_BINDINGS=1` | 14.4 | 1,217,406 | 778,636 | 1.5 | 31.7 |
+| **`SHARED_TRANSLATION=1`** | **57.6** | 1,042,109 | **133,339,214** | **129.0** | 156.8 |
+| `SPIKE` + `SHARED` | 55.1 | 1,031,358 | 124,839,345 | 122.1 | 153.7 |
+| all three | 88.0 | 1,030,325 | 127,622,799 | 125.0 | 210.4 |
+
+`CARRICK_DSR_SHARED_TRANSLATION=1` **on its own** costs 4.2x wall, and the
+mechanism is unambiguous: `direct_resolver_exits` goes **778,739 -> 133,339,214,
+a 171x increase**. Every direct branch takes a full gateway round-trip to
+re-resolve its target instead of jumping through a bound direct link. The
+per-round-trip phases scale with it — `phase_finish_exit_ns` 2.46 s -> 44.1 s,
+`phase_prepare_index_ns` 2.53 s -> 25.5 s, `phase_loop_quiesce_count` 1.84 M ->
+134 M.
+
+Neither of the other flags causes it and neither repairs it. `DIRECT_BINDINGS=1`
+on top of shared makes things *worse* (88.0 s vs 55.1 s), which is the
+direct-binding record scan of task #19 paying a cost it cannot recover here.
+
+**And sharing is barely delivering reuse even so:** translations fall only
+1,196,909 -> 1,042,109 (13%). A 13% cut in translation work does not begin to pay
+for a 4.2x wall regression.
+
+Correction to an earlier reading in this document's run 3: the `shared_unit_*`
+counters (`shared_unit_lookups`, `shared_unit_hits`, `shared_unit_loads`,
+`shared_translations_avoided`) exist in `ResolverStats` but are NOT among the
+fields the `resolver-process` profile frame prints, so their absence from the
+output is not evidence of zero hits. The 13% translation figure is the
+independent evidence that reuse is not landing, and it stands on its own.
+
+### What this changes about rank 1
+
+Container-lifetime translation sharing has **two independent defects**, and the
+one that was being worked was not the binding one:
+
+1. **Enabling sharing collapses direct linking** — 171x more direct-resolve
+   gateway exits. This is the 17–50x slowdown, and it is an emission/binding
+   defect, not a cache-lookup cost. Fix this first; until it is fixed, no amount
+   of load-path optimization can make sharing a win.
+2. **Sharing avoids only 13% of translations** even when enabled, against the
+   799,494-translations prize that motivated it (~40 processes each translating
+   20,000–53,000 blocks of the same toolchain binary).
+
+Emit the `shared_unit_*` counters in the profile frame before doing either, so
+lookups, hits, loads and misses are observable rather than inferred.
