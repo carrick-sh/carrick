@@ -555,7 +555,7 @@ or flip the default from this M4 observation alone.
 python3 scripts/perf/native_wall_capture.py capture \
   --receipt target/perf/native-m4-tip/arm.json \
   --overlay scripts/perf/overlays/native-default.json \
-  --run-id native-m4-wall-default-a \
+  --run-id-prefix native-m4-wall-default-a \
   --trace-out target/perf/native-m4-wall-default-a.raw \
   --summary-jsonl target/perf/native-m4-wall-default-a.jsonl \
   --stdout target/perf/native-m4-wall-default-a.stdout \
@@ -563,7 +563,7 @@ python3 scripts/perf/native_wall_capture.py capture \
 python3 scripts/perf/native_wall_capture.py capture \
   --receipt target/perf/native-m4-tip/arm.json \
   --overlay scripts/perf/overlays/native-default.json \
-  --run-id native-m4-wall-default-b \
+  --run-id-prefix native-m4-wall-default-b \
   --trace-out target/perf/native-m4-wall-default-b.raw \
   --summary-jsonl target/perf/native-m4-wall-default-b.jsonl \
   --stdout target/perf/native-m4-wall-default-b.stdout \
@@ -571,7 +571,7 @@ python3 scripts/perf/native_wall_capture.py capture \
 python3 scripts/perf/native_wall_capture.py capture \
   --receipt target/perf/native-m4-tip/arm.json \
   --overlay scripts/perf/overlays/native-shared.json \
-  --run-id native-m4-wall-shared-a \
+  --run-id-prefix native-m4-wall-shared-a \
   --trace-out target/perf/native-m4-wall-shared-a.raw \
   --summary-jsonl target/perf/native-m4-wall-shared-a.jsonl \
   --stdout target/perf/native-m4-wall-shared-a.stdout \
@@ -579,7 +579,7 @@ python3 scripts/perf/native_wall_capture.py capture \
 python3 scripts/perf/native_wall_capture.py capture \
   --receipt target/perf/native-m4-tip/arm.json \
   --overlay scripts/perf/overlays/native-shared.json \
-  --run-id native-m4-wall-shared-b \
+  --run-id-prefix native-m4-wall-shared-b \
   --trace-out target/perf/native-m4-wall-shared-b.raw \
   --summary-jsonl target/perf/native-m4-wall-shared-b.jsonl \
   --stdout target/perf/native-m4-wall-shared-b.stdout \
@@ -611,7 +611,7 @@ scripts/build-linux-fixtures.sh
 python3 scripts/perf/native_wall_capture.py capture-elf \
   --receipt target/perf/native-m4-tip/arm.json \
   --elf fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-native-fault-pages \
-  --run-id native-m4-wall-fault-stack \
+  --run-id-prefix native-m4-wall-fault-stack \
   --trace-out target/perf/native-m4-wall-fault-stack.raw \
   --summary-jsonl target/perf/native-m4-wall-fault-stack.jsonl \
   --stdout target/perf/native-m4-wall-fault-stack.stdout \
@@ -653,7 +653,7 @@ python3 scripts/perf/native_fault_capture.py capture-go \
   --receipt target/perf/native-m4-tip/arm.json \
   --qualification target/perf/native-m4-fault-provider.json \
   --overlay scripts/perf/overlays/native-default.json \
-  --run-id native-m4-fault-a \
+  --run-id-prefix native-m4-fault-a \
   --trace-out target/perf/native-m4-fault-a.raw \
   --summary-jsonl target/perf/native-m4-fault-a.jsonl \
   --stdout target/perf/native-m4-fault-a.stdout \
@@ -662,7 +662,7 @@ python3 scripts/perf/native_fault_capture.py capture-go \
   --receipt target/perf/native-m4-tip/arm.json \
   --qualification target/perf/native-m4-fault-provider.json \
   --overlay scripts/perf/overlays/native-default.json \
-  --run-id native-m4-fault-b \
+  --run-id-prefix native-m4-fault-b \
   --trace-out target/perf/native-m4-fault-b.raw \
   --summary-jsonl target/perf/native-m4-fault-b.jsonl \
   --stdout target/perf/native-m4-fault-b.stdout \
