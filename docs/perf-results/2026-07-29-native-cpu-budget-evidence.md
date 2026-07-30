@@ -1367,3 +1367,37 @@ Enumerating those paths — every route from host code into the cache, not just
 work, not another gate.
 
 Reverted. Tree clean, tip BUILD_OK.
+
+### Run 21d — the entry paths ARE enumerated, which refutes run 21c's own theory
+
+Run 21c closed by proposing that some unenumerated route from host code into the
+cache fails to carry the prepared context. Enumerating them settles it: on
+aarch64 there are exactly **three** `gateway::enter_translated*` call sites
+outside tests and the oracle, and all three are in `ThreadTranslator::enter_prepared`:
+
+| branch | condition | carries bindings |
+|---|---|---|
+| `enter_translated_with_trusted_private_cache` | `count == 0 && !shared_translation_runtime_enabled()` | n/a — unreachable with sharing on |
+| `enter_translated_with_cache_range_and_catalog` | `count == 0` | no |
+| `..._with_cache_range_and_generation_bindings_and_catalog` | otherwise | yes |
+
+(The fourth hit, `native_darwin/dsr/mod.rs:109`, is a test-support entry; the
+`carrick_dsr_x86` ones are the other architecture.)
+
+So there is no hidden entry path. Every entry goes through `enter_prepared`,
+which means `generation_binding_count == 0` at the middle branch is the only way
+to reach translated code without a table — and with the table installed that is
+reachable only when `shared` is `Some(authority)` whose own
+`generation_binding_count` is zero, i.e. a unit published with an empty binding
+table.
+
+That also weakens the inference behind runs 20-21c: `far` values of `0x20` and
+`0x60` matched `index * 16` for indices 2 and 6 and were persuasive, but
+`far = 0` matches index 0 *and* matches any other null dereference equally well.
+The first two were evidence; the third is not, and it should not be read as
+confirming the same mechanism.
+
+**Remaining work, now genuinely narrow:** determine whether any loaded unit
+carries `generation_binding_count == 0` while owning blocks whose guards index a
+table, and re-run the fault with the register dump restored so `far = 0` is
+attributed rather than assumed. Both are single runs.
