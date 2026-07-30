@@ -248,3 +248,74 @@ one that was being worked was not the binding one:
 
 Emit the `shared_unit_*` counters in the profile frame before doing either, so
 lookups, hits, loads and misses are observable rather than inferred.
+
+## Run 5 — the 171x explosion, root-caused to 99.92% unbindable edges
+
+### First, a correction to run 4
+
+Run 4 said sharing was "barely delivering reuse" and a later commit said the
+loaded units were "loaded and thrown away". **Both readings were wrong**, and the
+arithmetic that refutes them was already available:
+
+| | |
+|---|---|
+| translations, sharing OFF | 1,196,909 |
+| translations, sharing ON | 1,031,914 |
+| reduction | 164,995 |
+| `shared_blocks_mapped` | 171,480 |
+| **reduction / blocks mapped** | **0.96** |
+
+The mapped blocks account for essentially all of the translation reduction.
+Sharing works exactly as designed where it applies; it simply applies to only
+**14.2%** of a process's blocks (3,176 mapped per successful load against 14,534
+translations per process).
+
+The mistake was using `cache_lookup_hits` (13 of 1,051,969) as a reuse measure —
+after this same document had already explained that it is not one, because
+lookups only reach the resolver for genuinely-new blocks. Do not read a
+low-level miss counter as a statement about a high-level cache's usefulness.
+
+### The real defect
+
+With `CARRICK_DSR_SHARED_TRANSLATION=1` and `CARRICK_DSR_DIRECT_BINDINGS=1`
+(57.3 s wall, BUILD_OK), the newly published direct-binding gauges say:
+
+| counter | value |
+|---|---|
+| `db_owner_validation_failures` | **136,218,515** |
+| `db_cas_wins` (edges actually bound) | 101,010 |
+| `db_cas_losses` | 4 |
+| `db_authority_validation_failures` | 0 |
+| `db_publication_retries` | 0 |
+| `direct_resolver_exits` | 136,321,369 |
+
+**99.92% of every direct-resolver exit fails owner validation**, and only 101,010
+edges are ever bound in the whole build.
+
+`DirectBindingRegistry::classify_cold_exit` can bind an edge only if
+`records_by_edge` contains `(source, target)` — that index is built from the
+LOADED UNITS' manifest records, so **only edges the publishing process declared
+can ever bind.** With the unit covering 14.2% of a process's blocks, nearly every
+edge leaving shared code targets a locally-translated block that no manifest
+declares, returns `MissingEligibleRecord`, and re-resolves through the gateway on
+every single traversal. Shared blocks are the HOT ones, so those unbindable edges
+are traversed ~780 times each: 136 M gateway round-trips.
+
+This also explains why `CARRICK_DSR_DIRECT_BINDINGS=1` does not help (133 M vs
+125 M resolver exits): the runtime binding path is reached and then declines,
+because the limit is the manifest, not the cell machinery. And it explains the
+architecture: loaded units are pinned `VM_PROT_READ | VM_PROT_EXECUTE` with the
+MAXIMUM protection also set (`pin_loaded_translation_protection`), so shared code
+can never be patched in place; it must indirect through writable per-process
+cells, which is what `LoadedTranslationProtection::BindingCells` exists for.
+
+### What has to change
+
+Either (a) let an edge from shared code bind to a PRIVATE, locally-translated
+target through a per-process cell — the general case the manifest cannot
+pre-declare — or (b) raise unit coverage far enough that most targets are
+in-unit. (a) is the real fix; (b) only moves the ratio.
+
+Until one of them lands, container-lifetime sharing trades a 14% translation
+saving for a 171x increase in gateway round-trips on the hottest code, which is
+why it measures 4.2x slower and ships off.

@@ -799,6 +799,16 @@ pub struct ProfileSnapshot {
     pub shared_unit_loads: u64,
     pub shared_blocks_mapped: u64,
     pub shared_translations_avoided: u64,
+    /// Direct-binding registry counters. POINT-IN-TIME GAUGES on the process
+    /// registry, never deltas -- like `cache_used_bytes`. Summing them across a
+    /// process's thread records multiplies them by the reporting thread count;
+    /// take the max per pid instead.
+    pub direct_binding_owner_validation_failures: u64,
+    pub direct_binding_authority_validation_failures: u64,
+    pub direct_binding_cas_wins: u64,
+    pub direct_binding_cas_losses: u64,
+    pub direct_binding_stale_winner_clears: u64,
+    pub direct_binding_publication_retries: u64,
     pub exclusive_fusion_sites: [u64; ExclusiveFusionClass::COUNT],
 }
 
@@ -960,6 +970,18 @@ impl CompleteThreadRecord {
             resolver.shared_translations_avoided,
         );
         frames.push(shared);
+        let mut binding = self.frame_header("direct-binding-gauge");
+        let _ = write!(
+            binding,
+            "|db_owner_validation_failures={}|db_authority_validation_failures={}|db_cas_wins={}|db_cas_losses={}|db_stale_winner_clears={}|db_publication_retries={}",
+            resolver.direct_binding_owner_validation_failures,
+            resolver.direct_binding_authority_validation_failures,
+            resolver.direct_binding_cas_wins,
+            resolver.direct_binding_cas_losses,
+            resolver.direct_binding_stale_winner_clears,
+            resolver.direct_binding_publication_retries,
+        );
+        frames.push(binding);
         let mut cache = self.frame_header("cache-gauge");
         let _ = write!(
             cache,
@@ -1484,7 +1506,7 @@ mod tests {
                 },
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 15);
+        assert_eq!(frames.len(), 16);
         assert!(frames[0].contains("|frame=core|"));
         assert!(frames[0].contains("|thread_cpu_ns=5"));
         let process = frames
@@ -1670,6 +1692,12 @@ mod tests {
         let frames = record
             .to_protocol_frames_with_resolver(
                 crate::profile::ProfileSnapshot {
+                    direct_binding_owner_validation_failures: u64::MAX,
+                    direct_binding_authority_validation_failures: u64::MAX,
+                    direct_binding_cas_wins: u64::MAX,
+                    direct_binding_cas_losses: u64::MAX,
+                    direct_binding_stale_winner_clears: u64::MAX,
+                    direct_binding_publication_retries: u64::MAX,
                     shared_unit_lookups: u64::MAX,
                     shared_unit_hits: u64::MAX,
                     shared_unit_loads: u64::MAX,
@@ -1698,7 +1726,7 @@ mod tests {
                 gauges,
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 15);
+        assert_eq!(frames.len(), 16);
         for frame in frames {
             let transport_len = frame.len().checked_add(1).expect("newline length");
             assert!(
