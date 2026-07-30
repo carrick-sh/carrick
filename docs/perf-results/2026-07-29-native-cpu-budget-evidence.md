@@ -965,3 +965,53 @@ This is now a specific, checkable statement rather than a hypothesis about
 missing context: compare what `emit_gateway_exit`'s stub writes before entering
 the gateway against what a target block's prologue reads, and patch at a point
 after every one of those writes.
+
+## Run 16 — the primary metric, measured; and the instrument is 4x better than assumed
+
+Tip `e83957a1` against baseline `0686248a`, 8 quads, ABBA-ordered, both arms
+separately built and signed:
+
+| metric | median ratio | wins | p | sd | resolvable |
+|---|---|---|---|---|---|
+| wall | 0.9954 | 6/8 | 0.1445 | 1.46% | ≥0.85% |
+| **CPU-seconds** | **0.9947** | 7/8 | 0.0352 | **1.28%** | **≥0.74%** |
+
+**Primary metric: 0.9947 against a target of ≤0.70. Not met**, and expected not
+to be: everything between those two commits is diagnostics. The block cache and
+the hardware SHA-256 backend both landed BEFORE the baseline, so this pair
+deliberately contains no performance change. The 0.53% is at the resolution
+limit and should be read as "indistinguishable from no change", which is what was
+predicted before running it.
+
+### The result that matters is the sd
+
+| protocol | metric | sd | smallest resolvable effect |
+|---|---|---|---|
+| plain A-then-B, 10 pairs | wall | 5.05–5.54% | ≥2.6–3.2% |
+| **ABBA, 8 quads** | **CPU-seconds** | **1.28%** | **≥0.74%** |
+
+The instrument is roughly **four times more sensitive** than the one every
+earlier conclusion in this document was drawn with. Two changes did that: CPU
+seconds instead of wall (`7c701293`), and ABBA ordering, which cancels the ~1%
+second-position penalty a null screen measured on identical binaries.
+
+### This invalidates the goal's out-of-scope clause
+
+The goal excludes codegen cycle quality on the grounds that three attempts each
+measured ≤2.6%. But ≤2.6% was the RESOLUTION FLOOR of the instrument used, not a
+measurement of the effect — those screens could not have distinguished a real 2%
+win from zero. At ≥0.74% resolution:
+
+| change | measured then | status now |
+|---|---|---|
+| whole generation-guard check removed | median 0.9867, p=0.38 | 1.3% is now well above the floor — re-measurable |
+| exit-target literal pool | "inconclusive", ~2% | ~2% is now ~3 sd — re-measurable |
+| gateway phase claim | median 1.0030, p=0.62 | genuinely ~0, stands |
+
+Two of the three were never actually refuted; they were unmeasurable. They
+should be re-screened under ABBA+CPU before staying out of scope — the literal
+pool especially, since it is also a Workstream B item (−41 MB emitted) and now
+has two independent reasons to land.
+
+**Method note for the campaign: re-measure a rejected change whenever the
+instrument improves by more than the effect that rejected it.**
