@@ -154,6 +154,9 @@ pub fn shared_translation_runtime_enabled() -> bool {
 /// fully encoded words via `TranslationCache::patch_code_word`, so the
 /// displacement computation, `B`-range check, and opcode encoding stay here
 /// with the rest of the AArch64 layer.
+/// `nop` -- fills a trampoline reservation whose target proved unreachable.
+const NOP_AARCH64: u32 = 0xd503_201f;
+
 pub fn encode_aarch64_direct_branch(
     site: cache::LinkSite,
     target: types::CacheVa,
@@ -2158,28 +2161,45 @@ impl ProcessState {
         self.blocks.insert(key, entry);
         self.dependencies.record(source_page, key.0, key.1);
         for link in links {
-            let target_generation = memory.dsr_generation_observation(link.target)?.expected();
+            let target_observation = memory.dsr_generation_observation(link.target)?;
+            let target_generation = target_observation.expected();
             let target_key = (link.target, target_generation);
             let site = cache::LinkSite {
                 source: entry,
                 slot: link.slot,
             };
-            // A SHARED target must NOT be patched, and this is load-bearing.
-            // A loaded unit's block reads unit-specific state from the context --
-            // its `generation_bindings` table, cache range and target authority --
-            // which only the gateway installs when it enters that unit. A direct
-            // branch bypasses that installation, so the block's guard dereferences
-            // the private context's NULL `generation_bindings` and faults at a
-            // small offset. MEASURED by removing this condition: the go-build
-            // guest dies immediately with "native DSR fault lies outside
-            // guest-owned host memory: 0x20"
+            // A SHARED target is patched THROUGH a trampoline, never directly.
+            // A loaded unit's block guards with `GenerationGuard::BindingIndex`,
+            // reading its unit's table from `CTX_GENERATION_BINDINGS`, which only
+            // the gateway installs when it enters that unit. A bare direct branch
+            // bypasses the installation and the guard reads whatever the private
+            // entry left there -- MEASURED, the go-build guest dies immediately
+            // with "native DSR fault lies outside guest-owned host memory: 0x20"
             // (docs/perf-results/2026-07-29-native-cpu-budget-evidence.md run 13).
-            if let Some(target) = self.blocks.get(&target_key).copied()
-                && !self.shared_blocks.contains_key(&target_key)
-            {
-                self.patch_direct_link_if_reachable(site, target)?;
-            } else {
-                self.pending.entry(target_key).or_default().push(site);
+            //
+            // Installing the table at ENTRY instead cannot work: a context holds
+            // ONE pointer while a private context reaches blocks from N units, so
+            // the guard indexes the wrong unit's table as soon as a second unit is
+            // touched (run 22b). The trampoline installs it at the EDGE, where the
+            // target's unit is statically known.
+            let shared_bindings = self
+                .shared_blocks
+                .get(&target_key)
+                .map(|authority| authority.generation_bindings);
+            match (self.blocks.get(&target_key).copied(), shared_bindings) {
+                (Some(target), None) => self.patch_direct_link_if_reachable(site, target)?,
+                (Some(target), Some(bindings)) => {
+                    self.patch_shared_edge_via_binding_trampoline(
+                        site,
+                        target,
+                        bindings,
+                        link.target,
+                        &target_observation,
+                    )?;
+                }
+                (None, _) => {
+                    self.pending.entry(target_key).or_default().push(site);
+                }
             }
         }
         if let Some(sites) = self.pending.remove(&key) {
@@ -2766,6 +2786,83 @@ impl ProcessState {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Patch a private -> shared edge through a trampoline that installs the
+    /// TARGET unit's generation-binding table, then branches to the block.
+    ///
+    /// Costs `BINDING_INSTALL_TRAMPOLINE_WORDS` of private cache per edge and
+    /// replaces a full gateway round trip on every traversal.
+    fn patch_shared_edge_via_binding_trampoline(
+        &mut self,
+        site: cache::LinkSite,
+        target: types::CacheVa,
+        bindings: usize,
+        target_guest: carrick_guest_mem::GuestVa,
+        observation: &cache::PageGenerationObservation,
+    ) -> Result<(), types::DsrError> {
+        if bindings == 0 {
+            // No table to install; leaving the site unpatched keeps the gateway
+            // exit, which is correct, just not fast.
+            return Ok(());
+        }
+        let len = emit::BINDING_INSTALL_TRAMPOLINE_WORDS * std::mem::size_of::<u32>();
+        let mut writer = self.cache.begin_write(len)?;
+        let entry = writer.entry();
+        let branch_slot = types::CacheOffset::published(
+            u32::try_from((emit::BINDING_INSTALL_TRAMPOLINE_WORDS - 1) * 4).unwrap_or(u32::MAX),
+        );
+        let branch = encode_aarch64_direct_branch(
+            cache::LinkSite {
+                source: entry,
+                slot: branch_slot,
+            },
+            target,
+        );
+        let mut words = [NOP_AARCH64; emit::BINDING_INSTALL_TRAMPOLINE_WORDS];
+        let reachable = match branch {
+            Ok(word) => {
+                words[..emit::BINDING_INSTALL_TRAMPOLINE_WORDS - 1]
+                    .copy_from_slice(&emit::binding_install_prologue(bindings as u64));
+                words[emit::BINDING_INSTALL_TRAMPOLINE_WORDS - 1] = word;
+                true
+            }
+            // Out of `B` range: publish the reservation as NOPs (the writer owes
+            // the cache exactly `len` bytes) and leave the site on its gateway
+            // exit.
+            Err(types::DsrError::CachePolicy(ref reason))
+                if reason.contains("outside AArch64 B range") =>
+            {
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        writer.write_words(&words)?;
+        let published = writer.publish()?;
+        // Register the trampoline so a PC inside it resolves to a block. Every
+        // word maps to the TARGET's guest start: the trampoline executes no
+        // guest instruction, so a signal landing in it recovers to "about to
+        // run the target", and re-entry through the gateway reinstalls the
+        // authority the trampoline was writing. Skipping this registration is
+        // what produced "cache PC ... is outside published DSR blocks
+        // (in_cache=true)" on the first run of this change.
+        let map = (0..emit::BINDING_INSTALL_TRAMPOLINE_WORDS)
+            .map(|word| emit::PcMapEntry {
+                guest: target_guest,
+                cache: types::CacheOffset::published(u32::try_from(word * 4).unwrap_or(u32::MAX)),
+            })
+            .collect();
+        self.push_published(PublishedBlock {
+            entry: published.entry(),
+            len,
+            map,
+            recovery: Vec::new(),
+            _generation: observation.clone(),
+        });
+        if reachable {
+            self.patch_direct_link_if_reachable(site, published.entry())?;
+        }
+        Ok(())
     }
 
     fn push_published(&mut self, block: PublishedBlock) {

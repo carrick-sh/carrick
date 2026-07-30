@@ -668,14 +668,22 @@ pub struct CacheWriter<'a> {
 }
 
 impl CacheWriter<'_> {
-    /// Test-support view of the reservation's EXEC entry address (compiled
-    /// unconditionally so the runtime's `#[cfg(test)]` consumers can reach it
-    /// across the crate boundary).
-    pub fn entry_for_test(&self) -> CacheVa {
+    /// The reservation's EXEC entry address, known BEFORE the words are
+    /// written. A trampoline whose last word is a `b` to a known target must
+    /// encode a displacement from its own address, so it needs this before it
+    /// can build the words it is about to write.
+    pub fn entry(&self) -> CacheVa {
         // SAFETY: `start` is inside the mapped region (reserved by
         // `begin_write`).
         let ptr = unsafe { self.cache.region.exec_base.as_ptr().add(self.start) };
         CacheVa::published(HostVa(ptr as usize))
+    }
+
+    /// Test-support alias of [`Self::entry`] (compiled unconditionally so the
+    /// runtime's `#[cfg(test)]` consumers can reach it across the crate
+    /// boundary).
+    pub fn entry_for_test(&self) -> CacheVa {
+        self.entry()
     }
 
     pub fn write_words(&mut self, words: &[u32]) -> Result<(), CacheError> {
