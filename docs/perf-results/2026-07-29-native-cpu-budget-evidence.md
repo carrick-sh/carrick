@@ -319,3 +319,74 @@ in-unit. (a) is the real fix; (b) only moves the ratio.
 Until one of them lands, container-lifetime sharing trades a 14% translation
 saving for a 171x increase in gateway round-trips on the hottest code, which is
 why it measures 4.2x slower and ships off.
+
+## Run 6 — correcting run 5, and the actual localization
+
+### Run 5's root cause was wrong, and a control arm refutes it
+
+Run 5 read `db_owner_validation_failures` = 136,218,515 of 136,321,369 exits
+(99.92%) as proof that shared-code edges cannot bind. Running the control that
+should have accompanied it — `DIRECT_BINDINGS=1` with sharing OFF — refutes it:
+
+| arm | wall | `direct_resolver_exits` | `db_owner_validation_failures` | `db_cas_wins` |
+|---|---|---|---|---|
+| bindings only, no sharing | **12.2 s** | 779,874 | 777,965 (99.8%) | 0 |
+| shared + bindings | 57.3 s | 136,321,369 | 136,218,515 (99.9%) | 101,010 |
+
+The failure ratio is ~99.8% in BOTH arms, and the fast arm binds nothing at all
+(`cas_wins` = 0) while running in 12.2 s. `classify_cold_exit` is called on
+EVERY `ResolveDirect` exit, and a locally-translated edge has no manifest record
+by construction, so the counter tracks exits 1:1 and says nothing about why they
+exploded. A ratio that is identical in the healthy and pathological arms cannot
+be the cause — the control arm is what makes that visible, and run 5 did not run
+one.
+
+### What the exits actually are
+
+Classifying each `ResolveDirect` by whether its source and target are shared
+blocks (scratch counter, 513 reporting processes, sampled at 750,000 exits):
+
+```
+EXITSRC total=750000 shared_source=178 private_source=749822 shared_target=745608
+```
+
+**99.4% of the exploding exits TARGET a shared block, and essentially none
+ORIGINATE from one** — the opposite of run 5's assumption. Locally-translated
+blocks branch into shared code, and those edges never bind, so every traversal
+takes a gateway round-trip. Shared blocks are the hot ones, which is why the
+count reaches 136 M.
+
+### Why a private -> shared edge cannot bind
+
+`classify_cold_exit` yields a binding cell only when `records_by_edge` holds
+`(source, target)`, and that index is built from the LOADED UNITS' manifest
+records — so only edges whose SOURCE is shared code can ever be classified. A
+private source block has its own emitted direct-binding stub and cell, but no
+unit declares it, so `binding_eligibility` is `Err`, `direct_binding_target` is
+never called, and the cell is never published.
+
+Everything else on that path is already correct and does NOT need changing:
+`target_cache_authority` and `direct_binding_target` both handle a shared target
+properly, returning the loaded unit's authority and a
+`DirectBindingTarget::shared_in_unit` descriptor. Only the eligibility gate
+rejects the edge.
+
+With sharing off this never bites, because every target is private and the
+emitter can commit the link when the target is already translated; the 779,874
+exits in that arm are the one-time cold resolves.
+
+### The fix, and why it is not a one-liner
+
+Publish the PRIVATE source's own cell for a valid target without demanding a
+manifest record: the cell address and ordinal already arrive in the exit
+metadata (`DirectBindingMiss`), and the target descriptor is already
+constructible. What must be preserved is the ownership validation the manifest
+currently provides — for a private source that means proving the cell lies
+inside this process's private, writable cache and within the exiting block's own
+stub envelope, plus ensuring `invalidate_target` clears these cells when the
+shared target's generation is invalidated (the descriptor carries the unit and
+generation, so the existing clear path is the place to check).
+
+That is a protocol extension in code governing cross-process code invalidation,
+where a mistake is silent wrong-code execution. It is specified here rather than
+attempted at the end of a long session.
