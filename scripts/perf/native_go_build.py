@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import platform
+import resource
 import statistics
 import subprocess
 import sys
@@ -201,11 +202,24 @@ def summarize_phases(
     for engine, rows in samples_by_engine.items():
         durations = [int(row["elapsed_ms"]) for row in rows]
         workloads = [int(row["workload_ms"]) for row in rows]
+        # CPU-seconds is the low-variance arm of every A/B: ambient load inflates
+        # wall time but barely touches CPU time. Wall paired-ratio sd is ~5% on
+        # this workload under ambient load, which only resolves ~2.6% effects at
+        # ten pairs -- larger than most single codegen changes can be.
+        #
+        # CARRICK ONLY. For the docker engine this is the CPU of the `docker`
+        # CLIENT, not of the build: that work happens inside the LinuxKit VM,
+        # which is not a descendant of this process. Do not compare the two
+        # engines' `cpu_s`.
+        cpu_seconds = [float(row["cpu_s"]) for row in rows if row.get("cpu_s") is not None]
         phases[engine] = {
             "sample_count": len(rows),
             "samples": rows,
             "median_ms": median_ms(durations),
             "workload_median_ms": median_ms(workloads),
+            "cpu_median_s": (
+                statistics.median(cpu_seconds) if cpu_seconds else None
+            ),
         }
     return phases
 
@@ -631,6 +645,11 @@ def run_sample(
     pre_provenance = (
         sample_provenance(repo, engine, normalized) if strict_evidence else None
     )
+    # Taken after `sample_provenance`'s git calls and before the workload, so the
+    # delta below contains only the measured child. RUSAGE_CHILDREN accumulates
+    # REAPED descendants, so a guest process carrick never waits for contributes
+    # nothing -- the metric is a floor, not a ceiling.
+    rusage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.monotonic_ns()
     result: subprocess.CompletedProcess[str] | None = None
     timeout: subprocess.TimeoutExpired | None = None
@@ -650,6 +669,11 @@ def run_sample(
         timeout = error
     finally:
         elapsed_ms = (time.monotonic_ns() - started) // 1_000_000
+        # Before `carrick_cleanup`/`docker_cleanup`, whose children would otherwise
+        # land inside the delta.
+        rusage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu_user_s = rusage_after.ru_utime - rusage_before.ru_utime
+        cpu_sys_s = rusage_after.ru_stime - rusage_before.ru_stime
         try:
             if engine == ENGINE_CARRICK:
                 cleanup_evidence = carrick_cleanup(repo, run_id)
@@ -699,6 +723,9 @@ def run_sample(
         "index": index,
         "run_id": run_id,
         "elapsed_ms": elapsed_ms,
+        "cpu_user_s": round(cpu_user_s, 6),
+        "cpu_sys_s": round(cpu_sys_s, 6),
+        "cpu_s": round(cpu_user_s + cpu_sys_s, 6),
         "workload_ns": workload_ns,
         "workload_ms": (
             workload_ns // 1_000_000 if workload_ns is not None else None
