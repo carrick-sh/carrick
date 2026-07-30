@@ -1144,3 +1144,50 @@ entirely private -> shared edges (99.4%), it is 74,726 distinct edges at 1,822
 traversals each, the branch range reaches (53/53 within +/-128 MiB), the patch
 point exists and is writable, and the exclusion that blocks it is one line in
 `ProcessState::publish_emitted`.
+
+## Run 19 — a 9.3% emitted-size cut moves CPU by nothing, and that re-scopes Workstream B
+
+`3d480e88` narrows gateway-exit guest-PC materialization. Mechanism gate passed
+outright: emitted bytes **610,046,264 -> 553,300,180 (-9.3%)**, private direct
+stub 56 -> 32 bytes, copy-only block 56 -> 44 bytes, both arms BUILD_OK with 71
+guest processes each.
+
+ABBA screen, 7 quads, `wide` vs `narrow`:
+
+| metric | median ratio | wins | p | sd | resolvable |
+|---|---|---|---|---|---|
+| wall | 0.9919 | 5/7 | 0.227 | 2.05% | ≥1.28% |
+| **CPU-seconds** | **1.0006** | 3/7 | 0.773 | 1.17% | ≥0.73% |
+
+**No CPU effect**, on an instrument that resolves 0.73%.
+
+### The arithmetic said so in advance, and it re-scopes the workstream
+
+`memmove` + `memset` + `sys_icache_invalidate` total 2.7% of CPU. Cutting emitted
+bytes by 9.3% can only move that by 9.3% x 2.7% = **0.25%** — a third of the
+resolution floor. The result is exactly what the numbers predicted; running it
+was worth doing to confirm the coupling, not to discover it.
+
+Extrapolating honestly: hitting Workstream B's emitted-bytes target of 400 MB
+(-33% from 599 MB) would move that term by 33% x 2.7% = **0.9%**, barely above
+the floor — and would do essentially nothing for B's other target, host share
+35.8% -> 25%. **The two B targets are not connected by enough leverage for one to
+deliver the other.**
+
+That means B's premise as written — "codegen enters scope as size reduction only,
+because emitted bytes are what memmove/memset/icache scale with" — is true but
+much smaller than it looks. The host bucket's 35.8% is not made of bytes moved;
+it is made of the WORK of translating: `decode_spec`, `assemble_block_inner`,
+`BTreeMap::insert`, malloc traffic, and the per-block metadata retained for
+~1.2 M blocks.
+
+### Where that leaves the goal
+
+The host-side lever is the NUMBER of translations, not the size of each one —
+which puts the weight back on Workstream A (cross-process reuse), and on making
+per-block translation cheaper algorithmically rather than smaller.
+
+The change is kept: it is strictly less emitted code, ~57 MB less JIT per build,
+with no identified cost and no measured CPU change. It is NOT counted toward any
+compounding total, and the campaign should stop expecting emitted-size work to
+pay in CPU.
