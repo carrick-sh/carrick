@@ -62,3 +62,17 @@ carrick-dsr = { path = "../carrick-dsr", features = ["test-hooks"] }
 # cross-checks from a non-Darwin rig (see the carrick-vmm-hvf Cargo.toml note from
 # the earlier extraction slice). The target gating lives INSIDE build.rs instead.
 cc = "1"
+
+# SHA-256 runs the portable SOFTWARE path by default, measured at 0.55 GB/s on
+# this host; the `asm` backend measures 2.20 GB/s, a 4.0x speedup, and
+# `sha2::sha256::compress256` was 2.0% of total CPU on the reference go-build --
+# as much as all `openat` kernel time. The digest is unchanged, so every
+# persisted cache key is unchanged.
+#
+# Target-gated to the lane the 4x was MEASURED on rather than enabled workspace
+# wide: `asm` pulls in `sha2-asm`, which compiles per-target assembly, and the
+# x86_64 BSD/Linux lanes cannot be built from this host to check. Cargo feature
+# unification means this enables the backend for every `sha2` user in an
+# aarch64-macos build, which is the intent.
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
