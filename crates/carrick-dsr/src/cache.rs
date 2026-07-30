@@ -506,6 +506,19 @@ impl TranslationCache {
         self.cursor = 0;
     }
 
+    /// Alignment every published block starts at.
+    ///
+    /// Instructions only need 4, but an emitted block may end in a literal pool
+    /// of 64-bit constants that a `ldr <reg>, <literal>` reads, and the emitter
+    /// can only align that pool RELATIVE TO THE BLOCK START -- it assembles at
+    /// offset 0 and learns its cache address afterwards. Handing out 8-aligned
+    /// starts is what makes an in-assembler `.align 8` mean anything at runtime;
+    /// without it, half the pools would sit 4-but-not-8 aligned and every
+    /// 64-bit literal load on those would split a pair of words.
+    ///
+    /// The cost is at most 4 wasted bytes per block, in a never-executed hole.
+    pub const BLOCK_ALIGNMENT: usize = 8;
+
     pub fn begin_write(&mut self, len: usize) -> Result<CacheWriter<'_>, CacheError> {
         if len == 0 || !len.is_multiple_of(std::mem::size_of::<u32>()) {
             return Err(CacheError::Policy(format!(
@@ -721,7 +734,14 @@ impl CacheWriter<'_> {
         self.cache.host.flush_icache(entry_ptr.cast(), self.len);
         self.cache.host.end_thread_write();
         self.write_enabled = false;
-        self.cache.cursor += self.len;
+        // Round the cursor so the NEXT block also starts 8-aligned; see
+        // `TranslationCache::BLOCK_ALIGNMENT`. `next_multiple_of` cannot
+        // overflow here: `begin_write` already proved `start + len <= capacity`,
+        // and the padding stays inside the region because the region's own length
+        // is a page multiple.
+        self.cache.cursor = (self.start + self.len)
+            .next_multiple_of(TranslationCache::BLOCK_ALIGNMENT)
+            .min(self.cache.region.capacity);
         Ok(PublishedCode {
             entry: CacheVa::published(HostVa(entry_ptr as usize)),
             len: self.len,
@@ -1239,9 +1259,43 @@ mod from_region_tests {
             .expect("publish one word into slice 1");
         let expected_entry = region.exec_base.as_ptr() as usize + SLICE_LEN;
         assert_eq!(published.entry().host().raw(), expected_entry);
-        assert_eq!(cache1.used_bytes(), 4);
+        // 8, not 4: the cursor is rounded so the next block also starts
+        // 8-aligned (`super::TranslationCache::BLOCK_ALIGNMENT`), which is what lets an
+        // emitted literal pool be aligned relative to its own block start.
+        assert_eq!(
+            cache1.used_bytes(),
+            super::TranslationCache::BLOCK_ALIGNMENT
+        );
 
         drop(cache1);
+        unsafe { TEST_HOST.unmap(&region) };
+    }
+
+    #[test]
+    fn every_published_block_starts_eight_byte_aligned() {
+        // An emitted block may end in a pool of 64-bit literals that a
+        // `ldr <reg>, <literal>` reads, and the emitter can only align that pool
+        // relative to the block start. So the cache must hand out 8-aligned
+        // starts even for odd-word blocks, or half the pools would split.
+        let region = TEST_HOST
+            .map_code_cache(SLICE_LEN * SLICE_COUNT)
+            .expect("map process-wide region");
+        let slice = region.sub_region(0, SLICE_LEN).expect("slice");
+        let mut cache = super::TranslationCache::from_region(slice, &TEST_HOST);
+        for words in 1..=9_usize {
+            let published = cache
+                .publish_words(&vec![0xd503_201f; words])
+                .expect("publish an odd-length block")
+                .entry()
+                .host()
+                .raw();
+            assert_eq!(
+                published % super::TranslationCache::BLOCK_ALIGNMENT,
+                0,
+                "a {words}-word block started at 0x{published:x}, not 8-aligned"
+            );
+        }
+        drop(cache);
         unsafe { TEST_HOST.unmap(&region) };
     }
 
