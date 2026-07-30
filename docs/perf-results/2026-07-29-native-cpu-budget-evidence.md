@@ -878,3 +878,45 @@ process can check locally.
 The falsification clause in the goal is therefore NOT triggered: the
 amplification is not intrinsic to sharing loaded units, it is intrinsic to
 sharing MORE THAN ONE of them per process — and the workload almost never does.
+
+## Run 14 — shape 3 also refuted; stop inferring the context contract, measure it
+
+Shape 3 was implemented as specified: `sole_unit_bindings()` returns the one
+loaded unit's table when a process holds exactly one, `PreparedEntry` installs
+that table on EVERY entry (private included) so the context no longer depends on
+which block the gateway entered, and the private -> shared patch plus the
+unit-load `pending` drain were gated on that condition.
+
+It still crashes — and the fault MOVED:
+
+| attempt | fault address |
+|---|---|
+| run 13 (no context work) | `0x20` |
+| run 14 (uniform `generation_bindings`) | **`0x60`** |
+
+A moving fault address is informative: installing the binding table fixed the
+first missing field and exposed a second. So `generation_bindings` is necessary
+but NOT sufficient — entering a shared block requires at least one further piece
+of per-unit context, and reading the code did not enumerate it correctly twice
+in a row.
+
+Reverted; the guest is BUILD_OK again and the tree is clean at `1dcc3d1a`.
+
+### The method correction
+
+Three attempts (runs 13, 14) have now inferred the context contract from source
+inspection and been refuted by a live crash costing a full build-and-run each.
+The contract must be MEASURED, not read:
+
+**Diff the `DsrContext` across a shared entry and a private entry.** Both go
+through `prepare_entry` -> the gateway; capture the full context struct at each
+and compare field by field. Every field that differs is a piece of per-unit state
+a direct branch would have to preserve, and the diff enumerates them exhaustively
+in one run instead of one-per-crash. `0x20` and `0x60` are the offsets already
+implicated; the diff will say what lives there and what else does.
+
+Only once that set is known can the choice be made honestly between "install all
+of it uniformly under the sole-unit condition" and "accept the gateway round-trip
+and make it cheap" — the latter being the fallback the goal's falsification
+clause anticipates, since the exit itself may be irreducible while its ~1,822x
+per-edge repetition is not.
