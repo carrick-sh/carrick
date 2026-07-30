@@ -1553,3 +1553,69 @@ write-protect toggling, icache invalidation, and fork-reset interaction, plus a
 red-first test and an 8-quad ABBA measurement. **A1 remains NOT MET; primary
 metric unmoved at 0.9947 vs target <=0.70.** What changed is that A1 is no longer
 mis-specified.
+
+## Run 23 — the edge trampoline lands; A0 met, A1 improved 3x but NOT met
+
+`b23503ea` patches every private->shared edge through a six-word trampoline that
+installs the TARGET unit's binding table before branching (design in run 22b).
+
+**Mechanism (A0) -- MET.** Go-build reference workload, sharing ON, which had
+never completed before:
+
+| metric | before | after |
+|---|---|---|
+| `resolve_src_private_tgt_shared` | 135,715,237 | **0** |
+| `resolve_private_to_shared_distinct_edges` | 74,726 | **0** |
+| workload | dies at `native DSR fault ... 0x20` | **BUILD_OK**, no faults |
+| `shared_blocks_mapped` | -- | 158,238 |
+| `shared_unit_hits` / loads | -- | 54 / 54 |
+
+Control arm, sharing OFF, same binary: 779,874 `direct_resolver_exits`.
+
+**Wall/CPU (A1) -- NOT MET.** ABBA, 8 quads, same binary, arms differ only by
+`--variant`:
+
+| metric | ratio ON/OFF | target | sd | resolvable |
+|---|---|---|---|---|
+| wall | **1.1141** | <=1.00 | 1.83% | >=1.07% |
+| cpu | **1.1062** | <=1.00 | 1.83% | >=1.06% |
+
+0/8 quads win, so the residual 11% is real, not noise. Against the 3.2-4.2x
+baseline this is a ~3x reduction in the regression, but sharing still costs more
+than it saves and therefore still ships OFF.
+
+### A measurement I got wrong first
+
+The first screen ran arm B as `--variant candidate` and reported 3.03x wall /
+3.55x CPU -- i.e. "amplification dead, regression unmoved", which would have
+falsified the whole approach. That variant also sets
+`CARRICK_DSR_ARTIFACT_SPIKE=1`, which neither this fix nor the gate's 173x
+baseline involves. The arm did not contain the change being tested. Fixed by
+adding `--variant shared` (`5f9cedfb`) with exactly the gate's configuration.
+
+Worth recording WHY it surfaced: `native_go_build.py` refuses to sample a dirty
+worktree, so editing the harness aborted all 32 runs instead of quietly
+producing numbers from unversioned code. The provenance guard turned a
+plausible-looking wrong answer into an obvious crash.
+
+### Where the residual 11% most likely is, and what to do
+
+The trampoline is not free: 74,726 edges x ~1,822 traversals x 6 words is
+~817 M extra instructions per build, the right order for a ~3.2 CPU-s delta
+(31.0 -> 34.2).
+
+Two candidates, cheapest first:
+
+1. **Shrink the executed trampoline 6 words -> 3**: replace the four-word
+   `movz`/`movk` chain with a PC-relative `ldr x17, <literal>`. Mechanical,
+   low risk; predicted ~5%, which alone does not reach 1.00.
+2. **Skip the trampoline when the process has exactly ONE loaded unit** --
+   patch the edge directly and install that unit's table at entry. Measured
+   54 unit loads across ~40 processes, so ~1.35 units per process: the vast
+   majority of edges would need no trampoline at all. This is what
+   constructions 1-4 attempted; they were correct for N=1 and wrong for N>1,
+   and the trampoline now covers N>1, so the guarded version is sound.
+
+**A1 not met (1.114 vs <=1.00). A2 not attempted. Primary metric unmoved: the
+shipped default is still sharing OFF, so `cpu_median_s` vs `0686248a` is
+unchanged.**
