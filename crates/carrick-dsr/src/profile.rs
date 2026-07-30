@@ -799,6 +799,12 @@ pub struct ProfileSnapshot {
     pub shared_unit_loads: u64,
     pub shared_blocks_mapped: u64,
     pub shared_translations_avoided: u64,
+    /// `ResolveDirect` exits classified by RANGE containment of the source and
+    /// target guest PCs in shared-unit code. Thread-scoped deltas, summable.
+    pub resolve_src_shared_tgt_shared: u64,
+    pub resolve_src_shared_tgt_private: u64,
+    pub resolve_src_private_tgt_shared: u64,
+    pub resolve_src_private_tgt_private: u64,
     /// Direct-binding registry counters. POINT-IN-TIME GAUGES on the process
     /// registry, never deltas -- like `cache_used_bytes`. Summing them across a
     /// process's thread records multiplies them by the reporting thread count;
@@ -970,6 +976,16 @@ impl CompleteThreadRecord {
             resolver.shared_translations_avoided,
         );
         frames.push(shared);
+        let mut resolve = self.frame_header("resolve-class");
+        let _ = write!(
+            resolve,
+            "|resolve_src_shared_tgt_shared={}|resolve_src_shared_tgt_private={}|resolve_src_private_tgt_shared={}|resolve_src_private_tgt_private={}",
+            resolver.resolve_src_shared_tgt_shared,
+            resolver.resolve_src_shared_tgt_private,
+            resolver.resolve_src_private_tgt_shared,
+            resolver.resolve_src_private_tgt_private,
+        );
+        frames.push(resolve);
         let mut binding = self.frame_header("direct-binding-gauge");
         let _ = write!(
             binding,
@@ -1506,7 +1522,7 @@ mod tests {
                 },
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 16);
+        assert_eq!(frames.len(), 17);
         assert!(frames[0].contains("|frame=core|"));
         assert!(frames[0].contains("|thread_cpu_ns=5"));
         let process = frames
@@ -1698,6 +1714,10 @@ mod tests {
                     direct_binding_cas_losses: u64::MAX,
                     direct_binding_stale_winner_clears: u64::MAX,
                     direct_binding_publication_retries: u64::MAX,
+                    resolve_src_shared_tgt_shared: u64::MAX,
+                    resolve_src_shared_tgt_private: u64::MAX,
+                    resolve_src_private_tgt_shared: u64::MAX,
+                    resolve_src_private_tgt_private: u64::MAX,
                     shared_unit_lookups: u64::MAX,
                     shared_unit_hits: u64::MAX,
                     shared_unit_loads: u64::MAX,
@@ -1726,7 +1746,7 @@ mod tests {
                 gauges,
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 16);
+        assert_eq!(frames.len(), 17);
         for frame in frames {
             let transport_len = frame.len().checked_add(1).expect("newline length");
             assert!(
