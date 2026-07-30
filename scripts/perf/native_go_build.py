@@ -28,6 +28,10 @@ ENGINE_BOTH = "both"
 VARIANT_DEFAULT = "default"
 VARIANT_PRECURSOR = "precursor"
 VARIANT_CANDIDATE = "candidate"
+# Container-lifetime sharing WITHOUT the artifact spike: the configuration the
+# A0/A1 gates are stated against (the 779,874 -> 135,259,579 exit amplification
+# was measured here, not under the spike).
+VARIANT_SHARED = "shared"
 PERFORMANCE_CONTROL_KEYS = (
     "CARRICK_DSR_ARTIFACT_SPIKE",
     "CARRICK_DSR_SHARED_TRANSLATION",
@@ -59,6 +63,11 @@ VARIANT_OVERLAYS: dict[str, dict[str, str | None]] = {
     },
     VARIANT_CANDIDATE: {
         "CARRICK_DSR_ARTIFACT_SPIKE": "1",
+        "CARRICK_DSR_SHARED_TRANSLATION": "1",
+        "CARRICK_DSR_DIRECT_BINDINGS": "1",
+    },
+    VARIANT_SHARED: {
+        "CARRICK_DSR_ARTIFACT_SPIKE": None,
         "CARRICK_DSR_SHARED_TRANSLATION": "1",
         "CARRICK_DSR_DIRECT_BINDINGS": "1",
     },
@@ -840,7 +849,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument(
         "--variant",
-        choices=(VARIANT_DEFAULT, VARIANT_PRECURSOR, VARIANT_CANDIDATE),
+        choices=(VARIANT_DEFAULT, VARIANT_PRECURSOR, VARIANT_CANDIDATE, VARIANT_SHARED),
         default=VARIANT_DEFAULT,
         help="select one fixed, scrubbed Carrick feature overlay",
     )
