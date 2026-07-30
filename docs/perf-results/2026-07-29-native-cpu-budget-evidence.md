@@ -448,3 +448,90 @@ arm that took one run each, after being asserted on the strength of a single
 correlated counter. The pattern is identical every time: a ratio measured only in
 the pathological arm, never in the healthy one. Run the control in the SAME
 commit as the claim.
+
+## Run 8 — profiling it, which is what should have happened first
+
+Runs 4–7 argued about WHICH COUNTER was big. None of them profiled the slow arm.
+This does, with `dtrace` + `ustack()`, matched arms (identical settings except
+`CARRICK_DSR_SHARED_TRANSLATION`, no `CARRICK_DSR_PROFILE` on either).
+
+### Two instrument faults had to be fixed first
+
+1. **The tracer was arming the hot probe.** `native-user-module-split.d` tracked
+   pids on BOTH `carrick*:::dsr-cache-capacity` and `carrick*:::dsr-cache-event`.
+   The latter fires per cache event — 136 M+ times with sharing on — so tracking
+   on it made the USDT forwarder itself 14.4 CPU-s of the profile. Track only on
+   `dsr-cache-capacity`, which fires once per process from
+   `ProcessTranslator::new`.
+2. **`ustack()` was unwalkable without frame pointers.** The first attempt
+   produced semantically impossible chains — `oci_client::sha256_digest` calling
+   `bad64::sysreg::ToPrimitive` calling `drop_in_place<Backtrace>` calling
+   `fcvtzs_z_p_z` — with the SAME bogus tail on every stack, the signature of an
+   unwinder scanning and snapping to nearest-preceding symbols. Rebuilding with
+   `RUSTFLAGS="-C force-frame-pointers=yes"` (a codegen flag, so the
+   `__DATA,__dof_carrick` USDT section survives — verified) produced coherent
+   stacks. Do not read a `ustack` profile of this binary without that flag.
+
+### Flat attribution, matched arms
+
+| | sharing OFF | sharing ON | ratio |
+|---|---|---|---|
+| total | 32.72 CPU-s | 113.27 CPU-s | 3.5x |
+| user | 22.20 | 56.52 | 2.5x |
+| kernel | 10.52 | 56.75 | **5.4x** |
+| carrick **host** code | 3.09 | **67.38** | **21.8x** |
+| JIT cache | 18.01 | 10.11 | **0.6x** |
+| system libs | 1.80 | 4.34 | 2.4x |
+
+The JIT cache share goes DOWN in absolute terms. Sharing does not make
+translated code slower — it moves the workload out of translated code and into
+carrick's own host resolver.
+
+### Where the host time goes
+
+Stacks containing, as a share of all on-CPU time (user stacks capture 31.5 of
+132.8 CPU-s; the remainder is kernel and JIT frames that do not unwind):
+
+| CPU-s | share | stack contains |
+|---|---|---|
+| 19.71 | 14.8% | `ThreadTranslator::finish_exit_profiled` |
+| 15.75 | 11.9% | `ThreadTranslator::translate_read_mostly` |
+| **13.81** | **10.4%** | **`parking_lot::RawRwLock::lock_{shared,exclusive}_slow`** |
+| 7.84 | 5.9% | `ThreadTranslator::prepare_entry` |
+
+Top leaf: `RawRwLock::lock_shared_slow` at 10.83 CPU-s, **8.2% of all on-CPU
+time**, with `lock_exclusive_slow` a further 2.2%.
+
+Every stack is the same shape:
+
+```
+run_native_thread_loop -> run_native_dsr_thread_loop_profiled
+  -> finish_exit_profiled (or prepare_entry)
+    -> translate_read_mostly
+      -> parking_lot::RawRwLock::lock_shared_slow
+```
+
+The kernel side corroborates it: the kernel leaves are `swtch_pri_continue` and
+`psynch_cvcontinue` — scheduler and condvar blocking, which is what a contended
+lock produces. (macOS/arm64 kernel stacks do not walk out of exception context,
+so only leaves are available.)
+
+### The answer
+
+**Sharing is slower because every one of the 173x-amplified gateway exits takes
+the process-wide `ProcessState` RwLock, and that lock goes to its parking
+slow path.** The exit amplification is the primary cause; the RwLock is where
+the amplified cost is actually paid, and it is the single largest identified
+consumer in the slow arm.
+
+That reframes the fix. Two independent levers now exist, and the second does not
+require understanding the exit amplification at all:
+
+1. Reduce the exits (still uncharacterised — see run 7's next measurement).
+2. **Make the exit path not contend.** `finish_exit_profiled` -> `translate_read_mostly`
+   takes a shared lock on every exit; a read-mostly fast path that avoids the
+   lock entirely (or a per-thread cache checked before it) removes 10.4% of CPU
+   in the slow arm regardless of why the exits are so numerous.
+
+Caveats: the frame-pointer build is not the shipping codegen; user stacks cover
+24% of on-CPU time; and this is one run per arm, not a paired screen.
