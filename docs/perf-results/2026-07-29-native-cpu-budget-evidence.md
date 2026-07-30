@@ -128,3 +128,69 @@ at this pair count, whatever its mechanism gate says.
    access (pervasive in Go) takes the 8-word general path instead of ~3 words.
 3. **carrick host user code, ~14%**, starting with `sha256::compress256` at 2.0%.
 4. Named syscalls, 9.3% in total, nothing above 2% — cannot move the headline.
+
+## Run 3 — `CARRICK_DSR_PROFILE=1` event counts
+
+The budget above says WHERE the CPU is; this says WHY, and it re-ranks the list.
+
+**Caveat first:** profiling slows this workload enough that the run hit its
+200 s timeout instead of finishing in ~17 s (`rc=125`), so the totals are a
+large partial sample and the *time* fractions are perturbed. The COUNTS and the
+per-process structure are what the conclusions below rest on.
+
+Aggregated over 47 guest processes:
+
+| metric | value |
+|---|---|
+| translations | **799,494** |
+| gateway entries | 1,018,915 |
+| code-cache lookups / hits | 799,570 / **76** |
+| invalidated blocks | 0 |
+| translation time | 4.87 s = 34.3% of profiled thread CPU (decode 15.3%, emit 18.6%) |
+
+Per-process translation counts: ~40 processes each translating **20,000–53,000
+blocks** (top: 53,173 / 46,874 / 46,835 / 43,029 …), and the top 40 account for
+780,788 of the 799,494 translations.
+
+Those ~40 processes are the per-package `compile` invocations of one `go build`
+— **the same toolchain binary, re-translated from scratch in every process.**
+The distinct block set across the whole build is a small fraction of 799,494.
+
+Read the 76/799,570 hit rate carefully: `CacheLookups` is incremented per
+*translate request*, and requests only reach the resolver when the upstream
+one-entry cache and direct-binding cells miss (`one_entry_hits` 491,878,
+`direct_resolver_exits` 512,505 on the same run). So the 0.01% is a statement
+that resolver requests are almost always for genuinely-new blocks — NOT that
+intra-process reuse is broken. The reuse that is missing is **across
+processes**.
+
+## Why this explains the three failed codegen cuts
+
+Translation is on the order of a third of the profiled thread CPU, and it scales
+with (processes x blocks-per-process) when it could scale with (distinct
+blocks). No amount of shaving executed words changes that term at all — and the
+executed-word cuts each removed ~1 of ~19 words in their path, which is below
+the instrument floor. Both halves of the disappointment have the same root: the
+work is dominated by translating code that was already translated in a sibling
+process, and by kernel faults, not by how tight the emitted code is.
+
+## Re-ranked, with the evidence for each rank
+
+1. **Cross-process (container-lifetime) translation reuse.** 799,494
+   translations across ~40 processes running the same binary. This is already
+   the repo's stated direction (`72b5a419` "plan container-lifetime translation
+   sharing", `92060018` "scope translation cache to one container"), and the
+   blocker is known and measured: shared translation is currently **17–50x
+   slower** than translating fresh, which is why it is off. Indexing
+   direct-binding records by edge took the worst case from >300 s to 64–76 s;
+   it needs to get under "translate it again" to be worth switching on.
+2. **Kernel non-syscall time, ~30%** — 2.2 M address-space and 1.79 M zero-fill
+   faults. Emitted code is only 2.08% of the zfod faults, so the mass is guest
+   anonymous memory plus the fork model.
+3. **Emitted-code SIZE, not speed** — `emit` is 18.6% and `decode` 15.3% of
+   profiled thread CPU. That reframes the literal pool: its 41 MB / 20%
+   reduction in emitted words was a real win against *translation* cost even
+   though it bought no execution speed. Size-reducing codegen is worth more than
+   cycle-reducing codegen on this workload.
+4. carrick host user code, ~14%, starting with `sha256::compress256` at 2.0%.
+5. Named syscalls, 9.3% total, nothing above 2%.
