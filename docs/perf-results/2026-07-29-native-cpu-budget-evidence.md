@@ -834,3 +834,47 @@ removes ~99.95% of 136 M gateway round-trips.
 when a target is outside `B` range: the unpatched site still holds its
 `b`-to-next-instruction into the gateway stub, which is correct and merely
 slower. Turning a placement accident into a failed translation was never right.
+
+### Run 13b — both proposed shapes are wrong, and a third is not
+
+Following the run 13 crash through, the two shapes proposed there do not survive
+contact:
+
+**Shape 1 (per-edge trampoline) is unsound.** A trampoline can install the
+unit's context state on the way in, but a direct branch has no return point, so
+nothing restores it on the way out. Control leaving shared code would run private
+blocks with a unit's state installed, and the signal handler classifies faulting
+PCs against exactly that state. A one-way branch cannot switch a *mode*.
+
+**Shape 2 (one unified binding table) is not constructible.** A unit's binding
+INDICES are baked into its immutable code at pack time and are unit-relative. A
+process loading several units cannot give them a common base without rewriting
+those indices, and it cannot rewrite them: unit code is pinned
+`VM_PROT_READ|VM_PROT_EXECUTE` (`LoadedTranslationProtection::ImmutableCode`) and
+is shared across processes.
+
+**Shape 3, which does survive.** Only ONE context field is genuinely per-unit:
+`generation_bindings`. The others are not —
+
+* the executable-range **catalog** already holds many ranges
+  (`executable_ranges.prepend(cache_start, cache_end)`), and the signal handler
+  already accepts "inside `cache_start..cache_end` OR in the catalog";
+* private blocks guard with `GenerationGuard::Absolute` (a baked cell address)
+  and never read `generation_bindings` at all — `BindingIndex` is constructed
+  only in a test.
+
+So if a process's `generation_bindings` pointer can be installed ONCE and left
+alone, a private -> shared direct branch needs no switch and becomes safe. The
+measurement says that is the common case already: **53 loaded units across 70
+processes**, i.e. most processes load at most one unit.
+
+Concretely: install the unit's `generation_bindings` at LOAD time rather than per
+gateway entry, permit the direct-link patch while a process holds exactly one
+loaded unit, and fall back to the gateway exit (today's behaviour) the moment a
+second unit loads. That is a far smaller change than either earlier shape, it
+preserves the existing path as the fallback, and it is gated by a condition the
+process can check locally.
+
+The falsification clause in the goal is therefore NOT triggered: the
+amplification is not intrinsic to sharing loaded units, it is intrinsic to
+sharing MORE THAN ONE of them per process — and the workload almost never does.
