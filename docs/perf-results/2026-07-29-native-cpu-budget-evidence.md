@@ -1687,3 +1687,53 @@ Two leads follow directly, both to be sized before building:
    and reusing it, which would cut both `compress256` and the compare.
 
 **A1 still NOT met at 1.114x. Primary metric unmoved -- sharing ships OFF.**
+
+## Run 25 — A1 is not reachable by cost. Sharing loses on COVERAGE.
+
+Sizing run 24's two leads against the goal's own "don't chase under 5%"
+guardrail kills both: `equal_same_length` is 0.36% of total and
+`compress256` ~0.45%. The named deltas are a long tail with no single lever,
+so there is nothing in the lookup path worth optimising on its own.
+
+That prompted measuring what sharing actually BUYS, which had not been done:
+
+| counter | value |
+|---|---|
+| `translations` (fresh) | **1,068,290** (A2 target <=400,000) |
+| `shared_blocks_mapped` | 158,238 |
+| coverage | **12.9%** (A2 target >=60%) |
+| per unit load | 2,930 blocks |
+| per process (~40) | 26,707 translated vs 3,956 mapped |
+
+Fresh translations are essentially UNCHANGED from the 1,031,914 baseline. The
+units load, the blocks map, the unit hit rate is fine (54/75) -- and the process
+still translates everything it was translating before.
+
+### The arithmetic that settles A1
+
+Translation is ~35.8% of CPU. At 12.9% coverage the most sharing can ever save
+is `0.129 x 35.8% ~= 4.6%` of CPU. The measured added cost is at least 5.2% in
+named leaves alone. **Even at ZERO edge cost, sharing at this coverage cannot be
+a net win** -- the benefit ceiling is below the cost floor.
+
+So A1 <= 1.0 is not reachable by making the mechanism cheaper, and the goal's
+premise -- "It loses on cost, not correctness" -- is wrong in a third way: it
+loses on COVERAGE. The exit amplification was real and is fixed (A0, 173x -> 0),
+the edge cost is real and is now 0.11% of total, and neither was ever the
+binding constraint.
+
+This is not the stated falsification condition (the amplification was NOT
+intrinsic), but it has the same consequence for sequencing: **A2's coverage
+metric is a PREREQUISITE for A1, not a follow-on.** Ordering A1 before A2 was a
+mistake in the goal, and every attempt to satisfy A1 on its own was
+consequently chasing a target that the coverage number forbids.
+
+### What to measure next
+
+Each unit load serves 2,930 blocks where the process needs 26,707. The question
+is why an artifact covers ~11% of what one process translates -- whether units
+are built from too narrow a capture, are capped, or are keyed so that most pages
+miss. That measurement, not another cost optimisation, is the path to A1.
+
+**A1 not met (1.114x) and NOT reachable at 12.9% coverage. A2 is now the
+blocking gate. Primary metric unmoved -- sharing ships OFF.**
