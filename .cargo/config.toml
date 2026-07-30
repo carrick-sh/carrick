@@ -19,3 +19,31 @@
 #
 # Build-speed wins that are SAFE (no linker change, no DTrace impact) live in the
 # workspace `[profile.*]` blocks in Cargo.toml.
+
+# ⚠️  DO NOT remove `force-frame-pointers` below.
+#
+# Without it `dtrace`'s `ustack()` cannot walk this binary, and — this is the
+# dangerous part — it does not fail loudly. It produces plausible-looking
+# NONSENSE by scanning the stack and snapping each word to the nearest preceding
+# symbol. A measured example from 2026-07-29:
+#
+#     carrick`oci_client::sha256_digest
+#     carrick`bad64::sysreg::...ToPrimitive...
+#     carrick`core::ptr::drop_in_place<Option<Backtrace>>
+#     carrick`fcvtzs_z_p_z+0x388
+#
+# — a call chain that cannot exist, with the SAME bogus tail on every stack.
+# Rebuilding with this flag turned the same profile into coherent stacks that
+# located a real defect (`RawRwLock::lock_shared_slow` at 8.2% of on-CPU time,
+# fixed in `perf(native): widen the per-thread block cache`). A profiler that
+# lies is worse than no profiler: it costs a whole investigation.
+#
+# Cost is near zero on aarch64-apple-darwin, where the platform ABI already
+# reserves x29 as the frame pointer; the x86_64 lanes give up %rbp, which is the
+# price of being able to profile them at all.
+#
+# CAVEAT: a `RUSTFLAGS` environment variable REPLACES this list wholesale rather
+# than appending to it, so exporting `RUSTFLAGS` silently drops frame pointers.
+# `just check-frame-pointers` (wired into `just ci`) fails if that happens.
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
