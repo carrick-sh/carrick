@@ -8,6 +8,7 @@ import statistics
 import struct
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import paired_stats
@@ -73,6 +74,19 @@ class PairedStatsTest(unittest.TestCase):
     def test_rejection_index_rejects_zero_population(self):
         with self.assertRaisesRegex(ValueError, "population must be positive"):
             paired_stats.rejection_index(paired_stats.BOOTSTRAP_SEED, 0)
+
+    def test_rejection_index_advances_past_rejected_output(self):
+        first_state = 0x1111
+        second_state = 0x2222
+        with mock.patch.object(
+            paired_stats,
+            "splitmix64",
+            side_effect=((first_state, paired_stats.MASK64), (second_state, 5)),
+        ) as splitmix64:
+            state, index, rejected = paired_stats.rejection_index(0, 3)
+
+        self.assertEqual((state, index, rejected), (second_state, 2, 1))
+        self.assertEqual(splitmix64.call_count, 2)
 
     def test_paired_bootstrap_rejects_empty_population(self):
         with self.assertRaisesRegex(ValueError, "ratios must not be empty"):
