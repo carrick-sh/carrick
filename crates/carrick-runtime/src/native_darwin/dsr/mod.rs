@@ -899,7 +899,7 @@ mod tests {
         // 15, up from 14: `resolver-shared` publishes the container-lifetime
         // translation counters, which existed in `ResolverStats` but were never
         // emitted -- so whether sharing ever hit was unobservable.
-        assert_eq!(frames.len(), 16);
+        assert_eq!(frames.len(), 17);
         assert!(frames.iter().any(|frame| frame.contains("|frame=process|")));
         assert!(
             frames
@@ -1440,8 +1440,8 @@ mod tests {
             let sibling_frames = frames_for_tid(&captured, SIBLING_TID);
             assert_eq!(
                 sibling_frames.len(),
-                16,
-                "the drain must emit the sibling's complete 16-frame record exactly once; \
+                17,
+                "the drain must emit the sibling's complete 17-frame record exactly once; \
                  captured stderr: {captured:?}"
             );
             for frame in [
@@ -1458,6 +1458,7 @@ mod tests {
                 "resolver-process",
                 "resolver-times",
                 "resolver-shared",
+                "resolve-class",
                 "direct-binding-gauge",
                 "cache-gauge",
                 "process",
@@ -1554,7 +1555,7 @@ mod tests {
             let frames = frames_for_tid(&captured, SELF_FLUSHED_TID);
             assert_eq!(
                 frames.len(),
-                16,
+                17,
                 "a self-flushed thread's record must appear exactly once (its own \
                  self-flush), never a second time from the leader's drain; captured: {captured:?}"
             );

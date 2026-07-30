@@ -495,6 +495,18 @@ pub struct ProcessState {
     shared_translation: Option<SharedTranslationConfiguration>,
     shared_blocks:
         BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), SharedBlockAuthority>,
+    /// Guest `[start, end)` of every block mapped from a loaded shared unit,
+    /// sorted and non-overlapping, for classifying a guest PC as shared or
+    /// private.
+    ///
+    /// `shared_blocks` is keyed by block START, which answers "is this PC a
+    /// shared block's ENTRY" -- not "is this PC inside shared code". Those differ
+    /// for every PC that is not an entry, and `PlannedExit::Direct` carries the
+    /// BRANCHING instruction's PC, which is an entry only for a one-instruction
+    /// block. Classifying exits with the start-keyed map is exactly what produced
+    /// the retracted `shared_source=178` reading in
+    /// `docs/perf-results/2026-07-29-native-cpu-budget-evidence.md` run 6.
+    shared_guest_ranges: Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>,
     loaded_shared_units: Vec<LoadedSharedUnit>,
     shared_unit_segments_consulted: BTreeSet<carrick_guest_mem::GuestVa>,
     shared_recording_segments: BTreeSet<carrick_guest_mem::GuestVa>,
@@ -607,6 +619,13 @@ pub struct ResolverStats {
     pub shared_unit_loads: u64,
     pub shared_blocks_mapped: u64,
     pub shared_translations_avoided: u64,
+    /// `ResolveDirect` exits classified by whether the SOURCE (the branching
+    /// instruction's guest PC) and the TARGET fall inside shared-unit code.
+    /// Thread-scoped, like `direct_resolver_exits`.
+    pub resolve_src_shared_tgt_shared: u64,
+    pub resolve_src_shared_tgt_private: u64,
+    pub resolve_src_private_tgt_shared: u64,
+    pub resolve_src_private_tgt_private: u64,
     invalid: Option<profile::ProfileError>,
 }
 
@@ -636,10 +655,14 @@ pub enum ResolverStat {
     SharedUnitLoads,
     SharedBlocksMapped,
     SharedTranslationsAvoided,
+    ResolveSrcSharedTgtShared,
+    ResolveSrcSharedTgtPrivate,
+    ResolveSrcPrivateTgtShared,
+    ResolveSrcPrivateTgtPrivate,
 }
 
 impl ResolverStat {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 24] = [
         Self::ResolverExits,
         Self::OneEntryHits,
         Self::Translations,
@@ -660,6 +683,10 @@ impl ResolverStat {
         Self::SharedUnitLoads,
         Self::SharedBlocksMapped,
         Self::SharedTranslationsAvoided,
+        Self::ResolveSrcSharedTgtShared,
+        Self::ResolveSrcSharedTgtPrivate,
+        Self::ResolveSrcPrivateTgtShared,
+        Self::ResolveSrcPrivateTgtPrivate,
     ];
 
     const fn name(self) -> &'static str {
@@ -684,6 +711,10 @@ impl ResolverStat {
             Self::SharedUnitLoads => "shared_unit_loads",
             Self::SharedBlocksMapped => "shared_blocks_mapped",
             Self::SharedTranslationsAvoided => "shared_translations_avoided",
+            Self::ResolveSrcSharedTgtShared => "resolve_src_shared_tgt_shared",
+            Self::ResolveSrcSharedTgtPrivate => "resolve_src_shared_tgt_private",
+            Self::ResolveSrcPrivateTgtShared => "resolve_src_private_tgt_shared",
+            Self::ResolveSrcPrivateTgtPrivate => "resolve_src_private_tgt_private",
         }
     }
 }
@@ -711,6 +742,10 @@ impl ResolverStats {
             ResolverStat::SharedUnitLoads => self.shared_unit_loads,
             ResolverStat::SharedBlocksMapped => self.shared_blocks_mapped,
             ResolverStat::SharedTranslationsAvoided => self.shared_translations_avoided,
+            ResolverStat::ResolveSrcSharedTgtShared => self.resolve_src_shared_tgt_shared,
+            ResolverStat::ResolveSrcSharedTgtPrivate => self.resolve_src_shared_tgt_private,
+            ResolverStat::ResolveSrcPrivateTgtShared => self.resolve_src_private_tgt_shared,
+            ResolverStat::ResolveSrcPrivateTgtPrivate => self.resolve_src_private_tgt_private,
         }
     }
 
@@ -736,6 +771,12 @@ impl ResolverStats {
             ResolverStat::SharedUnitLoads => self.shared_unit_loads = value,
             ResolverStat::SharedBlocksMapped => self.shared_blocks_mapped = value,
             ResolverStat::SharedTranslationsAvoided => self.shared_translations_avoided = value,
+            ResolverStat::ResolveSrcSharedTgtShared => self.resolve_src_shared_tgt_shared = value,
+            ResolverStat::ResolveSrcSharedTgtPrivate => self.resolve_src_shared_tgt_private = value,
+            ResolverStat::ResolveSrcPrivateTgtShared => self.resolve_src_private_tgt_shared = value,
+            ResolverStat::ResolveSrcPrivateTgtPrivate => {
+                self.resolve_src_private_tgt_private = value
+            }
         }
     }
 
@@ -1103,6 +1144,10 @@ impl ThreadTranslator {
                 .direct_bindings
                 .counters()
                 .publication_retries,
+            resolve_src_shared_tgt_shared: self.stats.resolve_src_shared_tgt_shared,
+            resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
+            resolve_src_private_tgt_shared: self.stats.resolve_src_private_tgt_shared,
+            resolve_src_private_tgt_private: self.stats.resolve_src_private_tgt_private,
             shared_unit_lookups: process.stats.shared_unit_lookups,
             shared_unit_hits: process.stats.shared_unit_hits,
             shared_unit_loads: process.stats.shared_unit_loads,
@@ -1166,6 +1211,10 @@ impl ThreadTranslator {
                 .direct_bindings
                 .counters()
                 .publication_retries,
+            resolve_src_shared_tgt_shared: self.stats.resolve_src_shared_tgt_shared,
+            resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
+            resolve_src_private_tgt_shared: self.stats.resolve_src_private_tgt_shared,
+            resolve_src_private_tgt_private: self.stats.resolve_src_private_tgt_private,
             shared_unit_lookups: delta.shared_unit_lookups,
             shared_unit_hits: delta.shared_unit_hits,
             shared_unit_loads: delta.shared_unit_loads,
@@ -1253,6 +1302,10 @@ impl ThreadTranslator {
             translation_publication_ns: 0,
             // Process-wide deltas, like the block above: owned by the draining
             // thread's own record, so structurally zero here.
+            resolve_src_shared_tgt_shared: stats.resolve_src_shared_tgt_shared,
+            resolve_src_shared_tgt_private: stats.resolve_src_shared_tgt_private,
+            resolve_src_private_tgt_shared: stats.resolve_src_private_tgt_shared,
+            resolve_src_private_tgt_private: stats.resolve_src_private_tgt_private,
             shared_unit_lookups: 0,
             shared_unit_hits: 0,
             shared_unit_loads: 0,
@@ -1518,6 +1571,7 @@ impl ProcessTranslator {
                 artifact_image_digest: None,
                 shared_translation: None,
                 shared_blocks: BTreeMap::new(),
+                shared_guest_ranges: Vec::new(),
                 loaded_shared_units: Vec::new(),
                 shared_unit_segments_consulted: BTreeSet::new(),
                 shared_recording_segments: BTreeSet::new(),
@@ -1771,6 +1825,7 @@ impl ProcessTranslator {
         state.executable_ranges.reset_head_to_private();
         recorder(DirectBindingResetEvent::ExecutableRangeHeadReset);
         state.shared_blocks.clear();
+        state.shared_guest_ranges.clear();
         state.loaded_shared_units.clear();
         recorder(DirectBindingResetEvent::UnitsDropped);
         state.executable_ranges.drop_shared_nodes();
@@ -1948,6 +2003,17 @@ impl ProcessState {
                 block.guest_start,
                 observation.expected(),
             );
+            if let Some(end) = block
+                .guest_start
+                .raw()
+                .checked_add((block.template.source_words().len() as u64) * 4)
+            {
+                // Guest extent comes from the SOURCE words; `code_len` is the
+                // emitted cache length and bears no fixed relation to the span of
+                // guest instructions the block covers.
+                self.shared_guest_ranges
+                    .push((block.guest_start, carrick_guest_mem::GuestVa(end)));
+            }
             self.shared_blocks.insert(
                 block_key,
                 SharedBlockAuthority {
@@ -1960,6 +2026,7 @@ impl ProcessState {
                 },
             );
         }
+        self.shared_guest_ranges.sort_unstable();
         self.stats.shared_blocks_mapped = self
             .stats
             .shared_blocks_mapped
@@ -2655,6 +2722,24 @@ impl ProcessState {
     }
 
     /// Drop every published block together with the indexes over them.
+    /// Is `pc` inside a block mapped from a loaded shared unit?
+    ///
+    /// Binary search over the sorted ranges: this runs on every `ResolveDirect`
+    /// under profiling, so it must not be a scan.
+    fn shared_block_contains(&self, pc: carrick_guest_mem::GuestVa) -> bool {
+        let ranges = &self.shared_guest_ranges;
+        match ranges.binary_search_by(|(start, _)| start.raw().cmp(&pc.raw())) {
+            // Exact hit on a block start.
+            Ok(_) => true,
+            // Otherwise the candidate is the range starting just below `pc`.
+            Err(0) => false,
+            Err(index) => {
+                let (_, end) = ranges[index - 1];
+                pc.raw() < end.raw()
+            }
+        }
+    }
+
     fn clear_published(&mut self) {
         self.published.clear();
         self.private_published_index.clear();
@@ -3004,6 +3089,10 @@ impl ThreadTranslator {
             shared_blocks_mapped: process.shared_blocks_mapped,
             shared_translations_avoided: process.shared_translations_avoided,
             invalid: self.stats.invalid.or(process.invalid),
+            resolve_src_shared_tgt_shared: self.stats.resolve_src_shared_tgt_shared,
+            resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
+            resolve_src_private_tgt_shared: self.stats.resolve_src_private_tgt_shared,
+            resolve_src_private_tgt_private: self.stats.resolve_src_private_tgt_private,
         }
     }
 
@@ -3378,8 +3467,27 @@ impl ThreadTranslator {
                 types::NativeDsrExit::Syscall { .. } => {
                     self.stats.add(ResolverStat::SyscallExits, 1);
                 }
-                types::NativeDsrExit::ResolveDirect { .. } => {
+                types::NativeDsrExit::ResolveDirect { source, target, .. } => {
                     self.stats.add(ResolverStat::DirectResolverExits, 1);
+                    // A0's exit criterion: classify by RANGE containment, and
+                    // report source and target together. One shared `read()` for
+                    // both, under the profiling guard only.
+                    let (source_shared, target_shared) = {
+                        let state = self.process.state.read();
+                        (
+                            state.shared_block_contains(source),
+                            state.shared_block_contains(target),
+                        )
+                    };
+                    self.stats.add(
+                        match (source_shared, target_shared) {
+                            (true, true) => ResolverStat::ResolveSrcSharedTgtShared,
+                            (true, false) => ResolverStat::ResolveSrcSharedTgtPrivate,
+                            (false, true) => ResolverStat::ResolveSrcPrivateTgtShared,
+                            (false, false) => ResolverStat::ResolveSrcPrivateTgtPrivate,
+                        },
+                        1,
+                    );
                 }
                 types::NativeDsrExit::ResolveIndirect { .. } => {}
                 _ => {}

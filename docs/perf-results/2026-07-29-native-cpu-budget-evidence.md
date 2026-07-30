@@ -602,3 +602,55 @@ campaign started with:
 Independent corroboration of a landed change: `sha256::compress256` is 0.40% of
 total here against **1.99%** in run 2, a ~5x drop consistent with the 4.0x
 hardware-backend speedup measured in isolation.
+
+## Run 10 — A0 met: the amplification is entirely private -> shared edges
+
+Run 6's source classification was invalid (it compared a BRANCH PC against
+block-START keys). This redoes it the way the goal's A0 exit criterion demands:
+`ProcessState::shared_guest_ranges` records each mapped shared block's guest
+`[start, end)` from its `source_words`, and every `ResolveDirect` is classified
+by binary-search RANGE containment of BOTH source and target.
+
+Sharing ON, 49.8 s, BUILD_OK, 136,489,314 `ResolveDirect` exits:
+
+| exits | share | class |
+|---|---|---|
+| 135,715,237 | **99.4%** | source private -> **target SHARED** |
+| 733,764 | 0.5% | source private -> target private |
+| 33,763 | 0.02% | source SHARED -> target SHARED |
+| 6,550 | 0.005% | source SHARED -> target private |
+
+**The control arm is built into the same measurement.** Sharing OFF totals
+779,874 `direct_resolver_exits`; here the private -> private population is
+733,764 — the same number. Enabling sharing does not change the normal exit
+population at all. It ADDS 135.7 M private -> shared exits, and those are the
+entire 173x.
+
+Two further facts fall out:
+
+- **Shared blocks barely exit at all** (40,313 combined, 0.03%). Their internal
+  edges are patched at pack time by `patch_same_unit_direct_link`, so
+  intra-unit control flow never reaches the gateway. The unit's own code is
+  fine; it is the boundary INTO it that is not.
+- **Every private -> shared edge re-resolves on every traversal.** 135.7 M
+  exits against 175,558 mapped shared blocks is ~770 re-resolutions per shared
+  block. Nothing binds that edge, ever.
+
+### A0 verdict
+
+Mechanism named: **a direct edge from privately-translated code into a
+loaded shared block is never bound, so it takes a full gateway round-trip every
+time it executes; shared blocks are the hot ones, so this is 99.4% of all
+resolver exits.** Confirmed by control: the private -> private population is
+unchanged between arms.
+
+### What A1 has to answer
+
+Private blocks emit `DirectExitEmissionPolicy::PrivateGateway`, an
+unconditional gateway exit with no cell and no baked branch, and the emitter
+never consults already-translated blocks (`committed_link` is cell-recovery
+metadata, not an emit-time target). Yet private -> private edges resolve only
+~0.7 M times for ~1.05 M translations — about once each — so SOMETHING stops
+them re-resolving that does not apply to a shared target. Find that mechanism
+and either extend it to shared targets or explain why it cannot be. Do not
+guess: five hypotheses have already died here.
