@@ -2002,20 +2002,43 @@ impl ProcessState {
             let (map, recovery, _direct_links) = block.template.take_runtime_metadata(host_bias)?;
             let block_key = (block.guest_start, types::CodeGeneration::INITIAL);
             if block.requires_sensitive_metadata {
-                let planned = block::plan_block(
+                // Mirror TRANSLATE-time planning exactly: same segment limit,
+                // and read the TERMINAL exit. `plan_block` plans one segment,
+                // and `BlockPlan::exit` is the FIRST segment's exit -- for a
+                // fused plan that is an internal conditional edge, never the
+                // terminator. Reading it here rejected every fused
+                // sensitive-exit block with "lost sensitive metadata identity"
+                // the moment superblocks became shareable.
+                let planned = block::plan_block_with_segments(
                     memory,
                     block.guest_start,
                     types::CodeGeneration::INITIAL,
                     256,
+                    self.superblock_segments,
                 )?;
-                let block::PlannedExit::Sensitive { exit, fusion, .. } = planned.exit else {
+                let block::PlannedExit::Sensitive {
+                    guest: sensitive_guest,
+                    exit,
+                    fusion,
+                    ..
+                } = planned.terminal_exit()
+                else {
                     return Err(types::DsrError::CachePolicy(format!(
                         "shared block 0x{:x} lost sensitive metadata identity",
                         block.guest_start.raw(),
                     )));
                 };
-                self.sensitive
-                    .insert(block_key, SensitiveMetadata { exit, fusion });
+                // Key by the SENSITIVE instruction's guest PC, exactly as the
+                // translate path does -- the exit lookup is by that PC, not by
+                // the block's start, and the two differ for any block longer
+                // than one instruction.
+                if let Some(site) = fusion {
+                    self.record_exclusive_fusion_site(site);
+                }
+                self.sensitive.insert(
+                    (sensitive_guest, types::CodeGeneration::INITIAL),
+                    SensitiveMetadata { exit, fusion },
+                );
             }
             self.push_published(PublishedBlock {
                 entry,
@@ -2540,13 +2563,21 @@ impl ProcessState {
                     && let Some(segment) = portable_segment
                     && self.shared_recording_segments.contains(&segment)
                     && let Some(source_words) = block_source_words.clone()
-                    // Superblocks are deliberately out of scope for the shared
-                    // and artifact caches in this slice: both key a template on
-                    // one block's source words and replay it byte-for-byte, and
-                    // neither has been proven against a plan whose emitted unit
-                    // spans several guest blocks. A fused block simply takes the
-                    // plain emit path -- a lost cache hit, never wrong code.
-                    && block.extensions.is_empty()
+                    // Fused (superblock) plans ARE in scope. Superblock
+                    // formation extends only along the FALL-THROUGH edge and
+                    // stops at `page_end`, so a fused plan is contiguous and
+                    // single-page and `block.end` covers every segment. The
+                    // template key is `instruction_fingerprint_words(start,
+                    // (end - start) / 4)`, which therefore already spans the
+                    // whole fused region, and `record_portable_block_artifact`
+                    // assembles from the same `BlockPlan` -- extensions
+                    // included -- that the plain emit path uses. Excluding them
+                    // cost 2.2x of shared coverage: 14.4% fused vs 32.1%
+                    // unfused (run 26).
+                    //
+                    // `ExclusiveRegion` stays out via the terminal-exit list
+                    // below: that lowering owns its whole block and is not a
+                    // segment.
                     && matches!(
                         block.terminal_exit(),
                         block::PlannedExit::Syscall { .. }
