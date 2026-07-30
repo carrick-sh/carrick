@@ -423,16 +423,12 @@ mod tests {
         )
         .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &copy_plan()).expect("emit copy-only block");
-        // 56, down from 60, down from 72. The gateway address stopped being a
-        // four-word `movz`/`movk` chain in `26de3c07` (it loads from the context
-        // now); this drop is the exit TARGET taking the same treatment, one `ldr`
-        // from the block's literal pool instead of four words
-        // (`emit::LiteralPool`). Pinned deliberately -- emitted size is a
-        // first-order cost on this lane, measured at 599 MB of JIT output across
-        // one `go build`, and this is the cheapest regression detector for it.
-        //
-        // `len` includes the pool; `instruction_bytes` is the code alone.
-        assert_eq!(emitted.len(), 56);
+        // 60, down from 72: the exit stub materialized its gateway address with
+        // a four-word `movz`/`movk` chain and now loads it from the context in
+        // one `ldr`. Pinned deliberately -- emitted size is a first-order cost
+        // on this lane (~717 MB of JIT output for one `go build`), and this is
+        // the cheapest regression detector for it.
+        assert_eq!(emitted.len(), 60);
         let original_words = [0xd503_201f, 0x9100_0400];
         let entry_word =
             unsafe { std::ptr::read_unaligned(emitted.entry().host().raw() as *const u32) };
@@ -1155,9 +1151,7 @@ mod tests {
         .expect("allocate translation cache");
         for plan in plans {
             let emitted = emit_block_direct(&mut cache, &plan).expect("emit mapped block");
-            // Stop at the literal pool: those words are data, unreachable, and
-            // deliberately unmapped.
-            for offset in (0..emitted.instruction_bytes()).step_by(4) {
+            for offset in (0..emitted.len()).step_by(4) {
                 let offset = CacheOffset::published(offset as u32);
                 assert!(
                     emitted.map().guest_for_cache(offset).is_some(),
@@ -1698,21 +1692,15 @@ mod tests {
                 .position(|word| *word == target_store)
                 .map(|offset| slow_tail + offset)
                 .expect("sensitive exit target store");
-            // The target is now ONE `ldr x17, <literal>` rather than a four-word
-            // `movz`/`movk` chain (`emit::LiteralPool`). Assert the stronger
-            // thing the old shape check could not: follow the instruction's own
-            // displacement to the pool and read what the CPU will actually load.
-            let load = words[target - 1];
+            let target_value = [
+                0xd280_0000 | (0x4004 << 5) | 17,
+                0xf280_0000 | (1 << 21) | 17,
+                0xf280_0000 | (2 << 21) | 17,
+                0xf280_0000 | (3 << 21) | 17,
+            ];
             assert_eq!(
-                load & 0xff00_001f,
-                0x5800_0011,
-                "slow sensitive exit must load its target with `ldr x17, <literal>`, got {load:#010x}"
-            );
-            let displacement = ((load >> 5) & 0x7ffff) as usize;
-            let entry = target - 1 + displacement;
-            let loaded = u64::from(words[entry]) | (u64::from(words[entry + 1]) << 32);
-            assert_eq!(
-                loaded, 0x4004,
+                &words[target - target_value.len()..target],
+                &target_value,
                 "slow sensitive exit target must use the published fallback resume PC"
             );
             let source_store = 0xf900_0000 | ((1088 / 8) << 10) | (28 << 5) | 17;
@@ -1720,20 +1708,15 @@ mod tests {
                 .iter()
                 .rposition(|word| *word == source_store)
                 .expect("sensitive exit source store");
-            // Same pool treatment as the target above.
-            let source_load = words[source - 1];
+            let source_value = [
+                0xd280_0000 | (0x4000 << 5) | 17,
+                0xf280_0000 | (1 << 21) | 17,
+                0xf280_0000 | (2 << 21) | 17,
+                0xf280_0000 | (3 << 21) | 17,
+            ];
             assert_eq!(
-                source_load & 0xff00_001f,
-                0x5800_0011,
-                "slow sensitive exit must load its source with `ldr x17, <literal>`, \
-                 got {source_load:#010x}"
-            );
-            let source_displacement = ((source_load >> 5) & 0x7ffff) as usize;
-            let source_entry = source - 1 + source_displacement;
-            let source_loaded =
-                u64::from(words[source_entry]) | (u64::from(words[source_entry + 1]) << 32);
-            assert_eq!(
-                source_loaded, 0x4000,
+                &words[source - source_value.len()..source],
+                &source_value,
                 "slow sensitive exit source must be the original load PC"
             );
         }
