@@ -1435,3 +1435,60 @@ attempts were aimed at an unverified target. The measured facts remain:
 (`snapshot.x[]`, `esr`, `far` at the unlowerable-fault site), reproduce, and read
 what `far = 0` actually is. Everything else about this fix is already known to
 work.
+
+## Run 22 — A1 attributed: the fault is not about the binding table
+
+Run 21d said `far = 0` must be ATTRIBUTED before being acted on. Two fixes were
+then attempted without doing that. This run does it.
+
+Restored the full register dump at the unlowerable-fault site and re-applied the
+minimal repro (private->shared edges patchable once a unit's bindings are
+installed). Result: the amplification dies as it always does --
+`resolve_src_private_tgt_shared` 135,715,237 -> **0**, `direct_resolver_exits`
+136,489,314 -> **1,402** -- and the guest faults 11 times, all at
+`far=0x60`, `esr=0x92000006` (translation fault, level 2), across two guest PCs.
+
+`0x60 = 6 x 16`, which matches a `GenerationGuard::BindingIndex` dereference of a
+NULL table at index 6. But the guard emits
+
+    ldr x19, [x28, #CTX_GENERATION_BINDINGS]
+    mov x17, #index
+    add x19, x19, x17, LSL #4
+    ldp x19, x17, [x19]          // faults here when the table is NULL
+
+so a fault in that `ldp` implies `x19 = 0x60` and `x17 = 6`. The snapshot reports
+`x19 = 0` and `x17 = 0` -- both are DSR-reserved scratch and not carried as guest
+state, so the register file neither confirms nor refutes the guard. **`far = 0x60`
+on its own remains non-diagnostic**, exactly as run 21d warned.
+
+What settles it is not the registers. It is the comment already sitting on the
+excluded branch, written at run 13 and then narrowed by me into "the bindings
+pointer":
+
+> A loaded unit's block reads unit-specific state from the context -- its
+> `generation_bindings` table, **cache range and target authority** -- which only
+> the gateway installs when it enters that unit.
+
+A direct branch bypasses the gateway, so it bypasses **all three** installations.
+Every one of the four constructions supplied exactly one of them. That is why each
+one killed the amplification and still faulted, and why the fault kept moving
+between `0x20`, `0x60` and `0` -- those are different unit-specific reads failing,
+not one bug relocating.
+
+### Consequence for Workstream A
+
+The shape "let a private context branch directly into a shared block, and hand it
+the missing state" cannot work by adding fields, because a private context may
+reach blocks from ANY loaded unit while a context can hold one unit's authority at
+a time. The two shapes that remain:
+
+1. Make shared blocks reachable from private contexts guard with `Absolute`
+   (self-contained, no unit-specific context read) -- costs the per-unit
+   indirection that `BindingIndex` exists to provide.
+2. Keep the exclusion and attack the 74,726 x 1,822 traversals by making the
+   gateway exit cheap, rather than by removing it.
+
+Neither is a variant of what was tried. A1 stays open, but it is no longer
+mis-specified: the target is unit-authority installation, not a null pointer.
+
+**A1 remains NOT MET. Primary metric unmoved at 0.9947 (target <=0.70).**
