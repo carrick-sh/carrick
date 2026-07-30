@@ -52,6 +52,21 @@ const _: () = assert!(RESERVED_SCRATCH == 19);
 /// (slot 144) and guest x28 (slot 224).
 pub const CTX_GUEST_RESERVED_SCRATCH: u32 = 152;
 
+/// Byte offset of the gateway phase, `DsrContext::entry_in_progress`.
+///
+/// Not a boolean: 1 means the gateway is handing control to translated code,
+/// 0 means translated code is executing, and 2 means the gateway's exit path has
+/// captured guest state and is transitioning host signal masks.
+/// `carrick_native_dsr_signal_handler` branches on all three, and does NOT trust
+/// phase 0 alone -- it also requires the interrupted PC to be inside the code
+/// cache or the executable-range catalog.
+///
+/// `gateway_aarch64.S` names this offset numerically as `CTX_GATEWAY_PHASE` and
+/// `csrc/native_darwin.c` static-asserts it, because neither an assembler nor a C
+/// compiler can read a Rust const. The `offset_of!` assertion below is what keeps
+/// the three in step.
+pub const CTX_GATEWAY_PHASE: u32 = 1152;
+
 pub const CTX_INDIRECT_CACHE: u32 = 1136;
 pub const CTX_GENERATION: u32 = 1144;
 pub const CTX_ENFORCE_CACHE_AUTHORITY: u32 = 1156;
@@ -551,6 +566,8 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, rewrite_context_scratch) 
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_cache) == 1136);
 const _: () = assert!(std::mem::offset_of!(DsrContext, generation) == 1144);
 const _: () = assert!(std::mem::offset_of!(DsrContext, entry_in_progress) == 1152);
+const _: () =
+    assert!(std::mem::offset_of!(DsrContext, entry_in_progress) == CTX_GATEWAY_PHASE as usize);
 const _: () = assert!(std::mem::offset_of!(DsrContext, enforce_cache_authority) == 1156);
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x15_scratch) == 1160);
 const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_x30_scratch) == 1168);

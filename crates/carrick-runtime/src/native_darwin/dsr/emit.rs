@@ -423,12 +423,14 @@ mod tests {
         )
         .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &copy_plan()).expect("emit copy-only block");
-        // 60, down from 72: the exit stub materialized its gateway address with
-        // a four-word `movz`/`movk` chain and now loads it from the context in
-        // one `ldr`. Pinned deliberately -- emitted size is a first-order cost
-        // on this lane (~717 MB of JIT output for one `go build`), and this is
-        // the cheapest regression detector for it.
-        assert_eq!(emitted.len(), 60);
+        // 56, down from 60 and originally 72: the exit stub stopped materializing
+        // its gateway address with a four-word `movz`/`movk` chain and now loads
+        // it from the context in one `ldr`, and the prologue stopped re-claiming
+        // the gateway phase (`gateway_aarch64.S` claims it as its last act before
+        // branching in). Pinned deliberately -- emitted size is a first-order
+        // cost on this lane (~717 MB of JIT output for one `go build`), and this
+        // is the cheapest regression detector for it.
+        assert_eq!(emitted.len(), 56);
         let original_words = [0xd503_201f, 0x9100_0400];
         let entry_word =
             unsafe { std::ptr::read_unaligned(emitted.entry().host().raw() as *const u32) };
@@ -436,10 +438,13 @@ mod tests {
             bad64::decode(entry_word, emitted.entry().host().raw() as u64)
                 .expect("decode entry marker")
                 .op(),
-            bad64::Op::STR
+            // The reload of guest x17, which the gateway clobbers to branch in.
+            // This used to be the `str wzr, [x28, #CTX_GATEWAY_PHASE]` that every
+            // block opened with; the gateway now claims phase zero itself.
+            bad64::Op::LDR
         );
         for (index, original_word) in original_words.into_iter().enumerate() {
-            let offset = (index + 2) * 4;
+            let offset = (index + 1) * 4;
             let pointer = (emitted.entry().host().raw() + offset) as *const u32;
             let word = unsafe { std::ptr::read_unaligned(pointer) };
             let decoded = bad64::decode(word, emitted.entry().host().raw() as u64 + offset as u64)
@@ -460,7 +465,7 @@ mod tests {
         );
         assert_eq!(
             emitted.map().cache_for_guest(GuestVa(0x4004)),
-            Some(CacheOffset::published(12))
+            Some(CacheOffset::published(8))
         );
         for entry in emitted.map().entries() {
             assert_eq!(entry.cache.get() % 4, 0);
@@ -502,7 +507,9 @@ mod tests {
         )
         .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &plan).expect("emit direct memory block");
-        let pointer = (emitted.entry().host().raw() + 8) as *const u32;
+        // One word in, not two: the prologue no longer opens with a store
+        // claiming the gateway phase.
+        let pointer = (emitted.entry().host().raw() + 4) as *const u32;
         assert_eq!(unsafe { std::ptr::read_unaligned(pointer) }, word);
     }
 
@@ -964,7 +971,9 @@ mod tests {
         )
         .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &plan).expect("emit direct SVE memory block");
-        let pointer = (emitted.entry().host().raw() + 8) as *const u32;
+        // One word in, not two: the prologue no longer opens with a store
+        // claiming the gateway phase.
+        let pointer = (emitted.entry().host().raw() + 4) as *const u32;
         assert_eq!(unsafe { std::ptr::read_unaligned(pointer) }, word);
     }
 

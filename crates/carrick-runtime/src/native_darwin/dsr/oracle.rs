@@ -8159,10 +8159,18 @@ fn dsr_live_kick_inside_fused_biased_exclusive_region_restores_both_scratch_gprs
     let _signal_oracle = install_signal_handlers_for_oracle();
     // Which emitted words the core reports as the interrupted PC is
     // microarchitectural and shifts with the body width, so sweep widths until
-    // their UNION covers every required word. `4` reaches all of them on its
+    // their UNION covers every required word. `13` reaches all of them on its
     // own most runs; the rest are the fallback.
+    //
+    // The covering width is NOT stable across changes to the emitted layout: it
+    // tracks the region's alignment, so removing or adding even one prologue word
+    // moves it. When the prologue stopped re-claiming the gateway phase the
+    // covering width went 4 -> 13, and every width from 1 to 12 lost the store
+    // (measured, 40k kicks each). A `store=false` failure here therefore means
+    // "re-find the covering width", not "recovery broke" -- the recovery
+    // assertions live inside the sweep and are unconditional.
     let mut sweeps: Vec<FusedRegionKickSweep> = Vec::new();
-    for (index, body_len) in [4_usize, 2, 16, 1, 8, 3, 6, 12].into_iter().enumerate() {
+    for (index, body_len) in [13_usize, 4, 2, 16, 1, 8, 3, 6, 12].into_iter().enumerate() {
         sweeps.push(live_biased_exclusive_kick_sweep(
             GuestVa(0x21_0000_0000 + (index as u64) * 0x10_0000),
             body_len,

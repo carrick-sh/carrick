@@ -5069,16 +5069,11 @@ fn assemble_block_inner(
     );
     let mut direct_links = Vec::with_capacity(plan.extensions.len() + 2);
     let mut recovery = Vec::new();
-    let entry_marker = current_offset(&assembler)?;
-    map_next(&assembler, &mut entries, plan.start)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str wzr, [x28, #1152]
-    );
-    recovery.push(RecoveryEntry {
-        cache: entry_marker,
-        action: RecoveryAction::RestoreGuestX17,
-    });
+    // No `str wzr, [x28, #1152]` here any more: `gateway_aarch64.S` claims phase
+    // zero as its last act before branching in, so a block does not re-claim it.
+    // That store was 15.1% of all sampled JIT instructions -- one per block
+    // entry, against one per GATEWAY entry now, and a direct-linked chain runs
+    // many blocks per gateway entry.
     let lean_guard = lean_generation_guard_enabled();
     let stale = guard.map(|_| assembler.new_dynamic_label());
     if !lean_guard {
@@ -6745,9 +6740,18 @@ mod tests {
                     !words.contains(&0xd53b_4210) && !words.contains(&0xd51b_4210),
                     "{name} guard still round-trips NZCV: {words:08x?}"
                 );
-                // Two stores remain and both are load-bearing: the gateway
-                // phase publish and the guard's own generation publish.
-                assert_eq!(stores, 2, "{name} lean prologue store count: {words:08x?}");
+                // ONE store remains, and it is the guard's own generation
+                // publish. The gateway-phase publish that used to sit beside it
+                // moved into `gateway_aarch64.S`, which claims phase zero once
+                // per GATEWAY entry instead of once per block entry.
+                assert_eq!(stores, 1, "{name} lean prologue store count: {words:08x?}");
+                assert!(
+                    !words
+                        .iter()
+                        .any(|word| context_store_slot(*word)
+                            == Some(crate::gateway::CTX_GATEWAY_PHASE)),
+                    "{name} prologue must not re-claim the gateway phase: {words:08x?}"
+                );
                 // Its scratch is the host-owned reserved register, and guest
                 // x16 is never named at all.
                 assert!(
@@ -7712,9 +7716,9 @@ mod tests {
                     source: GuestVa(0x4000),
                     target: GuestVa(0x5000),
                     kind: DirectLinkKind::Branch,
-                    slot: 16,
-                    stub_start: 20,
-                    stub_end: 276,
+                    slot: 12,
+                    stub_start: 16,
+                    stub_end: 272,
                     committed_link: None,
                 }],
             ),
@@ -7732,9 +7736,9 @@ mod tests {
                     source: GuestVa(0x4000),
                     target: GuestVa(0x5000),
                     kind: DirectLinkKind::Call,
-                    slot: 32,
-                    stub_start: 36,
-                    stub_end: 292,
+                    slot: 28,
+                    stub_start: 32,
+                    stub_end: 288,
                     committed_link: Some(0x4004),
                 }],
             ),
@@ -7753,18 +7757,18 @@ mod tests {
                         source: GuestVa(0x4000),
                         target: GuestVa(0x4004),
                         kind: DirectLinkKind::ConditionalFallthrough,
-                        slot: 20,
-                        stub_start: 28,
-                        stub_end: 284,
+                        slot: 16,
+                        stub_start: 24,
+                        stub_end: 280,
                         committed_link: None,
                     },
                     ExpectedDirectLink {
                         source: GuestVa(0x4000),
                         target: GuestVa(0x5000),
                         kind: DirectLinkKind::ConditionalTaken,
-                        slot: 24,
-                        stub_start: 284,
-                        stub_end: 540,
+                        slot: 20,
+                        stub_start: 280,
+                        stub_end: 536,
                         committed_link: None,
                     },
                 ],
@@ -7783,9 +7787,9 @@ mod tests {
                     source: GuestVa(0x4004),
                     target: GuestVa(0x4004),
                     kind: DirectLinkKind::Continue,
-                    slot: 16,
-                    stub_start: 20,
-                    stub_end: 276,
+                    slot: 12,
+                    stub_start: 16,
+                    stub_end: 272,
                     committed_link: None,
                 }],
             ),
