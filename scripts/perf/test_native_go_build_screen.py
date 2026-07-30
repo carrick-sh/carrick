@@ -86,9 +86,11 @@ class NativeGoBuildScreenTest(unittest.TestCase):
         )
 
         self.assertEqual(first, second)
-        self.assertEqual(first["seed"], 0)
+        self.assertEqual(first["seed_hex"], "0x4341525249434b31")
         self.assertEqual(first["draws"], 100_000)
-        self.assertEqual(first["one_sided_95_ratio"], 91 / 99)
+        self.assertEqual(first["one_sided_upper"], 46 / 51)
+        self.assertEqual(first["prng_id"], "splitmix64-v1")
+        self.assertEqual(first["sampler_id"], "u64-rejection-mod-v1")
 
     def test_retention_requires_candidate_median_below_c0(self):
         rows = []
@@ -200,10 +202,9 @@ class NativeGoBuildScreenTest(unittest.TestCase):
             [10, 20, 30, 40, 50],
             [5, 10, 15, 20, 25],
             draws=10,
-            seed=0,
+            seed=0x4341525249434B31,
         )
-        self.assertEqual(fixture["nearest_rank_index"], 10)
-        self.assertEqual(fixture["one_sided_95_ratio"], 1.5)
+        self.assertEqual(fixture["one_sided_upper"], 0.5)
 
     def test_rejected_screen_is_written_atomically_with_samples(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,14 +4,14 @@
 from __future__ import annotations
 
 import argparse
-import math
+import dataclasses
 import pathlib
-import random
 import statistics
 import sys
 from collections.abc import Callable, Sequence
 
 import native_go_build
+import paired_stats
 
 
 SCHEMA = "carrick.native-go-build-screen.v1"
@@ -42,30 +42,17 @@ def bootstrap_ratio(
     controls: Sequence[int],
     candidates: Sequence[int],
     *,
-    draws: int = 100_000,
-    seed: int = 0,
+    draws: int = paired_stats.BOOTSTRAP_DRAWS,
+    seed: int = paired_stats.BOOTSTRAP_SEED,
 ) -> dict[str, object]:
     if len(controls) != 5 or len(candidates) != 5:
         raise ValueError("bootstrap requires exactly five controls and candidates")
-    if draws <= 0:
-        raise ValueError("bootstrap draws must be positive")
-    generator = random.Random(seed)
-    ratios = []
-    for _ in range(draws):
-        control = [generator.choice(controls) for _ in range(5)]
-        candidate = [generator.choice(candidates) for _ in range(5)]
-        control_median = median(control)
-        if control_median <= 0:
-            raise ValueError("bootstrap control median must be positive")
-        ratios.append(median(candidate) / control_median)
-    ratios.sort()
-    nearest_rank = math.ceil(0.95 * draws)
-    return {
-        "seed": seed,
-        "draws": draws,
-        "nearest_rank_index": nearest_rank,
-        "one_sided_95_ratio": ratios[nearest_rank - 1],
-    }
+    if any(control <= 0 for control in controls):
+        raise ValueError("paired controls must be positive")
+    ratios = [candidate / control for control, candidate in zip(controls, candidates)]
+    return dataclasses.asdict(
+        paired_stats.paired_bootstrap(ratios, draws=draws, seed=seed)
+    )
 
 
 def evaluate_screen(samples: Sequence[dict[str, object]]) -> dict[str, object]:
@@ -164,7 +151,7 @@ def evaluate_retention(samples: Sequence[dict[str, object]]) -> dict[str, object
         reasons.append("candidate median is not below contemporaneous control")
     if ratio > 0.97:
         reasons.append("candidate/control median ratio exceeds 0.97")
-    if float(bootstrap["one_sided_95_ratio"]) >= 1.0:
+    if float(bootstrap["one_sided_upper"]) >= 1.0:
         reasons.append("one-sided 95% bootstrap ratio is not below 1.0")
     if candidate_median >= C0_MS:
         reasons.append(f"candidate median is not below C0={C0_MS} ms")
