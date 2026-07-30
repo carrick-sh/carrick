@@ -397,6 +397,22 @@ pub struct DirectBindingRegistry {
     )]
     descriptors: Vec<Box<DirectBindingTarget>>,
     incoming: BTreeMap<(GuestVa, CodeGeneration), Vec<IncomingDirectBinding>>,
+    /// `(source, target)` -> the `(unit_index, record_index)` slots that name
+    /// that edge, built once per registered unit.
+    ///
+    /// `classify_cold_exit` runs on EVERY cold exit, and it used to find its
+    /// candidates by scanning every binding record of every loaded unit and
+    /// collecting them into a fresh `Vec`. With no units loaded that costs
+    /// nothing -- the iterator is empty and an empty `Vec` does not allocate --
+    /// which is why it went unnoticed: the scan only has records to walk when
+    /// shared translation is on. Measured cost of that asymmetry on one cold
+    /// go-build: 17-50x slower with `CARRICK_DSR_SHARED_TRANSLATION=1` (>300 s
+    /// against 17.2 s and 18.8 s controls), with the seven hottest user stacks
+    /// all being this function.
+    ///
+    /// Unit indices stay valid because `units` is only ever pushed to or
+    /// cleared wholesale -- never removed from individually.
+    records_by_edge: BTreeMap<(GuestVa, GuestVa), Vec<(usize, usize)>>,
     counters: DirectBindingCounters,
 }
 
@@ -421,6 +437,7 @@ impl DirectBindingRegistry {
             enabled,
             owners_by_cell: BTreeMap::new(),
             units: Vec::new(),
+            records_by_edge: BTreeMap::new(),
             descriptors: Vec::new(),
             incoming: BTreeMap::new(),
             counters: DirectBindingCounters::default(),
@@ -456,6 +473,7 @@ impl DirectBindingRegistry {
                 published_bitmap: Box::new([]),
                 source_lease: unit.clone(),
             });
+            self.index_unit_records(self.units.len() - 1);
             return Ok(None);
         }
         if unit.manifest.binding_layout != DirectBindingLayout::SidecarV1
@@ -546,10 +564,33 @@ impl DirectBindingRegistry {
             published_bitmap,
             source_lease: unit.clone(),
         });
+        self.index_unit_records(self.units.len() - 1);
         for owner in owners {
             self.owners_by_cell.insert(owner.cell, owner);
         }
         Ok(Some(unit_index))
+    }
+
+    /// Fold one just-pushed unit's records into [`Self::records_by_edge`].
+    ///
+    /// Called from every `units.push` site; `units` is otherwise only cleared
+    /// wholesale, so the recorded indices never dangle.
+    fn index_unit_records(&mut self, unit_index: usize) {
+        let Some(unit) = self.units.get(unit_index) else {
+            return;
+        };
+        let edges: Vec<((GuestVa, GuestVa), usize)> = unit
+            .records
+            .iter()
+            .enumerate()
+            .map(|(record_index, record)| ((record.source, record.target), record_index))
+            .collect();
+        for (edge, record_index) in edges {
+            self.records_by_edge
+                .entry(edge)
+                .or_default()
+                .push((unit_index, record_index));
+        }
     }
 
     /// Selects the exact predeclared manifest record for one cold direct exit.
@@ -572,50 +613,54 @@ impl DirectBindingRegistry {
                 return Err(DirectBindingValidationReason::MappedCellFailure);
             }
         };
-        let mut candidates = self
-            .units
-            .iter()
-            .enumerate()
-            .flat_map(|(unit_index, unit)| {
-                unit.records
-                    .iter()
-                    .enumerate()
-                    .filter(move |(_, record)| record.source == source && record.target == target)
-                    .map(move |(record_index, _)| (unit_index, record_index))
-            })
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            self.counters.owner_validation_failures =
-                self.counters.owner_validation_failures.saturating_add(1);
-            return Err(DirectBindingValidationReason::MissingEligibleRecord);
-        }
-        if candidates.len() > 1
-            && let Some(exact_miss) = miss
-        {
-            candidates.retain(|(unit_index, record_index)| {
-                let Some(unit) = self.units.get(*unit_index) else {
-                    return false;
+        // Indexed lookup, not a scan: see `records_by_edge`. Allocation-free on
+        // every path, which matters because this runs on every cold exit.
+        let selection = (|| -> Result<(usize, usize), DirectBindingValidationReason> {
+            let slots = self
+                .records_by_edge
+                .get(&(source, target))
+                .filter(|slots| !slots.is_empty())
+                .ok_or(DirectBindingValidationReason::MissingEligibleRecord)?;
+            if let [only] = slots.as_slice() {
+                return Ok(*only);
+            }
+            // Several units declare this edge. Exactly as before, disambiguating
+            // needs the miss metadata; without it the edge stays ambiguous.
+            let exact_miss = miss.ok_or(DirectBindingValidationReason::AmbiguousEligibleRecord)?;
+            let mut chosen = None;
+            for &(unit_index, record_index) in slots {
+                let Some(unit) = self.units.get(unit_index) else {
+                    continue;
                 };
-                let Some(record) = unit.records.get(*record_index) else {
-                    return false;
+                let Some(record) = unit.records.get(record_index) else {
+                    continue;
                 };
-                record.ordinal == exact_miss.ordinal
+                let eligible = record.ordinal == exact_miss.ordinal
                     && self
                         .owners_by_cell
                         .get(&exact_miss.cell)
                         .is_some_and(|owner| {
-                            owner.unit_index == *unit_index
+                            owner.unit_index == unit_index
                                 && owner.record == *record
                                 && owner.cell == exact_miss.cell
-                        })
-            });
-        }
-        if candidates.len() != 1 {
-            self.counters.owner_validation_failures =
-                self.counters.owner_validation_failures.saturating_add(1);
-            return Err(DirectBindingValidationReason::AmbiguousEligibleRecord);
-        }
-        let (unit_index, record_index) = candidates[0];
+                        });
+                if eligible {
+                    if chosen.is_some() {
+                        return Err(DirectBindingValidationReason::AmbiguousEligibleRecord);
+                    }
+                    chosen = Some((unit_index, record_index));
+                }
+            }
+            chosen.ok_or(DirectBindingValidationReason::AmbiguousEligibleRecord)
+        })();
+        let (unit_index, record_index) = match selection {
+            Ok(selected) => selected,
+            Err(reason) => {
+                self.counters.owner_validation_failures =
+                    self.counters.owner_validation_failures.saturating_add(1);
+                return Err(reason);
+            }
+        };
         let unit = &self.units[unit_index];
         let record = &unit.records[record_index];
         let cell = match unit.binding_layout {
@@ -933,6 +978,7 @@ impl DirectBindingRegistry {
 
         let units_dropped = u64::try_from(self.units.len()).unwrap_or(u64::MAX);
         self.units.clear();
+        self.records_by_edge.clear();
         self.counters = DirectBindingCounters::default();
         ExecBindingClearStats {
             cells_cleared,
