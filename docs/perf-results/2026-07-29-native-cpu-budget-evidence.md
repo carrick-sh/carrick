@@ -920,3 +920,48 @@ of it uniformly under the sole-unit condition" and "accept the gateway round-tri
 and make it cheap" — the latter being the fallback the goal's falsification
 clause anticipates, since the exit itself may be irreducible while its ~1,822x
 per-edge repetition is not.
+
+## Run 15 — what the crash actually says, and the corrected A1 target
+
+Two facts narrow it much further than "some context field is missing".
+
+**1. The context fields a unit's code reads are all common, not per-unit.**
+Disassembling a published 3.7 MB unit and extracting every `x28`-relative access
+gives, by frequency: `0x460`, `0x438`, `0x488`, `0x3a8` (NZCV save), `0x4b0`
+(biased fault address), `0x4a8` (**`host_bias`**), `0x490`, `0x448`, `0x88`
+(guest x17 slot), `0x440`, `0x4f0` (**`generation_bindings`**), `0x430`
+(`CTX_ENTRY`), … Only `0x4f0` is per-unit, and shape 3 already installed it.
+
+**2. The fault is a HOST address that cannot be lowered, not a bad context
+read.** The message comes from `lower_dsr_fault_address`: a biased memory access
+produced host address `0x60` and `guest_fault_address()` refused it. A biased
+access computes `guest | bias`, so `0x60` means the guest BASE REGISTER held
+~zero when the access executed — the block ran with wrong register state, not
+with a wrong context.
+
+### So the missing piece is a register/slot convention, not context state
+
+A `DirectLink`'s `slot` sits BEFORE its exit stub: the slot holds
+`b`-to-next-instruction and falls into the stub, which saves guest registers
+(guest x17 to context slot `0x88` among them) before entering the gateway.
+Patching the SLOT therefore skips the stub's saves, and the target block's
+prologue — which reloads guest x17 from slot `0x88` — reads whatever was left
+there by some earlier exit.
+
+That is consistent with both crashes and with private -> private patching being
+safe today only because those targets are reached under the same convention the
+private emitter maintains end to end.
+
+### The corrected A1 target
+
+Do not patch the slot. The binding has to preserve whatever the stub establishes,
+which means either patching the stub's FINAL branch (after its saves) rather than
+its entry, or emitting a dedicated bind-target stub that performs the saves and
+then branches. `emit_cached_direct_exit` — the `PortableUnitAuthority` path —
+already has exactly this shape, which is why unit-internal edges bind safely and
+this attempt did not.
+
+This is now a specific, checkable statement rather than a hypothesis about
+missing context: compare what `emit_gateway_exit`'s stub writes before entering
+the gateway against what a target block's prologue reads, and patch at a point
+after every one of those writes.
