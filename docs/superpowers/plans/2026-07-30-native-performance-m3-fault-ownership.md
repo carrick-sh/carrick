@@ -790,10 +790,10 @@ changed hash.
 
 ```text
 capture-go --receipt ARM --qualification PROVIDER --overlay OVERLAY
-  --run-id ID --trace-out RAW --summary-jsonl JSONL --stdout STDOUT
+  --run-id-prefix PREFIX --trace-out RAW --summary-jsonl JSONL --stdout STDOUT
   --capture-receipt RECEIPT
 capture-elf --receipt ARM --qualification PROVIDER --elf ELF
-  --run-id ID --trace-out RAW --summary-jsonl JSONL --stdout STDOUT
+  --run-id-prefix PREFIX --trace-out RAW --summary-jsonl JSONL --stdout STDOUT
   --capture-receipt RECEIPT
 ```
 
@@ -805,6 +805,11 @@ Both run the receipt binary's `trace --profile native-faults`, pass the sealed
 provider, capture stdout/stderr, run scoped `kill.sh` in `finally`, and
 atomically publish hashes for raw, summary, stdout, arm, provider, overlay/ELF,
 marker, and cleanup evidence. Red tests inject every drift/failure.
+
+Both generate the actual ID as `<validated-prefix>-<uuid4>`, prove it absent,
+pre-reap that exact ID before M1 preflight, and reuse it for launch and
+`finally` cleanup. The capture receipt records the actual ID. Tests reject ID
+collision, failed pre-reap, or any attempt to reuse a literal prior ID.
 
 `native_fault_capture.py promote-set` accepts exactly the M3 roles listed in
 Task 5 Step 7. It revalidates qualification raw/status, the sealed provider,
@@ -952,7 +957,7 @@ python3 scripts/perf/native_fault_capture.py capture-elf \
   --receipt target/perf/native-m3-tip/arm.json \
   --qualification target/perf/native-fault-provider-v1.json \
   --elf fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-native-fault-pages \
-  --run-id native-m3-known-pages \
+  --run-id-prefix native-m3-known-pages \
   --trace-out target/perf/native-fault-pages.raw \
   --summary-jsonl target/perf/native-fault-pages.jsonl \
   --stdout target/perf/native-fault-pages.stdout \
@@ -980,7 +985,7 @@ python3 scripts/perf/native_fault_capture.py capture-go \
   --receipt target/perf/native-m3-tip/arm.json \
   --qualification target/perf/native-fault-provider-v1.json \
   --overlay scripts/perf/overlays/native-default.json \
-  --run-id native-m3-fault-go-a \
+  --run-id-prefix native-m3-fault-go-a \
   --trace-out target/perf/native-faults-go-a-v1.raw \
   --summary-jsonl target/perf/native-faults-go-a-v1.jsonl \
   --stdout target/perf/native-faults-go-a-v1.stdout \
@@ -989,7 +994,7 @@ python3 scripts/perf/native_fault_capture.py capture-go \
   --receipt target/perf/native-m3-tip/arm.json \
   --qualification target/perf/native-fault-provider-v1.json \
   --overlay scripts/perf/overlays/native-default.json \
-  --run-id native-m3-fault-go-b \
+  --run-id-prefix native-m3-fault-go-b \
   --trace-out target/perf/native-faults-go-b-v1.raw \
   --summary-jsonl target/perf/native-faults-go-b-v1.jsonl \
   --stdout target/perf/native-faults-go-b-v1.stdout \

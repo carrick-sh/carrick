@@ -569,7 +569,7 @@ DSRPROF2|guest-image-base|pid=P|start_sec=S|start_usec=U|image=I|epoch=E|base=A
 DSRPROF2|cpu-user|pid=P|start_sec=S|start_usec=U|image=I|epoch=E|pc=A|count=N
 DSRPROF2|kernel-enter|pid=P|start_sec=S|start_usec=U|image=I|epoch=E|tid=TID|provider=V|function=F|class=C|timestamp_ns=T
 DSRPROF2|kernel-return|pid=P|start_sec=S|start_usec=U|image=I|epoch=E|tid=TID|provider=V|function=F|class=C|timestamp_ns=T
-DSRPROF2|kernel-terminal-close|pid=P|start_sec=S|start_usec=U|image=I|epoch=E|tid=TID|provider=V|function=F|class=C|timestamp_ns=T
+DSRPROF2|kernel-terminal-close|pid=P|start_sec=S|start_usec=U|image=I|epoch=E|tid=TID|provider=V|function=F|class=C|scope=G|timestamp_ns=T
 DSRPROF2|cpu-kernel|pid=P|start_sec=S|start_usec=U|image=I|epoch=E|class=C|pc=A|count=N
 DSRPROF2|offcpu-block|pid=P|start_sec=S|start_usec=U|image=I|epoch=E|tid=TID|episode=O|kind=K|pc=A|timestamp_ns=T
 DSRPROF2|offcpu-wake|pid=P|start_sec=S|start_usec=U|image=I|epoch=E|tid=TID|episode=O|observed_pid=OP|observed_sec=OS|observed_usec=OU|observed_image=OI|observed_epoch=OE|timestamp_ns=T
@@ -601,9 +601,11 @@ raw inputs, and hashes them again; the parser verifies the header values
 against that receipt before the stream can become gating-eligible.
 
 `kernel-enter` pushes `(provider,function,class,key)` on a per-`tid` stack.
-`kernel-return` must match and pop the exact top. A qualified non-returning
-entry closes only through `kernel-terminal-close`; every other unmatched
-return, nested mismatch, key change, or open stack at process exit is fatal.
+`kernel-return` must match and pop the exact top. `scope` is exactly `thread`
+or `process`; a qualified non-returning entry closes only through
+`kernel-terminal-close` with the receipt-qualified scope and corresponding
+`proc:::lwp-exit` or `proc:::exit` observation. Every other unmatched return,
+nested mismatch, key/scope change, or open stack at process exit is fatal.
 `offcpu-block` opens a monotonically increasing per-thread episode.
 `offcpu-wake` closes that exact episode and carries the currently observed
 process-image key independently; the parser requires its `observed_*` key to
@@ -669,15 +671,16 @@ the receipt SHA-256. This is orchestration in `commands.rs`; the D program does
 not pretend it can spawn an internal fixture.
 
 Use the terminal fixture plus the same standalone libdtrace consumer to
-qualify exact non-returning entry spellings on this OS build. Do not hard-code
-Mach trap names: the qualified Mach set may be empty. For each candidate
-`syscall`/`mach_trap` entry observed during controlled thread and process
-termination, require fixture markers, the expected `proc:::exit`, no matching
-return, and zero consumer drops. The resulting closed `(provider,function)`
-set and receipt hash are passed to `native-wall.d`; any unqualified purported
-terminal remains an unmatched entry and fails the capture. Tests include
-qualified syscall termination, an empty Mach set, a returning-call negative
-control, and provider-list drift.
+qualify exact non-returning entry spellings and closure scope on this OS build.
+Do not hard-code Mach trap names: the qualified Mach set may be empty. For each
+candidate `syscall`/`mach_trap` entry observed during controlled thread and
+process termination, require fixture markers, the corresponding
+`proc:::lwp-exit` or `proc:::exit`, no matching return, and zero consumer
+drops. The resulting closed `(provider,function,scope)` set and receipt hash
+are passed to `native-wall.d`; any unqualified purported terminal remains an
+unmatched entry and fails the capture. Tests include thread- versus
+process-scope mismatch, qualified syscall termination, an empty Mach set, a
+returning-call negative control, and provider-list drift.
 
 In the actual `native-wall.d`, `BEGIN` emits no sample. At the first
 target-context probe, read `curpsinfo->pr_start.tv_sec`/`tv_usec`; at
@@ -783,9 +786,9 @@ Tests enumerate captured qualification rows, including any observed
 on every OS build. Simultaneous syscall and mach-trap state invalidates the
 profile. At each kernel-on-CPU sample, increment exactly one state and preserve
 the raw kernel PC/stack population. A return must match the top provider/name.
-Thread/process exit may close only a matching receipt-qualified non-returning
-entry at the corresponding scope; every other missing return remains an
-acceptance failure.
+Thread/process exit emits the explicit scoped terminal-close row and may close
+only a matching receipt-qualified non-returning entry at that scope; every
+other missing return remains an acceptance failure.
 
 - [ ] **Step 4: Enforce complete v2 acceptance**
 
@@ -1015,7 +1018,7 @@ otool -l target/release/carrick | grep -q __dof_carrick
 - [ ] **Step 2: Add and red-first test the receipt-bound capture wrapper**
 
 `native_wall_capture.py capture` takes `--receipt`, one complete M1 overlay,
-`--run-id`, `--trace-out`, `--summary-jsonl`, `--stdout`, and
+`--run-id-prefix`, `--trace-out`, `--summary-jsonl`, `--stdout`, and
 `--capture-receipt`. It re-verifies
 the receipt, M1 host preflight, and complete overlay before executing exactly:
 
@@ -1031,13 +1034,16 @@ command = [
 ]
 ```
 
-It shares the workload-command builder rather than copying its shell string,
-captures stdout/stderr, requires exactly one workload clock and `BUILD_OK`,
-invokes `scripts/sudo/kill.sh` with the validated `run_id` as its sole argument
-in `finally`, and emits a small capture
+It generates the actual ID as `<validated-prefix>-<uuid4>`, proves that exact
+ID absent, invokes `scripts/sudo/kill.sh <actual-id>` before launch, then runs
+M1 preflight with that ID. It shares the workload-command builder rather than
+copying its shell string, captures stdout/stderr, requires exactly one workload
+clock and `BUILD_OK`, invokes `scripts/sudo/kill.sh` with the same actual ID as
+its sole argument in `finally`, and emits a small capture
 receipt containing hashes of raw, JSONL, stdout, arm receipt, overlay, and
-marker result. Tests prove receipt/overlay drift, timeout, missing marker,
-trace failure, cleanup failure, and a foreign-run preflight all fail closed.
+marker result plus the generated ID. Tests prove ID collision/absence,
+pre-reap failure, receipt/overlay drift, timeout, missing marker, trace
+failure, cleanup failure, and a foreign-run preflight all fail closed.
 
 The same module exposes `capture-lifecycle`. It generates a run ID as
 `native-m2-lifecycle-<uuid4>`, validates that the exact ID is absent, calls
@@ -1123,7 +1129,7 @@ worktree remains clean:
 python3 scripts/perf/native_wall_capture.py capture \
   --receipt target/perf/native-m2-tip/arm.json \
   --overlay scripts/perf/overlays/native-default.json \
-  --run-id native-m2-default-a \
+  --run-id-prefix native-m2-default-a \
   --trace-out target/perf/native-wall-default-v2-a.raw \
   --summary-jsonl target/perf/native-wall-default-v2-a.jsonl \
   --stdout target/perf/native-wall-default-v2-a.stdout \
@@ -1131,7 +1137,7 @@ python3 scripts/perf/native_wall_capture.py capture \
 python3 scripts/perf/native_wall_capture.py capture \
   --receipt target/perf/native-m2-tip/arm.json \
   --overlay scripts/perf/overlays/native-default.json \
-  --run-id native-m2-default-b \
+  --run-id-prefix native-m2-default-b \
   --trace-out target/perf/native-wall-default-v2-b.raw \
   --summary-jsonl target/perf/native-wall-default-v2-b.jsonl \
   --stdout target/perf/native-wall-default-v2-b.stdout \
@@ -1155,7 +1161,7 @@ acceptance/stability gates:
 python3 scripts/perf/native_wall_capture.py capture \
   --receipt target/perf/native-m2-tip/arm.json \
   --overlay scripts/perf/overlays/native-shared.json \
-  --run-id native-m2-shared-a \
+  --run-id-prefix native-m2-shared-a \
   --trace-out target/perf/native-wall-shared-v2-a.raw \
   --summary-jsonl target/perf/native-wall-shared-v2-a.jsonl \
   --stdout target/perf/native-wall-shared-v2-a.stdout \
@@ -1163,7 +1169,7 @@ python3 scripts/perf/native_wall_capture.py capture \
 python3 scripts/perf/native_wall_capture.py capture \
   --receipt target/perf/native-m2-tip/arm.json \
   --overlay scripts/perf/overlays/native-shared.json \
-  --run-id native-m2-shared-b \
+  --run-id-prefix native-m2-shared-b \
   --trace-out target/perf/native-wall-shared-v2-b.raw \
   --summary-jsonl target/perf/native-wall-shared-v2-b.jsonl \
   --stdout target/perf/native-wall-shared-v2-b.stdout \
