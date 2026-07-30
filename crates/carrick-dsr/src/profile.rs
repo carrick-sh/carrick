@@ -789,6 +789,16 @@ pub struct ProfileSnapshot {
     pub nested_translation_ns: u64,
     pub cache_used_bytes: usize,
     pub cache_capacity_bytes: usize,
+    /// Container-lifetime translation sharing. These existed in the resolver's
+    /// own stats but were never PUBLISHED, so whether sharing ever hit was
+    /// unobservable -- a four-arm bisect had to infer "no reuse" from
+    /// translations failing to drop
+    /// (docs/perf-results/2026-07-29-native-cpu-budget-evidence.md).
+    pub shared_unit_lookups: u64,
+    pub shared_unit_hits: u64,
+    pub shared_unit_loads: u64,
+    pub shared_blocks_mapped: u64,
+    pub shared_translations_avoided: u64,
     pub exclusive_fusion_sites: [u64; ExclusiveFusionClass::COUNT],
 }
 
@@ -939,6 +949,17 @@ impl CompleteThreadRecord {
             resolver.translation_publication_ns,
         );
         frames.push(times);
+        let mut shared = self.frame_header("resolver-shared");
+        let _ = write!(
+            shared,
+            "|shared_unit_lookups={}|shared_unit_hits={}|shared_unit_loads={}|shared_blocks_mapped={}|shared_translations_avoided={}",
+            resolver.shared_unit_lookups,
+            resolver.shared_unit_hits,
+            resolver.shared_unit_loads,
+            resolver.shared_blocks_mapped,
+            resolver.shared_translations_avoided,
+        );
+        frames.push(shared);
         let mut cache = self.frame_header("cache-gauge");
         let _ = write!(
             cache,
@@ -1463,7 +1484,7 @@ mod tests {
                 },
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 14);
+        assert_eq!(frames.len(), 15);
         assert!(frames[0].contains("|frame=core|"));
         assert!(frames[0].contains("|thread_cpu_ns=5"));
         let process = frames
@@ -1649,6 +1670,11 @@ mod tests {
         let frames = record
             .to_protocol_frames_with_resolver(
                 crate::profile::ProfileSnapshot {
+                    shared_unit_lookups: u64::MAX,
+                    shared_unit_hits: u64::MAX,
+                    shared_unit_loads: u64::MAX,
+                    shared_blocks_mapped: u64::MAX,
+                    shared_translations_avoided: u64::MAX,
                     resolver_exits: u64::MAX,
                     one_entry_hits: u64::MAX,
                     translations: u64::MAX,
@@ -1672,7 +1698,7 @@ mod tests {
                 gauges,
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 14);
+        assert_eq!(frames.len(), 15);
         for frame in frames {
             let transport_len = frame.len().checked_add(1).expect("newline length");
             assert!(

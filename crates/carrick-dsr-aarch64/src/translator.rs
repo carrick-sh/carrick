@@ -540,10 +540,19 @@ pub enum ResolverStat {
     TranslationPlanNs,
     TranslationEmitNs,
     TranslationPublicationNs,
+    // Process-scoped like Translations and CacheLookups: incremented on
+    // `ProcessState::stats`, so they MUST flow through `checked_delta` /
+    // `reported_stats` or summing the per-thread records over-counts them once
+    // per reporting thread.
+    SharedUnitLookups,
+    SharedUnitHits,
+    SharedUnitLoads,
+    SharedBlocksMapped,
+    SharedTranslationsAvoided,
 }
 
 impl ResolverStat {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 20] = [
         Self::ResolverExits,
         Self::OneEntryHits,
         Self::Translations,
@@ -559,6 +568,11 @@ impl ResolverStat {
         Self::TranslationPlanNs,
         Self::TranslationEmitNs,
         Self::TranslationPublicationNs,
+        Self::SharedUnitLookups,
+        Self::SharedUnitHits,
+        Self::SharedUnitLoads,
+        Self::SharedBlocksMapped,
+        Self::SharedTranslationsAvoided,
     ];
 
     const fn name(self) -> &'static str {
@@ -578,6 +592,11 @@ impl ResolverStat {
             Self::TranslationPlanNs => "translation_plan_ns",
             Self::TranslationEmitNs => "translation_emit_ns",
             Self::TranslationPublicationNs => "translation_publication_ns",
+            Self::SharedUnitLookups => "shared_unit_lookups",
+            Self::SharedUnitHits => "shared_unit_hits",
+            Self::SharedUnitLoads => "shared_unit_loads",
+            Self::SharedBlocksMapped => "shared_blocks_mapped",
+            Self::SharedTranslationsAvoided => "shared_translations_avoided",
         }
     }
 }
@@ -600,6 +619,11 @@ impl ResolverStats {
             ResolverStat::TranslationPlanNs => self.translation_plan_ns,
             ResolverStat::TranslationEmitNs => self.translation_emit_ns,
             ResolverStat::TranslationPublicationNs => self.translation_publication_ns,
+            ResolverStat::SharedUnitLookups => self.shared_unit_lookups,
+            ResolverStat::SharedUnitHits => self.shared_unit_hits,
+            ResolverStat::SharedUnitLoads => self.shared_unit_loads,
+            ResolverStat::SharedBlocksMapped => self.shared_blocks_mapped,
+            ResolverStat::SharedTranslationsAvoided => self.shared_translations_avoided,
         }
     }
 
@@ -620,6 +644,11 @@ impl ResolverStats {
             ResolverStat::TranslationPlanNs => self.translation_plan_ns = value,
             ResolverStat::TranslationEmitNs => self.translation_emit_ns = value,
             ResolverStat::TranslationPublicationNs => self.translation_publication_ns = value,
+            ResolverStat::SharedUnitLookups => self.shared_unit_lookups = value,
+            ResolverStat::SharedUnitHits => self.shared_unit_hits = value,
+            ResolverStat::SharedUnitLoads => self.shared_unit_loads = value,
+            ResolverStat::SharedBlocksMapped => self.shared_blocks_mapped = value,
+            ResolverStat::SharedTranslationsAvoided => self.shared_translations_avoided = value,
         }
     }
 
@@ -968,6 +997,11 @@ impl ThreadTranslator {
             nested_translation_ns: self.nested_translation_ns,
             cache_used_bytes: process.cache.used_bytes(),
             cache_capacity_bytes: process.cache.capacity_bytes(),
+            shared_unit_lookups: process.stats.shared_unit_lookups,
+            shared_unit_hits: process.stats.shared_unit_hits,
+            shared_unit_loads: process.stats.shared_unit_loads,
+            shared_blocks_mapped: process.stats.shared_blocks_mapped,
+            shared_translations_avoided: process.stats.shared_translations_avoided,
             exclusive_fusion_sites: process.exclusive_fusion_site_counts(),
         }
     }
@@ -1008,6 +1042,11 @@ impl ThreadTranslator {
             nested_translation_ns: self.nested_translation_ns,
             cache_used_bytes: process.cache.used_bytes(),
             cache_capacity_bytes: process.cache.capacity_bytes(),
+            shared_unit_lookups: delta.shared_unit_lookups,
+            shared_unit_hits: delta.shared_unit_hits,
+            shared_unit_loads: delta.shared_unit_loads,
+            shared_blocks_mapped: delta.shared_blocks_mapped,
+            shared_translations_avoided: delta.shared_translations_avoided,
             exclusive_fusion_sites: process.exclusive_fusion_site_counts(),
         })
     }
@@ -1070,6 +1109,13 @@ impl ThreadTranslator {
             translation_plan_ns: 0,
             translation_emit_ns: 0,
             translation_publication_ns: 0,
+            // Process-wide deltas, like the block above: owned by the draining
+            // thread's own record, so structurally zero here.
+            shared_unit_lookups: 0,
+            shared_unit_hits: 0,
+            shared_unit_loads: 0,
+            shared_blocks_mapped: 0,
+            shared_translations_avoided: 0,
             exclusive_fusion_sites: process_state.exclusive_fusion_site_counts(),
         })
     }
