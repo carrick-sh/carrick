@@ -110,7 +110,6 @@ pub struct EmittedBlock {
     map: InstructionMap,
     direct_links: Vec<DirectLink>,
     recovery: Vec<RecoveryEntry>,
-    instruction_bytes: usize,
 }
 
 struct AssembledBlock {
@@ -118,15 +117,6 @@ struct AssembledBlock {
     map: InstructionMap,
     direct_links: Vec<DirectLink>,
     recovery: Vec<RecoveryEntry>,
-    /// Bytes of INSTRUCTIONS, i.e. where the literal pool begins.
-    ///
-    /// Equal to the whole length when the block has no pool. The distinction is
-    /// load-bearing: "every emitted word has a guest-PC mapping" is an invariant
-    /// the tests enforce, and it is about instructions. Pool words are data --
-    /// unreachable, never resumed at, deliberately unmapped -- so giving them
-    /// mappings to satisfy the check would hollow it out. This boundary lets the
-    /// check stay strict about the part that matters.
-    instruction_bytes: usize,
 }
 
 impl AssembledBlock {
@@ -134,13 +124,11 @@ impl AssembledBlock {
         let mut writer = cache.begin_write(self.words.len().saturating_mul(4))?;
         writer.write_words(&self.words)?;
         let code = writer.publish()?;
-        let instruction_bytes = self.instruction_bytes;
         Ok(EmittedBlock {
             code,
             map: self.map,
             direct_links: self.direct_links,
             recovery: self.recovery,
-            instruction_bytes,
         })
     }
 }
@@ -400,10 +388,6 @@ impl EmittedBlock {
         recovery: Vec<RecoveryEntry>,
     ) -> Result<Self, DsrError> {
         Ok(Self {
-            // A replayed artifact carries its own emitted bytes verbatim, and the
-            // recording path keeps the fixed-width chain, so it has no pool: all
-            // of it is instructions.
-            instruction_bytes: code.len(),
             code,
             map: InstructionMap::new(entries)?,
             direct_links,
@@ -417,14 +401,6 @@ impl EmittedBlock {
 
     pub const fn len(&self) -> usize {
         self.code.len()
-    }
-
-    /// Bytes of instructions, excluding any trailing literal pool.
-    ///
-    /// Use this, not [`Self::len`], when walking emitted words as instructions:
-    /// the pool is data and carries no PC-map entry by design.
-    pub const fn instruction_bytes(&self) -> usize {
-        self.instruction_bytes
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -508,148 +484,6 @@ fn emit_mov_u64(
         assembler.push_u32(base | (halfword << 21) | (immediate << 5) | register);
     }
     Ok(())
-}
-
-/// How a gateway exit materializes the guest PCs it hands to the gateway.
-///
-/// Only the immutable-unit precursor needs `FixedChain`: its 64-word template is
-/// validated word-by-word at fixed offsets by `rewrite_direct_binding_stub`, so
-/// its length is a contract. Every other exit takes `Pool`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExitTargetWidth {
-    FixedChain,
-    Pool,
-}
-
-/// Per-block pool of 64-bit constants, reached by `ldr <reg>, <literal>`.
-///
-/// Exit targets used to be built with a `movz`/`movk` chain that
-/// [`emit_mov_u64`] always emits at FOUR words, whatever the value. Measured on
-/// a cold go-build, that made `dsr:x17-materialize` 29.1% of every word carrick
-/// emits -- the largest single class, larger than any guest class -- and 13.9%
-/// of sampled executed PCs (`scripts/perf/emitted_shape.py`).
-///
-/// A gateway exit does not even want the value in a register: it materializes it
-/// and immediately stores it to a context slot. So the whole sequence
-///
-/// ```text
-///     movz/movk x17, <target>     ; 4 words
-///     str x17, [x28, #1080]
-/// ```
-///
-/// becomes two words, one of which is data-free:
-///
-/// ```text
-///     ldr x17, <pool entry>
-///     str x17, [x28, #1080]
-/// ```
-///
-/// # Why a pool and not a shorter chain
-///
-/// Dropping the chain's dead high halfwords is tempting -- a guest PC below
-/// 2**32 needs two words, not four -- and it is safe from the artifact-rebinding
-/// angle, because `ArtifactRecording::record_mov_wide` ignores everything that is
-/// not a `MaterializedValue::Process`. It was tried, and it is WRONG: it makes
-/// the emitted layout depend on the value, and `rewrite_direct_binding_stub`
-/// validates the immutable-unit precursor by decoding words at FIXED offsets. A
-/// pool load is one word for every value, so the layout stays fixed -- which is
-/// exactly why the design specified a pool rather than a narrower chain.
-///
-/// # Alignment
-///
-/// Entries are 8-byte aligned relative to the block start, and
-/// `TranslationCache::BLOCK_ALIGNMENT` makes every block start 8-aligned at
-/// runtime, so a 64-bit literal load never splits a pair of words. The
-/// in-assembler `.align 8` would otherwise be meaningless: the emitter assembles
-/// at offset 0 and learns its cache address afterwards.
-#[derive(Default)]
-struct LiteralPool {
-    entries: Vec<(dynasmrt::DynamicLabel, u64)>,
-}
-
-impl LiteralPool {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Emit `ldr x<register>, <entry>` for `value`, reserving the entry.
-    #[allow(
-        clippy::useless_conversion,
-        reason = "dynasm's `X()` dynamic-register macro expands to `.into()`, which is a \
-                  no-op on the `u8` this already holds"
-    )]
-    ///
-    /// Identical values share one entry: a conditional's target is materialized
-    /// both in its stub and in the resolver behind it, and one shared 8-byte slot
-    /// is strictly better than two.
-    fn emit_load(
-        &mut self,
-        assembler: &mut VecAssembler<Aarch64Relocation>,
-        entries: &mut Vec<PcMapEntry>,
-        guest: GuestVa,
-        register: u32,
-        value: u64,
-    ) -> Result<(), DsrError> {
-        let label = match self
-            .entries
-            .iter()
-            .find(|(_, existing)| *existing == value)
-            .map(|(label, _)| *label)
-        {
-            Some(label) => label,
-            None => {
-                let label = assembler.new_dynamic_label();
-                self.entries.push((label, value));
-                label
-            }
-        };
-        let register = u8::try_from(register).map_err(|_| {
-            DsrError::CachePolicy(format!("literal-pool register does not fit u8: {register}"))
-        })?;
-        map_next(assembler, entries, guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; ldr X(register), =>label
-        );
-        Ok(())
-    }
-
-    /// Lay the pool down. Call once, AFTER every instruction of the block: these
-    /// are data words, they carry no PC-map entry, and nothing branches to them.
-    ///
-    /// Consumes the pool so a caller cannot reserve an entry and then forget:
-    /// dropping a non-empty pool leaves its dynamic labels undefined, and dynasm
-    /// reports that as a bare `UnknownLabel` at finalize with no hint about the
-    /// cause. `Drop` below turns that into a named debug assertion.
-    fn finish(mut self, assembler: &mut VecAssembler<Aarch64Relocation>) {
-        let entries = std::mem::take(&mut self.entries);
-        if entries.is_empty() {
-            return;
-        }
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; .align 8
-        );
-        for (label, value) in entries {
-            dynasmrt::dynasm!(assembler
-                ; .arch aarch64
-                ; =>label
-                ; .u64 value
-            );
-        }
-    }
-}
-
-impl Drop for LiteralPool {
-    fn drop(&mut self) {
-        debug_assert!(
-            self.entries.is_empty(),
-            "a literal pool with {} reserved entries was dropped without finish(); \
-             its dynamic labels stay undefined and dynasm fails at finalize with a \
-             bare UnknownLabel",
-            self.entries.len()
-        );
-    }
 }
 
 fn emit_word(
@@ -997,38 +831,14 @@ fn emit_gateway_exit(
     source: Option<GuestVa>,
     status: u32,
     gateway: GatewayKind,
-    targets: ExitTargetWidth,
-    pool: &mut LiteralPool,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
-    // A gateway exit never wants the target in a register: it materializes it
-    // and immediately stores it to a context slot. `ExitTargetWidth::Pool` makes
-    // that one `ldr` from the block's literal pool instead of a four-word
-    // `movz`/`movk` chain -- see `LiteralPool` for the measurement and for why
-    // the immutable-unit precursor must keep the chain.
-    let materialize = |assembler: &mut VecAssembler<Aarch64Relocation>,
-                       entries: &mut Vec<PcMapEntry>,
-                       pool: &mut LiteralPool,
-                       value: u64,
-                       recording: Option<&mut ArtifactRecording>|
-     -> Result<(), DsrError> {
-        match targets {
-            ExitTargetWidth::FixedChain => emit_mov_u64(
-                assembler,
-                entries,
-                guest,
-                17,
-                MaterializedValue::Guest(value),
-                recording,
-            ),
-            ExitTargetWidth::Pool => pool.emit_load(assembler, entries, guest, 17, value),
-        }
-    };
-    materialize(
+    emit_mov_u64(
         assembler,
         entries,
-        pool,
-        target.raw(),
+        guest,
+        17,
+        MaterializedValue::Guest(target.raw()),
         recording.as_deref_mut(),
     )?;
     map_next(assembler, entries, guest)?;
@@ -1037,11 +847,12 @@ fn emit_gateway_exit(
         ; str x17, [x28, #1080]
     );
     if let Some(source) = source {
-        materialize(
+        emit_mov_u64(
             assembler,
             entries,
-            pool,
-            source.raw(),
+            guest,
+            17,
+            MaterializedValue::Guest(source.raw()),
             recording.as_deref_mut(),
         )?;
         map_next(assembler, entries, guest)?;
@@ -1803,7 +1614,6 @@ fn emit_cached_direct_exit(
     target: GuestVa,
     committed_link: Option<u64>,
     recovery: &mut Vec<RecoveryEntry>,
-    pool: &mut LiteralPool,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     let scratch_capture_start = current_offset(assembler)?;
@@ -2018,8 +1828,6 @@ fn emit_cached_direct_exit(
         Some(source_guest),
         2,
         GatewayKind::Direct,
-        ExitTargetWidth::FixedChain,
-        pool,
         recording,
     )?;
     record_direct_binding_sidecar_phases(
@@ -2146,10 +1954,6 @@ fn emit_internal_fallthrough_edge(
 
 /// Emit the deferred stub for one fused conditional's taken edge and register
 /// its direct link.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a deferred taken edge carries its assembler, sinks, envelope, policy and pool"
-)]
 fn emit_internal_taken_stub(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
@@ -2157,7 +1961,6 @@ fn emit_internal_taken_stub(
     recovery: &mut Vec<RecoveryEntry>,
     edge: PendingTakenEdge,
     direct_exit_policy: DirectExitEmissionPolicy,
-    pool: &mut LiteralPool,
     recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     dynasmrt::dynasm!(assembler
@@ -2174,7 +1977,6 @@ fn emit_internal_taken_stub(
         None,
         recovery,
         direct_exit_policy,
-        pool,
         recording,
     )?;
     direct_links.push(DirectLink {
@@ -2204,7 +2006,6 @@ fn emit_direct_exit(
     committed_link: Option<u64>,
     recovery: &mut Vec<RecoveryEntry>,
     policy: DirectExitEmissionPolicy,
-    pool: &mut LiteralPool,
     recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     match policy {
@@ -2216,8 +2017,6 @@ fn emit_direct_exit(
             Some(source_guest),
             2,
             GatewayKind::Direct,
-            ExitTargetWidth::Pool,
-            pool,
             recording,
         ),
         DirectExitEmissionPolicy::PortableUnitAuthority => emit_cached_direct_exit(
@@ -2228,7 +2027,6 @@ fn emit_direct_exit(
             target,
             committed_link,
             recovery,
-            pool,
             recording,
         ),
     }
@@ -4428,7 +4226,6 @@ fn emit_region_direct_exit(
     target: GuestVa,
     clear_monitor: bool,
     policy: DirectExitEmissionPolicy,
-    pool: &mut LiteralPool,
     recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     if clear_monitor {
@@ -4456,7 +4253,6 @@ fn emit_region_direct_exit(
         None,
         recovery,
         policy,
-        pool,
         recording,
     )?;
     direct_links.push(DirectLink {
@@ -4571,7 +4367,6 @@ fn emit_biased_exclusive_region(
     scratch: super::types::BiasedExclusiveScratch,
     host_bias: carrick_dsr::address::NativeHostBias,
     policy: DirectExitEmissionPolicy,
-    pool: &mut LiteralPool,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     let address = scratch.address.index();
@@ -5002,7 +4797,6 @@ fn emit_biased_exclusive_region(
         exit.end,
         false,
         policy,
-        pool,
         recording.as_deref_mut(),
     )?;
     if let Some((_, tail, branch_guest, target)) = early_exit {
@@ -5020,7 +4814,6 @@ fn emit_biased_exclusive_region(
             target,
             false,
             policy,
-            pool,
             recording.as_deref_mut(),
         )?;
     }
@@ -5036,8 +4829,6 @@ fn emit_biased_exclusive_region(
         Some(exit.start),
         6,
         GatewayKind::Sensitive,
-        ExitTargetWidth::Pool,
-        pool,
         recording.as_deref_mut(),
     )
 }
@@ -5075,7 +4866,6 @@ fn emit_exclusive_region(
     fusion: super::types::ExclusiveFusionSite,
     mode: EmitAddressMode,
     policy: DirectExitEmissionPolicy,
-    pool: &mut LiteralPool,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     if let EmitAddressMode::Biased { host_bias } = mode {
@@ -5097,7 +4887,6 @@ fn emit_exclusive_region(
             scratch,
             host_bias,
             policy,
-            pool,
             recording.as_deref_mut(),
         );
     }
@@ -5226,7 +5015,6 @@ fn emit_exclusive_region(
         exit.end,
         false,
         policy,
-        pool,
         recording.as_deref_mut(),
     )?;
 
@@ -5247,7 +5035,6 @@ fn emit_exclusive_region(
             target,
             true,
             policy,
-            pool,
             recording.as_deref_mut(),
         )?;
     }
@@ -5267,9 +5054,6 @@ fn assemble_block_inner(
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<AssembledBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
-    // Owned here and laid down after every instruction of the block; see
-    // `LiteralPool`.
-    let mut pool = LiteralPool::new();
     // Count the fused segments too: a superblock maps several segments' worth
     // of words, and translation time is a real cost here -- deep fusion already
     // taxes it (see `block::SUPERBLOCK_SEGMENT_LIMIT`), so do not add
@@ -5607,7 +5391,6 @@ fn assemble_block_inner(
             fusion,
             mode,
             direct_exit_policy,
-            &mut pool,
             recording.as_deref_mut(),
         )?;
     } else {
@@ -6018,8 +5801,6 @@ fn assemble_block_inner(
                 None,
                 1,
                 GatewayKind::Syscall,
-                ExitTargetWidth::Pool,
-                &mut pool,
                 recording.as_deref_mut(),
             )?;
         } else if let PlannedExit::Direct { word, exit, .. } = terminal {
@@ -6054,7 +5835,6 @@ fn assemble_block_inner(
                     committed_link,
                     &mut recovery,
                     direct_exit_policy,
-                    &mut pool,
                     recording.as_deref_mut(),
                 )?;
                 direct_links.push(DirectLink {
@@ -6111,7 +5891,6 @@ fn assemble_block_inner(
                     None,
                     &mut recovery,
                     direct_exit_policy,
-                    &mut pool,
                     recording.as_deref_mut(),
                 )?;
                 direct_links.push(DirectLink {
@@ -6138,7 +5917,6 @@ fn assemble_block_inner(
                     None,
                     &mut recovery,
                     direct_exit_policy,
-                    &mut pool,
                     recording.as_deref_mut(),
                 )?;
                 direct_links.push(DirectLink {
@@ -6188,7 +5966,6 @@ fn assemble_block_inner(
                     exit.resume,
                     false,
                     direct_exit_policy,
-                    &mut pool,
                     recording.as_deref_mut(),
                 )?;
             } else {
@@ -6200,8 +5977,6 @@ fn assemble_block_inner(
                     Some(exit_guest),
                     6,
                     GatewayKind::Sensitive,
-                    ExitTargetWidth::Pool,
-                    &mut pool,
                     recording.as_deref_mut(),
                 )?;
             }
@@ -6218,7 +5993,6 @@ fn assemble_block_inner(
                 None,
                 &mut recovery,
                 direct_exit_policy,
-                &mut pool,
                 recording.as_deref_mut(),
             )?;
             direct_links.push(DirectLink {
@@ -6240,8 +6014,6 @@ fn assemble_block_inner(
                 Some(exit_guest),
                 7,
                 GatewayKind::Unsupported,
-                ExitTargetWidth::Pool,
-                &mut pool,
                 recording.as_deref_mut(),
             )?;
         } else {
@@ -6259,7 +6031,6 @@ fn assemble_block_inner(
                 &mut recovery,
                 edge,
                 direct_exit_policy,
-                &mut pool,
                 recording.as_deref_mut(),
             )?;
         }
@@ -6316,8 +6087,6 @@ fn assemble_block_inner(
             Some(plan.start),
             2,
             GatewayKind::Direct,
-            ExitTargetWidth::Pool,
-            &mut pool,
             recording.as_deref_mut(),
         )?;
         if lean_guard {
@@ -6332,12 +6101,6 @@ fn assemble_block_inner(
             }
         }
     }
-    // Data, after every instruction and every deferred stub: nothing branches
-    // into it and it carries no PC-map entry, so it must not sit between
-    // instructions. 8-byte aligned relative to the block start, which
-    // `TranslationCache::BLOCK_ALIGNMENT` turns into runtime alignment.
-    let instruction_bytes = current_offset(&assembler)?.get() as usize;
-    pool.finish(&mut assembler);
     let bytes = assembler
         .finalize()
         .map_err(|error| DsrError::Assembler(error.to_string()))?;
@@ -6357,7 +6120,6 @@ fn assemble_block_inner(
         map,
         direct_links,
         recovery,
-        instruction_bytes,
     })
 }
 
@@ -7660,14 +7422,7 @@ mod tests {
 
     #[test]
     fn private_direct_edges_use_compact_gateway_stubs() {
-        // 32, down from 56. A private gateway stub materializes two guest PCs,
-        // and each was a four-word `movz`/`movk` chain; each is now one `ldr`
-        // from the block's literal pool (see `LiteralPool`), so 14 words became
-        // 8. The immutable-unit precursor keeps its chains -- that template is
-        // validated word-by-word at fixed offsets by
-        // `rewrite_direct_binding_stub` -- which is why the sidecar tests below
-        // are unaffected.
-        const PRIVATE_DIRECT_GATEWAY_STUB_BYTES: u32 = 32;
+        const PRIVATE_DIRECT_GATEWAY_STUB_BYTES: u32 = 56;
 
         let mut kinds = std::collections::BTreeSet::new();
         for (case, emitted) in direct_edge_cases(DirectExitEmissionPolicy::PrivateGateway) {
@@ -7691,7 +7446,6 @@ mod tests {
         let mut entries = Vec::new();
         let mut direct_links = Vec::new();
         let mut recovery = Vec::new();
-        let mut pool = LiteralPool::new();
         emit_region_direct_exit(
             &mut assembler,
             &mut entries,
@@ -7702,13 +7456,9 @@ mod tests {
             GuestVa(0x7010),
             false,
             DirectExitEmissionPolicy::PrivateGateway,
-            &mut pool,
             None,
         )
         .expect("emit private fused-exclusive continuation");
-        // Lay the pool down before finalize, as `assemble_block_inner` does: an
-        // entry reserves a dynamic label, and finalizing with it undefined fails.
-        pool.finish(&mut assembler);
         let _ = assembler
             .finalize()
             .expect("finalize private fused-exclusive continuation");
@@ -8053,7 +7803,6 @@ mod tests {
         let mut entries = Vec::new();
         let mut direct_links = Vec::new();
         let mut recovery = Vec::new();
-        let mut pool = LiteralPool::new();
         emit_region_direct_exit(
             &mut assembler,
             &mut entries,
@@ -8064,13 +7813,9 @@ mod tests {
             GuestVa(0x7010),
             false,
             DirectExitEmissionPolicy::PortableUnitAuthority,
-            &mut pool,
             None,
         )
         .expect("emit fused-exclusive continuation");
-        // Lay the pool down before finalize, as `assemble_block_inner` does: an
-        // entry reserves a dynamic label, and finalizing with it undefined fails.
-        pool.finish(&mut assembler);
         let _ = assembler
             .finalize()
             .expect("finalize fused-exclusive continuation");
