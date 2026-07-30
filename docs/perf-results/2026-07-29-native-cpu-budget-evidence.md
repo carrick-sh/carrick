@@ -1251,3 +1251,49 @@ implementation must change in two ways:
 
 That is now a fix with a confirmed mechanism behind it rather than a sixth
 guess.
+
+## Run 21 — the fix WORKS: 135.7 M -> 0. One residual NULL-table path remains
+
+With the run-20 diagnosis in hand (a shared block's guard indexing a NULL
+`generation_bindings`), the corrected fix installs the unit's table at LOAD into
+`ProcessState::installed_unit_bindings`, has every `PreparedEntry` -- private
+entries included -- carry it, gates the shared-target patch on it being
+installed, and records each patched site so a second unit's arrival restores them
+(binding indices are per-unit, so a second unit's block would index the first
+unit's table).
+
+Measured on the sharing-ON arm:
+
+| metric | before | with the fix |
+|---|---|---|
+| `resolve_src_private_tgt_shared` | 135,715,237 | **0** |
+| `direct_resolver_exits` | 136,489,314 | **68,941** |
+| gateway entries | 272,690,918 | **323,384** |
+
+**The amplification is eliminated** — the exact population A0 identified as 99.4%
+of all resolver exits goes to zero, and total direct-resolver exits fall by a
+factor of ~1,980. That is the mechanism gate for A1, passed.
+
+### What still fails
+
+The run does not reach BUILD_OK: a residual fault at `far=0x60` — the same NULL
+table at binding index 6. So one path still reaches a shared block with
+`generation_bindings == 0`. Fork is NOT it: `after_fork_child` leaves
+`installed_unit_bindings` intact, and `MAP_JIT` is `MAP_PRIVATE`, so a child
+inherits both the patched code and the installed pointer.
+
+The remaining suspect is install/patch ORDERING: a unit is loaded lazily by
+`try_load_shared_unit` *during* a translate, i.e. inside a gateway entry whose
+`PreparedEntry` was built before the load and therefore carries
+`generation_bindings: 0`. Patches become live immediately. Any path that reaches
+a patched branch without first re-entering the gateway would run with the stale
+NULL context.
+
+The fix for that is to gate patch-enable on the CURRENT entry already carrying
+the table, rather than on the process having installed it — which needs the
+thread's prepared-entry state threaded into `ProcessState::translate`, a
+signature change through `translate_read_mostly`.
+
+Reverted, because a crashing change cannot ship. But the approach is now proven
+rather than hypothesised: it removes 135.7 M gateway round-trips, and what is
+left is one ordering condition with a named fix.
