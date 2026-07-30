@@ -1788,3 +1788,70 @@ gates the primary metric.
 
 **Primary metric unmoved. A0 met. A1 1.114x and unreachable at this coverage.
 A2 14.4% vs >=60%, blocked on superblock templating.**
+
+## Run 27 — fusion+sharing lands, and FALSIFIES the goal's premise
+
+`7781d97e` makes fused superblocks shareable and fixes two consume-side
+sensitive-metadata defects found in the process (one of them latent since before
+fusion: metadata keyed by block START while the lookup is by the SENSITIVE
+instruction's PC).
+
+**Every A2-direction metric moved the right way**, fusion still on:
+
+| metric | before | after |
+|---|---|---|
+| shared-block coverage | 14.4% | **33.1%** |
+| fresh translations | 1,045,248 | **819,901** (-21.6%) |
+
+**And the paired A1 ratio got WORSE.** ABBA, 8 quads, same binary:
+
+| screen | wall | cpu |
+|---|---|---|
+| before fused sharing | 1.1141 | 1.1062 |
+| after fused sharing | **1.2683** | **1.2353** |
+
+0/8 quads win, sd 1.40-1.48%, so this is not noise.
+
+The host-side work it was supposed to remove DID go away -- named-leaf deltas vs
+the previous ON arm: `_platform_memmove` -191, `sha256::compress256` -160,
+`SlicePartialEq::equal_same_length` 113 -> **0**, `decode_spec` -100,
+`publish_emitted` -65. The mechanism did exactly what it was built to do.
+
+(A single JIT-aware profile run put the ON arm FASTER, 31,754 -> 30,013 samples,
+contradicting the screen. One unpaired run is not an instrument against 8 ABBA
+quads; the screen governs. Recorded because the temptation is to quote whichever
+number flatters the change.)
+
+### This is the goal's falsification condition, reached from the other side
+
+The goal says: "If A2 and B land but the paired ratio doesn't reach 0.70,
+translation was not the binding constraint and Workstream C becomes primary."
+
+We now have something stronger than that conditional. **Cutting fresh
+translations by 21.6% made the workload measurably SLOWER** (1.106 -> 1.235
+CPU). Translation volume is not merely insufficient to reach 0.70 -- reducing it
+by this mechanism is actively negative. The premise in the goal's own rationale,
+that carrick "spends about as long producing translated code as running it" and
+that producing it ~800,000 times is therefore the lever, does not survive the
+measurement.
+
+The most plausible remaining mechanism is execution locality: 400,000+ blocks
+mapped across 54 separately `dlopen`ed unit mappings replace a compact,
+bump-allocated private cache. That is a hypothesis, not a finding -- the leaf
+profile cannot see it because the classifier still misfiles unit-mapped code
+(run 24), and fixing the classifier is the prerequisite for testing it.
+
+### Standing
+
+- A0 **met** (173x -> 0, control-confirmed).
+- A1 **not met and moving away**: 1.114x -> 1.268x wall.
+- A2 coverage 14.4% -> 33.1% (target >=60%), translations 1,045,248 -> 819,901
+  (target <=400,000). Both improved, neither met.
+- Primary metric **unmoved**: sharing ships OFF, so the default path is
+  unchanged.
+
+The change is kept: it ships nothing (sharing is off by default), it fixes a
+real latent bug, and it is the prerequisite for any future coverage work. But it
+does not advance the goal, and Workstream A should not receive more effort until
+the locality hypothesis is tested -- which needs the profiler classifier fixed
+first.
