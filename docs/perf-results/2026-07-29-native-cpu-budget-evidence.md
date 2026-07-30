@@ -535,3 +535,70 @@ require understanding the exit amplification at all:
 
 Caveats: the frame-pointer build is not the shipping codegen; user stacks cover
 24% of on-CPU time; and this is one run per arm, not a paired screen.
+
+## Run 9 — JIT-aware profiling, and a re-check of what we are aiming at
+
+`ustack()` cannot walk translated frames: JIT'd guest code uses x29 as a guest
+register, so there is no frame-pointer chain. Unwinding those samples costs
+buffer space and aggregation slots to produce garbage, which is why run 8 landed
+only 24% of on-CPU time in usable stacks.
+
+`dsr-cache-bounds` (new) publishes each process's JIT cache host-VA range once at
+creation, so `scripts/dtrace/native-jit-aware-profile.d` classifies a sampled PC
+with two compares and invokes the unwinder ONLY for host frames.
+
+Two things had to be right for the classification to mean anything:
+
+* **The bounds must be inherited across fork.** carrick forks a real host process
+  per guest `clone(2)` — ~50 for one go-build — and the child inherits the
+  parent's JIT mapping. Marking the child tracked without copying its bounds put
+  every forked child's translated samples in the "host" bucket.
+* **Truncate generously and aggregate by NAME offline.** dtrace keys `usym`/
+  `ustack` on `(pid, address)`, so one hot symbol fragments into ~50 entries
+  across ~50 processes; `trunc(@leaves, 25)` discarded nearly all the signal and
+  left a ranking that was an artifact of process count.
+
+### The shipping configuration, 34.4 CPU-s
+
+| CPU-s | share | bucket |
+|---|---|---|
+| 12.29 | **35.8%** | carrick HOST code |
+| 12.21 | **35.5%** | JIT cache (translated guest + inserted words) |
+| 9.85 | 28.7% | kernel |
+
+Host leaves, aggregated by name (74% of the host bucket captured):
+
+| CPU-s | share of total | leaf |
+|---|---|---|
+| 0.398 | 1.16% | `_platform_memmove` |
+| 0.282 | 0.82% | `_platform_memset` |
+| 0.244 | 0.71% | `sys_icache_invalidate` |
+| 0.179 | 0.52% | `decode_spec` |
+| 0.154 | 0.45% | `_xzm_xzone_malloc_tiny` |
+| 0.152 | 0.44% | `emit::assemble_block_inner` |
+| 0.145 | 0.42% | `BTreeMap::insert` |
+| 0.137 | 0.40% | `sha2::sha256::compress256` |
+
+### Are we aiming at the right thing?
+
+**The host bucket is as large as the JIT bucket, and it is almost entirely
+TRANSLATION.** `memmove` + `memset` + `sys_icache_invalidate` alone are 2.7% of
+total and are pure mechanical cost of *emitting* code — copying words into the
+cache, zeroing, and I-cache maintenance — all proportional to emitted BYTES.
+Add `decode_spec`, `assemble_block_inner`, `BTreeMap::insert` and the malloc
+traffic and the picture is unambiguous: carrick spends about as long PRODUCING
+translated code as RUNNING it, ~800,000 times per build.
+
+That confirms the ranking arrived at in runs 3–8 and contradicts the one this
+campaign started with:
+
+1. **Translation cost and reuse** — 35.8%, and the reason container-lifetime
+   sharing matters. Also why emitted-code SIZE beats emitted-code SPEED here:
+   size is what `memmove`/`memset`/`icache` scale with.
+2. **Kernel, 28.7%** — dominated by faults (run 1: 2.2 M address-space faults).
+3. **Codegen quality** — only part of the 35.5% JIT bucket, and three separate
+   attempts measured ≤2.6% each.
+
+Independent corroboration of a landed change: `sha256::compress256` is 0.40% of
+total here against **1.99%** in run 2, a ~5x drop consistent with the 4.0x
+hardware-backend speedup measured in isolation.

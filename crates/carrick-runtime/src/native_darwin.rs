@@ -1451,6 +1451,10 @@ impl carrick_dsr::probes::DsrProbeSink for NativeDsrProbeForwarder {
     fn dsr_cache_capacity(&self, role: carrick_dsr::probes::DsrCacheRole, capacity_bytes: u64) {
         crate::probes::dsr_cache_capacity(native_dsr_cache_role(role), capacity_bytes);
     }
+
+    fn dsr_cache_bounds(&self, base: u64, end: u64) {
+        crate::probes::dsr_cache_bounds(base, end);
+    }
 }
 
 /// Install the USDT forwarder as `carrick_dsr::probes`' process-wide sink.

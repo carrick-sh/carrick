@@ -1537,6 +1537,9 @@ impl ProcessTranslator {
             probes::DsrCacheRole::Common,
             u64::try_from(capacity).unwrap_or(u64::MAX),
         );
+        // Publish the cache's host-VA bounds so a profiler can classify a sampled
+        // PC as JIT or host without unwinding it.
+        probes::dsr_cache_bounds(cache_range.start as u64, cache_range.end as u64);
         Ok(translator)
     }
 
