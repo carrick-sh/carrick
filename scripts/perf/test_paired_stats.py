@@ -78,14 +78,22 @@ class PairedStatsTest(unittest.TestCase):
     def test_rejection_index_advances_past_rejected_output(self):
         first_state = 0x1111
         second_state = 0x2222
+        input_states: list[int] = []
+        outputs = iter(((first_state, paired_stats.MASK64), (second_state, 5)))
+
+        def forced_splitmix64(state: int) -> tuple[int, int]:
+            input_states.append(state)
+            return next(outputs)
+
         with mock.patch.object(
             paired_stats,
             "splitmix64",
-            side_effect=((first_state, paired_stats.MASK64), (second_state, 5)),
+            side_effect=forced_splitmix64,
         ) as splitmix64:
             state, index, rejected = paired_stats.rejection_index(0, 3)
 
         self.assertEqual((state, index, rejected), (second_state, 2, 1))
+        self.assertEqual(input_states, [0, first_state])
         self.assertEqual(splitmix64.call_count, 2)
 
     def test_paired_bootstrap_rejects_empty_population(self):
