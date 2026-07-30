@@ -79,6 +79,13 @@ class NativeGoBuildTest(unittest.TestCase):
 
         self.assertEqual(carrick[-1], docker[-1])
 
+    def test_compatibility_command_uses_harness_binary_without_override(self):
+        repo = pathlib.Path("/harness")
+
+        command = native_go_build.build_command(repo, "carrick", "run-c")
+
+        self.assertEqual(command[0], "/harness/target/release/carrick")
+
     def test_docker_command_requires_native_arm64(self):
         docker = native_go_build.build_command(
             pathlib.Path("/repo"), "docker", "run-d"
@@ -179,6 +186,85 @@ class NativeGoBuildTest(unittest.TestCase):
         self.assertEqual(
             captured.read_text(), "WORKLOAD_NS=1200000000\nBUILD_OK\n"
         )
+
+    def test_explicit_sample_identity_binds_command_and_provenance(self):
+        harness, _ = self.install_fake_docker("arm64")
+        subprocess.run(
+            ["git", "init", "-q"], cwd=harness, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=harness,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Native Go Build Test"],
+            cwd=harness,
+            check=True,
+        )
+        (harness / "README").write_text("fixture\n")
+        subprocess.run(["git", "add", "-A"], cwd=harness, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "fixture"], cwd=harness, check=True
+        )
+        binary = pathlib.Path("/immutable/A/carrick")
+        image = "localhost:5005/carrick-go-conformance:immutable-a"
+        default_binary = harness / "target/release/carrick"
+        original_run = native_go_build.subprocess.run
+
+        def run_workload_or_real(*args, **kwargs):
+            command = args[0]
+            if command[0] == str(binary.resolve()):
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "WORKLOAD_NS=1200000000\nBUILD_OK\n",
+                    "",
+                )
+            return original_run(*args, **kwargs)
+
+        def hash_explicit_binary(path):
+            self.assertNotEqual(path, default_binary)
+            self.assertEqual(path, binary.resolve())
+            return "a" * 64
+
+        with (
+            mock.patch.object(
+                native_go_build, "foreign_workload_census", return_value=[]
+            ),
+            mock.patch.object(
+                native_go_build, "running_docker_oracles", return_value=[]
+            ),
+            mock.patch.object(native_go_build, "sha256_file", side_effect=hash_explicit_binary),
+            mock.patch.object(native_go_build.subprocess, "run", side_effect=run_workload_or_real),
+            mock.patch.object(
+                native_go_build,
+                "carrick_cleanup",
+                return_value={"status": 0, "stdout": "", "stderr": ""},
+            ),
+        ):
+            sample = native_go_build.run_sample(
+                harness,
+                "carrick",
+                index=1,
+                timeout_seconds=5,
+                binary=binary,
+                image=image,
+                current_run_id="run-c1",
+            )
+
+        self.assertEqual(sample["run_id"], "run-c1")
+        self.assertEqual(sample["command"]["argv"][0], str(binary.resolve()))
+        self.assertEqual(sample["command"]["argv"][8], image)
+        self.assertEqual(sample["binary_path"], str(binary.resolve()))
+        self.assertEqual(sample["binary_sha256"], "a" * 64)
+        for provenance in (
+            sample["provenance"]["pre"],
+            sample["provenance"]["post"],
+        ):
+            self.assertEqual(provenance["binary_path"], str(binary.resolve()))
+            self.assertEqual(provenance["binary_sha256"], "a" * 64)
+            self.assertEqual(provenance["image_ref"], image)
 
     def test_timeout_retains_partial_stdout_and_stderr_before_reraising(self):
         directory, _ = self.install_fake_docker("arm64")
@@ -362,6 +448,58 @@ class NativeGoBuildTest(unittest.TestCase):
 
         self.assertEqual(len(foreign), 1)
         self.assertIn("pid=30", foreign[0])
+
+    def test_census_uses_delimited_titles_and_receipt_binaries(self):
+        rows = [
+            (101, "carrick:native-go-build-carrick-old-1:go"),
+            (102, "/tmp/carrick:native-go-build-carrick-old-2:compile"),
+            (103, "carrick:run-c1: go"),
+            (104, "carrick:run-c10: go"),
+            (105, "/var/tmp/native-m1/arm/carrick run --exec-backend native"),
+            (106, "python3 -c 'print(\"carrick is just text\")'"),
+            (107, "python3 scripts/perf/native_go_build.py --engine carrick"),
+        ]
+
+        foreign = native_go_build.foreign_rows(
+            rows,
+            own_pid=20,
+            ancestor_pids={1},
+            current_run_id="run-c1",
+            known_receipt_binaries=(pathlib.Path("/var/tmp/native-m1/arm/carrick"),),
+        )
+
+        self.assertEqual(
+            foreign,
+            [
+                "pid=101 command=carrick:native-go-build-carrick-old-1:go",
+                "pid=102 command=/tmp/carrick:native-go-build-carrick-old-2:compile",
+                "pid=104 command=carrick:run-c10: go",
+                (
+                    "pid=105 command=/var/tmp/native-m1/arm/carrick run "
+                    "--exec-backend native"
+                ),
+                "pid=107 command=python3 scripts/perf/native_go_build.py --engine carrick",
+            ],
+        )
+
+    def test_census_uses_kill_script_process_listing_grammar(self):
+        listing = subprocess.CompletedProcess(
+            ["ps"], 0, "101 carrick:old-run:go\n", ""
+        )
+        with (
+            mock.patch.object(native_go_build.subprocess, "run", return_value=listing) as run,
+            mock.patch.object(native_go_build, "own_ancestor_pids", return_value={1}),
+            mock.patch.object(native_go_build.os, "getpid", return_value=20),
+        ):
+            foreign = native_go_build.foreign_workload_census(current_run_id="run-c1")
+
+        self.assertEqual(foreign, ["pid=101 command=carrick:old-run:go"])
+        run.assert_called_once_with(
+            ["ps", "-axww", "-o", "pid=", "-o", "command="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     def test_phase_summary_reports_workload_median(self):
         summary = native_go_build.summarize_phases(
