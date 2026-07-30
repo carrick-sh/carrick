@@ -416,6 +416,18 @@ pub struct ThreadTranslator {
     pub process: Arc<ProcessTranslator>,
     pub tid: i32,
     block_cache: ThreadBlockCache,
+    /// Distinct `(source, target)` private -> shared edges this thread has
+    /// resolved, under profiling only. 135.7M such exits is meaningless until it
+    /// is divided by the number of edges producing them: a small set traversed
+    /// many times each is a binding problem with a bounded fix, whereas a set as
+    /// large as the exit count would mean the edges are genuinely one-shot.
+    profiled_private_to_shared_edges: std::collections::HashSet<(u64, u64)>,
+    /// The same for private -> private edges. This is the CONTROL: if those are
+    /// also traversed many times each yet resolve rarely, a binding mechanism
+    /// already exists and the fix is to extend it to shared targets. If instead
+    /// they are one-shot (distinct ~= exits), no such mechanism exists and the
+    /// asymmetry is simply that shared units concentrate the HOT code.
+    profiled_private_to_private_edges: std::collections::HashSet<(u64, u64)>,
     /// Last `cache.used_bytes()` seen under the lock. The per-thread fast path
     /// reports this rather than taking the lock for a diagnostic gauge.
     last_cache_used_bytes: u64,
@@ -936,6 +948,8 @@ impl ThreadTranslator {
             process,
             tid,
             block_cache: ThreadBlockCache::new(),
+            profiled_private_to_shared_edges: std::collections::HashSet::new(),
+            profiled_private_to_private_edges: std::collections::HashSet::new(),
             last_cache_used_bytes: 0,
             stats: ResolverStats::default(),
             budget: profile::ThreadBudget::from_environment(tid),
@@ -1144,6 +1158,10 @@ impl ThreadTranslator {
                 .direct_bindings
                 .counters()
                 .publication_retries,
+            resolve_private_to_shared_distinct_edges: self.profiled_private_to_shared_edges.len()
+                as u64,
+            resolve_private_to_private_distinct_edges: self.profiled_private_to_private_edges.len()
+                as u64,
             resolve_src_shared_tgt_shared: self.stats.resolve_src_shared_tgt_shared,
             resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
             resolve_src_private_tgt_shared: self.stats.resolve_src_private_tgt_shared,
@@ -1211,6 +1229,10 @@ impl ThreadTranslator {
                 .direct_bindings
                 .counters()
                 .publication_retries,
+            resolve_private_to_shared_distinct_edges: self.profiled_private_to_shared_edges.len()
+                as u64,
+            resolve_private_to_private_distinct_edges: self.profiled_private_to_private_edges.len()
+                as u64,
             resolve_src_shared_tgt_shared: self.stats.resolve_src_shared_tgt_shared,
             resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
             resolve_src_private_tgt_shared: self.stats.resolve_src_private_tgt_shared,
@@ -1302,6 +1324,8 @@ impl ThreadTranslator {
             translation_publication_ns: 0,
             // Process-wide deltas, like the block above: owned by the draining
             // thread's own record, so structurally zero here.
+            resolve_private_to_shared_distinct_edges: 0,
+            resolve_private_to_private_distinct_edges: 0,
             resolve_src_shared_tgt_shared: stats.resolve_src_shared_tgt_shared,
             resolve_src_shared_tgt_private: stats.resolve_src_shared_tgt_private,
             resolve_src_private_tgt_shared: stats.resolve_src_private_tgt_shared,
@@ -3483,8 +3507,16 @@ impl ThreadTranslator {
                         match (source_shared, target_shared) {
                             (true, true) => ResolverStat::ResolveSrcSharedTgtShared,
                             (true, false) => ResolverStat::ResolveSrcSharedTgtPrivate,
-                            (false, true) => ResolverStat::ResolveSrcPrivateTgtShared,
-                            (false, false) => ResolverStat::ResolveSrcPrivateTgtPrivate,
+                            (false, true) => {
+                                self.profiled_private_to_shared_edges
+                                    .insert((source.raw(), target.raw()));
+                                ResolverStat::ResolveSrcPrivateTgtShared
+                            }
+                            (false, false) => {
+                                self.profiled_private_to_private_edges
+                                    .insert((source.raw(), target.raw()));
+                                ResolverStat::ResolveSrcPrivateTgtPrivate
+                            }
                         },
                         1,
                     );

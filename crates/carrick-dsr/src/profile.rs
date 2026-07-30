@@ -805,6 +805,10 @@ pub struct ProfileSnapshot {
     pub resolve_src_shared_tgt_private: u64,
     pub resolve_src_private_tgt_shared: u64,
     pub resolve_src_private_tgt_private: u64,
+    /// DISTINCT private -> shared edges seen by this thread.
+    pub resolve_private_to_shared_distinct_edges: u64,
+    /// Control for the above: distinct private -> private edges.
+    pub resolve_private_to_private_distinct_edges: u64,
     /// Direct-binding registry counters. POINT-IN-TIME GAUGES on the process
     /// registry, never deltas -- like `cache_used_bytes`. Summing them across a
     /// process's thread records multiplies them by the reporting thread count;
@@ -979,11 +983,13 @@ impl CompleteThreadRecord {
         let mut resolve = self.frame_header("resolve-class");
         let _ = write!(
             resolve,
-            "|resolve_src_shared_tgt_shared={}|resolve_src_shared_tgt_private={}|resolve_src_private_tgt_shared={}|resolve_src_private_tgt_private={}",
+            "|resolve_src_shared_tgt_shared={}|resolve_src_shared_tgt_private={}|resolve_src_private_tgt_shared={}|resolve_src_private_tgt_private={}|resolve_private_to_shared_distinct_edges={}|resolve_private_to_private_distinct_edges={}",
             resolver.resolve_src_shared_tgt_shared,
             resolver.resolve_src_shared_tgt_private,
             resolver.resolve_src_private_tgt_shared,
             resolver.resolve_src_private_tgt_private,
+            resolver.resolve_private_to_shared_distinct_edges,
+            resolver.resolve_private_to_private_distinct_edges,
         );
         frames.push(resolve);
         let mut binding = self.frame_header("direct-binding-gauge");
@@ -1718,6 +1724,8 @@ mod tests {
                     resolve_src_shared_tgt_private: u64::MAX,
                     resolve_src_private_tgt_shared: u64::MAX,
                     resolve_src_private_tgt_private: u64::MAX,
+                    resolve_private_to_shared_distinct_edges: u64::MAX,
+                    resolve_private_to_private_distinct_edges: u64::MAX,
                     shared_unit_lookups: u64::MAX,
                     shared_unit_hits: u64::MAX,
                     shared_unit_loads: u64::MAX,
