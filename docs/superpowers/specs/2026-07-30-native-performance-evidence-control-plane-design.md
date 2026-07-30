@@ -1,7 +1,7 @@
 # Darwin native performance evidence control plane
 
 - **Date:** 2026-07-30
-- **Status:** conceptual design approved 2026-07-30; written-spec review pending
+- **Status:** conceptual and written design approved 2026-07-30
 - **Lane:** Darwin/AArch64 native DSR only
 - **Controller:** `handoff.md` and
   `docs/perf-results/2026-07-29-native-cpu-budget-evidence.md`
