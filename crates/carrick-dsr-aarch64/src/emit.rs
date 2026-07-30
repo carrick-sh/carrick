@@ -164,6 +164,35 @@ impl GenerationGuard {
     }
 }
 
+/// Words in a binding-install trampoline: a four-word `movz`/`movk` chain, the
+/// context store, and the branch to the shared block.
+pub const BINDING_INSTALL_TRAMPOLINE_WORDS: usize = 6;
+
+/// The five words that install `bindings` as the context's generation-binding
+/// table. The caller appends the sixth word, a `b` to the shared block.
+///
+/// A loaded unit's block guards with `GenerationGuard::BindingIndex`, which
+/// reads the table from `CTX_GENERATION_BINDINGS`. Only the gateway installs
+/// that, so a direct branch from a private block would read whatever the
+/// private entry left there. Supplying it at ENTRY cannot work -- a context
+/// holds one pointer while a private context reaches blocks from N units -- so
+/// it is installed here, at the EDGE, where the target's unit is statically
+/// known.
+///
+/// `x17` is dead at an edge: the target's own guard prologue clobbers it before
+/// any use.
+pub fn binding_install_prologue(bindings: u64) -> [u32; BINDING_INSTALL_TRAMPOLINE_WORDS - 1] {
+    let halfword = |shift: u32| u32::from(((bindings >> shift) & 0xffff) as u16) << 5;
+    [
+        0xd280_0011 | halfword(0),  // movz x17, bindings[15:0]
+        0xf2a0_0011 | halfword(16), // movk x17, bindings[31:16], lsl #16
+        0xf2c0_0011 | halfword(32), // movk x17, bindings[47:32], lsl #32
+        0xf2e0_0011 | halfword(48), // movk x17, bindings[63:48], lsl #48
+        // str x17, [x28, #CTX_GENERATION_BINDINGS]
+        0xf900_0000 | ((super::gateway::CTX_GENERATION_BINDINGS / 8) << 10) | (28 << 5) | 17,
+    ]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryAction {
     Noop,
