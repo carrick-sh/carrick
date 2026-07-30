@@ -997,6 +997,24 @@ impl ThreadTranslator {
             nested_translation_ns: self.nested_translation_ns,
             cache_used_bytes: process.cache.used_bytes(),
             cache_capacity_bytes: process.cache.capacity_bytes(),
+            direct_binding_owner_validation_failures: process
+                .direct_bindings
+                .counters()
+                .owner_validation_failures,
+            direct_binding_authority_validation_failures: process
+                .direct_bindings
+                .counters()
+                .authority_validation_failures,
+            direct_binding_cas_wins: process.direct_bindings.counters().cas_wins,
+            direct_binding_cas_losses: process.direct_bindings.counters().cas_losses,
+            direct_binding_stale_winner_clears: process
+                .direct_bindings
+                .counters()
+                .stale_winner_clears,
+            direct_binding_publication_retries: process
+                .direct_bindings
+                .counters()
+                .publication_retries,
             shared_unit_lookups: process.stats.shared_unit_lookups,
             shared_unit_hits: process.stats.shared_unit_hits,
             shared_unit_loads: process.stats.shared_unit_loads,
@@ -1042,6 +1060,24 @@ impl ThreadTranslator {
             nested_translation_ns: self.nested_translation_ns,
             cache_used_bytes: process.cache.used_bytes(),
             cache_capacity_bytes: process.cache.capacity_bytes(),
+            direct_binding_owner_validation_failures: process
+                .direct_bindings
+                .counters()
+                .owner_validation_failures,
+            direct_binding_authority_validation_failures: process
+                .direct_bindings
+                .counters()
+                .authority_validation_failures,
+            direct_binding_cas_wins: process.direct_bindings.counters().cas_wins,
+            direct_binding_cas_losses: process.direct_bindings.counters().cas_losses,
+            direct_binding_stale_winner_clears: process
+                .direct_bindings
+                .counters()
+                .stale_winner_clears,
+            direct_binding_publication_retries: process
+                .direct_bindings
+                .counters()
+                .publication_retries,
             shared_unit_lookups: delta.shared_unit_lookups,
             shared_unit_hits: delta.shared_unit_hits,
             shared_unit_loads: delta.shared_unit_loads,
@@ -1097,6 +1133,24 @@ impl ThreadTranslator {
             // Point-in-time gauges, never deltas: real live reads.
             cache_used_bytes: process_state.cache.used_bytes(),
             cache_capacity_bytes: process_state.cache.capacity_bytes(),
+            direct_binding_owner_validation_failures: process_state
+                .direct_bindings
+                .counters()
+                .owner_validation_failures,
+            direct_binding_authority_validation_failures: process_state
+                .direct_bindings
+                .counters()
+                .authority_validation_failures,
+            direct_binding_cas_wins: process_state.direct_bindings.counters().cas_wins,
+            direct_binding_cas_losses: process_state.direct_bindings.counters().cas_losses,
+            direct_binding_stale_winner_clears: process_state
+                .direct_bindings
+                .counters()
+                .stale_winner_clears,
+            direct_binding_publication_retries: process_state
+                .direct_bindings
+                .counters()
+                .publication_retries,
             // Process-wide deltas: owned by the draining thread's own record
             // (see the doc comment above); structurally zero here.
             translations: 0,
