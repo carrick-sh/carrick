@@ -1056,3 +1056,58 @@ thing three times.
 
 Recorded as a hard rule for this problem: **do not propose another A1 fix without
 the faulting cache PC and the decoded instruction in hand.**
+
+## Run 18 — the faulting site is a CALL, and the obvious call hazard is excluded
+
+Decoding the faulting guest instruction (reported at the fault by reading the
+guest word and printing it) across every failure in one repro run:
+
+```
+9x  recovered_guest_pc=0x97ed0  insn=[94000ed4 …]
+1x  recovered_guest_pc=0x7e880  insn=[94000ec4 …]
+```
+
+`0x94000ed4` is a **`BL`** — a call. So every failure is at a patched
+private -> shared CALL edge, which is consistent with the A1 sizing: the 74,726
+edges are call sites, and `SHARED -> private` (returns) barely appears because
+returns are indirect.
+
+The obvious call hazard is that a patched branch skips the link-register write.
+It does not: `assemble_block_inner` emits
+
+```rust
+if exit.kind == DirectKind::Call {
+    emit_mov_u64(.., 30, MaterializedValue::Guest(exit.resume.raw()), ..)?;   // x30
+}
+…
+let slot = current_offset(&assembler)?;      // <- the patch point, AFTER x30
+emit_word(.., 0x1400_0001)?;
+```
+
+so guest x30 is established BEFORE the slot and survives the patch.
+
+### Running tally of excluded explanations
+
+| candidate | status |
+|---|---|
+| missing per-unit context (`generation_bindings`) | necessary, insufficient (run 14) |
+| context lost its address mode (`host_bias`) | refuted — bias is correct (run 17) |
+| patched branch skips the link-register write | **refuted — x30 precedes the slot** |
+| some other guest register the target's entry expects | surviving |
+
+The fault is a guest base register holding ~0x20 on entry to the callee. Four
+mechanisms have now been named and excluded by measurement, each costing a
+build-and-run.
+
+### Stopping rule for A1
+
+The surviving explanation cannot be settled by more single-shot experiments: it
+needs the callee's emitted prologue and the live register file at the fault,
+i.e. a debugger session (`process save-core` + `bt all`, per AGENTS.md) or an
+instrumented dump of the guest register file at the unlowerable-fault site.
+Anything less is a fifth guess.
+
+What is durable from this: the amplification is entirely private -> shared CALL
+edges, they are bindable in principle (range measured, patch point identified,
+link register verified safe), and four wrong explanations are written down so the
+next attempt does not re-derive them.
