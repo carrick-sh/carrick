@@ -1997,3 +1997,78 @@ three guesses have now died on first contact with a counter.
 
 **Primary metric unmoved. C: 30.7% kernel non-syscall and 2.2 M faults both
 unchanged; no fix attempted.**
+
+---
+
+# Campaign conclusion: the 0.70 target fails honestly
+
+The goal provided for this: "the 0.70 target then fails honestly rather than by
+moving the target." That clause is now reached, on evidence, for all three
+workstreams. Recording it plainly so the next campaign does not re-derive it.
+
+## Primary metric
+
+**Unmoved, ~1.0 vs `0686248a`.** Sharing ships OFF, so the shipped path is
+unchanged. Nothing that ships regressed.
+
+## Workstream A — dead, but not for the reason the goal anticipated
+
+The falsification clause expected A to die if the exit amplification were
+INTRINSIC. It was not: it was root-caused and fixed (173x -> 0, control-armed,
+`b23503ea`). A died anyway, of something the goal did not consider.
+
+| step | result |
+|---|---|
+| A0 | **met** -- 135,259,579 -> 0 private->shared resolver exits |
+| edge trampoline | A1 3.2-4.2x -> **1.114x** |
+| fusion made shareable (`7781d97e`) | coverage 14.4% -> **33.1%**, translations -21.6% |
+| A1 after that | **1.268x** -- WORSE |
+
+**Cutting fresh translations 21.6% made the workload measurably slower**
+(1.106 -> 1.235 CPU, 0/8 quads, sd 1.4%). Translation volume is not the binding
+constraint on this workload. The goal's one-line rationale -- that carrick
+produces translated code ~800,000 times per build and that this is therefore the
+lever -- does not survive its own measurement.
+
+## Workstream B — premise measured false
+
+A 9.3% cut in emitted bytes (`3d480e88`, 610.0 -> 553.3 MB) moved CPU by zero.
+B's full 400 MB target extrapolates to ~0.9%. The metric B is stated in --
+emitted bytes -- does not drive the CPU it was chosen to proxy.
+
+## Workstream C — largest bucket, mechanism unattributed after four probes
+
+| candidate | verdict |
+|---|---|
+| scavenger decommit (`madvise`) | **refuted**, 328 calls vs 1,716,964 zfod (1:5000) |
+| per-process address-space setup | **refuted**, ~2,000/process trivial vs ~34,000/process build |
+| sub-page `PROT_NONE` amplifier | **real**, but bounds to ~382,000 faults = 18% of the term, <5% CPU |
+| the zfod majority (82%) | **unattributed** |
+
+C is blocked on instrumentation, not ideas: `vminfo` carries no fault address, so
+every probe has been indirect. Distinct-address accounting
+(`fbt::vm_fault:entry`, or a guest-side page census) is the prerequisite for any
+fault-path change.
+
+## What the ceiling actually looks like
+
+A is dead by measurement. B's proxy metric does not drive CPU. C's 30.7% is real
+but unattributed, and its one identified mechanism is under the goal's own 5%
+chase threshold. Codegen cycle quality is explicitly out of scope and measured
+<=2.6% three times. **There is no identified path to 0.70 from here**, and
+claiming otherwise would require inventing a lever none of the measurements
+support.
+
+## What is worth keeping
+
+- Sharing is now CORRECT and coverage-capable with fusion on -- a prerequisite
+  for any future attempt, even though it does not pay today.
+- A latent bug fixed: sensitive-exit metadata was keyed by block START while the
+  lookup is by the SENSITIVE instruction's PC, wrong for any block longer than
+  one instruction, and unreachable only because units held short blocks.
+- The instrument: ABBA + CPU-seconds resolves >=0.8-1.1% at n=8, ~4x sharper
+  than the wall screens that produced several earlier "rejections" -- those were
+  unmeasurable, not refuted, and are worth revisiting.
+- Two profiler defects recorded: unit-mapped code is misfiled as `host` (run 24),
+  and `vminfo` gives no address (run 30). Both cap what the next campaign can
+  see until fixed.
