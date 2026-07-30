@@ -1949,3 +1949,51 @@ this workstream both died on first contact with a counter.
 
 **Primary metric unmoved. C's mechanism still unattributed, but two of three
 candidates are now eliminated.**
+
+## Run 30 — a real sub-page amplifier found; the zfod bulk stays unattributed
+
+Peak-RSS sampling during the build (45 processes, `ps` every 0.3 s, BUILD_OK):
+median peak **91 MB**, max 1,286 MB -- against 34,000 zfod x 16 KB = **531 MB**
+first-touched per process. Suggestive of re-faulting, but NOT decisive: 0.3 s
+sampling of ~1-2 s processes misses peaks, and the flat fault distribution
+(31-39k everywhere) sitting beside a heavily skewed RSS distribution is itself
+unexplained.
+
+The mechanism question was answerable from the code instead. `MappedMemory`
+runs in `uses_linux4k_subpages()` mode on exactly this platform --
+`host_page_size == 16K && linux_page_size == 4K` -- and
+`native_host_prot_for_page` resolves a host page's protection by classifying its
+four guest sub-pages:
+
+| class | host protection |
+|---|---|
+| `Uniform16k` | the real protection |
+| `MixedGuarded(_)` / `Composed16k` | **`PROT_NONE`** |
+| `Unsupported(_)` | **`PROT_NONE`** |
+
+Any 16 KB host page whose four 4 KB guest pages disagree on protection is mapped
+`PROT_NONE`, so EVERY access to it faults -- not merely the first. That is a
+genuine, unbounded fault amplifier and it is guest-layout-dependent: a guest that
+places a guard page, or a `.data`/`.bss` boundary, inside a 16 KB host page pays
+a fault per access forever.
+
+**Scope, stated honestly:** this explains the non-zero-fill faults,
+2,098,739 - 1,716,964 = **~382,000**, which is 18% of the term. It does NOT
+explain the 1.72 M zfod, because zero-fill is first-touch by definition and a
+re-fault of an already-populated page is not zfod.
+
+So C's mechanism is still not attributed. Three candidates are now eliminated
+(scavenger decommit, process startup, and -- for the zfod majority -- sub-page
+protection), and one real amplifier is found that is worth fixing on its own
+terms but caps out at 18% of the fault term and well under 5% of CPU.
+
+### What would actually settle it
+
+`vminfo` carries no fault address, which is why every probe so far has been
+indirect. Settling this needs distinct-address accounting: `fbt::vm_fault:entry`
+with the faulting address, or a guest-side census of pages touched. Until one of
+those runs, any change to the fault path is a guess -- and in this workstream
+three guesses have now died on first contact with a counter.
+
+**Primary metric unmoved. C: 30.7% kernel non-syscall and 2.2 M faults both
+unchanged; no fix attempted.**
