@@ -1191,3 +1191,63 @@ The change is kept: it is strictly less emitted code, ~57 MB less JIT per build,
 with no identified cost and no measured CPU change. It is NOT counted toward any
 compounding total, and the campaign should stop expecting emitted-size work to
 pay in CPU.
+
+## Run 20 — the crash, finally diagnosed from the register file
+
+Five mechanisms were proposed from source inspection and refuted. The snapshot
+had the answer the whole time. Dumping it at the unlowerable fault:
+
+```
+esr=0x92000006  far=0x20
+small_regs=[x3=0 x4=0 x5=0 x6=0 x8=0 … x19=0x0 x20=0 … x26=0]
+```
+
+- `esr = 0x92000006` — data abort, translation fault.
+- `far = 0x20` — the hardware faulting address.
+- **`x19 = 0`** — and x19 is `gateway::RESERVED_SCRATCH`, the register a
+  `GenerationGuard::BindingIndex` guard loads the binding table into:
+
+```asm
+ldr x19, [x28, #CTX_GENERATION_BINDINGS]   ; x19 = table base
+…
+ldp x19, x17, [x19, #index*16]             ; faults here
+```
+
+With a NULL table base, `index = 2` gives `2 * 16 = 0x20` — **exactly the
+observed FAR**. Run 14's shape-3 attempt faulted at `0x60`, which is
+`index 6 * 16`: the same dereference at a different block's index.
+
+So the crash is, and always was, **a shared block's generation guard indexing a
+NULL `generation_bindings` table**. That is the mechanism run 13 named first and
+run 14 tried to fix — the fix direction was right, and its *implementation* was
+what failed: `sole_unit_bindings()` returned `None` for the entries that
+faulted, so `PreparedEntry` still carried `generation_bindings: 0`.
+
+### Why the earlier reasoning went wrong, and it is worth naming
+
+Run 17 measured `host_bias` as correct and concluded "not a context defect, it is
+register state". Both halves were true and the inference was still wrong: the bad
+value *was* in a register (x19), and that register's contents came *from* the
+context. A correct measurement of one context field does not clear the context.
+
+The five refutations remain valid as refutations — they each excluded a specific
+mechanism — but the search was ordered by what was easy to read rather than by
+what the fault was already reporting. **The register file should have been the
+first measurement, not the sixth.**
+
+### The corrected fix
+
+Shape 3's idea stands: with one loaded unit, install its `generation_bindings`
+uniformly so the context does not depend on which block the gateway entered. Its
+implementation must change in two ways:
+
+1. Install the pointer **at unit load**, into process state that every
+   `PreparedEntry` reads unconditionally — not via a per-call
+   `sole_unit_bindings()` that returns `None` whenever the process is between
+   states.
+2. **Gate the patch on the pointer actually being installed**, not on unit
+   count, so an edge can never be patched while the context could still carry a
+   NULL table.
+
+That is now a fix with a confirmed mechanism behind it rather than a sixth
+guess.
