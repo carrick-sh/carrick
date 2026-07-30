@@ -1492,3 +1492,64 @@ Neither is a variant of what was tried. A1 stays open, but it is no longer
 mis-specified: the target is unit-authority installation, not a null pointer.
 
 **A1 remains NOT MET. Primary metric unmoved at 0.9947 (target <=0.70).**
+
+### Run 22b — why all four constructions failed, and the design that follows
+
+Attribution narrowed the constraint from three context fields to one, then to a
+cardinality problem. Both steps are measured, not reasoned.
+
+**Only ONE unit-specific field is read by emitted code.** Census of every
+`CTX_*` referenced in `emit.rs`:
+
+| field | uses | unit-specific? |
+|---|---|---|
+| `CTX_GUEST_RESERVED_SCRATCH` | 7 | no -- per-thread |
+| `CTX_GENERATION_BINDINGS` | 3 | **YES -- read by the guard** |
+| `CTX_GENERATION` | 3 | no |
+| `CTX_INDIRECT_CACHE` | 2 | no -- per-thread cache |
+| `CTX_CACHE_START` / `CTX_CACHE_END` | 1 each | no -- **written** by the indirect-cache install path, not read as authority |
+| `CTX_GATEWAY_PHASE` | 1 | no |
+
+`target_authority` has no `CTX_` constant at all: it is runtime-side, never read
+by emitted code. So the run-13 comment's "cache range and target authority" are
+not what faults. The single unit-specific read is the binding table.
+
+**The real constraint is cardinality, not nullness.** A context holds ONE
+`generation_bindings` pointer; a private context reaches blocks from N units. All
+four constructions installed one table at ENTRY. That is correct only while the
+thread touches one unit, and silently wrong afterwards -- the guard indexes the
+WRONG unit's table, which is why the fault address wandered (`0x20`, `0x60`, `0`)
+instead of staying put. A null table was only ever the special case N=0.
+
+**Design that follows: install at the EDGE, not at entry.** Each private->shared
+edge statically knows its target's unit, and `ProcessState::shared_blocks` already
+stores per-block `SharedBlockAuthority { generation_bindings, .. }` -- the exact
+pointer, available at patch time. Patch the slot to a per-target trampoline:
+
+    <materialize authority.generation_bindings -> x17>
+    str x17, [x28, #CTX_GENERATION_BINDINGS]
+    b   target
+
+~3-6 instructions against a full gateway round trip, on 74,726 edges x 1,822
+traversals.
+
+Premises, both verified rather than assumed:
+
+- **Private code never reads the field**, so leaving a unit's table installed
+  after the edge cannot corrupt it. Production `GenerationGuard::binding(` has
+  exactly one caller (`emit.rs:4231`, the shared-unit artifact path); the live
+  private path (`translator.rs:2584`/`2593`) uses `GenerationGuard::new` =
+  `Absolute`. Every other `binding(` caller is a test or the oracle.
+- **x17 is free at the edge**: the target's own guard prologue clobbers x17 (and
+  x19) before any use.
+
+Open risk to check when implementing: whether the runtime reads
+`context.generation_bindings` on a gateway EXIT taken from a private entry whose
+table the trampoline overwrote.
+
+Not implemented here. It needs a cache trampoline allocator (none exists --
+`patch_direct_link_if_reachable` only writes a single branch word), MAP_JIT
+write-protect toggling, icache invalidation, and fork-reset interaction, plus a
+red-first test and an 8-quad ABBA measurement. **A1 remains NOT MET; primary
+metric unmoved at 0.9947 vs target <=0.70.** What changed is that A1 is no longer
+mis-specified.
