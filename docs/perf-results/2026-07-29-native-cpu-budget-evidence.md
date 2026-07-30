@@ -654,3 +654,52 @@ metadata, not an emit-time target). Yet private -> private edges resolve only
 them re-resolving that does not apply to a shared target. Find that mechanism
 and either extend it to shared targets or explain why it cannot be. Do not
 guess: five hypotheses have already died here.
+
+## Run 11 — A1 sized: 74,726 cold call edges into hot shared code
+
+The A0 classification said 99.4% of the amplified exits are private -> shared.
+That is meaningless until divided by the number of EDGES producing them, so both
+classes now also count DISTINCT `(source, target)` pairs, and the private ->
+private class is carried as the control.
+
+Same binary, both arms:
+
+| arm | class | exits | distinct edges | traversals per edge |
+|---|---|---|---|---|
+| OFF | private -> private | 782,054 | 440,578 | **1.8** |
+| ON | private -> private | 734,116 | 481,368 | **1.5** |
+| ON | private -> **shared** | 136,133,949 | 74,726 | **1,822** |
+
+### There is no binding mechanism to extend — that was the open question
+
+Private -> private edges resolve **1.8 times each**. They are cold. The healthy
+arm is not fast because something binds its direct edges; it is fast because its
+direct edges are almost never traversed twice. Enabling sharing leaves that
+population untouched (1.5 per edge) and adds a population traversed **a thousand
+times more often per edge**.
+
+That closes the question A0 left open, and it rules out "extend the existing
+mechanism": there isn't one. A binding path for these edges has to be BUILT.
+
+### Why the shared edges are the hot ones
+
+A unit is published precisely because its code RECURS across processes — so a
+loaded unit contains, by construction, the hot code. Meanwhile
+`source SHARED -> target private` is only 6,550, and `SHARED -> SHARED` only
+33,763 (intra-unit edges are patched at pack time by
+`patch_same_unit_direct_link`). So control does not leave shared code by a direct
+edge at all: private code CALLS into shared code 136 M times over 74,726 call
+sites, and returns by an indirect branch that is not a `ResolveDirect`.
+
+This is a call-site binding problem — the classic inline-cache shape — not a
+cache-lookup, fusion, manifest, or validation problem, each of which was
+hypothesised and refuted earlier in this document.
+
+### The fix, and its bound
+
+Bind those 74,726 edges once each and ~99.95% of 136 M gateway round-trips
+disappear. The source block is PRIVATE and therefore writable (`MAP_JIT`), so its
+gateway-exit stub can be rewritten in place to reach the shared target directly —
+subject to branch range, since a loaded unit is a separately mapped image and may
+sit outside a `b`'s +/-128 MiB, in which case the stub needs an indirect hop
+through a writable slot rather than a direct branch.
