@@ -16,6 +16,8 @@
 #pragma D option quiet
 #pragma D option aggsize=8m
 
+tick-90s { exit(0); }
+
 vminfo:::as_fault  /execname == "carrick"/ { @as[pid]  = count(); @tas  = count(); }
 vminfo:::zfod      /execname == "carrick"/ { @zf[pid]  = count(); @tzf  = count(); }
 vminfo:::cow_fault /execname == "carrick"/ { @cow[pid] = count(); @tcow = count(); }
