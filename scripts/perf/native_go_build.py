@@ -35,6 +35,12 @@ KNOWN_PERFORMANCE_COMMANDS = (
     "scripts/perf/native_go_build_screen.py",
     "scripts/perf/direct_binding_mechanism.py",
 )
+KNOWN_PERFORMANCE_PATHS = tuple(
+    re.compile(
+        rf"(?<!\S)(?:\./|/(?:\S+/)*)?{re.escape(command)}(?=$|\s)"
+    )
+    for command in KNOWN_PERFORMANCE_COMMANDS
+)
 REWRITTEN_PROCTITLE = re.compile(r"carrick:[^:]+:")
 # Container-lifetime sharing WITHOUT the artifact spike: the configuration the
 # A0/A1 gates are stated against (the 779,874 -> 135,259,579 exit amplification
@@ -408,11 +414,7 @@ def foreign_rows(
         if current_title is not None and current_title in command:
             continue
         is_known_command = any(
-            command == known
-            or command.startswith(f"{known} ")
-            or f" {known} " in command
-            or command.endswith(f" {known}")
-            for known in KNOWN_PERFORMANCE_COMMANDS
+            path.search(command) for path in KNOWN_PERFORMANCE_PATHS
         )
         executable = command.split(maxsplit=1)[0]
         is_receipt_binary = executable in receipt_binaries
