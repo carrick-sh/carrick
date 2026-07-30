@@ -1331,3 +1331,39 @@ The next attempt should thread the fact as a parameter through
 `ProcessState::translate` rather than staging it on shared state, and should
 enumerate the entry paths that can reach a patched branch instead of assuming
 `prepare_entry` is the only one.
+
+### Run 21c — thread-local gating: amplification gone again, NULL path survives
+
+Third construction of the A1 fix, correcting run 21b's race by moving the patch
+decision onto the thread that owns the fact:
+
+* `installed_unit_bindings` set at unit LOAD, carried by every `PreparedEntry`
+  including private ones;
+* `ThreadTranslator::entry_carries_bindings` recorded in `prepare_entry` --
+  per-thread, so no cross-thread overwrite;
+* patching moved out of `publish_emitted` and into the `ResolveDirect` handler,
+  where it runs only if THIS entry carried the table, draining `pending` for the
+  resolved target;
+* patched sites recorded so a second unit's arrival restores them.
+
+Result: amplification eliminated again --
+`resolve_src_private_tgt_shared` 135,715,237 -> **48**, `direct_resolver_exits`
+136,489,314 -> **69,140**, gateway entries 272,690,918 -> **332,194** -- and the
+run still faults at `far=0`, a NULL table at binding index 0.
+
+Checked and excluded as the NULL source: `enter_prepared`'s
+`enter_translated_with_trusted_private_cache` branch is guarded by
+`!shared_translation_runtime_enabled()`, so it cannot be taken in this
+configuration; the `generation_binding_count == 0` branch is unreachable once the
+table is installed; and fork inherits both the patched code (`MAP_JIT` is
+`MAP_PRIVATE`) and the installed pointer at the same virtual address.
+
+**Three independent constructions, each eliminating 135.7 M gateway round-trips,
+each leaving one entry path that reaches a shared block with a NULL table.** The
+consistency of that outcome is itself the finding: the patch mechanism is right
+and some entry path into translated code does not carry the prepared context.
+Enumerating those paths — every route from host code into the cache, not just
+`prepare_entry`/`enter_prepared` — is the remaining work, and it is enumeration
+work, not another gate.
+
+Reverted. Tree clean, tip BUILD_OK.
