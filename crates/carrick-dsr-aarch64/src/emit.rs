@@ -486,6 +486,61 @@ fn emit_mov_u64(
     Ok(())
 }
 
+/// How many `movz`/`movk` words a guest PC materialization occupies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuestPcWidth {
+    /// Four words regardless of value, for a site whose shape is validated.
+    Fixed,
+    /// Only the halfwords the value needs.
+    Narrow,
+}
+
+/// Materialize a NON-relocated guest PC in as few `movz`/`movk` words as allowed.
+///
+/// `emit_mov_u64` is deliberately fixed-width because a `MaterializedValue::Process`
+/// site is rewritten in place later and the relocator expects four halfwords. The
+/// values a gateway exit stores -- the guest target and source PCs -- are
+/// `MaterializedValue::Guest`, which `record_mov_wide` skips entirely and nothing
+/// ever rewrites, so they only need enough halfwords to hold the value.
+///
+/// This is the single largest emitted class: `dsr:x17-materialize` measured 29.1%
+/// of ALL emitted words, and guest addresses on this workload occupy two to three
+/// halfwords rather than four.
+///
+/// Restricted to the PRIVATE gateway exit on purpose. The cell-based
+/// `emit_cached_direct_exit` path has its shape validated at fixed word offsets by
+/// `rewrite_direct_binding_stub`, and narrowing there breaks the sidecar rewrite --
+/// measured: 11 tests, all of them `sidecar_*`/`direct_binding_*`.
+fn emit_guest_pc(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    guest: GuestVa,
+    register: u32,
+    value: u64,
+    width: GuestPcWidth,
+) -> Result<(), DsrError> {
+    // From halfword 0 upward so the leading instruction is always the `movz`
+    // that zeroes the register; the rest are `movk`.
+    let halfwords = match width {
+        GuestPcWidth::Fixed => 4,
+        GuestPcWidth::Narrow => 64_u32
+            .saturating_sub(value.leading_zeros())
+            .div_ceil(16)
+            .max(1),
+    };
+    for halfword in 0..halfwords {
+        map_next(assembler, entries, guest)?;
+        let immediate = ((value >> (halfword * 16)) & 0xffff) as u32;
+        let base = if halfword == 0 {
+            0xd280_0000
+        } else {
+            0xf280_0000
+        };
+        assembler.push_u32(base | (halfword << 21) | (immediate << 5) | register);
+    }
+    Ok(())
+}
+
 fn emit_word(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
@@ -831,30 +886,24 @@ fn emit_gateway_exit(
     source: Option<GuestVa>,
     status: u32,
     gateway: GatewayKind,
-    mut recording: Option<&mut ArtifactRecording>,
+    // Retained for signature stability and future materializations: this stub's
+    // only wide values are guest PCs, which `record_mov_wide` skips because they
+    // are never relocated, so there is nothing here to record today.
+    _recording: Option<&mut ArtifactRecording>,
+    // WIDE when this stub is embedded in `emit_cached_direct_exit`'s sidecar,
+    // whose instruction shape `rewrite_direct_binding_stub` validates at fixed
+    // word offsets; NARROW for a standalone private exit, where nothing pins the
+    // layout.
+    width: GuestPcWidth,
 ) -> Result<(), DsrError> {
-    emit_mov_u64(
-        assembler,
-        entries,
-        guest,
-        17,
-        MaterializedValue::Guest(target.raw()),
-        recording.as_deref_mut(),
-    )?;
+    emit_guest_pc(assembler, entries, guest, 17, target.raw(), width)?;
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x17, [x28, #1080]
     );
     if let Some(source) = source {
-        emit_mov_u64(
-            assembler,
-            entries,
-            guest,
-            17,
-            MaterializedValue::Guest(source.raw()),
-            recording.as_deref_mut(),
-        )?;
+        emit_guest_pc(assembler, entries, guest, 17, source.raw(), width)?;
         map_next(assembler, entries, guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
@@ -1829,6 +1878,7 @@ fn emit_cached_direct_exit(
         2,
         GatewayKind::Direct,
         recording,
+        GuestPcWidth::Fixed,
     )?;
     record_direct_binding_sidecar_phases(
         recovery,
@@ -2018,6 +2068,7 @@ fn emit_direct_exit(
             2,
             GatewayKind::Direct,
             recording,
+            GuestPcWidth::Narrow,
         ),
         DirectExitEmissionPolicy::PortableUnitAuthority => emit_cached_direct_exit(
             assembler,
@@ -4830,6 +4881,7 @@ fn emit_biased_exclusive_region(
         6,
         GatewayKind::Sensitive,
         recording.as_deref_mut(),
+        GuestPcWidth::Narrow,
     )
 }
 
@@ -5797,6 +5849,7 @@ fn assemble_block_inner(
                 1,
                 GatewayKind::Syscall,
                 recording.as_deref_mut(),
+                GuestPcWidth::Narrow,
             )?;
         } else if let PlannedExit::Direct { word, exit, .. } = terminal {
             if exit.kind == super::types::DirectKind::Call {
@@ -5973,6 +6026,7 @@ fn assemble_block_inner(
                     6,
                     GatewayKind::Sensitive,
                     recording.as_deref_mut(),
+                    GuestPcWidth::Narrow,
                 )?;
             }
         } else if let PlannedExit::Continue { target, .. } = terminal {
@@ -6010,6 +6064,7 @@ fn assemble_block_inner(
                 7,
                 GatewayKind::Unsupported,
                 recording.as_deref_mut(),
+                GuestPcWidth::Narrow,
             )?;
         } else {
             return Err(DsrError::BlockPolicy(
@@ -6083,6 +6138,7 @@ fn assemble_block_inner(
             2,
             GatewayKind::Direct,
             recording.as_deref_mut(),
+            GuestPcWidth::Narrow,
         )?;
         if lean_guard {
             // The stale edge builds its typed exit in x17, so a kick landing
@@ -7426,15 +7482,31 @@ mod tests {
 
     #[test]
     fn private_direct_edges_use_compact_gateway_stubs() {
-        const PRIVATE_DIRECT_GATEWAY_STUB_BYTES: u32 = 56;
+        // The stub is no longer a FIXED size: it stores two guest PCs, and each is
+        // materialized in only the `movz`/`movk` halfwords its value needs
+        // (`GuestPcWidth::Narrow`). 56 bytes is the worst case, when both PCs
+        // occupy all four halfwords; these fixtures use low guest addresses and
+        // land at 32, a 43% reduction. `dsr:x17-materialize` was measured at
+        // 29.1% of ALL emitted words, so this is the largest emitted class.
+        //
+        // The SIDECAR path keeps the fixed four-word form
+        // (`GuestPcWidth::Fixed`), because `rewrite_direct_binding_stub`
+        // validates its instruction shape at fixed word offsets.
+        const PRIVATE_DIRECT_GATEWAY_STUB_WORST_CASE_BYTES: u32 = 56;
+        const PRIVATE_DIRECT_GATEWAY_STUB_FIXTURE_BYTES: u32 = 32;
 
         let mut kinds = std::collections::BTreeSet::new();
         for (case, emitted) in direct_edge_cases(DirectExitEmissionPolicy::PrivateGateway) {
             for link in emitted.direct_links {
                 kinds.insert(link.kind as u8);
+                let bytes = link.stub.end.get() - link.stub.start.get();
+                assert!(
+                    bytes <= PRIVATE_DIRECT_GATEWAY_STUB_WORST_CASE_BYTES,
+                    "{case} {:?}: private direct stub exceeds the worst case: {bytes}",
+                    link.kind,
+                );
                 assert_eq!(
-                    link.stub.end.get() - link.stub.start.get(),
-                    PRIVATE_DIRECT_GATEWAY_STUB_BYTES,
+                    bytes, PRIVATE_DIRECT_GATEWAY_STUB_FIXTURE_BYTES,
                     "{case} {:?}: private direct edge must use the compact direct gateway",
                     link.kind,
                 );
@@ -7473,7 +7545,7 @@ mod tests {
         assert_eq!(link.kind, DirectLinkKind::Continue);
         assert_eq!(
             link.stub.end.get() - link.stub.start.get(),
-            PRIVATE_DIRECT_GATEWAY_STUB_BYTES,
+            PRIVATE_DIRECT_GATEWAY_STUB_FIXTURE_BYTES,
             "fused-exclusive continuation: private direct edge must use the compact direct gateway"
         );
     }

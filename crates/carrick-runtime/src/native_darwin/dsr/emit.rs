@@ -423,14 +423,18 @@ mod tests {
         )
         .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &copy_plan()).expect("emit copy-only block");
-        // 56, down from 60 and originally 72: the exit stub stopped materializing
-        // its gateway address with a four-word `movz`/`movk` chain and now loads
-        // it from the context in one `ldr`, and the prologue stopped re-claiming
-        // the gateway phase (`gateway_aarch64.S` claims it as its last act before
-        // branching in). Pinned deliberately -- emitted size is a first-order
-        // cost on this lane (~717 MB of JIT output for one `go build`), and this
+        // 44, down from 56, 60 and originally 72. Three cuts in order: the exit
+        // stub loads its gateway address from the context instead of
+        // materializing it in four words; the prologue stopped re-claiming the
+        // gateway phase (`gateway_aarch64.S` claims it as its last act before
+        // branching in); and the stub now materializes its guest PCs with
+        // `GuestPcWidth::Narrow`, emitting only the halfwords each value needs.
+        //
+        // Pinned deliberately -- emitted size is a first-order cost on this lane
+        // (~599 MB of JIT output for one `go build`, and `memmove` + `memset` +
+        // `sys_icache_invalidate` scale with it at 2.7% of total CPU), and this
         // is the cheapest regression detector for it.
-        assert_eq!(emitted.len(), 56);
+        assert_eq!(emitted.len(), 44);
         let original_words = [0xd503_201f, 0x9100_0400];
         let entry_word =
             unsafe { std::ptr::read_unaligned(emitted.entry().host().raw() as *const u32) };
@@ -1701,12 +1705,11 @@ mod tests {
                 .position(|word| *word == target_store)
                 .map(|offset| slow_tail + offset)
                 .expect("sensitive exit target store");
-            let target_value = [
-                0xd280_0000 | (0x4004 << 5) | 17,
-                0xf280_0000 | (1 << 21) | 17,
-                0xf280_0000 | (2 << 21) | 17,
-                0xf280_0000 | (3 << 21) | 17,
-            ];
+            // ONE word, not four: a gateway exit materializes its guest PCs with
+            // `GuestPcWidth::Narrow`, emitting only the halfwords the value needs,
+            // and 0x4004 fits in the first. The four-word form survives only where
+            // a site is relocated or its shape validated.
+            let target_value = [0xd280_0000 | (0x4004 << 5) | 17];
             assert_eq!(
                 &words[target - target_value.len()..target],
                 &target_value,
@@ -1717,12 +1720,11 @@ mod tests {
                 .iter()
                 .rposition(|word| *word == source_store)
                 .expect("sensitive exit source store");
-            let source_value = [
-                0xd280_0000 | (0x4000 << 5) | 17,
-                0xf280_0000 | (1 << 21) | 17,
-                0xf280_0000 | (2 << 21) | 17,
-                0xf280_0000 | (3 << 21) | 17,
-            ];
+            // ONE word, not four: a gateway exit materializes its guest PCs with
+            // `GuestPcWidth::Narrow`, emitting only the halfwords the value needs,
+            // and 0x4000 fits in the first. The four-word form survives only where
+            // a site is relocated or its shape validated.
+            let source_value = [0xd280_0000 | (0x4000 << 5) | 17];
             assert_eq!(
                 &words[source - source_value.len()..source],
                 &source_value,
