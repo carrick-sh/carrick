@@ -703,3 +703,62 @@ gateway-exit stub can be rewritten in place to reach the shared target directly 
 subject to branch range, since a loaded unit is a separately mapped image and may
 sit outside a `b`'s +/-128 MiB, in which case the stub needs an indirect hop
 through a writable slot rather than a direct branch.
+
+## Run 12 — A1 design: every unknown resolved by measurement
+
+### Branch range: reachable, measured
+
+A private -> shared patch needs the target within a `b`'s +/-128 MiB. Publishing
+each loaded unit's executable range through `dsr-cache-bounds` and measuring the
+distance to that process's private cache, over one go-build:
+
+| | distance, private cache <-> loaded unit |
+|---|---|
+| min | 0.0 MiB |
+| median | **1.4 MiB** |
+| max | **2.0 MiB** |
+| within +/-128 MiB | **53 / 53** |
+
+A direct `b` reaches in every observed case. No indirect hop is required — though
+the patcher must still range-check and fail closed to the existing gateway exit,
+because nothing guarantees this placement.
+
+(That probe call also fixes a real gap in
+`scripts/dtrace/native-jit-aware-profile.d`: it knew only the private cache, so
+shared-unit samples were being filed as host code.)
+
+### The patch point already exists in private blocks
+
+`assemble_block_inner` records a `DirectLink { slot, source, target, kind, stub }`
+for every direct exit **regardless of `DirectExitEmissionPolicy`**, and emits at
+`slot` the word `0x1400_0001` — `b` to the next instruction, which simply falls
+into the gateway-exit stub. Rewriting that ONE word to `b <target>` makes the
+edge jump straight to the target and never reach the gateway. This is exactly
+what `patch_same_unit_direct_link` already does for intra-unit edges at pack
+time; private blocks carry the same patch point, unused at runtime.
+
+Private blocks are `MAP_JIT` and therefore writable, so the rewrite is legal
+where a shared unit's `VM_PROT_READ|VM_PROT_EXECUTE` pinning made one impossible.
+
+### What is missing, precisely
+
+`PublishedBlock` retains `entry`, `len`, `map`, `recovery`, `_generation` — **not
+`direct_links`**. The resolver therefore cannot find the slot for the
+`(source, target)` it just resolved. Retaining them (or a side index
+`(source, target) -> slot cache VA`) is the one structural addition the fix
+needs.
+
+The other half is invalidation, and it must not be improvised: a patched slot
+points at a target whose generation can advance. `DirectBindingTable::invalidate_target`
+already does this for unit CELLS, keyed by `(page, generation)`, and
+`ProcessState::translate` already walks `dependencies.invalidate_page` on every
+generation bump. A private slot patch has to be registered in the same structure
+so the same walk restores it to `0x1400_0001`.
+
+### Expected effect
+
+74,726 edges bound once each against 136 M traversals: ~99.95% of the
+private -> shared round-trips disappear, which is 99.4% of all resolver exits in
+the sharing-ON arm. That is the whole of gate A1, and it is what makes A2's
+translation-reuse win (1,046,467 -> target 400,000 translations) collectable
+rather than swamped.

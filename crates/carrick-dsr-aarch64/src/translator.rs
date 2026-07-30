@@ -2050,6 +2050,13 @@ impl ProcessState {
                 },
             );
         }
+        // Publish the loaded unit's executable range too. Two reasons: a profiler
+        // classifying PCs as JIT-or-host must know about unit code as well as the
+        // private cache (otherwise shared-unit samples are filed as host), and
+        // the distance between this range and the private cache decides whether a
+        // private -> shared edge can be bound with a direct `b` (+/-128 MiB) or
+        // needs an indirect hop.
+        probes::dsr_cache_bounds(cache_start as u64, cache_end as u64);
         self.shared_guest_ranges.sort_unstable();
         self.stats.shared_blocks_mapped = self
             .stats
