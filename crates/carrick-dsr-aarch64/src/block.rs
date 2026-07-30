@@ -224,12 +224,18 @@ pub fn plan_with_reader_for_counter_plan(
 /// | 4   | 3,402        | 1,369,560     | 20,910,297   | 2,268          |
 /// | 8   | 3,287        | 1,440,476     | 22,345,884   | 2,153          |
 ///
-/// At 2 the emitted code SHRINKS 9.6% and translation time is flat; past it the
-/// bytes come back and translation time rises 7.4% then 14.8%, buying steadily
-/// less exit reduction. On a workload of short-lived processes with cold caches
-/// that tax is paid in full, so depth beyond 2 must earn its way back on a wall
-/// screen before the cap moves.
-pub const SUPERBLOCK_SEGMENT_LIMIT: usize = 2;
+/// The cap was 2 on that table alone, and that was the wrong term to optimize.
+/// Executed-instruction attribution later showed a block ENTRY costs far more
+/// than the table suggested: `str wzr, [x28, #1152]` (the gateway-phase store,
+/// one per entry) is 15.1% of JIT samples, and the entry's generation guard sits
+/// behind it. Fusion amortizes both, and the execution win outweighs the
+/// translation tax: a paired CPU-time screen at cap 8 against cap 2 won 9 of 12
+/// pairs, median 1.25% less CPU (sign test p = 0.073, so a small effect
+/// measured at the edge of significance rather than a decisive one).
+///
+/// Depth is still not free -- the bytes and translate time above are real -- so
+/// raising this further needs its own screen, not extrapolation.
+pub const SUPERBLOCK_SEGMENT_LIMIT: usize = 8;
 
 /// The production default.
 ///
