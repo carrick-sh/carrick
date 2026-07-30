@@ -1111,3 +1111,36 @@ What is durable from this: the amplification is entirely private -> shared CALL
 edges, they are bindable in principle (range measured, patch point identified,
 link register verified safe), and four wrong explanations are written down so the
 next attempt does not re-derive them.
+
+### Run 18b — the kind bisect fails too; A1 is debugger work
+
+Excluding `DirectLinkKind::Call` from the shared-target patch and leaving every
+other kind patched **still faults at `0x20`**. So the failure is not
+call-specific, and run 18's inference from "every reported guest PC is a `BL`"
+was over-drawn: the reported PC is the exit SOURCE, and most edges into shared
+code happen to be calls, so seeing only `BL` there says nothing about which
+edges break.
+
+That is the fifth mechanism named and killed by measurement:
+
+| candidate | verdict |
+|---|---|
+| missing per-unit context (`generation_bindings`) | necessary, insufficient |
+| context lost its address mode (`host_bias`) | refuted — bias correct |
+| patch skips the link-register write | refuted — x30 precedes the slot |
+| failure is specific to CALL edges | **refuted — excluding them still faults** |
+| some other guest register the callee expects | surviving, unproven |
+
+**A1 is now explicitly debugger work, not experiment work.** Five single-shot
+experiments have each cost a build-and-run and returned a negative; the surviving
+explanation needs the live register file and the callee's emitted prologue at the
+moment of the fault. The next person should take a core
+(`lldb -p <pid> -o "process save-core …"`, per AGENTS.md) or dump the guest
+register file at the unlowerable-fault site, and read the answer rather than
+proposing a sixth candidate.
+
+Everything else needed is already established and recorded: the amplification is
+entirely private -> shared edges (99.4%), it is 74,726 distinct edges at 1,822
+traversals each, the branch range reaches (53/53 within +/-128 MiB), the patch
+point exists and is writable, and the exclusion that blocks it is one line in
+`ProcessState::publish_emitted`.
