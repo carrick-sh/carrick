@@ -390,3 +390,61 @@ generation, so the existing clear path is the place to check).
 That is a protocol extension in code governing cross-process code invalidation,
 where a mistake is silent wrong-code execution. It is specified here rather than
 attempted at the end of a long session.
+
+## Run 7 — retracting half of run 6, and two more refuted hypotheses
+
+### Run 6's source classification was invalid
+
+Run 6 concluded "99.4% of exits TARGET a shared block and essentially none
+ORIGINATE from one". **The second half is an artifact of the test.** The scratch
+classifier compared `source` against `shared_blocks`, whose keys are block
+STARTS — but `PlannedExit::Direct { guest, .. }` carries the guest PC of the
+BRANCHING INSTRUCTION, and `emit_direct_exit` passes that as `source_guest`. A
+shared block whose branch is not its first instruction is therefore counted as
+"private source", which is almost always. `shared_source=178` measures nothing.
+
+The `shared_target` half stands: targets ARE block starts, so **99.4% of the
+exploding exits do target a shared block**.
+
+### Two further hypotheses, both refuted by controls
+
+| hypothesis | control | verdict |
+|---|---|---|
+| shared-code edges cannot bind (99.92% `owner_validation_failures`) | bindings-only, sharing OFF: same 99.8% ratio, 12.2 s, `cas_wins`=0 | **refuted** — the counter tracks exits 1:1 in both arms |
+| superblocks are excluded from shared units, so loading one un-fuses hot code | fusion OFF, sharing OFF: 1,435,358 exits, 13.1 s | **refuted** — losing fusion costs 1.8x, not 173x |
+
+| arm | wall | translations | `direct_resolver_exits` | gateway entries |
+|---|---|---|---|---|
+| fusion ON, sharing OFF | 12.2 s | 1,217,693 | 779,874 | 3,652,660 |
+| fusion OFF, sharing OFF | 13.1 s | 1,870,324 | 1,435,358 | 5,128,236 |
+| fusion ON, sharing ON | 61.2 s | 1,045,352 | 135,259,579 | 272,690,918 |
+
+### What is actually established
+
+- Enabling sharing multiplies direct-resolver exits ~173x and gateway entries
+  ~75x. This is the whole cost; it is not translation, not fusion, not binding
+  validation.
+- Sharing delivers a 14% translation reduction, proportional to its 14.2% block
+  coverage (reduction/blocks-mapped = 0.96).
+- 99.4% of the exploding exits target a shared block.
+- Private blocks emit `DirectExitEmissionPolicy::PrivateGateway`, an
+  unconditional gateway exit with no cell and no baked branch; only portable
+  (unit) blocks emit the cell-based `PortableUnitAuthority` stub. In the healthy
+  arm direct exits are simply RARE (780 k for the whole build), and `cas_wins`
+  is 0 — so cell binding plays no part in the fast path at all.
+
+### The next measurement, stated so it is not guessed at again
+
+Classify each `ResolveDirect` by whether the SOURCE PC falls inside a shared
+block's `[start, end)` RANGE — not by equality against block-start keys — and
+report source and target classes together. That distinguishes the two remaining
+stories: flow bouncing between shared blocks whose cell stubs never bind
+(`cas_wins` 101,010 against 136 M exits), versus private code repeatedly
+re-entering shared code. They need different fixes, and three hypotheses have
+already died for want of exactly this discrimination.
+
+**Method note.** Four hypotheses in this investigation were refuted by a control
+arm that took one run each, after being asserted on the strength of a single
+correlated counter. The pattern is identical every time: a ratio measured only in
+the pathological arm, never in the healthy one. Run the control in the SAME
+commit as the claim.
