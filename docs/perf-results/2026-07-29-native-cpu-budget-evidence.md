@@ -1297,3 +1297,37 @@ signature change through `translate_read_mostly`.
 Reverted, because a crashing change cannot ship. But the approach is now proven
 rather than hypothesised: it removes 135.7 M gateway round-trips, and what is
 left is one ordering condition with a named fix.
+
+### Run 21b — the ordering gate is not sufficient, and it has a threading defect
+
+Gating the patch on the CURRENT entry carrying the table -- staged into
+`ProcessState::current_entry_carries_bindings` under the same write guard as the
+translate, set from `PreparedEntry::generation_binding_count` -- still faults,
+now at `far=0`, i.e. the same NULL table at binding index 0.
+
+Two things are wrong with that attempt, and the second is mine:
+
+1. **The gate does not cover every path.** A patch armed during an entry that
+   carried the table is still live for every later entry, so a NULL-table entry
+   must still exist somewhere the gate does not see.
+2. **The staging is per-PROCESS but the fact is per-THREAD.** Several guest
+   threads share one `ProcessState`; thread B's `false` can overwrite thread A's
+   `true` between A staging it and A's patch decision reading it. On a
+   multi-threaded guest that is a race, not a gate — it needs to be a parameter
+   on the call, not a field on shared state.
+
+Reverted. Tree clean, tip BUILD_OK, 186 + 166 tests green.
+
+**What stands from runs 20-21, and it is the substantive result:** the mechanism
+is diagnosed (a shared block's guard indexing a NULL `generation_bindings`,
+confirmed from the register file, `far == index * 16`), and installing the table
+at load DOES eliminate the amplification — `resolve_src_private_tgt_shared`
+135,715,237 -> 0 and `direct_resolver_exits` 136,489,314 -> 68,941, a ~1,980x
+reduction. What is not yet solved is guaranteeing that EVERY entry reaching a
+patched branch carries the table, on a multi-threaded guest, including entries
+prepared before a lazy unit load.
+
+The next attempt should thread the fact as a parameter through
+`ProcessState::translate` rather than staging it on shared state, and should
+enumerate the entry paths that can reach a patched branch instead of assuming
+`prepare_entry` is the only one.
