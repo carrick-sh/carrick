@@ -12,6 +12,7 @@ import pathlib
 import platform
 import resource
 import re
+import secrets
 import statistics
 import subprocess
 import sys
@@ -32,6 +33,7 @@ VARIANT_CANDIDATE = "candidate"
 KNOWN_PERFORMANCE_COMMANDS = (
     "target/release/carrick",
     "scripts/perf/native_go_build.py",
+    "scripts/perf/native_go_build_abba.py",
     "scripts/perf/native_go_build_screen.py",
     "scripts/perf/direct_binding_mechanism.py",
 )
@@ -64,12 +66,16 @@ PERFORMANCE_CONTROL_KEYS = (
     "CARRICK_DSR_SUPERBLOCK",
 )
 HARNESS_CARRICK_ALLOWLIST = frozenset()
+SEMANTIC_DEFAULT_OVERLAY: dict[str, str | None] = {
+    key: None for key in PERFORMANCE_CONTROL_KEYS
+}
+SEMANTIC_SHARED_OVERLAY: dict[str, str | None] = {
+    **SEMANTIC_DEFAULT_OVERLAY,
+    "CARRICK_DSR_SHARED_TRANSLATION": "1",
+    "CARRICK_DSR_DIRECT_BINDINGS": "1",
+}
 VARIANT_OVERLAYS: dict[str, dict[str, str | None]] = {
-    VARIANT_DEFAULT: {
-        "CARRICK_DSR_ARTIFACT_SPIKE": None,
-        "CARRICK_DSR_SHARED_TRANSLATION": None,
-        "CARRICK_DSR_DIRECT_BINDINGS": None,
-    },
+    VARIANT_DEFAULT: SEMANTIC_DEFAULT_OVERLAY,
     VARIANT_PRECURSOR: {
         "CARRICK_DSR_ARTIFACT_SPIKE": "1",
         "CARRICK_DSR_SHARED_TRANSLATION": "1",
@@ -80,11 +86,7 @@ VARIANT_OVERLAYS: dict[str, dict[str, str | None]] = {
         "CARRICK_DSR_SHARED_TRANSLATION": "1",
         "CARRICK_DSR_DIRECT_BINDINGS": "1",
     },
-    VARIANT_SHARED: {
-        "CARRICK_DSR_ARTIFACT_SPIKE": None,
-        "CARRICK_DSR_SHARED_TRANSLATION": "1",
-        "CARRICK_DSR_DIRECT_BINDINGS": "1",
-    },
+    VARIANT_SHARED: SEMANTIC_SHARED_OVERLAY,
 }
 
 
@@ -331,21 +333,60 @@ def reject_ambient_carrick(
         )
 
 
-def write_json_atomic(path: pathlib.Path, payload: dict[str, object]) -> None:
+def write_json_atomic(
+    path: pathlib.Path,
+    payload: dict[str, object],
+    *,
+    exclusive: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        delete=False,
-    ) as temporary:
-        temporary_path = pathlib.Path(temporary.name)
-        json.dump(payload, temporary, indent=2, sort_keys=True)
-        temporary.write("\n")
-        temporary.flush()
-        os.fsync(temporary.fileno())
-    os.replace(temporary_path, path)
+    directory_flags = os.O_RDONLY
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory = os.open(path.parent, directory_flags)
+    temporary_name = (
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(16)}.tmp"
+    )
+    try:
+        temporary_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        temporary_flags |= getattr(os, "O_CLOEXEC", 0)
+        temporary_descriptor = os.open(
+            temporary_name,
+            temporary_flags,
+            0o600,
+            dir_fd=directory,
+        )
+        with os.fdopen(
+            temporary_descriptor,
+            mode="w",
+            encoding="utf-8",
+        ) as temporary:
+            json.dump(payload, temporary, indent=2, sort_keys=True)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        if exclusive:
+            os.link(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+            )
+            os.unlink(temporary_name, dir_fd=directory)
+        else:
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+            )
+        os.fsync(directory)
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
 
 
 def repository_is_git(repo: pathlib.Path) -> bool:
@@ -533,7 +574,7 @@ def sample_provenance(
 def busy_host_reasons() -> list[str]:
     reasons: list[str] = []
     process_list = subprocess.run(
-        ["ps", "-eo", "pid=,args="],
+        ["ps", "-axww", "-o", "pid=", "-o", "command="],
         check=True,
         capture_output=True,
         text=True,
@@ -786,24 +827,23 @@ def run_sample(
     if captured_output is not None:
         captured_output.parent.mkdir(parents=True, exist_ok=True)
         captured_output.write_text(combined)
-    if timeout is not None:
-        if cleanup_error is not None:
-            raise timeout from cleanup_error
-        raise timeout
-    assert result is not None
-    build_ok = stdout.splitlines().count("BUILD_OK") == 1
-    workload_ns: int | None = None
-    workload_error: str | None = None
-    try:
-        workload_ns = workload_ns_from_stdout(stdout)
-    except ValueError as error:
-        workload_error = str(error)
     if cleanup_error is not None:
         cleanup_evidence = {
             "status": 125,
             "stdout": "",
             "stderr": f"cleanup launch failed: {cleanup_error}",
         }
+    return_code = None if timeout is not None else result.returncode
+    build_ok = (
+        timeout is None
+        and stdout.splitlines().count("BUILD_OK") == 1
+    )
+    workload_ns: int | None = None
+    workload_error: str | None = None
+    try:
+        workload_ns = workload_ns_from_stdout(stdout)
+    except ValueError as error:
+        workload_error = str(error)
     sample = {
         "engine": engine,
         "index": index,
@@ -818,11 +858,12 @@ def run_sample(
         "workload_ms": (
             workload_ns // 1_000_000 if workload_ns is not None else None
         ),
-        "return_code": result.returncode,
+        "return_code": return_code,
+        "timed_out": timeout is not None,
         "build_ok": build_ok,
         "command": {
             "argv": command,
-            "status": result.returncode,
+            "status": return_code,
             "build_ok": build_ok,
         },
         "environment_overlay": normalized,
@@ -839,6 +880,16 @@ def run_sample(
         "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
         "stderr_sha256": hashlib.sha256(stderr.encode()).hexdigest(),
     }
+    if timeout is not None:
+        sample_error = SampleEvidenceError(
+            f"go-build sample {index} timed out: run_id={run_id} "
+            f"timeout_seconds={timeout_seconds} command={command!r}",
+            sample,
+        )
+        if cleanup_error is not None:
+            raise sample_error from cleanup_error
+        raise sample_error
+    assert result is not None
     if result.returncode != 0 or not build_ok:
         sample_error = SampleEvidenceError(
             f"go-build sample {index} failed: run_id={run_id} "

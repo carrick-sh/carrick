@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -109,6 +110,44 @@ class NativeGoBuildTest(unittest.TestCase):
             ),
             10.0,
         )
+
+    def test_atomic_json_exclusive_create_and_replaces_sync_directory(self):
+        directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(directory, ignore_errors=True))
+        output = directory / "campaign.json"
+        sync_modes = []
+
+        def record_sync(descriptor):
+            sync_modes.append(os.fstat(descriptor).st_mode)
+
+        with mock.patch.object(
+            native_go_build.os,
+            "fsync",
+            side_effect=record_sync,
+        ):
+            native_go_build.write_json_atomic(
+                output,
+                {"generation": 1},
+                exclusive=True,
+            )
+            native_go_build.write_json_atomic(output, {"generation": 2})
+
+        self.assertEqual(json.loads(output.read_text()), {"generation": 2})
+        self.assertEqual(
+            sum(stat.S_ISREG(mode) for mode in sync_modes),
+            2,
+        )
+        self.assertEqual(
+            sum(stat.S_ISDIR(mode) for mode in sync_modes),
+            2,
+        )
+        with self.assertRaises(FileExistsError):
+            native_go_build.write_json_atomic(
+                output,
+                {"generation": 3},
+                exclusive=True,
+            )
+        self.assertEqual(json.loads(output.read_text()), {"generation": 2})
 
     def test_docker_phase_rejects_non_arm64_image(self):
         self.install_fake_docker("amd64")
@@ -266,36 +305,114 @@ class NativeGoBuildTest(unittest.TestCase):
             self.assertEqual(provenance["binary_sha256"], "a" * 64)
             self.assertEqual(provenance["image_ref"], image)
 
-    def test_timeout_retains_partial_stdout_and_stderr_before_reraising(self):
+    def test_timeout_becomes_complete_sample_evidence_after_cleanup(self):
         directory, _ = self.install_fake_docker("arm64")
         captured = directory / "profile" / "docker-1.log"
-        run_id = "native-go-build-docker-123-456-1"
+        binary = directory / "immutable-arm" / "carrick"
+        binary.parent.mkdir()
+        binary.write_bytes(b"immutable arm\n")
+        run_id = "native-go-build-carrick-123-456-1"
         timeout = subprocess.TimeoutExpired(
-            ["docker", "run"],
+            [str(binary), "run"],
             5,
             output="partial stdout\n",
             stderr="partial stderr\n",
         )
+        pre = {"stage": "pre", "binary_sha256": "a" * 64}
+        post = {"stage": "post", "binary_sha256": "a" * 64}
+        cleanup_evidence = {
+            "status": 0,
+            "stdout": "cleanup stdout\n",
+            "stderr": "",
+        }
 
         with (
             mock.patch.object(native_go_build.os, "getpid", return_value=123),
             mock.patch.object(native_go_build.time, "time_ns", return_value=456),
             mock.patch.object(
+                native_go_build,
+                "repository_is_git",
+                return_value=True,
+            ),
+            mock.patch.object(
+                native_go_build,
+                "sample_provenance",
+                side_effect=(pre, post),
+            ),
+            mock.patch.object(
                 native_go_build.subprocess, "run", side_effect=timeout
             ),
-            mock.patch.object(native_go_build, "docker_cleanup") as cleanup,
-            self.assertRaises(subprocess.TimeoutExpired),
+            mock.patch.object(
+                native_go_build,
+                "carrick_cleanup",
+                return_value=cleanup_evidence,
+            ) as cleanup,
+            self.assertRaises(native_go_build.SampleEvidenceError) as caught,
+        ):
+            native_go_build.run_sample(
+                directory,
+                "carrick",
+                index=1,
+                timeout_seconds=5,
+                captured_output=captured,
+                binary=binary,
+                current_run_id=run_id,
+            )
+
+        self.assertEqual(captured.read_text(), "partial stdout\npartial stderr\n")
+        cleanup.assert_called_once_with(directory, run_id)
+        row = caught.exception.sample
+        self.assertEqual(row["run_id"], run_id)
+        self.assertEqual(row["command"]["argv"][0], str(binary.resolve()))
+        self.assertIsNone(row["command"]["status"])
+        self.assertIsNone(row["return_code"])
+        self.assertTrue(row["timed_out"])
+        self.assertFalse(row["build_ok"])
+        self.assertEqual(row["stdout"], "partial stdout\n")
+        self.assertEqual(row["stderr"], "partial stderr\n")
+        self.assertEqual(row["cleanup"], cleanup_evidence)
+        self.assertEqual(row["provenance"], {"pre": pre, "post": post})
+        self.assertGreaterEqual(row["elapsed_ms"], 0)
+        self.assertIn("cpu_user_s", row)
+        self.assertIn("cpu_sys_s", row)
+        self.assertIn("cpu_s", row)
+
+    def test_timeout_normalizes_cleanup_launch_failure_without_masking_sample(self):
+        directory, _ = self.install_fake_docker("arm64")
+        timeout = subprocess.TimeoutExpired(
+            ["docker", "run"],
+            5,
+            output=b"partial stdout\n",
+            stderr=b"partial stderr\n",
+        )
+        cleanup_timeout = subprocess.TimeoutExpired(["docker", "rm"], 30)
+
+        with (
+            mock.patch.object(
+                native_go_build.subprocess,
+                "run",
+                side_effect=timeout,
+            ),
+            mock.patch.object(
+                native_go_build,
+                "docker_cleanup",
+                side_effect=cleanup_timeout,
+            ),
+            self.assertRaises(native_go_build.SampleEvidenceError) as caught,
         ):
             native_go_build.run_sample(
                 directory,
                 "docker",
                 index=1,
                 timeout_seconds=5,
-                captured_output=captured,
             )
 
-        self.assertEqual(captured.read_text(), "partial stdout\npartial stderr\n")
-        cleanup.assert_called_once_with(run_id)
+        row = caught.exception.sample
+        self.assertTrue(row["timed_out"])
+        self.assertEqual(row["stdout"], "partial stdout\n")
+        self.assertEqual(row["stderr"], "partial stderr\n")
+        self.assertEqual(row["cleanup"]["status"], 125)
+        self.assertIn("cleanup launch failed", row["cleanup"]["stderr"])
 
     def test_cleanup_failure_does_not_suppress_failed_sample_capture(self):
         directory, _ = self.install_fake_docker("arm64")
@@ -365,6 +482,57 @@ class NativeGoBuildTest(unittest.TestCase):
         self.assertEqual(row["stderr"], "sample stderr\n")
         self.assertEqual(row["command"]["status"], 0)
         self.assertEqual(row["cleanup"], cleanup)
+
+    def test_post_provenance_drift_retains_both_snapshots_in_failed_sample(self):
+        directory, _ = self.install_fake_docker("arm64")
+        binary = directory / "arm" / "carrick"
+        binary.parent.mkdir()
+        binary.write_bytes(b"arm\n")
+        result = subprocess.CompletedProcess(
+            [str(binary), "run"],
+            0,
+            "WORKLOAD_NS=1200000000\nBUILD_OK\n",
+            "",
+        )
+        pre = {"binary_sha256": "a" * 64}
+        post = {"binary_sha256": "b" * 64}
+
+        with (
+            mock.patch.object(
+                native_go_build,
+                "repository_is_git",
+                return_value=True,
+            ),
+            mock.patch.object(
+                native_go_build,
+                "sample_provenance",
+                side_effect=(pre, post),
+            ),
+            mock.patch.object(
+                native_go_build.subprocess,
+                "run",
+                return_value=result,
+            ),
+            mock.patch.object(
+                native_go_build,
+                "carrick_cleanup",
+                return_value={"status": 0, "stdout": "", "stderr": ""},
+            ),
+            self.assertRaises(native_go_build.SampleEvidenceError) as caught,
+        ):
+            native_go_build.run_sample(
+                directory,
+                "carrick",
+                index=1,
+                timeout_seconds=5,
+                binary=binary,
+            )
+
+        self.assertIn("provenance drifted", str(caught.exception))
+        self.assertEqual(
+            caught.exception.sample["provenance"],
+            {"pre": pre, "post": post},
+        )
 
     def test_phase_names_each_captured_output_by_engine_and_sample(self):
         directory, _ = self.install_fake_docker("arm64")
@@ -440,14 +608,20 @@ class NativeGoBuildTest(unittest.TestCase):
             (10, "/bin/zsh -c eval 'python3 scripts/perf/native_go_build.py'"),
             (20, "python3 scripts/perf/native_go_build.py --engine both"),
             (30, "target/release/carrick run --exec-backend native sh"),
+            (
+                40,
+                "python3 scripts/perf/native_go_build_abba.py run "
+                "--output /tmp/other.json",
+            ),
         ]
 
         foreign = native_go_build.foreign_rows(
             rows, own_pid=20, ancestor_pids={10, 1}
         )
 
-        self.assertEqual(len(foreign), 1)
+        self.assertEqual(len(foreign), 2)
         self.assertIn("pid=30", foreign[0])
+        self.assertIn("pid=40", foreign[1])
 
     def test_census_uses_delimited_titles_and_receipt_binaries(self):
         rows = [
@@ -512,6 +686,39 @@ class NativeGoBuildTest(unittest.TestCase):
             text=True,
         )
 
+    def test_busy_host_census_uses_full_width_process_commands(self):
+        listing = subprocess.CompletedProcess(
+            ["ps"],
+            0,
+            "101 cargo build --release\n"
+            "102 /bin/sh -c while :; do :; done\n",
+            "",
+        )
+        with (
+            mock.patch.object(
+                native_go_build.subprocess,
+                "run",
+                return_value=listing,
+            ) as run,
+            mock.patch.object(native_go_build.os, "getpid", return_value=20),
+            mock.patch.object(native_go_build.os, "cpu_count", return_value=8),
+            mock.patch.object(
+                native_go_build.os,
+                "getloadavg",
+                return_value=(1.0, 1.0, 1.0),
+            ),
+        ):
+            reasons = native_go_build.busy_host_reasons()
+
+        self.assertTrue(any("active compiler" in reason for reason in reasons))
+        self.assertTrue(any("spin loop" in reason for reason in reasons))
+        run.assert_called_once_with(
+            ["ps", "-axww", "-o", "pid=", "-o", "command="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
     def test_phase_summary_reports_workload_median(self):
         summary = native_go_build.summarize_phases(
             {
@@ -524,6 +731,42 @@ class NativeGoBuildTest(unittest.TestCase):
         )
 
         self.assertEqual(summary["carrick"]["workload_median_ms"], 14)
+
+    def test_checked_in_semantic_overlays_are_complete_and_authoritative(self):
+        overlay_directory = pathlib.Path(native_go_build.__file__).parent / "overlays"
+        default = json.loads((overlay_directory / "native-default.json").read_text())
+        shared = json.loads((overlay_directory / "native-shared.json").read_text())
+
+        self.assertEqual(
+            tuple(default),
+            native_go_build.PERFORMANCE_CONTROL_KEYS,
+        )
+        self.assertEqual(tuple(shared), native_go_build.PERFORMANCE_CONTROL_KEYS)
+        self.assertTrue(all(value is None for value in default.values()))
+        self.assertEqual(
+            {
+                key: value
+                for key, value in shared.items()
+                if value is not None
+            },
+            {
+                "CARRICK_DSR_SHARED_TRANSLATION": "1",
+                "CARRICK_DSR_DIRECT_BINDINGS": "1",
+            },
+        )
+        self.assertIsNone(shared["CARRICK_DSR_ARTIFACT_SPIKE"])
+        self.assertEqual(
+            native_go_build.fixed_variant_overlay(
+                native_go_build.VARIANT_DEFAULT
+            ),
+            default,
+        )
+        self.assertEqual(
+            native_go_build.fixed_variant_overlay(
+                native_go_build.VARIANT_SHARED
+            ),
+            shared,
+        )
 
     def test_docker_cli_writes_v3_phase_artifact(self):
         directory, _ = self.install_fake_docker("arm64")
