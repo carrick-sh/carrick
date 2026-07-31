@@ -1,6 +1,6 @@
 # Native-lane performance handoff
 
-**Date:** 2026-07-30
+**Date:** 2026-07-31
 **Branch:** `codex/native-performance-m1` (M1 correctness checkpoint
 `5020e509`)
 **Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
@@ -19,12 +19,12 @@ its ignored raw trace receipts remain under `target/perf/`.
 
 ---
 
-## Current checkpoint — M2 exec preflight accepted, speed result still open
+## Current checkpoint — M2 exec handoff accepted, speed result still open
 
 M2 now has an accepted process-owned translated-range catalog through the
 first real shared-code consumer, checked post-fork replay, and atomic inherited
-exec retirement. This is an observability/correctness milestone, not a
-performance result.
+exec retirement plus post-success activation/publication/install handoff. This
+is an observability/correctness milestone, not a performance result.
 
 The retained signed binary is
 `403b12878e36412943c0c5b79ba2271d11b0afbf77f2036afafa2211e610d69f`.
@@ -111,16 +111,44 @@ with 5 ignored, `just test` passed, and check/clippy/fmt/domain/diff gates
 passed. Controller reruns of the `MAX-1` and composed fork/exec regressions
 also passed.
 
-Signed live fork/exec tracing remains deliberately pending: production
-fork-child exec host-self-reexecs into a fresh dormant translator, so the
-inherited-translator path is only a unit seam.
+Post-success exec handoff landed as `9767b954`, with production completion
+ordering in `669a61d5` and final installation/wire preflight in `874b3a35`. It
+now:
 
-**Next:** implement one post-success activation/metadata helper for both
-in-process exec and production self-reexec, then extend the maintained DTrace
-catalog script and run the fixed child-exec/wait proof. After that, take two
-default and two shared Go-build attribution captures with the same signed
-binary, choose the first opt-out optimization from measured CPU/kernel
-ownership, and retain it only through the primary ABBA CPU gate.
+- prepares every fallible thread installation before catalog activation or
+  image publication, retaining the exact selected process and checked epoch;
+- activates the selected catalog, publishes host base/catalog, guest image,
+  and host JIT identity, then commits translator installation without a
+  recoverable `Result`;
+- pre-serializes exact NUL-terminated host/catalog/guest USDT wire buffers
+  before mapped-memory PONR, avoiding `usdt` JSON/string allocation while
+  firing the post-success probes;
+- delays self-reexec reset-end, ptrace exec-stop, snapshot/TLS state, and
+  service completion until after translator installation; and
+- proves real production activation and installation failures leave the
+  replacement dormant, emit no image metadata, close exactly one RAII
+  `Aborted`, and never resume the replacement image.
+
+The first independent review found early self-reexec completion and
+helper-only failure coverage. The second found stale metadata on fallible
+install and hidden `usdt` serialization allocations. Both were repaired
+red-first; final contract and adversarial re-reviews are clean. Final gates
+passed 333 serialized native Darwin tests with 5 ignored, 28 observability
+tests, translated-range 18/18, shared-unit 7/7, the checked handoff-epoch
+test, `just test`, `just test-integration`, check, clippy, formatting, domain
+lint, and diff checks. Controller reruns of the production failure, checked
+epoch, and exact wire-buffer tests passed.
+
+Signed live fork/exec tracing remains deliberately pending: production
+fork-child exec host-self-reexecs into a fresh dormant translator, and the
+signed launch-owned trace is the authority for the complete process lifecycle.
+
+**Next:** extend the maintained DTrace catalog script and add its fail-closed
+capture wrapper, then run the fixed signed child-exec/wait proof. No new
+runtime/DSR probe is currently required. After that, take two default and two
+shared Go-build attribution captures with the same signed binary, choose the
+first opt-out optimization from measured CPU/kernel ownership, and retain it
+only through the primary ABBA CPU gate.
 
 The ≥30% CPU goal remains open; no new paired CPU ratio has been measured.
 
