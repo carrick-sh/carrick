@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -914,6 +915,65 @@ class DTraceSourceContractTests(unittest.TestCase):
         self.assertEqual(contract["lifecycle_summaries"], 1)
         self.assertEqual(contract["self_bound_seconds"], 30)
 
+    def test_maintained_script_compiles_with_system_dtrace_when_available(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("system DTrace compile gate is Darwin-only")
+        dtrace = pathlib.Path("/usr/sbin/dtrace")
+        if not dtrace.is_file():
+            self.skipTest("system DTrace is unavailable")
+        available = subprocess.run(
+            ["sudo", "-n", str(dtrace), "-V"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if available.returncode != 0:
+            self.skipTest("passwordless system DTrace is unavailable")
+
+        binary_override = os.environ.get("CARRICK_DTRACE_COMPILE_BINARY")
+        if binary_override:
+            binary = pathlib.Path(binary_override).resolve()
+            if not binary.is_file():
+                self.fail("CARRICK_DTRACE_COMPILE_BINARY is not a regular file")
+            compile_target = f"{shlex.quote(str(binary))} --version"
+            command = [
+                "sudo",
+                "-n",
+                str(dtrace),
+                "-Z",
+                "-e",
+                "-s",
+                str(self.script),
+                "-c",
+                compile_target,
+            ]
+            compile_source = None
+        else:
+            self.assertIn("$target", self.source)
+            compile_source = self.source.replace("$target", "(pid_t)1")
+            command = [
+                "sudo",
+                "-n",
+                str(dtrace),
+                "-Z",
+                "-e",
+                "-s",
+                "/dev/stdin",
+            ]
+
+        result = subprocess.run(
+            command,
+            input=compile_source,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"system DTrace rejected the maintained script:\n{result.stderr}",
+        )
+
     def test_static_contract_rejects_each_missing_lifecycle_provider(self) -> None:
         required = (
             "proc:::create",
@@ -1014,6 +1074,182 @@ class DTraceSourceContractTests(unittest.TestCase):
             self.module.EvidenceError, "parent-ready|milestone|stage"
         ):
             self.module.validate_dtrace_source(wrong_stage)
+
+    def test_static_contract_binds_created_owner_clause_locals(self) -> None:
+        valid = (
+            "    this->child_epoch = runtime_epoch[this->child_pid,\n"
+            "        this->child_incarnation];"
+        )
+        weakened = self.source.replace(
+            valid,
+            "    this->child_epoch = (uint64_t)0;",
+            1,
+        )
+        self.assertNotEqual(weakened, self.source)
+        with self.assertRaisesRegex(
+            self.module.EvidenceError, "created owner|clause-local|child_epoch"
+        ):
+            self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_rejects_created_owner_clause_local_rebinds(self) -> None:
+        anchor = (
+            "    this->child_epoch = runtime_epoch[this->child_pid,\n"
+            "        this->child_incarnation];"
+        )
+        for local in ("child_pid", "child_incarnation", "child_epoch"):
+            with self.subTest(local=local):
+                weakened = self.source.replace(
+                    anchor,
+                    anchor + f"\n    this->{local} = (uint64_t)0;",
+                    1,
+                )
+                self.assertNotEqual(weakened, self.source)
+                with self.assertRaisesRegex(
+                    self.module.EvidenceError,
+                    "created owner|clause-local|rebind|assignment",
+                ):
+                    self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_requires_created_owner_binding_order(self) -> None:
+        epoch = (
+            "    this->child_epoch = runtime_epoch[this->child_pid,\n"
+            "        this->child_incarnation];"
+        )
+        catalog = (
+            "    catalog_live[this->child_pid, this->child_incarnation,\n"
+            "        (uint64_t)1, this->child_epoch] = 0;"
+        )
+        self.assertIn(epoch + "\n" + catalog, self.source)
+        weakened = self.source.replace(
+            epoch + "\n" + catalog,
+            catalog + "\n" + epoch,
+            1,
+        )
+        with self.assertRaisesRegex(
+            self.module.EvidenceError, "created owner|clause-local|order"
+        ):
+            self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_rejects_protected_local_compound_writes(self) -> None:
+        mutations = (
+            (
+                "    pending_by_pid[this->child_pid, this->child_incarnation,\n"
+                "        (uint64_t)1, this->child_epoch] = 0;",
+                "    this->child_epoch += (uint64_t)1;",
+            ),
+            (
+                "        ordinal, arg1, arg2, arg3);",
+                "    this->run_unit++;",
+            ),
+        )
+        for anchor, extra_write in mutations:
+            with self.subTest(write=extra_write.strip()):
+                weakened = self.source.replace(
+                    anchor,
+                    anchor + "\n" + extra_write,
+                    1,
+                )
+                self.assertNotEqual(weakened, self.source)
+                with self.assertRaisesRegex(
+                    self.module.EvidenceError,
+                    "owner|shared run|clause-local|assignment",
+                ):
+                    self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_requires_forward_read_range_seeds(self) -> None:
+        weakened = self.source.replace(
+            "    parent_private_start = (uint64_t)0;\n",
+            "",
+            1,
+        )
+        self.assertNotEqual(weakened, self.source)
+        with self.assertRaisesRegex(
+            self.module.EvidenceError, "target-birth|milestone|range seed"
+        ):
+            self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_binds_shared_run_clause_locals(self) -> None:
+        valid = (
+            "    this->run_unit = pending_unit[pid, incarnation[pid],\n"
+            "        image_generation[pid, incarnation[pid]],\n"
+            "        runtime_epoch[pid, incarnation[pid]], arg0];"
+        )
+        weakened = self.source.replace(
+            valid,
+            valid[:-1] + " + (uint64_t)1;",
+            1,
+        )
+        self.assertNotEqual(weakened, self.source)
+        with self.assertRaisesRegex(
+            self.module.EvidenceError, "shared run|clause-local|run_unit"
+        ):
+            self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_rejects_shared_run_clause_local_rebinds(self) -> None:
+        anchor = (
+            "    this->run_unit = pending_unit[pid, incarnation[pid],\n"
+            "        image_generation[pid, incarnation[pid]],\n"
+            "        runtime_epoch[pid, incarnation[pid]], arg0];"
+        )
+        for local in (
+            "run_unit",
+            "run_start",
+            "run_end",
+            "run_announcement_ordinal",
+            "run_commit_ordinal",
+        ):
+            with self.subTest(local=local):
+                weakened = self.source.replace(
+                    anchor,
+                    anchor + f"\n    this->{local} = (uint64_t)0;",
+                    1,
+                )
+                self.assertNotEqual(weakened, self.source)
+                with self.assertRaisesRegex(
+                    self.module.EvidenceError,
+                    "shared run|clause-local|rebind|assignment",
+                ):
+                    self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_binds_single_shared_run_wire_record(self) -> None:
+        mutations = (
+            (
+                "        this->run_unit, this->run_start, this->run_end,\n",
+                "        this->run_start, this->run_unit, this->run_end,\n",
+            ),
+            (
+                '|cache_pc=%#x|generation=%d\\n",\n',
+                '|cache_pc=%#x|generation=%d",\n',
+            ),
+        )
+        for old, new in mutations:
+            with self.subTest(mutation=old.strip()):
+                weakened = self.source.replace(old, new, 1)
+                self.assertNotEqual(weakened, self.source)
+                with self.assertRaisesRegex(
+                    self.module.EvidenceError,
+                    "shared run|wire|printf|clause-local",
+                ):
+                    self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_rejects_duplicate_shared_run_wire_producer(self) -> None:
+        marker = (
+            '    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|'
+            "kind=shared-run-begin|"
+        )
+        start = self.source.index(marker)
+        end = self.source.index(";\n", start) + 1
+        wire = self.source[start:end]
+        duplicated = (
+            self.source
+            + "\ncarrick*:::dsr-run-begin\n/1/\n{\n"
+            + wire
+            + "\n}\n"
+        )
+        with self.assertRaisesRegex(
+            self.module.EvidenceError, "shared run|wire|producer|exactly one"
+        ):
+            self.module.validate_dtrace_source(duplicated)
 
     def test_static_contract_requires_general_exec_and_early_metadata_guards(self) -> None:
         weak_exec = self.source.replace(
