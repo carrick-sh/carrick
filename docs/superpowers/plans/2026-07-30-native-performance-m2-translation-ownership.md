@@ -288,6 +288,7 @@ struct PreparedSharedInstall {
     tid: i32,
     catalog_entry: CatalogSharedRange,
     blocks: Vec<PreparedSharedBlock>,
+    sensitive_updates: Vec<((GuestVa, CodeGeneration), SensitiveMetadata)>,
     normalized_guest_ranges: Vec<(GuestVa, GuestVa)>,
     loaded_unit: LoadedSharedUnit,
     direct_binding: PreparedDirectBindingUnit,
@@ -300,7 +301,6 @@ struct PreparedSharedBlock {
     key: (GuestVa, CodeGeneration),
     entry: CacheVa,
     published: PublishedBlock,
-    sensitive: Option<((GuestVa, CodeGeneration), SensitiveMetadata)>,
     fusion_site: Option<ExclusiveFusionSite>,
     guest_ranges: Vec<Range<GuestVa>>,
     authority: SharedBlockAuthority,
@@ -403,6 +403,9 @@ Cover:
 - duplicate guest starts, overlapping cache extents, empty/unaligned PC maps,
   repeated-but-valid guest PCs, and nested/overlapping guest ranges that are
   not normalized to one union;
+- distinct block starts that converge on one sensitive terminal PC, including
+  equal exit semantics with equal/different fusion metadata and a conflicting
+  sensitive-exit negative control;
 - sequence overflow;
 - failure in every validation, vector-reserve, block-metadata, direct-binding,
   retention, and executable-range preparation stage leaves the catalog,
@@ -485,9 +488,23 @@ reserve may change capacity but not catalog contents or sequence state. The
 install preparation takes `&NativeMappedMemory` because generation
 observations and `plan_block_with_segments` cannot be prepared correctly
 without the active address space. It builds every `PublishedBlock`,
-sensitive/fusion record, exact guest range, and `SharedBlockAuthority` in
-`PreparedSharedBlock`, and it aggregates dependency tuples into one prepared
-page-dependency batch.
+fusion record, exact guest range, and `SharedBlockAuthority` in
+`PreparedSharedBlock`; it aggregates sensitive-terminal metadata separately
+by sensitive guest PC and dependency tuples into one prepared page-dependency
+batch.
+
+Block-start identity and sensitive-terminal identity are different domains
+even though both currently have the raw shape
+`(GuestVa, CodeGeneration)`. Do not compare an incoming block-start key
+against the `sensitive` map. Distinct translated block starts may legitimately
+converge on the same sensitive instruction. For one sensitive key, require
+every planned `SensitiveExit` to be identical. Merge equal fusion metadata as
+itself; if fusion metadata is absent or differs across owners, retain
+`fusion=None` as the deterministic conservative profiling value. Apply the
+same merge against already installed sensitive metadata. A conflicting
+`SensitiveExit` is a real policy error and leaves all logical state unchanged.
+Preparation emits one normalized `sensitive_updates` entry per sensitive key;
+commit inserts those prepared entries without validation.
 
 Do not derive guest extent from `block.template.source_words()`: production
 packing deliberately clears that field in `into_runtime_metadata_only`.
@@ -531,11 +548,13 @@ Split the current mutating helpers at their real transaction boundaries:
   destination.
 - Reserve `published`, `shared_published_index`, `shared_guest_ranges`, and
   `loaded_shared_units` for the whole batch, plus the shared catalog vector in
-  `TranslatedRangeCatalog::prepare_shared`. Preflight duplicate keys against
-  `blocks`, `sensitive`, and `shared_blocks`, plus duplicates within the
-  prepared batch. `BTreeMap` has no stable fallible-reserve API: its eventual
-  inserts may terminate the process on allocator failure, but cannot return a
-  recoverable error and resume guest execution.
+  `TranslatedRangeCatalog::prepare_shared`. Preflight incoming block-start
+  keys against `blocks` and `shared_blocks`, plus duplicates within the
+  prepared batch. Do not use the sensitive-terminal map as a block-start
+  collision index; normalize it through the merge rule above. `BTreeMap` has
+  no stable fallible-reserve API: its eventual inserts may terminate the
+  process on allocator failure, but cannot return a recoverable error and
+  resume guest execution.
 
 Every recoverable preparation failure therefore returns with the catalog,
 reachable indexes, retained-unit set, and executable-range head intact.
@@ -546,10 +565,11 @@ do not provide a cache entry or executable authority.
 Once preparation succeeds, `commit_shared_install` is deliberately infallible:
 it first appends/emits the authoritative typed catalog entry, then installs the
 already prepared direct-binding owner, retained stable-pointer owners, block
-indexes, page dependencies, normalized guest-range union, and unit retention.
-The executable-range node is linked and release-published last, after every
-other logical structure is visible. It returns no `Result`, validates nothing,
-and is called while the exclusive `ProcessState` write guard is held.
+indexes, normalized sensitive updates, page dependencies, normalized
+guest-range union, and unit retention. The executable-range node is linked and
+release-published last, after every other logical structure is visible. It
+returns no `Result`, validates nothing, and is called while the exclusive
+`ProcessState` write guard is held.
 Capacity-backed vector inserts are allocation-free; standard-library tree
 inserts have only the process-terminating allocator-failure case described
 above. Only after all logical structures are committed may the guard release
