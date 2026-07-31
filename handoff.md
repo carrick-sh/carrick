@@ -168,11 +168,19 @@ that completes inside the maintained 30-second DTrace bound. Focused gates
 passed 59 lifecycle tests, 61 ABBA tests, Python compilation, formatting, and
 diff checks; the live receipt was independently reloaded and revalidated.
 
-**Next:** take two native-default and two shared Go-build attribution captures
-with this same signed binary. Choose the largest repeatable opt-out
-translation/kernel owner, implement one narrow candidate, and retain it only
-through the primary ABBA total-child-CPU gate. No new runtime/DSR probe is
-currently required unless the four captures leave the owner unresolved.
+This lifecycle receipt closes the catalog/fork/exec prerequisite, but it does
+not make the current PID-only `DSRPROF1` native-wall stream gating-eligible.
+Repository verification after acceptance confirmed that the approved
+birth-keyed `DSRPROF2` grammar, launch-time birth/terminal qualification,
+balanced kernel transition state, v2 symbol rules, and receipt-bound Go-build
+capture surface are still absent.
+
+**Next:** execute M2 Tasks 3–5 in the approved translation-ownership plan,
+then add the Go-build `capture`/`promote-set` wrapper surface. Only after those
+gates are green should this same signed code state be rebuilt into the
+immutable arm for two native-default and two shared captures. Those four
+profiles choose the largest repeatable opt-out translation/kernel owner; one
+narrow candidate then advances to the primary ABBA total-child-CPU gate.
 
 The ≥30% CPU goal remains open; no new paired CPU ratio has been measured.
 
