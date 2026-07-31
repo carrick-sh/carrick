@@ -113,16 +113,52 @@ pub struct EmittedBlock {
 }
 
 struct AssembledBlock {
+    instruction_bytes: Vec<u8>,
+    // Existing structural emitter tests inspect words extensively. Preserve
+    // that view only in this crate's test build; production must not recreate
+    // the staging allocation this change removes.
+    #[cfg(test)]
     words: Vec<u32>,
     map: InstructionMap,
     direct_links: Vec<DirectLink>,
     recovery: Vec<RecoveryEntry>,
 }
 
+fn direct_instruction_bytes_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+/// Publish dynasm's byte stream directly by default. The old `Vec<u32>`
+/// staging allocation remains a same-binary control arm, selected only with
+/// `CARRICK_DSR_DIRECT_BYTES=0`.
+fn direct_instruction_bytes_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        direct_instruction_bytes_enabled_from(
+            std::env::var_os("CARRICK_DSR_DIRECT_BYTES").as_deref(),
+        )
+    })
+}
+
 impl AssembledBlock {
+    /// Materialize host-endian words only for artifact recording and tests.
+    /// The production private-cache path publishes `instruction_bytes`
+    /// directly and therefore avoids this allocation and full-block copy.
+    fn instruction_words(&self) -> Vec<u32> {
+        self.instruction_bytes
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect()
+    }
+
     fn publish(self, cache: &mut TranslationCache) -> Result<EmittedBlock, DsrError> {
-        let mut writer = cache.begin_write(self.words.len().saturating_mul(4))?;
-        writer.write_words(&self.words)?;
+        let mut writer = cache.begin_write(self.instruction_bytes.len())?;
+        if direct_instruction_bytes_enabled() {
+            writer.write_instruction_bytes(&self.instruction_bytes)?;
+        } else {
+            let words = self.instruction_words();
+            writer.write_words(&words)?;
+        }
         let code = writer.publish()?;
         Ok(EmittedBlock {
             code,
@@ -4554,7 +4590,7 @@ pub fn emit_block_recording_artifact_optional(
     )?;
     let artifact = recording
         .finish(
-            assembled.words.clone(),
+            assembled.instruction_words(),
             assembled.map.entries().to_vec(),
             assembled.recovery.clone(),
             assembled.direct_links.clone(),
@@ -4586,7 +4622,7 @@ pub fn record_portable_block_artifact(
         Some(&mut recording),
     )?;
     recording.finish(
-        assembled.words,
+        assembled.instruction_words(),
         assembled.map.entries().to_vec(),
         assembled.recovery,
         assembled.direct_links,
@@ -6549,12 +6585,15 @@ fn assemble_block_inner(
             bytes.len()
         )));
     }
+    #[cfg(test)]
     let words = bytes
         .chunks_exact(4)
         .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .collect::<Vec<_>>();
+        .collect();
     let map = InstructionMap::new(entries)?;
     Ok(AssembledBlock {
+        instruction_bytes: bytes,
+        #[cfg(test)]
         words,
         map,
         direct_links,
@@ -7042,6 +7081,17 @@ mod tests {
         IndirectKind,
     };
     use super::*;
+
+    #[test]
+    fn direct_instruction_bytes_are_default_on_with_an_exact_opt_out() {
+        assert!(direct_instruction_bytes_enabled_from(None));
+        assert!(direct_instruction_bytes_enabled_from(Some(
+            std::ffi::OsStr::new("1")
+        )));
+        assert!(!direct_instruction_bytes_enabled_from(Some(
+            std::ffi::OsStr::new("0")
+        )));
+    }
 
     fn copy_plan() -> BlockPlan {
         BlockPlan {

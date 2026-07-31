@@ -20,6 +20,50 @@ pub const TRANSLATION_UNIT_BINDING_EXPORT: &str = "carrick_aot_unit_bindings";
 const DARWIN_HOST_PAGE_SIZE: u64 = 16 * 1024;
 const DARWIN_HOST_PAGE_SIZE_USIZE: usize = 16 * 1024;
 static DIRECT_BINDING_RUNTIME_ENABLED: OnceLock<bool> = OnceLock::new();
+static SHARED_MANIFEST_ARC_ENABLED: OnceLock<bool> = OnceLock::new();
+static SHARED_SOURCE_FINGERPRINT_REUSE_ENABLED: OnceLock<bool> = OnceLock::new();
+static SHARED_RECOVERY_RUNS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn shared_manifest_arc_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn shared_manifest_arc_enabled() -> bool {
+    *SHARED_MANIFEST_ARC_ENABLED.get_or_init(|| {
+        let value = std::env::var_os("CARRICK_DSR_SHARED_MANIFEST_ARC");
+        shared_manifest_arc_enabled_from(value.as_deref())
+    })
+}
+
+fn retain_loaded_manifest(manifest: Arc<TranslationUnitManifest>) -> Arc<TranslationUnitManifest> {
+    if shared_manifest_arc_enabled() {
+        manifest
+    } else {
+        Arc::new((*manifest).clone())
+    }
+}
+
+fn shared_source_fingerprint_reuse_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+pub fn shared_source_fingerprint_reuse_enabled() -> bool {
+    *SHARED_SOURCE_FINGERPRINT_REUSE_ENABLED.get_or_init(|| {
+        let value = std::env::var_os("CARRICK_DSR_SHARED_SOURCE_FINGERPRINT_REUSE");
+        shared_source_fingerprint_reuse_enabled_from(value.as_deref())
+    })
+}
+
+fn shared_recovery_runs_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn shared_recovery_runs_enabled() -> bool {
+    *SHARED_RECOVERY_RUNS_ENABLED.get_or_init(|| {
+        let value = std::env::var_os("CARRICK_DSR_SHARED_RECOVERY_RUNS");
+        shared_recovery_runs_enabled_from(value.as_deref())
+    })
+}
 
 /// Exact maximum protection assigned to one loaded AOT mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,6 +310,17 @@ impl TranslationUnitKey {
     }
 }
 
+/// A dyld export whose signed symbol identity is unique to one translation
+/// unit key. Resolving this exact symbol after `dlopen` cheaply binds a loaded
+/// image to the manifest without rereading and hashing the entire dylib in
+/// every descendant process.
+pub fn translation_unit_base_export(key: &TranslationUnitKey) -> Result<String, serde_json::Error> {
+    Ok(format!(
+        "{TRANSLATION_UNIT_BASE_EXPORT}_{}",
+        key.file_stem()?
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortableBlockRecord {
     pub guest_start: GuestVa,
@@ -434,6 +489,20 @@ impl PendingTranslationUnit {
         candidates: Vec<PortableBlockCandidate>,
         binding_layout: DirectBindingLayout,
     ) -> Result<Self, crate::types::DsrError> {
+        Self::pack_with_recovery_runs(
+            key,
+            candidates,
+            binding_layout,
+            shared_recovery_runs_enabled(),
+        )
+    }
+
+    fn pack_with_recovery_runs(
+        key: TranslationUnitKey,
+        candidates: Vec<PortableBlockCandidate>,
+        binding_layout: DirectBindingLayout,
+        recovery_runs: bool,
+    ) -> Result<Self, crate::types::DsrError> {
         let mut code = Vec::new();
         let mut blocks = Vec::with_capacity(candidates.len());
         let mut entries = BTreeMap::new();
@@ -476,7 +545,9 @@ impl PendingTranslationUnit {
                 entry_offset,
                 code_len,
                 requires_sensitive_metadata: candidate.requires_sensitive_metadata,
-                template: candidate.template.into_runtime_metadata_only(),
+                template: candidate
+                    .template
+                    .into_runtime_metadata_only_with_recovery_runs(recovery_runs)?,
             });
         }
         let mut unresolved = Vec::new();
@@ -691,22 +762,36 @@ pub enum PublishOutcome {
     Existing,
 }
 
-#[derive(Clone)]
 pub struct SharedLoadedTranslationUnit {
-    pub manifest: TranslationUnitManifest,
+    pub manifest: Arc<TranslationUnitManifest>,
     pub base: usize,
     pub binding_base: Option<DirectBindingCellVa>,
     _lease: Arc<dyn Send + Sync>,
 }
 
+impl Clone for SharedLoadedTranslationUnit {
+    fn clone(&self) -> Self {
+        Self {
+            manifest: if shared_manifest_arc_enabled() {
+                Arc::clone(&self.manifest)
+            } else {
+                Arc::new((*self.manifest).clone())
+            },
+            base: self.base,
+            binding_base: self.binding_base,
+            _lease: Arc::clone(&self._lease),
+        }
+    }
+}
+
 impl SharedLoadedTranslationUnit {
     pub fn new(
-        manifest: TranslationUnitManifest,
+        manifest: impl Into<Arc<TranslationUnitManifest>>,
         base: usize,
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
         Self {
-            manifest,
+            manifest: retain_loaded_manifest(manifest.into()),
             base,
             binding_base: None,
             _lease: lease,
@@ -714,13 +799,13 @@ impl SharedLoadedTranslationUnit {
     }
 
     pub fn new_with_binding_base(
-        manifest: TranslationUnitManifest,
+        manifest: impl Into<Arc<TranslationUnitManifest>>,
         base: usize,
         binding_base: Option<DirectBindingCellVa>,
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
         Self {
-            manifest,
+            manifest: retain_loaded_manifest(manifest.into()),
             base,
             binding_base,
             _lease: lease,
@@ -761,6 +846,31 @@ pub struct SharedExecutableSegment {
     pub guest_start: GuestVa,
     pub guest_len: GuestCodeLen,
     pub source_words: Arc<[u32]>,
+    source_fingerprint: SourceFingerprint,
+}
+
+impl SharedExecutableSegment {
+    pub fn new(
+        file_offset: ImageFileOffset,
+        file_len: ImageFileLen,
+        guest_start: GuestVa,
+        guest_len: GuestCodeLen,
+        source_words: Arc<[u32]>,
+    ) -> Self {
+        let source_fingerprint = SourceFingerprint::from_words(&source_words);
+        Self {
+            file_offset,
+            file_len,
+            guest_start,
+            guest_len,
+            source_words,
+            source_fingerprint,
+        }
+    }
+
+    pub const fn source_fingerprint(&self) -> SourceFingerprint {
+        self.source_fingerprint
+    }
 }
 
 impl SharedImageConfig {
@@ -772,13 +882,29 @@ impl SharedImageConfig {
     }
 
     pub fn key_for_segment(&self, segment: &SharedExecutableSegment) -> TranslationUnitKey {
+        self.key_for_segment_with_fingerprint_reuse(
+            segment,
+            shared_source_fingerprint_reuse_enabled(),
+        )
+    }
+
+    fn key_for_segment_with_fingerprint_reuse(
+        &self,
+        segment: &SharedExecutableSegment,
+        reuse: bool,
+    ) -> TranslationUnitKey {
+        let source_fingerprint = if reuse {
+            segment.source_fingerprint()
+        } else {
+            SourceFingerprint::from_words(&segment.source_words)
+        };
         TranslationUnitKey::for_segment(
             self.executable.clone(),
             segment.file_offset,
             segment.file_len,
             segment.guest_start,
             segment.guest_len,
-            SourceFingerprint::from_words(&segment.source_words),
+            source_fingerprint,
             self.page_profile,
             self.address_mode,
         )
@@ -800,7 +926,9 @@ impl TranslationUnitManifest {
         if self.key.translator_abi() != TRANSLATOR_ABI_CURRENT {
             return Err(UnitMissReason::TranslatorAbi);
         }
-        if self.base_export != TRANSLATION_UNIT_BASE_EXPORT
+        let expected_base_export =
+            translation_unit_base_export(&self.key).map_err(|_| UnitMissReason::Schema)?;
+        if self.base_export != expected_base_export
             || self.code_len == 0
             || self.code_len > MAX_TRANSLATION_UNIT_CODE_BYTES as u64
         {
@@ -1049,7 +1177,9 @@ mod tests {
     use super::*;
     use crate::artifact_spike::{ArtifactBindings, ArtifactTemplate};
     use crate::block::{BlockPlan, PlannedExit};
-    use crate::emit::{DirectLink, DirectLinkKind, DirectStubEnvelope, PcMapEntry};
+    use crate::emit::{
+        DirectLink, DirectLinkKind, DirectStubEnvelope, PcMapEntry, RecoveryAction, RecoveryEntry,
+    };
     use crate::types::{CacheOffset, CodeGeneration, DirectExit, DirectKind};
     use carrick_dsr::address::NativeHostBias;
     use carrick_guest_mem::GuestVa;
@@ -1114,15 +1244,16 @@ mod tests {
     }
 
     fn manifest_v2_fixture() -> TranslationUnitManifest {
+        let key = key(
+            ExecutableIdentity::Digest([0x11; 32]),
+            SourceFingerprint([0xaa; 32]),
+            AddressModeIdentity::Direct,
+        );
         TranslationUnitManifest {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
-            key: key(
-                ExecutableIdentity::Digest([0x11; 32]),
-                SourceFingerprint([0xaa; 32]),
-                AddressModeIdentity::Direct,
-            ),
+            base_export: translation_unit_base_export(&key).expect("unit export"),
+            key,
             dylib_sha256: [0x22; 32],
-            base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
             code_len: 512,
             blocks: Vec::new(),
             binding_layout: DirectBindingLayout::SidecarV1,
@@ -1146,6 +1277,166 @@ mod tests {
                 data_offset: 0,
             }],
         }
+    }
+
+    #[test]
+    fn loaded_unit_clones_share_the_immutable_manifest() {
+        let unit = SharedLoadedTranslationUnit::new(manifest_v2_fixture(), 0x1000, Arc::new(()));
+        let cloned = unit.clone();
+
+        assert!(std::ptr::eq(&unit.manifest.blocks, &cloned.manifest.blocks,));
+    }
+
+    #[test]
+    fn shared_manifest_arc_is_default_on_with_an_exact_opt_out() {
+        assert!(shared_manifest_arc_enabled_from(None));
+        assert!(shared_manifest_arc_enabled_from(Some(
+            std::ffi::OsStr::new("1")
+        )));
+        assert!(shared_manifest_arc_enabled_from(Some(
+            std::ffi::OsStr::new("false")
+        )));
+        assert!(!shared_manifest_arc_enabled_from(Some(
+            std::ffi::OsStr::new("0")
+        )));
+    }
+
+    #[test]
+    fn shared_source_fingerprint_reuse_is_default_on_with_an_exact_opt_out() {
+        assert!(shared_source_fingerprint_reuse_enabled_from(None));
+        assert!(shared_source_fingerprint_reuse_enabled_from(Some(
+            std::ffi::OsStr::new("1")
+        )));
+        assert!(shared_source_fingerprint_reuse_enabled_from(Some(
+            std::ffi::OsStr::new("false")
+        )));
+        assert!(!shared_source_fingerprint_reuse_enabled_from(Some(
+            std::ffi::OsStr::new("0")
+        )));
+    }
+
+    #[test]
+    fn shared_recovery_runs_are_default_on_with_an_exact_opt_out() {
+        assert!(shared_recovery_runs_enabled_from(None));
+        assert!(shared_recovery_runs_enabled_from(Some(
+            std::ffi::OsStr::new("1")
+        )));
+        assert!(shared_recovery_runs_enabled_from(Some(
+            std::ffi::OsStr::new("false")
+        )));
+        assert!(!shared_recovery_runs_enabled_from(Some(
+            std::ffi::OsStr::new("0")
+        )));
+    }
+
+    #[test]
+    fn packed_recovery_runs_round_trip_smaller_than_entry_mode() {
+        let key = key(
+            ExecutableIdentity::Digest([0x51; 32]),
+            SourceFingerprint([0x61; 32]),
+            AddressModeIdentity::Direct,
+        );
+        let template = ArtifactTemplate::normalize(
+            vec![0xd503_201f; 1024],
+            vec![PcMapEntry {
+                guest: GuestVa(0x400000),
+                cache: CacheOffset::published(0),
+            }],
+            (0..1024)
+                .map(|index| RecoveryEntry {
+                    cache: CacheOffset::published(index * 4),
+                    action: RecoveryAction::RestoreScratch { register: 16 },
+                })
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &ArtifactBindings::from_values([]).expect("empty bindings"),
+        )
+        .expect("recovery template");
+        let candidate = PortableBlockCandidate {
+            guest_start: GuestVa(0x400000),
+            generation_binding: 0,
+            requires_sensitive_metadata: false,
+            template,
+        };
+        let runs = PendingTranslationUnit::pack_with_recovery_runs(
+            key.clone(),
+            vec![candidate.clone()],
+            DirectBindingLayout::Disabled,
+            true,
+        )
+        .expect("pack recovery runs");
+        let entries = PendingTranslationUnit::pack_with_recovery_runs(
+            key,
+            vec![candidate],
+            DirectBindingLayout::Disabled,
+            false,
+        )
+        .expect("pack recovery entries");
+
+        assert!(runs.blocks[0].template.recovery_is_run_encoded());
+        assert!(!entries.blocks[0].template.recovery_is_run_encoded());
+        assert_eq!(
+            runs.blocks[0].template.metadata_counts().recovery_entries,
+            1024
+        );
+        assert_eq!(runs.blocks[0].template.metadata_counts().recovery_runs, 1);
+
+        let manifest = |pending: PendingTranslationUnit| TranslationUnitManifest {
+            schema: TRANSLATION_UNIT_SCHEMA_V2,
+            base_export: translation_unit_base_export(&pending.key).expect("unit export"),
+            key: pending.key,
+            dylib_sha256: [0x71; 32],
+            code_len: pending.code.len() as u64,
+            blocks: pending.blocks,
+            binding_layout: pending.binding_layout,
+            binding_export: pending.binding_export,
+            binding_data_len: pending.binding_data_len,
+            cell_size: pending.cell_size,
+            bindings: pending.bindings,
+            binding_relocations: pending.binding_relocations,
+        };
+        let runs = manifest(runs);
+        let entries = manifest(entries);
+        let config = bincode::config::standard().with_fixed_int_encoding();
+        let run_bytes = bincode::serde::encode_to_vec(&runs, config).expect("encode runs");
+        let entry_bytes = bincode::serde::encode_to_vec(&entries, config).expect("encode entries");
+        assert!(run_bytes.len() * 4 < entry_bytes.len());
+        let (decoded, consumed): (TranslationUnitManifest, usize) =
+            bincode::serde::decode_from_slice(&run_bytes, config).expect("decode runs");
+        assert_eq!(consumed, run_bytes.len());
+        assert_eq!(decoded, runs);
+        assert!(decoded.blocks[0].template.recovery_is_run_encoded());
+    }
+
+    #[test]
+    fn shared_segment_key_reuses_its_construction_time_source_fingerprint() {
+        let source_words: Arc<[u32]> = vec![0xd280_0540, 0xd65f_03c0].into();
+        let segment = SharedExecutableSegment::new(
+            ImageFileOffset::new(0x1000),
+            ImageFileLen::new(8).expect("file length"),
+            GuestVa(0x400000),
+            GuestCodeLen::new(8).expect("guest length"),
+            Arc::clone(&source_words),
+        );
+        let image = SharedImageConfig {
+            executable: ExecutableIdentity::Digest([0x11; 32]),
+            page_profile: NativePageProfileIdentity::Native16k,
+            address_mode: AddressModeIdentity::Direct,
+            segments: vec![segment.clone()],
+        };
+
+        assert_eq!(
+            image.key_for_segment_with_fingerprint_reuse(&segment, true),
+            image.key_for_segment_with_fingerprint_reuse(&segment, false),
+        );
+        assert_eq!(
+            image
+                .key_for_segment_with_fingerprint_reuse(&segment, true)
+                .source_fingerprint(),
+            SourceFingerprint::from_words(&source_words),
+        );
     }
 
     fn manifest_block(guest_start: u64, entry_offset: u32, code_len: u32) -> PortableBlockRecord {
@@ -1244,15 +1535,16 @@ mod tests {
     #[test]
     fn source_fingerprint_mismatch_is_a_typed_miss() {
         let source = [0xd280_0000_u32];
+        let key = key(
+            ExecutableIdentity::Digest([0x11; 32]),
+            SourceFingerprint::from_words(&source),
+            AddressModeIdentity::Direct,
+        );
         let manifest = TranslationUnitManifest {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
-            key: key(
-                ExecutableIdentity::Digest([0x11; 32]),
-                SourceFingerprint::from_words(&source),
-                AddressModeIdentity::Direct,
-            ),
+            base_export: translation_unit_base_export(&key).expect("unit export"),
+            key,
             dylib_sha256: [0x22; 32],
-            base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
             code_len: 4,
             blocks: Vec::new(),
             binding_layout: DirectBindingLayout::Disabled,
@@ -1272,15 +1564,16 @@ mod tests {
     #[test]
     fn previous_target_cache_abi_is_rejected() {
         let source = [0xd280_0000_u32];
+        let key = key(
+            ExecutableIdentity::Digest([0x11; 32]),
+            SourceFingerprint::from_words(&source),
+            AddressModeIdentity::Direct,
+        );
         let mut manifest = TranslationUnitManifest {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
-            key: key(
-                ExecutableIdentity::Digest([0x11; 32]),
-                SourceFingerprint::from_words(&source),
-                AddressModeIdentity::Direct,
-            ),
+            base_export: translation_unit_base_export(&key).expect("unit export"),
+            key,
             dylib_sha256: [0x22; 32],
-            base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
             code_len: 4,
             blocks: Vec::new(),
             binding_layout: DirectBindingLayout::Disabled,
@@ -1703,6 +1996,33 @@ mod tests {
         assert_ne!(
             first.file_stem().expect("first stem"),
             second.file_stem().expect("second stem")
+        );
+    }
+
+    #[test]
+    fn translation_unit_base_export_binds_the_full_unit_identity() {
+        let first = key(
+            ExecutableIdentity::Digest([0x11; 32]),
+            SourceFingerprint([0xaa; 32]),
+            AddressModeIdentity::Direct,
+        );
+        let second = key(
+            ExecutableIdentity::Digest([0x22; 32]),
+            SourceFingerprint([0xaa; 32]),
+            AddressModeIdentity::Direct,
+        );
+
+        let first_export = translation_unit_base_export(&first).expect("first export");
+        let second_export = translation_unit_base_export(&second).expect("second export");
+
+        assert!(first_export.starts_with(TRANSLATION_UNIT_BASE_EXPORT));
+        assert_ne!(first_export, second_export);
+        assert_eq!(
+            first_export,
+            format!(
+                "{TRANSLATION_UNIT_BASE_EXPORT}_{}",
+                first.file_stem().expect("first stem")
+            )
         );
     }
 

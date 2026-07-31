@@ -4425,8 +4425,8 @@ fn published_shared_block_prevents_second_process_translation() {
         AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
         ImageFileOffset, NativePageProfileIdentity, PortableBlockRecord, PublishOutcome,
         SharedExecutableSegment, SharedImageConfig, SharedLoadedTranslationUnit, SourceFingerprint,
-        TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey,
-        TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
+        TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey, TranslationUnitManifest,
+        TranslationUnitStore, UnitMissReason, translation_unit_base_export,
     };
 
     #[derive(Clone)]
@@ -4496,7 +4496,7 @@ fn published_shared_block_prevents_second_process_translation() {
         schema: TRANSLATION_UNIT_SCHEMA_V2,
         key: key.clone(),
         dylib_sha256: [0x22; 32],
-        base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+        base_export: translation_unit_base_export(&key).expect("keyed translation export"),
         code_len: code_len as u64,
         blocks: vec![PortableBlockRecord {
             guest_start: guest,
@@ -4525,13 +4525,13 @@ fn published_shared_block_prevents_second_process_translation() {
                 executable: ExecutableIdentity::Digest([0x11; 32]),
                 page_profile: NativePageProfileIdentity::Native16k,
                 address_mode: AddressModeIdentity::biased(fixture.host_bias),
-                segments: vec![SharedExecutableSegment {
-                    file_offset: ImageFileOffset::new(0),
-                    file_len: ImageFileLen::new(8).expect("nonzero file length"),
-                    guest_start: guest,
-                    guest_len: GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
-                    source_words: words.to_vec().into(),
-                }],
+                segments: vec![SharedExecutableSegment::new(
+                    ImageFileOffset::new(0),
+                    ImageFileLen::new(8).expect("nonzero file length"),
+                    guest,
+                    GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
+                    words.to_vec().into(),
+                )],
             },
             store,
         )
@@ -4588,8 +4588,8 @@ fn shared_to_private_indirect_cache_hit_installs_target_authority() {
         AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
         ImageFileOffset, NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate,
         PublishOutcome, SharedExecutableSegment, SharedImageConfig, SharedLoadedTranslationUnit,
-        SourceFingerprint, TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V2,
-        TranslationUnitKey, TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
+        SourceFingerprint, TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey, TranslationUnitManifest,
+        TranslationUnitStore, UnitMissReason, translation_unit_base_export,
     };
 
     struct FixtureStore(SharedLoadedTranslationUnit);
@@ -4671,7 +4671,7 @@ fn shared_to_private_indirect_cache_hit_installs_target_authority() {
         schema: TRANSLATION_UNIT_SCHEMA_V2,
         key: key.clone(),
         dylib_sha256: [0x88; 32],
-        base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+        base_export: translation_unit_base_export(&key).expect("keyed translation export"),
         code_len: pending.code.len() as u64,
         blocks: pending.blocks,
         binding_layout: pending.binding_layout,
@@ -4691,13 +4691,13 @@ fn shared_to_private_indirect_cache_hit_installs_target_authority() {
                 executable: ExecutableIdentity::Digest([0x77; 32]),
                 page_profile: NativePageProfileIdentity::Native16k,
                 address_mode: AddressModeIdentity::biased(fixture.host_bias),
-                segments: vec![SharedExecutableSegment {
-                    file_offset: ImageFileOffset::new(0),
-                    file_len: ImageFileLen::new(4).expect("nonzero file length"),
-                    guest_start: guest,
-                    guest_len: GuestCodeLen::new(4).expect("nonzero guest length"),
-                    source_words: words[..1].to_vec().into(),
-                }],
+                segments: vec![SharedExecutableSegment::new(
+                    ImageFileOffset::new(0),
+                    ImageFileLen::new(4).expect("nonzero file length"),
+                    guest,
+                    GuestCodeLen::new(4).expect("nonzero guest length"),
+                    words[..1].to_vec().into(),
+                )],
             },
             Arc::new(FixtureStore(SharedLoadedTranslationUnit::new(
                 manifest, base, lease,
@@ -4760,8 +4760,8 @@ fn indirect_authority_switch_jittered_sigpipe_never_becomes_entry_kick() {
         AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
         ImageFileOffset, NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate,
         PublishOutcome, SharedExecutableSegment, SharedImageConfig, SharedLoadedTranslationUnit,
-        SourceFingerprint, TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V2,
-        TranslationUnitKey, TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
+        SourceFingerprint, TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey, TranslationUnitManifest,
+        TranslationUnitStore, UnitMissReason, translation_unit_base_export,
     };
 
     struct FixtureStore(SharedLoadedTranslationUnit);
@@ -4844,7 +4844,7 @@ fn indirect_authority_switch_jittered_sigpipe_never_becomes_entry_kick() {
         schema: TRANSLATION_UNIT_SCHEMA_V2,
         key: key.clone(),
         dylib_sha256: [0x89; 32],
-        base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+        base_export: translation_unit_base_export(&key).expect("keyed translation export"),
         code_len: pending.code.len() as u64,
         blocks: pending.blocks,
         binding_layout: pending.binding_layout,
@@ -4864,13 +4864,13 @@ fn indirect_authority_switch_jittered_sigpipe_never_becomes_entry_kick() {
                 executable: ExecutableIdentity::Digest([0x79; 32]),
                 page_profile: NativePageProfileIdentity::Native16k,
                 address_mode: AddressModeIdentity::biased(fixture.host_bias),
-                segments: vec![SharedExecutableSegment {
-                    file_offset: ImageFileOffset::new(0),
-                    file_len: ImageFileLen::new(4).expect("nonzero file length"),
-                    guest_start: source,
-                    guest_len: GuestCodeLen::new(4).expect("nonzero guest length"),
-                    source_words: words[..1].to_vec().into(),
-                }],
+                segments: vec![SharedExecutableSegment::new(
+                    ImageFileOffset::new(0),
+                    ImageFileLen::new(4).expect("nonzero file length"),
+                    source,
+                    GuestCodeLen::new(4).expect("nonzero guest length"),
+                    words[..1].to_vec().into(),
+                )],
             },
             Arc::new(FixtureStore(SharedLoadedTranslationUnit::new(
                 manifest, base, lease,
@@ -5267,20 +5267,20 @@ fn direct_binding_live_fixture(
                 page_profile: NativePageProfileIdentity::Native16k,
                 address_mode: AddressModeIdentity::biased(fixture.host_bias),
                 segments: vec![
-                    SharedExecutableSegment {
-                        file_offset: ImageFileOffset::new(0),
-                        file_len: ImageFileLen::new(4).expect("source file length"),
-                        guest_start: source,
-                        guest_len: GuestCodeLen::new(4).expect("source guest length"),
-                        source_words: vec![source_word].into(),
-                    },
-                    SharedExecutableSegment {
-                        file_offset: ImageFileOffset::new(4),
-                        file_len: ImageFileLen::new(4).expect("target file length"),
-                        guest_start: target,
-                        guest_len: GuestCodeLen::new(4).expect("target guest length"),
-                        source_words: vec![target_word].into(),
-                    },
+                    SharedExecutableSegment::new(
+                        ImageFileOffset::new(0),
+                        ImageFileLen::new(4).expect("source file length"),
+                        source,
+                        GuestCodeLen::new(4).expect("source guest length"),
+                        vec![source_word].into(),
+                    ),
+                    SharedExecutableSegment::new(
+                        ImageFileOffset::new(4),
+                        ImageFileLen::new(4).expect("target file length"),
+                        target,
+                        GuestCodeLen::new(4).expect("target guest length"),
+                        vec![target_word].into(),
+                    ),
                 ],
             },
             store,
@@ -5373,35 +5373,26 @@ fn direct_binding_recovery_for_cache_pc(
     cache_pc: GuestVa,
 ) -> Option<(super::emit::DirectBindingRecoveryPhase, usize)> {
     let cache_pc = usize::try_from(cache_pc.raw()).ok()?;
-    let state = fixture.fixture.translator.process.state.read();
-    state.published.iter().find_map(|block| {
-        let offset = cache_pc.checked_sub(block.entry.host().raw())?;
-        if offset >= block.len {
-            return None;
-        }
-        let offset = u32::try_from(offset).ok()?;
-        let sidecar_start = block
-            .recovery
-            .iter()
-            .filter_map(|entry| {
-                matches!(
-                    entry.action,
-                    super::emit::RecoveryAction::RestoreDirectBinding { .. }
-                )
-                .then_some(entry.cache.get())
-            })
-            .min()?;
-        block
-            .recovery
-            .iter()
-            .find(|entry| entry.cache.get() == offset)
-            .and_then(|entry| match entry.action {
-                super::emit::RecoveryAction::RestoreDirectBinding { phase, .. } => {
-                    Some((phase, usize::try_from((offset - sidecar_start) / 4).ok()?))
-                }
-                _ => None,
-            })
-    })
+    [fixture.source, fixture.target]
+        .into_iter()
+        .find_map(|guest| {
+            let points = fixture
+                .fixture
+                .translator
+                .direct_binding_recovery_points_for_test(guest)
+                .ok()?;
+            let sidecar_start = points
+                .iter()
+                .map(|(point, _action)| point.host().raw())
+                .min()?;
+            let (_point, action) = points
+                .iter()
+                .find(|(point, _action)| point.host().raw() == cache_pc)?;
+            let super::emit::RecoveryAction::RestoreDirectBinding { phase, .. } = action else {
+                return None;
+            };
+            Some((*phase, (cache_pc - sidecar_start) / 4))
+        })
 }
 
 fn direct_binding_phase_index(phase: super::emit::DirectBindingRecoveryPhase) -> usize {
@@ -5820,35 +5811,15 @@ impl Drop for SuspendedMachThread {
 }
 
 fn direct_binding_sidecar_start(fixture: &DirectBindingLiveFixture, guest: GuestVa) -> usize {
-    let state = fixture.fixture.translator.process.state.read();
-    let block = state
-        .published
-        .iter()
-        .find(|block| {
-            state
-                .blocks
-                .get(&(guest, CodeGeneration::INITIAL))
-                .is_some_and(|entry| *entry == block.entry)
-        })
-        .expect("published direct-binding block");
-    let recovery_start = block
-        .recovery
-        .iter()
-        .filter_map(|entry| {
-            matches!(
-                entry.action,
-                super::emit::RecoveryAction::RestoreDirectBinding { .. }
-            )
-            .then_some(entry.cache.get())
-        })
+    fixture
+        .fixture
+        .translator
+        .direct_binding_recovery_points_for_test(guest)
+        .expect("resolve direct-binding recovery points")
+        .into_iter()
+        .map(|(cache_pc, _action)| cache_pc.host().raw())
         .min()
-        .expect("direct-binding recovery start");
-    block
-        .entry
-        .host()
-        .raw()
-        .checked_add(recovery_start as usize)
-        .expect("direct-binding sidecar address")
+        .expect("direct-binding recovery start")
 }
 
 fn cmp_nzcv(lhs: u64, rhs: u64) -> u32 {
@@ -6504,13 +6475,13 @@ fn direct_binding_generation_change_clears_and_rebinds() {
                 executable,
                 page_profile: NativePageProfileIdentity::Native16k,
                 address_mode: AddressModeIdentity::biased(fixture.host_bias),
-                segments: vec![SharedExecutableSegment {
-                    file_offset: ImageFileOffset::new(0),
-                    file_len: ImageFileLen::new(4).expect("source file length"),
-                    guest_start: source,
-                    guest_len: GuestCodeLen::new(4).expect("source guest length"),
-                    source_words: vec![source_word].into(),
-                }],
+                segments: vec![SharedExecutableSegment::new(
+                    ImageFileOffset::new(0),
+                    ImageFileLen::new(4).expect("source file length"),
+                    source,
+                    GuestCodeLen::new(4).expect("source guest length"),
+                    vec![source_word].into(),
+                )],
             },
             store,
         )
@@ -6655,9 +6626,9 @@ fn translated_block_is_published_on_retirement_and_reused() {
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
         NativePageProfileIdentity, PendingTranslationUnit, PublishOutcome, SharedExecutableSegment,
-        SharedImageConfig, SharedLoadedTranslationUnit, TRANSLATION_UNIT_BASE_EXPORT,
-        TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey, TranslationUnitManifest,
-        TranslationUnitStore, UnitMissReason,
+        SharedImageConfig, SharedLoadedTranslationUnit, TRANSLATION_UNIT_SCHEMA_V2,
+        TranslationUnitKey, TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
+        translation_unit_base_export,
     };
 
     #[derive(Default)]
@@ -6711,7 +6682,8 @@ fn translated_block_is_published_on_retirement_and_reused() {
                 schema: TRANSLATION_UNIT_SCHEMA_V2,
                 key: pending.key.clone(),
                 dylib_sha256: [0x33; 32],
-                base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+                base_export: translation_unit_base_export(&pending.key)
+                    .expect("keyed translation export"),
                 code_len: pending.code.len() as u64,
                 blocks: pending.blocks.clone(),
                 binding_layout: pending.binding_layout,
@@ -6736,13 +6708,13 @@ fn translated_block_is_published_on_retirement_and_reused() {
                     executable: ExecutableIdentity::Digest([0x66; 32]),
                     page_profile: NativePageProfileIdentity::Native16k,
                     address_mode: AddressModeIdentity::biased(fixture.host_bias),
-                    segments: vec![SharedExecutableSegment {
-                        file_offset: ImageFileOffset::new(0),
-                        file_len: ImageFileLen::new(16 * 1024).expect("nonzero file length"),
-                        guest_start: fixture.guest_code,
-                        guest_len: GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
-                        source_words: words.to_vec().into(),
-                    }],
+                    segments: vec![SharedExecutableSegment::new(
+                        ImageFileOffset::new(0),
+                        ImageFileLen::new(16 * 1024).expect("nonzero file length"),
+                        fixture.guest_code,
+                        GuestCodeLen::new(16 * 1024).expect("nonzero guest length"),
+                        words.to_vec().into(),
+                    )],
                 },
                 store,
             )

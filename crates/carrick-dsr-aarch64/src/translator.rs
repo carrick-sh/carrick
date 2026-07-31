@@ -1396,7 +1396,26 @@ pub struct PublishedBlock {
     pub len: usize,
     pub map: Vec<emit::PcMapEntry>,
     pub recovery: Vec<emit::RecoveryEntry>,
+    shared_recovery: Option<SharedRecoveryMetadata>,
     pub _generation: cache::PageGenerationObservation,
+}
+
+struct SharedRecoveryMetadata {
+    recovery: artifact_spike::PortableRecoveryMetadata,
+    host_bias: Option<u64>,
+}
+
+static SHARED_RECOVERY_LAZY_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn shared_recovery_lazy_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn shared_recovery_lazy_enabled() -> bool {
+    *SHARED_RECOVERY_LAZY_ENABLED.get_or_init(|| {
+        let value = std::env::var_os("CARRICK_DSR_SHARED_RECOVERY_LAZY");
+        shared_recovery_lazy_enabled_from(value.as_deref())
+    })
 }
 
 /// One entry of an address-ordered index over [`ProcessState::published`]:
@@ -3054,7 +3073,11 @@ impl ProcessState {
                     "shared sensitive-metadata reservation failed: {error}"
                 ))
             })?;
-        for (block, observation) in unit.manifest.blocks.iter_mut().zip(observations) {
+        for (block, observation) in Arc::make_mut(&mut unit.manifest)
+            .blocks
+            .iter_mut()
+            .zip(observations)
+        {
             let address = cache_start
                 .checked_add(block.entry_offset as usize)
                 .ok_or_else(|| {
@@ -3071,7 +3094,22 @@ impl ProcessState {
                 ));
             }
             let entry = types::CacheVa::published(carrick_guest_mem::HostVa(address));
-            let (map, recovery, _direct_links) = block.template.take_runtime_metadata(host_bias)?;
+            let (map, recovery, shared_recovery) = if shared_recovery_lazy_enabled() {
+                let (map, recovery, _direct_links) =
+                    block.template.take_portable_runtime_metadata();
+                (
+                    map,
+                    Vec::new(),
+                    Some(SharedRecoveryMetadata {
+                        recovery,
+                        host_bias,
+                    }),
+                )
+            } else {
+                let (map, recovery, _direct_links) =
+                    block.template.take_runtime_metadata(host_bias)?;
+                (map, recovery, None)
+            };
             let guest_ranges =
                 exact_guest_ranges_from_pc_map(block.guest_start, block.code_len as usize, &map)?;
             guest_range_additions
@@ -3107,6 +3145,7 @@ impl ProcessState {
                 len: block.code_len as usize,
                 map,
                 recovery,
+                shared_recovery,
                 _generation: observation.clone(),
             };
             dependency_records.push((
@@ -3458,6 +3497,7 @@ impl ProcessState {
             len: emitted_len,
             map,
             recovery,
+            shared_recovery: None,
             _generation: observation,
         });
         self.blocks.insert(key, entry);
@@ -4167,6 +4207,7 @@ impl ProcessState {
             len,
             map,
             recovery: Vec::new(),
+            shared_recovery: None,
             _generation: observation.clone(),
         });
         if reachable {
@@ -4282,6 +4323,16 @@ impl ProcessState {
                 .iter()
                 .find(|entry| entry.cache == types::CacheOffset::published(offset))
                 .map(|entry| entry.action);
+            let recovery = match recovery {
+                Some(recovery) => Some(recovery),
+                None => match block.shared_recovery.as_ref() {
+                    Some(metadata) => metadata.recovery.rebind_for_cache(
+                        types::CacheOffset::published(offset),
+                        metadata.host_bias,
+                    )?,
+                    None => None,
+                },
+            };
             return Ok((guest, recovery));
         }
         let first = self
@@ -4664,6 +4715,46 @@ impl ThreadTranslator {
                 })
             })
             .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn direct_binding_recovery_points_for_test(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Result<Vec<(types::CacheVa, emit::RecoveryAction)>, types::DsrError> {
+        let state = self.process.state.read();
+        let mut points = Vec::new();
+        for block in &state.published {
+            for mapping in block.map.iter().filter(|mapping| mapping.guest == guest) {
+                let address = block
+                    .entry
+                    .host()
+                    .raw()
+                    .checked_add(mapping.cache.get() as usize)
+                    .ok_or_else(|| {
+                        types::DsrError::CachePolicy(
+                            "direct-binding recovery test address overflow".to_string(),
+                        )
+                    })?;
+                let cache_pc =
+                    carrick_guest_mem::GuestVa(u64::try_from(address).map_err(|_| {
+                        types::DsrError::CachePolicy(
+                            "direct-binding recovery test address exceeds u64".to_string(),
+                        )
+                    })?);
+                let (mapped_guest, recovery) = state.guest_pc_for_cache(cache_pc)?;
+                if mapped_guest == guest
+                    && let Some(action @ emit::RecoveryAction::RestoreDirectBinding { .. }) =
+                        recovery
+                {
+                    points.push((
+                        types::CacheVa::published(carrick_guest_mem::HostVa(address)),
+                        action,
+                    ));
+                }
+            }
+        }
+        Ok(points)
     }
 
     #[doc(hidden)]
@@ -5372,15 +5463,15 @@ mod tests {
         SharedInstallCommitPhase, SharedInstallLogicalSnapshot, SharedInstallPrepareStage,
         ThreadTranslator, TranslatedRangeCatalog, TranslatedRangeRecorder,
         exact_guest_ranges_from_pc_map, merge_sensitive_metadata, normalized_guest_range_union,
-        set_shared_install_prepare_failpoint_for_test, translated_unit_id,
-        translation_source_words_required, typed_unit_id_from_digest,
+        set_shared_install_prepare_failpoint_for_test, shared_recovery_lazy_enabled_from,
+        translated_unit_id, translation_source_words_required, typed_unit_id_from_digest,
     };
     use crate::artifact_spike::{ArtifactBindings, ArtifactTemplate};
     use crate::emit::PcMapEntry;
     use crate::mapped_memory::NativeMappedMemory;
     use crate::shared_cache::{
         DirectBindingLayout, PortableBlockRecord, SharedLoadedTranslationUnit,
-        TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitManifest,
+        TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitManifest, translation_unit_base_export,
     };
     use crate::types;
     use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
@@ -6609,20 +6700,26 @@ mod tests {
         let template = ArtifactTemplate::normalize(
             Vec::new(),
             map,
-            Vec::new(),
+            vec![crate::emit::RecoveryEntry {
+                cache: types::CacheOffset::published(4),
+                action: crate::emit::RecoveryAction::RestoreGuestX17,
+            }],
             Vec::new(),
             Vec::new(),
             Vec::new(),
             &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
         )
         .expect("shared block metadata")
-        .into_runtime_metadata_only();
+        .into_runtime_metadata_only_with_recovery_runs(true)
+        .expect("compact shared recovery metadata");
+        let key = direct_binding_owner_and_publication::key(42);
+        let base_export = translation_unit_base_export(&key).expect("keyed translation export");
         SharedLoadedTranslationUnit::new(
             TranslationUnitManifest {
                 schema: TRANSLATION_UNIT_SCHEMA_V2,
-                key: direct_binding_owner_and_publication::key(42),
+                key,
                 dylib_sha256: [0x42; 32],
-                base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+                base_export,
                 code_len: 16,
                 blocks: vec![PortableBlockRecord {
                     guest_start: GuestVa(0x400000),
@@ -6672,12 +6769,14 @@ mod tests {
                 template,
             }
         };
+        let key = direct_binding_owner_and_publication::key(43);
+        let base_export = translation_unit_base_export(&key).expect("keyed translation export");
         SharedLoadedTranslationUnit::new(
             TranslationUnitManifest {
                 schema: TRANSLATION_UNIT_SCHEMA_V2,
-                key: direct_binding_owner_and_publication::key(43),
+                key,
                 dylib_sha256: [0x43; 32],
-                base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+                base_export,
                 code_len: 32,
                 blocks: vec![
                     block(GuestVa(0x400000), 0, 0),
@@ -7140,6 +7239,39 @@ mod tests {
                 if event.unit_id() == prepared_id
                     && event.range() == &(HostVa(base)..HostVa(base + 16))
         ));
+        assert!(state.published[0].recovery.is_empty());
+        assert!(state.published[0].shared_recovery.is_some());
+        assert!(
+            state.published[0]
+                .shared_recovery
+                .as_ref()
+                .expect("shared recovery metadata")
+                .recovery
+                .is_run_encoded()
+        );
+        assert_eq!(
+            state
+                .guest_pc_for_cache(GuestVa(u64::try_from(base + 4).expect("cache PC")))
+                .expect("bind one shared recovery action on demand"),
+            (
+                GuestVa(0x400000),
+                Some(crate::emit::RecoveryAction::RestoreGuestX17),
+            )
+        );
+    }
+
+    #[test]
+    fn shared_recovery_binding_is_default_lazy_with_an_exact_opt_out() {
+        assert!(shared_recovery_lazy_enabled_from(None));
+        assert!(shared_recovery_lazy_enabled_from(Some(
+            std::ffi::OsStr::new("1")
+        )));
+        assert!(shared_recovery_lazy_enabled_from(Some(
+            std::ffi::OsStr::new("false")
+        )));
+        assert!(!shared_recovery_lazy_enabled_from(Some(
+            std::ffi::OsStr::new("0")
+        )));
     }
 
     #[test]
@@ -7252,6 +7384,7 @@ mod tests {
                     cache: types::CacheOffset::published(4),
                     action: emit::RecoveryAction::RestoreGuestX17,
                 }],
+                shared_recovery: None,
                 _generation: generations.observe(guest).expect("generation observation"),
             }
         }
@@ -7500,6 +7633,8 @@ mod tests {
             unit_key: TranslationUnitKey,
             records: Vec<UnresolvedDirectBindingRecord>,
         ) -> UnitFixture {
+            let base_export =
+                super::translation_unit_base_export(&unit_key).expect("keyed translation export");
             let storage = std::iter::repeat_with(|| AtomicPtr::new(std::ptr::null_mut()))
                 .take(records.len())
                 .collect::<Vec<_>>()
@@ -7518,7 +7653,7 @@ mod tests {
                     schema: TRANSLATION_UNIT_SCHEMA_V2,
                     key: unit_key,
                     dylib_sha256: [0x55; 32],
-                    base_export: "test_code".to_string(),
+                    base_export,
                     code_len: 0x1000,
                     blocks: Vec::new(),
                     binding_layout: DirectBindingLayout::SidecarV1,
@@ -7539,12 +7674,14 @@ mod tests {
             unit_key: TranslationUnitKey,
             records: Vec<UnresolvedDirectBindingRecord>,
         ) -> SharedLoadedTranslationUnit {
+            let base_export =
+                super::translation_unit_base_export(&unit_key).expect("keyed translation export");
             SharedLoadedTranslationUnit::new_with_binding_base(
                 TranslationUnitManifest {
                     schema: TRANSLATION_UNIT_SCHEMA_V2,
                     key: unit_key,
                     dylib_sha256: [0x66; 32],
-                    base_export: "test_code".to_string(),
+                    base_export,
                     code_len: 0x1000,
                     blocks: Vec::new(),
                     binding_layout: DirectBindingLayout::Disabled,

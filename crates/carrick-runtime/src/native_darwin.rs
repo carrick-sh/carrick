@@ -1739,6 +1739,12 @@ fn run_image_in_child(
         close_fd(stdout_pipe.1);
         close_fd(stderr_pipe.1);
 
+        // The launch-owned CLI is the DTrace `$target`, but THIS fork child is
+        // the first native translator owner. Publish its checked Darwin birth
+        // tuple before any profile or DSR event so the capture can key the
+        // initial catalog to the correct PID incarnation. Disabled USDT keeps
+        // the query at zero cost outside a native-wall capture.
+        crate::probes::host_process_birth_current();
         // Process startup attribution starts here: the guest pid is THIS
         // child, and its rusage clock restarted at fork, so the window must
         // anchor after the fork (env-gated; profile-off reads no clocks).

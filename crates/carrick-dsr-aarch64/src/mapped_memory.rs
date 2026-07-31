@@ -850,30 +850,26 @@ impl NativeMappedMemory {
                     .chunks_exact(4)
                     .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
                     .collect::<Vec<_>>();
-                segments.push(crate::shared_cache::SharedExecutableSegment {
+                segments.push(crate::shared_cache::SharedExecutableSegment::new(
                     // AddressSpace currently exposes page-granular executable
                     // provenance but not the original PT_LOAD file offset. The
                     // guest start remains an exact, typed coordinate in the key;
                     // using it here keeps distinct mapped segments isolated until
                     // the loader grows an explicit file-offset carrier.
-                    file_offset: crate::shared_cache::ImageFileOffset::new(span.start),
-                    file_len: crate::shared_cache::ImageFileLen::new(byte_len).ok_or_else(
-                        || {
-                            NativeMemoryError::Unsupported(
-                                "shared executable span has zero file length".to_string(),
-                            )
-                        },
-                    )?,
-                    guest_start: carrick_guest_mem::GuestVa(span.start),
-                    guest_len: crate::shared_cache::GuestCodeLen::new(byte_len).ok_or_else(
-                        || {
-                            NativeMemoryError::Unsupported(
-                                "shared executable span has zero guest length".to_string(),
-                            )
-                        },
-                    )?,
-                    source_words: source_words.into(),
-                });
+                    crate::shared_cache::ImageFileOffset::new(span.start),
+                    crate::shared_cache::ImageFileLen::new(byte_len).ok_or_else(|| {
+                        NativeMemoryError::Unsupported(
+                            "shared executable span has zero file length".to_string(),
+                        )
+                    })?,
+                    carrick_guest_mem::GuestVa(span.start),
+                    crate::shared_cache::GuestCodeLen::new(byte_len).ok_or_else(|| {
+                        NativeMemoryError::Unsupported(
+                            "shared executable span has zero guest length".to_string(),
+                        )
+                    })?,
+                    source_words.into(),
+                ));
             }
         }
         let digest = if let Some(digest) = executable_digest {

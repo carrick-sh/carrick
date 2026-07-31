@@ -20,6 +20,92 @@ its ignored raw trace receipts remain under `target/perf/`.
 
 ---
 
+## Active performance checkpoint — retained shared-cache mechanisms
+
+The performance campaign is now producing measured mechanism wins. The branch
+is still active and is **not merge-ready**: the complete repository gate is
+green, but run-encoded recovery metadata still needs its clean retention ABBA,
+the retained stack needs one cumulative rerun, and the work needs milestone
+commits.
+
+Retained default-on changes, each with an exact `=0` opt-out, now remove:
+
+- cloned shared manifests, varint decode overhead, and repeated source hashing;
+- eager per-process recovery-action binding, with portable recovery metadata
+  additionally run-encoded for lazy fault-time lookup;
+- full 60+ MiB dylib reads and SHA-256 rehashes in every descendant, replaced
+  by bounded Mach-O reads plus a signed key-specific export identity; and
+- indirect copying of instruction bytes where the direct form is proven.
+
+The clean cumulative old/new mechanism comparison before keyed dylib identity
+measured `-11.9%` guest workload, `-10.6%` outer wall, `-12.6%` user CPU,
+`-5.9%` system CPU, `-10.7%` peak RSS, and `-20.1%` page reclaims. A separate
+clean ABBA for keyed dylib identity added `-2.51%` guest workload and `-2.02%`
+wall with flat system CPU/RSS. Multiplying those independent effects projects
+about `-14.1%` cumulative workload, but that figure is explicitly a projection
+until the final combined binary is rerun. The last measured shared/default gap
+was `+16.46%`; keyed identity projects it near `+13.5%`, also not an official
+measurement.
+
+The maintained low-overhead syscall CPU tracer
+(`scripts/dtrace/native-syscall-cpu-directional.d` plus
+`scripts/perf/native_syscall_cpu_directional.py`) completed exact default and
+shared captures with zero DTrace drops. It attributed nearly the entire shared
+syscall-CPU delta to `read(2)`, and caller tracing resolved the largest reads to
+`ContainerCacheAuthority::load_unit`. This led to keyed dylib identity and then
+to the remaining manifest owner.
+
+A preserved real Go-build cache and the reusable
+`native_manifest_census` example now show that the remaining representation is
+not marginal. The six-line ignored receipt is
+`target/perf/native-manifest-census-20260731n1.jsonl` (SHA-256
+`8600538f0e48f689670e09b786af0c42be3fecd0c4c53c06fe6f0ed722d6b0cc`):
+
+- the largest units have manifests of `129.8`, `87.2`, `63.5`, and `54.6` MB
+  beside only `6–15` MiB of translated code;
+- block runtime metadata owns `99.5–99.6%` of the large manifests, while direct
+  binding records and relocations together own less than `0.5%`;
+- the largest unit contains `3,708,221` PC-map entries and `3,456,821` recovery
+  entries; and
+- those recovery entries reduce to `454,986` contiguous same-action runs, a
+  `7.6x` count reduction before any PC-map compaction.
+
+The attempted manifest-backed direct-binding record indirection was rejected
+and removed: two adjacent controlled pairs put it about `+2–3%` slower. It is
+not part of the retained tree.
+
+Run-encoded recovery metadata is now implemented default-on with
+`CARRICK_DSR_SHARED_RECOVERY_RUNS=0` as the exact entry-wire opt-out. The wire
+rejects zero-length and overflowing runs, runtime fault lookup binds one action
+without eagerly expanding the map, and the benchmark/DTrace target can select
+either representation. One signed ordered pair completed the real Go build in
+`12.314s` with runs versus `13.396s` with entries (about `8.1%` directional
+improvement). That pair proves operability only; it is explicitly not retained
+performance evidence.
+
+Verification is green: 252/252 `carrick-dsr-aarch64` tests, 35/35
+`carrick-native-darwin` tests, 111 relevant Python harness tests, the serialized
+runtime library at 1,128 passed with 5 ignored, and the complete `just ci` gate.
+The full gate exposed four stale keyed-export fixtures and two eager-recovery
+test helpers; both were corrected through the production validation key and a
+single representation-neutral recovery lookup seam before the green rerun.
+
+**Next:** checkpoint and rebuild/sign this exact tree, then run at least eight
+clean ABBA quads of recovery runs versus entries plus the zero-drop syscall/read
+CPU tracer on the same binary. Retain only if total workload/CPU improves;
+compact PC maps are the next representation target. After that, rerun exact
+default/shared and old/new cumulative comparisons, refresh this handoff, and
+make the measured milestone commit.
+
+Current confidence is high (`~88%`) that the campaign retains a meaningful
+native performance improvement, because the current wins are independently
+measured and the next owner is concrete. Confidence that run encoding itself
+survives the retention gate is about `70%`; confidence that this tranche closes
+the remaining shared/default parity gap is moderate (`~65%`) because the clean
+ABBA and cumulative comparison remain open.
+
+---
+
 ## Current checkpoint — M2 lifecycle, raw-v2 parser, and launch identities
 
 M2 now has an accepted process-owned translated-range catalog through the

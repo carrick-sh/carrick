@@ -5,16 +5,17 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use carrick_dsr_aarch64::direct_binding::{DirectBindingCellRef, DirectBindingCellVa};
 pub use carrick_dsr_aarch64::shared_cache::PublishOutcome;
 use carrick_dsr_aarch64::shared_cache::{
     LoadedTranslationProtection, MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit,
-    TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey,
-    TranslationUnitManifest, UnitMissReason, pin_loaded_translation_protection,
+    TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey, TranslationUnitManifest, UnitMissReason,
+    pin_loaded_translation_protection, shared_source_fingerprint_reuse_enabled,
+    translation_unit_base_export,
 };
 use sha2::{Digest, Sha256};
 
@@ -24,6 +25,8 @@ const MANIFEST_DECODE_LIMIT: usize = 256 * 1024 * 1024;
 const AOT_SEGMENT_PAGE_SIZE: u64 = 16 * 1024;
 
 static CONTAINER_CACHE: Mutex<Option<ContainerCacheAuthority>> = Mutex::new(None);
+static FIXED_WIDTH_MANIFEST_ENABLED: OnceLock<bool> = OnceLock::new();
+static KEYED_DYLIB_IDENTITY_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct UnitStoreError {
@@ -82,9 +85,14 @@ impl std::error::Error for UnitStoreError {
 
 #[derive(Debug)]
 pub struct LoadedTranslationUnit {
-    pub manifest: TranslationUnitManifest,
+    pub manifest: Arc<TranslationUnitManifest>,
     pub base: std::ptr::NonNull<u8>,
     pub binding_base: Option<DirectBindingCellVa>,
+    lease: Arc<LoadedTranslationLease>,
+}
+
+#[derive(Debug)]
+struct LoadedTranslationLease {
     handle: std::ptr::NonNull<libc::c_void>,
 }
 
@@ -97,7 +105,13 @@ unsafe impl Send for LoadedTranslationUnit {}
 // through `DirectBindingCellRef` atomics.
 unsafe impl Sync for LoadedTranslationUnit {}
 
-impl Drop for LoadedTranslationUnit {
+// SAFETY: dyld owns the handle's immutable mappings; the handle is only
+// released when the final `Arc` drops.
+unsafe impl Send for LoadedTranslationLease {}
+// SAFETY: see `Send`; no mutation is exposed through this lifetime token.
+unsafe impl Sync for LoadedTranslationLease {}
+
+impl Drop for LoadedTranslationLease {
     fn drop(&mut self) {
         let _ = unsafe { libc::dlclose(self.handle.as_ptr()) };
     }
@@ -111,20 +125,71 @@ impl Drop for UnitFileLock {
     }
 }
 
-fn encode_manifest(manifest: &TranslationUnitManifest) -> Result<Vec<u8>, std::io::Error> {
-    bincode::serde::encode_to_vec(
-        manifest,
-        bincode::config::standard().with_limit::<MANIFEST_DECODE_LIMIT>(),
-    )
+fn fixed_width_manifest_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn fixed_width_manifest_enabled() -> bool {
+    *FIXED_WIDTH_MANIFEST_ENABLED.get_or_init(|| {
+        let value = std::env::var_os("CARRICK_DSR_SHARED_MANIFEST_FIXED");
+        fixed_width_manifest_enabled_from(value.as_deref())
+    })
+}
+
+fn keyed_dylib_identity_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn keyed_dylib_identity_enabled() -> bool {
+    *KEYED_DYLIB_IDENTITY_ENABLED.get_or_init(|| {
+        let value = std::env::var_os("CARRICK_DSR_SHARED_DYLIB_KEYED_IDENTITY");
+        keyed_dylib_identity_enabled_from(value.as_deref())
+    })
+}
+
+fn encode_manifest_with_fixed_width(
+    manifest: &TranslationUnitManifest,
+    fixed_width: bool,
+) -> Result<Vec<u8>, std::io::Error> {
+    if fixed_width {
+        bincode::serde::encode_to_vec(
+            manifest,
+            bincode::config::standard()
+                .with_fixed_int_encoding()
+                .with_limit::<MANIFEST_DECODE_LIMIT>(),
+        )
+    } else {
+        bincode::serde::encode_to_vec(
+            manifest,
+            bincode::config::standard().with_limit::<MANIFEST_DECODE_LIMIT>(),
+        )
+    }
     .map_err(|error| invalid_data(format!("encode translation unit manifest: {error}")))
 }
 
-fn decode_manifest(bytes: &[u8]) -> Result<TranslationUnitManifest, std::io::Error> {
-    let (manifest, consumed) = bincode::serde::decode_from_slice(
-        bytes,
-        bincode::config::standard().with_limit::<MANIFEST_DECODE_LIMIT>(),
-    )
-    .map_err(|error| invalid_data(format!("decode translation unit manifest: {error}")))?;
+fn encode_manifest(manifest: &TranslationUnitManifest) -> Result<Vec<u8>, std::io::Error> {
+    encode_manifest_with_fixed_width(manifest, fixed_width_manifest_enabled())
+}
+
+fn decode_manifest_with_fixed_width(
+    bytes: &[u8],
+    fixed_width: bool,
+) -> Result<TranslationUnitManifest, std::io::Error> {
+    let decoded = if fixed_width {
+        bincode::serde::decode_from_slice(
+            bytes,
+            bincode::config::standard()
+                .with_fixed_int_encoding()
+                .with_limit::<MANIFEST_DECODE_LIMIT>(),
+        )
+    } else {
+        bincode::serde::decode_from_slice(
+            bytes,
+            bincode::config::standard().with_limit::<MANIFEST_DECODE_LIMIT>(),
+        )
+    };
+    let (manifest, consumed) = decoded
+        .map_err(|error| invalid_data(format!("decode translation unit manifest: {error}")))?;
     if consumed != bytes.len() {
         return Err(invalid_data(format!(
             "translation unit manifest has {} trailing bytes",
@@ -132,6 +197,10 @@ fn decode_manifest(bytes: &[u8]) -> Result<TranslationUnitManifest, std::io::Err
         )));
     }
     Ok(manifest)
+}
+
+fn decode_manifest(bytes: &[u8]) -> Result<TranslationUnitManifest, std::io::Error> {
+    decode_manifest_with_fixed_width(bytes, fixed_width_manifest_enabled())
 }
 
 #[derive(Clone, Copy)]
@@ -334,6 +403,87 @@ fn translation_ranges(dylib: &[u8]) -> Result<MachOTranslationRanges, UnitMissRe
     })
 }
 
+fn translation_ranges_from_file(path: &Path) -> Result<MachOTranslationRanges, UnitStoreError> {
+    const MACH_HEADER_64_SIZE: usize = 32;
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const MAX_LOAD_COMMAND_BYTES: usize = 1024 * 1024;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            UnitStoreError::with_source(
+                "open translation unit headers",
+                UnitMissReason::ManifestRange,
+                error,
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        UnitStoreError::with_source(
+            "stat translation unit headers",
+            UnitMissReason::ManifestRange,
+            error,
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(UnitStoreError::new(
+            "validate translation unit file type",
+            UnitMissReason::ManifestRange,
+        ));
+    }
+
+    let mut header = [0_u8; MACH_HEADER_64_SIZE];
+    file.read_exact_at(&mut header, 0).map_err(|error| {
+        UnitStoreError::with_source(
+            "read translation unit header",
+            UnitMissReason::ManifestRange,
+            error,
+        )
+    })?;
+    if read_macho_u32(&header, 0) != Some(MH_MAGIC_64) {
+        return Err(UnitStoreError::new(
+            "validate translation unit header",
+            UnitMissReason::ManifestRange,
+        ));
+    }
+    let command_bytes = read_macho_u32(&header, 20)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value <= MAX_LOAD_COMMAND_BYTES)
+        .ok_or_else(|| {
+            UnitStoreError::new(
+                "validate translation unit load commands",
+                UnitMissReason::ManifestRange,
+            )
+        })?;
+    let header_bytes = MACH_HEADER_64_SIZE
+        .checked_add(command_bytes)
+        .filter(|value| u64::try_from(*value).is_ok_and(|value| value <= metadata.len()))
+        .ok_or_else(|| {
+            UnitStoreError::new(
+                "validate translation unit load command extent",
+                UnitMissReason::ManifestRange,
+            )
+        })?;
+    let mut bytes = vec![0_u8; header_bytes];
+    bytes[..MACH_HEADER_64_SIZE].copy_from_slice(&header);
+    if command_bytes != 0 {
+        file.read_exact_at(
+            &mut bytes[MACH_HEADER_64_SIZE..],
+            MACH_HEADER_64_SIZE as u64,
+        )
+        .map_err(|error| {
+            UnitStoreError::with_source(
+                "read translation unit load commands",
+                UnitMissReason::ManifestRange,
+                error,
+            )
+        })?;
+    }
+    translation_ranges(&bytes)
+        .map_err(|reason| UnitStoreError::new("validate translation unit sections", reason))
+}
+
 fn image_base_for_symbol(symbol: std::ptr::NonNull<u8>) -> Result<usize, UnitMissReason> {
     let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
     if unsafe { libc::dladdr(symbol.as_ptr().cast(), info.as_mut_ptr()) } == 0 {
@@ -428,12 +578,13 @@ fn validate_loaded_binding_cells_atomically(
 fn manifest_for_pending(
     pending: &PendingTranslationUnit,
     dylib_sha256: [u8; 32],
+    base_export: &str,
 ) -> TranslationUnitManifest {
     TranslationUnitManifest {
         schema: TRANSLATION_UNIT_SCHEMA_V2,
         key: pending.key.clone(),
         dylib_sha256,
-        base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+        base_export: base_export.to_owned(),
         code_len: pending.code.len() as u64,
         blocks: pending.blocks.clone(),
         binding_layout: pending.binding_layout,
@@ -604,7 +755,14 @@ impl ContainerCacheAuthority {
                 UnitMissReason::ManifestRange,
             ));
         }
-        let preflight_manifest = manifest_for_pending(pending, [0; 32]);
+        let base_export = translation_unit_base_export(&pending.key).map_err(|error| {
+            UnitStoreError::with_source(
+                "derive keyed translation export",
+                UnitMissReason::Schema,
+                error,
+            )
+        })?;
+        let preflight_manifest = manifest_for_pending(pending, [0; 32], &base_export);
         preflight_manifest
             .validate_ranges()
             .and_then(|()| preflight_manifest.validate_binding_data(&pending.binding_data))
@@ -641,7 +799,7 @@ impl ContainerCacheAuthority {
             })?;
         }
         let mut exports = vec![crate::aot::AotExport {
-            name: TRANSLATION_UNIT_BASE_EXPORT,
+            name: &base_export,
             section: crate::aot::AotSection::Text,
             offset: 0,
         }];
@@ -710,7 +868,8 @@ impl ContainerCacheAuthority {
         let signed_dylib = std::fs::read(dylib_temp.path()).map_err(|error| {
             UnitStoreError::with_source("read signed dylib", UnitMissReason::DylibDigest, error)
         })?;
-        let manifest = manifest_for_pending(pending, Sha256::digest(&signed_dylib).into());
+        let manifest =
+            manifest_for_pending(pending, Sha256::digest(&signed_dylib).into(), &base_export);
         manifest
             .validate_ranges()
             .map_err(|reason| UnitStoreError::new("validate manifest", reason))?;
@@ -824,6 +983,19 @@ impl ContainerCacheAuthority {
         expected_key: &TranslationUnitKey,
         source_words: &[u32],
     ) -> Result<LoadedTranslationUnit, UnitStoreError> {
+        self.load_unit_with_keyed_identity(
+            expected_key,
+            source_words,
+            keyed_dylib_identity_enabled(),
+        )
+    }
+
+    fn load_unit_with_keyed_identity(
+        &self,
+        expected_key: &TranslationUnitKey,
+        source_words: &[u32],
+        keyed_identity: bool,
+    ) -> Result<LoadedTranslationUnit, UnitStoreError> {
         let stem = expected_key.file_stem().map_err(|error| {
             UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
         })?;
@@ -850,21 +1022,34 @@ impl ContainerCacheAuthority {
                 UnitMissReason::ImageIdentity,
             ));
         }
-        manifest
-            .validate_source(source_words)
-            .map_err(|reason| UnitStoreError::new("validate unit source", reason))?;
-        let dylib = std::fs::read(&dylib_path).map_err(|error| {
-            UnitStoreError::with_source("read dylib", UnitMissReason::DylibDigest, error)
-        })?;
-        let digest: [u8; 32] = Sha256::digest(&dylib).into();
-        if digest != manifest.dylib_sha256 {
-            return Err(UnitStoreError::new(
-                "validate dylib digest",
-                UnitMissReason::DylibDigest,
-            ));
+        if !shared_source_fingerprint_reuse_enabled() {
+            manifest
+                .validate_source(source_words)
+                .map_err(|reason| UnitStoreError::new("validate unit source", reason))?;
         }
-        let ranges = translation_ranges(&dylib)
-            .map_err(|reason| UnitStoreError::new("validate translation unit sections", reason))?;
+        let ranges = if keyed_identity {
+            // The exact key is part of the signed Mach-O export name. `dlopen`
+            // validates the signed image and the later `dlsym` of that exact
+            // export binds it to this already-validated manifest. Reading only
+            // the bounded load-command prefix here avoids pulling a 60+ MiB
+            // unit through every descendant merely to rediscover its digest.
+            translation_ranges_from_file(&dylib_path)?
+        } else {
+            // Exact opt-out for A/B qualification and diagnosis.
+            let dylib = std::fs::read(&dylib_path).map_err(|error| {
+                UnitStoreError::with_source("read dylib", UnitMissReason::DylibDigest, error)
+            })?;
+            let digest: [u8; 32] = Sha256::digest(&dylib).into();
+            if digest != manifest.dylib_sha256 {
+                return Err(UnitStoreError::new(
+                    "validate dylib digest",
+                    UnitMissReason::DylibDigest,
+                ));
+            }
+            translation_ranges(&dylib).map_err(|reason| {
+                UnitStoreError::new("validate translation unit sections", reason)
+            })?
+        };
         let code_len = usize::try_from(manifest.code_len).map_err(|_| {
             UnitStoreError::new(
                 "validate translation code length",
@@ -1053,10 +1238,10 @@ impl ContainerCacheAuthority {
             loaded_binding_base = Some(binding_cell_base);
         }
         Ok(LoadedTranslationUnit {
-            manifest,
+            manifest: Arc::new(manifest),
             base,
             binding_base: loaded_binding_base,
-            handle,
+            lease: Arc::new(LoadedTranslationLease { handle }),
         })
     }
 
@@ -1218,16 +1403,19 @@ impl carrick_dsr_aarch64::shared_cache::TranslationUnitStore for ActiveContainer
         let authority = active.as_ref().ok_or(UnitMissReason::MissingPair)?;
         match authority.load_unit(key, source_words) {
             Ok(loaded) => {
-                let loaded = std::sync::Arc::new(loaded);
-                let base = loaded.base.as_ptr() as usize;
-                let binding_base = loaded.binding_base;
-                let manifest = loaded.manifest.clone();
+                let LoadedTranslationUnit {
+                    manifest,
+                    base,
+                    binding_base,
+                    lease,
+                } = loaded;
+                let base = base.as_ptr() as usize;
                 Ok(Some(
                     carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit::new_with_binding_base(
                         manifest,
                         base,
                         binding_base,
-                        loaded,
+                        lease,
                     ),
                 ))
             }
@@ -1325,11 +1513,13 @@ mod tests {
 
     fn fixture_manifest() -> TranslationUnitManifest {
         let pending = fixture_pending();
+        let base_export =
+            translation_unit_base_export(&pending.key).expect("keyed translation export");
         TranslationUnitManifest {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
             key: pending.key,
             dylib_sha256: [0x22; 32],
-            base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+            base_export,
             code_len: pending.code.len() as u64,
             blocks: pending.blocks,
             binding_layout: pending.binding_layout,
@@ -1985,6 +2175,75 @@ mod tests {
             "compact manifest is {} bytes versus {} bytes of JSON",
             encoded.len(),
             json.len(),
+        );
+    }
+
+    #[test]
+    fn fixed_width_manifest_wire_round_trips() {
+        let manifest = fixture_manifest();
+        let encoded =
+            encode_manifest_with_fixed_width(&manifest, true).expect("encode fixed-width manifest");
+        let decoded =
+            decode_manifest_with_fixed_width(&encoded, true).expect("decode fixed-width manifest");
+
+        assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn fixed_width_manifest_encoding_is_default_on_with_an_exact_opt_out() {
+        assert!(fixed_width_manifest_enabled_from(None));
+        assert!(fixed_width_manifest_enabled_from(Some(
+            std::ffi::OsStr::new("1")
+        )));
+        assert!(!fixed_width_manifest_enabled_from(Some(
+            std::ffi::OsStr::new("0")
+        )));
+    }
+
+    #[test]
+    fn keyed_dylib_identity_is_default_on_with_an_exact_opt_out() {
+        assert!(keyed_dylib_identity_enabled_from(None));
+        assert!(keyed_dylib_identity_enabled_from(Some(
+            std::ffi::OsStr::new("1")
+        )));
+        assert!(!keyed_dylib_identity_enabled_from(Some(
+            std::ffi::OsStr::new("0")
+        )));
+    }
+
+    #[test]
+    fn keyed_dylib_identity_rejects_another_valid_signed_unit() {
+        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let first = fixture_pending();
+        let mut second = fixture_pending();
+        second.key = TranslationUnitKey::for_segment(
+            ExecutableIdentity::Digest([0x33; 32]),
+            ImageFileOffset::new(0),
+            ImageFileLen::new(8).expect("nonzero file length"),
+            GuestVa(0x400000),
+            GuestCodeLen::new(8).expect("nonzero guest length"),
+            SourceFingerprint::from_words(&fixture_source_words()),
+            NativePageProfileIdentity::Native16k,
+            AddressModeIdentity::biased(
+                NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
+            ),
+        );
+        authority.publish_unit(&first).expect("publish first unit");
+        authority
+            .publish_unit(&second)
+            .expect("publish second unit");
+        let (first_dylib, _) =
+            authority.final_paths(&first.key.file_stem().expect("first unit stem"));
+        let (second_dylib, _) =
+            authority.final_paths(&second.key.file_stem().expect("second unit stem"));
+        std::fs::copy(second_dylib, first_dylib).expect("substitute valid signed unit");
+
+        assert_eq!(
+            authority
+                .load_unit_with_keyed_identity(&first.key, &fixture_source_words(), true)
+                .expect_err("another key's signed dylib must not load")
+                .reason(),
+            UnitMissReason::Dlopen
         );
     }
 
