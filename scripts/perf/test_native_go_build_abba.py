@@ -6,11 +6,13 @@ import json
 import os
 import pathlib
 import plistlib
+import signal
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -211,6 +213,42 @@ class ArmReceiptTest(unittest.TestCase):
             self.real_subprocess_run(command, cwd=self.source, check=True)
         return tracked
 
+    def load_receipt_in_bounded_child(self, receipt, timeout_seconds=0.5):
+        read_fd, write_fd = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(read_fd)
+            try:
+                native_go_build_abba.load_and_verify_arm(receipt)
+                result = "accepted"
+            except BaseException as error:
+                result = f"{type(error).__name__}: {error}"
+            try:
+                os.write(write_fd, result.encode())
+            finally:
+                os.close(write_fd)
+            os._exit(0)
+
+        os.close(write_fd)
+        deadline = time.monotonic() + timeout_seconds
+        status = None
+        while time.monotonic() < deadline:
+            waited, status = os.waitpid(child, os.WNOHANG)
+            if waited == child:
+                break
+            time.sleep(0.01)
+        else:
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+            os.close(read_fd)
+            self.fail("child blocked while opening FIFO arm receipt")
+        try:
+            output = os.read(read_fd, 4096).decode()
+        finally:
+            os.close(read_fd)
+        self.assertEqual(status, 0)
+        return output
+
     def test_rejects_role_outside_control_and_candidate(self):
         with self.assertRaisesRegex(ValueError, "role"):
             self.prepare(role="baseline")
@@ -332,6 +370,17 @@ class ArmReceiptTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "symlink"):
             self.load(destination / "arm.json")
+
+    def test_reverification_rejects_fifo_receipt_without_blocking(self):
+        destination, _ = self.prepare()
+        receipt = destination / "arm.json"
+        receipt.unlink()
+        os.mkfifo(receipt, 0o444)
+
+        result = self.load_receipt_in_bounded_child(receipt)
+
+        self.assertIn("RuntimeError", result)
+        self.assertIn("regular file", result)
 
     def test_reverification_does_not_refresh_git_index(self):
         tracked = self.initialize_real_source_repository()

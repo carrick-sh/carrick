@@ -309,7 +309,11 @@ def _open_path_no_symlinks(
             result = current
             current = -1
             return result
-        final_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        final_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         if directory:
             final_flags |= getattr(os, "O_DIRECTORY", 0)
         result = os.open(
