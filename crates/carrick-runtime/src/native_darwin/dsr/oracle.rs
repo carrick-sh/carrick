@@ -333,6 +333,123 @@ fn biased_wrapped_negative_literal_fault_reports_guest_address() {
     assert_eq!(snapshot.x[0], original_x0);
 }
 
+#[derive(Clone, Copy)]
+enum BiasedColdArmBase {
+    Register { index: usize, value: u64 },
+    StackPointer(u64),
+}
+
+#[test]
+fn biased_out_of_aperture_accesses_execute_the_cold_fault_arm() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    const APERTURE_END: u64 = carrick_dsr::address::BIASED_GUEST_APERTURE_END;
+    const OUTSIDE: u64 = APERTURE_END + 0x4000;
+    const GENERAL_BIAS: u64 = 0x80_0000_0000;
+    const COMPACT_BIAS: u64 = 0x200_0000_0000;
+
+    let cases = [
+        (
+            "reserved negative immediate",
+            0xf85f_8020, // ldur x0, [x1, #-8]
+            GENERAL_BIAS,
+            BiasedColdArmBase::Register {
+                index: 1,
+                value: OUTSIDE + 8,
+            },
+            OUTSIDE,
+        ),
+        (
+            "general pre-index",
+            0xf81f_8c20, // str x0, [x1, #-8]!
+            GENERAL_BIAS,
+            BiasedColdArmBase::Register {
+                index: 1,
+                value: OUTSIDE + 8,
+            },
+            OUTSIDE,
+        ),
+        (
+            "compact immediate",
+            0xf900_0420, // str x0, [x1, #8]
+            COMPACT_BIAS,
+            BiasedColdArmBase::Register {
+                index: 1,
+                value: OUTSIDE,
+            },
+            OUTSIDE + 8,
+        ),
+        (
+            "compact stack pointer",
+            0xf900_07e0, // str x0, [sp, #8]
+            COMPACT_BIAS,
+            BiasedColdArmBase::StackPointer(OUTSIDE),
+            OUTSIDE + 8,
+        ),
+        (
+            "dc zva",
+            0xd50b_7421, // dc zva, x1
+            GENERAL_BIAS,
+            BiasedColdArmBase::Register {
+                index: 1,
+                value: OUTSIDE,
+            },
+            OUTSIDE,
+        ),
+    ];
+
+    for (case_index, (name, word, bias, base, expected_address)) in cases.into_iter().enumerate() {
+        let guest_code = GuestVa(0x20_0008_0000 + case_index as u64 * 0x10_0000);
+        let mut fixture =
+            biased_translator_fixture_with(bias, 16 * 1024, &[word, 0xd400_0001], guest_code);
+        let mut host_stack = vec![0_u8; 16 * 1024];
+        let mut snapshot =
+            seeded_snapshot(host_stack.as_mut_ptr() as u64 + host_stack.len() as u64);
+        snapshot.pc = guest_code.raw();
+        snapshot.x[0] = 0x1122_3344_5566_7788;
+        match base {
+            BiasedColdArmBase::Register { index, value } => snapshot.x[index] = value,
+            BiasedColdArmBase::StackPointer(value) => snapshot.sp = value,
+        }
+        let original_x = snapshot.x;
+        let original_sp = snapshot.sp;
+        let prepared = fixture
+            .translator
+            .prepare_entry::<false>(&fixture.memory, &snapshot)
+            .unwrap_or_else(|error| panic!("{name}: prepare cold-arm fault: {error}"));
+        let prepared_exit = fixture
+            .translator
+            .enter_prepared::<false>(prepared, &mut snapshot)
+            .unwrap_or_else(|error| panic!("{name}: enter cold-arm fault: {error}"));
+        let exit = fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared, prepared_exit)
+            .unwrap_or_else(|error| panic!("{name}: finish cold-arm fault: {error}"));
+
+        assert!(
+            matches!(
+                exit,
+                super::ThreadExit::Fault {
+                    kind: super::ThreadFault::Host { signal, .. },
+                    address: super::ThreadFaultAddress::Guest(address),
+                } if matches!(signal, libc::SIGSEGV | libc::SIGBUS)
+                    && address == GuestVa(expected_address)
+            ),
+            "{name}: expected exact out-of-aperture guest fault, got {exit:?}"
+        );
+        assert_eq!(
+            snapshot.fault_address, expected_address,
+            "{name}: published guest fault address"
+        );
+        assert_eq!(
+            snapshot.pc,
+            guest_code.raw(),
+            "{name}: faulting instruction must remain incomplete"
+        );
+        assert_eq!(snapshot.x, original_x, "{name}: guest registers");
+        assert_eq!(snapshot.sp, original_sp, "{name}: guest stack pointer");
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum BiasedRecoveryMatrixShape {
     ScalarPre,
@@ -348,6 +465,12 @@ enum BiasedRecoveryMatrixShape {
     ScalarNegativeImmediate,
     /// `ldr x0, [x1, x2, lsl #3]` -- a register offset, likewise general-only.
     ScalarRegisterOffset,
+    /// `ldr x0, [sp]` -- the compact lowering's stack-pointer base, which
+    /// cannot name SP directly as an ORR source.
+    StackPointer,
+    /// `dc zva, x1` -- the sensitive exit that is lowered into the same
+    /// biased address/recovery machinery as ordinary memory.
+    DcZva,
     Literal,
     VirtualX18,
     VirtualX28,
@@ -367,6 +490,8 @@ impl BiasedRecoveryMatrixShape {
             Self::PairLoadPost => vec![0xa8c1_0c22, 0xd400_0001],
             Self::ScalarNegativeImmediate => vec![0xf85f_8020, 0xd400_0001],
             Self::ScalarRegisterOffset => vec![0xf862_7820, 0xd400_0001],
+            Self::StackPointer => vec![0xf940_03e0, 0xd400_0001],
+            Self::DcZva => vec![0xd50b_7421, 0xd400_0001],
             Self::Literal => vec![0x5800_0040, 0xd400_0001, 0x5566_7788, 0x1122_3344],
             Self::VirtualX18 => vec![0xf940_0240, 0xd400_0001],
             Self::VirtualX28 => vec![0xf940_0380, 0xd400_0001],
@@ -409,6 +534,14 @@ impl BiasedRecoveryMatrixShape {
                 snapshot.x[1] = fixture.guest_data.raw();
                 snapshot.x[2] = 1;
             }
+            Self::StackPointer => {
+                unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
+                snapshot.sp = fixture.guest_data.raw();
+            }
+            Self::DcZva => {
+                unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
+                snapshot.x[1] = fixture.guest_data.raw();
+            }
             Self::Literal => {}
             Self::VirtualX18 => {
                 unsafe { *(fixture.data_host.raw() as *mut u64) = VALUE };
@@ -446,6 +579,33 @@ fn biased_recovery_matrix_routes_every_offset_through_finish_exit() {
     }
 }
 
+fn skipped_by_taken_forward_cbz(
+    points: &[(
+        super::types::CacheVa,
+        carrick_dsr_aarch64::emit::RecoveryAction,
+    )],
+    candidate: super::types::CacheVa,
+) -> bool {
+    let candidate = candidate.host().raw();
+    points.iter().any(|(cache_pc, _)| {
+        let pc = cache_pc.host().raw();
+        let word = unsafe { std::ptr::read_unaligned(pc as *const u32) };
+        if word & 0xff00_0000 != 0xb400_0000 {
+            return false;
+        }
+        let immediate = i64::from((word >> 5) & 0x7ffff);
+        let immediate = (immediate << (64 - 19)) >> (64 - 19);
+        let Ok(pc) = i64::try_from(pc) else {
+            return false;
+        };
+        let Ok(candidate) = i64::try_from(candidate) else {
+            return false;
+        };
+        let target = pc + immediate * 4;
+        candidate > pc && candidate < target
+    })
+}
+
 #[allow(
     clippy::panic,
     reason = "test-oracle helper extracted from a #[test] fn; an unrecognized skipped word must abort the matrix loudly"
@@ -458,6 +618,8 @@ fn biased_recovery_matrix_at(bias: u64) {
         BiasedRecoveryMatrixShape::PairLoadPost,
         BiasedRecoveryMatrixShape::ScalarNegativeImmediate,
         BiasedRecoveryMatrixShape::ScalarRegisterOffset,
+        BiasedRecoveryMatrixShape::StackPointer,
+        BiasedRecoveryMatrixShape::DcZva,
         BiasedRecoveryMatrixShape::Literal,
         BiasedRecoveryMatrixShape::VirtualX18,
         BiasedRecoveryMatrixShape::VirtualX28,
@@ -482,13 +644,19 @@ fn biased_recovery_matrix_at(bias: u64) {
                 .translator
                 .enter_prepared::<false>(prepared, &mut snapshot)
                 .expect("enter matrix expected execution");
-            assert!(matches!(
-                fixture
-                    .translator
-                    .finish_exit(&fixture.memory, &mut snapshot, prepared, exit)
-                    .expect("finish matrix expected execution"),
-                super::ThreadExit::Syscall { .. }
-            ));
+            let expected_exit = fixture
+                .translator
+                .finish_exit(&fixture.memory, &mut snapshot, prepared, exit)
+                .expect("finish matrix expected execution");
+            let expected_terminal = if matches!(shape, BiasedRecoveryMatrixShape::DcZva) {
+                matches!(expected_exit, super::ThreadExit::Continue)
+            } else {
+                matches!(expected_exit, super::ThreadExit::Syscall { .. })
+            };
+            assert!(
+                expected_terminal,
+                "bias=0x{bias:x} shape={shape:?} unexpected terminal exit {expected_exit:?}"
+            );
             (original, snapshot)
         };
 
@@ -512,7 +680,7 @@ fn biased_recovery_matrix_at(bias: u64) {
 
         let mut skipped_invalid_publication = false;
         let mut skipped_invalid_tag = false;
-        let mut skipped_compact_slow_address = false;
+        let mut skipped_aperture_slow_path = false;
         for point_index in 0..recovery_count {
             let mut fixture =
                 biased_translator_fixture_with(bias, 16 * 1024, &shape.words(), guest_code);
@@ -525,9 +693,8 @@ fn biased_recovery_matrix_at(bias: u64) {
                 .translator
                 .prepare_entry::<false>(&fixture.memory, &snapshot)
                 .expect("prepare matrix recovery point");
-            let (cache_pc, action) = fixture
-                .translator
-                .recovery_points_for_test(guest_code)
+            let recovery_points = fixture.translator.recovery_points_for_test(guest_code);
+            let (cache_pc, action) = recovery_points
                 .get(point_index)
                 .copied()
                 .expect("matrix recovery point");
@@ -553,32 +720,29 @@ fn biased_recovery_matrix_at(bias: u64) {
                 ..
             } = fault_exit
             else {
+                let expected_terminal = if matches!(shape, BiasedRecoveryMatrixShape::DcZva) {
+                    matches!(
+                        fault_exit,
+                        super::types::NativeDsrExit::ResolveDirect { .. }
+                    )
+                } else {
+                    matches!(fault_exit, super::types::NativeDsrExit::Syscall { .. })
+                };
                 assert!(
-                    matches!(fault_exit, super::types::NativeDsrExit::Syscall { .. }),
+                    expected_terminal,
                     "bias=0x{bias:x} shape={shape:?} point={point_index} expected fault or an audited skipped invalid-path instruction, got {fault_exit:?}"
                 );
+                assert!(
+                    skipped_by_taken_forward_cbz(&recovery_points, cache_pc),
+                    "bias=0x{bias:x} shape={shape:?} point={point_index} skipped \
+                     word 0x{original_word:08x} is outside the aperture branch's cold arm"
+                );
+                skipped_aperture_slow_path = true;
                 let publication_store = 0xf900_0000 | ((1200 / 8) << 10) | (28 << 5);
-                // The compact lowering computes the guest effective address
-                // for fault reporting INSIDE its slow path, so an in-window
-                // base leaves those words unexecuted too. The general lowering
-                // computes it before the window check, so it has no such word
-                // and the assertion below keeps this leniency off that path.
-                // ADD(immediate) keeps its shift flag in bit 22, so the mask
-                // must preserve it: 0xff80_001f clears bit 22 and made the
-                // `lsl #12` arm unmatchable dead code.
-                let compact_slow_address = original_word & 0xffe0_03ff == 0xaa00_03f2
-                    || original_word & 0xffc0_001f == 0x9100_0012
-                    || original_word & 0xffc0_001f == 0x9140_0012;
                 if original_word & !0x1f == publication_store {
                     skipped_invalid_publication = true;
                 } else if original_word & !0x3ff == 0xb251_0000 {
                     skipped_invalid_tag = true;
-                } else if compact_slow_address || original_word == 0x1400_0002 {
-                    skipped_compact_slow_address = true;
-                } else {
-                    panic!(
-                        "bias=0x{bias:x} shape={shape:?} point={point_index} unexpectedly skipped word 0x{original_word:08x}"
-                    );
                 }
                 continue;
             };
@@ -647,14 +811,19 @@ fn biased_recovery_matrix_at(bias: u64) {
                     },
                     "bias=0x{bias:x} shape={shape:?} point={point_index} store completion"
                 );
+            } else if matches!(shape, BiasedRecoveryMatrixShape::DcZva) {
+                assert_eq!(
+                    observed_data,
+                    if completed { 0 } else { 0x1122_3344_5566_7788 },
+                    "bias=0x{bias:x} shape={shape:?} point={point_index} zero completion"
+                );
             }
         }
-        assert!(
-            !skipped_compact_slow_address || bias & (0x200_0000_0000 - 1) == 0,
-            "bias=0x{bias:x} shape={shape:?} general lowering must not skip a \
-             compact slow-path word"
-        );
         let has_checked_nonliteral_address = !matches!(shape, BiasedRecoveryMatrixShape::Literal);
+        assert_eq!(
+            skipped_aperture_slow_path, has_checked_nonliteral_address,
+            "bias=0x{bias:x} shape={shape:?} aperture slow path"
+        );
         assert_eq!(
             skipped_invalid_publication, has_checked_nonliteral_address,
             "bias=0x{bias:x} shape={shape:?} invalid-address publication path"
@@ -7211,8 +7380,8 @@ fn live_compact_writeback_kick_sweep(
         .collect::<Vec<_>>();
     let scratch = 17_u32;
     let access_word = (STP_XZR_XZR_X5_POST16 & !(0x1f << 5)) | (scratch << 5);
-    let movz_word = 0xd2c0_0012 | (((COMPACT_BIAS >> 32) as u32) << 5);
-    let sub_word = 0xcb00_0000 | (18 << 16) | (scratch << 5) | 5;
+    let movz_word = 0xd2c0_0005 | (((COMPACT_BIAS >> 32) as u32) << 5);
+    let sub_word = 0xcb00_0000 | (5 << 16) | (scratch << 5) | 5;
     let restore_word = 0xf940_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch;
     let indices_of = |needle: u32, what: &str| -> BTreeSet<usize> {
         let found = emitted_words

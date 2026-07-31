@@ -3,7 +3,7 @@
 use std::sync::atomic::AtomicU64;
 
 use carrick_guest_mem::{GuestVa, HostVa};
-use dynasmrt::{DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation};
+use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, aarch64::Aarch64Relocation};
 
 use super::artifact_spike::{
     ArtifactRecord, ArtifactRecording, GatewayKind, MaterializedValue, ProcessValue,
@@ -1030,17 +1030,36 @@ fn emit_indirect_exit(
         ; str x30, [x28, #1168]
     );
     if let Some(offset) = virtual_snapshot_offset(register) {
+        // Guest x17 is already saved above, so physical x17 is the stable
+        // scratch for a virtual target. Never stage this value through
+        // physical x18: Darwin may clear its platform register between the
+        // load and store, publishing a null indirect target. Every word in
+        // the x17 window carries recovery because an asynchronous kick must
+        // restore the guest's architectural x15/x16/x17 values.
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreIndirectRegisters,
+        });
         emit_word(
             assembler,
             entries,
             guest,
-            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 18,
+            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 17,
         )?;
-        map_next(assembler, entries, guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x18, [x28, #1080]
-        );
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreIndirectRegisters,
+        });
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf900_0000 | ((1080 / 8) << 10) | (28 << 5) | 17,
+        )?;
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreIndirectRegisters,
+        });
     } else {
         // Keep ordinary guest targets out of physical x18. Darwin does not
         // reliably restore custom x18 across asynchronous signals, and V8's
@@ -1940,6 +1959,20 @@ struct PendingTakenEdge {
     target: GuestVa,
     slot: CacheOffset,
     stub: dynasmrt::DynamicLabel,
+    restore_guest_x17_across_stub: bool,
+}
+
+fn record_guest_x17_recovery_range(
+    recovery: &mut Vec<RecoveryEntry>,
+    start: CacheOffset,
+    end: CacheOffset,
+) {
+    for offset in (start.get()..end.get()).step_by(4) {
+        recovery.push(RecoveryEntry {
+            cache: CacheOffset::published(offset),
+            action: RecoveryAction::RestoreGuestX17,
+        });
+    }
 }
 
 /// Emit the internal edge of a fused conditional branch.
@@ -1952,6 +1985,7 @@ struct PendingTakenEdge {
 fn emit_internal_fallthrough_edge(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
     exit: PlannedExit,
 ) -> Result<PendingTakenEdge, DsrError> {
     let PlannedExit::Direct {
@@ -1980,18 +2014,88 @@ fn emit_internal_fallthrough_edge(
         .and_then(gpr_index)
         .and_then(virtual_snapshot_offset);
     if let Some(offset) = virtual_offset {
+        // An internal fall-through cannot simply clobber physical x17: unlike a
+        // terminal edge, the next fused segment consumes the guest's live x17.
+        // Save it in both the canonical and recovery slots, use Darwin-stable
+        // x17 for the virtual condition, and reload it on fall-through. Physical
+        // x18 is unusable here because Darwin may clear its platform register
+        // between the load and the conditional branch.
         emit_word(
             assembler,
             entries,
             guest,
-            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 18,
+            0xf900_0000 | ((136 / 8) << 10) | (28 << 5) | 17,
         )?;
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf900_0000 | ((1128 / 8) << 10) | (28 << 5) | 17,
+        )?;
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreGuestX17,
+        });
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 17,
+        )?;
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreGuestX17,
+        });
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            relocated_direct_word(word, exit, Some(17))?,
+        )?;
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreGuestX17,
+        });
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; b =>fallthrough
+        );
+        let slot = current_offset(assembler)?;
+        recovery.push(RecoveryEntry {
+            cache: slot,
+            action: RecoveryAction::RestoreGuestX17,
+        });
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; b =>stub
+            ; =>fallthrough
+        );
+        recovery.push(RecoveryEntry {
+            cache: current_offset(assembler)?,
+            action: RecoveryAction::RestoreGuestX17,
+        });
+        emit_word(
+            assembler,
+            entries,
+            guest,
+            0xf940_0000 | ((136 / 8) << 10) | (28 << 5) | 17,
+        )?;
+        return Ok(PendingTakenEdge {
+            guest,
+            target: exit.target,
+            slot,
+            stub,
+            restore_guest_x17_across_stub: true,
+        });
     }
+
     emit_word(
         assembler,
         entries,
         guest,
-        relocated_direct_word(word, exit, virtual_offset.map(|_| 18))?,
+        relocated_direct_word(word, exit, None)?,
     )?;
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
@@ -2018,9 +2122,6 @@ fn emit_internal_fallthrough_edge(
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; b =>stub
-    );
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
         ; =>fallthrough
     );
     Ok(PendingTakenEdge {
@@ -2028,6 +2129,7 @@ fn emit_internal_fallthrough_edge(
         target: exit.target,
         slot,
         stub,
+        restore_guest_x17_across_stub: false,
     })
 }
 
@@ -2058,6 +2160,12 @@ fn emit_internal_taken_stub(
         direct_exit_policy,
         recording,
     )?;
+    let stub_end = current_offset(assembler)?;
+    if edge.restore_guest_x17_across_stub
+        && direct_exit_policy == DirectExitEmissionPolicy::PrivateGateway
+    {
+        record_guest_x17_recovery_range(recovery, stub_start, stub_end);
+    }
     direct_links.push(DirectLink {
         slot: edge.slot,
         source: edge.guest,
@@ -2065,7 +2173,7 @@ fn emit_internal_taken_stub(
         kind: DirectLinkKind::ConditionalTaken,
         stub: DirectStubEnvelope {
             start: stub_start,
-            end: current_offset(assembler)?,
+            end: stub_end,
         },
     });
     Ok(())
@@ -2948,6 +3056,51 @@ fn emit_with_biased_recovery(
     emit_word(assembler, entries, guest, word)
 }
 
+#[allow(
+    clippy::useless_conversion,
+    reason = "dynasm's dynamic-register expansion adds the conversion after the required u8 cast"
+)]
+fn emit_biased_cbz(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    register: u32,
+    target: DynamicLabel,
+    action: BiasedMemoryRecovery,
+) -> Result<(), DsrError> {
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RecoverBiasedMemory(action),
+    });
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbz X(register as u8), =>target
+    );
+    Ok(())
+}
+
+fn emit_biased_branch(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    recovery: &mut Vec<RecoveryEntry>,
+    guest: GuestVa,
+    target: DynamicLabel,
+    action: BiasedMemoryRecovery,
+) -> Result<(), DsrError> {
+    recovery.push(RecoveryEntry {
+        cache: current_offset(assembler)?,
+        action: RecoveryAction::RecoverBiasedMemory(action),
+    });
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b =>target
+    );
+    Ok(())
+}
+
 fn emit_biased_materialize_u64(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
@@ -3211,57 +3364,21 @@ const fn add_extended_uxtx(destination: u32, base: BiasedBase, addend: u32) -> O
     Some(0x8b20_0000 | (addend << 16) | (3 << 13) | (rn << 5) | destination)
 }
 
-/// The spill-free biased lowering: the whole address computation lives in the
-/// reserved register plus physical x18, so the access costs no context store
-/// and no restore.
-///
-/// The word sequence deliberately mirrors the general lowering's branch-free
-/// two-`cbz` shape rather than branching around a slow block, so the only
-/// words an in-aperture access skips remain the guest-address publication and
-/// the invalid-host tag -- the same two the recovery matrix audits.
-///
-/// ```text
-///   <effective guest address> -> x19      ; x19 is also the immediate temp
-///   lsr x18, x19, #41                     ; aperture flag
-///   cbz x18, +8                           ; in aperture: skip the publish
-///   str x19, [x28, #1200]                 ; publish the guest fault address
-///   ldr x19, [x28, #1192]                 ; host bias
-///   add x19, <base>, x19                  ; host base (base was never clobbered)
-///   cbz x18, +8                           ; in aperture: skip the tag
-///   orr x19, x19, #1 << 47                ; unmappable host address
-///   <access, base = x19>
-/// ```
 #[allow(
     clippy::too_many_arguments,
-    reason = "the spill-free lowering carries the same emission and recovery context as the general one"
+    reason = "the address builder carries the same emission and recovery context as its caller"
 )]
-fn emit_reserved_biased_memory(
+fn emit_reserved_guest_address(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     plan: &BlockPlan,
     guest: GuestVa,
     memory: super::types::MemoryAccess,
     base: BiasedBase,
-    host_bias: carrick_dsr::address::NativeHostBias,
     recovery: &mut Vec<RecoveryEntry>,
+    address: u32,
+    action: BiasedMemoryRecovery,
 ) -> Result<(), DsrError> {
-    let address = crate::gateway::RESERVED_SCRATCH;
-    // Nothing is spilled, so there is no scratch to restore and no base to
-    // commit; every recovery point below reduces to "resume the instruction".
-    let action = BiasedMemoryRecovery {
-        scratch_registers: [0; 4],
-        scratch_count: 0,
-        base_scratch: address,
-        base,
-        base_coordinate: BiasedBaseCoordinate::Guest,
-        commit_base: false,
-        virtual_x18_scratch: None,
-        virtual_x28_scratch: None,
-        virtual_reserved_scratch: None,
-        host_bias,
-        instruction_complete: false,
-    };
-
     let load_base = biased_base_load_word(base, address).ok_or_else(|| {
         unsupported_action(
             plan,
@@ -3346,26 +3463,85 @@ fn emit_reserved_biased_memory(
             )?;
         }
     }
-    emit_with_biased_recovery(
-        assembler,
-        entries,
-        recovery,
-        guest,
-        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (address << 5) | 18,
-        action,
-    )?; // lsr x18, effective, #BIASED_FAST_ADDRESS_BITS
-    emit_with_biased_recovery(
-        assembler,
-        entries,
-        recovery,
-        guest,
-        0xb400_0052, // cbz x18, +8
-        action,
+    Ok(())
+}
+
+/// The spill-free biased lowering keeps every live value in Darwin-stable
+/// physical x19. The aperture check consumes the first effective-address
+/// value, so only the cold invalid-address arm recomputes it for publication.
+/// The in-aperture hot arm stays store-free, loses the former second `cbz`,
+/// and never exposes state through Darwin's asynchronously cleared x18.
+///
+/// ```text
+///   <effective guest address> -> x19
+///   lsr x19, x19, #41
+///   cbz x19, fast
+/// slow:
+///   <effective guest address> -> x19
+///   str x19, [x28, #1200]
+///   ldr x19, [x28, #1192]
+///   add x19, <base>, x19
+///   orr x19, x19, #1 << 47
+///   b access
+/// fast:
+///   ldr x19, [x28, #1192]
+///   add x19, <base>, x19
+/// access:
+///   <access, base = x19>
+/// ```
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the spill-free lowering carries the same emission and recovery context as the general one"
+)]
+fn emit_reserved_biased_memory(
+    assembler: &mut VecAssembler<Aarch64Relocation>,
+    entries: &mut Vec<PcMapEntry>,
+    plan: &BlockPlan,
+    guest: GuestVa,
+    memory: super::types::MemoryAccess,
+    base: BiasedBase,
+    host_bias: carrick_dsr::address::NativeHostBias,
+    recovery: &mut Vec<RecoveryEntry>,
+) -> Result<(), DsrError> {
+    let address = crate::gateway::RESERVED_SCRATCH;
+    // Nothing is spilled, so there is no scratch to restore and no base to
+    // commit; every recovery point below reduces to "resume the instruction".
+    let action = BiasedMemoryRecovery {
+        scratch_registers: [0; 4],
+        scratch_count: 0,
+        base_scratch: address,
+        base,
+        base_coordinate: BiasedBaseCoordinate::Guest,
+        commit_base: false,
+        virtual_x18_scratch: None,
+        virtual_x28_scratch: None,
+        virtual_reserved_scratch: None,
+        host_bias,
+        instruction_complete: false,
+    };
+
+    emit_reserved_guest_address(
+        assembler, entries, plan, guest, memory, base, recovery, address, action,
     )?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (address << 5) | address,
+        action,
+    )?; // lsr x19, effective, #BIASED_FAST_ADDRESS_BITS
+    let fast = assembler.new_dynamic_label();
+    let access = assembler.new_dynamic_label();
+    emit_biased_cbz(assembler, entries, recovery, guest, address, fast, action)?;
+
     // Keeping the valid path store-free is part of the DSR hot-path contract:
     // only an address outside the flags-neutral fast window is published, and
     // recovery reports that guest value instead of the deliberately invalid
     // host FAR the tagged access below produces.
+    emit_reserved_guest_address(
+        assembler, entries, plan, guest, memory, base, recovery, address, action,
+    )?;
     emit_with_biased_recovery(
         assembler,
         entries,
@@ -3396,17 +3572,29 @@ fn emit_reserved_biased_memory(
         entries,
         recovery,
         guest,
-        0xb400_0052, // cbz x18, +8
+        0xb251_0000 | (address << 5) | address,
         action,
-    )?;
+    )?; // orr x19, x19, #1 << 47
+    emit_biased_branch(assembler, entries, recovery, guest, access, action)?;
+
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>fast
+    );
     emit_with_biased_recovery(
         assembler,
         entries,
         recovery,
         guest,
-        0xb251_0000 | (address << 5) | address,
+        0xf940_0000 | ((1192 / 8) << 10) | (28 << 5) | address,
         action,
-    )?; // orr x19, x19, #1 << 47
+    )?; // ldr x19, [x28, #1192]
+    emit_with_biased_recovery(assembler, entries, recovery, guest, bias_add, action)?;
+
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>access
+    );
     let rewritten = (memory.word & !(0x1f << 5)) | (address << 5);
     // The access is the last emitted word: there is no restore epilogue and
     // therefore no recovery point that has to report the instruction complete.
@@ -3444,8 +3632,9 @@ fn compact_biased_form(
     }
     match base {
         BiasedBase::Register(_) => {}
-        // Stack-pointer bases take one extra base-copy word and never write
-        // back in this slice; virtual x18/x28 bases keep the general path.
+        // Stack-pointer bases cannot be ORR sources: they need one copy for
+        // the aperture check and rebuild SP in whichever arm executes. They
+        // never write back in this slice; virtual bases keep the general path.
         BiasedBase::StackPointer if !writeback => {}
         _ => return None,
     }
@@ -3555,9 +3744,12 @@ fn emit_compact_biased_memory(
         entries,
         recovery,
         guest,
-        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (checked_base << 5) | 18,
+        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (checked_base << 5) | scratch,
         action,
-    )?; // lsr x18, base, #BIASED_FAST_ADDRESS_BITS
+    )?; // lsr scratch, base, #BIASED_FAST_ADDRESS_BITS
+    let fast = assembler.new_dynamic_label();
+    let access = assembler.new_dynamic_label();
+    emit_biased_cbz(assembler, entries, recovery, guest, scratch, fast, action)?;
 
     // Slow path: publish the guest effective address for fault reporting,
     // then tag the base so the access faults on an unmappable host address.
@@ -3567,43 +3759,123 @@ fn emit_compact_biased_memory(
     let immediate_high = u32::try_from(form.immediate >> 12).map_err(|_| {
         DsrError::BlockPolicy("compact biased immediate high bits exceed u32".to_string())
     })?;
-    let mut slow: Vec<u32> = Vec::with_capacity(5);
+    let slow_base = match form.base {
+        BiasedBase::Register(register) => register,
+        BiasedBase::StackPointer => 31,
+        _ => {
+            return Err(unsupported_action(
+                plan,
+                guest,
+                memory.word,
+                "compact biased memory accepted a non-register base",
+            ));
+        }
+    };
     if form.immediate == 0 {
-        slow.push(0xaa00_03e0 | (checked_base << 16) | 18); // mov x18, base
-    } else if immediate_high != 0 {
-        // add x18, base, #high, lsl #12 — first stage reads the base.
-        slow.push(0x9140_0000 | (immediate_high << 10) | (checked_base << 5) | 18);
-        slow.push(0x9100_0000 | (immediate_low << 10) | (18 << 5) | 18);
-    } else {
-        slow.push(0x9100_0000 | (immediate_low << 10) | (checked_base << 5) | 18);
-    }
-    slow.push(0xf900_0000 | ((1200 / 8) << 10) | (28 << 5) | 18); // str x18, [x28, #1200]
-    slow.push(0xb251_0000 | (checked_base << 5) | scratch); // orr xS, base, #1<<47
-    slow.push(0x1400_0002); // b +8, over the fast orr
-
-    let skip = u32::try_from(slow.len() + 1).map_err(|_| {
-        DsrError::BlockPolicy("compact biased slow path exceeds cbz range".to_string())
-    })?;
-    emit_with_biased_recovery(
-        assembler,
-        entries,
-        recovery,
-        guest,
-        0xb400_0000 | (skip << 5) | 18, // cbz x18, past the slow path
-        action,
-    )?;
-    for word in slow {
+        let word = match form.base {
+            BiasedBase::Register(register) => 0xaa00_03e0 | (register << 16) | scratch,
+            BiasedBase::StackPointer => 0x9100_03e0 | scratch,
+            _ => unreachable!("compact base validated above"),
+        };
         emit_with_biased_recovery(assembler, entries, recovery, guest, word, action)?;
+    } else if immediate_high != 0 {
+        // The first ADD reads the architectural base (including SP); the
+        // second extends the same stable scratch with the low twelve bits.
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x9140_0000 | (immediate_high << 10) | (slow_base << 5) | scratch,
+            action,
+        )?;
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x9100_0000 | (immediate_low << 10) | (scratch << 5) | scratch,
+            action,
+        )?;
+    } else {
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x9100_0000 | (immediate_low << 10) | (slow_base << 5) | scratch,
+            action,
+        )?;
     }
     emit_with_biased_recovery(
         assembler,
         entries,
         recovery,
         guest,
-        0xb240_0000 | (immr << 16) | (imms << 10) | (checked_base << 5) | scratch,
+        0xf900_0000 | ((1200 / 8) << 10) | (28 << 5) | scratch,
         action,
-    )?; // orr xS, base, #bias
+    )?; // publish the guest effective address
+    if form.base == BiasedBase::StackPointer {
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x9100_03e0 | scratch, // add scratch, sp, #0
+            action,
+        )?;
+    }
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb251_0000
+            | (if form.base == BiasedBase::StackPointer {
+                scratch
+            } else {
+                checked_base
+            } << 5)
+            | scratch,
+        action,
+    )?; // tagged invalid host base
+    emit_biased_branch(assembler, entries, recovery, guest, access, action)?;
 
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>fast
+    );
+    if form.base == BiasedBase::StackPointer {
+        emit_with_biased_recovery(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            0x9100_03e0 | scratch, // add scratch, sp, #0
+            action,
+        )?;
+    }
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xb240_0000
+            | (immr << 16)
+            | (imms << 10)
+            | (if form.base == BiasedBase::StackPointer {
+                scratch
+            } else {
+                checked_base
+            } << 5)
+            | scratch,
+        action,
+    )?; // orr scratch, base, #bias
+
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>access
+    );
     let rewritten = (memory.word & !(0x1f << 5)) | (scratch << 5);
     emit_with_biased_recovery(assembler, entries, recovery, guest, rewritten, action)?;
     action.instruction_complete = true;
@@ -3614,15 +3886,6 @@ fn emit_compact_biased_memory(
         // full-width subtract, which is exact for every wrap and overhang.
         action.base_coordinate = BiasedBaseCoordinate::Host;
         action.commit_base = true;
-        emit_biased_materialize_u64(
-            assembler,
-            entries,
-            recovery,
-            guest,
-            18,
-            host_bias.get(),
-            action,
-        )?;
         let BiasedBase::Register(base_register) = form.base else {
             return Err(unsupported_action(
                 plan,
@@ -3631,14 +3894,28 @@ fn emit_compact_biased_memory(
                 "compact biased writeback requires a register base",
             ));
         };
+        // The architectural base is the final destination and is Darwin
+        // stable, so it can stage the full-width bias without another
+        // borrowed scratch. Recovery throughout this completed window derives
+        // the final guest base from the still-live host-coordinate `scratch`,
+        // overwriting any partially materialized base value.
+        emit_biased_materialize_u64(
+            assembler,
+            entries,
+            recovery,
+            guest,
+            base_register,
+            host_bias.get(),
+            action,
+        )?;
         emit_with_biased_recovery(
             assembler,
             entries,
             recovery,
             guest,
-            0xcb00_0000 | (18 << 16) | (scratch << 5) | base_register,
+            0xcb00_0000 | (base_register << 16) | (scratch << 5) | base_register,
             action,
-        )?; // sub xBASE, xS, x18
+        )?; // sub xBASE, xS, xBASE
     }
 
     if !reserved {
@@ -3875,17 +4152,21 @@ fn emit_biased_memory(
         entries,
         recovery,
         guest,
-        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (bias_scratch << 5) | 18,
+        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (bias_scratch << 5) | base_scratch,
         action,
-    )?; // lsr x18, effective, #BIASED_FAST_ADDRESS_BITS
-    emit_with_biased_recovery(
+    )?; // lsr base_scratch, effective, #BIASED_FAST_ADDRESS_BITS
+    let fast = assembler.new_dynamic_label();
+    let access = assembler.new_dynamic_label();
+    emit_biased_cbz(
         assembler,
         entries,
         recovery,
         guest,
-        0xb400_0052, // cbz x18, +8
+        base_scratch,
+        fast,
         action,
     )?;
+
     // Publish only an address outside the flags-neutral 40-bit fast window.
     // The final aperture guard covers the ceiling-to-1-TiB sliver. Larger
     // values use the tagged host access below, which cannot alias a Darwin
@@ -3922,7 +4203,22 @@ fn emit_biased_memory(
         entries,
         recovery,
         guest,
-        0xb400_0052, // cbz x18, +8
+        0xb251_0000 | (base_scratch << 5) | base_scratch,
+        action,
+    )?; // orr base, base, #1 << 47
+    emit_biased_branch(assembler, entries, recovery, guest, access, action)?;
+
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>fast
+    );
+    emit_with_biased_recovery(assembler, entries, recovery, guest, load_base, action)?;
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf940_0000 | ((1192 / 8) << 10) | (28 << 5) | bias_scratch,
         action,
     )?;
     emit_with_biased_recovery(
@@ -3930,9 +4226,14 @@ fn emit_biased_memory(
         entries,
         recovery,
         guest,
-        0xb251_0000 | (base_scratch << 5) | base_scratch,
+        0x8b00_0000 | (bias_scratch << 16) | (base_scratch << 5) | base_scratch,
         action,
-    )?; // orr base, base, #1 << 47
+    )?;
+
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>access
+    );
     emit_with_biased_recovery(assembler, entries, recovery, guest, rewritten, action)?;
     action.instruction_complete = true;
 
@@ -4083,15 +4384,18 @@ fn emit_biased_dc_zva(
         entries,
         recovery,
         guest,
-        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (base_scratch << 5) | 18,
+        0xd340_fc00 | (BIASED_FAST_ADDRESS_BITS << 16) | (base_scratch << 5) | bias_scratch,
         action,
-    )?; // lsr x18, guest_address, #BIASED_FAST_ADDRESS_BITS
-    emit_with_biased_recovery(
+    )?; // lsr bias_scratch, guest_address, #BIASED_FAST_ADDRESS_BITS
+    let fast = assembler.new_dynamic_label();
+    let access = assembler.new_dynamic_label();
+    emit_biased_cbz(
         assembler,
         entries,
         recovery,
         guest,
-        0xb400_0052, // cbz x18, +8
+        bias_scratch,
+        fast,
         action,
     )?;
     emit_with_biased_recovery(
@@ -4102,9 +4406,6 @@ fn emit_biased_dc_zva(
         0xf900_0000 | ((1200 / 8) << 10) | (28 << 5) | base_scratch,
         action,
     )?;
-    // x18 is Carrick-owned inside translated code and may have held the guest
-    // address. Reload the source before applying the process's host bias.
-    emit_with_biased_recovery(assembler, entries, recovery, guest, load_base, action)?;
     emit_with_biased_recovery(
         assembler,
         entries,
@@ -4126,7 +4427,21 @@ fn emit_biased_dc_zva(
         entries,
         recovery,
         guest,
-        0xb400_0052, // cbz x18, +8
+        0xb251_0000 | (base_scratch << 5) | base_scratch,
+        action,
+    )?; // orr address, address, #1 << 47
+    emit_biased_branch(assembler, entries, recovery, guest, access, action)?;
+
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>fast
+    );
+    emit_with_biased_recovery(
+        assembler,
+        entries,
+        recovery,
+        guest,
+        0xf940_0000 | ((1192 / 8) << 10) | (28 << 5) | bias_scratch,
         action,
     )?;
     emit_with_biased_recovery(
@@ -4134,9 +4449,14 @@ fn emit_biased_dc_zva(
         entries,
         recovery,
         guest,
-        0xb251_0000 | (base_scratch << 5) | base_scratch,
+        0x8b00_0000 | (bias_scratch << 16) | (base_scratch << 5) | base_scratch,
         action,
-    )?; // orr address, address, #1 << 47
+    )?;
+
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>access
+    );
     emit_with_biased_recovery(
         assembler,
         entries,
@@ -5498,6 +5818,7 @@ fn assemble_block_inner(
                     pending_taken.push(emit_internal_fallthrough_edge(
                         &mut assembler,
                         &mut entries,
+                        &mut recovery,
                         exit,
                     )?);
                     continue;
@@ -5930,19 +6251,35 @@ fn assemble_block_inner(
                     .and_then(gpr_index)
                     .and_then(virtual_snapshot_offset);
                 if let Some(offset) = virtual_offset {
+                    recovery.push(RecoveryEntry {
+                        cache: current_offset(&assembler)?,
+                        action: RecoveryAction::RestoreGuestX17,
+                    });
                     emit_word(
                         &mut assembler,
                         &mut entries,
                         exit_guest,
-                        0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 18,
+                        0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 17,
                     )?;
+                }
+                if virtual_offset.is_some() {
+                    recovery.push(RecoveryEntry {
+                        cache: current_offset(&assembler)?,
+                        action: RecoveryAction::RestoreGuestX17,
+                    });
                 }
                 emit_word(
                     &mut assembler,
                     &mut entries,
                     exit_guest,
-                    relocated_direct_word(word, exit, virtual_offset.map(|_| 18))?,
+                    relocated_direct_word(word, exit, virtual_offset.map(|_| 17))?,
                 )?;
+                if virtual_offset.is_some() {
+                    recovery.push(RecoveryEntry {
+                        cache: current_offset(&assembler)?,
+                        action: RecoveryAction::RestoreGuestX17,
+                    });
+                }
                 let fall_slot = current_offset(&assembler)?;
                 // `b +2` skips exactly the taken-branch word below to reach the
                 // fall-through stub, which stays correct however long a stub is.
@@ -5953,6 +6290,12 @@ fn assemble_block_inner(
                 // which silently encoded the length of the fall-through
                 // gateway stub emitted below it.
                 let taken_stub = assembler.new_dynamic_label();
+                if virtual_offset.is_some() {
+                    recovery.push(RecoveryEntry {
+                        cache: taken_slot,
+                        action: RecoveryAction::RestoreGuestX17,
+                    });
+                }
                 map_next(&assembler, &mut entries, exit_guest)?;
                 dynasmrt::dynasm!(assembler
                     ; .arch aarch64
@@ -5970,6 +6313,12 @@ fn assemble_block_inner(
                     direct_exit_policy,
                     recording.as_deref_mut(),
                 )?;
+                let fall_stub_end = current_offset(&assembler)?;
+                if virtual_offset.is_some()
+                    && direct_exit_policy == DirectExitEmissionPolicy::PrivateGateway
+                {
+                    record_guest_x17_recovery_range(&mut recovery, fall_stub_start, fall_stub_end);
+                }
                 direct_links.push(DirectLink {
                     slot: fall_slot,
                     source: exit_guest,
@@ -5977,7 +6326,7 @@ fn assemble_block_inner(
                     kind: DirectLinkKind::ConditionalFallthrough,
                     stub: DirectStubEnvelope {
                         start: fall_stub_start,
-                        end: current_offset(&assembler)?,
+                        end: fall_stub_end,
                     },
                 });
                 dynasmrt::dynasm!(assembler
@@ -5996,6 +6345,16 @@ fn assemble_block_inner(
                     direct_exit_policy,
                     recording.as_deref_mut(),
                 )?;
+                let taken_stub_end = current_offset(&assembler)?;
+                if virtual_offset.is_some()
+                    && direct_exit_policy == DirectExitEmissionPolicy::PrivateGateway
+                {
+                    record_guest_x17_recovery_range(
+                        &mut recovery,
+                        taken_stub_start,
+                        taken_stub_end,
+                    );
+                }
                 direct_links.push(DirectLink {
                     slot: taken_slot,
                     source: exit_guest,
@@ -6003,7 +6362,7 @@ fn assemble_block_inner(
                     kind: DirectLinkKind::ConditionalTaken,
                     stub: DirectStubEnvelope {
                         start: taken_stub_start,
-                        end: current_offset(&assembler)?,
+                        end: taken_stub_end,
                     },
                 });
             }
@@ -6679,7 +7038,8 @@ pub fn recover_rewrite_state(
 mod tests {
     use super::super::block::PlannedInst;
     use super::super::types::{
-        CodeGeneration, CounterDestination, CounterRead, DirectExit, DirectKind,
+        CodeGeneration, CounterDestination, CounterRead, DirectExit, DirectKind, IndirectExit,
+        IndirectKind,
     };
     use super::*;
 
@@ -6739,6 +7099,201 @@ mod tests {
     /// The context byte slot a 64-bit `ldr Xt, [x28, #imm]` reads.
     fn context_load_slot(word: u32) -> Option<u32> {
         ((word & 0xFFC0_03E0) == 0xF940_0380).then(|| ((word >> 10) & 0xFFF) * 8)
+    }
+
+    #[test]
+    fn virtual_indirect_target_never_crosses_darwin_x18() {
+        let plan = BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4004),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Indirect {
+                guest: GuestVa(0x4000),
+                word: 0xd63f_0260, // blr x19
+                exit: IndirectExit {
+                    kind: IndirectKind::Call,
+                    register: bad64::Reg::X19,
+                    resume: GuestVa(0x4004),
+                },
+            },
+            extensions: Vec::new(),
+        };
+        let assembled = assemble_block_inner(
+            &plan,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble virtual indirect target");
+        let words = &assembled.words;
+
+        let stable_staging = [
+            0xf940_4f91, // ldr x17, [x28, #152] — guest x19
+            0xf902_1f91, // str x17, [x28, #1080] — indirect target
+        ];
+        let staging_index = words
+            .windows(stable_staging.len())
+            .position(|window| window == stable_staging)
+            .unwrap_or_else(|| {
+                panic!("virtual indirect target must stay in Darwin-stable x17: {words:08x?}")
+            });
+        assert!(
+            !words.windows(2).any(|window| {
+                window
+                    == [
+                        0xf940_4f92, // ldr x18, [x28, #152]
+                        0xf902_1f92, // str x18, [x28, #1080]
+                    ]
+            }),
+            "Darwin may asynchronously clear physical x18 between these words"
+        );
+        for word_index in staging_index..=staging_index + 2 {
+            let offset = u32::try_from(word_index * 4).expect("test block offset");
+            assert!(
+                assembled.recovery.iter().any(|entry| {
+                    entry.cache.get() == offset
+                        && entry.action == RecoveryAction::RestoreIndirectRegisters
+                }),
+                "x17 staging word {word_index} must restore guest x15/x16/x17 on interruption"
+            );
+        }
+    }
+
+    fn virtual_test_bit_exit(guest: GuestVa, target: GuestVa) -> PlannedExit {
+        PlannedExit::Direct {
+            guest,
+            word: 0xb7f8_0fb3, // tbnz x19, #63, target
+            exit: DirectExit {
+                kind: DirectKind::TestBit { nonzero: true },
+                target,
+                resume: GuestVa(guest.raw() + 4),
+                condition: None,
+                register: Some(bad64::Reg::X19),
+                bit: Some(63),
+            },
+        }
+    }
+
+    #[test]
+    fn terminal_virtual_condition_never_crosses_darwin_x18() {
+        let plan = direct_plan(virtual_test_bit_exit(GuestVa(0x4000), GuestVa(0x5000)));
+        let assembled = assemble_block_inner(
+            &plan,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble virtual conditional exit");
+        let words = &assembled.words;
+        let stable_staging = [
+            0xf940_4f91, // ldr x17, [x28, #152] — guest x19
+            0xb7f8_0051, // tbnz x17, #63, +2
+        ];
+        let staging_index = words
+            .windows(stable_staging.len())
+            .position(|window| window == stable_staging)
+            .unwrap_or_else(|| {
+                panic!("virtual condition must stay in Darwin-stable x17: {words:08x?}")
+            });
+        assert!(
+            !words.windows(2).any(|window| {
+                window
+                    == [
+                        0xf940_4f92, // ldr x18, [x28, #152]
+                        0xb7f8_0052, // tbnz x18, #63, +2
+                    ]
+            }),
+            "Darwin may asynchronously clear physical x18 between these words"
+        );
+        for word_index in staging_index..=staging_index + 3 {
+            let offset = u32::try_from(word_index * 4).expect("test block offset");
+            assert!(
+                assembled.recovery.iter().any(|entry| {
+                    entry.cache.get() == offset && entry.action == RecoveryAction::RestoreGuestX17
+                }),
+                "x17 conditional staging word {word_index} must restore guest x17 on interruption"
+            );
+        }
+        for link in &assembled.direct_links {
+            assert!(
+                matches!(
+                    link.kind,
+                    DirectLinkKind::ConditionalFallthrough | DirectLinkKind::ConditionalTaken
+                ),
+                "virtual conditional emitted unexpected link kind {:?}",
+                link.kind
+            );
+            for offset in (link.stub.start.get()..link.stub.end.get()).step_by(4) {
+                assert!(
+                    assembled.recovery.iter().any(|entry| {
+                        entry.cache.get() == offset
+                            && entry.action == RecoveryAction::RestoreGuestX17
+                    }),
+                    "{:?} stub word at {offset} must restore guest x17",
+                    link.kind
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fused_virtual_condition_never_crosses_darwin_x18() {
+        let mut plan = fused_two_segment_plan();
+        plan.exit = virtual_test_bit_exit(GuestVa(0x4004), GuestVa(0x5000));
+        let assembled = assemble_block_inner(
+            &plan,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble fused virtual conditional edge");
+        let words = &assembled.words;
+        let stable_staging = [
+            0xf900_4791, // str x17, [x28, #136] — canonical guest x17
+            0xf902_3791, // str x17, [x28, #1128] — recovery guest x17
+            0xf940_4f91, // ldr x17, [x28, #152] — guest x19
+            0xb7f8_0051, // tbnz x17, #63, +2
+        ];
+        let staging_index = words
+            .windows(stable_staging.len())
+            .position(|window| window == stable_staging)
+            .unwrap_or_else(|| {
+                panic!("fused virtual condition must preserve and use x17: {words:08x?}")
+            });
+        assert!(
+            !words.windows(2).any(|window| {
+                window
+                    == [
+                        0xf940_4f92, // ldr x18, [x28, #152]
+                        0xb7f8_0052, // tbnz x18, #63, +2
+                    ]
+            }),
+            "fused virtual condition must not cross Darwin-volatile x18"
+        );
+        assert!(
+            words[staging_index + stable_staging.len()..]
+                .iter()
+                .take(4)
+                .any(|word| *word == 0xf940_4791),
+            "fused fall-through must restore guest x17 before the next guest instruction"
+        );
+        let taken = assembled
+            .direct_links
+            .iter()
+            .find(|link| link.kind == DirectLinkKind::ConditionalTaken)
+            .expect("fused virtual conditional taken link");
+        for offset in (taken.stub.start.get()..taken.stub.end.get()).step_by(4) {
+            assert!(
+                assembled.recovery.iter().any(|entry| {
+                    entry.cache.get() == offset && entry.action == RecoveryAction::RestoreGuestX17
+                }),
+                "fused virtual taken stub word at {offset} must restore guest x17"
+            );
+        }
     }
 
     /// Anything that writes memory: the prologue is store-throughput-bound, so
@@ -6923,23 +7478,30 @@ mod tests {
         memory: super::super::types::MemoryAccess,
         bias: u64,
     ) -> Vec<u32> {
+        let plan = biased_memory_plan(memory);
+        let assembled = assemble_biased_emission(&plan, bias);
+        biased_guest_words(&assembled, plan.start)
+    }
+
+    fn assemble_biased_emission(plan: &BlockPlan, bias: u64) -> AssembledBlock {
         let host_bias =
             carrick_dsr::address::NativeHostBias::new(bias, 0x4000).expect("aligned test bias");
-        let plan = biased_memory_plan(memory);
-        let access = plan.start;
-        let assembled = assemble_block_inner(
-            &plan,
+        assemble_block_inner(
+            plan,
             None,
             EmitAddressMode::Biased { host_bias },
             DirectExitEmissionPolicy::PrivateGateway,
             None,
         )
-        .expect("assemble biased memory fixture");
+        .expect("assemble biased memory fixture")
+    }
+
+    fn biased_guest_words(assembled: &AssembledBlock, guest: GuestVa) -> Vec<u32> {
         let words = assembled
             .map
             .entries()
             .iter()
-            .filter(|entry| entry.guest == access)
+            .filter(|entry| entry.guest == guest)
             .map(|entry| {
                 let index = entry.cache.get() as usize / 4;
                 assembled.words[index]
@@ -6947,6 +7509,461 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!words.is_empty(), "the access emitted no words");
         words
+    }
+
+    fn finalize_test_words(assembler: VecAssembler<Aarch64Relocation>) -> Vec<u32> {
+        let bytes = assembler.finalize().expect("finalize test emission");
+        assert!(bytes.len().is_multiple_of(4));
+        bytes
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect()
+    }
+
+    fn assemble_reserved_access_words(
+        memory: super::super::types::MemoryAccess,
+        bias: u64,
+    ) -> Vec<u32> {
+        let plan = biased_memory_plan(memory);
+        let host_bias =
+            carrick_dsr::address::NativeHostBias::new(bias, 0x4000).expect("aligned test bias");
+        let base = biased_base(memory).expect("reserved test base");
+        let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
+        let mut entries = Vec::new();
+        let mut recovery = Vec::new();
+        emit_reserved_biased_memory(
+            &mut assembler,
+            &mut entries,
+            &plan,
+            plan.start,
+            memory,
+            base,
+            host_bias,
+            &mut recovery,
+        )
+        .expect("emit reserved biased fixture");
+        finalize_test_words(assembler)
+    }
+
+    fn assemble_compact_access_emission(
+        memory: super::super::types::MemoryAccess,
+        bias: u64,
+    ) -> (Vec<u32>, Vec<RecoveryEntry>) {
+        let plan = biased_memory_plan(memory);
+        let host_bias =
+            carrick_dsr::address::NativeHostBias::new(bias, 0x4000).expect("aligned test bias");
+        let base = biased_base(memory).expect("compact test base");
+        let immediate = match memory.effective_address {
+            super::super::types::MemoryEffectiveAddress::Base => 0,
+            super::super::types::MemoryEffectiveAddress::Immediate(immediate) => {
+                u64::try_from(immediate).expect("non-negative compact immediate")
+            }
+            super::super::types::MemoryEffectiveAddress::RegisterOffset { .. } => {
+                panic!("compact test fixture cannot use a register offset")
+            }
+        };
+        let form = CompactBiasedForm {
+            bias_orr: host_bias
+                .aperture_disjoint_orr_immediate()
+                .expect("compact test bias"),
+            base,
+            immediate,
+        };
+        let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
+        let mut entries = Vec::new();
+        let mut recovery = Vec::new();
+        emit_compact_biased_memory(
+            &mut assembler,
+            &mut entries,
+            &plan,
+            plan.start,
+            memory,
+            host_bias,
+            &mut recovery,
+            form,
+        )
+        .expect("emit compact biased fixture");
+        (finalize_test_words(assembler), recovery)
+    }
+
+    fn assemble_compact_access_words(
+        memory: super::super::types::MemoryAccess,
+        bias: u64,
+    ) -> Vec<u32> {
+        assemble_compact_access_emission(memory, bias).0
+    }
+
+    fn physical_x18_offenders(name: &str, words: &[u32]) -> Vec<(String, usize, u32)> {
+        words
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, word)| {
+                bad64::decode(word, 0x4000 + index as u64 * 4).unwrap_or_else(|error| {
+                    panic!("{name} emitted undecodable word {index}=0x{word:08x}: {error}")
+                });
+                super::super::decode::decoded_operands_mention_gpr(
+                    word,
+                    GuestVa(0x4000 + index as u64 * 4),
+                    18,
+                )
+                .then(|| (name.to_string(), index, word))
+            })
+            .collect()
+    }
+
+    fn biased_dc_zva_plan() -> BlockPlan {
+        BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4004),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Sensitive {
+                guest: GuestVa(0x4000),
+                word: 0xd50b_7420, // dc zva, x0
+                exit: super::super::types::SensitiveExit {
+                    kind: super::super::types::SensitiveKind::DcZva,
+                    register: Some(bad64::Reg::X0),
+                    resume: GuestVa(0x4004),
+                },
+                fusion: None,
+            },
+            extensions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn biased_lowerings_never_emit_darwin_volatile_physical_x18() {
+        let compact_high_and_low_immediate = super::super::types::MemoryAccess {
+            // str x0, [x1, #0x1238] -- the displacement needs both ADD
+            // immediate stages in the compact slow path.
+            word: 0xf900_0000 | (0x247 << 10) | (1 << 5),
+            op: bad64::Op::STR,
+            base: super::super::types::MemoryBase::Register(bad64::Reg::X1),
+            effective_address: super::super::types::MemoryEffectiveAddress::Immediate(0x1238),
+            writeback: super::super::types::MemoryWriteback::None,
+            class: super::super::types::MemoryClass::Scalar,
+            virtualization: super::super::types::MemoryVirtualization::None,
+        };
+        let compact_writeback = super::super::types::MemoryAccess {
+            word: 0xa881_7c3f, // stp xzr, xzr, [x1], #16
+            op: bad64::Op::STP,
+            base: super::super::types::MemoryBase::Register(bad64::Reg::X1),
+            effective_address: super::super::types::MemoryEffectiveAddress::Base,
+            writeback: super::super::types::MemoryWriteback::PostIndex,
+            class: super::super::types::MemoryClass::Pair,
+            virtualization: super::super::types::MemoryVirtualization::None,
+        };
+        let compact_stack_pointer = super::super::types::MemoryAccess {
+            word: 0xf900_07e0, // str x0, [sp, #8]
+            op: bad64::Op::STR,
+            base: super::super::types::MemoryBase::Register(bad64::Reg::SP),
+            effective_address: super::super::types::MemoryEffectiveAddress::Immediate(8),
+            writeback: super::super::types::MemoryWriteback::None,
+            class: super::super::types::MemoryClass::Scalar,
+            virtualization: super::super::types::MemoryVirtualization::None,
+        };
+        let reserved = super::super::types::MemoryAccess {
+            word: 0xf85f_8020, // ldur x0, [x1, #-8]
+            op: bad64::Op::LDUR,
+            base: super::super::types::MemoryBase::Register(bad64::Reg::X1),
+            effective_address: super::super::types::MemoryEffectiveAddress::Immediate(-8),
+            writeback: super::super::types::MemoryWriteback::None,
+            class: super::super::types::MemoryClass::Scalar,
+            virtualization: super::super::types::MemoryVirtualization::None,
+        };
+        let general = super::super::types::MemoryAccess {
+            word: 0xf81f_8c20, // str x0, [x1, #-8]!
+            op: bad64::Op::STR,
+            base: super::super::types::MemoryBase::Register(bad64::Reg::X1),
+            effective_address: super::super::types::MemoryEffectiveAddress::Immediate(-8),
+            writeback: super::super::types::MemoryWriteback::PreIndex,
+            class: super::super::types::MemoryClass::Scalar,
+            virtualization: super::super::types::MemoryVirtualization::None,
+        };
+        let dc_zva = biased_dc_zva_plan();
+
+        let dc_zva_emission = assemble_biased_emission(&dc_zva, 0x80_0000_0000);
+        let cases = [
+            (
+                "compact high+low immediate",
+                assemble_compact_access_words(compact_high_and_low_immediate, 0x200_0000_0000),
+            ),
+            (
+                "compact multi-chunk writeback bias",
+                assemble_compact_access_words(compact_writeback, 0x0001_fe00_0000_0000),
+            ),
+            (
+                "compact stack pointer",
+                assemble_compact_access_words(compact_stack_pointer, 0x200_0000_0000),
+            ),
+            (
+                "reserved negative immediate",
+                assemble_reserved_access_words(reserved, 0x80_0000_0000),
+            ),
+            (
+                "general pre-index",
+                assemble_biased_access_words(general, 0x80_0000_0000),
+            ),
+            (
+                "dc zva",
+                biased_guest_words(&dc_zva_emission, GuestVa(0x4000)),
+            ),
+        ];
+        assert!(
+            !contains_general_bias_load(&cases[0].1),
+            "compact high+low fixture escaped to the general lowering"
+        );
+        assert!(
+            cases[0].1.windows(2).any(|words| {
+                words[0] & 0xffc0_03e0 == 0x9140_0020 && words[1] & 0xffc0_0000 == 0x9100_0000
+            }),
+            "compact fixture did not exercise both immediate stages: {:08x?}",
+            cases[0].1
+        );
+        assert!(
+            !contains_general_bias_load(&cases[1].1),
+            "compact writeback fixture escaped to the general lowering"
+        );
+        assert_eq!(
+            cases[1]
+                .1
+                .iter()
+                .filter(|word| { matches!(**word & 0xff80_001f, 0xd280_0001 | 0xf280_0001) })
+                .count(),
+            2,
+            "compact writeback must exercise a two-chunk bias: {:08x?}",
+            cases[1].1
+        );
+        assert!(
+            !contains_general_bias_load(&cases[2].1),
+            "compact SP fixture escaped to the general lowering"
+        );
+        assert_eq!(
+            cases[2]
+                .1
+                .iter()
+                .filter(|word| **word & 0xffff_ffe0 == 0x9100_03e0)
+                .count(),
+            3,
+            "compact SP must rebuild its base before checking, tagging, and translating: {:08x?}",
+            cases[2].1
+        );
+        assert!(
+            cases[3]
+                .1
+                .iter()
+                .any(|word| word & 0x1f == crate::gateway::RESERVED_SCRATCH),
+            "reserved fixture did not use the reserved address register"
+        );
+        assert!(
+            !cases[3].1.iter().any(|word| {
+                let slot = ((*word >> 10) & 0xfff) * 8;
+                matches!(slot, 1120 | 1128 | 1160 | 1168)
+                    && matches!(*word & 0xffc0_0380, 0xf900_0380 | 0xf940_0380)
+            }),
+            "reserved fixture must remain spill-free: {:08x?}",
+            cases[3].1
+        );
+        assert!(
+            contains_general_bias_load(&cases[4].1),
+            "general fixture did not route through the context bias load"
+        );
+        assert!(
+            cases[5].1.iter().any(|word| word & !0x1f == 0xd50b_7420),
+            "dc zva fixture did not emit the host instruction"
+        );
+
+        let offenders = cases
+            .iter()
+            .flat_map(|(name, words)| physical_x18_offenders(name, words))
+            .collect::<Vec<_>>();
+        assert!(
+            offenders.is_empty(),
+            "biased lowering emitted Darwin-volatile physical x18 operands: {offenders:08x?}"
+        );
+    }
+
+    #[test]
+    fn compact_multichunk_writeback_recovers_at_each_bias_materialization_boundary() {
+        let memory = super::super::types::MemoryAccess {
+            word: 0xa881_7c3f, // stp xzr, xzr, [x1], #16
+            op: bad64::Op::STP,
+            base: super::super::types::MemoryBase::Register(bad64::Reg::X1),
+            effective_address: super::super::types::MemoryEffectiveAddress::Base,
+            writeback: super::super::types::MemoryWriteback::PostIndex,
+            class: super::super::types::MemoryClass::Pair,
+            virtualization: super::super::types::MemoryVirtualization::None,
+        };
+        let bias = 0x0001_fe00_0000_0000;
+        let (words, recovery) = assemble_compact_access_emission(memory, bias);
+        let materializations = words
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, word)| matches!(*word & 0xff80_001f, 0xd280_0001 | 0xf280_0001))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            materializations.len(),
+            2,
+            "fixture must materialize the bias in two independent chunks: {words:08x?}"
+        );
+
+        let guest_base_after_writeback = 0x1234_0010_u64;
+        let host_base_after_writeback = bias + guest_base_after_writeback;
+        for (word_index, word) in materializations {
+            let offset = u32::try_from(word_index * 4).expect("materialization offset");
+            let action = recovery
+                .iter()
+                .find_map(|entry| (entry.cache.get() == offset).then_some(entry.action))
+                .unwrap_or_else(|| {
+                    panic!("materialization word {word_index}=0x{word:08x} has no recovery action")
+                });
+            let RecoveryAction::RecoverBiasedMemory(action) = action else {
+                panic!(
+                    "materialization word {word_index}=0x{word:08x} has wrong recovery {action:?}"
+                );
+            };
+            assert!(action.instruction_complete);
+            assert!(action.commit_base);
+            assert_eq!(action.base, BiasedBase::Register(1));
+            assert_eq!(action.base_coordinate, BiasedBaseCoordinate::Host);
+            assert_eq!(action.scratch_count, 1);
+
+            let scratch = usize::try_from(action.base_scratch).expect("scratch index");
+            let saved_scratch = 0xfeed_face_cafe_beef;
+            let mut snapshot = crate::snapshot::NativeUcontextSnapshot::default();
+            snapshot.x[1] = 0xdead_0000_0000_0000 | u64::from(word_index as u32);
+            snapshot.x[scratch] = host_base_after_writeback;
+            recover_rewrite_state(
+                &mut snapshot,
+                RecoveryAction::RecoverBiasedMemory(action),
+                saved_scratch,
+                0,
+                0,
+                0,
+                0,
+            )
+            .expect("recover multi-chunk materialization boundary");
+            assert_eq!(
+                snapshot.x[1], guest_base_after_writeback,
+                "partial bias chunk at word {word_index} leaked into the guest base"
+            );
+            assert_eq!(
+                snapshot.x[scratch], saved_scratch,
+                "borrowed scratch at word {word_index}"
+            );
+        }
+    }
+
+    #[test]
+    fn biased_dc_zva_recovery_restores_every_borrowed_scratch_at_every_boundary() {
+        let plan = biased_dc_zva_plan();
+        let assembled = assemble_biased_emission(&plan, 0x80_0000_0000);
+        let dc_offset = assembled
+            .words
+            .iter()
+            .position(|word| word & !0x1f == 0xd50b_7420)
+            .map(|index| u32::try_from(index * 4).expect("dc zva offset"))
+            .expect("host dc zva word");
+        let actions = assembled
+            .recovery
+            .iter()
+            .filter_map(|entry| match entry.action {
+                RecoveryAction::RecoverBiasedMemory(action) => Some((entry.cache.get(), action)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !actions.is_empty(),
+            "dc zva lowering must publish typed recovery"
+        );
+        assert!(
+            actions.windows(2).all(|pair| pair[1].0 == pair[0].0 + 4),
+            "dc zva recovery must cover every post-spill word exactly once: {actions:?}"
+        );
+        let (first_offset, first_action) = actions.first().copied().expect("first dc zva action");
+        let first_index = usize::try_from(first_offset / 4).expect("first action index");
+        assert!(
+            first_index >= 2,
+            "dc zva recovery begins before both spills"
+        );
+        for (index, register) in first_action.scratch_registers[..2]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let slot = BIASED_SCRATCH_CONTEXT_OFFSETS[index];
+            assert_eq!(
+                assembled.words[first_index - 2 + index],
+                0xf900_0000 | ((slot / 8) << 10) | (28 << 5) | register,
+                "dc zva recovery must begin immediately after scratch spill {index}"
+            );
+        }
+        let (last_offset, last_action) = actions.last().copied().expect("last dc zva action");
+        let last_index = usize::try_from(last_offset / 4).expect("last action index");
+        assert!(last_action.instruction_complete);
+        assert_eq!(
+            assembled.words[last_index],
+            0xf940_0000
+                | ((BIASED_SCRATCH_CONTEXT_OFFSETS[0] / 8) << 10)
+                | (28 << 5)
+                | last_action.scratch_registers[0],
+            "dc zva recovery must extend through the final scratch restore"
+        );
+
+        for (offset, action) in actions {
+            assert_eq!(
+                assembled
+                    .recovery
+                    .iter()
+                    .filter(|entry| entry.cache.get() == offset)
+                    .count(),
+                1,
+                "dc zva offset {offset} must have exactly one recovery action"
+            );
+            assert_eq!(
+                action.instruction_complete,
+                offset > dc_offset,
+                "dc zva completion transition at offset {offset}"
+            );
+            assert!(!action.commit_base, "dc zva never commits a guest base");
+            assert_eq!(action.scratch_count, 2);
+            let scratches = &action.scratch_registers[..2];
+            assert_ne!(scratches[0], scratches[1]);
+            assert!(
+                scratches.iter().all(|register| !matches!(
+                    *register,
+                    18 | 28 | crate::gateway::RESERVED_SCRATCH
+                )),
+                "dc zva recovery borrowed forbidden scratch: {scratches:?}"
+            );
+
+            let mut snapshot = crate::snapshot::NativeUcontextSnapshot::default();
+            snapshot.x[scratches[0] as usize] = 0xdead_0000_0000_0001;
+            snapshot.x[scratches[1] as usize] = 0xdead_0000_0000_0002;
+            recover_rewrite_state(
+                &mut snapshot,
+                RecoveryAction::RecoverBiasedMemory(action),
+                0x1111_1111_1111_1111,
+                0x2222_2222_2222_2222,
+                0,
+                0,
+                0,
+            )
+            .expect("recover dc zva boundary");
+            assert_eq!(snapshot.x[scratches[0] as usize], 0x1111_1111_1111_1111);
+            assert_eq!(snapshot.x[scratches[1] as usize], 0x2222_2222_2222_2222);
+            assert_eq!(
+                recovery_resume_pc(
+                    plan.start,
+                    Some(RecoveryAction::RecoverBiasedMemory(action))
+                )
+                .expect("dc zva resume PC"),
+                plan.start.raw() + u64::from(action.instruction_complete) * 4,
+                "dc zva resume at offset {offset}"
+            );
+        }
     }
 
     fn subsequence_at(words: &[u32], first: u32) -> Option<usize> {
@@ -6984,14 +8001,14 @@ mod tests {
         if crate::emit::reserved_scratch_enabled() {
             // No writeback, so the address register is the reserved one: no
             // spill prologue and no restore epilogue bracket the sequence.
-            let start = subsequence_at(&words, 0xd369_fc32).expect("compact aperture check");
+            let start = subsequence_at(&words, 0xd369_fc33).expect("compact aperture check");
             assert_eq!(
                 &words[start..start + 8],
                 &[
-                    0xd369_fc32, // lsr x18, x1, #41
-                    0xb400_00b2, // cbz x18, +20 (to the fast orr)
-                    0x9100_2032, // add x18, x1, #8 (slow: guest effective address)
-                    0xf902_5b92, // str x18, [x28, #1200] (publish guest fault addr)
+                    0xd369_fc33, // lsr x19, x1, #41
+                    0xb400_00b3, // cbz x19, +20 (to the fast orr)
+                    0x9100_2033, // add x19, x1, #8 (slow: guest effective address)
+                    0xf902_5b93, // str x19, [x28, #1200] (publish guest fault addr)
                     0xb251_0033, // orr x19, x1, #(1 << 47) (tagged invalid host)
                     0x1400_0002, // b +8 (over the fast orr)
                     0xb257_0033, // orr x19, x1, #(1 << 41) (host address)
@@ -7005,10 +8022,10 @@ mod tests {
                 &words[start..start + 10],
                 &[
                     0xf902_3391, // str x17, [x28, #1120]
-                    0xd369_fc32, // lsr x18, x1, #41
-                    0xb400_00b2, // cbz x18, +20 (to the fast orr)
-                    0x9100_2032, // add x18, x1, #8 (slow: guest effective address)
-                    0xf902_5b92, // str x18, [x28, #1200] (publish guest fault addr)
+                    0xd369_fc31, // lsr x17, x1, #41
+                    0xb400_00b1, // cbz x17, +20 (to the fast orr)
+                    0x9100_2031, // add x17, x1, #8 (slow: guest effective address)
+                    0xf902_5b91, // str x17, [x28, #1200] (publish guest fault addr)
                     0xb251_0031, // orr x17, x1, #(1 << 47) (tagged invalid host)
                     0x1400_0002, // b +8 (over the fast orr)
                     0xb257_0031, // orr x17, x1, #(1 << 41) (host address)
@@ -7045,16 +8062,16 @@ mod tests {
             &words[start..start + 12],
             &[
                 0xf902_3391, // str x17, [x28, #1120]
-                0xd369_fc32, // lsr x18, x1, #41
-                0xb400_00b2, // cbz x18, +20 (to the fast orr)
-                0xaa01_03f2, // mov x18, x1 (slow: guest effective address)
-                0xf902_5b92, // str x18, [x28, #1200]
+                0xd369_fc31, // lsr x17, x1, #41
+                0xb400_00b1, // cbz x17, +20 (to the fast orr)
+                0xaa01_03f1, // mov x17, x1 (slow: guest effective address)
+                0xf902_5b91, // str x17, [x28, #1200]
                 0xb251_0031, // orr x17, x1, #(1 << 47)
                 0x1400_0002, // b +8
                 0xb257_0031, // orr x17, x1, #(1 << 41)
                 0xa881_7e3f, // stp xzr, xzr, [x17], #16
-                0xd2c0_4012, // movz x18, #0x200, lsl #32 (the bias)
-                0xcb12_0221, // sub x1, x17, x18 (exact un-bias commit)
+                0xd2c0_4001, // movz x1, #0x200, lsl #32 (the bias)
+                0xcb01_0221, // sub x1, x17, x1 (exact un-bias commit)
                 0xf942_3391, // ldr x17, [x28, #1120]
             ],
             "compact post-index writeback shape"
