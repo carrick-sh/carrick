@@ -2129,6 +2129,71 @@ fn take_native_syscall_service_probe_events() -> Vec<NativeSyscallServiceProbeEv
     NATIVE_SYSCALL_SERVICE_PROBE_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeForkChildResumeEvent {
+    ChildTranslatorRebuild,
+    ForkPost,
+    SyscallCompletion,
+    GuestResume,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NATIVE_FORK_CHILD_RESUME_EVENTS:
+        std::cell::RefCell<Vec<NativeForkChildResumeEvent>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_native_fork_child_resume_event(event: NativeForkChildResumeEvent) {
+    NATIVE_FORK_CHILD_RESUME_EVENTS.with(|events| events.borrow_mut().push(event));
+}
+
+#[cfg(test)]
+fn take_native_fork_child_resume_events() -> Vec<NativeForkChildResumeEvent> {
+    NATIVE_FORK_CHILD_RESUME_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+}
+
+/// Repair the child-owned translator and publish the child-side fork boundary.
+///
+/// This is the last fallible child-only stage before syscall completion and
+/// guest resume. Keeping the error mapping and every post-repair publication
+/// in one seam makes `?` at the caller preserve the still-open syscall span:
+/// its RAII drop emits one `Aborted` end while no resume-shaped event escapes.
+fn repair_native_fork_child_before_resume(
+    translator: &mut dsr::ThreadTranslator,
+    tid: i32,
+    snapshot: &mut NativeUcontextSnapshot,
+    child_stack: u64,
+) -> Result<(), RuntimeError> {
+    let translator_rebuild_start = std::time::Instant::now();
+    translator
+        .after_fork_child(tid)
+        .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    let translator_rebuild_us = translator_rebuild_start
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    crate::probes::native_fork_lifecycle(
+        NativeForkPhase::ChildTranslatorRebuild,
+        translator_rebuild_us,
+        i64::from(tid),
+        0,
+    );
+    #[cfg(test)]
+    record_native_fork_child_resume_event(NativeForkChildResumeEvent::ChildTranslatorRebuild);
+
+    // `arg0 == 0` is the D script's child clause.
+    crate::probes::fork_post(0, snapshot.pc, 0);
+    #[cfg(test)]
+    record_native_fork_child_resume_event(NativeForkChildResumeEvent::ForkPost);
+    if child_stack != 0 {
+        snapshot.sp = child_stack;
+    }
+    Ok(())
+}
+
 /// Outcome of [`NativeThreadRuntime::acquire_fork_token`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeForkTokenFlow {
@@ -3013,26 +3078,12 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             // the child's `fork-pre`/`fork-post` bracket after
                             // it means the bracket spans everything the guest
                             // actually waits for.
-                            let translator_rebuild_start = std::time::Instant::now();
-                            translator
-                                .after_fork_child(thread_runtime.tid().raw())
-                                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-                            let translator_rebuild_us = translator_rebuild_start
-                                .elapsed()
-                                .as_micros()
-                                .min(u128::from(u64::MAX))
-                                as u64;
-                            crate::probes::native_fork_lifecycle(
-                                NativeForkPhase::ChildTranslatorRebuild,
-                                translator_rebuild_us,
-                                i64::from(thread_runtime.tid().raw()),
-                                0,
-                            );
-                            // `arg0 == 0` is the D script's child clause.
-                            crate::probes::fork_post(0, snapshot.pc, 0);
-                            if child_stack != 0 {
-                                snapshot.sp = child_stack;
-                            }
+                            repair_native_fork_child_before_resume(
+                                &mut translator,
+                                thread_runtime.tid().raw(),
+                                &mut snapshot,
+                                child_stack,
+                            )?;
                         }
                         snapshot = complete_dsr_syscall(
                             &dispatcher,
@@ -6711,7 +6762,9 @@ mod tests {
     }
 
     #[test]
-    fn fork_child_translator_error_maps_to_unsupported_before_resume() {
+    fn fork_child_translator_error_aborts_service_before_all_resume_events() {
+        take_native_syscall_service_probe_events();
+        take_native_fork_child_resume_events();
         let process = std::sync::Arc::new(
             dsr::test_process_translator(16 * 1024).expect("create translator"),
         );
@@ -6722,16 +6775,53 @@ mod tests {
             .set_translated_range_epoch_for_test(u64::MAX)
             .expect("seed epoch overflow");
         let mut translator = dsr::ThreadTranslator::for_process(process, 71);
+        let mut snapshot = NativeUcontextSnapshot {
+            pc: 0x40_0000,
+            sp: 0x50_0000,
+            ..NativeUcontextSnapshot::default()
+        };
+        let mut service = NativeSyscallServiceSpan::open(220, "clone");
+        assert!(service.branch(NativeSyscallBranchKind::Process));
 
-        let result = translator
-            .after_fork_child(72)
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()));
+        let result = (|| {
+            repair_native_fork_child_before_resume(&mut translator, 72, &mut snapshot, 0x60_0000)?;
+            record_native_fork_child_resume_event(NativeForkChildResumeEvent::SyscallCompletion);
+            require_native_syscall_service_transition(
+                service.end(NativeSyscallServiceOutcome::Resume),
+                "test fork resume end",
+            )?;
+            record_native_fork_child_resume_event(NativeForkChildResumeEvent::GuestResume);
+            Ok::<(), RuntimeError>(())
+        })();
+        drop(service);
 
         assert!(matches!(
             result,
             Err(RuntimeError::Unsupported(message))
                 if message.contains("translated-range epoch overflow")
         ));
+        assert_eq!(
+            take_native_syscall_service_probe_events(),
+            vec![
+                NativeSyscallServiceProbeEvent::Entry {
+                    number: 220,
+                    name: "clone",
+                },
+                NativeSyscallServiceProbeEvent::Branch(NativeSyscallBranchKind::Process),
+                NativeSyscallServiceProbeEvent::End {
+                    number: 220,
+                    name: "clone",
+                    outcome: NativeSyscallServiceOutcome::Aborted,
+                },
+            ],
+            "the failed child branch must close its inherited service exactly once"
+        );
+        assert!(
+            take_native_fork_child_resume_events().is_empty(),
+            "repair failure must precede rebuild completion, fork-post, syscall completion, \
+             and guest resume"
+        );
+        assert_eq!(snapshot.sp, 0x50_0000, "child stack must remain untouched");
     }
 
     #[test]
