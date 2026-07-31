@@ -588,6 +588,10 @@ def _require_d_clause(
     actions: Sequence[str],
     description: str,
     exact_predicate: bool = False,
+    exact_actions: bool = False,
+    ordered_actions: bool = False,
+    unique_assignment_targets: Sequence[str] = (),
+    unique_call_names: Sequence[str] = (),
 ) -> None:
     expected_predicate = [_compact_d(item) for item in predicate]
     expected_actions = [_compact_d(item) for item in actions]
@@ -596,12 +600,42 @@ def _require_d_clause(
             continue
         actual_predicate = _compact_d(clause.predicate)
         actual_actions = _compact_d(clause.actions)
+        actual_action_statements = _split_d_top_level(clause.actions, ";")
         predicate_matches = (
             actual_predicate == expected_predicate[0]
             if exact_predicate
             else all(item in actual_predicate for item in expected_predicate)
         )
-        if predicate_matches and all(item in actual_actions for item in expected_actions):
+        if ordered_actions:
+            width = len(expected_actions)
+            actions_match = any(
+                actual_action_statements[index : index + width]
+                == tuple(expected_actions)
+                for index in range(len(actual_action_statements) - width + 1)
+            )
+        elif exact_actions:
+            actions_match = all(
+                item in actual_action_statements for item in expected_actions
+            )
+        else:
+            actions_match = all(item in actual_actions for item in expected_actions)
+        assignments_match = all(
+            sum(
+                statement.startswith(_compact_d(target))
+                for statement in actual_action_statements
+            )
+            == 1
+            for target in unique_assignment_targets
+        )
+        calls_match = all(
+            sum(
+                statement.startswith(f"{_compact_d(name)}(")
+                for statement in actual_action_statements
+            )
+            == 1
+            for name in unique_call_names
+        )
+        if predicate_matches and actions_match and assignments_match and calls_match:
             return
     raise EvidenceError(f"maintained lifecycle script lacks {description} clause")
 
@@ -702,10 +736,10 @@ def _expected_d_identity_accesses() -> dict[str, Counter[tuple[str, ...]]]:
         "(uint64_t)0",
     )
     created = (
-        "args[0]->pr_pid",
-        "incarnation[args[0]->pr_pid]",
+        "this->child_pid",
+        "this->child_incarnation",
         "(uint64_t)1",
-        "runtime_epoch[args[0]->pr_pid,incarnation[args[0]->pr_pid]]",
+        "this->child_epoch",
     )
     parent = ("pid", pid_inc, "(uint64_t)1", "(uint64_t)1")
     child_preexec = ("pid", pid_inc, "(uint64_t)1", "(uint64_t)2")
@@ -786,15 +820,10 @@ def _expected_d_identity_accesses() -> dict[str, Counter[tuple[str, ...]]]:
         expected[name] = counted(
             (target_announcement, 1), (dynamic_announcement, 7)
         )
-    nested_pending_unit = (
-        "pending_unit[pid,incarnation[pid],"
-        "image_generation[pid,incarnation[pid]],"
-        "runtime_epoch[pid,incarnation[pid]],arg0]"
-    )
     expected["ann_ordinal"] = counted(
         (target_announcement, 1),
         (dynamic_announcement, 12),
-        ((*dynamic, nested_pending_unit), 1),
+        ((*dynamic, "this->run_unit"), 1),
     )
 
     target_pending = (*target, "0")
@@ -802,7 +831,7 @@ def _expected_d_identity_accesses() -> dict[str, Counter[tuple[str, ...]]]:
     pending_counts = {
         "pending_present": 7,
         "pending_epoch": 5,
-        "pending_unit": 7,
+        "pending_unit": 6,
         "pending_start": 6,
         "pending_end": 6,
         "pending_commit_ordinal": 8,
@@ -890,6 +919,10 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
             raise EvidenceError(
                 f"maintained lifecycle milestone {milestone} lacks one executable clause"
             )
+    if action_text.count("|kind=shared-run-begin|") != 1:
+        raise EvidenceError(
+            "maintained lifecycle requires exactly one shared run wire producer"
+        )
 
     stage = "lifecycle_stage[pid, incarnation[pid]]"
     child = "pid == lifecycle_child_pid"
@@ -900,6 +933,8 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
             (),
             (
                 "lifecycle_target_birth = 1",
+                "parent_private_start = (uint64_t)0",
+                "parent_private_end = (uint64_t)0",
                 "tracked[$target] = 1",
                 "lifecycle_stage[$target, incarnation[$target]] = 1",
             ),
@@ -1226,6 +1261,92 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
             actions=("metadata_violations++", "unexpected_events++"),
             description=f"stage-10 reexec metadata rejection for {provider}",
         )
+
+    _require_d_clause(
+        clauses,
+        "proc:::create",
+        predicate=("tracked[pid]",),
+        actions=(
+            "this->child_pid = args[0]->pr_pid",
+            "this->child_incarnation = incarnation[this->child_pid]",
+            (
+                "this->child_epoch = runtime_epoch[this->child_pid, "
+                "this->child_incarnation]"
+            ),
+            (
+                "catalog_live[this->child_pid, this->child_incarnation, "
+                "(uint64_t)1, this->child_epoch] = 0"
+            ),
+            (
+                "pending_by_pid[this->child_pid, this->child_incarnation, "
+                "(uint64_t)1, this->child_epoch] = 0"
+            ),
+        ),
+        description="created owner clause-local identity binding",
+        exact_actions=True,
+        ordered_actions=True,
+        unique_assignment_targets=(
+            "this->child_pid",
+            "this->child_incarnation",
+            "this->child_epoch",
+        ),
+    )
+    _require_d_clause(
+        clauses,
+        "carrick*:::dsr-run-begin",
+        predicate=(
+            "pending_start[pid, incarnation[pid]",
+            "pending_end[pid, incarnation[pid]",
+        ),
+        actions=(
+            (
+                "this->run_unit = pending_unit[pid, incarnation[pid], "
+                "image_generation[pid, incarnation[pid]], "
+                "runtime_epoch[pid, incarnation[pid]], arg0]"
+            ),
+            (
+                "this->run_start = pending_start[pid, incarnation[pid], "
+                "image_generation[pid, incarnation[pid]], "
+                "runtime_epoch[pid, incarnation[pid]], arg0]"
+            ),
+            (
+                "this->run_end = pending_end[pid, incarnation[pid], "
+                "image_generation[pid, incarnation[pid]], "
+                "runtime_epoch[pid, incarnation[pid]], arg0]"
+            ),
+            (
+                "this->run_announcement_ordinal = ann_ordinal[pid, "
+                "incarnation[pid], image_generation[pid, incarnation[pid]], "
+                "runtime_epoch[pid, incarnation[pid]], this->run_unit]"
+            ),
+            (
+                "this->run_commit_ordinal = pending_commit_ordinal[pid, "
+                "incarnation[pid], image_generation[pid, incarnation[pid]], "
+                "runtime_epoch[pid, incarnation[pid]], arg0]"
+            ),
+            (
+                'printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|'
+                "kind=shared-run-begin|pid=%d|incarnation=%d|tid=%d|"
+                "unit_id=%d|start=%#x|end=%#x|announcement_ordinal=%d|"
+                "commit_ordinal=%d|run_ordinal=%d|guest_pc=%#x|cache_pc=%#x|"
+                'generation=%d\\n", ordinal, process_ordinal[pid], pid, '
+                "incarnation[pid], arg0, this->run_unit, this->run_start, "
+                "this->run_end, this->run_announcement_ordinal, "
+                "this->run_commit_ordinal, ordinal, arg1, arg2, arg3)"
+            ),
+        ),
+        description="shared run clause-local identity binding",
+        exact_actions=True,
+        ordered_actions=True,
+        unique_assignment_targets=(
+            "this->run_unit",
+            "this->run_start",
+            "this->run_end",
+            "this->run_announcement_ordinal",
+            "this->run_commit_ordinal",
+        ),
+        unique_call_names=("printf",),
+    )
 
     expected_arities = {
         "catalog_live": 4,

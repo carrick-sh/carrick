@@ -47,6 +47,8 @@ dtrace:::BEGIN
     lifecycle_child_pid = 0;
     lifecycle_target_birth = 1;
     lifecycle_child_birth = 0;
+    parent_private_start = (uint64_t)0;
+    parent_private_end = (uint64_t)0;
     parent_catalog_ok = 0;
     child_preexec_catalog_ok = 0;
     child_postexec_catalog_ok = 0;
@@ -165,14 +167,14 @@ proc:::create
     lifecycle_stage[args[0]->pr_pid,
         incarnation[args[0]->pr_pid]] = 1;
     process_ordinal[args[0]->pr_pid] = (uint64_t)0;
-    catalog_live[args[0]->pr_pid, incarnation[args[0]->pr_pid],
-        (uint64_t)1,
-        runtime_epoch[args[0]->pr_pid,
-            incarnation[args[0]->pr_pid]]] = 0;
-    pending_by_pid[args[0]->pr_pid, incarnation[args[0]->pr_pid],
-        (uint64_t)1,
-        runtime_epoch[args[0]->pr_pid,
-            incarnation[args[0]->pr_pid]]] = 0;
+    this->child_pid = args[0]->pr_pid;
+    this->child_incarnation = incarnation[this->child_pid];
+    this->child_epoch = runtime_epoch[this->child_pid,
+        this->child_incarnation];
+    catalog_live[this->child_pid, this->child_incarnation,
+        (uint64_t)1, this->child_epoch] = 0;
+    pending_by_pid[this->child_pid, this->child_incarnation,
+        (uint64_t)1, this->child_epoch] = 0;
 }
 
 proc:::create
@@ -1394,26 +1396,25 @@ carrick*:::dsr-run-begin
     ordinal++;
     process_ordinal[pid]++;
     shared_run_begin++;
+    this->run_unit = pending_unit[pid, incarnation[pid],
+        image_generation[pid, incarnation[pid]],
+        runtime_epoch[pid, incarnation[pid]], arg0];
+    this->run_start = pending_start[pid, incarnation[pid],
+        image_generation[pid, incarnation[pid]],
+        runtime_epoch[pid, incarnation[pid]], arg0];
+    this->run_end = pending_end[pid, incarnation[pid],
+        image_generation[pid, incarnation[pid]],
+        runtime_epoch[pid, incarnation[pid]], arg0];
+    this->run_announcement_ordinal = ann_ordinal[pid, incarnation[pid],
+        image_generation[pid, incarnation[pid]],
+        runtime_epoch[pid, incarnation[pid]], this->run_unit];
+    this->run_commit_ordinal = pending_commit_ordinal[pid, incarnation[pid],
+        image_generation[pid, incarnation[pid]],
+        runtime_epoch[pid, incarnation[pid]], arg0];
     printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-run-begin|pid=%d|incarnation=%d|tid=%d|unit_id=%d|start=%#x|end=%#x|announcement_ordinal=%d|commit_ordinal=%d|run_ordinal=%d|guest_pc=%#x|cache_pc=%#x|generation=%d\n",
         ordinal, process_ordinal[pid], pid, incarnation[pid], arg0,
-        pending_unit[pid, incarnation[pid],
-            image_generation[pid, incarnation[pid]],
-            runtime_epoch[pid, incarnation[pid]], arg0],
-        pending_start[pid, incarnation[pid],
-            image_generation[pid, incarnation[pid]],
-            runtime_epoch[pid, incarnation[pid]], arg0],
-        pending_end[pid, incarnation[pid],
-            image_generation[pid, incarnation[pid]],
-            runtime_epoch[pid, incarnation[pid]], arg0],
-        ann_ordinal[pid, incarnation[pid],
-            image_generation[pid, incarnation[pid]],
-            runtime_epoch[pid, incarnation[pid]],
-            pending_unit[pid, incarnation[pid],
-                image_generation[pid, incarnation[pid]],
-                runtime_epoch[pid, incarnation[pid]], arg0]],
-        pending_commit_ordinal[pid, incarnation[pid],
-            image_generation[pid, incarnation[pid]],
-            runtime_epoch[pid, incarnation[pid]], arg0],
+        this->run_unit, this->run_start, this->run_end,
+        this->run_announcement_ordinal, this->run_commit_ordinal,
         ordinal, arg1, arg2, arg3);
     pending_present[pid, incarnation[pid],
         image_generation[pid, incarnation[pid]],
