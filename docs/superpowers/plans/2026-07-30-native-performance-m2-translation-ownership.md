@@ -340,11 +340,17 @@ struct PreparedPageDependencyPage {
     existing: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedCatalogExecReset {
+    next_epoch: TranslatedRangeEpoch,
+}
+
 impl TranslatedRangeCatalog {
     fn dormant(private: Range<HostVa>) -> Result<Self, DsrError>;
     fn activate_if_dormant(&mut self) -> Result<(), DsrError>;
     fn replay_after_fork(&mut self) -> Result<(), DsrError>;
-    fn reset_dormant_for_exec(&mut self) -> Result<(), DsrError>;
+    fn prepare_dormant_for_exec(&self) -> Result<PreparedCatalogExecReset, DsrError>;
+    fn commit_dormant_for_exec(&mut self, prepared: PreparedCatalogExecReset);
     fn prepare_shared(
         &mut self,
         unit_id: TranslatedUnitId,
@@ -390,7 +396,7 @@ impl PageBlockDependencies {
 }
 ```
 
-- [ ] **Step 1: Add red publisher-state tests**
+- [x] **Step 1: Add red publisher-state tests**
 
 Cover:
 
@@ -417,7 +423,8 @@ Cover:
   structure visible before the exclusive guard is released;
 - replay reproduces the identical ordered catalog under a fresh nonzero epoch;
 - two sibling `ThreadTranslator`s do not duplicate replay;
-- child replay occurs after `ProcessTranslator::after_fork_child`; and
+- child replay occurs within `ProcessTranslator::after_fork_child`, after its
+  inherited direct-binding/cache repair and before the method returns; and
 - compatibility `dsr_cache_bounds` may still fire but is not the catalog
   authority.
 
@@ -427,13 +434,13 @@ state snapshot. A successful `try_reserve` may change capacity, but no
 failpoint may change a lookup result, catalog frontier, retained unit, or
 executable-range head.
 
-- [ ] **Step 2: Run and prove red**
+- [x] **Step 2: Run and prove red**
 
 ```bash
 cargo test -p carrick-dsr-aarch64 translated_range_catalog -- --nocapture
 ```
 
-- [ ] **Step 3: Construct dormant and activate only at the PONR handoff**
+- [x] **Step 3: Construct dormant and activate only at the PONR handoff**
 
 Add `translated_ranges: TranslatedRangeCatalog` to `ProcessState`. Build it
 from `cache.host_range()` in `ProcessTranslator::new_with_host`, but emit
@@ -455,13 +462,13 @@ Keep `probes::dsr_cache_bounds` as compatibility only. Remove
 `probes::host_jit_range` ownership from `native_darwin.rs`; if retained for
 old scripts, it announces only compatibility state and never controls replay.
 
-- [ ] **Step 4: Give shared units a stable typed identity**
+- [x] **Step 4: Give shared units a stable typed identity**
 
 Reuse `direct_binding_unit_digest(&unit.manifest.key)` as the stable source,
 convert it through `TranslatedUnitId::new`, and reject zero instead of
 synthesizing a replacement. Store that ID in `LoadedSharedUnit`.
 
-- [ ] **Step 5: Prepare every fallible mutation, then commit publication before
+- [x] **Step 5: Prepare every fallible mutation, then commit publication before
 reachability**
 
 Keep shared-unit installation under the exclusive `ProcessState` write guard.
@@ -584,12 +591,12 @@ structures are committed. Do not substitute zero or add a second fallible
 lookup at commit time. A `_with_recorder` commit seam proves publication order
 without touching the process-global `OnceLock` probe sink.
 
-- [ ] **Step 6: Replay after fork**
+- [x] **Step 6: Replay after fork**
 
 In `ThreadTranslator::after_fork_child`, preserve this order:
 
 ```rust
-self.process.after_fork_child();
+self.process.after_fork_child()?;
 self.block_cache.clear();
 ```
 
@@ -598,22 +605,51 @@ and performs synchronous reset/replay/ready after cache repair and before it
 returns. This is an explicit `replay_after_fork`, not the idempotent initial
 activation method. Propagate epoch-overflow failure through
 `ProcessTranslator::after_fork_child`, `ThreadTranslator::after_fork_child`,
-and the runtime child-resume path; do not wrap, saturate, or panic. All other
-replay work is infallible because the in-memory catalog was validated before
-publication. Tests must show replay is after process repair and before child
-guest resume.
+and the runtime child-resume path; do not wrap, saturate, or panic. Before
+emitting anything, validate that the inherited catalog is active, its ready
+frontier covers exactly `1..=sequence_frontier`, and every retained shared
+entry is replayable. Under the same process writer, emit the fresh
+reset/private/shared/ready sequence and re-key retained shared-range event
+owners so a grandchild can replay the same unit IDs and ranges. Preserve the
+catalog contents and next sequence across replay. Clear the thread-local block
+cache only after successful process replay.
+
+The runtime child repair helper returns the error before any
+`ChildTranslatorRebuild`, `fork_post`, syscall-completion, stack-mutation, or
+guest-resume event. If a `Resume` service span has already opened, its RAII end
+is exactly one `Aborted`; never report a completed resume after replay failure.
+Tests must cover the ordered success path, checked overflow, unchanged failure
+state, sibling idempotence, real COW isolation under a bounded supervisor, and
+the runtime failure-event boundary.
 
 - [ ] **Step 7: Activate replacement catalogs only after successful exec**
 
-For inherited-translator exec reset, clear shared ranges and advance/reset the
-dormant publisher through an explicit `reset_dormant_for_exec` together with
-the existing translator state. Preflight the private-JIT epoch lease count
-before destructive clearing rather than asserting it after mutation has begun.
-For an ordinary replacement translator, keep the candidate dormant through
-pre-PONR work. At the successful active handoff in `native_darwin.rs`, activate
-the replacement, then republish host image base/catalog and guest compatibility
-metadata under the new image/runtime key. Ignore the current transition-time
-pre-success announcements in `DSRPROF2`.
+Do not compose inherited-translator exec from one fallible destructive reset.
+Prepare the transition while the old image remains authoritative and under the
+`ProcessState` writer:
+
+- validate the reset token without consuming it;
+- count every live private-JIT descriptor lease and prove the registry owns the
+  exact process-epoch set using `Arc::ptr_eq`;
+- reject external or stale leases before clearing a cell; and
+- only when the replacement reuses the retiring translator, require an active
+  catalog and precompute its checked next epoch and dormant state.
+
+Finish that preparation immediately before the mapped-memory PONR is armed.
+After PONR, consume the already validated token and commit the optional catalog
+transition infallibly, then perform the existing destructive binding, cache,
+and shared-state clear without another recoverable error or assertion. The
+catalog commit retains its private range, installs the prepared epoch, clears
+shared entries, resets the sequence frontier, becomes dormant, and emits
+nothing. A fresh replacement translator stays dormant without advancing or
+overflow-checking the retiring catalog.
+
+At the successful active handoff in `native_darwin.rs`, activate the selected
+translator exactly once, then republish host image base/catalog and guest
+compatibility metadata under the new image/runtime key. Production self-reexec
+must prove the same post-success metadata state as the inherited-translator
+test seam. Ignore the current transition-time pre-success announcements in
+`DSRPROF2`.
 
 - [ ] **Step 8: Run focused tests and commit**
 

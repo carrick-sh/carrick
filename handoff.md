@@ -11,17 +11,19 @@ default). No VMM/HVF/KVM/bhyve behaviour was touched.
 > stands: **`neutral-domains` remains opt-in — do not make it the production
 > default until Tasks 43, 55 and 58 close.**
 
-Evidence for everything below is in
+Historical M1 and pre-M2 evidence is in
 [`docs/perf-results/2026-07-29-native-cpu-budget-evidence.md`](docs/perf-results/2026-07-29-native-cpu-budget-evidence.md),
-runs 1–31. Read that before re-deriving anything here.
+runs 1–31. Current M2 execution state is recorded here and in
+`.superpowers/sdd/2026-07-30-native-performance-m2-translation-ownership/`;
+its ignored raw trace receipts remain under `target/perf/`.
 
 ---
 
-## Current checkpoint — M2 shared ownership accepted, speed result still open
+## Current checkpoint — M2 fork replay accepted, speed result still open
 
 M2 now has an accepted process-owned translated-range catalog through the
-first real shared-code consumer. This is an observability/correctness
-milestone, not a performance result.
+first real shared-code consumer and checked post-fork replay. This is an
+observability/correctness milestone, not a performance result.
 
 The retained signed binary is
 `403b12878e36412943c0c5b79ba2271d11b0afbf77f2036afafa2211e610d69f`.
@@ -70,12 +72,30 @@ DTrace dynamic-array truncation (`0x10edbc380 -> 0xedbc380` and a unit ID to
 its low 32 bits). Commit `0c13a7bf` corrected the complete retained scalar
 path; only the later `...31i` and `...31j` receipts are accepted.
 
-**Next:** finish catalog lifecycle across fork replay and exec reset/handoff,
-including propagated checked epoch failure and production self-reexec proof.
-Then take two default and two shared Go-build attribution captures with the
-same signed binary, use the now-complete catalog to stop misclassifying shared
-JIT code as host, select the first opt-out optimization from measured CPU/
-kernel ownership, and retain it only through the primary ABBA CPU gate.
+Fork replay landed as `488e569d`, with failure hardening in `c771e23a` and the
+bounded real-COW supervisor cleanup in `b32bb6f6`. It now:
+
+- validates the complete active catalog and ready frontier before emission;
+- advances the epoch with checked failure propagation;
+- replays reset/private/shared/ready under the process writer and re-keys
+  retained shared events for grandchild forks;
+- clears the thread cache only after process replay succeeds; and
+- aborts the open runtime resume service exactly once before any rebuild,
+  fork-post, syscall-completion, stack-mutation, or guest-resume event on
+  failure.
+
+Focused catalog, fork, runtime failure, full DSR library, and serialized native
+Darwin tests passed. Two independent review passes closed the bounded-wait,
+child-allocation, inherited-frontier, runtime-event, and fork-failure FD
+findings. Signed live fork/exec tracing is deliberately still pending until the
+exec half is complete.
+
+**Next:** implement the prepared exec-reset transaction and post-success
+activation/metadata handoff, including production self-reexec proof. Then take
+two default and two shared Go-build attribution captures with the same signed
+binary, use the complete catalog to stop misclassifying shared JIT code as
+host, select the first opt-out optimization from measured CPU/kernel ownership,
+and retain it only through the primary ABBA CPU gate.
 
 The ≥30% CPU goal remains open; no new paired CPU ratio has been measured.
 
