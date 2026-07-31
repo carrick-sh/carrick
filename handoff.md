@@ -1,8 +1,9 @@
 # Native-lane performance handoff
 
 **Date:** 2026-07-31
-**Branch:** `codex/native-performance-m1` (M2 raw-v2 parser checkpoint
-`c035f89a`; M1 correctness checkpoint `5020e509`)
+**Branch:** `codex/native-performance-m1` (M2 launch-qualification checkpoint
+`51e20831`; raw-v2 parser checkpoint `c035f89a`; M1 correctness checkpoint
+`5020e509`)
 **Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
 default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
@@ -19,7 +20,7 @@ its ignored raw trace receipts remain under `target/perf/`.
 
 ---
 
-## Current checkpoint — M2 lifecycle accepted, raw-v2 parser landed
+## Current checkpoint — M2 lifecycle, raw-v2 parser, and launch identities
 
 M2 now has an accepted process-owned translated-range catalog through the
 first real shared-code consumer, checked post-fork replay, and atomic inherited
@@ -182,25 +183,64 @@ Focused integration and unit suites, warnings-denied clippy, formatting,
 typed-domain lint, and diff checks passed.
 
 This is still structural validation, not a gating-eligible v2 profile. The
-header hashes have syntax authority, but launch-time birth and terminal
-qualification receipts do not yet bind their values; `native-wall.d` still
-emits PID-only `DSRPROF1`, and v2 summary publication remains absent.
+header hashes have syntax authority, but `native-wall.d` still emits PID-only
+`DSRPROF1`, and v2 summary publication remains absent.
 
-This lifecycle receipt closes the catalog/fork/exec prerequisite, and the raw
-grammar now exists, but neither makes the current PID-only `DSRPROF1`
-native-wall stream gating-eligible. Launch-time birth/terminal qualification,
-`DSRPROF2` production emission, balanced kernel-state sampling, v2 symbol
-rules, and the receipt-bound Go-build capture surface remain absent.
+Commit `51e20831` adds the first live launch-qualification slice. The approved
+design assumed Darwin `proc` provider start fields could supply process birth
+identity; live tracing disproved that assumption because every `pr_start`
+field was zero. The retained implementation instead queries checked
+`PROC_PIDTBSDINFO` tuples and publishes them through a typed USDT probe. The
+query stays inside the probe's enabled closure, so ordinary untraced runs pay
+no process-info syscall cost. The CLI root publishes before command-specific
+work and a native fork child publishes immediately after its child guard,
+before later post-fork DSR events.
 
-**Next:** finish M2 Task 3 by adding launch-time process-birth and terminal-call
-qualification through the same libdtrace launch path, bind both receipt hashes
-into parser authority, and make `native-wall.d` emit the validated lifecycle.
-Then complete balanced v2 kernel/off-CPU reconciliation and exact ownership
-rules before adding the Go-build `capture`/`promote-set` surface. Only after
-those gates are green should this code state be rebuilt into the immutable arm
-for two native-default and two shared captures. Those four profiles choose the
-largest repeatable opt-out translation/kernel owner; one narrow candidate then
-advances to the primary ABBA total-child-CPU gate.
+Controlled hidden fixtures and strict `BIRTHQUAL1` / `TERMINALQUAL1` parsers
+live-proved the replacement mechanism:
+
+- birth run `native-birth-qualifier-dev-006` observed the exact parent tuple
+  twice, the exact child tuple twice, one matching `proc:::create`, both natural
+  exits, and zero timeouts or violations (raw SHA-256
+  `5c7136a8873121add7da71755acaea75985e2d0f20db1e8c75ed72ebd9a469c5`);
+- thread run `native-terminal-qualifier-thread-dev-003` identified
+  `syscall::bsdthread_terminate` at `proc:::lwp-exit`, with three returning-call
+  controls and zero violations (raw SHA-256
+  `26ea1052117cecca53d1365681514bc2008f05b06ba4ab92a2c723fe1a7afc48`);
+  and
+- process run `native-terminal-qualifier-process-dev-002` identified
+  `syscall::exit` at `proc:::exit`, with one returning-call control and zero
+  violations (raw SHA-256
+  `7c44f2482d11652dffec416424a2cd3963a769479e2acbc5fa87d15344c0d2ea`).
+
+The parsers bind the D programs, raw files, normalized receipts, and Darwin OS
+build. On build `26A5388g`, the structural birth receipt is
+`95fe4186319da4383b83264fa7eea054f9019562ad7b59caa421eb18992b122d` and the
+terminal receipt is
+`e500c6bf4e131f724f04a2b9a0eec45337f5f170ba2a44525e4f4b7097ee1fd4`.
+These are not yet gating authorities: the hidden offline validator supplies a
+zero-valued report for structural replay, while the automatic launch path must
+bind the actual libdtrace drop/interruption report before admitting a victim
+capture. Full host tests, integration tests, focused warnings-denied clippy,
+formatting, domain lint, diff checks, and all three live DTrace fixtures passed.
+
+The lifecycle receipt closes the catalog/fork/exec prerequisite, the raw
+grammar exists, and the required Darwin birth/terminal mechanisms are now
+live-qualified standalone. None makes the current PID-only `DSRPROF1`
+native-wall stream gating-eligible. Automatic drop-aware launch qualification,
+receipt binding, `DSRPROF2` production emission, balanced kernel-state
+sampling, v2 symbol rules, and the receipt-bound Go-build capture surface
+remain absent.
+
+**Next:** make the three qualifications automatic through the same libdtrace
+consumer, retain each real drop/interruption report, and require those receipt
+hashes in DSRPROF2 header authority. Then make `native-wall.d` emit the
+birth-keyed lifecycle and complete balanced v2 kernel/off-CPU reconciliation
+and exact ownership rules before adding the Go-build `capture`/`promote-set`
+surface. Only after those gates are green should this code state be rebuilt
+into the immutable arm for two native-default and two shared captures. Those
+four profiles choose the largest repeatable opt-out translation/kernel owner;
+one narrow candidate then advances to the primary ABBA total-child-CPU gate.
 
 The ≥30% CPU goal remains open; no new paired CPU ratio has been measured.
 
