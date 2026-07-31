@@ -7919,7 +7919,12 @@ mod tests {
             let mut pipe_fds = [-1; 2];
             assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
             let pid = unsafe { libc::fork() };
-            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if pid < 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = unsafe { libc::close(pipe_fds[0]) };
+                let _ = unsafe { libc::close(pipe_fds[1]) };
+                panic!("fork failed: {error}");
+            }
             if pid == 0 {
                 let _ = unsafe { libc::close(pipe_fds[0]) };
                 loop {
