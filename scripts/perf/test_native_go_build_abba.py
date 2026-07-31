@@ -1006,6 +1006,36 @@ class CampaignContractTest(unittest.TestCase):
                 self.arm("B", receipt, candidate),
             )
 
+    def test_same_binary_accepts_declared_default_on_zero_opt_outs(self):
+        receipt = self.receipt("control")
+        candidate = self.overlay(
+            CARRICK_DSR_SHARED_TRANSLATION="1",
+            CARRICK_DSR_DIRECT_BINDINGS="1",
+        )
+
+        for key in (
+            "CARRICK_DSR_DIRECT_BYTES",
+            "CARRICK_DSR_SHARED_MANIFEST_ARC",
+            "CARRICK_DSR_SHARED_MANIFEST_FIXED",
+            "CARRICK_DSR_SHARED_SOURCE_FINGERPRINT_REUSE",
+            "CARRICK_DSR_SHARED_DYLIB_KEYED_IDENTITY",
+            "CARRICK_DSR_SHARED_RECOVERY_LAZY",
+            "CARRICK_DSR_SHARED_RECOVERY_RUNS",
+        ):
+            with self.subTest(key=key):
+                control = self.overlay(
+                    CARRICK_DSR_SHARED_TRANSLATION="1",
+                    CARRICK_DSR_DIRECT_BINDINGS="1",
+                    **{key: "0"},
+                )
+                self.assertEqual(
+                    native_go_build_abba.validate_arm_mode(
+                        self.arm("A", receipt, control),
+                        self.arm("B", receipt, candidate),
+                    ),
+                    "same-binary",
+                )
+
     def test_two_binary_mode_requires_separate_source_worktrees(self):
         control_receipt = self.receipt("control")
         candidate_receipt = dataclasses.replace(

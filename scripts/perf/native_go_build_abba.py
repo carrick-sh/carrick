@@ -74,6 +74,17 @@ MACHO_UUID_RE = re.compile(
     r"\(arm64\)(?:\s|$)"
 )
 DISABLE_CONTROL_RE = re.compile(r"^CARRICK_DISABLE_[A-Z0-9_]+$")
+DEFAULT_ON_ZERO_OPT_OUT_KEYS = frozenset(
+    (
+        "CARRICK_DSR_DIRECT_BYTES",
+        "CARRICK_DSR_SHARED_MANIFEST_ARC",
+        "CARRICK_DSR_SHARED_MANIFEST_FIXED",
+        "CARRICK_DSR_SHARED_SOURCE_FINGERPRINT_REUSE",
+        "CARRICK_DSR_SHARED_DYLIB_KEYED_IDENTITY",
+        "CARRICK_DSR_SHARED_RECOVERY_LAZY",
+        "CARRICK_DSR_SHARED_RECOVERY_RUNS",
+    )
+)
 QUAD_METRICS = (
     "cpu_s",
     "cpu_user_s",
@@ -266,10 +277,16 @@ def validate_arm_mode(control: ArmSpec, candidate: ArmSpec) -> str:
     ]
     if len(differences) == 1:
         key = differences[0]
-        if (
-            DISABLE_CONTROL_RE.fullmatch(key)
+        declared_disable = (
+            DISABLE_CONTROL_RE.fullmatch(key) is not None
             and control_environment[key] == "1"
-            and candidate_environment[key] is None
+        )
+        declared_default_on_opt_out = (
+            key in DEFAULT_ON_ZERO_OPT_OUT_KEYS
+            and control_environment[key] == "0"
+        )
+        if candidate_environment[key] is None and (
+            declared_disable or declared_default_on_opt_out
         ):
             return "same-binary"
     raise ValueError(
