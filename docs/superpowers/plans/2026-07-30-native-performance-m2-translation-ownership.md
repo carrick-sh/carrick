@@ -262,6 +262,7 @@ Co-Authored-By: Codex <codex@openai.com>"
 - Modify: `crates/carrick-dsr-aarch64/src/shared_cache.rs`
 - Modify: `crates/carrick-runtime/src/native_darwin.rs`
 - Modify: `crates/carrick-dsr-aarch64/src/mapped_memory.rs`
+- Modify: `crates/carrick-dsr/src/cache.rs`
 
 **Interfaces:**
 
@@ -290,6 +291,7 @@ struct PreparedSharedInstall {
     normalized_guest_ranges: Vec<(GuestVa, GuestVa)>,
     loaded_unit: LoadedSharedUnit,
     direct_binding: PreparedDirectBindingUnit,
+    page_dependencies: PreparedPageBlockDependencies,
     executable_range: PreparedExecutableRange,
     direct_binding_probe: DirectBindingUnitLoadedProbe,
 }
@@ -300,7 +302,6 @@ struct PreparedSharedBlock {
     published: PublishedBlock,
     sensitive: Option<((GuestVa, CodeGeneration), SensitiveMetadata)>,
     fusion_site: Option<ExclusiveFusionSite>,
-    dependency: (GuestVa, GuestVa, CodeGeneration),
     guest_ranges: Vec<Range<GuestVa>>,
     authority: SharedBlockAuthority,
 }
@@ -329,13 +330,23 @@ pub(crate) struct PreparedExecutableRange {
     node: Box<ExecutableRangeCatalogNode>,
 }
 
+pub struct PreparedPageBlockDependencies {
+    pages: Vec<PreparedPageDependencyPage>,
+}
+
+struct PreparedPageDependencyPage {
+    page: GuestVa,
+    records: Vec<(GuestVa, CodeGeneration)>,
+    existing: bool,
+}
+
 impl TranslatedRangeCatalog {
     fn dormant(private: Range<HostVa>) -> Result<Self, DsrError>;
     fn activate_if_dormant(&mut self) -> Result<(), DsrError>;
     fn replay_after_fork(&mut self) -> Result<(), DsrError>;
     fn reset_dormant_for_exec(&mut self) -> Result<(), DsrError>;
     fn prepare_shared(
-        &self,
+        &mut self,
         unit_id: TranslatedUnitId,
         range: Range<HostVa>,
     ) -> Result<CatalogSharedRange, DsrError>;
@@ -369,6 +380,14 @@ impl ExecutableRangeCatalog {
     ) -> Result<PreparedExecutableRange, DsrError>;
     fn commit_prepend(&mut self, prepared: PreparedExecutableRange);
 }
+
+impl PageBlockDependencies {
+    fn prepare_record_batch(
+        &mut self,
+        records: &[(GuestVa, GuestVa, CodeGeneration)],
+    ) -> Result<PreparedPageBlockDependencies, CacheError>;
+    fn commit_record_batch(&mut self, prepared: PreparedPageBlockDependencies);
+}
 ```
 
 - [ ] **Step 1: Add red publisher-state tests**
@@ -382,7 +401,8 @@ Cover:
 - duplicate unit identity with equal or different bounds;
 - overlap between private/shared and between two shared ranges;
 - duplicate guest starts, overlapping cache extents, empty/unaligned PC maps,
-  and nested/overlapping guest ranges that are not normalized to one union;
+  repeated-but-valid guest PCs, and nested/overlapping guest ranges that are
+  not normalized to one union;
 - sequence overflow;
 - failure in every validation, vector-reserve, block-metadata, direct-binding,
   retention, and executable-range preparation stage leaves the catalog,
@@ -459,21 +479,28 @@ let range = HostVa(unit.base)
 overlap checks, sequence assignment, every fallible
 `block.template.take_runtime_metadata`/sensitive-block planning operation, and
 all vector `try_reserve` calls without changing any logical lookup result or
-catalog frontier. It takes `&NativeMappedMemory` because generation
+catalog frontier. `TranslatedRangeCatalog::prepare_shared` takes `&mut self`
+because reserving its shared-entry vector is part of preparation; a successful
+reserve may change capacity but not catalog contents or sequence state. The
+install preparation takes `&NativeMappedMemory` because generation
 observations and `plan_block_with_segments` cannot be prepared correctly
 without the active address space. It builds every `PublishedBlock`,
-sensitive/fusion record, dependency tuple, guest range, and
-`SharedBlockAuthority` in `PreparedSharedBlock`.
+sensitive/fusion record, exact guest range, and `SharedBlockAuthority` in
+`PreparedSharedBlock`, and it aggregates dependency tuples into one prepared
+page-dependency batch.
 
 Do not derive guest extent from `block.template.source_words()`: production
 packing deliberately clears that field in `into_runtime_metadata_only`.
 Instead, derive exact four-byte guest instruction intervals from the taken
-`PcMapEntry` list, validate alignment/uniqueness and that `guest_start` is
-represented, and merge adjacent entries into per-block ranges. Prepare the
-normalized union of the existing and new guest intervals so
-`shared_guest_ranges` remains sorted and non-overlapping; commit replaces the
-old vector with that preallocated union. A single min/max interval is invalid
-when the map is non-contiguous.
+`PcMapEntry` list. Cache offsets must be aligned, in bounds, and strictly
+increasing. Guest PCs must be aligned and overflow-safe, but repeated guest PCs
+are valid for multiword lowering: sort and deduplicate them before interval
+construction. Require that `guest_start` is represented, then merge adjacent
+entries into per-block ranges. Prepare a new normalized union containing both
+the existing and new guest intervals so `shared_guest_ranges` remains sorted
+and non-overlapping; commit replaces the old vector with that complete
+preallocated union rather than appending into the destination. A single
+min/max interval is invalid when the map is non-contiguous.
 
 Strengthen `TranslationUnitManifest::validate_ranges` to reject duplicate
 guest starts and overlapping/duplicate cache extents before any preparation.
@@ -496,8 +523,15 @@ Split the current mutating helpers at their real transaction boundaries:
   stable-node slot with `try_reserve`, and allocates the boxed node while the
   old head remains published. `commit_prepend` links that node to the current
   head, retains it, and performs the release-store.
+- `PageBlockDependencies::prepare_record_batch` groups records by page, removes
+  duplicates against both existing state and the prepared batch, fallibly
+  reserves every existing per-page vector, and fully builds vectors for new
+  pages. `commit_record_batch` only extends reserved vectors or moves a complete
+  vector into the `BTreeMap`; it does not call `Vec::push` on an unreserved
+  destination.
 - Reserve `published`, `shared_published_index`, `shared_guest_ranges`, and
-  `loaded_shared_units` for the whole batch. Preflight duplicate keys against
+  `loaded_shared_units` for the whole batch, plus the shared catalog vector in
+  `TranslatedRangeCatalog::prepare_shared`. Preflight duplicate keys against
   `blocks`, `sensitive`, and `shared_blocks`, plus duplicates within the
   prepared batch. `BTreeMap` has no stable fallible-reserve API: its eventual
   inserts may terminate the process on allocator failure, but cannot return a
@@ -511,15 +545,18 @@ do not provide a cache entry or executable authority.
 
 Once preparation succeeds, `commit_shared_install` is deliberately infallible:
 it first appends/emits the authoritative typed catalog entry, then installs the
-already prepared direct-binding owner, block indexes, unit retention, and
-executable-range node. It returns no `Result`, validates nothing, and is called
-while the exclusive `ProcessState` write guard is held. Capacity-backed vector
-inserts are allocation-free; standard-library tree inserts have only the
-process-terminating allocator-failure case described above. Only after all
-logical structures are committed may the guard release and guest execution
-resume. An unexpected panic or allocator termination prevents natural trace
-completion, so it cannot publish accepted evidence. A recoverable failed load
-publishes nothing; every reachable unit was announced first.
+already prepared direct-binding owner, retained stable-pointer owners, block
+indexes, page dependencies, normalized guest-range union, and unit retention.
+The executable-range node is linked and release-published last, after every
+other logical structure is visible. It returns no `Result`, validates nothing,
+and is called while the exclusive `ProcessState` write guard is held.
+Capacity-backed vector inserts are allocation-free; standard-library tree
+inserts have only the process-terminating allocator-failure case described
+above. Only after all logical structures are committed may the guard release
+and guest execution resume. An unexpected panic or allocator termination
+prevents natural trace completion, so it cannot publish accepted evidence. A
+recoverable failed load publishes nothing; every reachable unit was announced
+first.
 
 `PreparedSharedInstall` carries the originating `tid`; the compatibility
 `DirectBindingUnitLoaded` event uses that exact value after the prepared
