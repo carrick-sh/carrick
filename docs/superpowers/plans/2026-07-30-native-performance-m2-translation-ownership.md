@@ -644,6 +644,16 @@ shared entries, resets the sequence frontier, becomes dormant, and emits
 nothing. A fresh replacement translator stays dormant without advancing or
 overflow-checking the retiring catalog.
 
+The prepared-reset half is accepted in `44c3bd6c`, `a6b1d9d6`, and
+`5889fa17`. The prepared authority retains both the `ProcessState` writer and
+an immutable borrow of the exact surviving thread across
+`arm_prepared_adoptions`, so neither the lease/catalog census nor token
+generation can change before its infallible commit. Token mint reserves both
+generation advances needed by a successful exec; `MAX-1` therefore rejects
+before cache mutation or PONR. The composed fork/inherited-exec fixture runs
+real child repair and proves catalog epochs `1 -> 2 -> 3` under bounded,
+process-group-contained supervision. Independent final re-review is clean.
+
 At the successful active handoff in `native_darwin.rs`, activate the selected
 translator exactly once, then republish host image base/catalog and guest
 compatibility metadata under the new image/runtime key. Production self-reexec
