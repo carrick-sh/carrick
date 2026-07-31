@@ -1,8 +1,8 @@
 # Native-lane performance handoff
 
 **Date:** 2026-07-31
-**Branch:** `codex/native-performance-m1` (M2 lifecycle checkpoint
-`e85e8a3b`; M1 correctness checkpoint `5020e509`)
+**Branch:** `codex/native-performance-m1` (M2 raw-v2 parser checkpoint
+`c035f89a`; M1 correctness checkpoint `5020e509`)
 **Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
 default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
@@ -19,7 +19,7 @@ its ignored raw trace receipts remain under `target/perf/`.
 
 ---
 
-## Current checkpoint — M2 lifecycle gate accepted, attribution next
+## Current checkpoint — M2 lifecycle accepted, raw-v2 parser landed
 
 M2 now has an accepted process-owned translated-range catalog through the
 first real shared-code consumer, checked post-fork replay, and atomic inherited
@@ -168,19 +168,39 @@ that completes inside the maintained 30-second DTrace bound. Focused gates
 passed 59 lifecycle tests, 61 ABBA tests, Python compilation, formatting, and
 diff checks; the live receipt was independently reloaded and revalidated.
 
-This lifecycle receipt closes the catalog/fork/exec prerequisite, but it does
-not make the current PID-only `DSRPROF1` native-wall stream gating-eligible.
-Repository verification after acceptance confirmed that the approved
-birth-keyed `DSRPROF2` grammar, launch-time birth/terminal qualification,
-balanced kernel transition state, v2 symbol rules, and receipt-bound Go-build
-capture surface are still absent.
+Commit `c035f89a` adds the first `DSRPROF2` implementation slice. A hidden
+`__native-profile-validate` harness and its shared parser implementation now
+fail closed
+over typed `(pid, start_sec, start_usec, image_generation, runtime_epoch)`
+identity, exact fork frontiers, fresh-epoch child replay, failed and successful
+exec, contiguous private/shared range catalogs, balanced kernel transitions,
+latched off-CPU episodes, exact stack blocks, and natural process-tree
+completion. The literal target/child fixture passes; more than thirty isolated
+birth, frontier, replay, range, exec, kernel, off-CPU, delimiter, drop, and
+completion corruptions reject. Existing `DSRPROF1` parsing remains unchanged.
+Focused integration and unit suites, warnings-denied clippy, formatting,
+typed-domain lint, and diff checks passed.
 
-**Next:** execute M2 Tasks 3–5 in the approved translation-ownership plan,
-then add the Go-build `capture`/`promote-set` wrapper surface. Only after those
-gates are green should this same signed code state be rebuilt into the
-immutable arm for two native-default and two shared captures. Those four
-profiles choose the largest repeatable opt-out translation/kernel owner; one
-narrow candidate then advances to the primary ABBA total-child-CPU gate.
+This is still structural validation, not a gating-eligible v2 profile. The
+header hashes have syntax authority, but launch-time birth and terminal
+qualification receipts do not yet bind their values; `native-wall.d` still
+emits PID-only `DSRPROF1`, and v2 summary publication remains absent.
+
+This lifecycle receipt closes the catalog/fork/exec prerequisite, and the raw
+grammar now exists, but neither makes the current PID-only `DSRPROF1`
+native-wall stream gating-eligible. Launch-time birth/terminal qualification,
+`DSRPROF2` production emission, balanced kernel-state sampling, v2 symbol
+rules, and the receipt-bound Go-build capture surface remain absent.
+
+**Next:** finish M2 Task 3 by adding launch-time process-birth and terminal-call
+qualification through the same libdtrace launch path, bind both receipt hashes
+into parser authority, and make `native-wall.d` emit the validated lifecycle.
+Then complete balanced v2 kernel/off-CPU reconciliation and exact ownership
+rules before adding the Go-build `capture`/`promote-set` surface. Only after
+those gates are green should this code state be rebuilt into the immutable arm
+for two native-default and two shared captures. Those four profiles choose the
+largest repeatable opt-out translation/kernel owner; one narrow candidate then
+advances to the primary ABBA total-child-CPU gate.
 
 The ≥30% CPU goal remains open; no new paired CPU ratio has been measured.
 
