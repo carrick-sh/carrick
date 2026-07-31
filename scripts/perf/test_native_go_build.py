@@ -72,6 +72,45 @@ class NativeGoBuildTest(unittest.TestCase):
         self.assertIn('GOCACHE="/tmp/gc-$CARRICK_RUN_ID"', rendered)
         self.assertNotIn("docker", rendered.lower())
 
+    def test_carrick_command_forwards_one_auditable_insecure_registry(self):
+        image = (
+            "localhost:5005/carrick-go-conformance@sha256:" + "4" * 64
+        )
+        transport = native_go_build.RegistryTransport(
+            registry="localhost:5005",
+            insecure=True,
+        )
+
+        command = native_go_build.build_command(
+            pathlib.Path("/repo"),
+            "carrick",
+            "run-c",
+            binary=pathlib.Path("/immutable/carrick"),
+            image=image,
+            registry_transport=transport,
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "/immutable/carrick",
+                "run",
+                "--exec-backend",
+                "native",
+                "--forward-env",
+                "CARRICK_INSECURE_REGISTRIES=localhost:5005",
+                "-e",
+                "CARRICK_RUN_ID=run-c",
+                "-w",
+                "/tmp",
+                image,
+                "/bin/sh",
+                "-c",
+                native_go_build.guest_script(),
+            ],
+        )
+        self.assertEqual(command.count("--forward-env"), 1)
+
     def test_five_sample_median_is_middle_value(self):
         self.assertEqual(native_go_build.median_ms([21, 18, 30, 19, 20]), 20)
 
@@ -373,12 +412,24 @@ class NativeGoBuildTest(unittest.TestCase):
         )
         binary = pathlib.Path("/immutable/A/carrick")
         image = "localhost:5005/carrick-go-conformance:immutable-a"
+        transport = native_go_build.RegistryTransport(
+            registry="localhost:5005",
+            insecure=True,
+        )
+        transport_evidence = {
+            "schema": "carrick.registry-transport.v1",
+            "registry": "localhost:5005",
+            "protocol": "http",
+            "forward_env": "CARRICK_INSECURE_REGISTRIES=localhost:5005",
+        }
         default_binary = harness / "target/release/carrick"
         original_run = native_go_build.subprocess.run
+        workload_environments = []
 
         def run_workload_or_real(*args, **kwargs):
             command = args[0]
             if command[0] == str(binary.resolve()):
+                workload_environments.append(dict(kwargs["env"]))
                 return subprocess.CompletedProcess(
                     command,
                     0,
@@ -414,14 +465,25 @@ class NativeGoBuildTest(unittest.TestCase):
                 timeout_seconds=5,
                 binary=binary,
                 image=image,
+                registry_transport=transport,
                 current_run_id="run-c1",
             )
 
         self.assertEqual(sample["run_id"], "run-c1")
         self.assertEqual(sample["command"]["argv"][0], str(binary.resolve()))
-        self.assertEqual(sample["command"]["argv"][8], image)
+        self.assertEqual(sample["command"]["argv"][4:6], [
+            "--forward-env",
+            "CARRICK_INSECURE_REGISTRIES=localhost:5005",
+        ])
+        self.assertEqual(sample["command"]["argv"][10], image)
+        self.assertEqual(sample["registry_transport"], transport_evidence)
         self.assertEqual(sample["binary_path"], str(binary.resolve()))
         self.assertEqual(sample["binary_sha256"], "a" * 64)
+        self.assertEqual(len(workload_environments), 1)
+        self.assertNotIn(
+            "CARRICK_INSECURE_REGISTRIES",
+            workload_environments[0],
+        )
         for provenance in (
             sample["provenance"]["pre"],
             sample["provenance"]["post"],
@@ -429,6 +491,10 @@ class NativeGoBuildTest(unittest.TestCase):
             self.assertEqual(provenance["binary_path"], str(binary.resolve()))
             self.assertEqual(provenance["binary_sha256"], "a" * 64)
             self.assertEqual(provenance["image_ref"], image)
+            self.assertEqual(
+                provenance["registry_transport"],
+                transport_evidence,
+            )
 
     def test_timeout_becomes_complete_sample_evidence_after_cleanup(self):
         directory, _ = self.install_fake_docker("arm64")
