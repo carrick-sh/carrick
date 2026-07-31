@@ -46,6 +46,8 @@ dtrace:::BEGIN
     lifecycle_ordinal = (uint64_t)0;
     lifecycle_root_pid = (pid_t)0;
     lifecycle_child_pid = (pid_t)0;
+    lifecycle_child_ns_pid = (uint64_t)0;
+    launcher_ready_seen = 0;
     lifecycle_target_birth = 0;
     lifecycle_child_birth = 0;
     parent_private_start = (uint64_t)0;
@@ -130,6 +132,38 @@ dtrace:::BEGIN
 }
 
 /*
+ * main() fires phase 27 after registering the DOF providers. This is the
+ * launcher's only valid pre-root lifecycle event and is the authority that
+ * DTrace attached before the native owner was forked.
+ *
+ * Keep rejection first: the valid clause changes launcher_ready_seen.
+ */
+carrick*:::dsr-cache-lifecycle
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target)) &&
+    !(pid == $target && (int)arg0 == pid && (int)arg1 == 27 &&
+    (uint64_t)arg2 == (uint64_t)0 &&
+    (uint64_t)arg3 == (uint64_t)0 &&
+    (uint64_t)arg4 == (uint64_t)0 && launcher_ready_seen == 0)/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::dsr-cache-lifecycle
+/lifecycle_root_pid == (pid_t)0 && pid == $target &&
+    (int)arg0 == pid && (int)arg1 == 27 &&
+    (uint64_t)arg2 == (uint64_t)0 &&
+    (uint64_t)arg3 == (uint64_t)0 &&
+    (uint64_t)arg4 == (uint64_t)0 && launcher_ready_seen == 0/
+{
+    launcher_ready_seen++;
+    lifecycle_ordinal++;
+    printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|kind=launcher-ready|pid=%d|incarnation=0|generation=0|epoch=0|phase=27\n",
+        lifecycle_ordinal, pid);
+}
+
+/*
  * `$target` is the `carrick trace` launcher, not the native catalog owner.
  * Discover the owner from the first in-scope descendant catalog reset. This
  * clause precedes every other reset clause so the same epoch-1 probe can seed
@@ -137,7 +171,8 @@ dtrace:::BEGIN
  */
 carrick*:::host-translated-range-reset
 /lifecycle_root_pid == (pid_t)0 && pid != $target && ppid == $target &&
-    progenyof($target) && (uint64_t)arg0 == (uint64_t)1/
+    progenyof($target) && (uint64_t)arg0 == (uint64_t)1 &&
+    launcher_ready_seen == 1/
 {
     this->root_pid = (pid_t)pid;
     lifecycle_root_pid = this->root_pid;
@@ -220,14 +255,6 @@ carrick*:::host-translated-range-ready
     identity_violations++;
 }
 
-carrick*:::dsr-cache-lifecycle
-/lifecycle_root_pid == (pid_t)0 &&
-    (pid == $target || progenyof($target))/
-{
-    unexpected_events++;
-    identity_violations++;
-}
-
 carrick*:::fork-post
 /lifecycle_root_pid == (pid_t)0 &&
     (pid == $target || progenyof($target))/
@@ -300,6 +327,44 @@ carrick*:::guest-exit
     identity_violations++;
 }
 
+carrick*:::fork-lifecycle
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+/*
+ * Native fork phase 104 is parent-side pre-fork bookkeeping. Its `a` value
+ * is the namespace-local child PID allocated before libc::fork, while
+ * proc:::create/fork-post identify the distinct host child PID.
+ *
+ * Keep the rejection clause first: DTrace evaluates same-probe clauses in
+ * program order, so the valid clause may publish the binding afterward
+ * without making that same firing look like a duplicate.
+ */
+carrick*:::fork-lifecycle
+/pid == lifecycle_root_pid && tracked[pid] &&
+    (int)arg0 == 0 && (int)arg1 == 104 &&
+    !(lifecycle_stage[pid, incarnation[pid]] == 5 &&
+    lifecycle_child_ns_pid == (uint64_t)0 &&
+    (int64_t)arg3 > 0 && (int64_t)arg4 == 0)/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::fork-lifecycle
+/pid == lifecycle_root_pid && tracked[pid] &&
+    (int)arg0 == 0 && (int)arg1 == 104 &&
+    lifecycle_stage[pid, incarnation[pid]] == 5 &&
+    lifecycle_child_ns_pid == (uint64_t)0 &&
+    (int64_t)arg3 > 0 && (int64_t)arg4 == 0/
+{
+    lifecycle_child_ns_pid = (uint64_t)arg3;
+}
+
 proc:::create
 /tracked[pid]/
 {
@@ -345,13 +410,14 @@ proc:::create
 }
 
 proc:::create
-/birth_valid[args[0]->pr_pid, incarnation[args[0]->pr_pid]] == 1/
+/birth_valid[args[0]->pr_pid, incarnation[args[0]->pr_pid]] == 1 &&
+    lifecycle_child_ns_pid > (uint64_t)0/
 {
     lifecycle_child_birth++;
     lifecycle_ordinal++;
-    printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|kind=child-birth|pid=%d|incarnation=%d|generation=1|epoch=1|parent_pid=%d\n",
+    printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|kind=child-birth|pid=%d|incarnation=%d|generation=1|epoch=1|ns_pid=%d|parent_pid=%d\n",
         lifecycle_ordinal, args[0]->pr_pid,
-        incarnation[args[0]->pr_pid], pid);
+        incarnation[args[0]->pr_pid], lifecycle_child_ns_pid, pid);
 }
 
 /* guest-exit arg0 is the host pid and arg1 is the guest exit code. */
@@ -1611,12 +1677,15 @@ carrick*:::dsr-run-begin
 carrick*:::syscall-return
 /pid == lifecycle_root_pid && tracked[pid] && (uint64_t)arg0 == (uint64_t)260 &&
     (int)arg2 != 0 &&
-    !(lifecycle_stage[pid, incarnation[pid]] == 5 &&
+    !((lifecycle_stage[pid, incarnation[pid]] == 5 &&
     lifecycle_child_pid > 0 && child_exit_seen == 1 &&
     lifecycle_stage[lifecycle_child_pid,
         incarnation[lifecycle_child_pid]] == 22 &&
-    (int)arg2 == lifecycle_child_pid && (int)arg3 == 0 &&
-    wait4_success == 0)/
+    lifecycle_child_ns_pid > (uint64_t)0 &&
+    (int)arg2 == (int)lifecycle_child_ns_pid && (int)arg3 == 0 &&
+    wait4_success == 0) ||
+    (lifecycle_stage[pid, incarnation[pid]] == 6 &&
+    wait4_success == 1 && (int)arg2 == -10 && (int)arg3 == 10))/
 {
     unexpected_events++;
     identity_violations++;
@@ -1629,15 +1698,16 @@ carrick*:::syscall-return
     lifecycle_child_pid > 0 && child_exit_seen == 1 &&
     lifecycle_stage[lifecycle_child_pid,
         incarnation[lifecycle_child_pid]] == 22 &&
-    (int)arg2 == lifecycle_child_pid && (int)arg3 == 0 &&
+    lifecycle_child_ns_pid > (uint64_t)0 &&
+    (int)arg2 == (int)lifecycle_child_ns_pid && (int)arg3 == 0 &&
     wait4_success == 0/
 {
     wait4_success++;
     lifecycle_stage[pid, incarnation[pid]] = 6;
     lifecycle_ordinal++;
-    printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|kind=parent-wait4|pid=%d|incarnation=%d|generation=1|epoch=1|child_pid=%d|retval=%d|errno=0\n",
+    printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|kind=parent-wait4|pid=%d|incarnation=%d|generation=1|epoch=1|child_pid=%d|child_ns_pid=%d|retval=%d|errno=0\n",
         lifecycle_ordinal, pid, incarnation[pid], lifecycle_child_pid,
-        (int)arg2);
+        lifecycle_child_ns_pid, (int)arg2);
 }
 
 dtrace:::DROP
@@ -1685,7 +1755,8 @@ dtrace:::END
     metadata_ok = metadata_complete[lifecycle_child_pid,
         incarnation[lifecycle_child_pid], (uint64_t)2, (uint64_t)1];
     lifecycle_ok = complete == 1 && root_exit_status == 0 &&
-        lifecycle_target_birth == 1 && lifecycle_child_birth == 1 &&
+        launcher_ready_seen == 1 && lifecycle_target_birth == 1 &&
+        lifecycle_child_birth == 1 &&
         parent_catalog_ok == 1 && child_preexec_catalog_ok == 1 &&
         child_postexec_catalog_ok == 1 &&
         parent_run == 1 && child_preexec_run == 1 &&
@@ -1717,7 +1788,7 @@ dtrace:::END
         run_order_violations == 0 && run_range_violations == 0 &&
         pending_collisions == 0 && exited_pending == 0 &&
         reset_with_pending == 0 &&
-        lifecycle_ordinal == (uint64_t)29 &&
+        lifecycle_ordinal == (uint64_t)30 &&
         lifecycle_stage[lifecycle_root_pid,
             incarnation[lifecycle_root_pid]] == 7 &&
         lifecycle_stage[lifecycle_child_pid,

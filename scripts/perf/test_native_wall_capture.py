@@ -35,13 +35,13 @@ def load_capture_module():
     return module
 
 
-GOOD_EVENTS = [
+_ROOT_EVENTS = [
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=1|kind=target-birth|pid=100|incarnation=1|generation=1|epoch=0|launcher_pid=99",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=2|kind=parent-reset|pid=100|incarnation=1|generation=1|epoch=1",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=3|kind=parent-private|pid=100|incarnation=1|generation=1|epoch=1|sequence=1|start=0x1000|end=0x2000",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=4|kind=parent-ready|pid=100|incarnation=1|generation=1|epoch=1|frontier=1",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=5|kind=parent-first-run|pid=100|incarnation=1|generation=1|epoch=1|cache_pc=0x1100",
-    "TRANSLATED_LIFECYCLE|schema=1|ordinal=6|kind=child-birth|pid=101|incarnation=1|generation=1|epoch=1|parent_pid=100",
+    "TRANSLATED_LIFECYCLE|schema=1|ordinal=6|kind=child-birth|pid=101|incarnation=1|generation=1|epoch=1|ns_pid=2|parent_pid=100",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=7|kind=fork-repair-begin|pid=101|incarnation=1|generation=1|epoch=1",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=8|kind=child-preexec-reset|pid=101|incarnation=1|generation=1|epoch=2",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=9|kind=child-preexec-private|pid=101|incarnation=1|generation=1|epoch=2|sequence=1|start=0x1000|end=0x2000",
@@ -63,8 +63,16 @@ GOOD_EVENTS = [
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=25|kind=host-jit-range|pid=101|incarnation=1|generation=2|epoch=1|start=0x3000|end=0x4000",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=26|kind=child-postexec-first-run|pid=101|incarnation=1|generation=2|epoch=1|cache_pc=0x3100",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=27|kind=child-exit|pid=101|incarnation=1|generation=2|epoch=1|status=0",
-    "TRANSLATED_LIFECYCLE|schema=1|ordinal=28|kind=parent-wait4|pid=100|incarnation=1|generation=1|epoch=1|child_pid=101|retval=101|errno=0",
+    "TRANSLATED_LIFECYCLE|schema=1|ordinal=28|kind=parent-wait4|pid=100|incarnation=1|generation=1|epoch=1|child_pid=101|child_ns_pid=2|retval=2|errno=0",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=29|kind=root-exit|pid=100|incarnation=1|generation=1|epoch=1|status=0",
+]
+GOOD_EVENTS = [
+    "TRANSLATED_LIFECYCLE|schema=1|ordinal=1|kind=launcher-ready|pid=99|"
+    "incarnation=0|generation=0|epoch=0|phase=27",
+    *[
+        event.replace(f"ordinal={index}", f"ordinal={index + 1}", 1)
+        for index, event in enumerate(_ROOT_EVENTS, start=1)
+    ],
 ]
 
 GOOD_SUMMARY = (
@@ -173,7 +181,26 @@ class LifecycleTraceFixtureTests(unittest.TestCase):
         self.assertEqual(parsed["lifecycle_ok"], 1)
         self.assertEqual(parsed["target_pid"], 100)
         self.assertEqual(parsed["child_pid"], 101)
-        self.assertEqual(parsed["event_count"], 29)
+        self.assertEqual(parsed["child_ns_pid"], 2)
+        self.assertEqual(parsed["event_count"], 30)
+
+    def test_accepts_transport_reordering_by_wire_ordinal(self) -> None:
+        reordered = [
+            GOOD_EVENTS[6],
+            *GOOD_EVENTS[:6],
+            *GOOD_EVENTS[7:],
+        ]
+
+        parsed = self.module().parse_lifecycle_trace(good_trace(reordered))
+
+        self.assertEqual(parsed["lifecycle_ok"], 1)
+        self.assertEqual(parsed["event_count"], 30)
+
+    def test_wait4_reap_uses_bound_namespace_pid(self) -> None:
+        parsed = self.module().parse_lifecycle_trace(good_trace())
+
+        self.assertEqual(parsed["child_pid"], 101)
+        self.assertEqual(parsed["child_ns_pid"], 2)
 
     def test_trace_target_is_discovered_root_not_trace_launcher(self) -> None:
         contract = self.module().validate_dtrace_source(
@@ -187,23 +214,51 @@ class LifecycleTraceFixtureTests(unittest.TestCase):
         self.assertEqual(parsed["launcher_pid"], 99)
         self.assertNotEqual(parsed["target_pid"], parsed["launcher_pid"])
 
+    def test_launcher_probe_readiness_is_an_explicit_milestone(self) -> None:
+        parsed = self.module().parse_lifecycle_trace(good_trace())
+        contract = self.module().validate_dtrace_source(
+            DTRACE_SCRIPT_PATH.read_text()
+        )
+
+        self.assertEqual(parsed["launcher_pid"], 99)
+        self.assertEqual(parsed["event_count"], 30)
+        self.assertEqual(contract["launcher_ready_handshake"], 1)
+
+    def test_rejects_drifted_launcher_probe_readiness(self) -> None:
+        module = self.module()
+        cases = {
+            "wrong launcher": GOOD_EVENTS[0].replace("pid=99", "pid=98"),
+            "wrong phase": GOOD_EVENTS[0].replace("phase=27", "phase=26"),
+            "live incarnation": GOOD_EVENTS[0].replace(
+                "incarnation=0", "incarnation=1"
+            ),
+            "unexpected field": GOOD_EVENTS[0] + "|fixture=1",
+        }
+        for label, launcher_ready in cases.items():
+            with self.subTest(label=label):
+                events = [launcher_ready, *GOOD_EVENTS[1:]]
+                with self.assertRaisesRegex(
+                    module.EvidenceError, "launcher-ready|typed phase"
+                ):
+                    module.parse_lifecycle_trace(good_trace(events))
+
     def test_rejects_missing_or_equal_trace_launcher_identity(self) -> None:
         module = self.module()
         cases = {
-            "missing": GOOD_EVENTS[0].replace("|launcher_pid=99", ""),
-            "same as root": GOOD_EVENTS[0].replace("launcher_pid=99", "launcher_pid=100"),
-            "same as child": GOOD_EVENTS[0].replace("launcher_pid=99", "launcher_pid=101"),
-            "unexpected field": GOOD_EVENTS[0] + "|fixture=1",
+            "missing": GOOD_EVENTS[1].replace("|launcher_pid=99", ""),
+            "same as root": GOOD_EVENTS[1].replace("launcher_pid=99", "launcher_pid=100"),
+            "same as child": GOOD_EVENTS[1].replace("launcher_pid=99", "launcher_pid=101"),
+            "unexpected field": GOOD_EVENTS[1] + "|fixture=1",
         }
         for label, target_birth in cases.items():
             with self.subTest(label=label):
-                events = [target_birth, *GOOD_EVENTS[1:]]
+                events = [GOOD_EVENTS[0], target_birth, *GOOD_EVENTS[2:]]
                 with self.assertRaisesRegex(
                     module.EvidenceError, "launcher|target-birth.*field"
                 ):
                     module.parse_lifecycle_trace(good_trace(events))
 
-    def test_rejects_missing_duplicate_and_reordered_milestones(self) -> None:
+    def test_rejects_missing_and_duplicate_milestones(self) -> None:
         module = self.module()
         for index, event in enumerate(GOOD_EVENTS):
             kind = event.split("|kind=", 1)[1].split("|", 1)[0]
@@ -215,12 +270,15 @@ class LifecycleTraceFixtureTests(unittest.TestCase):
                 mutated = GOOD_EVENTS[:index] + [event, event] + GOOD_EVENTS[index + 1 :]
                 with self.assertRaisesRegex(module.EvidenceError, kind):
                     module.parse_lifecycle_trace(good_trace(mutated))
-            if index:
-                with self.subTest(kind=kind, mutation="reordered"):
-                    mutated = list(GOOD_EVENTS)
-                    mutated[index - 1], mutated[index] = mutated[index], mutated[index - 1]
-                    with self.assertRaisesRegex(module.EvidenceError, "order|ordinal"):
-                        module.parse_lifecycle_trace(good_trace(mutated))
+
+    def test_rejects_semantic_reorder_encoded_by_wire_ordinals(self) -> None:
+        module = self.module()
+        mutated = list(GOOD_EVENTS)
+        mutated[1] = mutated[1].replace("|ordinal=2|", "|ordinal=3|")
+        mutated[2] = mutated[2].replace("|ordinal=3|", "|ordinal=2|")
+
+        with self.assertRaisesRegex(module.EvidenceError, "order"):
+            module.parse_lifecycle_trace(good_trace(mutated))
 
     def test_rejects_stale_postexec_metadata_generation(self) -> None:
         module = self.module()
@@ -540,7 +598,7 @@ class LifecycleCaptureFixtureTests(unittest.TestCase):
         run_id = "native-m2-lifecycle-12345678-1234-4678-9234-567812345678"
         self.assertEqual(payload["run_id"], run_id)
         self.assertEqual(
-            payload["schema"], "carrick.native-m2-lifecycle-capture.v3"
+            payload["schema"], "carrick.native-m2-lifecycle-capture.v4"
         )
         self.assertEqual(payload["dof"], self.boundary.dof)
         self.assertEqual(payload["lifecycle_summary"]["launcher_pid"], 99)
@@ -1114,13 +1172,19 @@ class DTraceSourceContractTests(unittest.TestCase):
         discovery = (
             "carrick*:::host-translated-range-reset\n"
             "/lifecycle_root_pid == (pid_t)0 && pid != $target && ppid == $target &&\n"
-            "    progenyof($target) && (uint64_t)arg0 == (uint64_t)1/"
+            "    progenyof($target) && (uint64_t)arg0 == (uint64_t)1 &&\n"
+            "    launcher_ready_seen == 1/"
         )
         self.assertIn(discovery, self.source)
         self.assertIn("    this->root_pid = (pid_t)pid;", self.source)
         self.assertIn("    lifecycle_root_pid = this->root_pid;", self.source)
         self.assertNotIn("tracked[$target]", self.source)
         self.assertNotIn("incarnation[$target]", self.source)
+
+    def test_static_contract_binds_namespace_pid_before_host_fork(self) -> None:
+        contract = self.module.validate_dtrace_source(self.source)
+
+        self.assertEqual(contract["namespace_pid_binding"], 1)
 
     def test_static_contract_rejects_weakened_root_discovery(self) -> None:
         mutations = (
@@ -1140,9 +1204,11 @@ class DTraceSourceContractTests(unittest.TestCase):
                 "direct child|root discovery",
             ),
             (
-                "(uint64_t)arg0 == (uint64_t)1/\n{\n"
+                "(uint64_t)arg0 == (uint64_t)1 &&\n"
+                "    launcher_ready_seen == 1/\n{\n"
                 "    this->root_pid = (pid_t)pid;",
-                "(uint64_t)arg0 == (uint64_t)2/\n{\n"
+                "(uint64_t)arg0 == (uint64_t)2 &&\n"
+                "    launcher_ready_seen == 1/\n{\n"
                 "    this->root_pid = (pid_t)pid;",
                 "epoch|root discovery",
             ),
@@ -1227,15 +1293,19 @@ class DTraceSourceContractTests(unittest.TestCase):
         guard = (
             "carrick*:::dsr-cache-lifecycle\n"
             "/lifecycle_root_pid == (pid_t)0 &&\n"
-            "    (pid == $target || progenyof($target))/\n"
+            "    (pid == $target || progenyof($target)) &&\n"
+            "    !(pid == $target && (int)arg0 == pid && (int)arg1 == 27 &&\n"
+            "    (uint64_t)arg2 == (uint64_t)0 &&\n"
+            "    (uint64_t)arg3 == (uint64_t)0 &&\n"
+            "    (uint64_t)arg4 == (uint64_t)0 && launcher_ready_seen == 0)/\n"
             "{\n"
             "    unexpected_events++;\n"
             "    identity_violations++;\n"
             "}"
         )
         neutralized = guard.replace(
-            "(pid == $target || progenyof($target))/",
-            "(pid == $target || progenyof($target)) &&\n"
+            "launcher_ready_seen == 0)/",
+            "launcher_ready_seen == 0) &&\n"
             "    (uint64_t)0 == (uint64_t)1/",
         )
         weakened = self.source.replace(guard, neutralized, 1)
@@ -1243,7 +1313,7 @@ class DTraceSourceContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             self.module.EvidenceError,
-            "pre-discovery lifecycle rejection.*dsr-cache-lifecycle",
+            "launcher readiness rejection",
         ):
             self.module.validate_dtrace_source(weakened)
 
@@ -1251,7 +1321,11 @@ class DTraceSourceContractTests(unittest.TestCase):
         guard = (
             "carrick*:::dsr-cache-lifecycle\n"
             "/lifecycle_root_pid == (pid_t)0 &&\n"
-            "    (pid == $target || progenyof($target))/\n"
+            "    (pid == $target || progenyof($target)) &&\n"
+            "    !(pid == $target && (int)arg0 == pid && (int)arg1 == 27 &&\n"
+            "    (uint64_t)arg2 == (uint64_t)0 &&\n"
+            "    (uint64_t)arg3 == (uint64_t)0 &&\n"
+            "    (uint64_t)arg4 == (uint64_t)0 && launcher_ready_seen == 0)/\n"
             "{\n"
             "    unexpected_events++;\n"
             "    identity_violations++;\n"
@@ -1268,7 +1342,7 @@ class DTraceSourceContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             self.module.EvidenceError,
-            "pre-discovery lifecycle rejection.*dsr-cache-lifecycle",
+            "launcher readiness rejection",
         ):
             self.module.validate_dtrace_source(weakened)
 
