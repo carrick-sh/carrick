@@ -699,6 +699,7 @@ class CampaignContractTest(unittest.TestCase):
         transport_evidence = native_go_build.registry_transport_evidence(
             transport
         )
+        assert transport_evidence is not None
         provenance = {
             "git_commit": "9" * 40,
             "git_status": [],
@@ -711,7 +712,6 @@ class CampaignContractTest(unittest.TestCase):
             },
             "image_ref": executed_image_ref,
             "image": self.image_identity(receipt),
-            "registry_transport": transport_evidence,
             "controlled_environment": environment,
             "foreign_processes": [],
             "docker_oracles": [],
@@ -747,10 +747,16 @@ class CampaignContractTest(unittest.TestCase):
             },
             "environment_overlay": environment,
             "controlled_environment": environment,
-            "registry_transport": transport_evidence,
+            "registry_transport": dict(transport_evidence),
             "provenance": {
-                "pre": dict(provenance),
-                "post": dict(provenance),
+                "pre": {
+                    **provenance,
+                    "registry_transport": dict(transport_evidence),
+                },
+                "post": {
+                    **provenance,
+                    "registry_transport": dict(transport_evidence),
+                },
             },
             "cleanup": {"status": 0, "stdout": "", "stderr": ""},
             "stdout": stdout,
@@ -1549,6 +1555,112 @@ class CampaignContractTest(unittest.TestCase):
         )
         self.assertIsNone(artifact["failure"]["sample"])
 
+    def test_preflight_registry_transport_drift_preserves_partial_artifact(self):
+        receipt = self.receipt("control")
+        control = self.arm("A", receipt)
+        candidate = self.arm("B", receipt)
+        original_preflight = native_go_build_abba._campaign_preflight
+        expected_transport = {
+            "schema": "carrick.registry-transport.v1",
+            "registry": "localhost:5005",
+            "protocol": "http",
+            "forward_env": "CARRICK_INSECURE_REGISTRIES=localhost:5005",
+        }
+        scenarios = (
+            {
+                "name": "initial",
+                "drift_call": 1,
+                "reason": (
+                    "registry transport drifted from campaign image identity"
+                ),
+                "sample_phases": [],
+                "recorded_preflight_registry": "attacker.invalid:5000",
+            },
+            {
+                "name": "quad",
+                "drift_call": 2,
+                "reason": "registry transport drifted before quad",
+                "sample_phases": ["warmup", "warmup"],
+                "recorded_preflight_registry": "localhost:5005",
+            },
+        )
+        for scenario in scenarios:
+            with self.subTest(name=scenario["name"]):
+                output = self.root / f"preflight-{scenario['name']}-drift.json"
+                positions = native_go_build_abba._campaign_positions(8)
+                preflight_calls = 0
+                sample_calls = 0
+
+                def preflight_with_drift(*args, **kwargs):
+                    nonlocal preflight_calls
+                    preflight_calls += 1
+                    result = original_preflight(*args, **kwargs)
+                    if preflight_calls != scenario["drift_call"]:
+                        return result
+                    return {
+                        **result,
+                        "registry_transport": {
+                            **result["registry_transport"],
+                            "registry": "attacker.invalid:5000",
+                        },
+                    }
+
+                def run_sample(_repo, _engine, index, _timeout, **kwargs):
+                    nonlocal sample_calls
+                    position = positions[sample_calls]
+                    sample_calls += 1
+                    arm = control if position["arm"] == "A" else candidate
+                    return self.sample(
+                        arm,
+                        index=index,
+                        run_id=kwargs["current_run_id"],
+                        image_ref=kwargs["image"],
+                        registry_transport=kwargs["registry_transport"],
+                    )
+
+                with (
+                    self.campaign_fixtures(control, candidate, run_sample),
+                    mock.patch.object(
+                        native_go_build_abba,
+                        "_campaign_preflight",
+                        side_effect=preflight_with_drift,
+                    ),
+                    self.assertRaisesRegex(
+                        native_go_build_abba.CampaignEvidenceError,
+                        scenario["reason"],
+                    ),
+                ):
+                    native_go_build_abba.run_campaign(
+                        self.root,
+                        control,
+                        candidate,
+                        output,
+                    )
+
+                artifact = json.loads(output.read_text())
+                self.assertFalse(artifact["complete"])
+                self.assertFalse(artifact["accepted"])
+                self.assertEqual(
+                    artifact["identity"]["registry_transport"],
+                    expected_transport,
+                )
+                self.assertEqual(
+                    [sample["phase"] for sample in artifact["samples"]],
+                    scenario["sample_phases"],
+                )
+                self.assertIsNone(artifact["failure"]["sample"])
+                self.assertEqual(
+                    artifact["failure"]["reason"],
+                    scenario["reason"],
+                )
+                self.assertEqual(len(artifact["preflights"]), 1)
+                self.assertEqual(
+                    artifact["preflights"][0]["registry_transport"][
+                        "registry"
+                    ],
+                    scenario["recorded_preflight_registry"],
+                )
+
     def test_run_image_reference_id_and_digest_must_match_both_receipts(self):
         receipt = self.receipt("control")
         control = self.arm("A", receipt)
@@ -2171,15 +2283,6 @@ class CampaignContractTest(unittest.TestCase):
                 10,
                 "localhost:5005/carrick-go-conformance@sha256:" + "0" * 64,
             ),
-            "registry transport": lambda row: row["registry_transport"].update(
-                {"registry": "attacker.invalid:5000"}
-            ),
-            "pre registry transport": lambda row: row["provenance"]["pre"][
-                "registry_transport"
-            ].update({"registry": "attacker.invalid:5000"}),
-            "post registry transport": lambda row: row["provenance"]["post"][
-                "registry_transport"
-            ].update({"registry": "attacker.invalid:5000"}),
             "overlay": lambda row: row["environment_overlay"].update(
                 {"CARRICK_DSR_PROFILE": "1"}
             ),
@@ -2223,6 +2326,68 @@ class CampaignContractTest(unittest.TestCase):
                 artifact = json.loads(output.read_text())
                 self.assertEqual(artifact["samples"], [])
                 self.assertIsNotNone(artifact["failure"]["sample"])
+
+    def test_campaign_reconciles_each_registry_transport_evidence_location(self):
+        receipt = self.receipt("control")
+        control = self.arm("A", receipt)
+        candidate = self.arm("B", receipt)
+        mutations = (
+            (
+                "sample",
+                lambda row: row["registry_transport"].update(
+                    {"registry": "attacker.invalid:5000"}
+                ),
+                "registry transport",
+            ),
+            (
+                "pre",
+                lambda row: row["provenance"]["pre"][
+                    "registry_transport"
+                ].update({"registry": "attacker.invalid:5000"}),
+                "pre/post provenance drift, pre provenance registry transport",
+            ),
+            (
+                "post",
+                lambda row: row["provenance"]["post"][
+                    "registry_transport"
+                ].update({"registry": "attacker.invalid:5000"}),
+                "pre/post provenance drift, post provenance registry transport",
+            ),
+        )
+        for location, mutate, expected_reason in mutations:
+            with self.subTest(location=location):
+                output = self.root / f"registry-{location}-drift.json"
+
+                def run_sample(_repo, _engine, index, _timeout, **kwargs):
+                    row = self.sample(
+                        control,
+                        index=index,
+                        run_id=kwargs["current_run_id"],
+                    )
+                    mutate(row)
+                    return row
+
+                with (
+                    self.campaign_fixtures(control, candidate, run_sample),
+                    self.assertRaisesRegex(
+                        native_go_build_abba.CampaignEvidenceError,
+                        "sample evidence",
+                    ),
+                ):
+                    native_go_build_abba.run_campaign(
+                        self.root,
+                        control,
+                        candidate,
+                        output,
+                    )
+
+                artifact = json.loads(output.read_text())
+                self.assertEqual(artifact["samples"], [])
+                self.assertIsNotNone(artifact["failure"]["sample"])
+                self.assertEqual(
+                    artifact["failure"]["reason"],
+                    f"sample evidence did not reconcile: {expected_reason}",
+                )
 
     def accepted_source(
         self,
