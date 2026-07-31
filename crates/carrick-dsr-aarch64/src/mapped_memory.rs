@@ -718,6 +718,26 @@ pub fn subtract_host_ranges(
 }
 
 impl NativeMappedMemory {
+    #[cfg(test)]
+    pub(crate) fn shared_install_test_fixture(page_size: u64) -> Self {
+        Self {
+            address_mode: NativeAddressMode::Direct,
+            owned_host_ranges: Arc::new(Vec::new()),
+            regions: Vec::new(),
+            protections: MemoryProtections::default(),
+            native_page_protections: BTreeMap::new(),
+            native_write_exec_writable_pages: BTreeSet::new(),
+            linux4k_page_protections: BTreeMap::new(),
+            exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
+            host_page_size: page_size,
+            linux_page_size: page_size,
+            dsr_generations: dsr::cache::PageGenerationTable::new(page_size)
+                .expect("shared-install test generation table"),
+            dsr_translator: None,
+            host_access_lifts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
     pub fn address_mode(&self) -> NativeAddressMode {
         self.address_mode
     }

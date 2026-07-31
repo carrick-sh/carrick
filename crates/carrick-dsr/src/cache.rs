@@ -212,6 +212,18 @@ pub struct PageBlockDependencies {
     blocks: BTreeMap<GuestVa, Vec<(GuestVa, CodeGeneration)>>,
 }
 
+#[derive(Debug)]
+pub struct PreparedPageBlockDependencies {
+    pages: Vec<PreparedPageDependencyPage>,
+}
+
+#[derive(Debug)]
+struct PreparedPageDependencyPage {
+    page: GuestVa,
+    records: Vec<(GuestVa, CodeGeneration)>,
+    existing: bool,
+}
+
 #[derive(Clone, Copy)]
 enum PublicationState {
     Building,
@@ -334,6 +346,114 @@ impl PageBlockDependencies {
         }
     }
 
+    pub fn prepare_record_batch(
+        &mut self,
+        records: &[(GuestVa, GuestVa, CodeGeneration)],
+    ) -> Result<PreparedPageBlockDependencies, CacheError> {
+        self.prepare_record_batch_impl(records, |destination, additional| {
+            destination.try_reserve(additional).map_err(|error| {
+                CacheError::Policy(format!(
+                    "page dependency reservation failed for {additional} records: {error}"
+                ))
+            })
+        })
+    }
+
+    fn prepare_record_batch_impl(
+        &mut self,
+        records: &[(GuestVa, GuestVa, CodeGeneration)],
+        mut reserve_existing: impl FnMut(
+            &mut Vec<(GuestVa, CodeGeneration)>,
+            usize,
+        ) -> Result<(), CacheError>,
+    ) -> Result<PreparedPageBlockDependencies, CacheError> {
+        let mut unique = Vec::new();
+        unique.try_reserve(records.len()).map_err(|error| {
+            CacheError::Policy(format!(
+                "page dependency tuple reservation failed for {} records: {error}",
+                records.len()
+            ))
+        })?;
+        let mut seen = std::collections::BTreeSet::new();
+        for &(page, block, generation) in records {
+            if seen.insert((page, block, generation))
+                && !self
+                    .blocks
+                    .get(&page)
+                    .is_some_and(|existing| existing.contains(&(block, generation)))
+            {
+                unique.push((page, block, generation));
+            }
+        }
+
+        let mut counts = BTreeMap::<GuestVa, usize>::new();
+        for &(page, _, _) in &unique {
+            let count = counts.entry(page).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                CacheError::Policy("page dependency record count overflow".to_string())
+            })?;
+        }
+        let mut grouped = BTreeMap::<GuestVa, Vec<(GuestVa, CodeGeneration)>>::new();
+        for (page, count) in counts {
+            let mut group = Vec::new();
+            group.try_reserve_exact(count).map_err(|error| {
+                CacheError::Policy(format!(
+                    "page dependency group reservation failed for {count} records: {error}"
+                ))
+            })?;
+            grouped.insert(page, group);
+        }
+        for (page, block, generation) in unique {
+            if let Some(group) = grouped.get_mut(&page) {
+                group.push((block, generation));
+            }
+        }
+
+        let mut pages = Vec::new();
+        pages.try_reserve(grouped.len()).map_err(|error| {
+            CacheError::Policy(format!(
+                "page dependency batch reservation failed for {} pages: {error}",
+                grouped.len()
+            ))
+        })?;
+        for (page, records) in grouped {
+            let existing = self.blocks.contains_key(&page);
+            if existing && let Some(destination) = self.blocks.get_mut(&page) {
+                reserve_existing(destination, records.len())?;
+            }
+            pages.push(PreparedPageDependencyPage {
+                page,
+                records,
+                existing,
+            });
+        }
+        Ok(PreparedPageBlockDependencies { pages })
+    }
+
+    pub fn commit_record_batch(&mut self, prepared: PreparedPageBlockDependencies) {
+        for page in prepared.pages {
+            if page.existing {
+                if let Some(destination) = self.blocks.get_mut(&page.page) {
+                    destination.extend(page.records);
+                }
+            } else {
+                self.blocks.insert(page.page, page.records);
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn prepare_record_batch_with_reserver(
+        &mut self,
+        records: &[(GuestVa, GuestVa, CodeGeneration)],
+        reserve_existing: impl FnMut(
+            &mut Vec<(GuestVa, CodeGeneration)>,
+            usize,
+        ) -> Result<(), CacheError>,
+    ) -> Result<PreparedPageBlockDependencies, CacheError> {
+        self.prepare_record_batch_impl(records, reserve_existing)
+    }
+
     pub fn invalidate_page(
         &mut self,
         page: GuestVa,
@@ -364,6 +484,14 @@ impl PageBlockDependencies {
         self.blocks
             .get(&page)
             .is_some_and(|blocks| blocks.contains(&(block, generation)))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn snapshot_for_test(&self) -> Vec<(GuestVa, Vec<(GuestVa, CodeGeneration)>)> {
+        self.blocks
+            .iter()
+            .map(|(page, records)| (*page, records.clone()))
+            .collect()
     }
 }
 
@@ -1036,6 +1164,70 @@ mod generation_tests {
         );
         assert!(dependencies.contains(PAGE, second, CodeGeneration::claimed(1)));
         assert!(dependencies.contains(other_page, other_page, CodeGeneration::INITIAL));
+    }
+
+    #[test]
+    fn page_block_dependencies_prepare_is_logically_inert_and_commit_is_complete() {
+        let mut dependencies = super::PageBlockDependencies::default();
+        let existing = GuestVa(PAGE.raw() + 0x100);
+        let added = GuestVa(PAGE.raw() + 0x200);
+        let other_page = GuestVa(PAGE.raw() + PAGE_SIZE);
+        dependencies.record(PAGE, existing, CodeGeneration::INITIAL);
+        let before = dependencies.snapshot_for_test();
+
+        let prepared = dependencies
+            .prepare_record_batch(&[
+                (PAGE, existing, CodeGeneration::INITIAL),
+                (PAGE, added, CodeGeneration::claimed(1)),
+                (PAGE, added, CodeGeneration::claimed(1)),
+                (other_page, other_page, CodeGeneration::INITIAL),
+            ])
+            .expect("prepare dependency batch");
+
+        assert_eq!(dependencies.snapshot_for_test(), before);
+        dependencies.commit_record_batch(prepared);
+        assert!(dependencies.contains(PAGE, existing, CodeGeneration::INITIAL));
+        assert!(dependencies.contains(PAGE, added, CodeGeneration::claimed(1)));
+        assert!(dependencies.contains(other_page, other_page, CodeGeneration::INITIAL));
+        assert_eq!(
+            dependencies.snapshot_for_test(),
+            vec![
+                (
+                    PAGE,
+                    vec![
+                        (existing, CodeGeneration::INITIAL),
+                        (added, CodeGeneration::claimed(1)),
+                    ],
+                ),
+                (other_page, vec![(other_page, CodeGeneration::INITIAL)],),
+            ]
+        );
+    }
+
+    #[test]
+    fn page_block_dependencies_reserve_failure_preserves_records() {
+        let mut dependencies = super::PageBlockDependencies::default();
+        let existing = GuestVa(PAGE.raw() + 0x100);
+        dependencies.record(PAGE, existing, CodeGeneration::INITIAL);
+        let before = dependencies.snapshot_for_test();
+
+        let error = dependencies
+            .prepare_record_batch_with_reserver(
+                &[(PAGE, GuestVa(PAGE.raw() + 0x200), CodeGeneration::INITIAL)],
+                |_records, _additional| {
+                    Err(super::CacheError::Policy(
+                        "injected page dependency reserve failure".to_owned(),
+                    ))
+                },
+            )
+            .expect_err("injected reserve failure");
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected page dependency reserve failure")
+        );
+        assert_eq!(dependencies.snapshot_for_test(), before);
     }
 
     #[test]

@@ -308,6 +308,25 @@ pub struct DirectBindingUnitOwner {
     source_lease: SharedLoadedTranslationUnit,
 }
 
+pub(crate) struct PreparedDirectBindingUnit {
+    unit_index: usize,
+    owner: DirectBindingUnitOwner,
+    cell_owners: Vec<DirectBindingOwner>,
+    edge_records: Vec<PreparedDirectBindingEdge>,
+}
+
+pub(crate) struct PreparedDirectBindingEdge {
+    key: (GuestVa, GuestVa),
+    records: Vec<(usize, usize)>,
+    existing: bool,
+}
+
+impl PreparedDirectBindingUnit {
+    pub(crate) const fn unit_index(&self) -> usize {
+        self.unit_index
+    }
+}
+
 /// Reverse edge retained after a successful direct-binding publication.
 pub struct IncomingDirectBinding {
     source: DirectBindingOwnerKey,
@@ -431,6 +450,20 @@ pub struct DirectBindingArenaSnapshot {
     pub bitmap_len: usize,
 }
 
+#[cfg(test)]
+type DirectBindingOwnerSnapshot = (DirectBindingCellVa, usize, UnresolvedDirectBindingRecord);
+
+#[cfg(test)]
+type DirectBindingEdgeSnapshot = ((GuestVa, GuestVa), Vec<(usize, usize)>);
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DirectBindingLogicalSnapshot {
+    units: Vec<TranslationUnitKey>,
+    owners: Vec<DirectBindingOwnerSnapshot>,
+    edges: Vec<DirectBindingEdgeSnapshot>,
+}
+
 impl DirectBindingRegistry {
     pub fn new(enabled: bool) -> Self {
         Self {
@@ -448,6 +481,10 @@ impl DirectBindingRegistry {
         self.enabled
     }
 
+    pub(crate) fn unit_count(&self) -> usize {
+        self.units.len()
+    }
+
     /// Registers the exact cells and retained source lease of a loaded unit.
     ///
     /// Disabled-layout units have no cells and return `Ok(None)`.
@@ -455,6 +492,14 @@ impl DirectBindingRegistry {
         &mut self,
         unit: &SharedLoadedTranslationUnit,
     ) -> Result<Option<usize>, DsrError> {
+        let prepared = self.prepare_loaded_unit(unit)?;
+        Ok(self.commit_loaded_unit(prepared))
+    }
+
+    pub(crate) fn prepare_loaded_unit(
+        &mut self,
+        unit: &SharedLoadedTranslationUnit,
+    ) -> Result<PreparedDirectBindingUnit, DsrError> {
         if self
             .units
             .iter()
@@ -464,17 +509,28 @@ impl DirectBindingRegistry {
                 "direct-binding unit owner is duplicated".to_string(),
             ));
         }
+        self.units.try_reserve(1).map_err(|error| {
+            DsrError::CachePolicy(format!(
+                "direct-binding unit owner reservation failed: {error}"
+            ))
+        })?;
+        let unit_index = self.units.len();
         if !self.enabled || unit.manifest.binding_layout == DirectBindingLayout::Disabled {
-            self.units.push(DirectBindingUnitOwner {
+            let owner = DirectBindingUnitOwner {
                 key: unit.manifest.key.clone(),
                 binding_base: None,
                 binding_layout: DirectBindingLayout::Disabled,
                 records: unit.manifest.bindings.clone().into_boxed_slice(),
                 published_bitmap: Box::new([]),
                 source_lease: unit.clone(),
+            };
+            let edge_records = self.prepare_unit_edges(unit_index, &owner.records)?;
+            return Ok(PreparedDirectBindingUnit {
+                unit_index,
+                owner,
+                cell_owners: Vec::new(),
+                edge_records,
             });
-            self.index_unit_records(self.units.len() - 1);
-            return Ok(None);
         }
         if unit.manifest.binding_layout != DirectBindingLayout::SidecarV1
             || unit.manifest.cell_size != DIRECT_BINDING_CELL_SIZE
@@ -504,8 +560,13 @@ impl DirectBindingRegistry {
         let binding_end = binding_base.get().checked_add(binding_len).ok_or_else(|| {
             DsrError::CachePolicy("direct-binding cell range overflow".to_string())
         })?;
-        let unit_index = self.units.len();
-        let mut owners = Vec::with_capacity(records.len());
+        let mut owners = Vec::new();
+        owners.try_reserve(records.len()).map_err(|error| {
+            DsrError::CachePolicy(format!(
+                "direct-binding cell owner reservation failed for {} records: {error}",
+                records.len()
+            ))
+        })?;
         for record in &records {
             let offset = usize::try_from(record.ordinal.get())
                 .ok()
@@ -555,42 +616,105 @@ impl DirectBindingRegistry {
             });
         }
         let bitmap_words = records.len().div_ceil(u64::BITS as usize);
-        let published_bitmap = vec![0; bitmap_words].into_boxed_slice();
-        self.units.push(DirectBindingUnitOwner {
+        let mut published_bitmap = Vec::new();
+        published_bitmap
+            .try_reserve_exact(bitmap_words)
+            .map_err(|error| {
+                DsrError::CachePolicy(format!(
+                    "direct-binding publication bitmap reservation failed for {bitmap_words} words: {error}"
+                ))
+            })?;
+        published_bitmap.resize(bitmap_words, 0);
+        let owner = DirectBindingUnitOwner {
             key: unit.manifest.key.clone(),
             binding_base: Some(binding_base),
             binding_layout: DirectBindingLayout::SidecarV1,
             records,
-            published_bitmap,
+            published_bitmap: published_bitmap.into_boxed_slice(),
             source_lease: unit.clone(),
-        });
-        self.index_unit_records(self.units.len() - 1);
-        for owner in owners {
-            self.owners_by_cell.insert(owner.cell, owner);
-        }
-        Ok(Some(unit_index))
+        };
+        let edge_records = self.prepare_unit_edges(unit_index, &owner.records)?;
+        Ok(PreparedDirectBindingUnit {
+            unit_index,
+            owner,
+            cell_owners: owners,
+            edge_records,
+        })
     }
 
-    /// Fold one just-pushed unit's records into [`Self::records_by_edge`].
-    ///
-    /// Called from every `units.push` site; `units` is otherwise only cleared
-    /// wholesale, so the recorded indices never dangle.
-    fn index_unit_records(&mut self, unit_index: usize) {
-        let Some(unit) = self.units.get(unit_index) else {
-            return;
-        };
-        let edges: Vec<((GuestVa, GuestVa), usize)> = unit
-            .records
-            .iter()
-            .enumerate()
-            .map(|(record_index, record)| ((record.source, record.target), record_index))
-            .collect();
-        for (edge, record_index) in edges {
-            self.records_by_edge
-                .entry(edge)
-                .or_default()
-                .push((unit_index, record_index));
+    fn prepare_unit_edges(
+        &mut self,
+        unit_index: usize,
+        records: &[UnresolvedDirectBindingRecord],
+    ) -> Result<Vec<PreparedDirectBindingEdge>, DsrError> {
+        let mut counts = BTreeMap::<(GuestVa, GuestVa), usize>::new();
+        for record in records {
+            let count = counts.entry((record.source, record.target)).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                DsrError::CachePolicy("direct-binding edge record count overflow".to_string())
+            })?;
         }
+        let mut grouped = BTreeMap::<(GuestVa, GuestVa), Vec<(usize, usize)>>::new();
+        for (edge, count) in counts {
+            let mut slots = Vec::new();
+            slots.try_reserve_exact(count).map_err(|error| {
+                DsrError::CachePolicy(format!(
+                    "direct-binding edge reservation failed for {count} records: {error}"
+                ))
+            })?;
+            grouped.insert(edge, slots);
+        }
+        for (record_index, record) in records.iter().enumerate() {
+            if let Some(slots) = grouped.get_mut(&(record.source, record.target)) {
+                slots.push((unit_index, record_index));
+            }
+        }
+
+        let mut prepared = Vec::new();
+        prepared.try_reserve(grouped.len()).map_err(|error| {
+            DsrError::CachePolicy(format!(
+                "direct-binding edge batch reservation failed for {} edges: {error}",
+                grouped.len()
+            ))
+        })?;
+        for (key, records) in grouped {
+            let existing = self.records_by_edge.contains_key(&key);
+            if existing && let Some(destination) = self.records_by_edge.get_mut(&key) {
+                destination.try_reserve(records.len()).map_err(|error| {
+                    DsrError::CachePolicy(format!(
+                        "direct-binding existing edge reservation failed for {} records: {error}",
+                        records.len()
+                    ))
+                })?;
+            }
+            prepared.push(PreparedDirectBindingEdge {
+                key,
+                records,
+                existing,
+            });
+        }
+        Ok(prepared)
+    }
+
+    pub(crate) fn commit_loaded_unit(
+        &mut self,
+        prepared: PreparedDirectBindingUnit,
+    ) -> Option<usize> {
+        let mapped = prepared.owner.binding_base.is_some();
+        self.units.push(prepared.owner);
+        for edge in prepared.edge_records {
+            if edge.existing {
+                if let Some(destination) = self.records_by_edge.get_mut(&edge.key) {
+                    destination.extend(edge.records);
+                }
+            } else {
+                self.records_by_edge.insert(edge.key, edge.records);
+            }
+        }
+        for owner in prepared.cell_owners {
+            self.owners_by_cell.insert(owner.cell, owner);
+        }
+        mapped.then_some(prepared.unit_index)
     }
 
     /// Selects the exact predeclared manifest record for one cold direct exit.
@@ -1003,6 +1127,23 @@ impl DirectBindingRegistry {
             records_len: unit.records.len(),
             bitmap_address: unit.published_bitmap.as_ptr() as usize,
             bitmap_len: unit.published_bitmap.len(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn logical_snapshot_for_test(&self) -> DirectBindingLogicalSnapshot {
+        DirectBindingLogicalSnapshot {
+            units: self.units.iter().map(|unit| unit.key.clone()).collect(),
+            owners: self
+                .owners_by_cell
+                .iter()
+                .map(|(cell, owner)| (*cell, owner.unit_index, owner.record.clone()))
+                .collect(),
+            edges: self
+                .records_by_edge
+                .iter()
+                .map(|(edge, records)| (*edge, records.clone()))
+                .collect(),
         }
     }
 

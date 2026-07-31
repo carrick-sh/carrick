@@ -489,6 +489,16 @@ struct TranslatedRangeCatalog {
     next_sequence: u64,
     ready_sequence: Option<u64>,
     private: std::ops::Range<carrick_guest_mem::HostVa>,
+    shared: Vec<CatalogSharedRange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CatalogSharedRange {
+    sequence: probes::TranslatedRangeSequence,
+    unit_id: probes::TranslatedUnitId,
+    range: std::ops::Range<carrick_guest_mem::HostVa>,
+    event: probes::TranslatedSharedRange,
+    next_sequence: u64,
 }
 
 impl TranslatedRangeCatalog {
@@ -521,6 +531,7 @@ impl TranslatedRangeCatalog {
             next_sequence: sequence.get(),
             ready_sequence: None,
             private,
+            shared: Vec::new(),
         })
     }
 
@@ -557,6 +568,96 @@ impl TranslatedRangeCatalog {
         self.ready_sequence = Some(final_sequence);
         Ok(())
     }
+
+    fn prepare_shared(
+        &mut self,
+        unit_id: probes::TranslatedUnitId,
+        range: std::ops::Range<carrick_guest_mem::HostVa>,
+    ) -> Result<CatalogSharedRange, types::DsrError> {
+        if self.ready_sequence.is_none() {
+            return Err(types::DsrError::CachePolicy(
+                "translated-range catalog is not active".to_string(),
+            ));
+        }
+        if self.sequence_frontier().checked_add(1) != Some(self.next_sequence) {
+            return Err(types::DsrError::CachePolicy(
+                "translated-range sequence frontier is inconsistent".to_string(),
+            ));
+        }
+        if ranges_overlap(&self.private, &range) {
+            return Err(types::DsrError::CachePolicy(
+                "shared translated range overlaps the private cache".to_string(),
+            ));
+        }
+        if self.shared.iter().any(|entry| entry.unit_id == unit_id) {
+            return Err(types::DsrError::CachePolicy(
+                "shared translated unit identity is duplicated".to_string(),
+            ));
+        }
+        if self
+            .shared
+            .iter()
+            .any(|entry| ranges_overlap(&entry.range, &range))
+        {
+            return Err(types::DsrError::CachePolicy(
+                "shared translated ranges overlap".to_string(),
+            ));
+        }
+        let sequence =
+            probes::TranslatedRangeSequence::new(self.next_sequence).map_err(|error| {
+                types::DsrError::CachePolicy(format!(
+                    "shared translated-range sequence is invalid: {error}"
+                ))
+            })?;
+        let next_sequence = sequence.get().checked_add(1).ok_or_else(|| {
+            types::DsrError::CachePolicy(
+                "translated-range sequence overflow during shared preparation".to_string(),
+            )
+        })?;
+        let event =
+            probes::TranslatedSharedRange::shared(self.epoch, sequence, unit_id, range.clone())
+                .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+        self.shared.try_reserve(1).map_err(|error| {
+            types::DsrError::CachePolicy(format!(
+                "shared translated-range catalog reservation failed: {error}"
+            ))
+        })?;
+        Ok(CatalogSharedRange {
+            sequence,
+            unit_id,
+            range,
+            event,
+            next_sequence,
+        })
+    }
+
+    fn commit_shared(&mut self, prepared: CatalogSharedRange) {
+        let mut recorder = DsrTranslatedRangeRecorder;
+        self.commit_shared_with_recorder(prepared, &mut recorder);
+    }
+
+    fn commit_shared_with_recorder(
+        &mut self,
+        prepared: CatalogSharedRange,
+        recorder: &mut dyn TranslatedRangeRecorder,
+    ) {
+        let next_sequence = prepared.next_sequence;
+        let event = prepared.event.clone();
+        self.shared.push(prepared);
+        recorder.add(probes::TranslatedRangeAdd::Shared(event));
+        self.next_sequence = next_sequence;
+    }
+
+    fn sequence_frontier(&self) -> u64 {
+        self.next_sequence.saturating_sub(1)
+    }
+}
+
+fn ranges_overlap(
+    left: &std::ops::Range<carrick_guest_mem::HostVa>,
+    right: &std::ops::Range<carrick_guest_mem::HostVa>,
+) -> bool {
+    left.start < right.end && right.start < left.end
 }
 
 impl Drop for ProcessTranslator {
@@ -635,12 +736,42 @@ pub struct ProcessState {
     superblock_segments: usize,
 }
 
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+struct SharedInstallLogicalSnapshot {
+    catalog_frontier: u64,
+    catalog_ready: Option<u64>,
+    catalog_shared: Vec<CatalogSharedRange>,
+    blocks: Vec<(
+        (carrick_guest_mem::GuestVa, types::CodeGeneration),
+        types::CacheVa,
+    )>,
+    sensitive_keys: Vec<(carrick_guest_mem::GuestVa, types::CodeGeneration)>,
+    fusion_sites: [Vec<(u64, u32)>; profile::ExclusiveFusionClass::COUNT],
+    published_len: usize,
+    private_published_index: Vec<PublishedIndexEntry>,
+    shared_published_index: Vec<PublishedIndexEntry>,
+    dependencies: Vec<(
+        carrick_guest_mem::GuestVa,
+        Vec<(carrick_guest_mem::GuestVa, types::CodeGeneration)>,
+    )>,
+    shared_blocks: Vec<(
+        (carrick_guest_mem::GuestVa, types::CodeGeneration),
+        SharedBlockAuthority,
+    )>,
+    shared_guest_ranges: Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>,
+    loaded_unit_ids: Vec<probes::TranslatedUnitId>,
+    direct_bindings: crate::direct_binding::DirectBindingLogicalSnapshot,
+    executable_head: usize,
+    executable_nodes: usize,
+}
+
 struct SharedTranslationConfiguration {
     image: crate::shared_cache::SharedImageConfig,
     store: Arc<dyn crate::shared_cache::TranslationUnitStore>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SharedBlockAuthority {
     generation_bindings: usize,
     generation_binding_count: usize,
@@ -658,10 +789,253 @@ impl SharedBlockAuthority {
 }
 
 struct LoadedSharedUnit {
+    #[allow(
+        dead_code,
+        reason = "retained for the shared catalog replay slice after Task 2b"
+    )]
+    unit_id: probes::TranslatedUnitId,
     _unit: crate::shared_cache::SharedLoadedTranslationUnit,
     _generation_bindings: Box<[gateway::GenerationBinding]>,
     _target_authority: Box<gateway::TargetCacheAuthority>,
     _direct_binding_unit_index: Option<usize>,
+}
+
+struct PreparedSharedInstall {
+    tid: i32,
+    cache_range: std::ops::Range<usize>,
+    catalog_entry: CatalogSharedRange,
+    blocks: Vec<PreparedSharedBlock>,
+    shared_published_index: Vec<PublishedIndexEntry>,
+    normalized_guest_ranges: Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>,
+    loaded_unit: LoadedSharedUnit,
+    direct_binding: crate::direct_binding::PreparedDirectBindingUnit,
+    page_dependencies: carrick_dsr::cache::PreparedPageBlockDependencies,
+    executable_range: gateway::PreparedExecutableRange,
+    direct_binding_probe: DirectBindingUnitLoadedProbe,
+}
+
+struct PreparedSharedBlock {
+    key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
+    entry: types::CacheVa,
+    published: PublishedBlock,
+    sensitive: Option<(
+        (carrick_guest_mem::GuestVa, types::CodeGeneration),
+        SensitiveMetadata,
+    )>,
+    fusion_site: Option<types::ExclusiveFusionSite>,
+    guest_ranges: Vec<std::ops::Range<carrick_guest_mem::GuestVa>>,
+    authority: SharedBlockAuthority,
+}
+
+#[derive(Clone, Copy)]
+struct DirectBindingUnitLoadedProbe {
+    digest: u64,
+    record_count: u64,
+    data_bytes: u64,
+}
+
+fn typed_unit_id_from_digest(digest: u64) -> Result<probes::TranslatedUnitId, types::DsrError> {
+    probes::TranslatedUnitId::new(digest).map_err(|error| {
+        types::DsrError::CachePolicy(format!(
+            "shared translated unit identity is invalid: {error}"
+        ))
+    })
+}
+
+fn translated_unit_id(
+    key: &crate::shared_cache::TranslationUnitKey,
+) -> Result<probes::TranslatedUnitId, types::DsrError> {
+    typed_unit_id_from_digest(crate::direct_binding::direct_binding_unit_digest(key)?)
+}
+
+fn exact_guest_ranges_from_pc_map(
+    guest_start: carrick_guest_mem::GuestVa,
+    block_code_len: usize,
+    map: &[emit::PcMapEntry],
+) -> Result<Vec<std::ops::Range<carrick_guest_mem::GuestVa>>, types::DsrError> {
+    if map.is_empty() {
+        return Err(types::DsrError::CachePolicy(
+            "shared block has an empty PC map".to_string(),
+        ));
+    }
+    let mut guest_pcs = Vec::new();
+    guest_pcs.try_reserve(map.len()).map_err(|error| {
+        types::DsrError::CachePolicy(format!(
+            "shared block PC-map guest reservation failed: {error}"
+        ))
+    })?;
+    let mut previous_cache = None;
+    let mut contains_start = false;
+    for entry in map {
+        let cache = usize::try_from(entry.cache.get()).map_err(|_| {
+            types::DsrError::CachePolicy(
+                "shared block PC-map cache offset does not fit usize".to_string(),
+            )
+        })?;
+        if !cache.is_multiple_of(4)
+            || cache >= block_code_len
+            || previous_cache.is_some_and(|previous| previous >= cache)
+        {
+            return Err(types::DsrError::CachePolicy(
+                "shared block PC-map cache offsets must be aligned, in bounds, and strictly increasing"
+                    .to_string(),
+            ));
+        }
+        if !entry.guest.raw().is_multiple_of(4) {
+            return Err(types::DsrError::CachePolicy(
+                "shared block PC-map guest PC is not four-byte aligned".to_string(),
+            ));
+        }
+        entry.guest.raw().checked_add(4).ok_or_else(|| {
+            types::DsrError::CachePolicy("shared block PC-map guest PC overflows".to_string())
+        })?;
+        contains_start |= entry.guest == guest_start;
+        previous_cache = Some(cache);
+        guest_pcs.push(entry.guest);
+    }
+    if !contains_start {
+        return Err(types::DsrError::CachePolicy(
+            "shared block PC map omits its declared guest start".to_string(),
+        ));
+    }
+    guest_pcs.sort_unstable();
+    guest_pcs.dedup();
+
+    let mut ranges: Vec<std::ops::Range<carrick_guest_mem::GuestVa>> = Vec::new();
+    ranges.try_reserve(guest_pcs.len()).map_err(|error| {
+        types::DsrError::CachePolicy(format!(
+            "shared block guest-range reservation failed: {error}"
+        ))
+    })?;
+    for guest in guest_pcs {
+        let end = carrick_guest_mem::GuestVa(guest.raw().checked_add(4).ok_or_else(|| {
+            types::DsrError::CachePolicy("shared block guest range overflows".to_string())
+        })?);
+        if let Some(previous) = ranges.last_mut()
+            && previous.end == guest
+        {
+            previous.end = end;
+        } else {
+            ranges.push(guest..end);
+        }
+    }
+    Ok(ranges)
+}
+
+fn normalized_guest_range_union(
+    existing: &[(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)],
+    additions: &[std::ops::Range<carrick_guest_mem::GuestVa>],
+) -> Result<Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>, types::DsrError> {
+    let count = existing.len().checked_add(additions.len()).ok_or_else(|| {
+        types::DsrError::CachePolicy("shared guest-range count overflow".to_string())
+    })?;
+    let mut ranges = Vec::new();
+    ranges.try_reserve(count).map_err(|error| {
+        types::DsrError::CachePolicy(format!(
+            "shared guest-range union reservation failed: {error}"
+        ))
+    })?;
+    for &(start, end) in existing {
+        validate_guest_interval(start, end)?;
+        ranges.push((start, end));
+    }
+    for addition in additions {
+        validate_guest_interval(addition.start, addition.end)?;
+        ranges.push((addition.start, addition.end));
+    }
+    ranges.sort_unstable();
+
+    let mut normalized: Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)> = Vec::new();
+    normalized.try_reserve(ranges.len()).map_err(|error| {
+        types::DsrError::CachePolicy(format!(
+            "normalized shared guest-range reservation failed: {error}"
+        ))
+    })?;
+    for (start, end) in ranges {
+        if let Some(previous) = normalized.last_mut()
+            && start <= previous.1
+        {
+            if end > previous.1 {
+                previous.1 = end;
+            }
+        } else {
+            normalized.push((start, end));
+        }
+    }
+    Ok(normalized)
+}
+
+fn validate_guest_interval(
+    start: carrick_guest_mem::GuestVa,
+    end: carrick_guest_mem::GuestVa,
+) -> Result<(), types::DsrError> {
+    if start >= end || !start.raw().is_multiple_of(4) || !end.raw().is_multiple_of(4) {
+        return Err(types::DsrError::CachePolicy(format!(
+            "shared guest interval is empty, reversed, or unaligned: 0x{:x}..0x{:x}",
+            start.raw(),
+            end.raw(),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SharedInstallPrepareStage {
+    Manifest,
+    Identity,
+    Catalog,
+    CollisionPreflight,
+    GenerationAuthorities,
+    BlockMetadata,
+    GuestUnion,
+    DirectBinding,
+    ProcessVectors,
+    PageDependencies,
+    ExecutableRange,
+    FinalConsistency,
+}
+
+#[cfg(test)]
+impl SharedInstallPrepareStage {
+    const ALL: [Self; 12] = [
+        Self::Manifest,
+        Self::Identity,
+        Self::Catalog,
+        Self::CollisionPreflight,
+        Self::GenerationAuthorities,
+        Self::BlockMetadata,
+        Self::GuestUnion,
+        Self::DirectBinding,
+        Self::ProcessVectors,
+        Self::PageDependencies,
+        Self::ExecutableRange,
+        Self::FinalConsistency,
+    ];
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHARED_INSTALL_PREPARE_FAILPOINT: std::cell::Cell<Option<SharedInstallPrepareStage>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_shared_install_prepare_failpoint_for_test(stage: Option<SharedInstallPrepareStage>) {
+    SHARED_INSTALL_PREPARE_FAILPOINT.set(stage);
+}
+
+#[cfg(test)]
+fn shared_install_prepare_checkpoint(
+    stage: SharedInstallPrepareStage,
+) -> Result<(), types::DsrError> {
+    if SHARED_INSTALL_PREPARE_FAILPOINT.get() == Some(stage) {
+        SHARED_INSTALL_PREPARE_FAILPOINT.set(None);
+        return Err(types::DsrError::CachePolicy(format!(
+            "injected shared-install preparation failure at {stage:?}"
+        )));
+    }
+    Ok(())
 }
 
 const fn translation_source_words_required(
@@ -705,7 +1079,7 @@ pub struct PublishedBlock {
 /// One entry of an address-ordered index over [`ProcessState::published`]:
 /// where a block's emitted code starts, and where the block itself sits in
 /// publication order.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PublishedIndexEntry {
     start: carrick_guest_mem::HostVa,
     block: usize,
@@ -2031,7 +2405,7 @@ impl ProcessState {
         let source_words = Arc::clone(&segment.source_words);
         let store = Arc::clone(&configuration.store);
         self.stats.shared_unit_lookups = self.stats.shared_unit_lookups.saturating_add(1);
-        let mut unit = match store.load(&key, &source_words) {
+        let unit = match store.load(&key, &source_words) {
             Ok(Some(unit)) => unit,
             Ok(None) => {
                 if store.claim_recording(&key) {
@@ -2042,28 +2416,121 @@ impl ProcessState {
             Err(_) => return Ok(None),
         };
         self.stats.shared_unit_loads = self.stats.shared_unit_loads.saturating_add(1);
+        let prepared = match self.prepare_shared_install(tid, memory, unit) {
+            Ok(prepared) => prepared,
+            Err(types::DsrError::GenerationChanged { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.commit_shared_install(prepared);
+        let result = self.blocks.get(&(guest, generation)).copied();
+        if result.is_some() {
+            self.stats.shared_unit_hits = self.stats.shared_unit_hits.saturating_add(1);
+            self.stats.shared_translations_avoided =
+                self.stats.shared_translations_avoided.saturating_add(1);
+        }
+        Ok(result)
+    }
+
+    fn prepare_shared_install(
+        &mut self,
+        tid: i32,
+        memory: &NativeMappedMemory,
+        mut unit: crate::shared_cache::SharedLoadedTranslationUnit,
+    ) -> Result<PreparedSharedInstall, types::DsrError> {
+        unit.manifest.validate_ranges().map_err(|reason| {
+            types::DsrError::CachePolicy(format!(
+                "loaded shared translation manifest is invalid: {reason:?}"
+            ))
+        })?;
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::Manifest)?;
+
+        let unit_id = translated_unit_id(&unit.manifest.key)?;
+        let code_len = usize::try_from(unit.manifest.code_len).map_err(|_| {
+            types::DsrError::CachePolicy(
+                "shared translation range length does not fit usize".to_string(),
+            )
+        })?;
+        let cache_start = unit.base;
+        let cache_end = cache_start.checked_add(code_len).ok_or_else(|| {
+            types::DsrError::CachePolicy("shared translation range overflow".to_string())
+        })?;
+        let host_range =
+            carrick_guest_mem::HostVa(cache_start)..carrick_guest_mem::HostVa(cache_end);
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::Identity)?;
+
+        let catalog_entry = self.translated_ranges.prepare_shared(unit_id, host_range)?;
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::Catalog)?;
+
+        let block_count = unit.manifest.blocks.len();
+        if block_count == 0 {
+            return Err(types::DsrError::CachePolicy(
+                "shared translation unit has no blocks".to_string(),
+            ));
+        }
+        let mut incoming_keys = BTreeSet::new();
+        for block in &unit.manifest.blocks {
+            let key = (block.guest_start, types::CodeGeneration::INITIAL);
+            if !incoming_keys.insert(key)
+                || self.blocks.contains_key(&key)
+                || self.sensitive.contains_key(&key)
+                || self.shared_blocks.contains_key(&key)
+            {
+                return Err(types::DsrError::CachePolicy(format!(
+                    "shared block identity collides at guest 0x{:x}",
+                    block.guest_start.raw()
+                )));
+            }
+        }
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::CollisionPreflight)?;
+
         let binding_count = unit
             .manifest
             .blocks
             .iter()
             .map(|block| block.generation_binding as usize)
             .max()
-            .map_or(0, |index| index.saturating_add(1));
-        if binding_count == 0 || binding_count > unit.manifest.blocks.len() {
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| {
+                types::DsrError::CachePolicy(
+                    "shared translation unit has invalid generation bindings".to_string(),
+                )
+            })?;
+        if binding_count == 0 || binding_count > block_count {
             return Err(types::DsrError::CachePolicy(
                 "shared translation unit has invalid generation bindings".to_string(),
             ));
         }
-        let mut bindings = std::iter::repeat_with(|| None)
-            .take(binding_count)
-            .collect::<Vec<_>>();
-        let mut observations = Vec::with_capacity(unit.manifest.blocks.len());
+        let mut binding_slots = Vec::new();
+        binding_slots
+            .try_reserve_exact(binding_count)
+            .map_err(|error| {
+                types::DsrError::CachePolicy(format!(
+                    "shared generation-binding reservation failed: {error}"
+                ))
+            })?;
+        binding_slots.resize_with(binding_count, || None);
+        let mut observations = Vec::new();
+        observations
+            .try_reserve_exact(block_count)
+            .map_err(|error| {
+                types::DsrError::CachePolicy(format!(
+                    "shared generation observation reservation failed: {error}"
+                ))
+            })?;
         for block in &unit.manifest.blocks {
             let observation = memory.dsr_generation_observation(block.guest_start)?;
             if observation.expected() != types::CodeGeneration::INITIAL {
-                return Ok(None);
+                return Err(types::DsrError::GenerationChanged {
+                    page: observation.page().raw(),
+                    expected: types::CodeGeneration::INITIAL.get(),
+                    observed: observation.expected().get(),
+                });
             }
-            let slot = bindings
+            let slot = binding_slots
                 .get_mut(block.generation_binding as usize)
                 .ok_or_else(|| {
                     types::DsrError::CachePolicy(
@@ -2081,7 +2548,7 @@ impl ProcessState {
             ));
             observations.push(observation);
         }
-        let generation_bindings = bindings
+        let generation_bindings = binding_slots
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| {
@@ -2091,12 +2558,6 @@ impl ProcessState {
             })?
             .into_boxed_slice();
         let bindings_pointer = generation_bindings.as_ptr() as usize;
-        let cache_start = unit.base;
-        let cache_end = cache_start
-            .checked_add(unit.manifest.code_len as usize)
-            .ok_or_else(|| {
-                types::DsrError::CachePolicy("shared translation range overflow".to_string())
-            })?;
         let target_authority = Box::new(gateway::TargetCacheAuthority::new(
             cache_start,
             cache_end,
@@ -2104,30 +2565,57 @@ impl ProcessState {
         ));
         let target_authority_pointer = target_authority.as_ref() as *const _;
         let loaded_unit_index = self.loaded_shared_units.len();
-        let direct_binding_unit_index = self.direct_bindings.register_loaded_unit(&unit)?;
-        let direct_binding_unit_digest =
-            crate::direct_binding::direct_binding_unit_digest(&unit.manifest.key)?;
-        let direct_binding_record_count =
-            u64::try_from(unit.manifest.bindings.len()).unwrap_or(u64::MAX);
-        let direct_binding_data_bytes = unit.manifest.binding_data_len;
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::GenerationAuthorities)?;
+
         let host_bias = unit.manifest.key.host_bias();
+        let mut blocks = Vec::new();
+        blocks.try_reserve_exact(block_count).map_err(|error| {
+            types::DsrError::CachePolicy(format!(
+                "shared prepared-block reservation failed: {error}"
+            ))
+        })?;
+        let mut guest_range_additions = Vec::new();
+        let mut dependency_records = Vec::new();
+        dependency_records
+            .try_reserve_exact(block_count)
+            .map_err(|error| {
+                types::DsrError::CachePolicy(format!(
+                    "shared page-dependency tuple reservation failed: {error}"
+                ))
+            })?;
+        let mut sensitive_keys = BTreeSet::new();
         for (block, observation) in unit.manifest.blocks.iter_mut().zip(observations) {
             let address = cache_start
                 .checked_add(block.entry_offset as usize)
                 .ok_or_else(|| {
                     types::DsrError::CachePolicy("shared block address overflow".to_string())
                 })?;
+            let block_end = address
+                .checked_add(block.code_len as usize)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy("shared block extent overflow".to_string())
+                })?;
+            if block_end > cache_end {
+                return Err(types::DsrError::CachePolicy(
+                    "shared block extent exceeds its unit".to_string(),
+                ));
+            }
             let entry = types::CacheVa::published(carrick_guest_mem::HostVa(address));
             let (map, recovery, _direct_links) = block.template.take_runtime_metadata(host_bias)?;
-            let block_key = (block.guest_start, types::CodeGeneration::INITIAL);
-            if block.requires_sensitive_metadata {
-                // Mirror TRANSLATE-time planning exactly: same segment limit,
-                // and read the TERMINAL exit. `plan_block` plans one segment,
-                // and `BlockPlan::exit` is the FIRST segment's exit -- for a
-                // fused plan that is an internal conditional edge, never the
-                // terminator. Reading it here rejected every fused
-                // sensitive-exit block with "lost sensitive metadata identity"
-                // the moment superblocks became shareable.
+            let guest_ranges =
+                exact_guest_ranges_from_pc_map(block.guest_start, block.code_len as usize, &map)?;
+            guest_range_additions
+                .try_reserve(guest_ranges.len())
+                .map_err(|error| {
+                    types::DsrError::CachePolicy(format!(
+                        "shared guest-range addition reservation failed: {error}"
+                    ))
+                })?;
+            guest_range_additions.extend(guest_ranges.iter().cloned());
+
+            let key = (block.guest_start, types::CodeGeneration::INITIAL);
+            let (sensitive, fusion_site) = if block.requires_sensitive_metadata {
                 let planned = block::plan_block_with_segments(
                     memory,
                     block.guest_start,
@@ -2147,45 +2635,42 @@ impl ProcessState {
                         block.guest_start.raw(),
                     )));
                 };
-                // Key by the SENSITIVE instruction's guest PC, exactly as the
-                // translate path does -- the exit lookup is by that PC, not by
-                // the block's start, and the two differ for any block longer
-                // than one instruction.
-                if let Some(site) = fusion {
-                    self.record_exclusive_fusion_site(site);
+                let sensitive_key = (sensitive_guest, types::CodeGeneration::INITIAL);
+                if self.sensitive.contains_key(&sensitive_key)
+                    || !sensitive_keys.insert(sensitive_key)
+                {
+                    return Err(types::DsrError::CachePolicy(format!(
+                        "shared sensitive block identity collides at guest 0x{:x}",
+                        sensitive_guest.raw()
+                    )));
                 }
-                self.sensitive.insert(
-                    (sensitive_guest, types::CodeGeneration::INITIAL),
-                    SensitiveMetadata { exit, fusion },
-                );
-            }
-            self.push_published(PublishedBlock {
+                (
+                    Some((sensitive_key, SensitiveMetadata { exit, fusion })),
+                    fusion,
+                )
+            } else {
+                (None, None)
+            };
+            let published = PublishedBlock {
                 entry,
                 len: block.code_len as usize,
                 map,
                 recovery,
                 _generation: observation.clone(),
-            });
-            self.blocks.insert(block_key, entry);
-            self.dependencies.record(
+            };
+            dependency_records.push((
                 observation.page(),
                 block.guest_start,
                 observation.expected(),
-            );
-            if let Some(end) = block
-                .guest_start
-                .raw()
-                .checked_add((block.template.source_words().len() as u64) * 4)
-            {
-                // Guest extent comes from the SOURCE words; `code_len` is the
-                // emitted cache length and bears no fixed relation to the span of
-                // guest instructions the block covers.
-                self.shared_guest_ranges
-                    .push((block.guest_start, carrick_guest_mem::GuestVa(end)));
-            }
-            self.shared_blocks.insert(
-                block_key,
-                SharedBlockAuthority {
+            ));
+            blocks.push(PreparedSharedBlock {
+                key,
+                entry,
+                published,
+                sensitive,
+                fusion_site,
+                guest_ranges,
+                authority: SharedBlockAuthority {
                     generation_bindings: bindings_pointer,
                     generation_binding_count: generation_bindings.len(),
                     cache_start,
@@ -2193,41 +2678,232 @@ impl ProcessState {
                     target_authority: target_authority_pointer as usize,
                     loaded_unit_index,
                 },
-            );
+            });
         }
-        // Publish the loaded unit's executable range too. Two reasons: a profiler
-        // classifying PCs as JIT-or-host must know about unit code as well as the
-        // private cache (otherwise shared-unit samples are filed as host), and
-        // the distance between this range and the private cache decides whether a
-        // private -> shared edge can be bound with a direct `b` (+/-128 MiB) or
-        // needs an indirect hop.
-        probes::dsr_cache_bounds(cache_start as u64, cache_end as u64);
-        self.shared_guest_ranges.sort_unstable();
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::BlockMetadata)?;
+
+        let normalized_guest_ranges =
+            normalized_guest_range_union(&self.shared_guest_ranges, &guest_range_additions)?;
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::GuestUnion)?;
+
+        let direct_binding = self.direct_bindings.prepare_loaded_unit(&unit)?;
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::DirectBinding)?;
+
+        self.published.try_reserve(block_count).map_err(|error| {
+            types::DsrError::CachePolicy(format!(
+                "shared published-block reservation failed: {error}"
+            ))
+        })?;
+        self.loaded_shared_units.try_reserve(1).map_err(|error| {
+            types::DsrError::CachePolicy(format!(
+                "shared loaded-unit retention reservation failed: {error}"
+            ))
+        })?;
+        let shared_index_count = self
+            .shared_published_index
+            .len()
+            .checked_add(block_count)
+            .ok_or_else(|| {
+                types::DsrError::CachePolicy("shared published-index count overflow".to_string())
+            })?;
+        let mut shared_published_index = Vec::new();
+        shared_published_index
+            .try_reserve_exact(shared_index_count)
+            .map_err(|error| {
+                types::DsrError::CachePolicy(format!(
+                    "shared published-index reservation failed: {error}"
+                ))
+            })?;
+        shared_published_index.extend_from_slice(&self.shared_published_index);
+        for (offset, block) in blocks.iter().enumerate() {
+            let block_index = self.published.len().checked_add(offset).ok_or_else(|| {
+                types::DsrError::CachePolicy("shared published-block index overflow".to_string())
+            })?;
+            shared_published_index.push(PublishedIndexEntry {
+                start: block.entry.host(),
+                block: block_index,
+            });
+        }
+        shared_published_index.sort_unstable_by_key(|entry| entry.start);
+        if shared_published_index
+            .windows(2)
+            .any(|pair| pair[0].start == pair[1].start)
+        {
+            return Err(types::DsrError::CachePolicy(
+                "shared published-block index collides".to_string(),
+            ));
+        }
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::ProcessVectors)?;
+
+        let page_dependencies = self
+            .dependencies
+            .prepare_record_batch(&dependency_records)?;
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::PageDependencies)?;
+
+        let executable_range = self
+            .executable_ranges
+            .prepare_prepend(cache_start, cache_end)?;
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::ExecutableRange)?;
+
+        if loaded_unit_index != self.loaded_shared_units.len()
+            || direct_binding.unit_index() != self.direct_bindings.unit_count()
+        {
+            return Err(types::DsrError::CachePolicy(
+                "shared prepared owner index changed before commit".to_string(),
+            ));
+        }
+        #[cfg(test)]
+        shared_install_prepare_checkpoint(SharedInstallPrepareStage::FinalConsistency)?;
+
+        let direct_binding_probe = DirectBindingUnitLoadedProbe {
+            digest: unit_id.get(),
+            record_count: u64::try_from(unit.manifest.bindings.len()).unwrap_or(u64::MAX),
+            data_bytes: unit.manifest.binding_data_len,
+        };
+        Ok(PreparedSharedInstall {
+            tid,
+            cache_range: cache_start..cache_end,
+            catalog_entry,
+            blocks,
+            shared_published_index,
+            normalized_guest_ranges,
+            loaded_unit: LoadedSharedUnit {
+                unit_id,
+                _unit: unit,
+                _generation_bindings: generation_bindings,
+                _target_authority: target_authority,
+                _direct_binding_unit_index: None,
+            },
+            direct_binding,
+            page_dependencies,
+            executable_range,
+            direct_binding_probe,
+        })
+    }
+
+    fn commit_shared_install(&mut self, prepared: PreparedSharedInstall) {
+        self.commit_shared_install_inner(prepared, None);
+    }
+
+    #[cfg(test)]
+    fn commit_shared_install_with_recorder(
+        &mut self,
+        prepared: PreparedSharedInstall,
+        recorder: &mut impl TranslatedRangeRecorder,
+    ) {
+        self.commit_shared_install_inner(prepared, Some(recorder));
+    }
+
+    fn commit_shared_install_inner(
+        &mut self,
+        prepared: PreparedSharedInstall,
+        recorder: Option<&mut dyn TranslatedRangeRecorder>,
+    ) {
+        let PreparedSharedInstall {
+            tid,
+            cache_range,
+            catalog_entry,
+            blocks,
+            shared_published_index,
+            normalized_guest_ranges,
+            mut loaded_unit,
+            direct_binding,
+            page_dependencies,
+            executable_range,
+            direct_binding_probe,
+        } = prepared;
+        let block_count = blocks.len();
+
+        if let Some(recorder) = recorder {
+            self.translated_ranges
+                .commit_shared_with_recorder(catalog_entry, recorder);
+        } else {
+            self.translated_ranges.commit_shared(catalog_entry);
+        }
+        loaded_unit._direct_binding_unit_index =
+            self.direct_bindings.commit_loaded_unit(direct_binding);
+        self.loaded_shared_units.push(loaded_unit);
+
+        for block in blocks {
+            let PreparedSharedBlock {
+                key,
+                entry,
+                published,
+                sensitive,
+                fusion_site,
+                guest_ranges: _guest_ranges,
+                authority,
+            } = block;
+            if let Some(site) = fusion_site {
+                self.record_exclusive_fusion_site(site);
+            }
+            if let Some((key, metadata)) = sensitive {
+                self.sensitive.insert(key, metadata);
+            }
+            self.published.push(published);
+            self.blocks.insert(key, entry);
+            self.shared_blocks.insert(key, authority);
+        }
+        self.shared_published_index = shared_published_index;
+        self.dependencies.commit_record_batch(page_dependencies);
+        self.shared_guest_ranges = normalized_guest_ranges;
         self.stats.shared_blocks_mapped = self
             .stats
             .shared_blocks_mapped
-            .saturating_add(unit.manifest.blocks.len() as u64);
-        self.loaded_shared_units.push(LoadedSharedUnit {
-            _unit: unit,
-            _generation_bindings: generation_bindings,
-            _target_authority: target_authority,
-            _direct_binding_unit_index: direct_binding_unit_index,
-        });
-        self.executable_ranges.prepend(cache_start, cache_end)?;
+            .saturating_add(block_count as u64);
+
+        self.executable_ranges.commit_prepend(executable_range);
+
+        probes::dsr_cache_bounds(cache_range.start as u64, cache_range.end as u64);
         probes::dsr_cache_event(
             tid,
             probes::DsrCacheEventKind::DirectBindingUnitLoaded,
-            direct_binding_unit_digest,
-            direct_binding_record_count,
-            direct_binding_data_bytes,
+            direct_binding_probe.digest,
+            direct_binding_probe.record_count,
+            direct_binding_probe.data_bytes,
         );
-        let result = self.blocks.get(&(guest, generation)).copied();
-        if result.is_some() {
-            self.stats.shared_unit_hits = self.stats.shared_unit_hits.saturating_add(1);
-            self.stats.shared_translations_avoided =
-                self.stats.shared_translations_avoided.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    fn shared_install_logical_snapshot_for_test(&self) -> SharedInstallLogicalSnapshot {
+        SharedInstallLogicalSnapshot {
+            catalog_frontier: self.translated_ranges.sequence_frontier(),
+            catalog_ready: self.translated_ranges.ready_sequence,
+            catalog_shared: self.translated_ranges.shared.clone(),
+            blocks: self
+                .blocks
+                .iter()
+                .map(|(key, entry)| (*key, *entry))
+                .collect(),
+            sensitive_keys: self.sensitive.keys().copied().collect(),
+            fusion_sites: std::array::from_fn(|index| {
+                self.exclusive_fusion_sites[index].iter().copied().collect()
+            }),
+            published_len: self.published.len(),
+            private_published_index: self.private_published_index.clone(),
+            shared_published_index: self.shared_published_index.clone(),
+            dependencies: self.dependencies.snapshot_for_test(),
+            shared_blocks: self
+                .shared_blocks
+                .iter()
+                .map(|(key, authority)| (*key, *authority))
+                .collect(),
+            shared_guest_ranges: self.shared_guest_ranges.clone(),
+            loaded_unit_ids: self
+                .loaded_shared_units
+                .iter()
+                .map(|unit| unit.unit_id)
+                .collect(),
+            direct_bindings: self.direct_bindings.logical_snapshot_for_test(),
+            executable_head: self.executable_ranges.head_ptr() as usize,
+            executable_nodes: self.executable_ranges.shared_node_count(),
         }
-        Ok(result)
     }
 
     pub fn record_exclusive_fusion_site(&mut self, site: types::ExclusiveFusionSite) {
@@ -4208,13 +4884,23 @@ mod tests {
     // by the mirrored-ordinal tests in carrick-dsr).
     use super::{
         DsrErrorProbeExt as _, NativeDsrExitProbeExt as _, ProcessTranslator, SharedBlockAuthority,
-        TranslatedRangeCatalog, TranslatedRangeRecorder, translation_source_words_required,
+        SharedInstallPrepareStage, TranslatedRangeCatalog, TranslatedRangeRecorder,
+        exact_guest_ranges_from_pc_map, normalized_guest_range_union,
+        set_shared_install_prepare_failpoint_for_test, translated_unit_id,
+        translation_source_words_required, typed_unit_id_from_digest,
+    };
+    use crate::artifact_spike::{ArtifactBindings, ArtifactTemplate};
+    use crate::emit::PcMapEntry;
+    use crate::mapped_memory::NativeMappedMemory;
+    use crate::shared_cache::{
+        DirectBindingLayout, PortableBlockRecord, SharedLoadedTranslationUnit,
+        TRANSLATION_UNIT_BASE_EXPORT, TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitManifest,
     };
     use crate::types;
     use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
     use carrick_dsr::probes::{
         TranslatedPrivateRange, TranslatedRangeAdd, TranslatedRangeEpoch, TranslatedRangeReady,
-        TranslatedRangeReset, TranslatedRangeSequence,
+        TranslatedRangeReset, TranslatedRangeSequence, TranslatedUnitId,
     };
     use carrick_guest_mem::{GuestVa, HostVa};
     use std::ptr::NonNull;
@@ -4361,6 +5047,525 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(recorder.events, Vec::<RecordedTranslatedRange>::new());
         }
+    }
+
+    fn active_catalog() -> (TranslatedRangeCatalog, TranslatedRangeRecorderFixture) {
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        let mut catalog = TranslatedRangeCatalog::dormant_with_recorder(
+            HostVa(0x1000)..HostVa(0x2000),
+            &mut recorder,
+        )
+        .expect("dormant catalog");
+        catalog
+            .activate_if_dormant_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        recorder.events.clear();
+        (catalog, recorder)
+    }
+
+    #[test]
+    fn translated_range_catalog_shared_prepare_is_atomic_and_commit_publishes_once() {
+        let (mut catalog, mut recorder) = active_catalog();
+        let before = (
+            catalog.next_sequence,
+            catalog.ready_sequence,
+            catalog.shared.clone(),
+        );
+        let unit_id = TranslatedUnitId::new(11).expect("unit id");
+
+        let prepared = catalog
+            .prepare_shared(unit_id, HostVa(0x2000)..HostVa(0x3000))
+            .expect("private-adjacent shared range");
+
+        assert_eq!(
+            (
+                catalog.next_sequence,
+                catalog.ready_sequence,
+                catalog.shared.clone(),
+            ),
+            before,
+            "preparation must not consume sequence or publish"
+        );
+        assert!(recorder.events.is_empty());
+
+        catalog.commit_shared_with_recorder(prepared.clone(), &mut recorder);
+
+        assert_eq!(catalog.next_sequence, 3);
+        assert_eq!(catalog.ready_sequence, Some(1));
+        assert_eq!(catalog.shared, vec![prepared.clone()]);
+        assert_eq!(
+            recorder.events,
+            vec![RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(
+                carrick_dsr::probes::TranslatedSharedRange::shared(
+                    catalog.epoch,
+                    prepared.sequence,
+                    unit_id,
+                    prepared.range,
+                )
+                .expect("typed shared event"),
+            ))]
+        );
+    }
+
+    #[test]
+    fn translated_range_catalog_assigns_ordered_shared_sequences_once() {
+        let (mut catalog, mut recorder) = active_catalog();
+        for (unit, start, end) in [(11, 0x3000, 0x4000), (12, 0x5000, 0x6000)] {
+            let prepared = catalog
+                .prepare_shared(
+                    TranslatedUnitId::new(unit).expect("unit id"),
+                    HostVa(start)..HostVa(end),
+                )
+                .expect("prepare disjoint shared range");
+            catalog.commit_shared_with_recorder(prepared, &mut recorder);
+        }
+
+        assert_eq!(
+            catalog
+                .shared
+                .iter()
+                .map(|entry| entry.sequence.get())
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(catalog.next_sequence, 4);
+        assert_eq!(recorder.events.len(), 2);
+        assert!(matches!(
+            recorder.events.as_slice(),
+            [
+                RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(first)),
+                RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(second)),
+            ] if first.sequence().get() == 2 && second.sequence().get() == 3
+        ));
+    }
+
+    #[test]
+    fn translated_range_catalog_rejects_shared_overlap_and_duplicate_identity_atomically() {
+        let (mut catalog, mut recorder) = active_catalog();
+        let committed = catalog
+            .prepare_shared(
+                TranslatedUnitId::new(11).expect("unit id"),
+                HostVa(0x3000)..HostVa(0x4000),
+            )
+            .expect("first shared range");
+        catalog.commit_shared_with_recorder(committed, &mut recorder);
+        recorder.events.clear();
+
+        for (case, unit, start, end) in [
+            ("exact private", 12, 0x1000, 0x2000),
+            ("inside private", 12, 0x1400, 0x1800),
+            ("contains private", 12, 0x0800, 0x2800),
+            ("partial private below", 12, 0x0800, 0x1400),
+            ("partial private above", 12, 0x1800, 0x2800),
+            ("duplicate id equal range", 11, 0x3000, 0x4000),
+            ("duplicate id disjoint range", 11, 0x5000, 0x6000),
+            ("exact shared overlap", 12, 0x3000, 0x4000),
+            ("partial shared overlap", 12, 0x3800, 0x4800),
+            ("nested shared overlap", 12, 0x3400, 0x3800),
+            ("contains shared", 12, 0x2800, 0x4800),
+        ] {
+            let before = (
+                catalog.next_sequence,
+                catalog.ready_sequence,
+                catalog.shared.clone(),
+            );
+            let result = catalog.prepare_shared(
+                TranslatedUnitId::new(unit).expect("unit id"),
+                HostVa(start)..HostVa(end),
+            );
+
+            assert!(result.is_err(), "{case}");
+            assert_eq!(
+                (
+                    catalog.next_sequence,
+                    catalog.ready_sequence,
+                    catalog.shared.clone(),
+                ),
+                before,
+                "{case}"
+            );
+            assert!(recorder.events.is_empty(), "{case}");
+        }
+
+        for (case, start, end) in [
+            ("empty", 0x5000, 0x5000),
+            ("reversed", 0x6000, 0x5000),
+            ("unaligned start", 0x5002, 0x6000),
+            ("unaligned end", 0x5000, 0x6002),
+        ] {
+            let before = catalog.next_sequence;
+            assert!(
+                catalog
+                    .prepare_shared(
+                        TranslatedUnitId::new(12).expect("unit id"),
+                        HostVa(start)..HostVa(end),
+                    )
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(catalog.next_sequence, before, "{case}");
+        }
+
+        assert!(
+            catalog
+                .prepare_shared(
+                    TranslatedUnitId::new(12).expect("unit id"),
+                    HostVa(0x4000)..HostVa(0x5000),
+                )
+                .is_ok(),
+            "shared adjacency is valid"
+        );
+    }
+
+    #[test]
+    fn translated_range_catalog_rejects_sequence_overflow_without_advancing() {
+        let (mut catalog, recorder) = active_catalog();
+        catalog.next_sequence = u64::MAX;
+        let before = (
+            catalog.next_sequence,
+            catalog.ready_sequence,
+            catalog.shared.clone(),
+        );
+
+        assert!(
+            catalog
+                .prepare_shared(
+                    TranslatedUnitId::new(12).expect("unit id"),
+                    HostVa(0x3000)..HostVa(0x4000),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            (
+                catalog.next_sequence,
+                catalog.ready_sequence,
+                catalog.shared,
+            ),
+            before
+        );
+        assert!(recorder.events.is_empty());
+    }
+
+    fn pc_map(entries: &[(u64, u32)]) -> Vec<PcMapEntry> {
+        entries
+            .iter()
+            .map(|(guest, cache)| PcMapEntry {
+                guest: GuestVa(*guest),
+                cache: types::CacheOffset::published(*cache),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shared_unit_pc_map_rejects_malformed_geometry() {
+        for (case, guest_start, code_len, map) in [
+            ("empty", GuestVa(0x4000), 8, pc_map(&[])),
+            (
+                "unaligned guest",
+                GuestVa(0x4000),
+                8,
+                pc_map(&[(0x4002, 0)]),
+            ),
+            (
+                "unaligned cache",
+                GuestVa(0x4000),
+                8,
+                pc_map(&[(0x4000, 2)]),
+            ),
+            (
+                "cache at block end",
+                GuestVa(0x4000),
+                8,
+                pc_map(&[(0x4000, 8)]),
+            ),
+            (
+                "duplicate cache",
+                GuestVa(0x4000),
+                8,
+                pc_map(&[(0x4000, 0), (0x4004, 0)]),
+            ),
+            (
+                "descending cache",
+                GuestVa(0x4000),
+                8,
+                pc_map(&[(0x4000, 4), (0x4004, 0)]),
+            ),
+            (
+                "declared start absent",
+                GuestVa(0x4000),
+                8,
+                pc_map(&[(0x4004, 0)]),
+            ),
+            (
+                "guest end overflow",
+                GuestVa(u64::MAX - 3),
+                8,
+                pc_map(&[(u64::MAX - 3, 0)]),
+            ),
+        ] {
+            assert!(
+                exact_guest_ranges_from_pc_map(guest_start, code_len, &map).is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_unit_pc_map_accepts_repeated_guests_and_preserves_holes() {
+        assert_eq!(
+            exact_guest_ranges_from_pc_map(
+                GuestVa(0x4000),
+                12,
+                &pc_map(&[(0x4000, 0), (0x4000, 4), (0x4004, 8)]),
+            )
+            .expect("repeated guest PCs are legal"),
+            vec![GuestVa(0x4000)..GuestVa(0x4008)]
+        );
+        assert_eq!(
+            exact_guest_ranges_from_pc_map(
+                GuestVa(0x4000),
+                24,
+                &pc_map(&[
+                    (0x4000, 0),
+                    (0x4000, 4),
+                    (0x4004, 8),
+                    (0x4010, 12),
+                    (0x4010, 16),
+                    (0x4014, 20),
+                ]),
+            )
+            .expect("non-contiguous guest PCs"),
+            vec![
+                GuestVa(0x4000)..GuestVa(0x4008),
+                GuestVa(0x4010)..GuestVa(0x4018),
+            ]
+        );
+        assert_eq!(
+            exact_guest_ranges_from_pc_map(
+                GuestVa(0x4000),
+                12,
+                &pc_map(&[(0x4010, 0), (0x4000, 4), (0x4004, 8)]),
+            )
+            .expect("cache order need not equal guest order"),
+            vec![
+                GuestVa(0x4000)..GuestVa(0x4008),
+                GuestVa(0x4010)..GuestVa(0x4014),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_unit_guest_range_union_is_deterministic_and_preserves_gaps() {
+        let existing = vec![
+            (GuestVa(0x1000), GuestVa(0x1010)),
+            (GuestVa(0x1030), GuestVa(0x1040)),
+            (GuestVa(0x1080), GuestVa(0x1090)),
+        ];
+        let additions = vec![
+            GuestVa(0x1050)..GuestVa(0x1060),
+            GuestVa(0x1028)..GuestVa(0x1034),
+            GuestVa(0x100c)..GuestVa(0x1010),
+            GuestVa(0x1014)..GuestVa(0x1020),
+            GuestVa(0x1008)..GuestVa(0x1014),
+            GuestVa(0x1008)..GuestVa(0x1014),
+        ];
+
+        assert_eq!(
+            normalized_guest_range_union(&existing, &additions).expect("normalized union"),
+            vec![
+                (GuestVa(0x1000), GuestVa(0x1020)),
+                (GuestVa(0x1028), GuestVa(0x1040)),
+                (GuestVa(0x1050), GuestVa(0x1060)),
+                (GuestVa(0x1080), GuestVa(0x1090)),
+            ]
+        );
+        assert_eq!(
+            normalized_guest_range_union(
+                &[],
+                &[
+                    GuestVa(0x2010)..GuestVa(0x2020),
+                    GuestVa(0x2000)..GuestVa(0x2004),
+                    GuestVa(0x2008)..GuestVa(0x2010),
+                    GuestVa(0x2000)..GuestVa(0x2004),
+                ],
+            )
+            .expect("reverse additions"),
+            vec![
+                (GuestVa(0x2000), GuestVa(0x2004)),
+                (GuestVa(0x2008), GuestVa(0x2020)),
+            ],
+            "one four-byte gap must remain visible"
+        );
+        assert_eq!(
+            normalized_guest_range_union(&[], &[]).expect("empty union"),
+            Vec::<(GuestVa, GuestVa)>::new()
+        );
+    }
+
+    #[test]
+    fn shared_unit_identity_is_stable_typed_and_zero_is_rejected() {
+        let first = direct_binding_owner_and_publication::key(40);
+        let second = direct_binding_owner_and_publication::key(41);
+        let first_id = translated_unit_id(&first).expect("first unit id");
+
+        assert_ne!(first_id.get(), 0);
+        assert_eq!(
+            translated_unit_id(&first).expect("stable first unit id"),
+            first_id
+        );
+        assert_ne!(
+            translated_unit_id(&second).expect("second unit id"),
+            first_id
+        );
+        assert!(
+            typed_unit_id_from_digest(0)
+                .expect_err("zero digest must not receive a replacement")
+                .to_string()
+                .contains("unit identity")
+        );
+    }
+
+    fn shared_install_unit(base: usize) -> SharedLoadedTranslationUnit {
+        let map = pc_map(&[(0x400000, 0), (0x400000, 4), (0x400004, 8), (0x400010, 12)]);
+        let template = ArtifactTemplate::normalize(
+            Vec::new(),
+            map,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
+        )
+        .expect("shared block metadata")
+        .into_runtime_metadata_only();
+        SharedLoadedTranslationUnit::new(
+            TranslationUnitManifest {
+                schema: TRANSLATION_UNIT_SCHEMA_V2,
+                key: direct_binding_owner_and_publication::key(42),
+                dylib_sha256: [0x42; 32],
+                base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+                code_len: 16,
+                blocks: vec![PortableBlockRecord {
+                    guest_start: GuestVa(0x400000),
+                    generation_binding: 0,
+                    entry_offset: 0,
+                    code_len: 16,
+                    requires_sensitive_metadata: false,
+                    template,
+                }],
+                binding_layout: DirectBindingLayout::Disabled,
+                binding_export: String::new(),
+                binding_data_len: 0,
+                cell_size: 0,
+                bindings: Vec::new(),
+                binding_relocations: Vec::new(),
+            },
+            base,
+            Arc::new(()),
+        )
+    }
+
+    #[test]
+    fn shared_unit_prepare_failpoints_leave_logical_state_unchanged() {
+        for stage in SharedInstallPrepareStage::ALL {
+            let process =
+                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+            let mut recorder = TranslatedRangeRecorderFixture::default();
+            process
+                .activate_translated_range_catalog_with_recorder(&mut recorder)
+                .expect("activate catalog");
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let mut state = process.state.write();
+            let base = (state.cache.host_range().end + 0x10_000) & !3;
+            let before = state.shared_install_logical_snapshot_for_test();
+            set_shared_install_prepare_failpoint_for_test(Some(stage));
+
+            let result = state.prepare_shared_install(73, &memory, shared_install_unit(base));
+            set_shared_install_prepare_failpoint_for_test(None);
+
+            assert!(result.is_err(), "{stage:?}");
+            assert_eq!(
+                state.shared_install_logical_snapshot_for_test(),
+                before,
+                "{stage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_unit_stale_generation_is_a_nonpublishing_preparation_miss() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        memory
+            .dsr_generations
+            .note_guest_code_write(GuestVa(0x400000)..GuestVa(0x400004))
+            .expect("advance guest generation");
+        let mut state = process.state.write();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+        let before = state.shared_install_logical_snapshot_for_test();
+
+        assert!(matches!(
+            state.prepare_shared_install(73, &memory, shared_install_unit(base)),
+            Err(types::DsrError::GenerationChanged { .. })
+        ));
+        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
+    }
+
+    #[test]
+    fn shared_unit_commit_installs_exact_ranges_and_one_typed_identity() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        recorder.events.clear();
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+        let head_before = state.executable_ranges.head_ptr();
+
+        let prepared = state
+            .prepare_shared_install(73, &memory, shared_install_unit(base))
+            .expect("prepare shared install");
+        let prepared_id = prepared.loaded_unit.unit_id;
+        assert_eq!(prepared.catalog_entry.unit_id, prepared_id);
+        state.commit_shared_install_with_recorder(prepared, &mut recorder);
+
+        assert_eq!(state.translated_ranges.shared.len(), 1);
+        assert_eq!(state.translated_ranges.shared[0].unit_id, prepared_id);
+        assert_eq!(state.loaded_shared_units.len(), 1);
+        assert_eq!(state.loaded_shared_units[0].unit_id, prepared_id);
+        assert_eq!(
+            state.shared_guest_ranges,
+            vec![
+                (GuestVa(0x400000), GuestVa(0x400008)),
+                (GuestVa(0x400010), GuestVa(0x400014)),
+            ]
+        );
+        assert!(state.shared_block_contains(GuestVa(0x400000)));
+        assert!(state.shared_block_contains(GuestVa(0x400004)));
+        assert!(!state.shared_block_contains(GuestVa(0x400008)));
+        assert!(state.shared_block_contains(GuestVa(0x400010)));
+        assert!(!state.shared_block_contains(GuestVa(0x400014)));
+        assert!(
+            state
+                .blocks
+                .contains_key(&(GuestVa(0x400000), types::CodeGeneration::INITIAL,))
+        );
+        assert_ne!(state.executable_ranges.head_ptr(), head_before);
+        assert!(state.executable_ranges.contains(base));
+        assert!(matches!(
+            recorder.events.as_slice(),
+            [RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(event))]
+                if event.unit_id() == prepared_id
+                    && event.range() == &(HostVa(base)..HostVa(base + 16))
+        ));
     }
 
     #[test]
