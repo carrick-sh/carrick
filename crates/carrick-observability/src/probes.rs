@@ -1347,6 +1347,35 @@ mod real {
         ranges: Vec<HostImageRange>,
     }
 
+    #[cfg(target_os = "macos")]
+    #[derive(Debug)]
+    struct HostImageBase {
+        pid: u32,
+        base: u64,
+        slide: i64,
+        path: String,
+    }
+
+    /// Owned host-image identity collected before a native exec crosses its
+    /// mapped-memory point of no return.
+    ///
+    /// The fields stay private so callers can only borrow the exact prepared
+    /// payload back into the two probe fires. In particular, this type is not
+    /// `Clone`: publication after translated-range activation cannot duplicate
+    /// the dyld path or catalog's `Vec<String>` storage.
+    #[cfg(target_os = "macos")]
+    #[derive(Debug)]
+    pub struct PreparedHostImagePublication {
+        base: HostImageBase,
+        catalog: HostImageCatalog,
+    }
+
+    /// Cross-target shape for the real USDT arm. Dyld identity exists only on
+    /// macOS, but the runtime is platform-checked with the same probe surface.
+    #[cfg(not(target_os = "macos"))]
+    #[derive(Debug)]
+    pub struct PreparedHostImagePublication;
+
     /// USDT probes for the carrick provider. The `usdt` crate's hard cap is
     /// 6 args per probe, so syscall args ride as a `&SyscallArgs` reference
     /// — usdt JSON-encodes it through serde and passes the resulting
@@ -2183,16 +2212,16 @@ mod real {
         carrick_usdt::execve__argv!(|| (std::process::id(), path, joined.as_str()));
     }
 
-    /// Publish this process's carrick image base / ASLR slide for offline
-    /// symbolication. See the `host__image__base` provider doc for why a
-    /// per-process announcement is required rather than one global base.
+    /// Collect this process's carrick image base / ASLR slide for offline
+    /// symbolication.
     ///
     /// Reports the HOST (carrick) image only. The inner guest image is a
     /// separate address range with a separate on-disk file, announced by
     /// [`guest_image_base`]; a consumer needs both, and conflating them
     /// resolves a guest PC against carrick's symbol table, which yields a
     /// plausible name that is simply wrong.
-    pub fn host_image_base() {
+    #[cfg(target_os = "macos")]
+    fn host_image_base_snapshot() -> HostImageBase {
         // Image 0 is the main executable. The mach_header address IS the
         // runtime __TEXT base, which is what `atos -l` wants; the slide is
         // reported alongside it so a consumer can convert either way, and the
@@ -2208,30 +2237,47 @@ mod real {
         // pointer is only read as an integer, never dereferenced; the name is a
         // dyld-owned NUL-terminated string that lives as long as the image, so
         // the borrow taken here cannot dangle.
-        #[cfg(target_os = "macos")]
-        {
-            // The probe macro expands to its own `unsafe`, so the FFI is scoped
-            // tightly here rather than wrapping the fire as well. The path is
-            // taken as an owned String inside the block: the borrow would
-            // otherwise be tied to a temporary `CStr` built from a raw pointer.
-            // This fires once per guest process, so the allocation is free in
-            // any sense that matters.
-            let (base, slide, path) = unsafe {
-                let name = mach2::dyld::_dyld_get_image_name(0);
-                (
-                    mach2::dyld::_dyld_get_image_header(0) as usize as u64,
-                    mach2::dyld::_dyld_get_image_vmaddr_slide(0) as i64,
-                    if name.is_null() {
-                        String::new()
-                    } else {
-                        std::ffi::CStr::from_ptr(name)
-                            .to_string_lossy()
-                            .into_owned()
-                    },
-                )
-            };
-            carrick_usdt::host__image__base!(|| (std::process::id(), base, slide, path.as_str()));
+        // The probe macro expands to its own `unsafe`, so the FFI is scoped
+        // tightly here rather than wrapping a later fire as well. Own the path:
+        // its source is a temporary `CStr` borrow from dyld.
+        let (base, slide, path) = unsafe {
+            let name = mach2::dyld::_dyld_get_image_name(0);
+            (
+                mach2::dyld::_dyld_get_image_header(0) as usize as u64,
+                mach2::dyld::_dyld_get_image_vmaddr_slide(0) as i64,
+                if name.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(name)
+                        .to_string_lossy()
+                        .into_owned()
+                },
+            )
+        };
+        HostImageBase {
+            pid: std::process::id(),
+            base,
+            slide,
+            path,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn publish_host_image_base_snapshot(snapshot: &HostImageBase) {
+        carrick_usdt::host__image__base!(|| (
+            snapshot.pid,
+            snapshot.base,
+            snapshot.slide,
+            snapshot.path.as_str()
+        ));
+    }
+
+    /// Collect and publish this process's carrick image base immediately.
+    /// Native exec handoff uses [`prepare_host_image_publication`] instead so
+    /// allocation happens before its fatal-only boundary.
+    pub fn host_image_base() {
+        #[cfg(target_os = "macos")]
+        publish_host_image_base_snapshot(&host_image_base_snapshot());
         // Not macOS: dyld is the mechanism above, and only the Darwin native
         // lane self-reexecs its guest processes. Announcing a base we have not
         // actually queried would be worse than announcing none -- a consumer
@@ -2378,6 +2424,41 @@ mod real {
 
     #[cfg(not(target_os = "macos"))]
     pub fn host_image_catalog() {}
+
+    /// Collect every owned host-image value before a native exec retires its
+    /// recoverable image. The returned payload is later borrowed by the probe
+    /// fires, so activation through thread installation performs no dyld walk,
+    /// path conversion, vector growth, or `String` clone.
+    #[cfg(target_os = "macos")]
+    pub fn prepare_host_image_publication() -> PreparedHostImagePublication {
+        PreparedHostImagePublication {
+            base: host_image_base_snapshot(),
+            catalog: host_image_catalog_snapshot(),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn prepare_host_image_publication() -> PreparedHostImagePublication {
+        PreparedHostImagePublication
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn publish_host_image_base(prepared: &PreparedHostImagePublication) {
+        publish_host_image_base_snapshot(&prepared.base);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn publish_host_image_base(_prepared: &PreparedHostImagePublication) {}
+
+    #[cfg(target_os = "macos")]
+    pub fn publish_host_image_catalog(prepared: &PreparedHostImagePublication) {
+        // `usdt` accepts a borrowed serializable provider argument through its
+        // `Borrow<T>` contract; this serializes the exact prepared allocation.
+        carrick_usdt::host__image__catalog!(|| &prepared.catalog);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn publish_host_image_catalog(_prepared: &PreparedHostImagePublication) {}
 
     /// Publish the INNER guest image: where the Linux binary this process is
     /// running got loaded, and which file it came from.
@@ -3254,6 +3335,13 @@ mod stub {
     //! plain logic, not probe fires, so they keep their REAL bodies — behaviour
     //! is identical to the real arm.
 
+    #[derive(Debug)]
+    pub struct PreparedHostImagePublication;
+
+    pub fn prepare_host_image_publication() -> PreparedHostImagePublication {
+        PreparedHostImagePublication
+    }
+
     macro_rules! stub {
         ($name:ident($($param:ident: $ty:ty),* $(,)?)) => {
             #[allow(dead_code, unused_variables)]
@@ -3302,6 +3390,8 @@ mod stub {
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(host_image_base());
     stub!(host_image_catalog());
+    stub!(publish_host_image_base(prepared: &PreparedHostImagePublication));
+    stub!(publish_host_image_catalog(prepared: &PreparedHostImagePublication));
     stub!(guest_image_base(base: u64, entry: u64, path: &str));
     stub!(host_jit_range(start: u64, end: u64));
     stub!(fs_op(op: &str, path: &str, errno: i32));
