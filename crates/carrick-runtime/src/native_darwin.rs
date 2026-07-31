@@ -3316,7 +3316,13 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         // memory retires sidecar cells and their authorities.
                         // No guest execution resumes until `reset_for_exec`
                         // installs the replacement process below.
-                        let mut exec_reset_token = translator.prepare_direct_binding_exec_reset();
+                        let mut exec_reset_token = translator
+                            .prepare_direct_binding_exec_reset()
+                            .map_err(|error| {
+                                RuntimeError::Trap(TrapError::Hypervisor(format!(
+                                    "native execve could not mint retiring translator authority: {error}"
+                                )))
+                            })?;
                         memory
                             .replace_image(
                                 &image,
@@ -3367,7 +3373,11 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         translator.begin_exec_reset();
                         translator.begin_exec_handoff();
                         let next_process = memory.read().dsr_process_translator()?;
-                        translator.reset_for_exec(next_process);
+                        translator.reset_for_exec(next_process).map_err(|error| {
+                            RuntimeError::Trap(TrapError::Hypervisor(format!(
+                                "native execve could not install replacement translator: {error}"
+                            )))
+                        })?;
                         crate::namespace::pid::mark_self_execed();
                         let cmdline = proc_argv.join(" ");
                         crate::dispatch::set_host_process_name(cmdline.as_bytes());
@@ -6953,16 +6963,7 @@ mod tests {
     }
 
     fn fork_test(test: impl FnOnce()) {
-        install_native_probe_sink();
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
-        if pid == 0 {
-            test();
-            unsafe { libc::_exit(0) };
-        }
-        let status = waitpid_blocking(pid).expect("wait for forked test");
-        assert!(libc::WIFEXITED(status), "forked test status={status:#x}");
-        assert_eq!(libc::WEXITSTATUS(status), 0);
+        fork_test_with_timeout(std::time::Duration::from_secs(5), test);
     }
 
     fn prepare_exec_reset_authority(
@@ -6972,7 +6973,9 @@ mod tests {
             .dsr_process_translator()
             .expect("retiring process translator");
         let mut thread = dsr::ThreadTranslator::for_process(process, 42);
-        let token = thread.prepare_direct_binding_exec_reset();
+        let token = thread
+            .prepare_direct_binding_exec_reset()
+            .expect("mint exec reset authority");
         (thread, token)
     }
 
@@ -7027,6 +7030,7 @@ mod tests {
     }
 
     fn fork_test_with_timeout(timeout: std::time::Duration, test: impl FnOnce()) {
+        install_native_probe_sink();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
@@ -9074,14 +9078,13 @@ mod tests {
                 .add_translated_range_for_test(72, 0x2200_0000..0x2201_0000)
                 .expect("seed inherited shared range");
             let inherited_before = inherited_process.translated_range_catalog_state_for_test();
-            let child = unsafe { libc::fork() };
-            assert!(
-                child >= 0,
-                "fork exec child: {}",
-                std::io::Error::last_os_error()
-            );
-            if child == 0 {
+            let mut exec_thread =
+                dsr::ThreadTranslator::for_process(Arc::clone(&inherited_process), 42);
+            fork_test_with_timeout(std::time::Duration::from_secs(5), || {
                 NATIVE_FORKED_GUEST_CHILD.store(true, std::sync::atomic::Ordering::Release);
+                if exec_thread.after_fork_child(43).is_err() {
+                    unsafe { libc::_exit(2) };
+                }
                 let prepared = memory
                     .prepare_exec_mapping(&target, plan.page_geometry)
                     .expect("prepare fork-child replacement without allocating a translator");
@@ -9093,9 +9096,12 @@ mod tests {
                     && Arc::ptr_eq(&prepared.process_translator, &inherited_process)
                     && prepared_mode == parent_mode;
                 if !reused {
-                    unsafe { libc::_exit(2) };
+                    unsafe { libc::_exit(3) };
                 }
-                let (exec_thread, mut reset_token) = prepare_exec_reset_authority(&memory);
+                let mut reset_token = match exec_thread.prepare_direct_binding_exec_reset() {
+                    Ok(token) => token,
+                    Err(_) => unsafe { libc::_exit(4) },
+                };
                 if memory
                     .replace_image(
                         &target,
@@ -9107,27 +9113,27 @@ mod tests {
                     )
                     .is_err()
                 {
-                    unsafe { libc::_exit(3) };
+                    unsafe { libc::_exit(5) };
                 }
                 let dormant =
-                    inherited_process.translated_range_catalog_state_for_test() == (2, 0, None, 0);
+                    inherited_process.translated_range_catalog_state_for_test() == (3, 0, None, 0);
                 if !dormant {
-                    unsafe { libc::_exit(4) };
+                    unsafe { libc::_exit(6) };
                 }
                 if inherited_process
                     .activate_translated_range_catalog()
                     .is_err()
                 {
-                    unsafe { libc::_exit(5) };
+                    unsafe { libc::_exit(7) };
                 }
                 let activated = inherited_process.translated_range_catalog_state_for_test();
                 if inherited_process
                     .activate_translated_range_catalog()
                     .is_err()
                     || inherited_process.translated_range_catalog_state_for_test() != activated
-                    || activated != (2, 1, Some(1), 0)
+                    || activated != (3, 1, Some(1), 0)
                 {
-                    unsafe { libc::_exit(6) };
+                    unsafe { libc::_exit(8) };
                 }
                 let passed = memory.address_mode() == prepared_mode
                     && Arc::ptr_eq(
@@ -9138,10 +9144,7 @@ mod tests {
                         .read_bytes(target.regions()[0].start + 0x40, 1)
                         .is_ok_and(|bytes| bytes == [0x43]);
                 unsafe { libc::_exit(i32::from(!passed)) };
-            }
-            let status = waitpid_blocking(child).expect("wait exec child");
-            assert!(libc::WIFEXITED(status), "child status={status:#x}");
-            assert_eq!(libc::WEXITSTATUS(status), 0);
+            });
             assert_eq!(memory.address_mode(), parent_mode);
             assert_eq!(
                 inherited_process.translated_range_catalog_state_for_test(),
