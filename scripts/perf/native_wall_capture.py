@@ -612,6 +612,7 @@ def _require_d_clause(
     exact_predicate: bool = False,
     exact_actions: bool = False,
     ordered_actions: bool = False,
+    exact_action_sequence: bool = False,
     unique_assignment_targets: Sequence[str] = (),
     unique_call_names: Sequence[str] = (),
 ) -> None:
@@ -628,7 +629,9 @@ def _require_d_clause(
             if exact_predicate
             else all(item in actual_predicate for item in expected_predicate)
         )
-        if ordered_actions:
+        if exact_action_sequence:
+            actions_match = actual_action_statements == tuple(expected_actions)
+        elif ordered_actions:
             width = len(expected_actions)
             actions_match = any(
                 actual_action_statements[index : index + width]
@@ -1078,47 +1081,66 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         clauses,
         "carrick*:::host-translated-range-reset",
         predicate=(
-            "lifecycle_root_pid == (pid_t)0",
-            "pid == $target || progenyof($target)",
+            "lifecycle_root_pid == (pid_t)0 && "
+            "(pid == $target || progenyof($target))",
         ),
         actions=(
             "unexpected_events++",
             "identity_violations++",
-            "|kind=root-discovery-order-violation|",
+            "lifecycle_ordinal++",
+            (
+                'printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|'
+                "kind=root-discovery-order-violation|pid=%d|incarnation=0|"
+                'generation=0|epoch=%d\\n", lifecycle_ordinal, pid, arg0)'
+            ),
         ),
         description="pre-discovery reset rejection",
+        exact_predicate=True,
+        exact_action_sequence=True,
     )
     _require_d_clause(
         clauses,
         "carrick*:::host-translated-range-reset",
         predicate=(
-            "lifecycle_root_pid != (pid_t)0",
-            "pid != $target",
-            "ppid == $target",
-            "progenyof($target)",
-            "pid != lifecycle_root_pid",
+            "lifecycle_root_pid != (pid_t)0 && pid != $target && "
+            "ppid == $target && progenyof($target) && "
+            "pid != lifecycle_root_pid && pid != lifecycle_child_pid",
         ),
         actions=(
             "unexpected_events++",
             "identity_violations++",
-            "|kind=second-lifecycle-root|",
+            "lifecycle_ordinal++",
+            (
+                'printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|'
+                "kind=second-lifecycle-root|pid=%d|incarnation=0|generation=0|"
+                'epoch=%d\\n", lifecycle_ordinal, pid, arg0)'
+            ),
         ),
         description="competing direct second root rejection",
+        exact_predicate=True,
+        exact_action_sequence=True,
     )
     _require_d_clause(
         clauses,
         "carrick*:::host-translated-range-reset",
         predicate=(
-            "lifecycle_root_pid != (pid_t)0",
-            "pid == lifecycle_root_pid",
-            "tracked[pid] == 0",
+            "lifecycle_root_pid != (pid_t)0 && pid == lifecycle_root_pid && "
+            "tracked[pid] == 0 && (pid == $target || progenyof($target))",
         ),
         actions=(
             "unexpected_events++",
             "identity_violations++",
-            "|kind=root-pid-reuse|",
+            "lifecycle_ordinal++",
+            (
+                'printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|'
+                "kind=root-pid-reuse|pid=%d|incarnation=%d|generation=%d|"
+                "epoch=%d\\n\", lifecycle_ordinal, pid, incarnation[pid], "
+                "image_generation[pid, incarnation[pid]], arg0)"
+            ),
         ),
         description="post-exit root PID reuse rejection",
+        exact_predicate=True,
+        exact_action_sequence=True,
     )
     for provider in (
         "carrick*:::host-translated-private-range",
@@ -1139,11 +1161,13 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
             clauses,
             provider,
             predicate=(
-                "lifecycle_root_pid == (pid_t)0",
-                "pid == $target || progenyof($target)",
+                "lifecycle_root_pid == (pid_t)0 && "
+                "(pid == $target || progenyof($target))",
             ),
             actions=("unexpected_events++", "identity_violations++"),
             description=f"pre-discovery lifecycle rejection for {provider}",
+            exact_predicate=True,
+            exact_action_sequence=True,
         )
 
     action_text = "\n".join(clause.actions for clause in clauses)
