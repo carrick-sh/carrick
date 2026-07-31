@@ -17,7 +17,71 @@ runs 1–31. Read that before re-deriving anything here.
 
 ---
 
-## Current checkpoint — M1 authority closed, M2 performance work open
+## Current checkpoint — M2 shared ownership accepted, speed result still open
+
+M2 now has an accepted process-owned translated-range catalog through the
+first real shared-code consumer. This is an observability/correctness
+milestone, not a performance result.
+
+The retained signed binary is
+`403b12878e36412943c0c5b79ba2271d11b0afbf77f2036afafa2211e610d69f`.
+Strict codesign and `__DATA,__dof_carrick` verification passed. The shared
+install path now:
+
+- derives a stable typed unit identity and exact PC-map guest ownership;
+- prepares catalog, block/index, direct-binding, dependency, retention, and
+  executable-range state without logical mutation on recoverable failure;
+- emits the shared catalog record first and release-publishes executable
+  authority last;
+- distinguishes block-start ownership from converging sensitive-terminal
+  ownership; and
+- has an actual-path regression test proving catalog event, complete logical
+  install under the old executable head, then head publication.
+
+The maintained
+[`scripts/dtrace/native-translated-range-catalog.d`](scripts/dtrace/native-translated-range-catalog.d)
+now fails closed over:
+
+```text
+shared-range announcement
+  -> post-commit kind-12 unit-loaded
+  -> PROFILE-only gateway entry inside that exact half-open range
+```
+
+It keys state by PID incarnation, keeps retained identities/addresses/epochs
+at explicit 64-bit width, separates commit failures from optional run-witness
+failures, and records root status, DTrace drops/errors, and every violation in
+its schema-2 summary.
+
+Accepted live receipts:
+
+| mode | run ID | result | trace SHA-256 |
+|---|---|---|---|
+| semantic, profile absent | `m2-shared-commit-proof-019fb496-20260731i` | 2 announcements, 2 matched unit loads, `commit_ok=1`, `run_ok=0`, zero commit violations/drops/errors, clean exit and cleanup | `734124bf58941cd3d544d3d313fd8c823f4825a7bea76a0e2216f438a5f97cde` |
+| trace-only, profile enabled | `m2-shared-run-proof-019fb496-20260731j` | 2 announcements, 2 unit loads, 2 in-range gateway entries, `commit_ok=1`, `run_ok=1`, every violation/pending/drop/error counter zero, clean exit and cleanup | `9d2868d56e29566071c17932bf43c9ead97f7b5575fc28cd77a2d544000a235d` |
+
+The profile-enabled final child independently reported
+`shared_unit_loads=2`, `shared_blocks_mapped=1168`, and
+`shared_translations_avoided=2`.
+
+Preserve the rejected precursor
+`m2-shared-commit-proof-019fb496-20260731g`: it said `commit_ok=1` but exposed
+DTrace dynamic-array truncation (`0x10edbc380 -> 0xedbc380` and a unit ID to
+its low 32 bits). Commit `0c13a7bf` corrected the complete retained scalar
+path; only the later `...31i` and `...31j` receipts are accepted.
+
+**Next:** finish catalog lifecycle across fork replay and exec reset/handoff,
+including propagated checked epoch failure and production self-reexec proof.
+Then take two default and two shared Go-build attribution captures with the
+same signed binary, use the now-complete catalog to stop misclassifying shared
+JIT code as host, select the first opt-out optimization from measured CPU/
+kernel ownership, and retain it only through the primary ABBA CPU gate.
+
+The ≥30% CPU goal remains open; no new paired CPU ratio has been measured.
+
+---
+
+## Prior checkpoint — M1 authority closed, M2 performance work opened
 
 **M1 instrument authority is complete, but it is not a speed result.** The
 accepted same-binary control/control artifact is
