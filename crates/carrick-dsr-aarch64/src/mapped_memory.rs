@@ -1687,8 +1687,10 @@ impl NativeMappedMemory {
         let retained_target_ranges = prepared.native_layout.owned_ranges();
         let retired_ranges = subtract_host_ranges(&self.owned_host_ranges, retained_target_ranges);
         let retiring_translator = self.dsr_process_translator()?;
-        reset_token
-            .validate_for(&retiring_translator, exec_thread)
+        let reuses_retiring_translator =
+            Arc::ptr_eq(&retiring_translator, &prepared.process_translator);
+        let prepared_translator_reset = retiring_translator
+            .prepare_reset_after_fork_for_exec(exec_thread, reset_token, reuses_retiring_translator)
             .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
         // Everything above remains pre-PONR: it may validate and allocate,
         // and dropping `prepared` must leave the authoritative old image
@@ -1698,9 +1700,7 @@ impl NativeMappedMemory {
         // rollback owner for those transferred intervals.
         prepared.native_layout.arm_prepared_adoptions();
         lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecCacheResetBegin);
-        retiring_translator
-            .reset_after_fork_for_exec(exec_thread, reset_token)
-            .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
+        prepared_translator_reset.commit();
         lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::ExecCacheResetEnd);
         for range in &retired_ranges {
             let start = range.start.raw();

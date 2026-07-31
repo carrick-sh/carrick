@@ -485,6 +485,30 @@ impl DirectBindingRegistry {
         self.units.len()
     }
 
+    /// Counts registry-owned private descriptor leases for one exact process
+    /// epoch, rejecting a descriptor retained from any other private epoch.
+    pub(crate) fn private_descriptor_leases_for(
+        &self,
+        process_epoch: &Arc<PrivateJitEpoch>,
+    ) -> Result<usize, DsrError> {
+        let mut count = 0_usize;
+        for descriptor in &self.descriptors {
+            let Some(descriptor_epoch) = descriptor.private_epoch() else {
+                continue;
+            };
+            if !Arc::ptr_eq(descriptor_epoch, process_epoch) {
+                return Err(DsrError::CachePolicy(
+                    "direct-binding registry retains a stale private JIT descriptor lease"
+                        .to_string(),
+                ));
+            }
+            count = count.checked_add(1).ok_or_else(|| {
+                DsrError::CachePolicy("private JIT descriptor lease count overflow".to_string())
+            })?;
+        }
+        Ok(count)
+    }
+
     /// Registers the exact cells and retained source lease of a loaded unit.
     ///
     /// Disabled-layout units have no cells and return `Ok(None)`.

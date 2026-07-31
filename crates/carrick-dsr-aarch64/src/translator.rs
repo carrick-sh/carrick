@@ -268,14 +268,51 @@ impl DirectBindingExecResetToken {
         Ok(())
     }
 
-    fn consume_for(
-        &mut self,
+    fn prepare_consumption<'token>(
+        &'token mut self,
         process: &ProcessTranslator,
         thread: &ThreadTranslator,
-    ) -> Result<(), types::DsrError> {
+    ) -> Result<ValidatedDirectBindingExecResetToken<'token>, types::DsrError> {
         self.validate_for(process, thread)?;
-        self.consumed = true;
-        Ok(())
+        Ok(ValidatedDirectBindingExecResetToken { token: self })
+    }
+}
+
+struct ValidatedDirectBindingExecResetToken<'token> {
+    token: &'token mut DirectBindingExecResetToken,
+}
+
+impl ValidatedDirectBindingExecResetToken<'_> {
+    fn consume(self) {
+        self.token.consumed = true;
+    }
+}
+
+/// Fully validated authority for one retiring translator's infallible exec
+/// reset commit.
+#[must_use = "a prepared exec reset must be committed only after mapped-memory PONR"]
+pub struct PreparedDirectBindingExecReset<'process, 'token> {
+    process: &'process ProcessTranslator,
+    token: ValidatedDirectBindingExecResetToken<'token>,
+    catalog: Option<PreparedCatalogExecReset>,
+    thread_tid: i32,
+}
+
+impl PreparedDirectBindingExecReset<'_, '_> {
+    /// Consumes the validated token and retires process-owned translator state
+    /// without any recoverable operation.
+    pub fn commit(self) -> crate::direct_binding::ExecBindingClearStats {
+        let process = self.process;
+        process.commit_reset_after_fork_for_exec_inner(self, |_| {})
+    }
+
+    #[cfg(test)]
+    fn commit_with_recorder(
+        self,
+        recorder: impl FnMut(DirectBindingResetEvent),
+    ) -> crate::direct_binding::ExecBindingClearStats {
+        let process = self.process;
+        process.commit_reset_after_fork_for_exec_inner(self, recorder)
     }
 }
 
@@ -509,6 +546,11 @@ struct CatalogSharedRange {
     next_sequence: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedCatalogExecReset {
+    next_epoch: probes::TranslatedRangeEpoch,
+}
+
 impl TranslatedRangeCatalog {
     fn dormant(
         private: std::ops::Range<carrick_guest_mem::HostVa>,
@@ -658,6 +700,30 @@ impl TranslatedRangeCatalog {
         self.epoch = epoch;
         self.ready_sequence = Some(frontier);
         Ok(())
+    }
+
+    fn prepare_dormant_for_exec(&self) -> Result<PreparedCatalogExecReset, types::DsrError> {
+        if self.ready_sequence.is_none() {
+            return Err(types::DsrError::CachePolicy(
+                "cannot reset a dormant translated-range catalog for exec".to_string(),
+            ));
+        }
+        let next_epoch = self.epoch.get().checked_add(1).ok_or_else(|| {
+            types::DsrError::CachePolicy(
+                "translated-range epoch overflow during exec reset".to_string(),
+            )
+        })?;
+        Ok(PreparedCatalogExecReset {
+            next_epoch: probes::TranslatedRangeEpoch::new(next_epoch)
+                .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?,
+        })
+    }
+
+    fn commit_dormant_for_exec(&mut self, prepared: PreparedCatalogExecReset) {
+        self.epoch = prepared.next_epoch;
+        self.next_sequence = 1;
+        self.ready_sequence = None;
+        self.shared.clear();
     }
 
     fn prepare_shared(
@@ -2267,6 +2333,49 @@ impl ProcessTranslator {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn add_translated_range_for_test(
+        &self,
+        unit_id: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<(), types::DsrError> {
+        let start = usize::try_from(range.start).map_err(|_| {
+            types::DsrError::CachePolicy(format!(
+                "test translated-range start is not representable: 0x{:x}",
+                range.start,
+            ))
+        })?;
+        let end = usize::try_from(range.end).map_err(|_| {
+            types::DsrError::CachePolicy(format!(
+                "test translated-range end is not representable: 0x{:x}",
+                range.end,
+            ))
+        })?;
+        let unit_id = probes::TranslatedUnitId::new(unit_id)
+            .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+        let mut state = self.state.write();
+        let prepared = state.translated_ranges.prepare_shared(
+            unit_id,
+            carrick_guest_mem::HostVa(start)..carrick_guest_mem::HostVa(end),
+        )?;
+        state.translated_ranges.commit_shared(prepared);
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn translated_range_catalog_state_for_test(&self) -> (u64, u64, Option<u64>, usize) {
+        let state = self.state.read();
+        let catalog = &state.translated_ranges;
+        (
+            catalog.epoch.get(),
+            catalog.sequence_frontier(),
+            catalog.ready_sequence,
+            catalog.shared.len(),
+        )
+    }
+
     #[cfg(test)]
     fn activate_translated_range_catalog_with_recorder(
         &self,
@@ -2474,7 +2583,9 @@ impl ProcessTranslator {
         thread: &ThreadTranslator,
         token: &mut DirectBindingExecResetToken,
     ) -> Result<crate::direct_binding::ExecBindingClearStats, types::DsrError> {
-        self.reset_after_fork_for_exec_inner(thread, token, |_| {})
+        Ok(self
+            .prepare_reset_after_fork_for_exec(thread, token, false)?
+            .commit())
     }
 
     #[cfg(test)]
@@ -2484,17 +2595,60 @@ impl ProcessTranslator {
         token: &mut DirectBindingExecResetToken,
         recorder: impl FnMut(DirectBindingResetEvent),
     ) -> Result<crate::direct_binding::ExecBindingClearStats, types::DsrError> {
-        self.reset_after_fork_for_exec_inner(thread, token, recorder)
+        Ok(self
+            .prepare_reset_after_fork_for_exec(thread, token, false)?
+            .commit_with_recorder(recorder))
     }
 
-    fn reset_after_fork_for_exec_inner(
-        &self,
+    /// Preflights the complete retiring-translator reset while the old image
+    /// remains authoritative. No logical process state or token is mutated.
+    pub fn prepare_reset_after_fork_for_exec<'process, 'token>(
+        &'process self,
         thread: &ThreadTranslator,
-        token: &mut DirectBindingExecResetToken,
+        token: &'token mut DirectBindingExecResetToken,
+        reset_translated_catalog: bool,
+    ) -> Result<PreparedDirectBindingExecReset<'process, 'token>, types::DsrError> {
+        let state = self.state.write();
+        let token = token.prepare_consumption(self, thread)?;
+        let live_private_leases =
+            crate::direct_binding::PrivateJitEpoch::live_descriptor_leases(&self.private_jit_epoch);
+        let registry_private_leases = state
+            .direct_bindings
+            .private_descriptor_leases_for(&self.private_jit_epoch)?;
+        if live_private_leases != registry_private_leases {
+            return Err(types::DsrError::CachePolicy(format!(
+                "private JIT descriptor lease ownership mismatch: {live_private_leases} live, \
+                 {registry_private_leases} owned by the direct-binding registry"
+            )));
+        }
+        let catalog = reset_translated_catalog
+            .then(|| state.translated_ranges.prepare_dormant_for_exec())
+            .transpose()?;
+        drop(state);
+        Ok(PreparedDirectBindingExecReset {
+            process: self,
+            token,
+            catalog,
+            thread_tid: thread.tid,
+        })
+    }
+
+    fn commit_reset_after_fork_for_exec_inner(
+        &self,
+        prepared: PreparedDirectBindingExecReset<'_, '_>,
         mut recorder: impl FnMut(DirectBindingResetEvent),
-    ) -> Result<crate::direct_binding::ExecBindingClearStats, types::DsrError> {
-        token.consume_for(self, thread)?;
+    ) -> crate::direct_binding::ExecBindingClearStats {
+        let PreparedDirectBindingExecReset {
+            process: _,
+            token,
+            catalog,
+            thread_tid,
+        } = prepared;
         let mut state = self.state.write();
+        token.consume();
+        if let Some(catalog) = catalog {
+            state.translated_ranges.commit_dormant_for_exec(catalog);
+        }
         let clear_stats = state.direct_bindings.clear_all_before_exec_with_evidence(
             |phase| match phase {
                 crate::direct_binding::DirectBindingExecClearPhase::Cells => {
@@ -2506,16 +2660,11 @@ impl ProcessTranslator {
                 }
                 crate::direct_binding::DirectBindingExecClearPhase::Descriptors => {
                     recorder(DirectBindingResetEvent::DescriptorsDropped);
-                    assert_eq!(
-                        Arc::strong_count(&self.private_jit_epoch),
-                        1,
-                        "private JIT cursor cannot reset while a descriptor epoch lease survives"
-                    );
                 }
             },
             |cell| {
                 probes::dsr_cache_event(
-                    thread.tid,
+                    thread_tid,
                     probes::DsrCacheEventKind::DirectBindingClear,
                     cell.get() as u64,
                     crate::direct_binding::DirectBindingClearReason::ExecReset.raw(),
@@ -2546,12 +2695,18 @@ impl ProcessTranslator {
         state.shared_publish_attempted = false;
         state.cache.reset_after_fork_for_exec();
         recorder(DirectBindingResetEvent::PrivateCursorReset);
-        Ok(clear_stats)
+        clear_stats
     }
 
     #[cfg(test)]
     pub fn private_epoch_leases_for_test(&self) -> usize {
         crate::direct_binding::PrivateJitEpoch::live_descriptor_leases(&self.private_jit_epoch)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn private_jit_epoch_lease_for_test(&self) -> Arc<crate::direct_binding::PrivateJitEpoch> {
+        Arc::clone(&self.private_jit_epoch)
     }
 }
 
@@ -5793,6 +5948,172 @@ mod tests {
         );
     }
 
+    fn active_catalog_with_shared_range() -> (TranslatedRangeCatalog, TranslatedRangeRecorderFixture)
+    {
+        let (mut catalog, mut recorder) = active_catalog();
+        let prepared = catalog
+            .prepare_shared(
+                TranslatedUnitId::new(41).expect("unit id"),
+                HostVa(0x3000)..HostVa(0x4000),
+            )
+            .expect("prepare shared range");
+        catalog.commit_shared_with_recorder(prepared, &mut recorder);
+        recorder.events.clear();
+        (catalog, recorder)
+    }
+
+    #[test]
+    fn translated_range_catalog_exec_reset_prepares_then_commits_dormant() {
+        let (mut catalog, recorder) = active_catalog_with_shared_range();
+        let private = catalog.private.clone();
+
+        let prepared = catalog
+            .prepare_dormant_for_exec()
+            .expect("prepare active catalog retirement");
+
+        assert_eq!(catalog.epoch.get(), 1, "preparation changed the live epoch");
+        assert_eq!(catalog.next_sequence, 3);
+        assert_eq!(catalog.ready_sequence, Some(1));
+        assert_eq!(catalog.shared.len(), 1);
+        assert!(recorder.events.is_empty());
+
+        catalog.commit_dormant_for_exec(prepared);
+
+        assert_eq!(catalog.epoch.get(), 2);
+        assert_eq!(catalog.next_sequence, 1);
+        assert_eq!(catalog.ready_sequence, None);
+        assert_eq!(catalog.private, private);
+        assert!(catalog.shared.is_empty());
+        assert!(
+            recorder.events.is_empty(),
+            "exec reset emitted range events"
+        );
+    }
+
+    #[test]
+    fn translated_range_catalog_exec_epoch_overflow_is_eventless_and_atomic() {
+        let (mut catalog, recorder) = active_catalog_with_shared_range();
+        catalog.epoch = TranslatedRangeEpoch::new(u64::MAX).expect("maximum epoch");
+        let before = (
+            catalog.epoch,
+            catalog.next_sequence,
+            catalog.ready_sequence,
+            catalog.private.clone(),
+            catalog.shared.clone(),
+        );
+
+        let result = catalog.prepare_dormant_for_exec();
+
+        assert!(matches!(result, Err(types::DsrError::CachePolicy(_))));
+        assert!(recorder.events.is_empty());
+        assert_eq!(
+            (
+                catalog.epoch,
+                catalog.next_sequence,
+                catalog.ready_sequence,
+                catalog.private.clone(),
+                catalog.shared.clone(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn translated_range_catalog_second_exec_reset_rejects_dormant_unchanged() {
+        let (mut catalog, recorder) = active_catalog_with_shared_range();
+        let prepared = catalog
+            .prepare_dormant_for_exec()
+            .expect("prepare first reset");
+        catalog.commit_dormant_for_exec(prepared);
+        let before = (
+            catalog.epoch,
+            catalog.next_sequence,
+            catalog.ready_sequence,
+            catalog.private.clone(),
+            catalog.shared.clone(),
+        );
+
+        let result = catalog.prepare_dormant_for_exec();
+
+        assert!(matches!(result, Err(types::DsrError::CachePolicy(_))));
+        assert!(recorder.events.is_empty());
+        assert_eq!(
+            (
+                catalog.epoch,
+                catalog.next_sequence,
+                catalog.ready_sequence,
+                catalog.private.clone(),
+                catalog.shared.clone(),
+            ),
+            before,
+        );
+    }
+
+    #[test]
+    fn translated_range_catalog_post_exec_activation_replays_private_once() {
+        let (mut catalog, mut recorder) = active_catalog_with_shared_range();
+        let prepared = catalog
+            .prepare_dormant_for_exec()
+            .expect("prepare exec reset");
+        catalog.commit_dormant_for_exec(prepared);
+        let private = catalog.private.clone();
+        let epoch = TranslatedRangeEpoch::new(2).expect("exec epoch");
+
+        catalog
+            .activate_if_dormant_with_recorder(&mut recorder)
+            .expect("activate replacement");
+        catalog
+            .activate_if_dormant_with_recorder(&mut recorder)
+            .expect("idempotent activation");
+
+        assert_eq!(
+            recorder.events,
+            vec![
+                RecordedTranslatedRange::Reset(TranslatedRangeReset::reset(epoch)),
+                RecordedTranslatedRange::Add(TranslatedRangeAdd::Private(
+                    TranslatedPrivateRange::private(
+                        epoch,
+                        TranslatedRangeSequence::new(1).expect("private sequence"),
+                        private,
+                    )
+                    .expect("private replay"),
+                )),
+                RecordedTranslatedRange::Ready(TranslatedRangeReady::ready(epoch, 1)),
+            ],
+        );
+        assert_eq!(catalog.next_sequence, 2);
+        assert_eq!(catalog.ready_sequence, Some(1));
+        assert!(catalog.shared.is_empty());
+    }
+
+    #[test]
+    fn translated_range_catalog_abandoned_exec_preparation_leaves_active_state() {
+        let (catalog, recorder) = active_catalog_with_shared_range();
+        let before = (
+            catalog.epoch,
+            catalog.next_sequence,
+            catalog.ready_sequence,
+            catalog.private.clone(),
+            catalog.shared.clone(),
+        );
+
+        let _prepared = catalog
+            .prepare_dormant_for_exec()
+            .expect("prepare reset without committing");
+
+        assert!(recorder.events.is_empty());
+        assert_eq!(
+            (
+                catalog.epoch,
+                catalog.next_sequence,
+                catalog.ready_sequence,
+                catalog.private.clone(),
+                catalog.shared.clone(),
+            ),
+            before,
+        );
+    }
+
     #[test]
     fn fork_child_replay_failure_preserves_thread_cache_and_suppresses_end_event() {
         let process = Arc::new(
@@ -8412,8 +8733,48 @@ mod tests {
             range
         }
 
-        fn catalog_head(process: &super::super::ProcessTranslator) -> usize {
-            process.state.read().executable_ranges.head_ptr() as usize
+        #[derive(Debug, PartialEq, Eq)]
+        struct ExecResetLogicalSnapshot {
+            catalog_epoch: u64,
+            catalog_frontier: u64,
+            catalog_ready: Option<u64>,
+            catalog_shared: Vec<super::super::CatalogSharedRange>,
+            direct_bindings: crate::direct_binding::DirectBindingLogicalSnapshot,
+            executable_head: usize,
+            executable_nodes: usize,
+            cache_used_bytes: usize,
+        }
+
+        fn activate_catalog_with_shared(process: &super::super::ProcessTranslator, seed: u64) {
+            process
+                .activate_translated_range_catalog()
+                .expect("activate translated catalog");
+            let mut state = process.state.write();
+            let start = 0x2000_0000 + seed * 0x20_000;
+            let prepared = state
+                .translated_ranges
+                .prepare_shared(
+                    carrick_dsr::probes::TranslatedUnitId::new(seed).expect("unit id"),
+                    HostVa(start as usize)..HostVa((start + 0x10_000) as usize),
+                )
+                .expect("prepare translated shared range");
+            state.translated_ranges.commit_shared(prepared);
+        }
+
+        fn exec_reset_snapshot(
+            process: &super::super::ProcessTranslator,
+        ) -> ExecResetLogicalSnapshot {
+            let state = process.state.read();
+            ExecResetLogicalSnapshot {
+                catalog_epoch: state.translated_ranges.epoch.get(),
+                catalog_frontier: state.translated_ranges.sequence_frontier(),
+                catalog_ready: state.translated_ranges.ready_sequence,
+                catalog_shared: state.translated_ranges.shared.clone(),
+                direct_bindings: state.direct_bindings.logical_snapshot_for_test(),
+                executable_head: state.executable_ranges.head_ptr() as usize,
+                executable_nodes: state.executable_ranges.shared_node_count(),
+                cache_used_bytes: state.cache.used_bytes(),
+            }
         }
 
         fn prepare_thread(
@@ -8516,6 +8877,80 @@ mod tests {
         }
 
         #[test]
+        fn external_private_epoch_lease_rejects_before_mutation_and_preserves_token() {
+            let (fixture, process, _, _) = one_published_binding(31);
+            let process = Arc::new(process);
+            let _shared_range = publish_catalog_range(&process, 31);
+            activate_catalog_with_shared(&process, 31);
+            process
+                .state
+                .write()
+                .cache
+                .publish_words(&[0xd503_201f])
+                .expect("seed private cache cursor");
+            let external_lease = Arc::clone(&process.private_jit_epoch);
+            let (thread, mut token) = prepare_thread(&process);
+            let before = exec_reset_snapshot(&process);
+            let pointer_before = fixture.storage[0].load(std::sync::atomic::Ordering::Acquire);
+
+            let outcome = process.prepare_reset_after_fork_for_exec(&thread, &mut token, true);
+
+            assert!(matches!(
+                outcome,
+                Err(crate::types::DsrError::CachePolicy(_))
+            ));
+            assert_eq!(exec_reset_snapshot(&process), before);
+            assert_eq!(
+                fixture.storage[0].load(std::sync::atomic::Ordering::Acquire),
+                pointer_before,
+                "lease rejection cleared the published cell",
+            );
+            assert_eq!(process.private_epoch_leases_for_test(), 2);
+
+            drop(external_lease);
+            let prepared = process
+                .prepare_reset_after_fork_for_exec(&thread, &mut token, true)
+                .expect("same token remains valid after external lease drops");
+            let mut events = Vec::new();
+            prepared.commit_with_recorder(|event| {
+                events.push(event);
+            });
+
+            assert_eq!(events, EXPECTED_ORDER);
+            assert!(
+                fixture.storage[0]
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .is_null(),
+            );
+            let state = process.state.read();
+            assert_eq!(state.cache.used_bytes(), 0);
+            assert_eq!(state.translated_ranges.epoch.get(), 2);
+            assert_eq!(state.translated_ranges.next_sequence, 1);
+            assert_eq!(state.translated_ranges.ready_sequence, None);
+            assert!(state.translated_ranges.shared.is_empty());
+        }
+
+        #[test]
+        fn registry_owned_private_descriptor_leases_pass_exact_preflight() {
+            let (_fixture, process, _, _) = one_published_binding(32);
+            let process = Arc::new(process);
+            let _shared_range = publish_catalog_range(&process, 32);
+            activate_catalog_with_shared(&process, 32);
+            let (thread, mut token) = prepare_thread(&process);
+            assert_eq!(process.private_epoch_leases_for_test(), 1);
+
+            let prepared = process
+                .prepare_reset_after_fork_for_exec(&thread, &mut token, true)
+                .expect("registry owns the exact live descriptor lease");
+            prepared.commit();
+
+            assert_eq!(process.private_epoch_leases_for_test(), 0);
+            let state = process.state.read();
+            assert_eq!(state.translated_ranges.epoch.get(), 2);
+            assert_eq!(state.translated_ranges.ready_sequence, None);
+        }
+
+        #[test]
         fn foreign_process_exec_reset_authority_is_rejected() {
             let (_authority_fixture, authority_process, _, _) = one_published_binding(25);
             let authority_process = Arc::new(authority_process);
@@ -8523,17 +8958,14 @@ mod tests {
             let (victim_fixture, victim_process, _, _) = one_published_binding(26);
             let victim_process = Arc::new(victim_process);
             let _shared_range = publish_catalog_range(&victim_process, 26);
-            let catalog_before = catalog_head(&victim_process);
+            activate_catalog_with_shared(&victim_process, 26);
+            let before = exec_reset_snapshot(&victim_process);
             let victim_thread = ThreadTranslator::for_process(Arc::clone(&victim_process), 43);
 
             let outcome = victim_process.reset_after_fork_for_exec(&victim_thread, &mut token);
 
             assert!(outcome.is_err(), "foreign process token must fail");
-            assert_eq!(
-                catalog_head(&victim_process),
-                catalog_before,
-                "foreign exec-reset authority mutated the executable catalog"
-            );
+            assert_eq!(exec_reset_snapshot(&victim_process), before);
             assert!(
                 !victim_fixture.storage[0]
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -8547,7 +8979,8 @@ mod tests {
             let (fixture, process, _, _) = one_published_binding(27);
             let process = Arc::new(process);
             let _shared_range = publish_catalog_range(&process, 27);
-            let catalog_before = catalog_head(&process);
+            activate_catalog_with_shared(&process, 27);
+            let before = exec_reset_snapshot(&process);
             let (_other_thread, mut token) = prepare_thread(&process);
             let surviving_thread = ThreadTranslator::for_process(Arc::clone(&process), 43);
             assert!(surviving_thread.block_cache.is_empty());
@@ -8558,11 +8991,7 @@ mod tests {
                 outcome.is_err(),
                 "a different surviving thread must not inherit reset authority"
             );
-            assert_eq!(
-                catalog_head(&process),
-                catalog_before,
-                "foreign-thread exec-reset authority mutated the executable catalog"
-            );
+            assert_eq!(exec_reset_snapshot(&process), before);
             assert!(
                 !fixture.storage[0]
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -8576,20 +9005,17 @@ mod tests {
             let (_fixture, process, _, _) = one_published_binding(28);
             let process = Arc::new(process);
             let _shared_range = publish_catalog_range(&process, 28);
+            activate_catalog_with_shared(&process, 28);
             let (thread, mut token) = prepare_thread(&process);
 
             process
                 .reset_after_fork_for_exec(&thread, &mut token)
                 .expect("first token consumption");
-            let catalog_before_reuse = catalog_head(&process);
+            let before_reuse = exec_reset_snapshot(&process);
             let second = process.reset_after_fork_for_exec(&thread, &mut token);
 
             assert!(second.is_err(), "exec reset authority must be single-use");
-            assert_eq!(
-                catalog_head(&process),
-                catalog_before_reuse,
-                "reused exec-reset authority mutated the executable catalog"
-            );
+            assert_eq!(exec_reset_snapshot(&process), before_reuse);
         }
 
         #[test]
@@ -8597,7 +9023,8 @@ mod tests {
             let (fixture, process, _, _) = one_published_binding(29);
             let process = Arc::new(process);
             let _shared_range = publish_catalog_range(&process, 29);
-            let catalog_before = catalog_head(&process);
+            activate_catalog_with_shared(&process, 29);
+            let before = exec_reset_snapshot(&process);
             let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 42);
             let mut stale = thread.prepare_direct_binding_exec_reset();
             let _current = thread.prepare_direct_binding_exec_reset();
@@ -8605,11 +9032,7 @@ mod tests {
             let outcome = process.reset_after_fork_for_exec(&thread, &mut stale);
 
             assert!(outcome.is_err(), "stale reset authority must fail");
-            assert_eq!(
-                catalog_head(&process),
-                catalog_before,
-                "stale exec-reset authority mutated the executable catalog"
-            );
+            assert_eq!(exec_reset_snapshot(&process), before);
             assert!(
                 !fixture.storage[0]
                     .load(std::sync::atomic::Ordering::Acquire)
