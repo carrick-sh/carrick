@@ -1,8 +1,8 @@
 # Native-lane performance handoff
 
 **Date:** 2026-07-31
-**Branch:** `codex/native-performance-m1` (M1 correctness checkpoint
-`5020e509`)
+**Branch:** `codex/native-performance-m1` (M2 lifecycle checkpoint
+`e85e8a3b`; M1 correctness checkpoint `5020e509`)
 **Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
 default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
@@ -19,7 +19,7 @@ its ignored raw trace receipts remain under `target/perf/`.
 
 ---
 
-## Current checkpoint — M2 exec handoff accepted, speed result still open
+## Current checkpoint — M2 lifecycle gate accepted, attribution next
 
 M2 now has an accepted process-owned translated-range catalog through the
 first real shared-code consumer, checked post-fork replay, and atomic inherited
@@ -139,16 +139,40 @@ test, `just test`, `just test-integration`, check, clippy, formatting, domain
 lint, and diff checks. Controller reruns of the production failure, checked
 epoch, and exact wire-buffer tests passed.
 
-Signed live fork/exec tracing remains deliberately pending: production
-fork-child exec host-self-reexecs into a fresh dormant translator, and the
-signed launch-owned trace is the authority for the complete process lifecycle.
+Signed live fork/exec tracing is now accepted at `e85e8a3b`. The immutable arm
+is `target/native-m2-lifecycle-arm-e85e8a3b` (binary SHA-256
+`ea89a1e0b3dda72dda2f456423ecb83dcfefcd91d14b059e6fb296e3d3c4b730`,
+Mach-O UUID `E72707BE-CD27-3929-BF17-6B58BFF8A2C4`) against canonical arm64
+image digest
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
+The receipt-bound proof is retained under
+`target/perf/native-m2-lifecycle-proof-e85e8a3b-a/`:
 
-**Next:** extend the maintained DTrace catalog script and add its fail-closed
-capture wrapper, then run the fixed signed child-exec/wait proof. No new
-runtime/DSR probe is currently required. After that, take two default and two
-shared Go-build attribution captures with the same signed binary, choose the
-first opt-out optimization from measured CPU/kernel ownership, and retain it
-only through the primary ABBA CPU gate.
+- run ID `native-m2-lifecycle-3fd5d09a-47fb-4158-bb47-62433720e0c9`;
+- capture schema `carrick.native-m2-lifecycle-capture.v4`, accepted closure
+  `dfdee66d8bdb0d620cd806f31d4e6ff7c17c4dde99bad03726ef1cb4b6204fdf`;
+- raw trace SHA-256
+  `66000405b7d79c2aca1cbc832f0bc2b3ae7ab61c18c0c639bd057551aa9e525b`;
+- 30 exact wire-ordered milestones from the typed phase-27 launcher handshake
+  through root exit, including host child PID `50561`, namespace PID `2`, and
+  a positive namespace-domain `wait4` reap;
+- `lifecycle_ok=1`, both stdout markers exactly once and ordered, and every
+  violation, pending, DTrace drop, and DTrace error counter zero; and
+- one successful run-ID-scoped cleanup with an empty final census.
+
+The maintained parser now accepts cross-CPU transport reordering only through
+a complete unique wire-ordinal set. It binds the guest namespace PID from
+native fork phase 104 before `libc::fork`, treats the launcher readiness probe
+as an exact once-only pre-root milestone, and uses a 50,000-iteration reducer
+that completes inside the maintained 30-second DTrace bound. Focused gates
+passed 59 lifecycle tests, 61 ABBA tests, Python compilation, formatting, and
+diff checks; the live receipt was independently reloaded and revalidated.
+
+**Next:** take two native-default and two shared Go-build attribution captures
+with this same signed binary. Choose the largest repeatable opt-out
+translation/kernel owner, implement one narrow candidate, and retain it only
+through the primary ABBA total-child-CPU gate. No new runtime/DSR probe is
+currently required unless the four captures leave the owner unresolved.
 
 The ≥30% CPU goal remains open; no new paired CPU ratio has been measured.
 
