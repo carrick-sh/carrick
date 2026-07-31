@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import contextlib
+import hashlib
 import json
 import os
 import pathlib
@@ -19,7 +20,7 @@ import native_go_build_abba
 
 class ArmReceiptTest(unittest.TestCase):
     def setUp(self):
-        self.root = pathlib.Path(tempfile.mkdtemp())
+        self.root = pathlib.Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
         self.source = self.root / "source"
         self.binary = self.source / "target/release/carrick"
@@ -27,6 +28,8 @@ class ArmReceiptTest(unittest.TestCase):
         self.binary.write_bytes(b"fixture-carrick-binary\n")
         self.binary.chmod(0o755)
         self.destination_index = 0
+        self.real_subprocess_run = subprocess.run
+        self.use_real_git = False
 
         self.commit = "1" * 40
         self.branch = "codex/native-performance-m1"
@@ -58,7 +61,14 @@ class ArmReceiptTest(unittest.TestCase):
 
     def fake_run(self, command, **kwargs):
         argv = [str(value) for value in command]
-        if argv[:3] == ["git", "status", "--porcelain"]:
+        if argv[0] == "git" and self.use_real_git:
+            return self.real_subprocess_run(command, **kwargs)
+        if argv[:4] == [
+            "git",
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+        ]:
             self.assertEqual(pathlib.Path(kwargs["cwd"]), self.source.resolve())
             output = self.status_outputs.pop(0) if self.status_outputs else ""
             return subprocess.CompletedProcess(argv, 0, output, "")
@@ -122,7 +132,9 @@ class ArmReceiptTest(unittest.TestCase):
         raise AssertionError(f"unexpected command: {argv!r}; kwargs={kwargs!r}")
 
     @contextlib.contextmanager
-    def command_fixtures(self):
+    def command_fixtures(self, *, real_git=False):
+        previous_real_git = self.use_real_git
+        self.use_real_git = real_git
         with (
             mock.patch.object(
                 native_go_build_abba.subprocess,
@@ -150,7 +162,10 @@ class ArmReceiptTest(unittest.TestCase):
                 side_effect=lambda: self.host_version,
             ),
         ):
-            yield
+            try:
+                yield
+            finally:
+                self.use_real_git = previous_real_git
 
     def prepare(
         self,
@@ -181,6 +196,20 @@ class ArmReceiptTest(unittest.TestCase):
         mutate(payload)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         path.chmod(0o444)
+
+    def initialize_real_source_repository(self):
+        (self.source / ".gitignore").write_text("target/\n")
+        tracked = self.source / "README"
+        tracked.write_text("fixture\n")
+        for command in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "test@example.invalid"],
+            ["git", "config", "user.name", "Arm Receipt Test"],
+            ["git", "add", ".gitignore", "README"],
+            ["git", "commit", "-qm", "fixture"],
+        ):
+            self.real_subprocess_run(command, cwd=self.source, check=True)
+        return tracked
 
     def test_rejects_role_outside_control_and_candidate(self):
         with self.assertRaisesRegex(ValueError, "role"):
@@ -293,6 +322,52 @@ class ArmReceiptTest(unittest.TestCase):
         linked_receipt.symlink_to(destination / "arm.json")
         with self.assertRaisesRegex(RuntimeError, "symlink"):
             self.load(linked_receipt)
+
+    def test_reverification_rejects_intermediate_directory_symlink(self):
+        destination, _ = self.prepare()
+        arms = destination.parent
+        real_arms = self.root / "real-arms"
+        arms.rename(real_arms)
+        arms.symlink_to(real_arms, target_is_directory=True)
+
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            self.load(destination / "arm.json")
+
+    def test_reverification_does_not_refresh_git_index(self):
+        tracked = self.initialize_real_source_repository()
+        destination = self.destination()
+        destination.parent.mkdir(parents=True)
+        with self.command_fixtures(real_git=True):
+            native_go_build_abba.prepare_arm(
+                self.source,
+                destination,
+                label="control",
+                role="control",
+                image_ref="localhost:5005/carrick-go-conformance:1.24",
+            )
+
+        tracked_stat = tracked.stat()
+        os.utime(
+            tracked,
+            ns=(
+                tracked_stat.st_atime_ns,
+                tracked_stat.st_mtime_ns + 2_000_000_000,
+            ),
+        )
+        index = self.source / ".git/index"
+        before = (
+            hashlib.sha256(index.read_bytes()).hexdigest(),
+            index.stat().st_mtime_ns,
+        )
+
+        with self.command_fixtures(real_git=True):
+            native_go_build_abba.load_and_verify_arm(destination / "arm.json")
+
+        after = (
+            hashlib.sha256(index.read_bytes()).hexdigest(),
+            index.stat().st_mtime_ns,
+        )
+        self.assertEqual(after, before)
 
     def test_reverification_rejects_size_mode_and_sha256_drift(self):
         for drift in ("size", "mode", "sha256"):

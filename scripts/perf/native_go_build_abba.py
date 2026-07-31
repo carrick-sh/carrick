@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -91,8 +92,7 @@ def utc_now() -> str:
 
 def sha256_file(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+    descriptor = _open_path_no_symlinks(path, "SHA-256 source")
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -119,9 +119,17 @@ def _command_error(name: str, result: subprocess.CompletedProcess) -> RuntimeErr
     return RuntimeError(f"{name} failed with status {result.returncode}{suffix}")
 
 
-def git_output(repo: pathlib.Path, *args: str) -> str:
+def git_output(
+    repo: pathlib.Path,
+    *args: str,
+    optional_locks: bool = True,
+) -> str:
+    command = ["git"]
+    if not optional_locks:
+        command.append("--no-optional-locks")
+    command.extend(args)
     result = subprocess.run(
-        ["git", *args],
+        command,
         cwd=repo,
         capture_output=True,
         text=True,
@@ -271,21 +279,82 @@ def _absolute_without_resolving(path: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(os.path.abspath(os.fspath(path)))
 
 
-def _reject_symlink(path: pathlib.Path, description: str) -> None:
+def _open_path_no_symlinks(
+    path: pathlib.Path,
+    description: str,
+    *,
+    directory: bool = False,
+) -> int:
+    """Open one absolute path without following any component symlink."""
+    absolute = _absolute_without_resolving(path)
+    components = absolute.parts
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    current = os.open(components[0], directory_flags)
     try:
-        mode = path.lstat().st_mode
+        for component in components[1:-1]:
+            next_directory = os.open(
+                component,
+                directory_flags,
+                dir_fd=current,
+            )
+            os.close(current)
+            current = next_directory
+        if len(components) == 1:
+            if not directory:
+                raise RuntimeError(f"{description} must not be the filesystem root")
+            result = current
+            current = -1
+            return result
+        final_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        if directory:
+            final_flags |= getattr(os, "O_DIRECTORY", 0)
+        result = os.open(
+            components[-1],
+            final_flags,
+            dir_fd=current,
+        )
+        return result
     except FileNotFoundError as error:
-        raise RuntimeError(f"missing {description}: {path}") from error
-    if stat.S_ISLNK(mode):
-        raise RuntimeError(f"{description} must not be a symlink: {path}")
+        raise RuntimeError(f"missing {description}: {absolute}") from error
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise RuntimeError(
+                f"{description} path contains a symlink "
+                f"or non-directory component: {absolute}"
+            ) from error
+        raise RuntimeError(
+            f"cannot open {description} without following symlinks: {absolute}"
+        ) from error
+    finally:
+        if current >= 0:
+            os.close(current)
 
 
 def _validate_regular_file(path: pathlib.Path, description: str) -> os.stat_result:
-    _reject_symlink(path, description)
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode):
-        raise RuntimeError(f"{description} must be a regular file: {path}")
-    return metadata
+    descriptor = _open_path_no_symlinks(path, description)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"{description} must be a regular file: {path}")
+        return metadata
+    finally:
+        os.close(descriptor)
+
+
+def _validate_directory(path: pathlib.Path, description: str) -> os.stat_result:
+    descriptor = _open_path_no_symlinks(
+        path,
+        description,
+        directory=True,
+    )
+    try:
+        return os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _cleanup_unpublished(destination: pathlib.Path) -> None:
@@ -302,31 +371,44 @@ def _cleanup_unpublished(destination: pathlib.Path) -> None:
 
 
 def _publish_receipt(destination: pathlib.Path, receipt: dict[str, object]) -> None:
-    receipt_path = destination / "arm.json"
-    descriptor = os.open(
-        receipt_path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        0o444,
+    directory_descriptor = _open_path_no_symlinks(
+        destination,
+        "receipt destination",
+        directory=True,
     )
     try:
-        os.fchmod(descriptor, 0o444)
-        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as stream:
-            json.dump(receipt, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-    finally:
-        os.close(descriptor)
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    directory_descriptor = os.open(destination, directory_flags)
-    try:
+        descriptor = os.open(
+            "arm.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o444,
+            dir_fd=directory_descriptor,
+        )
+        try:
+            os.fchmod(descriptor, 0o444)
+            with os.fdopen(
+                descriptor,
+                "w",
+                encoding="utf-8",
+                closefd=False,
+            ) as stream:
+                json.dump(receipt, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            os.close(descriptor)
         os.fsync(directory_descriptor)
     finally:
         os.close(directory_descriptor)
 
 
 def _source_status(source_repo: pathlib.Path) -> list[str]:
-    return git_output(source_repo, "status", "--porcelain").splitlines()
+    return git_output(
+        source_repo,
+        "status",
+        "--porcelain",
+        optional_locks=False,
+    ).splitlines()
 
 
 def prepare_arm(
@@ -345,11 +427,12 @@ def prepare_arm(
         raise ValueError("image_ref must be nonempty")
 
     resolved_source = source_repo.resolve(strict=True)
-    if not resolved_source.is_dir():
-        raise ValueError(f"source repository is not a directory: {resolved_source}")
+    _validate_directory(resolved_source, "source repository")
     absolute_destination = _absolute_without_resolving(destination)
     absolute_destination.parent.mkdir(parents=True, exist_ok=True)
-    _reject_symlink(absolute_destination.parent, "destination parent")
+    resolved_destination_parent = absolute_destination.parent.resolve(strict=True)
+    _validate_directory(resolved_destination_parent, "destination parent")
+    absolute_destination = resolved_destination_parent / absolute_destination.name
     absolute_destination.mkdir(mode=0o755)
     published = False
     try:
@@ -389,10 +472,10 @@ def prepare_arm(
         shutil.copy2(built_binary, copied, follow_symlinks=False)
         copied_metadata = _validate_regular_file(copied, "copied Carrick binary")
         copied.chmod(stat.S_IMODE(copied_metadata.st_mode) & ~0o222)
-        copied_metadata = copied.stat()
-        copied_descriptor = os.open(
+        copied_metadata = copied.lstat()
+        copied_descriptor = _open_path_no_symlinks(
             copied,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            "copied Carrick binary",
         )
         try:
             os.fsync(copied_descriptor)
@@ -450,15 +533,16 @@ def prepare_arm(
 
 def _read_receipt(path: pathlib.Path) -> tuple[pathlib.Path, dict[str, object]]:
     absolute = _absolute_without_resolving(path)
-    _reject_symlink(absolute.parent, "receipt directory")
-    metadata = _validate_regular_file(absolute, "arm receipt")
-    if stat.S_IMODE(metadata.st_mode) != 0o444:
-        raise RuntimeError(
-            f"arm receipt mode changed: expected 0o444, got {stat.S_IMODE(metadata.st_mode):#o}"
-        )
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(absolute, flags)
+    descriptor = _open_path_no_symlinks(absolute, "arm receipt")
     try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"arm receipt must be a regular file: {absolute}")
+        if stat.S_IMODE(metadata.st_mode) != 0o444:
+            raise RuntimeError(
+                "arm receipt mode changed: "
+                f"expected 0o444, got {stat.S_IMODE(metadata.st_mode):#o}"
+            )
         with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as stream:
             payload = json.load(stream)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -620,9 +704,7 @@ def load_and_verify_arm(path: pathlib.Path) -> ArmReceipt:
     source_repo = pathlib.Path(str(payload["source_repo"]))
     if not source_repo.is_absolute():
         raise ValueError("arm receipt source_repo must be absolute")
-    _reject_symlink(source_repo, "source repository")
-    if not source_repo.is_dir():
-        raise RuntimeError(f"source repository is missing: {source_repo}")
+    _validate_directory(source_repo, "source repository")
     status = _source_status(source_repo)
     if status:
         raise RuntimeError("arm receipt source repository is no longer clean")
