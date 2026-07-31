@@ -6953,6 +6953,7 @@ mod tests {
     }
 
     fn fork_test(test: impl FnOnce()) {
+        install_native_probe_sink();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
         if pid == 0 {
@@ -8704,6 +8705,150 @@ mod tests {
     }
 
     #[test]
+    fn exec_transition_fresh_candidate_stays_dormant_without_retiring_catalog_reset() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let source_image = lifecycle_image(LifecycleImageKind::DirectPie, 0x31);
+            let target_image = lifecycle_image(LifecycleImageKind::DirectPie, 0x72);
+            let mut memory = NativeMappedMemory::map(
+                &source_image,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map source image");
+            let retiring = memory
+                .dsr_process_translator()
+                .expect("retiring translator");
+            retiring
+                .activate_translated_range_catalog()
+                .expect("activate retiring catalog");
+            retiring
+                .add_translated_range_for_test(71, 0x2000_0000..0x2001_0000)
+                .expect("seed retiring shared catalog entry");
+            retiring
+                .set_translated_range_epoch_for_test(u64::MAX)
+                .expect("seed overflow boundary");
+            let retiring_before = retiring.translated_range_catalog_state_for_test();
+
+            let abandoned = memory
+                .prepare_exec_mapping(&target_image, plan.page_geometry)
+                .expect("prepare fresh replacement");
+            assert!(!abandoned.reset_inherited_translator);
+            assert!(!Arc::ptr_eq(&abandoned.process_translator, &retiring));
+            assert_eq!(
+                abandoned
+                    .process_translator
+                    .translated_range_catalog_state_for_test(),
+                (1, 0, None, 0),
+                "fresh candidate activated before the exec point of no return",
+            );
+            drop(abandoned);
+            assert_eq!(
+                retiring.translated_range_catalog_state_for_test(),
+                retiring_before,
+                "abandoned preparation changed the active retiring catalog",
+            );
+
+            let prepared = memory
+                .prepare_exec_mapping(&target_image, plan.page_geometry)
+                .expect("prepare replacement after abandonment");
+            let candidate = Arc::clone(&prepared.process_translator);
+            let (exec_thread, mut reset_token) = prepare_exec_reset_authority(&memory);
+            memory
+                .replace_image(
+                    &target_image,
+                    &[],
+                    plan.page_geometry,
+                    &exec_thread,
+                    &mut reset_token,
+                    prepared,
+                )
+                .expect("fresh replacement must not preflight retiring catalog overflow");
+
+            assert_eq!(
+                retiring.translated_range_catalog_state_for_test(),
+                retiring_before,
+                "fresh replacement reset the retiring catalog",
+            );
+            assert_eq!(
+                candidate.translated_range_catalog_state_for_test(),
+                (1, 0, None, 0),
+                "preflight/commit slice must leave fresh replacement dormant",
+            );
+        });
+    }
+
+    #[test]
+    fn exec_transition_external_private_lease_rejects_before_ponr_and_token_retries() {
+        fork_test(|| {
+            let plan = native16k_test_plan();
+            let source_image = lifecycle_image(LifecycleImageKind::DirectPie, 0x31);
+            let target_image = lifecycle_image(LifecycleImageKind::DirectPie, 0x72);
+            let mut memory = NativeMappedMemory::map(
+                &source_image,
+                native_memory_layout(),
+                plan.page_geometry.host_page_size,
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("map source image");
+            let retiring = memory
+                .dsr_process_translator()
+                .expect("retiring translator");
+            retiring
+                .activate_translated_range_catalog()
+                .expect("activate retiring catalog");
+            let retiring_before = retiring.translated_range_catalog_state_for_test();
+            let external_lease = retiring.private_jit_epoch_lease_for_test();
+            let prepared = memory
+                .prepare_exec_mapping(&target_image, plan.page_geometry)
+                .expect("prepare rejected replacement");
+            let (exec_thread, mut reset_token) = prepare_exec_reset_authority(&memory);
+
+            let error = memory
+                .replace_image(
+                    &target_image,
+                    &[],
+                    plan.page_geometry,
+                    &exec_thread,
+                    &mut reset_token,
+                    prepared,
+                )
+                .expect_err("external lease must reject replacement before PONR");
+
+            assert!(
+                error.to_string().contains("private JIT descriptor lease"),
+                "unexpected error: {error}",
+            );
+            assert_eq!(
+                memory
+                    .read_bytes(source_image.regions()[0].start + 0x100, 1)
+                    .expect("old image remains readable"),
+                [0x31],
+            );
+            assert_eq!(
+                retiring.translated_range_catalog_state_for_test(),
+                retiring_before,
+            );
+
+            drop(external_lease);
+            let prepared = memory
+                .prepare_exec_mapping(&target_image, plan.page_geometry)
+                .expect("prepare retry after lease drop");
+            memory
+                .replace_image(
+                    &target_image,
+                    &[],
+                    plan.page_geometry,
+                    &exec_thread,
+                    &mut reset_token,
+                    prepared,
+                )
+                .expect("same validated authority remains usable after preflight rejection");
+        });
+    }
+
+    #[test]
     fn direct_exec_preserves_the_identity_fast_path_and_owned_ranges() {
         assert_exec_transition(LifecycleImageKind::DirectPie, LifecycleImageKind::DirectPie);
         let old = [carrick_guest_mem::HostVa(0x4000)..carrick_guest_mem::HostVa(0xc000)];
@@ -8922,6 +9067,13 @@ mod tests {
             .expect("map parent image before fork");
             let parent_mode = memory.address_mode();
             let inherited_process = memory.dsr_process_translator().expect("parent translator");
+            inherited_process
+                .activate_translated_range_catalog()
+                .expect("activate inherited catalog");
+            inherited_process
+                .add_translated_range_for_test(72, 0x2200_0000..0x2201_0000)
+                .expect("seed inherited shared range");
+            let inherited_before = inherited_process.translated_range_catalog_state_for_test();
             let child = unsafe { libc::fork() };
             assert!(
                 child >= 0,
@@ -8957,6 +9109,26 @@ mod tests {
                 {
                     unsafe { libc::_exit(3) };
                 }
+                let dormant =
+                    inherited_process.translated_range_catalog_state_for_test() == (2, 0, None, 0);
+                if !dormant {
+                    unsafe { libc::_exit(4) };
+                }
+                if inherited_process
+                    .activate_translated_range_catalog()
+                    .is_err()
+                {
+                    unsafe { libc::_exit(5) };
+                }
+                let activated = inherited_process.translated_range_catalog_state_for_test();
+                if inherited_process
+                    .activate_translated_range_catalog()
+                    .is_err()
+                    || inherited_process.translated_range_catalog_state_for_test() != activated
+                    || activated != (2, 1, Some(1), 0)
+                {
+                    unsafe { libc::_exit(6) };
+                }
                 let passed = memory.address_mode() == prepared_mode
                     && Arc::ptr_eq(
                         &memory.dsr_process_translator().expect("child translator"),
@@ -8971,6 +9143,11 @@ mod tests {
             assert!(libc::WIFEXITED(status), "child status={status:#x}");
             assert_eq!(libc::WEXITSTATUS(status), 0);
             assert_eq!(memory.address_mode(), parent_mode);
+            assert_eq!(
+                inherited_process.translated_range_catalog_state_for_test(),
+                inherited_before,
+                "child exec reset mutated the parent's COW catalog",
+            );
         });
     }
 
