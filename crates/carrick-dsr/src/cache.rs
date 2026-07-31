@@ -844,6 +844,32 @@ impl CacheWriter<'_> {
         Ok(())
     }
 
+    /// Copy an already-assembled instruction byte stream into this write.
+    ///
+    /// Dynasm assembles into `Vec<u8>`. Accepting that representation directly
+    /// avoids allocating and filling an intermediate `Vec<u32>` merely to copy
+    /// the same bytes into the JIT mapping. [`TranslationCache::begin_write`]
+    /// already guarantees the reservation is an instruction multiple.
+    pub fn write_instruction_bytes(&mut self, bytes: &[u8]) -> Result<(), CacheError> {
+        if bytes.len() != self.len {
+            return Err(CacheError::Policy(format!(
+                "emitted instruction byte length mismatch: reserved={} emitted={}",
+                self.len,
+                bytes.len(),
+            )));
+        }
+        // SAFETY: `begin_write` reserved `len` bytes at `start` inside the
+        // region, `bytes.len() == len`, and the write alias is writable for
+        // this thread (per-thread write window opened by `begin_write`).
+        let exec_ptr = unsafe { self.cache.region.exec_base.as_ptr().add(self.start) };
+        let destination = self.cache.region.write_ptr_for(exec_ptr).ok_or_else(|| {
+            CacheError::Policy("cache write destination is outside the region".to_string())
+        })?;
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len()) };
+        self.written = bytes.len();
+        Ok(())
+    }
+
     pub fn publish(mut self) -> Result<PublishedCode, CacheError> {
         if self.written != self.len {
             return Err(CacheError::Policy(format!(
@@ -1062,6 +1088,28 @@ mod generation_tests {
         assert_eq!(
             unsafe { *(published.entry().host().raw() as *const u32) },
             0xd420_0000
+        );
+    }
+
+    #[test]
+    fn translation_cache_publishes_instruction_bytes_without_word_staging() {
+        let mut cache =
+            super::TranslationCache::new(16 * 1024, &TEST_HOST).expect("translation cache");
+        let bytes = [0x1f, 0x20, 0x03, 0xd5, 0x00, 0x00, 0x20, 0xd4];
+        let mut writer = cache
+            .begin_write(bytes.len())
+            .expect("reserve instruction bytes");
+        writer
+            .write_instruction_bytes(&bytes)
+            .expect("write instruction bytes");
+        let published = writer.publish().expect("publish instruction bytes");
+
+        assert_eq!(published.len(), bytes.len());
+        assert_eq!(
+            unsafe {
+                std::slice::from_raw_parts(published.entry().host().raw() as *const u8, bytes.len())
+            },
+            bytes,
         );
     }
 

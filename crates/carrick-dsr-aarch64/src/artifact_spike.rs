@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileExt;
 use std::ptr::NonNull;
@@ -67,7 +68,7 @@ fn decode_artifact_template(payload: &[u8]) -> Result<ArtifactTemplate, DsrError
             payload.len().saturating_sub(consumed)
         )));
     }
-    Ok(wire.into())
+    wire.try_into()
 }
 
 pub fn validate_fresh_enabled() -> bool {
@@ -182,10 +183,23 @@ struct WireDirectLink {
 struct WireArtifactTemplate {
     words: Vec<u32>,
     map_deltas: Vec<(i64, u32)>,
-    recovery_deltas: Vec<(u32, PortableRecoveryAction)>,
+    recovery: WirePortableRecoveryMetadata,
     direct_links: Vec<WireDirectLink>,
     relocations: Vec<ArtifactRelocation>,
     source_words: Vec<u32>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum WirePortableRecoveryMetadata {
+    Entries(Vec<(u32, PortableRecoveryAction)>),
+    Runs(Vec<WirePortableRecoveryRun>),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WirePortableRecoveryRun {
+    start_delta: u32,
+    entry_count: u32,
+    action: PortableRecoveryAction,
 }
 
 impl serde::Serialize for ArtifactTemplate {
@@ -202,7 +216,9 @@ impl<'de> serde::Deserialize<'de> for ArtifactTemplate {
     where
         D: serde::Deserializer<'de>,
     {
-        WireArtifactTemplate::deserialize(deserializer).map(Into::into)
+        WireArtifactTemplate::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -225,21 +241,10 @@ impl From<&ArtifactTemplate> for WireArtifactTemplate {
                 delta
             })
             .collect();
-        let mut previous_recovery = 0_u32;
-        let recovery_deltas = template
-            .recovery
-            .iter()
-            .map(|entry| {
-                let cache = entry.cache.get();
-                let delta = cache.wrapping_sub(previous_recovery);
-                previous_recovery = cache;
-                (delta, entry.action)
-            })
-            .collect();
         Self {
             words: template.words.clone(),
             map_deltas,
-            recovery_deltas,
+            recovery: WirePortableRecoveryMetadata::from(&template.recovery),
             direct_links: template
                 .direct_links
                 .iter()
@@ -258,8 +263,10 @@ impl From<&ArtifactTemplate> for WireArtifactTemplate {
     }
 }
 
-impl From<WireArtifactTemplate> for ArtifactTemplate {
-    fn from(template: WireArtifactTemplate) -> Self {
+impl TryFrom<WireArtifactTemplate> for ArtifactTemplate {
+    type Error = DsrError;
+
+    fn try_from(template: WireArtifactTemplate) -> Result<Self, Self::Error> {
         let mut guest = 0_i64;
         let mut cache = 0_u32;
         let map = template
@@ -274,19 +281,8 @@ impl From<WireArtifactTemplate> for ArtifactTemplate {
                 }
             })
             .collect();
-        let mut recovery_cache = 0_u32;
-        let recovery = template
-            .recovery_deltas
-            .into_iter()
-            .map(|(cache_delta, action)| {
-                recovery_cache = recovery_cache.wrapping_add(cache_delta);
-                PortableRecoveryEntry {
-                    cache: CacheOffset::published(recovery_cache),
-                    action,
-                }
-            })
-            .collect();
-        Self {
+        let recovery = PortableRecoveryMetadata::try_from(template.recovery)?;
+        Ok(Self {
             words: template.words,
             map,
             recovery,
@@ -306,7 +302,7 @@ impl From<WireArtifactTemplate> for ArtifactTemplate {
                 .collect(),
             relocations: template.relocations,
             source_words: template.source_words,
-        }
+        })
     }
 }
 
@@ -1307,6 +1303,25 @@ impl PortableRecoveryAction {
     }
 
     fn rebind(self, bindings: &ArtifactBindings) -> Result<RecoveryAction, DsrError> {
+        self.rebind_with(|value| bindings.value(value))
+    }
+
+    fn rebind_with_host_bias(self, host_bias: Option<u64>) -> Result<RecoveryAction, DsrError> {
+        self.rebind_with(|value| match (value, host_bias) {
+            (ProcessValue::HostBias, Some(host_bias)) => Ok(host_bias),
+            (ProcessValue::HostBias, None) => Err(DsrError::CachePolicy(
+                "artifact recovery requires a missing host-bias binding".to_string(),
+            )),
+            (value, _) => Err(DsrError::CachePolicy(format!(
+                "shared recovery requires unsupported process binding {value:?}"
+            ))),
+        })
+    }
+
+    fn rebind_with(
+        self,
+        mut binding: impl FnMut(ProcessValue) -> Result<u64, DsrError>,
+    ) -> Result<RecoveryAction, DsrError> {
         Ok(match self {
             Self::Noop => RecoveryAction::Noop,
             Self::RestoreGuestX17 => RecoveryAction::RestoreGuestX17,
@@ -1399,7 +1414,7 @@ impl PortableRecoveryAction {
             },
             Self::RecoverCounterRead(recovery) => RecoveryAction::RecoverCounterRead(recovery),
             Self::RecoverBiasedMemory(recovery) => {
-                let raw_bias = bindings.value(ProcessValue::HostBias)?;
+                let raw_bias = binding(ProcessValue::HostBias)?;
                 let host_bias =
                     carrick_dsr::address::NativeHostBias::new(raw_bias, 1).map_err(|error| {
                         DsrError::CachePolicy(format!(
@@ -1437,22 +1452,333 @@ impl PortableRecoveryAction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct PortableRecoveryEntry {
+pub(crate) struct PortableRecoveryEntry {
     cache: CacheOffset,
     action: PortableRecoveryAction,
+}
+
+impl PortableRecoveryEntry {
+    pub(crate) const fn cache(self) -> CacheOffset {
+        self.cache
+    }
+
+    pub(crate) fn rebind_with_host_bias(
+        self,
+        host_bias: Option<u64>,
+    ) -> Result<RecoveryAction, DsrError> {
+        self.action.rebind_with_host_bias(host_bias)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PortableRecoveryRun {
+    start: CacheOffset,
+    entry_count: NonZeroU32,
+    action: PortableRecoveryAction,
+}
+
+impl PortableRecoveryRun {
+    fn last_cache(self) -> Result<u32, DsrError> {
+        self.entry_count
+            .get()
+            .checked_sub(1)
+            .and_then(|entries| entries.checked_mul(4))
+            .and_then(|span| self.start.get().checked_add(span))
+            .ok_or_else(|| {
+                DsrError::CachePolicy("portable recovery run range overflow".to_string())
+            })
+    }
+
+    fn next_cache(self) -> Result<u32, DsrError> {
+        self.last_cache()?.checked_add(4).ok_or_else(|| {
+            DsrError::CachePolicy("portable recovery run endpoint overflow".to_string())
+        })
+    }
+
+    fn contains(self, cache: CacheOffset) -> bool {
+        let Some(delta) = cache.get().checked_sub(self.start.get()) else {
+            return false;
+        };
+        delta.is_multiple_of(4) && delta / 4 < self.entry_count.get()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PortableRecoveryMetadata {
+    Entries(Vec<PortableRecoveryEntry>),
+    Runs(Vec<PortableRecoveryRun>),
+}
+
+impl Default for PortableRecoveryMetadata {
+    fn default() -> Self {
+        Self::Entries(Vec::new())
+    }
+}
+
+fn recovery_entry_run_count(entries: &[PortableRecoveryEntry]) -> usize {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            let Some(previous) = index
+                .checked_sub(1)
+                .and_then(|previous| entries.get(previous))
+            else {
+                return true;
+            };
+            previous.action != entry.action
+                || previous.cache.get().checked_add(4) != Some(entry.cache.get())
+        })
+        .count()
+}
+
+impl PortableRecoveryMetadata {
+    pub(crate) fn is_run_encoded(&self) -> bool {
+        matches!(self, Self::Runs(_))
+    }
+
+    pub(crate) fn into_runs(self) -> Result<Self, DsrError> {
+        let Self::Entries(entries) = self else {
+            return Ok(self);
+        };
+        let mut runs: Vec<PortableRecoveryRun> = Vec::new();
+        runs.try_reserve_exact(recovery_entry_run_count(&entries))
+            .map_err(|error| {
+                DsrError::CachePolicy(format!("portable recovery run reservation failed: {error}"))
+            })?;
+        for entry in entries {
+            if let Some(run) = runs.last_mut()
+                && run.action == entry.action
+                && run.next_cache()? == entry.cache.get()
+            {
+                let count = run.entry_count.get().checked_add(1).ok_or_else(|| {
+                    DsrError::CachePolicy("portable recovery run length overflow".to_string())
+                })?;
+                run.entry_count = NonZeroU32::new(count).ok_or_else(|| {
+                    DsrError::CachePolicy(
+                        "portable recovery run length must be nonzero".to_string(),
+                    )
+                })?;
+            } else {
+                runs.push(PortableRecoveryRun {
+                    start: entry.cache,
+                    entry_count: NonZeroU32::MIN,
+                    action: entry.action,
+                });
+            }
+        }
+        Ok(Self::Runs(runs))
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        match self {
+            Self::Entries(entries) => entries.len(),
+            Self::Runs(runs) => runs.iter().map(|run| run.entry_count.get() as usize).sum(),
+        }
+    }
+
+    pub(crate) fn run_count(&self) -> usize {
+        match self {
+            Self::Entries(entries) => recovery_entry_run_count(entries),
+            Self::Runs(runs) => runs.len(),
+        }
+    }
+
+    fn action_at(&self, cache: CacheOffset) -> Option<PortableRecoveryAction> {
+        match self {
+            Self::Entries(entries) => entries
+                .iter()
+                .find(|entry| entry.cache == cache)
+                .map(|entry| entry.action),
+            Self::Runs(runs) => runs
+                .iter()
+                .find(|run| run.contains(cache))
+                .map(|run| run.action),
+        }
+    }
+
+    pub(crate) fn rebind_for_cache(
+        &self,
+        cache: CacheOffset,
+        host_bias: Option<u64>,
+    ) -> Result<Option<RecoveryAction>, DsrError> {
+        self.action_at(cache)
+            .map(|action| action.rebind_with_host_bias(host_bias))
+            .transpose()
+    }
+
+    fn into_entries(self) -> Result<Vec<PortableRecoveryEntry>, DsrError> {
+        let runs = match self {
+            Self::Entries(entries) => return Ok(entries),
+            Self::Runs(runs) => runs,
+        };
+        let entry_count = runs.iter().try_fold(0_usize, |total, run| {
+            total
+                .checked_add(run.entry_count.get() as usize)
+                .ok_or_else(|| {
+                    DsrError::CachePolicy("portable recovery entry count overflow".to_string())
+                })
+        })?;
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(entry_count).map_err(|error| {
+            DsrError::CachePolicy(format!(
+                "portable recovery entry reservation failed: {error}"
+            ))
+        })?;
+        for run in runs {
+            for index in 0..run.entry_count.get() {
+                let cache = index
+                    .checked_mul(4)
+                    .and_then(|offset| run.start.get().checked_add(offset))
+                    .ok_or_else(|| {
+                        DsrError::CachePolicy(
+                            "portable recovery run expansion overflow".to_string(),
+                        )
+                    })?;
+                entries.push(PortableRecoveryEntry {
+                    cache: CacheOffset::published(cache),
+                    action: run.action,
+                });
+            }
+        }
+        Ok(entries)
+    }
+}
+
+impl From<&PortableRecoveryMetadata> for WirePortableRecoveryMetadata {
+    fn from(recovery: &PortableRecoveryMetadata) -> Self {
+        match recovery {
+            PortableRecoveryMetadata::Entries(entries) => {
+                let mut previous = 0_u32;
+                Self::Entries(
+                    entries
+                        .iter()
+                        .map(|entry| {
+                            let cache = entry.cache.get();
+                            let delta = cache.wrapping_sub(previous);
+                            previous = cache;
+                            (delta, entry.action)
+                        })
+                        .collect(),
+                )
+            }
+            PortableRecoveryMetadata::Runs(runs) => {
+                let mut previous = 0_u32;
+                Self::Runs(
+                    runs.iter()
+                        .map(|run| {
+                            let start = run.start.get();
+                            let start_delta = start.wrapping_sub(previous);
+                            previous = start;
+                            WirePortableRecoveryRun {
+                                start_delta,
+                                entry_count: run.entry_count.get(),
+                                action: run.action,
+                            }
+                        })
+                        .collect(),
+                )
+            }
+        }
+    }
+}
+
+impl TryFrom<WirePortableRecoveryMetadata> for PortableRecoveryMetadata {
+    type Error = DsrError;
+
+    fn try_from(wire: WirePortableRecoveryMetadata) -> Result<Self, Self::Error> {
+        match wire {
+            WirePortableRecoveryMetadata::Entries(entries) => {
+                let mut cache = 0_u32;
+                let entries = entries
+                    .into_iter()
+                    .map(|(delta, action)| {
+                        cache = cache.checked_add(delta).ok_or_else(|| {
+                            DsrError::CachePolicy(
+                                "portable recovery entry delta overflow".to_string(),
+                            )
+                        })?;
+                        Ok(PortableRecoveryEntry {
+                            cache: CacheOffset::published(cache),
+                            action,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DsrError>>()?;
+                Ok(Self::Entries(entries))
+            }
+            WirePortableRecoveryMetadata::Runs(runs) => {
+                let mut start = 0_u32;
+                let runs = runs
+                    .into_iter()
+                    .map(|run| {
+                        start = start.checked_add(run.start_delta).ok_or_else(|| {
+                            DsrError::CachePolicy(
+                                "portable recovery run delta overflow".to_string(),
+                            )
+                        })?;
+                        let entry_count = NonZeroU32::new(run.entry_count).ok_or_else(|| {
+                            DsrError::CachePolicy(
+                                "portable recovery run length must be nonzero".to_string(),
+                            )
+                        })?;
+                        let run = PortableRecoveryRun {
+                            start: CacheOffset::published(start),
+                            entry_count,
+                            action: run.action,
+                        };
+                        run.last_cache()?;
+                        Ok(run)
+                    })
+                    .collect::<Result<Vec<_>, DsrError>>()?;
+                Ok(Self::Runs(runs))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactTemplate {
     words: Vec<u32>,
     map: Vec<PcMapEntry>,
-    recovery: Vec<PortableRecoveryEntry>,
+    recovery: PortableRecoveryMetadata,
     direct_links: Vec<DirectLink>,
     relocations: Vec<ArtifactRelocation>,
     source_words: Vec<u32>,
 }
 
+/// Cardinalities for attributing an artifact template's retained metadata.
+///
+/// This deliberately reports counts, not process addresses or the private
+/// recovery representation. Offline cache diagnostics can use it without
+/// widening the runtime mutation surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactTemplateMetadataCounts {
+    pub words: usize,
+    pub pc_map_entries: usize,
+    pub recovery_entries: usize,
+    pub recovery_runs: usize,
+    pub direct_links: usize,
+    pub relocations: usize,
+    pub source_words: usize,
+}
+
 impl ArtifactTemplate {
+    pub fn metadata_counts(&self) -> ArtifactTemplateMetadataCounts {
+        ArtifactTemplateMetadataCounts {
+            words: self.words.len(),
+            pc_map_entries: self.map.len(),
+            recovery_entries: self.recovery.entry_count(),
+            recovery_runs: self.recovery.run_count(),
+            direct_links: self.direct_links.len(),
+            relocations: self.relocations.len(),
+            source_words: self.source_words.len(),
+        }
+    }
+
+    pub(crate) fn recovery_is_run_encoded(&self) -> bool {
+        matches!(self.recovery, PortableRecoveryMetadata::Runs(_))
+    }
+
     pub fn source_words(&self) -> &[u32] {
         &self.source_words
     }
@@ -1475,6 +1801,17 @@ impl ArtifactTemplate {
         self
     }
 
+    pub(crate) fn into_runtime_metadata_only_with_recovery_runs(
+        self,
+        recovery_runs: bool,
+    ) -> Result<Self, DsrError> {
+        let mut runtime = self.into_runtime_metadata_only();
+        if recovery_runs {
+            runtime.recovery = std::mem::take(&mut runtime.recovery).into_runs()?;
+        }
+        Ok(runtime)
+    }
+
     pub fn take_runtime_metadata(
         &mut self,
         host_bias: Option<u64>,
@@ -1487,6 +1824,7 @@ impl ArtifactTemplate {
         };
         let map = std::mem::take(&mut self.map);
         let recovery = std::mem::take(&mut self.recovery)
+            .into_entries()?
             .into_iter()
             .map(|entry| {
                 Ok(RecoveryEntry {
@@ -1496,6 +1834,16 @@ impl ArtifactTemplate {
             })
             .collect::<Result<Vec<_>, DsrError>>()?;
         Ok((map, recovery, std::mem::take(&mut self.direct_links)))
+    }
+
+    pub(crate) fn take_portable_runtime_metadata(
+        &mut self,
+    ) -> (Vec<PcMapEntry>, PortableRecoveryMetadata, Vec<DirectLink>) {
+        (
+            std::mem::take(&mut self.map),
+            std::mem::take(&mut self.recovery),
+            std::mem::take(&mut self.direct_links),
+        )
     }
 
     /// Materialize only container-stable relocations for an immutable unit.
@@ -1557,7 +1905,9 @@ impl ArtifactTemplate {
         };
         let recovery = self
             .recovery
-            .iter()
+            .clone()
+            .into_entries()?
+            .into_iter()
             .map(|entry| {
                 Ok(RecoveryEntry {
                     cache: entry.cache,
@@ -1675,15 +2025,17 @@ impl ArtifactTemplate {
                 *word &= !MOV_WIDE_IMM16_MASK;
             }
         }
-        let recovery = recovery
-            .into_iter()
-            .map(|entry| {
-                Ok(PortableRecoveryEntry {
-                    cache: entry.cache,
-                    action: PortableRecoveryAction::normalize(entry.action, bindings)?,
+        let recovery = PortableRecoveryMetadata::Entries(
+            recovery
+                .into_iter()
+                .map(|entry| {
+                    Ok(PortableRecoveryEntry {
+                        cache: entry.cache,
+                        action: PortableRecoveryAction::normalize(entry.action, bindings)?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, DsrError>>()?;
+                .collect::<Result<Vec<_>, DsrError>>()?,
+        );
         Ok(Self {
             words,
             map,
@@ -1704,7 +2056,7 @@ pub fn replay_artifact(
         cache,
         template.words.clone(),
         template.map.clone(),
-        template.recovery.clone(),
+        template.recovery.clone().into_entries()?,
         template.direct_links.clone(),
         &template.relocations,
         bindings,
@@ -1720,7 +2072,7 @@ pub fn replay_artifact_owned(
         cache,
         template.words,
         template.map,
-        template.recovery,
+        template.recovery.into_entries()?,
         template.direct_links,
         &template.relocations,
         bindings,
@@ -1877,6 +2229,125 @@ mod tests {
         let decoded: ArtifactTemplate =
             serde_json::from_slice(&encoded).expect("decode artifact template");
         assert_eq!(decoded, template);
+    }
+
+    #[test]
+    fn metadata_counts_distinguish_contiguous_recovery_runs() {
+        let restore_16 = PortableRecoveryAction::RestoreScratch { register: 16 };
+        let template = ArtifactTemplate {
+            words: Vec::new(),
+            map: Vec::new(),
+            recovery: PortableRecoveryMetadata::Entries(vec![
+                PortableRecoveryEntry {
+                    cache: CacheOffset::published(0),
+                    action: restore_16,
+                },
+                PortableRecoveryEntry {
+                    cache: CacheOffset::published(4),
+                    action: restore_16,
+                },
+                PortableRecoveryEntry {
+                    cache: CacheOffset::published(12),
+                    action: restore_16,
+                },
+                PortableRecoveryEntry {
+                    cache: CacheOffset::published(16),
+                    action: PortableRecoveryAction::RestoreScratch { register: 17 },
+                },
+            ]),
+            direct_links: Vec::new(),
+            relocations: Vec::new(),
+            source_words: Vec::new(),
+        };
+
+        assert_eq!(
+            template.metadata_counts(),
+            ArtifactTemplateMetadataCounts {
+                words: 0,
+                pc_map_entries: 0,
+                recovery_entries: 4,
+                recovery_runs: 3,
+                direct_links: 0,
+                relocations: 0,
+                source_words: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn portable_recovery_runs_preserve_sparse_lookup_semantics() {
+        let restore_16 = PortableRecoveryAction::RestoreScratch { register: 16 };
+        let restore_17 = PortableRecoveryAction::RestoreScratch { register: 17 };
+        let entries = vec![
+            PortableRecoveryEntry {
+                cache: CacheOffset::published(0),
+                action: restore_16,
+            },
+            PortableRecoveryEntry {
+                cache: CacheOffset::published(4),
+                action: restore_16,
+            },
+            PortableRecoveryEntry {
+                cache: CacheOffset::published(12),
+                action: restore_16,
+            },
+            PortableRecoveryEntry {
+                cache: CacheOffset::published(16),
+                action: restore_17,
+            },
+        ];
+        let compact = PortableRecoveryMetadata::Entries(entries.clone())
+            .into_runs()
+            .expect("compact recovery runs");
+
+        assert_eq!(compact.entry_count(), entries.len());
+        assert_eq!(compact.run_count(), 3);
+        for offset in [0, 4, 8, 12, 16, 20] {
+            let cache = CacheOffset::published(offset);
+            let expected = entries
+                .iter()
+                .find(|entry| entry.cache == cache)
+                .map(|entry| entry.action);
+            assert_eq!(compact.action_at(cache), expected, "cache offset {offset}");
+        }
+    }
+
+    #[test]
+    fn portable_recovery_wire_rejects_zero_length_run() {
+        let wire = WirePortableRecoveryMetadata::Runs(vec![WirePortableRecoveryRun {
+            start_delta: 0,
+            entry_count: 0,
+            action: PortableRecoveryAction::RestoreScratch { register: 16 },
+        }]);
+
+        let error = PortableRecoveryMetadata::try_from(wire)
+            .expect_err("zero-length recovery run must be malformed");
+        assert!(error.to_string().contains("nonzero"));
+    }
+
+    #[test]
+    fn portable_runtime_recovery_binds_one_entry_without_eager_materialization() {
+        let host_bias = 0x8000_0000;
+        let (mut template, _) = emit_artifact_fixture(0x1234_5678, host_bias);
+        let (_, expected_recovery, _) = template
+            .runtime_metadata(Some(host_bias))
+            .expect("eager runtime metadata");
+
+        let (_, portable_recovery, _) = template.take_portable_runtime_metadata();
+        let actual_recovery = portable_recovery
+            .into_entries()
+            .expect("expand portable recovery metadata")
+            .into_iter()
+            .map(|entry| {
+                Ok(RecoveryEntry {
+                    cache: entry.cache(),
+                    action: entry.rebind_with_host_bias(Some(host_bias))?,
+                })
+            })
+            .collect::<Result<Vec<_>, DsrError>>()
+            .expect("bind portable recovery entries on demand");
+
+        assert_eq!(actual_recovery, expected_recovery);
     }
 
     #[test]
