@@ -23,6 +23,39 @@ import native_go_build
 import native_go_build_abba
 
 
+class MachOUuidTest(unittest.TestCase):
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
+
+    def test_uses_system_dwarfdump_when_path_has_failing_shadow(self):
+        shadow_dir = self.root / "shadow-bin"
+        shadow_dir.mkdir()
+        marker = self.root / "shadow-invoked"
+        shadow = shadow_dir / "dwarfdump"
+        shadow.write_text(
+            "#!/bin/sh\n"
+            'printf shadow > "$DWARFDUMP_SHADOW_MARKER"\n'
+            "exit 71\n"
+        )
+        shadow.chmod(0o755)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PATH": f"{shadow_dir}{os.pathsep}{os.environ['PATH']}",
+                "DWARFDUMP_SHADOW_MARKER": str(marker),
+            },
+        ):
+            uuid = native_go_build_abba.macho_uuid(pathlib.Path(sys.executable))
+
+        self.assertRegex(
+            uuid,
+            r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$",
+        )
+        self.assertFalse(marker.exists(), "PATH shadow dwarfdump was invoked")
+
+
 class ArmReceiptTest(unittest.TestCase):
     def setUp(self):
         self.root = pathlib.Path(tempfile.mkdtemp()).resolve()
@@ -105,7 +138,7 @@ class ArmReceiptTest(unittest.TestCase):
         if argv[:3] == ["codesign", "-d", "--entitlements"]:
             self.assertEqual(pathlib.Path(argv[-1]).name, "carrick")
             return subprocess.CompletedProcess(argv, 0, self.entitlements, b"")
-        if argv[:2] == ["dwarfdump", "--uuid"]:
+        if argv[:2] == ["/usr/bin/dwarfdump", "--uuid"]:
             self.assertEqual(pathlib.Path(argv[-1]).name, "carrick")
             output = (
                 f"UUID: {self.macho_uuid} (arm64) {argv[-1]}\n"
