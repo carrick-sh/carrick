@@ -28,7 +28,7 @@ import native_go_build  # noqa: E402
 import native_go_build_abba  # noqa: E402
 
 
-CAPTURE_SCHEMA = "carrick.native-m2-lifecycle-capture.v3"
+CAPTURE_SCHEMA = "carrick.native-m2-lifecycle-capture.v4"
 LIFECYCLE_PREFIX = "TRANSLATED_LIFECYCLE|"
 SUMMARY_PREFIX = "TRANSLATED_LIFECYCLE_SUMMARY|"
 RUN_ID_PREFIX = "native-m2-lifecycle-"
@@ -47,13 +47,14 @@ DOF_EVIDENCE_FIELDS = frozenset(
 )
 LIFECYCLE_REDUCER = (
     "set -eu; "
-    "(i=0; while [ \"$i\" -lt 500000 ]; do i=$((i + 1)); done; "
-    "exec /bin/sh -c 'i=0; while [ \"$i\" -lt 500000 ]; "
+    "(i=0; while [ \"$i\" -lt 50000 ]; do i=$((i + 1)); done; "
+    "exec /bin/sh -c 'i=0; while [ \"$i\" -lt 50000 ]; "
     "do i=$((i + 1)); done; echo CHILD_EXEC_OK') & "
     "child=$!; wait \"$child\"; echo PARENT_WAIT_OK"
 )
 
 MILESTONES = (
+    "launcher-ready",
     "target-birth",
     "parent-reset",
     "parent-private",
@@ -312,6 +313,9 @@ def parse_lifecycle_trace(raw: str) -> dict[str, Any]:
         )
 
     events = [_parse_wire_record(line, LIFECYCLE_PREFIX) for line in event_lines]
+    for event in events:
+        if _wire_int(event, "schema") != 1:
+            raise EvidenceError("lifecycle event schema is not 1")
     actual_kinds = [event.get("kind", "") for event in events]
     for kind in MILESTONES:
         count = actual_kinds.count(kind)
@@ -323,15 +327,43 @@ def parse_lifecycle_trace(raw: str) -> dict[str, Any]:
     if unexpected:
         label = unexpected[0] or "unnamed"
         raise EvidenceError(f"unexpected or disarmed lifecycle event: {label}")
+    ordinals = [_wire_int(event, "ordinal") for event in events]
+    if sorted(ordinals) != list(range(1, len(events) + 1)):
+        raise EvidenceError("lifecycle event ordinal is duplicated or gapped")
+    events.sort(key=lambda event: _wire_int(event, "ordinal"))
+    actual_kinds = [event.get("kind", "") for event in events]
     if tuple(actual_kinds) != MILESTONES:
         raise EvidenceError("lifecycle milestone order is invalid")
     for expected, event in enumerate(events, start=1):
-        if _wire_int(event, "schema") != 1:
-            raise EvidenceError("lifecycle event schema is not 1")
         if _wire_int(event, "ordinal") != expected:
             raise EvidenceError("lifecycle event ordinal is gapped or reordered")
 
     by_kind = {str(event["kind"]): event for event in events}
+    launcher_ready = by_kind["launcher-ready"]
+    launcher_ready_fields = {
+        "schema",
+        "ordinal",
+        "kind",
+        "pid",
+        "incarnation",
+        "generation",
+        "epoch",
+        "phase",
+    }
+    if set(launcher_ready) != launcher_ready_fields:
+        raise EvidenceError(
+            "launcher-ready fields are not schema-1 exact: "
+            f"unknown={sorted(set(launcher_ready) - launcher_ready_fields)} "
+            f"missing={sorted(launcher_ready_fields - set(launcher_ready))}"
+        )
+    if (
+        _wire_int(launcher_ready, "incarnation") != 0
+        or _wire_int(launcher_ready, "generation") != 0
+        or _wire_int(launcher_ready, "epoch") != 0
+        or _wire_int(launcher_ready, "phase") != 27
+    ):
+        raise EvidenceError("launcher-ready identity or typed phase drifted")
+    ready_launcher_pid = _wire_int(launcher_ready, "pid")
     target_birth = by_kind["target-birth"]
     target_birth_fields = {
         "schema",
@@ -351,12 +383,35 @@ def parse_lifecycle_trace(raw: str) -> dict[str, Any]:
         )
     target_pid = _wire_int(target_birth, "pid")
     launcher_pid = _wire_int(target_birth, "launcher_pid")
-    child_pid = _wire_int(by_kind["child-birth"], "pid")
+    if launcher_pid != ready_launcher_pid:
+        raise EvidenceError("launcher-ready PID differs from target-birth authority")
+    child_birth = by_kind["child-birth"]
+    child_birth_fields = {
+        "schema",
+        "ordinal",
+        "kind",
+        "pid",
+        "incarnation",
+        "generation",
+        "epoch",
+        "ns_pid",
+        "parent_pid",
+    }
+    if set(child_birth) != child_birth_fields:
+        raise EvidenceError(
+            "child-birth fields are not schema-1 exact: "
+            f"unknown={sorted(set(child_birth) - child_birth_fields)} "
+            f"missing={sorted(child_birth_fields - set(child_birth))}"
+        )
+    child_pid = _wire_int(child_birth, "pid")
+    child_ns_pid = _wire_int(child_birth, "ns_pid")
     live_pids = (launcher_pid, target_pid, child_pid)
     if any(identity <= 0 for identity in live_pids) or len(set(live_pids)) != 3:
         raise EvidenceError(
             "trace launcher, lifecycle root, and child PID identities are invalid"
         )
+    if child_ns_pid <= 0:
+        raise EvidenceError("child namespace PID identity is invalid")
 
     parent_expected = {
         "target-birth": 0,
@@ -409,7 +464,7 @@ def parse_lifecycle_trace(raw: str) -> dict[str, Any]:
             by_kind[kind], kind=kind, pid=child_pid, generation=2, epoch=1
         )
 
-    if _wire_int(by_kind["child-birth"], "parent_pid") != target_pid:
+    if _wire_int(child_birth, "parent_pid") != target_pid:
         raise EvidenceError("child birth parent identity drifted")
     for kind in (
         "parent-private",
@@ -446,9 +501,29 @@ def parse_lifecycle_trace(raw: str) -> dict[str, Any]:
     if _wire_int(by_kind["child-exit"], "status") != 0:
         raise EvidenceError("child exit status is nonzero")
     wait = by_kind["parent-wait4"]
+    wait_fields = {
+        "schema",
+        "ordinal",
+        "kind",
+        "pid",
+        "incarnation",
+        "generation",
+        "epoch",
+        "child_pid",
+        "child_ns_pid",
+        "retval",
+        "errno",
+    }
+    if set(wait) != wait_fields:
+        raise EvidenceError(
+            "parent-wait4 fields are not schema-1 exact: "
+            f"unknown={sorted(set(wait) - wait_fields)} "
+            f"missing={sorted(wait_fields - set(wait))}"
+        )
     if (
         _wire_int(wait, "child_pid") != child_pid
-        or _wire_int(wait, "retval") != child_pid
+        or _wire_int(wait, "child_ns_pid") != child_ns_pid
+        or _wire_int(wait, "retval") != child_ns_pid
         or _wire_int(wait, "errno") != 0
     ):
         raise EvidenceError("parent wait4 did not positively reap the exited child")
@@ -475,6 +550,7 @@ def parse_lifecycle_trace(raw: str) -> dict[str, Any]:
         "launcher_pid": launcher_pid,
         "target_pid": target_pid,
         "child_pid": child_pid,
+        "child_ns_pid": child_ns_pid,
         "event_count": len(events),
     }
 
@@ -910,6 +986,7 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         "proc:::exec-success",
         "proc:::exec-failure",
         "proc:::exit",
+        "carrick*:::fork-lifecycle",
         "carrick*:::dsr-cache-lifecycle",
         "carrick*:::host-image-base",
         "carrick*:::host-image-catalog",
@@ -958,6 +1035,8 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         actions=(
             "lifecycle_root_pid = (pid_t)0",
             "lifecycle_child_pid = (pid_t)0",
+            "lifecycle_child_ns_pid = (uint64_t)0",
+            "launcher_ready_seen = 0",
             "live_owners = 0",
             "parent_private_start = (uint64_t)0",
             "parent_private_end = (uint64_t)0",
@@ -1046,6 +1125,7 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
             "ppid == $target",
             "progenyof($target)",
             "(uint64_t)arg0 == (uint64_t)1",
+            "launcher_ready_seen == 1",
         ),
         actions=(
             "this->root_pid = (pid_t)pid",
@@ -1146,7 +1226,6 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         "carrick*:::host-translated-private-range",
         "carrick*:::host-translated-shared-range",
         "carrick*:::host-translated-range-ready",
-        "carrick*:::dsr-cache-lifecycle",
         "carrick*:::fork-post",
         "carrick*:::host-image-base",
         "carrick*:::host-image-catalog",
@@ -1156,6 +1235,7 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         "carrick*:::dsr-run-begin",
         "carrick*:::syscall-return",
         "carrick*:::guest-exit",
+        "carrick*:::fork-lifecycle",
     ):
         _require_d_clause(
             clauses,
@@ -1168,6 +1248,113 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
             description=f"pre-discovery lifecycle rejection for {provider}",
             exact_predicate=True,
             exact_action_sequence=True,
+        )
+
+    launcher_ready_rejection = (
+        "lifecycle_root_pid == (pid_t)0 && "
+        "(pid == $target || progenyof($target)) && "
+        "!(pid == $target && (int)arg0 == pid && (int)arg1 == 27 && "
+        "(uint64_t)arg2 == (uint64_t)0 && "
+        "(uint64_t)arg3 == (uint64_t)0 && "
+        "(uint64_t)arg4 == (uint64_t)0 && launcher_ready_seen == 0)"
+    )
+    launcher_ready_acceptance = (
+        "lifecycle_root_pid == (pid_t)0 && pid == $target && "
+        "(int)arg0 == pid && (int)arg1 == 27 && "
+        "(uint64_t)arg2 == (uint64_t)0 && "
+        "(uint64_t)arg3 == (uint64_t)0 && "
+        "(uint64_t)arg4 == (uint64_t)0 && launcher_ready_seen == 0"
+    )
+    _require_d_clause(
+        clauses,
+        "carrick*:::dsr-cache-lifecycle",
+        predicate=(launcher_ready_rejection,),
+        actions=("unexpected_events++", "identity_violations++"),
+        description="invalid pre-root launcher readiness rejection",
+        exact_predicate=True,
+        exact_action_sequence=True,
+    )
+    _require_d_clause(
+        clauses,
+        "carrick*:::dsr-cache-lifecycle",
+        predicate=(launcher_ready_acceptance,),
+        actions=(
+            "launcher_ready_seen++",
+            "lifecycle_ordinal++",
+            (
+                'printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|'
+                "kind=launcher-ready|pid=%d|incarnation=0|generation=0|"
+                'epoch=0|phase=27\\n", lifecycle_ordinal, pid)'
+            ),
+        ),
+        description="typed pre-root launcher readiness acceptance",
+        exact_predicate=True,
+        exact_action_sequence=True,
+    )
+    launcher_ready_indices = [
+        index
+        for index, clause in enumerate(clauses)
+        if clause.provider == "carrick*:::dsr-cache-lifecycle"
+        and _compact_d("lifecycle_root_pid == (pid_t)0")
+        in _compact_d(clause.predicate)
+        and _compact_d("(int)arg1 == 27") in _compact_d(clause.predicate)
+    ]
+    if (
+        len(launcher_ready_indices) != 2
+        or "unexpected_events++"
+        not in clauses[launcher_ready_indices[0]].actions
+        or "launcher_ready_seen++"
+        not in clauses[launcher_ready_indices[1]].actions
+    ):
+        raise EvidenceError(
+            "maintained launcher readiness rejection must precede acceptance"
+        )
+
+    _require_d_clause(
+        clauses,
+        "carrick*:::fork-lifecycle",
+        predicate=(
+            "pid == lifecycle_root_pid && tracked[pid] && "
+            "(int)arg0 == 0 && (int)arg1 == 104 && "
+            "!(lifecycle_stage[pid, incarnation[pid]] == 5 && "
+            "lifecycle_child_ns_pid == (uint64_t)0 && "
+            "(int64_t)arg3 > 0 && (int64_t)arg4 == 0)",
+        ),
+        actions=("unexpected_events++", "identity_violations++"),
+        description="invalid pre-fork namespace PID binding rejection",
+        exact_predicate=True,
+        exact_action_sequence=True,
+    )
+    _require_d_clause(
+        clauses,
+        "carrick*:::fork-lifecycle",
+        predicate=(
+            "pid == lifecycle_root_pid && tracked[pid] && "
+            "(int)arg0 == 0 && (int)arg1 == 104 && "
+            "lifecycle_stage[pid, incarnation[pid]] == 5 && "
+            "lifecycle_child_ns_pid == (uint64_t)0 && "
+            "(int64_t)arg3 > 0 && (int64_t)arg4 == 0",
+        ),
+        actions=("lifecycle_child_ns_pid = (uint64_t)arg3",),
+        description="typed pre-fork namespace PID binding",
+        exact_predicate=True,
+        exact_action_sequence=True,
+    )
+    namespace_binding_indices = [
+        index
+        for index, clause in enumerate(clauses)
+        if clause.provider == "carrick*:::fork-lifecycle"
+        and _compact_d("(int)arg1 == 104") in _compact_d(clause.predicate)
+    ]
+    if (
+        len(namespace_binding_indices) != 2
+        or "unexpected_events++"
+        not in clauses[namespace_binding_indices[0]].actions
+        or "lifecycle_child_ns_pid = (uint64_t)arg3"
+        not in clauses[namespace_binding_indices[1]].actions
+    ):
+        raise EvidenceError(
+            "maintained lifecycle namespace PID rejection must precede binding"
         )
 
     action_text = "\n".join(clause.actions for clause in clauses)
@@ -1185,6 +1372,21 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
     child = "pid == lifecycle_child_pid"
     milestone_contracts = (
         (
+            "launcher-ready",
+            "carrick*:::dsr-cache-lifecycle",
+            (
+                "lifecycle_root_pid == (pid_t)0",
+                "pid == $target",
+                "(int)arg0 == pid",
+                "(int)arg1 == 27",
+                "(uint64_t)arg2 == (uint64_t)0",
+                "(uint64_t)arg3 == (uint64_t)0",
+                "(uint64_t)arg4 == (uint64_t)0",
+                "launcher_ready_seen == 0",
+            ),
+            ("launcher_ready_seen++",),
+        ),
+        (
             "target-birth",
             "carrick*:::host-translated-range-reset",
             (
@@ -1193,6 +1395,7 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
                 "ppid == $target",
                 "progenyof($target)",
                 "(uint64_t)arg0 == (uint64_t)1",
+                "launcher_ready_seen == 1",
             ),
             (
                 "this->root_pid = (pid_t)pid",
@@ -1245,6 +1448,7 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
             "proc:::create",
             (
                 "birth_valid[args[0]->pr_pid, incarnation[args[0]->pr_pid]] == 1",
+                "lifecycle_child_ns_pid > (uint64_t)0",
             ),
             ("lifecycle_child_birth++",),
         ),
@@ -1413,6 +1617,10 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
                 "pid == lifecycle_root_pid",
                 f"{stage} == 5",
                 "lifecycle_stage[lifecycle_child_pid, incarnation[lifecycle_child_pid]] == 22",
+                "lifecycle_child_ns_pid > (uint64_t)0",
+                "(int)arg2 == (int)lifecycle_child_ns_pid",
+                "(int)arg3 == 0",
+                "wait4_success == 0",
             ),
             ("wait4_success++", f"{stage} = 6"),
         ),
@@ -1661,6 +1869,8 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         "guest_exit_authority": 1,
         "launcher_scope_only": 1,
         "lifecycle_root_discovery": 1,
+        "launcher_ready_handshake": 1,
+        "namespace_pid_binding": 1,
     }
 
 
@@ -2445,6 +2655,7 @@ def capture_lifecycle(
         summary_record["launcher_pid"] = parsed["launcher_pid"]
         summary_record["target_pid"] = parsed["target_pid"]
         summary_record["child_pid"] = parsed["child_pid"]
+        summary_record["child_ns_pid"] = parsed["child_ns_pid"]
         summary_record["event_count"] = parsed["event_count"]
         summary_raw = _canonical_json_bytes(summary_record) + b"\n"
         _write_bytes_atomic(config.summary_jsonl, summary_raw)
