@@ -6583,6 +6583,12 @@ fn handle_native_fork(
             *vfork_completion = Some(NativeVforkCompletion { fd: write_fd });
         }
         NATIVE_FORKED_GUEST_CHILD.store(true, std::sync::atomic::Ordering::Release);
+        // Disabled USDT keeps this query at zero cost in ordinary runs. A
+        // native-wall capture needs the child's Darwin PID incarnation before
+        // any post-fork DSR event can be attributed; `proc:::create` exposes a
+        // zeroed `pr_start` on current Darwin, so the child publishes the
+        // checked `PROC_PIDTBSDINFO` tuple itself.
+        crate::probes::host_process_birth_current();
         native_trace_fork_phase("child-guard-installed");
         crate::probes::native_fork_lifecycle(
             NativeForkPhase::ChildBarrierRepair,

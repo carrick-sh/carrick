@@ -69,6 +69,103 @@ impl std::fmt::Display for ProbeRegistrationError {
 
 impl std::error::Error for ProbeRegistrationError {}
 
+/// Stable Darwin process incarnation used by birth-keyed trace records.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HostProcessBirth {
+    pid: u32,
+    start_sec: i64,
+    start_usec: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum HostProcessBirthError {
+    #[error("host process birth PID must be nonzero")]
+    ZeroPid,
+    #[error("host process start seconds must be positive, got {0}")]
+    InvalidStartSeconds(i64),
+    #[error("host process start microseconds are outside timeval range: {0}")]
+    InvalidMicroseconds(i32),
+    #[error("host process birth value does not fit the signed wire domain")]
+    WireDomainOverflow,
+    #[error("proc_pidinfo({pid}) returned {result}, expected {expected}, errno={errno}")]
+    Query {
+        pid: u32,
+        result: i32,
+        expected: i32,
+        errno: i32,
+    },
+    #[error("proc_pidinfo({requested}) described pid {observed}")]
+    PidMismatch { requested: u32, observed: u32 },
+}
+
+impl HostProcessBirth {
+    pub fn new(pid: u32, start_sec: i64, start_usec: i32) -> Result<Self, HostProcessBirthError> {
+        if pid == 0 {
+            return Err(HostProcessBirthError::ZeroPid);
+        }
+        if start_sec <= 0 {
+            return Err(HostProcessBirthError::InvalidStartSeconds(start_sec));
+        }
+        if !(0..1_000_000).contains(&start_usec) {
+            return Err(HostProcessBirthError::InvalidMicroseconds(start_usec));
+        }
+        Ok(Self {
+            pid,
+            start_sec,
+            start_usec,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn query(pid: u32) -> Result<Self, HostProcessBirthError> {
+        let pid_arg = i32::try_from(pid).map_err(|_| HostProcessBirthError::WireDomainOverflow)?;
+        let expected = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .map_err(|_| HostProcessBirthError::WireDomainOverflow)?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let result = unsafe {
+            libc::proc_pidinfo(
+                pid_arg,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                expected,
+            )
+        };
+        if result != expected {
+            return Err(HostProcessBirthError::Query {
+                pid,
+                result,
+                expected,
+                errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            });
+        }
+        let info = unsafe { info.assume_init() };
+        if info.pbi_pid != pid {
+            return Err(HostProcessBirthError::PidMismatch {
+                requested: pid,
+                observed: info.pbi_pid,
+            });
+        }
+        let start_sec = i64::try_from(info.pbi_start_tvsec)
+            .map_err(|_| HostProcessBirthError::WireDomainOverflow)?;
+        let start_usec = i32::try_from(info.pbi_start_tvusec)
+            .map_err(|_| HostProcessBirthError::WireDomainOverflow)?;
+        Self::new(pid, start_sec, start_usec)
+    }
+
+    pub const fn pid(self) -> u32 {
+        self.pid
+    }
+
+    pub const fn start_sec(self) -> i64 {
+        self.start_sec
+    }
+
+    pub const fn start_usec(self) -> i32 {
+        self.start_usec
+    }
+}
+
 #[cfg(any(
     target_os = "macos",
     all(
@@ -1129,6 +1226,52 @@ mod dsr_probe_abi {
 }
 
 #[cfg(test)]
+mod host_process_birth_probe_abi {
+    use super::{HostProcessBirth, HostProcessBirthError};
+
+    #[test]
+    fn process_birth_domain_rejects_invalid_raw_identity() {
+        assert!(matches!(
+            HostProcessBirth::new(0, 1, 1),
+            Err(HostProcessBirthError::ZeroPid)
+        ));
+        assert!(matches!(
+            HostProcessBirth::new(1, 1, 1_000_000),
+            Err(HostProcessBirthError::InvalidMicroseconds(1_000_000))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_birth_query_is_nonzero_and_stable_for_current_process() {
+        let first = HostProcessBirth::query(std::process::id())
+            .unwrap_or_else(|error| unreachable!("query current process birth: {error}"));
+        let second = HostProcessBirth::query(std::process::id())
+            .unwrap_or_else(|error| unreachable!("repeat current process birth: {error}"));
+        assert_eq!(first, second);
+        assert_eq!(first.pid(), std::process::id());
+        assert!(first.start_sec() > 0);
+        assert!((0..1_000_000).contains(&first.start_usec()));
+    }
+
+    #[test]
+    fn process_birth_probe_accepts_only_typed_identity() {
+        let _: fn(HostProcessBirth) = super::host_process_birth;
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn host__process__birth(_: u32, _: i64, _: i32) {}",
+            "stub!(host_process_birth(event: super::HostProcessBirth));",
+            "stub!(host_process_birth_current());",
+        ] {
+            assert!(
+                source.contains(declaration),
+                "missing process-birth ABI {declaration:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod translated_range_probe_abi {
     use std::ops::Range;
 
@@ -1438,6 +1581,8 @@ mod real {
     /// the JSON (looks like `[v0,v1,v2,v3,v4,v5]`).
     #[usdt::provider(provider = "carrick")]
     mod carrick_usdt {
+        /// Process incarnation from Darwin `PROC_PIDTBSDINFO`.
+        fn host__process__birth(_: u32, _: i64, _: i32) {}
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6], contiguous); DTrace
         // does `copyin(arg2, 48)` and reads the six args by offset. This probe
         // fires on EVERY guest syscall, so we must NOT JSON-encode here — that
@@ -2044,6 +2189,29 @@ mod real {
     pub fn dsr_cache_bounds(base: u64, end: u64) {
         carrick_usdt::dsr__cache__bounds!(|| (base, end));
     }
+
+    #[inline(always)]
+    pub fn host_process_birth(event: super::HostProcessBirth) {
+        carrick_usdt::host__process__birth!(|| {
+            (event.pid(), event.start_sec(), event.start_usec())
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[inline(always)]
+    pub fn host_process_birth_current() {
+        carrick_usdt::host__process__birth!(|| {
+            let pid = std::process::id();
+            match super::HostProcessBirth::query(pid) {
+                Ok(event) => (event.pid(), event.start_sec(), event.start_usec()),
+                Err(_) => (pid, 0, 0),
+            }
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[inline(always)]
+    pub fn host_process_birth_current() {}
 
     #[inline(always)]
     pub fn host_translated_range_reset(event: super::TranslatedRangeReset) {
@@ -3553,6 +3721,8 @@ mod stub {
     stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64));
     stub!(dsr_cache_capacity(role: super::DsrCacheRole, capacity_bytes: u64));
     stub!(dsr_cache_bounds(base: u64, end: u64));
+    stub!(host_process_birth(event: super::HostProcessBirth));
+    stub!(host_process_birth_current());
     stub!(host_translated_range_reset(event: super::TranslatedRangeReset));
     stub!(host_translated_private_range(event: super::TranslatedPrivateRange));
     stub!(host_translated_shared_range(event: super::TranslatedSharedRange));

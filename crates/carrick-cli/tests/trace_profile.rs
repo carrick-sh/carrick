@@ -1,10 +1,87 @@
 #![allow(clippy::unwrap_used)]
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 fn cli() -> Command {
     Command::cargo_bin("carrick").unwrap()
+}
+
+#[test]
+fn native_profile_qualification_fixtures_are_hidden_and_deterministic() {
+    cli()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("__native-profile-birth-fixture").not())
+        .stdout(predicates::str::contains("__native-profile-terminal-fixture").not())
+        .stdout(predicates::str::contains("__native-profile-validate-qualification").not());
+
+    cli()
+        .args(["__native-profile-birth-fixture", "--hold-ms", "10"])
+        .assert()
+        .success()
+        .stdout("BIRTH_FIXTURE_OK\n");
+
+    cli()
+        .args(["__native-profile-terminal-fixture", "--mode", "thread"])
+        .assert()
+        .success()
+        .stdout("TERMINAL_THREAD_ARMED\nTERMINAL_THREAD_OK\n");
+
+    cli()
+        .args(["__native-profile-terminal-fixture", "--mode", "process"])
+        .assert()
+        .success()
+        .stdout("TERMINAL_PROCESS_ARMED\n");
+}
+
+#[test]
+fn native_profile_qualification_scripts_bind_observed_identity_and_scope() {
+    let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace");
+    let birth = std::fs::read_to_string(scripts.join("native-birth-qualify.d")).unwrap();
+    for contract in [
+        "carrick*:::host-process-birth",
+        "proc:::create",
+        "parent_observations < 2",
+        "child_context_seen < 2",
+        "copyinstr(arg1) == \"BIRTH_FIXTURE_OK\\n\"",
+        "child_exit_reason",
+        "target_exit_reason",
+        "timed_out",
+        "violations",
+    ] {
+        assert!(
+            birth.contains(contract),
+            "missing birth contract {contract:?}"
+        );
+    }
+    assert!(
+        !birth.contains("curpsinfo->pr_start"),
+        "Darwin proc-provider start fields were live-proven zero"
+    );
+
+    let terminal = std::fs::read_to_string(scripts.join("native-terminal-qualify.d")).unwrap();
+    for contract in [
+        "syscall:::entry",
+        "syscall:::return",
+        "mach_trap:::entry",
+        "mach_trap:::return",
+        "proc:::lwp-exit",
+        "proc:::exit",
+        "scope=thread",
+        "scope=process",
+        "returning_controls",
+        "candidate_count",
+        "timed_out",
+        "violations",
+    ] {
+        assert!(
+            terminal.contains(contract),
+            "missing terminal contract {contract:?}"
+        );
+    }
 }
 
 const DSRPROF2_FIXTURE: &str = concat!(
