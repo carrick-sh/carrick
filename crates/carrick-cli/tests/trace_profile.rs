@@ -69,7 +69,7 @@ fn native_profile_qualification_scripts_bind_observed_identity_and_scope() {
         "proc:::create",
         "parent_observations < 2",
         "child_context_seen < 2",
-        "copyinstr(arg1) == \"BIRTH_FIXTURE_OK\\n\"",
+        "arg0 == 1 && arg2 == 17",
         "child_exit_reason",
         "target_exit_reason",
         "timed_out",
@@ -84,6 +84,10 @@ fn native_profile_qualification_scripts_bind_observed_identity_and_scope() {
         !birth.contains("curpsinfo->pr_start"),
         "Darwin proc-provider start fields were live-proven zero"
     );
+    assert!(
+        !birth.contains("copyin(arg1)") && !birth.contains("copyinstr(arg1)"),
+        "host syscall arguments carry guest virtual addresses; dereferencing the marker drops the probe"
+    );
 
     let terminal = std::fs::read_to_string(scripts.join("native-terminal-qualify.d")).unwrap();
     for contract in [
@@ -95,6 +99,9 @@ fn native_profile_qualification_scripts_bind_observed_identity_and_scope() {
         "proc:::exit",
         "scope=thread",
         "scope=process",
+        "arg0 == 1 && arg2 == 22",
+        "arg0 == 1 && arg2 == 19",
+        "arg0 == 1 && arg2 == 23",
         "returning_controls",
         "candidate_count",
         "timed_out",
@@ -105,47 +112,13 @@ fn native_profile_qualification_scripts_bind_observed_identity_and_scope() {
             "missing terminal contract {contract:?}"
         );
     }
+    assert!(
+        !terminal.contains("copyin(arg1)") && !terminal.contains("copyinstr(arg1)"),
+        "host syscall arguments carry guest virtual addresses; dereferencing a terminal marker drops the probe"
+    );
 }
 
-const DSRPROF2_FIXTURE: &str = concat!(
-    "DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v2|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499\n",
-    "DSRPROF2|target-birth|pid=100|start_sec=10|start_usec=20|image=1|epoch=0\n",
-    "DSRPROF2|range-reset|pid=100|start_sec=10|start_usec=20|image=1|epoch=0\n",
-    "DSRPROF2|range-private|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=1|start=0x1000|end=0x2000\n",
-    "DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=2|unit_id=7|start=0x3000|end=0x3800\n",
-    "DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=3|unit_id=8|start=0x4000|end=0x4800\n",
-    "DSRPROF2|range-ready|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|final_sequence=3\n",
-    "DSRPROF2|host-image-base|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|base=0x100000000\n",
-    "DSRPROF2|host-image-catalog|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|payload={\"ranges\":[{\"start\":4294967296,\"end\":4294971392,\"path\":\"/carrick\"}]}\n",
-    "DSRPROF2|guest-image-base|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|base=0x400000\n",
-    "DSRPROF2|cpu-user|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|pc=0x1100|count=3\n",
-    "DSRPROF2|kernel-enter|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1000\n",
-    "DSRPROF2|kernel-return|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1200\n",
-    "DSRPROF2|offcpu-block|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|kind=voluntary|pc=0x1150|timestamp_ns=1300\n",
-    "DSRPROF2|offcpu-wake|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|observed_pid=100|observed_sec=10|observed_usec=20|observed_image=1|observed_epoch=0|timestamp_ns=1800\n",
-    "DSRPROF2|offcpu|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=voluntary|pc=0x1150|count=1|total_ns=500\n",
-    "DSRPROF2|process-create|child_pid=101|child_sec=11|child_usec=21|child_image=1|child_epoch=0|parent_pid=100|parent_sec=10|parent_usec=20|parent_image=1|parent_epoch=0\n",
-    "DSRPROF2|fork-inherit|child_pid=101|child_sec=11|child_usec=21|parent_pid=100|parent_sec=10|parent_usec=20|parent_image=1|parent_epoch=0|range_frontier=3|mapping_frontier=0\n",
-    "DSRPROF2|range-reset|pid=101|start_sec=11|start_usec=21|image=1|epoch=1\n",
-    "DSRPROF2|range-private|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=1|start=0x1000|end=0x2000\n",
-    "DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=2|unit_id=7|start=0x3000|end=0x3800\n",
-    "DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=3|unit_id=8|start=0x4000|end=0x4800\n",
-    "DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|final_sequence=3\n",
-    "DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=4|unit_id=9|start=0x5000|end=0x5800\n",
-    "DSRPROF2|range-ready|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|final_sequence=4\n",
-    "DSRPROF2|exec-attempt|pid=101|start_sec=11|start_usec=21|image=1|epoch=1\n",
-    "DSRPROF2|exec-failure|pid=101|start_sec=11|start_usec=21|image=1|epoch=1\n",
-    "DSRPROF2|exec-attempt|pid=101|start_sec=11|start_usec=21|image=1|epoch=1\n",
-    "DSRPROF2|exec-success|pid=101|start_sec=11|start_usec=21|retired_image=1|retired_epoch=1|new_image=2|new_epoch=0\n",
-    "DSRPROF2|range-reset|pid=101|start_sec=11|start_usec=21|image=2|epoch=0\n",
-    "DSRPROF2|range-private|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|sequence=1|start=0x6000|end=0x7000\n",
-    "DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|final_sequence=1\n",
-    "DSRPROF2|process-exit|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|reason=1\n",
-    "DSRPROF2|process-exit|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|reason=1\n",
-    "DSRPROF2|wall-state|kind=on-cpu|count=10\n",
-    "DSRPROF2|wall-state|kind=all-sleeping|count=1\n",
-    "DSRPROF2|complete|profile=native-wall|bounded=0|target_exit_reason=1|live_at_end=0\n",
-);
+const DSRPROF2_FIXTURE: &str = include_str!("fixtures/dsrprof2-valid.raw");
 
 fn validate_dsrprof2_fixture(contents: &str, extra_args: &[&str]) -> assert_cmd::assert::Assert {
     let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -167,10 +140,33 @@ fn dsrprof2_accepts_birth_keyed_lifecycle_fixture() {
 }
 
 #[test]
+fn dsrprof2_reports_completion_violation_category() {
+    let corrupt = DSRPROF2_FIXTURE
+        .replacen("bounded=0", "bounded=1", 1)
+        .replacen("offcpu_violations=0", "offcpu_violations=7", 1);
+
+    validate_dsrprof2_fixture(&corrupt, &[])
+        .failure()
+        .stderr(contains("offcpu_violations=7"));
+}
+
+#[test]
+fn dsrprof2_names_dynamic_drop_subcategories() {
+    validate_dsrprof2_fixture(
+        DSRPROF2_FIXTURE,
+        &["--dynamic-rinse-drops", "7", "--dynamic-dirty-drops", "11"],
+    )
+    .failure()
+    .stderr(contains("dynamic=0"))
+    .stderr(contains("dynamic_rinse=7"))
+    .stderr(contains("dynamic_dirty=11"));
+}
+
+#[test]
 fn dsrprof2_preserves_exact_stack_blocks() {
     let process_create = "DSRPROF2|process-create|child_pid=101|child_sec=11|child_usec=21|child_image=1|child_epoch=0|parent_pid=100|parent_sec=10|parent_usec=20|parent_image=1|parent_epoch=0";
     let stack = concat!(
-        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500\n",
+        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500\n\n",
         "libsystem_kernel.dylib`__psynch_cvwait+0xa\n",
         "carrick`wait_for_translation+0x20\n",
         "DSRSTACK2|end\n",
@@ -206,7 +202,7 @@ fn dsrprof2_rejects_corrupt_lifecycle_fixtures() {
     let offcpu_wake = "DSRPROF2|offcpu-wake|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|observed_pid=100|observed_sec=10|observed_usec=20|observed_image=1|observed_epoch=0|timestamp_ns=1800";
     let offcpu_summary = "DSRPROF2|offcpu|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=voluntary|pc=0x1150|count=1|total_ns=500";
     let exec_success = "DSRPROF2|exec-success|pid=101|start_sec=11|start_usec=21|retired_image=1|retired_epoch=1|new_image=2|new_epoch=0";
-    let old_host_catalog = "DSRPROF2|host-image-catalog|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|payload={\"ranges\":[{\"start\":4294967296,\"end\":4294971392,\"path\":\"/carrick\"}]}";
+    let old_host_catalog = "DSRPROF2|host-image-catalog|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|payload={\"ok\":{\"pid\":101,\"ranges\":[{\"start\":4294967296,\"end\":4294971392,\"path\":\"/carrick\"}]}}";
 
     let duplicate_create = DSRPROF2_FIXTURE.replacen(
         fork_inherit,
@@ -302,6 +298,7 @@ fn dsrprof2_rejects_corrupt_lifecycle_fixtures() {
         DSRPROF2_FIXTURE.replacen(&format!("{offcpu_summary}\n"), "", 1),
         duplicate_offcpu_summary,
         host_catalog_after_exec,
+        DSRPROF2_FIXTURE.replacen("\"pid\":100", "\"pid\":999", 1),
         retired_transition_reuse,
         DSRPROF2_FIXTURE.replacen("retired_image=1", "retired_image=2", 1),
         DSRPROF2_FIXTURE.replacen("mapping_frontier=0", "mapping_frontier=1", 1),
@@ -389,6 +386,83 @@ fn bundled_profile_scripts_emit_one_versioned_completion() {
         assert!(script.contains("pid == $target"));
         assert!(script.contains("target_exit_reason = arg0"));
     }
+}
+
+#[test]
+fn native_wall_profile_emits_categorized_completion_contract() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/native-wall.d");
+    let script = std::fs::read_to_string(path).unwrap();
+    let completion = "DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d";
+
+    assert_eq!(script.matches(completion).count(), 1);
+    for counter in [
+        "identity_violations",
+        "lifecycle_violations",
+        "range_violations",
+        "kernel_violations",
+        "offcpu_violations",
+    ] {
+        assert!(
+            script.contains(&format!("{counter} = 0")),
+            "missing initialization for {counter}"
+        );
+    }
+    assert!(
+        !script.contains("\n\tviolations =") && !script.contains("\n\tviolations++"),
+        "native-wall must not collapse integrity failures into an opaque counter"
+    );
+
+    let duplicate_guard = concat!(
+        "sched:::off-cpu\n",
+        "/tracked[pid] && thread_lifecycle[pid, tid] != 2 &&\n",
+        "    range_ready[pid] && exec_inflight[pid] == 0 &&\n",
+        "    off_open[pid, tid] == 2/"
+    );
+    let opening_guard = concat!(
+        "sched:::off-cpu\n",
+        "/tracked[pid] && thread_lifecycle[pid, tid] != 2 &&\n",
+        "    range_ready[pid] && exec_inflight[pid] == 0 &&\n",
+        "    off_open[pid, tid] != 2/"
+    );
+    assert!(
+        script.find(duplicate_guard).unwrap() < script.find(opening_guard).unwrap(),
+        "DTrace clauses for one probe observe earlier clause mutations; duplicate detection must run before opening the episode"
+    );
+    for hot_zero_store in ["\tkernel_depth[pid, tid]--;", "\toff_open[pid, tid] = 0;"] {
+        assert!(
+            !script.contains(hot_zero_store),
+            "zero deallocates a DTrace associative entry onto its dirty list: {hot_zero_store:?}"
+        );
+    }
+    for sentinel_contract in [
+        "kernel_depth[pid, tid] > (uint64_t)1",
+        "kernel_depth[pid, tid] = (uint64_t)(this->depth + 1)",
+        "kernel_depth[pid, tid] = this->depth;",
+        "off_open[pid, tid] == 2",
+        "off_open[pid, tid] != 2",
+        "off_open[pid, tid] = 2;",
+        "off_open[pid, tid] = 1;",
+    ] {
+        assert!(
+            script.contains(sentinel_contract),
+            "missing nonzero idle-sentinel contract {sentinel_contract:?}"
+        );
+    }
+    for thread_lifecycle_contract in [
+        "proc:::lwp-start",
+        "thread_lifecycle[pid, tid] = 1;",
+        "thread_lifecycle[pid, tid] = 2;",
+    ] {
+        assert!(
+            script.contains(thread_lifecycle_contract),
+            "missing terminal-thread scheduler exclusion {thread_lifecycle_contract:?}"
+        );
+    }
+    assert!(
+        script.matches("thread_lifecycle[pid, tid] != 2").count() >= 4,
+        "every scheduler state/episode clause must exclude post-lwp-exit events"
+    );
 }
 
 #[test]

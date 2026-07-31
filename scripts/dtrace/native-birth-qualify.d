@@ -10,6 +10,9 @@
  * This program is intentionally fixture-only. The caller must run the hidden
  * __native-profile-birth-fixture through the same libdtrace launch path used
  * for the eventual victim and must also reject every consumer-side drop.
+ * The fixture's final marker is its only 17-byte write to fd 1. arg1 is a
+ * guest virtual address in this provider, so attempting to copyin/copyinstr it
+ * silently drops the clause instead of proving the marker.
  */
 
 dtrace:::BEGIN
@@ -80,8 +83,7 @@ carrick*:::host-process-birth
 
 syscall::write:entry,
 syscall::write_nocancel:entry
-/pid == $target && arg0 == 1 && arg2 == 17 &&
-    copyinstr(arg1) == "BIRTH_FIXTURE_OK\n"/
+/pid == $target && arg0 == 1 && arg2 == 17/
 {
 	marker_seen++;
 	violations += marker_seen == 1 ? 0 : 1;

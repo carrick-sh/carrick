@@ -7,6 +7,9 @@ use carrick_runtime::dtrace_consumer::DTraceRunReport;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+const DSRPROF2_HEADER_PLACEHOLDER: &str = "/* CARRICK_DSRPROF2_HEADER */";
+const DSRPROF2_TERMINALS_PLACEHOLDER: &str = "/* CARRICK_DSRPROF2_TERMINALS */";
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TerminalScope {
@@ -41,6 +44,8 @@ pub(crate) struct QualificationTraceReport {
     principal_drops: u64,
     aggregation_drops: u64,
     dynamic_drops: u64,
+    dynamic_rinse_drops: u64,
+    dynamic_dirty_drops: u64,
     other_drops: u64,
     interrupted: bool,
 }
@@ -51,6 +56,8 @@ impl From<DTraceRunReport> for QualificationTraceReport {
             principal_drops: report.principal_drops,
             aggregation_drops: report.aggregation_drops,
             dynamic_drops: report.dynamic_drops,
+            dynamic_rinse_drops: report.dynamic_rinse_drops,
+            dynamic_dirty_drops: report.dynamic_dirty_drops,
             other_drops: report.other_drops,
             interrupted: report.interrupted,
         }
@@ -76,6 +83,12 @@ pub(crate) struct NativeProfileQualification {
     terminal_process_trace_report: QualificationTraceReport,
     pub(crate) birth_receipt_sha256: String,
     pub(crate) terminal_receipt_sha256: String,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct RenderedNativeProfileProgram {
+    pub(crate) program: String,
+    pub(crate) authority: crate::trace_profile::V2ProfileAuthority,
 }
 
 pub(crate) fn validate_qualification_paths(
@@ -115,6 +128,72 @@ impl NativeProfileQualification {
     #[cfg(target_os = "macos")]
     pub(crate) fn terminal_receipt_sha256(&self) -> &str {
         &self.terminal_receipt_sha256
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn v2_profile_authority(
+        &self,
+        profile_program: &str,
+    ) -> Result<crate::trace_profile::V2ProfileAuthority> {
+        crate::trace_profile::V2ProfileAuthority::new(
+            &self.os_build,
+            &sha256_hex(profile_program.as_bytes()),
+            &self.birth_receipt_sha256,
+            &self.terminal_receipt_sha256,
+            self.terminals.iter().map(|terminal| {
+                (
+                    terminal.provider.clone(),
+                    terminal.function.clone(),
+                    terminal.scope.as_str().to_owned(),
+                )
+            }),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn render_v2_profile_program(
+        &self,
+        profile_template: &str,
+    ) -> Result<RenderedNativeProfileProgram> {
+        let placeholder_count = profile_template
+            .match_indices(DSRPROF2_HEADER_PLACEHOLDER)
+            .count();
+        if placeholder_count != 1 {
+            bail!(
+                "native-wall profile template must contain exactly one DSRPROF2 header placeholder, found {placeholder_count}"
+            );
+        }
+        let terminal_placeholder_count = profile_template
+            .match_indices(DSRPROF2_TERMINALS_PLACEHOLDER)
+            .count();
+        if terminal_placeholder_count != 1 {
+            bail!(
+                "native-wall profile template must contain exactly one DSRPROF2 terminal placeholder, found {terminal_placeholder_count}"
+            );
+        }
+        // The authority names the immutable bundled template. Hashing the
+        // receipt-substituted program would make the header self-referential.
+        let authority = self.v2_profile_authority(profile_template)?;
+        let header_action = format!("printf(\"{}\\n\");", authority.header_record());
+        let terminal_actions = self
+            .terminals
+            .iter()
+            .map(|terminal| {
+                let scope = match terminal.scope {
+                    TerminalScope::Thread => 1,
+                    TerminalScope::Process => 2,
+                };
+                format!(
+                    "terminal_scope[\"{}\", \"{}\"] = {scope};",
+                    terminal.provider, terminal.function
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\t");
+        let program = profile_template
+            .replacen(DSRPROF2_HEADER_PLACEHOLDER, &header_action, 1)
+            .replacen(DSRPROF2_TERMINALS_PLACEHOLDER, &terminal_actions, 1);
+        Ok(RenderedNativeProfileProgram { program, authority })
     }
 }
 
@@ -491,6 +570,13 @@ pub(crate) fn parse_terminal_qualification(
 }
 
 impl TerminalScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Thread => "thread",
+            Self::Process => "process",
+        }
+    }
+
     fn parse(value: &str) -> Result<Self> {
         match value {
             "thread" => Ok(Self::Thread),
@@ -640,14 +726,18 @@ fn require_lossless(report: DTraceRunReport, label: &str) -> Result<()> {
     if report.principal_drops != 0
         || report.aggregation_drops != 0
         || report.dynamic_drops != 0
+        || report.dynamic_rinse_drops != 0
+        || report.dynamic_dirty_drops != 0
         || report.other_drops != 0
         || report.interrupted
     {
         bail!(
-            "{label} qualification was lossy: drops={}/{}/{}/{}, interrupted={}",
+            "{label} qualification was lossy: principal={}, aggregation={}, dynamic={}, dynamic_rinse={}, dynamic_dirty={}, other={}, interrupted={}",
             report.principal_drops,
             report.aggregation_drops,
             report.dynamic_drops,
+            report.dynamic_rinse_drops,
+            report.dynamic_dirty_drops,
             report.other_drops,
             report.interrupted
         );
@@ -720,12 +810,89 @@ mod tests {
             "principal_drops": 0,
             "aggregation_drops": 0,
             "dynamic_drops": 0,
+            "dynamic_rinse_drops": 0,
+            "dynamic_dirty_drops": 0,
             "other_drops": 0,
             "interrupted": false,
         });
         assert_eq!(json["birth_trace_report"], lossless);
         assert_eq!(json["terminal_thread_trace_report"], lossless);
         assert_eq!(json["terminal_process_trace_report"], lossless);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rendered_profile_binds_receipts_without_self_referential_program_hash() {
+        const TEMPLATE: &str = concat!(
+            "dtrace:::BEGIN\n{\n",
+            "\t/* CARRICK_DSRPROF2_HEADER */\n",
+            "\t/* CARRICK_DSRPROF2_TERMINALS */\n",
+            "}\n",
+        );
+        const TEMPLATE_SHA256: &str =
+            "0165d2911bb8ac98c4295e66beed1a34742ca0d6fcaac6f15894c3545a838c6e";
+
+        let first = build_qualification(
+            BIRTH,
+            THREAD,
+            PROCESS,
+            DTraceRunReport::default(),
+            DTraceRunReport::default(),
+            DTraceRunReport::default(),
+            "26A123",
+        )
+        .unwrap_or_else(|error| unreachable!("valid first qualification: {error}"));
+        let second_birth = BIRTH.replacen("parent_usec=386633", "parent_usec=386634", 1);
+        let second = build_qualification(
+            &second_birth,
+            THREAD,
+            PROCESS,
+            DTraceRunReport::default(),
+            DTraceRunReport::default(),
+            DTraceRunReport::default(),
+            "26A123",
+        )
+        .unwrap_or_else(|error| unreachable!("valid second qualification: {error}"));
+
+        let first_rendered = first
+            .render_v2_profile_program(TEMPLATE)
+            .unwrap_or_else(|error| unreachable!("render first profile: {error}"));
+        let second_rendered = second
+            .render_v2_profile_program(TEMPLATE)
+            .unwrap_or_else(|error| unreachable!("render second profile: {error}"));
+
+        assert_eq!(first_rendered.authority.program_sha256(), TEMPLATE_SHA256);
+        assert_eq!(second_rendered.authority.program_sha256(), TEMPLATE_SHA256);
+        assert_ne!(
+            first_rendered.authority.header_record(),
+            second_rendered.authority.header_record()
+        );
+        assert_eq!(
+            first_rendered.program,
+            format!(
+                concat!(
+                    "dtrace:::BEGIN\n{{\n",
+                    "\tprintf(\"{}\\n\");\n",
+                    "\tterminal_scope[\"syscall\", \"bsdthread_terminate\"] = 1;\n",
+                    "\tterminal_scope[\"syscall\", \"exit\"] = 2;\n",
+                    "}}\n",
+                ),
+                first_rendered.authority.header_record()
+            )
+        );
+
+        for malformed in [
+            "dtrace:::BEGIN { }",
+            "/* CARRICK_DSRPROF2_HEADER */\n/* CARRICK_DSRPROF2_HEADER */\n",
+            "/* CARRICK_DSRPROF2_HEADER */\n",
+            concat!(
+                "/* CARRICK_DSRPROF2_HEADER */\n",
+                "/* CARRICK_DSRPROF2_TERMINALS */\n",
+                "/* CARRICK_DSRPROF2_TERMINALS */\n",
+            ),
+        ] {
+            assert!(first.render_v2_profile_program(malformed).is_err());
+        }
     }
 
     #[test]

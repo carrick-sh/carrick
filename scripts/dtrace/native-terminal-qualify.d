@@ -7,9 +7,12 @@
  * Qualify the exact syscall/mach_trap spellings that terminate a controlled
  * thread or process without a matching return on this Darwin build.
  *
- * The hidden terminal fixture emits NUL-backed write markers. Only entries on
- * that marker's exact thread are candidates; ordinary returning calls after
- * the marker are negative controls and must match/clear normally.
+ * The hidden terminal fixture emits controlled fd-1 writes whose distinct
+ * lengths identify its three NUL-backed markers. arg1 is a guest virtual
+ * address in this provider, so attempting to copyin/copyinstr it silently
+ * drops the clause. Only entries on the armed marker's exact thread are
+ * candidates; ordinary returning calls after the marker are negative controls
+ * and must match/clear normally.
  */
 
 dtrace:::BEGIN
@@ -30,8 +33,7 @@ dtrace:::BEGIN
 
 syscall::write:entry,
 syscall::write_nocancel:entry
-/pid == $target && arg0 == 1 && arg2 == 22 &&
-    copyinstr(arg1) == "TERMINAL_THREAD_ARMED\n"/
+/pid == $target && arg0 == 1 && arg2 == 22/
 {
 	thread_armed_seen++;
 	violations += thread_armed_seen == 1 && process_armed_seen == 0 ? 0 : 1;
@@ -40,8 +42,7 @@ syscall::write_nocancel:entry
 
 syscall::write:entry,
 syscall::write_nocancel:entry
-/pid == $target && arg0 == 1 && arg2 == 19 &&
-    copyinstr(arg1) == "TERMINAL_THREAD_OK\n"/
+/pid == $target && arg0 == 1 && arg2 == 19/
 {
 	thread_ok_seen++;
 	violations += thread_ok_seen == 1 && thread_armed_seen == 1 ? 0 : 1;
@@ -49,8 +50,7 @@ syscall::write_nocancel:entry
 
 syscall::write:entry,
 syscall::write_nocancel:entry
-/pid == $target && arg0 == 1 && arg2 == 23 &&
-    copyinstr(arg1) == "TERMINAL_PROCESS_ARMED\n"/
+/pid == $target && arg0 == 1 && arg2 == 23/
 {
 	process_armed_seen++;
 	violations += process_armed_seen == 1 && thread_armed_seen == 0 ? 0 : 1;

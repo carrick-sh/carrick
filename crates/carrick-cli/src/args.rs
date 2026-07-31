@@ -152,6 +152,10 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = 0)]
         dynamic_drops: u64,
         #[arg(long, default_value_t = 0)]
+        dynamic_rinse_drops: u64,
+        #[arg(long, default_value_t = 0)]
+        dynamic_dirty_drops: u64,
+        #[arg(long, default_value_t = 0)]
         other_drops: u64,
         #[arg(long, default_value_t = false)]
         interrupted: bool,
