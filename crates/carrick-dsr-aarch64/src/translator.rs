@@ -765,6 +765,8 @@ struct SharedInstallLogicalSnapshot {
     shared_guest_ranges: Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>,
     loaded_unit_ids: Vec<probes::TranslatedUnitId>,
     direct_bindings: crate::direct_binding::DirectBindingLogicalSnapshot,
+    direct_binding_units: usize,
+    shared_blocks_mapped: u64,
     executable_head: usize,
     executable_nodes: usize,
 }
@@ -828,6 +830,19 @@ struct PreparedSharedBlock {
     fusion_site: Option<types::ExclusiveFusionSite>,
     guest_ranges: Vec<std::ops::Range<carrick_guest_mem::GuestVa>>,
     authority: SharedBlockAuthority,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SharedInstallCommitPhase {
+    CatalogSharedAdd,
+    LogicalStateInstalled,
+    ExecutableHeadPublished,
+}
+
+#[cfg(test)]
+trait SharedInstallCommitObserver {
+    fn observe(&mut self, phase: SharedInstallCommitPhase, state: &ProcessState);
 }
 
 #[derive(Clone, Copy)]
@@ -2846,6 +2861,9 @@ impl ProcessState {
     }
 
     fn commit_shared_install(&mut self, prepared: PreparedSharedInstall) {
+        #[cfg(test)]
+        self.commit_shared_install_inner(prepared, None, None);
+        #[cfg(not(test))]
         self.commit_shared_install_inner(prepared, None);
     }
 
@@ -2855,13 +2873,24 @@ impl ProcessState {
         prepared: PreparedSharedInstall,
         recorder: &mut impl TranslatedRangeRecorder,
     ) {
-        self.commit_shared_install_inner(prepared, Some(recorder));
+        self.commit_shared_install_inner(prepared, Some(recorder), None);
+    }
+
+    #[cfg(test)]
+    fn commit_shared_install_with_observer(
+        &mut self,
+        prepared: PreparedSharedInstall,
+        recorder: &mut impl TranslatedRangeRecorder,
+        observer: &mut impl SharedInstallCommitObserver,
+    ) {
+        self.commit_shared_install_inner(prepared, Some(recorder), Some(observer));
     }
 
     fn commit_shared_install_inner(
         &mut self,
         prepared: PreparedSharedInstall,
         recorder: Option<&mut dyn TranslatedRangeRecorder>,
+        #[cfg(test)] mut observer: Option<&mut dyn SharedInstallCommitObserver>,
     ) {
         let PreparedSharedInstall {
             tid,
@@ -2884,6 +2913,10 @@ impl ProcessState {
                 .commit_shared_with_recorder(catalog_entry, recorder);
         } else {
             self.translated_ranges.commit_shared(catalog_entry);
+        }
+        #[cfg(test)]
+        if let Some(observer) = observer.as_mut() {
+            observer.observe(SharedInstallCommitPhase::CatalogSharedAdd, self);
         }
         loaded_unit._direct_binding_unit_index =
             self.direct_bindings.commit_loaded_unit(direct_binding);
@@ -2916,7 +2949,15 @@ impl ProcessState {
             .shared_blocks_mapped
             .saturating_add(block_count as u64);
 
+        #[cfg(test)]
+        if let Some(observer) = observer.as_mut() {
+            observer.observe(SharedInstallCommitPhase::LogicalStateInstalled, self);
+        }
         self.executable_ranges.commit_prepend(executable_range);
+        #[cfg(test)]
+        if let Some(observer) = observer.as_mut() {
+            observer.observe(SharedInstallCommitPhase::ExecutableHeadPublished, self);
+        }
 
         probes::dsr_cache_bounds(cache_range.start as u64, cache_range.end as u64);
         probes::dsr_cache_event(
@@ -2963,6 +3004,8 @@ impl ProcessState {
                 .map(|unit| unit.unit_id)
                 .collect(),
             direct_bindings: self.direct_bindings.logical_snapshot_for_test(),
+            direct_binding_units: self.direct_bindings.unit_count(),
+            shared_blocks_mapped: self.stats.shared_blocks_mapped,
             executable_head: self.executable_ranges.head_ptr() as usize,
             executable_nodes: self.executable_ranges.shared_node_count(),
         }
@@ -4946,7 +4989,8 @@ mod tests {
     // by the mirrored-ordinal tests in carrick-dsr).
     use super::{
         DsrErrorProbeExt as _, NativeDsrExitProbeExt as _, ProcessTranslator, SensitiveMetadata,
-        SharedBlockAuthority, SharedInstallPrepareStage, TranslatedRangeCatalog,
+        SharedBlockAuthority, SharedInstallCommitObserver, SharedInstallCommitPhase,
+        SharedInstallLogicalSnapshot, SharedInstallPrepareStage, TranslatedRangeCatalog,
         TranslatedRangeRecorder, exact_guest_ranges_from_pc_map, merge_sensitive_metadata,
         normalized_guest_range_union, set_shared_install_prepare_failpoint_for_test,
         translated_unit_id, translation_source_words_required, typed_unit_id_from_digest,
@@ -4965,7 +5009,9 @@ mod tests {
         TranslatedRangeReset, TranslatedRangeSequence, TranslatedUnitId,
     };
     use carrick_guest_mem::{GuestVa, HostVa};
+    use std::cell::RefCell;
     use std::ptr::NonNull;
+    use std::rc::Rc;
     use std::sync::{Arc, Barrier};
 
     const PC: GuestVa = GuestVa(0x1000);
@@ -5041,6 +5087,103 @@ mod tests {
         fn ready(&mut self, event: TranslatedRangeReady) {
             self.events.push(RecordedTranslatedRange::Ready(event));
         }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SharedInstallCommitOrderEvent {
+        CatalogEvent,
+        Phase(SharedInstallCommitPhase),
+    }
+
+    struct SharedInstallCommitRecorderFixture {
+        order: Rc<RefCell<Vec<SharedInstallCommitOrderEvent>>>,
+    }
+
+    impl TranslatedRangeRecorder for SharedInstallCommitRecorderFixture {
+        fn reset(&mut self, _event: TranslatedRangeReset) {
+            panic!("shared-install commit must not emit reset");
+        }
+
+        fn add(&mut self, event: TranslatedRangeAdd) {
+            assert!(matches!(event, TranslatedRangeAdd::Shared(_)));
+            self.order
+                .borrow_mut()
+                .push(SharedInstallCommitOrderEvent::CatalogEvent);
+        }
+
+        fn ready(&mut self, _event: TranslatedRangeReady) {
+            panic!("shared-install commit must not emit ready");
+        }
+    }
+
+    struct SharedInstallCommitObserverFixture {
+        order: Rc<RefCell<Vec<SharedInstallCommitOrderEvent>>>,
+        observations: Vec<(SharedInstallCommitPhase, SharedInstallLogicalSnapshot)>,
+    }
+
+    impl SharedInstallCommitObserver for SharedInstallCommitObserverFixture {
+        fn observe(&mut self, phase: SharedInstallCommitPhase, state: &super::ProcessState) {
+            self.order
+                .borrow_mut()
+                .push(SharedInstallCommitOrderEvent::Phase(phase));
+            self.observations
+                .push((phase, state.shared_install_logical_snapshot_for_test()));
+        }
+    }
+
+    fn assert_non_catalog_commit_state_equal(
+        actual: &SharedInstallLogicalSnapshot,
+        expected: &SharedInstallLogicalSnapshot,
+    ) {
+        assert_eq!(actual.blocks, expected.blocks);
+        assert_eq!(actual.sensitive, expected.sensitive);
+        assert_eq!(actual.fusion_sites, expected.fusion_sites);
+        assert_eq!(actual.published_len, expected.published_len);
+        assert_eq!(
+            actual.private_published_index,
+            expected.private_published_index
+        );
+        assert_eq!(
+            actual.shared_published_index,
+            expected.shared_published_index
+        );
+        assert_eq!(actual.dependencies, expected.dependencies);
+        assert_eq!(actual.shared_blocks, expected.shared_blocks);
+        assert_eq!(actual.shared_guest_ranges, expected.shared_guest_ranges);
+        assert_eq!(actual.loaded_unit_ids, expected.loaded_unit_ids);
+        assert_eq!(actual.direct_bindings, expected.direct_bindings);
+        assert_eq!(actual.direct_binding_units, expected.direct_binding_units);
+        assert_eq!(actual.shared_blocks_mapped, expected.shared_blocks_mapped);
+        assert_eq!(actual.executable_head, expected.executable_head);
+        assert_eq!(actual.executable_nodes, expected.executable_nodes);
+    }
+
+    fn assert_commit_state_except_executable_equal(
+        actual: &SharedInstallLogicalSnapshot,
+        expected: &SharedInstallLogicalSnapshot,
+    ) {
+        assert_eq!(actual.catalog_frontier, expected.catalog_frontier);
+        assert_eq!(actual.catalog_ready, expected.catalog_ready);
+        assert_eq!(actual.catalog_shared, expected.catalog_shared);
+        assert_eq!(actual.blocks, expected.blocks);
+        assert_eq!(actual.sensitive, expected.sensitive);
+        assert_eq!(actual.fusion_sites, expected.fusion_sites);
+        assert_eq!(actual.published_len, expected.published_len);
+        assert_eq!(
+            actual.private_published_index,
+            expected.private_published_index
+        );
+        assert_eq!(
+            actual.shared_published_index,
+            expected.shared_published_index
+        );
+        assert_eq!(actual.dependencies, expected.dependencies);
+        assert_eq!(actual.shared_blocks, expected.shared_blocks);
+        assert_eq!(actual.shared_guest_ranges, expected.shared_guest_ranges);
+        assert_eq!(actual.loaded_unit_ids, expected.loaded_unit_ids);
+        assert_eq!(actual.direct_bindings, expected.direct_bindings);
+        assert_eq!(actual.direct_binding_units, expected.direct_binding_units);
+        assert_eq!(actual.shared_blocks_mapped, expected.shared_blocks_mapped);
     }
 
     #[test]
@@ -5663,7 +5806,6 @@ mod tests {
         process
             .activate_translated_range_catalog_with_recorder(&mut recorder)
             .expect("activate catalog");
-        recorder.events.clear();
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
         state.profiling = true;
@@ -5673,6 +5815,14 @@ mod tests {
         let metadata = shared_sensitive_metadata(GuestVa(0x40000c), Some(fusion));
         let before = state.shared_install_logical_snapshot_for_test();
         let head_before = state.executable_ranges.head_ptr();
+        let commit_order = Rc::new(RefCell::new(Vec::new()));
+        let mut commit_recorder = SharedInstallCommitRecorderFixture {
+            order: Rc::clone(&commit_order),
+        };
+        let mut commit_observer = SharedInstallCommitObserverFixture {
+            order: Rc::clone(&commit_order),
+            observations: Vec::new(),
+        };
 
         let prepared = state
             .prepare_shared_install_with_sensitive_planner(
@@ -5686,7 +5836,113 @@ mod tests {
         assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
         assert_eq!(prepared.sensitive_updates, vec![(sensitive_key, metadata)]);
         assert_eq!(prepared.blocks.len(), 2);
-        state.commit_shared_install_with_recorder(prepared, &mut recorder);
+        state.commit_shared_install_with_observer(
+            prepared,
+            &mut commit_recorder,
+            &mut commit_observer,
+        );
+
+        let [
+            (catalog_phase, catalog_state),
+            (logical_phase, logical_state),
+            (executable_phase, executable_state),
+        ] = commit_observer.observations.as_slice()
+        else {
+            panic!(
+                "expected three commit observations, got {:?}",
+                commit_observer
+                    .observations
+                    .iter()
+                    .map(|(phase, _)| phase)
+                    .collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(*catalog_phase, SharedInstallCommitPhase::CatalogSharedAdd);
+        assert_eq!(catalog_state.catalog_frontier, before.catalog_frontier + 1);
+        assert_eq!(catalog_state.catalog_ready, before.catalog_ready);
+        assert_eq!(
+            catalog_state.catalog_shared.len(),
+            before.catalog_shared.len() + 1
+        );
+        assert_non_catalog_commit_state_equal(catalog_state, &before);
+
+        assert_eq!(
+            *logical_phase,
+            SharedInstallCommitPhase::LogicalStateInstalled
+        );
+        assert_eq!(
+            logical_state.catalog_frontier,
+            catalog_state.catalog_frontier
+        );
+        assert_eq!(logical_state.catalog_ready, catalog_state.catalog_ready);
+        assert_eq!(logical_state.catalog_shared, catalog_state.catalog_shared);
+        assert_eq!(logical_state.blocks.len(), 2);
+        assert_eq!(logical_state.sensitive, vec![(sensitive_key, metadata)]);
+        assert_eq!(
+            logical_state
+                .fusion_sites
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(logical_state.published_len, 2);
+        assert_eq!(logical_state.shared_published_index.len(), 2);
+        assert_eq!(
+            logical_state
+                .dependencies
+                .iter()
+                .map(|(_, records)| records.len())
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(logical_state.shared_blocks.len(), 2);
+        assert_eq!(
+            logical_state.shared_guest_ranges,
+            vec![
+                (GuestVa(0x400000), GuestVa(0x40000c)),
+                (GuestVa(0x400010), GuestVa(0x40001c)),
+            ]
+        );
+        assert_eq!(logical_state.loaded_unit_ids.len(), 1);
+        assert_ne!(logical_state.direct_bindings, before.direct_bindings);
+        assert_eq!(
+            logical_state.direct_binding_units,
+            before.direct_binding_units + 1
+        );
+        assert_eq!(
+            logical_state.shared_blocks_mapped,
+            before.shared_blocks_mapped + 2
+        );
+        assert_eq!(logical_state.executable_head, before.executable_head);
+        assert_eq!(logical_state.executable_nodes, before.executable_nodes);
+
+        assert_eq!(
+            *executable_phase,
+            SharedInstallCommitPhase::ExecutableHeadPublished
+        );
+        assert_commit_state_except_executable_equal(executable_state, logical_state);
+        assert_ne!(
+            executable_state.executable_head,
+            logical_state.executable_head
+        );
+        assert_eq!(
+            executable_state.executable_nodes,
+            logical_state.executable_nodes + 1
+        );
+        assert_eq!(
+            commit_order.borrow().as_slice(),
+            [
+                SharedInstallCommitOrderEvent::CatalogEvent,
+                SharedInstallCommitOrderEvent::Phase(SharedInstallCommitPhase::CatalogSharedAdd),
+                SharedInstallCommitOrderEvent::Phase(
+                    SharedInstallCommitPhase::LogicalStateInstalled,
+                ),
+                SharedInstallCommitOrderEvent::Phase(
+                    SharedInstallCommitPhase::ExecutableHeadPublished,
+                ),
+            ]
+        );
 
         assert_eq!(state.sensitive.get(&sensitive_key), Some(&metadata));
         assert_eq!(state.sensitive.len(), 1);
@@ -5699,10 +5955,6 @@ mod tests {
         }
         assert_eq!(state.blocks.len(), 2);
         assert_eq!(state.exclusive_fusion_site_counts().iter().sum::<u64>(), 1);
-        assert!(matches!(
-            recorder.events.as_slice(),
-            [RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(_))]
-        ));
         assert_ne!(state.executable_ranges.head_ptr(), head_before);
         assert!(state.executable_ranges.contains(base));
     }
