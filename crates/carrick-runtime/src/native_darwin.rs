@@ -1275,6 +1275,75 @@ fn native_dsr_synchronization_kind(
 }
 
 impl carrick_dsr::probes::DsrProbeSink for NativeDsrProbeForwarder {
+    fn translated_range_reset(&self, event: carrick_dsr::probes::TranslatedRangeReset) {
+        let Ok(epoch) = crate::probes::TranslatedRangeEpoch::new(event.epoch().get()) else {
+            return;
+        };
+        crate::probes::host_translated_range_reset(crate::probes::TranslatedRangeReset::reset(
+            epoch,
+        ));
+    }
+
+    fn translated_range_add(&self, event: carrick_dsr::probes::TranslatedRangeAdd) {
+        use carrick_dsr::probes::TranslatedRangeAdd as Seam;
+
+        match event {
+            Seam::Private(event) => {
+                let Ok(epoch) = crate::probes::TranslatedRangeEpoch::new(event.epoch().get())
+                else {
+                    return;
+                };
+                let Ok(sequence) =
+                    crate::probes::TranslatedRangeSequence::new(event.sequence().get())
+                else {
+                    return;
+                };
+                let Ok(event) = crate::probes::TranslatedPrivateRange::private(
+                    epoch,
+                    sequence,
+                    event.range().clone(),
+                ) else {
+                    return;
+                };
+                crate::probes::host_translated_private_range(event);
+            }
+            Seam::Shared(event) => {
+                let Ok(epoch) = crate::probes::TranslatedRangeEpoch::new(event.epoch().get())
+                else {
+                    return;
+                };
+                let Ok(sequence) =
+                    crate::probes::TranslatedRangeSequence::new(event.sequence().get())
+                else {
+                    return;
+                };
+                let Ok(unit_id) = crate::probes::TranslatedUnitId::new(event.unit_id().get())
+                else {
+                    return;
+                };
+                let Ok(event) = crate::probes::TranslatedSharedRange::shared(
+                    epoch,
+                    sequence,
+                    unit_id,
+                    event.range().clone(),
+                ) else {
+                    return;
+                };
+                crate::probes::host_translated_shared_range(event);
+            }
+        }
+    }
+
+    fn translated_range_ready(&self, event: carrick_dsr::probes::TranslatedRangeReady) {
+        let Ok(epoch) = crate::probes::TranslatedRangeEpoch::new(event.epoch().get()) else {
+            return;
+        };
+        crate::probes::host_translated_range_ready(crate::probes::TranslatedRangeReady::ready(
+            epoch,
+            event.final_sequence(),
+        ));
+    }
+
     fn dsr_cache_lifecycle(
         &self,
         tid: i32,

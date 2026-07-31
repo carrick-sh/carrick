@@ -19,7 +19,9 @@ workspace = true
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
 libc.workspace = true
+thiserror.workspace = true
 
 # `probes::host_image_base` reads the main image's base/slide/path through dyld.
 # libc deprecated those three in favour of mach2, and the workspace denies
@@ -30,7 +32,6 @@ mach2.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-thiserror.workspace = true
 
 # usdt is scoped to EXACTLY the target set that compiles `probes::real` — see
 # the matching `#[cfg]` at the top of src/probes.rs. Everything else links

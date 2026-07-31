@@ -654,6 +654,7 @@ name = "carrick-observability"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-guest-mem",
  "libc",
  "mach2",
  "parking_lot",
