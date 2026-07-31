@@ -28,7 +28,7 @@ import native_go_build  # noqa: E402
 import native_go_build_abba  # noqa: E402
 
 
-CAPTURE_SCHEMA = "carrick.native-m2-lifecycle-capture.v2"
+CAPTURE_SCHEMA = "carrick.native-m2-lifecycle-capture.v3"
 LIFECYCLE_PREFIX = "TRANSLATED_LIFECYCLE|"
 SUMMARY_PREFIX = "TRANSLATED_LIFECYCLE_SUMMARY|"
 RUN_ID_PREFIX = "native-m2-lifecycle-"
@@ -332,10 +332,31 @@ def parse_lifecycle_trace(raw: str) -> dict[str, Any]:
             raise EvidenceError("lifecycle event ordinal is gapped or reordered")
 
     by_kind = {str(event["kind"]): event for event in events}
-    target_pid = _wire_int(by_kind["target-birth"], "pid")
+    target_birth = by_kind["target-birth"]
+    target_birth_fields = {
+        "schema",
+        "ordinal",
+        "kind",
+        "pid",
+        "incarnation",
+        "generation",
+        "epoch",
+        "launcher_pid",
+    }
+    if set(target_birth) != target_birth_fields:
+        raise EvidenceError(
+            "target-birth fields are not schema-1 exact: "
+            f"unknown={sorted(set(target_birth) - target_birth_fields)} "
+            f"missing={sorted(target_birth_fields - set(target_birth))}"
+        )
+    target_pid = _wire_int(target_birth, "pid")
+    launcher_pid = _wire_int(target_birth, "launcher_pid")
     child_pid = _wire_int(by_kind["child-birth"], "pid")
-    if target_pid <= 0 or child_pid <= 0 or target_pid == child_pid:
-        raise EvidenceError("target and child PID identities are invalid")
+    live_pids = (launcher_pid, target_pid, child_pid)
+    if any(identity <= 0 for identity in live_pids) or len(set(live_pids)) != 3:
+        raise EvidenceError(
+            "trace launcher, lifecycle root, and child PID identities are invalid"
+        )
 
     parent_expected = {
         "target-birth": 0,
@@ -451,6 +472,7 @@ def parse_lifecycle_trace(raw: str) -> dict[str, Any]:
 
     return {
         **summary,
+        "launcher_pid": launcher_pid,
         "target_pid": target_pid,
         "child_pid": child_pid,
         "event_count": len(events),
@@ -729,10 +751,10 @@ def _expected_d_identity_accesses() -> dict[str, Counter[tuple[str, ...]]]:
     pid_epoch = f"runtime_epoch[pid,{pid_inc}]"
     dynamic = ("pid", pid_inc, pid_gen, pid_epoch)
     dynamic_epoch_zero = ("pid", pid_inc, pid_gen, "(uint64_t)0")
-    target = (
-        "$target",
-        "incarnation[$target]",
-        "(uint64_t)1",
+    neutral = (
+        "(pid_t)0",
+        "(uint64_t)0",
+        "(uint64_t)0",
         "(uint64_t)0",
     )
     created = (
@@ -759,7 +781,7 @@ def _expected_d_identity_accesses() -> dict[str, Counter[tuple[str, ...]]]:
 
     expected = {
         "catalog_live": counted(
-            (target, 1),
+            (neutral, 1),
             (created, 1),
             (dynamic, 10),
             (dynamic_epoch_zero, 1),
@@ -768,7 +790,7 @@ def _expected_d_identity_accesses() -> dict[str, Counter[tuple[str, ...]]]:
             (child_postexec, 1),
         ),
         "pending_by_pid": counted(
-            (target, 1),
+            (neutral, 1),
             (created, 1),
             (dynamic, 5),
             (dynamic_epoch_zero, 1),
@@ -802,31 +824,31 @@ def _expected_d_identity_accesses() -> dict[str, Counter[tuple[str, ...]]]:
         "metadata_jit_range",
     ):
         expected[name] = counted(
-            (target, 1),
+            (neutral, 1),
             (dynamic_epoch_zero, 1),
             (child_postexec, 4),
             (closed_child, 1),
         )
     expected["metadata_complete"] = counted(
-        (target, 1),
+        (neutral, 1),
         (dynamic_epoch_zero, 1),
         (child_postexec, 1),
         (closed_child, 1),
     )
 
-    target_announcement = (*target, "(uint64_t)0")
+    neutral_announcement = (*neutral, "(uint64_t)0")
     dynamic_announcement = (*dynamic, "(uint64_t)arg2")
     for name in ("ann_epoch", "ann_start", "ann_end"):
         expected[name] = counted(
-            (target_announcement, 1), (dynamic_announcement, 7)
+            (neutral_announcement, 1), (dynamic_announcement, 7)
         )
     expected["ann_ordinal"] = counted(
-        (target_announcement, 1),
+        (neutral_announcement, 1),
         (dynamic_announcement, 12),
         ((*dynamic, "this->run_unit"), 1),
     )
 
-    target_pending = (*target, "0")
+    neutral_pending = (*neutral, "0")
     dynamic_pending = (*dynamic, "arg0")
     pending_counts = {
         "pending_present": 7,
@@ -838,7 +860,7 @@ def _expected_d_identity_accesses() -> dict[str, Counter[tuple[str, ...]]]:
     }
     for name, count in pending_counts.items():
         expected[name] = counted(
-            (target_pending, 1), (dynamic_pending, count)
+            (neutral_pending, 1), (dynamic_pending, count)
         )
     return expected
 
@@ -913,6 +935,217 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
     if ticks != ["tick-30s"]:
         raise EvidenceError("maintained lifecycle script must self-bound at 30 seconds")
 
+    if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\[\$target(?:,|\])", executable):
+        raise EvidenceError(
+            "maintained lifecycle launcher must remain scope-only, never an identity tuple"
+        )
+    for forbidden in (
+        "pid == $target && tracked[pid]",
+        "pid == $target || pid == lifecycle_child_pid",
+    ):
+        if _compact_d(forbidden) in _compact_d(executable):
+            raise EvidenceError(
+                "maintained lifecycle launcher must not be used as the lifecycle root"
+            )
+
+    _require_d_clause(
+        clauses,
+        "dtrace:::BEGIN",
+        predicate=(),
+        actions=(
+            "lifecycle_root_pid = (pid_t)0",
+            "lifecycle_child_pid = (pid_t)0",
+            "live_owners = 0",
+            "parent_private_start = (uint64_t)0",
+            "parent_private_end = (uint64_t)0",
+            "tracked[(pid_t)0] = 0",
+            "incarnation[(pid_t)0] = (uint64_t)0",
+            "image_generation[(pid_t)0, (uint64_t)0] = (uint64_t)0",
+            "runtime_epoch[(pid_t)0, (uint64_t)0] = (uint64_t)0",
+            "process_ordinal[(pid_t)0] = (uint64_t)0",
+            "catalog_live[(pid_t)0, (uint64_t)0, (uint64_t)0, (uint64_t)0] = 0",
+            (
+                "ann_epoch[(pid_t)0, (uint64_t)0, (uint64_t)0, "
+                "(uint64_t)0, (uint64_t)0] = (uint64_t)0"
+            ),
+            (
+                "ann_start[(pid_t)0, (uint64_t)0, (uint64_t)0, "
+                "(uint64_t)0, (uint64_t)0] = (uint64_t)0"
+            ),
+            (
+                "ann_end[(pid_t)0, (uint64_t)0, (uint64_t)0, "
+                "(uint64_t)0, (uint64_t)0] = (uint64_t)0"
+            ),
+            (
+                "ann_ordinal[(pid_t)0, (uint64_t)0, (uint64_t)0, "
+                "(uint64_t)0, (uint64_t)0] = (uint64_t)0"
+            ),
+            (
+                "pending_epoch[(pid_t)0, (uint64_t)0, (uint64_t)0, "
+                "(uint64_t)0, 0] = (uint64_t)0"
+            ),
+            (
+                "pending_unit[(pid_t)0, (uint64_t)0, (uint64_t)0, "
+                "(uint64_t)0, 0] = (uint64_t)0"
+            ),
+            (
+                "pending_start[(pid_t)0, (uint64_t)0, (uint64_t)0, "
+                "(uint64_t)0, 0] = (uint64_t)0"
+            ),
+            (
+                "pending_end[(pid_t)0, (uint64_t)0, (uint64_t)0, "
+                "(uint64_t)0, 0] = (uint64_t)0"
+            ),
+            (
+                "pending_commit_ordinal[(pid_t)0, (uint64_t)0, "
+                "(uint64_t)0, (uint64_t)0, 0] = (uint64_t)0"
+            ),
+            "pending_by_pid[(pid_t)0, (uint64_t)0, (uint64_t)0, (uint64_t)0] = 0",
+        ),
+        description="neutral typed lifecycle identity seeds",
+        exact_actions=True,
+    )
+
+    discovery_matches = [
+        (index, clause)
+        for index, clause in enumerate(clauses)
+        if "|kind=target-birth|" in clause.actions
+    ]
+    if len(discovery_matches) != 1:
+        raise EvidenceError("maintained lifecycle requires one root discovery clause")
+    discovery_index, discovery_clause = discovery_matches[0]
+    reset_indices = [
+        index
+        for index, clause in enumerate(clauses)
+        if clause.provider == "carrick*:::host-translated-range-reset"
+    ]
+    schema2_reset_indices = [
+        index
+        for index, clause in enumerate(clauses)
+        if clause.provider == "carrick*:::host-translated-range-reset"
+        and "|kind=reset|" in clause.actions
+    ]
+    if (
+        not reset_indices
+        or discovery_index != reset_indices[0]
+        or len(schema2_reset_indices) != 1
+        or discovery_index >= schema2_reset_indices[0]
+    ):
+        raise EvidenceError(
+            "maintained lifecycle root discovery must execute before schema-2 reset"
+        )
+    _require_d_clause(
+        clauses,
+        "carrick*:::host-translated-range-reset",
+        predicate=(
+            "lifecycle_root_pid == (pid_t)0",
+            "pid != $target",
+            "ppid == $target",
+            "progenyof($target)",
+            "(uint64_t)arg0 == (uint64_t)1",
+        ),
+        actions=(
+            "this->root_pid = (pid_t)pid",
+            "lifecycle_root_pid = this->root_pid",
+            "tracked[this->root_pid] = 1",
+            "pid_live[this->root_pid] = 1",
+            "incarnation[this->root_pid] = (uint64_t)1",
+            "image_generation[this->root_pid, (uint64_t)1] = (uint64_t)1",
+            "runtime_epoch[this->root_pid, (uint64_t)1] = (uint64_t)0",
+            "execution_armed[this->root_pid, (uint64_t)1] = 1",
+            "exec_inflight[this->root_pid, (uint64_t)1] = 0",
+            "lifecycle_stage[this->root_pid, (uint64_t)1] = 1",
+            "process_ordinal[this->root_pid] = (uint64_t)0",
+            "live_owners++",
+            "lifecycle_target_birth++",
+            (
+                'printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|'
+                "kind=target-birth|pid=%d|incarnation=1|generation=1|epoch=0|"
+                'launcher_pid=%d\\n", lifecycle_ordinal, pid, $target)'
+            ),
+        ),
+        description="typed direct-child epoch-1 root discovery",
+        exact_actions=True,
+        unique_assignment_targets=("this->root_pid", "lifecycle_root_pid"),
+        unique_call_names=("printf",),
+    )
+    if _compact_d(discovery_clause.actions).count(
+        _compact_d("lifecycle_root_pid = this->root_pid")
+    ) != 1:
+        raise EvidenceError("maintained lifecycle root discovery identity is ambiguous")
+
+    _require_d_clause(
+        clauses,
+        "carrick*:::host-translated-range-reset",
+        predicate=(
+            "lifecycle_root_pid == (pid_t)0",
+            "pid == $target || progenyof($target)",
+        ),
+        actions=(
+            "unexpected_events++",
+            "identity_violations++",
+            "|kind=root-discovery-order-violation|",
+        ),
+        description="pre-discovery reset rejection",
+    )
+    _require_d_clause(
+        clauses,
+        "carrick*:::host-translated-range-reset",
+        predicate=(
+            "lifecycle_root_pid != (pid_t)0",
+            "pid != $target",
+            "ppid == $target",
+            "progenyof($target)",
+            "pid != lifecycle_root_pid",
+        ),
+        actions=(
+            "unexpected_events++",
+            "identity_violations++",
+            "|kind=second-lifecycle-root|",
+        ),
+        description="competing direct second root rejection",
+    )
+    _require_d_clause(
+        clauses,
+        "carrick*:::host-translated-range-reset",
+        predicate=(
+            "lifecycle_root_pid != (pid_t)0",
+            "pid == lifecycle_root_pid",
+            "tracked[pid] == 0",
+        ),
+        actions=(
+            "unexpected_events++",
+            "identity_violations++",
+            "|kind=root-pid-reuse|",
+        ),
+        description="post-exit root PID reuse rejection",
+    )
+    for provider in (
+        "carrick*:::host-translated-private-range",
+        "carrick*:::host-translated-shared-range",
+        "carrick*:::host-translated-range-ready",
+        "carrick*:::dsr-cache-lifecycle",
+        "carrick*:::fork-post",
+        "carrick*:::host-image-base",
+        "carrick*:::host-image-catalog",
+        "carrick*:::guest-image-base",
+        "carrick*:::host-jit-range",
+        "carrick*:::dsr-cache-event",
+        "carrick*:::dsr-run-begin",
+        "carrick*:::syscall-return",
+        "carrick*:::guest-exit",
+    ):
+        _require_d_clause(
+            clauses,
+            provider,
+            predicate=(
+                "lifecycle_root_pid == (pid_t)0",
+                "pid == $target || progenyof($target)",
+            ),
+            actions=("unexpected_events++", "identity_violations++"),
+            description=f"pre-discovery lifecycle rejection for {provider}",
+        )
+
     action_text = "\n".join(clause.actions for clause in clauses)
     for milestone in MILESTONES:
         if action_text.count(f"|kind={milestone}|") != 1:
@@ -929,20 +1162,28 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
     milestone_contracts = (
         (
             "target-birth",
-            "dtrace:::BEGIN",
-            (),
+            "carrick*:::host-translated-range-reset",
             (
-                "lifecycle_target_birth = 1",
-                "parent_private_start = (uint64_t)0",
-                "parent_private_end = (uint64_t)0",
-                "tracked[$target] = 1",
-                "lifecycle_stage[$target, incarnation[$target]] = 1",
+                "lifecycle_root_pid == (pid_t)0",
+                "pid != $target",
+                "ppid == $target",
+                "progenyof($target)",
+                "(uint64_t)arg0 == (uint64_t)1",
+            ),
+            (
+                "this->root_pid = (pid_t)pid",
+                "lifecycle_root_pid = this->root_pid",
+                "tracked[this->root_pid] = 1",
+                "incarnation[this->root_pid] = (uint64_t)1",
+                "lifecycle_stage[this->root_pid, (uint64_t)1] = 1",
+                "live_owners++",
+                "lifecycle_target_birth++",
             ),
         ),
         (
             "parent-reset",
             "carrick*:::host-translated-range-reset",
-            ("pid == $target", f"{stage} == 1"),
+            ("pid == lifecycle_root_pid", f"{stage} == 1"),
             (
                 "runtime_epoch[pid, incarnation[pid]] = (uint64_t)1",
                 "catalog_pending++",
@@ -952,7 +1193,7 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         (
             "parent-private",
             "carrick*:::host-translated-private-range",
-            ("pid == $target", f"{stage} == 2"),
+            ("pid == lifecycle_root_pid", f"{stage} == 2"),
             (
                 "parent_private_start = (uint64_t)arg2",
                 "parent_private_end = (uint64_t)arg3",
@@ -962,7 +1203,7 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         (
             "parent-ready",
             "carrick*:::host-translated-range-ready",
-            ("pid == $target", f"{stage} == 3"),
+            ("pid == lifecycle_root_pid", f"{stage} == 3"),
             (
                 "parent_catalog_ok++",
                 "catalog_pending--",
@@ -972,7 +1213,7 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         (
             "parent-first-run",
             "carrick*:::dsr-run-begin",
-            ("pid == $target", f"{stage} == 4"),
+            ("pid == lifecycle_root_pid", f"{stage} == 4"),
             ("parent_run++", f"{stage} = 5"),
         ),
         (
@@ -1145,7 +1386,7 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
             "parent-wait4",
             "carrick*:::syscall-return",
             (
-                "pid == $target",
+                "pid == lifecycle_root_pid",
                 f"{stage} == 5",
                 "lifecycle_stage[lifecycle_child_pid, incarnation[lifecycle_child_pid]] == 22",
             ),
@@ -1154,7 +1395,11 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         (
             "root-exit",
             "carrick*:::guest-exit",
-            ("pid == $target", f"{stage} == 6", "(int)arg1 == 0"),
+            (
+                "pid == lifecycle_root_pid",
+                f"{stage} == 6",
+                "(int)arg1 == 0",
+            ),
             (
                 "root_exit_seen = 1",
                 "root_exit_status = (int)arg1",
@@ -1192,14 +1437,14 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
     _require_d_clause(
         clauses,
         "carrick*:::guest-exit",
-        predicate=("pid == $target", "(int)arg1 != 0"),
+        predicate=("pid == lifecycle_root_pid", "(int)arg1 != 0"),
         actions=("root_exit_status = (int)arg1", "identity_violations++"),
         description="nonzero root guest-exit rejection",
     )
     _require_d_clause(
         clauses,
         "carrick*:::guest-exit",
-        predicate=("pid == $target", "(int)arg1 == 0"),
+        predicate=("pid == lifecycle_root_pid", "(int)arg1 == 0"),
         actions=("root_exit_seen = 1", "|kind=root-exit|"),
         description="root guest-exit authority",
     )
@@ -1390,6 +1635,8 @@ def validate_dtrace_source(source: str) -> dict[str, int]:
         "lifecycle_summaries": lifecycle,
         "self_bound_seconds": 30,
         "guest_exit_authority": 1,
+        "launcher_scope_only": 1,
+        "lifecycle_root_discovery": 1,
     }
 
 
@@ -2171,6 +2418,7 @@ def capture_lifecycle(
         stdout_raw = result.stdout.encode()
         _write_bytes_atomic(config.stdout, stdout_raw)
         summary_record = {key: parsed[key] for key in sorted(SUMMARY_FIELDS)}
+        summary_record["launcher_pid"] = parsed["launcher_pid"]
         summary_record["target_pid"] = parsed["target_pid"]
         summary_record["child_pid"] = parsed["child_pid"]
         summary_record["event_count"] = parsed["event_count"]

@@ -44,8 +44,9 @@ dtrace:::BEGIN
 
     /* Schema-1 launch-owned fork/exec lifecycle state. */
     lifecycle_ordinal = (uint64_t)0;
-    lifecycle_child_pid = 0;
-    lifecycle_target_birth = 1;
+    lifecycle_root_pid = (pid_t)0;
+    lifecycle_child_pid = (pid_t)0;
+    lifecycle_target_birth = 0;
     lifecycle_child_birth = 0;
     parent_private_start = (uint64_t)0;
     parent_private_end = (uint64_t)0;
@@ -75,62 +76,228 @@ dtrace:::BEGIN
     catalog_pending = 0;
     repair_pending = 0;
     reexec_pending = 0;
-    live_owners = 1;
+    live_owners = 0;
 
     /*
-     * DTrace infers dynamic value width from the first assignment. Seed every
-     * identity, epoch, address, and ordinal as uint64_t before reading it. The
-     * sentinels are inert: unit IDs are nonzero and no join uses TID zero.
-     * Incarnation is retained across exit so a reused numeric PID can never
-     * address tuples left by the process that previously owned that PID.
+     * DTrace fixes dynamic-array value widths at first assignment. Keep one
+     * neutral, untracked PID-zero seed for every identity-keyed array; the
+     * launcher is never installed as an owner. Unit IDs and TIDs are nonzero,
+     * so these tuples cannot join a real catalog record.
      */
-    tracked[$target] = 1;
-    pid_live[$target] = 1;
-    incarnation[$target] = (uint64_t)1;
-    image_generation[$target, incarnation[$target]] = (uint64_t)1;
-    runtime_epoch[$target, incarnation[$target]] = (uint64_t)0;
-    execution_armed[$target, incarnation[$target]] = 1;
-    exec_inflight[$target, incarnation[$target]] = 0;
-    lifecycle_stage[$target, incarnation[$target]] = 1;
-    metadata_host_base[$target, incarnation[$target], (uint64_t)1,
+    tracked[(pid_t)0] = 0;
+    pid_live[(pid_t)0] = 0;
+    incarnation[(pid_t)0] = (uint64_t)0;
+    image_generation[(pid_t)0, (uint64_t)0] = (uint64_t)0;
+    runtime_epoch[(pid_t)0, (uint64_t)0] = (uint64_t)0;
+    execution_armed[(pid_t)0, (uint64_t)0] = 0;
+    exec_inflight[(pid_t)0, (uint64_t)0] = 0;
+    lifecycle_stage[(pid_t)0, (uint64_t)0] = 0;
+    process_ordinal[(pid_t)0] = (uint64_t)0;
+    catalog_live[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0] = 0;
-    metadata_host_catalog[$target, incarnation[$target], (uint64_t)1,
+    metadata_host_base[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0] = 0;
-    metadata_guest_base[$target, incarnation[$target], (uint64_t)1,
+    metadata_host_catalog[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0] = 0;
-    metadata_jit_range[$target, incarnation[$target], (uint64_t)1,
+    metadata_guest_base[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0] = 0;
-    metadata_complete[$target, incarnation[$target], (uint64_t)1,
+    metadata_jit_range[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0] = 0;
-    process_ordinal[$target] = (uint64_t)0;
-    catalog_live[$target, incarnation[$target], (uint64_t)1,
+    metadata_complete[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0] = 0;
-    ann_epoch[$target, incarnation[$target], (uint64_t)1,
+    ann_epoch[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0, (uint64_t)0] = (uint64_t)0;
-    ann_start[$target, incarnation[$target], (uint64_t)1,
+    ann_start[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0, (uint64_t)0] = (uint64_t)0;
-    ann_end[$target, incarnation[$target], (uint64_t)1,
+    ann_end[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0, (uint64_t)0] = (uint64_t)0;
-    ann_ordinal[$target, incarnation[$target], (uint64_t)1,
+    ann_ordinal[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0, (uint64_t)0] = (uint64_t)0;
-    pending_present[$target, incarnation[$target], (uint64_t)1,
+    pending_present[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0, 0] = 0;
-    pending_epoch[$target, incarnation[$target], (uint64_t)1,
+    pending_epoch[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0, 0] = (uint64_t)0;
-    pending_unit[$target, incarnation[$target], (uint64_t)1,
+    pending_unit[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0, 0] = (uint64_t)0;
-    pending_start[$target, incarnation[$target], (uint64_t)1,
+    pending_start[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0, 0] = (uint64_t)0;
-    pending_end[$target, incarnation[$target], (uint64_t)1,
+    pending_end[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0, 0] = (uint64_t)0;
-    pending_commit_ordinal[$target, incarnation[$target], (uint64_t)1,
+    pending_commit_ordinal[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0, 0] = (uint64_t)0;
-    pending_by_pid[$target, incarnation[$target], (uint64_t)1,
+    pending_by_pid[(pid_t)0, (uint64_t)0, (uint64_t)0,
         (uint64_t)0] = 0;
+}
 
+/*
+ * `$target` is the `carrick trace` launcher, not the native catalog owner.
+ * Discover the owner from the first in-scope descendant catalog reset. This
+ * clause precedes every other reset clause so the same epoch-1 probe can seed
+ * both lifecycle and schema-2 state without an untyped or partially live key.
+ */
+carrick*:::host-translated-range-reset
+/lifecycle_root_pid == (pid_t)0 && pid != $target && ppid == $target &&
+    progenyof($target) && (uint64_t)arg0 == (uint64_t)1/
+{
+    this->root_pid = (pid_t)pid;
+    lifecycle_root_pid = this->root_pid;
+    tracked[this->root_pid] = 1;
+    pid_live[this->root_pid] = 1;
+    incarnation[this->root_pid] = (uint64_t)1;
+    image_generation[this->root_pid, (uint64_t)1] = (uint64_t)1;
+    runtime_epoch[this->root_pid, (uint64_t)1] = (uint64_t)0;
+    execution_armed[this->root_pid, (uint64_t)1] = 1;
+    exec_inflight[this->root_pid, (uint64_t)1] = 0;
+    lifecycle_stage[this->root_pid, (uint64_t)1] = 1;
+    process_ordinal[this->root_pid] = (uint64_t)0;
+    live_owners++;
+    lifecycle_target_birth++;
     lifecycle_ordinal++;
-    printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|kind=target-birth|pid=%d|incarnation=1|generation=1|epoch=0\n",
-        lifecycle_ordinal, $target);
+    printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|kind=target-birth|pid=%d|incarnation=1|generation=1|epoch=0|launcher_pid=%d\n",
+        lifecycle_ordinal, pid, $target);
+}
+
+/* Any in-scope reset before a valid descendant epoch-1 root is fail-closed. */
+carrick*:::host-translated-range-reset
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+    lifecycle_ordinal++;
+    printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|kind=root-discovery-order-violation|pid=%d|incarnation=0|generation=0|epoch=%d\n",
+        lifecycle_ordinal, pid, arg0);
+}
+
+/* An untracked reset after discovery is a second lifecycle root, never a child. */
+carrick*:::host-translated-range-reset
+/lifecycle_root_pid != (pid_t)0 &&
+    pid != $target && ppid == $target && progenyof($target) &&
+    pid != lifecycle_root_pid && pid != lifecycle_child_pid/
+{
+    unexpected_events++;
+    identity_violations++;
+    lifecycle_ordinal++;
+    printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|kind=second-lifecycle-root|pid=%d|incarnation=0|generation=0|epoch=%d\n",
+        lifecycle_ordinal, pid, arg0);
+}
+
+/* The retained root identity can never be reclaimed after proc exit/PID reuse. */
+carrick*:::host-translated-range-reset
+/lifecycle_root_pid != (pid_t)0 && pid == lifecycle_root_pid &&
+    tracked[pid] == 0 && (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+    lifecycle_ordinal++;
+    printf("TRANSLATED_LIFECYCLE|schema=1|ordinal=%d|kind=root-pid-reuse|pid=%d|incarnation=%d|generation=%d|epoch=%d\n",
+        lifecycle_ordinal, pid, incarnation[pid],
+        image_generation[pid, incarnation[pid]], arg0);
+}
+
+/* No lifecycle-bearing USDT event may precede root discovery. */
+carrick*:::host-translated-private-range
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::host-translated-shared-range
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::host-translated-range-ready
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::dsr-cache-lifecycle
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::fork-post
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::host-image-base
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::host-image-catalog
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::guest-image-base
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::host-jit-range
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::dsr-cache-event
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::dsr-run-begin
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::syscall-return
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
+}
+
+carrick*:::guest-exit
+/lifecycle_root_pid == (pid_t)0 &&
+    (pid == $target || progenyof($target))/
+{
+    unexpected_events++;
+    identity_violations++;
 }
 
 proc:::create
@@ -140,7 +307,7 @@ proc:::create
     identity_violations += pid_live[args[0]->pr_pid] != 0 ? 1 : 0;
     birth_valid[args[0]->pr_pid,
         (uint64_t)(incarnation[args[0]->pr_pid] + 1)] =
-        pid == $target &&
+        pid == lifecycle_root_pid &&
         lifecycle_stage[pid, incarnation[pid]] == 5 &&
         lifecycle_child_pid == 0 &&
         pid_live[args[0]->pr_pid] == 0 ? 1 : 0;
@@ -216,7 +383,7 @@ carrick*:::guest-exit
 }
 
 carrick*:::guest-exit
-/pid == $target && tracked[pid] &&
+/pid == lifecycle_root_pid && tracked[pid] &&
     ((uint64_t)arg0 != (uint64_t)pid ||
     lifecycle_stage[pid, incarnation[pid]] != 6 ||
     (int)arg1 != 0 || root_exit_seen != 0)/
@@ -228,7 +395,7 @@ carrick*:::guest-exit
 }
 
 carrick*:::guest-exit
-/pid == $target && tracked[pid] &&
+/pid == lifecycle_root_pid && tracked[pid] &&
     (uint64_t)arg0 == (uint64_t)pid &&
     lifecycle_stage[pid, incarnation[pid]] == 6 &&
     (int)arg1 == 0 && root_exit_seen == 0/
@@ -489,8 +656,8 @@ carrick*:::host-translated-range-reset
 
 /* Exactly three private-only catalogs: parent, fork replay, post-exec fresh. */
 carrick*:::host-translated-range-reset
-/(pid == $target || pid == lifecycle_child_pid) && tracked[pid] &&
-    !((pid == $target &&
+/(pid == lifecycle_root_pid || pid == lifecycle_child_pid) && tracked[pid] &&
+    !((pid == lifecycle_root_pid &&
         lifecycle_stage[pid, incarnation[pid]] == 1 &&
         image_generation[pid, incarnation[pid]] == (uint64_t)1 &&
         (uint64_t)arg0 == (uint64_t)1) ||
@@ -508,7 +675,7 @@ carrick*:::host-translated-range-reset
 }
 
 carrick*:::host-translated-range-reset
-/pid == $target && tracked[pid] &&
+/pid == lifecycle_root_pid && tracked[pid] &&
     lifecycle_stage[pid, incarnation[pid]] == 1 &&
     image_generation[pid, incarnation[pid]] == (uint64_t)1 &&
     (uint64_t)arg0 == (uint64_t)1/
@@ -560,8 +727,8 @@ carrick*:::host-translated-range-reset
 
 /* The sharing-disabled lifecycle has exactly one private range per catalog. */
 carrick*:::host-translated-private-range
-/(pid == $target || pid == lifecycle_child_pid) && tracked[pid] &&
-    !((pid == $target &&
+/(pid == lifecycle_root_pid || pid == lifecycle_child_pid) && tracked[pid] &&
+    !((pid == lifecycle_root_pid &&
         lifecycle_stage[pid, incarnation[pid]] == 2 &&
         (uint64_t)arg0 == (uint64_t)1 &&
         (uint64_t)arg1 == (uint64_t)1 &&
@@ -585,7 +752,7 @@ carrick*:::host-translated-private-range
 }
 
 carrick*:::host-translated-private-range
-/pid == $target && tracked[pid] &&
+/pid == lifecycle_root_pid && tracked[pid] &&
     lifecycle_stage[pid, incarnation[pid]] == 2 &&
     (uint64_t)arg0 == (uint64_t)1 &&
     (uint64_t)arg1 == (uint64_t)1 &&
@@ -654,7 +821,7 @@ carrick*:::host-translated-private-range
 }
 
 carrick*:::host-translated-shared-range
-/(pid == $target || pid == lifecycle_child_pid) && tracked[pid]/
+/(pid == lifecycle_root_pid || pid == lifecycle_child_pid) && tracked[pid]/
 {
     unexpected_events++;
     catalog_violations++;
@@ -783,8 +950,8 @@ carrick*:::host-translated-shared-range
 
 /* Ready closes each catalog; no later announcement may change its frontier. */
 carrick*:::host-translated-range-ready
-/(pid == $target || pid == lifecycle_child_pid) && tracked[pid] &&
-    !((pid == $target &&
+/(pid == lifecycle_root_pid || pid == lifecycle_child_pid) && tracked[pid] &&
+    !((pid == lifecycle_root_pid &&
         lifecycle_stage[pid, incarnation[pid]] == 3 &&
         (uint64_t)arg0 == (uint64_t)1 &&
         (uint64_t)arg1 == (uint64_t)1 &&
@@ -810,7 +977,7 @@ carrick*:::host-translated-range-ready
 }
 
 carrick*:::host-translated-range-ready
-/pid == $target && tracked[pid] &&
+/pid == lifecycle_root_pid && tracked[pid] &&
     lifecycle_stage[pid, incarnation[pid]] == 3 &&
     (uint64_t)arg0 == (uint64_t)1 &&
     (uint64_t)arg1 == (uint64_t)1 &&
@@ -1212,7 +1379,7 @@ carrick*:::dsr-cache-event
 
 /* First in-range execution is the resume frontier; phase 36 is not used. */
 carrick*:::dsr-run-begin
-/(pid == $target || pid == lifecycle_child_pid) && tracked[pid] &&
+/(pid == lifecycle_root_pid || pid == lifecycle_child_pid) && tracked[pid] &&
     execution_armed[pid, incarnation[pid]] == 0/
 {
     lifecycle_run_violations++;
@@ -1225,7 +1392,7 @@ carrick*:::dsr-run-begin
 }
 
 carrick*:::dsr-run-begin
-/(pid == $target || pid == lifecycle_child_pid) && tracked[pid] &&
+/(pid == lifecycle_root_pid || pid == lifecycle_child_pid) && tracked[pid] &&
     execution_armed[pid, incarnation[pid]] == 1 &&
     !(ready_seen[pid, incarnation[pid],
         image_generation[pid, incarnation[pid]],
@@ -1236,7 +1403,7 @@ carrick*:::dsr-run-begin
     (uint64_t)arg2 < private_end[pid, incarnation[pid],
         image_generation[pid, incarnation[pid]],
         runtime_epoch[pid, incarnation[pid]]] &&
-    ((pid == $target &&
+    ((pid == lifecycle_root_pid &&
         lifecycle_stage[pid, incarnation[pid]] >= 4 &&
         lifecycle_stage[pid, incarnation[pid]] <= 6) ||
     (pid == lifecycle_child_pid &&
@@ -1258,7 +1425,7 @@ carrick*:::dsr-run-begin
 }
 
 carrick*:::dsr-run-begin
-/pid == $target && tracked[pid] &&
+/pid == lifecycle_root_pid && tracked[pid] &&
     execution_armed[pid, incarnation[pid]] == 1 &&
     lifecycle_stage[pid, incarnation[pid]] == 4 &&
     ready_seen[pid, incarnation[pid], (uint64_t)1, (uint64_t)1] == 1 &&
@@ -1442,7 +1609,7 @@ carrick*:::dsr-run-begin
 
 /* Linux aarch64 wait4 is syscall 260; zero is a parked/retry return. */
 carrick*:::syscall-return
-/pid == $target && tracked[pid] && (uint64_t)arg0 == (uint64_t)260 &&
+/pid == lifecycle_root_pid && tracked[pid] && (uint64_t)arg0 == (uint64_t)260 &&
     (int)arg2 != 0 &&
     !(lifecycle_stage[pid, incarnation[pid]] == 5 &&
     lifecycle_child_pid > 0 && child_exit_seen == 1 &&
@@ -1456,7 +1623,7 @@ carrick*:::syscall-return
 }
 
 carrick*:::syscall-return
-/pid == $target && tracked[pid] && (uint64_t)arg0 == (uint64_t)260 &&
+/pid == lifecycle_root_pid && tracked[pid] && (uint64_t)arg0 == (uint64_t)260 &&
     (int)arg2 != 0 &&
     lifecycle_stage[pid, incarnation[pid]] == 5 &&
     lifecycle_child_pid > 0 && child_exit_seen == 1 &&
@@ -1551,7 +1718,8 @@ dtrace:::END
         pending_collisions == 0 && exited_pending == 0 &&
         reset_with_pending == 0 &&
         lifecycle_ordinal == (uint64_t)29 &&
-        lifecycle_stage[$target, incarnation[$target]] == 7 &&
+        lifecycle_stage[lifecycle_root_pid,
+            incarnation[lifecycle_root_pid]] == 7 &&
         lifecycle_stage[lifecycle_child_pid,
             incarnation[lifecycle_child_pid]] == 22 &&
         dtrace_drops == 0 && dtrace_errors == 0;
