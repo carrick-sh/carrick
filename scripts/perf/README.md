@@ -21,3 +21,19 @@ Each sample has a unique `CARRICK_RUN_ID`, a cold guest `GOCACHE`, a bounded
 deadline, and cleanup through `scripts/sudo/kill.sh`. The JSON records every
 sample, the median, binary hash, git state, host provenance, and preflight
 state. Run the Docker oracle in a separate phase.
+
+## Receipt-bound ABBA authority
+
+`native_go_build_abba.py` is the retention authority for this workload. It
+prepares signed immutable arm receipts, then revalidates the receipt binary,
+image, host, environment, and idle-state preflight before every execution. An
+official run excludes one warm-up per arm and measures at least eight
+A1/B1/B2/A2 quads; its primary metric is total child CPU from
+`RUSAGE_CHILDREN`, which is a floor rather than a wall-time or throughput
+claim. The approved loopback registry is plain HTTP `localhost:5005`, forwarded
+only through the evidence-visible
+`CARRICK_INSECURE_REGISTRIES=localhost:5005` contract; an ambient host setting
+fails preflight. The accepted M1 control/control receipt is
+[`evidence/native-go-build-abba-control-control-v1.json`](evidence/native-go-build-abba-control-control-v1.json).
+Accepting a same-binary control/control run validates the instrument and its
+measured resolution only: it cannot establish or retain an optimization.

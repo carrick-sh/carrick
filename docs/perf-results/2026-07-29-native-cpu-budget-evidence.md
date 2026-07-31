@@ -2072,3 +2072,66 @@ support.
 - Two profiler defects recorded: unit-mapped code is misfiled as `host` (run 24),
   and `vminfo` gives no address (run 30). Both cap what the next campaign can
   see until fixed.
+
+---
+
+# M1 closeout: receipt-bound instrument authority, not a speedup
+
+## Run 31 — accepted control/control ABBA null
+
+This run closes the provenance and statistical-instrument prerequisite for the
+next performance campaign. It does **not** change the performance result above.
+
+The accepted `carrick.native-go-build-abba.v1` artifact is
+[`native-go-build-abba-control-control-v1.json`](../../scripts/perf/evidence/native-go-build-abba-control-control-v1.json)
+(SHA-256
+`13f53bfec091cbbdee53dd1cbd91e8bad061948989a004113fe8fb1c24171ee8`).
+It is a same-binary control/control run from
+`2c23c71bfcac62e66529a7b60632703ac22a412b`; both receipts and every sample
+resolve to the 23,882,864-byte binary
+`6a632fe53ac3d6acd3b66c670b7ea8b939bbd5cef4ab0d1db602d96bda88a73e`
+(Mach-O UUID `F0DBEE67-CC93-30F8-BDBF-39779E711DC9`). The host receipt records
+`macOS-27.0-arm64-arm-64bit-Mach-O` on arm64.
+
+The runner completed nine passing preflights, two excluded A/B warm-ups, and 32
+measured executions in eight A1/B1/B2/A2 quads. Immutable image execution used
+plain HTTP `localhost:5005`, forwarded exactly as
+`CARRICK_INSECURE_REGISTRIES=localhost:5005`; the runner still rejects that
+setting when inherited from the ambient host environment.
+
+Total child CPU from `RUSAGE_CHILDREN` is the primary metric and an instrument
+floor, not a wall-time or throughput claim:
+
+| total-CPU result | value |
+|---|---:|
+| median B/A quad ratio | `1.0052799282253981` |
+| deterministic paired 95% interval | `[0.9734240943172773, 1.0563503469116038]` |
+| one-sided 95% upper bound | `1.0433435718348583` |
+| B wins / one-sided sign probability | `3/8`; `219/256 = 0.85546875` |
+| n=8 one-sided resolution | `2.502124580562758%` |
+
+The artifact is `complete=true` and `accepted=true`, but
+`statistical_pass=false` and `retained=false`: total CPU did not establish an
+improvement. Its embedded mechanism and correctness fields deliberately remain
+`external_gate_required`. This is instrument proof only—no speedup, regression,
+retained optimization, or new campaign baseline was measured. In particular,
+it does not replace H0 at `0686248a`, revise Run 16's `0.9947` ratio, or move the
+goal's primary metric.
+
+### Correctness closeout after the null campaign
+
+The first retry-enabled broad native smoke reported 21/23, and the two targeted
+recoveries then reported 2/2. Preserve that sequence as discovery evidence; it
+does not retroactively make the first broad attempt a 23/23 pass. LLDB/core
+evidence then showed that Darwin could clear physical x18 while native DSR
+still held live translated branch, conditional, and biased-memory state there.
+Commit `5020e509` moves those live ranges to stable typed scratch registers and
+extends exact recovery coverage through the affected boundaries.
+
+On that committed fix, the structural gates passed 192/192 AArch64 tests and
+54/54 biased-runtime tests. The signed
+`test.test_subprocess.POSIXProcessTestCase.test_close_fds` reducer passed 4/4;
+`just conformance-native smoke --workers 4 --flake-retries 1` then matched
+23/23, and full `just ci` passed. These are external correctness receipts for
+M1; they do not turn the earlier control/control artifact into a performance
+result or authorize an M2/M3 claim.
