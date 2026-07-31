@@ -461,6 +461,104 @@ pub struct ProcessTranslator {
     exec_reset_identity: Arc<DirectBindingExecProcessIdentity>,
 }
 
+trait TranslatedRangeRecorder {
+    fn reset(&mut self, event: probes::TranslatedRangeReset);
+    fn add(&mut self, event: probes::TranslatedRangeAdd);
+    fn ready(&mut self, event: probes::TranslatedRangeReady);
+}
+
+struct DsrTranslatedRangeRecorder;
+
+impl TranslatedRangeRecorder for DsrTranslatedRangeRecorder {
+    fn reset(&mut self, event: probes::TranslatedRangeReset) {
+        probes::translated_range_reset(event);
+    }
+
+    fn add(&mut self, event: probes::TranslatedRangeAdd) {
+        probes::translated_range_add(event);
+    }
+
+    fn ready(&mut self, event: probes::TranslatedRangeReady) {
+        probes::translated_range_ready(event);
+    }
+}
+
+#[derive(Debug)]
+struct TranslatedRangeCatalog {
+    epoch: probes::TranslatedRangeEpoch,
+    next_sequence: u64,
+    ready_sequence: Option<u64>,
+    private: std::ops::Range<carrick_guest_mem::HostVa>,
+}
+
+impl TranslatedRangeCatalog {
+    fn dormant(
+        private: std::ops::Range<carrick_guest_mem::HostVa>,
+    ) -> Result<Self, types::DsrError> {
+        let mut recorder = DsrTranslatedRangeRecorder;
+        Self::dormant_with_recorder(private, &mut recorder)
+    }
+
+    fn dormant_with_recorder(
+        private: std::ops::Range<carrick_guest_mem::HostVa>,
+        _recorder: &mut impl TranslatedRangeRecorder,
+    ) -> Result<Self, types::DsrError> {
+        if private.start.raw() == 0 || private.end.raw() == 0 {
+            return Err(types::DsrError::CachePolicy(format!(
+                "translated private range has a zero endpoint: 0x{:x}..0x{:x}",
+                private.start.raw(),
+                private.end.raw(),
+            )));
+        }
+        let epoch = probes::TranslatedRangeEpoch::new(1)
+            .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+        let sequence = probes::TranslatedRangeSequence::new(1)
+            .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+        probes::TranslatedPrivateRange::private(epoch, sequence, private.clone())
+            .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+        Ok(Self {
+            epoch,
+            next_sequence: sequence.get(),
+            ready_sequence: None,
+            private,
+        })
+    }
+
+    fn activate_if_dormant(&mut self) -> Result<(), types::DsrError> {
+        let mut recorder = DsrTranslatedRangeRecorder;
+        self.activate_if_dormant_with_recorder(&mut recorder)
+    }
+
+    fn activate_if_dormant_with_recorder(
+        &mut self,
+        recorder: &mut impl TranslatedRangeRecorder,
+    ) -> Result<(), types::DsrError> {
+        if self.ready_sequence.is_some() {
+            return Ok(());
+        }
+        let sequence = probes::TranslatedRangeSequence::new(self.next_sequence)
+            .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+        let private =
+            probes::TranslatedPrivateRange::private(self.epoch, sequence, self.private.clone())
+                .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+        let final_sequence = sequence.get();
+        let next_sequence = final_sequence.checked_add(1).ok_or_else(|| {
+            types::DsrError::CachePolicy(
+                "translated-range sequence overflow during initial activation".to_string(),
+            )
+        })?;
+        let reset = probes::TranslatedRangeReset::reset(self.epoch);
+        let ready = probes::TranslatedRangeReady::ready(self.epoch, final_sequence);
+
+        recorder.reset(reset);
+        recorder.add(probes::TranslatedRangeAdd::Private(private));
+        recorder.ready(ready);
+        self.next_sequence = next_sequence;
+        self.ready_sequence = Some(final_sequence);
+        Ok(())
+    }
+}
+
 impl Drop for ProcessTranslator {
     fn drop(&mut self) {
         if std::env::var_os("CARRICK_DSR_ARTIFACT_REPORT").as_deref()
@@ -485,6 +583,7 @@ impl Drop for ProcessTranslator {
 
 pub struct ProcessState {
     pub cache: cache::TranslationCache,
+    translated_ranges: TranslatedRangeCatalog,
     pub artifact_store: Option<artifact_spike::ArtifactStore>,
     pub blocks: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheVa>,
     pub pending:
@@ -1572,6 +1671,10 @@ impl ProcessTranslator {
         artifact_spike::ensure_authority_if_enabled()?;
         let cache = cache::TranslationCache::new(capacity, host)?;
         let cache_range = cache.host_range();
+        let translated_ranges = TranslatedRangeCatalog::dormant(
+            carrick_guest_mem::HostVa(cache_range.start)
+                ..carrick_guest_mem::HostVa(cache_range.end),
+        )?;
         let translator = Self {
             private_target_authority: Box::new(gateway::TargetCacheAuthority::new(
                 cache_range.start,
@@ -1582,6 +1685,7 @@ impl ProcessTranslator {
             exec_reset_identity: Arc::new(DirectBindingExecProcessIdentity),
             state: RwLock::new(ProcessState {
                 cache,
+                translated_ranges,
                 artifact_store: artifact_spike::store_if_enabled()?,
                 blocks: BTreeMap::new(),
                 pending: BTreeMap::new(),
@@ -1622,6 +1726,21 @@ impl ProcessTranslator {
         // PC as JIT or host without unwinding it.
         probes::dsr_cache_bounds(cache_range.start as u64, cache_range.end as u64);
         Ok(translator)
+    }
+
+    pub fn activate_translated_range_catalog(&self) -> Result<(), types::DsrError> {
+        self.state.write().translated_ranges.activate_if_dormant()
+    }
+
+    #[cfg(test)]
+    fn activate_translated_range_catalog_with_recorder(
+        &self,
+        recorder: &mut impl TranslatedRangeRecorder,
+    ) -> Result<(), types::DsrError> {
+        self.state
+            .write()
+            .translated_ranges
+            .activate_if_dormant_with_recorder(recorder)
     }
 
     pub fn cache_host_range(&self) -> std::ops::Range<u64> {
@@ -4089,12 +4208,17 @@ mod tests {
     // by the mirrored-ordinal tests in carrick-dsr).
     use super::{
         DsrErrorProbeExt as _, NativeDsrExitProbeExt as _, ProcessTranslator, SharedBlockAuthority,
-        translation_source_words_required,
+        TranslatedRangeCatalog, TranslatedRangeRecorder, translation_source_words_required,
     };
     use crate::types;
     use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
-    use carrick_guest_mem::GuestVa;
+    use carrick_dsr::probes::{
+        TranslatedPrivateRange, TranslatedRangeAdd, TranslatedRangeEpoch, TranslatedRangeReady,
+        TranslatedRangeReset, TranslatedRangeSequence,
+    };
+    use carrick_guest_mem::{GuestVa, HostVa};
     use std::ptr::NonNull;
+    use std::sync::{Arc, Barrier};
 
     const PC: GuestVa = GuestVa(0x1000);
 
@@ -4142,6 +4266,100 @@ mod tests {
 
         fn remap_for_fork_child(&self, _prior: &JitRegion) -> std::io::Result<ForkChildJit> {
             Ok(ForkChildJit::Inherited)
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum RecordedTranslatedRange {
+        Reset(TranslatedRangeReset),
+        Add(TranslatedRangeAdd),
+        Ready(TranslatedRangeReady),
+    }
+
+    #[derive(Default)]
+    struct TranslatedRangeRecorderFixture {
+        events: Vec<RecordedTranslatedRange>,
+    }
+
+    impl TranslatedRangeRecorder for TranslatedRangeRecorderFixture {
+        fn reset(&mut self, event: TranslatedRangeReset) {
+            self.events.push(RecordedTranslatedRange::Reset(event));
+        }
+
+        fn add(&mut self, event: TranslatedRangeAdd) {
+            self.events.push(RecordedTranslatedRange::Add(event));
+        }
+
+        fn ready(&mut self, event: TranslatedRangeReady) {
+            self.events.push(RecordedTranslatedRange::Ready(event));
+        }
+    }
+
+    #[test]
+    fn translated_range_catalog_stays_dormant_until_one_process_activation() {
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        let private = HostVa(0x1000)..HostVa(0x2000);
+        let _catalog = TranslatedRangeCatalog::dormant_with_recorder(private, &mut recorder)
+            .expect("valid dormant catalog");
+
+        assert_eq!(recorder.events, Vec::<RecordedTranslatedRange>::new());
+    }
+
+    #[test]
+    fn translated_range_catalog_emits_initial_private_replay_once_across_siblings() {
+        let process = Arc::new(
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator"),
+        );
+        let cache_range = process.state.read().cache.host_range();
+        let expected_range = HostVa(cache_range.start)..HostVa(cache_range.end);
+        let epoch = TranslatedRangeEpoch::new(1).expect("nonzero epoch");
+        let sequence = TranslatedRangeSequence::new(1).expect("nonzero sequence");
+        let private = TranslatedPrivateRange::private(epoch, sequence, expected_range)
+            .expect("valid private cache range");
+        let expected = vec![
+            RecordedTranslatedRange::Reset(TranslatedRangeReset::reset(epoch)),
+            RecordedTranslatedRange::Add(TranslatedRangeAdd::Private(private)),
+            RecordedTranslatedRange::Ready(TranslatedRangeReady::ready(epoch, 1)),
+        ];
+        let sibling_count = 8;
+        let barrier = Arc::new(Barrier::new(sibling_count));
+        let siblings = (0..sibling_count)
+            .map(|_| {
+                let process = Arc::clone(&process);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut recorder = TranslatedRangeRecorderFixture::default();
+                    barrier.wait();
+                    process
+                        .activate_translated_range_catalog_with_recorder(&mut recorder)
+                        .expect("sibling activation");
+                    recorder.events
+                })
+            })
+            .collect::<Vec<_>>();
+        let events = siblings
+            .into_iter()
+            .flat_map(|sibling| sibling.join().expect("sibling join"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn translated_range_catalog_rejects_invalid_private_state_before_publication() {
+        for private in [
+            HostVa(0)..HostVa(4),
+            HostVa(0x1000)..HostVa(0x1000),
+            HostVa(0x2000)..HostVa(0x1000),
+            HostVa(0x1001)..HostVa(0x2000),
+            HostVa(0x1000)..HostVa(0x2002),
+        ] {
+            let mut recorder = TranslatedRangeRecorderFixture::default();
+
+            let result = TranslatedRangeCatalog::dormant_with_recorder(private, &mut recorder);
+
+            assert!(result.is_err());
+            assert_eq!(recorder.events, Vec::<RecordedTranslatedRange>::new());
         }
     }
 

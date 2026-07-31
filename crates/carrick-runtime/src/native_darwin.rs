@@ -1939,6 +1939,12 @@ enum NativeThreadStart {
     },
 }
 
+impl NativeThreadStart {
+    const fn activates_translated_range_catalog(&self) -> bool {
+        matches!(self, Self::Initial { .. })
+    }
+}
+
 enum NativeThreadLoopOutcome {
     ProcessExit(i32),
     ThreadDone,
@@ -2373,6 +2379,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
     thread_runtime: &mut NativeThreadRuntime,
     start: NativeThreadStart,
 ) -> Result<NativeThreadLoopOutcome, RuntimeError> {
+    let activates_translated_range_catalog = start.activates_translated_range_catalog();
     let mut guest_tpidr_el0 = match &start {
         NativeThreadStart::Initial { .. } => 0,
         NativeThreadStart::Detached {
@@ -2388,6 +2395,11 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
         NativeThreadStart::Detached { context, .. } => *context,
     };
     let process_translator = memory.read().dsr_process_translator()?;
+    if activates_translated_range_catalog {
+        process_translator
+            .activate_translated_range_catalog()
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
+    }
     let cache_range = process_translator.cache_host_range();
     if PROFILE {
         // A guest exec can host-self-reexec carrick and then run to exit
@@ -6680,6 +6692,21 @@ fn last_io_error(context: &str) -> RuntimeError {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn only_initial_native_thread_start_activates_the_process_catalog() {
+        let initial = NativeThreadStart::Initial {
+            entry: 0x1000,
+            initial_sp: 0x2000,
+        };
+        let detached = NativeThreadStart::Detached {
+            context: Box::new(NativeUcontextSnapshot::default()),
+            guest_tpidr_el0: 0,
+        };
+
+        assert!(initial.activates_translated_range_catalog());
+        assert!(!detached.activates_translated_range_catalog());
+    }
 
     #[test]
     fn native_syscall_service_normal_and_terminal_outcomes_close_once() {
