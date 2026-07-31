@@ -1179,6 +1179,99 @@ class DTraceSourceContractTests(unittest.TestCase):
                 ):
                     self.module.validate_dtrace_source(weakened)
 
+    def test_static_contract_rejects_neutralized_root_identity_guards(self) -> None:
+        for marker in (
+            "root-discovery-order-violation",
+            "second-lifecycle-root",
+            "root-pid-reuse",
+        ):
+            marker_offset = self.source.index(f"|kind={marker}|")
+            clause_start = self.source.rfind(
+                "carrick*:::host-translated-range-reset", 0, marker_offset
+            )
+            clause_end = self.source.index("\n}\n", marker_offset) + 2
+            guard = self.source[clause_start:clause_end]
+
+            predicate_end = guard.index("/\n{")
+            false_predicate = (
+                guard[:predicate_end]
+                + " && (uint64_t)0 == (uint64_t)1"
+                + guard[predicate_end:]
+            )
+            rolled_back = guard.replace(
+                "    identity_violations++;\n",
+                "    identity_violations++;\n"
+                "    unexpected_events--;\n"
+                "    identity_violations--;\n",
+                1,
+            )
+
+            for mutation, neutralized in (
+                ("false predicate", false_predicate),
+                ("counter rollback", rolled_back),
+            ):
+                with self.subTest(marker=marker, mutation=mutation):
+                    weakened = (
+                        self.source[:clause_start]
+                        + neutralized
+                        + self.source[clause_end:]
+                    )
+                    self.assertNotEqual(weakened, self.source)
+                    with self.assertRaisesRegex(
+                        self.module.EvidenceError,
+                        "pre-discovery|root discovery|second root|PID reuse|post-exit",
+                    ):
+                        self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_rejects_neutralized_pre_discovery_predicate(self) -> None:
+        guard = (
+            "carrick*:::dsr-cache-lifecycle\n"
+            "/lifecycle_root_pid == (pid_t)0 &&\n"
+            "    (pid == $target || progenyof($target))/\n"
+            "{\n"
+            "    unexpected_events++;\n"
+            "    identity_violations++;\n"
+            "}"
+        )
+        neutralized = guard.replace(
+            "(pid == $target || progenyof($target))/",
+            "(pid == $target || progenyof($target)) &&\n"
+            "    (uint64_t)0 == (uint64_t)1/",
+        )
+        weakened = self.source.replace(guard, neutralized, 1)
+        self.assertNotEqual(weakened, self.source)
+
+        with self.assertRaisesRegex(
+            self.module.EvidenceError,
+            "pre-discovery lifecycle rejection.*dsr-cache-lifecycle",
+        ):
+            self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_rejects_pre_discovery_counter_rollback(self) -> None:
+        guard = (
+            "carrick*:::dsr-cache-lifecycle\n"
+            "/lifecycle_root_pid == (pid_t)0 &&\n"
+            "    (pid == $target || progenyof($target))/\n"
+            "{\n"
+            "    unexpected_events++;\n"
+            "    identity_violations++;\n"
+            "}"
+        )
+        neutralized = guard.replace(
+            "    identity_violations++;\n",
+            "    identity_violations++;\n"
+            "    unexpected_events--;\n"
+            "    identity_violations--;\n",
+        )
+        weakened = self.source.replace(guard, neutralized, 1)
+        self.assertNotEqual(weakened, self.source)
+
+        with self.assertRaisesRegex(
+            self.module.EvidenceError,
+            "pre-discovery lifecycle rejection.*dsr-cache-lifecycle",
+        ):
+            self.module.validate_dtrace_source(weakened)
+
     def test_static_contract_requires_discovery_before_schema_two_reset(self) -> None:
         discovery_start = self.source.index(
             "carrick*:::host-translated-range-reset\n"
