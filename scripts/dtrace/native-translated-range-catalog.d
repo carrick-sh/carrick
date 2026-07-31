@@ -18,7 +18,7 @@
 
 dtrace:::BEGIN
 {
-    ordinal = 0;
+    ordinal = (uint64_t)0;
     resets = 0;
     private_ranges = 0;
     shared_ranges = 0;
@@ -43,26 +43,27 @@ dtrace:::BEGIN
     tick_expired = 0;
 
     /*
-     * Seed every dynamic-array shape before reading it. The sentinels are
-     * inert: translated unit IDs are nonzero, and no real join uses TID zero.
+     * DTrace infers dynamic value width from the first assignment. Seed every
+     * identity, epoch, address, and ordinal as uint64_t before reading it. The
+     * sentinels are inert: unit IDs are nonzero and no join uses TID zero.
      * Incarnation is retained across exit so a reused numeric PID can never
      * address tuples left by the process that previously owned that PID.
      */
     tracked[$target] = 1;
-    incarnation[$target] = 1;
-    process_ordinal[$target] = 0;
-    catalog_epoch[$target, incarnation[$target]] = 0;
+    incarnation[$target] = (uint64_t)1;
+    process_ordinal[$target] = (uint64_t)0;
+    catalog_epoch[$target, incarnation[$target]] = (uint64_t)0;
     catalog_live[$target, incarnation[$target]] = 0;
-    ann_epoch[$target, incarnation[$target], 0] = 0;
-    ann_start[$target, incarnation[$target], 0] = 0;
-    ann_end[$target, incarnation[$target], 0] = 0;
-    ann_ordinal[$target, incarnation[$target], 0] = 0;
+    ann_epoch[$target, incarnation[$target], (uint64_t)0] = (uint64_t)0;
+    ann_start[$target, incarnation[$target], (uint64_t)0] = (uint64_t)0;
+    ann_end[$target, incarnation[$target], (uint64_t)0] = (uint64_t)0;
+    ann_ordinal[$target, incarnation[$target], (uint64_t)0] = (uint64_t)0;
     pending_present[$target, incarnation[$target], 0] = 0;
-    pending_epoch[$target, incarnation[$target], 0] = 0;
-    pending_unit[$target, incarnation[$target], 0] = 0;
-    pending_start[$target, incarnation[$target], 0] = 0;
-    pending_end[$target, incarnation[$target], 0] = 0;
-    pending_commit_ordinal[$target, incarnation[$target], 0] = 0;
+    pending_epoch[$target, incarnation[$target], 0] = (uint64_t)0;
+    pending_unit[$target, incarnation[$target], 0] = (uint64_t)0;
+    pending_start[$target, incarnation[$target], 0] = (uint64_t)0;
+    pending_end[$target, incarnation[$target], 0] = (uint64_t)0;
+    pending_commit_ordinal[$target, incarnation[$target], 0] = (uint64_t)0;
     pending_by_pid[$target, incarnation[$target]] = 0;
 }
 
@@ -71,9 +72,11 @@ proc:::create
 {
     tracked[args[0]->pr_pid] = 1;
     /* Deliberately increment retained state before initializing this owner. */
-    incarnation[args[0]->pr_pid]++;
-    process_ordinal[args[0]->pr_pid] = 0;
-    catalog_epoch[args[0]->pr_pid, incarnation[args[0]->pr_pid]] = 0;
+    incarnation[args[0]->pr_pid] =
+        (uint64_t)(incarnation[args[0]->pr_pid] + 1);
+    process_ordinal[args[0]->pr_pid] = (uint64_t)0;
+    catalog_epoch[args[0]->pr_pid, incarnation[args[0]->pr_pid]] =
+        (uint64_t)0;
     catalog_live[args[0]->pr_pid, incarnation[args[0]->pr_pid]] = 0;
     pending_by_pid[args[0]->pr_pid, incarnation[args[0]->pr_pid]] = 0;
 }
@@ -90,8 +93,8 @@ proc:::exit
 {
     exited_pending += pending_by_pid[pid, incarnation[pid]];
     tracked[pid] = 0;
-    process_ordinal[pid] = 0;
-    catalog_epoch[pid, incarnation[pid]] = 0;
+    process_ordinal[pid] = (uint64_t)0;
+    catalog_epoch[pid, incarnation[pid]] = (uint64_t)0;
     catalog_live[pid, incarnation[pid]] = 0;
     pending_by_pid[pid, incarnation[pid]] = 0;
 }
@@ -106,7 +109,7 @@ carrick*:::host-translated-range-reset
         ordinal, process_ordinal[pid], pid, arg0);
     reset_with_pending +=
         pending_by_pid[pid, incarnation[pid]] != 0 ? 1 : 0;
-    catalog_epoch[pid, incarnation[pid]] = arg0;
+    catalog_epoch[pid, incarnation[pid]] = (uint64_t)arg0;
     catalog_live[pid, incarnation[pid]] = 1;
 }
 
@@ -131,7 +134,7 @@ carrick*:::host-translated-shared-range
 }
 
 carrick*:::host-translated-shared-range
-/(pid == $target || progenyof($target)) && arg2 == 0/
+/(pid == $target || progenyof($target)) && (uint64_t)arg2 == 0/
 {
     ordinal++;
     process_ordinal[pid]++;
@@ -142,7 +145,8 @@ carrick*:::host-translated-shared-range
 }
 
 carrick*:::host-translated-shared-range
-/(pid == $target || progenyof($target)) && arg2 != 0 && arg3 >= arg4/
+/(pid == $target || progenyof($target)) && (uint64_t)arg2 != 0 &&
+    (uint64_t)arg3 >= (uint64_t)arg4/
 {
     ordinal++;
     process_ordinal[pid]++;
@@ -153,7 +157,8 @@ carrick*:::host-translated-shared-range
 }
 
 carrick*:::host-translated-shared-range
-/(pid == $target || progenyof($target)) && arg2 != 0 && arg3 < arg4 &&
+/(pid == $target || progenyof($target)) && (uint64_t)arg2 != 0 &&
+    (uint64_t)arg3 < (uint64_t)arg4 &&
     catalog_live[pid, incarnation[pid]] != 1/
 {
     ordinal++;
@@ -165,9 +170,10 @@ carrick*:::host-translated-shared-range
 }
 
 carrick*:::host-translated-shared-range
-/(pid == $target || progenyof($target)) && arg2 != 0 && arg3 < arg4 &&
+/(pid == $target || progenyof($target)) && (uint64_t)arg2 != 0 &&
+    (uint64_t)arg3 < (uint64_t)arg4 &&
     catalog_live[pid, incarnation[pid]] == 1 &&
-    catalog_epoch[pid, incarnation[pid]] != arg0/
+    catalog_epoch[pid, incarnation[pid]] != (uint64_t)arg0/
 {
     ordinal++;
     process_ordinal[pid]++;
@@ -178,11 +184,12 @@ carrick*:::host-translated-shared-range
 }
 
 carrick*:::host-translated-shared-range
-/(pid == $target || progenyof($target)) && arg2 != 0 && arg3 < arg4 &&
+/(pid == $target || progenyof($target)) && (uint64_t)arg2 != 0 &&
+    (uint64_t)arg3 < (uint64_t)arg4 &&
     catalog_live[pid, incarnation[pid]] == 1 &&
-    catalog_epoch[pid, incarnation[pid]] == arg0 &&
-    ann_ordinal[pid, incarnation[pid], arg2] != 0 &&
-    ann_epoch[pid, incarnation[pid], arg2] == arg0/
+    catalog_epoch[pid, incarnation[pid]] == (uint64_t)arg0 &&
+    ann_ordinal[pid, incarnation[pid], (uint64_t)arg2] != 0 &&
+    ann_epoch[pid, incarnation[pid], (uint64_t)arg2] == (uint64_t)arg0/
 {
     ordinal++;
     process_ordinal[pid]++;
@@ -193,16 +200,18 @@ carrick*:::host-translated-shared-range
 }
 
 carrick*:::host-translated-shared-range
-/(pid == $target || progenyof($target)) && arg2 != 0 && arg3 < arg4 &&
+/(pid == $target || progenyof($target)) && (uint64_t)arg2 != 0 &&
+    (uint64_t)arg3 < (uint64_t)arg4 &&
     catalog_live[pid, incarnation[pid]] == 1 &&
-    catalog_epoch[pid, incarnation[pid]] == arg0 &&
-    (ann_ordinal[pid, incarnation[pid], arg2] == 0 ||
-    ann_epoch[pid, incarnation[pid], arg2] != arg0)/
+    catalog_epoch[pid, incarnation[pid]] == (uint64_t)arg0 &&
+    (ann_ordinal[pid, incarnation[pid], (uint64_t)arg2] == 0 ||
+    ann_epoch[pid, incarnation[pid], (uint64_t)arg2] != (uint64_t)arg0)/
 {
-    ann_epoch[pid, incarnation[pid], arg2] = arg0;
-    ann_start[pid, incarnation[pid], arg2] = arg3;
-    ann_end[pid, incarnation[pid], arg2] = arg4;
-    ann_ordinal[pid, incarnation[pid], arg2] = ordinal;
+    ann_epoch[pid, incarnation[pid], (uint64_t)arg2] = (uint64_t)arg0;
+    ann_start[pid, incarnation[pid], (uint64_t)arg2] = (uint64_t)arg3;
+    ann_end[pid, incarnation[pid], (uint64_t)arg2] = (uint64_t)arg4;
+    ann_ordinal[pid, incarnation[pid], (uint64_t)arg2] =
+        (uint64_t)ordinal;
     shared_announced++;
 }
 
@@ -219,11 +228,11 @@ carrick*:::host-translated-range-ready
 carrick*:::dsr-cache-event
 /(pid == $target || progenyof($target)) && arg1 == 12 &&
     (catalog_live[pid, incarnation[pid]] != 1 ||
-    ann_epoch[pid, incarnation[pid], arg2] !=
+    ann_epoch[pid, incarnation[pid], (uint64_t)arg2] !=
         catalog_epoch[pid, incarnation[pid]] ||
-    ann_start[pid, incarnation[pid], arg2] >=
-        ann_end[pid, incarnation[pid], arg2] ||
-    ann_ordinal[pid, incarnation[pid], arg2] == 0)/
+    ann_start[pid, incarnation[pid], (uint64_t)arg2] >=
+        ann_end[pid, incarnation[pid], (uint64_t)arg2] ||
+    ann_ordinal[pid, incarnation[pid], (uint64_t)arg2] == 0)/
 {
     ordinal++;
     process_ordinal[pid]++;
@@ -235,30 +244,30 @@ carrick*:::dsr-cache-event
 carrick*:::dsr-cache-event
 /(pid == $target || progenyof($target)) && arg1 == 12 &&
     catalog_live[pid, incarnation[pid]] == 1 &&
-    ann_epoch[pid, incarnation[pid], arg2] ==
+    ann_epoch[pid, incarnation[pid], (uint64_t)arg2] ==
         catalog_epoch[pid, incarnation[pid]] &&
-    ann_start[pid, incarnation[pid], arg2] <
-        ann_end[pid, incarnation[pid], arg2] &&
-    ann_ordinal[pid, incarnation[pid], arg2] != 0 &&
-    ann_ordinal[pid, incarnation[pid], arg2] >= ordinal + 1/
+    ann_start[pid, incarnation[pid], (uint64_t)arg2] <
+        ann_end[pid, incarnation[pid], (uint64_t)arg2] &&
+    ann_ordinal[pid, incarnation[pid], (uint64_t)arg2] != 0 &&
+    ann_ordinal[pid, incarnation[pid], (uint64_t)arg2] >= ordinal + 1/
 {
     ordinal++;
     process_ordinal[pid]++;
     commit_order_violations++;
     printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=unit-loaded-order-violation|pid=%d|incarnation=%d|tid=%d|unit_id=%d|announcement_ordinal=%d|commit_ordinal=%d\n",
         ordinal, process_ordinal[pid], pid, incarnation[pid], arg0, arg2,
-        ann_ordinal[pid, incarnation[pid], arg2], ordinal);
+        ann_ordinal[pid, incarnation[pid], (uint64_t)arg2], ordinal);
 }
 
 carrick*:::dsr-cache-event
 /(pid == $target || progenyof($target)) && arg1 == 12 &&
     catalog_live[pid, incarnation[pid]] == 1 &&
-    ann_epoch[pid, incarnation[pid], arg2] ==
+    ann_epoch[pid, incarnation[pid], (uint64_t)arg2] ==
         catalog_epoch[pid, incarnation[pid]] &&
-    ann_start[pid, incarnation[pid], arg2] <
-        ann_end[pid, incarnation[pid], arg2] &&
-    ann_ordinal[pid, incarnation[pid], arg2] != 0 &&
-    ann_ordinal[pid, incarnation[pid], arg2] < ordinal + 1 &&
+    ann_start[pid, incarnation[pid], (uint64_t)arg2] <
+        ann_end[pid, incarnation[pid], (uint64_t)arg2] &&
+    ann_ordinal[pid, incarnation[pid], (uint64_t)arg2] != 0 &&
+    ann_ordinal[pid, incarnation[pid], (uint64_t)arg2] < ordinal + 1 &&
     pending_present[pid, incarnation[pid], arg0] != 0/
 {
     ordinal++;
@@ -273,12 +282,12 @@ carrick*:::dsr-cache-event
 carrick*:::dsr-cache-event
 /(pid == $target || progenyof($target)) && arg1 == 12 &&
     catalog_live[pid, incarnation[pid]] == 1 &&
-    ann_epoch[pid, incarnation[pid], arg2] ==
+    ann_epoch[pid, incarnation[pid], (uint64_t)arg2] ==
         catalog_epoch[pid, incarnation[pid]] &&
-    ann_start[pid, incarnation[pid], arg2] <
-        ann_end[pid, incarnation[pid], arg2] &&
-    ann_ordinal[pid, incarnation[pid], arg2] != 0 &&
-    ann_ordinal[pid, incarnation[pid], arg2] < ordinal + 1 &&
+    ann_start[pid, incarnation[pid], (uint64_t)arg2] <
+        ann_end[pid, incarnation[pid], (uint64_t)arg2] &&
+    ann_ordinal[pid, incarnation[pid], (uint64_t)arg2] != 0 &&
+    ann_ordinal[pid, incarnation[pid], (uint64_t)arg2] < ordinal + 1 &&
     pending_present[pid, incarnation[pid], arg0] == 0/
 {
     ordinal++;
@@ -288,18 +297,20 @@ carrick*:::dsr-cache-event
     pending_by_pid[pid, incarnation[pid]]++;
     pending_present[pid, incarnation[pid], arg0] = 1;
     pending_epoch[pid, incarnation[pid], arg0] =
-        catalog_epoch[pid, incarnation[pid]];
-    pending_unit[pid, incarnation[pid], arg0] = arg2;
+        (uint64_t)catalog_epoch[pid, incarnation[pid]];
+    pending_unit[pid, incarnation[pid], arg0] = (uint64_t)arg2;
     pending_start[pid, incarnation[pid], arg0] =
-        ann_start[pid, incarnation[pid], arg2];
+        (uint64_t)ann_start[pid, incarnation[pid], (uint64_t)arg2];
     pending_end[pid, incarnation[pid], arg0] =
-        ann_end[pid, incarnation[pid], arg2];
-    pending_commit_ordinal[pid, incarnation[pid], arg0] = ordinal;
+        (uint64_t)ann_end[pid, incarnation[pid], (uint64_t)arg2];
+    pending_commit_ordinal[pid, incarnation[pid], arg0] =
+        (uint64_t)ordinal;
     printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=unit-loaded|pid=%d|incarnation=%d|tid=%d|unit_id=%d|start=%#x|end=%#x|announcement_ordinal=%d|commit_ordinal=%d|records=%d|data_bytes=%d\n",
         ordinal, process_ordinal[pid], pid, incarnation[pid], arg0, arg2,
-        ann_start[pid, incarnation[pid], arg2],
-        ann_end[pid, incarnation[pid], arg2],
-        ann_ordinal[pid, incarnation[pid], arg2], ordinal, arg3, arg4);
+        ann_start[pid, incarnation[pid], (uint64_t)arg2],
+        ann_end[pid, incarnation[pid], (uint64_t)arg2],
+        ann_ordinal[pid, incarnation[pid], (uint64_t)arg2],
+        ordinal, arg3, arg4);
 }
 
 carrick*:::dsr-run-begin
@@ -324,8 +335,8 @@ carrick*:::dsr-run-begin
     pending_epoch[pid, incarnation[pid], arg0] ==
         catalog_epoch[pid, incarnation[pid]] &&
     pending_commit_ordinal[pid, incarnation[pid], arg0] < ordinal + 1 &&
-    (arg2 < pending_start[pid, incarnation[pid], arg0] ||
-    arg2 >= pending_end[pid, incarnation[pid], arg0])/
+    ((uint64_t)arg2 < pending_start[pid, incarnation[pid], arg0] ||
+    (uint64_t)arg2 >= pending_end[pid, incarnation[pid], arg0])/
 {
     ordinal++;
     process_ordinal[pid]++;
@@ -344,8 +355,8 @@ carrick*:::dsr-run-begin
     pending_epoch[pid, incarnation[pid], arg0] ==
         catalog_epoch[pid, incarnation[pid]] &&
     pending_commit_ordinal[pid, incarnation[pid], arg0] < ordinal + 1 &&
-    pending_start[pid, incarnation[pid], arg0] <= arg2 &&
-    arg2 < pending_end[pid, incarnation[pid], arg0]/
+    pending_start[pid, incarnation[pid], arg0] <= (uint64_t)arg2 &&
+    (uint64_t)arg2 < pending_end[pid, incarnation[pid], arg0]/
 {
     ordinal++;
     process_ordinal[pid]++;
@@ -360,11 +371,11 @@ carrick*:::dsr-run-begin
         pending_commit_ordinal[pid, incarnation[pid], arg0],
         ordinal, arg1, arg2, arg3);
     pending_present[pid, incarnation[pid], arg0] = 0;
-    pending_epoch[pid, incarnation[pid], arg0] = 0;
-    pending_unit[pid, incarnation[pid], arg0] = 0;
-    pending_start[pid, incarnation[pid], arg0] = 0;
-    pending_end[pid, incarnation[pid], arg0] = 0;
-    pending_commit_ordinal[pid, incarnation[pid], arg0] = 0;
+    pending_epoch[pid, incarnation[pid], arg0] = (uint64_t)0;
+    pending_unit[pid, incarnation[pid], arg0] = (uint64_t)0;
+    pending_start[pid, incarnation[pid], arg0] = (uint64_t)0;
+    pending_end[pid, incarnation[pid], arg0] = (uint64_t)0;
+    pending_commit_ordinal[pid, incarnation[pid], arg0] = (uint64_t)0;
     pending_by_pid[pid, incarnation[pid]]--;
     pending_loaded_units--;
 }
