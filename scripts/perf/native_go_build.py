@@ -333,6 +333,52 @@ def reject_ambient_carrick(
         )
 
 
+def _inode_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _name_identity(
+    directory: int,
+    name: str,
+) -> tuple[int, int] | None:
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=directory,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    return _inode_identity(metadata)
+
+
+def _require_name_matches_descriptor(
+    directory: int,
+    name: str,
+    descriptor: int,
+    description: str,
+) -> None:
+    expected = _inode_identity(os.fstat(descriptor))
+    if _name_identity(directory, name) != expected:
+        raise RuntimeError(f"{description} identity drifted")
+
+
+def _unlink_name_if_owned(
+    directory: int,
+    name: str,
+    descriptor: int,
+) -> None:
+    expected = _inode_identity(os.fstat(descriptor))
+    if _name_identity(directory, name) == expected:
+        # Darwin has no conditional unlink-by-inode operation. Leave a
+        # mismatched name alone, and tolerate the owned name disappearing
+        # between the identity check and this best-effort cleanup.
+        try:
+            os.unlink(name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+
+
 def write_json_atomic(
     path: pathlib.Path,
     payload: dict[str, object],
@@ -347,6 +393,7 @@ def write_json_atomic(
     temporary_name = (
         f".{path.name}.{os.getpid()}.{secrets.token_hex(16)}.tmp"
     )
+    temporary_descriptor = -1
     try:
         temporary_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         temporary_flags |= getattr(os, "O_CLOEXEC", 0)
@@ -360,11 +407,18 @@ def write_json_atomic(
             temporary_descriptor,
             mode="w",
             encoding="utf-8",
+            closefd=False,
         ) as temporary:
             json.dump(payload, temporary, indent=2, sort_keys=True)
             temporary.write("\n")
             temporary.flush()
             os.fsync(temporary.fileno())
+        _require_name_matches_descriptor(
+            directory,
+            temporary_name,
+            temporary_descriptor,
+            "atomic JSON temporary pathname",
+        )
         if exclusive:
             os.link(
                 temporary_name,
@@ -372,7 +426,6 @@ def write_json_atomic(
                 src_dir_fd=directory,
                 dst_dir_fd=directory,
             )
-            os.unlink(temporary_name, dir_fd=directory)
         else:
             os.replace(
                 temporary_name,
@@ -380,12 +433,27 @@ def write_json_atomic(
                 src_dir_fd=directory,
                 dst_dir_fd=directory,
             )
+        _require_name_matches_descriptor(
+            directory,
+            path.name,
+            temporary_descriptor,
+            "atomic JSON destination",
+        )
+        if exclusive:
+            _unlink_name_if_owned(
+                directory,
+                temporary_name,
+                temporary_descriptor,
+            )
         os.fsync(directory)
     finally:
-        try:
-            os.unlink(temporary_name, dir_fd=directory)
-        except FileNotFoundError:
-            pass
+        if temporary_descriptor >= 0:
+            _unlink_name_if_owned(
+                directory,
+                temporary_name,
+                temporary_descriptor,
+            )
+            os.close(temporary_descriptor)
         os.close(directory)
 
 
@@ -457,8 +525,10 @@ def foreign_rows(
         is_known_command = any(
             path.search(command) for path in KNOWN_PERFORMANCE_PATHS
         )
-        executable = command.split(maxsplit=1)[0]
-        is_receipt_binary = executable in receipt_binaries
+        is_receipt_binary = any(
+            command == binary or command.startswith(f"{binary} ")
+            for binary in receipt_binaries
+        )
         if is_known_command or is_receipt_binary or REWRITTEN_PROCTITLE.search(command):
             foreign.append(f"pid={pid} command={command}")
     return foreign
@@ -772,6 +842,7 @@ def run_sample(
     started = time.monotonic_ns()
     result: subprocess.CompletedProcess[str] | None = None
     timeout: subprocess.TimeoutExpired | None = None
+    execution_error: Exception | None = None
     cleanup_error: Exception | None = None
     cleanup_evidence: dict[str, object] | None = None
     try:
@@ -786,6 +857,8 @@ def run_sample(
         )
     except subprocess.TimeoutExpired as error:
         timeout = error
+    except Exception as error:
+        execution_error = error
     finally:
         elapsed_ms = (time.monotonic_ns() - started) // 1_000_000
         # Before `carrick_cleanup`/`docker_cleanup`, whose children would otherwise
@@ -819,23 +892,41 @@ def run_sample(
         combined = combined_output(timeout.stdout, timeout.stderr)
         stdout = combined_output(timeout.stdout, None)
         stderr = combined_output(None, timeout.stderr)
-    else:
-        assert result is not None
+    elif result is not None:
         combined = combined_output(result.stdout, result.stderr)
         stdout = combined_output(result.stdout, None)
         stderr = combined_output(None, result.stderr)
+    else:
+        combined = combined_output(
+            getattr(execution_error, "stdout", None),
+            getattr(execution_error, "stderr", None),
+        )
+        stdout = combined_output(
+            getattr(execution_error, "stdout", None),
+            None,
+        )
+        stderr = combined_output(
+            None,
+            getattr(execution_error, "stderr", None),
+        )
+    capture_error: Exception | None = None
     if captured_output is not None:
-        captured_output.parent.mkdir(parents=True, exist_ok=True)
-        captured_output.write_text(combined)
+        try:
+            captured_output.parent.mkdir(parents=True, exist_ok=True)
+            captured_output.write_text(combined)
+        except Exception as error:
+            capture_error = error
     if cleanup_error is not None:
         cleanup_evidence = {
             "status": 125,
             "stdout": "",
             "stderr": f"cleanup launch failed: {cleanup_error}",
         }
-    return_code = None if timeout is not None else result.returncode
+    return_code = result.returncode if result is not None else None
     build_ok = (
         timeout is None
+        and execution_error is None
+        and result is not None
         and stdout.splitlines().count("BUILD_OK") == 1
     )
     workload_ns: int | None = None
@@ -861,6 +952,22 @@ def run_sample(
         "return_code": return_code,
         "timed_out": timeout is not None,
         "build_ok": build_ok,
+        "execution_error": (
+            None
+            if execution_error is None
+            else {
+                "type": type(execution_error).__name__,
+                "message": str(execution_error),
+            }
+        ),
+        "capture_error": (
+            None
+            if capture_error is None
+            else {
+                "type": type(capture_error).__name__,
+                "message": str(capture_error),
+            }
+        ),
         "command": {
             "argv": command,
             "status": return_code,
@@ -889,6 +996,18 @@ def run_sample(
         if cleanup_error is not None:
             raise sample_error from cleanup_error
         raise sample_error
+    if execution_error is not None:
+        raise SampleEvidenceError(
+            f"go-build sample {index} execution failed after launch: "
+            f"run_id={run_id} error={execution_error}",
+            sample,
+        ) from execution_error
+    if capture_error is not None:
+        raise SampleEvidenceError(
+            f"go-build sample {index} output capture failed: "
+            f"run_id={run_id} error={capture_error}",
+            sample,
+        ) from capture_error
     assert result is not None
     if result.returncode != 0 or not build_ok:
         sample_error = SampleEvidenceError(

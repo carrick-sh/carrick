@@ -646,9 +646,15 @@ class CampaignContractTest(unittest.TestCase):
         run_id: str,
         value: float = 100.0,
         build_ok: bool = True,
+        image_ref: str | None = None,
     ) -> dict[str, object]:
         receipt = arm.receipt
         environment = dict(arm.environment)
+        executed_image_ref = (
+            receipt.image_repo_digests[0]
+            if image_ref is None
+            else image_ref
+        )
         provenance = {
             "git_commit": "9" * 40,
             "git_status": [],
@@ -659,7 +665,7 @@ class CampaignContractTest(unittest.TestCase):
                 "machine": "arm64",
                 "node": "fixture-host",
             },
-            "image_ref": receipt.image_ref,
+            "image_ref": executed_image_ref,
             "image": self.image_identity(receipt),
             "controlled_environment": environment,
             "foreign_processes": [],
@@ -688,6 +694,14 @@ class CampaignContractTest(unittest.TestCase):
                     "run",
                     "--exec-backend",
                     "native",
+                    "-e",
+                    f"CARRICK_RUN_ID={run_id}",
+                    "-w",
+                    "/tmp",
+                    executed_image_ref,
+                    "/bin/sh",
+                    "-c",
+                    native_go_build.guest_script(),
                 ],
                 "status": 0,
                 "build_ok": build_ok,
@@ -861,6 +875,30 @@ class CampaignContractTest(unittest.TestCase):
                 self.arm("A", self.receipt("control"), legacy_candidate),
                 self.arm("B", self.receipt("candidate"), legacy_candidate),
             )
+
+    def test_timing_perturbing_overlays_are_rejected_in_every_arm_mode(self):
+        control_receipt = self.receipt("control")
+        candidate_receipt = self.receipt("candidate")
+        for key in (
+            "CARRICK_DSR_PROFILE",
+            "CARRICK_NATIVE_TRACE_SYSCALLS",
+        ):
+            environment = self.overlay(**{key: "1"})
+            for mode, candidate in (
+                ("same-binary", control_receipt),
+                ("two-binary", candidate_receipt),
+            ):
+                with (
+                    self.subTest(key=key, mode=mode),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        rf"timing-perturbing.*{key}",
+                    ),
+                ):
+                    native_go_build_abba.validate_arm_mode(
+                        self.arm("A", control_receipt, environment),
+                        self.arm("B", candidate, environment),
+                    )
 
     def test_same_binary_rejects_identity_drift_and_legacy_candidate(self):
         receipt = self.receipt("control")
@@ -1271,6 +1309,14 @@ class CampaignContractTest(unittest.TestCase):
                 accepted_thermal + "CPU_Speed_Limit = 75\n",
                 "thermal",
             ),
+            (
+                "Now drawing from 'AC Power'\n",
+                "CPU_Speed_Limit = 50\n"
+                "CPU_Speed_Limit = 100\n"
+                "Scheduler_Limit = 100\n"
+                "CPU_Available = 1\n",
+                "thermal",
+            ),
         )
         for battery, thermal, reason in rejected:
             with self.subTest(reason=reason):
@@ -1647,6 +1693,241 @@ class CampaignContractTest(unittest.TestCase):
             "external_gate_required",
         )
 
+    def test_null_control_control_is_ineligible_even_when_b_is_faster(self):
+        receipt = self.receipt("control")
+        control = self.arm("A", receipt)
+        candidate = self.arm("B", receipt)
+        output = self.root / "faster-null-control.json"
+        positions = native_go_build_abba._campaign_positions(8)
+        call_index = 0
+
+        def run_sample(_repo, _engine, index, _timeout, **kwargs):
+            nonlocal call_index
+            position = positions[call_index]
+            call_index += 1
+            value = 100.0 if position["arm"] == "A" else 80.0
+            return self.sample(
+                control,
+                index=index,
+                run_id=kwargs["current_run_id"],
+                value=value,
+            )
+
+        with self.campaign_fixtures(
+            control,
+            candidate,
+            run_sample,
+        ):
+            artifact = native_go_build_abba.run_campaign(
+                self.root,
+                control,
+                candidate,
+                output,
+            )
+
+        self.assertTrue(artifact["accepted"])
+        self.assertFalse(artifact["decision"]["statistical_pass"])
+        self.assertFalse(artifact["decision"]["retained"])
+        self.assertEqual(
+            artifact["decision"]["reason"],
+            "total CPU statistical gates did not establish an improvement",
+        )
+
+    def test_same_binary_real_variant_remains_statistically_eligible(self):
+        receipt = self.receipt("control")
+        control = self.arm(
+            "A",
+            receipt,
+            self.overlay(CARRICK_DISABLE_VDSO="1"),
+        )
+        candidate = self.arm("B", receipt)
+        output = self.root / "faster-same-binary-variant.json"
+        positions = native_go_build_abba._campaign_positions(8)
+        call_index = 0
+
+        def run_sample(_repo, _engine, index, _timeout, **kwargs):
+            nonlocal call_index
+            position = positions[call_index]
+            call_index += 1
+            arm = control if position["arm"] == "A" else candidate
+            value = 100.0 if position["arm"] == "A" else 80.0
+            return self.sample(
+                arm,
+                index=index,
+                run_id=kwargs["current_run_id"],
+                value=value,
+            )
+
+        with self.campaign_fixtures(
+            control,
+            candidate,
+            run_sample,
+        ):
+            artifact = native_go_build_abba.run_campaign(
+                self.root,
+                control,
+                candidate,
+                output,
+            )
+
+        self.assertTrue(artifact["accepted"])
+        self.assertTrue(artifact["decision"]["statistical_pass"])
+        self.assertFalse(artifact["decision"]["retained"])
+
+    def test_campaign_executes_receipt_digest_and_records_human_tag(self):
+        receipt = self.receipt("control")
+        control = self.arm("A", receipt)
+        candidate = self.arm("B", receipt)
+        output = self.root / "digest-bound.json"
+        positions = native_go_build_abba._campaign_positions(8)
+        call_index = 0
+        observed_images = []
+
+        def run_sample(_repo, _engine, index, _timeout, **kwargs):
+            nonlocal call_index
+            call_index += 1
+            observed_images.append(kwargs["image"])
+            return self.sample(
+                control,
+                index=index,
+                run_id=kwargs["current_run_id"],
+                image_ref=kwargs["image"],
+            )
+
+        with self.campaign_fixtures(
+            control,
+            candidate,
+            run_sample,
+        ):
+            artifact = native_go_build_abba.run_campaign(
+                self.root,
+                control,
+                candidate,
+                output,
+            )
+
+        executed = receipt.image_repo_digests[0]
+        self.assertEqual(observed_images, [executed] * len(positions))
+        self.assertEqual(artifact["identity"]["image_ref"], receipt.image_ref)
+        self.assertEqual(
+            artifact["identity"]["executed_image_ref"],
+            executed,
+        )
+        self.assertTrue(
+            all(
+                sample["command"]["argv"][8] == executed
+                and sample["provenance"]["pre"]["image_ref"] == executed
+                and sample["provenance"]["post"]["image_ref"] == executed
+                for sample in artifact["samples"]
+            )
+        )
+
+    def test_campaign_rejects_receipt_digest_from_another_repository(self):
+        receipt = dataclasses.replace(
+            self.receipt("control"),
+            image_repo_digests=(
+                "localhost:5005/other-image@sha256:" + "4" * 64,
+            ),
+        )
+        control = self.arm("A", receipt)
+        candidate = self.arm("B", receipt)
+        output = self.root / "mismatched-digest.json"
+
+        with (
+            self.campaign_fixtures(
+                control,
+                candidate,
+                lambda *_args, **_kwargs: self.fail(
+                    "sample launched with a mismatched repository digest"
+                ),
+            ),
+            self.assertRaisesRegex(
+                native_go_build_abba.CampaignEvidenceError,
+                "matching immutable repo digest",
+            ),
+        ):
+            native_go_build_abba.run_campaign(
+                self.root,
+                control,
+                candidate,
+                output,
+            )
+
+        artifact = json.loads(output.read_text())
+        self.assertFalse(artifact["accepted"])
+        self.assertEqual(artifact["samples"], [])
+        self.assertIsNone(artifact["failure"]["sample"])
+
+    def test_executed_image_ref_normalizes_repository_and_rejects_ambiguity(self):
+        receipt = self.receipt("control")
+        matching = receipt.image_repo_digests[0]
+        unrelated_first = dataclasses.replace(
+            receipt,
+            image_repo_digests=(
+                "localhost:5005/unrelated@sha256:" + "3" * 64,
+                matching,
+            ),
+        )
+        self.assertEqual(
+            native_go_build_abba._executed_image_ref(
+                receipt.image_ref,
+                unrelated_first,
+            ),
+            matching,
+        )
+
+        docker_hub = dataclasses.replace(
+            receipt,
+            image_ref="index.docker.io/ubuntu:24.04",
+            image_repo_digests=(
+                "registry-1.docker.io/library/ubuntu@sha256:" + "6" * 64,
+            ),
+        )
+        self.assertEqual(
+            native_go_build_abba._executed_image_ref(
+                docker_hub.image_ref,
+                docker_hub,
+            ),
+            docker_hub.image_repo_digests[0],
+        )
+
+        ambiguous = dataclasses.replace(
+            receipt,
+            image_repo_digests=(
+                "localhost:5005/carrick-go-conformance@sha256:"
+                + "4" * 64,
+                "localhost:5005/carrick-go-conformance@sha256:"
+                + "5" * 64,
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+            native_go_build_abba._executed_image_ref(
+                ambiguous.image_ref,
+                ambiguous,
+            )
+
+        for malformed in (
+            "localhost:5005/carrick-go-conformance:latest",
+            "localhost:5005/carrick-go-conformance@sha256:fake-digest",
+            "localhost:5005/carrick-go-conformance@sha256:" + "7" * 63,
+            "localhost:5005/carrick-go-conformance@sha256:" + "A" * 64,
+        ):
+            with (
+                self.subTest(malformed=malformed),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "no matching immutable repo digest",
+                ),
+            ):
+                invalid = dataclasses.replace(
+                    receipt,
+                    image_repo_digests=(malformed,),
+                )
+                native_go_build_abba._executed_image_ref(
+                    invalid.image_ref,
+                    invalid,
+                )
+
     def test_two_binary_campaign_passes_full_binary_set_and_can_pass_statistics(self):
         control_receipt = self.receipt("control")
         candidate_receipt = self.receipt("candidate")
@@ -1767,6 +2048,10 @@ class CampaignContractTest(unittest.TestCase):
             ),
             "command binary": lambda row: row["command"]["argv"].__setitem__(
                 0, str(self.root / "other-carrick")
+            ),
+            "command image": lambda row: row["command"]["argv"].__setitem__(
+                8,
+                "localhost:5005/carrick-go-conformance@sha256:" + "0" * 64,
             ),
             "overlay": lambda row: row["environment_overlay"].update(
                 {"CARRICK_DSR_PROFILE": "1"}
@@ -1953,6 +2238,78 @@ class CampaignContractTest(unittest.TestCase):
             [path for path in self.root.iterdir() if path.name.startswith(".published.json.")],
             [],
         )
+
+    def test_accepted_publication_rejects_temp_name_substitution(self):
+        source, _payload = self.accepted_source()
+        destination = self.root / "published.json"
+        foreign = b'{"attacker":true}\n'
+        real_link = os.link
+        swapped_name = None
+
+        def substitute_before_link(
+            temporary_name,
+            destination_name,
+            *,
+            src_dir_fd,
+            dst_dir_fd,
+            follow_symlinks,
+        ):
+            nonlocal swapped_name
+            swapped_name = temporary_name
+            os.unlink(temporary_name, dir_fd=src_dir_fd)
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=src_dir_fd,
+            )
+            try:
+                os.write(descriptor, foreign)
+            finally:
+                os.close(descriptor)
+            return real_link(
+                temporary_name,
+                destination_name,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        with (
+            mock.patch.object(
+                native_go_build_abba.os,
+                "link",
+                side_effect=substitute_before_link,
+            ),
+            self.assertRaisesRegex(RuntimeError, "identity"),
+        ):
+            native_go_build_abba.publish_accepted_artifact(
+                source,
+                destination,
+            )
+
+        self.assertIsNotNone(swapped_name)
+        self.assertEqual(destination.read_bytes(), foreign)
+        self.assertEqual((self.root / swapped_name).read_bytes(), foreign)
+
+    def test_owned_publication_temp_cleanup_tolerates_name_disappearance(self):
+        temporary = self.root / ".published.json.tmp"
+        temporary.write_text("{}\n")
+        directory_descriptor = os.open(self.root, os.O_RDONLY)
+        temporary_descriptor = os.open(temporary, os.O_RDONLY)
+        self.addCleanup(os.close, directory_descriptor)
+        self.addCleanup(os.close, temporary_descriptor)
+
+        with mock.patch.object(
+            native_go_build_abba.os,
+            "unlink",
+            side_effect=FileNotFoundError,
+        ):
+            native_go_build_abba._unlink_directory_name_if_owned(
+                directory_descriptor,
+                temporary.name,
+                temporary_descriptor,
+            )
 
     def test_parent_sync_failure_is_reported_after_nonoverwriting_link(self):
         source, _payload = self.accepted_source()
