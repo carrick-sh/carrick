@@ -552,9 +552,12 @@ mod tests {
         let process = std::sync::Arc::new(
             super::test_process_translator(16 * 1024).expect("create translator"),
         );
+        process
+            .activate_translated_range_catalog()
+            .expect("activate catalog");
         let mut translator = super::ThreadTranslator::for_process(process, 37);
         assert_eq!(translator.tid, 37);
-        translator.after_fork_child(73);
+        translator.after_fork_child(73).expect("fork repair");
         assert_eq!(translator.tid, 73);
     }
 
@@ -563,6 +566,9 @@ mod tests {
         let process = std::sync::Arc::new(
             super::test_process_translator(16 * 1024).expect("create translator"),
         );
+        process
+            .activate_translated_range_catalog()
+            .expect("activate catalog");
         process.state.write().stats.translations = 9;
         let mut translator = super::ThreadTranslator::for_process(process, 42);
         translator.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
@@ -571,7 +577,7 @@ mod tests {
             .record_exit(super::profile::ExitClass::Syscall)
             .expect("record parent exit");
 
-        translator.after_fork_child(73);
+        translator.after_fork_child(73).expect("fork repair");
 
         let record = translator
             .budget
