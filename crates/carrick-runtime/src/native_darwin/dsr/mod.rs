@@ -672,7 +672,9 @@ mod tests {
         let mut thread = super::ThreadTranslator::for_process(old, 42);
         thread.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
 
-        thread.reset_for_exec_with_sink(next, |_| {});
+        thread
+            .reset_for_exec_with_sink(next, |_| {})
+            .expect("reset translator for exec");
         thread
             .process
             .state
@@ -752,7 +754,9 @@ mod tests {
         let mut thread = super::ThreadTranslator::for_process(old, 42);
         thread.budget = super::profile::ThreadBudget::enabled_for_test(41, 42);
 
-        thread.reset_for_exec_with_sink(std::sync::Arc::clone(&next), |_| {});
+        thread
+            .reset_for_exec_with_sink(std::sync::Arc::clone(&next), |_| {})
+            .expect("reset translator for exec");
 
         assert_eq!(
             next.state.read().exclusive_fusion_site_counts()
@@ -775,7 +779,9 @@ mod tests {
             super::test_process_translator(16 * 1024).expect("create next translator"),
         );
 
-        thread.reset_for_exec(next);
+        thread
+            .reset_for_exec(next)
+            .expect("reset translator for exec");
 
         assert_eq!(
             old.state.read().blocks.get(&key),
@@ -822,7 +828,9 @@ mod tests {
             .add(super::ResolverStat::Translations, 5);
         let mut pre_exec = Vec::new();
 
-        thread.reset_for_exec_with_sink(next, |frames| pre_exec.extend_from_slice(frames));
+        thread
+            .reset_for_exec_with_sink(next, |frames| pre_exec.extend_from_slice(frames))
+            .expect("reset translator for exec");
 
         assert_eq!(protocol_value(&pre_exec, "era"), 0);
         assert_eq!(protocol_value(&pre_exec, "gateway_entries"), 1);
@@ -1639,11 +1647,15 @@ mod tests {
         process.state.write().blocks.insert(key, entry);
         let mut thread = super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 42);
 
-        let mut reset_token = thread.prepare_direct_binding_exec_reset();
+        let mut reset_token = thread
+            .prepare_direct_binding_exec_reset()
+            .expect("mint exec reset authority");
         process
             .reset_after_fork_for_exec(&thread, &mut reset_token)
             .expect("consume surviving thread exec reset authority");
-        thread.reset_for_exec(std::sync::Arc::clone(&process));
+        thread
+            .reset_for_exec(std::sync::Arc::clone(&process))
+            .expect("reset translator for exec");
 
         let state = process.state.read();
         assert!(state.blocks.is_empty());

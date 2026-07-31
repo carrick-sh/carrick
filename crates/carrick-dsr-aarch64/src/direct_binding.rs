@@ -457,11 +457,55 @@ type DirectBindingOwnerSnapshot = (DirectBindingCellVa, usize, UnresolvedDirectB
 type DirectBindingEdgeSnapshot = ((GuestVa, GuestVa), Vec<(usize, usize)>);
 
 #[cfg(test)]
+type DirectBindingUnitSnapshot = (
+    TranslationUnitKey,
+    Option<DirectBindingCellVa>,
+    DirectBindingLayout,
+    Vec<UnresolvedDirectBindingRecord>,
+    Vec<u64>,
+    TranslationUnitKey,
+    usize,
+    Option<DirectBindingCellVa>,
+);
+
+#[cfg(test)]
+type DirectBindingDescriptorSnapshot = (
+    DirectBindingTargetPrefix,
+    GuestVa,
+    CodeGeneration,
+    Option<usize>,
+    Option<(TranslationUnitKey, usize, Option<DirectBindingCellVa>)>,
+    Option<usize>,
+);
+
+#[cfg(test)]
+type DirectBindingIncomingSnapshot = (
+    (GuestVa, CodeGeneration),
+    Vec<(DirectBindingOwnerKey, DirectBindingCellVa, usize)>,
+);
+
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DirectBindingLogicalSnapshot {
-    units: Vec<TranslationUnitKey>,
+    enabled: bool,
+    units: Vec<DirectBindingUnitSnapshot>,
     owners: Vec<DirectBindingOwnerSnapshot>,
     edges: Vec<DirectBindingEdgeSnapshot>,
+    descriptors: Vec<DirectBindingDescriptorSnapshot>,
+    incoming: Vec<DirectBindingIncomingSnapshot>,
+    counters: DirectBindingCounters,
+}
+
+#[cfg(test)]
+impl DirectBindingLogicalSnapshot {
+    pub(crate) fn has_published_exec_reset_state(&self) -> bool {
+        self.units
+            .iter()
+            .any(|unit| unit.4.iter().any(|word| *word != 0))
+            && !self.descriptors.is_empty()
+            && !self.incoming.is_empty()
+            && self.counters.cas_wins != 0
+    }
 }
 
 impl DirectBindingRegistry {
@@ -1157,7 +1201,23 @@ impl DirectBindingRegistry {
     #[cfg(test)]
     pub(crate) fn logical_snapshot_for_test(&self) -> DirectBindingLogicalSnapshot {
         DirectBindingLogicalSnapshot {
-            units: self.units.iter().map(|unit| unit.key.clone()).collect(),
+            enabled: self.enabled,
+            units: self
+                .units
+                .iter()
+                .map(|unit| {
+                    (
+                        unit.key.clone(),
+                        unit.binding_base,
+                        unit.binding_layout,
+                        unit.records.to_vec(),
+                        unit.published_bitmap.to_vec(),
+                        unit.source_lease.manifest.key.clone(),
+                        unit.source_lease.base,
+                        unit.source_lease.binding_base,
+                    )
+                })
+                .collect(),
             owners: self
                 .owners_by_cell
                 .iter()
@@ -1168,6 +1228,41 @@ impl DirectBindingRegistry {
                 .iter()
                 .map(|(edge, records)| (*edge, records.clone()))
                 .collect(),
+            descriptors: self
+                .descriptors
+                .iter()
+                .map(|descriptor| {
+                    (
+                        descriptor.prefix,
+                        descriptor.target_page,
+                        descriptor.target_generation,
+                        descriptor
+                            .private_epoch
+                            .as_ref()
+                            .map(|epoch| Arc::as_ptr(epoch) as usize),
+                        descriptor.shared_lease.as_ref().map(|lease| {
+                            (lease.manifest.key.clone(), lease.base, lease.binding_base)
+                        }),
+                        descriptor.shared_unit_index,
+                    )
+                })
+                .collect(),
+            incoming: self
+                .incoming
+                .iter()
+                .map(|(target, incoming)| {
+                    (
+                        *target,
+                        incoming
+                            .iter()
+                            .map(|entry| {
+                                (entry.source.clone(), entry.cell, entry.expected as usize)
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+            counters: self.counters,
         }
     }
 

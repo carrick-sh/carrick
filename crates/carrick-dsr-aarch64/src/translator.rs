@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
 use carrick_dsr::probes;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 
 use crate::emit::{recover_rewrite_state, recovery_resume_pc};
 use crate::mapped_memory::NativeMappedMemory;
@@ -291,19 +291,18 @@ impl ValidatedDirectBindingExecResetToken<'_> {
 /// Fully validated authority for one retiring translator's infallible exec
 /// reset commit.
 #[must_use = "a prepared exec reset must be committed only after mapped-memory PONR"]
-pub struct PreparedDirectBindingExecReset<'process, 'token> {
-    process: &'process ProcessTranslator,
+pub struct PreparedDirectBindingExecReset<'process, 'thread, 'token> {
+    state: RwLockWriteGuard<'process, ProcessState>,
+    thread: &'thread ThreadTranslator,
     token: ValidatedDirectBindingExecResetToken<'token>,
     catalog: Option<PreparedCatalogExecReset>,
-    thread_tid: i32,
 }
 
-impl PreparedDirectBindingExecReset<'_, '_> {
+impl PreparedDirectBindingExecReset<'_, '_, '_> {
     /// Consumes the validated token and retires process-owned translator state
     /// without any recoverable operation.
     pub fn commit(self) -> crate::direct_binding::ExecBindingClearStats {
-        let process = self.process;
-        process.commit_reset_after_fork_for_exec_inner(self, |_| {})
+        self.commit_inner(|_| {})
     }
 
     #[cfg(test)]
@@ -311,8 +310,71 @@ impl PreparedDirectBindingExecReset<'_, '_> {
         self,
         recorder: impl FnMut(DirectBindingResetEvent),
     ) -> crate::direct_binding::ExecBindingClearStats {
-        let process = self.process;
-        process.commit_reset_after_fork_for_exec_inner(self, recorder)
+        self.commit_inner(recorder)
+    }
+
+    fn commit_inner(
+        self,
+        mut recorder: impl FnMut(DirectBindingResetEvent),
+    ) -> crate::direct_binding::ExecBindingClearStats {
+        let PreparedDirectBindingExecReset {
+            mut state,
+            thread,
+            token,
+            catalog,
+        } = self;
+        let thread_tid = thread.tid;
+        token.consume();
+        if let Some(catalog) = catalog {
+            state.translated_ranges.commit_dormant_for_exec(catalog);
+        }
+        let clear_stats = state.direct_bindings.clear_all_before_exec_with_evidence(
+            |phase| match phase {
+                crate::direct_binding::DirectBindingExecClearPhase::Cells => {
+                    recorder(DirectBindingResetEvent::CellsCleared);
+                    recorder(DirectBindingResetEvent::ThreadCachesCleared);
+                }
+                crate::direct_binding::DirectBindingExecClearPhase::Indexes => {
+                    recorder(DirectBindingResetEvent::IndexesCleared);
+                }
+                crate::direct_binding::DirectBindingExecClearPhase::Descriptors => {
+                    recorder(DirectBindingResetEvent::DescriptorsDropped);
+                }
+            },
+            |cell| {
+                probes::dsr_cache_event(
+                    thread_tid,
+                    probes::DsrCacheEventKind::DirectBindingClear,
+                    cell.get() as u64,
+                    crate::direct_binding::DirectBindingClearReason::ExecReset.raw(),
+                    0,
+                );
+            },
+        );
+        state.executable_ranges.reset_head_to_private();
+        recorder(DirectBindingResetEvent::ExecutableRangeHeadReset);
+        state.shared_blocks.clear();
+        state.shared_guest_ranges.clear();
+        state.loaded_shared_units.clear();
+        recorder(DirectBindingResetEvent::UnitsDropped);
+        state.executable_ranges.drop_shared_nodes();
+        recorder(DirectBindingResetEvent::ExecutableRangeNodesDropped);
+        state.clear_published();
+        state.blocks.clear();
+        state.pending.clear();
+        state.stats = ResolverStats::default();
+        state.reported_stats = ResolverStats::default();
+        state.sensitive.clear();
+        state.unsupported.clear();
+        state.dependencies = cache::PageBlockDependencies::default();
+        state.shared_translation = None;
+        state.shared_unit_segments_consulted.clear();
+        state.shared_recording_segments.clear();
+        state.shared_candidates.clear();
+        state.shared_publish_attempted = false;
+        state.cache.reset_after_fork_for_exec();
+        recorder(DirectBindingResetEvent::PrivateCursorReset);
+        clear_stats
     }
 }
 
@@ -1655,6 +1717,7 @@ impl ThreadTranslator {
         recorder: &mut impl ForkChildRepairRecorder,
         lifecycle: &mut impl FnMut(probes::DsrCacheLifecyclePhase),
     ) -> Result<(), types::DsrError> {
+        let next_exec_reset_epoch = self.next_exec_reset_epoch()?;
         self.tid = tid;
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
         lifecycle(probes::DsrCacheLifecyclePhase::ForkChildRepairBegin);
@@ -1667,7 +1730,7 @@ impl ThreadTranslator {
         );
         self.process.after_fork_child_inner(recorder)?;
         self.block_cache.clear();
-        self.exec_reset_epoch = self.exec_reset_epoch.wrapping_add(1);
+        self.exec_reset_epoch = next_exec_reset_epoch;
         self.stats = ResolverStats::default();
         self.budget.reset_after_fork_child(tid);
         if self.budget.enabled() {
@@ -1747,22 +1810,25 @@ impl ThreadTranslator {
     /// The runtime calls this after sibling retirement and before mapped
     /// memory starts retiring the old image. No translated execution may
     /// resume until `reset_for_exec` installs the replacement process.
-    pub fn prepare_direct_binding_exec_reset(&mut self) -> DirectBindingExecResetToken {
+    pub fn prepare_direct_binding_exec_reset(
+        &mut self,
+    ) -> Result<DirectBindingExecResetToken, types::DsrError> {
+        let next_exec_reset_epoch = self.next_exec_reset_epoch()?;
         self.block_cache.clear();
         self.indirect_cache.clear();
-        self.exec_reset_epoch = self.exec_reset_epoch.wrapping_add(1);
-        DirectBindingExecResetToken {
+        self.exec_reset_epoch = next_exec_reset_epoch;
+        Ok(DirectBindingExecResetToken {
             process_identity: Arc::clone(&self.process.exec_reset_identity),
             thread_identity: Arc::clone(&self.exec_reset_identity),
             thread_epoch: self.exec_reset_epoch,
             consumed: false,
-        }
+        })
     }
 
-    pub fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) {
+    pub fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) -> Result<(), types::DsrError> {
         self.reset_for_exec_with_sink(next, |frames| {
             let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, frames);
-        });
+        })
     }
 
     #[doc(hidden)]
@@ -1770,13 +1836,14 @@ impl ThreadTranslator {
         &mut self,
         next: Arc<ProcessTranslator>,
         mut sink: impl FnMut(&[String]),
-    ) {
+    ) -> Result<(), types::DsrError> {
+        let next_exec_reset_epoch = self.next_exec_reset_epoch()?;
         if let Some(frames) = self.take_profile_frames() {
             sink(&frames);
         }
         self.process = next;
         self.block_cache.clear();
-        self.exec_reset_epoch = self.exec_reset_epoch.wrapping_add(1);
+        self.exec_reset_epoch = next_exec_reset_epoch;
         self.start_next_profile_epoch();
         self.last_kick = None;
         self.indirect_cache.clear();
@@ -1795,6 +1862,15 @@ impl ThreadTranslator {
             block_count,
             generation_count,
         );
+        Ok(())
+    }
+
+    fn next_exec_reset_epoch(&self) -> Result<u64, types::DsrError> {
+        self.exec_reset_epoch.checked_add(1).ok_or_else(|| {
+            types::DsrError::CachePolicy(
+                "thread exec-reset authority generation overflow".to_string(),
+            )
+        })
     }
 
     pub fn start_next_profile_epoch(&mut self) {
@@ -2602,12 +2678,12 @@ impl ProcessTranslator {
 
     /// Preflights the complete retiring-translator reset while the old image
     /// remains authoritative. No logical process state or token is mutated.
-    pub fn prepare_reset_after_fork_for_exec<'process, 'token>(
+    pub fn prepare_reset_after_fork_for_exec<'process, 'thread, 'token>(
         &'process self,
-        thread: &ThreadTranslator,
+        thread: &'thread ThreadTranslator,
         token: &'token mut DirectBindingExecResetToken,
         reset_translated_catalog: bool,
-    ) -> Result<PreparedDirectBindingExecReset<'process, 'token>, types::DsrError> {
+    ) -> Result<PreparedDirectBindingExecReset<'process, 'thread, 'token>, types::DsrError> {
         let state = self.state.write();
         let token = token.prepare_consumption(self, thread)?;
         let live_private_leases =
@@ -2624,78 +2700,12 @@ impl ProcessTranslator {
         let catalog = reset_translated_catalog
             .then(|| state.translated_ranges.prepare_dormant_for_exec())
             .transpose()?;
-        drop(state);
         Ok(PreparedDirectBindingExecReset {
-            process: self,
+            state,
+            thread,
             token,
             catalog,
-            thread_tid: thread.tid,
         })
-    }
-
-    fn commit_reset_after_fork_for_exec_inner(
-        &self,
-        prepared: PreparedDirectBindingExecReset<'_, '_>,
-        mut recorder: impl FnMut(DirectBindingResetEvent),
-    ) -> crate::direct_binding::ExecBindingClearStats {
-        let PreparedDirectBindingExecReset {
-            process: _,
-            token,
-            catalog,
-            thread_tid,
-        } = prepared;
-        let mut state = self.state.write();
-        token.consume();
-        if let Some(catalog) = catalog {
-            state.translated_ranges.commit_dormant_for_exec(catalog);
-        }
-        let clear_stats = state.direct_bindings.clear_all_before_exec_with_evidence(
-            |phase| match phase {
-                crate::direct_binding::DirectBindingExecClearPhase::Cells => {
-                    recorder(DirectBindingResetEvent::CellsCleared);
-                    recorder(DirectBindingResetEvent::ThreadCachesCleared);
-                }
-                crate::direct_binding::DirectBindingExecClearPhase::Indexes => {
-                    recorder(DirectBindingResetEvent::IndexesCleared);
-                }
-                crate::direct_binding::DirectBindingExecClearPhase::Descriptors => {
-                    recorder(DirectBindingResetEvent::DescriptorsDropped);
-                }
-            },
-            |cell| {
-                probes::dsr_cache_event(
-                    thread_tid,
-                    probes::DsrCacheEventKind::DirectBindingClear,
-                    cell.get() as u64,
-                    crate::direct_binding::DirectBindingClearReason::ExecReset.raw(),
-                    0,
-                );
-            },
-        );
-        state.executable_ranges.reset_head_to_private();
-        recorder(DirectBindingResetEvent::ExecutableRangeHeadReset);
-        state.shared_blocks.clear();
-        state.shared_guest_ranges.clear();
-        state.loaded_shared_units.clear();
-        recorder(DirectBindingResetEvent::UnitsDropped);
-        state.executable_ranges.drop_shared_nodes();
-        recorder(DirectBindingResetEvent::ExecutableRangeNodesDropped);
-        state.clear_published();
-        state.blocks.clear();
-        state.pending.clear();
-        state.stats = ResolverStats::default();
-        state.reported_stats = ResolverStats::default();
-        state.sensitive.clear();
-        state.unsupported.clear();
-        state.dependencies = cache::PageBlockDependencies::default();
-        state.shared_translation = None;
-        state.shared_unit_segments_consulted.clear();
-        state.shared_recording_segments.clear();
-        state.shared_candidates.clear();
-        state.shared_publish_attempted = false;
-        state.cache.reset_after_fork_for_exec();
-        recorder(DirectBindingResetEvent::PrivateCursorReset);
-        clear_stats
     }
 
     #[cfg(test)]
@@ -2706,6 +2716,7 @@ impl ProcessTranslator {
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn private_jit_epoch_lease_for_test(&self) -> Arc<crate::direct_binding::PrivateJitEpoch> {
+        let _state = self.state.read();
         Arc::clone(&self.private_jit_epoch)
     }
 }
@@ -8738,8 +8749,30 @@ mod tests {
             catalog_epoch: u64,
             catalog_frontier: u64,
             catalog_ready: Option<u64>,
+            catalog_private: std::ops::Range<HostVa>,
             catalog_shared: Vec<super::super::CatalogSharedRange>,
             direct_bindings: crate::direct_binding::DirectBindingLogicalSnapshot,
+            blocks: Vec<((GuestVa, CodeGeneration), CacheVa)>,
+            pending: Vec<((GuestVa, CodeGeneration), usize)>,
+            stats: super::super::ResolverStats,
+            reported_stats: super::super::ResolverStats,
+            sensitive: Vec<((GuestVa, CodeGeneration), super::super::SensitiveMetadata)>,
+            unsupported: Vec<((GuestVa, CodeGeneration), u32)>,
+            published_len: usize,
+            private_published_index: Vec<super::super::PublishedIndexEntry>,
+            shared_published_index: Vec<super::super::PublishedIndexEntry>,
+            dependencies: Vec<(GuestVa, Vec<(GuestVa, CodeGeneration)>)>,
+            shared_translation_configured: bool,
+            shared_blocks: Vec<(
+                (GuestVa, CodeGeneration),
+                super::super::SharedBlockAuthority,
+            )>,
+            shared_guest_ranges: Vec<(GuestVa, GuestVa)>,
+            loaded_unit_ids: Vec<carrick_dsr::probes::TranslatedUnitId>,
+            shared_unit_segments_consulted: Vec<GuestVa>,
+            shared_recording_segments: Vec<GuestVa>,
+            shared_candidates: Vec<(GuestVa, usize)>,
+            shared_publish_attempted: bool,
             executable_head: usize,
             executable_nodes: usize,
             cache_used_bytes: usize,
@@ -8769,8 +8802,63 @@ mod tests {
                 catalog_epoch: state.translated_ranges.epoch.get(),
                 catalog_frontier: state.translated_ranges.sequence_frontier(),
                 catalog_ready: state.translated_ranges.ready_sequence,
+                catalog_private: state.translated_ranges.private.clone(),
                 catalog_shared: state.translated_ranges.shared.clone(),
                 direct_bindings: state.direct_bindings.logical_snapshot_for_test(),
+                blocks: state
+                    .blocks
+                    .iter()
+                    .map(|(key, entry)| (*key, *entry))
+                    .collect(),
+                pending: state
+                    .pending
+                    .iter()
+                    .map(|(key, links)| (*key, links.len()))
+                    .collect(),
+                stats: state.stats,
+                reported_stats: state.reported_stats,
+                sensitive: state
+                    .sensitive
+                    .iter()
+                    .map(|(key, metadata)| (*key, *metadata))
+                    .collect(),
+                unsupported: state
+                    .unsupported
+                    .iter()
+                    .map(|(key, (word, _))| (*key, *word))
+                    .collect(),
+                published_len: state.published.len(),
+                private_published_index: state.private_published_index.clone(),
+                shared_published_index: state.shared_published_index.clone(),
+                dependencies: state.dependencies.snapshot_for_test(),
+                shared_translation_configured: state.shared_translation.is_some(),
+                shared_blocks: state
+                    .shared_blocks
+                    .iter()
+                    .map(|(key, authority)| (*key, *authority))
+                    .collect(),
+                shared_guest_ranges: state.shared_guest_ranges.clone(),
+                loaded_unit_ids: state
+                    .loaded_shared_units
+                    .iter()
+                    .map(|unit| unit.unit_id)
+                    .collect(),
+                shared_unit_segments_consulted: state
+                    .shared_unit_segments_consulted
+                    .iter()
+                    .copied()
+                    .collect(),
+                shared_recording_segments: state
+                    .shared_recording_segments
+                    .iter()
+                    .copied()
+                    .collect(),
+                shared_candidates: state
+                    .shared_candidates
+                    .iter()
+                    .map(|(guest, candidates)| (*guest, candidates.len()))
+                    .collect(),
+                shared_publish_attempted: state.shared_publish_attempted,
                 executable_head: state.executable_ranges.head_ptr() as usize,
                 executable_nodes: state.executable_ranges.shared_node_count(),
                 cache_used_bytes: state.cache.used_bytes(),
@@ -8802,7 +8890,9 @@ mod tests {
             };
             assert!(words_before.iter().any(|word| *word != 0));
 
-            let token = thread.prepare_direct_binding_exec_reset();
+            let token = thread
+                .prepare_direct_binding_exec_reset()
+                .expect("mint exec reset authority");
 
             assert!(thread.block_cache.is_empty());
             // SAFETY: as above; preparation completed synchronously while
@@ -8863,7 +8953,9 @@ mod tests {
 
             assert_eq!(process.private_epoch_leases_for_test(), 0);
             assert_eq!(first, EXPECTED_ORDER);
-            let mut second_token = thread.prepare_direct_binding_exec_reset();
+            let mut second_token = thread
+                .prepare_direct_binding_exec_reset()
+                .expect("mint second exec reset authority");
             let mut second = Vec::new();
             process
                 .reset_after_fork_for_exec_with_recorder(&thread, &mut second_token, |event| {
@@ -8872,7 +8964,9 @@ mod tests {
                 .expect("fresh authority keeps successful reset idempotent");
             assert_eq!(second, EXPECTED_ORDER, "exec reset must be idempotent");
             assert_eq!(process.private_epoch_leases_for_test(), 0);
-            thread.reset_for_exec(Arc::clone(&process));
+            thread
+                .reset_for_exec(Arc::clone(&process))
+                .expect("reset surviving thread for exec");
             assert!(thread.block_cache.is_empty());
         }
 
@@ -8891,6 +8985,10 @@ mod tests {
             let external_lease = Arc::clone(&process.private_jit_epoch);
             let (thread, mut token) = prepare_thread(&process);
             let before = exec_reset_snapshot(&process);
+            assert!(
+                before.direct_bindings.has_published_exec_reset_state(),
+                "rejection fixture must seed descriptor, incoming-edge, bitmap, and counter state"
+            );
             let pointer_before = fixture.storage[0].load(std::sync::atomic::Ordering::Acquire);
 
             let outcome = process.prepare_reset_after_fork_for_exec(&thread, &mut token, true);
@@ -9026,8 +9124,12 @@ mod tests {
             activate_catalog_with_shared(&process, 29);
             let before = exec_reset_snapshot(&process);
             let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 42);
-            let mut stale = thread.prepare_direct_binding_exec_reset();
-            let _current = thread.prepare_direct_binding_exec_reset();
+            let mut stale = thread
+                .prepare_direct_binding_exec_reset()
+                .expect("mint stale authority");
+            let _current = thread
+                .prepare_direct_binding_exec_reset()
+                .expect("mint current authority");
 
             let outcome = process.reset_after_fork_for_exec(&thread, &mut stale);
 
@@ -9039,6 +9141,153 @@ mod tests {
                     .is_null(),
                 "validation must complete before the first cell clear"
             );
+        }
+
+        #[test]
+        fn prepared_exec_reset_holds_process_state_exclusively_until_commit() {
+            let (_fixture, process, _, _) = one_published_binding(33);
+            let process = Arc::new(process);
+            let (thread, mut token) = prepare_thread(&process);
+
+            let prepared = process
+                .prepare_reset_after_fork_for_exec(&thread, &mut token, false)
+                .expect("prepare reset authority");
+
+            assert!(
+                process.state.try_read().is_none(),
+                "prepared authority must freeze process state through mapped-memory PONR"
+            );
+            prepared.commit();
+            assert!(
+                process.state.try_read().is_some(),
+                "commit must release the held process-state authority"
+            );
+        }
+
+        #[test]
+        fn exec_reset_snapshot_tracks_every_rejection_sensitive_field() {
+            let (_fixture, process, _, _) = one_published_binding(34);
+            let process = Arc::new(process);
+            macro_rules! assert_tracked {
+                ($label:literal, $mutation:expr) => {{
+                    let before = exec_reset_snapshot(&process);
+                    $mutation;
+                    assert_ne!(exec_reset_snapshot(&process), before, $label);
+                }};
+            }
+
+            assert_tracked!("process stats", {
+                let mut state = process.state.write();
+                state.stats.translations = 1;
+            });
+            assert_tracked!("reported process stats", {
+                let mut state = process.state.write();
+                state.reported_stats.translations = 1;
+            });
+            assert_tracked!("private block index", {
+                let mut state = process.state.write();
+                state.blocks.insert(
+                    (GuestVa(0x7100_0000), CodeGeneration::INITIAL),
+                    CacheVa::published(HostVa(0x1000)),
+                );
+            });
+            assert_tracked!("pending link index", {
+                let mut state = process.state.write();
+                state
+                    .pending
+                    .insert((GuestVa(0x7101_0000), CodeGeneration::INITIAL), Vec::new());
+            });
+            assert_tracked!("page dependencies", {
+                let mut state = process.state.write();
+                state.dependencies.record(
+                    GuestVa(0x7102_0000),
+                    GuestVa(0x7103_0000),
+                    CodeGeneration::INITIAL,
+                );
+            });
+            assert_tracked!("shared guest ranges", {
+                let mut state = process.state.write();
+                state
+                    .shared_guest_ranges
+                    .push((GuestVa(0x7104_0000), GuestVa(0x7105_0000)));
+            });
+            assert_tracked!("consulted shared segments", {
+                let mut state = process.state.write();
+                state
+                    .shared_unit_segments_consulted
+                    .insert(GuestVa(0x7106_0000));
+            });
+            assert_tracked!("recording shared segments", {
+                let mut state = process.state.write();
+                state.shared_recording_segments.insert(GuestVa(0x7107_0000));
+            });
+            assert_tracked!("shared candidates", {
+                let mut state = process.state.write();
+                state
+                    .shared_candidates
+                    .insert(GuestVa(0x7108_0000), Vec::new());
+            });
+            assert_tracked!("shared publish attempt", {
+                let mut state = process.state.write();
+                state.shared_publish_attempted = true;
+            });
+            assert_tracked!("private cache cursor", {
+                let mut state = process.state.write();
+                state
+                    .cache
+                    .publish_words(&[0xd503_201f])
+                    .expect("publish one cache word");
+            });
+            assert_tracked!(
+                "translated catalog lifecycle",
+                activate_catalog_with_shared(&process, 34)
+            );
+            assert_tracked!(
+                "executable range catalog",
+                publish_catalog_range(&process, 34)
+            );
+            assert_tracked!("direct-binding descriptors and indexes", {
+                let mut state = process.state.write();
+                state
+                    .direct_bindings
+                    .clear_all_before_exec_with_evidence(|_| {}, |_| {});
+            });
+        }
+
+        #[test]
+        fn exec_reset_epoch_overflow_is_rejected_without_wrapping() {
+            let (_fixture, process, _, _) = one_published_binding(35);
+            let process = Arc::new(process);
+            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 42);
+            thread.exec_reset_epoch = u64::MAX;
+
+            let token_outcome = thread.prepare_direct_binding_exec_reset();
+
+            assert!(matches!(
+                token_outcome,
+                Err(crate::types::DsrError::CachePolicy(_))
+            ));
+            assert_eq!(thread.exec_reset_epoch, u64::MAX);
+
+            let (_next_fixture, next_process, _, _) = one_published_binding(36);
+            let next_process = Arc::new(next_process);
+            let reset_outcome = thread.reset_for_exec(Arc::clone(&next_process));
+
+            assert!(matches!(
+                reset_outcome,
+                Err(crate::types::DsrError::CachePolicy(_))
+            ));
+            assert!(Arc::ptr_eq(&thread.process, &process));
+            assert_eq!(thread.exec_reset_epoch, u64::MAX);
+
+            let fork_outcome = thread.after_fork_child(43);
+
+            assert!(matches!(
+                fork_outcome,
+                Err(crate::types::DsrError::CachePolicy(_))
+            ));
+            assert_eq!(thread.tid, 42);
+            assert_eq!(thread.exec_reset_epoch, u64::MAX);
         }
     }
 
