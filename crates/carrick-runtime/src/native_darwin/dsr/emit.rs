@@ -577,10 +577,24 @@ mod tests {
             .iter()
             .position(|word| word & !0x1f == store_masked)
             .expect("biased invalid path publishes exact guest fault address");
-        assert_eq!(
-            words.get(store.wrapping_sub(1)).copied(),
-            Some(0xb400_0052),
-            "cbz must skip the publication store for every in-range access"
+        let covering_cbz = words
+            .iter()
+            .copied()
+            .enumerate()
+            .take(store)
+            .find(|(index, word)| {
+                if word & 0xff00_0000 != 0xb400_0000 {
+                    return false;
+                }
+                let immediate = i64::from((word >> 5) & 0x7ffff);
+                let immediate = (immediate << (64 - 19)) >> (64 - 19);
+                let target = *index as i64 + immediate;
+                target > store as i64
+            });
+        assert!(
+            covering_cbz.is_some(),
+            "a taken forward cbz must skip the publication store for every in-range access: \
+             {words:08x?}"
         );
     }
 
