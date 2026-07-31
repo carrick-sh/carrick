@@ -45,32 +45,37 @@ dtrace:::BEGIN
     /*
      * Seed every dynamic-array shape before reading it. The sentinels are
      * inert: translated unit IDs are nonzero, and no real join uses TID zero.
+     * Incarnation is retained across exit so a reused numeric PID can never
+     * address tuples left by the process that previously owned that PID.
      */
     tracked[$target] = 1;
+    incarnation[$target] = 1;
     process_ordinal[$target] = 0;
-    catalog_epoch[$target] = 0;
-    catalog_live[$target] = 0;
-    ann_epoch[$target, 0] = 0;
-    ann_start[$target, 0] = 0;
-    ann_end[$target, 0] = 0;
-    ann_ordinal[$target, 0] = 0;
-    pending_present[$target, 0] = 0;
-    pending_epoch[$target, 0] = 0;
-    pending_unit[$target, 0] = 0;
-    pending_start[$target, 0] = 0;
-    pending_end[$target, 0] = 0;
-    pending_commit_ordinal[$target, 0] = 0;
-    pending_by_pid[$target] = 0;
+    catalog_epoch[$target, incarnation[$target]] = 0;
+    catalog_live[$target, incarnation[$target]] = 0;
+    ann_epoch[$target, incarnation[$target], 0] = 0;
+    ann_start[$target, incarnation[$target], 0] = 0;
+    ann_end[$target, incarnation[$target], 0] = 0;
+    ann_ordinal[$target, incarnation[$target], 0] = 0;
+    pending_present[$target, incarnation[$target], 0] = 0;
+    pending_epoch[$target, incarnation[$target], 0] = 0;
+    pending_unit[$target, incarnation[$target], 0] = 0;
+    pending_start[$target, incarnation[$target], 0] = 0;
+    pending_end[$target, incarnation[$target], 0] = 0;
+    pending_commit_ordinal[$target, incarnation[$target], 0] = 0;
+    pending_by_pid[$target, incarnation[$target]] = 0;
 }
 
 proc:::create
 /tracked[pid]/
 {
     tracked[args[0]->pr_pid] = 1;
+    /* Deliberately increment retained state before initializing this owner. */
+    incarnation[args[0]->pr_pid]++;
     process_ordinal[args[0]->pr_pid] = 0;
-    catalog_epoch[args[0]->pr_pid] = 0;
-    catalog_live[args[0]->pr_pid] = 0;
-    pending_by_pid[args[0]->pr_pid] = 0;
+    catalog_epoch[args[0]->pr_pid, incarnation[args[0]->pr_pid]] = 0;
+    catalog_live[args[0]->pr_pid, incarnation[args[0]->pr_pid]] = 0;
+    pending_by_pid[args[0]->pr_pid, incarnation[args[0]->pr_pid]] = 0;
 }
 
 proc:::exit
@@ -83,12 +88,12 @@ proc:::exit
 proc:::exit
 /tracked[pid]/
 {
-    exited_pending += pending_by_pid[pid];
+    exited_pending += pending_by_pid[pid, incarnation[pid]];
     tracked[pid] = 0;
     process_ordinal[pid] = 0;
-    catalog_epoch[pid] = 0;
-    catalog_live[pid] = 0;
-    pending_by_pid[pid] = 0;
+    catalog_epoch[pid, incarnation[pid]] = 0;
+    catalog_live[pid, incarnation[pid]] = 0;
+    pending_by_pid[pid, incarnation[pid]] = 0;
 }
 
 carrick*:::host-translated-range-reset
@@ -99,9 +104,10 @@ carrick*:::host-translated-range-reset
     resets++;
     printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=reset|pid=%d|epoch=%d\n",
         ordinal, process_ordinal[pid], pid, arg0);
-    reset_with_pending += pending_by_pid[pid] != 0 ? 1 : 0;
-    catalog_epoch[pid] = arg0;
-    catalog_live[pid] = 1;
+    reset_with_pending +=
+        pending_by_pid[pid, incarnation[pid]] != 0 ? 1 : 0;
+    catalog_epoch[pid, incarnation[pid]] = arg0;
+    catalog_live[pid, incarnation[pid]] = 1;
 }
 
 carrick*:::host-translated-private-range
@@ -130,8 +136,9 @@ carrick*:::host-translated-shared-range
     ordinal++;
     process_ordinal[pid]++;
     invalid_announcement++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-invalid-announcement|reason=zero-unit-id|pid=%d|epoch=%d|unit_id=%d|start=%#x|end=%#x\n",
-        ordinal, process_ordinal[pid], pid, arg0, arg2, arg3, arg4);
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-invalid-announcement|reason=zero-unit-id|pid=%d|incarnation=%d|epoch=%d|unit_id=%d|start=%#x|end=%#x\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0, arg2,
+        arg3, arg4);
 }
 
 carrick*:::host-translated-shared-range
@@ -140,54 +147,62 @@ carrick*:::host-translated-shared-range
     ordinal++;
     process_ordinal[pid]++;
     invalid_announcement++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-invalid-announcement|reason=invalid-bounds|pid=%d|epoch=%d|unit_id=%d|start=%#x|end=%#x\n",
-        ordinal, process_ordinal[pid], pid, arg0, arg2, arg3, arg4);
-}
-
-carrick*:::host-translated-shared-range
-/(pid == $target || progenyof($target)) && arg2 != 0 && arg3 < arg4 &&
-    catalog_live[pid] != 1/
-{
-    ordinal++;
-    process_ordinal[pid]++;
-    invalid_announcement++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-invalid-announcement|reason=catalog-not-live|pid=%d|epoch=%d|unit_id=%d|start=%#x|end=%#x\n",
-        ordinal, process_ordinal[pid], pid, arg0, arg2, arg3, arg4);
-}
-
-carrick*:::host-translated-shared-range
-/(pid == $target || progenyof($target)) && arg2 != 0 && arg3 < arg4 &&
-    catalog_live[pid] == 1 && catalog_epoch[pid] != arg0/
-{
-    ordinal++;
-    process_ordinal[pid]++;
-    invalid_announcement++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-invalid-announcement|reason=catalog-epoch-mismatch|pid=%d|epoch=%d|catalog_epoch=%d|unit_id=%d|start=%#x|end=%#x\n",
-        ordinal, process_ordinal[pid], pid, arg0, catalog_epoch[pid], arg2,
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-invalid-announcement|reason=invalid-bounds|pid=%d|incarnation=%d|epoch=%d|unit_id=%d|start=%#x|end=%#x\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0, arg2,
         arg3, arg4);
 }
 
 carrick*:::host-translated-shared-range
 /(pid == $target || progenyof($target)) && arg2 != 0 && arg3 < arg4 &&
-    catalog_live[pid] == 1 && catalog_epoch[pid] == arg0 &&
-    ann_ordinal[pid, arg2] != 0 && ann_epoch[pid, arg2] == arg0/
+    catalog_live[pid, incarnation[pid]] != 1/
 {
     ordinal++;
     process_ordinal[pid]++;
-    duplicate_announcement++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-duplicate-announcement|pid=%d|epoch=%d|unit_id=%d|start=%#x|end=%#x\n",
-        ordinal, process_ordinal[pid], pid, arg0, arg2, arg3, arg4);
+    invalid_announcement++;
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-invalid-announcement|reason=catalog-not-live|pid=%d|incarnation=%d|epoch=%d|unit_id=%d|start=%#x|end=%#x\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0, arg2,
+        arg3, arg4);
 }
 
 carrick*:::host-translated-shared-range
 /(pid == $target || progenyof($target)) && arg2 != 0 && arg3 < arg4 &&
-    catalog_live[pid] == 1 && catalog_epoch[pid] == arg0 &&
-    (ann_ordinal[pid, arg2] == 0 || ann_epoch[pid, arg2] != arg0)/
+    catalog_live[pid, incarnation[pid]] == 1 &&
+    catalog_epoch[pid, incarnation[pid]] != arg0/
 {
-    ann_epoch[pid, arg2] = arg0;
-    ann_start[pid, arg2] = arg3;
-    ann_end[pid, arg2] = arg4;
-    ann_ordinal[pid, arg2] = ordinal;
+    ordinal++;
+    process_ordinal[pid]++;
+    invalid_announcement++;
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-invalid-announcement|reason=catalog-epoch-mismatch|pid=%d|incarnation=%d|epoch=%d|catalog_epoch=%d|unit_id=%d|start=%#x|end=%#x\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0,
+        catalog_epoch[pid, incarnation[pid]], arg2, arg3, arg4);
+}
+
+carrick*:::host-translated-shared-range
+/(pid == $target || progenyof($target)) && arg2 != 0 && arg3 < arg4 &&
+    catalog_live[pid, incarnation[pid]] == 1 &&
+    catalog_epoch[pid, incarnation[pid]] == arg0 &&
+    ann_ordinal[pid, incarnation[pid], arg2] != 0 &&
+    ann_epoch[pid, incarnation[pid], arg2] == arg0/
+{
+    ordinal++;
+    process_ordinal[pid]++;
+    duplicate_announcement++;
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-duplicate-announcement|pid=%d|incarnation=%d|epoch=%d|unit_id=%d|start=%#x|end=%#x\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0, arg2,
+        arg3, arg4);
+}
+
+carrick*:::host-translated-shared-range
+/(pid == $target || progenyof($target)) && arg2 != 0 && arg3 < arg4 &&
+    catalog_live[pid, incarnation[pid]] == 1 &&
+    catalog_epoch[pid, incarnation[pid]] == arg0 &&
+    (ann_ordinal[pid, incarnation[pid], arg2] == 0 ||
+    ann_epoch[pid, incarnation[pid], arg2] != arg0)/
+{
+    ann_epoch[pid, incarnation[pid], arg2] = arg0;
+    ann_start[pid, incarnation[pid], arg2] = arg3;
+    ann_end[pid, incarnation[pid], arg2] = arg4;
+    ann_ordinal[pid, incarnation[pid], arg2] = ordinal;
     shared_announced++;
 }
 
@@ -203,132 +218,154 @@ carrick*:::host-translated-range-ready
 
 carrick*:::dsr-cache-event
 /(pid == $target || progenyof($target)) && arg1 == 12 &&
-    (catalog_live[pid] != 1 ||
-    ann_epoch[pid, arg2] != catalog_epoch[pid] ||
-    ann_start[pid, arg2] >= ann_end[pid, arg2] ||
-    ann_ordinal[pid, arg2] == 0)/
+    (catalog_live[pid, incarnation[pid]] != 1 ||
+    ann_epoch[pid, incarnation[pid], arg2] !=
+        catalog_epoch[pid, incarnation[pid]] ||
+    ann_start[pid, incarnation[pid], arg2] >=
+        ann_end[pid, incarnation[pid], arg2] ||
+    ann_ordinal[pid, incarnation[pid], arg2] == 0)/
 {
     ordinal++;
     process_ordinal[pid]++;
     missing_announcement++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=unit-loaded-missing-announcement|pid=%d|tid=%d|unit_id=%d\n",
-        ordinal, process_ordinal[pid], pid, arg0, arg2);
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=unit-loaded-missing-announcement|pid=%d|incarnation=%d|tid=%d|unit_id=%d\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0, arg2);
 }
 
 carrick*:::dsr-cache-event
 /(pid == $target || progenyof($target)) && arg1 == 12 &&
-    catalog_live[pid] == 1 &&
-    ann_epoch[pid, arg2] == catalog_epoch[pid] &&
-    ann_start[pid, arg2] < ann_end[pid, arg2] &&
-    ann_ordinal[pid, arg2] != 0 &&
-    ann_ordinal[pid, arg2] >= ordinal + 1/
+    catalog_live[pid, incarnation[pid]] == 1 &&
+    ann_epoch[pid, incarnation[pid], arg2] ==
+        catalog_epoch[pid, incarnation[pid]] &&
+    ann_start[pid, incarnation[pid], arg2] <
+        ann_end[pid, incarnation[pid], arg2] &&
+    ann_ordinal[pid, incarnation[pid], arg2] != 0 &&
+    ann_ordinal[pid, incarnation[pid], arg2] >= ordinal + 1/
 {
     ordinal++;
     process_ordinal[pid]++;
     commit_order_violations++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=unit-loaded-order-violation|pid=%d|tid=%d|unit_id=%d|announcement_ordinal=%d|commit_ordinal=%d\n",
-        ordinal, process_ordinal[pid], pid, arg0, arg2,
-        ann_ordinal[pid, arg2], ordinal);
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=unit-loaded-order-violation|pid=%d|incarnation=%d|tid=%d|unit_id=%d|announcement_ordinal=%d|commit_ordinal=%d\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0, arg2,
+        ann_ordinal[pid, incarnation[pid], arg2], ordinal);
 }
 
 carrick*:::dsr-cache-event
 /(pid == $target || progenyof($target)) && arg1 == 12 &&
-    catalog_live[pid] == 1 &&
-    ann_epoch[pid, arg2] == catalog_epoch[pid] &&
-    ann_start[pid, arg2] < ann_end[pid, arg2] &&
-    ann_ordinal[pid, arg2] != 0 &&
-    ann_ordinal[pid, arg2] < ordinal + 1 &&
-    pending_present[pid, arg0] != 0/
+    catalog_live[pid, incarnation[pid]] == 1 &&
+    ann_epoch[pid, incarnation[pid], arg2] ==
+        catalog_epoch[pid, incarnation[pid]] &&
+    ann_start[pid, incarnation[pid], arg2] <
+        ann_end[pid, incarnation[pid], arg2] &&
+    ann_ordinal[pid, incarnation[pid], arg2] != 0 &&
+    ann_ordinal[pid, incarnation[pid], arg2] < ordinal + 1 &&
+    pending_present[pid, incarnation[pid], arg0] != 0/
 {
     ordinal++;
     process_ordinal[pid]++;
     unit_loaded++;
     pending_collisions++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=unit-loaded-pending-collision|pid=%d|tid=%d|unit_id=%d|pending_unit_id=%d\n",
-        ordinal, process_ordinal[pid], pid, arg0, arg2,
-        pending_unit[pid, arg0]);
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=unit-loaded-pending-collision|pid=%d|incarnation=%d|tid=%d|unit_id=%d|pending_unit_id=%d\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0, arg2,
+        pending_unit[pid, incarnation[pid], arg0]);
 }
 
 carrick*:::dsr-cache-event
 /(pid == $target || progenyof($target)) && arg1 == 12 &&
-    catalog_live[pid] == 1 &&
-    ann_epoch[pid, arg2] == catalog_epoch[pid] &&
-    ann_start[pid, arg2] < ann_end[pid, arg2] &&
-    ann_ordinal[pid, arg2] != 0 &&
-    ann_ordinal[pid, arg2] < ordinal + 1 &&
-    pending_present[pid, arg0] == 0/
+    catalog_live[pid, incarnation[pid]] == 1 &&
+    ann_epoch[pid, incarnation[pid], arg2] ==
+        catalog_epoch[pid, incarnation[pid]] &&
+    ann_start[pid, incarnation[pid], arg2] <
+        ann_end[pid, incarnation[pid], arg2] &&
+    ann_ordinal[pid, incarnation[pid], arg2] != 0 &&
+    ann_ordinal[pid, incarnation[pid], arg2] < ordinal + 1 &&
+    pending_present[pid, incarnation[pid], arg0] == 0/
 {
     ordinal++;
     process_ordinal[pid]++;
     unit_loaded++;
     pending_loaded_units++;
-    pending_by_pid[pid]++;
-    pending_present[pid, arg0] = 1;
-    pending_epoch[pid, arg0] = catalog_epoch[pid];
-    pending_unit[pid, arg0] = arg2;
-    pending_start[pid, arg0] = ann_start[pid, arg2];
-    pending_end[pid, arg0] = ann_end[pid, arg2];
-    pending_commit_ordinal[pid, arg0] = ordinal;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=unit-loaded|pid=%d|tid=%d|unit_id=%d|start=%#x|end=%#x|announcement_ordinal=%d|commit_ordinal=%d|records=%d|data_bytes=%d\n",
-        ordinal, process_ordinal[pid], pid, arg0, arg2,
-        ann_start[pid, arg2], ann_end[pid, arg2],
-        ann_ordinal[pid, arg2], ordinal, arg3, arg4);
+    pending_by_pid[pid, incarnation[pid]]++;
+    pending_present[pid, incarnation[pid], arg0] = 1;
+    pending_epoch[pid, incarnation[pid], arg0] =
+        catalog_epoch[pid, incarnation[pid]];
+    pending_unit[pid, incarnation[pid], arg0] = arg2;
+    pending_start[pid, incarnation[pid], arg0] =
+        ann_start[pid, incarnation[pid], arg2];
+    pending_end[pid, incarnation[pid], arg0] =
+        ann_end[pid, incarnation[pid], arg2];
+    pending_commit_ordinal[pid, incarnation[pid], arg0] = ordinal;
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=unit-loaded|pid=%d|incarnation=%d|tid=%d|unit_id=%d|start=%#x|end=%#x|announcement_ordinal=%d|commit_ordinal=%d|records=%d|data_bytes=%d\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0, arg2,
+        ann_start[pid, incarnation[pid], arg2],
+        ann_end[pid, incarnation[pid], arg2],
+        ann_ordinal[pid, incarnation[pid], arg2], ordinal, arg3, arg4);
 }
 
 carrick*:::dsr-run-begin
 /(pid == $target || progenyof($target)) &&
-    pending_present[pid, arg0] != 0 &&
-    (pending_epoch[pid, arg0] != catalog_epoch[pid] ||
-    pending_commit_ordinal[pid, arg0] >= ordinal + 1)/
+    pending_present[pid, incarnation[pid], arg0] != 0 &&
+    (pending_epoch[pid, incarnation[pid], arg0] !=
+        catalog_epoch[pid, incarnation[pid]] ||
+    pending_commit_ordinal[pid, incarnation[pid], arg0] >= ordinal + 1)/
 {
     ordinal++;
     process_ordinal[pid]++;
     run_order_violations++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-run-order-violation|pid=%d|tid=%d|unit_id=%d|commit_ordinal=%d|run_ordinal=%d\n",
-        ordinal, process_ordinal[pid], pid, arg0,
-        pending_unit[pid, arg0], pending_commit_ordinal[pid, arg0], ordinal);
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-run-order-violation|pid=%d|incarnation=%d|tid=%d|unit_id=%d|commit_ordinal=%d|run_ordinal=%d\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0,
+        pending_unit[pid, incarnation[pid], arg0],
+        pending_commit_ordinal[pid, incarnation[pid], arg0], ordinal);
 }
 
 carrick*:::dsr-run-begin
 /(pid == $target || progenyof($target)) &&
-    pending_present[pid, arg0] != 0 &&
-    pending_epoch[pid, arg0] == catalog_epoch[pid] &&
-    pending_commit_ordinal[pid, arg0] < ordinal + 1 &&
-    (arg2 < pending_start[pid, arg0] || arg2 >= pending_end[pid, arg0])/
+    pending_present[pid, incarnation[pid], arg0] != 0 &&
+    pending_epoch[pid, incarnation[pid], arg0] ==
+        catalog_epoch[pid, incarnation[pid]] &&
+    pending_commit_ordinal[pid, incarnation[pid], arg0] < ordinal + 1 &&
+    (arg2 < pending_start[pid, incarnation[pid], arg0] ||
+    arg2 >= pending_end[pid, incarnation[pid], arg0])/
 {
     ordinal++;
     process_ordinal[pid]++;
     run_range_violations++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-run-range-violation|pid=%d|tid=%d|unit_id=%d|start=%#x|end=%#x|cache_pc=%#x|commit_ordinal=%d|run_ordinal=%d\n",
-        ordinal, process_ordinal[pid], pid, arg0,
-        pending_unit[pid, arg0], pending_start[pid, arg0],
-        pending_end[pid, arg0], arg2, pending_commit_ordinal[pid, arg0],
-        ordinal);
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-run-range-violation|pid=%d|incarnation=%d|tid=%d|unit_id=%d|start=%#x|end=%#x|cache_pc=%#x|commit_ordinal=%d|run_ordinal=%d\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0,
+        pending_unit[pid, incarnation[pid], arg0],
+        pending_start[pid, incarnation[pid], arg0],
+        pending_end[pid, incarnation[pid], arg0], arg2,
+        pending_commit_ordinal[pid, incarnation[pid], arg0], ordinal);
 }
 
 carrick*:::dsr-run-begin
 /(pid == $target || progenyof($target)) &&
-    pending_present[pid, arg0] != 0 &&
-    pending_epoch[pid, arg0] == catalog_epoch[pid] &&
-    pending_commit_ordinal[pid, arg0] < ordinal + 1 &&
-    pending_start[pid, arg0] <= arg2 && arg2 < pending_end[pid, arg0]/
+    pending_present[pid, incarnation[pid], arg0] != 0 &&
+    pending_epoch[pid, incarnation[pid], arg0] ==
+        catalog_epoch[pid, incarnation[pid]] &&
+    pending_commit_ordinal[pid, incarnation[pid], arg0] < ordinal + 1 &&
+    pending_start[pid, incarnation[pid], arg0] <= arg2 &&
+    arg2 < pending_end[pid, incarnation[pid], arg0]/
 {
     ordinal++;
     process_ordinal[pid]++;
     shared_run_begin++;
-    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-run-begin|pid=%d|tid=%d|unit_id=%d|start=%#x|end=%#x|announcement_ordinal=%d|commit_ordinal=%d|run_ordinal=%d|guest_pc=%#x|cache_pc=%#x|generation=%d\n",
-        ordinal, process_ordinal[pid], pid, arg0,
-        pending_unit[pid, arg0], pending_start[pid, arg0],
-        pending_end[pid, arg0],
-        ann_ordinal[pid, pending_unit[pid, arg0]],
-        pending_commit_ordinal[pid, arg0], ordinal, arg1, arg2, arg3);
-    pending_present[pid, arg0] = 0;
-    pending_epoch[pid, arg0] = 0;
-    pending_unit[pid, arg0] = 0;
-    pending_start[pid, arg0] = 0;
-    pending_end[pid, arg0] = 0;
-    pending_commit_ordinal[pid, arg0] = 0;
-    pending_by_pid[pid]--;
+    printf("TRANSLATED_RANGE|ordinal=%d|process_ordinal=%d|kind=shared-run-begin|pid=%d|incarnation=%d|tid=%d|unit_id=%d|start=%#x|end=%#x|announcement_ordinal=%d|commit_ordinal=%d|run_ordinal=%d|guest_pc=%#x|cache_pc=%#x|generation=%d\n",
+        ordinal, process_ordinal[pid], pid, incarnation[pid], arg0,
+        pending_unit[pid, incarnation[pid], arg0],
+        pending_start[pid, incarnation[pid], arg0],
+        pending_end[pid, incarnation[pid], arg0],
+        ann_ordinal[pid, incarnation[pid],
+            pending_unit[pid, incarnation[pid], arg0]],
+        pending_commit_ordinal[pid, incarnation[pid], arg0],
+        ordinal, arg1, arg2, arg3);
+    pending_present[pid, incarnation[pid], arg0] = 0;
+    pending_epoch[pid, incarnation[pid], arg0] = 0;
+    pending_unit[pid, incarnation[pid], arg0] = 0;
+    pending_start[pid, incarnation[pid], arg0] = 0;
+    pending_end[pid, incarnation[pid], arg0] = 0;
+    pending_commit_ordinal[pid, incarnation[pid], arg0] = 0;
+    pending_by_pid[pid, incarnation[pid]]--;
     pending_loaded_units--;
 }
 
