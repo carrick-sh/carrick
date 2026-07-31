@@ -31,7 +31,9 @@ class NativeGoBuildTest(unittest.TestCase):
             f"  printf '\"{architecture}\"\\n'\n"
             "  printf '\"sha256:fake-image\"\\n'\n"
             "  printf "
-            "'[\"localhost:5005/carrick-go-conformance@sha256:fake-digest\"]\\n'\n"
+            "'[\"localhost:5005/carrick-go-conformance@sha256:"
+            + "4" * 64
+            + "\"]\\n'\n"
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = "run" ]; then\n'
@@ -149,6 +151,128 @@ class NativeGoBuildTest(unittest.TestCase):
             )
         self.assertEqual(json.loads(output.read_text()), {"generation": 2})
 
+    def test_atomic_json_exclusive_create_rejects_temp_name_substitution(self):
+        directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(directory, ignore_errors=True))
+        output = directory / "campaign.json"
+        foreign = b'{"attacker":true}\n'
+        real_link = os.link
+        swapped_name = None
+
+        def substitute_before_link(
+            source,
+            destination,
+            *,
+            src_dir_fd,
+            dst_dir_fd,
+        ):
+            nonlocal swapped_name
+            swapped_name = source
+            os.unlink(source, dir_fd=src_dir_fd)
+            descriptor = os.open(
+                source,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=src_dir_fd,
+            )
+            try:
+                os.write(descriptor, foreign)
+            finally:
+                os.close(descriptor)
+            return real_link(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        with (
+            mock.patch.object(
+                native_go_build.os,
+                "link",
+                side_effect=substitute_before_link,
+            ),
+            self.assertRaisesRegex(RuntimeError, "identity"),
+        ):
+            native_go_build.write_json_atomic(
+                output,
+                {"accepted": True},
+                exclusive=True,
+            )
+
+        self.assertIsNotNone(swapped_name)
+        self.assertEqual(output.read_bytes(), foreign)
+        self.assertEqual((directory / swapped_name).read_bytes(), foreign)
+
+    def test_atomic_json_replace_rejects_temp_name_substitution(self):
+        directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(directory, ignore_errors=True))
+        output = directory / "campaign.json"
+        output.write_text('{"generation":0}\n')
+        foreign = b'{"attacker":true}\n'
+        real_replace = os.replace
+
+        def substitute_before_replace(
+            source,
+            destination,
+            *,
+            src_dir_fd,
+            dst_dir_fd,
+        ):
+            os.unlink(source, dir_fd=src_dir_fd)
+            descriptor = os.open(
+                source,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=src_dir_fd,
+            )
+            try:
+                os.write(descriptor, foreign)
+            finally:
+                os.close(descriptor)
+            return real_replace(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        with (
+            mock.patch.object(
+                native_go_build.os,
+                "replace",
+                side_effect=substitute_before_replace,
+            ),
+            self.assertRaisesRegex(RuntimeError, "identity"),
+        ):
+            native_go_build.write_json_atomic(
+                output,
+                {"generation": 1},
+            )
+
+        self.assertEqual(output.read_bytes(), foreign)
+
+    def test_owned_temp_cleanup_tolerates_concurrent_name_disappearance(self):
+        directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(directory, ignore_errors=True))
+        temporary = directory / ".campaign.json.tmp"
+        temporary.write_text("{}\n")
+        directory_descriptor = os.open(directory, os.O_RDONLY)
+        temporary_descriptor = os.open(temporary, os.O_RDONLY)
+        self.addCleanup(os.close, directory_descriptor)
+        self.addCleanup(os.close, temporary_descriptor)
+
+        with mock.patch.object(
+            native_go_build.os,
+            "unlink",
+            side_effect=FileNotFoundError,
+        ):
+            native_go_build._unlink_name_if_owned(
+                directory_descriptor,
+                temporary.name,
+                temporary_descriptor,
+            )
+
     def test_docker_phase_rejects_non_arm64_image(self):
         self.install_fake_docker("amd64")
 
@@ -166,7 +290,8 @@ class NativeGoBuildTest(unittest.TestCase):
                 "architecture": "arm64",
                 "id": "sha256:fake-image",
                 "repo_digests": [
-                    "localhost:5005/carrick-go-conformance@sha256:fake-digest"
+                    "localhost:5005/carrick-go-conformance@sha256:"
+                    + "4" * 64
                 ],
             },
         )
@@ -414,6 +539,108 @@ class NativeGoBuildTest(unittest.TestCase):
         self.assertEqual(row["cleanup"]["status"], 125)
         self.assertIn("cleanup launch failed", row["cleanup"]["stderr"])
 
+    def test_non_timeout_execution_exception_retains_current_sample_evidence(self):
+        directory, _ = self.install_fake_docker("arm64")
+        execution_error = UnicodeDecodeError(
+            "utf-8",
+            b"\xff",
+            0,
+            1,
+            "invalid start byte",
+        )
+        cleanup_evidence = {
+            "status": 0,
+            "stdout": "cleanup stdout\n",
+            "stderr": "",
+        }
+
+        with (
+            mock.patch.object(
+                native_go_build.subprocess,
+                "run",
+                side_effect=execution_error,
+            ),
+            mock.patch.object(
+                native_go_build,
+                "docker_cleanup",
+                return_value=cleanup_evidence,
+            ),
+            self.assertRaises(native_go_build.SampleEvidenceError) as caught,
+        ):
+            native_go_build.run_sample(
+                directory,
+                "docker",
+                index=1,
+                timeout_seconds=5,
+                current_run_id="execution-error-run",
+            )
+
+        row = caught.exception.sample
+        self.assertEqual(row["run_id"], "execution-error-run")
+        self.assertIsNone(row["return_code"])
+        self.assertFalse(row["timed_out"])
+        self.assertFalse(row["build_ok"])
+        self.assertEqual(row["stdout"], "")
+        self.assertEqual(row["stderr"], "")
+        self.assertEqual(row["cleanup"], cleanup_evidence)
+        self.assertEqual(
+            row["execution_error"],
+            {
+                "type": "UnicodeDecodeError",
+                "message": str(execution_error),
+            },
+        )
+
+    def test_captured_output_exception_retains_current_sample_evidence(self):
+        directory, _ = self.install_fake_docker("arm64")
+        captured = directory / "profile" / "docker-1.log"
+        result = subprocess.CompletedProcess(
+            ["docker", "run"],
+            0,
+            "WORKLOAD_NS=1200000000\nBUILD_OK\n",
+            "",
+        )
+        capture_error = OSError("injected capture write failure")
+
+        with (
+            mock.patch.object(
+                native_go_build.subprocess,
+                "run",
+                return_value=result,
+            ),
+            mock.patch.object(
+                native_go_build,
+                "docker_cleanup",
+                return_value={"status": 0, "stdout": "", "stderr": ""},
+            ),
+            mock.patch.object(
+                pathlib.Path,
+                "write_text",
+                side_effect=capture_error,
+            ),
+            self.assertRaises(native_go_build.SampleEvidenceError) as caught,
+        ):
+            native_go_build.run_sample(
+                directory,
+                "docker",
+                index=1,
+                timeout_seconds=5,
+                captured_output=captured,
+                current_run_id="capture-error-run",
+            )
+
+        row = caught.exception.sample
+        self.assertEqual(row["run_id"], "capture-error-run")
+        self.assertEqual(row["return_code"], 0)
+        self.assertTrue(row["build_ok"])
+        self.assertEqual(
+            row["capture_error"],
+            {
+                "type": "OSError",
+                "message": str(capture_error),
+            },
+        )
+
     def test_cleanup_failure_does_not_suppress_failed_sample_capture(self):
         directory, _ = self.install_fake_docker("arm64")
         captured = directory / "profile" / "docker-1.log"
@@ -636,6 +863,10 @@ class NativeGoBuildTest(unittest.TestCase):
             (109, "./target/release/carrick run native"),
             (110, "/Volumes/carrick/scripts/perf/native_go_build.py --engine carrick"),
             (111, "./scripts/perf/native_go_build.py --engine carrick"),
+            (
+                112,
+                "/var/tmp/native m1/arm/carrick run --exec-backend native",
+            ),
         ]
 
         foreign = native_go_build.foreign_rows(
@@ -643,7 +874,10 @@ class NativeGoBuildTest(unittest.TestCase):
             own_pid=20,
             ancestor_pids={1},
             current_run_id="run-c1",
-            known_receipt_binaries=(pathlib.Path("/var/tmp/native-m1/arm/carrick"),),
+            known_receipt_binaries=(
+                pathlib.Path("/var/tmp/native-m1/arm/carrick"),
+                pathlib.Path("/var/tmp/native m1/arm/carrick"),
+            ),
         )
 
         self.assertEqual(
@@ -664,6 +898,10 @@ class NativeGoBuildTest(unittest.TestCase):
                     "native_go_build.py --engine carrick"
                 ),
                 "pid=111 command=./scripts/perf/native_go_build.py --engine carrick",
+                (
+                    "pid=112 command=/var/tmp/native m1/arm/carrick run "
+                    "--exec-backend native"
+                ),
             ],
         )
 

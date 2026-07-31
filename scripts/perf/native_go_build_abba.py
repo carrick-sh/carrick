@@ -65,7 +65,9 @@ IMAGE_FIELDS = frozenset(("architecture", "id", "repo_digests"))
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-REPO_DIGEST_RE = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
+REPO_DIGEST_RE = re.compile(
+    r"^(?P<repository>[^@\s]+)@sha256:[0-9a-f]{64}$"
+)
 MACHO_UUID_RE = re.compile(
     r"^UUID: ([0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}) "
     r"\(arm64\)(?:\s|$)"
@@ -77,6 +79,12 @@ QUAD_METRICS = (
     "cpu_sys_s",
     "elapsed_ms",
     "workload_ms",
+)
+TIMING_PERTURBING_CONTROL_KEYS = frozenset(
+    (
+        "CARRICK_DSR_PROFILE",
+        "CARRICK_NATIVE_TRACE_SYSCALLS",
+    )
 )
 
 
@@ -170,6 +178,16 @@ def _validated_environment(arm: ArmSpec) -> dict[str, str | None]:
         if value is not None and type(value) is not str:
             raise ValueError(f"{arm.label} environment value for {key} must be str or null")
         environment[key] = value
+    timing_perturbations = sorted(
+        key
+        for key in TIMING_PERTURBING_CONTROL_KEYS
+        if environment[key] is not None
+    )
+    if timing_perturbations:
+        raise ValueError(
+            f"{arm.label} environment contains timing-perturbing controls: "
+            + ", ".join(timing_perturbations)
+        )
     return environment
 
 
@@ -455,6 +473,7 @@ def _darwin_power_preflight() -> dict[str, object]:
         numeric_values[match.group(1)] = int(match.group(2))
     numeric_ok = (
         numeric_only
+        and len(thermal_lines) == len(numeric_patterns)
         and set(numeric_values) == set(numeric_patterns)
         and numeric_values == numeric_patterns
     )
@@ -483,6 +502,65 @@ def _expected_image(receipt: ArmReceipt) -> dict[str, object]:
     }
 
 
+def _image_repository(reference: str) -> str:
+    repository = reference.rsplit("@", 1)[0]
+    if "@" not in reference:
+        last_slash = repository.rfind("/")
+        last_colon = repository.rfind(":")
+        if last_colon > last_slash:
+            repository = repository[:last_colon]
+    if not repository or any(character.isspace() for character in repository):
+        raise ValueError(f"image reference has an invalid repository: {reference!r}")
+    components = repository.split("/")
+    first = components[0]
+    has_explicit_registry = (
+        len(components) > 1
+        and (
+            first == "localhost"
+            or "." in first
+            or ":" in first
+        )
+    )
+    if has_explicit_registry:
+        registry = first.lower()
+        repository_path = "/".join(components[1:]).lower()
+    else:
+        registry = "docker.io"
+        repository_path = repository.lower()
+    if registry in {"index.docker.io", "registry-1.docker.io"}:
+        registry = "docker.io"
+    if registry == "docker.io" and "/" not in repository_path:
+        repository_path = f"library/{repository_path}"
+    if not repository_path:
+        raise ValueError(f"image reference has an invalid repository: {reference!r}")
+    return f"{registry}/{repository_path}"
+
+
+def _executed_image_ref(image_ref: str, receipt: ArmReceipt) -> str:
+    requested_repository = _image_repository(image_ref)
+    matches = tuple(
+        sorted(
+            {
+                digest
+                for digest in receipt.image_repo_digests
+                if REPO_DIGEST_RE.fullmatch(digest)
+                and _image_repository(digest) == requested_repository
+            }
+        )
+    )
+    if len(matches) > 1:
+        raise RuntimeError(
+            "arm receipt has ambiguous immutable repo digests for requested "
+            f"repository {requested_repository!r}: {list(matches)!r}"
+        )
+    if not matches:
+        raise RuntimeError(
+            "arm receipt has no matching immutable repo digest for requested "
+            f"repository {requested_repository!r}"
+        )
+    return matches[0]
+
+
 def _campaign_preflight(
     control: ArmSpec,
     candidate: ArmSpec,
@@ -508,6 +586,18 @@ def _campaign_preflight(
     candidate_image = _expected_image(candidate.receipt)
     if control_image != candidate_image:
         raise RuntimeError("arm receipt image ID or repo digests differ")
+    control_executed_image = _executed_image_ref(
+        image_ref,
+        control.receipt,
+    )
+    candidate_executed_image = _executed_image_ref(
+        image_ref,
+        candidate.receipt,
+    )
+    if control_executed_image != candidate_executed_image:
+        raise RuntimeError(
+            "control and candidate immutable execution references differ"
+        )
     current_image = _image_receipt(image_ref)
     if current_image != control_image:
         raise RuntimeError("campaign image identity drifted from arm receipts")
@@ -544,6 +634,7 @@ def _campaign_preflight(
             str(path) for path in known_receipt_binaries
         ],
         "image_ref": image_ref,
+        "executed_image_ref": control_executed_image,
         "image": current_image,
         "power": power,
         "busy_host_reasons": busy_reasons,
@@ -580,6 +671,7 @@ def _validate_sample_evidence(
     sample: dict[str, object],
     arm: ArmSpec,
     *,
+    harness_repo: pathlib.Path,
     expected_index: int,
     expected_run_id: str,
     image_ref: str,
@@ -614,12 +706,15 @@ def _validate_sample_evidence(
         errors.append("command")
     else:
         argv = command.get("argv")
-        if (
-            not isinstance(argv, list)
-            or not argv
-            or not _path_matches(argv[0], receipt.binary_path)
-        ):
-            errors.append("command binary")
+        expected_argv = native_go_build.build_command(
+            harness_repo,
+            native_go_build.ENGINE_CARRICK,
+            expected_run_id,
+            binary=receipt.binary_path.resolve(),
+            image=image_ref,
+        )
+        if argv != expected_argv:
+            errors.append("command argv")
         if command.get("status") != 0 or command.get("build_ok") is not True:
             errors.append("command status")
 
@@ -694,6 +789,7 @@ def _campaign_decision(
     statistics_payload: dict[str, object],
     *,
     complete: bool,
+    statistically_eligible: bool = True,
 ) -> dict[str, object]:
     metrics = statistics_payload["metrics"]
     primary = metrics["cpu_s"]
@@ -720,7 +816,7 @@ def _campaign_decision(
             for metric in secondary
         ),
     }
-    statistical_pass = all(criteria.values())
+    statistical_pass = statistically_eligible and all(criteria.values())
     return {
         "statistical_pass": statistical_pass,
         "retained": False,
@@ -783,6 +879,10 @@ def run_campaign(
     if type(image_ref) is not str or not image_ref:
         raise ValueError("image_ref must be nonempty")
     mode = validate_arm_mode(control, candidate)
+    null_control_control = (
+        control.receipt.path.resolve() == candidate.receipt.path.resolve()
+        and control.environment == candidate.environment
+    )
     if os.path.lexists(output):
         raise FileExistsError(
             f"campaign output already exists and cannot resume: {output}"
@@ -812,6 +912,7 @@ def run_campaign(
             "cooldown_seconds": float(cooldown_seconds),
             "timeout_seconds": timeout_seconds,
             "image_ref": image_ref,
+            "executed_image_ref": None,
             "schedule": "excluded-a-b-then-a1-b1-b2-a2-v1",
             "primary_metric": "rusage-children-total-cpu-floor-v1",
         },
@@ -837,25 +938,32 @@ def run_campaign(
     positions = _campaign_positions(quads)
 
     try:
-        artifact["preflights"].append(
-            _campaign_preflight(
-                control,
-                candidate,
-                image_ref=image_ref,
-                known_receipt_binaries=known_receipt_binaries,
-            )
+        initial_preflight = _campaign_preflight(
+            control,
+            candidate,
+            image_ref=image_ref,
+            known_receipt_binaries=known_receipt_binaries,
         )
+        artifact["preflights"].append(initial_preflight)
+        executed_image_ref = str(initial_preflight["executed_image_ref"])
+        artifact["identity"]["executed_image_ref"] = executed_image_ref
         native_go_build.write_json_atomic(output, artifact)
         for sample_index, position in enumerate(positions, start=1):
             if position["position"] == "a1":
-                artifact["preflights"].append(
-                    _campaign_preflight(
-                        control,
-                        candidate,
-                        image_ref=image_ref,
-                        known_receipt_binaries=known_receipt_binaries,
-                    )
+                quad_preflight = _campaign_preflight(
+                    control,
+                    candidate,
+                    image_ref=image_ref,
+                    known_receipt_binaries=known_receipt_binaries,
                 )
+                if (
+                    quad_preflight["executed_image_ref"]
+                    != executed_image_ref
+                ):
+                    raise RuntimeError(
+                        "immutable execution reference drifted before quad"
+                    )
+                artifact["preflights"].append(quad_preflight)
                 native_go_build.write_json_atomic(output, artifact)
             arm = control if position["arm"] == "A" else candidate
             sample_run_id = (
@@ -869,7 +977,7 @@ def run_campaign(
                     timeout_seconds,
                     environment_overlay=dict(arm.environment),
                     binary=arm.receipt.binary_path,
-                    image=image_ref,
+                    image=executed_image_ref,
                     current_run_id=sample_run_id,
                     known_receipt_binaries=known_receipt_binaries,
                 )
@@ -883,9 +991,10 @@ def run_campaign(
                 _validate_sample_evidence(
                     annotated,
                     arm,
+                    harness_repo=harness_repo,
                     expected_index=sample_index,
                     expected_run_id=sample_run_id,
-                    image_ref=image_ref,
+                    image_ref=executed_image_ref,
                 )
             except ValueError as error:
                 raise native_go_build.SampleEvidenceError(
@@ -928,6 +1037,7 @@ def run_campaign(
         artifact["decision"] = _campaign_decision(
             statistics_payload,
             complete=True,
+            statistically_eligible=not null_control_control,
         )
         artifact["finished_at"] = utc_now()
         native_go_build.write_json_atomic(output, artifact)
@@ -1030,6 +1140,54 @@ def _directory_path_matches_descriptor(
         os.close(current)
 
 
+def _directory_name_identity(
+    directory: int,
+    name: str,
+) -> tuple[int, int] | None:
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=directory,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    return metadata.st_dev, metadata.st_ino
+
+
+def _require_directory_name_matches_descriptor(
+    directory: int,
+    name: str,
+    descriptor: int,
+    description: str,
+) -> None:
+    metadata = os.fstat(descriptor)
+    if _directory_name_identity(directory, name) != (
+        metadata.st_dev,
+        metadata.st_ino,
+    ):
+        raise RuntimeError(f"{description} identity drifted")
+
+
+def _unlink_directory_name_if_owned(
+    directory: int,
+    name: str,
+    descriptor: int,
+) -> None:
+    metadata = os.fstat(descriptor)
+    if _directory_name_identity(directory, name) == (
+        metadata.st_dev,
+        metadata.st_ino,
+    ):
+        # Darwin has no conditional unlink-by-inode operation. Leave a
+        # mismatched name alone, and tolerate the owned name disappearing
+        # between the identity check and this best-effort cleanup.
+        try:
+            os.unlink(name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+
+
 def publish_accepted_artifact(
     source: pathlib.Path,
     destination: pathlib.Path,
@@ -1125,6 +1283,12 @@ def publish_accepted_artifact(
             raise RuntimeError(
                 "accepted artifact destination parent path changed"
             )
+        _require_directory_name_matches_descriptor(
+            parent_descriptor,
+            temporary_name,
+            temporary_descriptor,
+            "publication temporary pathname",
+        )
         try:
             os.link(
                 temporary_name,
@@ -1137,16 +1301,23 @@ def publish_accepted_artifact(
             raise FileExistsError(
                 f"accepted artifact destination already exists: {destination}"
             ) from error
+        _require_directory_name_matches_descriptor(
+            parent_descriptor,
+            destination.name,
+            temporary_descriptor,
+            "published artifact destination",
+        )
         os.fsync(parent_descriptor)
         return payload
     finally:
+        if temporary_descriptor >= 0 and temporary_name is not None:
+            _unlink_directory_name_if_owned(
+                parent_descriptor,
+                temporary_name,
+                temporary_descriptor,
+            )
         if temporary_descriptor >= 0:
             os.close(temporary_descriptor)
-        if temporary_name is not None:
-            try:
-                os.unlink(temporary_name, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                pass
         os.close(parent_descriptor)
 
 
