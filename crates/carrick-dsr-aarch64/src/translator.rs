@@ -581,11 +581,11 @@ impl TranslatedRangeCatalog {
         &mut self,
         recorder: &mut impl TranslatedRangeRecorder,
     ) -> Result<(), types::DsrError> {
-        if self.ready_sequence.is_none() {
-            return Err(types::DsrError::CachePolicy(
+        let inherited_ready = self.ready_sequence.ok_or_else(|| {
+            types::DsrError::CachePolicy(
                 "cannot replay a dormant translated-range catalog after fork".to_string(),
-            ));
-        }
+            )
+        })?;
         let epoch_value = self.epoch.get().checked_add(1).ok_or_else(|| {
             types::DsrError::CachePolicy(
                 "translated-range epoch overflow during fork replay".to_string(),
@@ -635,6 +635,12 @@ impl TranslatedRangeCatalog {
                 "translated-range sequence frontier underflow during fork replay".to_string(),
             )
         })?;
+        if inherited_ready == 0 || inherited_ready > frontier {
+            return Err(types::DsrError::CachePolicy(format!(
+                "translated-range ready sequence {inherited_ready} is outside inherited \
+                 frontier 1..={frontier} during fork replay"
+            )));
+        }
         let reset = probes::TranslatedRangeReset::reset(epoch);
         let ready = probes::TranslatedRangeReady::ready(epoch, frontier);
 
@@ -5601,6 +5607,48 @@ mod tests {
     }
 
     #[test]
+    fn translated_range_catalog_rejects_invalid_inherited_ready_frontier() {
+        for invalid_ready in [0, 3] {
+            let (mut catalog, mut recorder) = active_catalog();
+            let prepared = catalog
+                .prepare_shared(
+                    TranslatedUnitId::new(11).expect("unit id"),
+                    HostVa(0x3000)..HostVa(0x4000),
+                )
+                .expect("prepare shared range");
+            catalog.commit_shared_with_recorder(prepared, &mut recorder);
+            recorder.events.clear();
+            catalog.ready_sequence = Some(invalid_ready);
+            let before = (
+                catalog.epoch,
+                catalog.next_sequence,
+                catalog.ready_sequence,
+                catalog.private.clone(),
+                catalog.shared.clone(),
+            );
+
+            let result = catalog.replay_after_fork(&mut recorder);
+
+            assert!(matches!(result, Err(types::DsrError::CachePolicy(_))));
+            assert!(
+                recorder.events.is_empty(),
+                "invalid ready {invalid_ready} emitted replay events"
+            );
+            assert_eq!(
+                (
+                    catalog.epoch,
+                    catalog.next_sequence,
+                    catalog.ready_sequence,
+                    catalog.private.clone(),
+                    catalog.shared.clone(),
+                ),
+                before,
+                "invalid ready {invalid_ready} mutated the catalog"
+            );
+        }
+    }
+
+    #[test]
     fn translated_range_catalog_replays_full_shared_frontier_after_fork() {
         let (mut catalog, mut recorder) = active_catalog();
         for (unit, start, end) in [(11, 0x3000, 0x4000), (12, 0x5000, 0x6000)] {
@@ -7623,6 +7671,7 @@ mod tests {
         use crate::types::CodeGeneration;
         use carrick_guest_mem::GuestVa;
         use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
 
         pub(super) fn one_published_binding(
             seed: u8,
@@ -7663,6 +7712,242 @@ mod tests {
             assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
             assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
             libc::WEXITSTATUS(status)
+        }
+
+        struct ForkChildPipeRecorder<'a> {
+            state: &'a parking_lot::RwLock<crate::translator::ProcessState>,
+            events: Vec<super::RecordedForkChildRepair>,
+            writer_held: bool,
+        }
+
+        impl ForkChildPipeRecorder<'_> {
+            fn record(&mut self, event: super::RecordedForkChildRepair) {
+                self.writer_held &= self.state.try_read().is_none();
+                self.events.push(event);
+            }
+        }
+
+        impl super::TranslatedRangeRecorder for ForkChildPipeRecorder<'_> {
+            fn reset(&mut self, event: carrick_dsr::probes::TranslatedRangeReset) {
+                self.record(super::RecordedForkChildRepair::Range(
+                    super::RecordedTranslatedRange::Reset(event),
+                ));
+            }
+
+            fn add(&mut self, event: carrick_dsr::probes::TranslatedRangeAdd) {
+                self.record(super::RecordedForkChildRepair::Range(
+                    super::RecordedTranslatedRange::Add(event),
+                ));
+            }
+
+            fn ready(&mut self, event: carrick_dsr::probes::TranslatedRangeReady) {
+                self.record(super::RecordedForkChildRepair::Range(
+                    super::RecordedTranslatedRange::Ready(event),
+                ));
+            }
+        }
+
+        impl super::ForkChildRepairRecorder for ForkChildPipeRecorder<'_> {
+            fn process_repaired(&mut self) {
+                self.record(super::RecordedForkChildRepair::ProcessRepaired);
+            }
+        }
+
+        fn terminate_and_reap_exact_child(pid: libc::pid_t) -> Result<i32, String> {
+            let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
+            if killed != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(format!("kill({pid}, SIGKILL) failed: {error}"));
+                }
+            }
+            loop {
+                let mut status = 0;
+                let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if waited == pid {
+                    return Ok(status);
+                }
+                let error = std::io::Error::last_os_error();
+                if waited < 0 && error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(format!("waitpid({pid}) after SIGKILL failed: {error}"));
+            }
+        }
+
+        fn child_supervision_failure(
+            pid: libc::pid_t,
+            read_fd: libc::c_int,
+            status: Option<i32>,
+            detail: String,
+        ) -> String {
+            let _ = unsafe { libc::close(read_fd) };
+            if status.is_some() {
+                return detail;
+            }
+            match terminate_and_reap_exact_child(pid) {
+                Ok(_) => detail,
+                Err(cleanup) => format!("{detail}; exact-child cleanup failed: {cleanup}"),
+            }
+        }
+
+        fn supervise_child_payload(
+            pid: libc::pid_t,
+            read_fd: libc::c_int,
+            payload: &mut [u8],
+            timeout: Duration,
+        ) -> Result<i32, String> {
+            let deadline = Instant::now() + timeout;
+            let mut read = 0_usize;
+            let mut status = None;
+            loop {
+                if status.is_none() {
+                    let mut child_status = 0;
+                    let waited = unsafe { libc::waitpid(pid, &mut child_status, libc::WNOHANG) };
+                    if waited == pid {
+                        status = Some(child_status);
+                    } else if waited < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::EINTR) {
+                            if error.raw_os_error() == Some(libc::ECHILD) {
+                                let _ = unsafe { libc::close(read_fd) };
+                                return Err(format!(
+                                    "waitpid({pid}, WNOHANG) lost child ownership; refusing \
+                                     cleanup signal"
+                                ));
+                            }
+                            return Err(child_supervision_failure(
+                                pid,
+                                read_fd,
+                                status,
+                                format!("waitpid({pid}, WNOHANG) failed: {error}"),
+                            ));
+                        }
+                    }
+                }
+                if read == payload.len()
+                    && let Some(status) = status
+                {
+                    let _ = unsafe { libc::close(read_fd) };
+                    return Ok(status);
+                }
+
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(child_supervision_failure(
+                        pid,
+                        read_fd,
+                        status,
+                        format!("child {pid} payload timed out after {timeout:?}"),
+                    ));
+                }
+                let poll_ms = (deadline - now).as_millis().clamp(1, 50) as libc::c_int;
+                let polled = if read < payload.len() {
+                    let mut poll_fd = libc::pollfd {
+                        fd: read_fd,
+                        events: libc::POLLIN | libc::POLLHUP,
+                        revents: 0,
+                    };
+                    let result = unsafe { libc::poll(&mut poll_fd, 1, poll_ms) };
+                    (result, poll_fd.revents)
+                } else {
+                    (unsafe { libc::poll(std::ptr::null_mut(), 0, poll_ms) }, 0)
+                };
+                if polled.0 < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(child_supervision_failure(
+                        pid,
+                        read_fd,
+                        status,
+                        format!("poll child {pid} payload failed: {error}"),
+                    ));
+                }
+                if polled.0 == 0 || read == payload.len() {
+                    continue;
+                }
+                if polled.1 & libc::POLLNVAL != 0 {
+                    return Err(child_supervision_failure(
+                        pid,
+                        read_fd,
+                        status,
+                        format!("poll child {pid} payload reported POLLNVAL"),
+                    ));
+                }
+                if polled.1 & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+                    continue;
+                }
+                let result = unsafe {
+                    libc::read(
+                        read_fd,
+                        payload.as_mut_ptr().add(read).cast::<libc::c_void>(),
+                        payload.len() - read,
+                    )
+                };
+                if result > 0 {
+                    read += result as usize;
+                    continue;
+                }
+                if result < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(child_supervision_failure(
+                        pid,
+                        read_fd,
+                        status,
+                        format!("read child {pid} payload failed: {error}"),
+                    ));
+                }
+                return Err(child_supervision_failure(
+                    pid,
+                    read_fd,
+                    status,
+                    format!(
+                        "child {pid} closed payload pipe after {read}/{} bytes",
+                        payload.len()
+                    ),
+                ));
+            }
+        }
+
+        #[test]
+        fn child_payload_deadline_kills_and_reaps_exact_child() {
+            let mut pipe_fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                let _ = unsafe { libc::close(pipe_fds[0]) };
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+
+            let _ = unsafe { libc::close(pipe_fds[1]) };
+            let mut payload = [0_u8; 1];
+            let result =
+                supervise_child_payload(pid, pipe_fds[0], &mut payload, Duration::from_millis(50));
+
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("timed out")),
+                "unexpected supervision result: {result:?}"
+            );
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD),
+                "the exact timed-out child must already be reaped"
+            );
         }
 
         #[test]
@@ -7896,49 +8181,58 @@ mod tests {
                 super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 50);
             let mut surviving =
                 super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 51);
+            let mut recorder = ForkChildPipeRecorder {
+                state: &process.state,
+                events: Vec::with_capacity(8),
+                writer_held: true,
+            };
+            let mut lifecycle = Vec::with_capacity(2);
             let mut pipe_fds = [-1; 2];
             assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
 
             let pid = unsafe { libc::fork() };
-            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if pid < 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = unsafe { libc::close(pipe_fds[0]) };
+                let _ = unsafe { libc::close(pipe_fds[1]) };
+                panic!("fork failed: {error}");
+            }
             if pid == 0 {
                 let _ = unsafe { libc::close(pipe_fds[0]) };
-                let mut recorder = super::ForkChildRepairRecorderFixture {
-                    state: &process.state,
-                    published_cell: None,
-                    events: Vec::new(),
-                };
-                let mut lifecycle = Vec::new();
                 let mut record_lifecycle = |phase| lifecycle.push(phase);
                 let repaired = surviving
                     .after_fork_child_with_recorders(52, &mut recorder, &mut record_lifecycle)
                     .is_ok();
-                let state = process.state.read();
-                let reset_count = recorder
-                    .events
-                    .iter()
-                    .filter(|event| {
-                        matches!(
-                            event,
-                            super::RecordedForkChildRepair::Range(
-                                super::RecordedTranslatedRange::Reset(_)
-                            )
-                        )
-                    })
-                    .count();
+                let mut epoch = 0_u64;
+                let mut frontier = 0_u64;
+                let mut reset_count = 0_u64;
+                for event in &recorder.events {
+                    match event {
+                        super::RecordedForkChildRepair::Range(
+                            super::RecordedTranslatedRange::Reset(reset),
+                        ) => {
+                            epoch = reset.epoch().get();
+                            reset_count += 1;
+                        }
+                        super::RecordedForkChildRepair::Range(
+                            super::RecordedTranslatedRange::Ready(ready),
+                        ) => frontier = ready.final_sequence(),
+                        _ => {}
+                    }
+                }
+                let mut lifecycle_end_count = 0_u64;
+                for phase in &lifecycle {
+                    if *phase == carrick_dsr::probes::DsrCacheLifecyclePhase::ForkChildRepairEnd {
+                        lifecycle_end_count += 1;
+                    }
+                }
                 let payload = [
-                    state.translated_ranges.epoch.get(),
-                    state.translated_ranges.sequence_frontier(),
-                    reset_count as u64,
-                    lifecycle
-                        .iter()
-                        .filter(|phase| {
-                            **phase
-                                == carrick_dsr::probes::DsrCacheLifecyclePhase::ForkChildRepairEnd
-                        })
-                        .count() as u64,
+                    epoch,
+                    frontier,
+                    reset_count,
+                    lifecycle_end_count,
+                    u64::from(recorder.writer_held),
                 ];
-                drop(state);
                 let bytes = std::mem::size_of_val(&payload);
                 let written = unsafe {
                     libc::write(pipe_fds[1], payload.as_ptr().cast::<libc::c_void>(), bytes)
@@ -7946,34 +8240,29 @@ mod tests {
                 let _ = unsafe { libc::close(pipe_fds[1]) };
                 unsafe {
                     libc::_exit(i32::from(
-                        !repaired || written != isize::try_from(bytes).expect("small payload"),
+                        !repaired
+                            || recorder.events.len() != 5
+                            || lifecycle.len() != 2
+                            || written != bytes as isize,
                     ))
                 };
             }
 
             let _ = unsafe { libc::close(pipe_fds[1]) };
-            let mut payload = [0_u64; 4];
-            let bytes = std::mem::size_of_val(&payload);
-            let mut read = 0_usize;
-            while read < bytes {
-                let result = unsafe {
-                    libc::read(
-                        pipe_fds[0],
-                        payload
-                            .as_mut_ptr()
-                            .cast::<u8>()
-                            .add(read)
-                            .cast::<libc::c_void>(),
-                        bytes - read,
-                    )
-                };
-                assert!(result > 0, "short child replay payload: {result}");
-                read += usize::try_from(result).expect("positive read length");
-            }
-            let _ = unsafe { libc::close(pipe_fds[0]) };
+            let mut payload = [0_u64; 5];
+            let payload_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    payload.as_mut_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&payload),
+                )
+            };
+            let status =
+                supervise_child_payload(pid, pipe_fds[0], payload_bytes, Duration::from_secs(5))
+                    .unwrap_or_else(|error| panic!("child replay supervision failed: {error}"));
 
-            assert_eq!(child_exit_status(pid), 0, "child replay failed");
-            assert_eq!(payload, [2, 2, 1, 1]);
+            assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
+            assert_eq!(libc::WEXITSTATUS(status), 0, "child replay failed");
+            assert_eq!(payload, [2, 2, 1, 1, 1]);
             let parent_after = {
                 let state = process.state.read();
                 (
