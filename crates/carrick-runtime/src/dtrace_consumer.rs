@@ -151,6 +151,8 @@ pub struct DTraceRunReport {
     pub principal_drops: u64,
     pub aggregation_drops: u64,
     pub dynamic_drops: u64,
+    pub dynamic_rinse_drops: u64,
+    pub dynamic_dirty_drops: u64,
     pub other_drops: u64,
     pub interrupted: bool,
 }
@@ -182,7 +184,9 @@ fn record_drop(report: &mut DTraceRunReport, kind: c_int, drops: u64) {
     let counter = match kind {
         DTRACEDROP_PRINCIPAL => &mut report.principal_drops,
         DTRACEDROP_AGGREGATION => &mut report.aggregation_drops,
-        DTRACEDROP_DYNAMIC | DTRACEDROP_DYNRINSE | DTRACEDROP_DYNDIRTY => &mut report.dynamic_drops,
+        DTRACEDROP_DYNAMIC => &mut report.dynamic_drops,
+        DTRACEDROP_DYNRINSE => &mut report.dynamic_rinse_drops,
+        DTRACEDROP_DYNDIRTY => &mut report.dynamic_dirty_drops,
         _ => &mut report.other_drops,
     };
     *counter = counter.saturating_add(drops);
@@ -541,7 +545,7 @@ where
     E: std::fmt::Display,
 {
     post_stop(crate::dtrace_symbols::LiveDtraceSymbolizer::new(hdl))
-        .map_err(|error| DTraceError::PostStop(error.to_string()))
+        .map_err(|error| DTraceError::PostStop(format!("{error:#}")))
 }
 
 fn run_child_under_dtrace_impl<T>(
@@ -774,6 +778,14 @@ mod tests {
         .expect_err("callback error");
         assert!(matches!(error, super::DTraceError::PostStop(_)));
         assert!(error.to_string().contains("callback failed"));
+
+        let contextual = invoke_post_stop(std::ptr::null_mut(), |_symbolizer| {
+            Err::<(), _>(anyhow::anyhow!("inner failure").context("outer context"))
+        })
+        .expect_err("contextual callback error");
+        let rendered = contextual.to_string();
+        assert!(rendered.contains("outer context"));
+        assert!(rendered.contains("inner failure"));
     }
 
     #[test]
@@ -851,7 +863,9 @@ mod tests {
             DTraceRunReport {
                 principal_drops: 1,
                 aggregation_drops: 2,
-                dynamic_drops: 12,
+                dynamic_drops: 3,
+                dynamic_rinse_drops: 4,
+                dynamic_dirty_drops: 5,
                 other_drops: 6,
                 interrupted: false,
             }

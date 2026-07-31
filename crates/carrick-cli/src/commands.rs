@@ -122,11 +122,11 @@ use crate::runtime_util::{
 use crate::trace_cli::{
     TraceSudoInvocation, current_supplementary_groups, trace_drop_credentials, trace_sudo_argv,
 };
-#[cfg(target_os = "macos")]
-use crate::trace_profile::kernel_sample_addresses_from_path;
 use crate::trace_profile::validate_v2_path;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::trace_profile::{ProfileSummary, capture_provenance, write_summary_atomic};
+#[cfg(target_os = "macos")]
+use crate::trace_profile::{kernel_sample_addresses_from_path, path_has_v2_header};
 
 #[cfg(target_os = "macos")]
 fn uses_live_kernel_symbols(profile: crate::trace_profile::TraceProfileKind) -> bool {
@@ -444,6 +444,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             principal_drops,
             aggregation_drops,
             dynamic_drops,
+            dynamic_rinse_drops,
+            dynamic_dirty_drops,
             other_drops,
             interrupted,
         } => {
@@ -453,6 +455,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     principal_drops,
                     aggregation_drops,
                     dynamic_drops,
+                    dynamic_rinse_drops,
+                    dynamic_dirty_drops,
                     other_drops,
                     interrupted,
                 },
@@ -1412,7 +1416,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     let err = std::process::Command::new("sudo").args(&forwarded).exec();
                     bail!("carrick trace: failed to re-exec under sudo: {}", err);
                 }
-                let script_src = match (&script, profile) {
+                let script_template = match (&script, profile) {
                     (Some(path), None) => {
                         Some(std::fs::read_to_string(path).with_context(|| {
                             format!("failed to read D script {}", path.display())
@@ -1444,6 +1448,19 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         None
                     };
                 #[cfg(target_os = "macos")]
+                let (script_src, native_profile_authority) =
+                    if let Some(qualification) = native_profile_qualification.as_ref() {
+                        let profile_template = script_template.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!("native-wall profile has no D program")
+                        })?;
+                        let rendered = qualification.render_v2_profile_program(profile_template)?;
+                        (Some(rendered.program), Some(rendered.authority))
+                    } else {
+                        (script_template, None)
+                    };
+                #[cfg(target_os = "freebsd")]
+                let script_src = script_template;
+                #[cfg(target_os = "macos")]
                 if let Some(qualification) = native_profile_qualification.as_ref() {
                     eprintln!(
                         "carrick trace: native-wall launch qualification accepted (birth={}, terminal={})",
@@ -1470,7 +1487,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 &command,
                                 &opts,
                                 |mut symbolizer| -> anyhow::Result<_> {
-                                    let addresses = kernel_sample_addresses_from_path(raw_path)?;
+                                    let addresses = kernel_sample_addresses_from_path(
+                                        raw_path,
+                                        native_profile_authority.as_ref(),
+                                    )?;
                                     if addresses.weighted_leaves.iter().any(|address| {
                                         addresses.requested.binary_search(address).is_err()
                                     }) {
@@ -1501,7 +1521,25 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 if let Some(requested_profile) = profile {
                     let raw_path = output_path
                         .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
-                    let mut summary = ProfileSummary::from_path(raw_path, report.into())?;
+                    let capture_status = report.into();
+                    #[cfg(target_os = "macos")]
+                    let mut summary = if requested_profile
+                        == crate::trace_profile::TraceProfileKind::NativeWall
+                        && path_has_v2_header(raw_path)?
+                    {
+                        let authority = native_profile_authority.clone().ok_or_else(|| {
+                            anyhow::anyhow!("DSRPROF2 stream has no launch authority")
+                        })?;
+                        ProfileSummary::from_v2_path_with_authority(
+                            raw_path,
+                            capture_status,
+                            authority,
+                        )?
+                    } else {
+                        ProfileSummary::from_path(raw_path, capture_status)?
+                    };
+                    #[cfg(target_os = "freebsd")]
+                    let mut summary = ProfileSummary::from_path(raw_path, capture_status)?;
                     summary.require_profile(requested_profile)?;
                     #[cfg(target_os = "macos")]
                     if let Some(overlay) = sampled_kernel_overlay {

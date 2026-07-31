@@ -269,15 +269,86 @@ struct V2OffcpuEpisode {
     timestamp_ns: u64,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct V2HostImageCatalogPayload {
-    ranges: Vec<HostImageRangeRecord>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct V2ProfileAuthority {
+    os_build: String,
+    program_sha256: String,
+    birth_qualification_sha256: String,
+    terminal_qualification_sha256: String,
+    terminal_qualifications: BTreeSet<(String, String, String)>,
+}
+
+impl V2ProfileAuthority {
+    pub(crate) fn new(
+        os_build: &str,
+        program_sha256: &str,
+        birth_qualification_sha256: &str,
+        terminal_qualification_sha256: &str,
+        terminal_qualifications: impl IntoIterator<Item = (String, String, String)>,
+    ) -> Result<Self> {
+        validate_percent_token(os_build, "authority os_build")?;
+        for (value, field) in [
+            (program_sha256, "authority program_sha256"),
+            (
+                birth_qualification_sha256,
+                "authority birth_qualification_sha256",
+            ),
+            (
+                terminal_qualification_sha256,
+                "authority terminal_qualification_sha256",
+            ),
+        ] {
+            validate_sha256(value, field)?;
+        }
+        let mut terminals = BTreeSet::new();
+        for (provider, function, scope) in terminal_qualifications {
+            if !matches!(provider.as_str(), "syscall" | "mach_trap") {
+                bail!("authority contains unknown terminal provider {provider:?}");
+            }
+            validate_percent_token(&function, "authority terminal function")?;
+            if !matches!(scope.as_str(), "thread" | "process") {
+                bail!("authority contains unknown terminal scope {scope:?}");
+            }
+            if !terminals.insert((provider, function, scope)) {
+                bail!("authority contains a duplicate terminal qualification");
+            }
+        }
+        if !terminals.iter().any(|(_, _, scope)| scope == "thread")
+            || !terminals.iter().any(|(_, _, scope)| scope == "process")
+        {
+            bail!("authority must qualify both thread and process termination");
+        }
+        Ok(Self {
+            os_build: os_build.to_owned(),
+            program_sha256: program_sha256.to_owned(),
+            birth_qualification_sha256: birth_qualification_sha256.to_owned(),
+            terminal_qualification_sha256: terminal_qualification_sha256.to_owned(),
+            terminal_qualifications: terminals,
+        })
+    }
+
+    pub(crate) fn program_sha256(&self) -> &str {
+        &self.program_sha256
+    }
+
+    pub(crate) fn header_record(&self) -> String {
+        format!(
+            "DSRPROF2|header|profile=native-wall|raw_schema={V2_RAW_SCHEMA}|os_build={}|program_sha256={}|birth_qualification_sha256={}|terminal_qualification_sha256={}|wall_hz=197|cpu_hz=499",
+            self.os_build,
+            self.program_sha256(),
+            self.birth_qualification_sha256,
+            self.terminal_qualification_sha256,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
 struct V2Validator {
+    authority: Option<V2ProfileAuthority>,
     header_seen: bool,
+    wall_hz: Option<u64>,
+    cpu_hz: Option<u64>,
+    elapsed_ns: Option<u64>,
     target: Option<ProcessBirthKey>,
     complete: bool,
     processes: BTreeMap<ProcessBirthKey, V2ProcessState>,
@@ -291,10 +362,22 @@ struct V2Validator {
     offcpu_closed: BTreeMap<(RawProcessImageKey, String, u64), (u64, u64)>,
     offcpu_summary: BTreeMap<(RawProcessImageKey, String, u64), (u64, u64)>,
     wall_state: BTreeMap<String, u64>,
+    cpu_user_summary: BTreeMap<(RawProcessImageKey, u64), u64>,
+    cpu_kernel_summary: BTreeMap<(RawProcessImageKey, String, u64), u64>,
     cpu_samples: u64,
     terminal_qualifications: BTreeSet<(String, String, String)>,
     open_stack: Option<V2StackRecord>,
     stacks: Vec<V2StackRecord>,
+}
+
+impl V2Validator {
+    fn with_authority(authority: V2ProfileAuthority) -> Self {
+        Self {
+            terminal_qualifications: authority.terminal_qualifications.clone(),
+            authority: Some(authority),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -304,6 +387,7 @@ struct V2StackRecord {
     count: u64,
     total_ns: u64,
     frames: Vec<String>,
+    leading_separator_seen: bool,
 }
 
 pub(crate) fn validate_v2_path(path: &Path, capture_status: ProfileCaptureStatus) -> Result<()> {
@@ -312,7 +396,41 @@ pub(crate) fn validate_v2_path(path: &Path, capture_status: ProfileCaptureStatus
     validate_v2_lines(contents.lines(), capture_status)
 }
 
+pub(crate) fn path_has_v2_header(path: &Path) -> Result<bool> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read profile stream header {}", path.display()))?;
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| line.starts_with("DSRPROF2|header|")))
+}
+
 fn validate_v2_lines<I, S>(lines: I, capture_status: ProfileCaptureStatus) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    validate_v2_lines_with_validator(lines, capture_status, V2Validator::default())
+}
+
+fn validate_v2_lines_with_validator<I, S>(
+    lines: I,
+    capture_status: ProfileCaptureStatus,
+    validator: V2Validator,
+) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    parse_v2_lines_with_validator(lines, capture_status, validator).map(|_| ())
+}
+
+fn parse_v2_lines_with_validator<I, S>(
+    lines: I,
+    capture_status: ProfileCaptureStatus,
+    mut validator: V2Validator,
+) -> Result<V2Validator>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -320,20 +438,23 @@ where
     if capture_status.principal_drops != 0
         || capture_status.aggregation_drops != 0
         || capture_status.dynamic_drops != 0
+        || capture_status.dynamic_rinse_drops != 0
+        || capture_status.dynamic_dirty_drops != 0
         || capture_status.other_drops != 0
         || capture_status.interrupted
     {
         bail!(
-            "DSRPROF2 capture is not lossless: drops={}/{}/{}/{}, interrupted={}",
+            "DSRPROF2 capture is not lossless: principal={}, aggregation={}, dynamic={}, dynamic_rinse={}, dynamic_dirty={}, other={}, interrupted={}",
             capture_status.principal_drops,
             capture_status.aggregation_drops,
             capture_status.dynamic_drops,
+            capture_status.dynamic_rinse_drops,
+            capture_status.dynamic_dirty_drops,
             capture_status.other_drops,
             capture_status.interrupted
         );
     }
 
-    let mut validator = V2Validator::default();
     for (index, raw_line) in lines.into_iter().enumerate() {
         let raw_line = raw_line.as_ref();
         if validator.open_stack.is_some() {
@@ -343,6 +464,14 @@ where
                     .with_context(|| format!("invalid stack end at line {}", index + 1))?;
             } else {
                 if raw_line.is_empty() {
+                    let stack = validator
+                        .open_stack
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("DSRSTACK2 state disappeared"))?;
+                    if stack.frames.is_empty() && !stack.leading_separator_seen {
+                        stack.leading_separator_seen = true;
+                        continue;
+                    }
                     bail!("empty DSRSTACK2 frame at line {}", index + 1);
                 }
                 if raw_line.starts_with("DSRPROF") || raw_line.starts_with("DSRSTACK") {
@@ -407,7 +536,7 @@ where
     if !validator.complete {
         bail!("DSRPROF2 stream is missing its completion record");
     }
-    Ok(())
+    Ok(validator)
 }
 
 impl V2Validator {
@@ -475,6 +604,7 @@ impl V2Validator {
             count,
             total_ns: record.decimal_u64("total_ns")?,
             frames: Vec::new(),
+            leading_separator_seen: false,
         });
         Ok(())
     }
@@ -529,9 +659,34 @@ impl V2Validator {
         ] {
             validate_sha256(record.required(field)?, field)?;
         }
-        if record.decimal_u64("wall_hz")? == 0 || record.decimal_u64("cpu_hz")? == 0 {
+        if let Some(authority) = self.authority.as_ref() {
+            for (field, expected) in [
+                ("os_build", authority.os_build.as_str()),
+                ("program_sha256", authority.program_sha256.as_str()),
+                (
+                    "birth_qualification_sha256",
+                    authority.birth_qualification_sha256.as_str(),
+                ),
+                (
+                    "terminal_qualification_sha256",
+                    authority.terminal_qualification_sha256.as_str(),
+                ),
+            ] {
+                let actual = record.required(field)?;
+                if actual != expected {
+                    bail!(
+                        "DSRPROF2 header {field} does not match launch authority: actual={actual:?}, expected={expected:?}"
+                    );
+                }
+            }
+        }
+        let wall_hz = record.decimal_u64("wall_hz")?;
+        let cpu_hz = record.decimal_u64("cpu_hz")?;
+        if wall_hz == 0 || cpu_hz == 0 {
             bail!("DSRPROF2 sampling frequencies must be positive");
         }
+        self.wall_hz = Some(wall_hz);
+        self.cpu_hz = Some(cpu_hz);
         self.header_seen = true;
         Ok(())
     }
@@ -737,7 +892,10 @@ impl V2Validator {
         record.exact_fields(&["epoch", "image", "pid", "start_sec", "start_usec"])?;
         let key = record.image_key()?;
         self.require_attribution_key(key)?;
-        self.require_no_open_thread_state(key.birth, "exec attempt")?;
+        // The runtime announces an attempt from inside the host `execve`
+        // syscall. That exact kernel frame, plus unrelated frames on sibling
+        // threads, may remain open until the attempt returns. Only a successful
+        // exec retires the process image, so enforce a clean boundary there.
         let process = self
             .processes
             .get_mut(&key.birth)
@@ -858,7 +1016,11 @@ impl V2Validator {
         {
             bail!("range-reset does not name the current or next runtime epoch");
         }
-        self.require_no_open_thread_state(key.birth, "runtime epoch reset")?;
+        // Runtime repair can publish its replacement range catalog from
+        // inside a host syscall. Exact kernel frames retain their old epoch
+        // key until return, but an off-CPU episode cannot cross the epoch
+        // because its wake observes the new key.
+        self.require_no_open_offcpu_state(key.birth, "runtime epoch reset")?;
         let prior = self
             .epochs
             .get(&current)
@@ -1059,8 +1221,22 @@ impl V2Validator {
         ])?;
         let key = record.image_key()?;
         self.require_attribution_key(key)?;
-        let payload: V2HostImageCatalogPayload = serde_json::from_str(record.required("payload")?)
-            .context("invalid DSRPROF2 host image catalog JSON")?;
+        let payload: HostImageCatalogEnvelope =
+            serde_json::from_str(record.required("payload")?)
+                .context("invalid DSRPROF2 host image catalog JSON")?;
+        let payload = match payload {
+            HostImageCatalogEnvelope::Ok { ok } => ok,
+            HostImageCatalogEnvelope::Err { err } => {
+                bail!("DSRPROF2 host image catalog probe failed: {err}")
+            }
+        };
+        if payload.pid != u64::from(key.birth.pid) {
+            bail!(
+                "DSRPROF2 host image catalog pid {} does not match record pid {}",
+                payload.pid,
+                key.birth.pid
+            );
+        }
         if payload.ranges.is_empty() {
             bail!("host image catalog has no ranges");
         }
@@ -1114,10 +1290,13 @@ impl V2Validator {
         ])?;
         let key = record.image_key()?;
         self.require_summary_key(key)?;
-        let _pc = record.address("pc")?;
+        let pc = record.address("pc")?;
         let count = record.decimal_u64("count")?;
         if count == 0 {
             bail!("cpu-user count must be positive");
+        }
+        if self.cpu_user_summary.insert((key, pc), count).is_some() {
+            bail!("duplicate cpu-user summary identity");
         }
         self.cpu_samples = self
             .cpu_samples
@@ -1139,14 +1318,22 @@ impl V2Validator {
         ])?;
         let key = record.image_key()?;
         self.require_summary_key(key)?;
-        let _pc = record.address("pc")?;
-        match record.required("class")? {
+        let pc = record.address("pc")?;
+        let class = record.required("class")?.to_owned();
+        match class.as_str() {
             "kernel-named-syscall" | "kernel-mach-trap" | "kernel-non-syscall" => {}
             other => bail!("unknown cpu-kernel class {other:?}"),
         }
         let count = record.decimal_u64("count")?;
         if count == 0 {
             bail!("cpu-kernel count must be positive");
+        }
+        if self
+            .cpu_kernel_summary
+            .insert((key, class, pc), count)
+            .is_some()
+        {
+            bail!("duplicate cpu-kernel summary identity");
         }
         self.cpu_samples = self
             .cpu_samples
@@ -1155,7 +1342,7 @@ impl V2Validator {
         Ok(())
     }
 
-    fn require_no_open_thread_state(&self, birth: ProcessBirthKey, boundary: &str) -> Result<()> {
+    fn require_no_open_kernel_state(&self, birth: ProcessBirthKey, boundary: &str) -> Result<()> {
         if self
             .kernel_stacks
             .iter()
@@ -1163,10 +1350,19 @@ impl V2Validator {
         {
             bail!("{boundary} crossed an open kernel transition stack");
         }
+        Ok(())
+    }
+
+    fn require_no_open_offcpu_state(&self, birth: ProcessBirthKey, boundary: &str) -> Result<()> {
         if self.offcpu_open.keys().any(|(owner, _)| *owner == birth) {
             bail!("{boundary} crossed an open off-CPU episode");
         }
         Ok(())
+    }
+
+    fn require_no_open_thread_state(&self, birth: ProcessBirthKey, boundary: &str) -> Result<()> {
+        self.require_no_open_kernel_state(birth, boundary)?;
+        self.require_no_open_offcpu_state(birth, boundary)
     }
 
     fn kernel_transition(&mut self, record: &V2Record, transition: KernelTransition) -> Result<()> {
@@ -1199,7 +1395,17 @@ impl V2Validator {
         };
         record.exact_fields(expected)?;
         let key = record.image_key()?;
-        self.require_attribution_key(key)?;
+        match transition {
+            KernelTransition::Enter => self.require_attribution_key(key)?,
+            KernelTransition::Return | KernelTransition::TerminalClose => {
+                // A frame opened before `proc:::exec` can close while image
+                // attribution is disarmed, and runtime repair can advance the
+                // epoch before the containing syscall returns. Its exact
+                // stack entry remains the authority, so the key must remain
+                // known rather than current.
+                self.require_known_key(key)?;
+            }
+        }
         let tid = record.decimal_u64("tid")?;
         if tid == 0 {
             bail!("kernel transition tid must be positive");
@@ -1333,7 +1539,10 @@ impl V2Validator {
             "timestamp_ns",
         ])?;
         let key = record.image_key()?;
-        self.require_attribution_key(key)?;
+        // `sched:::on-cpu` closes episodes that began before `proc:::exec`
+        // even while new attribution is disarmed. The latched open episode
+        // supplies the exact image authority; it must still be current.
+        self.require_current_key(key)?;
         let observed = RawProcessImageKey {
             birth: record.birth("observed_pid", "observed_sec", "observed_usec")?,
             image_generation: record.decimal_u64("observed_image")?,
@@ -1463,12 +1672,65 @@ impl V2Validator {
     }
 
     fn completion(&mut self, record: &V2Record) -> Result<()> {
-        record.exact_fields(&["bounded", "live_at_end", "profile", "target_exit_reason"])?;
+        record.exact_fields(&[
+            "bounded",
+            "elapsed_ns",
+            "identity_violations",
+            "kernel_violations",
+            "lifecycle_violations",
+            "live_at_end",
+            "offcpu_violations",
+            "profile",
+            "range_violations",
+            "target_exit_reason",
+            "timed_out",
+        ])?;
         if record.required("profile")? != "native-wall" {
             bail!("DSRPROF2 completion profile must be native-wall");
         }
-        if record.decimal_u64("bounded")? != 0 {
-            bail!("gating DSRPROF2 capture must not be bounded");
+        let elapsed_ns = record.decimal_u64("elapsed_ns")?;
+        if elapsed_ns == 0 {
+            bail!("DSRPROF2 completion elapsed_ns must be positive");
+        }
+
+        let bounded = record.decimal_u64("bounded")?;
+        if bounded > 1 {
+            bail!("DSRPROF2 completion bounded field must be 0 or 1");
+        }
+        let timed_out = record.decimal_u64("timed_out")?;
+        if timed_out > 1 {
+            bail!("DSRPROF2 completion timed_out field must be 0 or 1");
+        }
+        let violations = [
+            (
+                "identity_violations",
+                record.decimal_u64("identity_violations")?,
+            ),
+            (
+                "lifecycle_violations",
+                record.decimal_u64("lifecycle_violations")?,
+            ),
+            ("range_violations", record.decimal_u64("range_violations")?),
+            (
+                "kernel_violations",
+                record.decimal_u64("kernel_violations")?,
+            ),
+            (
+                "offcpu_violations",
+                record.decimal_u64("offcpu_violations")?,
+            ),
+        ];
+        let expected_bounded = timed_out != 0 || violations.iter().any(|(_, count)| *count != 0);
+        if bounded != u64::from(expected_bounded) {
+            bail!(
+                "DSRPROF2 completion bounded={bounded} disagrees with timeout and integrity counters"
+            );
+        }
+        if timed_out != 0 {
+            bail!("gating DSRPROF2 capture timed out");
+        }
+        if let Some((name, count)) = violations.into_iter().find(|(_, count)| *count != 0) {
+            bail!("gating DSRPROF2 capture reports {name}={count}");
         }
         if record.decimal_u64("live_at_end")? != 0 {
             bail!("DSRPROF2 completion reports live processes");
@@ -1526,6 +1788,7 @@ impl V2Validator {
             let _ = stack.total_ns;
         }
         let _presentation_instances = self.presentation_instances()?;
+        self.elapsed_ns = Some(elapsed_ns);
         self.complete = true;
         Ok(())
     }
@@ -1551,6 +1814,10 @@ impl V2Validator {
             instances.insert(birth, instance);
         }
         Ok(instances)
+    }
+
+    fn into_profile_summary(self, capture_status: ProfileCaptureStatus) -> Result<ProfileSummary> {
+        build_v2_profile_summary(self, capture_status)
     }
 }
 
@@ -1879,13 +2146,170 @@ pub(crate) struct KernelSampleAddresses {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn kernel_sample_addresses_from_path(path: &Path) -> Result<KernelSampleAddresses> {
+pub(crate) fn kernel_sample_addresses_from_path(
+    path: &Path,
+    v2_authority: Option<&V2ProfileAuthority>,
+) -> Result<KernelSampleAddresses> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read native-wall raw stream {}", path.display()))?;
+    if contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| line.starts_with("DSRPROF2|header|"))
+    {
+        let authority = v2_authority
+            .cloned()
+            .ok_or_else(|| anyhow!("DSRPROF2 kernel symbol lookup has no launch authority"))?;
+        validate_v2_lines_with_validator(
+            contents.lines(),
+            ProfileCaptureStatus::default(),
+            V2Validator::with_authority(authority),
+        )
+        .context("validate authoritative DSRPROF2 stream before kernel symbol lookup")?;
+        return kernel_sample_addresses_from_v2_lines(contents.lines());
+    }
     let summary = ProfileSummary::from_lines(contents.lines(), ProfileCaptureStatus::default())
         .context("validate native-wall raw stream before kernel symbol lookup")?;
     summary.require_profile(TraceProfileKind::NativeWall)?;
     kernel_sample_addresses_from_lines(contents.lines())
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_sample_addresses_from_v2_lines<I, S>(lines: I) -> Result<KernelSampleAddresses>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut addresses = BTreeSet::new();
+    let mut kernel_pc_leaves = BTreeMap::<u64, u64>::new();
+    let mut kernel_stack_leaves = BTreeMap::<u64, u64>::new();
+    let mut open_stack = None::<(String, u64, Vec<String>, bool)>;
+
+    for (index, raw_line) in lines.into_iter().enumerate() {
+        let line = raw_line.as_ref().trim();
+        if let Some((_, _, frames, leading_separator_seen)) = open_stack.as_mut() {
+            if line == "DSRSTACK2|end" {
+                let (kind, count, frames, _) = open_stack
+                    .take()
+                    .ok_or_else(|| anyhow!("DSRSTACK2 extraction state disappeared"))?;
+                if frames.is_empty() {
+                    bail!("DSRSTACK2 block at line {} has no frames", index + 1);
+                }
+                if matches!(
+                    kind.as_str(),
+                    "kernel-named-syscall" | "kernel-mach-trap" | "kernel-non-syscall"
+                ) {
+                    let leaf = raw_kernel_address(
+                        frames
+                            .first()
+                            .ok_or_else(|| anyhow!("DSRSTACK2 kernel stack lost its leaf"))?,
+                    )?;
+                    let population = kernel_stack_leaves.entry(leaf).or_default();
+                    *population = population
+                        .checked_add(count)
+                        .ok_or_else(|| anyhow!("DSRPROF2 kernel stack leaf population overflow"))?;
+                    for frame in frames {
+                        addresses.insert(raw_kernel_address(&frame)?);
+                    }
+                } else if !kind.starts_with("offcpu-") {
+                    bail!("unknown DSRSTACK2 attribution kind {kind:?}");
+                }
+            } else if line.is_empty() {
+                if frames.is_empty() && !*leading_separator_seen {
+                    *leading_separator_seen = true;
+                    continue;
+                }
+                bail!("empty DSRSTACK2 frame at line {}", index + 1);
+            } else if line.starts_with("DSRPROF") || line.starts_with("DSRSTACK") {
+                bail!(
+                    "profile marker interrupted DSRSTACK2 block at line {}",
+                    index + 1
+                );
+            } else {
+                frames.push(line.to_owned());
+            }
+            continue;
+        }
+
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("DSRSTACK2|") {
+            let record = V2Record::parse(line, V2_STACK_PREFIX)
+                .with_context(|| format!("invalid DSRSTACK2 record at line {}", index + 1))?;
+            if record.tag != "begin" {
+                bail!("DSRSTACK2 end without begin at line {}", index + 1);
+            }
+            record.exact_fields(&[
+                "count",
+                "epoch",
+                "image",
+                "kind",
+                "pid",
+                "start_sec",
+                "start_usec",
+                "total_ns",
+            ])?;
+            let _key = record.image_key()?;
+            let kind = record.required("kind")?.to_owned();
+            validate_percent_token(&kind, "stack kind")?;
+            let count = record.decimal_u64("count")?;
+            if count == 0 {
+                bail!("DSRSTACK2 count must be positive");
+            }
+            let _total_ns = record.decimal_u64("total_ns")?;
+            open_stack = Some((kind, count, Vec::new(), false));
+            continue;
+        }
+        if !line.starts_with("DSRPROF2|") {
+            bail!("unknown DSRPROF2 extraction line {}: {line:?}", index + 1);
+        }
+        let record = V2Record::parse(line, V2_PROTOCOL_PREFIX)
+            .with_context(|| format!("invalid DSRPROF2 record at line {}", index + 1))?;
+        if record.tag != "cpu-kernel" {
+            continue;
+        }
+        record.exact_fields(&[
+            "class",
+            "count",
+            "epoch",
+            "image",
+            "pc",
+            "pid",
+            "start_sec",
+            "start_usec",
+        ])?;
+        let _key = record.image_key()?;
+        match record.required("class")? {
+            "kernel-named-syscall" | "kernel-mach-trap" | "kernel-non-syscall" => {}
+            other => bail!("unknown cpu-kernel class {other:?}"),
+        }
+        let leaf = record.address("pc")?;
+        let count = record.decimal_u64("count")?;
+        if count == 0 {
+            bail!("cpu-kernel count must be positive");
+        }
+        addresses.insert(leaf);
+        let population = kernel_pc_leaves.entry(leaf).or_default();
+        *population = population
+            .checked_add(count)
+            .ok_or_else(|| anyhow!("DSRPROF2 kernel PC population overflow"))?;
+    }
+
+    if open_stack.is_some() {
+        bail!("DSRPROF2 stream ended inside a DSRSTACK2 block");
+    }
+    if addresses.is_empty() {
+        bail!("DSRPROF2 stream has no raw kernel stack addresses");
+    }
+    if kernel_pc_leaves != kernel_stack_leaves {
+        bail!("DSRPROF2 kernel PC and exact stack leaf populations differ");
+    }
+    Ok(KernelSampleAddresses {
+        requested: addresses.into_iter().collect(),
+        weighted_leaves: kernel_pc_leaves.into_keys().collect(),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1997,6 +2421,8 @@ pub(crate) struct ProfileCaptureStatus {
     pub(crate) principal_drops: u64,
     pub(crate) aggregation_drops: u64,
     pub(crate) dynamic_drops: u64,
+    pub(crate) dynamic_rinse_drops: u64,
+    pub(crate) dynamic_dirty_drops: u64,
     pub(crate) other_drops: u64,
     pub(crate) interrupted: bool,
 }
@@ -2008,6 +2434,8 @@ impl From<carrick_runtime::dtrace_consumer::DTraceRunReport> for ProfileCaptureS
             principal_drops: report.principal_drops,
             aggregation_drops: report.aggregation_drops,
             dynamic_drops: report.dynamic_drops,
+            dynamic_rinse_drops: report.dynamic_rinse_drops,
+            dynamic_dirty_drops: report.dynamic_dirty_drops,
             other_drops: report.other_drops,
             interrupted: report.interrupted,
         }
@@ -2062,6 +2490,335 @@ struct MetricBuilder {
     samples_ns: Vec<f64>,
     sampling_interval: Option<u64>,
     incomplete: u64,
+}
+
+fn add_v2_exact_metric(
+    grouped: &mut BTreeMap<ProfileScope, MetricBuilder>,
+    scope: ProfileScope,
+    count: Option<u64>,
+    total_ns: Option<u64>,
+) -> Result<()> {
+    let builder = grouped.entry(scope).or_default();
+    if let Some(value) = count {
+        builder.count = Some(
+            builder
+                .count
+                .unwrap_or(0)
+                .checked_add(value)
+                .ok_or_else(|| anyhow!("DSRPROF2 summary count overflow"))?,
+        );
+    }
+    if let Some(value) = total_ns {
+        builder.total_ns = Some(
+            builder
+                .total_ns
+                .unwrap_or(0)
+                .checked_add(value)
+                .ok_or_else(|| anyhow!("DSRPROF2 summary duration overflow"))?,
+        );
+    }
+    Ok(())
+}
+
+fn v2_profile_scope(
+    phase: impl Into<String>,
+    pid: Option<u64>,
+    kind: Option<String>,
+    source_pc: Option<u64>,
+) -> ProfileScope {
+    ProfileScope {
+        phase: Some(phase.into()),
+        pid,
+        tid: None,
+        kind,
+        source_pc,
+        target_pc: None,
+    }
+}
+
+fn build_v2_profile_summary(
+    mut validator: V2Validator,
+    capture_status: ProfileCaptureStatus,
+) -> Result<ProfileSummary> {
+    if !validator.complete {
+        bail!("cannot summarize an incomplete DSRPROF2 stream");
+    }
+    let instances = validator.presentation_instances()?;
+    let instance_for = |key: RawProcessImageKey| {
+        instances
+            .get(&key.birth)
+            .copied()
+            .ok_or_else(|| anyhow!("DSRPROF2 summary lost a process presentation identity"))
+    };
+    let target = validator
+        .target
+        .ok_or_else(|| anyhow!("DSRPROF2 summary lost its target birth"))?;
+    let wall_hz = validator
+        .wall_hz
+        .ok_or_else(|| anyhow!("DSRPROF2 summary lost wall_hz"))?;
+    let cpu_hz = validator
+        .cpu_hz
+        .ok_or_else(|| anyhow!("DSRPROF2 summary lost cpu_hz"))?;
+    let elapsed_ns = validator
+        .elapsed_ns
+        .ok_or_else(|| anyhow!("DSRPROF2 summary lost elapsed_ns"))?;
+
+    let mut grouped = BTreeMap::<ProfileScope, MetricBuilder>::new();
+    let mut wall_samples = 0_u64;
+    for (kind, count) in &validator.wall_state {
+        wall_samples = wall_samples
+            .checked_add(*count)
+            .ok_or_else(|| anyhow!("DSRPROF2 wall-state population overflow"))?;
+        add_v2_exact_metric(
+            &mut grouped,
+            v2_profile_scope("wall-state", None, Some(kind.clone()), None),
+            Some(*count),
+            None,
+        )?;
+    }
+    add_v2_exact_metric(
+        &mut grouped,
+        v2_profile_scope("wall-samples", None, None, None),
+        Some(wall_samples),
+        None,
+    )?;
+    add_v2_exact_metric(
+        &mut grouped,
+        v2_profile_scope("elapsed", None, None, None),
+        None,
+        Some(elapsed_ns),
+    )?;
+
+    let child_count = validator
+        .processes
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("DSRPROF2 summary has no target process"))?;
+    let child_count = u64::try_from(child_count).context("DSRPROF2 child count exceeds u64")?;
+    for (kind, count) in [
+        ("create", child_count),
+        ("exit", child_count),
+        ("live-at-end", 0),
+    ] {
+        add_v2_exact_metric(
+            &mut grouped,
+            v2_profile_scope("process-lifecycle", None, Some(kind.to_owned()), None),
+            Some(count),
+            None,
+        )?;
+    }
+
+    for ((key, pc), count) in &validator.cpu_user_summary {
+        add_v2_exact_metric(
+            &mut grouped,
+            v2_profile_scope("cpu-user-pc", Some(instance_for(*key)?), None, Some(*pc)),
+            Some(*count),
+            None,
+        )?;
+    }
+    let mut kernel_pc_samples = 0_u64;
+    for ((key, class, pc), count) in &validator.cpu_kernel_summary {
+        kernel_pc_samples = kernel_pc_samples
+            .checked_add(*count)
+            .ok_or_else(|| anyhow!("DSRPROF2 kernel PC population overflow"))?;
+        add_v2_exact_metric(
+            &mut grouped,
+            v2_profile_scope(
+                "cpu-kernel-pc",
+                Some(instance_for(*key)?),
+                Some(class.clone()),
+                Some(*pc),
+            ),
+            Some(*count),
+            None,
+        )?;
+    }
+
+    let mut offcpu_population = BTreeMap::<String, (u64, u64)>::new();
+    for ((key, kind, pc), (count, total_ns)) in &validator.offcpu_summary {
+        let phase = format!("offcpu-{kind}-pc");
+        add_v2_exact_metric(
+            &mut grouped,
+            v2_profile_scope(phase, Some(instance_for(*key)?), None, Some(*pc)),
+            Some(*count),
+            Some(*total_ns),
+        )?;
+        let population = offcpu_population.entry(kind.clone()).or_default();
+        population.0 = population
+            .0
+            .checked_add(*count)
+            .ok_or_else(|| anyhow!("DSRPROF2 off-CPU count overflow"))?;
+        population.1 = population
+            .1
+            .checked_add(*total_ns)
+            .ok_or_else(|| anyhow!("DSRPROF2 off-CPU duration overflow"))?;
+    }
+    for (kind, (_, total_ns)) in &offcpu_population {
+        add_v2_exact_metric(
+            &mut grouped,
+            v2_profile_scope(format!("offcpu-{kind}-total"), None, None, None),
+            None,
+            Some(*total_ns),
+        )?;
+    }
+
+    for (key, epoch) in &validator.epochs {
+        let pid = Some(instance_for(*key)?);
+        for (kind, base) in [
+            ("host", epoch.host_image_base),
+            ("guest", epoch.guest_image_base),
+        ] {
+            if let Some(base) = base {
+                add_v2_exact_metric(
+                    &mut grouped,
+                    v2_profile_scope("image-base", pid, Some(kind.to_owned()), Some(base)),
+                    Some(1),
+                    None,
+                )?;
+            }
+        }
+    }
+
+    let mut metrics = Vec::new();
+    for (scope, builder) in grouped {
+        metrics.push(ProfileOutputMetric {
+            scope,
+            metric: ProfileMetric::Exact {
+                count: builder.count,
+                total_ns: builder.total_ns,
+                minimum_ns: None,
+                maximum_ns: None,
+            },
+            sampling_interval: None,
+        });
+    }
+
+    for (key, epoch) in &validator.epochs {
+        if let Some(ranges) = epoch.host_image_catalog.as_ref() {
+            let pid = instance_for(*key)?;
+            metrics.push(ProfileOutputMetric {
+                scope: v2_profile_scope(
+                    "image-catalog",
+                    Some(pid),
+                    Some(format!(
+                        "image-{}-epoch-{}",
+                        key.image_generation, key.runtime_epoch
+                    )),
+                    None,
+                ),
+                metric: ProfileMetric::ImageCatalog {
+                    pid,
+                    ranges: ranges.clone(),
+                },
+                sampling_interval: None,
+            });
+        }
+    }
+
+    validator.stacks.sort_by(|left, right| {
+        (
+            left.key,
+            left.kind.as_str(),
+            left.count,
+            left.total_ns,
+            &left.frames,
+        )
+            .cmp(&(
+                right.key,
+                right.kind.as_str(),
+                right.count,
+                right.total_ns,
+                &right.frames,
+            ))
+    });
+    let mut kernel_stack_samples = 0_u64;
+    let mut offcpu_stack_population = BTreeMap::<String, (u64, u64)>::new();
+    for stack in validator.stacks {
+        let pid = instance_for(stack.key)?;
+        let (phase, value_ns) = if let Some(kind) = stack.kind.strip_prefix("offcpu-") {
+            let population = offcpu_stack_population.entry(kind.to_owned()).or_default();
+            population.0 = population
+                .0
+                .checked_add(stack.count)
+                .ok_or_else(|| anyhow!("DSRPROF2 off-CPU stack count overflow"))?;
+            population.1 = population
+                .1
+                .checked_add(stack.total_ns)
+                .ok_or_else(|| anyhow!("DSRPROF2 off-CPU stack duration overflow"))?;
+            (format!("offcpu-{kind}-stack"), Some(stack.total_ns))
+        } else {
+            if !matches!(
+                stack.kind.as_str(),
+                "kernel-named-syscall" | "kernel-mach-trap" | "kernel-non-syscall"
+            ) {
+                bail!("unknown DSRPROF2 kernel stack kind {:?}", stack.kind);
+            }
+            if stack.total_ns != 0 {
+                bail!("DSRPROF2 kernel stack unexpectedly carries duration");
+            }
+            kernel_stack_samples = kernel_stack_samples
+                .checked_add(stack.count)
+                .ok_or_else(|| anyhow!("DSRPROF2 kernel stack population overflow"))?;
+            ("cpu-kernel-stack".to_owned(), None)
+        };
+        metrics.push(ProfileOutputMetric {
+            scope: v2_profile_scope(phase, Some(pid), Some(stack.kind.clone()), None),
+            metric: ProfileMetric::StackTrace {
+                state: stack.kind,
+                pid: Some(pid),
+                count: Some(stack.count),
+                value_ns,
+                frames: stack.frames,
+            },
+            sampling_interval: None,
+        });
+    }
+    if kernel_stack_samples != kernel_pc_samples {
+        bail!(
+            "DSRPROF2 kernel stack population {kernel_stack_samples} does not match kernel PC population {kernel_pc_samples}"
+        );
+    }
+    if offcpu_stack_population != offcpu_population {
+        bail!("DSRPROF2 off-CPU stack and PC populations disagree");
+    }
+
+    metrics.push(ProfileOutputMetric {
+        scope: v2_profile_scope("sampling-configuration", None, None, None),
+        metric: ProfileMetric::SamplingConfiguration { wall_hz, cpu_hz },
+        sampling_interval: None,
+    });
+    metrics.push(ProfileOutputMetric {
+        scope: ProfileScope {
+            phase: None,
+            pid: None,
+            tid: None,
+            kind: None,
+            source_pc: None,
+            target_pc: None,
+        },
+        metric: ProfileMetric::Completion,
+        sampling_interval: None,
+    });
+
+    let target_exit_reason = validator
+        .processes
+        .get(&target)
+        .and_then(|process| process.exit_reason)
+        .ok_or_else(|| anyhow!("DSRPROF2 summary lost target exit status"))?;
+    Ok(ProfileSummary {
+        profile: TraceProfileKind::NativeWall,
+        completion: CompletionState {
+            complete: true,
+            bounded: false,
+            target_exit_reason,
+            high_cardinality_overflow: false,
+            incomplete_pairs: 0,
+            cardinality: ProfileCardinality::default(),
+            drops: capture_status,
+        },
+        metrics,
+        provenance: ProfileProvenance::default(),
+    })
 }
 
 fn summed_count(
@@ -2179,6 +2936,10 @@ pub(crate) enum ProfileMetric {
         pid: u64,
         ranges: Vec<HostImageRangeRecord>,
     },
+    SamplingConfiguration {
+        wall_hz: u64,
+        cpu_hz: u64,
+    },
     #[cfg(target_os = "macos")]
     SampledKernelSymbols {
         overlay: SampledKernelSymbolOverlay,
@@ -2253,11 +3014,44 @@ impl ProfileSummary {
         Self::from_lines(contents.lines(), capture_status)
     }
 
+    pub(crate) fn from_v2_path_with_authority(
+        path: &Path,
+        capture_status: ProfileCaptureStatus,
+        authority: V2ProfileAuthority,
+    ) -> Result<Self> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("read authoritative DSRPROF2 stream {}", path.display()))?;
+        let validator = parse_v2_lines_with_validator(
+            contents.lines(),
+            capture_status,
+            V2Validator::with_authority(authority),
+        )?;
+        validator.into_profile_summary(capture_status)
+    }
+
     pub(crate) fn from_lines<I, S>(lines: I, capture_status: ProfileCaptureStatus) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let lines = lines
+            .into_iter()
+            .map(|line| line.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        if lines
+            .iter()
+            .map(|line| line.trim())
+            .find(|line| !line.is_empty())
+            .is_some_and(|line| line.starts_with("DSRPROF2|"))
+        {
+            let validator = parse_v2_lines_with_validator(
+                lines.iter().map(String::as_str),
+                capture_status,
+                V2Validator::default(),
+            )?;
+            return validator.into_profile_summary(capture_status);
+        }
+
         if capture_status.principal_drops != 0 {
             bail!(
                 "DTrace principal buffer dropped {} record(s); profile stream is truncated",
@@ -2272,8 +3066,8 @@ impl ProfileSummary {
         let mut open_stack = None::<StackTraceRecord>;
         let mut completion = None;
 
-        for (index, raw_line) in lines.into_iter().enumerate() {
-            let line = raw_line.as_ref().trim();
+        for (index, raw_line) in lines.iter().enumerate() {
+            let line = raw_line.trim();
             if line.is_empty() {
                 continue;
             }
@@ -2481,11 +3275,15 @@ impl ProfileSummary {
                 && incomplete_pairs == 0
                 && capture_status.aggregation_drops == 0
                 && capture_status.dynamic_drops == 0
+                && capture_status.dynamic_rinse_drops == 0
+                && capture_status.dynamic_dirty_drops == 0
                 && capture_status.other_drops == 0,
             bounded,
             target_exit_reason,
             high_cardinality_overflow: capture_status.aggregation_drops != 0
-                || capture_status.dynamic_drops != 0,
+                || capture_status.dynamic_drops != 0
+                || capture_status.dynamic_rinse_drops != 0
+                || capture_status.dynamic_dirty_drops != 0,
             incomplete_pairs,
             cardinality,
             drops: capture_status,
@@ -2660,16 +3458,20 @@ impl ProfileSummary {
             .collect::<BTreeSet<_>>();
 
         let mut expected_requested = BTreeSet::new();
-        let mut weighted_leaves = BTreeSet::new();
         for metric in &self.metrics {
             if metric.scope.phase.as_deref() == Some("cpu-kernel-pc")
                 && let Some(address) = metric.scope.source_pc
             {
                 expected_requested.insert(address);
-                weighted_leaves.insert(address);
             }
             if let ProfileMetric::StackTrace { state, frames, .. } = &metric.metric
-                && state == "kernel-oncpu"
+                && matches!(
+                    state.as_str(),
+                    "kernel-oncpu"
+                        | "kernel-named-syscall"
+                        | "kernel-mach-trap"
+                        | "kernel-non-syscall"
+                )
             {
                 for frame in frames {
                     expected_requested.insert(raw_kernel_address(frame)?);
@@ -2689,17 +3491,10 @@ impl ProfileSummary {
                 "sampled overlay does not match raw kernel address population: missing={missing:#x?}, extra={extra:#x?}"
             );
         }
-        let unresolved_leaves = weighted_leaves
-            .intersection(&unresolved)
-            .copied()
-            .collect::<Vec<_>>();
-        if !unresolved_leaves.is_empty() {
-            bail!("sampled overlay has unresolved weighted leaves: {unresolved_leaves:#x?}");
-        }
         for address in &overlay.unresolved {
             if address.status != -1 || address.dtrace_errno != 1015 {
                 bail!(
-                    "unresolved caller {:#x} has status ({}, {}), expected (-1, 1015)",
+                    "unresolved kernel address {:#x} has status ({}, {}), expected (-1, 1015)",
                     address.address,
                     address.status,
                     address.dtrace_errno
@@ -2748,7 +3543,7 @@ impl ProfileSummary {
 
     pub(crate) fn render_human(&self) -> String {
         format!(
-            "DSR profile {}: {} metric row(s), complete={}, bounded={}, interrupted={}, target_exit_reason={}, incomplete_pairs={}, drops={}/{}/{}/{}",
+            "DSR profile {}: {} metric row(s), complete={}, bounded={}, interrupted={}, target_exit_reason={}, incomplete_pairs={}, drops=principal:{},aggregation:{},dynamic:{},dynamic_rinse:{},dynamic_dirty:{},other:{}",
             self.profile.as_str(),
             self.metrics.len().saturating_sub(1),
             self.completion.complete,
@@ -2759,6 +3554,8 @@ impl ProfileSummary {
             self.completion.drops.principal_drops,
             self.completion.drops.aggregation_drops,
             self.completion.drops.dynamic_drops,
+            self.completion.drops.dynamic_rinse_drops,
+            self.completion.drops.dynamic_dirty_drops,
             self.completion.drops.other_drops,
         )
     }
@@ -2871,6 +3668,155 @@ pub(crate) fn write_summary_atomic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsrprof2_summary_preserves_birth_keyed_metrics() {
+        let summary = ProfileSummary::from_lines(
+            include_str!("../tests/fixtures/dsrprof2-valid.raw").lines(),
+            ProfileCaptureStatus::default(),
+        )
+        .expect("DSRPROF2 summary");
+        assert_eq!(summary.profile, TraceProfileKind::NativeWall);
+        assert!(summary.completion.complete);
+
+        let rows = summary
+            .json_rows()
+            .into_iter()
+            .map(|row| serde_json::to_value(row).expect("serialize DSRPROF2 summary row"))
+            .collect::<Vec<_>>();
+        let exact = |phase: &str, pid: Option<u64>, source_pc: Option<u64>| {
+            rows.iter().find(|row| {
+                row["scope"]["phase"] == phase
+                    && pid.is_none_or(|value| row["scope"]["pid"] == value)
+                    && source_pc.is_none_or(|value| row["scope"]["source_pc"] == value)
+                    && row["metric"]["type"] == "exact"
+            })
+        };
+        assert_eq!(
+            exact("wall-samples", None, None).unwrap()["metric"]["count"],
+            11
+        );
+        assert_eq!(
+            exact("cpu-user-pc", Some(1), Some(0x1100)).unwrap()["metric"]["count"],
+            3
+        );
+        let offcpu = exact("offcpu-voluntary-pc", Some(1), Some(0x1150)).unwrap();
+        assert_eq!(offcpu["metric"]["count"], 1);
+        assert_eq!(offcpu["metric"]["total_ns"], 500);
+        assert_eq!(
+            exact("elapsed", None, None).unwrap()["metric"]["total_ns"],
+            60_000_000
+        );
+        assert!(rows.iter().any(|row| {
+            row["scope"]["phase"] == "offcpu-voluntary-stack"
+                && row["scope"]["pid"] == 1
+                && row["metric"]["value_ns"] == 500
+        }));
+        assert!(rows.iter().any(|row| {
+            row["scope"]["phase"] == "image-catalog"
+                && row["scope"]["pid"] == 1
+                && row["metric"]["pid"] == 1
+        }));
+        assert_eq!(rows.last().unwrap()["metric"]["type"], "completion");
+    }
+
+    #[test]
+    fn dsrprof2_authoritative_summary_retains_terminal_qualification() {
+        let terminal = concat!(
+            "DSRPROF2|kernel-enter|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=bsdthread_terminate|class=named-syscall|timestamp_ns=1900\n",
+            "DSRPROF2|kernel-terminal-close|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=bsdthread_terminate|class=named-syscall|scope=thread|timestamp_ns=2000\n",
+        );
+        let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw").replacen(
+            "DSRPROF2|process-exit|pid=100",
+            &format!("{terminal}DSRPROF2|process-exit|pid=100"),
+            1,
+        );
+        let input = tempfile::NamedTempFile::new().expect("temporary DSRPROF2 stream");
+        std::fs::write(input.path(), raw).expect("write temporary DSRPROF2 stream");
+        let authority = V2ProfileAuthority::new(
+            "26A123",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            [
+                (
+                    "syscall".to_owned(),
+                    "bsdthread_terminate".to_owned(),
+                    "thread".to_owned(),
+                ),
+                (
+                    "syscall".to_owned(),
+                    "exit".to_owned(),
+                    "process".to_owned(),
+                ),
+            ],
+        )
+        .expect("valid launch authority");
+
+        let summary = ProfileSummary::from_v2_path_with_authority(
+            input.path(),
+            ProfileCaptureStatus::default(),
+            authority,
+        )
+        .expect("authoritative DSRPROF2 summary");
+
+        assert_eq!(summary.profile, TraceProfileKind::NativeWall);
+        assert!(summary.completion.complete);
+    }
+
+    #[test]
+    fn dsrprof2_header_must_match_exact_launch_authority() {
+        let authority = V2ProfileAuthority::new(
+            "26A123",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            [
+                (
+                    "syscall".to_owned(),
+                    "bsdthread_terminate".to_owned(),
+                    "thread".to_owned(),
+                ),
+                (
+                    "syscall".to_owned(),
+                    "exit".to_owned(),
+                    "process".to_owned(),
+                ),
+            ],
+        )
+        .expect("valid launch authority");
+        let header = "DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v2|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499";
+
+        let mut validator = V2Validator::with_authority(authority.clone());
+        validator
+            .header(&V2Record::parse(header, V2_PROTOCOL_PREFIX).expect("exact header"))
+            .expect("matching authority");
+
+        for corrupt in [
+            header.replacen("os_build=26A123", "os_build=26A124", 1),
+            header.replacen(
+                "program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "program_sha256=daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                1,
+            ),
+            header.replacen(
+                "birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "birth_qualification_sha256=dbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                1,
+            ),
+            header.replacen(
+                "terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "terminal_qualification_sha256=dccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                1,
+            ),
+        ] {
+            let mut validator = V2Validator::with_authority(authority.clone());
+            let record = V2Record::parse(&corrupt, V2_PROTOCOL_PREFIX)
+                .expect("syntactically valid corrupt header");
+            assert!(validator.header(&record).is_err());
+        }
+    }
+
     #[cfg(target_os = "macos")]
     use carrick_runtime::dtrace_symbols::{
         KernelIdentity, SampledKernelSymbol, SampledKernelSymbolOverlay, UnresolvedKernelAddress,
@@ -3003,18 +3949,51 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn sampled_kernel_overlay_rejects_unresolved_leaf_or_nonpublic_caller_status() {
-        for overlay in [
-            sampled_kernel_overlay(&[0x1028, 0x1038], &[(0x1018, -1, 1015)]),
-            sampled_kernel_overlay(&[0x1018, 0x1028], &[(0x1038, -2, 999)]),
-        ] {
-            let mut summary = ProfileSummary::from_lines(
-                raw_native_wall_lines(),
-                ProfileCaptureStatus::default(),
-            )
-            .expect("summary");
-            assert!(summary.attach_sampled_kernel_overlay(overlay).is_err());
-        }
+    fn dsrprof2_summary_overlay_accepts_v2_kernel_stack_kinds() {
+        let mut summary = ProfileSummary::from_lines(
+            include_str!("../tests/fixtures/dsrprof2-valid.raw").lines(),
+            ProfileCaptureStatus::default(),
+        )
+        .expect("DSRPROF2 summary");
+
+        summary
+            .attach_sampled_kernel_overlay(sampled_kernel_overlay(
+                &[0xfffffe0010010010, 0xfffffe0010020020],
+                &[],
+            ))
+            .expect("attach sampled overlay to DSRPROF2 summary");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sampled_kernel_overlay_accepts_libdtrace_nosym_leaf() {
+        let mut summary =
+            ProfileSummary::from_lines(raw_native_wall_lines(), ProfileCaptureStatus::default())
+                .expect("summary");
+
+        summary
+            .attach_sampled_kernel_overlay(sampled_kernel_overlay(
+                &[0x1028, 0x1038],
+                &[(0x1018, -1, 1015)],
+            ))
+            .expect("attach exact unresolved kernel leaf");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sampled_kernel_overlay_rejects_nonpublic_lookup_status() {
+        let mut summary =
+            ProfileSummary::from_lines(raw_native_wall_lines(), ProfileCaptureStatus::default())
+                .expect("summary");
+
+        assert!(
+            summary
+                .attach_sampled_kernel_overlay(sampled_kernel_overlay(
+                    &[0x1018, 0x1028],
+                    &[(0x1038, -2, 999)],
+                ))
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -3134,6 +4113,34 @@ mod tests {
             kernel_sample_addresses_from_lines(raw_native_wall_lines()).expect("addresses");
         assert_eq!(addresses.requested, [0x1018, 0x1028, 0x1038]);
         assert_eq!(addresses.weighted_leaves, BTreeSet::from([0x1018]));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dsrprof2_kernel_address_extraction_ignores_user_offcpu_stacks() {
+        let lines = [
+            "DSRPROF2|cpu-kernel|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|class=kernel-named-syscall|pc=0xfffffe0010010010|count=2",
+            "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=kernel-named-syscall|count=2|total_ns=0",
+            "",
+            "0xfffffe0010010010",
+            "0xfffffe0010020020",
+            "DSRSTACK2|end",
+            "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-runnable|count=1|total_ns=50",
+            "",
+            "0x100001018",
+            "0x100001028",
+            "DSRSTACK2|end",
+        ];
+
+        let addresses = kernel_sample_addresses_from_v2_lines(lines).expect("DSRPROF2 addresses");
+        assert_eq!(
+            addresses.requested,
+            [0xfffffe0010010010, 0xfffffe0010020020]
+        );
+        assert_eq!(
+            addresses.weighted_leaves,
+            BTreeSet::from([0xfffffe0010010010])
+        );
     }
 
     #[cfg(target_os = "macos")]
