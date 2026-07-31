@@ -1,7 +1,8 @@
 # Native-lane performance handoff
 
 **Date:** 2026-07-30
-**Branch:** `main` (tip `5f65eabd`)
+**Branch:** `codex/native-performance-m1` (M1 correctness checkpoint
+`5020e509`)
 **Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
 default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
@@ -12,7 +13,43 @@ default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
 Evidence for everything below is in
 [`docs/perf-results/2026-07-29-native-cpu-budget-evidence.md`](docs/perf-results/2026-07-29-native-cpu-budget-evidence.md),
-runs 1–30. Read that before re-deriving anything here.
+runs 1–31. Read that before re-deriving anything here.
+
+---
+
+## Current checkpoint — M1 authority closed, M2 performance work open
+
+**M1 instrument authority is complete, but it is not a speed result.** The
+accepted same-binary control/control artifact is
+[`scripts/perf/evidence/native-go-build-abba-control-control-v1.json`](scripts/perf/evidence/native-go-build-abba-control-control-v1.json)
+(SHA-256
+`13f53bfec091cbbdee53dd1cbd91e8bad061948989a004113fe8fb1c24171ee8`).
+Its eight-quad total-child-CPU B/A median is `1.0052799282253981`, with
+`statistical_pass=false` and `retained=false`. It validates receipt-bound ABBA
+execution and the instrument's 2.5021% n=8 resolution; it does not update H0,
+establish a regression, or claim an optimization.
+
+**The load-coupled correctness defect discovered during closeout is fixed.**
+The first retry-enabled broad smoke reported 21/23 and its two targeted retries
+reported 2/2; preserve that sequence as discovery evidence, not as a rewritten
+23/23 run. A real LLDB core then proved that translated execution still carried
+control and address state through physical x18 even though Darwin may clear its
+platform register asynchronously. Commit `5020e509` removes all such emitted
+live ranges and adds fail-closed decoded-instruction, cold-arm, stack-pointer,
+DC-ZVA, and every-recovery-boundary coverage.
+
+The retained signed binary
+`d31e60966075c3709ac3cd83a0fe4b4b6d672371ba2b6ff9e99ae6400d13c9e0`
+passed the exact concurrent CPython `test_close_fds` reducer 4/4. A fresh
+`just conformance-native smoke --workers 4 --flake-retries 1` then reported
+23/23 MATCH, including `cpython-subprocess` 278/278; the oracle phase used all
+23 cached results and ran Docker zero times. Final `just ci` passed.
+
+**Next:** begin M2 with a fresh signed binary from this retained code state, an
+untraced Go-build run, and DTrace/carrick-trace attribution. Keep the Go-build
+workload as the primary retention gate, use controls that opt out of one
+hypothesis at a time, and do not turn a trace sample into a performance claim.
+The ≥30% CPU goal is still open.
 
 ---
 
