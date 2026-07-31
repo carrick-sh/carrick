@@ -637,6 +637,42 @@ mod native_syscall_service_probe_abi {
     }
 }
 
+#[cfg(test)]
+mod image_publication_probe_abi {
+    use super::{PreparedGuestImagePath, PreparedHostImagePublication};
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn prepared_image_publication_wrappers_keep_real_or_stub_signatures() {
+        let _: fn(String) -> PreparedGuestImagePath = super::prepare_guest_image_path;
+        let _: fn(u64, u64, &PreparedGuestImagePath) = super::guest_image_base;
+        let _: fn() -> PreparedHostImagePublication = super::prepare_host_image_publication;
+        let _: fn(&PreparedHostImagePublication) = super::publish_host_image_base;
+        let _: fn(&PreparedHostImagePublication) = super::publish_host_image_catalog;
+        assert_send_sync::<PreparedGuestImagePath>();
+        assert_send_sync::<PreparedHostImagePublication>();
+    }
+
+    #[test]
+    fn image_publication_provider_uses_only_prepared_raw_path_pointers() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn host__image__base(_: u32, _: u64, _: i64, _: *const u8) {}",
+            "fn host__image__catalog(_: *const u8) {}",
+            "fn guest__image__base(_: u32, _: u64, _: u64, _: *const u8) {}",
+        ] {
+            assert!(
+                source.contains(declaration),
+                "missing raw-pointer provider declaration {declaration:?}"
+            );
+        }
+        assert!(source.contains(
+            "stub!(guest_image_base(base: u64, entry: u64, path: &PreparedGuestImagePath));"
+        ));
+    }
+}
+
 /// Which side of a native (DSR) fork a `fork-lifecycle` sample describes.
 ///
 /// Deliberately the SAME role convention the HVF lane and
@@ -1356,18 +1392,37 @@ mod real {
         path: String,
     }
 
+    /// Owned, immutable guest-image path in the exact NUL-terminated wire
+    /// shape consumed by DTrace's `copyinstr`.
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct PreparedGuestImagePath {
+        wire: Box<[u8]>,
+    }
+
+    impl PreparedGuestImagePath {
+        pub fn as_str(&self) -> &str {
+            let path = &self.wire[..self.wire.len().saturating_sub(1)];
+            // SAFETY: the only constructor consumes a valid `String` and
+            // appends one byte; it never changes the original UTF-8 bytes.
+            unsafe { std::str::from_utf8_unchecked(path) }
+        }
+    }
+
     /// Owned host-image identity collected before a native exec crosses its
     /// mapped-memory point of no return.
     ///
-    /// The fields stay private so callers can only borrow the exact prepared
-    /// payload back into the two probe fires. In particular, this type is not
-    /// `Clone`: publication after translated-range activation cannot duplicate
-    /// the dyld path or catalog's `Vec<String>` storage.
+    /// The fields stay private so callers can only fire raw pointers into the
+    /// exact prepared NUL buffers. This type is deliberately not `Clone`:
+    /// publication after translated-range activation cannot rebuild the dyld
+    /// path or reserialize the catalog.
     #[cfg(target_os = "macos")]
     #[derive(Debug)]
     pub struct PreparedHostImagePublication {
-        base: HostImageBase,
-        catalog: HostImageCatalog,
+        pid: u32,
+        base: u64,
+        slide: i64,
+        base_path_wire: Box<[u8]>,
+        catalog_wire: Box<[u8]>,
     }
 
     /// Cross-target shape for the real USDT arm. Dyld identity exists only on
@@ -1651,20 +1706,21 @@ mod real {
         /// ELF's load address for the same reason: the native lane maps guest
         /// text into the same address space, so a sampled PC can legitimately
         /// land in the guest image rather than in ours.
-        fn host__image__base(_: u32, _: u64, _: i64, _: &str) {}
+        fn host__image__base(_: u32, _: u64, _: i64, _: *const u8) {}
         /// Executable dyld image ranges for this process.
         ///
-        /// The catalog is JSON-encoded lazily by `usdt`, so enumerating dyld
-        /// images costs nothing unless this exact probe is enabled.
+        /// The caller supplies the already encoded
+        /// `{"ok":<compact-json>}\0` wire buffer. `usdt` receives only its
+        /// retained raw pointer and performs no serialization at probe fire.
         #[cfg(target_os = "macos")]
-        fn host__image__catalog(_: crate::probes::real::HostImageCatalog) {}
+        fn host__image__catalog(_: *const u8) {}
         /// The INNER guest image: `pid`, load base, entry, and path.
         ///
         /// Reported separately from `host-image-base` because they are two
         /// different files at two different bases sharing one address space.
         /// A guest PC resolved against carrick's symbol table produces a name,
         /// not an error -- so the two must never be conflated.
-        fn guest__image__base(_: u32, _: u64, _: u64, _: &str) {}
+        fn guest__image__base(_: u32, _: u64, _: u64, _: *const u8) {}
         /// Half-open executable range of this process's anonymous DSR cache.
         ///
         /// A sampled PC outside the host and guest images may be translated
@@ -2262,14 +2318,28 @@ mod real {
         }
     }
 
+    fn nul_terminated_wire(value: String) -> Box<[u8]> {
+        let mut bytes = value.into_bytes();
+        bytes.push(0);
+        bytes.into_boxed_slice()
+    }
+
+    pub fn prepare_guest_image_path(path: String) -> PreparedGuestImagePath {
+        PreparedGuestImagePath {
+            wire: nul_terminated_wire(path),
+        }
+    }
+
+    fn prepared_guest_image_path_arg(path: &PreparedGuestImagePath) -> *const u8 {
+        path.wire.as_ptr()
+    }
+
     #[cfg(target_os = "macos")]
-    fn publish_host_image_base_snapshot(snapshot: &HostImageBase) {
-        carrick_usdt::host__image__base!(|| (
-            snapshot.pid,
-            snapshot.base,
-            snapshot.slide,
-            snapshot.path.as_str()
-        ));
+    fn publish_host_image_base_snapshot(snapshot: HostImageBase) {
+        let path_wire = nul_terminated_wire(snapshot.path);
+        let path = path_wire.as_ptr();
+        carrick_usdt::host__image__base!(|| (snapshot.pid, snapshot.base, snapshot.slide, path));
+        std::hint::black_box(&path_wire);
     }
 
     /// Collect and publish this process's carrick image base immediately.
@@ -2277,7 +2347,7 @@ mod real {
     /// allocation happens before its fatal-only boundary.
     pub fn host_image_base() {
         #[cfg(target_os = "macos")]
-        publish_host_image_base_snapshot(&host_image_base_snapshot());
+        publish_host_image_base_snapshot(host_image_base_snapshot());
         // Not macOS: dyld is the mechanism above, and only the Darwin native
         // lane self-reexecs its guest processes. Announcing a base we have not
         // actually queried would be worse than announcing none -- a consumer
@@ -2411,30 +2481,73 @@ mod real {
 
     /// Publish exact executable ranges for Darwin's process runtime images.
     ///
-    /// The snapshot is constructed inside the probe closure. `usdt` invokes
-    /// that closure only when `host-image-catalog` has a live consumer, keeping
-    /// the ordinary native path at its single disabled-probe branch. Carrick's
-    /// own text has a separate exact announcement; framework PCs outside this
-    /// bounded catalog remain unresolved and count against the coverage gate.
+    /// This compatibility convenience prepares a complete one-shot wire
+    /// buffer before firing. Native exec uses [`prepare_host_image_publication`]
+    /// earlier, before its point of no return. Carrick's own text has a
+    /// separate exact announcement; framework PCs outside this bounded catalog
+    /// remain unresolved and count against the coverage gate.
     #[cfg(target_os = "macos")]
-    #[allow(clippy::redundant_closure)] // usdt rejects a bare function item.
     pub fn host_image_catalog() {
-        carrick_usdt::host__image__catalog!(|| host_image_catalog_snapshot());
+        let catalog_wire = host_image_catalog_wire(&host_image_catalog_snapshot());
+        let catalog = catalog_wire.as_ptr();
+        carrick_usdt::host__image__catalog!(|| catalog);
+        std::hint::black_box(&catalog_wire);
     }
 
     #[cfg(not(target_os = "macos"))]
     pub fn host_image_catalog() {}
 
+    #[cfg(target_os = "macos")]
+    fn host_image_catalog_wire(catalog: &HostImageCatalog) -> Box<[u8]> {
+        let payload = match serde_json::to_string(catalog) {
+            Ok(json) => format!("{{\"ok\":{json}}}"),
+            Err(error) => format!("{{\"err\":\"{error}\"}}"),
+        };
+        nul_terminated_wire(payload)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_host_image_publication_from_snapshots(
+        base: HostImageBase,
+        catalog: HostImageCatalog,
+    ) -> PreparedHostImagePublication {
+        PreparedHostImagePublication {
+            pid: base.pid,
+            base: base.base,
+            slide: base.slide,
+            base_path_wire: nul_terminated_wire(base.path),
+            catalog_wire: host_image_catalog_wire(&catalog),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepared_host_image_base_args(
+        prepared: &PreparedHostImagePublication,
+    ) -> (u32, u64, i64, *const u8) {
+        (
+            prepared.pid,
+            prepared.base,
+            prepared.slide,
+            prepared.base_path_wire.as_ptr(),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepared_host_image_catalog_arg(prepared: &PreparedHostImagePublication) -> *const u8 {
+        prepared.catalog_wire.as_ptr()
+    }
+
     /// Collect every owned host-image value before a native exec retires its
-    /// recoverable image. The returned payload is later borrowed by the probe
-    /// fires, so activation through thread installation performs no dyld walk,
-    /// path conversion, vector growth, or `String` clone.
+    /// recoverable image. Paths are NUL-terminated and the catalog is wrapped
+    /// in the exact legacy `{"ok":...}` JSON envelope here. The later probe
+    /// fires only pass raw pointers, so activation through thread installation
+    /// performs no dyld walk, serialization, path conversion, or allocation.
     #[cfg(target_os = "macos")]
     pub fn prepare_host_image_publication() -> PreparedHostImagePublication {
-        PreparedHostImagePublication {
-            base: host_image_base_snapshot(),
-            catalog: host_image_catalog_snapshot(),
-        }
+        prepare_host_image_publication_from_snapshots(
+            host_image_base_snapshot(),
+            host_image_catalog_snapshot(),
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2444,7 +2557,9 @@ mod real {
 
     #[cfg(target_os = "macos")]
     pub fn publish_host_image_base(prepared: &PreparedHostImagePublication) {
-        publish_host_image_base_snapshot(&prepared.base);
+        let args = prepared_host_image_base_args(prepared);
+        carrick_usdt::host__image__base!(|| args);
+        std::hint::black_box(&prepared.base_path_wire);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2452,9 +2567,9 @@ mod real {
 
     #[cfg(target_os = "macos")]
     pub fn publish_host_image_catalog(prepared: &PreparedHostImagePublication) {
-        // `usdt` accepts a borrowed serializable provider argument through its
-        // `Borrow<T>` contract; this serializes the exact prepared allocation.
-        carrick_usdt::host__image__catalog!(|| &prepared.catalog);
+        let catalog = prepared_host_image_catalog_arg(prepared);
+        carrick_usdt::host__image__catalog!(|| catalog);
+        std::hint::black_box(&prepared.catalog_wire);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2466,8 +2581,10 @@ mod real {
     /// The native lane maps guest text into the same address space as carrick's
     /// own code, so a sampled PC can land in either. Without this, guest-range
     /// PCs are indistinguishable from JIT output and get reported as unmapped.
-    pub fn guest_image_base(base: u64, entry: u64, path: &str) {
-        carrick_usdt::guest__image__base!(|| (std::process::id(), base, entry, path));
+    pub fn guest_image_base(base: u64, entry: u64, path: &PreparedGuestImagePath) {
+        let path_arg = prepared_guest_image_path_arg(path);
+        carrick_usdt::guest__image__base!(|| (std::process::id(), base, entry, path_arg));
+        std::hint::black_box(&path.wire);
     }
 
     /// Publish the half-open executable range of this process's DSR code cache.
@@ -3235,6 +3352,51 @@ mod real {
             ));
         }
 
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn prepared_image_publication_retains_exact_usdt_wire_pointers_and_bytes() {
+            let prepared = super::prepare_host_image_publication_from_snapshots(
+                super::HostImageBase {
+                    pid: 17,
+                    base: 0x10_0000,
+                    slide: -0x2000,
+                    path: "/tmp/carrick".to_owned(),
+                },
+                super::HostImageCatalog {
+                    pid: 17,
+                    ranges: vec![super::HostImageRange {
+                        start: 0x10_0000,
+                        end: 0x10_4000,
+                        path: "/tmp/\"carrick\\bin".to_owned(),
+                    }],
+                },
+            );
+
+            let (pid, base, slide, base_path) = super::prepared_host_image_base_args(&prepared);
+            assert_eq!((pid, base, slide), (17, 0x10_0000, -0x2000));
+            assert_eq!(base_path, prepared.base_path_wire.as_ptr());
+            assert_eq!(prepared.base_path_wire.as_ref(), b"/tmp/carrick\0");
+
+            let catalog = super::prepared_host_image_catalog_arg(&prepared);
+            assert_eq!(catalog, prepared.catalog_wire.as_ptr());
+            assert_eq!(
+                prepared.catalog_wire.as_ref(),
+                b"{\"ok\":{\"pid\":17,\"ranges\":[{\"start\":1048576,\"end\":1064960,\"path\":\"/tmp/\\\"carrick\\\\bin\"}]}}\0"
+            );
+
+            let guest = super::prepare_guest_image_path("/bin/guest".to_owned());
+            let guest_path = super::prepared_guest_image_path_arg(&guest);
+            assert_eq!(guest_path, guest.wire.as_ptr());
+            assert_eq!(guest.wire.as_ref(), b"/bin/guest\0");
+            assert_eq!(guest.as_str(), "/bin/guest");
+            let moved_guest = guest;
+            assert_eq!(
+                super::prepared_guest_image_path_arg(&moved_guest),
+                guest_path,
+                "moving the owner changed its boxed wire pointer"
+            );
+        }
+
         #[test]
         fn guest_mem_probe_digest_reports_wrapping_sum_and_edges() {
             let bytes = [
@@ -3338,6 +3500,28 @@ mod stub {
     #[derive(Debug)]
     pub struct PreparedHostImagePublication;
 
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct PreparedGuestImagePath {
+        wire: Box<[u8]>,
+    }
+
+    impl PreparedGuestImagePath {
+        pub fn as_str(&self) -> &str {
+            let path = &self.wire[..self.wire.len().saturating_sub(1)];
+            // SAFETY: the only constructor consumes a valid `String` and
+            // appends one byte; it never changes the original UTF-8 bytes.
+            unsafe { std::str::from_utf8_unchecked(path) }
+        }
+    }
+
+    pub fn prepare_guest_image_path(path: String) -> PreparedGuestImagePath {
+        let mut wire = path.into_bytes();
+        wire.push(0);
+        PreparedGuestImagePath {
+            wire: wire.into_boxed_slice(),
+        }
+    }
+
     pub fn prepare_host_image_publication() -> PreparedHostImagePublication {
         PreparedHostImagePublication
     }
@@ -3392,7 +3576,7 @@ mod stub {
     stub!(host_image_catalog());
     stub!(publish_host_image_base(prepared: &PreparedHostImagePublication));
     stub!(publish_host_image_catalog(prepared: &PreparedHostImagePublication));
-    stub!(guest_image_base(base: u64, entry: u64, path: &str));
+    stub!(guest_image_base(base: u64, entry: u64, path: &PreparedGuestImagePath));
     stub!(host_jit_range(start: u64, end: u64));
     stub!(fs_op(op: &str, path: &str, errno: i32));
     stub!(host_pipe_io(host_fd: i32, dir: i32, n: i64));

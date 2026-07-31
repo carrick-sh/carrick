@@ -847,11 +847,11 @@ impl ResumedImage {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct NativeGuestImageCompatibility {
     base: u64,
     entry: u64,
-    resolved_path: String,
+    resolved_path: crate::probes::PreparedGuestImagePath,
 }
 
 impl NativeGuestImageCompatibility {
@@ -864,7 +864,7 @@ impl NativeGuestImageCompatibility {
                 .min()
                 .unwrap_or(0),
             entry: image.entry(),
-            resolved_path: resolved_path.into(),
+            resolved_path: crate::probes::prepare_guest_image_path(resolved_path.into()),
         }
     }
 }
@@ -1085,7 +1085,7 @@ pub(crate) fn resume_guest_from_capsule(
         loaded
     })?;
     let (source, guest_image) = resumed.into_handoff(guest.resolved_path);
-    let resolved = guest_image.resolved_path.clone();
+    let resolved = guest_image.resolved_path.as_str().to_owned();
     native_reexec_lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecResetBegin);
     dispatcher.reset_memory_state_on_execve();
     dispatcher.reset_signal_handlers_on_execve();
@@ -2002,9 +2002,9 @@ enum NativeInitialProcessCompletion {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-enum NativeProcessHandoffError<Activation, Installation, Completion> {
+enum NativeProcessHandoffError<Preparation, Activation, Completion> {
+    Preparation(Preparation),
     Activation(Activation),
-    Installation(Installation),
     Completion(Completion),
 }
 
@@ -2043,42 +2043,59 @@ impl NativeImagePublisher for NativeProbeImagePublisher {
     }
 }
 
-fn activate_publish_install_native_process<
+fn prepare_activate_publish_commit_native_process<
     T,
+    Prepared,
+    PreparationError,
     ActivationError,
-    InstallationError,
     CompletionError,
 >(
     process: Arc<dsr::ProcessTranslator>,
+    prepare: impl FnOnce(Arc<dsr::ProcessTranslator>) -> Result<Prepared, PreparationError>,
+    activate: impl FnOnce(&dsr::ProcessTranslator) -> Result<(), ActivationError>,
+    publish: impl FnOnce(&dsr::ProcessTranslator),
+    commit: impl FnOnce(Prepared) -> T,
+    complete: impl FnOnce() -> Result<(), CompletionError>,
+) -> Result<T, NativeProcessHandoffError<PreparationError, ActivationError, CompletionError>> {
+    let prepared = prepare(Arc::clone(&process)).map_err(NativeProcessHandoffError::Preparation)?;
+    activate(&process).map_err(NativeProcessHandoffError::Activation)?;
+    publish(&process);
+    let installed = commit(prepared);
+    complete().map_err(NativeProcessHandoffError::Completion)?;
+    Ok(installed)
+}
+
+fn publish_native_process_images(
+    process: &dsr::ProcessTranslator,
     host_images: Option<&crate::probes::PreparedHostImagePublication>,
     guest_image: &NativeGuestImageCompatibility,
-    activate: impl FnOnce(&dsr::ProcessTranslator) -> Result<(), ActivationError>,
     publisher: &mut impl NativeImagePublisher,
-    install: impl FnOnce(Arc<dsr::ProcessTranslator>) -> Result<T, InstallationError>,
-    complete: impl FnOnce() -> Result<(), CompletionError>,
-) -> Result<T, NativeProcessHandoffError<ActivationError, InstallationError, CompletionError>> {
-    activate(&process).map_err(NativeProcessHandoffError::Activation)?;
+) {
     if let Some(host_images) = host_images {
         publisher.host_base(host_images);
         publisher.host_catalog(host_images);
     }
     publisher.guest(guest_image);
     publisher.host_jit(process.cache_host_range());
-    let installed = install(process).map_err(NativeProcessHandoffError::Installation)?;
-    complete().map_err(NativeProcessHandoffError::Completion)?;
-    Ok(installed)
 }
 
-fn install_native_thread_start_with<T, ActivationError, InstallationError, CompletionError>(
+fn install_native_thread_start_with<
+    T,
+    Prepared,
+    PreparationError,
+    ActivationError,
+    CompletionError,
+>(
     process: Arc<dsr::ProcessTranslator>,
     start: NativeThreadStart,
+    prepare: impl FnOnce(Arc<dsr::ProcessTranslator>) -> Result<Prepared, PreparationError>,
     activate: impl FnOnce(&dsr::ProcessTranslator) -> Result<(), ActivationError>,
     publisher: &mut impl NativeImagePublisher,
-    install: impl FnOnce(Arc<dsr::ProcessTranslator>) -> Result<T, InstallationError>,
+    commit: impl FnOnce(Prepared) -> T,
     complete: impl FnOnce(NativeInitialProcessCompletion) -> Result<(), CompletionError>,
 ) -> Result<
     (T, NativeUcontextSnapshot, u64),
-    NativeProcessHandoffError<ActivationError, InstallationError, CompletionError>,
+    NativeProcessHandoffError<PreparationError, ActivationError, CompletionError>,
 > {
     match start {
         NativeThreadStart::Initial {
@@ -2088,13 +2105,19 @@ fn install_native_thread_start_with<T, ActivationError, InstallationError, Compl
             host_images,
             completion,
         } => {
-            let installed = activate_publish_install_native_process(
+            let installed = prepare_activate_publish_commit_native_process(
                 process,
-                host_images.as_ref(),
-                &guest_image,
+                prepare,
                 activate,
-                publisher,
-                install,
+                |selected| {
+                    publish_native_process_images(
+                        selected,
+                        host_images.as_ref(),
+                        &guest_image,
+                        publisher,
+                    );
+                },
+                commit,
                 || complete(completion),
             )?;
             Ok((
@@ -2110,9 +2133,10 @@ fn install_native_thread_start_with<T, ActivationError, InstallationError, Compl
         NativeThreadStart::Detached {
             context,
             guest_tpidr_el0,
-        } => install(process)
-            .map(|installed| (installed, *context, guest_tpidr_el0))
-            .map_err(NativeProcessHandoffError::Installation),
+        } => {
+            let prepared = prepare(process).map_err(NativeProcessHandoffError::Preparation)?;
+            Ok((commit(prepared), *context, guest_tpidr_el0))
+        }
     }
 }
 
@@ -2120,7 +2144,7 @@ fn install_native_thread_start_with<T, ActivationError, InstallationError, Compl
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeProcessHandoffFailpoint {
     Activation,
-    Installation,
+    InstallationPreparation,
 }
 
 #[cfg(test)]
@@ -2150,12 +2174,13 @@ fn take_native_process_handoff_failpoint(expected: NativeProcessHandoffFailpoint
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeProcessHandoffEvent {
+    InstallationPreparationAttempt,
     ActivationAttempt,
     HostBase,
     HostCatalog,
     Guest,
     HostJit,
-    InstallationAttempt,
+    InstallationCommit,
     SnapshotInstalled,
     PtraceExecStop,
     ServiceCompletion,
@@ -2194,36 +2219,57 @@ fn activate_selected_native_process(
     process.activate_translated_range_catalog()
 }
 
-fn install_initial_native_process(
+fn prepare_initial_native_process(
     process: Arc<dsr::ProcessTranslator>,
     tid: i32,
-) -> Result<dsr::ThreadTranslator, dsr::types::DsrError> {
+) -> Result<dsr::PreparedThreadInstall, dsr::types::DsrError> {
     #[cfg(test)]
     {
-        record_native_process_handoff_event(NativeProcessHandoffEvent::InstallationAttempt);
-        if take_native_process_handoff_failpoint(NativeProcessHandoffFailpoint::Installation) {
+        record_native_process_handoff_event(
+            NativeProcessHandoffEvent::InstallationPreparationAttempt,
+        );
+        if take_native_process_handoff_failpoint(
+            NativeProcessHandoffFailpoint::InstallationPreparation,
+        ) {
             return Err(dsr::types::DsrError::CachePolicy(
-                "injected native process handoff installation failure".to_owned(),
+                "injected native process handoff installation preparation failure".to_owned(),
             ));
         }
     }
-    Ok(dsr::ThreadTranslator::for_process(process, tid))
+    Ok(dsr::ThreadTranslator::prepare_for_process(process, tid))
 }
 
-fn install_exec_native_process(
-    translator: &mut dsr::ThreadTranslator,
+fn commit_initial_native_process(prepared: dsr::PreparedThreadInstall) -> dsr::ThreadTranslator {
+    let translator = prepared.commit();
+    #[cfg(test)]
+    record_native_process_handoff_event(NativeProcessHandoffEvent::InstallationCommit);
+    translator
+}
+
+fn prepare_exec_native_process<'a>(
+    translator: &'a mut dsr::ThreadTranslator,
     process: Arc<dsr::ProcessTranslator>,
-) -> Result<(), dsr::types::DsrError> {
+) -> Result<dsr::PreparedThreadExecHandoff<'a>, dsr::types::DsrError> {
     #[cfg(test)]
     {
-        record_native_process_handoff_event(NativeProcessHandoffEvent::InstallationAttempt);
-        if take_native_process_handoff_failpoint(NativeProcessHandoffFailpoint::Installation) {
+        record_native_process_handoff_event(
+            NativeProcessHandoffEvent::InstallationPreparationAttempt,
+        );
+        if take_native_process_handoff_failpoint(
+            NativeProcessHandoffFailpoint::InstallationPreparation,
+        ) {
             return Err(dsr::types::DsrError::CachePolicy(
-                "injected native process handoff installation failure".to_owned(),
+                "injected native process handoff installation preparation failure".to_owned(),
             ));
         }
     }
-    translator.reset_for_exec(process)
+    translator.prepare_reset_for_exec(process)
+}
+
+fn commit_exec_native_process(prepared: dsr::PreparedThreadExecHandoff<'_>) {
+    prepared.commit();
+    #[cfg(test)]
+    record_native_process_handoff_event(NativeProcessHandoffEvent::InstallationCommit);
 }
 
 fn install_native_thread_start(
@@ -2235,9 +2281,10 @@ fn install_native_thread_start(
     install_native_thread_start_with(
         process,
         start,
+        |selected| prepare_initial_native_process(selected, tid),
         activate_selected_native_process,
         &mut NativeProbeImagePublisher,
-        |selected| install_initial_native_process(selected, tid),
+        commit_initial_native_process,
         |completion| {
             if completion == NativeInitialProcessCompletion::SelfReexec {
                 crate::exec_helpers::stop_after_traced_exec(dispatcher);
@@ -2253,13 +2300,11 @@ fn install_native_thread_start(
         },
     )
     .map_err(|error| match error {
+        NativeProcessHandoffError::Preparation(error) => RuntimeError::Trap(TrapError::Hypervisor(
+            format!("native initial process could not prepare translator: {error}"),
+        )),
         NativeProcessHandoffError::Activation(error) => {
             RuntimeError::Unsupported(error.to_string())
-        }
-        NativeProcessHandoffError::Installation(error) => {
-            RuntimeError::Trap(TrapError::Hypervisor(format!(
-                "native initial process could not install translator: {error}"
-            )))
         }
         NativeProcessHandoffError::Completion(never) => match never {},
     })
@@ -2279,13 +2324,19 @@ fn complete_native_in_process_exec_handoff(
     guest_tpidr_el0: &mut u64,
     complete_process_state: impl FnOnce(),
 ) -> Result<(), RuntimeError> {
-    activate_publish_install_native_process(
+    prepare_activate_publish_commit_native_process(
         process,
-        host_images,
-        guest_image,
+        |selected| prepare_exec_native_process(translator, selected),
         activate_selected_native_process,
-        &mut NativeProbeImagePublisher,
-        |selected| install_exec_native_process(translator, selected),
+        |selected| {
+            publish_native_process_images(
+                selected,
+                host_images,
+                guest_image,
+                &mut NativeProbeImagePublisher,
+            );
+        },
+        commit_exec_native_process,
         || {
             complete_process_state();
             *guest_tpidr_el0 = 0;
@@ -2311,13 +2362,11 @@ fn complete_native_in_process_exec_handoff(
         },
     )
     .map_err(|error| match error {
+        NativeProcessHandoffError::Preparation(error) => RuntimeError::Trap(TrapError::Hypervisor(
+            format!("native execve could not prepare replacement translator: {error}"),
+        )),
         NativeProcessHandoffError::Activation(error) => {
             RuntimeError::Unsupported(error.to_string())
-        }
-        NativeProcessHandoffError::Installation(error) => {
-            RuntimeError::Trap(TrapError::Hypervisor(format!(
-                "native execve could not install replacement translator: {error}"
-            )))
         }
         NativeProcessHandoffError::Completion(error) => error,
     })
@@ -3615,7 +3664,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             Err(error) => {
                                 tracing::warn!(
                                     %error,
-                                    path = guest_image.resolved_path,
+                                    path = guest_image.resolved_path.as_str(),
                                     "native execve replacement validation failed before image retirement"
                                 );
                                 snapshot = complete_dsr_syscall(
@@ -7107,7 +7156,7 @@ mod tests {
         NativeGuestImageCompatibility {
             base: 0x40_0000,
             entry: 0x40_1000,
-            resolved_path: "/bin/handoff-probe".to_owned(),
+            resolved_path: crate::probes::prepare_guest_image_path("/bin/handoff-probe".to_owned()),
         }
     }
 
@@ -7142,6 +7191,11 @@ mod tests {
             assert_eq!(metadata, self.expected_guest);
             if self.require_same_guest_address {
                 assert!(std::ptr::eq(metadata, self.expected_guest));
+                assert_eq!(
+                    metadata.resolved_path.as_str().as_ptr(),
+                    self.expected_guest.resolved_path.as_str().as_ptr(),
+                    "guest publisher did not retain the prepared path allocation"
+                );
             }
             self.events.borrow_mut().push("guest");
         }
@@ -7167,18 +7221,24 @@ mod tests {
             require_same_guest_address: true,
         };
 
-        let installed = activate_publish_install_native_process(
+        let installed = prepare_activate_publish_commit_native_process(
             Arc::clone(&process),
-            Some(&host_images),
-            &guest_image,
+            Ok::<_, dsr::types::DsrError>,
             |selected| {
                 events.borrow_mut().push("activate");
                 selected.activate_translated_range_catalog()
             },
-            &mut publisher,
             |selected| {
+                publish_native_process_images(
+                    selected,
+                    Some(&host_images),
+                    &guest_image,
+                    &mut publisher,
+                );
+            },
+            |prepared| {
                 events.borrow_mut().push("install");
-                Ok::<_, dsr::types::DsrError>(selected)
+                prepared
             },
             || {
                 events.borrow_mut().push("completion");
@@ -7220,18 +7280,23 @@ mod tests {
             require_same_guest_address: true,
         };
 
-        let result = activate_publish_install_native_process(
+        let result = prepare_activate_publish_commit_native_process(
             process,
-            Some(&host_images),
-            &guest_image,
+            Ok::<_, &'static str>,
             |_| {
                 events.borrow_mut().push("activate");
                 Err::<(), _>("injected activation failure")
             },
-            &mut publisher,
+            |selected| {
+                publish_native_process_images(
+                    selected,
+                    Some(&host_images),
+                    &guest_image,
+                    &mut publisher,
+                );
+            },
             |_| {
                 events.borrow_mut().push("install");
-                Ok::<(), &'static str>(())
             },
             || {
                 events.borrow_mut().push("completion");
@@ -7252,7 +7317,7 @@ mod tests {
     fn production_post_retirement_handoff_failures_abort_without_snapshot_or_resume() {
         for failpoint in [
             NativeProcessHandoffFailpoint::Activation,
-            NativeProcessHandoffFailpoint::Installation,
+            NativeProcessHandoffFailpoint::InstallationPreparation,
         ] {
             take_native_syscall_service_probe_events();
             take_native_process_handoff_events();
@@ -7328,16 +7393,19 @@ mod tests {
             let handoff_events = take_native_process_handoff_events();
             let expected_handoff_events = match failpoint {
                 NativeProcessHandoffFailpoint::Activation => {
-                    vec![NativeProcessHandoffEvent::ActivationAttempt]
+                    vec![
+                        NativeProcessHandoffEvent::InstallationPreparationAttempt,
+                        NativeProcessHandoffEvent::ActivationAttempt,
+                    ]
                 }
-                NativeProcessHandoffFailpoint::Installation => vec![
-                    NativeProcessHandoffEvent::ActivationAttempt,
-                    NativeProcessHandoffEvent::Guest,
-                    NativeProcessHandoffEvent::HostJit,
-                    NativeProcessHandoffEvent::InstallationAttempt,
-                ],
+                NativeProcessHandoffFailpoint::InstallationPreparation => {
+                    vec![NativeProcessHandoffEvent::InstallationPreparationAttempt]
+                }
             };
-            assert_eq!(handoff_events, expected_handoff_events);
+            assert_eq!(
+                handoff_events, expected_handoff_events,
+                "{failpoint:?} published stale handoff metadata before install preflight"
+            );
             assert_eq!(
                 handoff_events
                     .iter()
@@ -7357,41 +7425,60 @@ mod tests {
                 replacement_range,
                 "failure changed the selected replacement identity",
             );
+            assert_eq!(
+                replacement.translated_range_catalog_state_for_test(),
+                (1, 0, None, 0),
+                "{failpoint:?} activated the replacement catalog",
+            );
         }
     }
 
     #[test]
-    fn production_self_reexec_activation_failure_never_closes_reset_or_installs_start() {
-        set_native_reexec_lifecycle_capture(true);
-        take_native_process_handoff_events();
-        set_native_process_handoff_failpoint(Some(NativeProcessHandoffFailpoint::Activation));
-        let process = Arc::new(dsr::test_process_translator(16 * 1024).expect("translator"));
-        let guest_image = handoff_guest_image();
-        let dispatcher = SyscallDispatcher::new();
-        let result = install_native_thread_start(
-            process,
-            NativeThreadStart::Initial {
-                entry: guest_image.entry,
-                initial_sp: 0x50_0000,
-                guest_image,
-                host_images: None,
-                completion: NativeInitialProcessCompletion::SelfReexec,
-            },
-            &dispatcher,
-            71,
-        );
-        set_native_process_handoff_failpoint(None);
+    fn production_self_reexec_preparation_and_activation_failures_never_close_reset() {
+        for failpoint in [
+            NativeProcessHandoffFailpoint::InstallationPreparation,
+            NativeProcessHandoffFailpoint::Activation,
+        ] {
+            set_native_reexec_lifecycle_capture(true);
+            take_native_process_handoff_events();
+            set_native_process_handoff_failpoint(Some(failpoint));
+            let process = Arc::new(dsr::test_process_translator(16 * 1024).expect("translator"));
+            let guest_image = handoff_guest_image();
+            let dispatcher = SyscallDispatcher::new();
+            let result = install_native_thread_start(
+                process,
+                NativeThreadStart::Initial {
+                    entry: guest_image.entry,
+                    initial_sp: 0x50_0000,
+                    guest_image,
+                    host_images: None,
+                    completion: NativeInitialProcessCompletion::SelfReexec,
+                },
+                &dispatcher,
+                71,
+            );
+            set_native_process_handoff_failpoint(None);
 
-        assert!(result.is_err(), "activation failure must be fatal");
-        assert!(
-            !take_native_reexec_lifecycle_capture()
-                .contains(&carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecResetEnd)
-        );
-        assert_eq!(
-            take_native_process_handoff_events(),
-            vec![NativeProcessHandoffEvent::ActivationAttempt],
-            "self-reexec failure must stop before publication, install, and completion",
-        );
+            assert!(result.is_err(), "{failpoint:?} must be fatal");
+            assert!(
+                !take_native_reexec_lifecycle_capture()
+                    .contains(&carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecResetEnd)
+            );
+            let expected = match failpoint {
+                NativeProcessHandoffFailpoint::InstallationPreparation => {
+                    vec![NativeProcessHandoffEvent::InstallationPreparationAttempt]
+                }
+                NativeProcessHandoffFailpoint::Activation => vec![
+                    NativeProcessHandoffEvent::InstallationPreparationAttempt,
+                    NativeProcessHandoffEvent::ActivationAttempt,
+                ],
+            };
+            assert_eq!(
+                take_native_process_handoff_events(),
+                expected,
+                "self-reexec failure must stop before publication, commit, and completion",
+            );
+        }
     }
 
     #[test]
@@ -7410,13 +7497,14 @@ mod tests {
         let initial = NativeThreadStart::Initial {
             entry: guest_image.entry,
             initial_sp: 0x50_0000,
-            guest_image: guest_image.clone(),
+            guest_image: handoff_guest_image(),
             host_images: None,
             completion: NativeInitialProcessCompletion::Boot,
         };
         install_native_thread_start_with(
             Arc::clone(&initial_process),
             initial,
+            Ok::<_, dsr::types::DsrError>,
             |selected| {
                 initial_events.borrow_mut().push("activate");
                 selected.activate_translated_range_catalog()
@@ -7424,7 +7512,6 @@ mod tests {
             &mut initial_publisher,
             |_| {
                 initial_events.borrow_mut().push("install");
-                Ok::<_, dsr::types::DsrError>(())
             },
             |completion| {
                 assert_eq!(completion, NativeInitialProcessCompletion::Boot);
@@ -7459,6 +7546,7 @@ mod tests {
         install_native_thread_start_with(
             Arc::clone(&detached_process),
             detached,
+            Ok::<_, dsr::types::DsrError>,
             |_| {
                 detached_events.borrow_mut().push("activate");
                 Ok::<_, dsr::types::DsrError>(())
@@ -7466,7 +7554,6 @@ mod tests {
             &mut detached_publisher,
             |_| {
                 detached_events.borrow_mut().push("install");
-                Ok::<_, dsr::types::DsrError>(())
             },
             |_| {
                 detached_events.borrow_mut().push("completion");
@@ -9548,19 +9635,22 @@ mod tests {
                 expected_host_jit: candidate.cache_host_range(),
                 require_same_guest_address: true,
             };
-            activate_publish_install_native_process(
+            prepare_activate_publish_commit_native_process(
                 Arc::clone(&candidate),
-                None,
-                &guest_image,
+                |selected| {
+                    assert!(Arc::ptr_eq(&selected, &candidate));
+                    exec_thread.prepare_reset_for_exec(selected)
+                },
                 |selected| {
                     events.borrow_mut().push("activate");
                     selected.activate_translated_range_catalog()
                 },
-                &mut publisher,
                 |selected| {
-                    assert!(Arc::ptr_eq(&selected, &candidate));
+                    publish_native_process_images(selected, None, &guest_image, &mut publisher);
+                },
+                |prepared| {
                     events.borrow_mut().push("install");
-                    exec_thread.reset_for_exec(selected)
+                    prepared.commit();
                 },
                 || {
                     events.borrow_mut().push("completion");
@@ -9941,20 +10031,21 @@ mod tests {
                     expected_host_jit: inherited_process.cache_host_range(),
                     require_same_guest_address: true,
                 };
-                let installed = activate_publish_install_native_process(
+                let installed = prepare_activate_publish_commit_native_process(
                     Arc::clone(&inherited_process),
-                    None,
-                    &guest_image,
-                    dsr::ProcessTranslator::activate_translated_range_catalog,
-                    &mut publisher,
                     |selected| {
                         if !Arc::ptr_eq(&selected, &inherited_process) {
                             return Err(dsr::types::DsrError::CachePolicy(
                                 "inherited exec selected a different translator".to_owned(),
                             ));
                         }
-                        exec_thread.reset_for_exec(selected)
+                        exec_thread.prepare_reset_for_exec(selected)
                     },
+                    dsr::ProcessTranslator::activate_translated_range_catalog,
+                    |selected| {
+                        publish_native_process_images(selected, None, &guest_image, &mut publisher);
+                    },
+                    dsr::PreparedThreadExecHandoff::commit,
                     || Ok::<_, dsr::types::DsrError>(()),
                 );
                 if installed.is_err() {
@@ -14924,7 +15015,7 @@ mod tests {
         let (_, legacy_compatibility) = legacy.into_handoff("ignored-fallback".to_owned());
 
         assert_eq!(prepared_compatibility, legacy_compatibility);
-        assert_eq!(prepared_compatibility.resolved_path, resolved_path);
+        assert_eq!(prepared_compatibility.resolved_path.as_str(), resolved_path);
         assert_eq!(prepared_compatibility.entry, prepared_load.0.entry());
         assert_eq!(
             prepared_compatibility.base,
