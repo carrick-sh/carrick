@@ -96,6 +96,12 @@ pub(crate) enum PullArg {
     Never,
 }
 
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub(crate) enum NativeProfileTerminalMode {
+    Thread,
+    Process,
+}
+
 impl From<PullArg> for carrick_image::PullPolicy {
     fn from(p: PullArg) -> Self {
         match p {
@@ -108,6 +114,28 @@ impl From<PullArg> for carrick_image::PullPolicy {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    /// Internal process-birth qualification fixture for native profiling.
+    #[command(name = "__native-profile-birth-fixture", hide = true)]
+    NativeProfileBirthFixture {
+        #[arg(long, default_value_t = 500)]
+        hold_ms: u64,
+    },
+    /// Internal terminal-call qualification fixture for native profiling.
+    #[command(name = "__native-profile-terminal-fixture", hide = true)]
+    NativeProfileTerminalFixture {
+        #[arg(long, value_enum)]
+        mode: NativeProfileTerminalMode,
+    },
+    /// Internal receipt validator for native-profile launch qualification.
+    #[command(name = "__native-profile-validate-qualification", hide = true)]
+    NativeProfileValidateQualification {
+        #[arg(long)]
+        birth: PathBuf,
+        #[arg(long)]
+        thread: PathBuf,
+        #[arg(long)]
+        process: PathBuf,
+    },
     /// Internal parser harness for fail-closed native-profile fixtures.
     #[command(name = "__native-profile-validate", hide = true)]
     NativeProfileValidate {

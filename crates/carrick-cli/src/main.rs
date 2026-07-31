@@ -125,6 +125,7 @@ mod debug;
 mod debug_layout;
 mod fs_setup;
 mod lifecycle;
+mod native_profile_qualification;
 // `perf_stats` + the bulk of `trace_profile` back the BSD libdtrace-based
 // `carrick trace --profile` pipeline. Other hosts retain only the shared
 // `TraceProfileKind` argument vocabulary.

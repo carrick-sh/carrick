@@ -88,7 +88,10 @@ use carrick_runtime::syscall::lookup_aarch64;
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::trap::hvf_capabilities;
 
-use crate::args::{Cli, Commands, NetworkCommand, RootfsCommand, SystemCommand, VolumeCommand};
+use crate::args::{
+    Cli, Commands, NativeProfileTerminalMode, NetworkCommand, RootfsCommand, SystemCommand,
+    VolumeCommand,
+};
 // Only the non-HVF `Commands::Debug` arm below matches on `DebugCommand`
 // variants directly; the macOS arm just forwards `command` into `run_debug`.
 #[cfg(any(
@@ -108,6 +111,7 @@ use crate::debug_layout::native_x86_layout_json;
 // Used only by the macOS-only `run-elf` arm.
 #[cfg(feature = "platform-macos")]
 use crate::fs_setup::install_fs_backend;
+use crate::native_profile_qualification::validate_qualification_paths;
 use crate::runtime_util::{
     block_on_oci, emit_raw, human_age, human_size, parse_env_file, parse_mount_flag,
     parse_publish_specs, parse_volume_mount, resolve_volumes_from_specs, truncate_str,
@@ -127,7 +131,213 @@ fn uses_live_kernel_symbols(profile: crate::trace_profile::TraceProfileKind) -> 
     profile == crate::trace_profile::TraceProfileKind::NativeWall
 }
 
+const BIRTH_FIXTURE_MARKER: &[u8] = b"BIRTH_FIXTURE_OK\n\0";
+const TERMINAL_THREAD_ARMED_MARKER: &[u8] = b"TERMINAL_THREAD_ARMED\n\0";
+const TERMINAL_THREAD_OK_MARKER: &[u8] = b"TERMINAL_THREAD_OK\n\0";
+const TERMINAL_PROCESS_ARMED_MARKER: &[u8] = b"TERMINAL_PROCESS_ARMED\n\0";
+
+fn nul_terminated_marker_bytes(marker: &'static [u8]) -> anyhow::Result<&'static [u8]> {
+    marker
+        .strip_suffix(&[0])
+        .ok_or_else(|| anyhow::anyhow!("native-profile marker lacks its NUL terminator"))
+}
+
+fn raw_write_all(fd: libc::c_int, mut bytes: &[u8]) -> bool {
+    while !bytes.is_empty() {
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written > 0 {
+            let Ok(written) = usize::try_from(written) else {
+                return false;
+            };
+            bytes = &bytes[written..];
+            continue;
+        }
+        if written < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn raw_read_byte(fd: libc::c_int) -> Option<u8> {
+    let mut byte = 0_u8;
+    loop {
+        let read = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+        if read == 1 {
+            return Some(byte);
+        }
+        if read < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return None;
+    }
+}
+
+fn close_raw_fd(fd: libc::c_int) {
+    let _ = unsafe { libc::close(fd) };
+}
+
+fn create_native_profile_pipe() -> anyhow::Result<[libc::c_int; 2]> {
+    let mut fds = [-1; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("create native-profile fixture pipe");
+    }
+    Ok(fds)
+}
+
+#[cfg(target_os = "macos")]
+fn publish_current_host_process_birth() -> anyhow::Result<()> {
+    let birth = carrick_runtime::probes::HostProcessBirth::query(std::process::id())
+        .context("query Darwin process birth identity")?;
+    carrick_runtime::probes::host_process_birth(birth);
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn publish_current_host_process_birth() -> anyhow::Result<()> {
+    bail!("native-profile process-birth qualification requires Darwin")
+}
+
+fn wait_fixture_child(pid: libc::pid_t) -> anyhow::Result<libc::c_int> {
+    let mut status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        if waited == pid {
+            return Ok(status);
+        }
+        if waited < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(std::io::Error::last_os_error()).context("wait for native-profile child");
+    }
+}
+
+fn run_native_profile_birth_fixture(hold_ms: u64) -> anyhow::Result<()> {
+    if !(1..=10_000).contains(&hold_ms) {
+        bail!("--hold-ms must be in 1..=10000");
+    }
+    publish_current_host_process_birth()?;
+    publish_current_host_process_birth()?;
+    let ready = create_native_profile_pipe()?;
+    let release = match create_native_profile_pipe() {
+        Ok(release) => release,
+        Err(error) => {
+            close_raw_fd(ready[0]);
+            close_raw_fd(ready[1]);
+            return Err(error);
+        }
+    };
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        for fd in [ready[0], ready[1], release[0], release[1]] {
+            close_raw_fd(fd);
+        }
+        return Err(std::io::Error::last_os_error()).context("fork native-profile birth fixture");
+    }
+    if child == 0 {
+        close_raw_fd(ready[0]);
+        close_raw_fd(release[1]);
+        let birth_ok = publish_current_host_process_birth().is_ok()
+            && publish_current_host_process_birth().is_ok();
+        let ready_ok = birth_ok && raw_write_all(ready[1], &[0x42]);
+        close_raw_fd(ready[1]);
+        let released = raw_read_byte(release[0]) == Some(0x52);
+        close_raw_fd(release[0]);
+        unsafe { libc::_exit(i32::from(!(ready_ok && released))) };
+    }
+
+    close_raw_fd(ready[1]);
+    close_raw_fd(release[0]);
+    let child_ready = raw_read_byte(ready[0]) == Some(0x42);
+    close_raw_fd(ready[0]);
+    if child_ready {
+        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+    }
+    let child_released = raw_write_all(release[1], &[0x52]);
+    close_raw_fd(release[1]);
+    let status = wait_fixture_child(child)?;
+    if !child_ready || !child_released {
+        bail!("native-profile birth fixture handshake failed");
+    }
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        bail!("native-profile birth child did not exit cleanly: status={status}");
+    }
+    if !raw_write_all(
+        libc::STDOUT_FILENO,
+        nul_terminated_marker_bytes(BIRTH_FIXTURE_MARKER)?,
+    ) {
+        return Err(std::io::Error::last_os_error()).context("write birth fixture marker");
+    }
+    Ok(())
+}
+
+extern "C" fn native_profile_terminal_thread_main(_: *mut libc::c_void) -> *mut libc::c_void {
+    if TERMINAL_THREAD_ARMED_MARKER.last() == Some(&0)
+        && raw_write_all(
+            libc::STDOUT_FILENO,
+            &TERMINAL_THREAD_ARMED_MARKER[..TERMINAL_THREAD_ARMED_MARKER.len() - 1],
+        )
+    {
+        std::ptr::null_mut()
+    } else {
+        std::ptr::dangling_mut::<libc::c_void>()
+    }
+}
+
+fn run_native_profile_terminal_fixture(mode: NativeProfileTerminalMode) -> anyhow::Result<()> {
+    match mode {
+        NativeProfileTerminalMode::Thread => {
+            let mut thread = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
+            let created = unsafe {
+                libc::pthread_create(
+                    thread.as_mut_ptr(),
+                    std::ptr::null(),
+                    native_profile_terminal_thread_main,
+                    std::ptr::null_mut(),
+                )
+            };
+            if created != 0 {
+                bail!("pthread_create native-profile terminal fixture failed: {created}");
+            }
+            let thread = unsafe { thread.assume_init() };
+            let mut result = std::ptr::null_mut();
+            let joined = unsafe { libc::pthread_join(thread, &raw mut result) };
+            if joined != 0 {
+                bail!("pthread_join native-profile terminal fixture failed: {joined}");
+            }
+            if !result.is_null() {
+                bail!("native-profile terminal thread marker write failed");
+            }
+            if !raw_write_all(
+                libc::STDOUT_FILENO,
+                nul_terminated_marker_bytes(TERMINAL_THREAD_OK_MARKER)?,
+            ) {
+                return Err(std::io::Error::last_os_error())
+                    .context("write terminal thread fixture marker");
+            }
+            Ok(())
+        }
+        NativeProfileTerminalMode::Process => {
+            if !raw_write_all(
+                libc::STDOUT_FILENO,
+                nul_terminated_marker_bytes(TERMINAL_PROCESS_ARMED_MARKER)?,
+            ) {
+                return Err(std::io::Error::last_os_error())
+                    .context("write terminal process fixture marker");
+            }
+            unsafe { libc::_exit(0) };
+        }
+    }
+}
+
 pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
+    // The `proc` provider exposes zeroed `pr_start` on current Darwin. Query
+    // `PROC_PIDTBSDINFO` only inside the enabled USDT closure so normal CLI
+    // invocations pay no syscall cost while native-profile captures receive a
+    // stable PID-incarnation key before any command-specific fork or exec.
+    carrick_runtime::probes::host_process_birth_current();
     let Cli { store, command } = cli;
     let store = store
         .map(ImageStore::new)
@@ -185,6 +395,20 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     };
 
     match command {
+        Commands::NativeProfileBirthFixture { hold_ms } => {
+            run_native_profile_birth_fixture(hold_ms)?;
+        }
+        Commands::NativeProfileTerminalFixture { mode } => {
+            run_native_profile_terminal_fixture(mode)?;
+        }
+        Commands::NativeProfileValidateQualification {
+            birth,
+            thread,
+            process,
+        } => {
+            let qualification = validate_qualification_paths(&birth, &thread, &process)?;
+            println!("{}", qualification.render_json()?);
+        }
         Commands::NativeProfileValidate {
             input,
             principal_drops,
