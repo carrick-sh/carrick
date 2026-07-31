@@ -746,7 +746,10 @@ struct SharedInstallLogicalSnapshot {
         (carrick_guest_mem::GuestVa, types::CodeGeneration),
         types::CacheVa,
     )>,
-    sensitive_keys: Vec<(carrick_guest_mem::GuestVa, types::CodeGeneration)>,
+    sensitive: Vec<(
+        (carrick_guest_mem::GuestVa, types::CodeGeneration),
+        SensitiveMetadata,
+    )>,
     fusion_sites: [Vec<(u64, u32)>; profile::ExclusiveFusionClass::COUNT],
     published_len: usize,
     private_published_index: Vec<PublishedIndexEntry>,
@@ -805,6 +808,10 @@ struct PreparedSharedInstall {
     cache_range: std::ops::Range<usize>,
     catalog_entry: CatalogSharedRange,
     blocks: Vec<PreparedSharedBlock>,
+    sensitive_updates: Vec<(
+        (carrick_guest_mem::GuestVa, types::CodeGeneration),
+        SensitiveMetadata,
+    )>,
     shared_published_index: Vec<PublishedIndexEntry>,
     normalized_guest_ranges: Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>,
     loaded_unit: LoadedSharedUnit,
@@ -818,10 +825,6 @@ struct PreparedSharedBlock {
     key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
     entry: types::CacheVa,
     published: PublishedBlock,
-    sensitive: Option<(
-        (carrick_guest_mem::GuestVa, types::CodeGeneration),
-        SensitiveMetadata,
-    )>,
     fusion_site: Option<types::ExclusiveFusionSite>,
     guest_ranges: Vec<std::ops::Range<carrick_guest_mem::GuestVa>>,
     authority: SharedBlockAuthority,
@@ -1045,10 +1048,31 @@ const fn translation_source_words_required(
     artifact_store_present || shared_translation_configured
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SensitiveMetadata {
     pub exit: types::SensitiveExit,
     pub fusion: Option<types::ExclusiveFusionSite>,
+}
+
+fn merge_sensitive_metadata(
+    key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
+    current: SensitiveMetadata,
+    incoming: SensitiveMetadata,
+) -> Result<SensitiveMetadata, types::DsrError> {
+    if current.exit != incoming.exit {
+        return Err(types::DsrError::CachePolicy(format!(
+            "shared sensitive exit conflicts at guest 0x{:x}",
+            key.0.raw()
+        )));
+    }
+    Ok(SensitiveMetadata {
+        exit: current.exit,
+        fusion: if current.fusion == incoming.fusion {
+            current.fusion
+        } else {
+            None
+        },
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2435,7 +2459,52 @@ impl ProcessState {
         &mut self,
         tid: i32,
         memory: &NativeMappedMemory,
+        unit: crate::shared_cache::SharedLoadedTranslationUnit,
+    ) -> Result<PreparedSharedInstall, types::DsrError> {
+        let superblock_segments = self.superblock_segments;
+        self.prepare_shared_install_with_sensitive_planner(tid, memory, unit, |block_start| {
+            let planned = block::plan_block_with_segments(
+                memory,
+                block_start,
+                types::CodeGeneration::INITIAL,
+                256,
+                superblock_segments,
+            )?;
+            let block::PlannedExit::Sensitive {
+                guest: sensitive_guest,
+                exit,
+                fusion,
+                ..
+            } = planned.terminal_exit()
+            else {
+                return Err(types::DsrError::CachePolicy(format!(
+                    "shared block 0x{:x} lost sensitive metadata identity",
+                    block_start.raw(),
+                )));
+            };
+            Ok((
+                (sensitive_guest, types::CodeGeneration::INITIAL),
+                SensitiveMetadata { exit, fusion },
+                fusion,
+            ))
+        })
+    }
+
+    fn prepare_shared_install_with_sensitive_planner(
+        &mut self,
+        tid: i32,
+        memory: &NativeMappedMemory,
         mut unit: crate::shared_cache::SharedLoadedTranslationUnit,
+        mut sensitive_planner: impl FnMut(
+            carrick_guest_mem::GuestVa,
+        ) -> Result<
+            (
+                (carrick_guest_mem::GuestVa, types::CodeGeneration),
+                SensitiveMetadata,
+                Option<types::ExclusiveFusionSite>,
+            ),
+            types::DsrError,
+        >,
     ) -> Result<PreparedSharedInstall, types::DsrError> {
         unit.manifest.validate_ranges().map_err(|reason| {
             types::DsrError::CachePolicy(format!(
@@ -2475,7 +2544,6 @@ impl ProcessState {
             let key = (block.guest_start, types::CodeGeneration::INITIAL);
             if !incoming_keys.insert(key)
                 || self.blocks.contains_key(&key)
-                || self.sensitive.contains_key(&key)
                 || self.shared_blocks.contains_key(&key)
             {
                 return Err(types::DsrError::CachePolicy(format!(
@@ -2584,7 +2652,14 @@ impl ProcessState {
                     "shared page-dependency tuple reservation failed: {error}"
                 ))
             })?;
-        let mut sensitive_keys = BTreeSet::new();
+        let mut sensitive_updates = Vec::new();
+        sensitive_updates
+            .try_reserve_exact(block_count)
+            .map_err(|error| {
+                types::DsrError::CachePolicy(format!(
+                    "shared sensitive-metadata reservation failed: {error}"
+                ))
+            })?;
         for (block, observation) in unit.manifest.blocks.iter_mut().zip(observations) {
             let address = cache_start
                 .checked_add(block.entry_offset as usize)
@@ -2615,41 +2690,23 @@ impl ProcessState {
             guest_range_additions.extend(guest_ranges.iter().cloned());
 
             let key = (block.guest_start, types::CodeGeneration::INITIAL);
-            let (sensitive, fusion_site) = if block.requires_sensitive_metadata {
-                let planned = block::plan_block_with_segments(
-                    memory,
-                    block.guest_start,
-                    types::CodeGeneration::INITIAL,
-                    256,
-                    self.superblock_segments,
-                )?;
-                let block::PlannedExit::Sensitive {
-                    guest: sensitive_guest,
-                    exit,
-                    fusion,
-                    ..
-                } = planned.terminal_exit()
-                else {
-                    return Err(types::DsrError::CachePolicy(format!(
-                        "shared block 0x{:x} lost sensitive metadata identity",
-                        block.guest_start.raw(),
-                    )));
-                };
-                let sensitive_key = (sensitive_guest, types::CodeGeneration::INITIAL);
-                if self.sensitive.contains_key(&sensitive_key)
-                    || !sensitive_keys.insert(sensitive_key)
+            let fusion_site = if block.requires_sensitive_metadata {
+                let (sensitive_key, metadata, fusion) = sensitive_planner(block.guest_start)?;
+                if let Some((_, current)) = sensitive_updates
+                    .iter_mut()
+                    .find(|(key, _)| *key == sensitive_key)
                 {
-                    return Err(types::DsrError::CachePolicy(format!(
-                        "shared sensitive block identity collides at guest 0x{:x}",
-                        sensitive_guest.raw()
-                    )));
+                    *current = merge_sensitive_metadata(sensitive_key, *current, metadata)?;
+                } else {
+                    let metadata = self.sensitive.get(&sensitive_key).copied().map_or_else(
+                        || Ok(metadata),
+                        |installed| merge_sensitive_metadata(sensitive_key, installed, metadata),
+                    )?;
+                    sensitive_updates.push((sensitive_key, metadata));
                 }
-                (
-                    Some((sensitive_key, SensitiveMetadata { exit, fusion })),
-                    fusion,
-                )
+                fusion
             } else {
-                (None, None)
+                None
             };
             let published = PublishedBlock {
                 entry,
@@ -2667,7 +2724,6 @@ impl ProcessState {
                 key,
                 entry,
                 published,
-                sensitive,
                 fusion_site,
                 guest_ranges,
                 authority: SharedBlockAuthority {
@@ -2680,6 +2736,7 @@ impl ProcessState {
                 },
             });
         }
+        sensitive_updates.sort_unstable_by_key(|(key, _)| *key);
         #[cfg(test)]
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::BlockMetadata)?;
 
@@ -2771,6 +2828,7 @@ impl ProcessState {
             cache_range: cache_start..cache_end,
             catalog_entry,
             blocks,
+            sensitive_updates,
             shared_published_index,
             normalized_guest_ranges,
             loaded_unit: LoadedSharedUnit {
@@ -2810,6 +2868,7 @@ impl ProcessState {
             cache_range,
             catalog_entry,
             blocks,
+            sensitive_updates,
             shared_published_index,
             normalized_guest_ranges,
             mut loaded_unit,
@@ -2835,7 +2894,6 @@ impl ProcessState {
                 key,
                 entry,
                 published,
-                sensitive,
                 fusion_site,
                 guest_ranges: _guest_ranges,
                 authority,
@@ -2843,12 +2901,12 @@ impl ProcessState {
             if let Some(site) = fusion_site {
                 self.record_exclusive_fusion_site(site);
             }
-            if let Some((key, metadata)) = sensitive {
-                self.sensitive.insert(key, metadata);
-            }
             self.published.push(published);
             self.blocks.insert(key, entry);
             self.shared_blocks.insert(key, authority);
+        }
+        for (key, metadata) in sensitive_updates {
+            self.sensitive.insert(key, metadata);
         }
         self.shared_published_index = shared_published_index;
         self.dependencies.commit_record_batch(page_dependencies);
@@ -2881,7 +2939,11 @@ impl ProcessState {
                 .iter()
                 .map(|(key, entry)| (*key, *entry))
                 .collect(),
-            sensitive_keys: self.sensitive.keys().copied().collect(),
+            sensitive: self
+                .sensitive
+                .iter()
+                .map(|(key, metadata)| (*key, *metadata))
+                .collect(),
             fusion_sites: std::array::from_fn(|index| {
                 self.exclusive_fusion_sites[index].iter().copied().collect()
             }),
@@ -4883,11 +4945,11 @@ mod tests {
     // carrick_dsr::probes mirrors (ordinal-identical to the USDT enums
     // by the mirrored-ordinal tests in carrick-dsr).
     use super::{
-        DsrErrorProbeExt as _, NativeDsrExitProbeExt as _, ProcessTranslator, SharedBlockAuthority,
-        SharedInstallPrepareStage, TranslatedRangeCatalog, TranslatedRangeRecorder,
-        exact_guest_ranges_from_pc_map, normalized_guest_range_union,
-        set_shared_install_prepare_failpoint_for_test, translated_unit_id,
-        translation_source_words_required, typed_unit_id_from_digest,
+        DsrErrorProbeExt as _, NativeDsrExitProbeExt as _, ProcessTranslator, SensitiveMetadata,
+        SharedBlockAuthority, SharedInstallPrepareStage, TranslatedRangeCatalog,
+        TranslatedRangeRecorder, exact_guest_ranges_from_pc_map, merge_sensitive_metadata,
+        normalized_guest_range_union, set_shared_install_prepare_failpoint_for_test,
+        translated_unit_id, translation_source_words_required, typed_unit_id_from_digest,
     };
     use crate::artifact_spike::{ArtifactBindings, ArtifactTemplate};
     use crate::emit::PcMapEntry;
@@ -5425,6 +5487,83 @@ mod tests {
         );
     }
 
+    fn shared_sensitive_metadata(
+        resume: GuestVa,
+        fusion: Option<types::ExclusiveFusionSite>,
+    ) -> SensitiveMetadata {
+        SensitiveMetadata {
+            exit: types::SensitiveExit {
+                kind: types::SensitiveKind::ReadCounter,
+                register: None,
+                resume,
+            },
+            fusion,
+        }
+    }
+
+    fn shared_sensitive_fusion(guest: GuestVa, word: u32) -> types::ExclusiveFusionSite {
+        types::ExclusiveFusionSite {
+            guest,
+            word,
+            disposition: types::ExclusiveFusionDisposition::EligibleBackendDisabled,
+            biased_scratch: None,
+        }
+    }
+
+    #[test]
+    fn shared_sensitive_merge_preserves_matching_fusion() {
+        let key = (GuestVa(0x4008), types::CodeGeneration::INITIAL);
+        let fusion = shared_sensitive_fusion(key.0, 0x885f_fc20);
+        let metadata = shared_sensitive_metadata(GuestVa(0x400c), Some(fusion));
+
+        assert_eq!(
+            merge_sensitive_metadata(key, metadata, metadata).expect("identical metadata"),
+            metadata
+        );
+    }
+
+    #[test]
+    fn shared_sensitive_merge_drops_missing_or_conflicting_fusion() {
+        let key = (GuestVa(0x4008), types::CodeGeneration::INITIAL);
+        let first_fusion = shared_sensitive_fusion(key.0, 0x885f_fc20);
+        let second_fusion = shared_sensitive_fusion(key.0, 0x885f_7c20);
+        let exit = GuestVa(0x400c);
+
+        for (case, left, right) in [
+            (
+                "present versus absent",
+                shared_sensitive_metadata(exit, Some(first_fusion)),
+                shared_sensitive_metadata(exit, None),
+            ),
+            (
+                "different present sites",
+                shared_sensitive_metadata(exit, Some(first_fusion)),
+                shared_sensitive_metadata(exit, Some(second_fusion)),
+            ),
+        ] {
+            assert_eq!(
+                merge_sensitive_metadata(key, left, right)
+                    .unwrap_or_else(|error| panic!("{case}: {error}")),
+                shared_sensitive_metadata(exit, None),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_sensitive_merge_rejects_conflicting_exit() {
+        let key = (GuestVa(0x4008), types::CodeGeneration::INITIAL);
+        let before = shared_sensitive_metadata(GuestVa(0x400c), None);
+        let conflict = shared_sensitive_metadata(GuestVa(0x4010), None);
+
+        assert!(matches!(
+            merge_sensitive_metadata(key, before, conflict),
+            Err(types::DsrError::CachePolicy(message))
+                if message.contains("sensitive exit")
+                    && message.contains("0x4008")
+        ));
+    }
+
     fn shared_install_unit(base: usize) -> SharedLoadedTranslationUnit {
         let map = pc_map(&[(0x400000, 0), (0x400000, 4), (0x400004, 8), (0x400010, 12)]);
         let template = ArtifactTemplate::normalize(
@@ -5463,6 +5602,292 @@ mod tests {
             base,
             Arc::new(()),
         )
+    }
+
+    fn shared_sensitive_install_unit(base: usize) -> SharedLoadedTranslationUnit {
+        let block = |guest_start: GuestVa, generation_binding, entry_offset| {
+            let map = pc_map(&[
+                (guest_start.raw(), 0),
+                (guest_start.raw(), 4),
+                (guest_start.raw() + 4, 8),
+                (guest_start.raw() + 8, 12),
+            ]);
+            let template = ArtifactTemplate::normalize(
+                Vec::new(),
+                map,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
+            )
+            .expect("shared sensitive block metadata")
+            .into_runtime_metadata_only();
+            PortableBlockRecord {
+                guest_start,
+                generation_binding,
+                entry_offset,
+                code_len: 16,
+                requires_sensitive_metadata: true,
+                template,
+            }
+        };
+        SharedLoadedTranslationUnit::new(
+            TranslationUnitManifest {
+                schema: TRANSLATION_UNIT_SCHEMA_V2,
+                key: direct_binding_owner_and_publication::key(43),
+                dylib_sha256: [0x43; 32],
+                base_export: TRANSLATION_UNIT_BASE_EXPORT.to_owned(),
+                code_len: 32,
+                blocks: vec![
+                    block(GuestVa(0x400000), 0, 0),
+                    block(GuestVa(0x400010), 1, 16),
+                ],
+                binding_layout: DirectBindingLayout::Disabled,
+                binding_export: String::new(),
+                binding_data_len: 0,
+                cell_size: 0,
+                bindings: Vec::new(),
+                binding_relocations: Vec::new(),
+            },
+            base,
+            Arc::new(()),
+        )
+    }
+
+    #[test]
+    fn shared_sensitive_converging_owners_prepare_and_commit_one_terminal_record() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        recorder.events.clear();
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        state.profiling = true;
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+        let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
+        let fusion = shared_sensitive_fusion(sensitive_key.0, 0x885f_fc20);
+        let metadata = shared_sensitive_metadata(GuestVa(0x40000c), Some(fusion));
+        let before = state.shared_install_logical_snapshot_for_test();
+        let head_before = state.executable_ranges.head_ptr();
+
+        let prepared = state
+            .prepare_shared_install_with_sensitive_planner(
+                73,
+                &memory,
+                shared_sensitive_install_unit(base),
+                |_| Ok((sensitive_key, metadata, Some(fusion))),
+            )
+            .expect("converging sensitive owners");
+
+        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
+        assert_eq!(prepared.sensitive_updates, vec![(sensitive_key, metadata)]);
+        assert_eq!(prepared.blocks.len(), 2);
+        state.commit_shared_install_with_recorder(prepared, &mut recorder);
+
+        assert_eq!(state.sensitive.get(&sensitive_key), Some(&metadata));
+        assert_eq!(state.sensitive.len(), 1);
+        for block_start in [GuestVa(0x400000), GuestVa(0x400010)] {
+            assert!(
+                state
+                    .blocks
+                    .contains_key(&(block_start, types::CodeGeneration::INITIAL))
+            );
+        }
+        assert_eq!(state.blocks.len(), 2);
+        assert_eq!(state.exclusive_fusion_site_counts().iter().sum::<u64>(), 1);
+        assert!(matches!(
+            recorder.events.as_slice(),
+            [RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(_))]
+        ));
+        assert_ne!(state.executable_ranges.head_ptr(), head_before);
+        assert!(state.executable_ranges.contains(base));
+    }
+
+    #[test]
+    fn shared_sensitive_converging_owners_keep_sites_but_drop_ambiguous_lookup_fusion() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        state.profiling = true;
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+        let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
+        let first_fusion = shared_sensitive_fusion(GuestVa(0x400000), 0x885f_fc20);
+        let second_fusion = shared_sensitive_fusion(GuestVa(0x400010), 0x885f_7c20);
+        let exit = GuestVa(0x40000c);
+
+        let prepared = state
+            .prepare_shared_install_with_sensitive_planner(
+                73,
+                &memory,
+                shared_sensitive_install_unit(base),
+                |block_start| {
+                    let fusion = if block_start == GuestVa(0x400000) {
+                        first_fusion
+                    } else {
+                        second_fusion
+                    };
+                    Ok((
+                        sensitive_key,
+                        shared_sensitive_metadata(exit, Some(fusion)),
+                        Some(fusion),
+                    ))
+                },
+            )
+            .expect("converging owners with distinct profiling sites");
+
+        assert_eq!(
+            prepared.sensitive_updates,
+            vec![(
+                sensitive_key,
+                shared_sensitive_metadata(GuestVa(0x40000c), None),
+            )]
+        );
+        assert_eq!(
+            prepared
+                .blocks
+                .iter()
+                .map(|block| block.fusion_site)
+                .collect::<Vec<_>>(),
+            vec![Some(first_fusion), Some(second_fusion)]
+        );
+        state.commit_shared_install(prepared);
+
+        assert_eq!(
+            state.sensitive.get(&sensitive_key),
+            Some(&shared_sensitive_metadata(GuestVa(0x40000c), None))
+        );
+        assert_eq!(state.exclusive_fusion_site_counts().iter().sum::<u64>(), 2);
+    }
+
+    #[test]
+    fn shared_sensitive_matching_installed_record_merges_without_preparation_mutation() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+        let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
+        let fusion = shared_sensitive_fusion(sensitive_key.0, 0x885f_fc20);
+        let metadata = shared_sensitive_metadata(GuestVa(0x40000c), Some(fusion));
+        state.sensitive.insert(sensitive_key, metadata);
+        let before = state.shared_install_logical_snapshot_for_test();
+
+        let prepared = state
+            .prepare_shared_install_with_sensitive_planner(
+                73,
+                &memory,
+                shared_sensitive_install_unit(base),
+                |_| Ok((sensitive_key, metadata, Some(fusion))),
+            )
+            .expect("matching installed sensitive metadata");
+
+        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
+        assert_eq!(prepared.sensitive_updates, vec![(sensitive_key, metadata)]);
+    }
+
+    #[test]
+    fn shared_sensitive_conflicting_exit_fails_without_logical_mutation() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+        let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
+        let installed = shared_sensitive_metadata(GuestVa(0x40000c), None);
+        let conflict = shared_sensitive_metadata(GuestVa(0x400010), None);
+        state.sensitive.insert(sensitive_key, installed);
+        let before = state.shared_install_logical_snapshot_for_test();
+
+        let result = state.prepare_shared_install_with_sensitive_planner(
+            73,
+            &memory,
+            shared_sensitive_install_unit(base),
+            |_| Ok((sensitive_key, conflict, None)),
+        );
+
+        assert!(matches!(
+            result,
+            Err(types::DsrError::CachePolicy(message))
+                if message.contains("sensitive exit")
+        ));
+        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
+    }
+
+    #[test]
+    fn shared_sensitive_conflicting_converging_owners_fail_without_logical_mutation() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+        let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
+        let before = state.shared_install_logical_snapshot_for_test();
+
+        let result = state.prepare_shared_install_with_sensitive_planner(
+            73,
+            &memory,
+            shared_sensitive_install_unit(base),
+            |block_start| {
+                let resume = if block_start == GuestVa(0x400000) {
+                    GuestVa(0x40000c)
+                } else {
+                    GuestVa(0x400010)
+                };
+                Ok((sensitive_key, shared_sensitive_metadata(resume, None), None))
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(types::DsrError::CachePolicy(message))
+                if message.contains("sensitive exit")
+        ));
+        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
+    }
+
+    #[test]
+    fn shared_sensitive_terminal_identity_does_not_collide_with_a_block_start() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+        let key = (GuestVa(0x400000), types::CodeGeneration::INITIAL);
+        state
+            .sensitive
+            .insert(key, shared_sensitive_metadata(GuestVa(0x500004), None));
+        let before = state.shared_install_logical_snapshot_for_test();
+
+        state
+            .prepare_shared_install(73, &memory, shared_install_unit(base))
+            .expect("terminal metadata is not a block-start collision");
+
+        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
     }
 
     #[test]
