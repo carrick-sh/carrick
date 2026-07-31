@@ -7,6 +7,217 @@ fn cli() -> Command {
     Command::cargo_bin("carrick").unwrap()
 }
 
+const DSRPROF2_FIXTURE: &str = concat!(
+    "DSRPROF2|header|profile=native-wall|raw_schema=carrick.dsrprof.raw.v2|os_build=26A123|program_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|birth_qualification_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb|terminal_qualification_sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc|wall_hz=197|cpu_hz=499\n",
+    "DSRPROF2|target-birth|pid=100|start_sec=10|start_usec=20|image=1|epoch=0\n",
+    "DSRPROF2|range-reset|pid=100|start_sec=10|start_usec=20|image=1|epoch=0\n",
+    "DSRPROF2|range-private|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=1|start=0x1000|end=0x2000\n",
+    "DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=2|unit_id=7|start=0x3000|end=0x3800\n",
+    "DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=3|unit_id=8|start=0x4000|end=0x4800\n",
+    "DSRPROF2|range-ready|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|final_sequence=3\n",
+    "DSRPROF2|host-image-base|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|base=0x100000000\n",
+    "DSRPROF2|host-image-catalog|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|payload={\"ranges\":[{\"start\":4294967296,\"end\":4294971392,\"path\":\"/carrick\"}]}\n",
+    "DSRPROF2|guest-image-base|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|base=0x400000\n",
+    "DSRPROF2|cpu-user|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|pc=0x1100|count=3\n",
+    "DSRPROF2|kernel-enter|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1000\n",
+    "DSRPROF2|kernel-return|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1200\n",
+    "DSRPROF2|offcpu-block|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|kind=voluntary|pc=0x1150|timestamp_ns=1300\n",
+    "DSRPROF2|offcpu-wake|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|observed_pid=100|observed_sec=10|observed_usec=20|observed_image=1|observed_epoch=0|timestamp_ns=1800\n",
+    "DSRPROF2|offcpu|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=voluntary|pc=0x1150|count=1|total_ns=500\n",
+    "DSRPROF2|process-create|child_pid=101|child_sec=11|child_usec=21|child_image=1|child_epoch=0|parent_pid=100|parent_sec=10|parent_usec=20|parent_image=1|parent_epoch=0\n",
+    "DSRPROF2|fork-inherit|child_pid=101|child_sec=11|child_usec=21|parent_pid=100|parent_sec=10|parent_usec=20|parent_image=1|parent_epoch=0|range_frontier=3|mapping_frontier=0\n",
+    "DSRPROF2|range-reset|pid=101|start_sec=11|start_usec=21|image=1|epoch=1\n",
+    "DSRPROF2|range-private|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=1|start=0x1000|end=0x2000\n",
+    "DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=2|unit_id=7|start=0x3000|end=0x3800\n",
+    "DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=3|unit_id=8|start=0x4000|end=0x4800\n",
+    "DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|final_sequence=3\n",
+    "DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=4|unit_id=9|start=0x5000|end=0x5800\n",
+    "DSRPROF2|range-ready|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|final_sequence=4\n",
+    "DSRPROF2|exec-attempt|pid=101|start_sec=11|start_usec=21|image=1|epoch=1\n",
+    "DSRPROF2|exec-failure|pid=101|start_sec=11|start_usec=21|image=1|epoch=1\n",
+    "DSRPROF2|exec-attempt|pid=101|start_sec=11|start_usec=21|image=1|epoch=1\n",
+    "DSRPROF2|exec-success|pid=101|start_sec=11|start_usec=21|retired_image=1|retired_epoch=1|new_image=2|new_epoch=0\n",
+    "DSRPROF2|range-reset|pid=101|start_sec=11|start_usec=21|image=2|epoch=0\n",
+    "DSRPROF2|range-private|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|sequence=1|start=0x6000|end=0x7000\n",
+    "DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|final_sequence=1\n",
+    "DSRPROF2|process-exit|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|reason=1\n",
+    "DSRPROF2|process-exit|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|reason=1\n",
+    "DSRPROF2|wall-state|kind=on-cpu|count=10\n",
+    "DSRPROF2|wall-state|kind=all-sleeping|count=1\n",
+    "DSRPROF2|complete|profile=native-wall|bounded=0|target_exit_reason=1|live_at_end=0\n",
+);
+
+fn validate_dsrprof2_fixture(contents: &str, extra_args: &[&str]) -> assert_cmd::assert::Assert {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
+    let mut command = cli();
+    command
+        .arg("__native-profile-validate")
+        .arg("--input")
+        .arg(file.path())
+        .args(extra_args);
+    command.assert()
+}
+
+#[test]
+fn dsrprof2_accepts_birth_keyed_lifecycle_fixture() {
+    validate_dsrprof2_fixture(DSRPROF2_FIXTURE, &[])
+        .success()
+        .stdout(contains("DSRPROF2_VALID"));
+}
+
+#[test]
+fn dsrprof2_preserves_exact_stack_blocks() {
+    let process_create = "DSRPROF2|process-create|child_pid=101|child_sec=11|child_usec=21|child_image=1|child_epoch=0|parent_pid=100|parent_sec=10|parent_usec=20|parent_image=1|parent_epoch=0";
+    let stack = concat!(
+        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500\n",
+        "libsystem_kernel.dylib`__psynch_cvwait+0xa\n",
+        "carrick`wait_for_translation+0x20\n",
+        "DSRSTACK2|end\n",
+    );
+    let valid = DSRPROF2_FIXTURE.replacen(process_create, &format!("{stack}{process_create}"), 1);
+    validate_dsrprof2_fixture(&valid, &[]).success();
+
+    for corrupt_stack in [
+        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500\nDSRSTACK2|end\n",
+        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500|extra=1\nframe\nDSRSTACK2|end\n",
+        "DSRSTACK2|end\n",
+        "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=offcpu-voluntary|count=1|total_ns=500\nDSRPROF2|wall-state|kind=on-cpu|count=1\nDSRSTACK2|end\n",
+    ] {
+        let corrupt = DSRPROF2_FIXTURE.replacen(
+            process_create,
+            &format!("{corrupt_stack}{process_create}"),
+            1,
+        );
+        validate_dsrprof2_fixture(&corrupt, &[]).failure();
+    }
+}
+
+#[test]
+fn dsrprof2_rejects_corrupt_lifecycle_fixtures() {
+    let process_create = "DSRPROF2|process-create|child_pid=101|child_sec=11|child_usec=21|child_image=1|child_epoch=0|parent_pid=100|parent_sec=10|parent_usec=20|parent_image=1|parent_epoch=0";
+    let fork_inherit = "DSRPROF2|fork-inherit|child_pid=101|child_sec=11|child_usec=21|parent_pid=100|parent_sec=10|parent_usec=20|parent_image=1|parent_epoch=0|range_frontier=3|mapping_frontier=0";
+    let cpu_user =
+        "DSRPROF2|cpu-user|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|pc=0x1100|count=3";
+    let target_birth = "DSRPROF2|target-birth|pid=100|start_sec=10|start_usec=20|image=1|epoch=0";
+    let parent_later_range = "DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=4|unit_id=9|start=0x5000|end=0x5800";
+    let kernel_return = "DSRPROF2|kernel-return|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1200";
+    let offcpu_block = "DSRPROF2|offcpu-block|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|kind=voluntary|pc=0x1150|timestamp_ns=1300";
+    let offcpu_wake = "DSRPROF2|offcpu-wake|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|observed_pid=100|observed_sec=10|observed_usec=20|observed_image=1|observed_epoch=0|timestamp_ns=1800";
+    let offcpu_summary = "DSRPROF2|offcpu|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=voluntary|pc=0x1150|count=1|total_ns=500";
+    let exec_success = "DSRPROF2|exec-success|pid=101|start_sec=11|start_usec=21|retired_image=1|retired_epoch=1|new_image=2|new_epoch=0";
+    let old_host_catalog = "DSRPROF2|host-image-catalog|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|payload={\"ranges\":[{\"start\":4294967296,\"end\":4294971392,\"path\":\"/carrick\"}]}";
+
+    let duplicate_create = DSRPROF2_FIXTURE.replacen(
+        fork_inherit,
+        &format!("{process_create}\n{fork_inherit}"),
+        1,
+    );
+    let sample_before_birth = DSRPROF2_FIXTURE
+        .replacen(&format!("{cpu_user}\n"), "", 1)
+        .replacen(target_birth, &format!("{cpu_user}\n{target_birth}"), 1);
+    let add_before_reset = DSRPROF2_FIXTURE.replacen(
+        concat!(
+            "DSRPROF2|range-reset|pid=100|start_sec=10|start_usec=20|image=1|epoch=0\n",
+            "DSRPROF2|range-private|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=1|start=0x1000|end=0x2000"
+        ),
+        concat!(
+            "DSRPROF2|range-private|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=1|start=0x1000|end=0x2000\n",
+            "DSRPROF2|range-reset|pid=100|start_sec=10|start_usec=20|image=1|epoch=0"
+        ),
+        1,
+    );
+    let child_inherits_later_addition = DSRPROF2_FIXTURE
+        .replacen(&format!("{parent_later_range}\n"), "", 1)
+        .replacen(
+            process_create,
+            &format!("{parent_later_range}\n{process_create}"),
+            1,
+        );
+    let nested_out_of_order = DSRPROF2_FIXTURE.replacen(
+        kernel_return,
+        &format!(
+            "DSRPROF2|kernel-enter|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=write|class=named-syscall|timestamp_ns=1100\n{kernel_return}"
+        ),
+        1,
+    );
+    let terminal_close_returning = DSRPROF2_FIXTURE.replacen(
+        kernel_return,
+        "DSRPROF2|kernel-terminal-close|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|scope=thread|timestamp_ns=1200",
+        1,
+    );
+    let duplicate_offcpu_block =
+        DSRPROF2_FIXTURE.replacen(offcpu_wake, &format!("{offcpu_block}\n{offcpu_wake}"), 1);
+    let duplicate_offcpu_summary = DSRPROF2_FIXTURE.replacen(
+        process_create,
+        &format!("{offcpu_summary}\n{process_create}"),
+        1,
+    );
+    let host_catalog_after_exec = DSRPROF2_FIXTURE.replacen(
+        exec_success,
+        &format!("{exec_success}\n{old_host_catalog}"),
+        1,
+    );
+    let retired_transition_reuse = DSRPROF2_FIXTURE.replacen(
+        exec_success,
+        &format!(
+            "{exec_success}\nDSRPROF2|kernel-enter|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|tid=101|provider=syscall|function=read|class=named-syscall|timestamp_ns=2000"
+        ),
+        1,
+    );
+    let child_inherits_after_frontier = DSRPROF2_FIXTURE.replacen(
+        "DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|final_sequence=3",
+        concat!(
+            "DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=4|unit_id=9|start=0x5000|end=0x5800\n",
+            "DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|final_sequence=4"
+        ),
+        1,
+    );
+
+    for corrupt in [
+        DSRPROF2_FIXTURE.replacen("start_usec=20|image=1|epoch=0|pc=0x1100", "start_usec=22|image=1|epoch=0|pc=0x1100", 1),
+        duplicate_create,
+        sample_before_birth,
+        DSRPROF2_FIXTURE.replacen("image=1|epoch=0|sequence=1", "image=0|epoch=0|sequence=1", 1),
+        add_before_reset,
+        DSRPROF2_FIXTURE.replacen("sequence=2|unit_id=7", "sequence=1|unit_id=7", 1),
+        DSRPROF2_FIXTURE.replacen("sequence=2|unit_id=7", "sequence=3|unit_id=7", 1),
+        DSRPROF2_FIXTURE.replacen("start=0x3000|end=0x3800", "start=0x1800|end=0x2800", 1),
+        DSRPROF2_FIXTURE.replacen("final_sequence=3", "final_sequence=2", 1),
+        DSRPROF2_FIXTURE.replacen("range_frontier=3", "range_frontier=4", 1),
+        child_inherits_later_addition,
+        child_inherits_after_frontier,
+        DSRPROF2_FIXTURE.replacen("DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=2|unit_id=7|start=0x3000|end=0x3800", "DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=2|unit_id=7|start=0x3000|end=0x3900", 1),
+        DSRPROF2_FIXTURE.replacen("observed_image=1", "observed_image=2", 1),
+        DSRPROF2_FIXTURE.replacen("provider=syscall|function=read|class=named-syscall|timestamp_ns=1200", "provider=mach_trap|function=read|class=named-syscall|timestamp_ns=1200", 1),
+        DSRPROF2_FIXTURE.replacen("function=read|class=named-syscall|timestamp_ns=1200", "function=write|class=named-syscall|timestamp_ns=1200", 1),
+        DSRPROF2_FIXTURE.replacen("function=read|class=named-syscall|timestamp_ns=1200", "function=read|class=mach-trap|timestamp_ns=1200", 1),
+        DSRPROF2_FIXTURE.replacen("image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1200", "image=2|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1200", 1),
+        nested_out_of_order,
+        terminal_close_returning,
+        DSRPROF2_FIXTURE.replacen(&format!("{kernel_return}\n"), "", 1),
+        duplicate_offcpu_block,
+        DSRPROF2_FIXTURE.replacen(&format!("{offcpu_wake}\n"), "", 1),
+        DSRPROF2_FIXTURE.replacen("count=1|total_ns=500", "count=1|total_ns=501", 1),
+        DSRPROF2_FIXTURE.replacen(&format!("{offcpu_summary}\n"), "", 1),
+        duplicate_offcpu_summary,
+        host_catalog_after_exec,
+        retired_transition_reuse,
+        DSRPROF2_FIXTURE.replacen("retired_image=1", "retired_image=2", 1),
+        DSRPROF2_FIXTURE.replacen("mapping_frontier=0", "mapping_frontier=1", 1),
+        DSRPROF2_FIXTURE.replacen("DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|final_sequence=3\n", "", 1),
+        DSRPROF2_FIXTURE.replacen("DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|final_sequence=1\n", "", 1),
+        DSRPROF2_FIXTURE.replacen("live_at_end=0", "live_at_end=1", 1),
+        DSRPROF2_FIXTURE.replacen("DSRPROF2|wall-state", "DSRPROF2|unknown", 1),
+        DSRPROF2_FIXTURE.replacen("DSRPROF2|process-create", "DSRPROF2|process-create|unknown=1", 1),
+        DSRPROF2_FIXTURE.replacen("pid=100|start_sec=10", "pid=4294967296|start_sec=10", 1),
+        format!("DSRPROF1|count|phase=run|value=1\n{DSRPROF2_FIXTURE}"),
+    ] {
+        validate_dsrprof2_fixture(&corrupt, &[]).failure();
+    }
+    validate_dsrprof2_fixture(DSRPROF2_FIXTURE, &["--principal-drops", "1"]).failure();
+}
+
 #[test]
 fn trace_profile_argument_relationships_are_enforced() {
     cli()
