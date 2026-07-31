@@ -33,6 +33,10 @@ sections 2, 6, 8, 9, and 10.
   never rounded to host pages.
 - Provider names encode reset/private/shared/ready. No raw action or kind
   integer crosses the USDT boundary.
+- The translated-range USDT family carries at most five scalars. It omits PID
+  from the provider payload; `native-wall.d` supplies the unchanged
+  `DSRPROF2` PID field from DTrace's built-in `pid`. Existing compatibility
+  probe ABIs remain unchanged.
 - A shared range is announced before any block/link can make its code
   reachable. Failed unit loads announce nothing.
 - Ranges remain immutable until exec/exit. Unload or address reuse stops this
@@ -115,7 +119,7 @@ pub struct TranslatedRangeReady {
 }
 ```
 
-- [ ] **Step 1: Add red domain and probe-shape tests**
+- [x] **Step 1: Add red domain and probe-shape tests**
 
 In `probes.rs`, add tests for:
 
@@ -126,9 +130,10 @@ In `probes.rs`, add tests for:
 - construction through struct literals or a kind/payload mismatch;
 - sequence raw round-trip only through named accessors;
 - enum ordinal uniqueness; and
-- exact probe function signatures with no generic raw action/kind argument.
+- exact one/four/five/two-scalar probe function signatures with no PID,
+  generic raw action, or generic raw kind argument.
 
-- [ ] **Step 2: Run and prove red**
+- [x] **Step 2: Run and prove red**
 
 ```bash
 cargo test -p carrick-observability translated_range -- --nocapture
@@ -136,7 +141,7 @@ cargo test -p carrick-observability translated_range -- --nocapture
 
 Expected: unresolved translated-range types and probe functions.
 
-- [ ] **Step 3: Implement named constructors at the DSR-neutral seam**
+- [x] **Step 3: Implement named constructors at the DSR-neutral seam**
 
 `carrick-dsr-aarch64` deliberately does not depend on
 `carrick-observability`. Put the canonical typed event domain in
@@ -183,23 +188,31 @@ by four. Fields remain private; named accessors expose epoch, sequence, range,
 and unit ID. `TranslatedRangeAdd::kind()` exhaustively derives its ordinal from
 the enum variant. Do not expose a general integer-to-kind constructor.
 
-- [ ] **Step 4: Add the four scalar USDT probes**
+- [x] **Step 4: Add the four scalar USDT probes**
 
 Declare and wrap exactly:
 
 ```rust
-fn host__translated__range__reset(_: u32, _: u64) {}
-fn host__translated__private__range(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+fn host__translated__range__reset(_: u64) {}
+fn host__translated__private__range(_: u64, _: u64, _: u64, _: u64) {}
 fn host__translated__shared__range(
-    _: u32, _: u64, _: u64, _: u64, _: u64, _: u64
+    _: u64, _: u64, _: u64, _: u64, _: u64
 ) {}
-fn host__translated__range__ready(_: u32, _: u64, _: u64) {}
+fn host__translated__range__ready(_: u64, _: u64) {}
 ```
 
 Public wrappers accept only `TranslatedRangeReset`,
 `TranslatedPrivateRange`, `TranslatedSharedRange`, and
-`TranslatedRangeReady`; they add `std::process::id()` and unwrap typed values
-at this boundary. Mirror identical no-op signatures in the stub module.
+`TranslatedRangeReady`; they unwrap typed values at this boundary and never
+accept or compute a PID. Mirror identical no-op signatures in the stub module.
+
+The Rust provider can declare six scalar arguments, but live Darwin evidence
+from real DSR probe sites shows that `arg5` is returned as constant zero. Five
+scalars are the reliable limit, so `native-wall.d` uses the DTrace built-in
+`pid` both to admit each event and to populate the unchanged `pid=P` field in
+the raw `DSRPROF2` range records. Do not split a range across companion probes.
+Existing `host-jit-range`, `dsr-cache-bounds`, and other compatibility ABIs
+remain unchanged.
 
 Extend `DsrProbeSink` with:
 
@@ -216,7 +229,7 @@ is the only engine-to-USDT bridge; the translator never calls
 `carrick_observability` directly, and the sink cannot pair a shared payload
 with the private probe.
 
-- [ ] **Step 5: Run focused tests and commit**
+- [x] **Step 5: Run focused tests and commit**
 
 ```bash
 cargo test -p carrick-observability translated_range -- --nocapture

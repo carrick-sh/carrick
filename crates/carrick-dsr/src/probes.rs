@@ -14,7 +14,11 @@
 //! (the runtime forwarder's exhaustive `match` breaks the build if a variant
 //! is added on either side alone).
 
+use std::num::NonZeroU64;
+use std::ops::Range;
 use std::sync::OnceLock;
+
+use carrick_guest_mem::HostVa;
 
 macro_rules! dsr_ordinal_enum {
     (
@@ -45,6 +49,270 @@ macro_rules! dsr_ordinal_enum {
         <[()]>::len(&[$(dsr_ordinal_enum!(@unit $variant)),+])
     };
     (@unit $variant:ident) => { () };
+}
+
+dsr_ordinal_enum! {
+    /// Executable translated-code ownership carried by a typed range event.
+    /// Mirrors `carrick_observability::probes::TranslatedRangeKind` exactly.
+    pub enum TranslatedRangeKind {
+        PrivateProcessCache = 1,
+        SharedUnit = 2,
+    }
+}
+
+/// Rejected translated-range identity or executable extent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TranslatedRangeError {
+    #[error("translated-range epoch must be nonzero")]
+    ZeroEpoch,
+    #[error("translated-range sequence must be nonzero")]
+    ZeroSequence,
+    #[error("translated shared-unit identity must be nonzero")]
+    ZeroUnitId,
+    #[error("translated executable range is empty at 0x{address:x}")]
+    EmptyRange { address: usize },
+    #[error("translated executable range is reversed: 0x{start:x}..0x{end:x}")]
+    ReversedRange { start: usize, end: usize },
+    #[error("translated executable range is not four-byte aligned: 0x{start:x}..0x{end:x}")]
+    UnalignedRange { start: usize, end: usize },
+}
+
+/// Nonzero identity for one process-image translated-range catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranslatedRangeEpoch(NonZeroU64);
+
+impl TranslatedRangeEpoch {
+    pub fn new(value: u64) -> Result<Self, TranslatedRangeError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(TranslatedRangeError::ZeroEpoch)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Nonzero monotonically increasing identity for one catalog addition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranslatedRangeSequence(NonZeroU64);
+
+impl TranslatedRangeSequence {
+    pub fn new(value: u64) -> Result<Self, TranslatedRangeError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(TranslatedRangeError::ZeroSequence)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Stable nonzero identity for one loaded shared translation unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranslatedUnitId(NonZeroU64);
+
+impl TranslatedUnitId {
+    pub fn new(value: u64) -> Result<Self, TranslatedRangeError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(TranslatedRangeError::ZeroUnitId)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Reset the translated-range catalog for one process-image epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranslatedRangeReset {
+    epoch: TranslatedRangeEpoch,
+}
+
+impl TranslatedRangeReset {
+    pub const fn reset(epoch: TranslatedRangeEpoch) -> Self {
+        Self { epoch }
+    }
+
+    pub const fn epoch(&self) -> TranslatedRangeEpoch {
+        self.epoch
+    }
+}
+
+/// Add one typed executable range to the active translated-range catalog.
+///
+/// The enum variants keep private and shared payloads distinct:
+///
+/// ```compile_fail
+/// use carrick_dsr::probes::{
+///     TranslatedRangeAdd, TranslatedRangeEpoch, TranslatedRangeSequence,
+///     TranslatedSharedRange, TranslatedUnitId,
+/// };
+/// use carrick_guest_mem::HostVa;
+///
+/// let epoch = TranslatedRangeEpoch::new(1).unwrap();
+/// let sequence = TranslatedRangeSequence::new(1).unwrap();
+/// let unit_id = TranslatedUnitId::new(1).unwrap();
+/// let shared = TranslatedSharedRange::shared(
+///     epoch,
+///     sequence,
+///     unit_id,
+///     HostVa(0x1000)..HostVa(0x2000),
+/// ).unwrap();
+/// let _ = TranslatedRangeAdd::Private(shared);
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TranslatedRangeAdd {
+    Private(TranslatedPrivateRange),
+    Shared(TranslatedSharedRange),
+}
+
+impl TranslatedRangeAdd {
+    pub const fn kind(&self) -> TranslatedRangeKind {
+        match self {
+            Self::Private(_) => TranslatedRangeKind::PrivateProcessCache,
+            Self::Shared(_) => TranslatedRangeKind::SharedUnit,
+        }
+    }
+}
+
+/// Exact half-open executable extent of the process-private translation cache.
+///
+/// Its fields are private and there is no unit-ID parameter, so a caller
+/// cannot construct a private event with shared-unit identity.
+///
+/// ```compile_fail
+/// use carrick_dsr::probes::{
+///     TranslatedPrivateRange, TranslatedRangeEpoch, TranslatedRangeSequence,
+/// };
+/// use carrick_guest_mem::HostVa;
+///
+/// let epoch = TranslatedRangeEpoch::new(1).unwrap();
+/// let sequence = TranslatedRangeSequence::new(1).unwrap();
+/// let _ = TranslatedPrivateRange {
+///     epoch,
+///     sequence,
+///     range: HostVa(0x1000)..HostVa(0x2000),
+/// };
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranslatedPrivateRange {
+    epoch: TranslatedRangeEpoch,
+    sequence: TranslatedRangeSequence,
+    range: Range<HostVa>,
+}
+
+impl TranslatedPrivateRange {
+    pub fn private(
+        epoch: TranslatedRangeEpoch,
+        sequence: TranslatedRangeSequence,
+        range: Range<HostVa>,
+    ) -> Result<Self, TranslatedRangeError> {
+        validate_translated_range(&range)?;
+        Ok(Self {
+            epoch,
+            sequence,
+            range,
+        })
+    }
+
+    pub const fn epoch(&self) -> TranslatedRangeEpoch {
+        self.epoch
+    }
+
+    pub const fn sequence(&self) -> TranslatedRangeSequence {
+        self.sequence
+    }
+
+    pub const fn range(&self) -> &Range<HostVa> {
+        &self.range
+    }
+}
+
+/// Exact half-open executable extent of one shared translation unit.
+///
+/// Its fields are private and construction requires a typed unit ID, so a
+/// caller cannot publish a shared event without unit identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranslatedSharedRange {
+    epoch: TranslatedRangeEpoch,
+    sequence: TranslatedRangeSequence,
+    unit_id: TranslatedUnitId,
+    range: Range<HostVa>,
+}
+
+impl TranslatedSharedRange {
+    pub fn shared(
+        epoch: TranslatedRangeEpoch,
+        sequence: TranslatedRangeSequence,
+        unit_id: TranslatedUnitId,
+        range: Range<HostVa>,
+    ) -> Result<Self, TranslatedRangeError> {
+        validate_translated_range(&range)?;
+        Ok(Self {
+            epoch,
+            sequence,
+            unit_id,
+            range,
+        })
+    }
+
+    pub const fn epoch(&self) -> TranslatedRangeEpoch {
+        self.epoch
+    }
+
+    pub const fn sequence(&self) -> TranslatedRangeSequence {
+        self.sequence
+    }
+
+    pub const fn unit_id(&self) -> TranslatedUnitId {
+        self.unit_id
+    }
+
+    pub const fn range(&self) -> &Range<HostVa> {
+        &self.range
+    }
+}
+
+/// Close the initial translated-range replay for one process-image epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranslatedRangeReady {
+    epoch: TranslatedRangeEpoch,
+    final_sequence: u64,
+}
+
+impl TranslatedRangeReady {
+    pub const fn ready(epoch: TranslatedRangeEpoch, final_sequence: u64) -> Self {
+        Self {
+            epoch,
+            final_sequence,
+        }
+    }
+
+    pub const fn epoch(&self) -> TranslatedRangeEpoch {
+        self.epoch
+    }
+
+    pub const fn final_sequence(&self) -> u64 {
+        self.final_sequence
+    }
+}
+
+fn validate_translated_range(range: &Range<HostVa>) -> Result<(), TranslatedRangeError> {
+    let start = range.start.raw();
+    let end = range.end.raw();
+    if start == end {
+        return Err(TranslatedRangeError::EmptyRange { address: start });
+    }
+    if start > end {
+        return Err(TranslatedRangeError::ReversedRange { start, end });
+    }
+    if !start.is_multiple_of(4) || !end.is_multiple_of(4) {
+        return Err(TranslatedRangeError::UnalignedRange { start, end });
+    }
+    Ok(())
 }
 
 dsr_ordinal_enum! {
@@ -224,6 +492,12 @@ dsr_ordinal_enum! {
 /// `dsr_cache_event` / `dsr_cache_capacity`) with the mirrored enums
 /// substituted.
 pub trait DsrProbeSink: Send + Sync {
+    fn translated_range_reset(&self, event: TranslatedRangeReset);
+
+    fn translated_range_add(&self, event: TranslatedRangeAdd);
+
+    fn translated_range_ready(&self, event: TranslatedRangeReady);
+
     fn dsr_cache_lifecycle(
         &self,
         tid: i32,
@@ -326,6 +600,33 @@ static SINK: OnceLock<&'static dyn DsrProbeSink> = OnceLock::new();
 /// without error, so racing initializers cannot flip a live sink mid-run.
 pub fn install_probe_sink(sink: &'static dyn DsrProbeSink) {
     let _ = SINK.set(sink);
+}
+
+/// Fire a translated-range catalog reset through the installed sink; no-op
+/// when no sink is installed.
+#[inline(always)]
+pub fn translated_range_reset(event: TranslatedRangeReset) {
+    if let Some(sink) = SINK.get() {
+        sink.translated_range_reset(event);
+    }
+}
+
+/// Fire one typed translated-range catalog addition through the installed
+/// sink; no-op when no sink is installed.
+#[inline(always)]
+pub fn translated_range_add(event: TranslatedRangeAdd) {
+    if let Some(sink) = SINK.get() {
+        sink.translated_range_add(event);
+    }
+}
+
+/// Fire the initial translated-range replay frontier through the installed
+/// sink; no-op when no sink is installed.
+#[inline(always)]
+pub fn translated_range_ready(event: TranslatedRangeReady) {
+    if let Some(sink) = SINK.get() {
+        sink.translated_range_ready(event);
+    }
 }
 
 /// Fire the `dsr__cache__lifecycle` probe through the installed sink; no-op
@@ -546,15 +847,32 @@ pub fn dsr_cache_bounds(base: u64, end: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carrick_guest_mem::HostVa;
+    use std::ops::Range;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct CountingSink {
+        translated_reset: AtomicU64,
+        translated_add: AtomicU64,
+        translated_ready: AtomicU64,
         lifecycle: AtomicU64,
         detail: AtomicU64,
         synchronization: AtomicU64,
     }
 
     impl DsrProbeSink for CountingSink {
+        fn translated_range_reset(&self, _event: TranslatedRangeReset) {
+            self.translated_reset.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn translated_range_add(&self, _event: TranslatedRangeAdd) {
+            self.translated_add.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn translated_range_ready(&self, _event: TranslatedRangeReady) {
+            self.translated_ready.fetch_add(1, Ordering::Relaxed);
+        }
+
         fn dsr_cache_lifecycle(
             &self,
             _tid: i32,
@@ -679,23 +997,48 @@ mod tests {
     #[test]
     fn uninstalled_is_noop_then_first_install_wins() {
         static FIRST: CountingSink = CountingSink {
+            translated_reset: AtomicU64::new(0),
+            translated_add: AtomicU64::new(0),
+            translated_ready: AtomicU64::new(0),
             lifecycle: AtomicU64::new(0),
             detail: AtomicU64::new(0),
             synchronization: AtomicU64::new(0),
         };
         static SECOND: CountingSink = CountingSink {
+            translated_reset: AtomicU64::new(0),
+            translated_add: AtomicU64::new(0),
+            translated_ready: AtomicU64::new(0),
             lifecycle: AtomicU64::new(0),
             detail: AtomicU64::new(0),
             synchronization: AtomicU64::new(0),
         };
 
         // No sink installed: helpers must be a silent no-op.
+        let translated_epoch = TranslatedRangeEpoch::new(1)
+            .unwrap_or_else(|error| unreachable!("valid translated epoch: {error}"));
+        let translated_sequence = TranslatedRangeSequence::new(1)
+            .unwrap_or_else(|error| unreachable!("valid translated sequence: {error}"));
+        let translated_private = TranslatedPrivateRange::private(
+            translated_epoch,
+            translated_sequence,
+            HostVa(0x1000)..HostVa(0x2000),
+        )
+        .unwrap_or_else(|error| unreachable!("valid translated private range: {error}"));
+        translated_range_reset(TranslatedRangeReset::reset(translated_epoch));
+        translated_range_add(TranslatedRangeAdd::Private(translated_private.clone()));
+        translated_range_ready(TranslatedRangeReady::ready(translated_epoch, 1));
         dsr_cache_lifecycle(1, DsrCacheLifecyclePhase::ExecImageMapBegin, 0, 0, 0);
         dsr_exec_map_detail(1, DsrExecMapDetailKind::Mmap, 0, 0, 0);
+        assert_eq!(FIRST.translated_reset.load(Ordering::Relaxed), 0);
+        assert_eq!(FIRST.translated_add.load(Ordering::Relaxed), 0);
+        assert_eq!(FIRST.translated_ready.load(Ordering::Relaxed), 0);
         assert_eq!(FIRST.lifecycle.load(Ordering::Relaxed), 0);
         assert_eq!(FIRST.detail.load(Ordering::Relaxed), 0);
 
         install_probe_sink(&FIRST);
+        translated_range_reset(TranslatedRangeReset::reset(translated_epoch));
+        translated_range_add(TranslatedRangeAdd::Private(translated_private));
+        translated_range_ready(TranslatedRangeReady::ready(translated_epoch, 1));
         dsr_cache_lifecycle(1, DsrCacheLifecyclePhase::ExecImageMapEnd, 1, 2, 3);
         dsr_exec_map_detail(1, DsrExecMapDetailKind::Copy, 4, 5, 6);
         let generations =
@@ -703,6 +1046,9 @@ mod tests {
         generations
             .observe(carrick_guest_mem::GuestVa(0x1_0000))
             .expect("generation observation");
+        assert_eq!(FIRST.translated_reset.load(Ordering::Relaxed), 1);
+        assert_eq!(FIRST.translated_add.load(Ordering::Relaxed), 1);
+        assert_eq!(FIRST.translated_ready.load(Ordering::Relaxed), 1);
         assert_eq!(FIRST.lifecycle.load(Ordering::Relaxed), 1);
         assert_eq!(FIRST.detail.load(Ordering::Relaxed), 1);
         assert_eq!(FIRST.synchronization.load(Ordering::Relaxed), 2);
@@ -711,6 +1057,9 @@ mod tests {
         install_probe_sink(&SECOND);
         dsr_cache_lifecycle(1, DsrCacheLifecyclePhase::ExecCacheResetBegin, 0, 0, 0);
         assert_eq!(FIRST.lifecycle.load(Ordering::Relaxed), 2);
+        assert_eq!(SECOND.translated_reset.load(Ordering::Relaxed), 0);
+        assert_eq!(SECOND.translated_add.load(Ordering::Relaxed), 0);
+        assert_eq!(SECOND.translated_ready.load(Ordering::Relaxed), 0);
         assert_eq!(SECOND.lifecycle.load(Ordering::Relaxed), 0);
         assert_eq!(SECOND.detail.load(Ordering::Relaxed), 0);
         assert_eq!(SECOND.synchronization.load(Ordering::Relaxed), 0);
@@ -757,5 +1106,124 @@ mod tests {
         for (index, role) in DsrCacheRole::ALL.iter().enumerate() {
             assert_eq!(role.raw() as usize, index);
         }
+    }
+
+    fn translated_epoch(value: u64) -> TranslatedRangeEpoch {
+        TranslatedRangeEpoch::new(value).unwrap_or_else(|error| {
+            unreachable!("nonzero test epoch must be valid: {error}");
+        })
+    }
+
+    fn translated_sequence(value: u64) -> TranslatedRangeSequence {
+        TranslatedRangeSequence::new(value).unwrap_or_else(|error| {
+            unreachable!("nonzero test sequence must be valid: {error}");
+        })
+    }
+
+    fn translated_unit_id(value: u64) -> TranslatedUnitId {
+        TranslatedUnitId::new(value).unwrap_or_else(|error| {
+            unreachable!("nonzero test unit identity must be valid: {error}");
+        })
+    }
+
+    #[test]
+    fn translated_range_domain_rejects_zero_identity_and_malformed_extents() {
+        assert!(matches!(
+            TranslatedRangeEpoch::new(0),
+            Err(TranslatedRangeError::ZeroEpoch)
+        ));
+        assert!(matches!(
+            TranslatedRangeSequence::new(0),
+            Err(TranslatedRangeError::ZeroSequence)
+        ));
+        assert!(matches!(
+            TranslatedUnitId::new(0),
+            Err(TranslatedRangeError::ZeroUnitId)
+        ));
+
+        for range in [
+            HostVa(0x1000)..HostVa(0x1000),
+            HostVa(0x2000)..HostVa(0x1000),
+            HostVa(0x1001)..HostVa(0x2000),
+            HostVa(0x1000)..HostVa(0x2002),
+        ] {
+            assert!(
+                TranslatedPrivateRange::private(
+                    translated_epoch(1),
+                    translated_sequence(1),
+                    range.clone()
+                )
+                .is_err(),
+                "malformed private executable extent must be rejected"
+            );
+            assert!(
+                TranslatedSharedRange::shared(
+                    translated_epoch(1),
+                    translated_sequence(1),
+                    translated_unit_id(1),
+                    range
+                )
+                .is_err(),
+                "malformed shared executable extent must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn translated_range_domain_has_typed_constructor_and_fire_shapes() {
+        let _: fn(
+            TranslatedRangeEpoch,
+            TranslatedRangeSequence,
+            Range<HostVa>,
+        ) -> Result<TranslatedPrivateRange, TranslatedRangeError> = TranslatedPrivateRange::private;
+        let _: fn(
+            TranslatedRangeEpoch,
+            TranslatedRangeSequence,
+            TranslatedUnitId,
+            Range<HostVa>,
+        ) -> Result<TranslatedSharedRange, TranslatedRangeError> = TranslatedSharedRange::shared;
+        let _: fn(TranslatedRangeReset) = translated_range_reset;
+        let _: fn(TranslatedRangeAdd) = translated_range_add;
+        let _: fn(TranslatedRangeReady) = translated_range_ready;
+
+        let private = TranslatedPrivateRange::private(
+            translated_epoch(2),
+            translated_sequence(3),
+            HostVa(0x1000)..HostVa(0x2000),
+        )
+        .unwrap_or_else(|error| unreachable!("valid private range: {error}"));
+        let shared = TranslatedSharedRange::shared(
+            translated_epoch(2),
+            translated_sequence(4),
+            translated_unit_id(5),
+            HostVa(0x3000)..HostVa(0x4000),
+        )
+        .unwrap_or_else(|error| unreachable!("valid shared range: {error}"));
+
+        assert_eq!(
+            TranslatedRangeAdd::Private(private.clone()).kind(),
+            TranslatedRangeKind::PrivateProcessCache
+        );
+        assert_eq!(
+            TranslatedRangeAdd::Shared(shared.clone()).kind(),
+            TranslatedRangeKind::SharedUnit
+        );
+        assert_eq!(translated_epoch(7).get(), 7);
+        assert_eq!(translated_sequence(11).get(), 11);
+        assert_eq!(translated_unit_id(13).get(), 13);
+        assert_eq!(private.range(), &(HostVa(0x1000)..HostVa(0x2000)));
+        assert_eq!(shared.unit_id(), translated_unit_id(5));
+    }
+
+    #[test]
+    fn translated_range_kind_ordinals_are_stable_and_unique() {
+        assert_eq!(TranslatedRangeKind::PrivateProcessCache.raw(), 1);
+        assert_eq!(TranslatedRangeKind::SharedUnit.raw(), 2);
+        let mut ordinals = TranslatedRangeKind::ALL
+            .map(TranslatedRangeKind::raw)
+            .to_vec();
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        assert_eq!(ordinals.len(), TranslatedRangeKind::ALL.len());
     }
 }

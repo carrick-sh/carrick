@@ -386,17 +386,24 @@ instruction alignment, monotonic sequence, and legal identity are validated
 before publication. The range is the exact executable extent; it is not
 expanded to page boundaries that could capture unrelated PCs.
 
-The USDT crate caps probes at six arguments. The wire contract therefore uses
-separate scalar probes instead of packing raw action/kind integers:
+The Rust USDT provider accepts six scalar arguments, but live Darwin evidence
+from real DSR probe sites shows that `arg5` is returned as constant zero. Five
+scalars are therefore the reliable wire limit. The translated-range family
+omits the redundant PID payload and uses separate probes instead of packing raw
+action/kind integers:
 
-- `host-translated-range-reset(pid, epoch)`;
-- `host-translated-private-range(pid, epoch, sequence, start, end)`;
-- `host-translated-shared-range(pid, epoch, sequence, unit_id, start, end)`;
-- `host-translated-range-ready(pid, epoch, final_sequence)`.
+- `host-translated-range-reset(epoch)`;
+- `host-translated-private-range(epoch, sequence, start, end)`;
+- `host-translated-shared-range(epoch, sequence, unit_id, start, end)`;
+- `host-translated-range-ready(epoch, final_sequence)`.
 
-Typed wrappers are the only call sites for those probes. Provider names carry
-the action and kind domains; the USDT boundary does not expose a generic raw
-action/kind parameter.
+Typed wrappers are the only call sites for those probes. They accept only the
+typed event and do not call `std::process::id()`. Provider names carry the
+action and kind domains; the USDT boundary does not expose a generic raw
+action/kind parameter. `native-wall.d` supplies the unchanged `DSRPROF2`
+`pid=P` field from DTrace's built-in `pid`, which is the kernel-derived process
+context of the firing probe. Existing `host-jit-range` and `dsr-cache-bounds`
+compatibility ABIs remain unchanged.
 
 Translated mappings are immutable for one process-image epoch. Private caches
 and loaded shared units remain mapped until exec or exit. If runtime work

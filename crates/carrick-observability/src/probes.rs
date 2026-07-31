@@ -34,6 +34,11 @@
 //! `usdt` type: [`register_dtrace_probes`] returns the crate-local
 //! [`ProbeRegistrationError`], so the `stub` arm needs no `usdt` at all.
 
+use std::num::NonZeroU64;
+use std::ops::Range;
+
+use carrick_guest_mem::HostVa;
+
 /// Failure returned by `register_dtrace_probes`.
 ///
 /// Deliberately a crate-local type rather than `usdt::Error`. `usdt` is
@@ -143,6 +148,269 @@ macro_rules! dsr_ordinal_enum {
         <[()]>::len(&[$(dsr_ordinal_enum!(@unit $variant)),+])
     };
     (@unit $variant:ident) => { () };
+}
+
+dsr_ordinal_enum! {
+    /// Executable translated-code ownership carried by a typed range event.
+    pub enum TranslatedRangeKind {
+        PrivateProcessCache = 1,
+        SharedUnit = 2,
+    }
+}
+
+/// Rejected translated-range identity or executable extent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TranslatedRangeError {
+    #[error("translated-range epoch must be nonzero")]
+    ZeroEpoch,
+    #[error("translated-range sequence must be nonzero")]
+    ZeroSequence,
+    #[error("translated shared-unit identity must be nonzero")]
+    ZeroUnitId,
+    #[error("translated executable range is empty at 0x{address:x}")]
+    EmptyRange { address: usize },
+    #[error("translated executable range is reversed: 0x{start:x}..0x{end:x}")]
+    ReversedRange { start: usize, end: usize },
+    #[error("translated executable range is not four-byte aligned: 0x{start:x}..0x{end:x}")]
+    UnalignedRange { start: usize, end: usize },
+}
+
+/// Nonzero identity for one process-image translated-range catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranslatedRangeEpoch(NonZeroU64);
+
+impl TranslatedRangeEpoch {
+    pub fn new(value: u64) -> Result<Self, TranslatedRangeError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(TranslatedRangeError::ZeroEpoch)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Nonzero monotonically increasing identity for one catalog addition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranslatedRangeSequence(NonZeroU64);
+
+impl TranslatedRangeSequence {
+    pub fn new(value: u64) -> Result<Self, TranslatedRangeError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(TranslatedRangeError::ZeroSequence)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Stable nonzero identity for one loaded shared translation unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranslatedUnitId(NonZeroU64);
+
+impl TranslatedUnitId {
+    pub fn new(value: u64) -> Result<Self, TranslatedRangeError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(TranslatedRangeError::ZeroUnitId)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Reset the translated-range catalog for one process-image epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranslatedRangeReset {
+    epoch: TranslatedRangeEpoch,
+}
+
+impl TranslatedRangeReset {
+    pub const fn reset(epoch: TranslatedRangeEpoch) -> Self {
+        Self { epoch }
+    }
+
+    pub const fn epoch(&self) -> TranslatedRangeEpoch {
+        self.epoch
+    }
+}
+
+/// Add one typed executable range to the active translated-range catalog.
+///
+/// The enum variants keep private and shared payloads distinct:
+///
+/// ```compile_fail
+/// use carrick_observability::probes::{
+///     TranslatedRangeAdd, TranslatedRangeEpoch, TranslatedRangeSequence,
+///     TranslatedSharedRange, TranslatedUnitId,
+/// };
+/// use carrick_guest_mem::HostVa;
+///
+/// let epoch = TranslatedRangeEpoch::new(1).unwrap();
+/// let sequence = TranslatedRangeSequence::new(1).unwrap();
+/// let unit_id = TranslatedUnitId::new(1).unwrap();
+/// let shared = TranslatedSharedRange::shared(
+///     epoch,
+///     sequence,
+///     unit_id,
+///     HostVa(0x1000)..HostVa(0x2000),
+/// ).unwrap();
+/// let _ = TranslatedRangeAdd::Private(shared);
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TranslatedRangeAdd {
+    Private(TranslatedPrivateRange),
+    Shared(TranslatedSharedRange),
+}
+
+impl TranslatedRangeAdd {
+    pub const fn kind(&self) -> TranslatedRangeKind {
+        match self {
+            Self::Private(_) => TranslatedRangeKind::PrivateProcessCache,
+            Self::Shared(_) => TranslatedRangeKind::SharedUnit,
+        }
+    }
+}
+
+/// Exact half-open executable extent of the process-private translation cache.
+///
+/// Its fields are private and there is no unit-ID parameter, so a caller
+/// cannot construct a private event with shared-unit identity.
+///
+/// ```compile_fail
+/// use carrick_observability::probes::{
+///     TranslatedPrivateRange, TranslatedRangeEpoch, TranslatedRangeSequence,
+/// };
+/// use carrick_guest_mem::HostVa;
+///
+/// let epoch = TranslatedRangeEpoch::new(1).unwrap();
+/// let sequence = TranslatedRangeSequence::new(1).unwrap();
+/// let _ = TranslatedPrivateRange {
+///     epoch,
+///     sequence,
+///     range: HostVa(0x1000)..HostVa(0x2000),
+/// };
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranslatedPrivateRange {
+    epoch: TranslatedRangeEpoch,
+    sequence: TranslatedRangeSequence,
+    range: Range<HostVa>,
+}
+
+impl TranslatedPrivateRange {
+    pub fn private(
+        epoch: TranslatedRangeEpoch,
+        sequence: TranslatedRangeSequence,
+        range: Range<HostVa>,
+    ) -> Result<Self, TranslatedRangeError> {
+        validate_translated_range(&range)?;
+        Ok(Self {
+            epoch,
+            sequence,
+            range,
+        })
+    }
+
+    pub const fn epoch(&self) -> TranslatedRangeEpoch {
+        self.epoch
+    }
+
+    pub const fn sequence(&self) -> TranslatedRangeSequence {
+        self.sequence
+    }
+
+    pub const fn range(&self) -> &Range<HostVa> {
+        &self.range
+    }
+}
+
+/// Exact half-open executable extent of one shared translation unit.
+///
+/// Its fields are private and construction requires a typed unit ID, so a
+/// caller cannot publish a shared event without unit identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranslatedSharedRange {
+    epoch: TranslatedRangeEpoch,
+    sequence: TranslatedRangeSequence,
+    unit_id: TranslatedUnitId,
+    range: Range<HostVa>,
+}
+
+impl TranslatedSharedRange {
+    pub fn shared(
+        epoch: TranslatedRangeEpoch,
+        sequence: TranslatedRangeSequence,
+        unit_id: TranslatedUnitId,
+        range: Range<HostVa>,
+    ) -> Result<Self, TranslatedRangeError> {
+        validate_translated_range(&range)?;
+        Ok(Self {
+            epoch,
+            sequence,
+            unit_id,
+            range,
+        })
+    }
+
+    pub const fn epoch(&self) -> TranslatedRangeEpoch {
+        self.epoch
+    }
+
+    pub const fn sequence(&self) -> TranslatedRangeSequence {
+        self.sequence
+    }
+
+    pub const fn unit_id(&self) -> TranslatedUnitId {
+        self.unit_id
+    }
+
+    pub const fn range(&self) -> &Range<HostVa> {
+        &self.range
+    }
+}
+
+/// Close the initial translated-range replay for one process-image epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranslatedRangeReady {
+    epoch: TranslatedRangeEpoch,
+    final_sequence: u64,
+}
+
+impl TranslatedRangeReady {
+    pub const fn ready(epoch: TranslatedRangeEpoch, final_sequence: u64) -> Self {
+        Self {
+            epoch,
+            final_sequence,
+        }
+    }
+
+    pub const fn epoch(&self) -> TranslatedRangeEpoch {
+        self.epoch
+    }
+
+    pub const fn final_sequence(&self) -> u64 {
+        self.final_sequence
+    }
+}
+
+fn validate_translated_range(range: &Range<HostVa>) -> Result<(), TranslatedRangeError> {
+    let start = range.start.raw();
+    let end = range.end.raw();
+    if start == end {
+        return Err(TranslatedRangeError::EmptyRange { address: start });
+    }
+    if start > end {
+        return Err(TranslatedRangeError::ReversedRange { start, end });
+    }
+    if !start.is_multiple_of(4) || !end.is_multiple_of(4) {
+        return Err(TranslatedRangeError::UnalignedRange { start, end });
+    }
+    Ok(())
 }
 
 dsr_ordinal_enum! {
@@ -824,6 +1092,202 @@ mod dsr_probe_abi {
     }
 }
 
+#[cfg(test)]
+mod translated_range_probe_abi {
+    use std::ops::Range;
+
+    use carrick_guest_mem::HostVa;
+
+    use super::{
+        TranslatedPrivateRange, TranslatedRangeAdd, TranslatedRangeEpoch, TranslatedRangeError,
+        TranslatedRangeKind, TranslatedRangeReady, TranslatedRangeReset, TranslatedRangeSequence,
+        TranslatedSharedRange, TranslatedUnitId,
+    };
+
+    fn epoch(value: u64) -> TranslatedRangeEpoch {
+        TranslatedRangeEpoch::new(value).unwrap_or_else(|error| {
+            unreachable!("nonzero test epoch must be valid: {error}");
+        })
+    }
+
+    fn sequence(value: u64) -> TranslatedRangeSequence {
+        TranslatedRangeSequence::new(value).unwrap_or_else(|error| {
+            unreachable!("nonzero test sequence must be valid: {error}");
+        })
+    }
+
+    fn unit_id(value: u64) -> TranslatedUnitId {
+        TranslatedUnitId::new(value).unwrap_or_else(|error| {
+            unreachable!("nonzero test unit identity must be valid: {error}");
+        })
+    }
+
+    #[test]
+    fn translated_range_identity_rejects_zero_and_round_trips_named_values() {
+        assert!(matches!(
+            TranslatedRangeEpoch::new(0),
+            Err(TranslatedRangeError::ZeroEpoch)
+        ));
+        assert!(matches!(
+            TranslatedRangeSequence::new(0),
+            Err(TranslatedRangeError::ZeroSequence)
+        ));
+        assert!(matches!(
+            TranslatedUnitId::new(0),
+            Err(TranslatedRangeError::ZeroUnitId)
+        ));
+
+        assert_eq!(epoch(7).get(), 7);
+        assert_eq!(sequence(11).get(), 11);
+        assert_eq!(unit_id(13).get(), 13);
+    }
+
+    #[test]
+    fn translated_range_rejects_empty_inverted_and_unaligned_extents() {
+        for range in [
+            HostVa(0x1000)..HostVa(0x1000),
+            HostVa(0x2000)..HostVa(0x1000),
+            HostVa(0x1001)..HostVa(0x2000),
+            HostVa(0x1000)..HostVa(0x2002),
+        ] {
+            assert!(
+                TranslatedPrivateRange::private(epoch(1), sequence(1), range.clone()).is_err(),
+                "malformed private executable extent must be rejected"
+            );
+            assert!(
+                TranslatedSharedRange::shared(epoch(1), sequence(1), unit_id(1), range).is_err(),
+                "malformed shared executable extent must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn translated_range_constructors_make_kind_and_unit_payload_unambiguous() {
+        let _: fn(
+            TranslatedRangeEpoch,
+            TranslatedRangeSequence,
+            Range<HostVa>,
+        ) -> Result<TranslatedPrivateRange, TranslatedRangeError> = TranslatedPrivateRange::private;
+        let _: fn(
+            TranslatedRangeEpoch,
+            TranslatedRangeSequence,
+            TranslatedUnitId,
+            Range<HostVa>,
+        ) -> Result<TranslatedSharedRange, TranslatedRangeError> = TranslatedSharedRange::shared;
+
+        let private =
+            TranslatedPrivateRange::private(epoch(2), sequence(3), HostVa(0x1000)..HostVa(0x2000))
+                .unwrap_or_else(|error| unreachable!("valid private range: {error}"));
+        let shared = TranslatedSharedRange::shared(
+            epoch(2),
+            sequence(4),
+            unit_id(5),
+            HostVa(0x3000)..HostVa(0x4000),
+        )
+        .unwrap_or_else(|error| unreachable!("valid shared range: {error}"));
+
+        assert_eq!(
+            TranslatedRangeAdd::Private(private.clone()).kind(),
+            TranslatedRangeKind::PrivateProcessCache
+        );
+        assert_eq!(
+            TranslatedRangeAdd::Shared(shared.clone()).kind(),
+            TranslatedRangeKind::SharedUnit
+        );
+        assert_eq!(private.epoch(), epoch(2));
+        assert_eq!(private.sequence(), sequence(3));
+        assert_eq!(private.range(), &(HostVa(0x1000)..HostVa(0x2000)));
+        assert_eq!(shared.epoch(), epoch(2));
+        assert_eq!(shared.sequence(), sequence(4));
+        assert_eq!(shared.unit_id(), unit_id(5));
+        assert_eq!(shared.range(), &(HostVa(0x3000)..HostVa(0x4000)));
+    }
+
+    #[test]
+    fn translated_range_kind_ordinals_are_stable_and_unique() {
+        assert_eq!(TranslatedRangeKind::PrivateProcessCache.raw(), 1);
+        assert_eq!(TranslatedRangeKind::SharedUnit.raw(), 2);
+        let mut ordinals = TranslatedRangeKind::ALL
+            .map(TranslatedRangeKind::raw)
+            .to_vec();
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        assert_eq!(ordinals.len(), TranslatedRangeKind::ALL.len());
+    }
+
+    #[test]
+    fn translated_range_wrappers_accept_only_typed_pid_free_events() {
+        let _: fn(TranslatedRangeReset) = super::host_translated_range_reset;
+        let _: fn(TranslatedPrivateRange) = super::host_translated_private_range;
+        let _: fn(TranslatedSharedRange) = super::host_translated_shared_range;
+        let _: fn(TranslatedRangeReady) = super::host_translated_range_ready;
+
+        let reset = TranslatedRangeReset::reset(epoch(17));
+        let ready = TranslatedRangeReady::ready(epoch(17), 23);
+        assert_eq!(reset.epoch(), epoch(17));
+        assert_eq!(ready.epoch(), epoch(17));
+        assert_eq!(ready.final_sequence(), 23);
+    }
+
+    #[test]
+    fn translated_range_provider_and_stub_keep_one_four_five_two_scalar_shapes() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn host__translated__range__reset(_: u64) {}",
+            "fn host__translated__private__range(_: u64, _: u64, _: u64, _: u64) {}",
+            "fn host__translated__shared__range(_: u64, _: u64, _: u64, _: u64, _: u64) {}",
+            "fn host__translated__range__ready(_: u64, _: u64) {}",
+            "stub!(host_translated_range_reset(event: super::TranslatedRangeReset));",
+            "stub!(host_translated_private_range(event: super::TranslatedPrivateRange));",
+            "stub!(host_translated_shared_range(event: super::TranslatedSharedRange));",
+            "stub!(host_translated_range_ready(event: super::TranslatedRangeReady));",
+        ] {
+            assert!(
+                source.contains(declaration),
+                "missing PID-free translated-range ABI declaration {declaration:?}"
+            );
+        }
+
+        let real_start = source
+            .rfind("mod real {")
+            .unwrap_or_else(|| unreachable!("real probe module must exist"));
+        let stub_start = source
+            .rfind("mod stub {")
+            .unwrap_or_else(|| unreachable!("stub probe module must exist"));
+        let real = &source[real_start..stub_start];
+        for (wrapper, next_wrapper) in [
+            (
+                "pub fn host_translated_range_reset(",
+                "pub fn host_translated_private_range(",
+            ),
+            (
+                "pub fn host_translated_private_range(",
+                "pub fn host_translated_shared_range(",
+            ),
+            (
+                "pub fn host_translated_shared_range(",
+                "pub fn host_translated_range_ready(",
+            ),
+            (
+                "pub fn host_translated_range_ready(",
+                "pub fn dsr_cache_lifecycle(",
+            ),
+        ] {
+            let start = real
+                .find(wrapper)
+                .unwrap_or_else(|| unreachable!("missing real wrapper {wrapper}"));
+            let tail = &real[start..];
+            let end = tail
+                .find(next_wrapper)
+                .unwrap_or_else(|| unreachable!("missing wrapper boundary {next_wrapper}"));
+            assert!(
+                !tail[..end].contains("std::process::id"),
+                "{wrapper} must source identity from DTrace's built-in pid"
+            );
+        }
+    }
+}
+
 #[cfg(any(
     target_os = "macos",
     all(
@@ -935,6 +1399,10 @@ mod real {
         fn dsr__cache__event(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         fn dsr__cache__capacity(_: u32, _: u64) {}
         fn dsr__cache__bounds(_: u64, _: u64) {}
+        fn host__translated__range__reset(_: u64) {}
+        fn host__translated__private__range(_: u64, _: u64, _: u64, _: u64) {}
+        fn host__translated__shared__range(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        fn host__translated__range__ready(_: u64, _: u64) {}
         fn dsr__cache__lifecycle(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         fn dsr__exec__map__detail(_: i32, _: u32, _: u64, _: u64, _: u64) {}
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6]); DTrace copyin's 48
@@ -1490,6 +1958,45 @@ mod real {
     #[inline(always)]
     pub fn dsr_cache_bounds(base: u64, end: u64) {
         carrick_usdt::dsr__cache__bounds!(|| (base, end));
+    }
+
+    #[inline(always)]
+    pub fn host_translated_range_reset(event: super::TranslatedRangeReset) {
+        carrick_usdt::host__translated__range__reset!(|| event.epoch().get());
+    }
+
+    #[inline(always)]
+    pub fn host_translated_private_range(event: super::TranslatedPrivateRange) {
+        carrick_usdt::host__translated__private__range!(|| {
+            let range = event.range();
+            (
+                event.epoch().get(),
+                event.sequence().get(),
+                range.start.raw() as u64,
+                range.end.raw() as u64,
+            )
+        });
+    }
+
+    #[inline(always)]
+    pub fn host_translated_shared_range(event: super::TranslatedSharedRange) {
+        carrick_usdt::host__translated__shared__range!(|| {
+            let range = event.range();
+            (
+                event.epoch().get(),
+                event.sequence().get(),
+                event.unit_id().get(),
+                range.start.raw() as u64,
+                range.end.raw() as u64,
+            )
+        });
+    }
+
+    #[inline(always)]
+    pub fn host_translated_range_ready(event: super::TranslatedRangeReady) {
+        carrick_usdt::host__translated__range__ready!(|| {
+            (event.epoch().get(), event.final_sequence())
+        });
     }
 
     #[inline(always)]
@@ -2774,6 +3281,10 @@ mod stub {
     stub!(dsr_cache_event(tid: i32, kind: super::DsrCacheEventKind, guest_pc: u64, generation: u64, used_bytes: u64));
     stub!(dsr_cache_capacity(role: super::DsrCacheRole, capacity_bytes: u64));
     stub!(dsr_cache_bounds(base: u64, end: u64));
+    stub!(host_translated_range_reset(event: super::TranslatedRangeReset));
+    stub!(host_translated_private_range(event: super::TranslatedPrivateRange));
+    stub!(host_translated_shared_range(event: super::TranslatedSharedRange));
+    stub!(host_translated_range_ready(event: super::TranslatedRangeReady));
     stub!(dsr_cache_lifecycle(tid: i32, phase: super::DsrCacheLifecyclePhase, used_bytes: u64, block_count: u64, generation_count: u64));
     stub!(dsr_exec_map_detail(tid: i32, kind: super::DsrExecMapDetailKind, duration_ns: u64, bytes: u64, operations: u64));
     stub!(fork_pre(pc: u64, elr: u64, cpsr: u64));
