@@ -1813,7 +1813,7 @@ impl ThreadTranslator {
     pub fn prepare_direct_binding_exec_reset(
         &mut self,
     ) -> Result<DirectBindingExecResetToken, types::DsrError> {
-        let next_exec_reset_epoch = self.next_exec_reset_epoch()?;
+        let next_exec_reset_epoch = self.next_exec_reset_epoch_for_prepared_exec()?;
         self.block_cache.clear();
         self.indirect_cache.clear();
         self.exec_reset_epoch = next_exec_reset_epoch;
@@ -1871,6 +1871,17 @@ impl ThreadTranslator {
                 "thread exec-reset authority generation overflow".to_string(),
             )
         })
+    }
+
+    fn next_exec_reset_epoch_for_prepared_exec(&self) -> Result<u64, types::DsrError> {
+        let prepared_epoch = self.next_exec_reset_epoch()?;
+        prepared_epoch.checked_add(1).ok_or_else(|| {
+            types::DsrError::CachePolicy(
+                "thread exec-reset authority cannot reserve replacement handoff generation"
+                    .to_string(),
+            )
+        })?;
+        Ok(prepared_epoch)
     }
 
     pub fn start_next_profile_epoch(&mut self) {
@@ -9256,6 +9267,29 @@ mod tests {
 
         #[test]
         fn exec_reset_epoch_overflow_is_rejected_without_wrapping() {
+            let (_reserved_fixture, reserved_process, _, _) = one_published_binding(37);
+            let reserved_process = Arc::new(reserved_process);
+            let mut reserved_thread =
+                ThreadTranslator::for_process(Arc::clone(&reserved_process), 41);
+            reserved_thread.exec_reset_epoch = u64::MAX - 1;
+            reserved_thread.block_cache.insert(
+                GuestVa(0x7200_0000),
+                CodeGeneration::INITIAL,
+                CacheVa::published(HostVa(0x1000)),
+            );
+
+            let reserved_outcome = reserved_thread.prepare_direct_binding_exec_reset();
+
+            assert!(matches!(
+                reserved_outcome,
+                Err(crate::types::DsrError::CachePolicy(_))
+            ));
+            assert_eq!(reserved_thread.exec_reset_epoch, u64::MAX - 1);
+            assert!(
+                !reserved_thread.block_cache.is_empty(),
+                "failed full-exec generation reservation must precede cache clearing"
+            );
+
             let (_fixture, process, _, _) = one_published_binding(35);
             let process = Arc::new(process);
             let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 42);

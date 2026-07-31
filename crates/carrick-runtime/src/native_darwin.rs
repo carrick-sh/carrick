@@ -7072,6 +7072,53 @@ mod tests {
         }
     }
 
+    /// Forks a bounded child without creating a nested process group.
+    ///
+    /// The direct child is killed and reaped exactly on its own deadline. It
+    /// also remains in the outer fork-test group, so the outer supervisor's
+    /// group kill contains both processes if its earlier wall deadline wins.
+    fn fork_nested_test_with_timeout(timeout: std::time::Duration, test: impl FnOnce()) {
+        let inherited_process_group = unsafe { libc::getpgrp() };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            assert_eq!(
+                unsafe { libc::getpgrp() },
+                inherited_process_group,
+                "nested child must remain in the outer supervision group"
+            );
+            test();
+            unsafe { libc::_exit(0) };
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid {
+                assert!(
+                    libc::WIFEXITED(status),
+                    "nested forked test status={status:#x}"
+                );
+                assert_eq!(libc::WEXITSTATUS(status), 0);
+                return;
+            }
+            assert!(
+                waited == 0
+                    || (waited < 0
+                        && std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted),
+                "nested waitpid failed: {}",
+                std::io::Error::last_os_error()
+            );
+            if std::time::Instant::now() >= deadline {
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                let _ = waitpid_blocking(pid);
+                panic!("nested forked test timed out after {timeout:?}");
+            }
+            unsafe { libc::usleep(10_000) };
+        }
+    }
+
     fn biased_test_memory(
         guest_start: carrick_guest_mem::GuestVa,
         len: usize,
@@ -9080,7 +9127,11 @@ mod tests {
             let inherited_before = inherited_process.translated_range_catalog_state_for_test();
             let mut exec_thread =
                 dsr::ThreadTranslator::for_process(Arc::clone(&inherited_process), 42);
-            fork_test_with_timeout(std::time::Duration::from_secs(5), || {
+            let outer_process_group = unsafe { libc::getpgrp() };
+            fork_nested_test_with_timeout(std::time::Duration::from_secs(5), || {
+                if unsafe { libc::getpgrp() } != outer_process_group {
+                    unsafe { libc::_exit(9) };
+                }
                 NATIVE_FORKED_GUEST_CHILD.store(true, std::sync::atomic::Ordering::Release);
                 if exec_thread.after_fork_child(43).is_err() {
                     unsafe { libc::_exit(2) };
