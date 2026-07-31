@@ -806,6 +806,8 @@ impl TranslationUnitManifest {
         {
             return Err(UnitMissReason::Schema);
         }
+        let mut guest_starts = BTreeSet::new();
+        let mut cache_extents = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
             let end = u64::from(block.entry_offset)
                 .checked_add(u64::from(block.code_len))
@@ -814,15 +816,17 @@ impl TranslationUnitManifest {
                 || !block.entry_offset.is_multiple_of(4)
                 || !block.code_len.is_multiple_of(4)
                 || end > self.code_len
+                || !guest_starts.insert(block.guest_start)
             {
                 return Err(UnitMissReason::ManifestRange);
             }
+            cache_extents.push((u64::from(block.entry_offset), end));
         }
-        let same_unit_targets = self
-            .blocks
-            .iter()
-            .map(|block| block.guest_start)
-            .collect::<BTreeSet<_>>();
+        cache_extents.sort_unstable();
+        if cache_extents.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(UnitMissReason::ManifestRange);
+        }
+        let same_unit_targets = guest_starts;
         let mut owners = BTreeSet::new();
         let mut previous_stub_end = None;
         for (index, binding) in self.bindings.iter().enumerate() {
@@ -1141,6 +1145,99 @@ mod tests {
                 miss_add_offset: 144,
                 data_offset: 0,
             }],
+        }
+    }
+
+    fn manifest_block(guest_start: u64, entry_offset: u32, code_len: u32) -> PortableBlockRecord {
+        PortableBlockRecord {
+            guest_start: GuestVa(guest_start),
+            generation_binding: 0,
+            entry_offset,
+            code_len,
+            requires_sensitive_metadata: false,
+            template: empty_template(),
+        }
+    }
+
+    #[test]
+    fn shared_cache_manifest_rejects_duplicate_guest_starts() {
+        let mut manifest = manifest_v2_fixture();
+        manifest.blocks = vec![
+            manifest_block(0x410000, 0, 16),
+            manifest_block(0x410000, 16, 16),
+        ];
+
+        assert_eq!(
+            manifest.validate_ranges(),
+            Err(UnitMissReason::ManifestRange)
+        );
+    }
+
+    #[test]
+    fn shared_cache_manifest_rejects_overlapping_block_cache_extents() {
+        for (case, blocks) in [
+            (
+                "duplicate",
+                vec![
+                    manifest_block(0x410000, 0, 16),
+                    manifest_block(0x410100, 0, 16),
+                ],
+            ),
+            (
+                "partial",
+                vec![
+                    manifest_block(0x410000, 0, 16),
+                    manifest_block(0x410100, 12, 16),
+                ],
+            ),
+            (
+                "nested",
+                vec![
+                    manifest_block(0x410000, 0, 32),
+                    manifest_block(0x410100, 8, 8),
+                ],
+            ),
+            (
+                "containing in reverse manifest order",
+                vec![
+                    manifest_block(0x410000, 8, 8),
+                    manifest_block(0x410100, 0, 32),
+                ],
+            ),
+        ] {
+            let mut manifest = manifest_v2_fixture();
+            manifest.blocks = blocks;
+
+            assert_eq!(
+                manifest.validate_ranges(),
+                Err(UnitMissReason::ManifestRange),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_cache_manifest_allows_adjacent_and_reverse_disjoint_cache_extents() {
+        for (case, blocks) in [
+            (
+                "adjacent",
+                vec![
+                    manifest_block(0x410000, 0, 16),
+                    manifest_block(0x410100, 16, 16),
+                ],
+            ),
+            (
+                "reverse disjoint",
+                vec![
+                    manifest_block(0x410000, 32, 16),
+                    manifest_block(0x410100, 0, 16),
+                ],
+            ),
+        ] {
+            let mut manifest = manifest_v2_fixture();
+            manifest.blocks = blocks;
+
+            assert_eq!(manifest.validate_ranges(), Ok(()), "{case}");
         }
     }
 

@@ -95,6 +95,10 @@ unsafe impl Send for ExecutableRangeCatalogNode {}
 // SAFETY: see `Send`; readers only traverse immutable nodes.
 unsafe impl Sync for ExecutableRangeCatalogNode {}
 
+pub(crate) struct PreparedExecutableRange {
+    node: Box<ExecutableRangeCatalogNode>,
+}
+
 pub struct ExecutableRangeCatalog {
     header: Box<ExecutableRangeCatalogHeader>,
     private: Box<ExecutableRangeCatalogNode>,
@@ -128,21 +132,62 @@ impl ExecutableRangeCatalog {
     }
 
     pub fn prepend(&mut self, start: usize, end: usize) -> Result<(), DsrError> {
+        let prepared = self.prepare_prepend(start, end)?;
+        self.commit_prepend(prepared);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_prepend(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Result<PreparedExecutableRange, DsrError> {
         if start >= end {
             return Err(DsrError::CachePolicy(
                 "shared executable range is empty or inverted".to_string(),
             ));
         }
-        let next = self.header.head.load(Ordering::Acquire);
-        let mut node = Box::new(ExecutableRangeCatalogNode {
-            start: start as u64,
-            end: end as u64,
-            next,
-        });
-        let published = std::ptr::from_mut(node.as_mut());
-        self.shared.push(node);
+        self.shared.try_reserve(1).map_err(|error| {
+            DsrError::CachePolicy(format!(
+                "shared executable range retention reservation failed: {error}"
+            ))
+        })?;
+        Ok(PreparedExecutableRange {
+            node: Box::new(ExecutableRangeCatalogNode {
+                start: start as u64,
+                end: end as u64,
+                next: std::ptr::null(),
+            }),
+        })
+    }
+
+    pub(crate) fn commit_prepend(&mut self, mut prepared: PreparedExecutableRange) {
+        prepared.node.next = self.header.head.load(Ordering::Acquire);
+        let published = std::ptr::from_mut(prepared.node.as_mut());
+        self.shared.push(prepared.node);
         self.header.head.store(published, Ordering::Release);
-        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn prepare_prepend_with_reserver(
+        &mut self,
+        start: usize,
+        end: usize,
+        reserve: impl FnOnce(&mut Vec<Box<ExecutableRangeCatalogNode>>) -> Result<(), DsrError>,
+    ) -> Result<PreparedExecutableRange, DsrError> {
+        if start >= end {
+            return Err(DsrError::CachePolicy(
+                "shared executable range is empty or inverted".to_string(),
+            ));
+        }
+        reserve(&mut self.shared)?;
+        Ok(PreparedExecutableRange {
+            node: Box::new(ExecutableRangeCatalogNode {
+                start: start as u64,
+                end: end as u64,
+                next: std::ptr::null(),
+            }),
+        })
     }
 
     pub fn header_ptr(&self) -> *const ExecutableRangeCatalogHeader {
@@ -1253,9 +1298,11 @@ mod indirect_cache_tests {
     }
 
     #[test]
-    fn context_created_before_cross_thread_catalog_prepend_sees_the_new_range() {
+    fn gateway_executable_range_prepare_keeps_head_unpublished_until_commit() {
         let mut catalog =
             ExecutableRangeCatalog::new(0x10_000, 0x20_000).expect("private cache range");
+        let private_head = catalog.head_ptr();
+        let private_nodes = catalog.shared_node_count();
         let mut context = DsrContext::new(
             NativeUcontextSnapshot::default(),
             CacheVa::published(carrick_guest_mem::HostVa(0x10_000)),
@@ -1270,13 +1317,18 @@ mod indirect_cache_tests {
         );
         context.executable_range_catalog = catalog.header_ptr();
         let header = context.executable_range_catalog as usize;
+        let prepared = catalog
+            .prepare_prepend(0x30_000, 0x40_000)
+            .expect("prepare shared cache range");
+
+        assert_eq!(catalog.head_ptr(), private_head);
+        assert_eq!(catalog.shared_node_count(), private_nodes);
+        assert!(!catalog.contains(0x38_000));
 
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    catalog
-                        .prepend(0x30_000, 0x40_000)
-                        .expect("publish shared cache range");
+                    catalog.commit_prepend(prepared);
                 })
                 .join()
                 .expect("join catalog publisher");
