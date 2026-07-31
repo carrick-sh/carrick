@@ -3014,7 +3014,9 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             // it means the bracket spans everything the guest
                             // actually waits for.
                             let translator_rebuild_start = std::time::Instant::now();
-                            translator.after_fork_child(thread_runtime.tid().raw());
+                            translator
+                                .after_fork_child(thread_runtime.tid().raw())
+                                .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
                             let translator_rebuild_us = translator_rebuild_start
                                 .elapsed()
                                 .as_micros()
@@ -6706,6 +6708,30 @@ mod tests {
 
         assert!(initial.activates_translated_range_catalog());
         assert!(!detached.activates_translated_range_catalog());
+    }
+
+    #[test]
+    fn fork_child_translator_error_maps_to_unsupported_before_resume() {
+        let process = std::sync::Arc::new(
+            dsr::test_process_translator(16 * 1024).expect("create translator"),
+        );
+        process
+            .activate_translated_range_catalog()
+            .expect("activate catalog");
+        process
+            .set_translated_range_epoch_for_test(u64::MAX)
+            .expect("seed epoch overflow");
+        let mut translator = dsr::ThreadTranslator::for_process(process, 71);
+
+        let result = translator
+            .after_fork_child(72)
+            .map_err(|error| RuntimeError::Unsupported(error.to_string()));
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Unsupported(message))
+                if message.contains("translated-range epoch overflow")
+        ));
     }
 
     #[test]

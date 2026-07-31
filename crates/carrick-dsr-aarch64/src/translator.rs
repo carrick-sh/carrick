@@ -467,6 +467,10 @@ trait TranslatedRangeRecorder {
     fn ready(&mut self, event: probes::TranslatedRangeReady);
 }
 
+trait ForkChildRepairRecorder: TranslatedRangeRecorder {
+    fn process_repaired(&mut self);
+}
+
 struct DsrTranslatedRangeRecorder;
 
 impl TranslatedRangeRecorder for DsrTranslatedRangeRecorder {
@@ -481,6 +485,10 @@ impl TranslatedRangeRecorder for DsrTranslatedRangeRecorder {
     fn ready(&mut self, event: probes::TranslatedRangeReady) {
         probes::translated_range_ready(event);
     }
+}
+
+impl ForkChildRepairRecorder for DsrTranslatedRangeRecorder {
+    fn process_repaired(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -566,6 +574,83 @@ impl TranslatedRangeCatalog {
         recorder.ready(ready);
         self.next_sequence = next_sequence;
         self.ready_sequence = Some(final_sequence);
+        Ok(())
+    }
+
+    fn replay_after_fork(
+        &mut self,
+        recorder: &mut impl TranslatedRangeRecorder,
+    ) -> Result<(), types::DsrError> {
+        if self.ready_sequence.is_none() {
+            return Err(types::DsrError::CachePolicy(
+                "cannot replay a dormant translated-range catalog after fork".to_string(),
+            ));
+        }
+        let epoch_value = self.epoch.get().checked_add(1).ok_or_else(|| {
+            types::DsrError::CachePolicy(
+                "translated-range epoch overflow during fork replay".to_string(),
+            )
+        })?;
+        let epoch = probes::TranslatedRangeEpoch::new(epoch_value)
+            .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+        let private_sequence = probes::TranslatedRangeSequence::new(1)
+            .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+        let private =
+            probes::TranslatedPrivateRange::private(epoch, private_sequence, self.private.clone())
+                .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+
+        let mut expected_sequence = 2_u64;
+        for entry in &self.shared {
+            let sequence =
+                probes::TranslatedRangeSequence::new(expected_sequence).map_err(|error| {
+                    types::DsrError::CachePolicy(format!(
+                        "translated-range fork replay sequence is invalid: {error}"
+                    ))
+                })?;
+            let next_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+                types::DsrError::CachePolicy(
+                    "translated-range sequence overflow during fork replay".to_string(),
+                )
+            })?;
+            if entry.sequence != sequence
+                || entry.next_sequence != next_sequence
+                || entry.event.epoch() != self.epoch
+                || entry.event.sequence() != entry.sequence
+                || entry.event.unit_id() != entry.unit_id
+                || entry.event.range() != &entry.range
+            {
+                return Err(types::DsrError::CachePolicy(
+                    "translated-range catalog is inconsistent during fork replay".to_string(),
+                ));
+            }
+            expected_sequence = next_sequence;
+        }
+        if expected_sequence != self.next_sequence {
+            return Err(types::DsrError::CachePolicy(
+                "translated-range sequence frontier is inconsistent during fork replay".to_string(),
+            ));
+        }
+        let frontier = self.next_sequence.checked_sub(1).ok_or_else(|| {
+            types::DsrError::CachePolicy(
+                "translated-range sequence frontier underflow during fork replay".to_string(),
+            )
+        })?;
+        let reset = probes::TranslatedRangeReset::reset(epoch);
+        let ready = probes::TranslatedRangeReady::ready(epoch, frontier);
+
+        recorder.reset(reset);
+        recorder.add(probes::TranslatedRangeAdd::Private(private));
+        for entry in &self.shared {
+            recorder.add(probes::TranslatedRangeAdd::Shared(
+                entry.event.replayed_in(epoch),
+            ));
+        }
+        recorder.ready(ready);
+        for entry in &mut self.shared {
+            entry.event = entry.event.replayed_in(epoch);
+        }
+        self.epoch = epoch;
+        self.ready_sequence = Some(frontier);
         Ok(())
     }
 
@@ -1477,9 +1562,30 @@ impl ThreadTranslator {
         }
     }
 
-    pub fn after_fork_child(&mut self, tid: i32) {
+    pub fn after_fork_child(&mut self, tid: i32) -> Result<(), types::DsrError> {
+        let mut recorder = DsrTranslatedRangeRecorder;
+        self.after_fork_child_inner(tid, &mut recorder, &mut |_| {})
+    }
+
+    #[cfg(test)]
+    fn after_fork_child_with_recorders(
+        &mut self,
+        tid: i32,
+        recorder: &mut impl ForkChildRepairRecorder,
+        lifecycle: &mut impl FnMut(probes::DsrCacheLifecyclePhase),
+    ) -> Result<(), types::DsrError> {
+        self.after_fork_child_inner(tid, recorder, lifecycle)
+    }
+
+    fn after_fork_child_inner(
+        &mut self,
+        tid: i32,
+        recorder: &mut impl ForkChildRepairRecorder,
+        lifecycle: &mut impl FnMut(probes::DsrCacheLifecyclePhase),
+    ) -> Result<(), types::DsrError> {
         self.tid = tid;
         let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
+        lifecycle(probes::DsrCacheLifecyclePhase::ForkChildRepairBegin);
         probes::dsr_cache_lifecycle(
             self.tid,
             probes::DsrCacheLifecyclePhase::ForkChildRepairBegin,
@@ -1487,7 +1593,7 @@ impl ThreadTranslator {
             block_count,
             generation_count,
         );
-        self.process.after_fork_child();
+        self.process.after_fork_child_inner(recorder)?;
         self.block_cache.clear();
         self.exec_reset_epoch = self.exec_reset_epoch.wrapping_add(1);
         self.stats = ResolverStats::default();
@@ -1538,6 +1644,8 @@ impl ThreadTranslator {
             block_count,
             generation_count,
         );
+        lifecycle(probes::DsrCacheLifecyclePhase::ForkChildRepairEnd);
+        Ok(())
     }
 
     pub fn begin_exec_reset(&self) {
@@ -2145,6 +2253,14 @@ impl ProcessTranslator {
         self.state.write().translated_ranges.activate_if_dormant()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_translated_range_epoch_for_test(&self, epoch: u64) -> Result<(), types::DsrError> {
+        self.state.write().translated_ranges.epoch = probes::TranslatedRangeEpoch::new(epoch)
+            .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn activate_translated_range_catalog_with_recorder(
         &self,
@@ -2305,7 +2421,25 @@ impl ProcessTranslator {
         )
     }
 
-    pub fn after_fork_child(&self) -> crate::direct_binding::ForkBindingClearStats {
+    pub fn after_fork_child(
+        &self,
+    ) -> Result<crate::direct_binding::ForkBindingClearStats, types::DsrError> {
+        let mut recorder = DsrTranslatedRangeRecorder;
+        self.after_fork_child_inner(&mut recorder)
+    }
+
+    #[cfg(test)]
+    fn after_fork_child_with_recorder(
+        &self,
+        recorder: &mut impl ForkChildRepairRecorder,
+    ) -> Result<crate::direct_binding::ForkBindingClearStats, types::DsrError> {
+        self.after_fork_child_inner(recorder)
+    }
+
+    fn after_fork_child_inner(
+        &self,
+        recorder: &mut impl ForkChildRepairRecorder,
+    ) -> Result<crate::direct_binding::ForkBindingClearStats, types::DsrError> {
         let mut state = self.state.write();
         let direct_binding_stats = state
             .direct_bindings
@@ -2321,10 +2455,12 @@ impl ProcessTranslator {
         state.cache.after_fork_child();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
+        recorder.process_repaired();
+        state.translated_ranges.replay_after_fork(recorder)?;
         let capacity = u64::try_from(state.cache.capacity_bytes()).unwrap_or(u64::MAX);
         drop(state);
         probes::dsr_cache_capacity(probes::DsrCacheRole::Child, capacity);
-        direct_binding_stats
+        Ok(direct_binding_stats)
     }
 
     pub fn reset_after_fork_for_exec(
@@ -4988,12 +5124,13 @@ mod tests {
     // carrick_dsr::probes mirrors (ordinal-identical to the USDT enums
     // by the mirrored-ordinal tests in carrick-dsr).
     use super::{
-        DsrErrorProbeExt as _, NativeDsrExitProbeExt as _, ProcessTranslator, SensitiveMetadata,
-        SharedBlockAuthority, SharedInstallCommitObserver, SharedInstallCommitPhase,
-        SharedInstallLogicalSnapshot, SharedInstallPrepareStage, TranslatedRangeCatalog,
-        TranslatedRangeRecorder, exact_guest_ranges_from_pc_map, merge_sensitive_metadata,
-        normalized_guest_range_union, set_shared_install_prepare_failpoint_for_test,
-        translated_unit_id, translation_source_words_required, typed_unit_id_from_digest,
+        DsrErrorProbeExt as _, ForkChildRepairRecorder, NativeDsrExitProbeExt as _,
+        ProcessTranslator, SensitiveMetadata, SharedBlockAuthority, SharedInstallCommitObserver,
+        SharedInstallCommitPhase, SharedInstallLogicalSnapshot, SharedInstallPrepareStage,
+        ThreadTranslator, TranslatedRangeCatalog, TranslatedRangeRecorder,
+        exact_guest_ranges_from_pc_map, merge_sensitive_metadata, normalized_guest_range_union,
+        set_shared_install_prepare_failpoint_for_test, translated_unit_id,
+        translation_source_words_required, typed_unit_id_from_digest,
     };
     use crate::artifact_spike::{ArtifactBindings, ArtifactTemplate};
     use crate::emit::PcMapEntry;
@@ -5005,8 +5142,8 @@ mod tests {
     use crate::types;
     use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
     use carrick_dsr::probes::{
-        TranslatedPrivateRange, TranslatedRangeAdd, TranslatedRangeEpoch, TranslatedRangeReady,
-        TranslatedRangeReset, TranslatedRangeSequence, TranslatedUnitId,
+        DsrCacheLifecyclePhase, TranslatedPrivateRange, TranslatedRangeAdd, TranslatedRangeEpoch,
+        TranslatedRangeReady, TranslatedRangeReset, TranslatedRangeSequence, TranslatedUnitId,
     };
     use carrick_guest_mem::{GuestVa, HostVa};
     use std::cell::RefCell;
@@ -5086,6 +5223,64 @@ mod tests {
 
         fn ready(&mut self, event: TranslatedRangeReady) {
             self.events.push(RecordedTranslatedRange::Ready(event));
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum RecordedForkChildRepair {
+        ProcessRepaired,
+        Range(RecordedTranslatedRange),
+    }
+
+    struct ForkChildRepairRecorderFixture<'a> {
+        state: &'a parking_lot::RwLock<super::ProcessState>,
+        published_cell:
+            Option<&'a std::sync::atomic::AtomicPtr<crate::direct_binding::DirectBindingTarget>>,
+        events: Vec<RecordedForkChildRepair>,
+    }
+
+    impl ForkChildRepairRecorderFixture<'_> {
+        fn assert_writer_held(&self) {
+            assert!(
+                self.state.try_read().is_none(),
+                "fork replay escaped the process-state writer"
+            );
+        }
+    }
+
+    impl TranslatedRangeRecorder for ForkChildRepairRecorderFixture<'_> {
+        fn reset(&mut self, event: TranslatedRangeReset) {
+            self.assert_writer_held();
+            self.events.push(RecordedForkChildRepair::Range(
+                RecordedTranslatedRange::Reset(event),
+            ));
+        }
+
+        fn add(&mut self, event: TranslatedRangeAdd) {
+            self.assert_writer_held();
+            self.events.push(RecordedForkChildRepair::Range(
+                RecordedTranslatedRange::Add(event),
+            ));
+        }
+
+        fn ready(&mut self, event: TranslatedRangeReady) {
+            self.assert_writer_held();
+            self.events.push(RecordedForkChildRepair::Range(
+                RecordedTranslatedRange::Ready(event),
+            ));
+        }
+    }
+
+    impl ForkChildRepairRecorder for ForkChildRepairRecorderFixture<'_> {
+        fn process_repaired(&mut self) {
+            self.assert_writer_held();
+            if let Some(cell) = self.published_cell {
+                assert!(
+                    cell.load(std::sync::atomic::Ordering::Acquire).is_null(),
+                    "translated replay began before inherited binding repair"
+                );
+            }
+            self.events.push(RecordedForkChildRepair::ProcessRepaired);
         }
     }
 
@@ -5342,6 +5537,257 @@ mod tests {
                 RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(second)),
             ] if first.sequence().get() == 2 && second.sequence().get() == 3
         ));
+    }
+
+    #[test]
+    fn translated_range_catalog_replays_private_range_under_checked_fork_epoch() {
+        let (mut catalog, mut recorder) = active_catalog();
+        let private = catalog.private.clone();
+        let epoch = TranslatedRangeEpoch::new(2).expect("nonzero epoch");
+        let sequence = TranslatedRangeSequence::new(1).expect("nonzero sequence");
+
+        catalog
+            .replay_after_fork(&mut recorder)
+            .expect("fork replay");
+
+        assert_eq!(
+            recorder.events,
+            vec![
+                RecordedTranslatedRange::Reset(TranslatedRangeReset::reset(epoch)),
+                RecordedTranslatedRange::Add(TranslatedRangeAdd::Private(
+                    TranslatedPrivateRange::private(epoch, sequence, private.clone())
+                        .expect("valid private range"),
+                )),
+                RecordedTranslatedRange::Ready(TranslatedRangeReady::ready(epoch, 1)),
+            ]
+        );
+        assert_eq!(catalog.epoch, epoch);
+        assert_eq!(catalog.next_sequence, 2);
+        assert_eq!(catalog.ready_sequence, Some(1));
+        assert_eq!(catalog.private, private);
+        assert!(catalog.shared.is_empty());
+    }
+
+    #[test]
+    fn translated_range_catalog_rejects_replay_while_dormant() {
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        let mut catalog = TranslatedRangeCatalog::dormant_with_recorder(
+            HostVa(0x1000)..HostVa(0x2000),
+            &mut recorder,
+        )
+        .expect("dormant catalog");
+        let before = (
+            catalog.epoch,
+            catalog.next_sequence,
+            catalog.ready_sequence,
+            catalog.private.clone(),
+            catalog.shared.clone(),
+        );
+
+        let result = catalog.replay_after_fork(&mut recorder);
+
+        assert!(matches!(result, Err(types::DsrError::CachePolicy(_))));
+        assert!(recorder.events.is_empty());
+        assert_eq!(
+            (
+                catalog.epoch,
+                catalog.next_sequence,
+                catalog.ready_sequence,
+                catalog.private,
+                catalog.shared,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn translated_range_catalog_replays_full_shared_frontier_after_fork() {
+        let (mut catalog, mut recorder) = active_catalog();
+        for (unit, start, end) in [(11, 0x3000, 0x4000), (12, 0x5000, 0x6000)] {
+            let prepared = catalog
+                .prepare_shared(
+                    TranslatedUnitId::new(unit).expect("unit id"),
+                    HostVa(start)..HostVa(end),
+                )
+                .expect("prepare shared range");
+            catalog.commit_shared_with_recorder(prepared, &mut recorder);
+        }
+        recorder.events.clear();
+        let private = catalog.private.clone();
+        let shared = catalog.shared.clone();
+        let epoch = TranslatedRangeEpoch::new(2).expect("nonzero epoch");
+
+        catalog
+            .replay_after_fork(&mut recorder)
+            .expect("fork replay");
+
+        let expected = vec![
+            RecordedTranslatedRange::Reset(TranslatedRangeReset::reset(epoch)),
+            RecordedTranslatedRange::Add(TranslatedRangeAdd::Private(
+                TranslatedPrivateRange::private(
+                    epoch,
+                    TranslatedRangeSequence::new(1).expect("private sequence"),
+                    private.clone(),
+                )
+                .expect("valid private range"),
+            )),
+            RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(
+                carrick_dsr::probes::TranslatedSharedRange::shared(
+                    epoch,
+                    TranslatedRangeSequence::new(2).expect("first shared sequence"),
+                    TranslatedUnitId::new(11).expect("first unit"),
+                    HostVa(0x3000)..HostVa(0x4000),
+                )
+                .expect("first replayed shared range"),
+            )),
+            RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(
+                carrick_dsr::probes::TranslatedSharedRange::shared(
+                    epoch,
+                    TranslatedRangeSequence::new(3).expect("second shared sequence"),
+                    TranslatedUnitId::new(12).expect("second unit"),
+                    HostVa(0x5000)..HostVa(0x6000),
+                )
+                .expect("second replayed shared range"),
+            )),
+            RecordedTranslatedRange::Ready(TranslatedRangeReady::ready(epoch, 3)),
+        ];
+        assert_eq!(recorder.events, expected);
+        assert_eq!(catalog.epoch, epoch);
+        assert_eq!(catalog.next_sequence, 4);
+        assert_eq!(catalog.ready_sequence, Some(3));
+        assert_eq!(catalog.private, private);
+        assert_eq!(
+            catalog
+                .shared
+                .iter()
+                .map(|entry| (entry.sequence, entry.unit_id, entry.range.clone()))
+                .collect::<Vec<_>>(),
+            shared
+                .iter()
+                .map(|entry| (entry.sequence, entry.unit_id, entry.range.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn translated_range_catalog_rekeys_retained_shared_events_for_grandchild_replay() {
+        let (mut catalog, mut recorder) = active_catalog();
+        let prepared = catalog
+            .prepare_shared(
+                TranslatedUnitId::new(11).expect("unit id"),
+                HostVa(0x3000)..HostVa(0x4000),
+            )
+            .expect("prepare shared range");
+        catalog.commit_shared_with_recorder(prepared, &mut recorder);
+        recorder.events.clear();
+        catalog
+            .replay_after_fork(&mut recorder)
+            .expect("child replay");
+        recorder.events.clear();
+
+        catalog
+            .replay_after_fork(&mut recorder)
+            .expect("grandchild replay");
+
+        let epoch = TranslatedRangeEpoch::new(3).expect("grandchild epoch");
+        assert_eq!(catalog.epoch, epoch);
+        assert_eq!(catalog.next_sequence, 3);
+        assert_eq!(catalog.ready_sequence, Some(2));
+        assert_eq!(catalog.shared[0].event.epoch(), epoch);
+        assert!(matches!(
+            recorder.events.as_slice(),
+            [
+                RecordedTranslatedRange::Reset(reset),
+                RecordedTranslatedRange::Add(TranslatedRangeAdd::Private(private)),
+                RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(shared)),
+                RecordedTranslatedRange::Ready(ready),
+            ] if reset.epoch() == epoch
+                && private.epoch() == epoch
+                && shared.epoch() == epoch
+                && ready.epoch() == epoch
+                && ready.final_sequence() == 2
+        ));
+    }
+
+    #[test]
+    fn translated_range_catalog_fork_epoch_overflow_is_failure_atomic() {
+        let (mut catalog, mut recorder) = active_catalog();
+        let prepared = catalog
+            .prepare_shared(
+                TranslatedUnitId::new(11).expect("unit id"),
+                HostVa(0x3000)..HostVa(0x4000),
+            )
+            .expect("prepare shared range");
+        catalog.commit_shared_with_recorder(prepared, &mut recorder);
+        recorder.events.clear();
+        catalog.epoch = TranslatedRangeEpoch::new(u64::MAX).expect("maximum epoch is nonzero");
+        let before = (
+            catalog.epoch,
+            catalog.next_sequence,
+            catalog.ready_sequence,
+            catalog.private.clone(),
+            catalog.shared.clone(),
+        );
+
+        let result = catalog.replay_after_fork(&mut recorder);
+
+        assert!(matches!(result, Err(types::DsrError::CachePolicy(_))));
+        assert!(recorder.events.is_empty());
+        assert_eq!(
+            (
+                catalog.epoch,
+                catalog.next_sequence,
+                catalog.ready_sequence,
+                catalog.private,
+                catalog.shared,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn fork_child_replay_failure_preserves_thread_cache_and_suppresses_end_event() {
+        let process = Arc::new(
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator"),
+        );
+        process
+            .activate_translated_range_catalog()
+            .expect("activate catalog");
+        process.state.write().translated_ranges.epoch =
+            TranslatedRangeEpoch::new(u64::MAX).expect("maximum epoch is nonzero");
+        let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 41);
+        thread.block_cache.insert(
+            GuestVa(0x4000),
+            types::CodeGeneration::INITIAL,
+            types::CacheVa::published(HostVa(
+                usize::try_from(process.cache_host_range().start).expect("host cache address"),
+            )),
+        );
+        let mut repair_recorder = ForkChildRepairRecorderFixture {
+            state: &process.state,
+            published_cell: None,
+            events: Vec::new(),
+        };
+        let mut lifecycle = Vec::new();
+        let mut record_lifecycle = |phase| lifecycle.push(phase);
+
+        let result =
+            thread.after_fork_child_with_recorders(42, &mut repair_recorder, &mut record_lifecycle);
+
+        assert!(matches!(result, Err(types::DsrError::CachePolicy(_))));
+        assert!(
+            !thread.block_cache.is_empty(),
+            "thread cache must remain intact until process replay succeeds"
+        );
+        assert_eq!(
+            repair_recorder.events,
+            vec![RecordedForkChildRepair::ProcessRepaired]
+        );
+        assert_eq!(
+            lifecycle,
+            vec![DsrCacheLifecyclePhase::ForkChildRepairBegin],
+            "failed replay must not announce fork repair completion"
+        );
     }
 
     #[test]
@@ -7292,8 +7738,11 @@ mod tests {
                 .read()
                 .direct_bindings
                 .arena_snapshot_for_test(unit_index);
+            process
+                .activate_translated_range_catalog()
+                .expect("activate catalog");
 
-            let stats = process.after_fork_child();
+            let stats = process.after_fork_child().expect("fork repair");
 
             let after = process
                 .state
@@ -7313,15 +7762,90 @@ mod tests {
         }
 
         #[test]
+        fn fork_child_process_repair_precedes_replay_under_one_writer() {
+            let (fixture, process, _, _) = one_published_binding(29);
+            let mut recorder = super::ForkChildRepairRecorderFixture {
+                state: &process.state,
+                published_cell: Some(&fixture.storage[0]),
+                events: Vec::new(),
+            };
+            process
+                .activate_translated_range_catalog_with_recorder(&mut recorder)
+                .expect("activate catalog");
+            recorder.events.clear();
+            {
+                let mut state = process.state.write();
+                let prepared = state
+                    .translated_ranges
+                    .prepare_shared(
+                        carrick_dsr::probes::TranslatedUnitId::new(29).expect("unit id"),
+                        carrick_guest_mem::HostVa(0x30_0000)..carrick_guest_mem::HostVa(0x31_0000),
+                    )
+                    .expect("prepare inherited shared range");
+                state
+                    .translated_ranges
+                    .commit_shared_with_recorder(prepared, &mut recorder);
+            }
+            recorder.events.clear();
+            let private = process.state.read().translated_ranges.private.clone();
+            let epoch = carrick_dsr::probes::TranslatedRangeEpoch::new(2).expect("child epoch");
+
+            let stats = process
+                .after_fork_child_with_recorder(&mut recorder)
+                .expect("fork repair and replay");
+
+            assert_eq!(stats.cells_cleared, 1);
+            assert_eq!(
+                recorder.events,
+                vec![
+                    super::RecordedForkChildRepair::ProcessRepaired,
+                    super::RecordedForkChildRepair::Range(super::RecordedTranslatedRange::Reset(
+                        carrick_dsr::probes::TranslatedRangeReset::reset(epoch),
+                    ),),
+                    super::RecordedForkChildRepair::Range(super::RecordedTranslatedRange::Add(
+                        carrick_dsr::probes::TranslatedRangeAdd::Private(
+                            carrick_dsr::probes::TranslatedPrivateRange::private(
+                                epoch,
+                                carrick_dsr::probes::TranslatedRangeSequence::new(1)
+                                    .expect("private sequence"),
+                                private,
+                            )
+                            .expect("private replay"),
+                        ),
+                    ),),
+                    super::RecordedForkChildRepair::Range(super::RecordedTranslatedRange::Add(
+                        carrick_dsr::probes::TranslatedRangeAdd::Shared(
+                            carrick_dsr::probes::TranslatedSharedRange::shared(
+                                epoch,
+                                carrick_dsr::probes::TranslatedRangeSequence::new(2)
+                                    .expect("shared sequence"),
+                                carrick_dsr::probes::TranslatedUnitId::new(29).expect("unit id"),
+                                carrick_guest_mem::HostVa(0x30_0000)
+                                    ..carrick_guest_mem::HostVa(0x31_0000),
+                            )
+                            .expect("shared replay"),
+                        ),
+                    ),),
+                    super::RecordedForkChildRepair::Range(super::RecordedTranslatedRange::Ready(
+                        carrick_dsr::probes::TranslatedRangeReady::ready(epoch, 2),
+                    ),),
+                ]
+            );
+        }
+
+        #[test]
         fn fork_child_clear_is_cow_private_from_the_parent() {
             let (fixture, process, _, _) = one_published_binding(21);
+            process
+                .activate_translated_range_catalog()
+                .expect("activate catalog");
             let parent_pointer = fixture.storage[0].load(Ordering::Acquire);
             assert!(!parent_pointer.is_null());
 
             let pid = unsafe { libc::fork() };
             assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
             if pid == 0 {
-                process.after_fork_child();
+                process.after_fork_child().expect("child fork repair");
                 let cleared = fixture.storage[0].load(Ordering::Acquire).is_null();
                 unsafe { libc::_exit(i32::from(!cleared)) };
             }
@@ -7339,15 +7863,146 @@ mod tests {
         }
 
         #[test]
+        fn fork_child_replays_once_while_parent_catalog_remains_unchanged() {
+            let process = std::sync::Arc::new(process_with_direct_bindings());
+            let mut setup_recorder = super::TranslatedRangeRecorderFixture::default();
+            process
+                .activate_translated_range_catalog_with_recorder(&mut setup_recorder)
+                .expect("activate parent catalog");
+            {
+                let mut state = process.state.write();
+                let prepared = state
+                    .translated_ranges
+                    .prepare_shared(
+                        carrick_dsr::probes::TranslatedUnitId::new(30).expect("unit id"),
+                        carrick_guest_mem::HostVa(0x32_0000)..carrick_guest_mem::HostVa(0x33_0000),
+                    )
+                    .expect("prepare inherited shared range");
+                state
+                    .translated_ranges
+                    .commit_shared_with_recorder(prepared, &mut setup_recorder);
+            }
+            let parent_before = {
+                let state = process.state.read();
+                (
+                    state.translated_ranges.epoch,
+                    state.translated_ranges.next_sequence,
+                    state.translated_ranges.ready_sequence,
+                    state.translated_ranges.private.clone(),
+                    state.translated_ranges.shared.clone(),
+                )
+            };
+            let _non_surviving_sibling =
+                super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 50);
+            let mut surviving =
+                super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 51);
+            let mut pipe_fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                let _ = unsafe { libc::close(pipe_fds[0]) };
+                let mut recorder = super::ForkChildRepairRecorderFixture {
+                    state: &process.state,
+                    published_cell: None,
+                    events: Vec::new(),
+                };
+                let mut lifecycle = Vec::new();
+                let mut record_lifecycle = |phase| lifecycle.push(phase);
+                let repaired = surviving
+                    .after_fork_child_with_recorders(52, &mut recorder, &mut record_lifecycle)
+                    .is_ok();
+                let state = process.state.read();
+                let reset_count = recorder
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            super::RecordedForkChildRepair::Range(
+                                super::RecordedTranslatedRange::Reset(_)
+                            )
+                        )
+                    })
+                    .count();
+                let payload = [
+                    state.translated_ranges.epoch.get(),
+                    state.translated_ranges.sequence_frontier(),
+                    reset_count as u64,
+                    lifecycle
+                        .iter()
+                        .filter(|phase| {
+                            **phase
+                                == carrick_dsr::probes::DsrCacheLifecyclePhase::ForkChildRepairEnd
+                        })
+                        .count() as u64,
+                ];
+                drop(state);
+                let bytes = std::mem::size_of_val(&payload);
+                let written = unsafe {
+                    libc::write(pipe_fds[1], payload.as_ptr().cast::<libc::c_void>(), bytes)
+                };
+                let _ = unsafe { libc::close(pipe_fds[1]) };
+                unsafe {
+                    libc::_exit(i32::from(
+                        !repaired || written != isize::try_from(bytes).expect("small payload"),
+                    ))
+                };
+            }
+
+            let _ = unsafe { libc::close(pipe_fds[1]) };
+            let mut payload = [0_u64; 4];
+            let bytes = std::mem::size_of_val(&payload);
+            let mut read = 0_usize;
+            while read < bytes {
+                let result = unsafe {
+                    libc::read(
+                        pipe_fds[0],
+                        payload
+                            .as_mut_ptr()
+                            .cast::<u8>()
+                            .add(read)
+                            .cast::<libc::c_void>(),
+                        bytes - read,
+                    )
+                };
+                assert!(result > 0, "short child replay payload: {result}");
+                read += usize::try_from(result).expect("positive read length");
+            }
+            let _ = unsafe { libc::close(pipe_fds[0]) };
+
+            assert_eq!(child_exit_status(pid), 0, "child replay failed");
+            assert_eq!(payload, [2, 2, 1, 1]);
+            let parent_after = {
+                let state = process.state.read();
+                (
+                    state.translated_ranges.epoch,
+                    state.translated_ranges.next_sequence,
+                    state.translated_ranges.ready_sequence,
+                    state.translated_ranges.private.clone(),
+                    state.translated_ranges.shared.clone(),
+                )
+            };
+            assert_eq!(
+                parent_after, parent_before,
+                "child replay must stay private to the child's COW image"
+            );
+        }
+
+        #[test]
         fn child_rebind_does_not_mutate_parent_cells() {
             let (fixture, process, source, target) = one_published_binding(22);
+            process
+                .activate_translated_range_catalog()
+                .expect("activate catalog");
             let parent_pointer = fixture.storage[0].load(Ordering::Acquire);
             assert!(!parent_pointer.is_null());
 
             let pid = unsafe { libc::fork() };
             assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
             if pid == 0 {
-                process.after_fork_child();
+                process.after_fork_child().expect("child fork repair");
                 let outcome = process.state.write().direct_bindings.publish(
                     DirectBindingMiss {
                         cell: fixture.unit.binding_base.expect("binding base"),
@@ -7379,6 +8034,9 @@ mod tests {
         #[test]
         fn fork_child_retains_inherited_catalog_and_publishes_through_cow() {
             let process = process_with_direct_bindings();
+            process
+                .activate_translated_range_catalog()
+                .expect("activate catalog");
             let inherited = 0x90_0000..0x91_0000;
             process
                 .state
@@ -7391,7 +8049,7 @@ mod tests {
             let pid = unsafe { libc::fork() };
             assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
             if pid == 0 {
-                process.after_fork_child();
+                process.after_fork_child().expect("child fork repair");
                 let child_only = 0xa0_0000..0xa1_0000;
                 let mut state = process.state.write();
                 let inherited_visible = state.executable_ranges.contains(inherited.start + 0x100);

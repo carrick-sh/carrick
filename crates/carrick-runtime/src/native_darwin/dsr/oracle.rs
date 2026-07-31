@@ -4536,6 +4536,11 @@ fn published_shared_block_prevents_second_process_translation() {
             store,
         )
         .expect("configure shared fixture");
+    fixture
+        .translator
+        .process
+        .activate_translated_range_catalog()
+        .expect("activate shared fixture catalog");
 
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -4699,6 +4704,11 @@ fn shared_to_private_indirect_cache_hit_installs_target_authority() {
             ))),
         )
         .expect("configure indirect fixture");
+    fixture
+        .translator
+        .process
+        .activate_translated_range_catalog()
+        .expect("activate indirect fixture catalog");
 
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -4867,6 +4877,11 @@ fn indirect_authority_switch_jittered_sigpipe_never_becomes_entry_kick() {
             ))),
         )
         .expect("configure shared indirect source");
+    fixture
+        .translator
+        .process
+        .activate_translated_range_catalog()
+        .expect("activate shared indirect catalog");
 
     let mut stack = vec![0_u8; 16 * 1024];
     let mut warm = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -5271,6 +5286,11 @@ fn direct_binding_live_fixture(
             store,
         )
         .expect("configure live direct-binding image");
+    fixture
+        .translator
+        .process
+        .activate_translated_range_catalog()
+        .expect("activate live direct-binding catalog");
 
     DirectBindingLiveFixture {
         fixture,
@@ -6495,6 +6515,11 @@ fn direct_binding_generation_change_clears_and_rebinds() {
             store,
         )
         .expect("configure sidecar source");
+    fixture
+        .translator
+        .process
+        .activate_translated_range_catalog()
+        .expect("activate sidecar source catalog");
 
     let mut stack = vec![0_u8; 16 * 1024];
     let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
@@ -6722,6 +6747,11 @@ fn translated_block_is_published_on_retirement_and_reused() {
                 store,
             )
             .expect("configure retirement fixture");
+        fixture
+            .translator
+            .process
+            .activate_translated_range_catalog()
+            .expect("activate retirement fixture catalog");
     }
 
     let words = [0xf940_0020, 0xd400_0001]; // ldr x0,[x1] ; svc #0

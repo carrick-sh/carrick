@@ -274,6 +274,20 @@ impl TranslatedSharedRange {
     pub const fn range(&self) -> &Range<HostVa> {
         &self.range
     }
+
+    /// Re-key a previously validated shared range for a process-local replay.
+    ///
+    /// Fork replay preserves the unit, sequence, and executable extent while
+    /// advancing only the child catalog epoch. Construction is infallible
+    /// because the retained event already passed all typed validation.
+    pub fn replayed_in(&self, epoch: TranslatedRangeEpoch) -> Self {
+        Self {
+            epoch,
+            sequence: self.sequence,
+            unit_id: self.unit_id,
+            range: self.range.clone(),
+        }
+    }
 }
 
 /// Close the initial translated-range replay for one process-image epoch.
