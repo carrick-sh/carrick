@@ -712,7 +712,14 @@ where
     )?;
     maybe_dump_debug_state(&image, debug_state_path);
 
-    run_image_in_child(image, dispatcher, max_traps, relative_relocations, plan)
+    run_image_in_child(
+        image,
+        canonical_host_executable_path(path),
+        dispatcher,
+        max_traps,
+        relative_relocations,
+        plan,
+    )
 }
 
 // See `run_static_elf`: macOS-arm-only until M0.8.
@@ -781,7 +788,14 @@ where
     )?;
     maybe_dump_debug_state(&image, debug_state_path);
 
-    run_image_in_child(image, dispatcher, max_traps, relative_relocations, plan)
+    run_image_in_child(
+        image,
+        resolved,
+        dispatcher,
+        max_traps,
+        relative_relocations,
+        plan,
+    )
 }
 
 type LoadedNativeExecveImage = (
@@ -819,6 +833,42 @@ impl NativeImageSource {
 struct ResumedImage {
     source: NativeImageSource,
     legacy_resolved_path: Option<String>,
+}
+
+impl ResumedImage {
+    fn guest_image_compatibility(
+        &self,
+        prepared_resolved_path: &str,
+    ) -> NativeGuestImageCompatibility {
+        NativeGuestImageCompatibility::from_image(
+            self.source.image(),
+            self.legacy_resolved_path
+                .as_deref()
+                .unwrap_or(prepared_resolved_path),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeGuestImageCompatibility {
+    base: u64,
+    entry: u64,
+    resolved_path: String,
+}
+
+impl NativeGuestImageCompatibility {
+    fn from_image(image: &AddressSpace, resolved_path: impl Into<String>) -> Self {
+        Self {
+            base: image
+                .regions()
+                .iter()
+                .map(|region| region.start)
+                .min()
+                .unwrap_or(0),
+            entry: image.entry(),
+            resolved_path: resolved_path.into(),
+        }
+    }
 }
 
 fn select_resumed_image<F>(
@@ -1036,10 +1086,8 @@ pub(crate) fn resume_guest_from_capsule(
         }
         loaded
     })?;
-    let resolved = resumed
-        .legacy_resolved_path
-        .clone()
-        .unwrap_or_else(|| guest.resolved_path.clone());
+    let guest_image = resumed.guest_image_compatibility(&guest.resolved_path);
+    let resolved = guest_image.resolved_path.clone();
     native_reexec_lifecycle(carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecResetBegin);
     dispatcher.reset_memory_state_on_execve();
     dispatcher.reset_signal_handlers_on_execve();
@@ -1063,6 +1111,7 @@ pub(crate) fn resume_guest_from_capsule(
         max_traps,
         &plan,
         NativeCurrentProcessEntry::SelfReexecRestore,
+        guest_image,
     )
     .map_err(anyhow::Error::from)
 }
@@ -1671,6 +1720,7 @@ fn add_load_bias(load_bias: u64, addend: i64) -> Result<u64, RuntimeError> {
 #[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 fn run_image_in_child(
     image: AddressSpace,
+    resolved_path: String,
     dispatcher: SyscallDispatcher,
     max_traps: usize,
     relative_relocations: Vec<NativeRelativeRelocation>,
@@ -1709,6 +1759,7 @@ fn run_image_in_child(
             crate::probes::host_image_base();
             crate::probes::host_image_catalog();
         }
+        let guest_image = NativeGuestImageCompatibility::from_image(&image, resolved_path);
         match run_image_in_current_process(
             NativeImageSource::Legacy {
                 image,
@@ -1719,6 +1770,7 @@ fn run_image_in_child(
             max_traps,
             plan,
             NativeCurrentProcessEntry::Initial,
+            guest_image,
         ) {
             Ok(code) => unsafe { libc::_exit(code) },
             Err(err) => {
@@ -1761,6 +1813,7 @@ fn run_image_in_current_process(
     max_traps: usize,
     plan: &ExecutionPlan,
     process_entry: NativeCurrentProcessEntry,
+    guest_image: NativeGuestImageCompatibility,
 ) -> Result<i32, RuntimeError> {
     let initial_sp = source.image().initial_stack_pointer().ok_or_else(|| {
         RuntimeError::Unsupported("native Darwin image has no initial stack".to_string())
@@ -1826,7 +1879,11 @@ fn run_image_in_current_process(
         max_traps,
         plan,
         &mut thread_runtime,
-        NativeThreadStart::Initial { entry, initial_sp },
+        NativeThreadStart::Initial {
+            entry,
+            initial_sp,
+            guest_image,
+        },
     )? {
         NativeThreadLoopOutcome::ProcessExit(code) => Ok(code),
         NativeThreadLoopOutcome::ThreadDone => {
@@ -1932,6 +1989,7 @@ enum NativeThreadStart {
     Initial {
         entry: u64,
         initial_sp: u64,
+        guest_image: NativeGuestImageCompatibility,
     },
     Detached {
         context: Box<NativeUcontextSnapshot>,
@@ -1939,9 +1997,98 @@ enum NativeThreadStart {
     },
 }
 
-impl NativeThreadStart {
-    const fn activates_translated_range_catalog(&self) -> bool {
-        matches!(self, Self::Initial { .. })
+#[derive(Debug, Eq, PartialEq)]
+enum NativeProcessHandoffError<Activation, Installation> {
+    Activation(Activation),
+    Installation(Installation),
+}
+
+trait NativeImagePublisher {
+    fn host_base(&mut self);
+    fn host_catalog(&mut self);
+    fn guest(&mut self, metadata: &NativeGuestImageCompatibility);
+    fn host_jit(&mut self, range: std::ops::Range<u64>);
+}
+
+struct NativeProbeImagePublisher;
+
+impl NativeImagePublisher for NativeProbeImagePublisher {
+    fn host_base(&mut self) {
+        crate::probes::host_image_base();
+    }
+
+    fn host_catalog(&mut self) {
+        crate::probes::host_image_catalog();
+    }
+
+    fn guest(&mut self, metadata: &NativeGuestImageCompatibility) {
+        crate::probes::guest_image_base(metadata.base, metadata.entry, &metadata.resolved_path);
+    }
+
+    fn host_jit(&mut self, range: std::ops::Range<u64>) {
+        crate::probes::host_jit_range(range.start, range.end);
+    }
+}
+
+fn activate_publish_install_native_process<T, ActivationError, InstallationError>(
+    process: Arc<dsr::ProcessTranslator>,
+    guest_image: &NativeGuestImageCompatibility,
+    profile: bool,
+    activate: impl FnOnce(&dsr::ProcessTranslator) -> Result<(), ActivationError>,
+    publisher: &mut impl NativeImagePublisher,
+    install: impl FnOnce(Arc<dsr::ProcessTranslator>) -> Result<T, InstallationError>,
+) -> Result<T, NativeProcessHandoffError<ActivationError, InstallationError>> {
+    activate(&process).map_err(NativeProcessHandoffError::Activation)?;
+    if profile {
+        publisher.host_base();
+        publisher.host_catalog();
+    }
+    publisher.guest(guest_image);
+    publisher.host_jit(process.cache_host_range());
+    install(process).map_err(NativeProcessHandoffError::Installation)
+}
+
+fn install_native_thread_start_with<T, ActivationError, InstallationError>(
+    process: Arc<dsr::ProcessTranslator>,
+    start: NativeThreadStart,
+    profile: bool,
+    activate: impl FnOnce(&dsr::ProcessTranslator) -> Result<(), ActivationError>,
+    publisher: &mut impl NativeImagePublisher,
+    install: impl FnOnce(Arc<dsr::ProcessTranslator>) -> Result<T, InstallationError>,
+) -> Result<
+    (T, NativeUcontextSnapshot, u64),
+    NativeProcessHandoffError<ActivationError, InstallationError>,
+> {
+    match start {
+        NativeThreadStart::Initial {
+            entry,
+            initial_sp,
+            guest_image,
+        } => {
+            let installed = activate_publish_install_native_process(
+                process,
+                &guest_image,
+                profile,
+                activate,
+                publisher,
+                install,
+            )?;
+            Ok((
+                installed,
+                NativeUcontextSnapshot {
+                    sp: initial_sp,
+                    pc: entry,
+                    ..NativeUcontextSnapshot::default()
+                },
+                0,
+            ))
+        }
+        NativeThreadStart::Detached {
+            context,
+            guest_tpidr_el0,
+        } => install(process)
+            .map(|installed| (installed, *context, guest_tpidr_el0))
+            .map_err(NativeProcessHandoffError::Installation),
     }
 }
 
@@ -2444,39 +2591,26 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
     thread_runtime: &mut NativeThreadRuntime,
     start: NativeThreadStart,
 ) -> Result<NativeThreadLoopOutcome, RuntimeError> {
-    let activates_translated_range_catalog = start.activates_translated_range_catalog();
-    let mut guest_tpidr_el0 = match &start {
-        NativeThreadStart::Initial { .. } => 0,
-        NativeThreadStart::Detached {
-            guest_tpidr_el0, ..
-        } => *guest_tpidr_el0,
-    };
-    let mut snapshot = match start {
-        NativeThreadStart::Initial { entry, initial_sp } => NativeUcontextSnapshot {
-            sp: initial_sp,
-            pc: entry,
-            ..NativeUcontextSnapshot::default()
-        },
-        NativeThreadStart::Detached { context, .. } => *context,
-    };
     let process_translator = memory.read().dsr_process_translator()?;
-    if activates_translated_range_catalog {
-        process_translator
-            .activate_translated_range_catalog()
-            .map_err(|error| RuntimeError::Unsupported(error.to_string()))?;
-    }
-    let cache_range = process_translator.cache_host_range();
-    if PROFILE {
-        // A guest exec can host-self-reexec carrick and then run to exit
-        // without issuing another execve. Publish the replacement ASLR base at
-        // the same profiled loop boundary as its JIT range; the execve-site
-        // announcement alone otherwise leaves that final host image unknown.
-        crate::probes::host_image_base();
-        crate::probes::host_image_catalog();
-    }
-    crate::probes::host_jit_range(cache_range.start, cache_range.end);
-    let mut translator =
-        dsr::ThreadTranslator::for_process(process_translator, thread_runtime.tid().raw());
+    let (mut translator, mut snapshot, mut guest_tpidr_el0) = install_native_thread_start_with(
+        process_translator,
+        start,
+        PROFILE,
+        dsr::ProcessTranslator::activate_translated_range_catalog,
+        &mut NativeProbeImagePublisher,
+        |process| {
+            Ok::<_, std::convert::Infallible>(dsr::ThreadTranslator::for_process(
+                process,
+                thread_runtime.tid().raw(),
+            ))
+        },
+    )
+    .map_err(|error| match error {
+        NativeProcessHandoffError::Activation(error) => {
+            RuntimeError::Unsupported(error.to_string())
+        }
+        NativeProcessHandoffError::Installation(never) => match never {},
+    })?;
     debug_assert_eq!(translator.profiling_enabled(), PROFILE);
     let prepare: DsrPrepareFn = prepare_dsr_entry::<PROFILE>;
     let enter: DsrEnterFn = enter_dsr_prepared::<PROFILE>;
@@ -3150,6 +3284,11 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         resolved_argv,
                         executable_digest,
                     )) => {
+                        // Retain the validated image identity before any
+                        // mapped-memory retirement. The post-PONR handoff
+                        // borrows this value and performs no path allocation.
+                        let guest_image =
+                            NativeGuestImageCompatibility::from_image(&image, resolved.clone());
                         // The inner guest image, now that its load address is
                         // known. Guest text shares this address space with
                         // carrick's own code, so a profiler that knows only the
@@ -3157,9 +3296,9 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         // resolves them against carrick's symbol table and gets
                         // a name that is wrong rather than an error.
                         crate::probes::guest_image_base(
-                            image.regions().iter().map(|r| r.start).min().unwrap_or(0),
-                            image.entry(),
-                            &resolved,
+                            guest_image.base,
+                            guest_image.entry,
+                            &guest_image.resolved_path,
                         );
                         if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                             if let Err(reason) = dispatcher.validate_native_reexec_fd_state() {
@@ -3373,10 +3512,23 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         translator.begin_exec_reset();
                         translator.begin_exec_handoff();
                         let next_process = memory.read().dsr_process_translator()?;
-                        translator.reset_for_exec(next_process).map_err(|error| {
-                            RuntimeError::Trap(TrapError::Hypervisor(format!(
-                                "native execve could not install replacement translator: {error}"
-                            )))
+                        activate_publish_install_native_process(
+                            next_process,
+                            &guest_image,
+                            PROFILE,
+                            dsr::ProcessTranslator::activate_translated_range_catalog,
+                            &mut NativeProbeImagePublisher,
+                            |next_process| translator.reset_for_exec(next_process),
+                        )
+                        .map_err(|error| match error {
+                            NativeProcessHandoffError::Activation(error) => {
+                                RuntimeError::Unsupported(error.to_string())
+                            }
+                            NativeProcessHandoffError::Installation(error) => {
+                                RuntimeError::Trap(TrapError::Hypervisor(format!(
+                                    "native execve could not install replacement translator: {error}"
+                                )))
+                            }
                         })?;
                         crate::namespace::pid::mark_self_execed();
                         let cmdline = proc_argv.join(" ");
@@ -6756,19 +6908,204 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
 
+    fn handoff_guest_image() -> NativeGuestImageCompatibility {
+        NativeGuestImageCompatibility {
+            base: 0x40_0000,
+            entry: 0x40_1000,
+            resolved_path: "/bin/handoff-probe".to_owned(),
+        }
+    }
+
+    struct RecordingNativeImagePublisher<'a> {
+        events: &'a RefCell<Vec<&'static str>>,
+        expected_guest: &'a NativeGuestImageCompatibility,
+        expected_host_jit: std::ops::Range<u64>,
+        require_same_guest_address: bool,
+    }
+
+    impl NativeImagePublisher for RecordingNativeImagePublisher<'_> {
+        fn host_base(&mut self) {
+            self.events.borrow_mut().push("host-base");
+        }
+
+        fn host_catalog(&mut self) {
+            self.events.borrow_mut().push("host-catalog");
+        }
+
+        fn guest(&mut self, metadata: &NativeGuestImageCompatibility) {
+            assert_eq!(metadata, self.expected_guest);
+            if self.require_same_guest_address {
+                assert!(std::ptr::eq(metadata, self.expected_guest));
+            }
+            self.events.borrow_mut().push("guest");
+        }
+
+        fn host_jit(&mut self, range: std::ops::Range<u64>) {
+            assert_eq!(range, self.expected_host_jit);
+            self.events.borrow_mut().push("host-jit");
+        }
+    }
+
     #[test]
-    fn only_initial_native_thread_start_activates_the_process_catalog() {
+    fn successful_process_handoff_activates_publishes_and_installs_in_exact_order() {
+        let process = Arc::new(dsr::test_process_translator(16 * 1024).expect("translator"));
+        let process_range = process.cache_host_range();
+        let guest_image = handoff_guest_image();
+        let events = RefCell::new(Vec::new());
+        let mut publisher = RecordingNativeImagePublisher {
+            events: &events,
+            expected_guest: &guest_image,
+            expected_host_jit: process_range,
+            require_same_guest_address: true,
+        };
+
+        let installed = activate_publish_install_native_process(
+            Arc::clone(&process),
+            &guest_image,
+            true,
+            |selected| {
+                events.borrow_mut().push("activate");
+                selected.activate_translated_range_catalog()
+            },
+            &mut publisher,
+            |selected| {
+                events.borrow_mut().push("install");
+                Ok::<_, dsr::types::DsrError>(selected)
+            },
+        )
+        .expect("successful handoff");
+
+        assert!(Arc::ptr_eq(&installed, &process));
+        assert_eq!(
+            process.translated_range_catalog_state_for_test(),
+            (1, 1, Some(1), 0),
+        );
+        assert_eq!(
+            events.into_inner(),
+            [
+                "activate",
+                "host-base",
+                "host-catalog",
+                "guest",
+                "host-jit",
+                "install",
+            ]
+        );
+    }
+
+    #[test]
+    fn activation_failure_suppresses_publication_install_and_resume() {
+        let process = Arc::new(dsr::test_process_translator(16 * 1024).expect("translator"));
+        let guest_image = handoff_guest_image();
+        let events = RefCell::new(Vec::new());
+        let mut publisher = RecordingNativeImagePublisher {
+            events: &events,
+            expected_guest: &guest_image,
+            expected_host_jit: process.cache_host_range(),
+            require_same_guest_address: true,
+        };
+
+        let result = activate_publish_install_native_process(
+            process,
+            &guest_image,
+            true,
+            |_| {
+                events.borrow_mut().push("activate");
+                Err::<(), _>("injected activation failure")
+            },
+            &mut publisher,
+            |_| {
+                events.borrow_mut().push("install");
+                Ok::<(), &'static str>(())
+            },
+        );
+        if result.is_ok() {
+            events.borrow_mut().push("resume");
+        }
+
+        assert_eq!(
+            result,
+            Err(NativeProcessHandoffError::Activation(
+                "injected activation failure"
+            ))
+        );
+        assert_eq!(events.into_inner(), ["activate"]);
+    }
+
+    #[test]
+    fn initial_start_hands_off_once_while_detached_start_only_installs() {
+        let guest_image = handoff_guest_image();
+        let initial_process =
+            Arc::new(dsr::test_process_translator(16 * 1024).expect("initial translator"));
+        let initial_events = RefCell::new(Vec::new());
+        let mut initial_publisher = RecordingNativeImagePublisher {
+            events: &initial_events,
+            expected_guest: &guest_image,
+            expected_host_jit: initial_process.cache_host_range(),
+            require_same_guest_address: false,
+        };
         let initial = NativeThreadStart::Initial {
-            entry: 0x1000,
-            initial_sp: 0x2000,
+            entry: guest_image.entry,
+            initial_sp: 0x50_0000,
+            guest_image: guest_image.clone(),
+        };
+        install_native_thread_start_with(
+            Arc::clone(&initial_process),
+            initial,
+            false,
+            |selected| {
+                initial_events.borrow_mut().push("activate");
+                selected.activate_translated_range_catalog()
+            },
+            &mut initial_publisher,
+            |_| {
+                initial_events.borrow_mut().push("install");
+                Ok::<_, dsr::types::DsrError>(())
+            },
+        )
+        .expect("install initial thread");
+        assert_eq!(
+            initial_events.into_inner(),
+            ["activate", "guest", "host-jit", "install"]
+        );
+        assert_eq!(
+            initial_process.translated_range_catalog_state_for_test(),
+            (1, 1, Some(1), 0),
+        );
+
+        let detached_process =
+            Arc::new(dsr::test_process_translator(16 * 1024).expect("detached translator"));
+        let detached_events = RefCell::new(Vec::new());
+        let mut detached_publisher = RecordingNativeImagePublisher {
+            events: &detached_events,
+            expected_guest: &guest_image,
+            expected_host_jit: detached_process.cache_host_range(),
+            require_same_guest_address: false,
         };
         let detached = NativeThreadStart::Detached {
             context: Box::new(NativeUcontextSnapshot::default()),
-            guest_tpidr_el0: 0,
+            guest_tpidr_el0: 7,
         };
-
-        assert!(initial.activates_translated_range_catalog());
-        assert!(!detached.activates_translated_range_catalog());
+        install_native_thread_start_with(
+            Arc::clone(&detached_process),
+            detached,
+            true,
+            |_| {
+                detached_events.borrow_mut().push("activate");
+                Ok::<_, dsr::types::DsrError>(())
+            },
+            &mut detached_publisher,
+            |_| {
+                detached_events.borrow_mut().push("install");
+                Ok::<_, dsr::types::DsrError>(())
+            },
+        )
+        .expect("install detached thread");
+        assert_eq!(detached_events.into_inner(), ["install"]);
+        assert_eq!(
+            detached_process.translated_range_catalog_state_for_test(),
+            (1, 0, None, 0),
+        );
     }
 
     #[test]
@@ -8805,7 +9142,7 @@ mod tests {
                 .prepare_exec_mapping(&target_image, plan.page_geometry)
                 .expect("prepare replacement after abandonment");
             let candidate = Arc::clone(&prepared.process_translator);
-            let (exec_thread, mut reset_token) = prepare_exec_reset_authority(&memory);
+            let (mut exec_thread, mut reset_token) = prepare_exec_reset_authority(&memory);
             memory
                 .replace_image(
                     &target_image,
@@ -8826,6 +9163,41 @@ mod tests {
                 candidate.translated_range_catalog_state_for_test(),
                 (1, 0, None, 0),
                 "preflight/commit slice must leave fresh replacement dormant",
+            );
+
+            let events = RefCell::new(Vec::new());
+            let guest_image =
+                NativeGuestImageCompatibility::from_image(&target_image, "/bin/fresh-replacement");
+            let mut publisher = RecordingNativeImagePublisher {
+                events: &events,
+                expected_guest: &guest_image,
+                expected_host_jit: candidate.cache_host_range(),
+                require_same_guest_address: true,
+            };
+            activate_publish_install_native_process(
+                Arc::clone(&candidate),
+                &guest_image,
+                false,
+                |selected| {
+                    events.borrow_mut().push("activate");
+                    selected.activate_translated_range_catalog()
+                },
+                &mut publisher,
+                |selected| {
+                    assert!(Arc::ptr_eq(&selected, &candidate));
+                    events.borrow_mut().push("install");
+                    exec_thread.reset_for_exec(selected)
+                },
+            )
+            .expect("activate and install fresh replacement");
+            assert_eq!(
+                events.into_inner(),
+                ["activate", "guest", "host-jit", "install"],
+            );
+            assert_eq!(
+                candidate.translated_range_catalog_state_for_test(),
+                (1, 1, Some(1), 0),
+                "fresh replacement must activate exactly once at handoff",
             );
         });
     }
@@ -9171,10 +9543,31 @@ mod tests {
                 if !dormant {
                     unsafe { libc::_exit(6) };
                 }
-                if inherited_process
-                    .activate_translated_range_catalog()
-                    .is_err()
-                {
+                let guest_image =
+                    NativeGuestImageCompatibility::from_image(&target, "/bin/inherited-exec");
+                let events = RefCell::new(Vec::new());
+                let mut publisher = RecordingNativeImagePublisher {
+                    events: &events,
+                    expected_guest: &guest_image,
+                    expected_host_jit: inherited_process.cache_host_range(),
+                    require_same_guest_address: true,
+                };
+                let installed = activate_publish_install_native_process(
+                    Arc::clone(&inherited_process),
+                    &guest_image,
+                    false,
+                    dsr::ProcessTranslator::activate_translated_range_catalog,
+                    &mut publisher,
+                    |selected| {
+                        if !Arc::ptr_eq(&selected, &inherited_process) {
+                            return Err(dsr::types::DsrError::CachePolicy(
+                                "inherited exec selected a different translator".to_owned(),
+                            ));
+                        }
+                        exec_thread.reset_for_exec(selected)
+                    },
+                );
+                if installed.is_err() {
                     unsafe { libc::_exit(7) };
                 }
                 let activated = inherited_process.translated_range_catalog_state_for_test();
@@ -14103,6 +14496,46 @@ mod tests {
 
         assert!(matches!(resumed.source, NativeImageSource::Legacy { .. }));
         assert_eq!(loader_calls.get(), 1);
+    }
+
+    #[test]
+    fn prepared_and_legacy_resume_select_identical_guest_image_compatibility() {
+        let temp = tempfile::tempdir().expect("create resume tempdir");
+        let path = native_prepared_resume_source(temp.path(), 0xd65f_03c0);
+        let resolved_path = path.to_str().expect("UTF-8 resume path");
+        let dispatcher = SyscallDispatcher::new();
+        let plan = native16k_test_plan();
+        let prepared_load = native_prepared_resume_load(&dispatcher, &path, &plan);
+        let record = native_prepared_resume_record(
+            &prepared_load.0,
+            &prepared_load.1,
+            plan.page_geometry.host_page_size,
+        );
+        let expected_digest = prepared_load.4;
+        let prepared = select_resumed_image(Some(record), expected_digest, || {
+            Err(crate::linux_abi::LINUX_EIO)
+        })
+        .expect("select prepared image");
+        let prepared_compatibility = prepared.guest_image_compatibility(resolved_path);
+
+        let legacy_load = native_prepared_resume_load(&dispatcher, &path, &plan);
+        let legacy = select_resumed_image(None, expected_digest, || Ok(legacy_load))
+            .expect("select legacy image");
+        let legacy_compatibility = legacy.guest_image_compatibility("ignored-fallback");
+
+        assert_eq!(prepared_compatibility, legacy_compatibility);
+        assert_eq!(prepared_compatibility.resolved_path, resolved_path);
+        assert_eq!(prepared_compatibility.entry, prepared_load.0.entry());
+        assert_eq!(
+            prepared_compatibility.base,
+            prepared_load
+                .0
+                .regions()
+                .iter()
+                .map(|region| region.start)
+                .min()
+                .unwrap_or(0),
+        );
     }
 
     #[test]
