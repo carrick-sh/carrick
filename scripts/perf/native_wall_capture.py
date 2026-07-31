@@ -28,7 +28,7 @@ import native_go_build  # noqa: E402
 import native_go_build_abba  # noqa: E402
 
 
-CAPTURE_SCHEMA = "carrick.native-m2-lifecycle-capture.v1"
+CAPTURE_SCHEMA = "carrick.native-m2-lifecycle-capture.v2"
 LIFECYCLE_PREFIX = "TRANSLATED_LIFECYCLE|"
 SUMMARY_PREFIX = "TRANSLATED_LIFECYCLE_SUMMARY|"
 RUN_ID_PREFIX = "native-m2-lifecycle-"
@@ -39,6 +39,11 @@ CARRICK_ENV_ALLOWLIST = frozenset(("CARRICK_DSR_PROFILE", "CARRICK_RUN_ID"))
 SAFE_LAUNCH_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 SAFE_LAUNCH_ENV_KEYS = frozenset(
     ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL")
+)
+DOF_SECTION = "__dof_carrick"
+SUPPORTED_DOF_SEGMENTS = frozenset(("__TEXT", "__DATA"))
+DOF_EVIDENCE_FIELDS = frozenset(
+    ("section", "segment", "size", "otool_listing_sha256")
 )
 LIFECYCLE_REDUCER = (
     "set -eu; "
@@ -1296,27 +1301,174 @@ def _load_default_overlay(path: pathlib.Path) -> tuple[dict[str, None], bytes]:
     return expected, raw
 
 
-def _data_dof_from_otool(binary: pathlib.Path) -> bool:
+def _parse_dof_otool_listing(raw: bytes) -> dict[str, object]:
+    """Return the one supported, nonempty DOF section in an otool listing."""
+
+    if type(raw) is not bytes:
+        raise EvidenceError("DOF otool listing is not raw bytes")
+    try:
+        listing = raw.decode()
+    except UnicodeDecodeError as error:
+        raise EvidenceError("DOF otool listing is not UTF-8 text") from error
+    if not listing.strip():
+        raise EvidenceError("DOF otool listing is empty")
+
+    lines = listing.splitlines()
+    target_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip() == f"sectname {DOF_SECTION}"
+    ]
+    if len(target_indexes) != 1:
+        raise EvidenceError(
+            f"DOF inspection requires exactly one sectname {DOF_SECTION}, "
+            f"found {len(target_indexes)}"
+        )
+    target_index = target_indexes[0]
+
+    load_starts = [
+        index
+        for index, line in enumerate(lines)
+        if re.fullmatch(r"Load command [0-9]+", line.strip())
+    ]
+    load_start = next(
+        (index for index in reversed(load_starts) if index < target_index),
+        None,
+    )
+    if load_start is None:
+        raise EvidenceError("DOF section is outside a Mach-O load command")
+    load_end = next(
+        (index for index in load_starts if index > target_index),
+        len(lines),
+    )
+    command_lines = lines[load_start:load_end]
+
+    section_starts = [
+        load_start + index
+        for index, line in enumerate(command_lines)
+        if line.strip() == "Section"
+    ]
+    section_start = next(
+        (index for index in reversed(section_starts) if index < target_index),
+        None,
+    )
+    if section_start is None:
+        raise EvidenceError("DOF sectname is outside a structural Section block")
+    section_end = next(
+        (index for index in section_starts if index > target_index),
+        load_end,
+    )
+    if target_index != section_start + 1:
+        raise EvidenceError("DOF Section block has malformed field order")
+
+    header_lines = lines[load_start + 1 : section_starts[0]]
+    commands = [
+        line.strip().split(None, 1)[1]
+        for line in header_lines
+        if line.strip().startswith("cmd ")
+    ]
+    if commands != ["LC_SEGMENT_64"]:
+        raise EvidenceError("DOF section is not in one LC_SEGMENT_64 load command")
+    load_segments = [
+        line.strip().split(None, 1)[1]
+        for line in header_lines
+        if line.strip().startswith("segname ")
+    ]
+    if len(load_segments) != 1:
+        raise EvidenceError("DOF load command has malformed segment identity")
+
+    section_lines = lines[section_start + 1 : section_end]
+
+    def section_field(name: str) -> str:
+        prefix = name + " "
+        values = [
+            line.strip().split(None, 1)[1]
+            for line in section_lines
+            if line.strip().startswith(prefix)
+        ]
+        if len(values) != 1:
+            raise EvidenceError(f"DOF Section block has malformed {name} field")
+        return values[0]
+
+    section_name = section_field("sectname")
+    segment = section_field("segname")
+    size_token = section_field("size")
+    if section_name != DOF_SECTION:
+        raise EvidenceError("DOF Section block identity drifted")
+    if segment != load_segments[0]:
+        raise EvidenceError("DOF section segment differs from its load command")
+    if segment not in SUPPORTED_DOF_SEGMENTS:
+        raise EvidenceError(
+            f"DOF section is in unsupported loadable segment {segment!r}"
+        )
+    if re.fullmatch(r"0x[0-9a-fA-F]+", size_token) is None:
+        raise EvidenceError("DOF section size is malformed")
+    size = int(size_token, 16)
+    if size <= 0:
+        raise EvidenceError("DOF section size must be positive")
+
+    return {
+        "section": section_name,
+        "segment": segment,
+        "size": size,
+        "otool_listing_sha256": _sha256_bytes(raw),
+    }
+
+
+def _dof_from_otool(binary: pathlib.Path) -> dict[str, object]:
     result = subprocess.run(
         ["otool", "-l", str(binary)],
         capture_output=True,
-        text=True,
         check=False,
     )
     if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace").strip()
+        stdout = result.stdout.decode(errors="replace").strip()
         raise EvidenceError(
-            "DOF inspection failed: " + (result.stderr.strip() or result.stdout.strip())
+            "DOF inspection failed: " + (stderr or stdout)
         )
-    lines = result.stdout.splitlines()
-    for index, line in enumerate(lines):
-        if line.strip() != "sectname __dof_carrick":
-            continue
-        if any(
-            candidate.strip() == "segname __DATA"
-            for candidate in lines[index + 1 : index + 8]
-        ):
-            return True
-    return False
+    return _parse_dof_otool_listing(result.stdout)
+
+
+def _validated_dof_evidence(
+    value: object, description: str
+) -> dict[str, object]:
+    if type(value) is not dict or set(value) != DOF_EVIDENCE_FIELDS:
+        raise EvidenceError(f"{description} DOF evidence field set is not exact")
+    section = value.get("section")
+    segment = value.get("segment")
+    size = value.get("size")
+    listing_sha = value.get("otool_listing_sha256")
+    if section != DOF_SECTION:
+        raise EvidenceError(f"{description} DOF section identity is invalid")
+    if segment not in SUPPORTED_DOF_SEGMENTS:
+        raise EvidenceError(f"{description} DOF segment is unsupported")
+    if type(size) is not int or size <= 0:
+        raise EvidenceError(f"{description} DOF section size is invalid")
+    if (
+        type(listing_sha) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", listing_sha) is None
+    ):
+        raise EvidenceError(f"{description} DOF otool listing hash is invalid")
+    return {
+        "section": section,
+        "segment": segment,
+        "size": size,
+        "otool_listing_sha256": listing_sha,
+    }
+
+
+def _revalidate_dof(
+    ops: object,
+    binary: pathlib.Path,
+    expected: Mapping[str, object],
+    description: str,
+) -> None:
+    current = _validated_dof_evidence(
+        ops.inspect_dof(binary), description
+    )
+    if current != expected:
+        raise EvidenceError(f"{description} DOF evidence drifted")
 
 
 def _delimited_process_token(command: str, token: str) -> bool:
@@ -1364,8 +1516,8 @@ class SystemBoundary:
     def verify_arm(self, receipt: pathlib.Path):
         return native_go_build_abba.load_and_verify_arm(receipt)
 
-    def has_data_dof(self, binary: pathlib.Path) -> bool:
-        return _data_dof_from_otool(binary)
+    def inspect_dof(self, binary: pathlib.Path) -> dict[str, object]:
+        return _dof_from_otool(binary)
 
     def running_docker_oracles(self) -> list[str]:
         return native_go_build.running_docker_oracles()
@@ -1737,8 +1889,9 @@ def capture_lifecycle(
     if pathlib.Path(arm.path).resolve() != config.receipt.resolve():
         raise EvidenceError("verified arm receipt identity drifted")
     binary = pathlib.Path(arm.binary_path).resolve()
-    if not ops.has_data_dof(binary):
-        raise EvidenceError("arm binary lacks required __DATA,__dof_carrick section")
+    dof = _validated_dof_evidence(
+        ops.inspect_dof(binary), "arm binary"
+    )
     executed_image = _executed_image_ref(arm)
     inputs = _snapshot_inputs(config, arm, overlay_raw)
     if inputs["binary"]["sha256"] != arm.binary_sha256:
@@ -1780,8 +1933,7 @@ def capture_lifecycle(
             reverified = ops.verify_arm(config.receipt.resolve())
             if reverified != arm or _executed_image_ref(reverified) != executed_image:
                 raise EvidenceError("arm receipt verification drifted before launch")
-            if not ops.has_data_dof(binary):
-                raise EvidenceError("arm binary __DATA DOF identity drifted")
+            _revalidate_dof(ops, binary, dof, "arm binary before launch")
             _verify_input_snapshot(config, arm, inputs)
             _load_default_overlay(config.overlay)
             validate_dtrace_source(config.script.read_text())
@@ -1835,8 +1987,7 @@ def capture_lifecycle(
             reverified = ops.verify_arm(config.receipt.resolve())
             if reverified != arm or _executed_image_ref(reverified) != executed_image:
                 raise EvidenceError("arm receipt verification drifted after launch")
-            if not ops.has_data_dof(binary):
-                raise EvidenceError("arm binary __DATA DOF identity drifted after launch")
+            _revalidate_dof(ops, binary, dof, "arm binary after launch")
             _verify_input_snapshot(config, arm, inputs)
             _load_default_overlay(config.overlay)
             validate_dtrace_source(config.script.read_text())
@@ -1891,8 +2042,7 @@ def capture_lifecycle(
         reverified = ops.verify_arm(config.receipt.resolve())
         if reverified != arm or _executed_image_ref(reverified) != executed_image:
             raise EvidenceError("arm receipt verification drifted before publication")
-        if not ops.has_data_dof(binary):
-            raise EvidenceError("arm binary __DATA DOF identity drifted before publication")
+        _revalidate_dof(ops, binary, dof, "arm binary before publication")
         _verify_input_snapshot(config, arm, inputs)
         _load_default_overlay(config.overlay)
         validate_dtrace_source(config.script.read_text())
@@ -1921,6 +2071,7 @@ def capture_lifecycle(
             "cpu_evidence": False,
             "run_id": run_id,
             "artifacts": artifacts,
+            "dof": dof,
             "environment": environment_evidence,
             "argv": command,
             "argv_sha256": _sha256_json(command),
@@ -1980,6 +2131,7 @@ def validate_capture_receipt(
         "cpu_evidence",
         "run_id",
         "artifacts",
+        "dof",
         "environment",
         "argv",
         "argv_sha256",
@@ -2019,6 +2171,9 @@ def validate_capture_receipt(
     run_id = payload.get("run_id")
     if type(run_id) is not str or not RUN_ID_RE.fullmatch(run_id):
         raise EvidenceError("capture receipt run ID is malformed")
+    recorded_dof = _validated_dof_evidence(
+        payload.get("dof"), "capture receipt"
+    )
 
     artifacts = payload.get("artifacts")
     required_artifacts = {
@@ -2105,10 +2260,12 @@ def validate_capture_receipt(
         raise EvidenceError("capture receipt binary path differs from verified arm")
     if arm.binary_sha256 != artifacts["binary"]["sha256"]:
         raise EvidenceError("capture receipt binary hash differs from verified arm")
-    if not ops.has_data_dof(binary_path):
-        raise EvidenceError(
-            "capture receipt binary lacks required __DATA,__dof_carrick"
-        )
+    _revalidate_dof(
+        ops,
+        binary_path,
+        recorded_dof,
+        "capture receipt binary",
+    )
     executed_image = _executed_image_ref(arm)
 
     argv = payload.get("argv")

@@ -82,6 +82,72 @@ def good_trace(events: list[str] | None = None, summary: str = GOOD_SUMMARY) -> 
     return "\n".join([*(GOOD_EVENTS if events is None else events), summary, ""])
 
 
+REAL_LD64_TEXT_DOF_LISTING = b"""\
+target/perf/native-m2-lifecycle-arm-15345cf2/carrick:
+Load command 1
+      cmd LC_SEGMENT_64
+  cmdsize 792
+  segname __TEXT
+   vmaddr 0x0000000100000000
+   vmsize 0x0000000000fb4000
+  fileoff 0
+ filesize 16465920
+  maxprot 0x00000005
+ initprot 0x00000005
+   nsects 9
+    flags 0x0
+Section
+  sectname __dof_carrick
+   segname __TEXT
+      addr 0x0000000100dc6f22
+      size 0x0000000000008f3e
+    offset 14446370
+     align 2^0 (1)
+    reloff 0
+    nreloc 0
+     flags 0x0000000f
+ reserved1 0
+ reserved2 0
+"""
+
+
+def dof_listing(
+    *,
+    segment: str = "__TEXT",
+    size: str = "0x0000000000000040",
+    section_segment: str | None = None,
+    section_marker: str = "Section",
+) -> bytes:
+    actual_section_segment = segment if section_segment is None else section_segment
+    return (
+        "fixture-carrick:\n"
+        "Load command 7\n"
+        "      cmd LC_SEGMENT_64\n"
+        "  cmdsize 152\n"
+        f"  segname {segment}\n"
+        "   vmaddr 0x0000000100000000\n"
+        "   vmsize 0x0000000000004000\n"
+        "  fileoff 0\n"
+        " filesize 16384\n"
+        "  maxprot 0x00000005\n"
+        " initprot 0x00000005\n"
+        "   nsects 1\n"
+        "    flags 0x0\n"
+        f"{section_marker}\n"
+        "  sectname __dof_carrick\n"
+        f"   segname {actual_section_segment}\n"
+        "      addr 0x0000000100001000\n"
+        f"      size {size}\n"
+        "    offset 4096\n"
+        "     align 2^0 (1)\n"
+        "    reloff 0\n"
+        "    nreloc 0\n"
+        "     flags 0x0000000f\n"
+        " reserved1 0\n"
+        " reserved2 0\n"
+    ).encode()
+
+
 class LifecycleTraceFixtureTests(unittest.TestCase):
     def module(self):
         module = load_capture_module()
@@ -239,7 +305,14 @@ class FixtureBoundary:
         self.arm = arm
         self.trace_out = trace_out
         self.uuid = uuid.UUID("12345678-1234-4678-9234-567812345678")
-        self.data_dof = True
+        self.dof = {
+            "section": "__dof_carrick",
+            "segment": "__TEXT",
+            "size": 0x40,
+            "otool_listing_sha256": hashlib.sha256(
+                b"fixture otool listing"
+            ).hexdigest(),
+        }
         self.docker_results: list[list[str]] = [[], []]
         self.presence_results: list[bool] = [False, False]
         self.process_results: list[list[tuple[int, str]]] = [[], []]
@@ -261,9 +334,9 @@ class FixtureBoundary:
         self.events.append(("verify-arm", receipt))
         return self.arm
 
-    def has_data_dof(self, binary: pathlib.Path) -> bool:
-        self.events.append(("data-dof", binary))
-        return self.data_dof
+    def inspect_dof(self, binary: pathlib.Path) -> dict[str, object]:
+        self.events.append(("inspect-dof", binary))
+        return dict(self.dof)
 
     def running_docker_oracles(self) -> list[str]:
         self.events.append(("docker", None))
@@ -436,6 +509,10 @@ class LifecycleCaptureFixtureTests(unittest.TestCase):
         run_id = "native-m2-lifecycle-12345678-1234-4678-9234-567812345678"
         self.assertEqual(payload["run_id"], run_id)
         self.assertEqual(
+            payload["schema"], "carrick.native-m2-lifecycle-capture.v2"
+        )
+        self.assertEqual(payload["dof"], self.boundary.dof)
+        self.assertEqual(
             [event for event in self.boundary.events if event[0] == "reap"],
             [("reap", run_id), ("reap", run_id)],
         )
@@ -513,9 +590,54 @@ class LifecycleCaptureFixtureTests(unittest.TestCase):
                 path.write_bytes(original)
                 self.next_attempt()
 
-    def test_wrong_data_dof_and_nondefault_overlay_reject(self) -> None:
-        self.boundary.data_dof = False
-        with self.assertRaisesRegex(self.module.EvidenceError, "__DATA"):
+    def test_dof_parser_and_nondefault_overlay_fail_closed(self) -> None:
+        current = self.module._parse_dof_otool_listing(
+            REAL_LD64_TEXT_DOF_LISTING
+        )
+        self.assertEqual(
+            current,
+            {
+                "section": "__dof_carrick",
+                "segment": "__TEXT",
+                "size": 0x8F3E,
+                "otool_listing_sha256": hashlib.sha256(
+                    REAL_LD64_TEXT_DOF_LISTING
+                ).hexdigest(),
+            },
+        )
+        for segment in ("__TEXT", "__DATA"):
+            with self.subTest(accepted_segment=segment):
+                listing = dof_listing(segment=segment)
+                parsed = self.module._parse_dof_otool_listing(listing)
+                self.assertEqual(parsed["segment"], segment)
+                self.assertEqual(parsed["size"], 0x40)
+                self.assertEqual(
+                    parsed["otool_listing_sha256"],
+                    hashlib.sha256(listing).hexdigest(),
+                )
+
+        malformed = dof_listing(section_marker="Not a section")
+        duplicate = dof_listing() + dof_listing(segment="__DATA")
+        missing = dof_listing().replace(b"__dof_carrick", b"__not_dof_here")
+        cases = {
+            "unsupported segment": dof_listing(segment="__OTHER"),
+            "zero size": dof_listing(size="0x0"),
+            "duplicate section": duplicate,
+            "missing section": missing,
+            "malformed section": malformed,
+            "mismatched segment": dof_listing(section_segment="__DATA"),
+            "malformed size": dof_listing(size="not-a-number"),
+        }
+        for label, listing in cases.items():
+            with self.subTest(rejected=label):
+                with self.assertRaisesRegex(
+                    self.module.EvidenceError,
+                    "DOF|__dof_carrick|segment|size|malformed",
+                ):
+                    self.module._parse_dof_otool_listing(listing)
+
+        self.boundary.dof = {}
+        with self.assertRaisesRegex(self.module.EvidenceError, "DOF"):
             self.capture()
 
         self.next_attempt()
@@ -739,17 +861,20 @@ class LifecycleCaptureFixtureTests(unittest.TestCase):
                 self.capture_receipt, boundary=self.boundary
             )
 
-    def test_recomputed_closure_rejects_each_opaque_hash_tamper(self) -> None:
+    def test_recomputed_closure_rejects_independently_verified_fields(self) -> None:
         self.capture()
         original = json.loads(self.capture_receipt.read_text())
         cases = (
-            ("environment", "effective_environment_sha256"),
-            ("cleanup", "stdout_sha256"),
+            ("environment", "effective_environment_sha256", "0" * 64),
+            ("cleanup", "stdout_sha256", "0" * 64),
+            ("dof", "segment", "__DATA"),
+            ("dof", "size", original["dof"]["size"] + 1),
+            ("dof", "otool_listing_sha256", "0" * 64),
         )
-        for section, field in cases:
+        for section, field, replacement in cases:
             with self.subTest(section=section, field=field):
                 payload = json.loads(json.dumps(original))
-                payload[section][field] = "0" * 64
+                payload[section][field] = replacement
                 if section == "environment":
                     environment = dict(payload["environment"])
                     environment.pop("sha256")
@@ -766,7 +891,7 @@ class LifecycleCaptureFixtureTests(unittest.TestCase):
                 self.capture_receipt.write_text(json.dumps(payload))
                 with self.assertRaisesRegex(
                     self.module.EvidenceError,
-                    f"{section}.*hash|hash.*{section}",
+                    f"{section}.*hash|hash.*{section}|DOF.*drifted",
                 ):
                     self.module.validate_capture_receipt(
                         self.capture_receipt, boundary=self.boundary
