@@ -108,6 +108,22 @@ impl From<PullArg> for carrick_image::PullPolicy {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    /// Internal parser harness for fail-closed native-profile fixtures.
+    #[command(name = "__native-profile-validate", hide = true)]
+    NativeProfileValidate {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        principal_drops: u64,
+        #[arg(long, default_value_t = 0)]
+        aggregation_drops: u64,
+        #[arg(long, default_value_t = 0)]
+        dynamic_drops: u64,
+        #[arg(long, default_value_t = 0)]
+        other_drops: u64,
+        #[arg(long, default_value_t = false)]
+        interrupted: bool,
+    },
     /// Internal transport-only diagnostic for the native host self-reexec path.
     #[command(name = "__native-exec-pid-probe", hide = true)]
     NativeExecPidProbe,

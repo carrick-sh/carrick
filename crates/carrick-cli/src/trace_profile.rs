@@ -15,6 +15,1544 @@ use carrick_runtime::dtrace_symbols::SampledKernelSymbolOverlay;
 
 const PROTOCOL_PREFIX: &str = "DSRPROF1";
 const JSON_SCHEMA: &str = "carrick.dsr-profile.v1";
+const V2_PROTOCOL_PREFIX: &str = "DSRPROF2";
+const V2_STACK_PREFIX: &str = "DSRSTACK2";
+const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v2";
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProcessBirthKey {
+    pid: u32,
+    start_sec: i64,
+    start_usec: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RawProcessImageKey {
+    birth: ProcessBirthKey,
+    image_generation: u64,
+    runtime_epoch: u64,
+}
+
+#[derive(Debug)]
+struct V2Record {
+    tag: String,
+    fields: BTreeMap<String, String>,
+}
+
+impl V2Record {
+    fn parse(line: &str, prefix: &str) -> Result<Self> {
+        let mut parts = line.split('|');
+        if parts.next() != Some(prefix) {
+            bail!("unknown profile protocol prefix in {line:?}");
+        }
+        let tag = parts
+            .next()
+            .filter(|tag| !tag.is_empty())
+            .ok_or_else(|| anyhow!("truncated {prefix} record"))?
+            .to_owned();
+        let mut fields = BTreeMap::new();
+        for raw_field in parts {
+            let (key, value) = raw_field
+                .split_once('=')
+                .ok_or_else(|| anyhow!("{prefix} field lacks '=': {raw_field:?}"))?;
+            if key.is_empty() || value.is_empty() {
+                bail!("{prefix} field has an empty key or value");
+            }
+            match fields.entry(key.to_owned()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(value.to_owned());
+                }
+                Entry::Occupied(_) => bail!("duplicate {prefix} field {key:?}"),
+            }
+        }
+        Ok(Self { tag, fields })
+    }
+
+    fn exact_fields(&self, expected: &[&str]) -> Result<()> {
+        let actual = self
+            .fields
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        if actual != expected {
+            let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+            let extra = actual.difference(&expected).copied().collect::<Vec<_>>();
+            bail!(
+                "{V2_PROTOCOL_PREFIX} {:?} field contract mismatch: missing={missing:?}, extra={extra:?}",
+                self.tag
+            );
+        }
+        Ok(())
+    }
+
+    fn required(&self, key: &str) -> Result<&str> {
+        self.fields
+            .get(key)
+            .map(String::as_str)
+            .ok_or_else(|| anyhow!("{} record is missing {key:?}", self.tag))
+    }
+
+    fn decimal_u64(&self, key: &str) -> Result<u64> {
+        parse_decimal_u64(self.required(key)?)
+            .with_context(|| format!("invalid {} field {key:?}", self.tag))
+    }
+
+    fn decimal_u32(&self, key: &str) -> Result<u32> {
+        let value = self.decimal_u64(key)?;
+        u32::try_from(value).with_context(|| format!("{} field {key:?} exceeds u32", self.tag))
+    }
+
+    fn signed_i64(&self, key: &str) -> Result<i64> {
+        parse_signed_i64(self.required(key)?)
+            .with_context(|| format!("invalid {} field {key:?}", self.tag))
+    }
+
+    fn signed_i32(&self, key: &str) -> Result<i32> {
+        let value = self.signed_i64(key)?;
+        i32::try_from(value).with_context(|| format!("{} field {key:?} exceeds i32", self.tag))
+    }
+
+    fn address(&self, key: &str) -> Result<u64> {
+        parse_v2_address(self.required(key)?)
+            .with_context(|| format!("invalid {} address {key:?}", self.tag))
+    }
+
+    fn birth(&self, pid: &str, sec: &str, usec: &str) -> Result<ProcessBirthKey> {
+        let birth = ProcessBirthKey {
+            pid: self.decimal_u32(pid)?,
+            start_sec: self.signed_i64(sec)?,
+            start_usec: self.signed_i32(usec)?,
+        };
+        if birth.pid == 0 {
+            bail!("{} process pid must be positive", self.tag);
+        }
+        if !(0..1_000_000).contains(&birth.start_usec) {
+            bail!("{} start_usec is outside timeval range", self.tag);
+        }
+        Ok(birth)
+    }
+
+    fn image_key(&self) -> Result<RawProcessImageKey> {
+        let key = RawProcessImageKey {
+            birth: self.birth("pid", "start_sec", "start_usec")?,
+            image_generation: self.decimal_u64("image")?,
+            runtime_epoch: self.decimal_u64("epoch")?,
+        };
+        if key.image_generation == 0 {
+            bail!("{} image generation must be positive", self.tag);
+        }
+        Ok(key)
+    }
+}
+
+fn parse_decimal_u64(value: &str) -> Result<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("expected unsigned decimal integer, got {value:?}");
+    }
+    value
+        .parse::<u64>()
+        .with_context(|| format!("decimal integer {value:?} exceeds u64"))
+}
+
+fn parse_signed_i64(value: &str) -> Result<i64> {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("expected signed decimal integer, got {value:?}");
+    }
+    value
+        .parse::<i64>()
+        .with_context(|| format!("signed integer {value:?} exceeds i64"))
+}
+
+fn parse_v2_address(value: &str) -> Result<u64> {
+    let digits = value
+        .strip_prefix("0x")
+        .filter(|digits| !digits.is_empty())
+        .ok_or_else(|| anyhow!("address {value:?} is not 0x-prefixed hexadecimal"))?;
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("address {value:?} contains a non-hexadecimal digit");
+    }
+    u64::from_str_radix(digits, 16).with_context(|| format!("address {value:?} exceeds u64"))
+}
+
+fn validate_sha256(value: &str, field: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{field} must be an exact hexadecimal SHA-256 digest");
+    }
+    Ok(())
+}
+
+fn validate_percent_token(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("{field} token must not be empty");
+    }
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                if index + 2 >= bytes.len()
+                    || !bytes[index + 1].is_ascii_hexdigit()
+                    || !bytes[index + 2].is_ascii_hexdigit()
+                {
+                    bail!("{field} contains an invalid percent escape");
+                }
+                index += 3;
+            }
+            byte if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':') => {
+                index += 1;
+            }
+            _ => bail!("{field} contains an unescaped byte"),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum V2RangeKind {
+    Private,
+    Shared { unit_id: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct V2Range {
+    sequence: u64,
+    start: u64,
+    end: u64,
+    kind: V2RangeKind,
+}
+
+#[derive(Clone, Debug, Default)]
+struct V2EpochState {
+    reset_observed: bool,
+    ranges: Vec<V2Range>,
+    ready_frontier: Option<u64>,
+    replay_expected: Option<Vec<V2Range>>,
+    host_image_base: Option<u64>,
+    host_image_catalog: Option<Vec<HostImageRangeRecord>>,
+    guest_image_base: Option<u64>,
+}
+
+impl V2EpochState {
+    fn is_ready(&self) -> bool {
+        self.reset_observed
+            && self.replay_expected.is_none()
+            && self.ready_frontier == u64::try_from(self.ranges.len()).ok()
+            && !self.ranges.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct V2ProcessState {
+    current: RawProcessImageKey,
+    alive: bool,
+    exec_attempt: Option<RawProcessImageKey>,
+    exit_reason: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct V2KernelFrame {
+    key: RawProcessImageKey,
+    provider: String,
+    function: String,
+    class: String,
+    timestamp_ns: u64,
+}
+
+#[derive(Clone, Debug)]
+struct V2OffcpuEpisode {
+    key: RawProcessImageKey,
+    episode: u64,
+    kind: String,
+    pc: u64,
+    timestamp_ns: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V2HostImageCatalogPayload {
+    ranges: Vec<HostImageRangeRecord>,
+}
+
+#[derive(Debug, Default)]
+struct V2Validator {
+    header_seen: bool,
+    target: Option<ProcessBirthKey>,
+    complete: bool,
+    processes: BTreeMap<ProcessBirthKey, V2ProcessState>,
+    active_pids: BTreeMap<u32, ProcessBirthKey>,
+    known_keys: BTreeSet<RawProcessImageKey>,
+    epochs: BTreeMap<RawProcessImageKey, V2EpochState>,
+    pending_inherit: BTreeMap<ProcessBirthKey, (RawProcessImageKey, RawProcessImageKey)>,
+    kernel_stacks: BTreeMap<(ProcessBirthKey, u64), Vec<V2KernelFrame>>,
+    offcpu_open: BTreeMap<(ProcessBirthKey, u64), V2OffcpuEpisode>,
+    offcpu_last_episode: BTreeMap<(ProcessBirthKey, u64), u64>,
+    offcpu_closed: BTreeMap<(RawProcessImageKey, String, u64), (u64, u64)>,
+    offcpu_summary: BTreeMap<(RawProcessImageKey, String, u64), (u64, u64)>,
+    wall_state: BTreeMap<String, u64>,
+    cpu_samples: u64,
+    terminal_qualifications: BTreeSet<(String, String, String)>,
+    open_stack: Option<V2StackRecord>,
+    stacks: Vec<V2StackRecord>,
+}
+
+#[derive(Debug)]
+struct V2StackRecord {
+    key: RawProcessImageKey,
+    kind: String,
+    count: u64,
+    total_ns: u64,
+    frames: Vec<String>,
+}
+
+pub(crate) fn validate_v2_path(path: &Path, capture_status: ProfileCaptureStatus) -> Result<()> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read DSRPROF2 stream {}", path.display()))?;
+    validate_v2_lines(contents.lines(), capture_status)
+}
+
+fn validate_v2_lines<I, S>(lines: I, capture_status: ProfileCaptureStatus) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    if capture_status.principal_drops != 0
+        || capture_status.aggregation_drops != 0
+        || capture_status.dynamic_drops != 0
+        || capture_status.other_drops != 0
+        || capture_status.interrupted
+    {
+        bail!(
+            "DSRPROF2 capture is not lossless: drops={}/{}/{}/{}, interrupted={}",
+            capture_status.principal_drops,
+            capture_status.aggregation_drops,
+            capture_status.dynamic_drops,
+            capture_status.other_drops,
+            capture_status.interrupted
+        );
+    }
+
+    let mut validator = V2Validator::default();
+    for (index, raw_line) in lines.into_iter().enumerate() {
+        let raw_line = raw_line.as_ref();
+        if validator.open_stack.is_some() {
+            if raw_line == "DSRSTACK2|end" {
+                validator
+                    .finish_stack()
+                    .with_context(|| format!("invalid stack end at line {}", index + 1))?;
+            } else {
+                if raw_line.is_empty() {
+                    bail!("empty DSRSTACK2 frame at line {}", index + 1);
+                }
+                if raw_line.starts_with("DSRPROF") || raw_line.starts_with("DSRSTACK") {
+                    bail!(
+                        "profile marker interrupted DSRSTACK2 block at line {}",
+                        index + 1
+                    );
+                }
+                let stack = validator
+                    .open_stack
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("DSRSTACK2 state disappeared"))?;
+                stack.frames.push(raw_line.to_owned());
+            }
+            continue;
+        }
+
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if validator.complete {
+            bail!(
+                "DSRPROF2 record appears after completion at line {}",
+                index + 1
+            );
+        }
+        if line.starts_with("DSRPROF1|")
+            || line.starts_with("NWSTACK1|")
+            || line.starts_with("NWIMAGES1|")
+        {
+            bail!("mixed v1/v2 profile stream at line {}", index + 1);
+        }
+        if line.starts_with("DSRSTACK2|") {
+            let record = V2Record::parse(line, V2_STACK_PREFIX)
+                .with_context(|| format!("invalid stack record at line {}", index + 1))?;
+            if record.tag != "begin" {
+                bail!(
+                    "unknown DSRSTACK2 tag {:?} at line {}",
+                    record.tag,
+                    index + 1
+                );
+            }
+            validator
+                .begin_stack(record)
+                .with_context(|| format!("invalid stack begin at line {}", index + 1))?;
+            continue;
+        }
+        if !line.starts_with("DSRPROF2|") {
+            bail!("unknown raw profile line {}: {line:?}", index + 1);
+        }
+        let record = V2Record::parse(line, V2_PROTOCOL_PREFIX)
+            .with_context(|| format!("invalid profile record at line {}", index + 1))?;
+        validator
+            .apply(record)
+            .with_context(|| format!("invalid DSRPROF2 record at line {}", index + 1))?;
+    }
+
+    if validator.open_stack.is_some() {
+        bail!("DSRPROF2 stream ended inside a stack block");
+    }
+    if !validator.complete {
+        bail!("DSRPROF2 stream is missing its completion record");
+    }
+    Ok(())
+}
+
+impl V2Validator {
+    fn apply(&mut self, record: V2Record) -> Result<()> {
+        if !self.header_seen && record.tag != "header" {
+            bail!("DSRPROF2 header must be the first record");
+        }
+        if self.header_seen && self.target.is_none() && record.tag != "target-birth" {
+            bail!("DSRPROF2 target-birth must follow the header");
+        }
+        match record.tag.as_str() {
+            "header" => self.header(&record),
+            "target-birth" => self.target_birth(&record),
+            "process-create" => self.process_create(&record),
+            "fork-inherit" => self.fork_inherit(&record),
+            "exec-attempt" => self.exec_attempt(&record),
+            "exec-failure" => self.exec_failure(&record),
+            "exec-success" => self.exec_success(&record),
+            "range-reset" => self.range_reset(&record),
+            "range-private" => self.range_add(&record, false),
+            "range-shared" => self.range_add(&record, true),
+            "range-ready" => self.range_ready(&record),
+            "host-image-base" => self.host_image_base(&record),
+            "host-image-catalog" => self.host_image_catalog(&record),
+            "guest-image-base" => self.guest_image_base(&record),
+            "cpu-user" => self.cpu_user(&record),
+            "kernel-enter" => self.kernel_transition(&record, KernelTransition::Enter),
+            "kernel-return" => self.kernel_transition(&record, KernelTransition::Return),
+            "kernel-terminal-close" => {
+                self.kernel_transition(&record, KernelTransition::TerminalClose)
+            }
+            "cpu-kernel" => self.cpu_kernel(&record),
+            "offcpu-block" => self.offcpu_block(&record),
+            "offcpu-wake" => self.offcpu_wake(&record),
+            "offcpu" => self.offcpu_summary(&record),
+            "process-exit" => self.process_exit(&record),
+            "wall-state" => self.wall_state(&record),
+            "complete" => self.completion(&record),
+            other => bail!("unknown DSRPROF2 tag {other:?}"),
+        }
+    }
+
+    fn begin_stack(&mut self, record: V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "count",
+            "epoch",
+            "image",
+            "kind",
+            "pid",
+            "start_sec",
+            "start_usec",
+            "total_ns",
+        ])?;
+        let key = record.image_key()?;
+        self.require_known_key(key)?;
+        let kind = record.required("kind")?.to_owned();
+        validate_percent_token(&kind, "stack kind")?;
+        let count = record.decimal_u64("count")?;
+        if count == 0 {
+            bail!("DSRSTACK2 count must be positive");
+        }
+        self.open_stack = Some(V2StackRecord {
+            key,
+            kind,
+            count,
+            total_ns: record.decimal_u64("total_ns")?,
+            frames: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn finish_stack(&mut self) -> Result<()> {
+        let stack = self
+            .open_stack
+            .take()
+            .ok_or_else(|| anyhow!("DSRSTACK2 end without begin"))?;
+        if stack.frames.is_empty() {
+            bail!("DSRSTACK2 block has no frames");
+        }
+        self.stacks.push(stack);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum KernelTransition {
+    Enter,
+    Return,
+    TerminalClose,
+}
+
+impl V2Validator {
+    fn header(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "birth_qualification_sha256",
+            "cpu_hz",
+            "os_build",
+            "profile",
+            "program_sha256",
+            "raw_schema",
+            "terminal_qualification_sha256",
+            "wall_hz",
+        ])?;
+        if self.header_seen {
+            bail!("duplicate DSRPROF2 header");
+        }
+        if record.required("profile")? != "native-wall" {
+            bail!("DSRPROF2 header profile must be native-wall");
+        }
+        if record.required("raw_schema")? != V2_RAW_SCHEMA {
+            bail!("unknown DSRPROF2 raw schema");
+        }
+        let os_build = record.required("os_build")?;
+        validate_percent_token(os_build, "os_build")?;
+        for field in [
+            "program_sha256",
+            "birth_qualification_sha256",
+            "terminal_qualification_sha256",
+        ] {
+            validate_sha256(record.required(field)?, field)?;
+        }
+        if record.decimal_u64("wall_hz")? == 0 || record.decimal_u64("cpu_hz")? == 0 {
+            bail!("DSRPROF2 sampling frequencies must be positive");
+        }
+        self.header_seen = true;
+        Ok(())
+    }
+
+    fn target_birth(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&["epoch", "image", "pid", "start_sec", "start_usec"])?;
+        if self.target.is_some() {
+            bail!("duplicate DSRPROF2 target birth");
+        }
+        let key = record.image_key()?;
+        if key.image_generation != 1 || key.runtime_epoch != 0 {
+            bail!("target birth must begin at image=1, epoch=0");
+        }
+        self.admit_process(key)?;
+        self.target = Some(key.birth);
+        Ok(())
+    }
+
+    fn admit_process(&mut self, key: RawProcessImageKey) -> Result<()> {
+        if self.processes.contains_key(&key.birth) {
+            bail!("duplicate process birth key {key:?}");
+        }
+        if let Some(existing) = self.active_pids.get(&key.birth.pid) {
+            bail!(
+                "pid {} is already live under birth key {existing:?}",
+                key.birth.pid
+            );
+        }
+        if !self.known_keys.insert(key) {
+            bail!("raw process-image key {key:?} was already admitted");
+        }
+        self.active_pids.insert(key.birth.pid, key.birth);
+        self.processes.insert(
+            key.birth,
+            V2ProcessState {
+                current: key,
+                alive: true,
+                exec_attempt: None,
+                exit_reason: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn require_known_key(&self, key: RawProcessImageKey) -> Result<()> {
+        if !self.known_keys.contains(&key) {
+            bail!("record references unknown process-image key {key:?}");
+        }
+        Ok(())
+    }
+
+    fn require_current_key(&self, key: RawProcessImageKey) -> Result<()> {
+        let process = self
+            .processes
+            .get(&key.birth)
+            .ok_or_else(|| anyhow!("unknown process birth key {:?}", key.birth))?;
+        if !process.alive {
+            bail!("record references exited process birth key {:?}", key.birth);
+        }
+        if process.current != key {
+            bail!(
+                "record key {key:?} does not equal current key {:?}",
+                process.current
+            );
+        }
+        Ok(())
+    }
+
+    fn require_attribution_key(&self, key: RawProcessImageKey) -> Result<()> {
+        self.require_current_key(key)?;
+        let process = self
+            .processes
+            .get(&key.birth)
+            .ok_or_else(|| anyhow!("process state disappeared"))?;
+        if process.exec_attempt.is_some() {
+            bail!("image attribution is disarmed during exec attempt");
+        }
+        if self.pending_inherit.contains_key(&key.birth) {
+            bail!("child attribution appeared before fork inheritance");
+        }
+        let epoch = self
+            .epochs
+            .get(&key)
+            .ok_or_else(|| anyhow!("process-image key {key:?} has no range reset"))?;
+        if !epoch.is_ready() {
+            bail!("process-image key {key:?} is not range-ready");
+        }
+        Ok(())
+    }
+
+    fn process_create(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "child_epoch",
+            "child_image",
+            "child_pid",
+            "child_sec",
+            "child_usec",
+            "parent_epoch",
+            "parent_image",
+            "parent_pid",
+            "parent_sec",
+            "parent_usec",
+        ])?;
+        let parent = RawProcessImageKey {
+            birth: record.birth("parent_pid", "parent_sec", "parent_usec")?,
+            image_generation: record.decimal_u64("parent_image")?,
+            runtime_epoch: record.decimal_u64("parent_epoch")?,
+        };
+        if parent.image_generation == 0 {
+            bail!("process-create parent image must be positive");
+        }
+        self.require_attribution_key(parent)?;
+        let child = RawProcessImageKey {
+            birth: record.birth("child_pid", "child_sec", "child_usec")?,
+            image_generation: record.decimal_u64("child_image")?,
+            runtime_epoch: record.decimal_u64("child_epoch")?,
+        };
+        if child.image_generation != 1 || child.runtime_epoch != 0 {
+            bail!("new child must begin at image=1, epoch=0");
+        }
+        if child.birth == parent.birth {
+            bail!("process-create parent and child birth keys must differ");
+        }
+        self.admit_process(child)?;
+        if self
+            .pending_inherit
+            .insert(child.birth, (parent, child))
+            .is_some()
+        {
+            bail!("duplicate pending fork inheritance for child");
+        }
+        Ok(())
+    }
+
+    fn fork_inherit(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "child_pid",
+            "child_sec",
+            "child_usec",
+            "mapping_frontier",
+            "parent_epoch",
+            "parent_image",
+            "parent_pid",
+            "parent_sec",
+            "parent_usec",
+            "range_frontier",
+        ])?;
+        let child_birth = record.birth("child_pid", "child_sec", "child_usec")?;
+        let parent = RawProcessImageKey {
+            birth: record.birth("parent_pid", "parent_sec", "parent_usec")?,
+            image_generation: record.decimal_u64("parent_image")?,
+            runtime_epoch: record.decimal_u64("parent_epoch")?,
+        };
+        if parent.image_generation == 0 {
+            bail!("fork-inherit parent image must be positive");
+        }
+        self.require_current_key(parent)?;
+        let (_, child) = self
+            .pending_inherit
+            .get(&child_birth)
+            .copied()
+            .ok_or_else(|| anyhow!("fork-inherit has no matching process-create"))?;
+        let expected = self
+            .pending_inherit
+            .get(&child_birth)
+            .copied()
+            .ok_or_else(|| anyhow!("fork-inherit pending state disappeared"))?;
+        if expected != (parent, child) {
+            bail!("fork-inherit does not match its process-create relation");
+        }
+        if record.decimal_u64("mapping_frontier")? != 0 {
+            bail!("M2 mapping_frontier must be zero");
+        }
+        let range_frontier = record.decimal_u64("range_frontier")?;
+        let parent_epoch = self
+            .epochs
+            .get(&parent)
+            .ok_or_else(|| anyhow!("fork parent has no translated-range catalog"))?;
+        let parent_len = u64::try_from(parent_epoch.ranges.len())
+            .context("fork parent range frontier exceeds u64")?;
+        if range_frontier != parent_len
+            || parent_epoch.ready_frontier != Some(range_frontier)
+            || !parent_epoch.is_ready()
+        {
+            bail!(
+                "fork range frontier {range_frontier} does not equal ready parent frontier {parent_len}"
+            );
+        }
+        let mut child_epoch = parent_epoch.clone();
+        child_epoch.ranges.truncate(
+            usize::try_from(range_frontier).context("fork range frontier exceeds usize")?,
+        );
+        child_epoch.ready_frontier = Some(range_frontier);
+        child_epoch.replay_expected = None;
+        if self.epochs.insert(child, child_epoch).is_some() {
+            bail!("child inherited catalog already exists");
+        }
+        self.pending_inherit.remove(&child_birth);
+        Ok(())
+    }
+
+    fn exec_attempt(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&["epoch", "image", "pid", "start_sec", "start_usec"])?;
+        let key = record.image_key()?;
+        self.require_attribution_key(key)?;
+        self.require_no_open_thread_state(key.birth, "exec attempt")?;
+        let process = self
+            .processes
+            .get_mut(&key.birth)
+            .ok_or_else(|| anyhow!("exec process state disappeared"))?;
+        if process.exec_attempt.replace(key).is_some() {
+            bail!("nested exec attempt for process birth key {:?}", key.birth);
+        }
+        Ok(())
+    }
+
+    fn exec_failure(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&["epoch", "image", "pid", "start_sec", "start_usec"])?;
+        let key = record.image_key()?;
+        self.require_current_key(key)?;
+        let process = self
+            .processes
+            .get_mut(&key.birth)
+            .ok_or_else(|| anyhow!("exec process state disappeared"))?;
+        if process.exec_attempt != Some(key) {
+            bail!("exec-failure does not match one open exec attempt");
+        }
+        process.exec_attempt = None;
+        Ok(())
+    }
+
+    fn exec_success(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "new_epoch",
+            "new_image",
+            "pid",
+            "retired_epoch",
+            "retired_image",
+            "start_sec",
+            "start_usec",
+        ])?;
+        let birth = record.birth("pid", "start_sec", "start_usec")?;
+        let retired = RawProcessImageKey {
+            birth,
+            image_generation: record.decimal_u64("retired_image")?,
+            runtime_epoch: record.decimal_u64("retired_epoch")?,
+        };
+        if retired.image_generation == 0 {
+            bail!("exec-success retired image must be positive");
+        }
+        self.require_current_key(retired)?;
+        self.require_no_open_thread_state(birth, "exec success")?;
+        let new_image = record.decimal_u64("new_image")?;
+        let new_epoch = record.decimal_u64("new_epoch")?;
+        if new_image
+            != retired
+                .image_generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("exec image generation overflow"))?
+            || new_epoch != 0
+        {
+            bail!("exec-success must advance one image generation and reset epoch to zero");
+        }
+        let replacement = RawProcessImageKey {
+            birth,
+            image_generation: new_image,
+            runtime_epoch: new_epoch,
+        };
+        if self.known_keys.contains(&replacement) {
+            bail!("exec-success reuses retired process-image key {replacement:?}");
+        }
+        let process = self
+            .processes
+            .get_mut(&birth)
+            .ok_or_else(|| anyhow!("exec process state disappeared"))?;
+        if process.exec_attempt != Some(retired) {
+            bail!("exec-success does not match one open exec attempt");
+        }
+        process.exec_attempt = None;
+        process.current = replacement;
+        self.known_keys.insert(replacement);
+        Ok(())
+    }
+
+    fn range_reset(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&["epoch", "image", "pid", "start_sec", "start_usec"])?;
+        let key = record.image_key()?;
+        let current = self
+            .processes
+            .get(&key.birth)
+            .filter(|process| process.alive)
+            .ok_or_else(|| anyhow!("range-reset references unknown or exited process"))?
+            .current;
+        if self.pending_inherit.contains_key(&key.birth) {
+            bail!("range-reset appeared before fork inheritance");
+        }
+        let process = self
+            .processes
+            .get(&key.birth)
+            .ok_or_else(|| anyhow!("range-reset process state disappeared"))?;
+        if process.exec_attempt.is_some() {
+            bail!("range-reset appeared while exec attribution is disarmed");
+        }
+        if key == current {
+            if self.epochs.contains_key(&key) {
+                bail!("duplicate range-reset for process-image key {key:?}");
+            }
+            self.epochs.insert(
+                key,
+                V2EpochState {
+                    reset_observed: true,
+                    ..V2EpochState::default()
+                },
+            );
+            return Ok(());
+        }
+        if key.birth != current.birth
+            || key.image_generation != current.image_generation
+            || key.runtime_epoch
+                != current
+                    .runtime_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("runtime epoch overflow"))?
+        {
+            bail!("range-reset does not name the current or next runtime epoch");
+        }
+        self.require_no_open_thread_state(key.birth, "runtime epoch reset")?;
+        let prior = self
+            .epochs
+            .get(&current)
+            .filter(|epoch| epoch.is_ready())
+            .ok_or_else(|| anyhow!("prior runtime epoch is not ready before reset"))?
+            .clone();
+        if self.epochs.contains_key(&key) || self.known_keys.contains(&key) {
+            bail!("range-reset reuses a previously admitted runtime epoch");
+        }
+        self.epochs.insert(
+            key,
+            V2EpochState {
+                reset_observed: true,
+                replay_expected: Some(prior.ranges),
+                ..V2EpochState::default()
+            },
+        );
+        self.known_keys.insert(key);
+        let process = self
+            .processes
+            .get_mut(&key.birth)
+            .ok_or_else(|| anyhow!("range-reset process state disappeared"))?;
+        process.current = key;
+        Ok(())
+    }
+
+    fn range_add(&mut self, record: &V2Record, shared: bool) -> Result<()> {
+        let expected = if shared {
+            &[
+                "end",
+                "epoch",
+                "image",
+                "pid",
+                "sequence",
+                "start",
+                "start_sec",
+                "start_usec",
+                "unit_id",
+            ][..]
+        } else {
+            &[
+                "end",
+                "epoch",
+                "image",
+                "pid",
+                "sequence",
+                "start",
+                "start_sec",
+                "start_usec",
+            ][..]
+        };
+        record.exact_fields(expected)?;
+        let key = record.image_key()?;
+        self.require_current_key(key)?;
+        let process = self
+            .processes
+            .get(&key.birth)
+            .ok_or_else(|| anyhow!("range process state disappeared"))?;
+        if process.exec_attempt.is_some() {
+            bail!("range addition appeared while exec attribution is disarmed");
+        }
+        let sequence = record.decimal_u64("sequence")?;
+        let start = record.address("start")?;
+        let end = record.address("end")?;
+        if start >= end || start % 4 != 0 || end % 4 != 0 {
+            bail!("translated range must be nonempty and four-byte aligned");
+        }
+        let kind = if shared {
+            let unit_id = record.decimal_u64("unit_id")?;
+            if unit_id == 0 {
+                bail!("shared translated unit id must be positive");
+            }
+            V2RangeKind::Shared { unit_id }
+        } else {
+            V2RangeKind::Private
+        };
+        let range = V2Range {
+            sequence,
+            start,
+            end,
+            kind,
+        };
+        let epoch = self
+            .epochs
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("range addition appeared before reset"))?;
+        let expected_sequence = u64::try_from(epoch.ranges.len())
+            .context("translated range count exceeds u64")?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("translated range sequence overflow"))?;
+        if sequence != expected_sequence {
+            bail!(
+                "translated range sequence {sequence} is not contiguous; expected {expected_sequence}"
+            );
+        }
+        if (!shared && sequence != 1) || (shared && sequence == 1) {
+            bail!("private range must be sequence one and shared ranges must follow it");
+        }
+        if epoch
+            .ranges
+            .iter()
+            .any(|existing| range.start < existing.end && existing.start < range.end)
+        {
+            bail!("translated range overlaps an existing catalog range");
+        }
+        if let V2RangeKind::Shared { unit_id } = range.kind
+            && epoch.ranges.iter().any(|existing| {
+                matches!(existing.kind, V2RangeKind::Shared { unit_id: old } if old == unit_id)
+            })
+        {
+            bail!("shared translated unit id {unit_id} is duplicated");
+        }
+        if let Some(replay) = epoch.replay_expected.as_ref() {
+            let index = epoch.ranges.len();
+            let expected_range = replay
+                .get(index)
+                .ok_or_else(|| anyhow!("runtime replay added beyond its inherited frontier"))?;
+            if expected_range != &range {
+                bail!("runtime replay differs from the inherited translated catalog");
+            }
+        }
+        epoch.ranges.push(range);
+        Ok(())
+    }
+
+    fn range_ready(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "epoch",
+            "final_sequence",
+            "image",
+            "pid",
+            "start_sec",
+            "start_usec",
+        ])?;
+        let key = record.image_key()?;
+        self.require_current_key(key)?;
+        let final_sequence = record.decimal_u64("final_sequence")?;
+        let epoch = self
+            .epochs
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("range-ready appeared before reset"))?;
+        let actual =
+            u64::try_from(epoch.ranges.len()).context("translated range count exceeds u64")?;
+        if final_sequence == 0 || final_sequence != actual {
+            bail!("range-ready frontier {final_sequence} does not match catalog frontier {actual}");
+        }
+        if epoch.ready_frontier == Some(final_sequence) {
+            bail!("duplicate range-ready frontier {final_sequence}");
+        }
+        if let Some(expected) = epoch.replay_expected.as_ref()
+            && expected != &epoch.ranges
+        {
+            bail!("range-ready closed an incomplete runtime replay");
+        }
+        epoch.replay_expected = None;
+        epoch.ready_frontier = Some(final_sequence);
+        Ok(())
+    }
+
+    fn require_summary_key(&self, key: RawProcessImageKey) -> Result<()> {
+        self.require_known_key(key)?;
+        let epoch = self
+            .epochs
+            .get(&key)
+            .ok_or_else(|| anyhow!("summary references key without a translated catalog"))?;
+        if !epoch.is_ready() {
+            bail!("summary references non-ready process-image key {key:?}");
+        }
+        Ok(())
+    }
+
+    fn host_image_base(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&["base", "epoch", "image", "pid", "start_sec", "start_usec"])?;
+        let key = record.image_key()?;
+        self.require_attribution_key(key)?;
+        let base = record.address("base")?;
+        if base == 0 {
+            bail!("host image base must be nonzero");
+        }
+        let epoch = self
+            .epochs
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("host image epoch disappeared"))?;
+        if epoch.host_image_base.replace(base).is_some() {
+            bail!("duplicate host image base for process-image key {key:?}");
+        }
+        Ok(())
+    }
+
+    fn host_image_catalog(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "epoch",
+            "image",
+            "payload",
+            "pid",
+            "start_sec",
+            "start_usec",
+        ])?;
+        let key = record.image_key()?;
+        self.require_attribution_key(key)?;
+        let payload: V2HostImageCatalogPayload = serde_json::from_str(record.required("payload")?)
+            .context("invalid DSRPROF2 host image catalog JSON")?;
+        if payload.ranges.is_empty() {
+            bail!("host image catalog has no ranges");
+        }
+        let mut prior_end = None;
+        for range in &payload.ranges {
+            if range.start >= range.end || range.path.is_empty() {
+                bail!("host image catalog contains an invalid range");
+            }
+            if prior_end.is_some_and(|end| range.start < end) {
+                bail!("host image catalog ranges overlap or are unsorted");
+            }
+            prior_end = Some(range.end);
+        }
+        let epoch = self
+            .epochs
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("host image epoch disappeared"))?;
+        if epoch.host_image_catalog.replace(payload.ranges).is_some() {
+            bail!("duplicate host image catalog for process-image key {key:?}");
+        }
+        Ok(())
+    }
+
+    fn guest_image_base(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&["base", "epoch", "image", "pid", "start_sec", "start_usec"])?;
+        let key = record.image_key()?;
+        self.require_attribution_key(key)?;
+        let base = record.address("base")?;
+        if base == 0 {
+            bail!("guest image base must be nonzero");
+        }
+        let epoch = self
+            .epochs
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("guest image epoch disappeared"))?;
+        if epoch.guest_image_base.replace(base).is_some() {
+            bail!("duplicate guest image base for process-image key {key:?}");
+        }
+        Ok(())
+    }
+
+    fn cpu_user(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "count",
+            "epoch",
+            "image",
+            "pc",
+            "pid",
+            "start_sec",
+            "start_usec",
+        ])?;
+        let key = record.image_key()?;
+        self.require_summary_key(key)?;
+        let _pc = record.address("pc")?;
+        let count = record.decimal_u64("count")?;
+        if count == 0 {
+            bail!("cpu-user count must be positive");
+        }
+        self.cpu_samples = self
+            .cpu_samples
+            .checked_add(count)
+            .ok_or_else(|| anyhow!("CPU sample population overflow"))?;
+        Ok(())
+    }
+
+    fn cpu_kernel(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "class",
+            "count",
+            "epoch",
+            "image",
+            "pc",
+            "pid",
+            "start_sec",
+            "start_usec",
+        ])?;
+        let key = record.image_key()?;
+        self.require_summary_key(key)?;
+        let _pc = record.address("pc")?;
+        match record.required("class")? {
+            "kernel-named-syscall" | "kernel-mach-trap" | "kernel-non-syscall" => {}
+            other => bail!("unknown cpu-kernel class {other:?}"),
+        }
+        let count = record.decimal_u64("count")?;
+        if count == 0 {
+            bail!("cpu-kernel count must be positive");
+        }
+        self.cpu_samples = self
+            .cpu_samples
+            .checked_add(count)
+            .ok_or_else(|| anyhow!("CPU sample population overflow"))?;
+        Ok(())
+    }
+
+    fn require_no_open_thread_state(&self, birth: ProcessBirthKey, boundary: &str) -> Result<()> {
+        if self
+            .kernel_stacks
+            .iter()
+            .any(|((owner, _), stack)| *owner == birth && !stack.is_empty())
+        {
+            bail!("{boundary} crossed an open kernel transition stack");
+        }
+        if self.offcpu_open.keys().any(|(owner, _)| *owner == birth) {
+            bail!("{boundary} crossed an open off-CPU episode");
+        }
+        Ok(())
+    }
+
+    fn kernel_transition(&mut self, record: &V2Record, transition: KernelTransition) -> Result<()> {
+        let expected = match transition {
+            KernelTransition::Enter | KernelTransition::Return => &[
+                "class",
+                "epoch",
+                "function",
+                "image",
+                "pid",
+                "provider",
+                "start_sec",
+                "start_usec",
+                "tid",
+                "timestamp_ns",
+            ][..],
+            KernelTransition::TerminalClose => &[
+                "class",
+                "epoch",
+                "function",
+                "image",
+                "pid",
+                "provider",
+                "scope",
+                "start_sec",
+                "start_usec",
+                "tid",
+                "timestamp_ns",
+            ][..],
+        };
+        record.exact_fields(expected)?;
+        let key = record.image_key()?;
+        self.require_attribution_key(key)?;
+        let tid = record.decimal_u64("tid")?;
+        if tid == 0 {
+            bail!("kernel transition tid must be positive");
+        }
+        let provider = record.required("provider")?.to_owned();
+        let function = record.required("function")?.to_owned();
+        let class = record.required("class")?.to_owned();
+        validate_percent_token(&function, "kernel function")?;
+        match (provider.as_str(), class.as_str()) {
+            ("syscall", "named-syscall") | ("mach_trap", "mach-trap") => {}
+            _ => bail!("kernel provider/class contract is invalid"),
+        }
+        let timestamp_ns = record.decimal_u64("timestamp_ns")?;
+        let stack_key = (key.birth, tid);
+        match transition {
+            KernelTransition::Enter => {
+                self.kernel_stacks
+                    .entry(stack_key)
+                    .or_default()
+                    .push(V2KernelFrame {
+                        key,
+                        provider,
+                        function,
+                        class,
+                        timestamp_ns,
+                    });
+            }
+            KernelTransition::Return | KernelTransition::TerminalClose => {
+                if matches!(transition, KernelTransition::TerminalClose) {
+                    let scope = record.required("scope")?;
+                    match scope {
+                        "thread" | "process" => {}
+                        other => bail!("unknown terminal-close scope {other:?}"),
+                    }
+                    if !self.terminal_qualifications.contains(&(
+                        provider.clone(),
+                        function.clone(),
+                        scope.to_owned(),
+                    )) {
+                        bail!("kernel terminal-close is absent from launch qualification");
+                    }
+                }
+                let stack = self
+                    .kernel_stacks
+                    .get_mut(&stack_key)
+                    .ok_or_else(|| anyhow!("kernel close has no matching entry stack"))?;
+                let top = stack
+                    .last()
+                    .ok_or_else(|| anyhow!("kernel close has no matching entry"))?;
+                if top.key != key
+                    || top.provider != provider
+                    || top.function != function
+                    || top.class != class
+                {
+                    bail!("kernel close does not match the exact top entry");
+                }
+                if timestamp_ns < top.timestamp_ns {
+                    bail!("kernel close timestamp precedes its entry");
+                }
+                stack.pop();
+                if stack.is_empty() {
+                    self.kernel_stacks.remove(&stack_key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn offcpu_block(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "episode",
+            "epoch",
+            "image",
+            "kind",
+            "pc",
+            "pid",
+            "start_sec",
+            "start_usec",
+            "tid",
+            "timestamp_ns",
+        ])?;
+        let key = record.image_key()?;
+        self.require_attribution_key(key)?;
+        let tid = record.decimal_u64("tid")?;
+        let episode = record.decimal_u64("episode")?;
+        if tid == 0 || episode == 0 {
+            bail!("off-CPU tid and episode must be positive");
+        }
+        let thread_key = (key.birth, tid);
+        if self.offcpu_open.contains_key(&thread_key) {
+            bail!("duplicate off-CPU block for one thread");
+        }
+        let expected_episode = self
+            .offcpu_last_episode
+            .get(&thread_key)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("off-CPU episode overflow"))?;
+        if episode != expected_episode {
+            bail!("off-CPU episode {episode} is not contiguous; expected {expected_episode}");
+        }
+        let kind = record.required("kind")?.to_owned();
+        validate_percent_token(&kind, "off-CPU kind")?;
+        let episode_state = V2OffcpuEpisode {
+            key,
+            episode,
+            kind,
+            pc: record.address("pc")?,
+            timestamp_ns: record.decimal_u64("timestamp_ns")?,
+        };
+        self.offcpu_open.insert(thread_key, episode_state);
+        self.offcpu_last_episode.insert(thread_key, episode);
+        Ok(())
+    }
+
+    fn offcpu_wake(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "episode",
+            "epoch",
+            "image",
+            "observed_epoch",
+            "observed_image",
+            "observed_pid",
+            "observed_sec",
+            "observed_usec",
+            "pid",
+            "start_sec",
+            "start_usec",
+            "tid",
+            "timestamp_ns",
+        ])?;
+        let key = record.image_key()?;
+        self.require_attribution_key(key)?;
+        let observed = RawProcessImageKey {
+            birth: record.birth("observed_pid", "observed_sec", "observed_usec")?,
+            image_generation: record.decimal_u64("observed_image")?,
+            runtime_epoch: record.decimal_u64("observed_epoch")?,
+        };
+        if observed.image_generation == 0 || observed != key {
+            bail!("off-CPU wake observed a different process-image key");
+        }
+        let tid = record.decimal_u64("tid")?;
+        let episode = record.decimal_u64("episode")?;
+        let thread_key = (key.birth, tid);
+        let open = self
+            .offcpu_open
+            .remove(&thread_key)
+            .ok_or_else(|| anyhow!("off-CPU wake has no matching block"))?;
+        if open.key != key || open.episode != episode {
+            bail!("off-CPU wake does not match the latched episode identity");
+        }
+        let timestamp_ns = record.decimal_u64("timestamp_ns")?;
+        let duration = timestamp_ns
+            .checked_sub(open.timestamp_ns)
+            .ok_or_else(|| anyhow!("off-CPU wake timestamp precedes block"))?;
+        let aggregate = self
+            .offcpu_closed
+            .entry((key, open.kind, open.pc))
+            .or_default();
+        aggregate.0 = aggregate
+            .0
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("off-CPU episode count overflow"))?;
+        aggregate.1 = aggregate
+            .1
+            .checked_add(duration)
+            .ok_or_else(|| anyhow!("off-CPU duration overflow"))?;
+        Ok(())
+    }
+
+    fn offcpu_summary(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&[
+            "count",
+            "epoch",
+            "image",
+            "kind",
+            "pc",
+            "pid",
+            "start_sec",
+            "start_usec",
+            "total_ns",
+        ])?;
+        let key = record.image_key()?;
+        self.require_summary_key(key)?;
+        let kind = record.required("kind")?.to_owned();
+        validate_percent_token(&kind, "off-CPU kind")?;
+        let pc = record.address("pc")?;
+        let count = record.decimal_u64("count")?;
+        if count == 0 {
+            bail!("off-CPU summary count must be positive");
+        }
+        let value = (count, record.decimal_u64("total_ns")?);
+        if self.offcpu_summary.insert((key, kind, pc), value).is_some() {
+            bail!("duplicate off-CPU summary identity");
+        }
+        Ok(())
+    }
+
+    fn process_exit(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&["epoch", "image", "pid", "reason", "start_sec", "start_usec"])?;
+        let key = record.image_key()?;
+        self.require_current_key(key)?;
+        if self.pending_inherit.contains_key(&key.birth) {
+            bail!("process exited before fork inheritance completed");
+        }
+        let process = self
+            .processes
+            .get(&key.birth)
+            .ok_or_else(|| anyhow!("exit process state disappeared"))?;
+        if process.exec_attempt.is_some() {
+            bail!("process exited with an open exec attempt");
+        }
+        self.require_no_open_thread_state(key.birth, "process exit")?;
+        self.require_all_birth_epochs_ready(key.birth)?;
+        let reason = record.decimal_u64("reason")?;
+        if reason != 1 {
+            bail!("gating DSRPROF2 process exit must be natural (reason=1)");
+        }
+        let process = self
+            .processes
+            .get_mut(&key.birth)
+            .ok_or_else(|| anyhow!("exit process state disappeared"))?;
+        process.alive = false;
+        process.exit_reason = Some(reason);
+        match self.active_pids.remove(&key.birth.pid) {
+            Some(active) if active == key.birth => {}
+            _ => bail!("active PID identity disappeared at process exit"),
+        }
+        Ok(())
+    }
+
+    fn require_all_birth_epochs_ready(&self, birth: ProcessBirthKey) -> Result<()> {
+        let mut found = false;
+        for (key, epoch) in &self.epochs {
+            if key.birth == birth {
+                found = true;
+                if !epoch.is_ready() {
+                    bail!("process birth {birth:?} has a non-ready DSR epoch {key:?}");
+                }
+            }
+        }
+        if !found {
+            bail!("process birth {birth:?} has no translated-range epoch");
+        }
+        Ok(())
+    }
+
+    fn wall_state(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&["count", "kind"])?;
+        let kind = record.required("kind")?.to_owned();
+        validate_percent_token(&kind, "wall-state kind")?;
+        let count = record.decimal_u64("count")?;
+        if count == 0 {
+            bail!("wall-state count must be positive");
+        }
+        if self.wall_state.insert(kind, count).is_some() {
+            bail!("duplicate wall-state bucket");
+        }
+        Ok(())
+    }
+
+    fn completion(&mut self, record: &V2Record) -> Result<()> {
+        record.exact_fields(&["bounded", "live_at_end", "profile", "target_exit_reason"])?;
+        if record.required("profile")? != "native-wall" {
+            bail!("DSRPROF2 completion profile must be native-wall");
+        }
+        if record.decimal_u64("bounded")? != 0 {
+            bail!("gating DSRPROF2 capture must not be bounded");
+        }
+        if record.decimal_u64("live_at_end")? != 0 {
+            bail!("DSRPROF2 completion reports live processes");
+        }
+        let target_exit_reason = record.decimal_u64("target_exit_reason")?;
+        if target_exit_reason != 1 {
+            bail!("DSRPROF2 target did not exit naturally");
+        }
+        let target = self
+            .target
+            .ok_or_else(|| anyhow!("DSRPROF2 stream has no target birth"))?;
+        let target_state = self
+            .processes
+            .get(&target)
+            .ok_or_else(|| anyhow!("DSRPROF2 target process state disappeared"))?;
+        if target_state.alive || target_state.exit_reason != Some(target_exit_reason) {
+            bail!("target completion does not match its process-exit record");
+        }
+        if self.processes.values().any(|process| process.alive) || !self.active_pids.is_empty() {
+            bail!("DSRPROF2 completed with live process state");
+        }
+        if self
+            .processes
+            .values()
+            .any(|process| process.exec_attempt.is_some())
+        {
+            bail!("DSRPROF2 completed with an open exec attempt");
+        }
+        if !self.pending_inherit.is_empty() {
+            bail!("DSRPROF2 completed with pending fork inheritance");
+        }
+        if self.kernel_stacks.values().any(|stack| !stack.is_empty()) {
+            bail!("DSRPROF2 completed with an open kernel transition stack");
+        }
+        if !self.offcpu_open.is_empty() {
+            bail!("DSRPROF2 completed with an open off-CPU episode");
+        }
+        if self.offcpu_closed != self.offcpu_summary {
+            bail!("off-CPU transition and aggregate populations disagree");
+        }
+        for birth in self.processes.keys().copied() {
+            self.require_all_birth_epochs_ready(birth)?;
+        }
+        if self.wall_state.is_empty() {
+            bail!("DSRPROF2 stream has no wall-state population");
+        }
+        if self.cpu_samples == 0 {
+            bail!("DSRPROF2 stream has no resolved CPU samples");
+        }
+        for stack in &self.stacks {
+            self.require_summary_key(stack.key)?;
+            if stack.kind.is_empty() || stack.count == 0 || stack.frames.is_empty() {
+                bail!("DSRSTACK2 summary is empty");
+            }
+            let _ = stack.total_ns;
+        }
+        let _presentation_instances = self.presentation_instances()?;
+        self.complete = true;
+        Ok(())
+    }
+
+    fn presentation_instances(&self) -> Result<BTreeMap<ProcessBirthKey, u64>> {
+        let target = self
+            .target
+            .ok_or_else(|| anyhow!("cannot assign identities without target birth"))?;
+        let mut children = self
+            .processes
+            .keys()
+            .copied()
+            .filter(|birth| *birth != target)
+            .collect::<Vec<_>>();
+        children.sort_by_key(|birth| (birth.start_sec, birth.start_usec, birth.pid));
+        let mut instances = BTreeMap::new();
+        instances.insert(target, 1);
+        for (index, birth) in children.into_iter().enumerate() {
+            let instance = u64::try_from(index)
+                .context("process instance index exceeds u64")?
+                .checked_add(2)
+                .ok_or_else(|| anyhow!("process instance identity overflow"))?;
+            instances.insert(birth, instance);
+        }
+        Ok(instances)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecordType {
@@ -109,6 +1647,7 @@ struct StackTraceRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct HostImageRangeRecord {
     start: u64,
     end: u64,

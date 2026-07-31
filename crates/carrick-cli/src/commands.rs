@@ -118,6 +118,7 @@ use crate::trace_cli::{
 };
 #[cfg(target_os = "macos")]
 use crate::trace_profile::kernel_sample_addresses_from_path;
+use crate::trace_profile::validate_v2_path;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::trace_profile::{ProfileSummary, capture_provenance, write_summary_atomic};
 
@@ -184,6 +185,26 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     };
 
     match command {
+        Commands::NativeProfileValidate {
+            input,
+            principal_drops,
+            aggregation_drops,
+            dynamic_drops,
+            other_drops,
+            interrupted,
+        } => {
+            validate_v2_path(
+                &input,
+                crate::trace_profile::ProfileCaptureStatus {
+                    principal_drops,
+                    aggregation_drops,
+                    dynamic_drops,
+                    other_drops,
+                    interrupted,
+                },
+            )?;
+            println!("DSRPROF2_VALID");
+        }
         Commands::NativeExecPidProbe => {
             carrick_runtime::native_self_reexec_pid_probe()?;
             anyhow::bail!("native self-reexec unexpectedly returned successfully")
