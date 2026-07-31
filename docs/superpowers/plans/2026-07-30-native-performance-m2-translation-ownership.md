@@ -284,8 +284,10 @@ struct CatalogSharedRange {
 
 #[derive(Debug)]
 struct PreparedSharedInstall {
+    tid: i32,
     catalog_entry: CatalogSharedRange,
     blocks: Vec<PreparedSharedBlock>,
+    normalized_guest_ranges: Vec<(GuestVa, GuestVa)>,
     loaded_unit: LoadedSharedUnit,
     direct_binding: PreparedDirectBindingUnit,
     executable_range: PreparedExecutableRange,
@@ -299,7 +301,7 @@ struct PreparedSharedBlock {
     sensitive: Option<((GuestVa, CodeGeneration), SensitiveMetadata)>,
     fusion_site: Option<ExclusiveFusionSite>,
     dependency: (GuestVa, GuestVa, CodeGeneration),
-    guest_range: Option<Range<GuestVa>>,
+    guest_ranges: Vec<Range<GuestVa>>,
     authority: SharedBlockAuthority,
 }
 
@@ -314,7 +316,13 @@ pub(crate) struct PreparedDirectBindingUnit {
     unit_index: usize,
     owner: DirectBindingUnitOwner,
     cell_owners: Vec<DirectBindingOwner>,
-    edge_records: Vec<((GuestVa, GuestVa), usize)>,
+    edge_records: Vec<PreparedDirectBindingEdge>,
+}
+
+pub(crate) struct PreparedDirectBindingEdge {
+    key: (GuestVa, GuestVa),
+    records: Vec<(usize, usize)>,
+    existing: bool,
 }
 
 pub(crate) struct PreparedExecutableRange {
@@ -323,7 +331,9 @@ pub(crate) struct PreparedExecutableRange {
 
 impl TranslatedRangeCatalog {
     fn dormant(private: Range<HostVa>) -> Result<Self, DsrError>;
-    fn activate_or_replay(&mut self) -> Result<(), DsrError>;
+    fn activate_if_dormant(&mut self) -> Result<(), DsrError>;
+    fn replay_after_fork(&mut self) -> Result<(), DsrError>;
+    fn reset_dormant_for_exec(&mut self) -> Result<(), DsrError>;
     fn prepare_shared(
         &self,
         unit_id: TranslatedUnitId,
@@ -336,6 +346,8 @@ impl TranslatedRangeCatalog {
 impl ProcessState {
     fn prepare_shared_install(
         &mut self,
+        tid: i32,
+        memory: &NativeMappedMemory,
         unit: SharedLoadedTranslationUnit,
     ) -> Result<PreparedSharedInstall, DsrError>;
     fn commit_shared_install(&mut self, prepared: PreparedSharedInstall);
@@ -343,7 +355,7 @@ impl ProcessState {
 
 impl DirectBindingRegistry {
     fn prepare_loaded_unit(
-        &self,
+        &mut self,
         unit: &SharedLoadedTranslationUnit,
     ) -> Result<PreparedDirectBindingUnit, DsrError>;
     fn commit_loaded_unit(&mut self, prepared: PreparedDirectBindingUnit) -> Option<usize>;
@@ -369,6 +381,8 @@ Cover:
 - two shared units emit sequences 2 and 3 exactly once;
 - duplicate unit identity with equal or different bounds;
 - overlap between private/shared and between two shared ranges;
+- duplicate guest starts, overlapping cache extents, empty/unaligned PC maps,
+  and nested/overlapping guest ranges that are not normalized to one union;
 - sequence overflow;
 - failure in every validation, vector-reserve, block-metadata, direct-binding,
   retention, and executable-range preparation stage leaves the catalog,
@@ -384,7 +398,11 @@ Cover:
 - compatibility `dsr_cache_bounds` may still fire but is not the catalog
   authority.
 
-Use an injected recorder in tests rather than enabling DTrace.
+Use an injected recorder in tests rather than enabling DTrace. Add
+thread-local, test-only failpoints for each preparation stage plus a logical
+state snapshot. A successful `try_reserve` may change capacity, but no
+failpoint may change a lookup result, catalog frontier, retained unit, or
+executable-range head.
 
 - [ ] **Step 2: Run and prove red**
 
@@ -441,18 +459,39 @@ let range = HostVa(unit.base)
 overlap checks, sequence assignment, every fallible
 `block.template.take_runtime_metadata`/sensitive-block planning operation, and
 all vector `try_reserve` calls without changing any logical lookup result or
-catalog frontier. It builds every `PublishedBlock`, sensitive/fusion record,
-dependency tuple, guest range, and `SharedBlockAuthority` in
-`PreparedSharedBlock`.
+catalog frontier. It takes `&NativeMappedMemory` because generation
+observations and `plan_block_with_segments` cannot be prepared correctly
+without the active address space. It builds every `PublishedBlock`,
+sensitive/fusion record, dependency tuple, guest range, and
+`SharedBlockAuthority` in `PreparedSharedBlock`.
+
+Do not derive guest extent from `block.template.source_words()`: production
+packing deliberately clears that field in `into_runtime_metadata_only`.
+Instead, derive exact four-byte guest instruction intervals from the taken
+`PcMapEntry` list, validate alignment/uniqueness and that `guest_start` is
+represented, and merge adjacent entries into per-block ranges. Prepare the
+normalized union of the existing and new guest intervals so
+`shared_guest_ranges` remains sorted and non-overlapping; commit replaces the
+old vector with that preallocated union. A single min/max interval is invalid
+when the map is non-contiguous.
+
+Strengthen `TranslationUnitManifest::validate_ranges` to reject duplicate
+guest starts and overlapping/duplicate cache extents before any preparation.
+The store is a trait boundary, so clean output from the built-in packer is not
+enough evidence.
 
 Split the current mutating helpers at their real transaction boundaries:
 
-- `DirectBindingRegistry::prepare_loaded_unit` validates the manifest and cell
+- `DirectBindingRegistry::prepare_loaded_unit` takes `&mut self`, validates the
+  manifest and cell
   ownership and builds the unit owner, per-cell owners, edge records, bitmap,
   and retained source lease without inserting them. The prepared
   `unit_index` must equal the registry length rechecked under the same
   `ProcessState` guard. `commit_loaded_unit` only moves those values into the
   registry and returns the already determined optional index.
+  Preparation groups records by edge: new-edge vectors are built completely,
+  and existing-edge vectors receive `try_reserve` capacity before commit.
+  A flat edge list does not make extension of existing vectors allocation-free.
 - `ExecutableRangeCatalog::prepare_prepend` validates the range, reserves one
   stable-node slot with `try_reserve`, and allocates the boxed node while the
   old head remains published. `commit_prepend` links that node to the current
@@ -482,6 +521,12 @@ resume. An unexpected panic or allocator termination prevents natural trace
 completion, so it cannot publish accepted evidence. A recoverable failed load
 publishes nothing; every reachable unit was announced first.
 
+`PreparedSharedInstall` carries the originating `tid`; the compatibility
+`DirectBindingUnitLoaded` event uses that exact value after the prepared
+structures are committed. Do not substitute zero or add a second fallible
+lookup at commit time. A `_with_recorder` commit seam proves publication order
+without touching the process-global `OnceLock` probe sink.
+
 - [ ] **Step 6: Replay after fork**
 
 In `ThreadTranslator::after_fork_child`, preserve this order:
@@ -493,19 +538,25 @@ self.block_cache.clear();
 
 `ProcessTranslator::after_fork_child` itself advances to a fresh local epoch
 and performs synchronous reset/replay/ready after cache repair and before it
-returns. The already validated in-memory catalog makes replay infallible apart
-from counter overflow, which is rejected when the catalog is built. Tests must
-show the replay is after process repair and before child guest resume.
+returns. This is an explicit `replay_after_fork`, not the idempotent initial
+activation method. Propagate epoch-overflow failure through
+`ProcessTranslator::after_fork_child`, `ThreadTranslator::after_fork_child`,
+and the runtime child-resume path; do not wrap, saturate, or panic. All other
+replay work is infallible because the in-memory catalog was validated before
+publication. Tests must show replay is after process repair and before child
+guest resume.
 
 - [ ] **Step 7: Activate replacement catalogs only after successful exec**
 
 For inherited-translator exec reset, clear shared ranges and advance/reset the
-dormant publisher together with the existing translator state. For an ordinary
-replacement translator, keep the candidate dormant through pre-PONR work. At
-the successful active handoff in `native_darwin.rs`, activate the replacement,
-then republish host image base/catalog and guest compatibility metadata under
-the new image/runtime key. Ignore the current transition-time pre-success
-announcements in `DSRPROF2`.
+dormant publisher through an explicit `reset_dormant_for_exec` together with
+the existing translator state. Preflight the private-JIT epoch lease count
+before destructive clearing rather than asserting it after mutation has begun.
+For an ordinary replacement translator, keep the candidate dormant through
+pre-PONR work. At the successful active handoff in `native_darwin.rs`, activate
+the replacement, then republish host image base/catalog and guest compatibility
+metadata under the new image/runtime key. Ignore the current transition-time
+pre-success announcements in `DSRPROF2`.
 
 - [ ] **Step 8: Run focused tests and commit**
 
