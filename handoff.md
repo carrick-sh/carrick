@@ -19,11 +19,12 @@ its ignored raw trace receipts remain under `target/perf/`.
 
 ---
 
-## Current checkpoint — M2 fork replay accepted, speed result still open
+## Current checkpoint — M2 exec preflight accepted, speed result still open
 
 M2 now has an accepted process-owned translated-range catalog through the
-first real shared-code consumer and checked post-fork replay. This is an
-observability/correctness milestone, not a performance result.
+first real shared-code consumer, checked post-fork replay, and atomic inherited
+exec retirement. This is an observability/correctness milestone, not a
+performance result.
 
 The retained signed binary is
 `403b12878e36412943c0c5b79ba2271d11b0afbf77f2036afafa2211e610d69f`.
@@ -87,15 +88,39 @@ bounded real-COW supervisor cleanup in `b32bb6f6`. It now:
 Focused catalog, fork, runtime failure, full DSR library, and serialized native
 Darwin tests passed. Two independent review passes closed the bounded-wait,
 child-allocation, inherited-frontier, runtime-event, and fork-failure FD
-findings. Signed live fork/exec tracing is deliberately still pending until the
-exec half is complete.
+findings.
 
-**Next:** implement the prepared exec-reset transaction and post-success
-activation/metadata handoff, including production self-reexec proof. Then take
-two default and two shared Go-build attribution captures with the same signed
-binary, use the complete catalog to stop misclassifying shared JIT code as
-host, select the first opt-out optimization from measured CPU/kernel ownership,
-and retain it only through the primary ABBA CPU gate.
+Atomic exec retirement landed as `44c3bd6c`, with authority/lifetime hardening
+in `a6b1d9d6` and final preflight/supervision boundaries in `5889fa17`. It now:
+
+- validates token identity, exact registry-owned private-JIT leases, and the
+  optional active catalog before mapped-memory PONR;
+- retains the process writer and exact surviving-thread borrow through PONR;
+- consumes the token, commits optional catalog dormancy, and tears down
+  bindings/cache/shared state without a post-PONR `Result` or assertion;
+- resets the catalog only when pointer equality proves translator reuse, while
+  a fresh replacement remains dormant and cannot inherit retiring-epoch
+  overflow;
+- reserves both thread-generation advances before PONR; and
+- composes actual child repair and inherited exec as catalog epochs
+  `1 -> 2 -> 3` under bounded, contained fork supervision.
+
+The final independent re-reviews are clean. Focused reset tests passed 11/11,
+the DSR library passed 238/238, the serialized runtime library passed 1,123
+with 5 ignored, `just test` passed, and check/clippy/fmt/domain/diff gates
+passed. Controller reruns of the `MAX-1` and composed fork/exec regressions
+also passed.
+
+Signed live fork/exec tracing remains deliberately pending: production
+fork-child exec host-self-reexecs into a fresh dormant translator, so the
+inherited-translator path is only a unit seam.
+
+**Next:** implement one post-success activation/metadata helper for both
+in-process exec and production self-reexec, then extend the maintained DTrace
+catalog script and run the fixed child-exec/wait proof. After that, take two
+default and two shared Go-build attribution captures with the same signed
+binary, choose the first opt-out optimization from measured CPU/kernel
+ownership, and retain it only through the primary ABBA CPU gate.
 
 The ≥30% CPU goal remains open; no new paired CPU ratio has been measured.
 
