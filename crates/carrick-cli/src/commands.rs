@@ -111,6 +111,8 @@ use crate::debug_layout::native_x86_layout_json;
 // Used only by the macOS-only `run-elf` arm.
 #[cfg(feature = "platform-macos")]
 use crate::fs_setup::install_fs_backend;
+#[cfg(target_os = "macos")]
+use crate::native_profile_qualification::run_native_profile_qualifications;
 use crate::native_profile_qualification::validate_qualification_paths;
 use crate::runtime_util::{
     block_on_oci, emit_raw, human_age, human_size, parse_env_file, parse_mount_flag,
@@ -128,6 +130,11 @@ use crate::trace_profile::{ProfileSummary, capture_provenance, write_summary_ato
 
 #[cfg(target_os = "macos")]
 fn uses_live_kernel_symbols(profile: crate::trace_profile::TraceProfileKind) -> bool {
+    profile == crate::trace_profile::TraceProfileKind::NativeWall
+}
+
+#[cfg(target_os = "macos")]
+fn uses_native_launch_qualification(profile: crate::trace_profile::TraceProfileKind) -> bool {
     profile == crate::trace_profile::TraceProfileKind::NativeWall
 }
 
@@ -214,9 +221,26 @@ fn wait_fixture_child(pid: libc::pid_t) -> anyhow::Result<libc::c_int> {
     }
 }
 
-fn run_native_profile_birth_fixture(hold_ms: u64) -> anyhow::Result<()> {
+fn silence_native_profile_fixture_stdout() -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .context("open native-profile fixture output sink")?;
+    if unsafe { libc::dup2(sink.as_raw_fd(), libc::STDOUT_FILENO) } != libc::STDOUT_FILENO {
+        return Err(std::io::Error::last_os_error())
+            .context("redirect native-profile fixture stdout");
+    }
+    Ok(())
+}
+
+fn run_native_profile_birth_fixture(hold_ms: u64, quiet: bool) -> anyhow::Result<()> {
     if !(1..=10_000).contains(&hold_ms) {
         bail!("--hold-ms must be in 1..=10000");
+    }
+    if quiet {
+        silence_native_profile_fixture_stdout()?;
     }
     publish_current_host_process_birth()?;
     publish_current_host_process_birth()?;
@@ -286,7 +310,13 @@ extern "C" fn native_profile_terminal_thread_main(_: *mut libc::c_void) -> *mut 
     }
 }
 
-fn run_native_profile_terminal_fixture(mode: NativeProfileTerminalMode) -> anyhow::Result<()> {
+fn run_native_profile_terminal_fixture(
+    mode: NativeProfileTerminalMode,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    if quiet {
+        silence_native_profile_fixture_stdout()?;
+    }
     match mode {
         NativeProfileTerminalMode::Thread => {
             let mut thread = std::mem::MaybeUninit::<libc::pthread_t>::uninit();
@@ -395,11 +425,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     };
 
     match command {
-        Commands::NativeProfileBirthFixture { hold_ms } => {
-            run_native_profile_birth_fixture(hold_ms)?;
+        Commands::NativeProfileBirthFixture { hold_ms, quiet } => {
+            run_native_profile_birth_fixture(hold_ms, quiet)?;
         }
-        Commands::NativeProfileTerminalFixture { mode } => {
-            run_native_profile_terminal_fixture(mode)?;
+        Commands::NativeProfileTerminalFixture { mode, quiet } => {
+            run_native_profile_terminal_fixture(mode, quiet)?;
         }
         Commands::NativeProfileValidateQualification {
             birth,
@@ -1403,6 +1433,24 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     .as_deref()
                     .or_else(|| internal_trace.as_ref().map(tempfile::NamedTempFile::path));
                 let drop_credentials = trace_drop_credentials(trace_uid, trace_gid, &trace_groups);
+                #[cfg(target_os = "macos")]
+                let native_profile_qualification =
+                    if profile.is_some_and(uses_native_launch_qualification) {
+                        Some(run_native_profile_qualifications(
+                            &me,
+                            drop_credentials.clone(),
+                        )?)
+                    } else {
+                        None
+                    };
+                #[cfg(target_os = "macos")]
+                if let Some(qualification) = native_profile_qualification.as_ref() {
+                    eprintln!(
+                        "carrick trace: native-wall launch qualification accepted (birth={}, terminal={})",
+                        qualification.birth_receipt_sha256(),
+                        qualification.terminal_receipt_sha256()
+                    );
+                }
                 let opts = carrick_runtime::dtrace_consumer::TraceOptions {
                     flowindent,
                     script: script_src,
@@ -2420,12 +2468,16 @@ mod tests {
     #[test]
     fn live_kernel_symbols_only_use_the_native_wall_callback() {
         assert!(uses_live_kernel_symbols(TraceProfileKind::NativeWall));
+        assert!(uses_native_launch_qualification(
+            TraceProfileKind::NativeWall
+        ));
         for profile in [
             TraceProfileKind::Dsr,
             TraceProfileKind::DsrIndirect,
             TraceProfileKind::DsrFork,
         ] {
             assert!(!uses_live_kernel_symbols(profile));
+            assert!(!uses_native_launch_qualification(profile));
         }
     }
 

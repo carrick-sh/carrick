@@ -35,6 +35,29 @@ fn native_profile_qualification_fixtures_are_hidden_and_deterministic() {
         .assert()
         .success()
         .stdout("TERMINAL_PROCESS_ARMED\n");
+
+    for arguments in [
+        vec![
+            "__native-profile-birth-fixture",
+            "--hold-ms",
+            "10",
+            "--quiet",
+        ],
+        vec![
+            "__native-profile-terminal-fixture",
+            "--mode",
+            "thread",
+            "--quiet",
+        ],
+        vec![
+            "__native-profile-terminal-fixture",
+            "--mode",
+            "process",
+            "--quiet",
+        ],
+    ] {
+        cli().args(arguments).assert().success().stdout("");
+    }
 }
 
 #[test]

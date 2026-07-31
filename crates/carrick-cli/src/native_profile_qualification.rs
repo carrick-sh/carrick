@@ -36,6 +36,27 @@ pub(crate) struct TerminalQualification {
     pub(crate) calls: BTreeSet<QualifiedTerminalCall>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct QualificationTraceReport {
+    principal_drops: u64,
+    aggregation_drops: u64,
+    dynamic_drops: u64,
+    other_drops: u64,
+    interrupted: bool,
+}
+
+impl From<DTraceRunReport> for QualificationTraceReport {
+    fn from(report: DTraceRunReport) -> Self {
+        Self {
+            principal_drops: report.principal_drops,
+            aggregation_drops: report.aggregation_drops,
+            dynamic_drops: report.dynamic_drops,
+            other_drops: report.other_drops,
+            interrupted: report.interrupted,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct NativeProfileQualification {
     schema: &'static str,
@@ -44,9 +65,15 @@ pub(crate) struct NativeProfileQualification {
     terminals: BTreeSet<QualifiedTerminalCall>,
     birth_program_sha256: String,
     terminal_program_sha256: String,
+    birth_raw: String,
+    terminal_thread_raw: String,
+    terminal_process_raw: String,
     birth_raw_sha256: String,
     terminal_thread_raw_sha256: String,
     terminal_process_raw_sha256: String,
+    birth_trace_report: QualificationTraceReport,
+    terminal_thread_trace_report: QualificationTraceReport,
+    terminal_process_trace_report: QualificationTraceReport,
     pub(crate) birth_receipt_sha256: String,
     pub(crate) terminal_receipt_sha256: String,
 }
@@ -79,6 +106,141 @@ impl NativeProfileQualification {
     pub(crate) fn render_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).context("serialize native-profile qualification")
     }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn birth_receipt_sha256(&self) -> &str {
+        &self.birth_receipt_sha256
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn terminal_receipt_sha256(&self) -> &str {
+        &self.terminal_receipt_sha256
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_native_profile_qualifications(
+    executable: &Path,
+    drop_credentials: Option<carrick_runtime::dtrace_consumer::TraceDropCredentials>,
+) -> Result<NativeProfileQualification> {
+    let os_build = command_output("/usr/sbin/sysctl", &["-n", "kern.osversion"])
+        .ok_or_else(|| anyhow!("read Darwin kern.osversion"))?;
+    run_native_profile_qualifications_with(
+        executable,
+        drop_credentials,
+        &os_build,
+        |child_path, child_argv, options| {
+            carrick_runtime::dtrace_consumer::run_child_under_dtrace(
+                child_path, child_argv, options,
+            )
+            .map_err(|error| anyhow!("qualification trace failed: {error}"))
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn run_native_profile_qualifications_with<F>(
+    executable: &Path,
+    drop_credentials: Option<carrick_runtime::dtrace_consumer::TraceDropCredentials>,
+    os_build: &str,
+    mut run_trace: F,
+) -> Result<NativeProfileQualification>
+where
+    F: FnMut(
+        &Path,
+        &[String],
+        &carrick_runtime::dtrace_consumer::TraceOptions,
+    ) -> Result<DTraceRunReport>,
+{
+    let (birth_raw, birth_report) = run_qualification_trace(
+        executable,
+        &[
+            "__native-profile-birth-fixture".to_owned(),
+            "--hold-ms".to_owned(),
+            "500".to_owned(),
+            "--quiet".to_owned(),
+        ],
+        carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_BIRTH_QUALIFY_D,
+        drop_credentials.clone(),
+        "birth",
+        &mut run_trace,
+    )?;
+    parse_birth_qualification(&birth_raw, birth_report)
+        .context("validate automatic birth qualification")?;
+
+    let (thread_raw, thread_report) = run_qualification_trace(
+        executable,
+        &[
+            "__native-profile-terminal-fixture".to_owned(),
+            "--mode".to_owned(),
+            "thread".to_owned(),
+            "--quiet".to_owned(),
+        ],
+        carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_TERMINAL_QUALIFY_D,
+        drop_credentials.clone(),
+        "terminal-thread",
+        &mut run_trace,
+    )?;
+    parse_terminal_qualification(&thread_raw, TerminalScope::Thread, thread_report)
+        .context("validate automatic thread-terminal qualification")?;
+
+    let (process_raw, process_report) = run_qualification_trace(
+        executable,
+        &[
+            "__native-profile-terminal-fixture".to_owned(),
+            "--mode".to_owned(),
+            "process".to_owned(),
+            "--quiet".to_owned(),
+        ],
+        carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_TERMINAL_QUALIFY_D,
+        drop_credentials,
+        "terminal-process",
+        &mut run_trace,
+    )?;
+    parse_terminal_qualification(&process_raw, TerminalScope::Process, process_report)
+        .context("validate automatic process-terminal qualification")?;
+
+    build_qualification(
+        &birth_raw,
+        &thread_raw,
+        &process_raw,
+        birth_report,
+        thread_report,
+        process_report,
+        os_build,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn run_qualification_trace<F>(
+    executable: &Path,
+    command: &[String],
+    script: &str,
+    drop_credentials: Option<carrick_runtime::dtrace_consumer::TraceDropCredentials>,
+    label: &str,
+    run_trace: &mut F,
+) -> Result<(String, DTraceRunReport)>
+where
+    F: FnMut(
+        &Path,
+        &[String],
+        &carrick_runtime::dtrace_consumer::TraceOptions,
+    ) -> Result<DTraceRunReport>,
+{
+    let output = tempfile::NamedTempFile::new()
+        .with_context(|| format!("create {label} qualification output"))?;
+    let options = carrick_runtime::dtrace_consumer::TraceOptions {
+        flowindent: false,
+        script: Some(script.to_owned()),
+        out_path: Some(output.path().to_string_lossy().into_owned()),
+        drop_credentials,
+        print_remaining_aggregates: false,
+    };
+    let report = run_trace(executable, command, &options)
+        .with_context(|| format!("run {label} qualification"))?;
+    let raw = fs::read_to_string(output.path())
+        .with_context(|| format!("read {label} qualification output"))?;
+    Ok((raw, report))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -111,12 +273,16 @@ fn build_qualification(
     let birth_raw_sha256 = sha256_hex(birth_raw.as_bytes());
     let terminal_thread_raw_sha256 = sha256_hex(thread_raw.as_bytes());
     let terminal_process_raw_sha256 = sha256_hex(process_raw.as_bytes());
+    let birth_trace_report = birth_report.into();
+    let terminal_thread_trace_report = thread_report.into();
+    let terminal_process_trace_report = process_report.into();
     let birth_receipt_sha256 = sha256_hex(
         &serde_json::to_vec(&serde_json::json!({
             "schema": "carrick.native-profile-birth-qualification.v1",
             "os_build": os_build,
             "program_sha256": birth_program_sha256,
             "raw_sha256": birth_raw_sha256,
+            "trace_report": birth_trace_report,
             "birth": birth,
         }))
         .context("serialize birth qualification receipt")?,
@@ -128,6 +294,8 @@ fn build_qualification(
             "program_sha256": terminal_program_sha256,
             "thread_raw_sha256": terminal_thread_raw_sha256,
             "process_raw_sha256": terminal_process_raw_sha256,
+            "thread_trace_report": terminal_thread_trace_report,
+            "process_trace_report": terminal_process_trace_report,
             "terminals": terminals,
         }))
         .context("serialize terminal qualification receipt")?,
@@ -139,9 +307,15 @@ fn build_qualification(
         terminals,
         birth_program_sha256,
         terminal_program_sha256,
+        birth_raw: birth_raw.to_owned(),
+        terminal_thread_raw: thread_raw.to_owned(),
+        terminal_process_raw: process_raw.to_owned(),
         birth_raw_sha256,
         terminal_thread_raw_sha256,
         terminal_process_raw_sha256,
+        birth_trace_report,
+        terminal_thread_trace_report,
+        terminal_process_trace_report,
         birth_receipt_sha256,
         terminal_receipt_sha256,
     })
@@ -537,6 +711,21 @@ mod tests {
         assert_eq!(authority.terminals.len(), 2);
         assert_eq!(authority.birth_receipt_sha256.len(), 64);
         assert_eq!(authority.terminal_receipt_sha256.len(), 64);
+        let rendered = authority
+            .render_json()
+            .unwrap_or_else(|error| unreachable!("render qualification: {error}"));
+        let json: serde_json::Value = serde_json::from_str(&rendered)
+            .unwrap_or_else(|error| unreachable!("parse qualification JSON: {error}"));
+        let lossless = serde_json::json!({
+            "principal_drops": 0,
+            "aggregation_drops": 0,
+            "dynamic_drops": 0,
+            "other_drops": 0,
+            "interrupted": false,
+        });
+        assert_eq!(json["birth_trace_report"], lossless);
+        assert_eq!(json["terminal_thread_trace_report"], lossless);
+        assert_eq!(json["terminal_process_trace_report"], lossless);
     }
 
     #[test]
@@ -586,5 +775,114 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn automatic_suite_runs_exact_quiet_fixtures_and_retains_raw_evidence() {
+        let credentials = carrick_runtime::dtrace_consumer::TraceDropCredentials {
+            uid: 501,
+            gid: 20,
+            groups: vec![20, 12],
+        };
+        let mut calls = Vec::new();
+        let qualification = run_native_profile_qualifications_with(
+            Path::new("/tmp/carrick"),
+            Some(credentials.clone()),
+            "26A123",
+            |executable, command, options| {
+                assert_eq!(executable, Path::new("/tmp/carrick"));
+                assert_eq!(options.drop_credentials, Some(credentials.clone()));
+                assert!(!options.flowindent);
+                assert!(!options.print_remaining_aggregates);
+                let command = command.join(" ");
+                let (expected_script, raw) = match command.as_str() {
+                    "__native-profile-birth-fixture --hold-ms 500 --quiet" => (
+                        carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_BIRTH_QUALIFY_D,
+                        BIRTH,
+                    ),
+                    "__native-profile-terminal-fixture --mode thread --quiet" => (
+                        carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_TERMINAL_QUALIFY_D,
+                        THREAD,
+                    ),
+                    "__native-profile-terminal-fixture --mode process --quiet" => (
+                        carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_TERMINAL_QUALIFY_D,
+                        PROCESS,
+                    ),
+                    other => unreachable!("unexpected qualification command {other:?}"),
+                };
+                assert_eq!(options.script.as_deref(), Some(expected_script));
+                let output = options
+                    .out_path
+                    .as_deref()
+                    .unwrap_or_else(|| unreachable!("qualification output path"));
+                std::fs::write(output, raw)
+                    .unwrap_or_else(|error| unreachable!("write qualification output: {error}"));
+                calls.push(command);
+                Ok(DTraceRunReport::default())
+            },
+        )
+        .unwrap_or_else(|error| unreachable!("automatic qualification: {error}"));
+
+        assert_eq!(
+            calls,
+            [
+                "__native-profile-birth-fixture --hold-ms 500 --quiet",
+                "__native-profile-terminal-fixture --mode thread --quiet",
+                "__native-profile-terminal-fixture --mode process --quiet",
+            ]
+        );
+        let rendered = qualification
+            .render_json()
+            .unwrap_or_else(|error| unreachable!("render automatic qualification: {error}"));
+        let json: serde_json::Value = serde_json::from_str(&rendered)
+            .unwrap_or_else(|error| unreachable!("parse automatic qualification JSON: {error}"));
+        assert_eq!(json["birth_raw"], BIRTH);
+        assert_eq!(json["terminal_thread_raw"], THREAD);
+        assert_eq!(json["terminal_process_raw"], PROCESS);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn automatic_suite_stops_at_the_first_lossy_consumer_report() {
+        let mut calls = 0_usize;
+        let error = run_native_profile_qualifications_with(
+            Path::new("/tmp/carrick"),
+            None,
+            "26A123",
+            |_executable, command, options| {
+                calls += 1;
+                let raw = if command.get(2).map(String::as_str) == Some("thread") {
+                    THREAD
+                } else if command.first().map(String::as_str)
+                    == Some("__native-profile-birth-fixture")
+                {
+                    BIRTH
+                } else {
+                    PROCESS
+                };
+                std::fs::write(
+                    options
+                        .out_path
+                        .as_deref()
+                        .unwrap_or_else(|| unreachable!("qualification output path")),
+                    raw,
+                )
+                .unwrap_or_else(|write_error| {
+                    unreachable!("write qualification output: {write_error}")
+                });
+                Ok(DTraceRunReport {
+                    principal_drops: u64::from(calls == 2),
+                    ..DTraceRunReport::default()
+                })
+            },
+        )
+        .expect_err("lossy terminal qualification must fail before process fixture");
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("terminal qualification was lossy")
+        }));
+        assert_eq!(calls, 2);
     }
 }

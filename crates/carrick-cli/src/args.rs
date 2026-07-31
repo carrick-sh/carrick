@@ -119,12 +119,16 @@ pub(crate) enum Commands {
     NativeProfileBirthFixture {
         #[arg(long, default_value_t = 500)]
         hold_ms: u64,
+        #[arg(long)]
+        quiet: bool,
     },
     /// Internal terminal-call qualification fixture for native profiling.
     #[command(name = "__native-profile-terminal-fixture", hide = true)]
     NativeProfileTerminalFixture {
         #[arg(long, value_enum)]
         mode: NativeProfileTerminalMode,
+        #[arg(long)]
+        quiet: bool,
     },
     /// Internal receipt validator for native-profile launch qualification.
     #[command(name = "__native-profile-validate-qualification", hide = true)]
