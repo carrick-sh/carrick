@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime
 import hashlib
 import json
@@ -66,6 +67,8 @@ PERFORMANCE_CONTROL_KEYS = (
     "CARRICK_DSR_SUPERBLOCK",
 )
 HARNESS_CARRICK_ALLOWLIST = frozenset()
+REGISTRY_TRANSPORT_SCHEMA = "carrick.registry-transport.v1"
+INSECURE_REGISTRIES_ENV = "CARRICK_INSECURE_REGISTRIES"
 SEMANTIC_DEFAULT_OVERLAY: dict[str, str | None] = {
     key: None for key in PERFORMANCE_CONTROL_KEYS
 }
@@ -96,6 +99,54 @@ class SampleEvidenceError(RuntimeError):
     def __init__(self, message: str, sample: dict[str, object]):
         super().__init__(message)
         self.sample = sample
+
+
+@dataclasses.dataclass(frozen=True)
+class RegistryTransport:
+    """Host-side OCI transport selected before Carrick resolves an image."""
+
+    registry: str
+    insecure: bool
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.registry) is not str
+            or not self.registry
+            or any(character.isspace() for character in self.registry)
+            or any(character in self.registry for character in ",=")
+        ):
+            raise ValueError(
+                "registry transport requires one valid registry authority"
+            )
+        if type(self.insecure) is not bool:
+            raise ValueError("registry transport insecure flag must be boolean")
+
+
+def registry_transport_evidence(
+    transport: RegistryTransport | None,
+) -> dict[str, object] | None:
+    if transport is None:
+        return None
+    forward_env = (
+        f"{INSECURE_REGISTRIES_ENV}={transport.registry}"
+        if transport.insecure
+        else None
+    )
+    return {
+        "schema": REGISTRY_TRANSPORT_SCHEMA,
+        "registry": transport.registry,
+        "protocol": "http" if transport.insecure else "https",
+        "forward_env": forward_env,
+    }
+
+
+def _registry_forward_args(
+    transport: RegistryTransport | None,
+) -> list[str]:
+    evidence = registry_transport_evidence(transport)
+    if evidence is None or evidence["forward_env"] is None:
+        return []
+    return ["--forward-env", str(evidence["forward_env"])]
 
 
 def guest_script() -> str:
@@ -151,6 +202,7 @@ def build_command(
     *,
     binary: pathlib.Path | None = None,
     image: str = DEFAULT_IMAGE,
+    registry_transport: RegistryTransport | None = None,
 ) -> list[str]:
     if engine == ENGINE_CARRICK:
         carrick = repo / "target/release/carrick" if binary is None else binary
@@ -159,6 +211,7 @@ def build_command(
             "run",
             "--exec-backend",
             "native",
+            *_registry_forward_args(registry_transport),
             "-e",
             f"CARRICK_RUN_ID={run_id}",
             "-w",
@@ -194,6 +247,7 @@ def build_carrick_command(
     *,
     binary: pathlib.Path | None = None,
     image: str = DEFAULT_IMAGE,
+    registry_transport: RegistryTransport | None = None,
 ) -> list[str]:
     return build_command(
         repo,
@@ -201,6 +255,7 @@ def build_carrick_command(
         run_id,
         binary=binary,
         image=image,
+        registry_transport=registry_transport,
     )
 
 
@@ -603,6 +658,7 @@ def sample_provenance(
     reject_contamination: bool = True,
     binary_path: pathlib.Path | None = None,
     image_ref: str = DEFAULT_IMAGE,
+    registry_transport: RegistryTransport | None = None,
     current_run_id: str | None = None,
     known_receipt_binaries: tuple[pathlib.Path, ...] = (),
 ) -> dict[str, object]:
@@ -634,6 +690,7 @@ def sample_provenance(
         },
         "image_ref": image_ref,
         "image": docker_image_provenance(image_ref),
+        "registry_transport": registry_transport_evidence(registry_transport),
         "controlled_environment": controlled_environment,
         "foreign_processes": foreign,
         "docker_oracles": docker_oracles,
@@ -787,6 +844,7 @@ def run_sample(
     *,
     binary: pathlib.Path | None = None,
     image: str = DEFAULT_IMAGE,
+    registry_transport: RegistryTransport | None = None,
     current_run_id: str | None = None,
     known_receipt_binaries: tuple[pathlib.Path, ...] = (),
 ) -> dict[str, object]:
@@ -806,6 +864,7 @@ def run_sample(
         run_id,
         binary=resolved_binary,
         image=image,
+        registry_transport=registry_transport,
     )
     normalized = normalized_overlay(environment_overlay)
     if engine == ENGINE_DOCKER and any(value is not None for value in normalized.values()):
@@ -828,6 +887,7 @@ def run_sample(
             normalized,
             binary_path=resolved_binary,
             image_ref=image,
+            registry_transport=registry_transport,
             current_run_id=run_id,
             known_receipt_binaries=known_receipt_binaries,
         )
@@ -883,6 +943,7 @@ def run_sample(
                 normalized,
                 binary_path=resolved_binary,
                 image_ref=image,
+                registry_transport=registry_transport,
                 current_run_id=run_id,
                 known_receipt_binaries=known_receipt_binaries,
             )
@@ -977,6 +1038,7 @@ def run_sample(
         "controlled_environment": {
             key: environment.get(key) for key in PERFORMANCE_CONTROL_KEYS
         },
+        "registry_transport": registry_transport_evidence(registry_transport),
         "provenance": {
             "pre": pre_provenance,
             "post": post_provenance,

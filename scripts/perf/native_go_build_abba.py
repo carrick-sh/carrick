@@ -8,6 +8,7 @@ import dataclasses
 import datetime
 import errno
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -86,6 +87,7 @@ TIMING_PERTURBING_CONTROL_KEYS = frozenset(
         "CARRICK_NATIVE_TRACE_SYSCALLS",
     )
 )
+APPROVED_INSECURE_LOOPBACK_REGISTRIES = frozenset(("localhost:5005",))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -536,6 +538,45 @@ def _image_repository(reference: str) -> str:
     return f"{registry}/{repository_path}"
 
 
+def _registry_host(registry: str) -> str:
+    if registry.startswith("["):
+        closing = registry.find("]")
+        if closing < 0:
+            raise ValueError(f"registry has an invalid IPv6 authority: {registry!r}")
+        return registry[1:closing]
+    return registry.split(":", 1)[0]
+
+
+def _registry_is_loopback(registry: str) -> bool:
+    host = _registry_host(registry)
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _registry_transport_for_image(
+    image_ref: str,
+) -> native_go_build.RegistryTransport:
+    registry = _image_repository(image_ref).split("/", 1)[0]
+    if registry in APPROVED_INSECURE_LOOPBACK_REGISTRIES:
+        return native_go_build.RegistryTransport(
+            registry=registry,
+            insecure=True,
+        )
+    if _registry_is_loopback(registry):
+        raise RuntimeError(
+            f"loopback registry {registry!r} is not approved for insecure "
+            "native performance transport"
+        )
+    return native_go_build.RegistryTransport(
+        registry=registry,
+        insecure=False,
+    )
+
+
 def _executed_image_ref(image_ref: str, receipt: ArmReceipt) -> str:
     requested_repository = _image_repository(image_ref)
     matches = tuple(
@@ -601,6 +642,9 @@ def _campaign_preflight(
     current_image = _image_receipt(image_ref)
     if current_image != control_image:
         raise RuntimeError("campaign image identity drifted from arm receipts")
+    registry_transport = _registry_transport_for_image(
+        control_executed_image
+    )
 
     native_go_build.reject_ambient_carrick(os.environ, {})
     power = _darwin_power_preflight()
@@ -635,6 +679,9 @@ def _campaign_preflight(
         ],
         "image_ref": image_ref,
         "executed_image_ref": control_executed_image,
+        "registry_transport": native_go_build.registry_transport_evidence(
+            registry_transport
+        ),
         "image": current_image,
         "power": power,
         "busy_host_reasons": busy_reasons,
@@ -675,6 +722,7 @@ def _validate_sample_evidence(
     expected_index: int,
     expected_run_id: str,
     image_ref: str,
+    registry_transport: native_go_build.RegistryTransport,
 ) -> None:
     receipt = arm.receipt
     environment = dict(arm.environment)
@@ -693,6 +741,11 @@ def _validate_sample_evidence(
         errors.append("environment overlay")
     if sample.get("controlled_environment") != environment:
         errors.append("controlled environment")
+    expected_transport = native_go_build.registry_transport_evidence(
+        registry_transport
+    )
+    if sample.get("registry_transport") != expected_transport:
+        errors.append("registry transport")
     if sample.get("return_code") != 0 or sample.get("timed_out") is not False:
         errors.append("completion status")
     if sample.get("build_ok") is not True:
@@ -712,6 +765,7 @@ def _validate_sample_evidence(
             expected_run_id,
             binary=receipt.binary_path.resolve(),
             image=image_ref,
+            registry_transport=registry_transport,
         )
         if argv != expected_argv:
             errors.append("command argv")
@@ -771,6 +825,8 @@ def _validate_sample_evidence(
                     errors.append(f"{name} provenance image_ref")
                 if snapshot.get("image") != _expected_image(receipt):
                     errors.append(f"{name} provenance image identity")
+                if snapshot.get("registry_transport") != expected_transport:
+                    errors.append(f"{name} provenance registry transport")
                 if snapshot.get("controlled_environment") != environment:
                     errors.append(f"{name} provenance environment")
                 if snapshot.get("engine") != native_go_build.ENGINE_CARRICK:
@@ -913,6 +969,7 @@ def run_campaign(
             "timeout_seconds": timeout_seconds,
             "image_ref": image_ref,
             "executed_image_ref": None,
+            "registry_transport": None,
             "schedule": "excluded-a-b-then-a1-b1-b2-a2-v1",
             "primary_metric": "rusage-children-total-cpu-floor-v1",
         },
@@ -938,6 +995,13 @@ def run_campaign(
     positions = _campaign_positions(quads)
 
     try:
+        registry_transport = _registry_transport_for_image(image_ref)
+        artifact["identity"]["registry_transport"] = (
+            native_go_build.registry_transport_evidence(
+                registry_transport
+            )
+        )
+        native_go_build.write_json_atomic(output, artifact)
         initial_preflight = _campaign_preflight(
             control,
             candidate,
@@ -946,6 +1010,13 @@ def run_campaign(
         )
         artifact["preflights"].append(initial_preflight)
         executed_image_ref = str(initial_preflight["executed_image_ref"])
+        if (
+            initial_preflight["registry_transport"]
+            != artifact["identity"]["registry_transport"]
+        ):
+            raise RuntimeError(
+                "registry transport drifted from campaign image identity"
+            )
         artifact["identity"]["executed_image_ref"] = executed_image_ref
         native_go_build.write_json_atomic(output, artifact)
         for sample_index, position in enumerate(positions, start=1):
@@ -963,6 +1034,13 @@ def run_campaign(
                     raise RuntimeError(
                         "immutable execution reference drifted before quad"
                     )
+                if (
+                    quad_preflight["registry_transport"]
+                    != artifact["identity"]["registry_transport"]
+                ):
+                    raise RuntimeError(
+                        "registry transport drifted before quad"
+                    )
                 artifact["preflights"].append(quad_preflight)
                 native_go_build.write_json_atomic(output, artifact)
             arm = control if position["arm"] == "A" else candidate
@@ -978,6 +1056,7 @@ def run_campaign(
                     environment_overlay=dict(arm.environment),
                     binary=arm.receipt.binary_path,
                     image=executed_image_ref,
+                    registry_transport=registry_transport,
                     current_run_id=sample_run_id,
                     known_receipt_binaries=known_receipt_binaries,
                 )
@@ -995,6 +1074,7 @@ def run_campaign(
                     expected_index=sample_index,
                     expected_run_id=sample_run_id,
                     image_ref=executed_image_ref,
+                    registry_transport=registry_transport,
                 )
             except ValueError as error:
                 raise native_go_build.SampleEvidenceError(

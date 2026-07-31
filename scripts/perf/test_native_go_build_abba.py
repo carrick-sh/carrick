@@ -680,6 +680,7 @@ class CampaignContractTest(unittest.TestCase):
         value: float = 100.0,
         build_ok: bool = True,
         image_ref: str | None = None,
+        registry_transport: native_go_build.RegistryTransport | None = None,
     ) -> dict[str, object]:
         receipt = arm.receipt
         environment = dict(arm.environment)
@@ -687,6 +688,16 @@ class CampaignContractTest(unittest.TestCase):
             receipt.image_repo_digests[0]
             if image_ref is None
             else image_ref
+        )
+        transport = (
+            native_go_build_abba._registry_transport_for_image(
+                executed_image_ref
+            )
+            if registry_transport is None
+            else registry_transport
+        )
+        transport_evidence = native_go_build.registry_transport_evidence(
+            transport
         )
         provenance = {
             "git_commit": "9" * 40,
@@ -700,6 +711,7 @@ class CampaignContractTest(unittest.TestCase):
             },
             "image_ref": executed_image_ref,
             "image": self.image_identity(receipt),
+            "registry_transport": transport_evidence,
             "controlled_environment": environment,
             "foreign_processes": [],
             "docker_oracles": [],
@@ -722,25 +734,20 @@ class CampaignContractTest(unittest.TestCase):
             "timed_out": False,
             "build_ok": build_ok,
             "command": {
-                "argv": [
-                    str(receipt.binary_path.resolve()),
-                    "run",
-                    "--exec-backend",
-                    "native",
-                    "-e",
-                    f"CARRICK_RUN_ID={run_id}",
-                    "-w",
-                    "/tmp",
-                    executed_image_ref,
-                    "/bin/sh",
-                    "-c",
-                    native_go_build.guest_script(),
-                ],
+                "argv": native_go_build.build_command(
+                    self.root,
+                    native_go_build.ENGINE_CARRICK,
+                    run_id,
+                    binary=receipt.binary_path.resolve(),
+                    image=executed_image_ref,
+                    registry_transport=transport,
+                ),
                 "status": 0,
                 "build_ok": build_ok,
             },
             "environment_overlay": environment,
             "controlled_environment": environment,
+            "registry_transport": transport_evidence,
             "provenance": {
                 "pre": dict(provenance),
                 "post": dict(provenance),
@@ -1451,37 +1458,51 @@ class CampaignContractTest(unittest.TestCase):
         control = self.arm("A", receipt)
         candidate = self.arm("B", receipt)
         output = self.root / "ambient.json"
-        with (
-            mock.patch.dict(
-                native_go_build_abba.os.environ,
-                {"CARRICK_UNDECLARED_CONTROL": "1"},
-                clear=True,
-            ),
-            self.campaign_fixtures(
-                control,
-                candidate,
-                lambda *_args, **_kwargs: self.fail(
-                    "sample launched after ambient contamination"
-                ),
-            ),
-            self.assertRaisesRegex(
-                native_go_build_abba.CampaignEvidenceError,
-                "ambient Carrick",
-            ),
-        ):
-            native_go_build_abba.run_campaign(
-                self.root,
-                control,
-                candidate,
-                output,
-            )
-
-        artifact = json.loads(output.read_text())
-        self.assertIsNone(artifact["failure"]["sample"])
-        self.assertIn(
+        for key in (
             "CARRICK_UNDECLARED_CONTROL",
-            artifact["failure"]["reason"],
-        )
+            "CARRICK_INSECURE_REGISTRIES",
+        ):
+            with self.subTest(key=key):
+                output = self.root / f"ambient-{key.lower()}.json"
+                with (
+                    mock.patch.dict(
+                        native_go_build_abba.os.environ,
+                        {key: "attacker.invalid:5000"},
+                        clear=True,
+                    ),
+                    self.campaign_fixtures(
+                        control,
+                        candidate,
+                        lambda *_args, **_kwargs: self.fail(
+                            "sample launched after ambient contamination"
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        native_go_build_abba.CampaignEvidenceError,
+                        "ambient Carrick",
+                    ),
+                ):
+                    native_go_build_abba.run_campaign(
+                        self.root,
+                        control,
+                        candidate,
+                        output,
+                    )
+
+                artifact = json.loads(output.read_text())
+                self.assertIsNone(artifact["failure"]["sample"])
+                self.assertIn(key, artifact["failure"]["reason"])
+                self.assertEqual(
+                    artifact["identity"]["registry_transport"],
+                    {
+                        "schema": "carrick.registry-transport.v1",
+                        "registry": "localhost:5005",
+                        "protocol": "http",
+                        "forward_env": (
+                            "CARRICK_INSECURE_REGISTRIES=localhost:5005"
+                        ),
+                    },
+                )
 
     def test_receipt_drift_before_first_quad_keeps_both_completed_warmups(self):
         receipt = self.receipt("control")
@@ -1815,16 +1836,19 @@ class CampaignContractTest(unittest.TestCase):
         positions = native_go_build_abba._campaign_positions(8)
         call_index = 0
         observed_images = []
+        observed_transports = []
 
         def run_sample(_repo, _engine, index, _timeout, **kwargs):
             nonlocal call_index
             call_index += 1
             observed_images.append(kwargs["image"])
+            observed_transports.append(kwargs["registry_transport"])
             return self.sample(
                 control,
                 index=index,
                 run_id=kwargs["current_run_id"],
                 image_ref=kwargs["image"],
+                registry_transport=kwargs["registry_transport"],
             )
 
         with self.campaign_fixtures(
@@ -1840,20 +1864,81 @@ class CampaignContractTest(unittest.TestCase):
             )
 
         executed = receipt.image_repo_digests[0]
+        transport = native_go_build.RegistryTransport(
+            registry="localhost:5005",
+            insecure=True,
+        )
+        transport_evidence = {
+            "schema": "carrick.registry-transport.v1",
+            "registry": "localhost:5005",
+            "protocol": "http",
+            "forward_env": "CARRICK_INSECURE_REGISTRIES=localhost:5005",
+        }
         self.assertEqual(observed_images, [executed] * len(positions))
+        self.assertEqual(
+            observed_transports,
+            [transport] * len(positions),
+        )
         self.assertEqual(artifact["identity"]["image_ref"], receipt.image_ref)
         self.assertEqual(
             artifact["identity"]["executed_image_ref"],
             executed,
         )
+        self.assertEqual(
+            artifact["identity"]["registry_transport"],
+            transport_evidence,
+        )
         self.assertTrue(
             all(
-                sample["command"]["argv"][8] == executed
+                preflight["registry_transport"] == transport_evidence
+                for preflight in artifact["preflights"]
+            )
+        )
+        self.assertTrue(
+            all(
+                sample["command"]["argv"][4:6]
+                == [
+                    "--forward-env",
+                    "CARRICK_INSECURE_REGISTRIES=localhost:5005",
+                ]
+                and sample["command"]["argv"][10] == executed
+                and sample["registry_transport"] == transport_evidence
                 and sample["provenance"]["pre"]["image_ref"] == executed
                 and sample["provenance"]["post"]["image_ref"] == executed
+                and sample["provenance"]["pre"]["registry_transport"]
+                == transport_evidence
+                and sample["provenance"]["post"]["registry_transport"]
+                == transport_evidence
                 for sample in artifact["samples"]
             )
         )
+
+    def test_registry_transport_authorizes_only_the_approved_loopback(self):
+        approved = native_go_build_abba._registry_transport_for_image(
+            "localhost:5005/carrick-go-conformance@sha256:" + "4" * 64
+        )
+        secure_remote = native_go_build_abba._registry_transport_for_image(
+            "ghcr.io/carrick-sh/conformance@sha256:" + "5" * 64
+        )
+
+        self.assertEqual(
+            approved,
+            native_go_build.RegistryTransport(
+                registry="localhost:5005",
+                insecure=True,
+            ),
+        )
+        self.assertEqual(
+            secure_remote,
+            native_go_build.RegistryTransport(
+                registry="ghcr.io",
+                insecure=False,
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "not approved"):
+            native_go_build_abba._registry_transport_for_image(
+                "localhost:5443/carrick-go-conformance@sha256:" + "6" * 64
+            )
 
     def test_campaign_rejects_receipt_digest_from_another_repository(self):
         receipt = dataclasses.replace(
@@ -2083,9 +2168,18 @@ class CampaignContractTest(unittest.TestCase):
                 0, str(self.root / "other-carrick")
             ),
             "command image": lambda row: row["command"]["argv"].__setitem__(
-                8,
+                10,
                 "localhost:5005/carrick-go-conformance@sha256:" + "0" * 64,
             ),
+            "registry transport": lambda row: row["registry_transport"].update(
+                {"registry": "attacker.invalid:5000"}
+            ),
+            "pre registry transport": lambda row: row["provenance"]["pre"][
+                "registry_transport"
+            ].update({"registry": "attacker.invalid:5000"}),
+            "post registry transport": lambda row: row["provenance"]["post"][
+                "registry_transport"
+            ].update({"registry": "attacker.invalid:5000"}),
             "overlay": lambda row: row["environment_overlay"].update(
                 {"CARRICK_DSR_PROFILE": "1"}
             ),
