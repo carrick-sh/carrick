@@ -20,6 +20,7 @@ from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 MODULE_PATH = HERE / "native_wall_capture.py"
+DTRACE_SCRIPT_PATH = HERE.parent / "dtrace/native-translated-range-catalog.d"
 
 
 def load_capture_module():
@@ -35,7 +36,7 @@ def load_capture_module():
 
 
 GOOD_EVENTS = [
-    "TRANSLATED_LIFECYCLE|schema=1|ordinal=1|kind=target-birth|pid=100|incarnation=1|generation=1|epoch=0",
+    "TRANSLATED_LIFECYCLE|schema=1|ordinal=1|kind=target-birth|pid=100|incarnation=1|generation=1|epoch=0|launcher_pid=99",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=2|kind=parent-reset|pid=100|incarnation=1|generation=1|epoch=1",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=3|kind=parent-private|pid=100|incarnation=1|generation=1|epoch=1|sequence=1|start=0x1000|end=0x2000",
     "TRANSLATED_LIFECYCLE|schema=1|ordinal=4|kind=parent-ready|pid=100|incarnation=1|generation=1|epoch=1|frontier=1",
@@ -170,8 +171,37 @@ class LifecycleTraceFixtureTests(unittest.TestCase):
     def test_accepts_one_complete_ordered_lifecycle(self) -> None:
         parsed = self.module().parse_lifecycle_trace(good_trace())
         self.assertEqual(parsed["lifecycle_ok"], 1)
+        self.assertEqual(parsed["target_pid"], 100)
         self.assertEqual(parsed["child_pid"], 101)
         self.assertEqual(parsed["event_count"], 29)
+
+    def test_trace_target_is_discovered_root_not_trace_launcher(self) -> None:
+        contract = self.module().validate_dtrace_source(
+            DTRACE_SCRIPT_PATH.read_text()
+        )
+        parsed = self.module().parse_lifecycle_trace(good_trace())
+
+        self.assertEqual(contract["launcher_scope_only"], 1)
+        self.assertEqual(contract["lifecycle_root_discovery"], 1)
+        self.assertEqual(parsed["target_pid"], 100)
+        self.assertEqual(parsed["launcher_pid"], 99)
+        self.assertNotEqual(parsed["target_pid"], parsed["launcher_pid"])
+
+    def test_rejects_missing_or_equal_trace_launcher_identity(self) -> None:
+        module = self.module()
+        cases = {
+            "missing": GOOD_EVENTS[0].replace("|launcher_pid=99", ""),
+            "same as root": GOOD_EVENTS[0].replace("launcher_pid=99", "launcher_pid=100"),
+            "same as child": GOOD_EVENTS[0].replace("launcher_pid=99", "launcher_pid=101"),
+            "unexpected field": GOOD_EVENTS[0] + "|fixture=1",
+        }
+        for label, target_birth in cases.items():
+            with self.subTest(label=label):
+                events = [target_birth, *GOOD_EVENTS[1:]]
+                with self.assertRaisesRegex(
+                    module.EvidenceError, "launcher|target-birth.*field"
+                ):
+                    module.parse_lifecycle_trace(good_trace(events))
 
     def test_rejects_missing_duplicate_and_reordered_milestones(self) -> None:
         module = self.module()
@@ -510,9 +540,11 @@ class LifecycleCaptureFixtureTests(unittest.TestCase):
         run_id = "native-m2-lifecycle-12345678-1234-4678-9234-567812345678"
         self.assertEqual(payload["run_id"], run_id)
         self.assertEqual(
-            payload["schema"], "carrick.native-m2-lifecycle-capture.v2"
+            payload["schema"], "carrick.native-m2-lifecycle-capture.v3"
         )
         self.assertEqual(payload["dof"], self.boundary.dof)
+        self.assertEqual(payload["lifecycle_summary"]["launcher_pid"], 99)
+        self.assertEqual(payload["lifecycle_summary"]["target_pid"], 100)
         self.assertEqual(
             [event for event in self.boundary.events if event[0] == "reap"],
             [("reap", run_id), ("reap", run_id)],
@@ -904,8 +936,7 @@ class DTraceSourceContractTests(unittest.TestCase):
         self.module = load_capture_module()
         self.assertIsNotNone(self.module)
         self.script = (
-            HERE.parent
-            / "dtrace/native-translated-range-catalog.d"
+            DTRACE_SCRIPT_PATH
         )
         self.source = self.script.read_text()
 
@@ -1061,7 +1092,7 @@ class DTraceSourceContractTests(unittest.TestCase):
 
         parent_ready = (
             "carrick*:::host-translated-range-ready\n"
-            "/pid == $target && tracked[pid] &&\n"
+            "/pid == lifecycle_root_pid && tracked[pid] &&\n"
             "    lifecycle_stage[pid, incarnation[pid]] == 3 &&"
         )
         wrong_stage = self.source.replace(
@@ -1074,6 +1105,102 @@ class DTraceSourceContractTests(unittest.TestCase):
             self.module.EvidenceError, "parent-ready|milestone|stage"
         ):
             self.module.validate_dtrace_source(wrong_stage)
+
+    def test_static_contract_discovers_typed_root_from_epoch_one_descendant(self) -> None:
+        contract = self.module.validate_dtrace_source(self.source)
+        self.assertEqual(contract["launcher_scope_only"], 1)
+        self.assertEqual(contract["lifecycle_root_discovery"], 1)
+
+        discovery = (
+            "carrick*:::host-translated-range-reset\n"
+            "/lifecycle_root_pid == (pid_t)0 && pid != $target && ppid == $target &&\n"
+            "    progenyof($target) && (uint64_t)arg0 == (uint64_t)1/"
+        )
+        self.assertIn(discovery, self.source)
+        self.assertIn("    this->root_pid = (pid_t)pid;", self.source)
+        self.assertIn("    lifecycle_root_pid = this->root_pid;", self.source)
+        self.assertNotIn("tracked[$target]", self.source)
+        self.assertNotIn("incarnation[$target]", self.source)
+
+    def test_static_contract_rejects_weakened_root_discovery(self) -> None:
+        mutations = (
+            (
+                "pid != $target && ppid == $target &&\n    progenyof($target)",
+                "pid != $target && ppid == $target",
+                "descendant|root discovery",
+            ),
+            (
+                "pid != $target && ppid == $target &&\n    progenyof($target)",
+                "ppid == $target && progenyof($target)",
+                "launcher|root discovery",
+            ),
+            (
+                "pid != $target && ppid == $target &&\n    progenyof($target)",
+                "pid != $target &&\n    progenyof($target)",
+                "direct child|root discovery",
+            ),
+            (
+                "(uint64_t)arg0 == (uint64_t)1/\n{\n"
+                "    this->root_pid = (pid_t)pid;",
+                "(uint64_t)arg0 == (uint64_t)2/\n{\n"
+                "    this->root_pid = (pid_t)pid;",
+                "epoch|root discovery",
+            ),
+            (
+                "    this->root_pid = (pid_t)pid;",
+                "    this->root_pid = (pid_t)$target;",
+                "launcher|root discovery",
+            ),
+        )
+        for old, new, message in mutations:
+            with self.subTest(mutation=new):
+                weakened = self.source.replace(old, new, 1)
+                self.assertNotEqual(weakened, self.source)
+                with self.assertRaisesRegex(
+                    self.module.EvidenceError, message
+                ):
+                    self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_rejects_missing_root_discovery_guards(self) -> None:
+        guard_markers = (
+            "root-discovery-order-violation",
+            "second-lifecycle-root",
+            "root-pid-reuse",
+        )
+        for marker in guard_markers:
+            with self.subTest(marker=marker):
+                weakened = self.source.replace(
+                    f"|kind={marker}|", f"|kind=fixture-{marker}|", 1
+                )
+                self.assertNotEqual(weakened, self.source)
+                with self.assertRaisesRegex(
+                    self.module.EvidenceError,
+                    "root discovery|second root|pre-discovery|PID reuse|post-exit",
+                ):
+                    self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_requires_discovery_before_schema_two_reset(self) -> None:
+        discovery_start = self.source.index(
+            "carrick*:::host-translated-range-reset\n"
+            "/lifecycle_root_pid == (pid_t)0"
+        )
+        discovery_end = self.source.index("\n}\n", discovery_start) + 3
+        discovery = self.source[discovery_start:discovery_end]
+        schema_two_start = self.source.index(
+            "carrick*:::host-translated-range-reset\n"
+            "/pid == $target || progenyof($target)/"
+        )
+        moved = (
+            self.source[:discovery_start]
+            + self.source[discovery_end:schema_two_start]
+            + self.source[schema_two_start:]
+            + "\n"
+            + discovery
+        )
+        with self.assertRaisesRegex(
+            self.module.EvidenceError, "before|root discovery|schema-2"
+        ):
+            self.module.validate_dtrace_source(moved)
 
     def test_static_contract_binds_created_owner_clause_locals(self) -> None:
         valid = (
@@ -1164,9 +1291,48 @@ class DTraceSourceContractTests(unittest.TestCase):
         )
         self.assertNotEqual(weakened, self.source)
         with self.assertRaisesRegex(
-            self.module.EvidenceError, "target-birth|milestone|range seed"
+            self.module.EvidenceError,
+            "target-birth|milestone|range seed|neutral typed lifecycle identity seeds",
         ):
             self.module.validate_dtrace_source(weakened)
+
+    def test_static_contract_requires_full_width_neutral_seed_values(self) -> None:
+        wide_seeds = (
+            "    incarnation[(pid_t)0] = (uint64_t)0;",
+            "    image_generation[(pid_t)0, (uint64_t)0] = (uint64_t)0;",
+            "    runtime_epoch[(pid_t)0, (uint64_t)0] = (uint64_t)0;",
+            "    process_ordinal[(pid_t)0] = (uint64_t)0;",
+            "    ann_epoch[(pid_t)0, (uint64_t)0, (uint64_t)0,\n"
+            "        (uint64_t)0, (uint64_t)0] = (uint64_t)0;",
+            "    ann_start[(pid_t)0, (uint64_t)0, (uint64_t)0,\n"
+            "        (uint64_t)0, (uint64_t)0] = (uint64_t)0;",
+            "    ann_end[(pid_t)0, (uint64_t)0, (uint64_t)0,\n"
+            "        (uint64_t)0, (uint64_t)0] = (uint64_t)0;",
+            "    ann_ordinal[(pid_t)0, (uint64_t)0, (uint64_t)0,\n"
+            "        (uint64_t)0, (uint64_t)0] = (uint64_t)0;",
+            "    pending_epoch[(pid_t)0, (uint64_t)0, (uint64_t)0,\n"
+            "        (uint64_t)0, 0] = (uint64_t)0;",
+            "    pending_unit[(pid_t)0, (uint64_t)0, (uint64_t)0,\n"
+            "        (uint64_t)0, 0] = (uint64_t)0;",
+            "    pending_start[(pid_t)0, (uint64_t)0, (uint64_t)0,\n"
+            "        (uint64_t)0, 0] = (uint64_t)0;",
+            "    pending_end[(pid_t)0, (uint64_t)0, (uint64_t)0,\n"
+            "        (uint64_t)0, 0] = (uint64_t)0;",
+            "    pending_commit_ordinal[(pid_t)0, (uint64_t)0, (uint64_t)0,\n"
+            "        (uint64_t)0, 0] = (uint64_t)0;",
+            "    parent_private_start = (uint64_t)0;",
+            "    parent_private_end = (uint64_t)0;",
+        )
+        for seed in wide_seeds:
+            with self.subTest(seed=seed.split("=", 1)[0].strip()):
+                self.assertIn(seed, self.source)
+                weakened = self.source.replace(
+                    seed, seed.replace("= (uint64_t)0;", "= 0;"), 1
+                )
+                with self.assertRaisesRegex(
+                    self.module.EvidenceError, "neutral.*seed|seed.*width|range seed"
+                ):
+                    self.module.validate_dtrace_source(weakened)
 
     def test_static_contract_binds_shared_run_clause_locals(self) -> None:
         valid = (
