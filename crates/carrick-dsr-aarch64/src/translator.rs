@@ -543,6 +543,71 @@ pub struct ThreadTranslator {
     exec_reset_epoch: u64,
 }
 
+/// Fully constructed initial thread translator awaiting process publication.
+/// Committing it is a move and has no recoverable failure path.
+#[must_use = "a prepared thread install must be committed or discarded"]
+pub struct PreparedThreadInstall {
+    thread: ThreadTranslator,
+}
+
+impl PreparedThreadInstall {
+    pub fn commit(self) -> ThreadTranslator {
+        self.thread
+    }
+}
+
+/// Checked replacement-thread handoff that exclusively borrows its survivor
+/// until the process swap is committed.
+#[must_use = "a prepared exec handoff must be committed or discarded"]
+pub struct PreparedThreadExecHandoff<'a> {
+    thread: &'a mut ThreadTranslator,
+    next: Arc<ProcessTranslator>,
+    next_exec_reset_epoch: u64,
+}
+
+impl PreparedThreadExecHandoff<'_> {
+    /// Commit the already checked replacement. This API is deliberately
+    /// Result-free: all recoverable validation happened in preparation.
+    pub fn commit(self) {
+        self.commit_with_sink(|frames| {
+            let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, frames);
+        });
+    }
+
+    #[doc(hidden)]
+    pub fn commit_with_sink(self, mut sink: impl FnMut(&[String])) {
+        let Self {
+            thread,
+            next,
+            next_exec_reset_epoch,
+        } = self;
+        if let Some(frames) = thread.take_profile_frames() {
+            sink(&frames);
+        }
+        thread.process = next;
+        thread.block_cache.clear();
+        thread.exec_reset_epoch = next_exec_reset_epoch;
+        thread.start_next_profile_epoch();
+        thread.last_kick = None;
+        thread.indirect_cache.clear();
+        let (used_bytes, block_count, generation_count) = thread.process.lifecycle_snapshot();
+        probes::dsr_cache_lifecycle(
+            thread.tid,
+            probes::DsrCacheLifecyclePhase::ExecTranslatorHandoffEnd,
+            used_bytes,
+            block_count,
+            generation_count,
+        );
+        probes::dsr_cache_lifecycle(
+            thread.tid,
+            probes::DsrCacheLifecyclePhase::ExecResetEnd,
+            used_bytes,
+            block_count,
+            generation_count,
+        );
+    }
+}
+
 /// One process's published JIT code plus its guest-to-cache block index,
 /// copied out for offline diagnostics (see `ProcessTranslator::code_snapshot`).
 pub struct CodeSnapshot {
@@ -1696,6 +1761,14 @@ impl ThreadTranslator {
         }
     }
 
+    /// Construct every initial thread-owned object before the selected
+    /// process publishes its translated-range identity.
+    pub fn prepare_for_process(process: Arc<ProcessTranslator>, tid: i32) -> PreparedThreadInstall {
+        PreparedThreadInstall {
+            thread: Self::for_process(process, tid),
+        }
+    }
+
     pub fn after_fork_child(&mut self, tid: i32) -> Result<(), types::DsrError> {
         let mut recorder = DsrTranslatedRangeRecorder;
         self.after_fork_child_inner(tid, &mut recorder, &mut |_| {})
@@ -1825,43 +1898,30 @@ impl ThreadTranslator {
         })
     }
 
-    pub fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) -> Result<(), types::DsrError> {
-        self.reset_for_exec_with_sink(next, |frames| {
-            let _ = profile::write_protocol_frames_to_fd(libc::STDERR_FILENO, frames);
+    pub fn prepare_reset_for_exec(
+        &mut self,
+        next: Arc<ProcessTranslator>,
+    ) -> Result<PreparedThreadExecHandoff<'_>, types::DsrError> {
+        let next_exec_reset_epoch = self.next_exec_reset_epoch()?;
+        Ok(PreparedThreadExecHandoff {
+            thread: self,
+            next,
+            next_exec_reset_epoch,
         })
+    }
+
+    pub fn reset_for_exec(&mut self, next: Arc<ProcessTranslator>) -> Result<(), types::DsrError> {
+        self.prepare_reset_for_exec(next)?.commit();
+        Ok(())
     }
 
     #[doc(hidden)]
     pub fn reset_for_exec_with_sink(
         &mut self,
         next: Arc<ProcessTranslator>,
-        mut sink: impl FnMut(&[String]),
+        sink: impl FnMut(&[String]),
     ) -> Result<(), types::DsrError> {
-        let next_exec_reset_epoch = self.next_exec_reset_epoch()?;
-        if let Some(frames) = self.take_profile_frames() {
-            sink(&frames);
-        }
-        self.process = next;
-        self.block_cache.clear();
-        self.exec_reset_epoch = next_exec_reset_epoch;
-        self.start_next_profile_epoch();
-        self.last_kick = None;
-        self.indirect_cache.clear();
-        let (used_bytes, block_count, generation_count) = self.process.lifecycle_snapshot();
-        probes::dsr_cache_lifecycle(
-            self.tid,
-            probes::DsrCacheLifecyclePhase::ExecTranslatorHandoffEnd,
-            used_bytes,
-            block_count,
-            generation_count,
-        );
-        probes::dsr_cache_lifecycle(
-            self.tid,
-            probes::DsrCacheLifecyclePhase::ExecResetEnd,
-            used_bytes,
-            block_count,
-            generation_count,
-        );
+        self.prepare_reset_for_exec(next)?.commit_with_sink(sink);
         Ok(())
     }
 
@@ -9322,6 +9382,33 @@ mod tests {
             ));
             assert_eq!(thread.tid, 42);
             assert_eq!(thread.exec_reset_epoch, u64::MAX);
+        }
+
+        #[test]
+        fn exec_handoff_prepares_the_checked_epoch_before_infallible_commit() {
+            let (_fixture, process, _, _) = one_published_binding(38);
+            let process = Arc::new(process);
+            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 44);
+            thread.exec_reset_epoch = u64::MAX - 2;
+            let _authority = thread
+                .prepare_direct_binding_exec_reset()
+                .expect("reserve the reset and replacement generations");
+            thread.block_cache.insert(
+                GuestVa(0x7300_0000),
+                CodeGeneration::INITIAL,
+                CacheVa::published(HostVa(0x2000)),
+            );
+            let (_next_fixture, next, _, _) = one_published_binding(39);
+            let next = Arc::new(next);
+
+            let prepared = thread
+                .prepare_reset_for_exec(Arc::clone(&next))
+                .expect("MAX replacement generation was reserved before PONR");
+            let _: () = prepared.commit_with_sink(|_| {});
+
+            assert!(Arc::ptr_eq(&thread.process, &next));
+            assert_eq!(thread.exec_reset_epoch, u64::MAX);
+            assert!(thread.block_cache.is_empty());
         }
     }
 
