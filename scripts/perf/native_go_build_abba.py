@@ -1458,7 +1458,7 @@ def entitlement_digest(binary: pathlib.Path) -> str:
 
 def macho_uuid(binary: pathlib.Path) -> str:
     result = subprocess.run(
-        ["dwarfdump", "--uuid", str(binary)],
+        ["/usr/bin/dwarfdump", "--uuid", str(binary)],
         capture_output=True,
         check=False,
     )
