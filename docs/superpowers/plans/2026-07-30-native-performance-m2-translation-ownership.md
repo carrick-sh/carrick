@@ -622,7 +622,7 @@ Tests must cover the ordered success path, checked overflow, unchanged failure
 state, sibling idempotence, real COW isolation under a bounded supervisor, and
 the runtime failure-event boundary.
 
-- [ ] **Step 7: Activate replacement catalogs only after successful exec**
+- [x] **Step 7: Activate replacement catalogs only after successful exec**
 
 Do not compose inherited-translator exec from one fallible destructive reset.
 Prepare the transition while the old image remains authoritative and under the
@@ -661,7 +661,20 @@ must prove the same post-success metadata state as the inherited-translator
 test seam. Ignore the current transition-time pre-success announcements in
 `DSRPROF2`.
 
-- [ ] **Step 8: Run focused tests and commit**
+The successful-handoff half is accepted in `9767b954`, `669a61d5`, and
+`874b3a35`. Installation preparation now precedes activation and publication;
+the selected thread/process handoff then commits without a recoverable
+`Result`. Host-base, host-catalog, and guest-path USDT wire buffers are
+serialized and NUL-terminated before the fatal-only boundary, so enabled probe
+fires pass only retained raw pointers and scalars. Successful completion
+remains ordered after activation, metadata publication, and translator
+installation. Production activation/install failure fixtures prove a dormant
+replacement, exactly one RAII `Aborted`, and no snapshot, ptrace stop, reset
+end, or resume. Initial, detached, in-process exec, prepared self-reexec, and
+legacy self-reexec paths share the checked seam. Final contract and adversarial
+re-reviews are clean.
+
+- [x] **Step 8: Run focused tests and commit**
 
 ```bash
 cargo test -p carrick-dsr-aarch64 translated_range -- --nocapture
@@ -683,6 +696,13 @@ Verified with catalog lifecycle, overlap, staging, sibling, and fork tests.
 
 Co-Authored-By: Codex <codex@openai.com>"
 ```
+
+The accepted implementation used the narrower commits recorded above rather
+than the illustrative single commit. Final gates passed 333 serialized native
+Darwin tests with 5 ignored, 28 observability tests, translated-range 18/18,
+shared-unit 7/7, the checked exec-handoff epoch test, `just test`,
+`just test-integration`, check, clippy, formatting, domain lint, and diff
+checks. Signed fork/self-reexec DTrace proof remains a separate live gate.
 
 ---
 
