@@ -1104,9 +1104,20 @@ class NativeGoBuildTest(unittest.TestCase):
         self.assertEqual(summary["carrick"]["workload_median_ms"], 14)
 
     def test_checked_in_semantic_overlays_are_complete_and_authoritative(self):
+        self.assertIn(
+            "CARRICK_DSR_SHARED_VALIDATED_MANIFEST_REUSE",
+            native_go_build.PERFORMANCE_CONTROL_KEYS,
+        )
         overlay_directory = pathlib.Path(native_go_build.__file__).parent / "overlays"
         default = json.loads((overlay_directory / "native-default.json").read_text())
         shared = json.loads((overlay_directory / "native-shared.json").read_text())
+
+        for overlay_path in overlay_directory.glob("*.json"):
+            with self.subTest(overlay=overlay_path.name):
+                self.assertEqual(
+                    tuple(json.loads(overlay_path.read_text())),
+                    native_go_build.PERFORMANCE_CONTROL_KEYS,
+                )
 
         self.assertEqual(
             tuple(default),

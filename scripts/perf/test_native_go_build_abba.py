@@ -1021,6 +1021,7 @@ class CampaignContractTest(unittest.TestCase):
             "CARRICK_DSR_SHARED_DYLIB_KEYED_IDENTITY",
             "CARRICK_DSR_SHARED_RECOVERY_LAZY",
             "CARRICK_DSR_SHARED_RECOVERY_RUNS",
+            "CARRICK_DSR_SHARED_VALIDATED_MANIFEST_REUSE",
         ):
             with self.subTest(key=key):
                 control = self.overlay(
