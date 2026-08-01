@@ -863,7 +863,11 @@ pub struct TranslationMetadataLoadEvidence {
     pub bytes_read: u64,
     pub bytes_mapped: u64,
     pub validation_ns: u64,
+    /// Physical V3 wire records across all sections, including its three
+    /// retained validation indexes. Zero for V2.
     pub mapped_records: u64,
+    /// Physical V2 manifest table entries retained after load. This excludes
+    /// guest ranges, edge groups, and validation indexes that only V3 stores.
     pub owned_records: u64,
 }
 

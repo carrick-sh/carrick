@@ -50,6 +50,7 @@ pub struct ValidatedMappedTranslationMetadata {
     header: WireHeaderV3,
     counts: [usize; 12],
     counts_u64: [u64; 12],
+    immutable_record_count: u64,
     #[cfg(test)]
     guest_range_access_fault: AtomicBool,
     #[cfg(test)]
@@ -82,6 +83,7 @@ impl ValidatedMappedTranslationMetadata {
         })?;
         let mut counts = [0; 12];
         let mut counts_u64 = [0; 12];
+        let mut immutable_record_count = 0_u64;
         for kind in all_section_kinds() {
             let section = layout
                 .section(kind)
@@ -89,6 +91,9 @@ impl ValidatedMappedTranslationMetadata {
             counts[section_slot(kind)] = usize::try_from(section.count().get())
                 .map_err(|_| MappedMetadataError::Arithmetic)?;
             counts_u64[section_slot(kind)] = section.count().get();
+            immutable_record_count = immutable_record_count
+                .checked_add(section.count().get())
+                .ok_or(MappedMetadataError::Arithmetic)?;
         }
         let metadata = Self {
             backing,
@@ -97,6 +102,7 @@ impl ValidatedMappedTranslationMetadata {
             header,
             counts,
             counts_u64,
+            immutable_record_count,
             #[cfg(test)]
             guest_range_access_fault: AtomicBool::new(false),
             #[cfg(test)]
@@ -136,6 +142,14 @@ impl ValidatedMappedTranslationMetadata {
     }
     pub fn edge_group_count(&self) -> usize {
         self.count(SectionKind::EdgeGroup)
+    }
+    /// Physical immutable records retained across all twelve V3 wire sections.
+    ///
+    /// This includes the guest-PC, block-guest, and binding-target validation
+    /// indexes. The checked aggregate is captured while constructing the fully
+    /// validated view, so evidence consumers do not rescan mapped tables.
+    pub fn immutable_record_count(&self) -> u64 {
+        self.immutable_record_count
     }
     pub fn block(&self, index: usize) -> Option<MappedBlockView<'_>> {
         if index >= self.block_count() {
