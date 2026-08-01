@@ -4,7 +4,15 @@
 //! structural validation. Mapping, publication, and translation-state use are
 //! separate Darwin-native concerns.
 
-mod wire;
+mod builder;
+mod view;
+pub(crate) mod wire;
+
+pub use builder::encode_translation_metadata_v3;
+pub use view::{
+    MappedBindingView, MappedBlockView, MappedEdgeGroupView, MappedPcMapView, MappedRecoveryView,
+    MetadataBacking, ValidatedMappedTranslationMetadata, VecMetadataBacking,
+};
 
 pub use wire::{
     BINDING_RECORD_V3_SIZE, BINDING_RELOCATION_RECORD_V3_SIZE, EDGE_GROUP_RECORD_V3_SIZE,

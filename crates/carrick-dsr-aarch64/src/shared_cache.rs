@@ -298,6 +298,30 @@ impl TranslationUnitKey {
         self.address_mode.host_bias()
     }
 
+    pub(crate) const fn executable(&self) -> &ExecutableIdentity {
+        &self.executable
+    }
+
+    pub(crate) const fn segment_file_offset(&self) -> ImageFileOffset {
+        self.segment_file_offset
+    }
+
+    pub(crate) const fn segment_file_len(&self) -> ImageFileLen {
+        self.segment_file_len
+    }
+
+    pub(crate) const fn guest_va_len(&self) -> GuestCodeLen {
+        self.guest_va_len
+    }
+
+    pub(crate) const fn page_profile(&self) -> NativePageProfileIdentity {
+        self.page_profile
+    }
+
+    pub(crate) const fn address_mode(&self) -> AddressModeIdentity {
+        self.address_mode
+    }
+
     pub fn file_stem(&self) -> Result<String, serde_json::Error> {
         let encoded = serde_json::to_vec(self)?;
         let digest: [u8; 32] = Sha256::digest(encoded).into();

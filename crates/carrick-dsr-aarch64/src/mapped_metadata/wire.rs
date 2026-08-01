@@ -1,9 +1,15 @@
-#![allow(dead_code)] // Task 2 consumes the typed layout view and raw records.
-
 //! V3's fixed-width, little-endian byte contract and allocation-free layout check.
 
 use zerocopy::byteorder::{I64, LittleEndian, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+
+use crate::artifact_spike::{PortableBiasedMemoryRecovery, PortableRecoveryAction};
+use crate::emit::{
+    BiasedBase, BiasedBaseCoordinate, BiasedExclusiveRecovery, BiasedExclusiveResume,
+    CounterReadRecovery, CounterScratchDestination, DirectBindingCaptureProgress,
+    DirectBindingRecoveryPhase, RecoveryAction,
+};
+use crate::types::{BiasedExclusiveScratch, DsrError, DsrScratchGpr};
 
 pub const MAPPED_METADATA_SCHEMA_V3: u32 = 3;
 pub const MAPPED_METADATA_MAGIC_V3: [u8; 8] = *b"CRKMDV3\0";
@@ -67,6 +73,21 @@ impl SectionKind {
 /// Structural failures that make a mapped V3 file ineligible for use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MappedMetadataError {
+    OwnedManifest,
+    Arithmetic,
+    MissingSection {
+        kind: SectionKind,
+    },
+    Key,
+    Block,
+    PcMap,
+    RecoverySpan,
+    RecoveryAction,
+    GuestRange,
+    Binding,
+    BindingRelocation,
+    EdgeGroup,
+    EdgeBackReference,
     HeaderTruncated {
         actual: usize,
     },
@@ -240,6 +261,433 @@ pub(crate) struct WireRecoveryActionV3 {
     pub payload: [U64<LittleEndian>; 5],
 }
 
+impl WireRecoveryActionV3 {
+    pub(crate) fn from_portable(action: PortableRecoveryAction) -> Result<Self, DsrError> {
+        let (tag, payload) = match action {
+            PortableRecoveryAction::Noop => (0, [0; 5]),
+            PortableRecoveryAction::RestoreGuestX17 => (1, [0; 5]),
+            PortableRecoveryAction::RestoreGenerationGuardRegisters => (2, [0; 5]),
+            PortableRecoveryAction::RestoreGenerationGuard => (3, [0; 5]),
+            PortableRecoveryAction::RestoreIndirectRegisters => (4, [0; 5]),
+            PortableRecoveryAction::RestoreIndirectResolver => (5, [0; 5]),
+            PortableRecoveryAction::RestoreScratch { register } => (6, words(&[register])),
+            PortableRecoveryAction::RestoreScratchInvalidBiasedLiteral { register } => {
+                (7, words(&[register]))
+            }
+            PortableRecoveryAction::RestoreScratchCompleted { register } => (8, words(&[register])),
+            PortableRecoveryAction::CommitVirtualizedAndRestoreScratch {
+                register,
+                virtual_register,
+            } => (9, words(&[register, virtual_register])),
+            PortableRecoveryAction::RestoreScratchAndContext {
+                register,
+                context_register,
+            } => (10, words(&[register, context_register])),
+            PortableRecoveryAction::RestoreScratchAndContextCompleted {
+                register,
+                context_register,
+            } => (11, words(&[register, context_register])),
+            PortableRecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
+                register,
+                context_register,
+                virtual_register,
+            } => (12, words(&[register, context_register, virtual_register])),
+            PortableRecoveryAction::RestoreDualVirtualReadOnly {
+                x18_scratch,
+                x28_scratch,
+                context_scratch,
+            } => (13, words(&[x18_scratch, x28_scratch, context_scratch])),
+            PortableRecoveryAction::RestoreDualVirtualReadOnlyCompleted {
+                x18_scratch,
+                x28_scratch,
+                context_scratch,
+            } => (14, words(&[x18_scratch, x28_scratch, context_scratch])),
+            PortableRecoveryAction::CommitDualVirtualAndRestore {
+                x18_scratch,
+                x28_scratch,
+                context_scratch,
+                virtual_register,
+                virtual_scratch,
+            } => (
+                15,
+                words(&[
+                    x18_scratch,
+                    x28_scratch,
+                    context_scratch,
+                    virtual_register,
+                    virtual_scratch,
+                ]),
+            ),
+            PortableRecoveryAction::CommitDualVirtualPairAndRestore {
+                x18_scratch,
+                x28_scratch,
+                context_scratch,
+                first_register,
+                second_register,
+            } => (
+                16,
+                words(&[
+                    x18_scratch,
+                    x28_scratch,
+                    context_scratch,
+                    first_register,
+                    second_register,
+                ]),
+            ),
+            PortableRecoveryAction::RecoverCounterRead(recovery) => {
+                let destination = match recovery.committed_scratch_destination {
+                    None => 0,
+                    Some(CounterScratchDestination::X15) => 1,
+                    Some(CounterScratchDestination::X16) => 2,
+                    Some(CounterScratchDestination::X17) => 3,
+                };
+                (
+                    17,
+                    [
+                        destination,
+                        u64::from(recovery.instruction_complete),
+                        0,
+                        0,
+                        0,
+                    ],
+                )
+            }
+            PortableRecoveryAction::RecoverBiasedMemory(recovery) => {
+                (18, encode_biased_memory(recovery)?)
+            }
+            PortableRecoveryAction::RecoverBiasedExclusive(recovery) => {
+                let resume = match recovery.resume {
+                    BiasedExclusiveResume::Load => 0,
+                    BiasedExclusiveResume::Exact => 1,
+                    BiasedExclusiveResume::Retry => 2,
+                };
+                (
+                    19,
+                    [
+                        u64::from(recovery.scratch.address.index()),
+                        u64::from(recovery.scratch.bias.index()),
+                        resume,
+                        0,
+                        0,
+                    ],
+                )
+            }
+            PortableRecoveryAction::RestoreDirectBinding {
+                phase,
+                capture_progress,
+                committed_link,
+            } => {
+                let phase = match phase {
+                    DirectBindingRecoveryPhase::ScratchCapture => 0,
+                    DirectBindingRecoveryPhase::CellAddress => 1,
+                    DirectBindingRecoveryPhase::TargetAcquire => 2,
+                    DirectBindingRecoveryPhase::AuthorityValidate => 3,
+                    DirectBindingRecoveryPhase::AuthorityInstall => 4,
+                    DirectBindingRecoveryPhase::ArchitecturalRestore => 5,
+                    DirectBindingRecoveryPhase::FinalBranch => 6,
+                    DirectBindingRecoveryPhase::MissExit => 7,
+                };
+                let capture = match capture_progress {
+                    DirectBindingCaptureProgress::None => 0,
+                    DirectBindingCaptureProgress::X15 => 1,
+                    DirectBindingCaptureProgress::X15X16 => 2,
+                    DirectBindingCaptureProgress::X15X16X30 => 3,
+                    DirectBindingCaptureProgress::Complete => 4,
+                };
+                let (present, value) = committed_link.map_or((0, 0), |value| (1, value));
+                (20, [phase, capture, present, value, 0])
+            }
+        };
+        Ok(Self {
+            tag: U32::new(tag),
+            reserved: U32::new(0),
+            payload: payload.map(U64::new),
+        })
+    }
+
+    pub(crate) fn validate(self) -> Result<(), MappedMetadataError> {
+        self.into_portable().map(|_| ())
+    }
+
+    pub(crate) fn into_recovery_action(
+        self,
+        host_bias: Option<u64>,
+    ) -> Result<RecoveryAction, DsrError> {
+        let portable = self
+            .into_portable()
+            .map_err(|_| DsrError::CachePolicy("invalid mapped V3 recovery action".to_string()))?;
+        portable.rebind_with_host_bias(host_bias)
+    }
+
+    fn into_portable(self) -> Result<PortableRecoveryAction, MappedMetadataError> {
+        if self.reserved.get() != 0 {
+            return Err(MappedMetadataError::RecoveryAction);
+        }
+        let p = self.payload.map(|word| word.get());
+        let action = match self.tag.get() {
+            0 if unused(&p, 0) => PortableRecoveryAction::Noop,
+            1 if unused(&p, 0) => PortableRecoveryAction::RestoreGuestX17,
+            2 if unused(&p, 0) => PortableRecoveryAction::RestoreGenerationGuardRegisters,
+            3 if unused(&p, 0) => PortableRecoveryAction::RestoreGenerationGuard,
+            4 if unused(&p, 0) => PortableRecoveryAction::RestoreIndirectRegisters,
+            5 if unused(&p, 0) => PortableRecoveryAction::RestoreIndirectResolver,
+            6 if unused(&p, 1) => PortableRecoveryAction::RestoreScratch {
+                register: u32_word(p[0])?,
+            },
+            7 if unused(&p, 1) => PortableRecoveryAction::RestoreScratchInvalidBiasedLiteral {
+                register: u32_word(p[0])?,
+            },
+            8 if unused(&p, 1) => PortableRecoveryAction::RestoreScratchCompleted {
+                register: u32_word(p[0])?,
+            },
+            9 if unused(&p, 2) => PortableRecoveryAction::CommitVirtualizedAndRestoreScratch {
+                register: u32_word(p[0])?,
+                virtual_register: u32_word(p[1])?,
+            },
+            10 if unused(&p, 2) => PortableRecoveryAction::RestoreScratchAndContext {
+                register: u32_word(p[0])?,
+                context_register: u32_word(p[1])?,
+            },
+            11 if unused(&p, 2) => PortableRecoveryAction::RestoreScratchAndContextCompleted {
+                register: u32_word(p[0])?,
+                context_register: u32_word(p[1])?,
+            },
+            12 if unused(&p, 3) => {
+                PortableRecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
+                    register: u32_word(p[0])?,
+                    context_register: u32_word(p[1])?,
+                    virtual_register: u32_word(p[2])?,
+                }
+            }
+            13 if unused(&p, 3) => PortableRecoveryAction::RestoreDualVirtualReadOnly {
+                x18_scratch: u32_word(p[0])?,
+                x28_scratch: u32_word(p[1])?,
+                context_scratch: u32_word(p[2])?,
+            },
+            14 if unused(&p, 3) => PortableRecoveryAction::RestoreDualVirtualReadOnlyCompleted {
+                x18_scratch: u32_word(p[0])?,
+                x28_scratch: u32_word(p[1])?,
+                context_scratch: u32_word(p[2])?,
+            },
+            15 => PortableRecoveryAction::CommitDualVirtualAndRestore {
+                x18_scratch: u32_word(p[0])?,
+                x28_scratch: u32_word(p[1])?,
+                context_scratch: u32_word(p[2])?,
+                virtual_register: u32_word(p[3])?,
+                virtual_scratch: u32_word(p[4])?,
+            },
+            16 => PortableRecoveryAction::CommitDualVirtualPairAndRestore {
+                x18_scratch: u32_word(p[0])?,
+                x28_scratch: u32_word(p[1])?,
+                context_scratch: u32_word(p[2])?,
+                first_register: u32_word(p[3])?,
+                second_register: u32_word(p[4])?,
+            },
+            17 if unused(&p, 2) => {
+                PortableRecoveryAction::RecoverCounterRead(CounterReadRecovery {
+                    committed_scratch_destination: match p[0] {
+                        0 => None,
+                        1 => Some(CounterScratchDestination::X15),
+                        2 => Some(CounterScratchDestination::X16),
+                        3 => Some(CounterScratchDestination::X17),
+                        _ => return Err(MappedMetadataError::RecoveryAction),
+                    },
+                    instruction_complete: bool_word(p[1])?,
+                })
+            }
+            18 => PortableRecoveryAction::RecoverBiasedMemory(decode_biased_memory(p)?),
+            19 if unused(&p, 3) => {
+                PortableRecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
+                    scratch: BiasedExclusiveScratch {
+                        address: scratch_gpr(p[0])?,
+                        bias: scratch_gpr(p[1])?,
+                    },
+                    resume: match p[2] {
+                        0 => BiasedExclusiveResume::Load,
+                        1 => BiasedExclusiveResume::Exact,
+                        2 => BiasedExclusiveResume::Retry,
+                        _ => return Err(MappedMetadataError::RecoveryAction),
+                    },
+                })
+            }
+            20 if p[4] == 0 => PortableRecoveryAction::RestoreDirectBinding {
+                phase: match p[0] {
+                    0 => DirectBindingRecoveryPhase::ScratchCapture,
+                    1 => DirectBindingRecoveryPhase::CellAddress,
+                    2 => DirectBindingRecoveryPhase::TargetAcquire,
+                    3 => DirectBindingRecoveryPhase::AuthorityValidate,
+                    4 => DirectBindingRecoveryPhase::AuthorityInstall,
+                    5 => DirectBindingRecoveryPhase::ArchitecturalRestore,
+                    6 => DirectBindingRecoveryPhase::FinalBranch,
+                    7 => DirectBindingRecoveryPhase::MissExit,
+                    _ => return Err(MappedMetadataError::RecoveryAction),
+                },
+                capture_progress: match p[1] {
+                    0 => DirectBindingCaptureProgress::None,
+                    1 => DirectBindingCaptureProgress::X15,
+                    2 => DirectBindingCaptureProgress::X15X16,
+                    3 => DirectBindingCaptureProgress::X15X16X30,
+                    4 => DirectBindingCaptureProgress::Complete,
+                    _ => return Err(MappedMetadataError::RecoveryAction),
+                },
+                committed_link: match p[2] {
+                    0 if p[3] == 0 => None,
+                    1 => Some(p[3]),
+                    _ => return Err(MappedMetadataError::RecoveryAction),
+                },
+            },
+            _ => return Err(MappedMetadataError::RecoveryAction),
+        };
+        Ok(action)
+    }
+}
+
+fn words(values: &[u32]) -> [u64; 5] {
+    let mut words = [0; 5];
+    for (target, value) in words.iter_mut().zip(values) {
+        *target = u64::from(*value);
+    }
+    words
+}
+
+fn unused(payload: &[u64; 5], used: usize) -> bool {
+    payload[used..].iter().all(|word| *word == 0)
+}
+
+fn u32_word(value: u64) -> Result<u32, MappedMetadataError> {
+    u32::try_from(value).map_err(|_| MappedMetadataError::RecoveryAction)
+}
+
+fn bool_word(value: u64) -> Result<bool, MappedMetadataError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(MappedMetadataError::RecoveryAction),
+    }
+}
+
+fn scratch_gpr(value: u64) -> Result<DsrScratchGpr, MappedMetadataError> {
+    let value = u32_word(value)?;
+    DsrScratchGpr::new(value).ok_or(MappedMetadataError::RecoveryAction)
+}
+
+fn packed_register(value: Option<u32>) -> Result<u64, DsrError> {
+    match value {
+        None => Ok(0),
+        Some(value) if value <= 30 => Ok(u64::from(value + 1)),
+        Some(value) => Err(DsrError::CachePolicy(format!(
+            "invalid portable recovery register x{value}"
+        ))),
+    }
+}
+
+fn encode_biased_memory(recovery: PortableBiasedMemoryRecovery) -> Result<[u64; 5], DsrError> {
+    for register in recovery
+        .scratch_registers
+        .into_iter()
+        .chain([recovery.base_scratch])
+    {
+        if register > 30 {
+            return Err(DsrError::CachePolicy(format!(
+                "invalid portable recovery register x{register}"
+            )));
+        }
+    }
+    if recovery.scratch_count > 4 {
+        return Err(DsrError::CachePolicy(
+            "invalid portable recovery scratch count".to_string(),
+        ));
+    }
+    let base = match recovery.base {
+        BiasedBase::None => 0,
+        BiasedBase::StackPointer => 1,
+        BiasedBase::VirtualX18 => 2,
+        BiasedBase::VirtualX28 => 3,
+        BiasedBase::VirtualReserved => 4,
+        BiasedBase::Register(register) if register <= 30 => u64::from(register) + 5,
+        BiasedBase::Register(register) => {
+            return Err(DsrError::CachePolicy(format!(
+                "invalid portable recovery base x{register}"
+            )));
+        }
+    };
+    let flags = u64::from(recovery.scratch_count)
+        | ((match recovery.base_coordinate {
+            BiasedBaseCoordinate::Host => 0,
+            BiasedBaseCoordinate::Guest => 1,
+        }) << 3)
+        | (u64::from(recovery.commit_base) << 4)
+        | (u64::from(recovery.instruction_complete) << 5)
+        | (packed_register(recovery.virtual_x18_scratch)? << 6)
+        | (packed_register(recovery.virtual_x28_scratch)? << 12)
+        | (packed_register(recovery.virtual_reserved_scratch)? << 18);
+    Ok([
+        u64::from(recovery.scratch_registers[0]) | (u64::from(recovery.scratch_registers[1]) << 32),
+        u64::from(recovery.scratch_registers[2]) | (u64::from(recovery.scratch_registers[3]) << 32),
+        u64::from(recovery.base_scratch) | (base << 32),
+        flags,
+        0,
+    ])
+}
+
+fn decode_biased_memory(p: [u64; 5]) -> Result<PortableBiasedMemoryRecovery, MappedMetadataError> {
+    if p[4] != 0 || p[3] >> 24 != 0 {
+        return Err(MappedMetadataError::RecoveryAction);
+    }
+    let register = |value: u64| -> Result<u32, MappedMetadataError> {
+        let value = u32_word(value)?;
+        (value <= 30)
+            .then_some(value)
+            .ok_or(MappedMetadataError::RecoveryAction)
+    };
+    let option = |value: u64| -> Result<Option<u32>, MappedMetadataError> {
+        match value {
+            0 => Ok(None),
+            1..=31 => Ok(Some(
+                u32::try_from(value - 1).map_err(|_| MappedMetadataError::RecoveryAction)?,
+            )),
+            _ => Err(MappedMetadataError::RecoveryAction),
+        }
+    };
+    let base_raw = p[2] >> 32;
+    let base = match base_raw {
+        0 => BiasedBase::None,
+        1 => BiasedBase::StackPointer,
+        2 => BiasedBase::VirtualX18,
+        3 => BiasedBase::VirtualX28,
+        4 => BiasedBase::VirtualReserved,
+        5..=35 => BiasedBase::Register(
+            u32::try_from(base_raw - 5).map_err(|_| MappedMetadataError::RecoveryAction)?,
+        ),
+        _ => return Err(MappedMetadataError::RecoveryAction),
+    };
+    let scratch_count = u8::try_from(p[3] & 7).map_err(|_| MappedMetadataError::RecoveryAction)?;
+    if scratch_count > 4 {
+        return Err(MappedMetadataError::RecoveryAction);
+    }
+    Ok(PortableBiasedMemoryRecovery {
+        scratch_registers: [
+            register(p[0] & 0xffff_ffff)?,
+            register(p[0] >> 32)?,
+            register(p[1] & 0xffff_ffff)?,
+            register(p[1] >> 32)?,
+        ],
+        scratch_count,
+        base_scratch: register(p[2] & 0xffff_ffff)?,
+        base,
+        base_coordinate: if (p[3] >> 3) & 1 == 0 {
+            BiasedBaseCoordinate::Host
+        } else {
+            BiasedBaseCoordinate::Guest
+        },
+        commit_base: (p[3] >> 4) & 1 != 0,
+        instruction_complete: (p[3] >> 5) & 1 != 0,
+        virtual_x18_scratch: option((p[3] >> 6) & 0x3f)?,
+        virtual_x28_scratch: option((p[3] >> 12) & 0x3f)?,
+        virtual_reserved_scratch: option((p[3] >> 18) & 0x3f)?,
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub(crate) struct WireGuestRangeV3 {
@@ -381,6 +829,10 @@ pub(crate) struct ValidatedSection {
 }
 
 impl ValidatedSection {
+    #[allow(
+        dead_code,
+        reason = "Task 3 consumes the section kind through mapped runtime views"
+    )]
     pub(crate) const fn kind(self) -> SectionKind {
         self.kind
     }
@@ -389,6 +841,10 @@ impl ValidatedSection {
         self.offset
     }
 
+    #[allow(
+        dead_code,
+        reason = "retained as checked geometry for Task 3 mapping evidence"
+    )]
     pub(crate) const fn byte_len(self) -> MappedMetadataLength {
         self.byte_len
     }
