@@ -36,7 +36,8 @@ def nativeperf_lines(
         f"exit_kick=0|exit_stale_generation=0|exit_unsupported={unsupported}",
         prefix
         + "sensitive|sensitive_exclusive=0|sensitive_read_tpidr=0|"
-        "sensitive_write_tpidr=0|sensitive_read_ctr=0|sensitive_read_dczid=0|"
+        "sensitive_write_tpidr=0|sensitive_read_counter=0|sensitive_read_ctr=0|"
+        "sensitive_read_dczid=0|"
         "sensitive_dc_zva=0|sensitive_dc_cvau=0|sensitive_ic_ivau=0",
         prefix
         + f"phases-a|phase_prepare_index_ns=10|phase_prepare_index_count={gateway}|"
