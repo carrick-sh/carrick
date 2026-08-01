@@ -138,14 +138,25 @@ test *ARGS:
         # parallel harness threads lets one oracle's temporary process state
         # corrupt another; keep the other workspace crates parallel and give
         # carrick-runtime a serial test process with identical coverage.
-        cargo test --workspace --exclude carrick-runtime --lib {{ARGS}}
+        # `--bins` is load-bearing, not tidiness: `carrick-cli` is a bin-only
+        # crate (no [lib], no src/lib.rs), so with `--lib` alone `cargo test`
+        # SILENTLY skips it and its 135 in-file tests never ran in any gate --
+        # including `perf_stats`'s golden-fixture contract, the only thing
+        # keeping the Rust and Python paired-statistics implementations in
+        # agreement. `--lib` on a lib-less package is not an error, it is a
+        # no-op, which is why this went unnoticed.
+        # NOT added: carrick-cli's `tests/cli.rs`, whose `run_elf_command_*`
+        # cases execute real guests. This recipe is defined as the tests that do
+        # NOT need the HVF runtime or Docker; those belong to a guest-capable
+        # lane.
+        cargo test --workspace --exclude carrick-runtime --lib --bins {{ARGS}}
         exec env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
     fi
     # Off-macOS: run the lib tests of THIS host's own crates only (-p list from
     # _platform_crates) under the backend feature set — `--workspace --lib` would
     # pull in carrick-vmm-hvf + the macos-default features and fail to compile.
     pkgs="$(just --justfile {{justfile()}} _platform_crates)"
-    exec cargo test $pkgs {{_platform_features}} --lib {{ARGS}}
+    exec cargo test $pkgs {{_platform_features}} --lib --bins {{ARGS}}
 
 # Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
 doc *ARGS:
