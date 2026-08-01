@@ -27,8 +27,10 @@ measurements. The branch is still active and is **not merge-ready**:
 run-encoded recovery metadata is retained, the qualified v2 profiler has a
 signed live proof, and the retained shared-translation stack has a clean
 cumulative result. Exact host-image PC resolution now isolates the remaining
-shared-path user-CPU owner to manifest decode and shared-unit installation, but
-that owner has not yet been improved.
+shared-path user-CPU owner to manifest decode and shared-unit installation. A
+narrow validation-only candidate was measured and rejected; the next candidate
+must change the manifest's runtime representation rather than merely trusting
+the same decoded structures sooner.
 
 Retained default-on changes, each with an exact `=0` opt-out, now remove:
 
@@ -244,6 +246,34 @@ for shared; analyzed JSON is
 `fe97899b5321f2d43153d35d212f2f17fe3cad9f0f06ca6562bc3d370b1175a9`
 and `883003c9a359e859f4d1b00d149c38bfc04f4119bd2651f7ebb7138a9741bd1b`.
 
+The first candidate at this boundary carried a typed proof that the cache
+loader had already validated the shared manifest, then skipped as many as
+three redundant full validation passes during shared-unit installation. Its
+same-binary, eight-quad ABBA completed all 32 measured runs on the authorized
+battery lane, but it failed the primary total-child-CPU retention gate:
+
+- total CPU was only `-0.31%` (`5/8` wins; one-sided upper `1.00289`,
+  two-sided interval `0.97968..1.00470`, sign probability `93/256`);
+- user CPU was `-0.61%` (`7/8`; one-sided upper `0.99819`), suggesting the
+  skipped work itself was real but small; and
+- system CPU was `+0.19%` (`3/8`; one-sided upper `1.01358`).
+
+The accepted-but-not-retained ignored artifact is
+`target/perf/native-manifest-validation-abba-battery-2361a31f.json` (SHA-256
+`a837e4005f3503d867626c5a0e74adfcf5c58ce4087dbfcfceb765d27ee070a3`).
+It binds source commit `2361a31f`, signed binary SHA-256
+`3c48c133782c3acc8d5f171869a10f869567c0a064f9c3098afa1145990c62f2`,
+and the same exact arm64 Go-build manifest used by the maintained campaigns.
+Commit `1b6d1ea7` removes the typed bypass and its measurement controls. This is
+a useful negative result: validation is not the remaining owner at useful
+scale, and carrying its proof through the runtime would add complexity without
+a demonstrated total-CPU benefit.
+
+Post-removal verification passes `just fmt-check`, all 101 relevant Python
+performance-harness tests, 252/252 `carrick-dsr-aarch64` tests, 20/20 focused
+`carrick-native-darwin` AOT-cache tests, and 167/167 focused native-DSR runtime
+tests with 5 ignored.
+
 Profiler-focused integration tests pass 10/10, exact raw replay passes, and the
 complete `just test` gate passes, including the serialized runtime library at
 1,128 passed with 5 ignored. The ordinary parallel `just ci` gate exposed an
@@ -270,14 +300,18 @@ The full gate exposed four stale keyed-export fixtures and two eager-recovery
 test helpers; both were corrected through the production validation key and a
 single representation-neutral recovery lookup seam before the green rerun.
 
-**Next:** implement one red-first, default-on shared-install candidate with an
-exact `=0` opt-out. Start at the now-proven repeated manifest-decode/index-build
-boundary, retain it only if a focused mechanism counter moves in the intended
-direction, then return it to the primary eight-quad total-child-CPU gate.
-`exact_guest_ranges_from_pc_map` is a smaller independently proven fallback if
-the representation spike needs a larger wire-format change. Synchronization
-and kqueue kernel frames remain secondary while the larger user-space owner is
-actionable.
+**Next:** design the representation-level shared-install candidate now that a
+larger manifest change is explicitly in scope. The recommended direction is a
+versioned mapped runtime-metadata representation that descendants can query
+without bincode decoding or rebuilding the large PC/recovery indexes. Before
+implementation, settle whether existing cache entries may be invalidated and
+rebuilt on the schema transition, compare that direction against a smaller
+index sidecar and an embedded-Mach-O representation, then write and approve the
+design and implementation plan. The eventual slice remains red-first,
+default-on, and exactly opt-out; it must first move a focused decode/index-build
+mechanism counter and then pass the primary eight-quad total-child-CPU gate.
+Synchronization and kqueue kernel frames remain secondary while the larger
+user-space owner is actionable.
 
 Confidence that run encoding should stay is high (`~93%`) because statistical,
 mechanism, correctness, and signed-live operability evidence now agree.
@@ -287,11 +321,16 @@ its upper interval remains well below parity. Confidence that the remaining
 shared/default regression is real is also very high (`~97%`), and confidence
 that the PC/leaf profiler plus exact image range selected the right next owner
 is high (`~90%`).
-Confidence in reaching the full `>=30%` total-CPU goal is now moderate
-(`~58%`): the direct stack result is `15.50%`, rather than the projected
-`~21%`, leaving about 14.5 points that require a new measured owner. The
-user-heavy shared/default delta and the `53.13%` host/unattributed user samples
-make further progress likely, but neither yet proves a production fix.
+Confidence that the validation-only candidate deserved rejection is very high
+(`~97%`), and confidence that a mapped representation can produce a measurable
+next win is moderately high (`~72%`) because decode/index construction is
+directly sampled and the current manifests reach 130 MiB. Confidence in
+reaching the full `>=30%` total-CPU goal remains moderate (`~58%`): the direct
+stack result is `15.50%`, rather than the projected `~21%`, leaving about 14.5
+points that require new measured owners. Permission to make a larger manifest
+change removes a design constraint, but it is not itself evidence, so the
+overall estimate should not rise until the mapped candidate passes the real
+gate.
 
 ---
 
