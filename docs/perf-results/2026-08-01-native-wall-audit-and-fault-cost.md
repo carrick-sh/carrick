@@ -391,3 +391,54 @@ largest lever identified and it does not reach the bar.
 - Nothing here is a promotion artifact. Section 1 is a fresh measurement with no
   paired control against a rebuilt historical binary; sections 3 and 4 are
   directional evidence from a perturbing instrument.
+
+---
+
+## 6 — The steady-state finding: emitted code is ~12x native
+
+The compute workload from the spread (`awk 'BEGIN{for(i=0;i<8000000;i++)s+=i}'`)
+decomposes cleanly, and it is the most consequential number in this document.
+
+| | wall | children user | children sys |
+|---|---|---|---|
+| carrick | 1,208 ms | **1.19 s** | 0.03 s |
+| docker | 109 ms | **0.10 s** | 0.00 s |
+
+**User-CPU ratio 11.9x, and both engines are CPU-bound** (user is 99% / 92% of
+wall). So this is not blocking, not syscalls (sys = 0.03 s), and not translation
+— `CARRICK_DSR_PROFILE` shows only **2,066 translations and 2,907 gateway
+entries** across the whole 1.2 s run.
+
+2,066 blocks over ~8M loop iterations means each block executes ~4,000 times.
+The cost is therefore **per-block and per-access inserted code, executed
+millions of times** — which cross-checks exactly against the H008 census figure
+that DSR-inserted words are **81.3% of matched JIT-code residency**. An 81%
+inserted-word share is ~5x on its own.
+
+### Why this reframes the campaign
+
+**Different workloads have different bottlenecks, and the campaign optimized for
+only one of them:**
+
+- a **cold build** is TRANSLATION-dominated (~800k translations, ~70 processes);
+- **steady-state compute** is EMITTED-CODE-dominated (translation is noise, the
+  same blocks run thousands of times).
+
+The 2026-07-29 CPU budget concluded "codegen is NOT the biggest bucket —
+DSR-inserted words are 18.6% of total CPU". That is true OF THE BUILD, and it
+was then generalized into a campaign-wide ranking that deprioritized codegen.
+On compute, inserted words ARE the cost.
+
+It also corrects "guest instructions are only ~1.15-1.55x Docker", repeated
+through these docs including earlier in this file. That came from comparing
+carrick's SHARE OF SAMPLED CPU in guest-shaped words against Docker's TOTAL CPU.
+Measured like for like — same binary, same work, in-guest window both sides —
+it is **~12x**.
+
+### Consequence for the <=2x bar
+
+No caching, AOT or sharing scheme touches this. Translation amortization was
+sized at ~4x redundancy and would leave ~10-11.5x; steady-state execution is
+~12x independently. **The bar is unreachable without materially better emitted
+code** — fewer inserted words per guest instruction — and that is a codegen
+problem the campaign ruled out on evidence that did not apply to it.
