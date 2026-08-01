@@ -1050,7 +1050,8 @@ struct SharedInstallLogicalSnapshot {
     loaded_unit_ids: Vec<probes::TranslatedUnitId>,
     direct_bindings: crate::direct_binding::DirectBindingLogicalSnapshot,
     direct_binding_units: usize,
-    shared_blocks_mapped: u64,
+    stats: ResolverStats,
+    reported_stats: ResolverStats,
     executable_head: usize,
     executable_nodes: usize,
 }
@@ -3838,7 +3839,8 @@ impl ProcessState {
                 .collect(),
             direct_bindings: self.direct_bindings.logical_snapshot_for_test(),
             direct_binding_units: self.direct_bindings.unit_count(),
-            shared_blocks_mapped: self.stats.shared_blocks_mapped,
+            stats: self.stats,
+            reported_stats: self.reported_stats,
             executable_head: self.executable_ranges.head_ptr() as usize,
             executable_nodes: self.executable_ranges.shared_node_count(),
         }
@@ -5979,11 +5981,11 @@ mod tests {
     // by the mirrored-ordinal tests in carrick-dsr).
     use super::{
         DsrErrorProbeExt as _, ForkChildRepairRecorder, NativeDsrExitProbeExt as _,
-        ProcessTranslator, PublishedBlockMetadata, SensitiveMetadata, SharedBlockAuthority,
-        SharedInstallCommitObserver, SharedInstallCommitPhase, SharedInstallLogicalSnapshot,
-        SharedInstallPrepareStage, ThreadTranslator, TranslatedRangeCatalog,
-        TranslatedRangeRecorder, exact_guest_ranges_from_pc_map, merge_published_indexes,
-        merge_sensitive_metadata, normalized_guest_range_union,
+        ProcessTranslator, PublishedBlockMetadata, ResolverStats, SensitiveMetadata,
+        SharedBlockAuthority, SharedInstallCommitObserver, SharedInstallCommitPhase,
+        SharedInstallLogicalSnapshot, SharedInstallPrepareStage, ThreadTranslator,
+        TranslatedRangeCatalog, TranslatedRangeRecorder, exact_guest_ranges_from_pc_map,
+        merge_published_indexes, merge_sensitive_metadata, normalized_guest_range_union,
         set_shared_install_prepare_failpoint_for_test, shared_recovery_lazy_enabled_from,
         translated_unit_id, translation_source_words_required, typed_unit_id_from_digest,
     };
@@ -6209,7 +6211,8 @@ mod tests {
         assert_eq!(actual.loaded_unit_ids, expected.loaded_unit_ids);
         assert_eq!(actual.direct_bindings, expected.direct_bindings);
         assert_eq!(actual.direct_binding_units, expected.direct_binding_units);
-        assert_eq!(actual.shared_blocks_mapped, expected.shared_blocks_mapped);
+        assert_eq!(actual.stats, expected.stats);
+        assert_eq!(actual.reported_stats, expected.reported_stats);
         assert_eq!(actual.executable_head, expected.executable_head);
         assert_eq!(actual.executable_nodes, expected.executable_nodes);
     }
@@ -6239,7 +6242,8 @@ mod tests {
         assert_eq!(actual.loaded_unit_ids, expected.loaded_unit_ids);
         assert_eq!(actual.direct_bindings, expected.direct_bindings);
         assert_eq!(actual.direct_binding_units, expected.direct_binding_units);
-        assert_eq!(actual.shared_blocks_mapped, expected.shared_blocks_mapped);
+        assert_eq!(actual.stats, expected.stats);
+        assert_eq!(actual.reported_stats, expected.reported_stats);
     }
 
     #[test]
@@ -7268,6 +7272,19 @@ mod tests {
         SharedLoadedTranslationUnit::new(shared_install_manifest(), base, Arc::new(()))
     }
 
+    fn v2_shared_install_unit(base: usize) -> SharedLoadedTranslationUnit {
+        let mut unit = shared_install_unit(base);
+        unit.load_evidence = TranslationMetadataLoadEvidence {
+            mode: TranslationMetadataMode::V2,
+            bytes_read: 2_468,
+            bytes_mapped: 0,
+            validation_ns: 74,
+            mapped_records: 0,
+            owned_records: 5,
+        };
+        unit
+    }
+
     fn mapped_shared_install_unit(base: usize) -> SharedLoadedTranslationUnit {
         let manifest = shared_install_manifest();
         let bytes = encode_translation_metadata_v3(&manifest).expect("encode mapped fixture");
@@ -7289,6 +7306,18 @@ mod tests {
             },
             Arc::new(()),
         )
+    }
+
+    fn metadata_stats(stats: ResolverStats) -> [u64; 7] {
+        [
+            stats.shared_metadata_bytes_read,
+            stats.shared_metadata_bytes_mapped,
+            stats.shared_metadata_validation_ns,
+            stats.shared_mapped_immutable_records,
+            stats.shared_owned_immutable_records,
+            stats.shared_guest_range_derivations,
+            stats.shared_direct_edge_group_builds,
+        ]
     }
 
     #[derive(Debug)]
@@ -7483,8 +7512,8 @@ mod tests {
             before.direct_binding_units + 1
         );
         assert_eq!(
-            logical_state.shared_blocks_mapped,
-            before.shared_blocks_mapped + 2
+            logical_state.stats.shared_blocks_mapped,
+            before.stats.shared_blocks_mapped + 2
         );
         assert_eq!(logical_state.executable_head, before.executable_head);
         assert_eq!(logical_state.executable_nodes, before.executable_nodes);
@@ -7715,10 +7744,11 @@ mod tests {
     }
 
     #[test]
-    fn shared_unit_prepare_failpoints_leave_logical_state_unchanged() {
+    fn resolver_stats_v2_prepare_failpoints_retry_exactly_once() {
         for stage in SharedInstallPrepareStage::ALL {
-            let process =
-                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+            let process = Arc::new(
+                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator"),
+            );
             let mut recorder = TranslatedRangeRecorderFixture::default();
             process
                 .activate_translated_range_catalog_with_recorder(&mut recorder)
@@ -7727,9 +7757,11 @@ mod tests {
             let mut state = process.state.write();
             let base = (state.cache.host_range().end + 0x10_000) & !3;
             let before = state.shared_install_logical_snapshot_for_test();
+            assert_eq!(before.stats, ResolverStats::default());
+            assert_eq!(before.reported_stats, ResolverStats::default());
             set_shared_install_prepare_failpoint_for_test(Some(stage));
 
-            let result = state.prepare_shared_install(73, &memory, shared_install_unit(base));
+            let result = state.prepare_shared_install(73, &memory, v2_shared_install_unit(base));
             set_shared_install_prepare_failpoint_for_test(None);
 
             assert!(result.is_err(), "{stage:?}");
@@ -7738,6 +7770,62 @@ mod tests {
                 before,
                 "{stage:?}"
             );
+            assert_eq!(metadata_stats(state.stats), [0; 7], "{stage:?}");
+
+            let prepared = state
+                .prepare_shared_install(73, &memory, v2_shared_install_unit(base))
+                .unwrap_or_else(|error| panic!("{stage:?} retry prepare: {error}"));
+            assert_eq!(
+                state.shared_install_logical_snapshot_for_test(),
+                before,
+                "{stage:?} successful preparation must still be nonpublishing"
+            );
+            state.commit_shared_install(prepared);
+            assert_eq!(metadata_stats(state.stats), [2_468, 0, 74, 0, 5, 1, 1]);
+            assert_eq!(state.reported_stats, ResolverStats::default());
+            drop(state);
+
+            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 41);
+            assert_eq!(
+                metadata_stats(thread.resolver_stats()),
+                [2_468, 0, 74, 0, 5, 1, 1]
+            );
+            assert_eq!(
+                metadata_stats(thread.resolver_stats()),
+                [2_468, 0, 74, 0, 5, 1, 1]
+            );
+            let first = thread.claim_profile_snapshot().expect("first V2 report");
+            assert_eq!(
+                [
+                    first.shared_metadata_bytes_read,
+                    first.shared_metadata_bytes_mapped,
+                    first.shared_metadata_validation_ns,
+                    first.shared_mapped_immutable_records,
+                    first.shared_owned_immutable_records,
+                    first.shared_guest_range_derivations,
+                    first.shared_direct_edge_group_builds,
+                ],
+                [2_468, 0, 74, 0, 5, 1, 1]
+            );
+            let second = thread.claim_profile_snapshot().expect("second V2 report");
+            assert_eq!(
+                [
+                    second.shared_metadata_bytes_read,
+                    second.shared_metadata_bytes_mapped,
+                    second.shared_metadata_validation_ns,
+                    second.shared_mapped_immutable_records,
+                    second.shared_owned_immutable_records,
+                    second.shared_guest_range_derivations,
+                    second.shared_direct_edge_group_builds,
+                ],
+                [0; 7]
+            );
+            let final_state = process.state.read();
+            assert_eq!(
+                metadata_stats(final_state.stats),
+                [2_468, 0, 74, 0, 5, 1, 1]
+            );
+            assert_eq!(final_state.reported_stats, final_state.stats);
         }
     }
 
@@ -7948,18 +8036,9 @@ mod tests {
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
         let base = (state.cache.host_range().end + 0x10_000) & !3;
-        let mut unit = shared_install_unit(base);
-        unit.load_evidence = TranslationMetadataLoadEvidence {
-            mode: TranslationMetadataMode::V2,
-            bytes_read: 2_468,
-            bytes_mapped: 0,
-            validation_ns: 74,
-            mapped_records: 0,
-            owned_records: 5,
-        };
 
         let prepared = state
-            .prepare_shared_install(73, &memory, unit)
+            .prepare_shared_install(73, &memory, v2_shared_install_unit(base))
             .expect("prepare V2 shared install");
         assert_eq!(state.stats.shared_metadata_bytes_read, 0);
         assert_eq!(state.stats.shared_owned_immutable_records, 0);
@@ -8060,10 +8139,11 @@ mod tests {
     }
 
     #[test]
-    fn mapped_shared_unit_prepare_failpoints_leave_all_logical_owners_unchanged() {
+    fn resolver_stats_v3_prepare_failpoints_retry_exactly_once() {
         for stage in SharedInstallPrepareStage::ALL {
-            let process =
-                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+            let process = Arc::new(
+                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator"),
+            );
             let mut recorder = TranslatedRangeRecorderFixture::default();
             process
                 .activate_translated_range_catalog_with_recorder(&mut recorder)
@@ -8072,6 +8152,8 @@ mod tests {
             let mut state = process.state.write();
             let base = (state.cache.host_range().end + 0x10_000) & !3;
             let before = state.shared_install_logical_snapshot_for_test();
+            assert_eq!(before.stats, ResolverStats::default());
+            assert_eq!(before.reported_stats, ResolverStats::default());
             set_shared_install_prepare_failpoint_for_test(Some(stage));
 
             let result =
@@ -8084,6 +8166,62 @@ mod tests {
                 before,
                 "{stage:?}"
             );
+            assert_eq!(metadata_stats(state.stats), [0; 7], "{stage:?}");
+
+            let prepared = state
+                .prepare_shared_install(73, &memory, mapped_shared_install_unit(base))
+                .unwrap_or_else(|error| panic!("{stage:?} retry prepare: {error}"));
+            assert_eq!(
+                state.shared_install_logical_snapshot_for_test(),
+                before,
+                "{stage:?} successful preparation must still be nonpublishing"
+            );
+            state.commit_shared_install(prepared);
+            assert_eq!(metadata_stats(state.stats), [0, 1_234, 37, 6, 0, 0, 0]);
+            assert_eq!(state.reported_stats, ResolverStats::default());
+            drop(state);
+
+            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 41);
+            assert_eq!(
+                metadata_stats(thread.resolver_stats()),
+                [0, 1_234, 37, 6, 0, 0, 0]
+            );
+            assert_eq!(
+                metadata_stats(thread.resolver_stats()),
+                [0, 1_234, 37, 6, 0, 0, 0]
+            );
+            let first = thread.claim_profile_snapshot().expect("first V3 report");
+            assert_eq!(
+                [
+                    first.shared_metadata_bytes_read,
+                    first.shared_metadata_bytes_mapped,
+                    first.shared_metadata_validation_ns,
+                    first.shared_mapped_immutable_records,
+                    first.shared_owned_immutable_records,
+                    first.shared_guest_range_derivations,
+                    first.shared_direct_edge_group_builds,
+                ],
+                [0, 1_234, 37, 6, 0, 0, 0]
+            );
+            let second = thread.claim_profile_snapshot().expect("second V3 report");
+            assert_eq!(
+                [
+                    second.shared_metadata_bytes_read,
+                    second.shared_metadata_bytes_mapped,
+                    second.shared_metadata_validation_ns,
+                    second.shared_mapped_immutable_records,
+                    second.shared_owned_immutable_records,
+                    second.shared_guest_range_derivations,
+                    second.shared_direct_edge_group_builds,
+                ],
+                [0; 7]
+            );
+            let final_state = process.state.read();
+            assert_eq!(
+                metadata_stats(final_state.stats),
+                [0, 1_234, 37, 6, 0, 0, 0]
+            );
+            assert_eq!(final_state.reported_stats, final_state.stats);
         }
     }
 
