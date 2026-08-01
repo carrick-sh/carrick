@@ -35,7 +35,6 @@ DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequenc
 DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|final_sequence=3
 DSRPROF2|kernel-return|pid=101|start_sec=11|start_usec=21|image=1|epoch=0|tid=101|provider=syscall|function=mprotect|class=named-syscall|timestamp_ns=1900
 DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=4|unit_id=9|start=0x5000|end=0x5800
-DSRPROF2|range-ready|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|final_sequence=4
 DSRPROF2|offcpu-block|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|tid=102|episode=1|kind=runnable|pc=0x6500|timestamp_ns=1950
 DSRPROF2|kernel-enter|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|tid=101|provider=syscall|function=execve|class=named-syscall|timestamp_ns=2000
 DSRPROF2|exec-attempt|pid=101|start_sec=11|start_usec=21|image=1|epoch=1
@@ -59,4 +58,4 @@ DSRSTACK2|begin|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|kind=offcpu-r
 DSRSTACK2|end
 DSRPROF2|wall-state|kind=on-cpu|count=10
 DSRPROF2|wall-state|kind=all-sleeping|count=1
-DSRPROF2|complete|profile=native-wall|bounded=0|timed_out=0|identity_violations=0|lifecycle_violations=0|range_violations=0|kernel_violations=0|offcpu_violations=0|target_exit_reason=1|live_at_end=0|elapsed_ns=60000000
+DSRPROF2|complete|profile=native-wall|bounded=0|timed_out=0|identity_violations=0|lifecycle_violations=0|range_violations=0|kernel_violations=0|offcpu_violations=0|probe_errors=0|target_exit_reason=1|live_at_end=0|elapsed_ns=60000000

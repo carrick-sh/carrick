@@ -236,9 +236,13 @@ struct V2EpochState {
 
 impl V2EpochState {
     fn is_ready(&self) -> bool {
+        let catalog_len = u64::try_from(self.ranges.len()).ok();
         self.reset_observed
             && self.replay_expected.is_none()
-            && self.ready_frontier == u64::try_from(self.ranges.len()).ok()
+            && self
+                .ready_frontier
+                .zip(catalog_len)
+                .is_some_and(|(ready, current)| ready > 0 && ready <= current)
             && !self.ranges.is_empty()
     }
 }
@@ -365,6 +369,7 @@ struct V2Validator {
     cpu_user_summary: BTreeMap<(RawProcessImageKey, u64), u64>,
     cpu_kernel_summary: BTreeMap<(RawProcessImageKey, String, u64), u64>,
     cpu_samples: u64,
+    transition_events_seen: bool,
     terminal_qualifications: BTreeSet<(String, String, String)>,
     open_stack: Option<V2StackRecord>,
     stacks: Vec<V2StackRecord>,
@@ -546,6 +551,16 @@ impl V2Validator {
         }
         if self.header_seen && self.target.is_none() && record.tag != "target-birth" {
             bail!("DSRPROF2 target-birth must follow the header");
+        }
+        if matches!(
+            record.tag.as_str(),
+            "kernel-enter"
+                | "kernel-return"
+                | "kernel-terminal-close"
+                | "offcpu-block"
+                | "offcpu-wake"
+        ) {
+            self.transition_events_seen = true;
         }
         match record.tag.as_str() {
             "header" => self.header(&record),
@@ -757,13 +772,6 @@ impl V2Validator {
 
     fn require_attribution_key(&self, key: RawProcessImageKey) -> Result<()> {
         self.require_current_key(key)?;
-        let process = self
-            .processes
-            .get(&key.birth)
-            .ok_or_else(|| anyhow!("process state disappeared"))?;
-        if process.exec_attempt.is_some() {
-            bail!("image attribution is disarmed during exec attempt");
-        }
         if self.pending_inherit.contains_key(&key.birth) {
             bail!("child attribution appeared before fork inheritance");
         }
@@ -867,12 +875,9 @@ impl V2Validator {
             .ok_or_else(|| anyhow!("fork parent has no translated-range catalog"))?;
         let parent_len = u64::try_from(parent_epoch.ranges.len())
             .context("fork parent range frontier exceeds u64")?;
-        if range_frontier != parent_len
-            || parent_epoch.ready_frontier != Some(range_frontier)
-            || !parent_epoch.is_ready()
-        {
+        if range_frontier != parent_len || !parent_epoch.is_ready() {
             bail!(
-                "fork range frontier {range_frontier} does not equal ready parent frontier {parent_len}"
+                "fork range frontier {range_frontier} does not equal active parent frontier {parent_len}"
             );
         }
         let mut child_epoch = parent_epoch.clone();
@@ -891,6 +896,19 @@ impl V2Validator {
     fn exec_attempt(&mut self, record: &V2Record) -> Result<()> {
         record.exact_fields(&["epoch", "image", "pid", "start_sec", "start_usec"])?;
         let key = record.image_key()?;
+        self.require_current_key(key)?;
+        let existing = self
+            .processes
+            .get(&key.birth)
+            .ok_or_else(|| anyhow!("exec process state disappeared"))?
+            .exec_attempt;
+        match existing {
+            Some(open) if open == key => return Ok(()),
+            Some(open) => {
+                bail!("exec attempt {key:?} conflicts with open image {open:?}")
+            }
+            None => {}
+        }
         self.require_attribution_key(key)?;
         // The runtime announces an attempt from inside the host `execve`
         // syscall. That exact kernel frame, plus unrelated frames on sibling
@@ -900,9 +918,7 @@ impl V2Validator {
             .processes
             .get_mut(&key.birth)
             .ok_or_else(|| anyhow!("exec process state disappeared"))?;
-        if process.exec_attempt.replace(key).is_some() {
-            bail!("nested exec attempt for process birth key {:?}", key.birth);
-        }
+        process.exec_attempt = Some(key);
         Ok(())
     }
 
@@ -986,13 +1002,6 @@ impl V2Validator {
         if self.pending_inherit.contains_key(&key.birth) {
             bail!("range-reset appeared before fork inheritance");
         }
-        let process = self
-            .processes
-            .get(&key.birth)
-            .ok_or_else(|| anyhow!("range-reset process state disappeared"))?;
-        if process.exec_attempt.is_some() {
-            bail!("range-reset appeared while exec attribution is disarmed");
-        }
         if key == current {
             if self.epochs.contains_key(&key) {
                 bail!("duplicate range-reset for process-image key {key:?}");
@@ -1075,13 +1084,6 @@ impl V2Validator {
         record.exact_fields(expected)?;
         let key = record.image_key()?;
         self.require_current_key(key)?;
-        let process = self
-            .processes
-            .get(&key.birth)
-            .ok_or_else(|| anyhow!("range process state disappeared"))?;
-        if process.exec_attempt.is_some() {
-            bail!("range addition appeared while exec attribution is disarmed");
-        }
         let sequence = record.decimal_u64("sequence")?;
         let start = record.address("start")?;
         let end = record.address("end")?;
@@ -1167,8 +1169,10 @@ impl V2Validator {
         if final_sequence == 0 || final_sequence != actual {
             bail!("range-ready frontier {final_sequence} does not match catalog frontier {actual}");
         }
-        if epoch.ready_frontier == Some(final_sequence) {
-            bail!("duplicate range-ready frontier {final_sequence}");
+        if let Some(initial) = epoch.ready_frontier {
+            bail!(
+                "duplicate range-ready frontier {final_sequence} after initial activation {initial}"
+            );
         }
         if let Some(expected) = epoch.replay_expected.as_ref()
             && expected != &epoch.ranges
@@ -1434,7 +1438,7 @@ impl V2Validator {
                     });
             }
             KernelTransition::Return | KernelTransition::TerminalClose => {
-                if matches!(transition, KernelTransition::TerminalClose) {
+                let terminal_scope = if matches!(transition, KernelTransition::TerminalClose) {
                     let scope = record.required("scope")?;
                     match scope {
                         "thread" | "process" => {}
@@ -1447,7 +1451,10 @@ impl V2Validator {
                     )) {
                         bail!("kernel terminal-close is absent from launch qualification");
                     }
-                }
+                    Some(scope)
+                } else {
+                    None
+                };
                 let stack = self
                     .kernel_stacks
                     .get_mut(&stack_key)
@@ -1468,6 +1475,25 @@ impl V2Validator {
                 stack.pop();
                 if stack.is_empty() {
                     self.kernel_stacks.remove(&stack_key);
+                }
+                match terminal_scope {
+                    Some("thread") => {
+                        // A qualified non-returning thread syscall is the last
+                        // observable event for this TID. Any lower kernel frame
+                        // or sleeping episode is right-censored by thread death.
+                        self.kernel_stacks.remove(&stack_key);
+                        self.offcpu_open.remove(&stack_key);
+                    }
+                    Some("process") => {
+                        // Darwin reports the exiting caller, not every sibling
+                        // it terminates. Process scope is therefore the explicit
+                        // authority to retire all right-censored sibling state.
+                        self.kernel_stacks
+                            .retain(|(birth, _), _| *birth != key.birth);
+                        self.offcpu_open.retain(|(birth, _), _| *birth != key.birth);
+                    }
+                    None => {}
+                    Some(_) => unreachable!("terminal scope was validated above"),
                 }
             }
         }
@@ -1615,13 +1641,6 @@ impl V2Validator {
         if self.pending_inherit.contains_key(&key.birth) {
             bail!("process exited before fork inheritance completed");
         }
-        let process = self
-            .processes
-            .get(&key.birth)
-            .ok_or_else(|| anyhow!("exit process state disappeared"))?;
-        if process.exec_attempt.is_some() {
-            bail!("process exited with an open exec attempt");
-        }
         self.require_no_open_thread_state(key.birth, "process exit")?;
         self.require_all_birth_epochs_ready(key.birth)?;
         let reason = record.decimal_u64("reason")?;
@@ -1632,6 +1651,10 @@ impl V2Validator {
             .processes
             .get_mut(&key.birth)
             .ok_or_else(|| anyhow!("exit process state disappeared"))?;
+        // Darwin does not guarantee `proc:::exec-failure` for every failed
+        // attempt. An observation that never reaches exec-success belongs to
+        // the retiring image and ends with the process.
+        process.exec_attempt = None;
         process.alive = false;
         process.exit_reason = Some(reason);
         match self.active_pids.remove(&key.birth.pid) {
@@ -1680,6 +1703,7 @@ impl V2Validator {
             "lifecycle_violations",
             "live_at_end",
             "offcpu_violations",
+            "probe_errors",
             "profile",
             "range_violations",
             "target_exit_reason",
@@ -1719,6 +1743,7 @@ impl V2Validator {
                 "offcpu_violations",
                 record.decimal_u64("offcpu_violations")?,
             ),
+            ("probe_errors", record.decimal_u64("probe_errors")?),
         ];
         let expected_bounded = timed_out != 0 || violations.iter().any(|(_, count)| *count != 0);
         if bounded != u64::from(expected_bounded) {
@@ -1768,7 +1793,7 @@ impl V2Validator {
         if !self.offcpu_open.is_empty() {
             bail!("DSRPROF2 completed with an open off-CPU episode");
         }
-        if self.offcpu_closed != self.offcpu_summary {
+        if self.transition_events_seen && self.offcpu_closed != self.offcpu_summary {
             bail!("off-CPU transition and aggregate populations disagree");
         }
         for birth in self.processes.keys().copied() {
@@ -2149,6 +2174,7 @@ pub(crate) struct KernelSampleAddresses {
 pub(crate) fn kernel_sample_addresses_from_path(
     path: &Path,
     v2_authority: Option<&V2ProfileAuthority>,
+    capture_status: ProfileCaptureStatus,
 ) -> Result<KernelSampleAddresses> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read native-wall raw stream {}", path.display()))?;
@@ -2163,13 +2189,13 @@ pub(crate) fn kernel_sample_addresses_from_path(
             .ok_or_else(|| anyhow!("DSRPROF2 kernel symbol lookup has no launch authority"))?;
         validate_v2_lines_with_validator(
             contents.lines(),
-            ProfileCaptureStatus::default(),
+            capture_status,
             V2Validator::with_authority(authority),
         )
         .context("validate authoritative DSRPROF2 stream before kernel symbol lookup")?;
         return kernel_sample_addresses_from_v2_lines(contents.lines());
     }
-    let summary = ProfileSummary::from_lines(contents.lines(), ProfileCaptureStatus::default())
+    let summary = ProfileSummary::from_lines(contents.lines(), capture_status)
         .context("validate native-wall raw stream before kernel symbol lookup")?;
     summary.require_profile(TraceProfileKind::NativeWall)?;
     kernel_sample_addresses_from_lines(contents.lines())
@@ -3721,10 +3747,12 @@ mod tests {
     }
 
     #[test]
-    fn dsrprof2_authoritative_summary_retains_terminal_qualification() {
+    fn dsrprof2_authoritative_summary_reconciles_process_terminal_scope() {
         let terminal = concat!(
-            "DSRPROF2|kernel-enter|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=bsdthread_terminate|class=named-syscall|timestamp_ns=1900\n",
-            "DSRPROF2|kernel-terminal-close|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=bsdthread_terminate|class=named-syscall|scope=thread|timestamp_ns=2000\n",
+            "DSRPROF2|kernel-enter|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=101|provider=syscall|function=kevent|class=named-syscall|timestamp_ns=1850\n",
+            "DSRPROF2|offcpu-block|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=101|episode=1|kind=voluntary|pc=0x1150|timestamp_ns=1875\n",
+            "DSRPROF2|kernel-enter|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=exit|class=named-syscall|timestamp_ns=1900\n",
+            "DSRPROF2|kernel-terminal-close|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=exit|class=named-syscall|scope=process|timestamp_ns=2000\n",
         );
         let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw").replacen(
             "DSRPROF2|process-exit|pid=100",

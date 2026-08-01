@@ -33,6 +33,7 @@ dtrace:::BEGIN
 	range_violations = 0;
 	kernel_violations = 0;
 	offcpu_violations = 0;
+	probe_errors = 0;
 	live_pids = 0;
 	on_cpu_threads = 0;
 	runnable_threads = 0;
@@ -46,7 +47,7 @@ dtrace:::BEGIN
 	image_generation[(pid_t)0] = (uint64_t)0;
 	current_epoch[(pid_t)0] = (uint64_t)0;
 	source_epoch[(pid_t)0] = (uint64_t)0;
-	exec_inflight[(pid_t)0] = 0;
+	exec_observed[(pid_t)0] = 0;
 	range_ready[(pid_t)0] = 0;
 	range_frontier[(pid_t)0] = (uint64_t)0;
 	catalog_seen[(pid_t)0, (uint64_t)0] = 0;
@@ -64,28 +65,28 @@ dtrace:::BEGIN
 	thread_state[(pid_t)0, (uint64_t)0] = 0;
 	thread_lifecycle[(pid_t)0, (uint64_t)0] = 0;
 	kernel_depth[(pid_t)0, (uint64_t)0] = (uint64_t)0;
-	kernel_provider[(pid_t)0, (uint64_t)0, (uint64_t)0] = 0;
 	kernel_function[(pid_t)0, (uint64_t)0, (uint64_t)0] = "";
-	kernel_birth_sec[(pid_t)0, (uint64_t)0, (uint64_t)0] = (int64_t)0;
-	kernel_birth_usec[(pid_t)0, (uint64_t)0, (uint64_t)0] = (int32_t)0;
 	kernel_image[(pid_t)0, (uint64_t)0, (uint64_t)0] = (uint64_t)0;
 	kernel_epoch[(pid_t)0, (uint64_t)0, (uint64_t)0] = (uint64_t)0;
-	kernel_started[(pid_t)0, (uint64_t)0, (uint64_t)0] = (uint64_t)0;
 	terminal_scope["", ""] = 0;
 
 	off_open[(pid_t)0, (uint64_t)0] = 0;
 	off_episode[(pid_t)0, (uint64_t)0] = (uint64_t)0;
-	off_birth_sec[(pid_t)0, (uint64_t)0] = (int64_t)0;
-	off_birth_usec[(pid_t)0, (uint64_t)0] = (int32_t)0;
 	off_image[(pid_t)0, (uint64_t)0] = (uint64_t)0;
 	off_epoch[(pid_t)0, (uint64_t)0] = (uint64_t)0;
-	off_kind[(pid_t)0, (uint64_t)0] = "";
+	off_kind[(pid_t)0, (uint64_t)0] = 0;
 	off_pc[(pid_t)0, (uint64_t)0] = (uint64_t)0;
 	off_started[(pid_t)0, (uint64_t)0] = (uint64_t)0;
 
 	/* These two actions are substituted from the lossless launch receipts. */
 	/* CARRICK_DSRPROF2_HEADER */
 	/* CARRICK_DSRPROF2_TERMINALS */
+}
+
+/* Surface D action faults explicitly; partial clauses corrupt exact state. */
+dtrace:::ERROR
+{
+	probe_errors++;
 }
 
 /* Retain every valid in-scope Carrick-published process incarnation. */
@@ -121,7 +122,7 @@ carrick*:::host-process-birth
 	image_generation[pid] = (uint64_t)1;
 	current_epoch[pid] = (uint64_t)0;
 	source_epoch[pid] = (uint64_t)0;
-	exec_inflight[pid] = 0;
+	exec_observed[pid] = 0;
 	range_ready[pid] = 1;
 	range_frontier[pid] = pending_range_frontier[pid];
 	catalog_seen[pid, (uint64_t)1] = 1;
@@ -148,7 +149,7 @@ carrick*:::host-translated-range-reset
 	image_generation[pid] = (uint64_t)1;
 	current_epoch[pid] = (uint64_t)0;
 	source_epoch[pid] = (uint64_t)0;
-	exec_inflight[pid] = 0;
+	exec_observed[pid] = 0;
 	range_ready[pid] = 0;
 	range_frontier[pid] = (uint64_t)0;
 	live_pids++;
@@ -165,61 +166,54 @@ carrick*:::host-translated-range-reset
 
 /* Latch the exact parent key and catalog frontier at host fork creation. */
 proc:::create
-/tracked[pid] && range_ready[pid] && exec_inflight[pid] == 0 &&
-    range_frontier[pid] > (uint64_t)0/
+/tracked[pid]/
 {
 	this->child = (pid_t)args[0]->pr_pid;
-	lifecycle_violations += tracked[this->child] != 0 ||
-	    pending_parent_pid[this->child] != (pid_t)0 ? 1 : 0;
-	pending_parent_pid[this->child] = (pid_t)pid;
-	pending_parent_sec[this->child] = birth_sec[pid];
-	pending_parent_usec[this->child] = birth_usec[pid];
-	pending_parent_image[this->child] = image_generation[pid];
-	pending_parent_epoch[this->child] = current_epoch[pid];
-	pending_range_frontier[this->child] = range_frontier[pid];
+	this->valid = range_ready[pid] && range_frontier[pid] > (uint64_t)0;
+	this->duplicate = tracked[this->child] != 0 ||
+	    pending_parent_pid[this->child] != (pid_t)0;
+	lifecycle_violations += !this->valid || this->duplicate ? 1 : 0;
+	pending_parent_pid[this->child] = this->valid && !this->duplicate ?
+	    (pid_t)pid : pending_parent_pid[this->child];
+	pending_parent_sec[this->child] = this->valid && !this->duplicate ?
+	    birth_sec[pid] : pending_parent_sec[this->child];
+	pending_parent_usec[this->child] = this->valid && !this->duplicate ?
+	    birth_usec[pid] : pending_parent_usec[this->child];
+	pending_parent_image[this->child] = this->valid && !this->duplicate ?
+	    image_generation[pid] : pending_parent_image[this->child];
+	pending_parent_epoch[this->child] = this->valid && !this->duplicate ?
+	    current_epoch[pid] : pending_parent_epoch[this->child];
+	pending_range_frontier[this->child] = this->valid && !this->duplicate ?
+	    range_frontier[pid] : pending_range_frontier[this->child];
 }
 
-proc:::create
-/tracked[pid] && !(range_ready[pid] && exec_inflight[pid] == 0 &&
-    range_frontier[pid] > (uint64_t)0)/
-{
-	lifecycle_violations++;
-}
-
-/* Exec attempt disarms all image-owned attribution until failure/success. */
+/*
+ * `proc:::exec` is an observation, not a balanced transition: Darwin can omit
+ * exec-failure. Keep attribution live until an actual exec-success retires it.
+ */
 proc:::exec
-/tracked[pid] && exec_inflight[pid] == 0/
+/tracked[pid]/
 {
 	printf("DSRPROF2|exec-attempt|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d\n",
 	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid],
 	    current_epoch[pid]);
-	exec_inflight[pid] = 1;
-}
-
-proc:::exec
-/tracked[pid] && exec_inflight[pid] != 0/
-{
-	lifecycle_violations++;
+	exec_observed[pid] = 1;
 }
 
 proc:::exec-failure
-/tracked[pid] && exec_inflight[pid] == 1/
+/tracked[pid]/
 {
+	lifecycle_violations += exec_observed[pid] == 1 ? 0 : 1;
 	printf("DSRPROF2|exec-failure|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d\n",
 	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid],
 	    current_epoch[pid]);
-	exec_inflight[pid] = 0;
-}
-
-proc:::exec-failure
-/tracked[pid] && exec_inflight[pid] != 1/
-{
-	lifecycle_violations++;
+	exec_observed[pid] = 0;
 }
 
 proc:::exec-success
-/tracked[pid] && exec_inflight[pid] == 1/
+/tracked[pid]/
 {
+	lifecycle_violations += exec_observed[pid] == 1 ? 0 : 1;
 	this->retired_image = image_generation[pid];
 	this->retired_epoch = current_epoch[pid];
 	this->new_image = (uint64_t)(this->retired_image + 1);
@@ -231,18 +225,12 @@ proc:::exec-success
 	source_epoch[pid] = (uint64_t)0;
 	range_ready[pid] = 0;
 	range_frontier[pid] = (uint64_t)0;
-	exec_inflight[pid] = 0;
-}
-
-proc:::exec-success
-/tracked[pid] && exec_inflight[pid] != 1/
-{
-	lifecycle_violations++;
+	exec_observed[pid] = 0;
 }
 
 /* Normalize Carrick's nonzero internal epoch into the raw per-image stream. */
 carrick*:::host-translated-range-reset
-/tracked[pid] && exec_inflight[pid] == 0/
+/tracked[pid]/
 {
 	this->image = image_generation[pid];
 	this->seen = catalog_seen[pid, this->image];
@@ -269,7 +257,7 @@ carrick*:::host-translated-range-reset
 }
 
 carrick*:::host-translated-private-range
-/tracked[pid] && exec_inflight[pid] == 0/
+/tracked[pid]/
 {
 	this->valid = source_epoch[pid] != (uint64_t)0 &&
 	    (uint64_t)arg0 == source_epoch[pid] &&
@@ -285,7 +273,7 @@ carrick*:::host-translated-private-range
 }
 
 carrick*:::host-translated-shared-range
-/tracked[pid] && exec_inflight[pid] == 0/
+/tracked[pid]/
 {
 	this->valid = source_epoch[pid] != (uint64_t)0 &&
 	    (uint64_t)arg0 == source_epoch[pid] &&
@@ -296,13 +284,13 @@ carrick*:::host-translated-shared-range
 	    ((uint64_t)arg4 & (uint64_t)3) == (uint64_t)0;
 	range_violations += this->valid ? 0 : 1;
 	range_frontier[pid] = this->valid ? (uint64_t)arg1 : range_frontier[pid];
-	printf("DSRPROF2|range-shared|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|sequence=%d|unit_id=%d|start=%#x|end=%#x\n",
+	printf("DSRPROF2|range-shared|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|sequence=%d|unit_id=%u|start=%#x|end=%#x\n",
 	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid],
 	    current_epoch[pid], arg1, arg2, arg3, arg4);
 }
 
 carrick*:::host-translated-range-ready
-/tracked[pid] && exec_inflight[pid] == 0/
+/tracked[pid]/
 {
 	this->valid = source_epoch[pid] != (uint64_t)0 &&
 	    (uint64_t)arg0 == source_epoch[pid] &&
@@ -317,7 +305,7 @@ carrick*:::host-translated-range-ready
 
 /* Image publications occur after range activation and remain image-stable. */
 carrick*:::host-image-base
-/tracked[pid] && range_ready[pid] && exec_inflight[pid] == 0 &&
+/tracked[pid] && range_ready[pid] &&
     (uint32_t)arg0 == (uint32_t)pid &&
     host_base_seen[pid, image_generation[pid]] == 0/
 {
@@ -328,7 +316,7 @@ carrick*:::host-image-base
 }
 
 carrick*:::host-image-catalog
-/tracked[pid] && range_ready[pid] && exec_inflight[pid] == 0 &&
+/tracked[pid] && range_ready[pid] &&
     host_catalog_seen[pid, image_generation[pid]] == 0/
 {
 	host_catalog_seen[pid, image_generation[pid]] = 1;
@@ -338,7 +326,7 @@ carrick*:::host-image-catalog
 }
 
 carrick*:::guest-image-base
-/tracked[pid] && range_ready[pid] && exec_inflight[pid] == 0 &&
+/tracked[pid] && range_ready[pid] &&
     (uint32_t)arg0 == (uint32_t)pid &&
     guest_base_seen[pid, image_generation[pid]] == 0/
 {
@@ -361,44 +349,23 @@ carrick*:::guest-image-base
  * encode logical depth + 1.
  */
 syscall:::entry
-/tracked[pid] && range_ready[pid] && exec_inflight[pid] == 0/
+/tracked[pid] && range_ready[pid]/
 {
 	this->depth = kernel_depth[pid, tid] == (uint64_t)0 ?
 	    (uint64_t)1 : kernel_depth[pid, tid];
 	kernel_depth[pid, tid] = (uint64_t)(this->depth + 1);
-	kernel_provider[pid, tid, this->depth] = 1;
 	kernel_function[pid, tid, this->depth] = probefunc;
-	kernel_birth_sec[pid, tid, this->depth] = birth_sec[pid];
-	kernel_birth_usec[pid, tid, this->depth] = birth_usec[pid];
 	kernel_image[pid, tid, this->depth] = image_generation[pid];
 	kernel_epoch[pid, tid, this->depth] = current_epoch[pid];
-	kernel_started[pid, tid, this->depth] = (uint64_t)timestamp;
-	printf("DSRPROF2|kernel-enter|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|tid=%d|provider=syscall|function=%s|class=named-syscall|timestamp_ns=%d\n",
-	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid],
-	    current_epoch[pid], tid, probefunc, timestamp);
 }
 
 syscall:::return
-/tracked[pid] && kernel_depth[pid, tid] > (uint64_t)1 &&
-    !(kernel_provider[pid, tid, kernel_depth[pid, tid] - 1] == 1 &&
-    kernel_function[pid, tid, kernel_depth[pid, tid] - 1] == probefunc)/
-{
-	kernel_violations++;
-}
-
-syscall:::return
-/tracked[pid] && kernel_depth[pid, tid] > (uint64_t)1 &&
-    kernel_provider[pid, tid, kernel_depth[pid, tid] - 1] == 1 &&
-    kernel_function[pid, tid, kernel_depth[pid, tid] - 1] == probefunc/
+/tracked[pid] && kernel_depth[pid, tid] > (uint64_t)1/
 {
 	this->depth = (uint64_t)(kernel_depth[pid, tid] - 1);
-	printf("DSRPROF2|kernel-return|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|tid=%d|provider=syscall|function=%s|class=named-syscall|timestamp_ns=%d\n",
-	    pid, kernel_birth_sec[pid, tid, this->depth],
-	    kernel_birth_usec[pid, tid, this->depth],
-	    kernel_image[pid, tid, this->depth],
-	    kernel_epoch[pid, tid, this->depth], tid,
-	    kernel_function[pid, tid, this->depth], timestamp);
-	kernel_depth[pid, tid] = this->depth;
+	this->valid = kernel_function[pid, tid, this->depth] == probefunc;
+	kernel_violations += this->valid ? 0 : 1;
+	kernel_depth[pid, tid] = this->valid ? this->depth : kernel_depth[pid, tid];
 }
 
 /* A reused Darwin thread ID becomes schedulable again only at lwp-start. */
@@ -406,6 +373,8 @@ proc:::lwp-start
 /tracked[pid]/
 {
 	thread_lifecycle[pid, tid] = 1;
+	kernel_depth[pid, tid] = (uint64_t)1;
+	off_open[pid, tid] = 1;
 }
 
 /* Scheduler state and exact off-CPU transition reconciliation. */
@@ -432,36 +401,22 @@ sched:::off-cpu
 
 sched:::off-cpu
 /tracked[pid] && thread_lifecycle[pid, tid] != 2 &&
-    range_ready[pid] && exec_inflight[pid] == 0 &&
-    off_open[pid, tid] == 2/
+    range_ready[pid]/
 {
-	offcpu_violations++;
-}
-
-/*
- * Same-probe DTrace clauses observe mutations from earlier clauses. Keep the
- * duplicate guard before the opener so the current off-cpu firing does not
- * diagnose the episode it just opened as a second transition.
- */
-sched:::off-cpu
-/tracked[pid] && thread_lifecycle[pid, tid] != 2 &&
-    range_ready[pid] && exec_inflight[pid] == 0 &&
-    off_open[pid, tid] != 2/
-{
-	off_episode[pid, tid]++;
+	this->duplicate = off_open[pid, tid] == 2;
+	offcpu_violations += this->duplicate ? 1 : 0;
+	off_episode[pid, tid] += this->duplicate ? (uint64_t)0 : (uint64_t)1;
 	off_open[pid, tid] = 2;
-	off_birth_sec[pid, tid] = birth_sec[pid];
-	off_birth_usec[pid, tid] = birth_usec[pid];
-	off_image[pid, tid] = image_generation[pid];
-	off_epoch[pid, tid] = current_epoch[pid];
-	off_kind[pid, tid] = curlwpsinfo->pr_state == SSLEEP ?
-	    "voluntary" : "runnable";
-	off_pc[pid, tid] = (uint64_t)uregs[R_PC];
-	off_started[pid, tid] = (uint64_t)timestamp;
-	printf("DSRPROF2|offcpu-block|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|tid=%d|episode=%d|kind=%s|pc=%#x|timestamp_ns=%d\n",
-	    pid, birth_sec[pid], birth_usec[pid], image_generation[pid],
-	    current_epoch[pid], tid, off_episode[pid, tid],
-	    off_kind[pid, tid], off_pc[pid, tid], timestamp);
+	off_image[pid, tid] = this->duplicate ?
+	    off_image[pid, tid] : image_generation[pid];
+	off_epoch[pid, tid] = this->duplicate ?
+	    off_epoch[pid, tid] : current_epoch[pid];
+	off_kind[pid, tid] = this->duplicate ? off_kind[pid, tid] :
+	    curlwpsinfo->pr_state == SSLEEP ? 1 : 2;
+	off_pc[pid, tid] = this->duplicate ?
+	    off_pc[pid, tid] : (uint64_t)uregs[R_PC];
+	off_started[pid, tid] = this->duplicate ?
+	    off_started[pid, tid] : (uint64_t)timestamp;
 }
 
 sched:::on-cpu
@@ -469,22 +424,18 @@ sched:::on-cpu
     off_open[pid, tid] == 2/
 {
 	this->delta = (uint64_t)(timestamp - off_started[pid, tid]);
-	printf("DSRPROF2|offcpu-wake|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|tid=%d|episode=%d|observed_pid=%d|observed_sec=%d|observed_usec=%d|observed_image=%d|observed_epoch=%d|timestamp_ns=%d\n",
-	    pid, off_birth_sec[pid, tid], off_birth_usec[pid, tid],
-	    off_image[pid, tid], off_epoch[pid, tid], tid,
-	    off_episode[pid, tid], pid, birth_sec[pid], birth_usec[pid],
-	    image_generation[pid], current_epoch[pid], timestamp);
-	@off_count[pid, off_birth_sec[pid, tid], off_birth_usec[pid, tid],
-	    off_image[pid, tid], off_epoch[pid, tid], off_kind[pid, tid],
+	this->kind = off_kind[pid, tid] == 1 ? "voluntary" : "runnable";
+	@off_count[pid, birth_sec[pid], birth_usec[pid],
+	    off_image[pid, tid], off_epoch[pid, tid], this->kind,
 	    off_pc[pid, tid]] = count();
-	@off_ns[pid, off_birth_sec[pid, tid], off_birth_usec[pid, tid],
-	    off_image[pid, tid], off_epoch[pid, tid], off_kind[pid, tid],
+	@off_ns[pid, birth_sec[pid], birth_usec[pid],
+	    off_image[pid, tid], off_epoch[pid, tid], this->kind,
 	    off_pc[pid, tid]] = sum(this->delta);
-	@off_stack_count[pid, off_birth_sec[pid, tid], off_birth_usec[pid, tid],
-	    off_image[pid, tid], off_epoch[pid, tid], off_kind[pid, tid],
+	@off_stack_count[pid, birth_sec[pid], birth_usec[pid],
+	    off_image[pid, tid], off_epoch[pid, tid], this->kind,
 	    ustack(24)] = count();
-	@off_stack_ns[pid, off_birth_sec[pid, tid], off_birth_usec[pid, tid],
-	    off_image[pid, tid], off_epoch[pid, tid], off_kind[pid, tid],
+	@off_stack_ns[pid, birth_sec[pid], birth_usec[pid],
+	    off_image[pid, tid], off_epoch[pid, tid], this->kind,
 	    ustack(24)] = sum(this->delta);
 	off_open[pid, tid] = 1;
 }
@@ -492,41 +443,19 @@ sched:::on-cpu
 /* Receipt-qualified non-returning calls close only at their proven scope. */
 proc:::lwp-exit
 /tracked[pid] && kernel_depth[pid, tid] > (uint64_t)1 &&
-    terminal_scope[
-        kernel_provider[pid, tid, kernel_depth[pid, tid] - 1] == 1 ?
-        "syscall" : "mach_trap",
-        kernel_function[pid, tid, kernel_depth[pid, tid] - 1]] == 1/
+    terminal_scope["syscall",
+	    kernel_function[pid, tid, kernel_depth[pid, tid] - 1]] == 1/
 {
 	this->depth = (uint64_t)(kernel_depth[pid, tid] - 1);
-	printf("DSRPROF2|kernel-terminal-close|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|tid=%d|provider=%s|function=%s|class=%s|scope=thread|timestamp_ns=%d\n",
-	    pid, kernel_birth_sec[pid, tid, this->depth],
-	    kernel_birth_usec[pid, tid, this->depth],
-	    kernel_image[pid, tid, this->depth],
-	    kernel_epoch[pid, tid, this->depth], tid,
-	    kernel_provider[pid, tid, this->depth] == 1 ?
-	    "syscall" : "mach_trap", kernel_function[pid, tid, this->depth],
-	    kernel_provider[pid, tid, this->depth] == 1 ?
-	    "named-syscall" : "mach-trap", timestamp);
 	kernel_depth[pid, tid] = this->depth;
 }
 
 proc:::exit
 /tracked[pid] && kernel_depth[pid, tid] > (uint64_t)1 &&
-    terminal_scope[
-        kernel_provider[pid, tid, kernel_depth[pid, tid] - 1] == 1 ?
-        "syscall" : "mach_trap",
-        kernel_function[pid, tid, kernel_depth[pid, tid] - 1]] == 2/
+    terminal_scope["syscall",
+	    kernel_function[pid, tid, kernel_depth[pid, tid] - 1]] == 2/
 {
 	this->depth = (uint64_t)(kernel_depth[pid, tid] - 1);
-	printf("DSRPROF2|kernel-terminal-close|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|tid=%d|provider=%s|function=%s|class=%s|scope=process|timestamp_ns=%d\n",
-	    pid, kernel_birth_sec[pid, tid, this->depth],
-	    kernel_birth_usec[pid, tid, this->depth],
-	    kernel_image[pid, tid, this->depth],
-	    kernel_epoch[pid, tid, this->depth], tid,
-	    kernel_provider[pid, tid, this->depth] == 1 ?
-	    "syscall" : "mach_trap", kernel_function[pid, tid, this->depth],
-	    kernel_provider[pid, tid, this->depth] == 1 ?
-	    "named-syscall" : "mach-trap", timestamp);
 	kernel_depth[pid, tid] = this->depth;
 }
 
@@ -538,18 +467,20 @@ proc:::lwp-exit
 	runnable_threads -= thread_state[pid, tid] == 2 ? 1 : 0;
 	sleeping_threads -= thread_state[pid, tid] == 3 ? 1 : 0;
 	thread_state[pid, tid] = 0;
+	kernel_depth[pid, tid] = (uint64_t)1;
+	off_open[pid, tid] = 1;
 }
 
 /* Aggregate CPU populations only after a complete range catalog is ready. */
 profile-499
-/tracked[pid] && range_ready[pid] && exec_inflight[pid] == 0 && arg1 != 0/
+/tracked[pid] && range_ready[pid] && arg1 != 0/
 {
 	@cpu_user[pid, birth_sec[pid], birth_usec[pid], image_generation[pid],
 	    current_epoch[pid], arg1] = count();
 }
 
 profile-499
-/tracked[pid] && range_ready[pid] && exec_inflight[pid] == 0 && arg0 != 0/
+/tracked[pid] && range_ready[pid] && arg0 != 0/
 {
 	this->class = kernel_depth[pid, tid] <= (uint64_t)1 ?
 	    "kernel-non-syscall" : "kernel-named-syscall";
@@ -578,7 +509,7 @@ proc:::exit
 	target_exit_reason = pid == root_pid ? arg0 : target_exit_reason;
 	tracked[pid] = 0;
 	range_ready[pid] = 0;
-	exec_inflight[pid] = 0;
+	exec_observed[pid] = 0;
 	live_pids--;
 }
 
@@ -607,11 +538,11 @@ dtrace:::END
 	printa("DSRSTACK2|begin|pid=%d|start_sec=%d|start_usec=%d|image=%d|epoch=%d|kind=offcpu-%s|count=%@d|total_ns=%@d\n%kDSRSTACK2|end\n",
 	    @off_stack_count, @off_stack_ns);
 	printa("DSRPROF2|wall-state|kind=%s|count=%@d\n", @wall_state);
-	printf("DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d\n",
+	printf("DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|probe_errors=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d\n",
 	    timed_out || identity_violations != 0 || lifecycle_violations != 0 ||
 	    range_violations != 0 || kernel_violations != 0 ||
-	    offcpu_violations != 0, timed_out, identity_violations,
+	    offcpu_violations != 0 || probe_errors != 0, timed_out, identity_violations,
 	    lifecycle_violations, range_violations, kernel_violations,
-	    offcpu_violations, target_exit_reason, live_pids,
+	    offcpu_violations, probe_errors, target_exit_reason, live_pids,
 	    timestamp - started);
 }
