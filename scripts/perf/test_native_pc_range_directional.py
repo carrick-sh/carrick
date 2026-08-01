@@ -70,6 +70,7 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
             result["leaf_capture"],
             {
                 "expected_outside_private_samples": 16,
+                "host_binary_raw_samples": 0,
                 "host_named_samples": 5,
                 "host_raw_samples": 0,
                 "observed_outside_private_samples": 16,
@@ -78,6 +79,62 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
         )
         self.assertEqual(result["completion"], {"target_exit": 1, "timed_out": 0})
         self.assertEqual(result["warnings"], [])
+
+    def test_joins_raw_host_pc_to_exact_process_image_offset(self) -> None:
+        result = self.analyze(
+            "\n".join(
+                (
+                    "PCPROFILE1|config|sample_hz=197",
+                    "PCPROFILE1|range|kind=private|pid=7|epoch=1|sequence=1|start=0x1000|end=0x2000",
+                    "PCPROFILE1|host-range|pid=7|epoch=1|start=0x8000|end=0xa000",
+                    "PCPROFILE1|sample|kind=user|pid=7|epoch=1|pc=0x9120|count=4",
+                    "PCLEAF2|pid=7|epoch=1|pc=0x9120|module=0x9120|symbol=0x9120|count=4",
+                    "PCPROFILE1|completion|target_exit=1|timed_out=0",
+                )
+            )
+        )
+
+        self.assertEqual(
+            result["host_binary_offsets"], [{"count": 4, "offset": "0x1120"}]
+        )
+        self.assertEqual(result["leaf_capture"]["host_binary_raw_samples"], 4)
+        self.assertEqual(
+            result["host_text_ranges"],
+            {"process_epochs": 1, "reported": 1, "unique": 1},
+        )
+        self.assertEqual(result["warnings"], [])
+
+    def test_treats_module_qualified_hex_symbol_as_raw(self) -> None:
+        result = self.analyze(
+            "\n".join(
+                (
+                    "PCPROFILE1|config|sample_hz=197",
+                    "PCPROFILE1|range|kind=private|pid=7|epoch=1|sequence=1|start=0x1000|end=0x2000",
+                    "PCPROFILE1|host-range|pid=7|epoch=1|start=0x8000|end=0xa000",
+                    "PCPROFILE1|sample|kind=user|pid=7|epoch=1|pc=0x9340|count=3",
+                    "PCLEAF2|pid=7|epoch=1|pc=0x9340|module=carrick|symbol=carrick`0x9340|count=3",
+                    "PCPROFILE1|completion|target_exit=1|timed_out=0",
+                )
+            )
+        )
+
+        self.assertEqual(result["host_leaves"], [])
+        self.assertEqual(
+            result["host_binary_offsets"], [{"count": 3, "offset": "0x1340"}]
+        )
+
+    def test_rejects_conflicting_host_text_ranges_for_one_epoch(self) -> None:
+        with self.assertRaisesRegex(ProfileError, "conflicting host text ranges"):
+            self.analyze(
+                "\n".join(
+                    (
+                        "PCPROFILE1|config|sample_hz=197",
+                        "PCPROFILE1|host-range|pid=7|epoch=1|start=0x8000|end=0xa000",
+                        "PCPROFILE1|host-range|pid=7|epoch=1|start=0x9000|end=0xb000",
+                        "PCPROFILE1|completion|target_exit=1|timed_out=0",
+                    )
+                )
+            )
 
     def test_aggregates_same_host_leaf_across_processes_after_exact_pc_join(self) -> None:
         result = self.analyze(
@@ -135,6 +192,12 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
         self.assertIn("profile-197", script)
         self.assertNotIn("profile-997", script)
         self.assertIn("PCPROFILE1|config|sample_hz=197", script)
+        self.assertIn("carrick*:::host-image-text-range", script)
+        self.assertIn(
+            "PCPROFILE1|host-range|pid=%d|epoch=%d|start=%#x|end=%#x",
+            script,
+        )
+        self.assertNotIn("host_start[args[0]->pr_pid]", script)
         self.assertIn(
             "PCLEAF2|pid=%d|epoch=%d|pc=%#x|module=%A|symbol=%A|count=%@u",
             script,

@@ -26,8 +26,9 @@ The performance campaign now has direct cumulative and shared/default
 measurements. The branch is still active and is **not merge-ready**:
 run-encoded recovery metadata is retained, the qualified v2 profiler has a
 signed live proof, and the retained shared-translation stack has a clean
-cumulative result, but the remaining shared-path user-CPU owner has not yet
-been isolated or improved.
+cumulative result. Exact host-image PC resolution now isolates the remaining
+shared-path user-CPU owner to manifest decode and shared-unit installation, but
+that owner has not yet been improved.
 
 Retained default-on changes, each with an exact `=0` opt-out, now remove:
 
@@ -199,10 +200,49 @@ The ignored exact receipts are
 `target/perf/native-user-leaf-v2-{default,shared}-{2,3}.{raw,json}`. Their raw
 SHA-256 values in default-2/default-3/shared-2/shared-3 order are `a5e3753f…`,
 `5430d10f…`, `50bc18a8…`, and `1a721596…`; adjacent analyzed JSON values are
-`a61e764a…`, `64fb1c8b…`, `87f1bf1c…`, and `81d6279b…`. Roughly `37–41%` of host-user samples still have
-raw leaf identities. Resolve those against an exact per-process Carrick image
-range before selecting the runtime change; a raw PC must not be guessed into
-the named shared-install cluster.
+`a61e764a…`, `64fb1c8b…`, `87f1bf1c…`, and `81d6279b…`.
+
+That remaining ambiguity is now resolved. A zero-work-when-disabled
+`host-image-text-range` USDT probe publishes the exact half-open Carrick text
+range after each native process activation. The v2 analyzer joins a raw leaf
+only when its exact `(pid, epoch, PC)` falls in that process's published range,
+normalizes it to an ASLR-independent binary offset, and rejects conflicting
+ranges. The first attempted implementation inherited the parent's range across
+fork; the live analyzer correctly rejected a child self-reexec conflict rather
+than silently mis-symbolicating it. Host ranges are therefore accepted only
+from an explicit activation in that process.
+
+A clean same-binary default/shared pair then completed naturally with
+`BUILD_OK`, no warnings, exact leaf reconciliation, and `70/70` process epochs
+publishing `70` exact text ranges in each arm. In default, `1,109/1,161`
+(`95.5%`) raw host samples were exact Carrick text PCs; in shared,
+`1,480/1,599` (`92.6%`) were. Symbolicating every normalized offset with the
+exact signed binary (`f333e776…`) and `atos -l 0x100000000` strengthens the
+shared-only load/install cluster substantially:
+
+- `DirectBindingRegistry::prepare_loaded_unit`: `53` shared versus `0` default;
+- bincode tuple decode and `DecodeError` drop: `49 + 42` versus `0`;
+- `exact_guest_ranges_from_pc_map`: `31` versus `0`;
+- unstable quicksort and slice equality: `34 + 32` versus `0`;
+- manifest `Vec` deserialization: `15` versus `0`; and
+- `prepare_unit_edges`: `8` versus `0`.
+
+Those eight non-overlapping leaves alone are `264` samples, or `8.9%` of the
+shared arm's host-user bucket. In contrast, generic SHA-256 was `131` shared
+versus `129` default, and `native_host_prot_for_page` was `73` versus `69`.
+The remaining shared-path CPU owner is therefore not an unresolved raw-PC or
+generic translation-cost story: repeated manifest decode plus shared-unit
+index/binding preparation is the next production boundary. This one pair is
+directional attribution, not a timing gate.
+
+The ignored exact receipts are
+`target/perf/native-user-leaf-v2-{default,shared}-5.{raw,json}`. Raw SHA-256 is
+`a3abde618c32c1747fec239f35eb912af0586b5f526bdd5c1101dd6ec64f3145`
+for default and
+`5b2af3a0638d7c4c5d8ee7d4d08a0e6391733c556e07ad3908cf0d50a2d94415`
+for shared; analyzed JSON is
+`fe97899b5321f2d43153d35d212f2f17fe3cad9f0f06ca6562bc3d370b1175a9`
+and `883003c9a359e859f4d1b00d149c38bfc04f4119bd2651f7ebb7138a9741bd1b`.
 
 Profiler-focused integration tests pass 10/10, exact raw replay passes, and the
 complete `just test` gate passes, including the serialized runtime library at
@@ -230,14 +270,14 @@ The full gate exposed four stale keyed-export fixtures and two eager-recovery
 test helpers; both were corrected through the production validation key and a
 single representation-neutral recovery lookup seam before the green rerun.
 
-**Next:** publish the exact Carrick executable range at native image activation
-with a zero-work-when-disabled USDT probe, join the remaining raw leaves to
-per-process offsets, and use LLDB/`atos` only to ground-truth ambiguous offsets.
-Then implement one red-first, default-on shared-install candidate with an exact
-opt-out and return it to the primary eight-quad total-child-CPU gate.
-Synchronization/kqueue kernel frames remain secondary until the user-space
-comparison is resolved; do not infer that PC-map compaction wins from address
-classification alone.
+**Next:** implement one red-first, default-on shared-install candidate with an
+exact `=0` opt-out. Start at the now-proven repeated manifest-decode/index-build
+boundary, retain it only if a focused mechanism counter moves in the intended
+direction, then return it to the primary eight-quad total-child-CPU gate.
+`exact_guest_ranges_from_pc_map` is a smaller independently proven fallback if
+the representation spike needs a larger wire-format change. Synchronization
+and kqueue kernel frames remain secondary while the larger user-space owner is
+actionable.
 
 Confidence that run encoding should stay is high (`~93%`) because statistical,
 mechanism, correctness, and signed-live operability evidence now agree.
@@ -245,7 +285,8 @@ Confidence that the shared-translation campaign has a meaningful cumulative
 win is now very high (`~98%`) because the direct result won all eight quads and
 its upper interval remains well below parity. Confidence that the remaining
 shared/default regression is real is also very high (`~97%`), and confidence
-that `DSRPROF2` can reliably select the next owner remains high (`~95%`).
+that the PC/leaf profiler plus exact image range selected the right next owner
+is high (`~90%`).
 Confidence in reaching the full `>=30%` total-CPU goal is now moderate
 (`~58%`): the direct stack result is `15.50%`, rather than the projected
 `~21%`, leaving about 14.5 points that require a new measured owner. The

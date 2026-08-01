@@ -86,6 +86,16 @@ def _is_raw_address(value: str) -> bool:
     return re.fullmatch(r"0x[0-9a-fA-F]+", value) is not None
 
 
+def _is_raw_leaf(module: str, symbol: str) -> bool:
+    module_is_raw = _is_raw_address(module)
+    symbol_is_raw = _is_raw_address(symbol)
+    if module_is_raw or symbol_is_raw:
+        if module_is_raw and symbol_is_raw:
+            return True
+        raise ProfileError("host leaf has inconsistent raw module/symbol identity")
+    return re.fullmatch(rf"{re.escape(module)}`0x[0-9a-fA-F]+", symbol) is not None
+
+
 def _integer(fields: dict[str, str], key: str, line_number: int) -> int:
     try:
         value = int(fields[key], 0)
@@ -140,6 +150,8 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
     sample_hz: int | None = None
     ranges: set[TranslatedRange] = set()
     range_reported = {"private": 0, "shared": 0}
+    host_range_reported = 0
+    host_ranges: dict[tuple[int, int], tuple[int, int]] = {}
     resets = 0
     user_samples: dict[tuple[int, int, int], int] = defaultdict(int)
     kernel_samples: dict[tuple[int, int], int] = defaultdict(int)
@@ -194,6 +206,27 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
                 )
             range_reported[kind] += 1
             ranges.add(TranslatedRange(pid, epoch, kind, start, end))
+        elif record == "host-range":
+            pid = _integer(fields, "pid", line_number)
+            epoch = _integer(fields, "epoch", line_number)
+            start = _integer(fields, "start", line_number)
+            end = _integer(fields, "end", line_number)
+            if pid <= 0 or epoch <= 0 or start <= 0 or start >= end:
+                raise ProfileError(
+                    f"line {line_number}: invalid host text range pid={pid} "
+                    f"epoch={epoch} 0x{start:x}..0x{end:x}"
+                )
+            key = (pid, epoch)
+            existing = host_ranges.get(key)
+            if existing is not None and existing != (start, end):
+                raise ProfileError(
+                    "conflicting host text ranges for "
+                    f"pid={pid} epoch={epoch}: "
+                    f"0x{existing[0]:x}..0x{existing[1]:x} and "
+                    f"0x{start:x}..0x{end:x}"
+                )
+            host_range_reported += 1
+            host_ranges[key] = (start, end)
         elif record == "sample":
             kind = fields.get("kind")
             pid = _integer(fields, "pid", line_number)
@@ -276,6 +309,8 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
     host_leaf_counts: Counter[tuple[str, str]] = Counter()
     host_named_samples = 0
     host_raw_samples = 0
+    host_binary_raw_samples = 0
+    host_binary_offsets: Counter[int] = Counter()
     shared_leaf_samples = 0
     if leaf_by_pc:
         if set(leaf_by_pc) != expected_outside_keys:
@@ -290,15 +325,12 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
             if owner is not None:
                 shared_leaf_samples += count
                 continue
-            module_is_raw = _is_raw_address(module)
-            symbol_is_raw = _is_raw_address(symbol)
-            if module_is_raw != symbol_is_raw:
-                raise ProfileError(
-                    "host leaf has inconsistent raw module/symbol identity for "
-                    f"pid={key[0]} epoch={key[1]} pc=0x{key[2]:x}"
-                )
-            if module_is_raw:
+            if _is_raw_leaf(module, symbol):
                 host_raw_samples += count
+                host_range = host_ranges.get((key[0], key[1]))
+                if host_range is not None and host_range[0] <= key[2] < host_range[1]:
+                    host_binary_raw_samples += count
+                    host_binary_offsets[key[2] - host_range[0]] += count
             else:
                 host_named_samples += count
                 host_leaf_counts[(module, symbol)] += count
@@ -388,6 +420,12 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
             key=lambda item: (-item[1], item[0][0], item[0][1]),
         )
     ]
+    hot_host_binary_offsets = [
+        {"count": count, "offset": f"0x{offset:x}"}
+        for offset, count in sorted(
+            host_binary_offsets.items(), key=lambda item: (-item[1], item[0])
+        )
+    ]
 
     return {
         "completion": completion,
@@ -395,13 +433,20 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
         "hot_host_global_pcs": hot_host_global_pcs,
         "hot_host_pcs": hot_host_pcs,
         "hot_translated_ranges": hot_translated_ranges,
+        "host_binary_offsets": hot_host_binary_offsets,
         "host_leaves": host_leaves,
         "leaf_capture": {
             "expected_outside_private_samples": expected_outside_samples,
+            "host_binary_raw_samples": host_binary_raw_samples,
             "host_named_samples": host_named_samples,
             "host_raw_samples": host_raw_samples,
             "observed_outside_private_samples": observed_outside_samples,
             "shared_translated_samples": shared_leaf_samples,
+        },
+        "host_text_ranges": {
+            "process_epochs": len(host_ranges),
+            "reported": host_range_reported,
+            "unique": len(set(host_ranges.values())),
         },
         "ranges": {
             "private_reported": range_reported["private"],
