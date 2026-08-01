@@ -553,6 +553,14 @@ pub struct DirectBindingArenaSnapshot {
 }
 
 #[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DirectBindingPreparationSnapshot {
+    pub(crate) units_len: usize,
+    pub(crate) units_capacity: usize,
+    pub(crate) edge_vector_capacities: Vec<((GuestVa, GuestVa), usize, usize)>,
+}
+
+#[cfg(test)]
 type DirectBindingOwnerSnapshot = (DirectBindingCellVa, usize, UnresolvedDirectBindingRecord);
 
 #[cfg(test)]
@@ -675,11 +683,13 @@ impl DirectBindingRegistry {
                 "direct-binding unit owner is duplicated".to_string(),
             ));
         }
-        self.units.try_reserve(1).map_err(|error| {
-            DsrError::CachePolicy(format!(
-                "direct-binding unit owner reservation failed: {error}"
-            ))
-        })?;
+        let mapped_metadata = matches!(
+            unit.metadata,
+            crate::shared_cache::LoadedTranslationMetadata::V3(_)
+        );
+        if !mapped_metadata {
+            self.reserve_unit_owner()?;
+        }
         let unit_index = self.units.len();
         if !self.enabled || unit.binding_layout() == DirectBindingLayout::Disabled {
             let owned_records = match &unit.metadata {
@@ -702,6 +712,9 @@ impl DirectBindingRegistry {
                 published_bitmap: Box::new([]),
                 source_lease: unit.clone(),
             };
+            if mapped_metadata {
+                self.reserve_unit_owner()?;
+            }
             return Ok(PreparedDirectBindingUnit {
                 unit_index,
                 owner,
@@ -768,20 +781,25 @@ impl DirectBindingRegistry {
                     (record, owner)
                 }
                 crate::shared_cache::LoadedTranslationMetadata::V3(metadata) => {
-                    let record_index = u32::try_from(record_index).map_err(|_| {
+                    let mapped_record_index = u32::try_from(record_index).map_err(|_| {
                         DsrError::CachePolicy(
                             "mapped direct-binding record index exceeds u32".to_string(),
                         )
                     })?;
                     let record = metadata
-                        .binding(record_index as usize)
+                        .binding(record_index)
                         .ok_or_else(|| {
                             DsrError::CachePolicy(format!(
-                                "mapped direct-binding record index {record_index} is invalid"
+                                "mapped direct-binding record index {mapped_record_index} is invalid"
                             ))
                         })?
                         .record();
-                    (record, DirectBindingRecordOwner::V3 { record_index })
+                    (
+                        record,
+                        DirectBindingRecordOwner::V3 {
+                            record_index: mapped_record_index,
+                        },
+                    )
                 }
             };
             let offset = usize::try_from(record.ordinal.get())
@@ -857,6 +875,10 @@ impl DirectBindingRegistry {
             published_bitmap: published_bitmap.into_boxed_slice(),
             source_lease: unit.clone(),
         };
+        if mapped_metadata {
+            self.reserve_unit_owner()?;
+            self.reserve_existing_edge_destinations(&edge_records)?;
+        }
         Ok(PreparedDirectBindingUnit {
             unit_index,
             owner,
@@ -864,6 +886,14 @@ impl DirectBindingRegistry {
             edge_records,
             #[cfg(test)]
             edge_group_builds: _edge_group_builds,
+        })
+    }
+
+    fn reserve_unit_owner(&mut self) -> Result<(), DsrError> {
+        self.units.try_reserve(1).map_err(|error| {
+            DsrError::CachePolicy(format!(
+                "direct-binding unit owner reservation failed: {error}"
+            ))
         })
     }
 
@@ -922,7 +952,7 @@ impl DirectBindingRegistry {
     }
 
     fn prepare_mapped_unit_edges(
-        &mut self,
+        &self,
         unit_index: usize,
         metadata: &crate::mapped_metadata::ValidatedMappedTranslationMetadata,
     ) -> Result<Vec<PreparedDirectBindingEdge>, DsrError> {
@@ -987,9 +1017,14 @@ impl DirectBindingRegistry {
             });
         }
 
-        // All mapped records and their back-references are proven before any
-        // process-local destination capacity changes.
-        for edge in &prepared {
+        Ok(prepared)
+    }
+
+    fn reserve_existing_edge_destinations(
+        &mut self,
+        prepared: &[PreparedDirectBindingEdge],
+    ) -> Result<(), DsrError> {
+        for edge in prepared {
             if edge.existing
                 && let Some(destination) = self.records_by_edge.get_mut(&edge.key)
             {
@@ -1001,7 +1036,7 @@ impl DirectBindingRegistry {
                 })?;
             }
         }
-        Ok(prepared)
+        Ok(())
     }
 
     pub(crate) fn commit_loaded_unit(
@@ -1451,6 +1486,19 @@ impl DirectBindingRegistry {
             records_len: unit.owned_records.len(),
             bitmap_address: unit.published_bitmap.as_ptr() as usize,
             bitmap_len: unit.published_bitmap.len(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preparation_snapshot_for_test(&self) -> DirectBindingPreparationSnapshot {
+        DirectBindingPreparationSnapshot {
+            units_len: self.units.len(),
+            units_capacity: self.units.capacity(),
+            edge_vector_capacities: self
+                .records_by_edge
+                .iter()
+                .map(|(edge, records)| (*edge, records.len(), records.capacity()))
+                .collect(),
         }
     }
 

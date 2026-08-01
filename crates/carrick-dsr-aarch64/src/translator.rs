@@ -8608,6 +8608,59 @@ mod tests {
             assert_eq!(registry.logical_snapshot_for_test(), before);
         }
 
+        #[test]
+        fn mapped_direct_binding_relationship_failure_preserves_registry_allocations() {
+            let manifest = mapped_direct_binding_manifest();
+            let mut v2_manifest = manifest.clone();
+            v2_manifest.key = key(73);
+            v2_manifest.base_export = super::translation_unit_base_export(&v2_manifest.key)
+                .expect("keyed V2 control export");
+            let v2 = v2_direct_binding_unit(v2_manifest);
+            let mut registry = DirectBindingRegistry::new(true);
+            registry
+                .register_loaded_unit(&v2.unit)
+                .expect("register V2 edge control");
+
+            let mut seed = 80_u8;
+            loop {
+                let snapshot = registry.preparation_snapshot_for_test();
+                if snapshot.units_len == snapshot.units_capacity {
+                    assert!(
+                        !snapshot.edge_vector_capacities.is_empty(),
+                        "the pressured registry must retain existing edge vectors"
+                    );
+                    break;
+                }
+                registry
+                    .register_loaded_unit(&disabled_unit(key(seed), Vec::new()))
+                    .expect("fill V2 unit reservation control");
+                seed = seed.checked_add(1).expect("fixture seed capacity");
+            }
+
+            let mapped = mapped_direct_binding_unit(&manifest);
+            mapped
+                .unit
+                .metadata
+                .v3()
+                .expect("mapped metadata")
+                .arm_edge_group_access_fault_for_test(1);
+            let before_logical = registry.logical_snapshot_for_test();
+            let before_allocations = registry.preparation_snapshot_for_test();
+
+            let error = match registry.prepare_loaded_unit(&mapped.unit) {
+                Ok(_) => panic!("post-validation edge-group access must fail"),
+                Err(error) => error,
+            };
+
+            assert!(error.to_string().contains("edge-group index 1"));
+            assert_eq!(registry.logical_snapshot_for_test(), before_logical);
+            assert_eq!(
+                registry.preparation_snapshot_for_test(),
+                before_allocations,
+                "mapped relationship failure must not reserve existing registry state"
+            );
+        }
+
         pub(super) fn process_with_direct_bindings() -> ProcessTranslator {
             let process =
                 ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
