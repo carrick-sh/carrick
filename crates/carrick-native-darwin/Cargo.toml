@@ -27,4 +27,6 @@ cc = "1"
 
 [dev-dependencies]
 carrick-guest-mem = { path = "../carrick-guest-mem" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
 mach2.workspace = true
