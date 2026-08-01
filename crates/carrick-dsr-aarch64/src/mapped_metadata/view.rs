@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use carrick_guest_mem::GuestVa;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -52,6 +52,8 @@ pub struct ValidatedMappedTranslationMetadata {
     counts_u64: [u64; 12],
     #[cfg(test)]
     guest_range_access_fault: AtomicBool,
+    #[cfg(test)]
+    edge_group_access_fault: AtomicUsize,
 }
 
 impl fmt::Debug for ValidatedMappedTranslationMetadata {
@@ -97,6 +99,8 @@ impl ValidatedMappedTranslationMetadata {
             counts_u64,
             #[cfg(test)]
             guest_range_access_fault: AtomicBool::new(false),
+            #[cfg(test)]
+            edge_group_access_fault: AtomicUsize::new(usize::MAX),
         };
         metadata.validate(expected_key)?;
         Ok(metadata)
@@ -173,6 +177,10 @@ impl ValidatedMappedTranslationMetadata {
         })
     }
     pub fn edge_group(&self, index: usize) -> Option<MappedEdgeGroupView<'_>> {
+        #[cfg(test)]
+        if self.edge_group_access_fault.load(Ordering::Acquire) == index {
+            return None;
+        }
         if index >= self.edge_group_count() {
             return None;
         }
@@ -190,6 +198,12 @@ impl ValidatedMappedTranslationMetadata {
     #[cfg(test)]
     pub(crate) fn arm_guest_range_access_fault_for_test(&self) {
         self.guest_range_access_fault.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_edge_group_access_fault_for_test(&self, group_index: usize) {
+        self.edge_group_access_fault
+            .store(group_index, Ordering::Release);
     }
 
     fn validate(&self, expected_key: &TranslationUnitKey) -> Result<(), MappedMetadataError> {
