@@ -8,7 +8,9 @@
  *
  * Aggregate sampled (pid, user-PC) pairs without unwinding them, retain the
  * process-owned private/shared translated-range announcements, and join the
- * two streams offline with scripts/perf/native_pc_range_directional.py.
+ * two streams offline with scripts/perf/native_pc_range_directional.py. The
+ * deliberately load-bounded 197 Hz rate reduces observer work on fork-heavy
+ * native workloads; this remains directional evidence, not a timing gate.
  * This deliberately is not a lossless DSRPROF2 capture or a timing gate.
  *
  * Run with dtrace -c and an exact CARRICK_RUN_ID. The target-exit clause
@@ -17,7 +19,7 @@
 
 dtrace:::BEGIN
 {
-	printf("PCPROFILE1|config|sample_hz=997\n");
+	printf("PCPROFILE1|config|sample_hz=197\n");
 	elapsed = 0;
 	target_exit = 0;
 	timed_out = 0;
@@ -66,27 +68,36 @@ proc:::create
 	private_end[args[0]->pr_pid] = private_end[pid];
 }
 
-profile-997
-/tracked[pid] && current_epoch[pid] != (uint64_t)0 && arg0 == 0/
-{
-	@user_pc[(pid_t)pid, current_epoch[pid], (uint64_t)uregs[R_PC]] = count();
-}
-
 /*
- * Symbolize only samples outside the current private cache. Shared JIT PCs
- * are deliberately still present here; they print as raw/anonymous leaves
- * and the exact PC/range stream remains the ownership authority. Named host
- * symbols can be aggregated offline without ever unwinding a JIT frame.
+ * Symbolize only samples outside the current private cache. Bind every leaf
+ * to its exact (pid, epoch, PC), so the analyzer can exclude shared translated
+ * PCs before trusting or aggregating named host symbols. Record the matching
+ * PC histogram entry in this same clause: a translated-range reset on another
+ * thread can otherwise change current_epoch between two profile clauses. The
+ * PC/range join is the ownership authority; symbol text alone never does.
  */
-profile-997
+profile-197
 /tracked[pid] && current_epoch[pid] != (uint64_t)0 && arg0 == 0 &&
  (private_end[pid] == (uint64_t)0 ||
  uregs[R_PC] < private_start[pid] || uregs[R_PC] >= private_end[pid])/
 {
-	@outside_leaf[umod(uregs[R_PC]), usym(uregs[R_PC])] = count();
+	@outside_user_pc[(pid_t)pid, current_epoch[pid],
+	    (uint64_t)uregs[R_PC]] = count();
+	@outside_leaf[(pid_t)pid, current_epoch[pid],
+	    (uint64_t)uregs[R_PC], umod(uregs[R_PC]),
+	    usym(uregs[R_PC])] = count();
 }
 
-profile-997
+profile-197
+/tracked[pid] && current_epoch[pid] != (uint64_t)0 && arg0 == 0 &&
+ private_end[pid] != (uint64_t)0 &&
+ uregs[R_PC] >= private_start[pid] && uregs[R_PC] < private_end[pid]/
+{
+	@private_user_pc[(pid_t)pid, current_epoch[pid],
+	    (uint64_t)uregs[R_PC]] = count();
+}
+
+profile-197
 /tracked[pid] && current_epoch[pid] != (uint64_t)0 && arg0 != 0/
 {
 	@kernel_pid[(pid_t)pid, current_epoch[pid]] = count();
@@ -123,11 +134,13 @@ tick-1s
 END
 {
 	printa("PCPROFILE1|sample|kind=user|pid=%d|epoch=%d|pc=%#x|count=%@u\n",
-	    @user_pc);
+	    @outside_user_pc);
+	printa("PCPROFILE1|sample|kind=user|pid=%d|epoch=%d|pc=%#x|count=%@u\n",
+	    @private_user_pc);
 	printa("PCPROFILE1|sample|kind=kernel|pid=%d|epoch=%d|count=%@u\n",
 	    @kernel_pid);
-	trunc(@outside_leaf, 8000);
-	printa("PCLEAF1|module=%A|symbol=%A|count=%@u\n", @outside_leaf);
+	printa("PCLEAF2|pid=%d|epoch=%d|pc=%#x|module=%A|symbol=%A|count=%@u\n",
+	    @outside_leaf);
 	printf("PCPROFILE1|completion|target_exit=%d|timed_out=%d\n",
 	    target_exit, timed_out);
 }

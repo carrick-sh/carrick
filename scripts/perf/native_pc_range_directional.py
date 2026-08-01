@@ -13,13 +13,15 @@ import argparse
 import dataclasses
 import json
 import pathlib
+import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 
 
-SCHEMA = "carrick.native-pc-range-directional.v1"
+SCHEMA = "carrick.native-pc-range-directional.v2"
 PROTOCOL = "PCPROFILE1"
+LEAF_PROTOCOL = "PCLEAF2"
 
 
 class ProfileError(RuntimeError):
@@ -51,6 +53,37 @@ def _parse_fields(line: str, line_number: int) -> tuple[str, dict[str, str]]:
             raise ProfileError(f"line {line_number}: duplicate or empty field {key!r}")
         fields[key] = value
     return parts[1], fields
+
+
+def _parse_leaf_fields(line: str, line_number: int) -> dict[str, str]:
+    parts = line.split("|")
+    if len(parts) < 2 or parts[0] != LEAF_PROTOCOL:
+        raise ProfileError(f"line {line_number}: malformed {LEAF_PROTOCOL} record")
+    fields: dict[str, str] = {}
+    for part in parts[1:]:
+        if "=" not in part:
+            raise ProfileError(f"line {line_number}: malformed leaf field {part!r}")
+        key, value = part.split("=", 1)
+        if not key or key in fields:
+            raise ProfileError(
+                f"line {line_number}: duplicate or empty leaf field {key!r}"
+            )
+        fields[key] = value
+    expected = {"pid", "epoch", "pc", "module", "symbol", "count"}
+    if set(fields) != expected:
+        missing = sorted(expected - set(fields))
+        extra = sorted(set(fields) - expected)
+        raise ProfileError(
+            f"line {line_number}: malformed {LEAF_PROTOCOL} fields "
+            f"missing={missing} extra={extra}"
+        )
+    if not fields["module"] or not fields["symbol"]:
+        raise ProfileError(f"line {line_number}: empty leaf module or symbol")
+    return fields
+
+
+def _is_raw_address(value: str) -> bool:
+    return re.fullmatch(r"0x[0-9a-fA-F]+", value) is not None
 
 
 def _integer(fields: dict[str, str], key: str, line_number: int) -> int:
@@ -110,9 +143,27 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
     resets = 0
     user_samples: dict[tuple[int, int, int], int] = defaultdict(int)
     kernel_samples: dict[tuple[int, int], int] = defaultdict(int)
+    leaf_samples: dict[tuple[int, int, int, str, str], int] = {}
     completion: dict[str, int] | None = None
 
     for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        if line.startswith(f"{LEAF_PROTOCOL}|"):
+            fields = _parse_leaf_fields(line, line_number)
+            pid = _integer(fields, "pid", line_number)
+            epoch = _integer(fields, "epoch", line_number)
+            pc = _integer(fields, "pc", line_number)
+            count = _integer(fields, "count", line_number)
+            if pid <= 0 or epoch <= 0 or pc <= 0 or count <= 0:
+                raise ProfileError(
+                    f"line {line_number}: leaf pid/epoch/pc/count must be positive"
+                )
+            key = (pid, epoch, pc, fields["module"], fields["symbol"])
+            if key in leaf_samples:
+                raise ProfileError(
+                    f"line {line_number}: duplicate {LEAF_PROTOCOL} record"
+                )
+            leaf_samples[key] = count
+            continue
         if not line.startswith(f"{PROTOCOL}|"):
             continue
         record, fields = _parse_fields(line, line_number)
@@ -180,8 +231,10 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
     hot_host: list[tuple[int, int, int, int]] = []
     host_by_pc: dict[int, int] = defaultdict(int)
     translated_samples: dict[TranslatedRange, int] = defaultdict(int)
+    owners: dict[tuple[int, int, int], TranslatedRange | None] = {}
     for (pid, epoch, pc), count in user_samples.items():
         owner = _range_owner(ranges_by_catalog, pid, epoch, pc)
+        owners[(pid, epoch, pc)] = owner
         if owner is None:
             bucket_counts["host"] += count
             hot_host.append((count, pid, epoch, pc))
@@ -189,6 +242,78 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
         else:
             bucket_counts[f"{owner.kind}_jit"] += count
             translated_samples[owner] += count
+
+    expected_outside_keys = {
+        key for key, owner in owners.items() if owner is None or owner.kind == "shared"
+    }
+    leaf_by_pc: dict[tuple[int, int, int], tuple[str, str, int]] = {}
+    for (pid, epoch, pc, module, symbol), count in leaf_samples.items():
+        key = (pid, epoch, pc)
+        if key in leaf_by_pc:
+            raise ProfileError(
+                "multiple leaf identities for "
+                f"pid={pid} epoch={epoch} pc=0x{pc:x}"
+            )
+        if key not in user_samples:
+            raise ProfileError(
+                "leaf sample has no matching user PC histogram entry for "
+                f"pid={pid} epoch={epoch} pc=0x{pc:x}"
+            )
+        owner = owners[key]
+        if owner is not None and owner.kind == "private":
+            raise ProfileError(
+                "leaf record unexpectedly names a private translated PC for "
+                f"pid={pid} epoch={epoch} pc=0x{pc:x}"
+            )
+        if count != user_samples[key]:
+            raise ProfileError(
+                "leaf sample count does not match user PC histogram for "
+                f"pid={pid} epoch={epoch} pc=0x{pc:x}: "
+                f"leaf={count} user={user_samples[key]}"
+            )
+        leaf_by_pc[key] = (module, symbol, count)
+
+    host_leaf_counts: Counter[tuple[str, str]] = Counter()
+    host_named_samples = 0
+    host_raw_samples = 0
+    shared_leaf_samples = 0
+    if leaf_by_pc:
+        if set(leaf_by_pc) != expected_outside_keys:
+            missing = len(expected_outside_keys - set(leaf_by_pc))
+            extra = len(set(leaf_by_pc) - expected_outside_keys)
+            raise ProfileError(
+                "leaf sample count coverage does not match outside-private PC "
+                f"histogram: missing={missing} extra={extra}"
+            )
+        for key, (module, symbol, count) in leaf_by_pc.items():
+            owner = owners[key]
+            if owner is not None:
+                shared_leaf_samples += count
+                continue
+            module_is_raw = _is_raw_address(module)
+            symbol_is_raw = _is_raw_address(symbol)
+            if module_is_raw != symbol_is_raw:
+                raise ProfileError(
+                    "host leaf has inconsistent raw module/symbol identity for "
+                    f"pid={key[0]} epoch={key[1]} pc=0x{key[2]:x}"
+                )
+            if module_is_raw:
+                host_raw_samples += count
+            else:
+                host_named_samples += count
+                host_leaf_counts[(module, symbol)] += count
+
+    expected_outside_samples = (
+        bucket_counts["host"] + bucket_counts["shared_jit"]
+    )
+    observed_outside_samples = sum(
+        count for _module, _symbol, count in leaf_by_pc.values()
+    )
+    if leaf_by_pc and observed_outside_samples != expected_outside_samples:
+        raise ProfileError(
+            "leaf sample count does not match outside-private population: "
+            f"leaf={observed_outside_samples} expected={expected_outside_samples}"
+        )
 
     user_total = sum(user_samples.values())
     kernel_total = sum(kernel_samples.values())
@@ -222,6 +347,8 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
         warnings.append("capture has no translated range records")
     if not user_samples:
         warnings.append("capture has no user PC samples")
+    if expected_outside_samples and not leaf_by_pc:
+        warnings.append("capture has no PC-bound leaf records")
 
     hot_host_pcs = [
         {"count": count, "epoch": epoch, "pc": f"0x{pc:x}", "pid": pid}
@@ -246,6 +373,21 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
             translated_samples.items(), key=lambda item: item[1], reverse=True
         )[:30]
     ]
+    host_leaves = [
+        {
+            "all_cpu_share": count / all_total if all_total else 0.0,
+            "count": count,
+            "host_user_share": (
+                count / bucket_counts["host"] if bucket_counts["host"] else 0.0
+            ),
+            "module": module,
+            "symbol": symbol,
+        }
+        for (module, symbol), count in sorted(
+            host_leaf_counts.items(),
+            key=lambda item: (-item[1], item[0][0], item[0][1]),
+        )
+    ]
 
     return {
         "completion": completion,
@@ -253,6 +395,14 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
         "hot_host_global_pcs": hot_host_global_pcs,
         "hot_host_pcs": hot_host_pcs,
         "hot_translated_ranges": hot_translated_ranges,
+        "host_leaves": host_leaves,
+        "leaf_capture": {
+            "expected_outside_private_samples": expected_outside_samples,
+            "host_named_samples": host_named_samples,
+            "host_raw_samples": host_raw_samples,
+            "observed_outside_private_samples": observed_outside_samples,
+            "shared_translated_samples": shared_leaf_samples,
+        },
         "ranges": {
             "private_reported": range_reported["private"],
             "private_unique": sum(item.kind == "private" for item in ranges),

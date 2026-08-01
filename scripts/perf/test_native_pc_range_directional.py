@@ -21,7 +21,7 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
         result = self.analyze(
             "\n".join(
                 (
-                    "PCPROFILE1|config|sample_hz=997",
+                    "PCPROFILE1|config|sample_hz=197",
                     "PCPROFILE1|reset|pid=41|epoch=1",
                     "PCPROFILE1|range|kind=private|pid=41|epoch=1|sequence=1|start=0x1000|end=0x2000",
                     "PCPROFILE1|range|kind=shared|pid=41|epoch=1|sequence=2|start=0x4000|end=0x5000",
@@ -29,12 +29,14 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
                     "PCPROFILE1|sample|kind=user|pid=41|epoch=1|pc=0x4400|count=11",
                     "PCPROFILE1|sample|kind=user|pid=41|epoch=1|pc=0x9000|count=5",
                     "PCPROFILE1|sample|kind=kernel|pid=41|epoch=1|count=3",
+                    "PCLEAF2|pid=41|epoch=1|pc=0x4400|module=unit.dylib|symbol=unit.dylib`block_4|count=11",
+                    "PCLEAF2|pid=41|epoch=1|pc=0x9000|module=carrick|symbol=carrick`host_leaf|count=5",
                     "PCPROFILE1|completion|target_exit=1|timed_out=0",
                 )
             )
         )
 
-        self.assertEqual(result["schema"], "carrick.native-pc-range-directional.v1")
+        self.assertEqual(result["schema"], "carrick.native-pc-range-directional.v2")
         self.assertFalse(result["gating_eligible"])
         self.assertEqual(
             result["samples"],
@@ -52,8 +54,95 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
         self.assertEqual(
             result["hot_host_global_pcs"], [{"count": 5, "pc": "0x9000"}]
         )
+        self.assertEqual(
+            result["host_leaves"],
+            [
+                {
+                    "all_cpu_share": 5 / 26,
+                    "count": 5,
+                    "host_user_share": 1.0,
+                    "module": "carrick",
+                    "symbol": "carrick`host_leaf",
+                }
+            ],
+        )
+        self.assertEqual(
+            result["leaf_capture"],
+            {
+                "expected_outside_private_samples": 16,
+                "host_named_samples": 5,
+                "host_raw_samples": 0,
+                "observed_outside_private_samples": 16,
+                "shared_translated_samples": 11,
+            },
+        )
         self.assertEqual(result["completion"], {"target_exit": 1, "timed_out": 0})
         self.assertEqual(result["warnings"], [])
+
+    def test_aggregates_same_host_leaf_across_processes_after_exact_pc_join(self) -> None:
+        result = self.analyze(
+            "\n".join(
+                (
+                    "PCPROFILE1|config|sample_hz=197",
+                    "PCPROFILE1|range|kind=private|pid=7|epoch=1|sequence=1|start=0x1000|end=0x2000",
+                    "PCPROFILE1|range|kind=private|pid=8|epoch=1|sequence=1|start=0x3000|end=0x4000",
+                    "PCPROFILE1|sample|kind=user|pid=7|epoch=1|pc=0x9000|count=3",
+                    "PCPROFILE1|sample|kind=user|pid=8|epoch=1|pc=0xa000|count=5",
+                    "PCLEAF2|pid=7|epoch=1|pc=0x9000|module=libsystem_platform.dylib|symbol=libsystem_platform.dylib`_platform_memmove|count=3",
+                    "PCLEAF2|pid=8|epoch=1|pc=0xa000|module=libsystem_platform.dylib|symbol=libsystem_platform.dylib`_platform_memmove|count=5",
+                    "PCPROFILE1|completion|target_exit=1|timed_out=0",
+                )
+            )
+        )
+
+        self.assertEqual(result["host_leaves"][0]["count"], 8)
+        self.assertEqual(result["host_leaves"][0]["host_user_share"], 1.0)
+        self.assertEqual(result["warnings"], [])
+
+    def test_rejects_leaf_population_that_does_not_match_pc_histogram(self) -> None:
+        with self.assertRaisesRegex(ProfileError, "leaf sample count"):
+            self.analyze(
+                "\n".join(
+                    (
+                        "PCPROFILE1|config|sample_hz=197",
+                        "PCPROFILE1|sample|kind=user|pid=5|epoch=1|pc=0x5000|count=2",
+                        "PCLEAF2|pid=5|epoch=1|pc=0x5000|module=carrick|symbol=carrick`leaf|count=1",
+                        "PCPROFILE1|completion|target_exit=1|timed_out=0",
+                    )
+                )
+            )
+
+    def test_rejects_leaf_record_for_private_translated_pc(self) -> None:
+        with self.assertRaisesRegex(ProfileError, "private translated PC"):
+            self.analyze(
+                "\n".join(
+                    (
+                        "PCPROFILE1|config|sample_hz=197",
+                        "PCPROFILE1|range|kind=private|pid=5|epoch=1|sequence=1|start=0x5000|end=0x6000",
+                        "PCPROFILE1|sample|kind=user|pid=5|epoch=1|pc=0x5100|count=2",
+                        "PCLEAF2|pid=5|epoch=1|pc=0x5100|module=0x5100|symbol=0x5100|count=2",
+                        "PCPROFILE1|completion|target_exit=1|timed_out=0",
+                    )
+                )
+            )
+
+    def test_dtrace_program_is_bounded_and_pc_binds_each_leaf(self) -> None:
+        script = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "scripts/dtrace/native-pc-range-directional.d"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("profile-197", script)
+        self.assertNotIn("profile-997", script)
+        self.assertIn("PCPROFILE1|config|sample_hz=197", script)
+        self.assertIn(
+            "PCLEAF2|pid=%d|epoch=%d|pc=%#x|module=%A|symbol=%A|count=%@u",
+            script,
+        )
+        self.assertIn("@outside_user_pc[(pid_t)pid, current_epoch[pid]", script)
+        self.assertIn("@private_user_pc[(pid_t)pid, current_epoch[pid]", script)
+        self.assertNotIn("@user_pc[", script)
+        self.assertNotIn("trunc(@outside_leaf", script)
 
     def test_deduplicates_exact_fork_replay_ranges(self) -> None:
         result = self.analyze(
