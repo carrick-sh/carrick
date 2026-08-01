@@ -21,6 +21,7 @@ const DARWIN_HOST_PAGE_SIZE: u64 = 16 * 1024;
 const DARWIN_HOST_PAGE_SIZE_USIZE: usize = 16 * 1024;
 static DIRECT_BINDING_RUNTIME_ENABLED: OnceLock<bool> = OnceLock::new();
 static SHARED_MANIFEST_ARC_ENABLED: OnceLock<bool> = OnceLock::new();
+static VALIDATED_MANIFEST_REUSE_ENABLED: OnceLock<bool> = OnceLock::new();
 static SHARED_SOURCE_FINGERPRINT_REUSE_ENABLED: OnceLock<bool> = OnceLock::new();
 static SHARED_RECOVERY_RUNS_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -41,6 +42,17 @@ fn retain_loaded_manifest(manifest: Arc<TranslationUnitManifest>) -> Arc<Transla
     } else {
         Arc::new((*manifest).clone())
     }
+}
+
+fn validated_manifest_reuse_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn validated_manifest_reuse_enabled() -> bool {
+    *VALIDATED_MANIFEST_REUSE_ENABLED.get_or_init(|| {
+        let value = std::env::var_os("CARRICK_DSR_SHARED_VALIDATED_MANIFEST_REUSE");
+        validated_manifest_reuse_enabled_from(value.as_deref())
+    })
 }
 
 fn shared_source_fingerprint_reuse_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
@@ -389,6 +401,35 @@ pub struct TranslationUnitManifest {
     pub cell_size: u32,
     pub bindings: Vec<UnresolvedDirectBindingRecord>,
     pub binding_relocations: Vec<DirectBindingRelocation>,
+}
+
+/// Immutable manifest plus proof that its complete range/schema validation ran.
+///
+/// Construction is the only way to obtain this authority. Consumers can then
+/// perform checks whose safety depends on manifest geometry without rebuilding
+/// the manifest's multi-million-entry validation indexes.
+#[derive(Clone, Debug)]
+pub struct ValidatedTranslationUnitManifest {
+    manifest: Arc<TranslationUnitManifest>,
+}
+
+impl ValidatedTranslationUnitManifest {
+    pub fn new(manifest: Arc<TranslationUnitManifest>) -> Result<Self, UnitMissReason> {
+        manifest.validate_ranges()?;
+        Ok(Self { manifest })
+    }
+
+    pub fn validate_binding_code(&self, code: &[u8]) -> Result<(), UnitMissReason> {
+        self.manifest.validate_binding_code_after_ranges(code)
+    }
+}
+
+impl std::ops::Deref for ValidatedTranslationUnitManifest {
+    type Target = TranslationUnitManifest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.manifest
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -763,7 +804,8 @@ pub enum PublishOutcome {
 }
 
 pub struct SharedLoadedTranslationUnit {
-    pub manifest: Arc<TranslationUnitManifest>,
+    manifest: Arc<TranslationUnitManifest>,
+    manifest_ranges_validated: bool,
     pub base: usize,
     pub binding_base: Option<DirectBindingCellVa>,
     _lease: Arc<dyn Send + Sync>,
@@ -777,6 +819,7 @@ impl Clone for SharedLoadedTranslationUnit {
             } else {
                 Arc::new((*self.manifest).clone())
             },
+            manifest_ranges_validated: self.manifest_ranges_validated,
             base: self.base,
             binding_base: self.binding_base,
             _lease: Arc::clone(&self._lease),
@@ -792,6 +835,7 @@ impl SharedLoadedTranslationUnit {
     ) -> Self {
         Self {
             manifest: retain_loaded_manifest(manifest.into()),
+            manifest_ranges_validated: false,
             base,
             binding_base: None,
             _lease: lease,
@@ -806,10 +850,43 @@ impl SharedLoadedTranslationUnit {
     ) -> Self {
         Self {
             manifest: retain_loaded_manifest(manifest.into()),
+            manifest_ranges_validated: false,
             base,
             binding_base,
             _lease: lease,
         }
+    }
+
+    pub fn new_validated_with_binding_base(
+        manifest: ValidatedTranslationUnitManifest,
+        base: usize,
+        binding_base: Option<DirectBindingCellVa>,
+        lease: Arc<dyn Send + Sync>,
+    ) -> Self {
+        Self {
+            manifest: retain_loaded_manifest(manifest.manifest),
+            manifest_ranges_validated: true,
+            base,
+            binding_base,
+            _lease: lease,
+        }
+    }
+
+    pub fn manifest(&self) -> &TranslationUnitManifest {
+        &self.manifest
+    }
+
+    pub(crate) fn manifest_mut(&mut self) -> &mut TranslationUnitManifest {
+        self.manifest_ranges_validated = false;
+        Arc::make_mut(&mut self.manifest)
+    }
+
+    fn manifest_requires_revalidation_with(&self, reuse_validated: bool) -> bool {
+        !reuse_validated || !self.manifest_ranges_validated
+    }
+
+    pub(crate) fn manifest_requires_revalidation(&self) -> bool {
+        self.manifest_requires_revalidation_with(validated_manifest_reuse_enabled())
     }
 }
 
@@ -1049,6 +1126,10 @@ impl TranslationUnitManifest {
 
     pub fn validate_binding_code(&self, code: &[u8]) -> Result<(), UnitMissReason> {
         self.validate_ranges()?;
+        self.validate_binding_code_after_ranges(code)
+    }
+
+    fn validate_binding_code_after_ranges(&self, code: &[u8]) -> Result<(), UnitMissReason> {
         for relocation in &self.binding_relocations {
             for (adrp_offset, add_offset) in [
                 (relocation.adrp_offset, relocation.add_offset),
@@ -1284,7 +1365,43 @@ mod tests {
         let unit = SharedLoadedTranslationUnit::new(manifest_v2_fixture(), 0x1000, Arc::new(()));
         let cloned = unit.clone();
 
-        assert!(std::ptr::eq(&unit.manifest.blocks, &cloned.manifest.blocks,));
+        assert!(std::ptr::eq(
+            &unit.manifest().blocks,
+            &cloned.manifest().blocks,
+        ));
+    }
+
+    #[test]
+    fn validated_manifest_authority_rejects_invalid_ranges() {
+        let mut manifest = manifest_v2_fixture();
+        manifest.schema = TRANSLATION_UNIT_SCHEMA_V1;
+
+        assert_eq!(
+            ValidatedTranslationUnitManifest::new(Arc::new(manifest)).unwrap_err(),
+            UnitMissReason::Schema,
+        );
+    }
+
+    #[test]
+    fn loaded_unit_reuses_validated_manifest_by_default_with_exact_opt_out() {
+        let unvalidated =
+            SharedLoadedTranslationUnit::new(manifest_v2_fixture(), 0x1000, Arc::new(()));
+        assert!(unvalidated.manifest_requires_revalidation_with(true));
+        assert!(unvalidated.manifest_requires_revalidation_with(false));
+
+        let validated = ValidatedTranslationUnitManifest::new(Arc::new(manifest_v2_fixture()))
+            .expect("validate fixture manifest");
+        let mut loaded = SharedLoadedTranslationUnit::new_validated_with_binding_base(
+            validated,
+            0x1000,
+            None,
+            Arc::new(()),
+        );
+        assert!(!loaded.manifest_requires_revalidation_with(true));
+        assert!(loaded.manifest_requires_revalidation_with(false));
+
+        let _ = loaded.manifest_mut();
+        assert!(loaded.manifest_requires_revalidation_with(true));
     }
 
     #[test]
@@ -1297,6 +1414,20 @@ mod tests {
             std::ffi::OsStr::new("false")
         )));
         assert!(!shared_manifest_arc_enabled_from(Some(
+            std::ffi::OsStr::new("0")
+        )));
+    }
+
+    #[test]
+    fn validated_manifest_reuse_is_default_on_with_an_exact_opt_out() {
+        assert!(validated_manifest_reuse_enabled_from(None));
+        assert!(validated_manifest_reuse_enabled_from(Some(
+            std::ffi::OsStr::new("1")
+        )));
+        assert!(validated_manifest_reuse_enabled_from(Some(
+            std::ffi::OsStr::new("false")
+        )));
+        assert!(!validated_manifest_reuse_enabled_from(Some(
             std::ffi::OsStr::new("0")
         )));
     }
