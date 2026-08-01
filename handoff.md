@@ -1,9 +1,10 @@
 # Native-lane performance handoff
 
-**Date:** 2026-07-31
+**Date:** 2026-08-01
 **Branch:** `codex/native-performance-m1` (recovery-run evidence checkpoint
 `b0ddf87d`; performance/timeout checkpoint `47457f44`; qualified profile-v2
-checkpoint `edbdc530`; M1 correctness checkpoint `5020e509`)
+checkpoint `edbdc530`; M1 correctness checkpoint `5020e509`; mapped-metadata
+V3 decision base `6ccc6471`)
 **Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
 default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
@@ -22,15 +23,13 @@ its ignored raw trace receipts remain under `target/perf/`.
 
 ## Active performance checkpoint — retained shared-cache mechanisms
 
-The performance campaign now has direct cumulative and shared/default
-measurements. The branch is still active and is **not merge-ready**:
-run-encoded recovery metadata is retained, the qualified v2 profiler has a
-signed live proof, and the retained shared-translation stack has a clean
-cumulative result. Exact host-image PC resolution now isolates the remaining
-shared-path user-CPU owner to manifest decode and shared-unit installation. A
-narrow validation-only candidate was measured and rejected; the next candidate
-must change the manifest's runtime representation rather than merely trusting
-the same decoded structures sooner.
+The performance campaign now has direct cumulative, shared/default, and
+incremental V2/V3 measurements. The branch is still active and is **not
+merge-ready**: run-encoded recovery metadata and mapped translation metadata
+V3 are retained, the qualified v2 profiler has signed live proofs, and the
+retained shared-translation stack has a clean cumulative result. The full
+`>=30%` goal remains open, and the next retained-tip owner still requires a
+fresh default/shared attribution before another production candidate.
 
 Retained default-on changes, each with an exact `=0` opt-out, now remove:
 
@@ -38,13 +37,114 @@ Retained default-on changes, each with an exact `=0` opt-out, now remove:
 - eager per-process recovery-action binding, with portable recovery metadata
   additionally run-encoded for lazy fault-time lookup;
 - full 60+ MiB dylib reads and SHA-256 rehashes in every descendant, replaced
-  by bounded Mach-O reads plus a signed key-specific export identity; and
+  by bounded Mach-O reads plus a signed key-specific export identity;
+- owned V2 manifest decode plus rebuilt PC/recovery/range/binding indexes in
+  every descendant, replaced by one validated read-only mapped V3 sidecar; and
 - indirect copying of instruction bytes where the direct form is proven.
+
+### Mapped translation metadata V3 — retained by the first timing authority
+
+Task 8 retains mapped translation metadata V3 default-on, with exact
+`CARRICK_DSR_SHARED_MAPPED_METADATA=0` as the V2 opt-out. This is the first and
+only V3 timing decision; Task 7's traced samples remain mechanism and
+secondary-risk evidence only.
+
+The single immutable same-binary receipt is
+`target/perf/mapped-metadata-arm/arm.json` (SHA-256
+`a53f2759608edb077d5b882787fecb85ed8ec4684be505d03774a24b3337cef1`).
+Both arms used that exact path and its read-only signed binary:
+
+- source commit `6ccc6471fe29a3bb4391777b7d76c45b33b98ec7` on
+  `codex/native-performance-m1`, with empty source status;
+- binary SHA-256
+  `cf3f64f7086820c404bad6419501338418938816ccda010509cae25d0cd2ef7d`,
+  Mach-O UUID `88F99BAA-962F-31DA-9EF0-25DF0BB1F329`, entitlement SHA-256
+  `c439c3ffbe9d1b486321de3360bd9f1368024751553ae131aa0490e4e49841dd`,
+  strict codesign accepted, and `__dof_carrick` present;
+- exact arm64 image
+  `localhost:5005/carrick-go-conformance@sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b`,
+  whose image ID and sole repo digest are the same digest; and
+- V2 overlay SHA-256
+  `3c40a2750fa9c843b3f4996fa6a782ceda09b36d516bcc3a76a64c77dff0e620`
+  versus V3 overlay SHA-256
+  `8a45d6d3731f2c057337bb34bcac4f07adc897707abc99d2dae51901defd95f8`.
+  Their only difference is mapped metadata `"0"` versus normalized default
+  `null`; shared translation and direct bindings remain exactly `"1"`.
+
+Campaign `46616-9c74e172bfc043998e0e2f6679e95e2e` ran the predeclared
+eight ABBA quads without a retry, splice, or selected run. It completed 2
+excluded warmups plus all 32/32 measured samples and nine preflights. Every
+sample returned zero, emitted `BUILD_OK` exactly once, avoided timeout, cleaned
+up with status zero, and retained identical pre/post provenance. Every
+preflight recorded AC power under the authorized `--allow-battery` policy, the
+explicit no-warning thermal contract, empty busy/foreign/Docker-oracle state,
+and the exact receipt/image. The raw and exclusively published artifacts are
+byte-identical at SHA-256
+`2839f8db60bcf7af25673128c478d83c210899d2d290301da11afde2b1924ba3`:
+[`scripts/perf/evidence/native-mapped-metadata-v3-abba.json`](scripts/perf/evidence/native-mapped-metadata-v3-abba.json).
+
+The primary total-child-CPU gate and every secondary moved in V3's favor:
+
+| metric | V2 median | V3 median | V3/V2 ratio (movement) | wins | one-sided upper | two-sided interval | sign probability |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| total CPU `cpu_s` | `32.443216` | `31.385478` | `0.9687464359233304` (`-3.125356407666957%`) | `8/8` | `0.981387322486502` | `0.9500661395872914..0.9897549000382243` | `1/256` (`0.00390625`) |
+| user CPU `cpu_user_s` | `22.6670175` | `21.81597875` | `0.9702604623790994` (`-2.9739537620900647%`) | `8/8` | `0.9838363782239512` | `0.9471561990435181..0.9950829044289131` | `1/256` (`0.00390625`) |
+| system CPU `cpu_sys_s` | `9.78776675` | `9.53821025` | `0.9668473192759123` (`-3.3152680724087724%`) | `8/8` | `0.9756878210968964` | `0.9567891510903371..0.9773623110282287` | `1/256` (`0.00390625`) |
+| outer wall `elapsed_ms` | `14547.5` | `14221.0` | `0.9789933273908056` (`-2.100667260919442%`) | `8/8` | `0.9870290191931548` | `0.9695616325408822..0.9932260504779589` | `1/256` (`0.00390625`) |
+| guest workload `workload_ms` | `12641.5` | `12317.0` | `0.9744598048364301` (`-2.5540195163569868%`) | `8/8` | `0.9854613443622682` | `0.9661680911680912..0.993543531648578` | `1/256` (`0.00390625`) |
+
+All five runner criteria are true: complete with eight quads, primary median
+below one, primary one-sided upper below one, primary exact sign probability
+below `0.05`, and no supported secondary regression. The artifact's
+`decision.retained=false` remains a deliberate harness boundary: it cannot
+self-certify the external mechanism and correctness authorities. The project
+decision is **retain V3**, because those external gates are separately green.
+
+The accepted mechanism/secondary-risk authority is
+`target/perf/native-metadata-v3-nmv3r4c-risk.json`, SHA-256
+`f333e218c396769e07d2290ec3ee0abb5cc5c2a5f2549214abf851c414d0c273`.
+It is one authenticated five-pair chain with status `passed`, no failures, and
+`supported_v3_owner_increases=[]`. Mean V3-minus-V2 movement per 1,000 samples
+was dyld `-0.228608` (`p=7/8`), kernel `-4.554182` (`p=13/16`), locks
+`-0.412291` (`p=7/8`), malloc `-1.620070` (`p=13/16`), and mmap/fault
+`+0.071952` (`p=1/16`). The positive mmap/fault point estimate is unsupported
+at the predeclared `0.05` threshold and is not a regression. For actual kernel
+time, the authoritative measurement is child-rusage `cpu_sys_s` above:
+`-3.3152680724087724%`, not the traced kernel sample rate.
+
+Task 7's production/correctness authority ran sequentially and passed
+`just fmt-check`, `just clippy`, `cargo test -p carrick-dsr-aarch64 --lib`
+(283), `cargo test -p carrick-native-darwin --lib` (45),
+`RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib` (1,128 passed, 5
+ignored), `RUST_TEST_THREADS=1 just ci`, `just build`, and native smoke
+conformance (23/23 full, 2/2 Node, 6/6 CPython; cached oracles and zero Docker
+runs). Final Task 7 evidence hardening additionally passed the full
+`scripts/perf` discovery (482), focused launcher/directional/risk tests (62),
+the DTrace compile smoke, focused trace-child test, warnings-denied CLI clippy,
+formatting, Python byte-compilation, and diff checks. Task 8 then rebuilt and
+signed clean source `6ccc6471` before freezing the receipt; no tracked source
+changed after preparation or during timing.
+
+Keep this incremental V2/V3 result separate from the earlier cumulative stack
+result. The prior direct cumulative improvement remains `15.5007%`; this new
+`3.125356407666957%` V2-to-V3 result is neither added to nor compounded with
+it, and no updated cumulative end-to-end result has been measured.
+
+**Next measured owner:** re-qualify the retained V3 shared/default gap, then
+target the mapped-validation scan only if it remains supported. Across the
+accepted five V3 mechanism captures,
+`ValidatedMappedTranslationMetadata::validate_guest_ranges` carried `291`
+exact Carrick-offset samples and `validate_pc_map` carried `157`, ahead of
+`DirectBindingRegistry::prepare_loaded_unit` at `188`; these are directional
+owner counts, not savings. Do not promote the unsupported mmap/fault point
+estimate or compound the V3 result. A fresh retained-tip default/shared
+attribution must establish the next production boundary before another
+candidate reaches the same eight-quad total-CPU gate.
 
 The final two-binary cumulative campaign directly compared clean detached
 source commits `04b2222d` and `b0ddf87d`, with shared translation enabled on
 both arms. Across eight complete ABBA quads the retained stack won `8/8` and
-measured a total-CPU ratio of `0.84499` (`-15.50%`; one-sided upper `0.87124`,
+measured a total-CPU ratio of `0.84499` (`-15.5007%`; one-sided upper `0.87124`,
 two-sided interval `0.80496..0.88793`, sign probability `1/256`). User CPU fell
 `17.40%`, system CPU `10.84%`, outer wall `15.66%`, and guest workload `17.87%`.
 This direct result supersedes the former `~21.4%` compounded projection: the
@@ -56,7 +156,7 @@ the current shared path. Shared translation still costs `6.76%` total CPU
 `1.02327..1.09442`), comprising `+8.49%` user CPU, `+2.93%` system CPU,
 `+6.22%` wall, and `+6.74%` guest workload. This replaces the older `+16.46%`
 gap: most of it is closed, but the remainder is statistically clear and is now
-predominantly user-space. The cumulative `-15.50%` result is therefore an
+predominantly user-space. The cumulative `-15.5007%` result is therefore an
 official result for the shared-translation mechanism stack, not a claim that
 the shipped default path improved by the same amount.
 
@@ -300,18 +400,10 @@ The full gate exposed four stale keyed-export fixtures and two eager-recovery
 test helpers; both were corrected through the production validation key and a
 single representation-neutral recovery lookup seam before the green rerun.
 
-**Next:** design the representation-level shared-install candidate now that a
-larger manifest change is explicitly in scope. The recommended direction is a
-versioned mapped runtime-metadata representation that descendants can query
-without bincode decoding or rebuilding the large PC/recovery indexes. Before
-implementation, settle whether existing cache entries may be invalidated and
-rebuilt on the schema transition, compare that direction against a smaller
-index sidecar and an embedded-Mach-O representation, then write and approve the
-design and implementation plan. The eventual slice remains red-first,
-default-on, and exactly opt-out; it must first move a focused decode/index-build
-mechanism counter and then pass the primary eight-quad total-child-CPU gate.
-Synchronization and kqueue kernel frames remain secondary while the larger
-user-space owner is actionable.
+**Superseded next direction:** the proposed versioned mapped runtime-metadata
+representation is now implemented, mechanism-proven, and retained by the Task
+8 authority above. Do not repeat that design decision or use this historical
+paragraph as the current next step.
 
 Confidence that run encoding should stay is high (`~93%`) because statistical,
 mechanism, correctness, and signed-live operability evidence now agree.
@@ -321,16 +413,13 @@ its upper interval remains well below parity. Confidence that the remaining
 shared/default regression is real is also very high (`~97%`), and confidence
 that the PC/leaf profiler plus exact image range selected the right next owner
 is high (`~90%`).
-Confidence that the validation-only candidate deserved rejection is very high
-(`~97%`), and confidence that a mapped representation can produce a measurable
-next win is moderately high (`~72%`) because decode/index construction is
-directly sampled and the current manifests reach 130 MiB. Confidence in
-reaching the full `>=30%` total-CPU goal remains moderate (`~58%`): the direct
-stack result is `15.50%`, rather than the projected `~21%`, leaving about 14.5
-points that require new measured owners. Permission to make a larger manifest
-change removes a design constraint, but it is not itself evidence, so the
-overall estimate should not rise until the mapped candidate passes the real
-gate.
+Confidence that the validation-only candidate deserved rejection remains very
+high (`~97%`). The former `~72%` forecast that a mapped representation could
+produce a measurable win is superseded by the direct V3 result above. The
+`>=30%` total-CPU goal remains open: the prior cumulative stack result is
+`15.5007%`, while V3 is an incremental V2/V3 result and cannot be compounded
+without a fresh end-to-end cumulative campaign. The next confidence update
+must follow retained-tip attribution and measurement, not projection.
 
 ---
 
@@ -560,9 +649,11 @@ low-perturbation host-user hypothesis that explains the directly measured
 resolve ambiguous PCs with LLDB where necessary, then advance one default-on
 candidate with an exact opt-out to the primary ABBA total-child-CPU gate.
 
-The `>=30%` CPU goal remains open. The combined shared-translation stack now
-has a direct `-15.50%` total-CPU result; the next 14.5 points require a new
-measured owner rather than compounding prior projections.
+The `>=30%` CPU goal remains open. The earlier combined shared-translation
+stack has a direct `-15.5007%` total-CPU result. V3's new result is incremental
+against V2 and does not establish an updated cumulative total; the remaining
+gap requires a fresh cumulative run and a new measured owner rather than
+compounding prior projections.
 
 ---
 
