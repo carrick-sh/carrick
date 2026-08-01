@@ -14,8 +14,8 @@ pub use carrick_dsr_aarch64::shared_cache::PublishOutcome;
 use carrick_dsr_aarch64::shared_cache::{
     LoadedTranslationProtection, MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit,
     TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitKey, TranslationUnitManifest, UnitMissReason,
-    pin_loaded_translation_protection, shared_source_fingerprint_reuse_enabled,
-    translation_unit_base_export,
+    ValidatedTranslationUnitManifest, pin_loaded_translation_protection,
+    shared_source_fingerprint_reuse_enabled, translation_unit_base_export,
 };
 use sha2::{Digest, Sha256};
 
@@ -85,7 +85,7 @@ impl std::error::Error for UnitStoreError {
 
 #[derive(Debug)]
 pub struct LoadedTranslationUnit {
-    pub manifest: Arc<TranslationUnitManifest>,
+    pub manifest: ValidatedTranslationUnitManifest,
     pub base: std::ptr::NonNull<u8>,
     pub binding_base: Option<DirectBindingCellVa>,
     lease: Arc<LoadedTranslationLease>,
@@ -538,10 +538,9 @@ fn loaded_segment_range(
 }
 
 fn validate_loaded_binding_cells_atomically(
-    manifest: &TranslationUnitManifest,
+    manifest: &ValidatedTranslationUnitManifest,
     binding_base: DirectBindingCellVa,
 ) -> Result<(), UnitMissReason> {
-    manifest.validate_ranges()?;
     let binding_len =
         usize::try_from(manifest.binding_data_len).map_err(|_| UnitMissReason::ManifestRange)?;
     let cell_size =
@@ -1009,12 +1008,10 @@ impl ContainerCacheAuthority {
         let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
             UnitStoreError::with_source("read manifest", UnitMissReason::Schema, error)
         })?;
-        let manifest: TranslationUnitManifest =
-            decode_manifest(&manifest_bytes).map_err(|error| {
-                UnitStoreError::with_source("decode manifest", UnitMissReason::Schema, error)
-            })?;
-        manifest
-            .validate_ranges()
+        let manifest = decode_manifest(&manifest_bytes).map_err(|error| {
+            UnitStoreError::with_source("decode manifest", UnitMissReason::Schema, error)
+        })?;
+        let manifest = ValidatedTranslationUnitManifest::new(Arc::new(manifest))
             .map_err(|reason| UnitStoreError::new("validate manifest", reason))?;
         if &manifest.key != expected_key {
             return Err(UnitStoreError::new(
@@ -1238,7 +1235,7 @@ impl ContainerCacheAuthority {
             loaded_binding_base = Some(binding_cell_base);
         }
         Ok(LoadedTranslationUnit {
-            manifest: Arc::new(manifest),
+            manifest,
             base,
             binding_base: loaded_binding_base,
             lease: Arc::new(LoadedTranslationLease { handle }),
@@ -1411,7 +1408,7 @@ impl carrick_dsr_aarch64::shared_cache::TranslationUnitStore for ActiveContainer
                 } = loaded;
                 let base = base.as_ptr() as usize;
                 Ok(Some(
-                    carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit::new_with_binding_base(
+                    carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit::new_validated_with_binding_base(
                         manifest,
                         base,
                         binding_base,
@@ -2141,7 +2138,7 @@ mod tests {
         );
         let binding_base = loaded.binding_base.expect("typed binding base");
         let lease: std::sync::Arc<dyn Send + Sync> = loaded.clone();
-        let shared = SharedLoadedTranslationUnit::new_with_binding_base(
+        let shared = SharedLoadedTranslationUnit::new_validated_with_binding_base(
             loaded.manifest.clone(),
             loaded.base.as_ptr() as usize,
             Some(binding_base),
