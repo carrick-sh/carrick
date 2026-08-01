@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""Stable DTrace target launcher for the canonical native Go workload.
+from __future__ import annotations
+
+import hashlib
+import marshal
+import sys
+
+
+_module_frame = sys._getframe()
+LOADED_MODULE_CODE = {
+    "digest_method": "sha256-canonical-marshal-roundtrip-v1",
+    "filename": _module_frame.f_code.co_filename,
+    "flags": _module_frame.f_code.co_flags,
+    "marshal_sha256": hashlib.sha256(
+        marshal.dumps(marshal.loads(marshal.dumps(_module_frame.f_code)))
+    ).hexdigest(),
+    "marshal_version": marshal.version,
+    "optimize": sys.flags.optimize,
+    "python_cache_tag": sys.implementation.cache_tag,
+}
+del _module_frame
+
+
+__doc__ = """Stable DTrace target launcher for the canonical native Go workload.
 
 Darwin DTrace may reject an ``env``/``execve`` target transition. Keeping this
 Python process alive while Carrick runs as its child gives D scripts one stable
@@ -7,19 +29,16 @@ Python process alive while Carrick runs as its child gives D scripts one stable
 Carrick binary the direct ``$target`` while keeping controls explicit.
 """
 
-from __future__ import annotations
 
 import argparse
 import base64
 import dataclasses
-import hashlib
 import json
 import os
 import pathlib
 import re
 import signal
 import subprocess
-import sys
 import time
 
 
@@ -52,7 +71,6 @@ DTRACE_DIAGNOSTIC_PATTERNS = (
 TRACE_CHILD_IDENTITY = re.compile(
     r"^TRACECHILD1\|euid=(\d+)\|egid=(\d+)\|groups=([0-9,]*)$"
 )
-
 
 @dataclasses.dataclass(frozen=True)
 class TraceIdentity:
@@ -236,11 +254,15 @@ def _execution_identity(
     analyzer_path = pathlib.Path(native_pc_range_directional.__file__).resolve()
     return {
         "analyzer": {
-            **_retained_artifact(analyzer_path),
+            **native_pc_range_risk.authenticate_loaded_module_source(
+                analyzer_path, native_pc_range_directional.LOADED_MODULE_CODE
+            ),
             "schema": native_pc_range_directional.SCHEMA,
         },
         "binary": native_pc_range_risk.inspect_binary_identity(binary),
-        "launcher": _retained_artifact(pathlib.Path(__file__)),
+        "launcher": native_pc_range_risk.authenticate_loaded_module_source(
+            pathlib.Path(__file__), LOADED_MODULE_CODE
+        ),
         "overlay_source": _retained_artifact(overlay_path),
         "trace_script": _retained_artifact(trace_script),
     }
@@ -254,11 +276,8 @@ def _load_predecessor(
     pair_ordinal: int,
     arm: str,
 ) -> tuple[dict[str, object], dict[str, object]]:
-    before = _retained_artifact(path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    after = _retained_artifact(path)
-    if before != after:
-        raise ValueError("predecessor capture drifted while loading")
+    payload_value, capture_artifact = native_pc_range_risk.stable_read_json(path)
+    payload = payload_value
     if (
         not isinstance(payload, dict)
         or payload.get("schema") != native_pc_range_risk.CAPTURE_SCHEMA
@@ -282,7 +301,9 @@ def _load_predecessor(
         )
     if not exact:
         raise ValueError("predecessor arm, pair, or ordinal is not exact")
-    binding = native_pc_range_risk.predecessor_binding(path, payload)
+    binding = native_pc_range_risk.predecessor_binding(
+        path, payload, capture_artifact
+    )
     return payload, binding
 
 
@@ -430,6 +451,8 @@ def _verify_standalone_capture(
 
     analyzer_status: int | None = None
     analysis: dict[str, object] | None = None
+    analysis_artifact: dict[str, object] | None = None
+    raw_artifact: dict[str, object] | None = None
     if trace_output.is_file():
         analyzer_status = native_pc_range_directional.main(
             [
@@ -447,9 +470,27 @@ def _verify_standalone_capture(
         if analyzer_status != 0:
             failures.append(f"strict directional analyzer exited {analyzer_status}")
         elif analysis_path.is_file():
-            analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+            analysis_value, analysis_artifact = (
+                native_pc_range_risk.stable_read_json(analysis_path)
+            )
+            if isinstance(analysis_value, dict):
+                analysis = analysis_value
+            else:
+                failures.append("strict directional analyzer JSON root is malformed")
         else:
             failures.append("strict directional analyzer retained no JSON receipt")
+        try:
+            raw_artifact = _retained_artifact(trace_output)
+        except (OSError, ValueError) as error:
+            failures.append(f"raw capture identity failed closed: {error}")
+        if (
+            analysis is not None
+            and raw_artifact is not None
+            and analysis.get("input_artifact") != raw_artifact
+        ):
+            failures.append(
+                "strict directional analysis does not bind the retained raw capture"
+            )
 
     execution_post: dict[str, object] | None = None
     try:
@@ -515,7 +556,6 @@ def _verify_standalone_capture(
     if not natural_completion:
         failures.append("capture did not authenticate exact natural completion")
 
-    analyzer_path = pathlib.Path(native_pc_range_directional.__file__).resolve()
     trace_script = trace_script.resolve()
     artifact_paths = {
         "raw": trace_output,
@@ -525,13 +565,16 @@ def _verify_standalone_capture(
     }
     completed_unix_ns = time.time_ns()
     receipt = {
-        "analyzer": {
-            **_retained_artifact(analyzer_path),
-            "schema": native_pc_range_directional.SCHEMA,
-        },
+        "analyzer": execution_pre.get("analyzer"),
         "analyzer_status": analyzer_status,
         "artifacts": {
-            role: _retained_artifact(path)
+            role: (
+                analysis_artifact
+                if role == "analysis" and analysis_artifact is not None
+                else raw_artifact
+                if role == "raw" and raw_artifact is not None
+                else _retained_artifact(path)
+            )
             for role, path in artifact_paths.items()
             if path.is_file()
         },

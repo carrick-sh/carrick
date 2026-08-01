@@ -84,20 +84,24 @@ carrick*:::host-image-text-range
  * Symbolize only samples outside the current private cache. Bind every leaf
  * to its exact (pid, epoch, PC), so the analyzer can exclude shared translated
  * PCs before trusting or aggregating named host symbols. Record the matching
- * PC histogram entry in this same clause: a translated-range reset on another
- * thread can otherwise change current_epoch between two profile clauses. The
- * PC/range join is the ownership authority; symbol text alone never does.
+ * PC histogram entry in this same clause. Snapshot the process catalog once:
+ * a translated-range reset on another CPU can otherwise change current_epoch
+ * even between two aggregation actions in one profile clause. The PC/range
+ * join is the ownership authority; symbol text alone never does.
  */
 profile-197
 /tracked[pid] && current_epoch[pid] != (uint64_t)0 && arg0 == 0 &&
  (private_end[pid] == (uint64_t)0 ||
  uregs[R_PC] < private_start[pid] || uregs[R_PC] >= private_end[pid])/
 {
-	@outside_user_pc[(pid_t)pid, current_epoch[pid],
-	    (uint64_t)uregs[R_PC]] = count();
-	@outside_leaf[(pid_t)pid, current_epoch[pid],
-	    (uint64_t)uregs[R_PC], umod(uregs[R_PC]),
-	    usym(uregs[R_PC])] = count();
+	this->sample_pid = (pid_t)pid;
+	this->sample_epoch = current_epoch[this->sample_pid];
+	this->sample_pc = (uint64_t)uregs[R_PC];
+	@outside_user_pc[this->sample_pid, this->sample_epoch,
+	    this->sample_pc] = count();
+	@outside_leaf[this->sample_pid, this->sample_epoch,
+	    this->sample_pc, umod(this->sample_pc),
+	    usym(this->sample_pc)] = count();
 }
 
 profile-197
@@ -105,15 +109,20 @@ profile-197
  private_end[pid] != (uint64_t)0 &&
  uregs[R_PC] >= private_start[pid] && uregs[R_PC] < private_end[pid]/
 {
-	@private_user_pc[(pid_t)pid, current_epoch[pid],
-	    (uint64_t)uregs[R_PC]] = count();
+	this->sample_pid = (pid_t)pid;
+	this->sample_epoch = current_epoch[this->sample_pid];
+	this->sample_pc = (uint64_t)uregs[R_PC];
+	@private_user_pc[this->sample_pid, this->sample_epoch,
+	    this->sample_pc] = count();
 }
 
 profile-197
 /tracked[pid] && current_epoch[pid] != (uint64_t)0 && arg0 != 0/
 {
-	@kernel_pid[(pid_t)pid, current_epoch[pid]] = count();
-	@kernel_stack[(pid_t)pid, current_epoch[pid], stack(24)] = count();
+	this->sample_pid = (pid_t)pid;
+	this->sample_epoch = current_epoch[this->sample_pid];
+	@kernel_pid[this->sample_pid, this->sample_epoch] = count();
+	@kernel_stack[this->sample_pid, this->sample_epoch, stack(24)] = count();
 }
 
 proc:::exit

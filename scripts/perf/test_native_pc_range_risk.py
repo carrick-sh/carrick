@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import marshal
+import os
 import pathlib
 import plistlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -31,6 +35,32 @@ def artifact(path: pathlib.Path) -> dict[str, object]:
             "mtime_ns": stat.st_mtime_ns,
             "size": stat.st_size,
         },
+    }
+
+
+def loaded_source_identity(path: pathlib.Path) -> dict[str, object]:
+    filename = str(path.resolve())
+    code = compile(
+        path.read_bytes(),
+        filename,
+        "exec",
+        flags=0,
+        dont_inherit=True,
+        optimize=sys.flags.optimize,
+    )
+    return {
+        "loaded_code": {
+            "digest_method": "sha256-canonical-marshal-roundtrip-v1",
+            "filename": filename,
+            "flags": code.co_flags,
+            "marshal_sha256": hashlib.sha256(
+                marshal.dumps(marshal.loads(marshal.dumps(code)))
+            ).hexdigest(),
+            "marshal_version": marshal.version,
+            "optimize": sys.flags.optimize,
+            "python_cache_tag": sys.implementation.cache_tag,
+        },
+        "source": artifact(path),
     }
 
 
@@ -66,8 +96,13 @@ class Campaign:
         self.analyzer_path = root / "native_pc_range_directional.py"
         self.launcher_path = root / "native_go_dtrace_target.py"
         self.trace_script.write_text("dtrace program\n")
-        self.analyzer_path.write_text("directional analyzer\n")
-        self.launcher_path.write_text("capture launcher\n")
+        self.analyzer_path.write_text("DIRECTIONAL_ANALYZER = True\n")
+        self.launcher_path.write_text("CAPTURE_LAUNCHER = True\n")
+        analyzer_identity = {
+            **loaded_source_identity(self.analyzer_path),
+            "schema": "carrick.native-pc-range-directional.v2",
+        }
+        launcher_identity = loaded_source_identity(self.launcher_path)
         self.binary = {
             **artifact(self.binary_path),
             "dof": {"address": 0x100400000, "offset": 40, "segment": "__TEXT", "size": 99},
@@ -106,7 +141,9 @@ class Campaign:
                 driver_stdout = root / f"p{ordinal}-{prefix}.driver.out"
                 driver_stderr = root / f"p{ordinal}-{prefix}.driver.err"
                 raw.write_text(f"unique raw pair={ordinal} mode={mode}\n", encoding="utf-8")
-                analyzed.write_text(json.dumps(analysis(offset=offset, owner_count=count)), encoding="utf-8")
+                analyzed_payload = analysis(offset=offset, owner_count=count)
+                analyzed_payload["input_artifact"] = artifact(raw)
+                analyzed.write_text(json.dumps(analyzed_payload), encoding="utf-8")
                 driver_stdout.write_text(f"WORKLOAD_NS={ordinal}{0 if mode == 'v2' else 1}\nBUILD_OK\n")
                 driver_stderr.write_text(f"TRACECHILD1|pair={ordinal}|mode={mode}\nok\n")
                 overlay_path = risk.OVERLAY_PATHS[mode]
@@ -115,7 +152,7 @@ class Campaign:
                 identity = {"egid": 20, "euid": 501, "supplementary_gids": [12, 20]}
                 chronology_index += 1
                 receipt = {
-                    "analyzer": {**artifact(self.analyzer_path), "schema": "carrick.native-pc-range-directional.v2"},
+                    "analyzer": analyzer_identity,
                     "artifacts": {
                         "analysis": artifact(analyzed),
                         "driver_stderr": artifact(driver_stderr),
@@ -142,16 +179,16 @@ class Campaign:
                     },
                     "execution_identity": {
                         "post": {
-                            "analyzer": {**artifact(self.analyzer_path), "schema": "carrick.native-pc-range-directional.v2"},
+                            "analyzer": analyzer_identity,
                             "binary": self.binary,
-                            "launcher": artifact(self.launcher_path),
+                            "launcher": launcher_identity,
                             "overlay_source": artifact(overlay_path),
                             "trace_script": artifact(self.trace_script),
                         },
                         "pre": {
-                            "analyzer": {**artifact(self.analyzer_path), "schema": "carrick.native-pc-range-directional.v2"},
+                            "analyzer": analyzer_identity,
                             "binary": self.binary,
-                            "launcher": artifact(self.launcher_path),
+                            "launcher": launcher_identity,
                             "overlay_source": artifact(overlay_path),
                             "trace_script": artifact(self.trace_script),
                         },
@@ -215,6 +252,7 @@ class NativePcRangeRiskTests(unittest.TestCase):
                 ),
                 "module": "carrick",
                 "offset": f"0x{offset:x}",
+                "owner_kind": "instruction_symbol",
                 "symbol": "pthread_mutex_lock" if offset == 0x20 else "ordinary",
             }
             for offset in offsets
@@ -358,6 +396,41 @@ Section
             )
         )
 
+    def test_non_instruction_section_names_never_enter_owner_predicates(self) -> None:
+        names = ("__lock_shared", "__mmap", "__malloc", "__dyld")
+        symbolizations = {
+            index: {
+                "absolute_address": f"0x{0x100000000 + index:x}",
+                "module": "carrick",
+                "offset": f"0x{index:x}",
+                "owner_kind": "non_instruction_section",
+                "section": name,
+                "section_offset": "0x0",
+                "segment": "__TEXT",
+                "symbol": f"__TEXT,{name}+0x0",
+            }
+            for index, name in enumerate(names, start=1)
+        }
+        payload = analysis(offset=1, owner_count=3)
+        payload["host_binary_offsets"] = [
+            {"count": 3, "offset": f"0x{offset:x}"}
+            for offset in symbolizations
+        ]
+        classified = risk.classify(payload, symbolizations)
+        self.assertEqual(
+            {
+                name: classified["categories"][name]["count"]
+                for name in ("dyld", "locks", "malloc", "mmap_fault")
+            },
+            {"dyld": 0, "locks": 0, "malloc": 0, "mmap_fault": 0},
+        )
+        self.assertEqual(classified["non_instruction_section_offsets"], 4)
+        self.assertEqual(classified["non_instruction_section_samples"], 12)
+        self.assertEqual(
+            [row["section"] for row in classified["non_instruction_section_owners"]],
+            list(names),
+        )
+
     def test_bare_atos_address_in_instruction_section_still_fails(self) -> None:
         binary = {
             "path": "/exact/carrick",
@@ -396,7 +469,9 @@ Section
         self.assertEqual(receipt["regression_method"], risk.REGRESSION_METHOD)
         self.assertEqual(
             receipt["artifacts"]["risk_analyzer"],
-            artifact(pathlib.Path(risk.__file__)),
+            risk.authenticate_loaded_module_source(
+                pathlib.Path(risk.__file__), risk.LOADED_MODULE_CODE
+            ),
         )
 
     def test_mixed_pair_deltas_preserve_point_delta_without_support(self) -> None:
@@ -498,6 +573,85 @@ Section
                 risk.atomic_write_json(output, {"schema": risk.SCHEMA, "status": "failed"})
         self.assertFalse(output.exists())
         self.assertEqual(list(self.root.glob(".atomic.json.*.tmp")), [])
+
+    def test_atomic_publication_revokes_pass_after_directory_fsync_error(self) -> None:
+        output = self.root / "atomic-post-replace.json"
+        fsync_calls = 0
+
+        def fail_directory_fsync(_fd: int) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError("directory fsync failed")
+
+        with mock.patch.object(risk.os, "fsync", side_effect=fail_directory_fsync):
+            with self.assertRaisesRegex(OSError, "directory fsync failed"):
+                risk.atomic_write_json(
+                    output, {"schema": risk.SCHEMA, "status": "passed"}
+                )
+        if output.exists():
+            self.assertNotEqual(json.loads(output.read_text())["status"], "passed")
+        self.assertEqual(list(self.root.glob(".atomic-post-replace.json.*.tmp")), [])
+
+    def test_stable_json_read_rejects_replacement_between_read_and_hash(self) -> None:
+        stable_json = getattr(risk, "stable_read_json", None)
+        self.assertIsNotNone(stable_json, "stable JSON read primitive is required")
+        source = self.root / "stable.json"
+        replacement = self.root / "replacement.json"
+        source.write_text('{"generation":"old"}\n', encoding="utf-8")
+        replacement.write_text('{"generation":"new"}\n', encoding="utf-8")
+        original_digest = risk._sha256_bytes
+
+        def replace_during_digest(payload: bytes) -> str:
+            os.replace(replacement, source)
+            return original_digest(payload)
+
+        with mock.patch.object(
+            risk, "_sha256_bytes", side_effect=replace_during_digest
+        ):
+            with self.assertRaisesRegex(ValueError, "replaced|drifted"):
+                stable_json(source)
+
+    def test_loaded_module_source_change_after_import_fails_preflight(self) -> None:
+        authenticate = getattr(risk, "authenticate_loaded_module_source", None)
+        self.assertIsNotNone(authenticate, "loaded-code authentication is required")
+        source = self.root / "loaded_fixture.py"
+        source.write_text(
+            "from __future__ import annotations\n"
+            "import hashlib, marshal, sys\n"
+            "_frame = sys._getframe()\n"
+            "LOADED_MODULE_CODE = {\n"
+            "    'digest_method': 'sha256-canonical-marshal-roundtrip-v1',\n"
+            "    'filename': _frame.f_code.co_filename,\n"
+            "    'flags': _frame.f_code.co_flags,\n"
+            "    'marshal_sha256': hashlib.sha256(marshal.dumps(marshal.loads(marshal.dumps(_frame.f_code)))).hexdigest(),\n"
+            "    'optimize': sys.flags.optimize,\n"
+            "}\n"
+            "del _frame\n"
+            "VALUE = 1\n",
+            encoding="utf-8",
+        )
+        spec = importlib.util.spec_from_file_location("loaded_fixture", source)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source.write_text(source.read_text().replace("VALUE = 1", "VALUE = 2"))
+        with self.assertRaisesRegex(ValueError, "loaded module code"):
+            authenticate(source, module.LOADED_MODULE_CODE)
+
+    def test_risk_preflight_rejects_unauthenticated_loaded_analyzer(self) -> None:
+        campaign = Campaign(self.root, deltas=[10, -10, 10, -10, 10])
+        with mock.patch.object(
+            risk,
+            "authenticate_loaded_module_source",
+            create=True,
+            side_effect=ValueError("loaded module code does not match source"),
+        ):
+            status, receipt = self.run_campaign(campaign)
+        self.assertEqual(status, 2)
+        assert receipt is not None
+        self.assertEqual(receipt["status"], "failed")
+        self.assertIn("loaded module code", " ".join(receipt["failures"]))
 
     def test_rejects_swaps_duplicates_pair_drift_and_determinant_drift(self) -> None:
         mutations = ("legacy", "swap", "duplicate", "pair", "trace")
