@@ -35,6 +35,31 @@ static FIXED_WIDTH_MANIFEST_ENABLED: OnceLock<bool> = OnceLock::new();
 static KEYED_DYLIB_IDENTITY_ENABLED: OnceLock<bool> = OnceLock::new();
 static MAPPED_METADATA_ENABLED: OnceLock<bool> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_BOUNDED_METADATA_OPEN_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn arm_after_bounded_metadata_open_for_test(hook: impl FnOnce() + 'static) {
+    AFTER_BOUNDED_METADATA_OPEN_FOR_TEST.with(|armed| {
+        assert!(
+            armed.borrow_mut().replace(Box::new(hook)).is_none(),
+            "bounded metadata-open hook was already armed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn run_after_bounded_metadata_open_for_test() {
+    AFTER_BOUNDED_METADATA_OPEN_FOR_TEST.with(|armed| {
+        if let Some(hook) = armed.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 #[derive(Debug)]
 pub struct UnitStoreError {
     operation: &'static str,
@@ -344,7 +369,7 @@ fn mapped_metadata_error(operation: &'static str, error: MappedMetadataError) ->
     )
 }
 
-fn open_metadata_at(directory: &File, name: &CStr) -> Result<File, UnitStoreError> {
+fn open_metadata_at(directory: &File, name: &CStr) -> Result<(File, usize), UnitStoreError> {
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -393,60 +418,29 @@ fn open_metadata_at(directory: &File, name: &CStr) -> Result<File, UnitStoreErro
             UnitMissReason::ManifestRange,
         ));
     }
-    Ok(file)
-}
-
-fn mapped_immutable_record_count(
-    metadata: &ValidatedMappedTranslationMetadata,
-) -> Result<u64, UnitStoreError> {
-    let mut records = u64::try_from(metadata.binding_count()).map_err(|_| {
+    let length = usize::try_from(length).map_err(|_| {
         UnitStoreError::new(
-            "count mapped metadata records",
+            "validate mapped metadata size",
             UnitMissReason::ManifestRange,
         )
     })?;
-    for index in 0..metadata.block_count() {
-        let block = metadata.block(index).ok_or_else(|| {
-            UnitStoreError::new(
-                "count mapped metadata records",
-                UnitMissReason::ManifestRange,
-            )
-        })?;
-        let block_records = 1_u64
-            .checked_add(u64::try_from(block.pc_map().len()).map_err(|_| {
-                UnitStoreError::new(
-                    "count mapped metadata records",
-                    UnitMissReason::ManifestRange,
-                )
-            })?)
-            .and_then(|count| {
-                u64::try_from(block.recovery().span_count())
-                    .ok()
-                    .and_then(|spans| count.checked_add(spans))
-            })
-            .ok_or_else(|| {
-                UnitStoreError::new(
-                    "count mapped metadata records",
-                    UnitMissReason::ManifestRange,
-                )
-            })?;
-        records = records.checked_add(block_records).ok_or_else(|| {
-            UnitStoreError::new(
-                "count mapped metadata records",
-                UnitMissReason::ManifestRange,
-            )
-        })?;
-    }
-    Ok(records)
+    Ok((file, length))
 }
 
 fn owned_immutable_record_count(manifest: &TranslationUnitManifest) -> Result<u64, UnitStoreError> {
-    let mut records = u64::try_from(manifest.bindings.len()).map_err(|_| {
-        UnitStoreError::new(
-            "count owned metadata records",
-            UnitMissReason::ManifestRange,
-        )
-    })?;
+    // V2 owns only its manifest tables. Guest ranges and edge/index tables are
+    // derived by consumers and therefore are not counted as retained records.
+    let mut records = manifest
+        .blocks
+        .len()
+        .checked_add(manifest.bindings.len())
+        .and_then(|count| count.checked_add(manifest.binding_relocations.len()))
+        .ok_or_else(|| {
+            UnitStoreError::new(
+                "count owned metadata records",
+                UnitMissReason::ManifestRange,
+            )
+        })?;
     for block in &manifest.blocks {
         let counts = block.template.metadata_counts();
         let recovery_records = if counts.recovery_runs == 0 {
@@ -454,24 +448,32 @@ fn owned_immutable_record_count(manifest: &TranslationUnitManifest) -> Result<u6
         } else {
             counts.recovery_runs
         };
-        let block_records = 1_usize
+        let template_records = counts
+            .words
             .checked_add(counts.pc_map_entries)
             .and_then(|count| count.checked_add(recovery_records))
-            .and_then(|count| u64::try_from(count).ok())
+            .and_then(|count| count.checked_add(counts.direct_links))
+            .and_then(|count| count.checked_add(counts.relocations))
+            .and_then(|count| count.checked_add(counts.source_words))
             .ok_or_else(|| {
                 UnitStoreError::new(
                     "count owned metadata records",
                     UnitMissReason::ManifestRange,
                 )
             })?;
-        records = records.checked_add(block_records).ok_or_else(|| {
+        records = records.checked_add(template_records).ok_or_else(|| {
             UnitStoreError::new(
                 "count owned metadata records",
                 UnitMissReason::ManifestRange,
             )
         })?;
     }
-    Ok(records)
+    u64::try_from(records).map_err(|_| {
+        UnitStoreError::new(
+            "count owned metadata records",
+            UnitMissReason::ManifestRange,
+        )
+    })
 }
 
 fn map_and_validate_metadata(
@@ -485,20 +487,16 @@ fn map_and_validate_metadata(
     ),
     UnitStoreError,
 > {
-    let file = open_metadata_at(directory, name)?;
-    let length = usize::try_from(
-        file.metadata()
-            .map_err(|error| {
-                UnitStoreError::with_source("stat mapped metadata", UnitMissReason::Schema, error)
-            })?
-            .len(),
-    )
-    .map_err(|_| {
-        UnitStoreError::new(
-            "validate mapped metadata size",
-            UnitMissReason::ManifestRange,
-        )
-    })?;
+    let (file, length) = open_metadata_at(directory, name)?;
+    #[cfg(test)]
+    run_after_bounded_metadata_open_for_test();
+    // SAFETY: the private cache authority makes each backing inode immutable
+    // after its temporary is flushed and synced. Publication/replacement may
+    // unlink a pathname but never writes or truncates the retained inode. The
+    // mmap length is the exact nonzero, bounded extent accepted by the single
+    // `fstat` above, and `_file` pins that inode for the mapping's lifetime.
+    // The test-only seam may append beyond `length`; it never mutates the
+    // extent mapped here.
     let mapping =
         unsafe { memmap2::MmapOptions::new().len(length).map(&file) }.map_err(|error| {
             UnitStoreError::with_source("map translation metadata", UnitMissReason::Schema, error)
@@ -511,7 +509,7 @@ fn map_and_validate_metadata(
     let metadata = ValidatedMappedTranslationMetadata::new(backing, expected_key)
         .map_err(|error| mapped_metadata_error("validate mapped metadata", error))?;
     let validation_ns = u64::try_from(validation_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let mapped_records = mapped_immutable_record_count(&metadata)?;
+    let mapped_records = metadata.immutable_record_count();
     let bytes_mapped = u64::try_from(length).map_err(|_| {
         UnitStoreError::new("measure mapped metadata", UnitMissReason::ManifestRange)
     })?;
@@ -1955,7 +1953,7 @@ mod tests {
         DirectBindingCellRef, DirectBindingOrdinal, DirectBindingTarget, DirectBindingTargetPrefix,
         PrivateJitEpoch,
     };
-    use carrick_dsr_aarch64::emit::{DirectLinkKind, PcMapEntry};
+    use carrick_dsr_aarch64::emit::{DirectLinkKind, PcMapEntry, RecoveryAction, RecoveryEntry};
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, DIRECT_BINDING_CELL_SIZE, DirectBindingLayout,
         DirectBindingRelocation, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
@@ -2069,6 +2067,34 @@ mod tests {
             data_offset: 0,
         }];
         pending.binding_data = vec![0; DIRECT_BINDING_CELL_SIZE as usize];
+        pending
+    }
+
+    fn fixture_pending_with_complete_metadata_tables() -> PendingTranslationUnit {
+        let mut pending = fixture_pending_with_binding_sidecar();
+        pending.blocks[0].template = ArtifactTemplate::normalize(
+            Vec::new(),
+            vec![
+                PcMapEntry {
+                    guest: GuestVa(0x400000),
+                    cache: CacheOffset::published(0),
+                },
+                PcMapEntry {
+                    guest: GuestVa(0x400008),
+                    cache: CacheOffset::published(4),
+                },
+            ],
+            vec![RecoveryEntry {
+                cache: CacheOffset::published(0),
+                action: RecoveryAction::Noop,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
+        )
+        .expect("complete metadata fixture")
+        .into_runtime_metadata_only();
         pending
     }
 
@@ -2887,8 +2913,73 @@ mod tests {
                 .expect("stat V3 metadata")
                 .len()
         );
-        assert_eq!(loaded.load_evidence.mapped_records, 2);
+        assert_eq!(loaded.load_evidence.mapped_records, 5);
         assert_eq!(loaded.load_evidence.owned_records, 0);
+    }
+
+    #[test]
+    fn mapped_metadata_uses_the_bounded_open_extent() {
+        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let pending = fixture_pending();
+        authority
+            .publish_unit_with_metadata_mode(&pending, true)
+            .expect("publish V3 unit");
+        let stem = pending.key.file_stem().expect("unit stem");
+        let (_, metadata_path) = authority.final_paths_with_metadata_mode(&stem, true);
+        let bounded_len = std::fs::metadata(&metadata_path)
+            .expect("stat V3 metadata before bounded open")
+            .len();
+        arm_after_bounded_metadata_open_for_test({
+            let metadata_path = metadata_path.clone();
+            move || {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(metadata_path)
+                    .expect("open V3 metadata after bounded open")
+                    .write_all(&[0xa5; 16])
+                    .expect("grow V3 metadata after bounded open");
+            }
+        });
+
+        let loaded = authority
+            .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, true)
+            .expect("map only the extent accepted by bounded open");
+
+        assert_eq!(loaded.load_evidence.bytes_mapped, bounded_len);
+    }
+
+    #[test]
+    fn mapped_metadata_evidence_counts_all_twelve_wire_sections() {
+        let pending = fixture_pending_with_complete_metadata_tables();
+        let v3_authority = ContainerCacheAuthority::create().expect("create V3 cache authority");
+        v3_authority
+            .publish_unit_with_metadata_mode(&pending, true)
+            .expect("publish complete V3 metadata fixture");
+        let v3 = v3_authority
+            .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, true)
+            .expect("load complete V3 metadata fixture");
+        assert_eq!(
+            v3.load_evidence.mapped_records, 15,
+            "V3 counts every physical record across all twelve wire sections"
+        );
+        assert_eq!(v3.load_evidence.owned_records, 0);
+    }
+
+    #[test]
+    fn owned_metadata_evidence_counts_only_retained_manifest_tables() {
+        let pending = fixture_pending_with_complete_metadata_tables();
+        let v2_authority = ContainerCacheAuthority::create().expect("create V2 cache authority");
+        v2_authority
+            .publish_unit_with_metadata_mode(&pending, false)
+            .expect("publish complete V2 metadata fixture");
+        let v2 = v2_authority
+            .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, false)
+            .expect("load complete V2 metadata fixture");
+        assert_eq!(v2.load_evidence.mapped_records, 0);
+        assert_eq!(
+            v2.load_evidence.owned_records, 6,
+            "V2 counts only its physically retained block, PC, recovery, binding, and relocation records"
+        );
     }
 
     #[test]
