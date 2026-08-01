@@ -817,17 +817,24 @@ impl<'a> MappedBlockView<'a> {
             count: self.recovery_count,
         }
     }
+    pub fn guest_range_count(self) -> usize {
+        self.guest_range_count
+    }
+    pub fn guest_range(self, relative: usize) -> Option<std::ops::Range<GuestVa>> {
+        if relative >= self.guest_range_count {
+            return None;
+        }
+        self.guest_range_start
+            .checked_add(relative)
+            .and_then(|index| {
+                self.metadata
+                    .record_checked::<WireGuestRangeV3>(SectionKind::GuestRange, index)
+                    .ok()
+            })
+            .map(|range| GuestVa(range.start.get())..GuestVa(range.end.get()))
+    }
     pub fn guest_ranges(self) -> impl Iterator<Item = std::ops::Range<GuestVa>> + 'a {
-        (0..self.guest_range_count).filter_map(move |relative| {
-            self.guest_range_start
-                .checked_add(relative)
-                .and_then(|index| {
-                    self.metadata
-                        .record_checked::<WireGuestRangeV3>(SectionKind::GuestRange, index)
-                        .ok()
-                })
-                .map(|range| GuestVa(range.start.get())..GuestVa(range.end.get()))
-        })
+        (0..self.guest_range_count).filter_map(move |relative| self.guest_range(relative))
     }
 }
 

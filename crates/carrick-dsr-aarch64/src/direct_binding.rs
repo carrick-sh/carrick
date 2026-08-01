@@ -201,12 +201,12 @@ impl DirectBindingTarget {
                 left_index == right_index
                     && left.base == right.base
                     && left.binding_base == right.binding_base
-                    && left.manifest.key == right.manifest.key
+                    && left.key() == right.key()
             }
             (None, Some(left), None, None, Some(right), None) => {
                 left.base == right.base
                     && left.binding_base == right.binding_base
-                    && left.manifest.key == right.manifest.key
+                    && left.key() == right.key()
             }
             _ => false,
         }
@@ -568,11 +568,7 @@ impl DirectBindingRegistry {
         &mut self,
         unit: &SharedLoadedTranslationUnit,
     ) -> Result<PreparedDirectBindingUnit, DsrError> {
-        if self
-            .units
-            .iter()
-            .any(|owner| owner.key == unit.manifest.key)
-        {
+        if self.units.iter().any(|owner| &owner.key == unit.key()) {
             return Err(DsrError::CachePolicy(
                 "direct-binding unit owner is duplicated".to_string(),
             ));
@@ -583,12 +579,18 @@ impl DirectBindingRegistry {
             ))
         })?;
         let unit_index = self.units.len();
-        if !self.enabled || unit.manifest.binding_layout == DirectBindingLayout::Disabled {
+        if !self.enabled || unit.binding_layout() == DirectBindingLayout::Disabled {
+            let records = match &unit.metadata {
+                crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => {
+                    manifest.bindings.clone().into_boxed_slice()
+                }
+                crate::shared_cache::LoadedTranslationMetadata::V3(_) => Box::new([]),
+            };
             let owner = DirectBindingUnitOwner {
-                key: unit.manifest.key.clone(),
+                key: unit.key().clone(),
                 binding_base: None,
                 binding_layout: DirectBindingLayout::Disabled,
-                records: unit.manifest.bindings.clone().into_boxed_slice(),
+                records,
                 published_bitmap: Box::new([]),
                 source_lease: unit.clone(),
             };
@@ -600,8 +602,11 @@ impl DirectBindingRegistry {
                 edge_records,
             });
         }
-        if unit.manifest.binding_layout != DirectBindingLayout::SidecarV1
-            || unit.manifest.cell_size != DIRECT_BINDING_CELL_SIZE
+        let manifest = unit.metadata.v2().ok_or_else(|| {
+            DsrError::CachePolicy("mapped direct-binding metadata is unsupported".to_string())
+        })?;
+        if manifest.binding_layout != DirectBindingLayout::SidecarV1
+            || manifest.cell_size != DIRECT_BINDING_CELL_SIZE
         {
             return Err(DsrError::CachePolicy(
                 "direct-binding unit has an unsupported cell layout".to_string(),
@@ -610,14 +615,14 @@ impl DirectBindingRegistry {
         let binding_base = unit.binding_base.ok_or_else(|| {
             DsrError::CachePolicy("direct-binding unit has no mapped cell base".to_string())
         })?;
-        let records = unit.manifest.bindings.clone().into_boxed_slice();
+        let records = manifest.bindings.clone().into_boxed_slice();
         let expected_len = records
             .len()
             .checked_mul(DIRECT_BINDING_CELL_SIZE as usize)
             .ok_or_else(|| {
                 DsrError::CachePolicy("direct-binding cell range overflow".to_string())
             })?;
-        let binding_len = usize::try_from(unit.manifest.binding_data_len).map_err(|_| {
+        let binding_len = usize::try_from(manifest.binding_data_len).map_err(|_| {
             DsrError::CachePolicy("direct-binding data length does not fit usize".to_string())
         })?;
         if binding_len != expected_len {
@@ -694,7 +699,7 @@ impl DirectBindingRegistry {
             })?;
         published_bitmap.resize(bitmap_words, 0);
         let owner = DirectBindingUnitOwner {
-            key: unit.manifest.key.clone(),
+            key: manifest.key.clone(),
             binding_base: Some(binding_base),
             binding_layout: DirectBindingLayout::SidecarV1,
             records,
@@ -1212,7 +1217,7 @@ impl DirectBindingRegistry {
                         unit.binding_layout,
                         unit.records.to_vec(),
                         unit.published_bitmap.to_vec(),
-                        unit.source_lease.manifest.key.clone(),
+                        unit.source_lease.key().clone(),
                         unit.source_lease.base,
                         unit.source_lease.binding_base,
                     )
@@ -1240,9 +1245,10 @@ impl DirectBindingRegistry {
                             .private_epoch
                             .as_ref()
                             .map(|epoch| Arc::as_ptr(epoch) as usize),
-                        descriptor.shared_lease.as_ref().map(|lease| {
-                            (lease.manifest.key.clone(), lease.base, lease.binding_base)
-                        }),
+                        descriptor
+                            .shared_lease
+                            .as_ref()
+                            .map(|lease| (lease.key().clone(), lease.base, lease.binding_base)),
                         descriptor.shared_unit_index,
                     )
                 })
@@ -1292,9 +1298,13 @@ impl DirectBindingRegistry {
         let expected_cell = DirectBindingCellVa::mapped(binding_base.get().checked_add(offset)?)?;
         if record != &owner.record
             || expected_cell != miss.cell
-            || unit.source_lease.manifest.key != unit.key
+            || unit.source_lease.key() != &unit.key
             || unit.source_lease.binding_base != Some(binding_base)
-            || unit.source_lease.manifest.bindings.as_slice() != unit.records.as_ref()
+            || !unit
+                .source_lease
+                .metadata
+                .v2()
+                .is_some_and(|manifest| manifest.bindings.as_slice() == unit.records.as_ref())
         {
             return None;
         }

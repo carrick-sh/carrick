@@ -1112,8 +1112,35 @@ struct PreparedSharedBlock {
     entry: types::CacheVa,
     published: PublishedBlock,
     fusion_site: Option<types::ExclusiveFusionSite>,
-    guest_ranges: Vec<std::ops::Range<carrick_guest_mem::GuestVa>>,
     authority: SharedBlockAuthority,
+}
+
+#[derive(Clone, Copy)]
+struct LoadedBlockScalars {
+    guest_start: carrick_guest_mem::GuestVa,
+    generation_binding: u32,
+}
+
+fn loaded_block_scalars(
+    metadata: &crate::shared_cache::LoadedTranslationMetadata,
+    index: usize,
+) -> Option<LoadedBlockScalars> {
+    match metadata {
+        crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => {
+            let block = manifest.blocks.get(index)?;
+            Some(LoadedBlockScalars {
+                guest_start: block.guest_start,
+                generation_binding: block.generation_binding,
+            })
+        }
+        crate::shared_cache::LoadedTranslationMetadata::V3(metadata) => {
+            let block = metadata.block(index)?;
+            Some(LoadedBlockScalars {
+                guest_start: block.guest_start(),
+                generation_binding: block.generation_binding(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1394,10 +1421,40 @@ pub struct TranslationResult {
 pub struct PublishedBlock {
     pub entry: types::CacheVa,
     pub len: usize,
-    pub map: Vec<emit::PcMapEntry>,
-    pub recovery: Vec<emit::RecoveryEntry>,
-    shared_recovery: Option<SharedRecoveryMetadata>,
+    metadata: PublishedBlockMetadata,
     pub _generation: cache::PageGenerationObservation,
+}
+
+enum PublishedBlockMetadata {
+    Owned {
+        map: Vec<emit::PcMapEntry>,
+        recovery: Vec<emit::RecoveryEntry>,
+        shared_recovery: Option<SharedRecoveryMetadata>,
+    },
+    Mapped {
+        loaded_unit_index: usize,
+        block_index: u32,
+    },
+}
+
+impl PublishedBlock {
+    #[cfg(test)]
+    fn owned_record_count(&self) -> usize {
+        match &self.metadata {
+            PublishedBlockMetadata::Owned {
+                map,
+                recovery,
+                shared_recovery,
+            } => {
+                map.len()
+                    + recovery.len()
+                    + shared_recovery
+                        .as_ref()
+                        .map_or(0, |metadata| metadata.recovery.entry_count())
+            }
+            PublishedBlockMetadata::Mapped { .. } => 0,
+        }
+    }
 }
 
 struct SharedRecoveryMetadata {
@@ -1425,6 +1482,54 @@ fn shared_recovery_lazy_enabled() -> bool {
 struct PublishedIndexEntry {
     start: carrick_guest_mem::HostVa,
     block: usize,
+}
+
+fn merge_published_indexes(
+    current: &[PublishedIndexEntry],
+    incoming: &[PublishedIndexEntry],
+) -> Result<Vec<PublishedIndexEntry>, types::DsrError> {
+    let strictly_ordered = |entries: &[PublishedIndexEntry]| {
+        entries.windows(2).all(|pair| pair[0].start < pair[1].start)
+    };
+    if !strictly_ordered(current) || !strictly_ordered(incoming) {
+        return Err(types::DsrError::CachePolicy(
+            "shared published-block index is not strictly ordered".to_string(),
+        ));
+    }
+    let total = current.len().checked_add(incoming.len()).ok_or_else(|| {
+        types::DsrError::CachePolicy("shared published-index count overflow".to_string())
+    })?;
+    let mut merged = Vec::new();
+    merged.try_reserve_exact(total).map_err(|error| {
+        types::DsrError::CachePolicy(format!(
+            "shared published-index reservation failed: {error}"
+        ))
+    })?;
+    let mut current_index = 0;
+    let mut incoming_index = 0;
+    while current_index < current.len() && incoming_index < incoming.len() {
+        match current[current_index]
+            .start
+            .cmp(&incoming[incoming_index].start)
+        {
+            std::cmp::Ordering::Less => {
+                merged.push(current[current_index]);
+                current_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push(incoming[incoming_index]);
+                incoming_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                return Err(types::DsrError::CachePolicy(
+                    "shared published-block index collides".to_string(),
+                ));
+            }
+        }
+    }
+    merged.extend_from_slice(&current[current_index..]);
+    merged.extend_from_slice(&incoming[incoming_index..]);
+    Ok(merged)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2919,16 +3024,18 @@ impl ProcessState {
             types::DsrError,
         >,
     ) -> Result<PreparedSharedInstall, types::DsrError> {
-        unit.manifest.validate_ranges().map_err(|reason| {
-            types::DsrError::CachePolicy(format!(
-                "loaded shared translation manifest is invalid: {reason:?}"
-            ))
-        })?;
+        if let crate::shared_cache::LoadedTranslationMetadata::V2(manifest) = &unit.metadata {
+            manifest.validate_ranges().map_err(|reason| {
+                types::DsrError::CachePolicy(format!(
+                    "loaded shared translation manifest is invalid: {reason:?}"
+                ))
+            })?;
+        }
         #[cfg(test)]
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::Manifest)?;
 
-        let unit_id = translated_unit_id(&unit.manifest.key)?;
-        let code_len = usize::try_from(unit.manifest.code_len).map_err(|_| {
+        let unit_id = translated_unit_id(unit.key())?;
+        let code_len = usize::try_from(unit.metadata.code_len()).map_err(|_| {
             types::DsrError::CachePolicy(
                 "shared translation range length does not fit usize".to_string(),
             )
@@ -2946,14 +3053,19 @@ impl ProcessState {
         #[cfg(test)]
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::Catalog)?;
 
-        let block_count = unit.manifest.blocks.len();
+        let block_count = unit.metadata.block_count();
         if block_count == 0 {
             return Err(types::DsrError::CachePolicy(
                 "shared translation unit has no blocks".to_string(),
             ));
         }
         let mut incoming_keys = BTreeSet::new();
-        for block in &unit.manifest.blocks {
+        for block_index in 0..block_count {
+            let block = loaded_block_scalars(&unit.metadata, block_index).ok_or_else(|| {
+                types::DsrError::CachePolicy(
+                    "shared translation block index is invalid".to_string(),
+                )
+            })?;
             let key = (block.guest_start, types::CodeGeneration::INITIAL);
             if !incoming_keys.insert(key)
                 || self.blocks.contains_key(&key)
@@ -2968,12 +3080,22 @@ impl ProcessState {
         #[cfg(test)]
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::CollisionPreflight)?;
 
-        let binding_count = unit
-            .manifest
-            .blocks
-            .iter()
-            .map(|block| block.generation_binding as usize)
-            .max()
+        let mut max_generation_binding = None;
+        for block_index in 0..block_count {
+            let block = loaded_block_scalars(&unit.metadata, block_index).ok_or_else(|| {
+                types::DsrError::CachePolicy(
+                    "shared translation block index is invalid".to_string(),
+                )
+            })?;
+            let binding = usize::try_from(block.generation_binding).map_err(|_| {
+                types::DsrError::CachePolicy(
+                    "shared generation binding index does not fit usize".to_string(),
+                )
+            })?;
+            max_generation_binding =
+                Some(max_generation_binding.map_or(binding, |current: usize| current.max(binding)));
+        }
+        let binding_count = max_generation_binding
             .and_then(|index| index.checked_add(1))
             .ok_or_else(|| {
                 types::DsrError::CachePolicy(
@@ -3002,7 +3124,12 @@ impl ProcessState {
                     "shared generation observation reservation failed: {error}"
                 ))
             })?;
-        for block in &unit.manifest.blocks {
+        for block_index in 0..block_count {
+            let block = loaded_block_scalars(&unit.metadata, block_index).ok_or_else(|| {
+                types::DsrError::CachePolicy(
+                    "shared translation block index is invalid".to_string(),
+                )
+            })?;
             let observation = memory.dsr_generation_observation(block.guest_start)?;
             if observation.expected() != types::CodeGeneration::INITIAL {
                 return Err(types::DsrError::GenerationChanged {
@@ -3012,7 +3139,11 @@ impl ProcessState {
                 });
             }
             let slot = binding_slots
-                .get_mut(block.generation_binding as usize)
+                .get_mut(usize::try_from(block.generation_binding).map_err(|_| {
+                    types::DsrError::CachePolicy(
+                        "shared generation binding index does not fit usize".to_string(),
+                    )
+                })?)
                 .ok_or_else(|| {
                     types::DsrError::CachePolicy(
                         "shared generation binding index is out of range".to_string(),
@@ -3049,7 +3180,7 @@ impl ProcessState {
         #[cfg(test)]
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::GenerationAuthorities)?;
 
-        let host_bias = unit.manifest.key.host_bias();
+        let host_bias = unit.key().host_bias();
         let mut blocks = Vec::new();
         blocks.try_reserve_exact(block_count).map_err(|error| {
             types::DsrError::CachePolicy(format!(
@@ -3073,101 +3204,224 @@ impl ProcessState {
                     "shared sensitive-metadata reservation failed: {error}"
                 ))
             })?;
-        for (block, observation) in Arc::make_mut(&mut unit.manifest)
-            .blocks
-            .iter_mut()
-            .zip(observations)
-        {
-            let address = cache_start
-                .checked_add(block.entry_offset as usize)
-                .ok_or_else(|| {
-                    types::DsrError::CachePolicy("shared block address overflow".to_string())
-                })?;
-            let block_end = address
-                .checked_add(block.code_len as usize)
-                .ok_or_else(|| {
-                    types::DsrError::CachePolicy("shared block extent overflow".to_string())
-                })?;
-            if block_end > cache_end {
-                return Err(types::DsrError::CachePolicy(
-                    "shared block extent exceeds its unit".to_string(),
-                ));
-            }
-            let entry = types::CacheVa::published(carrick_guest_mem::HostVa(address));
-            let (map, recovery, shared_recovery) = if shared_recovery_lazy_enabled() {
-                let (map, recovery, _direct_links) =
-                    block.template.take_portable_runtime_metadata();
-                (
-                    map,
-                    Vec::new(),
-                    Some(SharedRecoveryMetadata {
-                        recovery,
-                        host_bias,
-                    }),
-                )
-            } else {
-                let (map, recovery, _direct_links) =
-                    block.template.take_runtime_metadata(host_bias)?;
-                (map, recovery, None)
-            };
-            let guest_ranges =
-                exact_guest_ranges_from_pc_map(block.guest_start, block.code_len as usize, &map)?;
-            guest_range_additions
-                .try_reserve(guest_ranges.len())
-                .map_err(|error| {
-                    types::DsrError::CachePolicy(format!(
-                        "shared guest-range addition reservation failed: {error}"
-                    ))
-                })?;
-            guest_range_additions.extend(guest_ranges.iter().cloned());
-
-            let key = (block.guest_start, types::CodeGeneration::INITIAL);
-            let fusion_site = if block.requires_sensitive_metadata {
-                let (sensitive_key, metadata, fusion) = sensitive_planner(block.guest_start)?;
-                if let Some((_, current)) = sensitive_updates
-                    .iter_mut()
-                    .find(|(key, _)| *key == sensitive_key)
+        match &mut unit.metadata {
+            crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => {
+                for (block, observation) in
+                    Arc::make_mut(manifest).blocks.iter_mut().zip(observations)
                 {
-                    *current = merge_sensitive_metadata(sensitive_key, *current, metadata)?;
-                } else {
-                    let metadata = self.sensitive.get(&sensitive_key).copied().map_or_else(
-                        || Ok(metadata),
-                        |installed| merge_sensitive_metadata(sensitive_key, installed, metadata),
+                    let address = cache_start
+                        .checked_add(block.entry_offset as usize)
+                        .ok_or_else(|| {
+                            types::DsrError::CachePolicy(
+                                "shared block address overflow".to_string(),
+                            )
+                        })?;
+                    let block_end =
+                        address
+                            .checked_add(block.code_len as usize)
+                            .ok_or_else(|| {
+                                types::DsrError::CachePolicy(
+                                    "shared block extent overflow".to_string(),
+                                )
+                            })?;
+                    if block_end > cache_end {
+                        return Err(types::DsrError::CachePolicy(
+                            "shared block extent exceeds its unit".to_string(),
+                        ));
+                    }
+                    let entry = types::CacheVa::published(carrick_guest_mem::HostVa(address));
+                    let (map, recovery, shared_recovery) = if shared_recovery_lazy_enabled() {
+                        let (map, recovery, _direct_links) =
+                            block.template.take_portable_runtime_metadata();
+                        (
+                            map,
+                            Vec::new(),
+                            Some(SharedRecoveryMetadata {
+                                recovery,
+                                host_bias,
+                            }),
+                        )
+                    } else {
+                        let (map, recovery, _direct_links) =
+                            block.template.take_runtime_metadata(host_bias)?;
+                        (map, recovery, None)
+                    };
+                    let guest_ranges = exact_guest_ranges_from_pc_map(
+                        block.guest_start,
+                        block.code_len as usize,
+                        &map,
                     )?;
-                    sensitive_updates.push((sensitive_key, metadata));
+                    guest_range_additions
+                        .try_reserve(guest_ranges.len())
+                        .map_err(|error| {
+                            types::DsrError::CachePolicy(format!(
+                                "shared guest-range addition reservation failed: {error}"
+                            ))
+                        })?;
+                    guest_range_additions.extend(guest_ranges);
+
+                    let key = (block.guest_start, types::CodeGeneration::INITIAL);
+                    let fusion_site = if block.requires_sensitive_metadata {
+                        let (sensitive_key, metadata, fusion) =
+                            sensitive_planner(block.guest_start)?;
+                        if let Some((_, current)) = sensitive_updates
+                            .iter_mut()
+                            .find(|(key, _)| *key == sensitive_key)
+                        {
+                            *current = merge_sensitive_metadata(sensitive_key, *current, metadata)?;
+                        } else {
+                            let metadata =
+                                self.sensitive.get(&sensitive_key).copied().map_or_else(
+                                    || Ok(metadata),
+                                    |installed| {
+                                        merge_sensitive_metadata(sensitive_key, installed, metadata)
+                                    },
+                                )?;
+                            sensitive_updates.push((sensitive_key, metadata));
+                        }
+                        fusion
+                    } else {
+                        None
+                    };
+                    let published = PublishedBlock {
+                        entry,
+                        len: block.code_len as usize,
+                        metadata: PublishedBlockMetadata::Owned {
+                            map,
+                            recovery,
+                            shared_recovery,
+                        },
+                        _generation: observation.clone(),
+                    };
+                    dependency_records.push((
+                        observation.page(),
+                        block.guest_start,
+                        observation.expected(),
+                    ));
+                    blocks.push(PreparedSharedBlock {
+                        key,
+                        entry,
+                        published,
+                        fusion_site,
+                        authority: SharedBlockAuthority {
+                            generation_bindings: bindings_pointer,
+                            generation_binding_count: generation_bindings.len(),
+                            cache_start,
+                            cache_end,
+                            target_authority: target_authority_pointer as usize,
+                            loaded_unit_index,
+                        },
+                    });
                 }
-                fusion
-            } else {
-                None
-            };
-            let published = PublishedBlock {
-                entry,
-                len: block.code_len as usize,
-                map,
-                recovery,
-                shared_recovery,
-                _generation: observation.clone(),
-            };
-            dependency_records.push((
-                observation.page(),
-                block.guest_start,
-                observation.expected(),
-            ));
-            blocks.push(PreparedSharedBlock {
-                key,
-                entry,
-                published,
-                fusion_site,
-                guest_ranges,
-                authority: SharedBlockAuthority {
-                    generation_bindings: bindings_pointer,
-                    generation_binding_count: generation_bindings.len(),
-                    cache_start,
-                    cache_end,
-                    target_authority: target_authority_pointer as usize,
-                    loaded_unit_index,
-                },
-            });
+            }
+            crate::shared_cache::LoadedTranslationMetadata::V3(metadata) => {
+                for (block_index, observation) in observations.into_iter().enumerate() {
+                    let block = metadata.block(block_index).ok_or_else(|| {
+                        types::DsrError::CachePolicy(format!(
+                            "mapped shared block index {block_index} is invalid"
+                        ))
+                    })?;
+                    let entry_offset = usize::try_from(block.entry_offset()).map_err(|_| {
+                        types::DsrError::CachePolicy(
+                            "mapped shared block entry offset does not fit usize".to_string(),
+                        )
+                    })?;
+                    let address = cache_start.checked_add(entry_offset).ok_or_else(|| {
+                        types::DsrError::CachePolicy(
+                            "mapped shared block address overflow".to_string(),
+                        )
+                    })?;
+                    let block_len = usize::try_from(block.code_len()).map_err(|_| {
+                        types::DsrError::CachePolicy(
+                            "mapped shared block length does not fit usize".to_string(),
+                        )
+                    })?;
+                    let block_end = address.checked_add(block_len).ok_or_else(|| {
+                        types::DsrError::CachePolicy(
+                            "mapped shared block extent overflow".to_string(),
+                        )
+                    })?;
+                    if block_end > cache_end {
+                        return Err(types::DsrError::CachePolicy(
+                            "mapped shared block extent exceeds its unit".to_string(),
+                        ));
+                    }
+                    guest_range_additions
+                        .try_reserve(block.guest_range_count())
+                        .map_err(|error| {
+                            types::DsrError::CachePolicy(format!(
+                                "mapped shared guest-range reservation failed: {error}"
+                            ))
+                        })?;
+                    for range_index in 0..block.guest_range_count() {
+                        guest_range_additions.push(block.guest_range(range_index).ok_or_else(
+                            || {
+                                types::DsrError::CachePolicy(format!(
+                                    "mapped shared guest-range index {range_index} is invalid"
+                                ))
+                            },
+                        )?);
+                    }
+
+                    let key = (block.guest_start(), types::CodeGeneration::INITIAL);
+                    let fusion_site = if block.requires_sensitive_metadata() {
+                        let (sensitive_key, metadata, fusion) =
+                            sensitive_planner(block.guest_start())?;
+                        if let Some((_, current)) = sensitive_updates
+                            .iter_mut()
+                            .find(|(key, _)| *key == sensitive_key)
+                        {
+                            *current = merge_sensitive_metadata(sensitive_key, *current, metadata)?;
+                        } else {
+                            let metadata =
+                                self.sensitive.get(&sensitive_key).copied().map_or_else(
+                                    || Ok(metadata),
+                                    |installed| {
+                                        merge_sensitive_metadata(sensitive_key, installed, metadata)
+                                    },
+                                )?;
+                            sensitive_updates.push((sensitive_key, metadata));
+                        }
+                        fusion
+                    } else {
+                        None
+                    };
+                    let entry = types::CacheVa::published(carrick_guest_mem::HostVa(address));
+                    let block_index = u32::try_from(block_index).map_err(|_| {
+                        types::DsrError::CachePolicy(
+                            "mapped shared block index exceeds u32".to_string(),
+                        )
+                    })?;
+                    let published = PublishedBlock {
+                        entry,
+                        len: block_len,
+                        metadata: PublishedBlockMetadata::Mapped {
+                            loaded_unit_index,
+                            block_index,
+                        },
+                        _generation: observation.clone(),
+                    };
+                    dependency_records.push((
+                        observation.page(),
+                        block.guest_start(),
+                        observation.expected(),
+                    ));
+                    blocks.push(PreparedSharedBlock {
+                        key,
+                        entry,
+                        published,
+                        fusion_site,
+                        authority: SharedBlockAuthority {
+                            generation_bindings: bindings_pointer,
+                            generation_binding_count: generation_bindings.len(),
+                            cache_start,
+                            cache_end,
+                            target_authority: target_authority_pointer as usize,
+                            loaded_unit_index,
+                        },
+                    });
+                }
+            }
         }
         sensitive_updates.sort_unstable_by_key(|(key, _)| *key);
         #[cfg(test)]
@@ -3192,40 +3446,71 @@ impl ProcessState {
                 "shared loaded-unit retention reservation failed: {error}"
             ))
         })?;
-        let shared_index_count = self
-            .shared_published_index
-            .len()
-            .checked_add(block_count)
-            .ok_or_else(|| {
-                types::DsrError::CachePolicy("shared published-index count overflow".to_string())
-            })?;
-        let mut shared_published_index = Vec::new();
-        shared_published_index
-            .try_reserve_exact(shared_index_count)
-            .map_err(|error| {
-                types::DsrError::CachePolicy(format!(
-                    "shared published-index reservation failed: {error}"
-                ))
-            })?;
-        shared_published_index.extend_from_slice(&self.shared_published_index);
-        for (offset, block) in blocks.iter().enumerate() {
-            let block_index = self.published.len().checked_add(offset).ok_or_else(|| {
-                types::DsrError::CachePolicy("shared published-block index overflow".to_string())
-            })?;
-            shared_published_index.push(PublishedIndexEntry {
-                start: block.entry.host(),
-                block: block_index,
-            });
-        }
-        shared_published_index.sort_unstable_by_key(|entry| entry.start);
-        if shared_published_index
-            .windows(2)
-            .any(|pair| pair[0].start == pair[1].start)
-        {
-            return Err(types::DsrError::CachePolicy(
-                "shared published-block index collides".to_string(),
-            ));
-        }
+        let shared_published_index = match &unit.metadata {
+            crate::shared_cache::LoadedTranslationMetadata::V2(_) => {
+                let shared_index_count = self
+                    .shared_published_index
+                    .len()
+                    .checked_add(block_count)
+                    .ok_or_else(|| {
+                        types::DsrError::CachePolicy(
+                            "shared published-index count overflow".to_string(),
+                        )
+                    })?;
+                let mut shared_published_index = Vec::new();
+                shared_published_index
+                    .try_reserve_exact(shared_index_count)
+                    .map_err(|error| {
+                        types::DsrError::CachePolicy(format!(
+                            "shared published-index reservation failed: {error}"
+                        ))
+                    })?;
+                shared_published_index.extend_from_slice(&self.shared_published_index);
+                for (offset, block) in blocks.iter().enumerate() {
+                    let block_index =
+                        self.published.len().checked_add(offset).ok_or_else(|| {
+                            types::DsrError::CachePolicy(
+                                "shared published-block index overflow".to_string(),
+                            )
+                        })?;
+                    shared_published_index.push(PublishedIndexEntry {
+                        start: block.entry.host(),
+                        block: block_index,
+                    });
+                }
+                shared_published_index.sort_unstable_by_key(|entry| entry.start);
+                if shared_published_index
+                    .windows(2)
+                    .any(|pair| pair[0].start == pair[1].start)
+                {
+                    return Err(types::DsrError::CachePolicy(
+                        "shared published-block index collides".to_string(),
+                    ));
+                }
+                shared_published_index
+            }
+            crate::shared_cache::LoadedTranslationMetadata::V3(_) => {
+                let mut incoming = Vec::new();
+                incoming.try_reserve_exact(block_count).map_err(|error| {
+                    types::DsrError::CachePolicy(format!(
+                        "mapped shared published-index reservation failed: {error}"
+                    ))
+                })?;
+                for (offset, block) in blocks.iter().enumerate() {
+                    let block_index =
+                        self.published.len().checked_add(offset).ok_or_else(|| {
+                            types::DsrError::CachePolicy(
+                                "mapped shared published-block index overflow".to_string(),
+                            )
+                        })?;
+                    incoming.push(PublishedIndexEntry {
+                        start: block.entry.host(),
+                        block: block_index,
+                    });
+                }
+                merge_published_indexes(&self.shared_published_index, &incoming)?
+            }
+        };
         #[cfg(test)]
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::ProcessVectors)?;
 
@@ -3253,8 +3538,8 @@ impl ProcessState {
 
         let direct_binding_probe = DirectBindingUnitLoadedProbe {
             digest: unit_id.get(),
-            record_count: u64::try_from(unit.manifest.bindings.len()).unwrap_or(u64::MAX),
-            data_bytes: unit.manifest.binding_data_len,
+            record_count: u64::try_from(unit.binding_count()).unwrap_or(u64::MAX),
+            data_bytes: unit.binding_data_len(),
         };
         Ok(PreparedSharedInstall {
             tid,
@@ -3346,7 +3631,6 @@ impl ProcessState {
                 entry,
                 published,
                 fusion_site,
-                guest_ranges: _guest_ranges,
                 authority,
             } = block;
             if let Some(site) = fusion_site {
@@ -3495,9 +3779,11 @@ impl ProcessState {
         self.push_published(PublishedBlock {
             entry,
             len: emitted_len,
-            map,
-            recovery,
-            shared_recovery: None,
+            metadata: PublishedBlockMetadata::Owned {
+                map,
+                recovery,
+                shared_recovery: None,
+            },
             _generation: observation,
         });
         self.blocks.insert(key, entry);
@@ -4205,9 +4491,11 @@ impl ProcessState {
         self.push_published(PublishedBlock {
             entry: published.entry(),
             len,
-            map,
-            recovery: Vec::new(),
-            shared_recovery: None,
+            metadata: PublishedBlockMetadata::Owned {
+                map,
+                recovery: Vec::new(),
+                shared_recovery: None,
+            },
             _generation: observation.clone(),
         });
         if reachable {
@@ -4308,30 +4596,79 @@ impl ProcessState {
             let offset = u32::try_from(cache_pc - start).map_err(|_| {
                 types::DsrError::CachePolicy("cache PC offset exceeds u32".to_string())
             })?;
-            let guest = block
-                .map
-                .iter()
-                .find(|entry| entry.cache == types::CacheOffset::published(offset))
-                .map(|entry| entry.guest)
-                .ok_or_else(|| {
-                    types::DsrError::CachePolicy(format!(
-                        "cache PC 0x{cache_pc:x} is not an emitted instruction boundary"
-                    ))
-                })?;
-            let recovery = block
-                .recovery
-                .iter()
-                .find(|entry| entry.cache == types::CacheOffset::published(offset))
-                .map(|entry| entry.action);
-            let recovery = match recovery {
-                Some(recovery) => Some(recovery),
-                None => match block.shared_recovery.as_ref() {
-                    Some(metadata) => metadata.recovery.rebind_for_cache(
-                        types::CacheOffset::published(offset),
-                        metadata.host_bias,
-                    )?,
-                    None => None,
-                },
+            let offset = types::CacheOffset::published(offset);
+            let (guest, recovery) = match &block.metadata {
+                PublishedBlockMetadata::Owned {
+                    map,
+                    recovery,
+                    shared_recovery,
+                } => {
+                    let guest = map
+                        .iter()
+                        .find(|entry| entry.cache == offset)
+                        .map(|entry| entry.guest)
+                        .ok_or_else(|| {
+                            types::DsrError::CachePolicy(format!(
+                                "cache PC 0x{cache_pc:x} is not an emitted instruction boundary"
+                            ))
+                        })?;
+                    let recovery = recovery
+                        .iter()
+                        .find(|entry| entry.cache == offset)
+                        .map(|entry| entry.action);
+                    let recovery = match recovery {
+                        Some(recovery) => Some(recovery),
+                        None => match shared_recovery.as_ref() {
+                            Some(metadata) => metadata
+                                .recovery
+                                .rebind_for_cache(offset, metadata.host_bias)?,
+                            None => None,
+                        },
+                    };
+                    (guest, recovery)
+                }
+                PublishedBlockMetadata::Mapped {
+                    loaded_unit_index,
+                    block_index,
+                } => {
+                    let loaded = self
+                        .loaded_shared_units
+                        .get(*loaded_unit_index)
+                        .ok_or_else(|| {
+                            types::DsrError::CachePolicy(format!(
+                                "mapped shared loaded-unit index {loaded_unit_index} is invalid"
+                            ))
+                        })?;
+                    let metadata = loaded._unit.metadata.v3().ok_or_else(|| {
+                        types::DsrError::CachePolicy(format!(
+                            "mapped shared loaded-unit index {loaded_unit_index} is not V3"
+                        ))
+                    })?;
+                    let block_index = usize::try_from(*block_index).map_err(|_| {
+                        types::DsrError::CachePolicy(format!(
+                            "mapped shared block index {block_index} does not fit usize"
+                        ))
+                    })?;
+                    let mapped = metadata.block(block_index).ok_or_else(|| {
+                        types::DsrError::CachePolicy(format!(
+                            "mapped shared block index {block_index} is invalid"
+                        ))
+                    })?;
+                    let guest = mapped.pc_map().guest_for_cache(offset).ok_or_else(|| {
+                        types::DsrError::CachePolicy(format!(
+                            "cache PC 0x{cache_pc:x} is not an emitted instruction boundary"
+                        ))
+                    })?;
+                    let recovery = mapped
+                        .recovery()
+                        .action_for_cache(offset)
+                        .map_err(|error| {
+                            types::DsrError::CachePolicy(format!(
+                                "mapped shared recovery lookup failed: {error:?}"
+                            ))
+                        })?;
+                    (guest, recovery)
+                }
             };
             return Ok((guest, recovery));
         }
@@ -4673,48 +5010,49 @@ impl ThreadTranslator {
         guest: carrick_guest_mem::GuestVa,
     ) -> Vec<(types::CacheVa, emit::RecoveryAction)> {
         let state = self.process.state.read();
-        state
-            .published
-            .iter()
-            .flat_map(|block| {
-                block.recovery.iter().filter_map(|recovery| {
-                    if !matches!(
-                        recovery.action,
-                        emit::RecoveryAction::RestoreScratch { .. }
-                            | emit::RecoveryAction::RestoreScratchCompleted { .. }
-                            | emit::RecoveryAction::CommitVirtualizedAndRestoreScratch { .. }
-                            | emit::RecoveryAction::RestoreScratchAndContext { .. }
-                            | emit::RecoveryAction::RestoreScratchAndContextCompleted { .. }
-                            | emit::RecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
-                                ..
-                            }
-                            | emit::RecoveryAction::RestoreDualVirtualReadOnly { .. }
-                            | emit::RecoveryAction::RestoreDualVirtualReadOnlyCompleted { .. }
-                            | emit::RecoveryAction::CommitDualVirtualAndRestore { .. }
-                            | emit::RecoveryAction::RecoverCounterRead(_)
-                            | emit::RecoveryAction::RecoverBiasedMemory(_)
-                    ) {
-                        return None;
-                    }
-                    let mapped_guest = block
-                        .map
-                        .iter()
-                        .find(|mapping| mapping.cache == recovery.cache)
-                        .map(|mapping| mapping.guest);
-                    if mapped_guest != Some(guest) {
-                        return None;
-                    }
-                    block
-                        .entry
-                        .host()
-                        .raw()
-                        .checked_add(recovery.cache.get() as usize)
-                        .map(carrick_guest_mem::HostVa)
-                        .map(types::CacheVa::published)
-                        .map(|cache_pc| (cache_pc, recovery.action))
-                })
-            })
-            .collect()
+        let mut points = Vec::new();
+        for block in &state.published {
+            let PublishedBlockMetadata::Owned { map, recovery, .. } = &block.metadata else {
+                continue;
+            };
+            for recovery in recovery {
+                if !matches!(
+                    recovery.action,
+                    emit::RecoveryAction::RestoreScratch { .. }
+                        | emit::RecoveryAction::RestoreScratchCompleted { .. }
+                        | emit::RecoveryAction::CommitVirtualizedAndRestoreScratch { .. }
+                        | emit::RecoveryAction::RestoreScratchAndContext { .. }
+                        | emit::RecoveryAction::RestoreScratchAndContextCompleted { .. }
+                        | emit::RecoveryAction::CommitVirtualizedAndRestoreScratchAndContext { .. }
+                        | emit::RecoveryAction::RestoreDualVirtualReadOnly { .. }
+                        | emit::RecoveryAction::RestoreDualVirtualReadOnlyCompleted { .. }
+                        | emit::RecoveryAction::CommitDualVirtualAndRestore { .. }
+                        | emit::RecoveryAction::RecoverCounterRead(_)
+                        | emit::RecoveryAction::RecoverBiasedMemory(_)
+                ) {
+                    continue;
+                }
+                let mapped_guest = map
+                    .iter()
+                    .find(|mapping| mapping.cache == recovery.cache)
+                    .map(|mapping| mapping.guest);
+                if mapped_guest != Some(guest) {
+                    continue;
+                }
+                if let Some(point) = block
+                    .entry
+                    .host()
+                    .raw()
+                    .checked_add(recovery.cache.get() as usize)
+                    .map(carrick_guest_mem::HostVa)
+                    .map(types::CacheVa::published)
+                    .map(|cache_pc| (cache_pc, recovery.action))
+                {
+                    points.push(point);
+                }
+            }
+        }
+        points
     }
 
     #[doc(hidden)]
@@ -4725,7 +5063,10 @@ impl ThreadTranslator {
         let state = self.process.state.read();
         let mut points = Vec::new();
         for block in &state.published {
-            for mapping in block.map.iter().filter(|mapping| mapping.guest == guest) {
+            let PublishedBlockMetadata::Owned { map, .. } = &block.metadata else {
+                continue;
+            };
+            for mapping in map.iter().filter(|mapping| mapping.guest == guest) {
                 let address = block
                     .entry
                     .host()
@@ -4766,7 +5107,10 @@ impl ThreadTranslator {
         let mut state = self.process.state.write();
         let is_recovery = state.published.iter().any(|block| {
             let start = block.entry.host().raw();
-            block.recovery.iter().any(|recovery| {
+            let PublishedBlockMetadata::Owned { recovery, .. } = &block.metadata else {
+                return false;
+            };
+            recovery.iter().any(|recovery| {
                 start
                     .checked_add(recovery.cache.get() as usize)
                     .is_some_and(|address| address == cache_pc.host().raw())
@@ -5459,19 +5803,25 @@ mod tests {
     // by the mirrored-ordinal tests in carrick-dsr).
     use super::{
         DsrErrorProbeExt as _, ForkChildRepairRecorder, NativeDsrExitProbeExt as _,
-        ProcessTranslator, SensitiveMetadata, SharedBlockAuthority, SharedInstallCommitObserver,
-        SharedInstallCommitPhase, SharedInstallLogicalSnapshot, SharedInstallPrepareStage,
-        ThreadTranslator, TranslatedRangeCatalog, TranslatedRangeRecorder,
-        exact_guest_ranges_from_pc_map, merge_sensitive_metadata, normalized_guest_range_union,
+        ProcessTranslator, PublishedBlockMetadata, SensitiveMetadata, SharedBlockAuthority,
+        SharedInstallCommitObserver, SharedInstallCommitPhase, SharedInstallLogicalSnapshot,
+        SharedInstallPrepareStage, ThreadTranslator, TranslatedRangeCatalog,
+        TranslatedRangeRecorder, exact_guest_ranges_from_pc_map, merge_published_indexes,
+        merge_sensitive_metadata, normalized_guest_range_union,
         set_shared_install_prepare_failpoint_for_test, shared_recovery_lazy_enabled_from,
         translated_unit_id, translation_source_words_required, typed_unit_id_from_digest,
     };
     use crate::artifact_spike::{ArtifactBindings, ArtifactTemplate};
     use crate::emit::PcMapEntry;
     use crate::mapped_memory::NativeMappedMemory;
+    use crate::mapped_metadata::{
+        MappedMetadataError, SectionKind, ValidatedLayout, ValidatedMappedTranslationMetadata,
+        VecMetadataBacking, encode_translation_metadata_v3,
+    };
     use crate::shared_cache::{
         DirectBindingLayout, PortableBlockRecord, SharedLoadedTranslationUnit,
-        TRANSLATION_UNIT_SCHEMA_V2, TranslationUnitManifest, translation_unit_base_export,
+        TRANSLATION_UNIT_SCHEMA_V2, TranslationMetadataLoadEvidence, TranslationMetadataMode,
+        TranslationUnitManifest, translation_unit_base_export,
     };
     use crate::types;
     use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
@@ -6695,7 +7045,7 @@ mod tests {
         ));
     }
 
-    fn shared_install_unit(base: usize) -> SharedLoadedTranslationUnit {
+    fn shared_install_manifest() -> TranslationUnitManifest {
         let map = pc_map(&[(0x400000, 0), (0x400000, 4), (0x400004, 8), (0x400010, 12)]);
         let template = ArtifactTemplate::normalize(
             Vec::new(),
@@ -6714,29 +7064,52 @@ mod tests {
         .expect("compact shared recovery metadata");
         let key = direct_binding_owner_and_publication::key(42);
         let base_export = translation_unit_base_export(&key).expect("keyed translation export");
-        SharedLoadedTranslationUnit::new(
-            TranslationUnitManifest {
-                schema: TRANSLATION_UNIT_SCHEMA_V2,
-                key,
-                dylib_sha256: [0x42; 32],
-                base_export,
+        TranslationUnitManifest {
+            schema: TRANSLATION_UNIT_SCHEMA_V2,
+            key,
+            dylib_sha256: [0x42; 32],
+            base_export,
+            code_len: 16,
+            blocks: vec![PortableBlockRecord {
+                guest_start: GuestVa(0x400000),
+                generation_binding: 0,
+                entry_offset: 0,
                 code_len: 16,
-                blocks: vec![PortableBlockRecord {
-                    guest_start: GuestVa(0x400000),
-                    generation_binding: 0,
-                    entry_offset: 0,
-                    code_len: 16,
-                    requires_sensitive_metadata: false,
-                    template,
-                }],
-                binding_layout: DirectBindingLayout::Disabled,
-                binding_export: String::new(),
-                binding_data_len: 0,
-                cell_size: 0,
-                bindings: Vec::new(),
-                binding_relocations: Vec::new(),
-            },
+                requires_sensitive_metadata: false,
+                template,
+            }],
+            binding_layout: DirectBindingLayout::Disabled,
+            binding_export: String::new(),
+            binding_data_len: 0,
+            cell_size: 0,
+            bindings: Vec::new(),
+            binding_relocations: Vec::new(),
+        }
+    }
+
+    fn shared_install_unit(base: usize) -> SharedLoadedTranslationUnit {
+        SharedLoadedTranslationUnit::new(shared_install_manifest(), base, Arc::new(()))
+    }
+
+    fn mapped_shared_install_unit(base: usize) -> SharedLoadedTranslationUnit {
+        let manifest = shared_install_manifest();
+        let bytes = encode_translation_metadata_v3(&manifest).expect("encode mapped fixture");
+        let metadata = ValidatedMappedTranslationMetadata::new(
+            Arc::new(VecMetadataBacking::new(bytes)),
+            &manifest.key,
+        )
+        .expect("validate mapped fixture");
+        SharedLoadedTranslationUnit::new_mapped(
+            metadata,
             base,
+            TranslationMetadataLoadEvidence {
+                mode: TranslationMetadataMode::V3,
+                bytes_read: 0,
+                bytes_mapped: 1_234,
+                validation_ns: 37,
+                mapped_records: 6,
+                owned_records: 0,
+            },
             Arc::new(()),
         )
     }
@@ -7239,11 +7612,18 @@ mod tests {
                 if event.unit_id() == prepared_id
                     && event.range() == &(HostVa(base)..HostVa(base + 16))
         ));
-        assert!(state.published[0].recovery.is_empty());
-        assert!(state.published[0].shared_recovery.is_some());
+        let PublishedBlockMetadata::Owned {
+            recovery,
+            shared_recovery,
+            ..
+        } = &state.published[0].metadata
+        else {
+            panic!("V2 shared block must retain owned metadata");
+        };
+        assert!(recovery.is_empty());
+        assert!(shared_recovery.is_some());
         assert!(
-            state.published[0]
-                .shared_recovery
+            shared_recovery
                 .as_ref()
                 .expect("shared recovery metadata")
                 .recovery
@@ -7258,6 +7638,207 @@ mod tests {
                 Some(crate::emit::RecoveryAction::RestoreGuestX17),
             )
         );
+    }
+
+    #[test]
+    fn mapped_shared_unit_references_metadata_and_resolves_every_cache_offset() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+
+        let prepared = state
+            .prepare_shared_install(73, &memory, mapped_shared_install_unit(base))
+            .expect("prepare mapped shared install");
+        state.commit_shared_install(prepared);
+
+        assert_eq!(state.loaded_shared_units.len(), 1);
+        assert_eq!(
+            state.loaded_shared_units[0]._unit.load_evidence,
+            TranslationMetadataLoadEvidence {
+                mode: TranslationMetadataMode::V3,
+                bytes_read: 0,
+                bytes_mapped: 1_234,
+                validation_ns: 37,
+                mapped_records: 6,
+                owned_records: 0,
+            }
+        );
+        assert!(matches!(
+            &state.published[0].metadata,
+            PublishedBlockMetadata::Mapped {
+                loaded_unit_index: 0,
+                block_index: 0,
+            }
+        ));
+        assert_eq!(state.published[0].owned_record_count(), 0);
+        for (offset, expected_guest_pc, expected_recovery) in [
+            (0_usize, GuestVa(0x400000), None),
+            (
+                4,
+                GuestVa(0x400000),
+                Some(crate::emit::RecoveryAction::RestoreGuestX17),
+            ),
+            (8, GuestVa(0x400004), None),
+            (12, GuestVa(0x400010), None),
+        ] {
+            let mapped_cache_pc = GuestVa(u64::try_from(base + offset).expect("mapped cache PC"));
+            assert_eq!(
+                state
+                    .guest_pc_for_cache(mapped_cache_pc)
+                    .expect("mapped lookup"),
+                (expected_guest_pc, expected_recovery),
+                "cache offset {offset}"
+            );
+        }
+        assert_eq!(
+            state.shared_guest_ranges,
+            vec![
+                (GuestVa(0x400000), GuestVa(0x400008)),
+                (GuestVa(0x400010), GuestVa(0x400014)),
+            ]
+        );
+    }
+
+    #[test]
+    fn mapped_shared_unit_lookup_fails_closed_on_invalid_owner_indexes() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+        let prepared = state
+            .prepare_shared_install(73, &memory, mapped_shared_install_unit(base))
+            .expect("prepare mapped shared install");
+        state.commit_shared_install(prepared);
+        let cache_pc = GuestVa(u64::try_from(base).expect("cache PC"));
+
+        state.published[0].metadata = PublishedBlockMetadata::Mapped {
+            loaded_unit_index: usize::MAX,
+            block_index: 0,
+        };
+        assert!(matches!(
+            state.guest_pc_for_cache(cache_pc),
+            Err(types::DsrError::CachePolicy(message))
+                if message.contains("loaded-unit index")
+        ));
+
+        state.published[0].metadata = PublishedBlockMetadata::Mapped {
+            loaded_unit_index: 0,
+            block_index: u32::MAX,
+        };
+        assert!(matches!(
+            state.guest_pc_for_cache(cache_pc),
+            Err(types::DsrError::CachePolicy(message))
+                if message.contains("block index")
+        ));
+    }
+
+    #[test]
+    fn mapped_shared_unit_published_indexes_merge_strictly_without_resorting() {
+        let current = [
+            super::PublishedIndexEntry {
+                start: HostVa(0x1000),
+                block: 1,
+            },
+            super::PublishedIndexEntry {
+                start: HostVa(0x3000),
+                block: 3,
+            },
+        ];
+        let incoming = [
+            super::PublishedIndexEntry {
+                start: HostVa(0x2000),
+                block: 2,
+            },
+            super::PublishedIndexEntry {
+                start: HostVa(0x4000),
+                block: 4,
+            },
+        ];
+
+        assert_eq!(
+            merge_published_indexes(&current, &incoming).expect("merge ordered indexes"),
+            vec![current[0], incoming[0], current[1], incoming[1]]
+        );
+        assert!(merge_published_indexes(&[current[1], current[0]], &incoming).is_err());
+        assert!(merge_published_indexes(&current, &[incoming[1], incoming[0]]).is_err());
+        assert!(merge_published_indexes(&current, &[current[1]]).is_err());
+    }
+
+    #[test]
+    fn mapped_shared_unit_prepare_failpoints_leave_all_logical_owners_unchanged() {
+        for stage in SharedInstallPrepareStage::ALL {
+            let process =
+                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+            let mut recorder = TranslatedRangeRecorderFixture::default();
+            process
+                .activate_translated_range_catalog_with_recorder(&mut recorder)
+                .expect("activate catalog");
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let mut state = process.state.write();
+            let base = (state.cache.host_range().end + 0x10_000) & !3;
+            let before = state.shared_install_logical_snapshot_for_test();
+            set_shared_install_prepare_failpoint_for_test(Some(stage));
+
+            let result =
+                state.prepare_shared_install(73, &memory, mapped_shared_install_unit(base));
+            set_shared_install_prepare_failpoint_for_test(None);
+
+            assert!(result.is_err(), "{stage:?}");
+            assert_eq!(
+                state.shared_install_logical_snapshot_for_test(),
+                before,
+                "{stage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mapped_shared_unit_bad_guest_range_fails_before_logical_state_changes() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let state = process.state.write();
+        let before = state.shared_install_logical_snapshot_for_test();
+        let manifest = shared_install_manifest();
+        let mut bytes = encode_translation_metadata_v3(&manifest).expect("encode mapped fixture");
+        let layout = ValidatedLayout::parse(&bytes).expect("parse mapped fixture layout");
+        let range_offset = usize::try_from(
+            layout
+                .section(SectionKind::GuestRange)
+                .expect("guest-range section")
+                .offset()
+                .get(),
+        )
+        .expect("guest-range offset");
+        let range_end = u64::from_le_bytes(
+            bytes[range_offset + 8..range_offset + 16]
+                .try_into()
+                .expect("guest-range end"),
+        );
+        bytes[range_offset..range_offset + 8].copy_from_slice(&range_end.to_le_bytes());
+
+        assert!(matches!(
+            ValidatedMappedTranslationMetadata::new(
+                Arc::new(VecMetadataBacking::new(bytes)),
+                &manifest.key,
+            ),
+            Err(MappedMetadataError::GuestRange)
+        ));
+        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
     }
 
     #[test]
@@ -7374,17 +7955,19 @@ mod tests {
             PublishedBlock {
                 entry,
                 len: words as usize * 4,
-                map: (0..words)
-                    .map(|word| emit::PcMapEntry {
-                        guest: GuestVa(guest.raw() + u64::from(word) * 4),
-                        cache: types::CacheOffset::published(word * 4),
-                    })
-                    .collect(),
-                recovery: vec![emit::RecoveryEntry {
-                    cache: types::CacheOffset::published(4),
-                    action: emit::RecoveryAction::RestoreGuestX17,
-                }],
-                shared_recovery: None,
+                metadata: super::super::PublishedBlockMetadata::Owned {
+                    map: (0..words)
+                        .map(|word| emit::PcMapEntry {
+                            guest: GuestVa(guest.raw() + u64::from(word) * 4),
+                            cache: types::CacheOffset::published(word * 4),
+                        })
+                        .collect(),
+                    recovery: vec![emit::RecoveryEntry {
+                        cache: types::CacheOffset::published(4),
+                        action: emit::RecoveryAction::RestoreGuestX17,
+                    }],
+                    shared_recovery: None,
+                },
                 _generation: generations.observe(guest).expect("generation observation"),
             }
         }
@@ -7748,7 +8331,7 @@ mod tests {
                     target,
                 )
                 .expect("exact owner");
-            assert_eq!(owner.unit, fixture.unit.manifest.key);
+            assert_eq!(&owner.unit, fixture.unit.key());
             assert_eq!(owner.ordinal, DirectBindingOrdinal::claimed(0));
             assert_eq!(
                 state.direct_bindings.owner_key(
@@ -7808,8 +8391,8 @@ mod tests {
                 )
                 .expect("first exact owner");
 
-            assert_eq!(owner.unit, first.unit.manifest.key);
-            assert_ne!(owner.unit, second.unit.manifest.key);
+            assert_eq!(&owner.unit, first.unit.key());
+            assert_ne!(&owner.unit, second.unit.key());
         }
 
         #[test]
@@ -7845,7 +8428,7 @@ mod tests {
             assert_eq!(
                 selected,
                 DirectBindingEligibility {
-                    unit: second.unit.manifest.key.clone(),
+                    unit: second.unit.key().clone(),
                     ordinal: DirectBindingOrdinal::claimed(0),
                     cell: second.unit.binding_base,
                 }
