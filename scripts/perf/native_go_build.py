@@ -758,6 +758,36 @@ def carrick_cleanup(repo: pathlib.Path, run_id: str) -> dict[str, object]:
     }
 
 
+def carrick_timeout_diagnostics(
+    repo: pathlib.Path,
+    binary: pathlib.Path,
+    run_id: str,
+) -> dict[str, object]:
+    out_dir = (repo / "target" / "perf" / "lldb-timeouts").resolve()
+    result = subprocess.run(
+        [
+            str(binary),
+            "debug",
+            "lldb-snapshot",
+            "--run-id",
+            run_id,
+            "--out-dir",
+            str(out_dir),
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    return {
+        "status": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "out_dir": str(out_dir),
+    }
+
+
 def docker_cleanup(run_id: str) -> dict[str, object]:
     result = subprocess.run(
         ["docker", "rm", "-f", run_id],
@@ -854,6 +884,7 @@ def run_sample(
     registry_transport: RegistryTransport | None = None,
     current_run_id: str | None = None,
     known_receipt_binaries: tuple[pathlib.Path, ...] = (),
+    capture_timeout_diagnostics: bool = True,
 ) -> dict[str, object]:
     resolved_binary = (
         harness_repo / "target/release/carrick" if binary is None else binary
@@ -912,6 +943,7 @@ def run_sample(
     execution_error: Exception | None = None
     cleanup_error: Exception | None = None
     cleanup_evidence: dict[str, object] | None = None
+    timeout_diagnostics: dict[str, object] | None = None
     try:
         result = subprocess.run(
             command,
@@ -933,6 +965,26 @@ def run_sample(
         rusage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
         cpu_user_s = rusage_after.ru_utime - rusage_before.ru_utime
         cpu_sys_s = rusage_after.ru_stime - rusage_before.ru_stime
+        if (
+            timeout is not None
+            and engine == ENGINE_CARRICK
+            and capture_timeout_diagnostics
+        ):
+            try:
+                timeout_diagnostics = carrick_timeout_diagnostics(
+                    harness_repo,
+                    resolved_binary,
+                    run_id,
+                )
+            except Exception as error:
+                timeout_diagnostics = {
+                    "status": 125,
+                    "stdout": "",
+                    "stderr": f"timeout diagnostics failed: {error}",
+                    "out_dir": str(
+                        (harness_repo / "target" / "perf" / "lldb-timeouts").resolve()
+                    ),
+                }
         try:
             if engine == ENGINE_CARRICK:
                 cleanup_evidence = carrick_cleanup(harness_repo, run_id)
@@ -1050,6 +1102,7 @@ def run_sample(
             "pre": pre_provenance,
             "post": post_provenance,
         },
+        "timeout_diagnostics": timeout_diagnostics,
         "cleanup": cleanup_evidence,
         "stdout": stdout,
         "stderr": stderr,

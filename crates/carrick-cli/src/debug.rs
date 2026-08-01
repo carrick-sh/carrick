@@ -95,7 +95,52 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
             )?;
             std::process::exit(status);
         }
+        DebugCommand::LldbSnapshot {
+            run_id,
+            out_dir,
+            lldb_plugin,
+            no_core,
+        } => {
+            run_lldb_snapshot(run_id, out_dir, lldb_plugin, no_core)?;
+        }
     }
+    Ok(())
+}
+
+fn run_lldb_snapshot(
+    run_id: String,
+    out_dir: PathBuf,
+    lldb_plugin_arg: Option<PathBuf>,
+    no_core: bool,
+) -> anyhow::Result<()> {
+    if run_id.is_empty() {
+        bail!("debug lldb-snapshot requires a nonempty --run-id");
+    }
+    fs::create_dir_all(&out_dir)
+        .with_context(|| format!("failed to create {}", out_dir.display()))?;
+    let exe = std::env::current_exe().context("failed to resolve current carrick binary path")?;
+    let lldb_plugin = lldb_plugin_arg.unwrap_or_else(default_lldb_plugin_path);
+    let lldb_log = out_dir.join(format!("{run_id}.lldb.txt"));
+    let ps_log = out_dir.join(format!("{run_id}.ps.txt"));
+    let pids = dump_lldb(&LldbDumpContext {
+        run_id: &run_id,
+        why: "external-timeout-snapshot",
+        exe: &exe,
+        lldb_plugin: &lldb_plugin,
+        out_dir: &out_dir,
+        lldb_log: &lldb_log,
+        ps_log: &ps_log,
+        no_core,
+    })?;
+    if pids.is_empty() {
+        bail!("no scoped Carrick processes matched run id `{run_id}`");
+    }
+    eprintln!(
+        "carrick debug lldb-snapshot: run_id={run_id} processes={} lldb_log={} ps_log={}",
+        pids.len(),
+        lldb_log.display(),
+        ps_log.display(),
+    );
     Ok(())
 }
 
