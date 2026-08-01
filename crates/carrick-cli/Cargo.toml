@@ -17,6 +17,16 @@ workspace = true
 # is default ON. Build with `--no-default-features` for the legacy trap-only
 # vector path.
 default        = ["syscall-shim", "platform-macos"]
+# Heap-allocation census (diagnostic, like carrick-runtime's `debug-stats`).
+# Installs `dhat` as the global allocator so every allocation is attributed to
+# a call stack, and writes one `dhat-<pid>.json` per process. Answers "what
+# allocates the ~20.5 GB of large-zone heap per `go build`" -- a question no
+# EXTERNAL instrument can answer here: `ustack()` misresolves across ~70
+# self-re-exec'd processes with independent ASLR slides, `fbt::mach_vm_allocate`
+# never fires, and `syscall::mmap` sees only the MAP_NORESERVE reservations
+# because libmalloc sub-allocates a few large regions. Opt-in: it makes the
+# binary much slower, so it is a measurement build, never a shipping one.
+alloc-census   = ["dep:dhat"]
 syscall-shim   = ["carrick-runtime/syscall-shim"]
 # Exactly one platform-* is active at a time; `default` keeps macOS building
 # exactly as today. `platform-linux` links NO HVF.
@@ -60,6 +70,7 @@ debug-all = [
 
 [dependencies]
 carrick-runtime = { path = "../carrick-runtime", default-features = false }
+dhat = { version = "0.3", optional = true }
 carrick-vmm-hvf = { path = "../carrick-vmm-hvf", optional = true }
 carrick-host-bsd = { path = "../carrick-host-bsd", optional = true }
 carrick-vmm-kvm = { path = "../carrick-vmm-kvm", optional = true }
