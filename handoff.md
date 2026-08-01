@@ -171,6 +171,39 @@ were `psynch_cvcontinue`, `thread_block_reason`, and
 `kqueue_scan_continue`; they require a narrower low-perturbation experiment
 before production coding.
 
+The narrower experiment is now live-proven. `native-pc-range-directional.d`
+samples at `197 Hz` instead of `997 Hz`, retains every leaf (no `trunc`), and
+binds each outside-private symbol to its exact `(pid, epoch, PC)`. The v2
+analyzer refuses a leaf without an identical PC-histogram population and uses
+the translated-range catalog—not symbol text—to exclude shared JIT code. Its
+first live default capture correctly rejected one epoch mismatch: another
+thread published an exec range reset between the former all-PC and leaf
+clauses. Recording the outside PC and leaf in the same DTrace clause removed
+that race; private PCs now use a separate clause.
+
+Two default/shared runs, in reversed order for the second pair, then completed
+naturally with `BUILD_OK`, no warnings, and exact leaf reconciliation. Default
+recorded `7,295` and `7,291` total samples; shared recorded `7,592` and `7,570`
+(`+3.95%` over the two-run totals, directional only). The split was similarly
+diffuse: shared versus default was `+4.64%` user, `+2.35%` kernel, `+5.38%`
+host-user, and `+3.76%` translated execution. The stable shared-only named
+cluster is shared-unit installation: across the pair
+`DirectBindingRegistry::prepare_loaded_unit` had `29` samples,
+bincode decode/drop `45`, `exact_guest_ranges_from_pc_map` `17`, plus sorting
+and B-tree insertion. Each individual leaf is under `0.5%` of host user
+samples, so there is no honest single-function winner yet. Generic `memmove`,
+SHA-256, icache invalidation, allocation, and wait leaves were similar or lower
+under shared translation.
+
+The ignored exact receipts are
+`target/perf/native-user-leaf-v2-{default,shared}-{2,3}.{raw,json}`. Their raw
+SHA-256 values in default-2/default-3/shared-2/shared-3 order are `a5e3753f…`,
+`5430d10f…`, `50bc18a8…`, and `1a721596…`; adjacent analyzed JSON values are
+`a61e764a…`, `64fb1c8b…`, `87f1bf1c…`, and `81d6279b…`. Roughly `37–41%` of host-user samples still have
+raw leaf identities. Resolve those against an exact per-process Carrick image
+range before selecting the runtime change; a raw PC must not be guessed into
+the named shared-install cluster.
+
 Profiler-focused integration tests pass 10/10, exact raw replay passes, and the
 complete `just test` gate passes, including the serialized runtime library at
 1,128 passed with 5 ignored. The ordinary parallel `just ci` gate exposed an
@@ -197,15 +230,14 @@ The full gate exposed four stale keyed-export fixtures and two eager-recovery
 test helpers; both were corrected through the production validation key and a
 single representation-neutral recovery lookup seam before the green rerun.
 
-**Next:** use DTrace to split the remaining `+8.49%` shared-path user-CPU cost
-into named host stacks versus translated execution with substantially less
-observer work than the full wall profiler. Keep lifecycle/drop accounting and
-symmetrically compare default/shared on the same signed binary. Use LLDB only
-where unresolved PCs need a ground-truth image/offset mapping. Then implement
-one red-first, default-on candidate with an exact opt-out and return it to the
-primary eight-quad total-child-CPU gate. Synchronization/kqueue kernel frames
-remain secondary until the user-space comparison is resolved; do not infer
-that PC-map compaction wins from address classification alone.
+**Next:** publish the exact Carrick executable range at native image activation
+with a zero-work-when-disabled USDT probe, join the remaining raw leaves to
+per-process offsets, and use LLDB/`atos` only to ground-truth ambiguous offsets.
+Then implement one red-first, default-on shared-install candidate with an exact
+opt-out and return it to the primary eight-quad total-child-CPU gate.
+Synchronization/kqueue kernel frames remain secondary until the user-space
+comparison is resolved; do not infer that PC-map compaction wins from address
+classification alone.
 
 Confidence that run encoding should stay is high (`~93%`) because statistical,
 mechanism, correctness, and signed-live operability evidence now agree.
