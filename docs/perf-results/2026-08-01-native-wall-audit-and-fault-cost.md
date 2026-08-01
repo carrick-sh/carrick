@@ -240,6 +240,35 @@ The large zone allocates via `mach_vm_allocate`, **not** `mmap` — which is why
 one traced build shows only 2,172 `mmap` calls against 1.88 M zfod, and why
 every syscall-level instrument aimed at this missed two thirds of it.
 
+### Attributing the 20.5 GB: three routes measured dead
+
+The large-zone mass is real and reproduces (1,252,285 zfod, 66.7%), but three
+obvious ways to attribute it to CALL SITES are each measured non-viable. Recorded
+so the next attempt starts from the fourth.
+
+1. **`ustack()` on the fault probe — corrupted, not empty.** A cold build runs
+   ~70 carrick processes (self-re-exec per guest exec) with independent ASLR
+   slides, nearly all dead at DTrace END. `ustack()` then resolves surviving
+   frames against the WRONG process image and prints plausible-but-false
+   symbols (observed: `serde_json::serialize_field -> hashbrown::RawTable::drop
+   -> read`, with every top stack tied at exactly count=154). Holding one guest
+   alive does not help — it donates its symbols to everyone else's frames.
+2. **`fbt::mach_vm_allocate` / `vm_allocate` — never fire.** Zero events for
+   `execname == "carrick"` across a full build, so the premise that libmalloc's
+   large zone is reachable there is FALSE on this build.
+3. **`syscall::mmap` — too coarse.** 2,119 calls totalling **2.4 TiB**, which is
+   just the ~36 GiB of `MAP_NORESERVE` per-process reservations (mmap arena
+   32 GiB + apertures) times ~70 processes. Those reservations touch nothing.
+   libmalloc takes a handful of large regions and sub-allocates them, so no
+   syscall exists per allocation and 20.5 GB of first touch has no syscall
+   footprint at all.
+
+**Therefore attribution must come from instrumenting carrick's own allocator in
+Rust** — a global-allocator shim counting allocations >= ~128 KiB by size and
+site — not from tracing it from outside. That is also what AGENTS.md mandates
+(Rust first, extend `carrick trace`/`carrick debug`), so the measurement route
+and the house rule agree.
+
 Ruled out with measurements (do not re-litigate): `MADV_WILLNEED` as a populate
 primitive (identical fault count to memset, 262,315 vs 262,315, slightly slower);
 `mlock`/`vm_map_wire` (slower than memset at both thread counts); `MAP_POPULATE`
