@@ -1486,10 +1486,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 &me,
                                 &command,
                                 &opts,
-                                |mut symbolizer| -> anyhow::Result<_> {
+                                |mut symbolizer, capture_report| -> anyhow::Result<_> {
                                     let addresses = kernel_sample_addresses_from_path(
                                         raw_path,
                                         native_profile_authority.as_ref(),
+                                        capture_report.into(),
                                     )?;
                                     if addresses.weighted_leaves.iter().any(|address| {
                                         addresses.requested.binary_search(address).is_err()

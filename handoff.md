@@ -1,9 +1,9 @@
 # Native-lane performance handoff
 
 **Date:** 2026-07-31
-**Branch:** `codex/native-performance-m1` (performance/timeout checkpoint
-`47457f44`; qualified profile-v2 checkpoint `edbdc530`; M1 correctness
-checkpoint `5020e509`)
+**Branch:** `codex/native-performance-m1` (recovery-run evidence checkpoint
+`b0ddf87d`; performance/timeout checkpoint `47457f44`; qualified profile-v2
+checkpoint `edbdc530`; M1 correctness checkpoint `5020e509`)
 **Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
 default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
@@ -23,10 +23,10 @@ its ignored raw trace receipts remain under `target/perf/`.
 ## Active performance checkpoint — retained shared-cache mechanisms
 
 The performance campaign is now producing measured mechanism wins. The branch
-is still active and is **not merge-ready**: the complete repository gate is
-green and run-encoded recovery metadata is retained, but the retained stack
-still needs one clean cumulative old/new rerun, the shared/default gap must be
-remeasured, and the qualified v2 profiler needs its signed live proof.
+is still active and is **not merge-ready**: run-encoded recovery metadata is
+retained and the qualified v2 profiler has a signed live proof, but the retained
+stack still needs one clean cumulative old/new rerun and the shared/default gap
+must be remeasured.
 
 Retained default-on changes, each with an exact `=0` opt-out, now remove:
 
@@ -104,6 +104,53 @@ The comparison is
 (SHA-256
 `7d2438ff1e4aa193bbc8180339516cad561540e8e110fd1722263ca406990696`).
 
+The production `DSRPROF2` wall profiler is now load-bounded and live-proven on
+the real shared-cache Go-build process tree. Run
+`native-v2-go-shared-b0ddf87d-summary-6` completed naturally in `24.340217250s`
+with `61,855` metric rows, zero incomplete pairs, zero remaining scoped
+processes, every lifecycle/integrity/probe-error counter at zero, and zero
+principal, aggregation, dynamic, dynamic-rinse, dynamic-dirty, or other drops.
+The signed live binary SHA-256 is
+`581ec7afec244e258b4cb35a7d4b7de5ae0681b9b4edfc68dd6649f3443692b7`;
+the header binds base commit `b0ddf87d` and records the profiler-hardening tree
+as dirty because the proof preceded this checkpoint commit.
+The ignored raw receipt is
+`target/perf/native-v2-go-shared-b0ddf87d-summary-6.raw` (`470,121` lines,
+SHA-256 `37e2e940c8895f23c8a4129b28210f743e4892828082f5c98422134769083929`);
+the accepted summary is the adjacent `.jsonl` file (SHA-256
+`0648b12657b8a626e74c38ad024266ed5c2fa11c64ed10a2c471f36d1f6d9e7d`).
+Offline exact replay through `__native-profile-validate` also accepted the raw
+receipt.
+
+The profiler now validates lifecycle state in the same DTrace clauses that
+mutate it, checks libdtrace loss before parsing or symbolization, records
+`dtrace:::ERROR`, right-censors terminal thread/process state, and emits
+aggregated production rows instead of hot per-transition records. Exact fixture
+replay still validates individual transitions. Its range model treats the
+first ready marker as the activation frontier while allowing later shared
+ranges to append and be inherited across fork; repeated ready markers reject.
+
+PC-range attribution classified the `12,257` user samples as `53.13%`
+host/unattributed, `33.30%` private translated code, and `13.58%` shared
+translated code. That proves translated execution is material, but does **not**
+yet prove the 3.7-million-entry PC map owns the next cost. Kernel samples are
+directional only: the largest frames were DTrace itself
+(`ml_set_interrupts_enabled_with_debug`, `dtrace_probe`), so they must not be
+selected as runtime optimization targets. The next non-observer kernel owners
+were `psynch_cvcontinue`, `thread_block_reason`, and
+`kqueue_scan_continue`; they require a narrower low-perturbation experiment
+before production coding.
+
+Profiler-focused integration tests pass 10/10, exact raw replay passes, and the
+complete `just test` gate passes, including the serialized runtime library at
+1,128 passed with 5 ignored. The ordinary parallel `just ci` gate exposed an
+unrelated pre-existing test-isolation defect in untouched
+`carrick-signal-core`: one attempt lost process-pending signal 15 while another
+attempt observed that same global signal in a sibling test. Both tests mutate
+the process-global pending mask concurrently. The full controlled gate
+`RUST_TEST_THREADS=1 just ci` passes; no signal production code or tests were
+changed in this checkpoint.
+
 The first ABBA attempt preserved a genuine 900-second, low-CPU timeout at
 quad 4 B2 instead of rewriting it away. Candidate-only and exact ABBA reducers
 then completed 32/32 and 18/18 runs, so it is retained as discovery evidence,
@@ -121,18 +168,23 @@ test helpers; both were corrected through the production validation key and a
 single representation-neutral recovery lookup seam before the green rerun.
 
 **Next:** run the exact old/new two-binary cumulative campaign and the current
-same-binary shared/default campaign. Then live-prove qualified `DSRPROF2` on the
-same Go-build workload and use its PC-range attribution to decide whether the
-3.7-million-entry PC map is the next representation owner. Do not start PC-map
-coding until those measurements identify the cost.
+same-binary shared/default campaign. Battery power is explicitly authorized for
+this campaign as of this checkpoint; preserve the power state in each receipt
+and retain the existing thermal/load gates. Then use the accepted v2 profile to
+build one narrower, low-perturbation experiment around host-side user time and
+the genuine synchronization/kqueue frames. Advance a default-on candidate with
+an exact opt-out only after that experiment identifies the cost; do not infer
+that PC-map compaction wins from address classification alone.
 
 Confidence that run encoding should stay is high (`~93%`) because statistical,
 mechanism, correctness, and signed-live operability evidence now agree.
 Confidence that the campaign has a meaningful cumulative native win is also
-high (`~92%`). Confidence in reaching the full `>=30%` total-CPU goal is
-moderate-to-high (`~68%`): the current stack projects around `21%`, leaving a
-real but bounded gap for PC-map and remaining kernel ownership work. Confidence
-that shared/default parity is now close is about `70%` until the exact rerun.
+high (`~92%`). Confidence that `DSRPROF2` can reliably select the next owner is
+now high (`~95%`) after the accepted zero-drop live run. Confidence in reaching
+the full `>=30%` total-CPU goal is moderate-to-high (`~70%`): the current stack
+projects around `21%`, leaving a real but bounded gap for host-side user time
+and remaining kernel ownership work. Confidence that shared/default parity is
+now close is about `70%` until the exact rerun.
 
 ---
 
@@ -307,8 +359,8 @@ and exact stack records. The ordinary summary and symbol overlay are published
 only after the shared parser accepts complete state and every libdtrace loss
 class, including split dynamic rinse and dirty drops. The valid fixture and
 adversarial header/lifecycle/range/kernel/off-CPU/completion/drop/symbol tests
-pass. A signed live v2 capture is still required before using the profiler as
-the next performance-selection authority.
+pass. The load-bounded hardening and signed Go-build proof described above now
+close the remaining live-capture gate.
 
 Commit `51e20831` adds the first live launch-qualification slice. The approved
 design assumed Darwin `proc` provider start fields could supply process birth
@@ -342,24 +394,26 @@ build. On build `26A5388g`, the structural birth receipt is
 `95fe4186319da4383b83264fa7eea054f9019562ad7b59caa421eb18992b122d` and the
 terminal receipt is
 `e500c6bf4e131f724f04a2b9a0eec45337f5f170ba2a44525e4f4b7097ee1fd4`.
-These are not yet gating authorities: the hidden offline validator supplies a
-zero-valued report for structural replay, while the automatic launch path must
-bind the actual libdtrace drop/interruption report before admitting a victim
-capture. Full host tests, integration tests, focused warnings-denied clippy,
-formatting, domain lint, diff checks, and all three live DTrace fixtures passed.
+Those standalone qualifier receipts are not gating authorities by themselves:
+the hidden offline validator supplies a zero-valued report for structural
+replay. The accepted production capture above supplies and checks the actual
+libdtrace drop/interruption report before admitting its victim summary. Full
+host tests, integration tests, focused warnings-denied clippy, formatting,
+domain lint, diff checks, and all three live DTrace fixtures passed.
 
 The lifecycle receipt closes the catalog/fork/exec prerequisite, the raw
-grammar and automatic launch authority now exist, and the required Darwin
-birth/terminal mechanisms are live-qualified. What remains is an immutable,
-signed real-workload `DSRPROF2` capture proving that production emission and
-qualification agree under the Go-build process tree. Use that capture, not the
-older PID-only `DSRPROF1` stream, to rank the next translation/kernel owner.
+grammar and automatic launch authority exist, the required Darwin
+birth/terminal mechanisms are live-qualified, and the immutable signed
+real-workload `DSRPROF2` capture proves production emission and qualification
+agree under the Go-build process tree. Use that capture, not the older PID-only
+`DSRPROF1` stream, to rank the next translation/kernel owner.
 
-**Next:** complete the cumulative old/new and shared/default CPU campaigns,
-then run the signed qualified v2 Go-build capture. If it accepts, use the
-birth-keyed PC-range and kernel/off-CPU summaries to select one narrow,
-default-on candidate with an exact opt-out and advance it to the primary ABBA
-total-child-CPU gate.
+**Next:** complete the explicitly battery-authorized cumulative old/new and
+shared/default CPU campaigns while preserving power and thermal metadata. In
+parallel with the resulting comparison, narrow the accepted birth-keyed
+PC-range and kernel/off-CPU summaries into one low-perturbation host-user or
+synchronization/kqueue hypothesis, then advance one default-on candidate with
+an exact opt-out to the primary ABBA total-child-CPU gate.
 
 The `>=30%` CPU goal remains open. Run encoding has now added a clean `-8.48%`
 total-CPU result; the combined-stack result is still awaiting direct

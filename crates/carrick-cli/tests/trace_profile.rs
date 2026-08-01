@@ -140,6 +140,88 @@ fn dsrprof2_accepts_birth_keyed_lifecycle_fixture() {
 }
 
 #[test]
+fn dsrprof2_accepts_summary_mode_without_transition_events() {
+    let summary_only = DSRPROF2_FIXTURE
+        .lines()
+        .filter(|line| {
+            ![
+                "DSRPROF2|kernel-enter|",
+                "DSRPROF2|kernel-return|",
+                "DSRPROF2|kernel-terminal-close|",
+                "DSRPROF2|offcpu-block|",
+                "DSRPROF2|offcpu-wake|",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    validate_dsrprof2_fixture(&summary_only, &[])
+        .success()
+        .stdout(contains("DSRPROF2_VALID"));
+}
+
+#[test]
+fn dsrprof2_accepts_committed_shared_range_after_initial_ready() {
+    let parent_ready = "DSRPROF2|range-ready|pid=100|start_sec=10|start_usec=20|image=1|epoch=0";
+    assert_eq!(DSRPROF2_FIXTURE.matches(parent_ready).count(), 1);
+
+    validate_dsrprof2_fixture(DSRPROF2_FIXTURE, &[])
+        .success()
+        .stdout(contains("DSRPROF2_VALID"));
+}
+
+#[test]
+fn dsrprof2_fork_inherits_dynamic_shared_frontier_after_initial_ready() {
+    let parent_range = "DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=4|unit_id=9|start=0x5000|end=0x5800";
+    let process_create = "DSRPROF2|process-create|child_pid=101|child_sec=11|child_usec=21|child_image=1|child_epoch=0|parent_pid=100|parent_sec=10|parent_usec=20|parent_image=1|parent_epoch=0";
+    let child_ready =
+        "DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|final_sequence=3";
+    let child_ready_four =
+        "DSRPROF2|range-ready|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|final_sequence=4";
+    let child_range = "DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=4|unit_id=9|start=0x5000|end=0x5800";
+    let runtime_lifecycle = DSRPROF2_FIXTURE
+        .replacen(&format!("{parent_range}\n"), "", 1)
+        .replacen(
+            process_create,
+            &format!("{parent_range}\n{process_create}"),
+            1,
+        )
+        .replacen("range_frontier=3", "range_frontier=4", 1)
+        .replacen(
+            child_ready,
+            &format!("{child_range}\n{child_ready_four}"),
+            1,
+        );
+
+    validate_dsrprof2_fixture(&runtime_lifecycle, &[])
+        .success()
+        .stdout(contains("DSRPROF2_VALID"));
+}
+
+#[test]
+fn dsrprof2_accepts_duplicate_exec_observation_for_same_image() {
+    let attempt = "DSRPROF2|exec-attempt|pid=101|start_sec=11|start_usec=21|image=1|epoch=1";
+    let repeated = DSRPROF2_FIXTURE.replacen(attempt, &format!("{attempt}\n{attempt}"), 1);
+
+    validate_dsrprof2_fixture(&repeated, &[])
+        .success()
+        .stdout(contains("DSRPROF2_VALID"));
+}
+
+#[test]
+fn dsrprof2_retires_unresolved_exec_observation_at_process_exit() {
+    let exit = "DSRPROF2|process-exit|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|reason=1";
+    let attempt = "DSRPROF2|exec-attempt|pid=100|start_sec=10|start_usec=20|image=1|epoch=0";
+    let unresolved = DSRPROF2_FIXTURE.replacen(exit, &format!("{attempt}\n{exit}"), 1);
+
+    validate_dsrprof2_fixture(&unresolved, &[])
+        .success()
+        .stdout(contains("DSRPROF2_VALID"));
+}
+
+#[test]
 fn dsrprof2_reports_completion_violation_category() {
     let corrupt = DSRPROF2_FIXTURE
         .replacen("bounded=0", "bounded=1", 1)
@@ -197,6 +279,8 @@ fn dsrprof2_rejects_corrupt_lifecycle_fixtures() {
         "DSRPROF2|cpu-user|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|pc=0x1100|count=3";
     let target_birth = "DSRPROF2|target-birth|pid=100|start_sec=10|start_usec=20|image=1|epoch=0";
     let parent_later_range = "DSRPROF2|range-shared|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|sequence=4|unit_id=9|start=0x5000|end=0x5800";
+    let repeated_parent_ready =
+        "DSRPROF2|range-ready|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|final_sequence=4";
     let kernel_return = "DSRPROF2|kernel-return|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|provider=syscall|function=read|class=named-syscall|timestamp_ns=1200";
     let offcpu_block = "DSRPROF2|offcpu-block|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|kind=voluntary|pc=0x1150|timestamp_ns=1300";
     let offcpu_wake = "DSRPROF2|offcpu-wake|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|tid=100|episode=1|observed_pid=100|observed_sec=10|observed_usec=20|observed_image=1|observed_epoch=0|timestamp_ns=1800";
@@ -230,6 +314,11 @@ fn dsrprof2_rejects_corrupt_lifecycle_fixtures() {
             &format!("{parent_later_range}\n{process_create}"),
             1,
         );
+    let repeated_range_ready = DSRPROF2_FIXTURE.replacen(
+        parent_later_range,
+        &format!("{parent_later_range}\n{repeated_parent_ready}"),
+        1,
+    );
     let nested_out_of_order = DSRPROF2_FIXTURE.replacen(
         kernel_return,
         &format!(
@@ -282,6 +371,7 @@ fn dsrprof2_rejects_corrupt_lifecycle_fixtures() {
         DSRPROF2_FIXTURE.replacen("final_sequence=3", "final_sequence=2", 1),
         DSRPROF2_FIXTURE.replacen("range_frontier=3", "range_frontier=4", 1),
         child_inherits_later_addition,
+        repeated_range_ready,
         child_inherits_after_frontier,
         DSRPROF2_FIXTURE.replacen("DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=2|unit_id=7|start=0x3000|end=0x3800", "DSRPROF2|range-shared|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|sequence=2|unit_id=7|start=0x3000|end=0x3900", 1),
         DSRPROF2_FIXTURE.replacen("observed_image=1", "observed_image=2", 1),
@@ -393,7 +483,7 @@ fn native_wall_profile_emits_categorized_completion_contract() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/native-wall.d");
     let script = std::fs::read_to_string(path).unwrap();
-    let completion = "DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d";
+    let completion = "DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|probe_errors=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d";
 
     assert_eq!(script.matches(completion).count(), 1);
     for counter in [
@@ -402,6 +492,7 @@ fn native_wall_profile_emits_categorized_completion_contract() {
         "range_violations",
         "kernel_violations",
         "offcpu_violations",
+        "probe_errors",
     ] {
         assert!(
             script.contains(&format!("{counter} = 0")),
@@ -412,22 +503,39 @@ fn native_wall_profile_emits_categorized_completion_contract() {
         !script.contains("\n\tviolations =") && !script.contains("\n\tviolations++"),
         "native-wall must not collapse integrity failures into an opaque counter"
     );
+    for transition in [
+        "printf(\"DSRPROF2|kernel-enter|",
+        "printf(\"DSRPROF2|kernel-return|",
+        "printf(\"DSRPROF2|kernel-terminal-close|",
+        "printf(\"DSRPROF2|offcpu-block|",
+        "printf(\"DSRPROF2|offcpu-wake|",
+    ] {
+        assert!(
+            !script.contains(transition),
+            "native-wall summary mode must not emit hot transition record {transition:?}"
+        );
+    }
 
-    let duplicate_guard = concat!(
-        "sched:::off-cpu\n",
-        "/tracked[pid] && thread_lifecycle[pid, tid] != 2 &&\n",
-        "    range_ready[pid] && exec_inflight[pid] == 0 &&\n",
-        "    off_open[pid, tid] == 2/"
-    );
-    let opening_guard = concat!(
-        "sched:::off-cpu\n",
-        "/tracked[pid] && thread_lifecycle[pid, tid] != 2 &&\n",
-        "    range_ready[pid] && exec_inflight[pid] == 0 &&\n",
-        "    off_open[pid, tid] != 2/"
-    );
+    for probe in [
+        "proc:::create\n",
+        "proc:::exec\n",
+        "proc:::exec-failure\n",
+        "proc:::exec-success\n",
+        "syscall:::return\n",
+    ] {
+        assert_eq!(
+            script.matches(probe).count(),
+            1,
+            "state validation and mutation for {probe:?} must share one DTrace clause"
+        );
+    }
     assert!(
-        script.find(duplicate_guard).unwrap() < script.find(opening_guard).unwrap(),
-        "DTrace clauses for one probe observe earlier clause mutations; duplicate detection must run before opening the episode"
+        script.split("\n\n").any(|clause| {
+            clause.starts_with("sched:::off-cpu\n")
+                && clause.contains("offcpu_violations +=")
+                && clause.contains("off_open[pid, tid] =")
+        }),
+        "off-CPU duplicate validation and episode opening must share one DTrace clause"
     );
     for hot_zero_store in ["\tkernel_depth[pid, tid]--;", "\toff_open[pid, tid] = 0;"] {
         assert!(
@@ -438,9 +546,8 @@ fn native_wall_profile_emits_categorized_completion_contract() {
     for sentinel_contract in [
         "kernel_depth[pid, tid] > (uint64_t)1",
         "kernel_depth[pid, tid] = (uint64_t)(this->depth + 1)",
-        "kernel_depth[pid, tid] = this->depth;",
+        "kernel_depth[pid, tid] = this->valid ? this->depth : kernel_depth[pid, tid];",
         "off_open[pid, tid] == 2",
-        "off_open[pid, tid] != 2",
         "off_open[pid, tid] = 2;",
         "off_open[pid, tid] = 1;",
     ] {
@@ -462,6 +569,10 @@ fn native_wall_profile_emits_categorized_completion_contract() {
     assert!(
         script.matches("thread_lifecycle[pid, tid] != 2").count() >= 4,
         "every scheduler state/episode clause must exclude post-lwp-exit events"
+    );
+    assert!(
+        script.contains("|unit_id=%u|start=%#x|end=%#x"),
+        "64-bit translated unit identities must use unsigned DTrace serialization"
     );
 }
 

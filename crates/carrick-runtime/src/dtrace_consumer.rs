@@ -519,7 +519,8 @@ pub fn run_child_under_dtrace(
     child_argv: &[String],
     opts: &TraceOptions,
 ) -> Result<DTraceRunReport, DTraceError> {
-    run_child_under_dtrace_impl(child_path, child_argv, opts, |_| Ok(())).map(|(report, ())| report)
+    run_child_under_dtrace_impl(child_path, child_argv, opts, |_, _| Ok(()))
+        .map(|(report, ())| report)
 }
 
 #[cfg(target_os = "macos")]
@@ -530,29 +531,42 @@ pub fn run_child_under_dtrace_with_post_stop<T, F, E>(
     post_stop: F,
 ) -> Result<(DTraceRunReport, T), DTraceError>
 where
-    F: for<'handle> FnOnce(crate::dtrace_symbols::LiveDtraceSymbolizer<'handle>) -> Result<T, E>,
+    F: for<'handle> FnOnce(
+        crate::dtrace_symbols::LiveDtraceSymbolizer<'handle>,
+        DTraceRunReport,
+    ) -> Result<T, E>,
     E: std::fmt::Display,
 {
-    run_child_under_dtrace_impl(child_path, child_argv, opts, |hdl| {
-        invoke_post_stop(hdl.cast(), post_stop)
+    run_child_under_dtrace_impl(child_path, child_argv, opts, |hdl, report| {
+        invoke_post_stop(hdl.cast(), report, post_stop)
     })
 }
 
 #[cfg(target_os = "macos")]
-fn invoke_post_stop<T, F, E>(hdl: *mut c_void, post_stop: F) -> Result<T, DTraceError>
+fn invoke_post_stop<T, F, E>(
+    hdl: *mut c_void,
+    report: DTraceRunReport,
+    post_stop: F,
+) -> Result<T, DTraceError>
 where
-    F: for<'handle> FnOnce(crate::dtrace_symbols::LiveDtraceSymbolizer<'handle>) -> Result<T, E>,
+    F: for<'handle> FnOnce(
+        crate::dtrace_symbols::LiveDtraceSymbolizer<'handle>,
+        DTraceRunReport,
+    ) -> Result<T, E>,
     E: std::fmt::Display,
 {
-    post_stop(crate::dtrace_symbols::LiveDtraceSymbolizer::new(hdl))
-        .map_err(|error| DTraceError::PostStop(format!("{error:#}")))
+    post_stop(
+        crate::dtrace_symbols::LiveDtraceSymbolizer::new(hdl),
+        report,
+    )
+    .map_err(|error| DTraceError::PostStop(format!("{error:#}")))
 }
 
 fn run_child_under_dtrace_impl<T>(
     child_path: &Path,
     child_argv: &[String],
     opts: &TraceOptions,
-    post_stop: impl FnOnce(*mut DtraceHdl) -> Result<T, DTraceError>,
+    post_stop: impl FnOnce(*mut DtraceHdl, DTraceRunReport) -> Result<T, DTraceError>,
 ) -> Result<(DTraceRunReport, T), DTraceError> {
     let trace_argv = trace_exec_argv(child_path, child_argv, opts.drop_credentials.as_ref())?;
     let mut argv_ptrs: Vec<*const c_char> = trace_argv.argv.iter().map(|s| s.as_ptr()).collect();
@@ -702,7 +716,7 @@ fn run_child_under_dtrace_impl<T>(
         unsafe { dtrace_aggregate_print(hdl.as_ptr(), out.fp(), std::ptr::null_mut()) };
     }
     unsafe { fflush(out.fp()) };
-    let post_stop_result = post_stop(hdl.as_ptr())?;
+    let post_stop_result = post_stop(hdl.as_ptr(), report)?;
     Ok((report, post_stop_result))
 }
 
@@ -766,20 +780,27 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn post_stop_callback_returns_owned_value_and_maps_errors() {
-        let value = invoke_post_stop(std::ptr::null_mut(), |_symbolizer| {
+        let report = DTraceRunReport {
+            principal_drops: 7,
+            ..DTraceRunReport::default()
+        };
+        let value = invoke_post_stop(std::ptr::null_mut(), report, |_symbolizer, observed| {
+            assert_eq!(observed, report);
             Ok::<_, std::io::Error>("owned".to_owned())
         })
         .expect("owned callback result");
         assert_eq!(value, "owned");
 
-        let error = invoke_post_stop(std::ptr::null_mut(), |_symbolizer| {
+        let error = invoke_post_stop(std::ptr::null_mut(), report, |_symbolizer, observed| {
+            assert_eq!(observed, report);
             Err::<(), _>(std::io::Error::other("callback failed"))
         })
         .expect_err("callback error");
         assert!(matches!(error, super::DTraceError::PostStop(_)));
         assert!(error.to_string().contains("callback failed"));
 
-        let contextual = invoke_post_stop(std::ptr::null_mut(), |_symbolizer| {
+        let contextual = invoke_post_stop(std::ptr::null_mut(), report, |_symbolizer, observed| {
+            assert_eq!(observed, report);
             Err::<(), _>(anyhow::anyhow!("inner failure").context("outer context"))
         })
         .expect_err("contextual callback error");
