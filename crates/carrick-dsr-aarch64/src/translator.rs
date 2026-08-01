@@ -4480,6 +4480,7 @@ impl ProcessState {
                 emitted_bytes,
                 TranslationOutcome::Translated,
             );
+            xlat_census::record(guest.raw());
             if let Some(started) = publication_started {
                 self.stats
                     .add_elapsed(ResolverStat::TranslationPublicationNs, started.elapsed());
@@ -11342,5 +11343,73 @@ mod tests {
         for (exit, expected) in cases {
             assert_eq!(exit.probe_fields(), expected, "exit={exit:?}");
         }
+    }
+}
+
+/// Translation redundancy census: how much of a cold build's ~800k translations
+/// is the SAME guest code re-translated in a different process?
+///
+/// This is the number that decides whether translation amortization is a
+/// 2x-of-Docker-class lever or a dead end, and no existing instrument answers
+/// it: `CARRICK_DSR_PROFILE` counts translations per process but says nothing
+/// about distinctness ACROSS processes, and the shared-translation lane's own
+/// 14% reduction (1,196,909 -> 1,031,914) reflects its 12.9% coverage ceiling
+/// rather than the underlying redundancy.
+///
+/// Env-gated on `CARRICK_XLAT_CENSUS_DIR` so it costs one branch when unset.
+/// Writes `xlat-<pid>.txt`: the total translation count, then every distinct
+/// guest VA translated by this process.
+///
+/// Caveat the consumer must apply: the native lane loads PIE guests at a FIXED
+/// base, so two DIFFERENT guest binaries can translate the same VA. A union
+/// over VAs therefore UNDER-counts distinct code and OVER-states redundancy.
+/// Read it alongside the per-process set sizes -- processes running the same
+/// binary have near-identical sets, which is what makes the grouping visible.
+pub(crate) mod xlat_census {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static DISTINCT: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    static ARMED: OnceLock<bool> = OnceLock::new();
+
+    fn census_dir() -> Option<&'static String> {
+        static DIR: OnceLock<Option<String>> = OnceLock::new();
+        DIR.get_or_init(|| std::env::var("CARRICK_XLAT_CENSUS_DIR").ok())
+            .as_ref()
+    }
+
+    extern "C" fn dump() {
+        let Some(dir) = census_dir() else { return };
+        let Some(set) = DISTINCT.get() else { return };
+        let Ok(distinct) = set.lock() else { return };
+        let pid = unsafe { libc::getpid() };
+        let mut out = format!(
+            "XLAT|pid={pid}|total={}|distinct={}\n",
+            TOTAL.load(Ordering::Relaxed),
+            distinct.len()
+        );
+        for va in distinct.iter() {
+            out.push_str(&format!("{va:#x}\n"));
+        }
+        let _ = std::fs::write(format!("{dir}/xlat-{pid}.txt"), out);
+    }
+
+    /// Called on every FRESH translation (never on a cache hit).
+    pub(crate) fn record(guest_va: u64) {
+        if census_dir().is_none() {
+            return;
+        }
+        TOTAL.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut distinct) = DISTINCT.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+            distinct.insert(guest_va);
+        }
+        // carrick's run paths end in `std::process::exit`, which runs libc
+        // atexit handlers but not `Drop`, so the dump has to be an atexit hook.
+        ARMED.get_or_init(|| {
+            unsafe { libc::atexit(dump) };
+            true
+        });
     }
 }
