@@ -1,970 +1,184 @@
-# Native-lane performance handoff
+# Native-lane performance: state of play
 
-**Date:** 2026-08-01
-**Branch:** `codex/native-performance-m1` -> `main` (fast-forward checkpoint;
-recovery-run evidence `b0ddf87d`; timeout diagnostics `47457f44`; qualified
-profile-v2 `edbdc530`; M1 correctness `5020e509`; corrected mapped-metadata V3
-implementation `d7935114`)
-**Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
-default). No VMM/HVF/KVM/bhyve behaviour was touched.
+**Date:** 2026-08-01 · **Branch:** `main` · **Scope:** Darwin/aarch64 native DSR
+(`--exec-backend native`, the shipped default). No VMM/HVF/KVM/bhyve behaviour is
+in scope.
 
 > The FreeBSD native x86 bring-up work (`1b55b4b0`, branch
-> `perf/native-xstate-transfer`) is unrelated and still open; its live caveat
-> stands: **`neutral-domains` remains opt-in — do not make it the production
-> default until Tasks 43, 55 and 58 close.**
-
-Historical M1 and pre-M2 evidence is in
-[`docs/perf-results/2026-07-29-native-cpu-budget-evidence.md`](docs/perf-results/2026-07-29-native-cpu-budget-evidence.md),
-runs 1–31. Current M2 execution state is recorded here and in
-`.superpowers/sdd/2026-07-30-native-performance-m2-translation-ownership/`;
-its ignored raw trace receipts remain under `target/perf/`.
-
----
-
-## Active performance checkpoint — retained shared-cache mechanisms
-
-The performance campaign now has direct cumulative, shared/default, and
-incremental V2/V3 measurements. This implementation checkpoint is green and
-ready to fast-forward to `main`, but the performance campaign is still active:
-run-encoded recovery metadata and corrected mapped translation metadata V3 are
-retained, the qualified v2 profiler has signed live proofs, and the retained
-shared-translation stack has a clean cumulative result. The full `>=30%` goal
-remains open. The next candidate has a hard impact floor: it must have a
-supported path to at least `10%` end-to-end CPU or wall improvement, not merely
-reduce a narrow validation loop.
-
-Retained default-on changes, each with an exact `=0` opt-out, now remove:
-
-- cloned shared manifests, varint decode overhead, and repeated source hashing;
-- eager per-process recovery-action binding, with portable recovery metadata
-  additionally run-encoded for lazy fault-time lookup;
-- full 60+ MiB dylib reads and SHA-256 rehashes in every descendant, replaced
-  by bounded Mach-O reads plus a signed key-specific export identity;
-- owned V2 manifest decode plus rebuilt PC/recovery/range/binding indexes in
-  every descendant, replaced by one validated read-only mapped V3 sidecar; and
-- indirect copying of instruction bytes where the direct form is proven.
-
-### Mapped translation metadata V3 — retained by the corrected authority
-
-Mapped translation metadata V3 remains default-on within the shared-translation
-lane, with exact `CARRICK_DSR_SHARED_MAPPED_METADATA=0` as the V2 opt-out. The
-initial implementation used `memmap2::MmapOptions::map`, which produced a
-read-only `MAP_SHARED` region even though the design required
-`MAP_PRIVATE|PROT_READ`. Commits `bd7540ac` and `d7935114` corrected the mapping
-to copy-on-write private semantics, made dyld-lease teardown order explicit,
-fixed the digest-mismatch fixture, and scoped Mach-only test support to Darwin.
-A Mach VM-region test now proves `VM_PROT_READ` plus `SM_COW`; drop probes prove
-the dyld lease remains alive through metadata teardown.
-
-The original published artifact
-[`scripts/perf/evidence/native-mapped-metadata-v3-abba.json`](scripts/perf/evidence/native-mapped-metadata-v3-abba.json)
-measured the superseded `MAP_SHARED` implementation at `6ccc6471`. It remains
-historical evidence only and must not be cited as the current V3 authority.
-
-The corrected immutable same-binary receipt is
-`target/perf/mapped-metadata-private-arm-d7935114/arm.json` (SHA-256
-`060cca26eaec0117b4464f2455183f0fee2d1ab5536d3ff5c391537ed1904be8`).
-Both arms used that exact path and its read-only signed binary:
-
-- source commit `d793511410c941fe9466b4738ff363d206963aca` on
-  `codex/native-performance-m1`, with empty source status;
-- binary SHA-256
-  `a41777473d75ebb0df9390f93bac767b9a06d27f29d69e39322fcc033f00ac20`,
-  Mach-O UUID `692757C9-59E7-332D-A197-F3864D5E2141`, entitlement SHA-256
-  `c439c3ffbe9d1b486321de3360bd9f1368024751553ae131aa0490e4e49841dd`,
-  strict codesign accepted, and `__dof_carrick` present;
-- exact arm64 image
-  `localhost:5005/carrick-go-conformance@sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b`,
-  whose image ID and sole repo digest are the same digest; and
-- V2 overlay SHA-256
-  `3c40a2750fa9c843b3f4996fa6a782ceda09b36d516bcc3a76a64c77dff0e620`
-  versus V3 overlay SHA-256
-  `8a45d6d3731f2c057337bb34bcac4f07adc897707abc99d2dae51901defd95f8`.
-  Their only difference is mapped metadata `"0"` versus normalized default
-  `null`; shared translation and direct bindings remain exactly `"1"`.
-
-Campaign `75995-dbb8b14f16b64b23a0c3a007941c25a1` ran a fresh,
-unspliced set of eight ABBA quads. It completed 2
-excluded warmups plus all 32/32 measured samples and nine preflights. Every
-sample returned zero, emitted `BUILD_OK` exactly once, avoided timeout, cleaned
-up with status zero, and retained identical pre/post provenance. Every
-preflight recorded Battery Power under the authorized `--allow-battery`
-policy, the explicit no-warning thermal contract, empty
-busy/foreign/Docker-oracle state, and the exact receipt/image. The raw and
-exclusively published artifacts are
-byte-identical at SHA-256
-`6b6b78419d4a4d391d5342b1b443d7c841268b052ff4fe14e1ad19527c47b88e`:
-[`scripts/perf/evidence/native-mapped-metadata-v3-private-abba.json`](scripts/perf/evidence/native-mapped-metadata-v3-private-abba.json).
-
-The primary total-child-CPU gate and every secondary moved in V3's favor:
-
-| metric | V2 median | V3 median | V3/V2 ratio (movement) | wins | one-sided upper | two-sided interval | sign probability |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| total CPU `cpu_s` | `32.7205275` | `31.8342200` | `0.9623953548920466` (`-3.760464510795336%`) | `7/8` | `0.9856085522576999` | `0.9478722904836884..0.9931111807559466` | `9/256` (`0.03515625`) |
-| user CPU `cpu_user_s` | `22.5795890` | `22.0263040` | `0.9636171547950005` (`-3.638284520499946%`) | `7/8` | `0.9875758909929790` | `0.9449311366409422..0.9913529929464772` | `9/256` (`0.03515625`) |
-| system CPU `cpu_sys_s` | `10.10353325` | `9.81125975` | `0.9678420005355608` (`-3.21579994644392%`) | `7/8` | `0.9883569304873058` | `0.9470984265023998..0.9970266165974714` | `9/256` (`0.03515625`) |
-| outer wall `elapsed_ms` | `14754.0` | `14435.25` | `0.9716786318058463` (`-2.832136819415365%`) | `7/8` | `0.9873923293102180` | `0.9582990758706876..0.9933562822719450` | `9/256` (`0.03515625`) |
-| guest workload `workload_ms` | `12778.0` | `12447.5` | `0.9677805185592670` (`-3.2219481440733055%`) | `7/8` | `0.9851296579205959` | `0.9471408538485510..0.9900784954377018` | `9/256` (`0.03515625`) |
-
-All five runner criteria are true: complete with eight quads, primary median
-below one, primary one-sided upper below one, primary exact sign probability
-below `0.05`, and no supported secondary regression. The artifact's
-`decision.retained=false` remains a deliberate harness boundary: it cannot
-self-certify the external mechanism and correctness authorities. The project
-decision is **retain V3**, because those external gates are separately green.
-
-The corrected mechanism/secondary-risk authority is
-`target/perf/native-metadata-v3-nmv3r5a-risk.json`, SHA-256
-`0f512ea15e58f366c631f9f3afdf34782c44246616810551cfed6d1b82251ea9`.
-It is one authenticated five-pair chain with status `passed`, no failures, and
-`supported_v3_owner_increases=[]`. Mean V3-minus-V2 movement per 1,000 samples
-was dyld `-0.103273` (`p=19/32`), kernel `+2.284103` (`p=3/8`), locks
-`+1.119697` (`p=1/16`), malloc `-3.036435` (`p=1`), and mmap/fault
-`-0.062537` (`p=7/8`). Neither positive point estimate meets the predeclared
-`0.05` support threshold, so neither is a regression. For actual kernel time,
-the authoritative measurement is child-rusage `cpu_sys_s` above:
-`-3.21579994644392%`, not the traced kernel sample rate.
-
-One earlier corrected-tip timing chain is deliberately failed and non-gating.
-Campaign `73358-75eff8af12294c7499eb1950fef9cb24` timed out at sample 9,
-quad 2 B2, after 180 seconds with only `0.322287` child CPU seconds
-(`0.020606` user, `0.301681` system). Its signature closely matches the
-preserved pre-V3 900-second B2 timeout (`0.321666` total, `0.020608` user,
-`0.301058` system). Automatic LLDB evidence shows the shell in
-`wait_native_proc_exit`, its child watcher in
-`native_publish_child_exit -> kick_all`, and the Go process parked across
-futex/netpoll waits. The exact compiler child could not be paused and was gone
-by LLDB's retry after the scoped `SIGCONT`. This supports a pre-existing
-child-exit/wakeup flake, not a deterministic private-metadata defect; the cause
-remains open.
-The accepted fresh campaign subsequently passed the same B2 position and all
-32 measured runs. Never splice either failed chain into accepted timing.
-
-Task 7's accepted production/correctness authority ran these exact commands
-sequentially; this is a durable command ledger of accepted prior outputs, not a
-request to rerun them during Task 8:
-
-```bash
-just fmt-check
-just clippy
-cargo test -p carrick-dsr-aarch64 --lib
-cargo test -p carrick-native-darwin --lib
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib
-RUST_TEST_THREADS=1 just ci
-just build
-codesign -d --entitlements :- target/release/carrick
-otool -l target/release/carrick | grep __dof_carrick
-just conformance-native smoke --workers 4
-just conformance-native smoke --workers 4 --ecosystem node
-just conformance-native smoke --workers 4 --ecosystem cpython
-```
-
-The corrected outputs were: formatting/clippy/CI/build/signing/entitlement/DOF
-all passed; `carrick-dsr-aarch64` passed 284, `carrick-native-darwin` passed 47,
-and serialized `carrick-runtime` passed 1,128 with 5 ignored. The full native
-smoke was 23/23 MATCH, Node was 2/2, and CPython was 6/6; every oracle was
-cached and Docker ran zero times.
-
-The Task 7 report also records this exact post-live evidence command and its
-243/243 result:
-
-```bash
-PYTHONPATH=scripts/perf python3 -m unittest \
-  scripts/perf/test_native_go_build.py \
-  scripts/perf/test_native_go_build_abba.py \
-  scripts/perf/test_native_go_dtrace_target.py \
-  scripts/perf/test_native_pc_range_directional.py \
-  scripts/perf/test_native_compiler_budget.py
-```
-
-Its final evidence-hardening round records these exact invocations against the
-retained tip:
-
-```bash
-cargo test -p carrick-cli trace_child
-cargo clippy -p carrick-cli --all-targets -- -D warnings
-just fmt-check
-git diff --check
-python3 -m py_compile \
-  scripts/perf/native_go_dtrace_target.py \
-  scripts/perf/native_pc_range_directional.py \
-  scripts/perf/native_pc_range_risk.py \
-  scripts/perf/test_native_go_dtrace_target.py \
-  scripts/perf/test_native_pc_range_directional.py \
-  scripts/perf/test_native_pc_range_risk.py
-```
-
-Those exact gates passed (trace-child 1/1); the same accepted report records
-62 focused launcher/directional/risk tests, the full `scripts/perf` discovery
-at 482 with zero failures/errors/skips, two semantic tests, and the DTrace
-compilation smoke as passed. It does not preserve shell argv for those four
-summaries, so this handoff does not invent approximate commands for them.
-The corrected authority then rebuilt and signed clean source `d7935114` before
-freezing the receipt; no tracked source changed after preparation or during
-timing. The full `scripts/perf` discovery passed 482/482 on that tip.
-
-Keep this incremental V2/V3 result separate from the earlier cumulative stack
-result. The prior direct cumulative improvement remains `15.5007%`; the
-corrected `3.760464510795336%` V2-to-V3 result is neither added to nor
-compounded with it, and no updated cumulative end-to-end result has been
-measured.
-
-**Next measured owner and impact floor:** first run a fresh corrected-tip
-default/shared attribution, then measure whole phases rather than isolated
-functions. Do not target `validate_guest_ranges` or another validation-only
-loop: the prior validation bypass measured only `-0.31%` total CPU and was
-correctly rejected. A production candidate now needs evidence for at least a
-`10%` end-to-end CPU or wall opportunity. The two live hypotheses are:
-
-1. collapse the repeated load/map/prepare lifecycle and recover execution
-   locality for the 400,000+ shared blocks currently spread over 54 separately
-   `dlopen`ed unit mappings, potentially through a larger packed code+metadata
-   representation; or
-2. if normal-run evidence supports it at the same scale, reduce the native
-   process/futex/epoll child-exit and wakeup lifecycle exposed by the timeout.
-
-Use DTrace/`carrick trace` to size complete dyld, mapping, preparation, fault,
-translated-execution, futex, epoll, and process-lifecycle buckets. Use LLDB for
-ambiguous wait topology. Reject any design whose removable measured share is
-below `10%`; the known sub-page `PROT_NONE` amplifier alone remains below that
-floor. Only the selected structural candidate advances to implementation and
-the same eight-quad total-child-CPU authority.
-
-The final two-binary cumulative campaign directly compared clean detached
-source commits `04b2222d` and `b0ddf87d`, with shared translation enabled on
-both arms. Across eight complete ABBA quads the retained stack won `8/8` and
-measured a total-CPU ratio of `0.84499` (`-15.5007%`; one-sided upper `0.87124`,
-two-sided interval `0.80496..0.88793`, sign probability `1/256`). User CPU fell
-`17.40%`, system CPU `10.84%`, outer wall `15.66%`, and guest workload `17.87%`.
-This direct result supersedes the former `~21.4%` compounded projection: the
-mechanisms overlap more than their isolated measurements implied.
-
-The adjacent same-binary campaign measured the current default path against
-the current shared path. Shared translation still costs `6.76%` total CPU
-(`8/8` quads favored default; two-sided ratio interval
-`1.02327..1.09442`), comprising `+8.49%` user CPU, `+2.93%` system CPU,
-`+6.22%` wall, and `+6.74%` guest workload. This replaces the older `+16.46%`
-gap: most of it is closed, but the remainder is statistically clear and is now
-predominantly user-space. The cumulative `-15.5007%` result is therefore an
-official result for the shared-translation mechanism stack, not a claim that
-the shipped default path improved by the same amount.
-
-Both maintained artifacts are complete and accepted:
-
-- [`scripts/perf/evidence/native-cumulative-shared-prestack-current-battery-b0ddf87d.json`](scripts/perf/evidence/native-cumulative-shared-prestack-current-battery-b0ddf87d.json)
-  (SHA-256
-  `7e29dd76d856056f70f828c294431f517f88b9cff49cff6af92aacf5b9795f22`);
-- [`scripts/perf/evidence/native-default-shared-gap-battery-b0ddf87d.json`](scripts/perf/evidence/native-default-shared-gap-battery-b0ddf87d.json)
-  (SHA-256
-  `3cb40488e9e744f525bc0dd51641ef2ba8cee07d62675e433f34c666053abb96`).
-
-Each campaign contains eight quads plus excluded warmups and nine preflight
-receipts. All preflights record the user's explicit battery authorization,
-exact `Battery Power`, no thermal or performance warning, no foreign workload,
-and no Docker oracle. Both arms use the exact arm64 platform manifest
-`sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b`.
-Docker's reset removed the old multi-platform index alias
-`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`;
-the selected manifest, config, and layer blobs were rehydrated byte-for-byte
-from Carrick's cache, so the workload bytes did not drift. The cumulative
-artifact leaves `decision.retained=false` only because the statistics harness
-cannot self-certify the already-passed external mechanism and correctness
-gates. The gap artifact's `statistical_pass=false` correctly means the selected
-shared candidate regressed; it does not make the accepted comparison invalid.
-
-The maintained low-overhead syscall CPU tracer
-(`scripts/dtrace/native-syscall-cpu-directional.d` plus
-`scripts/perf/native_syscall_cpu_directional.py`) completed exact default and
-shared captures with zero DTrace drops. It attributed nearly the entire shared
-syscall-CPU delta to `read(2)`, and caller tracing resolved the largest reads to
-`ContainerCacheAuthority::load_unit`. This led to keyed dylib identity and then
-to the remaining manifest owner.
-
-A preserved real Go-build cache and the reusable
-`native_manifest_census` example now show that the remaining representation is
-not marginal. The six-line ignored receipt is
-`target/perf/native-manifest-census-20260731n1.jsonl` (SHA-256
-`8600538f0e48f689670e09b786af0c42be3fecd0c4c53c06fe6f0ed722d6b0cc`):
-
-- the largest units have manifests of `129.8`, `87.2`, `63.5`, and `54.6` MB
-  beside only `6–15` MiB of translated code;
-- block runtime metadata owns `99.5–99.6%` of the large manifests, while direct
-  binding records and relocations together own less than `0.5%`;
-- the largest unit contains `3,708,221` PC-map entries and `3,456,821` recovery
-  entries; and
-- those recovery entries reduce to `454,986` contiguous same-action runs, a
-  `7.6x` count reduction before any PC-map compaction.
-
-The attempted manifest-backed direct-binding record indirection was rejected
-and removed: two adjacent controlled pairs put it about `+2–3%` slower. It is
-not part of the retained tree.
-
-Run-encoded recovery metadata is now implemented and retained default-on, with
-`CARRICK_DSR_SHARED_RECOVERY_RUNS=0` as the exact entry-wire opt-out. The wire
-rejects zero-length and overflowing runs, runtime fault lookup binds one action
-without eagerly expanding the map, and the benchmark/DTrace target can select
-either representation. The immutable same-binary eight-quad ABBA is published
-as
-[`scripts/perf/evidence/native-recovery-runs-abba-47457f44.json`](scripts/perf/evidence/native-recovery-runs-abba-47457f44.json)
-(SHA-256
-`13320af91b2870e1dfe0b08b250fc44723a35d96b5035a8dad234a5f5fbcab70`).
-Runs won all eight quads: total CPU ratio `0.91519` (`-8.48%`, one-sided upper
-`0.92377`, sign probability `1/256`), user CPU `-9.45%`, system CPU `-6.62%`,
-outer wall `-8.30%`, and guest workload `-9.46%`. The artifact deliberately
-leaves `decision.retained=false` because the statistical harness cannot
-self-certify its external mechanism and correctness gates; those gates are now
-satisfied by the bounded DTrace comparison and clean full repository gate.
-
-The exact entries/runs DTrace pair completed naturally with no parser warnings.
-Runs reduced total samples by `10.53%`, kernel samples by `9.02%`, user samples
-by `11.85%`, and accounted syscall CPU from `6.220s` to `5.911s` (`-4.97%`).
-The largest reductions were `read` (`-33.7%` CPU), `mprotect` (`-14.4%`), and
-`write` (`-37.5%`). This is directional mechanism evidence rather than a
-receipt-bound lossless profile; the ABBA result is the retention authority.
-The comparison is
-`target/perf/native-recovery-runs-syscall-cpu-comparison-47457f44.json`
-(SHA-256
-`7d2438ff1e4aa193bbc8180339516cad561540e8e110fd1722263ca406990696`).
-
-The production `DSRPROF2` wall profiler is now load-bounded and live-proven on
-the real shared-cache Go-build process tree. Run
-`native-v2-go-shared-b0ddf87d-summary-6` completed naturally in `24.340217250s`
-with `61,855` metric rows, zero incomplete pairs, zero remaining scoped
-processes, every lifecycle/integrity/probe-error counter at zero, and zero
-principal, aggregation, dynamic, dynamic-rinse, dynamic-dirty, or other drops.
-The signed live binary SHA-256 is
-`581ec7afec244e258b4cb35a7d4b7de5ae0681b9b4edfc68dd6649f3443692b7`;
-the header binds base commit `b0ddf87d` and records the profiler-hardening tree
-as dirty because the proof preceded this checkpoint commit.
-The ignored raw receipt is
-`target/perf/native-v2-go-shared-b0ddf87d-summary-6.raw` (`470,121` lines,
-SHA-256 `37e2e940c8895f23c8a4129b28210f743e4892828082f5c98422134769083929`);
-the accepted summary is the adjacent `.jsonl` file (SHA-256
-`0648b12657b8a626e74c38ad024266ed5c2fa11c64ed10a2c471f36d1f6d9e7d`).
-Offline exact replay through `__native-profile-validate` also accepted the raw
-receipt.
-
-The profiler now validates lifecycle state in the same DTrace clauses that
-mutate it, checks libdtrace loss before parsing or symbolization, records
-`dtrace:::ERROR`, right-censors terminal thread/process state, and emits
-aggregated production rows instead of hot per-transition records. Exact fixture
-replay still validates individual transitions. Its range model treats the
-first ready marker as the activation frontier while allowing later shared
-ranges to append and be inherited across fork; repeated ready markers reject.
-
-PC-range attribution classified the `12,257` user samples as `53.13%`
-host/unattributed, `33.30%` private translated code, and `13.58%` shared
-translated code. That proves translated execution is material, but does **not**
-yet prove the 3.7-million-entry PC map owns the next cost. Kernel samples are
-directional only: the largest frames were DTrace itself
-(`ml_set_interrupts_enabled_with_debug`, `dtrace_probe`), so they must not be
-selected as runtime optimization targets. The next non-observer kernel owners
-were `psynch_cvcontinue`, `thread_block_reason`, and
-`kqueue_scan_continue`; they require a narrower low-perturbation experiment
-before production coding.
-
-The narrower experiment is now live-proven. `native-pc-range-directional.d`
-samples at `197 Hz` instead of `997 Hz`, retains every leaf (no `trunc`), and
-binds each outside-private symbol to its exact `(pid, epoch, PC)`. The v2
-analyzer refuses a leaf without an identical PC-histogram population and uses
-the translated-range catalog—not symbol text—to exclude shared JIT code. Its
-first live default capture correctly rejected one epoch mismatch: another
-thread published an exec range reset between the former all-PC and leaf
-clauses. Recording the outside PC and leaf in the same DTrace clause removed
-that race; private PCs now use a separate clause.
-
-Two default/shared runs, in reversed order for the second pair, then completed
-naturally with `BUILD_OK`, no warnings, and exact leaf reconciliation. Default
-recorded `7,295` and `7,291` total samples; shared recorded `7,592` and `7,570`
-(`+3.95%` over the two-run totals, directional only). The split was similarly
-diffuse: shared versus default was `+4.64%` user, `+2.35%` kernel, `+5.38%`
-host-user, and `+3.76%` translated execution. The stable shared-only named
-cluster is shared-unit installation: across the pair
-`DirectBindingRegistry::prepare_loaded_unit` had `29` samples,
-bincode decode/drop `45`, `exact_guest_ranges_from_pc_map` `17`, plus sorting
-and B-tree insertion. Each individual leaf is under `0.5%` of host user
-samples, so there is no honest single-function winner yet. Generic `memmove`,
-SHA-256, icache invalidation, allocation, and wait leaves were similar or lower
-under shared translation.
-
-The ignored exact receipts are
-`target/perf/native-user-leaf-v2-{default,shared}-{2,3}.{raw,json}`. Their raw
-SHA-256 values in default-2/default-3/shared-2/shared-3 order are `a5e3753f…`,
-`5430d10f…`, `50bc18a8…`, and `1a721596…`; adjacent analyzed JSON values are
-`a61e764a…`, `64fb1c8b…`, `87f1bf1c…`, and `81d6279b…`.
-
-That remaining ambiguity is now resolved. A zero-work-when-disabled
-`host-image-text-range` USDT probe publishes the exact half-open Carrick text
-range after each native process activation. The v2 analyzer joins a raw leaf
-only when its exact `(pid, epoch, PC)` falls in that process's published range,
-normalizes it to an ASLR-independent binary offset, and rejects conflicting
-ranges. The first attempted implementation inherited the parent's range across
-fork; the live analyzer correctly rejected a child self-reexec conflict rather
-than silently mis-symbolicating it. Host ranges are therefore accepted only
-from an explicit activation in that process.
-
-A clean same-binary default/shared pair then completed naturally with
-`BUILD_OK`, no warnings, exact leaf reconciliation, and `70/70` process epochs
-publishing `70` exact text ranges in each arm. In default, `1,109/1,161`
-(`95.5%`) raw host samples were exact Carrick text PCs; in shared,
-`1,480/1,599` (`92.6%`) were. Symbolicating every normalized offset with the
-exact signed binary (`f333e776…`) and `atos -l 0x100000000` strengthens the
-shared-only load/install cluster substantially:
-
-- `DirectBindingRegistry::prepare_loaded_unit`: `53` shared versus `0` default;
-- bincode tuple decode and `DecodeError` drop: `49 + 42` versus `0`;
-- `exact_guest_ranges_from_pc_map`: `31` versus `0`;
-- unstable quicksort and slice equality: `34 + 32` versus `0`;
-- manifest `Vec` deserialization: `15` versus `0`; and
-- `prepare_unit_edges`: `8` versus `0`.
-
-Those eight non-overlapping leaves alone are `264` samples, or `8.9%` of the
-shared arm's host-user bucket. In contrast, generic SHA-256 was `131` shared
-versus `129` default, and `native_host_prot_for_page` was `73` versus `69`.
-The remaining shared-path CPU owner is therefore not an unresolved raw-PC or
-generic translation-cost story: repeated manifest decode plus shared-unit
-index/binding preparation is the next production boundary. This one pair is
-directional attribution, not a timing gate.
-
-The ignored exact receipts are
-`target/perf/native-user-leaf-v2-{default,shared}-5.{raw,json}`. Raw SHA-256 is
-`a3abde618c32c1747fec239f35eb912af0586b5f526bdd5c1101dd6ec64f3145`
-for default and
-`5b2af3a0638d7c4c5d8ee7d4d08a0e6391733c556e07ad3908cf0d50a2d94415`
-for shared; analyzed JSON is
-`fe97899b5321f2d43153d35d212f2f17fe3cad9f0f06ca6562bc3d370b1175a9`
-and `883003c9a359e859f4d1b00d149c38bfc04f4119bd2651f7ebb7138a9741bd1b`.
-
-The first candidate at this boundary carried a typed proof that the cache
-loader had already validated the shared manifest, then skipped as many as
-three redundant full validation passes during shared-unit installation. Its
-same-binary, eight-quad ABBA completed all 32 measured runs on the authorized
-battery lane, but it failed the primary total-child-CPU retention gate:
-
-- total CPU was only `-0.31%` (`5/8` wins; one-sided upper `1.00289`,
-  two-sided interval `0.97968..1.00470`, sign probability `93/256`);
-- user CPU was `-0.61%` (`7/8`; one-sided upper `0.99819`), suggesting the
-  skipped work itself was real but small; and
-- system CPU was `+0.19%` (`3/8`; one-sided upper `1.01358`).
-
-The accepted-but-not-retained ignored artifact is
-`target/perf/native-manifest-validation-abba-battery-2361a31f.json` (SHA-256
-`a837e4005f3503d867626c5a0e74adfcf5c58ce4087dbfcfceb765d27ee070a3`).
-It binds source commit `2361a31f`, signed binary SHA-256
-`3c48c133782c3acc8d5f171869a10f869567c0a064f9c3098afa1145990c62f2`,
-and the same exact arm64 Go-build manifest used by the maintained campaigns.
-Commit `f45cc1bc` removes the typed bypass and its measurement controls. This is
-a useful negative result: validation is not the remaining owner at useful
-scale, and carrying its proof through the runtime would add complexity without
-a demonstrated total-CPU benefit.
-
-Post-removal verification passes `just fmt-check`, all 101 relevant Python
-performance-harness tests, 252/252 `carrick-dsr-aarch64` tests, 20/20 focused
-`carrick-native-darwin` AOT-cache tests, and 167/167 focused native-DSR runtime
-tests with 5 ignored.
-
-Profiler-focused integration tests pass 10/10, exact raw replay passes, and the
-complete `just test` gate passes, including the serialized runtime library at
-1,128 passed with 5 ignored. The ordinary parallel `just ci` gate exposed an
-unrelated pre-existing test-isolation defect in untouched
-`carrick-signal-core`: one attempt lost process-pending signal 15 while another
-attempt observed that same global signal in a sibling test. Both tests mutate
-the process-global pending mask concurrently. The full controlled gate
-`RUST_TEST_THREADS=1 just ci` passes; no signal production code or tests were
-changed in this checkpoint.
-
-The first ABBA attempt preserved a genuine 900-second, low-CPU timeout at
-quad 4 B2 instead of rewriting it away. Candidate-only and exact ABBA reducers
-then completed 32/32 and 18/18 runs, so it is retained as discovery evidence,
-not attributed to run encoding. Commit `47457f44` adds
-`carrick debug lldb-snapshot` and automatic pre-cleanup timeout snapshots to
-the performance harness. A signed live three-process proof recovered nonempty
-event rings and all-thread stacks before run-ID cleanup reached zero.
-
-Verification is green: 252/252 `carrick-dsr-aarch64` tests, 35/35
-`carrick-native-darwin` tests, 111 relevant Python harness tests, the serialized
-runtime library at 1,128 passed with 5 ignored, and the complete `just ci` gate
-on clean HEAD `47457f44`.
-The full gate exposed four stale keyed-export fixtures and two eager-recovery
-test helpers; both were corrected through the production validation key and a
-single representation-neutral recovery lookup seam before the green rerun.
-
-**Superseded next direction:** the proposed versioned mapped runtime-metadata
-representation is now implemented, mechanism-proven, and retained by the Task
-8 authority above. Do not repeat that design decision or use this historical
-paragraph as the current next step.
-
-Confidence that run encoding should stay is high (`~93%`) because statistical,
-mechanism, correctness, and signed-live operability evidence now agree.
-Confidence that the shared-translation campaign has a meaningful cumulative
-win is now very high (`~98%`) because the direct result won all eight quads and
-its upper interval remains well below parity. Confidence that the remaining
-shared/default regression is real is also very high (`~97%`), and confidence
-that the PC/leaf profiler plus exact image range selected the right next owner
-is high (`~90%`).
-Confidence that the validation-only candidate deserved rejection remains very
-high (`~97%`). The former `~72%` forecast that a mapped representation could
-produce a measurable win is superseded by the direct V3 result above. The
-`>=30%` total-CPU goal remains open: the prior cumulative stack result is
-`15.5007%`, while V3 is an incremental V2/V3 result and cannot be compounded
-without a fresh end-to-end cumulative campaign. The next confidence update
-must follow retained-tip attribution and measurement, not projection.
-
----
-
-## Current checkpoint — M2 lifecycle, raw-v2 parser, and launch identities
-
-M2 now has an accepted process-owned translated-range catalog through the
-first real shared-code consumer, checked post-fork replay, and atomic inherited
-exec retirement plus post-success activation/publication/install handoff. This
-is an observability/correctness milestone, not a performance result.
-
-The retained signed binary is
-`403b12878e36412943c0c5b79ba2271d11b0afbf77f2036afafa2211e610d69f`.
-Strict codesign and `__DATA,__dof_carrick` verification passed. The shared
-install path now:
-
-- derives a stable typed unit identity and exact PC-map guest ownership;
-- prepares catalog, block/index, direct-binding, dependency, retention, and
-  executable-range state without logical mutation on recoverable failure;
-- emits the shared catalog record first and release-publishes executable
-  authority last;
-- distinguishes block-start ownership from converging sensitive-terminal
-  ownership; and
-- has an actual-path regression test proving catalog event, complete logical
-  install under the old executable head, then head publication.
-
-The maintained
-[`scripts/dtrace/native-translated-range-catalog.d`](scripts/dtrace/native-translated-range-catalog.d)
-now fails closed over:
-
-```text
-shared-range announcement
-  -> post-commit kind-12 unit-loaded
-  -> PROFILE-only gateway entry inside that exact half-open range
-```
-
-It keys state by PID incarnation, keeps retained identities/addresses/epochs
-at explicit 64-bit width, separates commit failures from optional run-witness
-failures, and records root status, DTrace drops/errors, and every violation in
-its schema-2 summary.
-
-Accepted live receipts:
-
-| mode | run ID | result | trace SHA-256 |
-|---|---|---|---|
-| semantic, profile absent | `m2-shared-commit-proof-019fb496-20260731i` | 2 announcements, 2 matched unit loads, `commit_ok=1`, `run_ok=0`, zero commit violations/drops/errors, clean exit and cleanup | `734124bf58941cd3d544d3d313fd8c823f4825a7bea76a0e2216f438a5f97cde` |
-| trace-only, profile enabled | `m2-shared-run-proof-019fb496-20260731j` | 2 announcements, 2 unit loads, 2 in-range gateway entries, `commit_ok=1`, `run_ok=1`, every violation/pending/drop/error counter zero, clean exit and cleanup | `9d2868d56e29566071c17932bf43c9ead97f7b5575fc28cd77a2d544000a235d` |
-
-The profile-enabled final child independently reported
-`shared_unit_loads=2`, `shared_blocks_mapped=1168`, and
-`shared_translations_avoided=2`.
-
-Preserve the rejected precursor
-`m2-shared-commit-proof-019fb496-20260731g`: it said `commit_ok=1` but exposed
-DTrace dynamic-array truncation (`0x10edbc380 -> 0xedbc380` and a unit ID to
-its low 32 bits). Commit `0c13a7bf` corrected the complete retained scalar
-path; only the later `...31i` and `...31j` receipts are accepted.
-
-Fork replay landed as `488e569d`, with failure hardening in `c771e23a` and the
-bounded real-COW supervisor cleanup in `b32bb6f6`. It now:
-
-- validates the complete active catalog and ready frontier before emission;
-- advances the epoch with checked failure propagation;
-- replays reset/private/shared/ready under the process writer and re-keys
-  retained shared events for grandchild forks;
-- clears the thread cache only after process replay succeeds; and
-- aborts the open runtime resume service exactly once before any rebuild,
-  fork-post, syscall-completion, stack-mutation, or guest-resume event on
-  failure.
-
-Focused catalog, fork, runtime failure, full DSR library, and serialized native
-Darwin tests passed. Two independent review passes closed the bounded-wait,
-child-allocation, inherited-frontier, runtime-event, and fork-failure FD
-findings.
-
-Atomic exec retirement landed as `44c3bd6c`, with authority/lifetime hardening
-in `a6b1d9d6` and final preflight/supervision boundaries in `5889fa17`. It now:
-
-- validates token identity, exact registry-owned private-JIT leases, and the
-  optional active catalog before mapped-memory PONR;
-- retains the process writer and exact surviving-thread borrow through PONR;
-- consumes the token, commits optional catalog dormancy, and tears down
-  bindings/cache/shared state without a post-PONR `Result` or assertion;
-- resets the catalog only when pointer equality proves translator reuse, while
-  a fresh replacement remains dormant and cannot inherit retiring-epoch
-  overflow;
-- reserves both thread-generation advances before PONR; and
-- composes actual child repair and inherited exec as catalog epochs
-  `1 -> 2 -> 3` under bounded, contained fork supervision.
-
-The final independent re-reviews are clean. Focused reset tests passed 11/11,
-the DSR library passed 238/238, the serialized runtime library passed 1,123
-with 5 ignored, `just test` passed, and check/clippy/fmt/domain/diff gates
-passed. Controller reruns of the `MAX-1` and composed fork/exec regressions
-also passed.
-
-Post-success exec handoff landed as `9767b954`, with production completion
-ordering in `669a61d5` and final installation/wire preflight in `874b3a35`. It
-now:
-
-- prepares every fallible thread installation before catalog activation or
-  image publication, retaining the exact selected process and checked epoch;
-- activates the selected catalog, publishes host base/catalog, guest image,
-  and host JIT identity, then commits translator installation without a
-  recoverable `Result`;
-- pre-serializes exact NUL-terminated host/catalog/guest USDT wire buffers
-  before mapped-memory PONR, avoiding `usdt` JSON/string allocation while
-  firing the post-success probes;
-- delays self-reexec reset-end, ptrace exec-stop, snapshot/TLS state, and
-  service completion until after translator installation; and
-- proves real production activation and installation failures leave the
-  replacement dormant, emit no image metadata, close exactly one RAII
-  `Aborted`, and never resume the replacement image.
-
-The first independent review found early self-reexec completion and
-helper-only failure coverage. The second found stale metadata on fallible
-install and hidden `usdt` serialization allocations. Both were repaired
-red-first; final contract and adversarial re-reviews are clean. Final gates
-passed 333 serialized native Darwin tests with 5 ignored, 28 observability
-tests, translated-range 18/18, shared-unit 7/7, the checked handoff-epoch
-test, `just test`, `just test-integration`, check, clippy, formatting, domain
-lint, and diff checks. Controller reruns of the production failure, checked
-epoch, and exact wire-buffer tests passed.
-
-Signed live fork/exec tracing is now accepted at `e85e8a3b`. The immutable arm
-is `target/native-m2-lifecycle-arm-e85e8a3b` (binary SHA-256
-`ea89a1e0b3dda72dda2f456423ecb83dcfefcd91d14b059e6fb296e3d3c4b730`,
-Mach-O UUID `E72707BE-CD27-3929-BF17-6B58BFF8A2C4`) against canonical arm64
-image digest
-`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`.
-The receipt-bound proof is retained under
-`target/perf/native-m2-lifecycle-proof-e85e8a3b-a/`:
-
-- run ID `native-m2-lifecycle-3fd5d09a-47fb-4158-bb47-62433720e0c9`;
-- capture schema `carrick.native-m2-lifecycle-capture.v4`, accepted closure
-  `dfdee66d8bdb0d620cd806f31d4e6ff7c17c4dde99bad03726ef1cb4b6204fdf`;
-- raw trace SHA-256
-  `66000405b7d79c2aca1cbc832f0bc2b3ae7ab61c18c0c639bd057551aa9e525b`;
-- 30 exact wire-ordered milestones from the typed phase-27 launcher handshake
-  through root exit, including host child PID `50561`, namespace PID `2`, and
-  a positive namespace-domain `wait4` reap;
-- `lifecycle_ok=1`, both stdout markers exactly once and ordered, and every
-  violation, pending, DTrace drop, and DTrace error counter zero; and
-- one successful run-ID-scoped cleanup with an empty final census.
-
-The maintained parser now accepts cross-CPU transport reordering only through
-a complete unique wire-ordinal set. It binds the guest namespace PID from
-native fork phase 104 before `libc::fork`, treats the launcher readiness probe
-as an exact once-only pre-root milestone, and uses a 50,000-iteration reducer
-that completes inside the maintained 30-second DTrace bound. Focused gates
-passed 59 lifecycle tests, 61 ABBA tests, Python compilation, formatting, and
-diff checks; the live receipt was independently reloaded and revalidated.
-
-Commit `c035f89a` adds the first `DSRPROF2` implementation slice. A hidden
-`__native-profile-validate` harness and its shared parser implementation now
-fail closed
-over typed `(pid, start_sec, start_usec, image_generation, runtime_epoch)`
-identity, exact fork frontiers, fresh-epoch child replay, failed and successful
-exec, contiguous private/shared range catalogs, balanced kernel transitions,
-latched off-CPU episodes, exact stack blocks, and natural process-tree
-completion. The literal target/child fixture passes; more than thirty isolated
-birth, frontier, replay, range, exec, kernel, off-CPU, delimiter, drop, and
-completion corruptions reject. Existing `DSRPROF1` parsing remains unchanged.
-Focused integration and unit suites, warnings-denied clippy, formatting,
-typed-domain lint, and diff checks passed.
-
-At that checkpoint this was structural validation rather than a gating-eligible
-v2 profile. Commit `edbdc530` has since closed the production-emission slice:
-the launch path renders `native-wall.d` from accepted birth and terminal
-qualifications, binds the OS/program/qualification receipt hashes into header
-authority, and emits birth-keyed `DSRPROF2` lifecycle, range, kernel, off-CPU,
-and exact stack records. The ordinary summary and symbol overlay are published
-only after the shared parser accepts complete state and every libdtrace loss
-class, including split dynamic rinse and dirty drops. The valid fixture and
-adversarial header/lifecycle/range/kernel/off-CPU/completion/drop/symbol tests
-pass. The load-bounded hardening and signed Go-build proof described above now
-close the remaining live-capture gate.
-
-Commit `51e20831` adds the first live launch-qualification slice. The approved
-design assumed Darwin `proc` provider start fields could supply process birth
-identity; live tracing disproved that assumption because every `pr_start`
-field was zero. The retained implementation instead queries checked
-`PROC_PIDTBSDINFO` tuples and publishes them through a typed USDT probe. The
-query stays inside the probe's enabled closure, so ordinary untraced runs pay
-no process-info syscall cost. The CLI root publishes before command-specific
-work and a native fork child publishes immediately after its child guard,
-before later post-fork DSR events.
-
-Controlled hidden fixtures and strict `BIRTHQUAL1` / `TERMINALQUAL1` parsers
-live-proved the replacement mechanism:
-
-- birth run `native-birth-qualifier-dev-006` observed the exact parent tuple
-  twice, the exact child tuple twice, one matching `proc:::create`, both natural
-  exits, and zero timeouts or violations (raw SHA-256
-  `5c7136a8873121add7da71755acaea75985e2d0f20db1e8c75ed72ebd9a469c5`);
-- thread run `native-terminal-qualifier-thread-dev-003` identified
-  `syscall::bsdthread_terminate` at `proc:::lwp-exit`, with three returning-call
-  controls and zero violations (raw SHA-256
-  `26ea1052117cecca53d1365681514bc2008f05b06ba4ab92a2c723fe1a7afc48`);
-  and
-- process run `native-terminal-qualifier-process-dev-002` identified
-  `syscall::exit` at `proc:::exit`, with one returning-call control and zero
-  violations (raw SHA-256
-  `7c44f2482d11652dffec416424a2cd3963a769479e2acbc5fa87d15344c0d2ea`).
-
-The parsers bind the D programs, raw files, normalized receipts, and Darwin OS
-build. On build `26A5388g`, the structural birth receipt is
-`95fe4186319da4383b83264fa7eea054f9019562ad7b59caa421eb18992b122d` and the
-terminal receipt is
-`e500c6bf4e131f724f04a2b9a0eec45337f5f170ba2a44525e4f4b7097ee1fd4`.
-Those standalone qualifier receipts are not gating authorities by themselves:
-the hidden offline validator supplies a zero-valued report for structural
-replay. The accepted production capture above supplies and checks the actual
-libdtrace drop/interruption report before admitting its victim summary. Full
-host tests, integration tests, focused warnings-denied clippy, formatting,
-domain lint, diff checks, and all three live DTrace fixtures passed.
-
-The lifecycle receipt closes the catalog/fork/exec prerequisite, the raw
-grammar and automatic launch authority exist, the required Darwin
-birth/terminal mechanisms are live-qualified, and the immutable signed
-real-workload `DSRPROF2` capture proves production emission and qualification
-agree under the Go-build process tree. Use that capture, not the older PID-only
-`DSRPROF1` stream, to rank the next translation/kernel owner.
-
-**Next:** narrow the accepted birth-keyed PC-range evidence into one
-low-perturbation host-user hypothesis that explains the directly measured
-`+8.49%` shared user-CPU delta. Preserve lifecycle and DTrace loss authority,
-resolve ambiguous PCs with LLDB where necessary, then advance one default-on
-candidate with an exact opt-out to the primary ABBA total-child-CPU gate.
-
-The `>=30%` CPU goal remains open. The earlier combined shared-translation
-stack has a direct `-15.5007%` total-CPU result. V3's new result is incremental
-against V2 and does not establish an updated cumulative total; the remaining
-gap requires a fresh cumulative run and a new measured owner rather than
-compounding prior projections.
-
----
-
-## Prior checkpoint — M1 authority closed, M2 performance work opened
-
-**M1 instrument authority is complete, but it is not a speed result.** The
-accepted same-binary control/control artifact is
-[`scripts/perf/evidence/native-go-build-abba-control-control-v1.json`](scripts/perf/evidence/native-go-build-abba-control-control-v1.json)
-(SHA-256
-`13f53bfec091cbbdee53dd1cbd91e8bad061948989a004113fe8fb1c24171ee8`).
-Its eight-quad total-child-CPU B/A median is `1.0052799282253981`, with
-`statistical_pass=false` and `retained=false`. It validates receipt-bound ABBA
-execution and the instrument's 2.5021% n=8 resolution; it does not update H0,
-establish a regression, or claim an optimization.
-
-**The load-coupled correctness defect discovered during closeout is fixed.**
-The first retry-enabled broad smoke reported 21/23 and its two targeted retries
-reported 2/2; preserve that sequence as discovery evidence, not as a rewritten
-23/23 run. A real LLDB core then proved that translated execution still carried
-control and address state through physical x18 even though Darwin may clear its
-platform register asynchronously. Commit `5020e509` removes all such emitted
-live ranges and adds fail-closed decoded-instruction, cold-arm, stack-pointer,
-DC-ZVA, and every-recovery-boundary coverage.
-
-The retained signed binary
-`d31e60966075c3709ac3cd83a0fe4b4b6d672371ba2b6ff9e99ae6400d13c9e0`
-passed the exact concurrent CPython `test_close_fds` reducer 4/4. A fresh
-`just conformance-native smoke --workers 4 --flake-retries 1` then reported
-23/23 MATCH, including `cpython-subprocess` 278/278; the oracle phase used all
-23 cached results and ran Docker zero times. Final `just ci` passed.
-
-**Next:** begin M2 with a fresh signed binary from this retained code state, an
-untraced Go-build run, and DTrace/carrick-trace attribution. Keep the Go-build
-workload as the primary retention gate, use controls that opt out of one
-hypothesis at a time, and do not turn a trace sample into a performance claim.
-The ≥30% CPU goal is still open.
-
----
+> `perf/native-xstate-transfer`) is unrelated and still open. Its caveat stands:
+> `neutral-domains` remains opt-in — do not make it the production default until
+> Tasks 43, 55 and 58 close.
 
 ## The goal
 
-**Make carrick's translation pipeline pay for itself:** land container-lifetime
-translation sharing as a net win, and cut non-guest work on the native/aarch64
-go-build reference workload by ≥30% CPU.
+**Make carrick's emitted code materially faster — close the ~12x steady-state
+execution penalty.**
 
-| | |
-|---|---|
-| **Primary metric** | `cpu_median_s` on the go-build reference workload, as a paired ratio vs baseline `0686248a` |
-| **Target** | ≤ 0.70 |
-| **Protocol** | ABBA-ordered, ≥8 quads, `abbascreen.sh` + `abbastats.py` |
+The bar is *within 2x of native-arm64 Docker* on the same work. We are at 10.9x on
+compute, 13.8x on a cold build, and 128x on a filesystem walk. Carrick's premise
+is running unmodified Linux binaries at host-native cost, so this number is the
+product, not a metric about it — and people will benchmark us on whatever workload
+they choose, not the one we tuned.
 
-Ratio, not absolute: total CPU ranges 32–44 CPU-s run-to-run on the same binary.
+Codegen is the goal because it is the only term that no other strategy reaches.
+Translation caching, AOT, and cross-process sharing were each sized this session
+and all leave ~10-11.5x, because steady-state execution is ~12x *independently* of
+how the code got there.
 
-### Workstream targets, and where the numbers stand
+**First step, and it blocks everything else: an executed-shape census on the
+compute workload.** See "Open" below — every codegen target is currently a guess.
 
-| gate | metric | start | target | now |
-|---|---|---|---|---|
-| A0 | `direct_resolver_exits`, sharing ON vs OFF | 779,874 → 135,259,579 (173x) | mechanism named + control arm | **0** |
-| A1 | wall, sharing ON ÷ OFF | 3.2–4.2x | ≤ 1.0x | 1.268x |
-| A2 | translations per build | 1,031,914 | ≤ 400,000 | 819,901 |
-| A2 | shared-unit block coverage | 14.2% | ≥ 60% | 33.1% |
-| B | emitted bytes per build | 599 MB | ≤ 400 MB | 553 MB |
-| B | host-code share of on-CPU | 35.8% | ≤ 25% | not re-measured |
-| C | kernel, non-syscall | 30.7% | ≤ 25% | unchanged |
-| C | address-space faults | 2,204,683 | ≤ 1,500,000 | 2,098,739 |
+## Why the previous framing has to be dropped
 
-**Primary metric today: ~1.0.** Sharing ships OFF, so the shipped path is
-unchanged. Every number above is reproducible; none is final.
+The campaign that preceded this optimized against a single workload — a cold
+`go build` — and generalized conclusions from it that do not hold elsewhere. A
+cold build is *translation*-dominated (~800k translations across ~70 short-lived
+processes). Steady-state compute is *emitted-code*-dominated (translation is
+noise; the same blocks run thousands of times). The 2026-07-29 CPU budget's
+"codegen is NOT the biggest bucket" is true of the build and was wrongly promoted
+into a campaign-wide ranking that deprioritized codegen.
 
----
+## Where we actually stand
 
-## What was attempted, and what each attempt measured
+`scripts/perf/workload-spread.sh` — five workloads, both engines, strictly serial
+phases, in-guest timing windows on both sides so container setup is excluded
+symmetrically. Measured on macOS 27 / t8132 / Apple Silicon (4 Performance +
+6 Efficiency cores — `hw.logicalcpu` is *not* homogeneous), against
+`localhost:5005/carrick-go-conformance:1.24`.
 
-### A0 — root-cause the exit amplification → **met**
+| workload | carrick | docker | ratio |
+|---|---|---|---|
+| startup (`true`) | 37 ms | ~0 ms | 37x (37 ms absolute — not a problem) |
+| **compute** (8M-iteration awk loop) | 1,196 ms | 110 ms | **10.9x** |
+| **fs-walk** (`find` over the Go tree) | 1,541 ms | 12 ms | **128x** |
+| build, cold GOCACHE | 11,199 ms | 812 ms | 13.8x |
 
-Classified every `ResolveDirect` by whether the source PC falls *inside* a
-shared block's `[start, end)` range — not equality against block-start keys, the
-mistake that forced a retraction in run 6. Result: 99.4% of amplified exits are
-private→shared, across 74,726 distinct edges at ~1,822 traversals each,
-confirmed by a control arm shipped in the same commit.
+There is no workload where carrick looks good. The build is a *composite* of the
+two problems above rather than a problem of its own.
 
-### A1 — stop being a regression
+## The finding that reframes the work
 
-Five constructions, in order.
+Decomposing the compute case (full detail in
+`docs/perf-results/2026-08-01-native-wall-audit-and-fault-cost.md` §6):
 
-**1–4: install the unit's binding table at gateway ENTRY.** Each removed the
-amplification (135,715,237 → 0 / 48 / 44) and each faulted. Attributing the
-fault (run 22) explained all four at once: a context holds ONE
-`generation_bindings` pointer while a private context reaches blocks from N
-units, so the guard indexes the wrong unit's table as soon as a second unit is
-touched. The wandering fault address (`0x20`, `0x60`, `0`) was that, not one bug
-relocating. All four reverted.
+```
+carrick   wall 1,208 ms   children user 1.19 s   sys 0.03 s
+docker    wall   109 ms   children user 0.10 s   sys 0.00 s
+```
 
-**5: install at the EDGE** — `b23503ea`, landed. Each private→shared edge is
-patched to a six-word trampoline (`movz`/`movk` chain, `str x17, [x28,
-#CTX_GENERATION_BINDINGS]`, `b`) built from the per-block
-`SharedBlockAuthority::generation_bindings` pointer already available at patch
-time. An edge statically knows its target's unit; entry-time install never can.
-Amplification 135,715,237 → **0**, and the workload completes with sharing ON
-for the first time. A1: 3.2–4.2x → **1.114x**.
+**~12x user CPU, both engines CPU-bound.** Not blocking. Not syscalls. And not
+translation — `CARRICK_DSR_PROFILE` reports only 2,066 translations and 2,907
+gateway entries across the entire 1.2 s run. Each block executes ~4,000 times, so
+the cost is emitted code *running*, not code being produced.
 
-The coverage work below then moved A1 to **1.268x**.
+This also corrects a number repeated throughout the older docs: "guest
+instructions are only ~1.15-1.55x Docker" compared carrick's *share of sampled
+CPU* in guest-shaped words against Docker's *total* CPU. Like-for-like it is ~12x.
 
-### A2 — raise coverage
+## Settled — do not re-litigate
 
-Measured that fused blocks were excluded from shared units
-(`block.extensions.is_empty()`), worth 2.2x of coverage: 14.4% with fusion on
-vs 32.1% with it off (run 26). Fusion is a shipped win (76% fewer gateway
-exits), so disabling it is not the trade — it also raises translations 22%.
+Each was measured, not argued. Evidence in
+`docs/perf-results/2026-08-01-native-wall-audit-and-fault-cost.md` unless noted.
 
-**Made fusion and sharing work together** — `7781d97e`, landed. The exclusion's
-premise held: superblock formation extends only along the fall-through and stops
-at `page_end`, so a fused plan is contiguous and single-page and the template key
-already spans it. Removing it exposed two consume-side defects, one **latent
-since before fusion** — sensitive-exit metadata was keyed by block START while
-the lookup is by the SENSITIVE instruction's PC, which differ for any block
-longer than one instruction.
+**Refuted mechanisms:** parallelism deficit (both engines ~2.5x on 10 CPUs);
+4K-on-16K page granule (`Auto` already resolves to 16k, identical fault counts);
+per-task kernel VM lock (XNU splits anon mappings at 128 MiB, each with its own
+rw-lock); "carrick's memcpy causes the fault term" (JIT first-touch is 2.08% of
+zfod).
 
-Coverage 14.4% → **33.1%**; translations 1,045,248 → **819,901** (−21.6%).
+**Already shipped — do not rebuild:** COW/file-backed guest *image* mapping.
+`map_prepared_region_extent` does this in production and guest-image zfod is
+**11**. (`map_prepared_for_plan` is a test-only helper; its `dead_code` marker
+misled two separate analyses into believing the path was dead.)
 
-**The paired ratio moved the wrong way**: 1.106 → 1.235 CPU, 0/8 quads, sd 1.4%.
-This is the campaign's most important open result — on this workload, cutting
-fresh translations by a fifth did not buy CPU, and the reason is not yet
-established. See *Open questions* #1; the leaf profile currently cannot see the
-likeliest mechanism.
+**Tried and rejected on measurement:** pre-sizing the `recovery` Vec (+54%
+allocation — it is retained, so over-allocation is retained too); thread-local
+scratch reuse for it (-2%, inside the instrument's noise); the exit-target literal
+pool (correctly reverted at `d4292368` — `movz`+3x`movk` is serially dependent at
+~4 cycles, the same as the `ldr` that replaced it, and the pool adds a D-cache
+access); a persistent AOT cache (+285% warm, 0 units published);
+`MADV_WILLNEED` / `mlock` / `MAP_POPULATE` as populate primitives.
 
-### B — per-translation host cost
+**Already optimal:** the direct-link fast path. `DirectLink.slot` is a branch in
+the block body targeting the stub label; patching it jumps straight to the target,
+so control never enters the stub. A patched link is `b <target>` with zero context
+stores.
 
-Narrow guest-PC materialization (`3d480e88`) cut emitted bytes 610.0 → 553.3 MB
-(−9.3%), mechanism gate confirmed. Paired CPU effect: zero. Extrapolated to B's
-full 400 MB target that is ~0.9%, which raises the question of whether emitted
-bytes are the right proxy for the CPU they were chosen to represent.
+## Measured and true
 
-### C — kernel fault term
+- **Translation redundancy is 4.04x cross-process, 1.00x intra-process**
+  (433,249 translations over 107,320 distinct guest VAs). The per-thread block
+  cache is perfect. 4.04x is an upper bound — a fixed PIE base aliases VAs across
+  binaries. Instrument: `CARRICK_XLAT_CENSUS_DIR`.
+- **73% of carrick's heap traffic is the DSR block assembler**, allocated fresh
+  per translated block. Instrument: `--features alloc-census` (dhat).
+- **The shared-translation lane is ~90% of a persistent AOT cache.** Its
+  `TranslationUnitKey` is fully content-addressed and stable across runs; only the
+  *publication path* is broken — `claim_recording` requires a second sighting, and
+  across three runs the cache held exactly one key. Fix or rewrite it; do **not**
+  delete it (an earlier recommendation in this campaign to delete it was wrong).
+- **`zero_backing` mprotect amplification is fixed** (`d2ba0f93`): 236,464 host
+  `mprotect` calls against 8 guest calls, now 6,665. Worth 2.1% of guest CPU — the
+  only performance change banked in this campaign.
 
-Baselined (2,098,739 `as_fault`, 82% zero-fill, 50 processes, flat at
-31–39k each) and three candidates probed:
+## Open, ranked by what it settles
 
-| candidate | result |
-|---|---|
-| scavenger decommit (`madvise`) | 328 calls vs 1,716,964 zfod — 1:5000, not the mechanism |
-| per-process address-space setup | ~2,000 faults/process trivial vs ~34,000/process build — not startup |
-| sub-page `PROT_NONE` amplifier | **real**: any 16 KB host page whose four 4 KB guest sub-pages disagree on protection maps `PROT_NONE`, so every access faults, not just the first. Bounds to ~382,000 faults = 18% of the term |
-| the zero-fill majority (82%) | **open** |
+1. **Executed-shape census on the compute workload.** `emitted_shape.py` measures
+   *emitted* words. On the build those approximate executed ones; on compute they
+   diverge completely, because stubs are emitted per edge but only executed when a
+   link is unpatched. H008 ran an executed census on the *build* — ctx-slot stores
+   43.2%, loads 20.4%, x17-materialize 13.9% — and nobody has run one on
+   steady-state compute. This blocks the codegen workstream: until it exists,
+   every target is a guess. `shape_classify.py` is already shared between the
+   emitted and sampled views.
+2. **fs-walk at 128x.** The largest multiplier measured anywhere, with a known
+   mechanism: **19.68 host `open`s per guest `open`** through the cap-std path,
+   even after `564dd281` cut it 41%. Never ranked because nothing was measuring it.
+3. **Whether the 2x bar is reachable at all**, given steady-state is ~12x.
 
----
+## Decisions that need a human
 
-## What landed (all gated, all on `main`)
+- Does the 2x bar apply to cold builds specifically, or to representative
+  workloads? This changes the ranking completely and needs no code to answer.
+- Is a persistent on-disk translation cache acceptable architecturally
+  (staleness, disk growth, GC)? The key already carries `translator_abi`, so stale
+  entries miss rather than corrupt.
 
-| commit | change |
-|---|---|
-| `b23503ea` | private→shared edges patch through a binding-install trampoline (A0) |
-| `7781d97e` | fused superblocks shareable + sensitive-metadata keying fix |
-| `3d480e88` | narrow guest-PC materialization (−9.3% emitted) |
-| `5f9cedfb` | `--variant shared` — sharing without the artifact spike |
-| `602df3af` | per-thread block cache (`lock_shared_slow` 8.2% → 4.0%) |
-| `0e969f07` | hardware SHA-256 (0.55 → 2.20 GB/s; 1.99% → 0.40% in-profile) |
-| `22394916` | frame pointers enforced workspace-wide + `just ci` check |
-| `7c701293` | CPU-seconds in the perf runner |
-| `0686248a` | JIT-aware profiler |
+## Instruments, and the ways they lie
 
-**Guardrails:** `baseline.jsonl` and `baseline.native-dsr.jsonl` unchanged
-across all 33 commits; `just ci` green at tip (36 suites, zero failures).
-Sharing remains off by default, so shipped behaviour is unchanged.
+Kept deliberately — each cost real hours. Fuller notes in AGENTS.md.
 
----
+- `ustack()` on this workload **does not fail, it lies**: ~70 self-re-exec'd
+  processes with independent ASLR slides, nearly all dead at DTrace END, so
+  surviving frames resolve against the *wrong* image and print plausible-but-false
+  symbols. The tell is uniform counts plus one address symbolizing differently in
+  different stacks.
+- `fbt::vm_fault:entry` is listed by `dtrace -l` and **never fires**: FBT sees the
+  exported `_vm_fault` (an alias of `_vm_fault_external`) while the trap path calls
+  the local `_vm_fault_internal`, and FBT exposes no local symbols on this build.
+  Check the KDK dSYM for a local twin before concluding a path is dead.
+- Kernel frames can be **symbolizer aliases** — `IORWLockUnlock` *is* `lck_rw_done`
+  at one address, so an "IOKit" frame in a VM profile is plain rw-lock traffic.
+- `execname` scoping silently tracks nothing once two arms are built under
+  different binary names.
+- The **allocation census resolves large effects only**: process coverage varied
+  23/25/34 across identical runs, because a process that `execve`s never drops the
+  profiler. That variance swamps anything under ~10%.
+- Anything measuring per-fault or per-operation cost must **pin core class**. A
+  GOMAXPROCS sweep changes threads, concurrent processes, *and* which cores run
+  the work; that confound produced a confident wrong conclusion here once already.
 
-## Open questions, ranked
+## Working notes
 
-1. **Why did −21.6% translations cost CPU?** Leading hypothesis is execution
-   locality: 400,000+ blocks across 54 separately `dlopen`ed unit mappings
-   replacing a compact bump-allocated private cache. **Blocked on tooling** —
-   the JIT-aware profiler classifies a PC by the PRIVATE cache bounds, so
-   unit-mapped code is misfiled as `host` and the arms' bucket totals are not
-   comparable across a sharing boundary (run 24). `shared_guest_ranges` already
-   tracks what the classifier needs. Fix that first; it gates the question.
+Durable lessons live in the agent memory directory, one file per lesson, indexed
+by `MEMORY.md`. Add to it when something turns out to be non-obvious, and correct
+or delete entries that turn out wrong. The operating rules — the overhead bar,
+opt-out defaults, no backward compatibility, Rust-first tooling, and the dtrace
+traps — are in AGENTS.md.
 
-2. **The zero-fill majority of the fault term** (82%, 1.72 M). `vminfo` carries
-   no fault address, which is why all three probes so far were indirect. Needs
-   distinct-address accounting — `fbt::vm_fault:entry`, or a guest-side census
-   of pages touched. Peak-RSS sampling gave median 91 MB/process against the
-   531 MB the fault count implies, but 0.3 s sampling of 1–2 s processes is not
-   evidence.
-
-3. **The sub-page `PROT_NONE` amplifier** is real and independent of everything
-   above — worth fixing on its own terms. Sized at 18% of the fault term and
-   under the goal's 5%-of-CPU chase threshold, so it will not move the headline
-   alone.
-
-4. **Re-screen the earlier rejections.** The instrument is now ~4x sharper (ABBA
-   + CPU resolves ≥0.8–1.1% at n=8, vs ~3.2% for the wall screens that produced
-   them). The whole-generation-guard arm measured 0.9867 (p=0.38) — unmeasurable
-   then, resolvable now. The goal placed codegen cycle quality out of scope;
-   revisit that scoping before spending on it.
-
-5. **A2's remaining coverage gap** (33.1% vs ≥60%). Each unit load serves ~2,930
-   blocks where a process translates ~26,707. Why an artifact covers ~11% of one
-   process's needs is unmeasured — narrow capture, a cap, or a keying mismatch.
-
----
-
-## Instrument and traps
-
-- **Use `abbascreen.sh` / `abbavariant.sh` + `abbastats.py`.** A null screen
-  measured a ~1% penalty on whichever arm runs SECOND; ABBA cancels it inside
-  each quad. Report CPU-seconds, not wall: sd 1.4–1.8% vs 4.3–5.5%.
-- **One unpaired run is not an instrument.** A single JIT-aware profile put the
-  ON arm faster while 8 ABBA quads said 1.235x slower. The screen governs — and
-  the temptation is always to quote whichever number flatters the change.
-- **Check the arm actually contains your change.** The first A1 screen used
-  `--variant candidate`, which also enables `CARRICK_DSR_ARTIFACT_SPIKE=1`;
-  neither the fix nor the gate's baseline involves it, so the result was void.
-  `--variant shared` is the gate's configuration.
-- **`native_go_build.py` refuses a dirty worktree.** Commit harness edits before
-  measuring — that guard turned a void run into an obvious crash rather than a
-  plausible-looking ratio.
-- **`sudo dtrace` needs a foreground call.** Detached/`nohup` runs lose the
-  credential silently while the workload still succeeds, yielding an empty
-  profile. Give D scripts a `tick-Ns { exit(0); }` so they self-terminate;
-  killing the `sudo` pid leaves dtrace running and hangs the harness.
-- **Attribute before building.** Four hypotheses in A1 and three in C died on
-  first contact with a counter. Two could have been refuted by arithmetic alone
-  — 817 M extra instructions is ~0.2 CPU-s, not the 3.2 being explained.
-- Stamp `CARRICK_RUN_ID` and reap with `scripts/sudo/kill.sh <run-id>`; never
-  `pkill -f carrick`.
+One pattern worth carrying forward: this campaign produced four reverts, and every
+one came from acting on a mechanism *inferred* from a correlation rather than
+measured. Hot PCs in `memmove` became "carrick's own copies". A `dead_code`
+attribute became "the path is dead". A concurrency sweep became "lock contention".
+An emitted-word census became an execution profile. The measurements were sound
+each time; the inferences ran ahead of them.
