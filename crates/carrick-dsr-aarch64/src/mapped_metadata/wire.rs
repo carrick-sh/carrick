@@ -1,6 +1,8 @@
+#![allow(dead_code)] // Task 2 consumes the typed layout view and raw records.
+
 //! V3's fixed-width, little-endian byte contract and allocation-free layout check.
 
-use zerocopy::byteorder::{LittleEndian, U32, U64};
+use zerocopy::byteorder::{I64, LittleEndian, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 pub const MAPPED_METADATA_SCHEMA_V3: u32 = 3;
@@ -8,6 +10,8 @@ pub const MAPPED_METADATA_MAGIC_V3: [u8; 8] = *b"CRKMDV3\0";
 pub const MAPPED_METADATA_ENDIAN_MARKER_V3: u32 = 0x0102_0304;
 const SECTION_ALIGNMENT_V3: u64 = 8;
 const SECTION_DIRECTORY_ENTRIES_V3: usize = 9;
+pub(crate) const WIRE_EXECUTABLE_HOST_FILE_V3: u32 = 1;
+pub(crate) const WIRE_EXECUTABLE_DIGEST_V3: u32 = 2;
 
 /// The stable kind of a V3 table. Zero is reserved for an unused fixed
 /// directory slot, never a section payload.
@@ -77,6 +81,12 @@ pub enum MappedMetadataError {
         found: u32,
     },
     HeaderReserved,
+    ExecutableKind {
+        raw: u32,
+    },
+    ExecutableUnusedStorage {
+        executable_kind: u32,
+    },
     TotalLength {
         declared: u64,
         actual: u64,
@@ -129,8 +139,30 @@ pub(crate) struct WireSectionV3 {
     pub reserved: U64<LittleEndian>,
 }
 
+/// The stable `HostFile` executable identity payload. Signed host-file times
+/// remain signed little-endian integers on disk.
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+pub(crate) struct WireHostFileExecutableV3 {
+    pub device: U64<LittleEndian>,
+    pub inode: U64<LittleEndian>,
+    pub size: U64<LittleEndian>,
+    pub mtime_seconds: I64<LittleEndian>,
+    pub mtime_nanoseconds: I64<LittleEndian>,
+}
+
+/// The stable digest executable identity payload. Its trailing bytes remain
+/// zero so both executable alternatives have a fixed 40-byte footprint.
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+pub(crate) struct WireDigestExecutableV3 {
+    pub digest: [u8; 32],
+    pub reserved: [u8; 8],
+}
+
 /// Fixed representation of the identity that selects a translation unit.
-/// Variant payload fields not selected by their discriminant are zero.
+/// The non-selected executable payload is all zero, selected by the stable
+/// `WIRE_EXECUTABLE_*_V3` discriminant.
 #[repr(C)]
 #[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub(crate) struct WireTranslationUnitKeyV3 {
@@ -143,7 +175,8 @@ pub(crate) struct WireTranslationUnitKeyV3 {
     pub guest_va_start: U64<LittleEndian>,
     pub guest_va_len: U64<LittleEndian>,
     pub host_bias: U64<LittleEndian>,
-    pub executable_payload: [u8; 40],
+    pub host_file: WireHostFileExecutableV3,
+    pub digest: WireDigestExecutableV3,
     pub source_fingerprint: [u8; 32],
 }
 
@@ -266,7 +299,9 @@ pub const EDGE_GROUP_RECORD_V3_SIZE: usize = std::mem::size_of::<WireEdgeGroupV3
 pub const EDGE_MEMBER_RECORD_V3_SIZE: usize = std::mem::size_of::<WireEdgeMemberV3>();
 
 const _: () = assert!(WIRE_SECTION_SIZE_V3 == 40);
-const _: () = assert!(std::mem::size_of::<WireTranslationUnitKeyV3>() == 128);
+const _: () = assert!(std::mem::size_of::<WireHostFileExecutableV3>() == 40);
+const _: () = assert!(std::mem::size_of::<WireDigestExecutableV3>() == 40);
+const _: () = assert!(std::mem::size_of::<WireTranslationUnitKeyV3>() == 168);
 const _: () = assert!(WIRE_BLOCK_V3_SIZE == 80);
 const _: () = assert!(PC_MAP_RECORD_V3_SIZE == 16);
 const _: () = assert!(RECOVERY_SPAN_RECORD_V3_SIZE == 16);
@@ -276,7 +311,59 @@ const _: () = assert!(BINDING_RECORD_V3_SIZE == 40);
 const _: () = assert!(BINDING_RELOCATION_RECORD_V3_SIZE == 24);
 const _: () = assert!(EDGE_GROUP_RECORD_V3_SIZE == 32);
 const _: () = assert!(EDGE_MEMBER_RECORD_V3_SIZE == 8);
-const _: () = assert!(HEADER_SIZE_V3 == 584);
+const _: () = assert!(HEADER_SIZE_V3 == 624);
+
+/// A validated offset into the metadata byte slice.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MappedMetadataOffset(u64);
+
+impl MappedMetadataOffset {
+    const fn from_wire(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+
+    fn checked_end(self, len: MappedMetadataLength) -> Option<u64> {
+        self.0.checked_add(len.0)
+    }
+}
+
+/// A validated byte length in the metadata byte slice.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MappedMetadataLength(u64);
+
+impl MappedMetadataLength {
+    const fn from_wire(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// A validated fixed-record count in a metadata section.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MappedMetadataRecordCount(u64);
+
+impl MappedMetadataRecordCount {
+    const fn from_wire(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
+
+    fn checked_byte_len(self, stride: u32) -> Option<MappedMetadataLength> {
+        self.0
+            .checked_mul(u64::from(stride))
+            .map(MappedMetadataLength)
+    }
+}
 
 /// A checked, copy-only directory view. It deliberately retains no slices so
 /// callers can pair it with any byte-backed mapping lifetime in the next layer.
@@ -286,14 +373,37 @@ pub struct ValidatedLayout {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ValidatedSection {
+pub(crate) struct ValidatedSection {
     kind: SectionKind,
-    offset: u64,
-    byte_len: u64,
-    count: u64,
+    offset: MappedMetadataOffset,
+    byte_len: MappedMetadataLength,
+    count: MappedMetadataRecordCount,
+}
+
+impl ValidatedSection {
+    pub(crate) const fn kind(self) -> SectionKind {
+        self.kind
+    }
+
+    pub(crate) const fn offset(self) -> MappedMetadataOffset {
+        self.offset
+    }
+
+    pub(crate) const fn byte_len(self) -> MappedMetadataLength {
+        self.byte_len
+    }
+
+    pub(crate) const fn count(self) -> MappedMetadataRecordCount {
+        self.count
+    }
 }
 
 impl ValidatedLayout {
+    /// Returns the already-validated semantic geometry for one table kind.
+    pub(crate) const fn section(&self, kind: SectionKind) -> Option<ValidatedSection> {
+        self.sections[kind.raw() as usize - 1]
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, MappedMetadataError> {
         if bytes.len() < HEADER_SIZE_V3 {
             return Err(MappedMetadataError::HeaderTruncated {
@@ -326,6 +436,7 @@ impl ValidatedLayout {
         if header.reserved.get() != 0 || header.binding_reserved.get() != 0 {
             return Err(MappedMetadataError::HeaderReserved);
         }
+        validate_executable_storage(&header.key)?;
         let actual = u64::try_from(bytes.len()).map_err(|_| MappedMetadataError::TotalLength {
             declared: header.total_len.get(),
             actual: u64::MAX,
@@ -338,7 +449,11 @@ impl ValidatedLayout {
         }
 
         let mut sections = [None; SECTION_DIRECTORY_ENTRIES_V3];
-        let mut intervals = [(SectionKind::Block, 0_u64, 0_u64); SECTION_DIRECTORY_ENTRIES_V3];
+        let mut intervals = [(
+            SectionKind::Block,
+            MappedMetadataOffset::from_wire(0),
+            0_u64,
+        ); SECTION_DIRECTORY_ENTRIES_V3];
         let mut interval_count = 0;
         for descriptor in &header.sections {
             let raw_kind = descriptor.kind.get();
@@ -367,30 +482,29 @@ impl ValidatedLayout {
                     actual: descriptor.stride.get(),
                 });
             }
-            let expected_len = descriptor
-                .count
-                .get()
-                .checked_mul(u64::from(expected_stride))
+            let offset = MappedMetadataOffset::from_wire(descriptor.offset.get());
+            let byte_len = MappedMetadataLength::from_wire(descriptor.byte_len.get());
+            let count = MappedMetadataRecordCount::from_wire(descriptor.count.get());
+            let expected_len = count
+                .checked_byte_len(expected_stride)
                 .ok_or(MappedMetadataError::SectionRangeOverflow { kind })?;
-            if descriptor.byte_len.get() != expected_len {
+            if byte_len != expected_len {
                 return Err(MappedMetadataError::SectionLength {
                     kind,
-                    expected: expected_len,
-                    actual: descriptor.byte_len.get(),
+                    expected: expected_len.get(),
+                    actual: byte_len.get(),
                 });
             }
-            if !descriptor.offset.get().is_multiple_of(SECTION_ALIGNMENT_V3) {
+            if !offset.get().is_multiple_of(SECTION_ALIGNMENT_V3) {
                 return Err(MappedMetadataError::SectionAlignment {
                     kind,
-                    offset: descriptor.offset.get(),
+                    offset: offset.get(),
                 });
             }
-            let end = descriptor
-                .offset
-                .get()
-                .checked_add(descriptor.byte_len.get())
+            let end = offset
+                .checked_end(byte_len)
                 .ok_or(MappedMetadataError::SectionRangeOverflow { kind })?;
-            if descriptor.offset.get() < HEADER_SIZE_V3 as u64 {
+            if offset.get() < HEADER_SIZE_V3 as u64 {
                 return Err(MappedMetadataError::SectionBounds {
                     kind,
                     end,
@@ -410,19 +524,22 @@ impl ValidatedLayout {
             }
             sections[kind_index] = Some(ValidatedSection {
                 kind,
-                offset: descriptor.offset.get(),
-                byte_len: descriptor.byte_len.get(),
-                count: descriptor.count.get(),
+                offset,
+                byte_len,
+                count,
             });
-            intervals[interval_count] = (kind, descriptor.offset.get(), end);
-            interval_count += 1;
+            if byte_len.get() != 0 {
+                intervals[interval_count] = (kind, offset, end);
+                interval_count += 1;
+            }
         }
 
-        intervals[..interval_count].sort_unstable_by_key(|(_, start, _)| *start);
+        intervals[..interval_count]
+            .sort_unstable_by_key(|(kind, start, _)| (start.get(), kind.raw()));
         for pair in intervals[..interval_count].windows(2) {
             let (left_kind, _left_start, left_end) = pair[0];
             let (right_kind, right_start, _right_end) = pair[1];
-            if left_end > right_start {
+            if left_end > right_start.get() {
                 return Err(MappedMetadataError::SectionOverlap {
                     left: left_kind,
                     right: right_kind,
@@ -433,11 +550,35 @@ impl ValidatedLayout {
     }
 }
 
+fn validate_executable_storage(key: &WireTranslationUnitKeyV3) -> Result<(), MappedMetadataError> {
+    let executable_kind = key.executable_kind.get();
+    match executable_kind {
+        WIRE_EXECUTABLE_HOST_FILE_V3 if key.digest.as_bytes().iter().all(|byte| *byte == 0) => {
+            Ok(())
+        }
+        WIRE_EXECUTABLE_DIGEST_V3
+            if key.host_file.as_bytes().iter().all(|byte| *byte == 0)
+                && key.digest.reserved.iter().all(|byte| *byte == 0) =>
+        {
+            Ok(())
+        }
+        WIRE_EXECUTABLE_HOST_FILE_V3 | WIRE_EXECUTABLE_DIGEST_V3 => {
+            Err(MappedMetadataError::ExecutableUnusedStorage { executable_kind })
+        }
+        raw => Err(MappedMetadataError::ExecutableKind { raw }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const HEADER_TOTAL_LEN_OFFSET: usize = 24;
+    const KEY_OFFSET: usize = std::mem::offset_of!(WireHeaderV3, key);
+    const KEY_EXECUTABLE_KIND_OFFSET: usize =
+        KEY_OFFSET + std::mem::offset_of!(WireTranslationUnitKeyV3, executable_kind);
+    const KEY_DIGEST_OFFSET: usize =
+        KEY_OFFSET + std::mem::offset_of!(WireTranslationUnitKeyV3, digest);
     const HEADER_SECTION_OFFSET: usize = std::mem::offset_of!(WireHeaderV3, sections);
     const SECTION_KIND_OFFSET: usize = 0;
     const SECTION_STRIDE_OFFSET: usize = 4;
@@ -469,6 +610,12 @@ mod tests {
         put_u32(&mut bytes, 12, MAPPED_METADATA_ENDIAN_MARKER_V3);
         put_u32(&mut bytes, 16, HEADER_SIZE_V3 as u32);
         put_u64(&mut bytes, HEADER_TOTAL_LEN_OFFSET, HEADER_SIZE_V3 as u64);
+        put_u32(
+            &mut bytes,
+            KEY_EXECUTABLE_KIND_OFFSET,
+            WIRE_EXECUTABLE_DIGEST_V3,
+        );
+        bytes[KEY_DIGEST_OFFSET] = 1;
         bytes
     }
 
@@ -671,5 +818,63 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn v3_layout_rejects_nonzero_unused_executable_variant_storage() {
+        let mut bytes = minimal_layout_fixture();
+        put_u32(&mut bytes, KEY_EXECUTABLE_KIND_OFFSET, 1);
+        bytes[KEY_DIGEST_OFFSET] = 1;
+
+        assert_eq!(
+            ValidatedLayout::parse(&bytes),
+            Err(MappedMetadataError::ExecutableUnusedStorage {
+                executable_kind: WIRE_EXECUTABLE_HOST_FILE_V3,
+            })
+        );
+    }
+
+    #[test]
+    fn v3_layout_allows_empty_sections_at_a_nonempty_section_start() {
+        let mut bytes = minimal_layout_fixture();
+        add_section(
+            &mut bytes,
+            SectionKind::RecoverySpan,
+            section(
+                SectionKind::RecoverySpan,
+                HEADER_SIZE_V3 as u64,
+                RECOVERY_SPAN_RECORD_V3_SIZE as u64,
+                1,
+            ),
+        );
+        add_section(
+            &mut bytes,
+            SectionKind::PcMap,
+            section(SectionKind::PcMap, HEADER_SIZE_V3 as u64, 0, 0),
+        );
+
+        assert!(ValidatedLayout::parse(&bytes).is_ok());
+    }
+
+    #[test]
+    fn v3_layout_exposes_checked_typed_section_geometry() {
+        let mut bytes = minimal_layout_fixture();
+        add_section(
+            &mut bytes,
+            SectionKind::PcMap,
+            section(
+                SectionKind::PcMap,
+                HEADER_SIZE_V3 as u64,
+                PC_MAP_RECORD_V3_SIZE as u64,
+                1,
+            ),
+        );
+
+        let layout = ValidatedLayout::parse(&bytes).expect("valid layout");
+        let section = layout.section(SectionKind::PcMap).expect("PC-map section");
+        assert_eq!(section.kind(), SectionKind::PcMap);
+        assert_eq!(section.offset().get(), HEADER_SIZE_V3 as u64);
+        assert_eq!(section.byte_len().get(), PC_MAP_RECORD_V3_SIZE as u64);
+        assert_eq!(section.count().get(), 1);
     }
 }
