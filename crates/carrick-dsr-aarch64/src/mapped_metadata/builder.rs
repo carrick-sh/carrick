@@ -13,10 +13,10 @@ use crate::shared_cache::{
 use super::wire::{
     HEADER_SIZE_V3, MAPPED_METADATA_ENDIAN_MARKER_V3, MAPPED_METADATA_MAGIC_V3,
     MAPPED_METADATA_SCHEMA_V3, MappedMetadataError, SectionKind, WIRE_EXECUTABLE_DIGEST_V3,
-    WIRE_EXECUTABLE_HOST_FILE_V3, WireBindingRelocationV3, WireBindingV3, WireBlockV3,
-    WireDigestExecutableV3, WireEdgeGroupV3, WireEdgeMemberV3, WireGuestRangeV3, WireHeaderV3,
-    WireHostFileExecutableV3, WirePcMapV3, WireRecoverySpanV3, WireSectionV3,
-    WireTranslationUnitKeyV3,
+    WIRE_EXECUTABLE_HOST_FILE_V3, WireBindingRelocationV3, WireBindingTargetIndexV3, WireBindingV3,
+    WireBlockGuestIndexV3, WireBlockV3, WireDigestExecutableV3, WireEdgeGroupV3, WireEdgeMemberV3,
+    WireGuestPcIndexV3, WireGuestRangeV3, WireHeaderV3, WireHostFileExecutableV3, WirePcMapV3,
+    WireRecoverySpanV3, WireSectionV3, WireTranslationUnitKeyV3,
 };
 
 pub fn encode_translation_metadata_v3(
@@ -36,6 +36,7 @@ pub fn encode_translation_metadata_v3(
 
     let mut block_bytes = Vec::new();
     let mut pc_bytes = Vec::new();
+    let mut guest_pc_index_bytes = Vec::new();
     let mut recovery_span_bytes = Vec::new();
     let mut recovery_action_bytes = Vec::new();
     let mut guest_range_bytes = Vec::new();
@@ -49,13 +50,42 @@ pub fn encode_translation_metadata_v3(
         let block_pc_start = pc_count;
         let map = block.template.pc_map_entries();
         validate_owned_pc_map(block.guest_start.raw(), block.code_len, map)?;
-        for entry in map {
+        let mut guest_order = map
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                Ok((
+                    entry.guest.raw(),
+                    u32::try_from(index).map_err(|_| MappedMetadataError::Arithmetic)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        guest_order.sort_unstable();
+        let guest_order = guest_order
+            .into_iter()
+            .map(|(_, ordinal)| ordinal)
+            .collect::<Vec<_>>();
+        let mut guest_order_by_pc = vec![0_u32; map.len()];
+        for (guest_ordinal, pc_ordinal) in guest_order.iter().copied().enumerate() {
+            let pc_index =
+                usize::try_from(pc_ordinal).map_err(|_| MappedMetadataError::Arithmetic)?;
+            guest_order_by_pc[pc_index] =
+                u32::try_from(guest_ordinal).map_err(|_| MappedMetadataError::Arithmetic)?;
+            push_record(
+                &mut guest_pc_index_bytes,
+                &WireGuestPcIndexV3 {
+                    pc_map_ordinal: U32::new(pc_ordinal),
+                    reserved: U32::new(0),
+                },
+            );
+        }
+        for (entry, guest_order_ordinal) in map.iter().zip(guest_order_by_pc) {
             push_record(
                 &mut pc_bytes,
                 &WirePcMapV3 {
                     guest: U64::new(entry.guest.raw()),
                     cache_offset: U32::new(entry.cache.get()),
-                    reserved: U32::new(0),
+                    guest_order_ordinal: U32::new(guest_order_ordinal),
                 },
             );
             pc_count = pc_count
@@ -103,7 +133,7 @@ pub fn encode_translation_metadata_v3(
         )?;
 
         let block_guest_range_start = guest_range_count;
-        for (start, end) in exact_guest_ranges(map)? {
+        for (start, end) in exact_guest_ranges(map, &guest_order)? {
             push_record(
                 &mut guest_range_bytes,
                 &WireGuestRangeV3 {
@@ -134,10 +164,34 @@ pub fn encode_translation_metadata_v3(
         );
     }
 
+    let mut block_guest_index_bytes = Vec::new();
+    let mut block_guest_order = manifest
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            Ok((
+                block.guest_start.raw(),
+                u32::try_from(index).map_err(|_| MappedMetadataError::Arithmetic)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    block_guest_order.sort_unstable();
+    for (_, block_index) in block_guest_order {
+        push_record(
+            &mut block_guest_index_bytes,
+            &WireBlockGuestIndexV3 {
+                block_index: U32::new(block_index),
+                reserved: U32::new(0),
+            },
+        );
+    }
+
     let mut binding_bytes = Vec::new();
     let mut relocation_bytes = Vec::new();
     let mut edge_group_bytes = Vec::new();
     let mut edge_member_bytes = Vec::new();
+    let mut binding_target_index_bytes = Vec::new();
     let mut groups = BTreeMap::<(u64, u64), Vec<u32>>::new();
     for binding in &manifest.bindings {
         groups
@@ -195,6 +249,21 @@ pub fn encode_translation_metadata_v3(
             },
         );
     }
+    let mut binding_target_order = manifest
+        .bindings
+        .iter()
+        .map(|binding| (binding.target.raw(), binding.ordinal.get()))
+        .collect::<Vec<_>>();
+    binding_target_order.sort_unstable();
+    for (_, binding_ordinal) in binding_target_order {
+        push_record(
+            &mut binding_target_index_bytes,
+            &WireBindingTargetIndexV3 {
+                binding_ordinal: U32::new(binding_ordinal),
+                reserved: U32::new(0),
+            },
+        );
+    }
     let mut relocations = vec![None; manifest.binding_relocations.len()];
     for relocation in &manifest.binding_relocations {
         let index = usize::try_from(relocation.ordinal.get())
@@ -231,6 +300,9 @@ pub fn encode_translation_metadata_v3(
         (SectionKind::BindingRelocation, relocation_bytes),
         (SectionKind::EdgeGroup, edge_group_bytes),
         (SectionKind::EdgeMember, edge_member_bytes),
+        (SectionKind::GuestPcIndex, guest_pc_index_bytes),
+        (SectionKind::BlockGuestIndex, block_guest_index_bytes),
+        (SectionKind::BindingTargetIndex, binding_target_index_bytes),
     ];
     serialize_metadata(manifest, sections)
 }
@@ -318,15 +390,21 @@ fn validate_owned_pc_map(
 
 fn exact_guest_ranges(
     map: &[crate::emit::PcMapEntry],
+    guest_order: &[u32],
 ) -> Result<Vec<(u64, u64)>, MappedMetadataError> {
-    let mut guests = map
-        .iter()
-        .map(|entry| entry.guest.raw())
-        .collect::<Vec<_>>();
-    guests.sort_unstable();
-    guests.dedup();
     let mut ranges: Vec<(u64, u64)> = Vec::new();
-    for guest in guests {
+    let mut previous_guest = None;
+    for ordinal in guest_order {
+        let index = usize::try_from(*ordinal).map_err(|_| MappedMetadataError::Arithmetic)?;
+        let guest = map
+            .get(index)
+            .ok_or(MappedMetadataError::Arithmetic)?
+            .guest
+            .raw();
+        if previous_guest == Some(guest) {
+            continue;
+        }
+        previous_guest = Some(guest);
         let end = guest
             .checked_add(4)
             .ok_or(MappedMetadataError::GuestRange)?;
@@ -361,7 +439,7 @@ fn validate_span_order(bytes: &[u8], start: u64, end: u64) -> Result<(), MappedM
 
 fn serialize_metadata(
     manifest: &TranslationUnitManifest,
-    sections: [(SectionKind, Vec<u8>); 9],
+    sections: [(SectionKind, Vec<u8>); 12],
 ) -> Result<Vec<u8>, MappedMetadataError> {
     let zero = WireSectionV3 {
         kind: U32::new(0),
@@ -371,7 +449,7 @@ fn serialize_metadata(
         count: U64::new(0),
         reserved: U64::new(0),
     };
-    let mut directory = [zero; 9];
+    let mut directory = [zero; 12];
     let mut offset = u64::try_from(HEADER_SIZE_V3).map_err(|_| MappedMetadataError::Arithmetic)?;
     for (slot, (kind, bytes)) in directory.iter_mut().zip(&sections) {
         let byte_len = u64::try_from(bytes.len()).map_err(|_| MappedMetadataError::Arithmetic)?;
