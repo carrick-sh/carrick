@@ -15,7 +15,7 @@ pub const MAPPED_METADATA_SCHEMA_V3: u32 = 3;
 pub const MAPPED_METADATA_MAGIC_V3: [u8; 8] = *b"CRKMDV3\0";
 pub const MAPPED_METADATA_ENDIAN_MARKER_V3: u32 = 0x0102_0304;
 const SECTION_ALIGNMENT_V3: u64 = 8;
-const SECTION_DIRECTORY_ENTRIES_V3: usize = 9;
+const SECTION_DIRECTORY_ENTRIES_V3: usize = 12;
 pub(crate) const WIRE_EXECUTABLE_HOST_FILE_V3: u32 = 1;
 pub(crate) const WIRE_EXECUTABLE_DIGEST_V3: u32 = 2;
 
@@ -33,6 +33,9 @@ pub enum SectionKind {
     BindingRelocation = 7,
     EdgeGroup = 8,
     EdgeMember = 9,
+    GuestPcIndex = 10,
+    BlockGuestIndex = 11,
+    BindingTargetIndex = 12,
 }
 
 impl SectionKind {
@@ -51,6 +54,9 @@ impl SectionKind {
             Self::BindingRelocation => BINDING_RELOCATION_RECORD_V3_SIZE as u32,
             Self::EdgeGroup => EDGE_GROUP_RECORD_V3_SIZE as u32,
             Self::EdgeMember => EDGE_MEMBER_RECORD_V3_SIZE as u32,
+            Self::GuestPcIndex => GUEST_PC_INDEX_RECORD_V3_SIZE as u32,
+            Self::BlockGuestIndex => BLOCK_GUEST_INDEX_RECORD_V3_SIZE as u32,
+            Self::BindingTargetIndex => BINDING_TARGET_INDEX_RECORD_V3_SIZE as u32,
         }
     }
 
@@ -65,6 +71,9 @@ impl SectionKind {
             7 => Some(Self::BindingRelocation),
             8 => Some(Self::EdgeGroup),
             9 => Some(Self::EdgeMember),
+            10 => Some(Self::GuestPcIndex),
+            11 => Some(Self::BlockGuestIndex),
+            12 => Some(Self::BindingTargetIndex),
             _ => None,
         }
     }
@@ -242,7 +251,7 @@ pub(crate) struct WireBlockV3 {
 pub(crate) struct WirePcMapV3 {
     pub guest: U64<LittleEndian>,
     pub cache_offset: U32<LittleEndian>,
-    pub reserved: U32<LittleEndian>,
+    pub guest_order_ordinal: U32<LittleEndian>,
 }
 
 #[repr(C)]
@@ -398,15 +407,30 @@ impl WireRecoveryActionV3 {
                 (20, [phase, capture, present, value, 0])
             }
         };
-        Ok(Self {
+        let wire = Self {
             tag: U32::new(tag),
             reserved: U32::new(0),
             payload: payload.map(U64::new),
-        })
+        };
+        wire.into_portable()
+            .map_err(|_| DsrError::CachePolicy("invalid portable recovery action".to_string()))?;
+        Ok(wire)
     }
 
-    pub(crate) fn validate(self) -> Result<(), MappedMetadataError> {
-        self.into_portable().map(|_| ())
+    pub(crate) fn validate(self, host_bias: Option<u64>) -> Result<(), MappedMetadataError> {
+        let portable = self.into_portable()?;
+        if matches!(
+            portable,
+            PortableRecoveryAction::RecoverBiasedMemory(_)
+                | PortableRecoveryAction::RecoverBiasedExclusive(_)
+        ) && host_bias.is_none()
+        {
+            return Err(MappedMetadataError::RecoveryAction);
+        }
+        portable
+            .rebind_with_host_bias(host_bias)
+            .map(|_| ())
+            .map_err(|_| MappedMetadataError::RecoveryAction)
     }
 
     pub(crate) fn into_recovery_action(
@@ -432,56 +456,56 @@ impl WireRecoveryActionV3 {
             4 if unused(&p, 0) => PortableRecoveryAction::RestoreIndirectRegisters,
             5 if unused(&p, 0) => PortableRecoveryAction::RestoreIndirectResolver,
             6 if unused(&p, 1) => PortableRecoveryAction::RestoreScratch {
-                register: u32_word(p[0])?,
+                register: gpr_word(p[0])?,
             },
             7 if unused(&p, 1) => PortableRecoveryAction::RestoreScratchInvalidBiasedLiteral {
-                register: u32_word(p[0])?,
+                register: gpr_word(p[0])?,
             },
             8 if unused(&p, 1) => PortableRecoveryAction::RestoreScratchCompleted {
-                register: u32_word(p[0])?,
+                register: gpr_word(p[0])?,
             },
             9 if unused(&p, 2) => PortableRecoveryAction::CommitVirtualizedAndRestoreScratch {
-                register: u32_word(p[0])?,
-                virtual_register: u32_word(p[1])?,
+                register: gpr_word(p[0])?,
+                virtual_register: gpr_word(p[1])?,
             },
             10 if unused(&p, 2) => PortableRecoveryAction::RestoreScratchAndContext {
-                register: u32_word(p[0])?,
-                context_register: u32_word(p[1])?,
+                register: gpr_word(p[0])?,
+                context_register: gpr_word(p[1])?,
             },
             11 if unused(&p, 2) => PortableRecoveryAction::RestoreScratchAndContextCompleted {
-                register: u32_word(p[0])?,
-                context_register: u32_word(p[1])?,
+                register: gpr_word(p[0])?,
+                context_register: gpr_word(p[1])?,
             },
             12 if unused(&p, 3) => {
                 PortableRecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
-                    register: u32_word(p[0])?,
-                    context_register: u32_word(p[1])?,
-                    virtual_register: u32_word(p[2])?,
+                    register: gpr_word(p[0])?,
+                    context_register: gpr_word(p[1])?,
+                    virtual_register: gpr_word(p[2])?,
                 }
             }
             13 if unused(&p, 3) => PortableRecoveryAction::RestoreDualVirtualReadOnly {
-                x18_scratch: u32_word(p[0])?,
-                x28_scratch: u32_word(p[1])?,
-                context_scratch: u32_word(p[2])?,
+                x18_scratch: gpr_word(p[0])?,
+                x28_scratch: gpr_word(p[1])?,
+                context_scratch: gpr_word(p[2])?,
             },
             14 if unused(&p, 3) => PortableRecoveryAction::RestoreDualVirtualReadOnlyCompleted {
-                x18_scratch: u32_word(p[0])?,
-                x28_scratch: u32_word(p[1])?,
-                context_scratch: u32_word(p[2])?,
+                x18_scratch: gpr_word(p[0])?,
+                x28_scratch: gpr_word(p[1])?,
+                context_scratch: gpr_word(p[2])?,
             },
             15 => PortableRecoveryAction::CommitDualVirtualAndRestore {
-                x18_scratch: u32_word(p[0])?,
-                x28_scratch: u32_word(p[1])?,
-                context_scratch: u32_word(p[2])?,
-                virtual_register: u32_word(p[3])?,
-                virtual_scratch: u32_word(p[4])?,
+                x18_scratch: gpr_word(p[0])?,
+                x28_scratch: gpr_word(p[1])?,
+                context_scratch: gpr_word(p[2])?,
+                virtual_register: gpr_word(p[3])?,
+                virtual_scratch: gpr_word(p[4])?,
             },
             16 => PortableRecoveryAction::CommitDualVirtualPairAndRestore {
-                x18_scratch: u32_word(p[0])?,
-                x28_scratch: u32_word(p[1])?,
-                context_scratch: u32_word(p[2])?,
-                first_register: u32_word(p[3])?,
-                second_register: u32_word(p[4])?,
+                x18_scratch: gpr_word(p[0])?,
+                x28_scratch: gpr_word(p[1])?,
+                context_scratch: gpr_word(p[2])?,
+                first_register: gpr_word(p[3])?,
+                second_register: gpr_word(p[4])?,
             },
             17 if unused(&p, 2) => {
                 PortableRecoveryAction::RecoverCounterRead(CounterReadRecovery {
@@ -556,6 +580,13 @@ fn unused(payload: &[u64; 5], used: usize) -> bool {
 
 fn u32_word(value: u64) -> Result<u32, MappedMetadataError> {
     u32::try_from(value).map_err(|_| MappedMetadataError::RecoveryAction)
+}
+
+fn gpr_word(value: u64) -> Result<u32, MappedMetadataError> {
+    let value = u32_word(value)?;
+    DsrScratchGpr::new(value)
+        .map(DsrScratchGpr::index)
+        .ok_or(MappedMetadataError::RecoveryAction)
 }
 
 fn bool_word(value: u64) -> Result<bool, MappedMetadataError> {
@@ -734,6 +765,32 @@ pub(crate) struct WireEdgeMemberV3 {
     pub reserved: U32<LittleEndian>,
 }
 
+/// One block-local PC ordinal, sorted by `(guest, pc_ordinal)` in the
+/// publisher. The guest VA remains canonical in `WirePcMapV3`, avoiding an
+/// extra eight bytes per multi-million-entry PC table.
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+pub(crate) struct WireGuestPcIndexV3 {
+    pub pc_map_ordinal: U32<LittleEndian>,
+    pub reserved: U32<LittleEndian>,
+}
+
+/// One block ordinal, sorted by the referenced block's guest start.
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+pub(crate) struct WireBlockGuestIndexV3 {
+    pub block_index: U32<LittleEndian>,
+    pub reserved: U32<LittleEndian>,
+}
+
+/// One binding ordinal, sorted by `(target, binding_ordinal)`.
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+pub(crate) struct WireBindingTargetIndexV3 {
+    pub binding_ordinal: U32<LittleEndian>,
+    pub reserved: U32<LittleEndian>,
+}
+
 pub const WIRE_SECTION_SIZE_V3: usize = std::mem::size_of::<WireSectionV3>();
 pub const HEADER_SIZE_V3: usize = std::mem::size_of::<WireHeaderV3>();
 const WIRE_BLOCK_V3_SIZE: usize = std::mem::size_of::<WireBlockV3>();
@@ -745,6 +802,10 @@ pub const BINDING_RECORD_V3_SIZE: usize = std::mem::size_of::<WireBindingV3>();
 pub const BINDING_RELOCATION_RECORD_V3_SIZE: usize = std::mem::size_of::<WireBindingRelocationV3>();
 pub const EDGE_GROUP_RECORD_V3_SIZE: usize = std::mem::size_of::<WireEdgeGroupV3>();
 pub const EDGE_MEMBER_RECORD_V3_SIZE: usize = std::mem::size_of::<WireEdgeMemberV3>();
+pub const GUEST_PC_INDEX_RECORD_V3_SIZE: usize = std::mem::size_of::<WireGuestPcIndexV3>();
+pub const BLOCK_GUEST_INDEX_RECORD_V3_SIZE: usize = std::mem::size_of::<WireBlockGuestIndexV3>();
+pub const BINDING_TARGET_INDEX_RECORD_V3_SIZE: usize =
+    std::mem::size_of::<WireBindingTargetIndexV3>();
 
 const _: () = assert!(WIRE_SECTION_SIZE_V3 == 40);
 const _: () = assert!(std::mem::size_of::<WireHostFileExecutableV3>() == 40);
@@ -759,7 +820,10 @@ const _: () = assert!(BINDING_RECORD_V3_SIZE == 40);
 const _: () = assert!(BINDING_RELOCATION_RECORD_V3_SIZE == 24);
 const _: () = assert!(EDGE_GROUP_RECORD_V3_SIZE == 32);
 const _: () = assert!(EDGE_MEMBER_RECORD_V3_SIZE == 8);
-const _: () = assert!(HEADER_SIZE_V3 == 624);
+const _: () = assert!(GUEST_PC_INDEX_RECORD_V3_SIZE == 8);
+const _: () = assert!(BLOCK_GUEST_INDEX_RECORD_V3_SIZE == 8);
+const _: () = assert!(BINDING_TARGET_INDEX_RECORD_V3_SIZE == 8);
+const _: () = assert!(HEADER_SIZE_V3 == 744);
 
 /// A validated offset into the metadata byte slice.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1332,5 +1396,106 @@ mod tests {
         assert_eq!(section.offset().get(), HEADER_SIZE_V3 as u64);
         assert_eq!(section.byte_len().get(), PC_MAP_RECORD_V3_SIZE as u64);
         assert_eq!(section.count().get(), 1);
+    }
+
+    #[test]
+    fn every_portable_recovery_variant_round_trips_through_v3() {
+        let x15 = DsrScratchGpr::new(15).expect("x15 scratch");
+        let x16 = DsrScratchGpr::new(16).expect("x16 scratch");
+        let actions = [
+            PortableRecoveryAction::Noop,
+            PortableRecoveryAction::RestoreGuestX17,
+            PortableRecoveryAction::RestoreGenerationGuardRegisters,
+            PortableRecoveryAction::RestoreGenerationGuard,
+            PortableRecoveryAction::RestoreIndirectRegisters,
+            PortableRecoveryAction::RestoreIndirectResolver,
+            PortableRecoveryAction::RestoreScratch { register: 15 },
+            PortableRecoveryAction::RestoreScratchInvalidBiasedLiteral { register: 16 },
+            PortableRecoveryAction::RestoreScratchCompleted { register: 17 },
+            PortableRecoveryAction::CommitVirtualizedAndRestoreScratch {
+                register: 15,
+                virtual_register: 18,
+            },
+            PortableRecoveryAction::RestoreScratchAndContext {
+                register: 16,
+                context_register: 17,
+            },
+            PortableRecoveryAction::RestoreScratchAndContextCompleted {
+                register: 17,
+                context_register: 18,
+            },
+            PortableRecoveryAction::CommitVirtualizedAndRestoreScratchAndContext {
+                register: 15,
+                context_register: 16,
+                virtual_register: 28,
+            },
+            PortableRecoveryAction::RestoreDualVirtualReadOnly {
+                x18_scratch: 15,
+                x28_scratch: 16,
+                context_scratch: 17,
+            },
+            PortableRecoveryAction::RestoreDualVirtualReadOnlyCompleted {
+                x18_scratch: 16,
+                x28_scratch: 17,
+                context_scratch: 18,
+            },
+            PortableRecoveryAction::CommitDualVirtualAndRestore {
+                x18_scratch: 15,
+                x28_scratch: 16,
+                context_scratch: 17,
+                virtual_register: 18,
+                virtual_scratch: 28,
+            },
+            PortableRecoveryAction::CommitDualVirtualPairAndRestore {
+                x18_scratch: 15,
+                x28_scratch: 16,
+                context_scratch: 17,
+                first_register: 18,
+                second_register: 28,
+            },
+            PortableRecoveryAction::RecoverCounterRead(CounterReadRecovery {
+                committed_scratch_destination: Some(CounterScratchDestination::X16),
+                instruction_complete: true,
+            }),
+            PortableRecoveryAction::RecoverBiasedMemory(PortableBiasedMemoryRecovery {
+                scratch_registers: [15, 16, 17, 28],
+                scratch_count: 4,
+                base_scratch: 14,
+                base: BiasedBase::Register(13),
+                base_coordinate: BiasedBaseCoordinate::Guest,
+                commit_base: true,
+                virtual_x18_scratch: Some(12),
+                virtual_x28_scratch: Some(11),
+                virtual_reserved_scratch: Some(10),
+                instruction_complete: true,
+            }),
+            PortableRecoveryAction::RecoverBiasedExclusive(BiasedExclusiveRecovery {
+                scratch: BiasedExclusiveScratch {
+                    address: x15,
+                    bias: x16,
+                },
+                resume: BiasedExclusiveResume::Retry,
+            }),
+            PortableRecoveryAction::RestoreDirectBinding {
+                phase: DirectBindingRecoveryPhase::AuthorityInstall,
+                capture_progress: DirectBindingCaptureProgress::Complete,
+                committed_link: Some(0x1234),
+            },
+        ];
+
+        for action in actions {
+            let wire = WireRecoveryActionV3::from_portable(action).expect("encode action");
+            assert_eq!(wire.into_portable().expect("decode action"), action);
+        }
+    }
+
+    #[test]
+    fn v3_recovery_encoding_rejects_an_invalid_gpr() {
+        assert!(
+            WireRecoveryActionV3::from_portable(PortableRecoveryAction::RestoreScratch {
+                register: 31,
+            })
+            .is_err()
+        );
     }
 }
