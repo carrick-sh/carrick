@@ -1,9 +1,9 @@
 # Native-lane performance handoff
 
 **Date:** 2026-07-31
-**Branch:** `codex/native-performance-m1` (M2 launch-qualification checkpoint
-`51e20831`; raw-v2 parser checkpoint `c035f89a`; M1 correctness checkpoint
-`5020e509`)
+**Branch:** `codex/native-performance-m1` (performance/timeout checkpoint
+`47457f44`; qualified profile-v2 checkpoint `edbdc530`; M1 correctness
+checkpoint `5020e509`)
 **Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
 default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
@@ -24,9 +24,9 @@ its ignored raw trace receipts remain under `target/perf/`.
 
 The performance campaign is now producing measured mechanism wins. The branch
 is still active and is **not merge-ready**: the complete repository gate is
-green, but run-encoded recovery metadata still needs its clean retention ABBA,
-the retained stack needs one cumulative rerun, and the work needs milestone
-commits.
+green and run-encoded recovery metadata is retained, but the retained stack
+still needs one clean cumulative old/new rerun, the shared/default gap must be
+remeasured, and the qualified v2 profiler needs its signed live proof.
 
 Retained default-on changes, each with an exact `=0` opt-out, now remove:
 
@@ -43,9 +43,12 @@ measured `-11.9%` guest workload, `-10.6%` outer wall, `-12.6%` user CPU,
 clean ABBA for keyed dylib identity added `-2.51%` guest workload and `-2.02%`
 wall with flat system CPU/RSS. Multiplying those independent effects projects
 about `-14.1%` cumulative workload, but that figure is explicitly a projection
-until the final combined binary is rerun. The last measured shared/default gap
-was `+16.46%`; keyed identity projects it near `+13.5%`, also not an official
-measurement.
+until the final combined binary is rerun. Run encoding then measured another
+`-8.48%` total CPU on the complete current stack; compounding the independent
+results projects roughly `-21.4%`, but this also remains a projection rather
+than an official old/new result. The last measured shared/default gap was
+`+16.46%`; keyed identity and run encoding should close much of it, but the
+current exact gap has not yet been measured.
 
 The maintained low-overhead syscall CPU tracer
 (`scripts/dtrace/native-syscall-cpu-directional.d` plus
@@ -74,35 +77,62 @@ The attempted manifest-backed direct-binding record indirection was rejected
 and removed: two adjacent controlled pairs put it about `+2–3%` slower. It is
 not part of the retained tree.
 
-Run-encoded recovery metadata is now implemented default-on with
+Run-encoded recovery metadata is now implemented and retained default-on, with
 `CARRICK_DSR_SHARED_RECOVERY_RUNS=0` as the exact entry-wire opt-out. The wire
 rejects zero-length and overflowing runs, runtime fault lookup binds one action
 without eagerly expanding the map, and the benchmark/DTrace target can select
-either representation. One signed ordered pair completed the real Go build in
-`12.314s` with runs versus `13.396s` with entries (about `8.1%` directional
-improvement). That pair proves operability only; it is explicitly not retained
-performance evidence.
+either representation. The immutable same-binary eight-quad ABBA is published
+as
+[`scripts/perf/evidence/native-recovery-runs-abba-47457f44.json`](scripts/perf/evidence/native-recovery-runs-abba-47457f44.json)
+(SHA-256
+`13320af91b2870e1dfe0b08b250fc44723a35d96b5035a8dad234a5f5fbcab70`).
+Runs won all eight quads: total CPU ratio `0.91519` (`-8.48%`, one-sided upper
+`0.92377`, sign probability `1/256`), user CPU `-9.45%`, system CPU `-6.62%`,
+outer wall `-8.30%`, and guest workload `-9.46%`. The artifact deliberately
+leaves `decision.retained=false` because the statistical harness cannot
+self-certify its external mechanism and correctness gates; those gates are now
+satisfied by the bounded DTrace comparison and clean full repository gate.
+
+The exact entries/runs DTrace pair completed naturally with no parser warnings.
+Runs reduced total samples by `10.53%`, kernel samples by `9.02%`, user samples
+by `11.85%`, and accounted syscall CPU from `6.220s` to `5.911s` (`-4.97%`).
+The largest reductions were `read` (`-33.7%` CPU), `mprotect` (`-14.4%`), and
+`write` (`-37.5%`). This is directional mechanism evidence rather than a
+receipt-bound lossless profile; the ABBA result is the retention authority.
+The comparison is
+`target/perf/native-recovery-runs-syscall-cpu-comparison-47457f44.json`
+(SHA-256
+`7d2438ff1e4aa193bbc8180339516cad561540e8e110fd1722263ca406990696`).
+
+The first ABBA attempt preserved a genuine 900-second, low-CPU timeout at
+quad 4 B2 instead of rewriting it away. Candidate-only and exact ABBA reducers
+then completed 32/32 and 18/18 runs, so it is retained as discovery evidence,
+not attributed to run encoding. Commit `47457f44` adds
+`carrick debug lldb-snapshot` and automatic pre-cleanup timeout snapshots to
+the performance harness. A signed live three-process proof recovered nonempty
+event rings and all-thread stacks before run-ID cleanup reached zero.
 
 Verification is green: 252/252 `carrick-dsr-aarch64` tests, 35/35
 `carrick-native-darwin` tests, 111 relevant Python harness tests, the serialized
-runtime library at 1,128 passed with 5 ignored, and the complete `just ci` gate.
+runtime library at 1,128 passed with 5 ignored, and the complete `just ci` gate
+on clean HEAD `47457f44`.
 The full gate exposed four stale keyed-export fixtures and two eager-recovery
 test helpers; both were corrected through the production validation key and a
 single representation-neutral recovery lookup seam before the green rerun.
 
-**Next:** checkpoint and rebuild/sign this exact tree, then run at least eight
-clean ABBA quads of recovery runs versus entries plus the zero-drop syscall/read
-CPU tracer on the same binary. Retain only if total workload/CPU improves;
-compact PC maps are the next representation target. After that, rerun exact
-default/shared and old/new cumulative comparisons, refresh this handoff, and
-make the measured milestone commit.
+**Next:** run the exact old/new two-binary cumulative campaign and the current
+same-binary shared/default campaign. Then live-prove qualified `DSRPROF2` on the
+same Go-build workload and use its PC-range attribution to decide whether the
+3.7-million-entry PC map is the next representation owner. Do not start PC-map
+coding until those measurements identify the cost.
 
-Current confidence is high (`~88%`) that the campaign retains a meaningful
-native performance improvement, because the current wins are independently
-measured and the next owner is concrete. Confidence that run encoding itself
-survives the retention gate is about `70%`; confidence that this tranche closes
-the remaining shared/default parity gap is moderate (`~65%`) because the clean
-ABBA and cumulative comparison remain open.
+Confidence that run encoding should stay is high (`~93%`) because statistical,
+mechanism, correctness, and signed-live operability evidence now agree.
+Confidence that the campaign has a meaningful cumulative native win is also
+high (`~92%`). Confidence in reaching the full `>=30%` total-CPU goal is
+moderate-to-high (`~68%`): the current stack projects around `21%`, leaving a
+real but bounded gap for PC-map and remaining kernel ownership work. Confidence
+that shared/default parity is now close is about `70%` until the exact rerun.
 
 ---
 
@@ -268,9 +298,17 @@ completion corruptions reject. Existing `DSRPROF1` parsing remains unchanged.
 Focused integration and unit suites, warnings-denied clippy, formatting,
 typed-domain lint, and diff checks passed.
 
-This is still structural validation, not a gating-eligible v2 profile. The
-header hashes have syntax authority, but `native-wall.d` still emits PID-only
-`DSRPROF1`, and v2 summary publication remains absent.
+At that checkpoint this was structural validation rather than a gating-eligible
+v2 profile. Commit `edbdc530` has since closed the production-emission slice:
+the launch path renders `native-wall.d` from accepted birth and terminal
+qualifications, binds the OS/program/qualification receipt hashes into header
+authority, and emits birth-keyed `DSRPROF2` lifecycle, range, kernel, off-CPU,
+and exact stack records. The ordinary summary and symbol overlay are published
+only after the shared parser accepts complete state and every libdtrace loss
+class, including split dynamic rinse and dirty drops. The valid fixture and
+adversarial header/lifecycle/range/kernel/off-CPU/completion/drop/symbol tests
+pass. A signed live v2 capture is still required before using the profiler as
+the next performance-selection authority.
 
 Commit `51e20831` adds the first live launch-qualification slice. The approved
 design assumed Darwin `proc` provider start fields could supply process birth
@@ -311,24 +349,21 @@ capture. Full host tests, integration tests, focused warnings-denied clippy,
 formatting, domain lint, diff checks, and all three live DTrace fixtures passed.
 
 The lifecycle receipt closes the catalog/fork/exec prerequisite, the raw
-grammar exists, and the required Darwin birth/terminal mechanisms are now
-live-qualified standalone. None makes the current PID-only `DSRPROF1`
-native-wall stream gating-eligible. Automatic drop-aware launch qualification,
-receipt binding, `DSRPROF2` production emission, balanced kernel-state
-sampling, v2 symbol rules, and the receipt-bound Go-build capture surface
-remain absent.
+grammar and automatic launch authority now exist, and the required Darwin
+birth/terminal mechanisms are live-qualified. What remains is an immutable,
+signed real-workload `DSRPROF2` capture proving that production emission and
+qualification agree under the Go-build process tree. Use that capture, not the
+older PID-only `DSRPROF1` stream, to rank the next translation/kernel owner.
 
-**Next:** make the three qualifications automatic through the same libdtrace
-consumer, retain each real drop/interruption report, and require those receipt
-hashes in DSRPROF2 header authority. Then make `native-wall.d` emit the
-birth-keyed lifecycle and complete balanced v2 kernel/off-CPU reconciliation
-and exact ownership rules before adding the Go-build `capture`/`promote-set`
-surface. Only after those gates are green should this code state be rebuilt
-into the immutable arm for two native-default and two shared captures. Those
-four profiles choose the largest repeatable opt-out translation/kernel owner;
-one narrow candidate then advances to the primary ABBA total-child-CPU gate.
+**Next:** complete the cumulative old/new and shared/default CPU campaigns,
+then run the signed qualified v2 Go-build capture. If it accepts, use the
+birth-keyed PC-range and kernel/off-CPU summaries to select one narrow,
+default-on candidate with an exact opt-out and advance it to the primary ABBA
+total-child-CPU gate.
 
-The ≥30% CPU goal remains open; no new paired CPU ratio has been measured.
+The `>=30%` CPU goal remains open. Run encoding has now added a clean `-8.48%`
+total-CPU result; the combined-stack result is still awaiting direct
+measurement.
 
 ---
 
