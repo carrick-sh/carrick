@@ -372,6 +372,22 @@ pub struct HostLift {
 /// window between prepare and restore unwinds or exits early. Callers disarm it
 /// and restore explicitly on the success path to preserve restore-error
 /// propagation.
+/// Does `zero_backing` take ONE protection lift for the whole range instead of
+/// a lift/restore `mprotect` PAIR per 64 KiB?
+///
+/// **DEFAULT ON.** `CARRICK_DSR_ZERO_FAST=0` is the exact escape hatch, and it
+/// exists so the two arms of a paired screen come from ONE binary -- the
+/// control still runs the chunked path. Measured on the cold `go build`
+/// reference workload: host `mprotect` falls **236,464 -> 6,665** (97.2%), and
+/// the 64 KiB length class -- 98% of the calls, exactly `ZERO_CHUNK`'s size --
+/// disappears entirely.
+fn zero_backing_single_lift_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_DSR_ZERO_FAST").as_deref() != Some(std::ffi::OsStr::new("0"))
+    })
+}
+
 pub struct HostLiftRestoreGuard<'a> {
     memory: &'a NativeMappedMemory,
     changed: &'a [(u64, libc::c_int)],
@@ -2208,6 +2224,39 @@ impl NativeMappedMemory {
         self.restore_temporary_host_access(&changed, address, length)
     }
 
+    /// Zero a contiguous, non-executable guest range with ONE protection lift
+    /// and ONE `memset`. Mirrors [`Self::copy_bytes_to_host`] exactly --
+    /// including the unwind-safe lift refcount -- but writes zeros directly
+    /// rather than streaming them from a source buffer.
+    ///
+    /// Callers must have established both preconditions (`region_contains` and
+    /// `!range_may_execute`); see `GuestMemory::zero_backing`, which selects
+    /// between this and the chunked fallback.
+    pub fn zero_bytes_to_host(&self, address: u64, len: usize) -> Result<(), MemoryError> {
+        let ptr = self
+            .host_address(carrick_guest_mem::GuestVa(address))?
+            .raw() as *mut u8;
+        // The caller excluded may-execute ranges, so this reports false and
+        // performs only the exclusive-monitor bump.
+        self.invalidate_and_note_dsr_write(address, len)?;
+        let changed = self.prepare_temporary_host_access(address, len, true)?;
+        let mut restore_on_unwind = HostLiftRestoreGuard {
+            memory: self,
+            changed: &changed,
+            address,
+            length: len,
+            armed: true,
+        };
+        // SAFETY: `region_contains` proved [address, address+len) is one mapped
+        // region, `host_address` resolved its base, and the lift above makes the
+        // whole range host-writable for the duration of this window.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, len);
+        }
+        restore_on_unwind.armed = false;
+        self.restore_temporary_host_access(&changed, address, len)
+    }
+
     /// The exclusive-monitor bump plus the conditional DSR code-mutation note
     /// that every `write_bytes_raw` path performs before touching guest RAM,
     /// regardless of whether the write also hits a native16k write-exec page.
@@ -3777,7 +3826,42 @@ impl GuestMemory for NativeMappedMemory {
         self.write_bytes_raw(address, bytes)
     }
 
+    /// Zero a guest range with ONE protection lift and ONE `memset`, instead of
+    /// one lift/restore `mprotect` PAIR per 64 KiB.
+    ///
+    /// The chunked path below costs two `mprotect` syscalls per 64 KiB, and a
+    /// cold `go build` measured **236,464** of them -- 98% at exactly
+    /// `ZERO_CHUNK`'s length -- against **8** guest `mprotect` calls, i.e. a
+    /// ~29,500x amplification that is entirely carrick's own. Each pair is a
+    /// full Darwin VM operation with a TLB shootdown IPI, and the whole loop
+    /// runs while holding the process-global `HostAliasTransactions` gate, so
+    /// siblings serialize behind it on a parking_lot Condvar.
+    ///
+    /// It also drops the copy: `write_bytes(0)` needs no source buffer, where
+    /// the chunked path streams a static 64 KiB zero page through
+    /// `copy_nonoverlapping` -- which is the `_platform_memmove`/`memset` mass
+    /// that shows up in fault attribution.
+    ///
+    /// Two cases still take the chunked path, both conservative:
+    ///   * a range spanning more than one mapped region (no single host
+    ///     pointer, and `copy_bytes_to_host` resolves per chunk); and
+    ///   * a range that MAY EXECUTE, where `write_bytes_raw` must escalate to
+    ///     `write_exec_page_bytes` for the W^X metadata update that a raw
+    ///     `memset` cannot perform.
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        if len == 0 {
+            return Ok(());
+        }
+        if zero_backing_single_lift_enabled()
+            && self.region_contains(address, len)
+            && !self.range_may_execute(address, len)
+        {
+            return self.zero_bytes_to_host(address, len);
+        }
+
+        // Conservative fallback: multi-region or may-execute ranges still go
+        // through the per-chunk write path, which resolves the host pointer per
+        // chunk and escalates to `write_exec_page_bytes` for W^X metadata.
         static ZERO_CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
         let mut offset = 0usize;
         while offset < len {
