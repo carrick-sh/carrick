@@ -1,4 +1,5 @@
 #pragma D option quiet
+#pragma D option zdefs
 #pragma D option bufsize=64m
 #pragma D option aggsize=128m
 #pragma D option dynvarsize=64m

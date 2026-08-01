@@ -189,6 +189,7 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
             / "scripts/dtrace/native-pc-range-directional.d"
         ).read_text(encoding="utf-8")
 
+        self.assertIn("#pragma D option zdefs", script)
         self.assertIn("profile-197", script)
         self.assertNotIn("profile-997", script)
         self.assertIn("PCPROFILE1|config|sample_hz=197", script)

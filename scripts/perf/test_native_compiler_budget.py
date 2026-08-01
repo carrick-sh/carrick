@@ -599,7 +599,8 @@ def nativeperf_frames(pid=10, tid=11, era=12):
         "exit_unsupported=0",
         prefix
         + "sensitive|sensitive_exclusive=0|sensitive_read_tpidr=0|"
-        "sensitive_write_tpidr=0|sensitive_read_ctr=0|sensitive_read_dczid=0|"
+        "sensitive_write_tpidr=0|sensitive_read_counter=0|sensitive_read_ctr=0|"
+        "sensitive_read_dczid=0|"
         "sensitive_dc_zva=0|sensitive_dc_cvau=0|sensitive_ic_ivau=0",
         prefix
         + "phases-a|phase_prepare_index_ns=10|phase_prepare_index_count=2|"
@@ -756,6 +757,15 @@ class NativePerfTests(unittest.TestCase):
         profile = budget.parse_nativeperf(nativeperf_frames())
         budget.validate_profile(profile)
         self.assertEqual(profile.threads[0].gateway_entries, 2)
+
+    def test_profile_accepts_pre_read_counter_sensitive_frame_as_zero(self):
+        lines = nativeperf_frames()
+        lines[2] = lines[2].replace("sensitive_read_counter=0|", "")
+        profile = budget.parse_nativeperf(lines)
+        self.assertEqual(
+            profile.threads[0].value("sensitive", "sensitive_read_counter"),
+            0,
+        )
         self.assertEqual(profile.threads[0].frames, frozenset(FRAME_NAMES))
 
     def test_profile_keeps_process_deltas_distinct_from_cache_gauges(self):
