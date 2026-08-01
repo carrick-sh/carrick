@@ -13,49 +13,6 @@ from native_go_dtrace_target import _has_carrick_proctitle
 
 
 class NativeGoDtraceTargetTests(unittest.TestCase):
-    def test_revalidate_manifest_passes_exact_opt_out_to_child(self) -> None:
-        captured_environment: dict[str, str] = {}
-
-        class RecordingProcess:
-            def __init__(self, _command, *, cwd, env):
-                del cwd
-                captured_environment.update(env)
-
-            def wait(self) -> int:
-                return 0
-
-        with (
-            mock.patch.object(
-                sys,
-                "argv",
-                [
-                    "native_go_dtrace_target.py",
-                    "--variant",
-                    "shared",
-                    "--manifest-validation",
-                    "revalidate",
-                    "--run-id",
-                    "manifest-revalidate-test",
-                ],
-            ),
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.object(
-                native_go_dtrace_target.subprocess,
-                "Popen",
-                side_effect=RecordingProcess,
-            ),
-        ):
-            try:
-                result = native_go_dtrace_target.main()
-            except SystemExit as error:
-                result = int(error.code)
-
-        self.assertEqual(result, 0)
-        self.assertEqual(
-            captured_environment["CARRICK_DSR_SHARED_VALIDATED_MANIFEST_REUSE"],
-            "0",
-        )
-
     def test_entries_recovery_wire_passes_exact_opt_out_to_child(self) -> None:
         captured_environment: dict[str, str] = {}
 

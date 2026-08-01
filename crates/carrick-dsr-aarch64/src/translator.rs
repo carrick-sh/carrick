@@ -2919,18 +2919,16 @@ impl ProcessState {
             types::DsrError,
         >,
     ) -> Result<PreparedSharedInstall, types::DsrError> {
-        if unit.manifest_requires_revalidation() {
-            unit.manifest().validate_ranges().map_err(|reason| {
-                types::DsrError::CachePolicy(format!(
-                    "loaded shared translation manifest is invalid: {reason:?}"
-                ))
-            })?;
-        }
+        unit.manifest.validate_ranges().map_err(|reason| {
+            types::DsrError::CachePolicy(format!(
+                "loaded shared translation manifest is invalid: {reason:?}"
+            ))
+        })?;
         #[cfg(test)]
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::Manifest)?;
 
-        let unit_id = translated_unit_id(&unit.manifest().key)?;
-        let code_len = usize::try_from(unit.manifest().code_len).map_err(|_| {
+        let unit_id = translated_unit_id(&unit.manifest.key)?;
+        let code_len = usize::try_from(unit.manifest.code_len).map_err(|_| {
             types::DsrError::CachePolicy(
                 "shared translation range length does not fit usize".to_string(),
             )
@@ -2948,14 +2946,14 @@ impl ProcessState {
         #[cfg(test)]
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::Catalog)?;
 
-        let block_count = unit.manifest().blocks.len();
+        let block_count = unit.manifest.blocks.len();
         if block_count == 0 {
             return Err(types::DsrError::CachePolicy(
                 "shared translation unit has no blocks".to_string(),
             ));
         }
         let mut incoming_keys = BTreeSet::new();
-        for block in &unit.manifest().blocks {
+        for block in &unit.manifest.blocks {
             let key = (block.guest_start, types::CodeGeneration::INITIAL);
             if !incoming_keys.insert(key)
                 || self.blocks.contains_key(&key)
@@ -2971,7 +2969,7 @@ impl ProcessState {
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::CollisionPreflight)?;
 
         let binding_count = unit
-            .manifest()
+            .manifest
             .blocks
             .iter()
             .map(|block| block.generation_binding as usize)
@@ -3004,7 +3002,7 @@ impl ProcessState {
                     "shared generation observation reservation failed: {error}"
                 ))
             })?;
-        for block in &unit.manifest().blocks {
+        for block in &unit.manifest.blocks {
             let observation = memory.dsr_generation_observation(block.guest_start)?;
             if observation.expected() != types::CodeGeneration::INITIAL {
                 return Err(types::DsrError::GenerationChanged {
@@ -3051,7 +3049,7 @@ impl ProcessState {
         #[cfg(test)]
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::GenerationAuthorities)?;
 
-        let host_bias = unit.manifest().key.host_bias();
+        let host_bias = unit.manifest.key.host_bias();
         let mut blocks = Vec::new();
         blocks.try_reserve_exact(block_count).map_err(|error| {
             types::DsrError::CachePolicy(format!(
@@ -3075,7 +3073,11 @@ impl ProcessState {
                     "shared sensitive-metadata reservation failed: {error}"
                 ))
             })?;
-        for (block, observation) in unit.manifest_mut().blocks.iter_mut().zip(observations) {
+        for (block, observation) in Arc::make_mut(&mut unit.manifest)
+            .blocks
+            .iter_mut()
+            .zip(observations)
+        {
             let address = cache_start
                 .checked_add(block.entry_offset as usize)
                 .ok_or_else(|| {
@@ -3251,8 +3253,8 @@ impl ProcessState {
 
         let direct_binding_probe = DirectBindingUnitLoadedProbe {
             digest: unit_id.get(),
-            record_count: u64::try_from(unit.manifest().bindings.len()).unwrap_or(u64::MAX),
-            data_bytes: unit.manifest().binding_data_len,
+            record_count: u64::try_from(unit.manifest.bindings.len()).unwrap_or(u64::MAX),
+            data_bytes: unit.manifest.binding_data_len,
         };
         Ok(PreparedSharedInstall {
             tid,
@@ -7746,7 +7748,7 @@ mod tests {
                     target,
                 )
                 .expect("exact owner");
-            assert_eq!(owner.unit, fixture.unit.manifest().key);
+            assert_eq!(owner.unit, fixture.unit.manifest.key);
             assert_eq!(owner.ordinal, DirectBindingOrdinal::claimed(0));
             assert_eq!(
                 state.direct_bindings.owner_key(
@@ -7806,8 +7808,8 @@ mod tests {
                 )
                 .expect("first exact owner");
 
-            assert_eq!(owner.unit, first.unit.manifest().key);
-            assert_ne!(owner.unit, second.unit.manifest().key);
+            assert_eq!(owner.unit, first.unit.manifest.key);
+            assert_ne!(owner.unit, second.unit.manifest.key);
         }
 
         #[test]
@@ -7843,7 +7845,7 @@ mod tests {
             assert_eq!(
                 selected,
                 DirectBindingEligibility {
-                    unit: second.unit.manifest().key.clone(),
+                    unit: second.unit.manifest.key.clone(),
                     ordinal: DirectBindingOrdinal::claimed(0),
                     cell: second.unit.binding_base,
                 }

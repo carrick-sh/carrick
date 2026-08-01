@@ -76,12 +76,6 @@ def main() -> int:
         help="select fixed-width manifest integers or the exact varint opt-out",
     )
     parser.add_argument(
-        "--manifest-validation",
-        choices=("reuse", "revalidate"),
-        default="reuse",
-        help="reuse validated manifest authority or select exact revalidation opt-out",
-    )
-    parser.add_argument(
         "--source-fingerprint",
         choices=("reuse", "rehash"),
         default="reuse",
@@ -125,9 +119,6 @@ def main() -> int:
             ),
             "CARRICK_DSR_SHARED_MANIFEST_FIXED": (
                 "0" if arguments.manifest_wire == "varint" else None
-            ),
-            "CARRICK_DSR_SHARED_VALIDATED_MANIFEST_REUSE": (
-                "0" if arguments.manifest_validation == "revalidate" else None
             ),
             "CARRICK_DSR_SHARED_SOURCE_FINGERPRINT_REUSE": (
                 "0" if arguments.source_fingerprint == "rehash" else None
