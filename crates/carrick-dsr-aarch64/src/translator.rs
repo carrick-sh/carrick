@@ -5063,15 +5063,53 @@ impl ThreadTranslator {
         let state = self.process.state.read();
         let mut points = Vec::new();
         for block in &state.published {
-            let PublishedBlockMetadata::Owned { map, .. } = &block.metadata else {
-                continue;
+            let cache_offsets = match &block.metadata {
+                PublishedBlockMetadata::Owned { map, .. } => map
+                    .iter()
+                    .filter(|mapping| mapping.guest == guest)
+                    .map(|mapping| mapping.cache)
+                    .collect::<Vec<_>>(),
+                PublishedBlockMetadata::Mapped {
+                    loaded_unit_index,
+                    block_index,
+                } => {
+                    let loaded = state
+                        .loaded_shared_units
+                        .get(*loaded_unit_index)
+                        .ok_or_else(|| {
+                            types::DsrError::CachePolicy(format!(
+                                "mapped shared loaded-unit index {loaded_unit_index} is invalid"
+                            ))
+                        })?;
+                    let metadata = loaded._unit.metadata.v3().ok_or_else(|| {
+                        types::DsrError::CachePolicy(format!(
+                            "mapped shared loaded-unit index {loaded_unit_index} is not V3"
+                        ))
+                    })?;
+                    let block_index = usize::try_from(*block_index).map_err(|_| {
+                        types::DsrError::CachePolicy(format!(
+                            "mapped shared block index {block_index} does not fit usize"
+                        ))
+                    })?;
+                    let mapped = metadata.block(block_index).ok_or_else(|| {
+                        types::DsrError::CachePolicy(format!(
+                            "mapped shared block index {block_index} is invalid"
+                        ))
+                    })?;
+                    mapped
+                        .pc_map()
+                        .iter()
+                        .filter(|mapping| mapping.guest == guest)
+                        .map(|mapping| mapping.cache)
+                        .collect::<Vec<_>>()
+                }
             };
-            for mapping in map.iter().filter(|mapping| mapping.guest == guest) {
+            for cache in cache_offsets {
                 let address = block
                     .entry
                     .host()
                     .raw()
-                    .checked_add(mapping.cache.get() as usize)
+                    .checked_add(cache.get() as usize)
                     .ok_or_else(|| {
                         types::DsrError::CachePolicy(
                             "direct-binding recovery test address overflow".to_string(),
