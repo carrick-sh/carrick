@@ -744,6 +744,7 @@ mod image_publication_probe_abi {
     fn prepared_image_publication_wrappers_keep_real_or_stub_signatures() {
         let _: fn(String) -> PreparedGuestImagePath = super::prepare_guest_image_path;
         let _: fn(u64, u64, &PreparedGuestImagePath) = super::guest_image_base;
+        let _: fn() = super::host_image_text_range;
         let _: fn() -> PreparedHostImagePublication = super::prepare_host_image_publication;
         let _: fn(&PreparedHostImagePublication) = super::publish_host_image_base;
         let _: fn(&PreparedHostImagePublication) = super::publish_host_image_catalog;
@@ -756,6 +757,7 @@ mod image_publication_probe_abi {
         let source = include_str!("probes.rs");
         for declaration in [
             "fn host__image__base(_: u32, _: u64, _: i64, _: *const u8) {}",
+            "fn host__image__text__range(_: u32, _: u64, _: u64) {}",
             "fn host__image__catalog(_: *const u8) {}",
             "fn guest__image__base(_: u32, _: u64, _: u64, _: *const u8) {}",
         ] {
@@ -1852,6 +1854,14 @@ mod real {
         /// text into the same address space, so a sampled PC can legitimately
         /// land in the guest image rather than in ours.
         fn host__image__base(_: u32, _: u64, _: i64, _: *const u8) {}
+        /// Exact half-open executable range of this process's Carrick image.
+        ///
+        /// Unlike `host-image-base`, this has no path or catalog payload. It is
+        /// safe to fire at every native image activation: dyld range discovery
+        /// runs inside the USDT closure and is therefore zero-work when no
+        /// consumer enables the probe.
+        #[cfg(target_os = "macos")]
+        fn host__image__text__range(_: u32, _: u64, _: u64) {}
         /// Executable dyld image ranges for this process.
         ///
         /// The caller supplies the already encoded
@@ -2602,6 +2612,38 @@ mod real {
             offset += command_size;
         }
         ranges
+    }
+
+    #[cfg(target_os = "macos")]
+    fn host_image_text_range_snapshot() -> (u32, u64, u64) {
+        // SAFETY: dyld image zero is the live main executable for the process.
+        // `executable_ranges` bounds its reads by that header's command table.
+        let (header, slide) = unsafe {
+            (
+                mach2::dyld::_dyld_get_image_header(0),
+                mach2::dyld::_dyld_get_image_vmaddr_slide(0),
+            )
+        };
+        let base = header as usize as u64;
+        let range = unsafe { executable_ranges(header, slide, "") }
+            .into_iter()
+            .find(|range| range.start <= base && base < range.end);
+        range.map_or((std::process::id(), 0, 0), |range| {
+            (std::process::id(), range.start, range.end)
+        })
+    }
+
+    /// Publish the exact Carrick executable range without preparing a dyld
+    /// catalog. The closure (including all dyld work) runs only when DTrace
+    /// enables this probe.
+    #[inline(always)]
+    #[allow(
+        clippy::redundant_closure,
+        reason = "the generated USDT macro requires a closure argument"
+    )]
+    pub fn host_image_text_range() {
+        #[cfg(target_os = "macos")]
+        carrick_usdt::host__image__text__range!(|| host_image_text_range_snapshot());
     }
 
     #[cfg(target_os = "macos")]
@@ -3743,6 +3785,7 @@ mod stub {
     stub!(lifecycle(phase: u32));
     stub!(execve_argv(path: &str, argv: &[Vec<u8>]));
     stub!(host_image_base());
+    stub!(host_image_text_range());
     stub!(host_image_catalog());
     stub!(publish_host_image_base(prepared: &PreparedHostImagePublication));
     stub!(publish_host_image_catalog(prepared: &PreparedHostImagePublication));

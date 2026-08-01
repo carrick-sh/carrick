@@ -2077,6 +2077,9 @@ fn publish_native_process_images(
     guest_image: &NativeGuestImageCompatibility,
     publisher: &mut impl NativeImagePublisher,
 ) {
+    // The USDT closure performs the dyld walk only when a consumer enables the
+    // probe, so normal native execution pays only the disabled-probe branch.
+    crate::probes::host_image_text_range();
     if let Some(host_images) = host_images {
         publisher.host_base(host_images);
         publisher.host_catalog(host_images);

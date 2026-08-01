@@ -68,6 +68,15 @@ proc:::create
 	private_end[args[0]->pr_pid] = private_end[pid];
 }
 
+carrick*:::host-image-text-range
+/(pid == $target || progenyof($target)) &&
+ (uint32_t)arg0 == (uint32_t)pid && current_epoch[pid] != (uint64_t)0 &&
+ (uint64_t)arg1 != (uint64_t)0 && (uint64_t)arg2 > (uint64_t)arg1/
+{
+	printf("PCPROFILE1|host-range|pid=%d|epoch=%d|start=%#x|end=%#x\n",
+	    pid, current_epoch[pid], arg1, arg2);
+}
+
 /*
  * Symbolize only samples outside the current private cache. Bind every leaf
  * to its exact (pid, epoch, PC), so the analyzer can exclude shared translated
