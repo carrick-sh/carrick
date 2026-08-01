@@ -450,10 +450,16 @@ def _checked_command(command: list[str], description: str) -> subprocess.Complet
     return result
 
 
-def _darwin_power_preflight() -> dict[str, object]:
+def _darwin_power_preflight(*, allow_battery: bool = False) -> dict[str, object]:
+    if type(allow_battery) is not bool:
+        raise ValueError("allow_battery must be a bool")
     battery = _checked_command(["pmset", "-g", "batt"], "pmset battery preflight")
     battery_lines = [line.strip() for line in battery.stdout.splitlines() if line.strip()]
-    if not any("Now drawing from 'AC Power'" in line for line in battery_lines):
+    on_ac = any("Now drawing from 'AC Power'" in line for line in battery_lines)
+    on_battery = any(
+        "Now drawing from 'Battery Power'" in line for line in battery_lines
+    )
+    if not on_ac and not (allow_battery and on_battery):
         raise RuntimeError(
             "native performance campaign requires AC Power: "
             + battery.stdout.strip()
@@ -502,7 +508,9 @@ def _darwin_power_preflight() -> dict[str, object]:
             + thermal.stdout.strip()
         )
     return {
-        "power_source": "AC Power",
+        "power_source": "AC Power" if on_ac else "Battery Power",
+        "battery_allowed": allow_battery,
+        "battery_authorized": allow_battery and on_battery,
         "battery_output": battery.stdout,
         "thermal_output": thermal.stdout,
         "thermal_contract": (
@@ -625,6 +633,7 @@ def _campaign_preflight(
     *,
     image_ref: str,
     known_receipt_binaries: tuple[pathlib.Path, ...],
+    allow_battery: bool = False,
 ) -> dict[str, object]:
     verified_control = load_and_verify_arm(control.receipt.path)
     verified_candidate = load_and_verify_arm(candidate.receipt.path)
@@ -664,7 +673,7 @@ def _campaign_preflight(
     )
 
     native_go_build.reject_ambient_carrick(os.environ, {})
-    power = _darwin_power_preflight()
+    power = _darwin_power_preflight(allow_battery=allow_battery)
     busy_reasons = native_go_build.busy_host_reasons()
     if busy_reasons:
         raise RuntimeError(
@@ -933,6 +942,7 @@ def run_campaign(
     cooldown_seconds: float = 2.0,
     timeout_seconds: int = 900,
     image_ref: str = native_go_build.DEFAULT_IMAGE,
+    allow_battery: bool = False,
 ) -> dict[str, object]:
     if type(quads) is not int or quads < 8:
         raise ValueError("official campaigns require at least eight quads")
@@ -951,6 +961,8 @@ def run_campaign(
         raise ValueError("cooldown_seconds must be finite and nonnegative")
     if type(image_ref) is not str or not image_ref:
         raise ValueError("image_ref must be nonempty")
+    if type(allow_battery) is not bool:
+        raise ValueError("allow_battery must be a bool")
     mode = validate_arm_mode(control, candidate)
     null_control_control = (
         control.receipt.path.resolve() == candidate.receipt.path.resolve()
@@ -985,6 +997,7 @@ def run_campaign(
             "cooldown_seconds": float(cooldown_seconds),
             "timeout_seconds": timeout_seconds,
             "image_ref": image_ref,
+            "allow_battery": allow_battery,
             "executed_image_ref": None,
             "registry_transport": None,
             "schedule": "excluded-a-b-then-a1-b1-b2-a2-v1",
@@ -1024,6 +1037,7 @@ def run_campaign(
             candidate,
             image_ref=image_ref,
             known_receipt_binaries=known_receipt_binaries,
+            allow_battery=allow_battery,
         )
         artifact["preflights"].append(initial_preflight)
         executed_image_ref = str(initial_preflight["executed_image_ref"])
@@ -1043,6 +1057,7 @@ def run_campaign(
                     candidate,
                     image_ref=image_ref,
                     known_receipt_binaries=known_receipt_binaries,
+                    allow_battery=allow_battery,
                 )
                 if (
                     quad_preflight["executed_image_ref"]
@@ -2189,6 +2204,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     run.add_argument("--cooldown-seconds", type=float, default=2.0)
     run.add_argument("--timeout-seconds", type=int, default=900)
     run.add_argument("--image", default=native_go_build.DEFAULT_IMAGE)
+    run.add_argument(
+        "--allow-battery",
+        action="store_true",
+        help=(
+            "accept an explicitly authorized Battery Power source while "
+            "retaining thermal/load gates and power evidence"
+        ),
+    )
     run.add_argument("--output", required=True, type=pathlib.Path)
     publish = subcommands.add_parser(
         "publish",
@@ -2234,6 +2257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cooldown_seconds=args.cooldown_seconds,
                 timeout_seconds=args.timeout_seconds,
                 image_ref=args.image,
+                allow_battery=args.allow_battery,
             )
         except CampaignEvidenceError as error:
             print(

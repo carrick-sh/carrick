@@ -1212,26 +1212,29 @@ class CampaignContractTest(unittest.TestCase):
     def test_run_parser_has_no_resume_state(self):
         receipt = self.root / "arm.json"
         overlay = self.root / "overlay.json"
-        args = native_go_build_abba.parse_args(
-            [
-                "run",
-                "--harness-repo",
-                str(self.root),
-                "--control-receipt",
-                str(receipt),
-                "--candidate-receipt",
-                str(receipt),
-                "--control-overlay",
-                str(overlay),
-                "--candidate-overlay",
-                str(overlay),
-                "--output",
-                str(self.root / "campaign.json"),
-            ]
-        )
+        argv = [
+            "run",
+            "--harness-repo",
+            str(self.root),
+            "--control-receipt",
+            str(receipt),
+            "--candidate-receipt",
+            str(receipt),
+            "--control-overlay",
+            str(overlay),
+            "--candidate-overlay",
+            str(overlay),
+            "--output",
+            str(self.root / "campaign.json"),
+        ]
+        args = native_go_build_abba.parse_args(argv)
 
         self.assertEqual(args.command, "run")
         self.assertFalse(hasattr(args, "resume"))
+        self.assertFalse(args.allow_battery)
+        self.assertTrue(
+            native_go_build_abba.parse_args([*argv, "--allow-battery"]).allow_battery
+        )
 
     def test_existing_campaign_output_cannot_be_resumed_or_overwritten(self):
         receipt = self.receipt("control")
@@ -1363,6 +1366,34 @@ class CampaignContractTest(unittest.TestCase):
                     result = native_go_build_abba._darwin_power_preflight()
                 self.assertEqual(result["power_source"], "AC Power")
                 self.assertEqual(result["thermal_output"], thermal)
+
+        battery_calls = iter(
+            (
+                subprocess.CompletedProcess(
+                    ["pmset", "-g", "batt"],
+                    0,
+                    "Now drawing from 'Battery Power'\n",
+                    "",
+                ),
+                subprocess.CompletedProcess(
+                    ["pmset", "-g", "therm"],
+                    0,
+                    accepted_thermal,
+                    "",
+                ),
+            )
+        )
+        with mock.patch.object(
+            native_go_build_abba.subprocess,
+            "run",
+            side_effect=lambda *_args, **_kwargs: next(battery_calls),
+        ):
+            battery_result = native_go_build_abba._darwin_power_preflight(
+                allow_battery=True
+            )
+        self.assertEqual(battery_result["power_source"], "Battery Power")
+        self.assertTrue(battery_result["battery_authorized"])
+        self.assertIn("Battery Power", battery_result["battery_output"])
 
         rejected = (
             (

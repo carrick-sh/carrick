@@ -30,7 +30,11 @@ image, host, environment, and idle-state preflight before every execution. An
 official run excludes one warm-up per arm and measures at least eight
 A1/B1/B2/A2 quads; its primary metric is total child CPU from
 `RUSAGE_CHILDREN`, which is a floor rather than a wall-time or throughput
-claim. The approved loopback registry is plain HTTP `localhost:5005`, forwarded
+claim. AC power is required by default. When the operator explicitly authorizes
+battery operation, `run --allow-battery` records both that authorization and
+the real `pmset` power output while retaining every thermal, load, compiler,
+foreign-workload, and Docker-oracle rejection. The approved loopback registry
+is plain HTTP `localhost:5005`, forwarded
 only through the evidence-visible
 `CARRICK_INSECURE_REGISTRIES=localhost:5005` contract; an ambient host setting
 fails preflight. The accepted M1 control/control receipt is
