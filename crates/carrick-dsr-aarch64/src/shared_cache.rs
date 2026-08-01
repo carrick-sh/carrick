@@ -872,16 +872,19 @@ pub struct TranslationMetadataLoadEvidence {
 }
 
 pub struct SharedLoadedTranslationUnit {
+    // Fields drop in declaration order. Release the dyld lease first so mapped
+    // metadata remains live through handle teardown.
+    _lease: Arc<dyn Send + Sync>,
     pub metadata: LoadedTranslationMetadata,
     pub base: usize,
     pub binding_base: Option<DirectBindingCellVa>,
     pub load_evidence: TranslationMetadataLoadEvidence,
-    _lease: Arc<dyn Send + Sync>,
 }
 
 impl Clone for SharedLoadedTranslationUnit {
     fn clone(&self) -> Self {
         Self {
+            _lease: Arc::clone(&self._lease),
             metadata: match &self.metadata {
                 LoadedTranslationMetadata::V2(manifest) => {
                     LoadedTranslationMetadata::V2(if shared_manifest_arc_enabled() {
@@ -897,7 +900,6 @@ impl Clone for SharedLoadedTranslationUnit {
             base: self.base,
             binding_base: self.binding_base,
             load_evidence: self.load_evidence,
-            _lease: Arc::clone(&self._lease),
         }
     }
 }
@@ -909,11 +911,11 @@ impl SharedLoadedTranslationUnit {
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
         Self {
+            _lease: lease,
             metadata: LoadedTranslationMetadata::V2(retain_loaded_manifest(manifest.into())),
             base,
             binding_base: None,
             load_evidence: TranslationMetadataLoadEvidence::default(),
-            _lease: lease,
         }
     }
 
@@ -924,11 +926,11 @@ impl SharedLoadedTranslationUnit {
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
         Self {
+            _lease: lease,
             metadata: LoadedTranslationMetadata::V2(retain_loaded_manifest(manifest.into())),
             base,
             binding_base,
             load_evidence: TranslationMetadataLoadEvidence::default(),
-            _lease: lease,
         }
     }
 
@@ -950,11 +952,11 @@ impl SharedLoadedTranslationUnit {
     ) -> Self {
         load_evidence.mode = TranslationMetadataMode::V3;
         Self {
+            _lease: lease,
             metadata: LoadedTranslationMetadata::V3(metadata.into()),
             base,
             binding_base,
             load_evidence,
-            _lease: lease,
         }
     }
 
@@ -1441,6 +1443,31 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SharedLeaseDropProbe;
+
+    #[derive(Debug)]
+    struct SharedLeaseObservedBacking {
+        bytes: Vec<u8>,
+        lease: std::sync::Weak<SharedLeaseDropProbe>,
+        lease_alive_when_dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::mapped_metadata::MetadataBacking for SharedLeaseObservedBacking {
+        fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for SharedLeaseObservedBacking {
+        fn drop(&mut self) {
+            self.lease_alive_when_dropped.store(
+                self.lease.upgrade().is_some(),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+
     #[test]
     fn loaded_unit_clones_share_the_immutable_manifest() {
         let unit = SharedLoadedTranslationUnit::new(manifest_v2_fixture(), 0x1000, Arc::new(()));
@@ -1449,6 +1476,58 @@ mod tests {
         let cloned_manifest = cloned.metadata.v2().expect("cloned V2 manifest");
 
         assert!(std::ptr::eq(&manifest.blocks, &cloned_manifest.blocks));
+    }
+
+    #[test]
+    fn shared_loaded_unit_releases_lease_before_metadata_backing() {
+        let mut manifest = manifest_v2_fixture();
+        manifest.blocks.push(PortableBlockRecord {
+            guest_start: GuestVa(0x400000),
+            generation_binding: 0,
+            entry_offset: 0,
+            code_len: 4,
+            requires_sensitive_metadata: false,
+            template: ArtifactTemplate::normalize(
+                Vec::new(),
+                vec![PcMapEntry {
+                    guest: GuestVa(0x400000),
+                    cache: CacheOffset::published(0),
+                }],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                &ArtifactBindings::from_values([]).expect("empty bindings"),
+            )
+            .expect("drop-order metadata")
+            .into_runtime_metadata_only(),
+        });
+        let bytes = crate::mapped_metadata::encode_translation_metadata_v3(&manifest)
+            .expect("encode V3 metadata");
+        let lease = Arc::new(SharedLeaseDropProbe);
+        let lease_alive_when_dropped = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let backing: Arc<dyn crate::mapped_metadata::MetadataBacking> =
+            Arc::new(SharedLeaseObservedBacking {
+                bytes,
+                lease: Arc::downgrade(&lease),
+                lease_alive_when_dropped: Arc::clone(&lease_alive_when_dropped),
+            });
+        let metadata =
+            crate::mapped_metadata::ValidatedMappedTranslationMetadata::new(backing, &manifest.key)
+                .expect("validate V3 metadata");
+        let unit = SharedLoadedTranslationUnit::new_mapped(
+            Arc::new(metadata),
+            0x1000,
+            TranslationMetadataLoadEvidence::default(),
+            lease,
+        );
+
+        drop(unit);
+
+        assert!(
+            !lease_alive_when_dropped.load(std::sync::atomic::Ordering::Acquire),
+            "shared dyld lease must be released before the mapped metadata backing"
+        );
     }
 
     #[test]

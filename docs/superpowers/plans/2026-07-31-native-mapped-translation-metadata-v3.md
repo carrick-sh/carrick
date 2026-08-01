@@ -620,9 +620,9 @@ impl MetadataBacking for ReadOnlyMetadataMapping {
 ```
 
 Open through the authority directory, require a regular file, verify the
-observed size is nonzero and within the V3 maximum, and use read-only
-`MmapOptions::map`. The retained `File` binds the mapped inode across pathname
-unlink.
+observed size is nonzero and within the V3 maximum, and use read-only private
+`MmapOptions::map_copy_read_only` (`MAP_PRIVATE|PROT_READ`). The retained `File`
+binds the mapped inode across pathname unlink.
 
 Use a single helper with the directory capability, not a path-only reopen:
 

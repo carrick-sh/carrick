@@ -625,7 +625,9 @@ Section
             "    'filename': _frame.f_code.co_filename,\n"
             "    'flags': _frame.f_code.co_flags,\n"
             "    'marshal_sha256': hashlib.sha256(marshal.dumps(marshal.loads(marshal.dumps(_frame.f_code)))).hexdigest(),\n"
+            "    'marshal_version': marshal.version,\n"
             "    'optimize': sys.flags.optimize,\n"
+            "    'python_cache_tag': sys.implementation.cache_tag,\n"
             "}\n"
             "del _frame\n"
             "VALUE = 1\n",
@@ -636,7 +638,9 @@ Section
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         source.write_text(source.read_text().replace("VALUE = 1", "VALUE = 2"))
-        with self.assertRaisesRegex(ValueError, "loaded module code"):
+        with self.assertRaisesRegex(
+            ValueError, "loaded module code does not match stable source"
+        ):
             authenticate(source, module.LOADED_MODULE_CODE)
 
     def test_risk_preflight_rejects_unauthenticated_loaded_analyzer(self) -> None:

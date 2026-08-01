@@ -27,3 +27,4 @@ cc = "1"
 
 [dev-dependencies]
 carrick-guest-mem = { path = "../carrick-guest-mem" }
+mach2.workspace = true

@@ -39,6 +39,9 @@ static MAPPED_METADATA_ENABLED: OnceLock<bool> = OnceLock::new();
 thread_local! {
     static AFTER_BOUNDED_METADATA_OPEN_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static LAST_MAPPED_METADATA_ADDRESS_FOR_TEST: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 #[cfg(test)]
@@ -117,11 +120,13 @@ impl std::error::Error for UnitStoreError {
 
 #[derive(Debug)]
 pub struct LoadedTranslationUnit {
+    // Fields drop in declaration order. Release dyld first so the mapped
+    // metadata remains live through handle teardown.
+    lease: Arc<LoadedTranslationLease>,
     pub metadata: LoadedTranslationMetadata,
     pub base: std::ptr::NonNull<u8>,
     pub binding_base: Option<DirectBindingCellVa>,
     pub load_evidence: TranslationMetadataLoadEvidence,
-    lease: Arc<LoadedTranslationLease>,
 }
 
 impl LoadedTranslationUnit {
@@ -490,17 +495,23 @@ fn map_and_validate_metadata(
     let (file, length) = open_metadata_at(directory, name)?;
     #[cfg(test)]
     run_after_bounded_metadata_open_for_test();
-    // SAFETY: the private cache authority makes each backing inode immutable
-    // after its temporary is flushed and synced. Publication/replacement may
-    // unlink a pathname but never writes or truncates the retained inode. The
-    // mmap length is the exact nonzero, bounded extent accepted by the single
-    // `fstat` above, and `_file` pins that inode for the mapping's lifetime.
-    // The test-only seam may append beyond `length`; it never mutates the
-    // extent mapped here.
-    let mapping =
-        unsafe { memmap2::MmapOptions::new().len(length).map(&file) }.map_err(|error| {
-            UnitStoreError::with_source("map translation metadata", UnitMissReason::Schema, error)
-        })?;
+    // SAFETY: `map_copy_read_only` requests `MAP_PRIVATE|PROT_READ`. The private
+    // cache authority makes each backing inode immutable after its temporary
+    // is flushed and synced. Publication/replacement may unlink a pathname but
+    // never writes or truncates the retained inode. The mmap length is the
+    // exact nonzero, bounded extent accepted by the single `fstat` above, and
+    // `_file` pins that inode for the mapping's lifetime. The test-only seam
+    // may append beyond `length`; it never mutates the extent mapped here.
+    let mapping = unsafe {
+        memmap2::MmapOptions::new()
+            .len(length)
+            .map_copy_read_only(&file)
+    }
+    .map_err(|error| {
+        UnitStoreError::with_source("map translation metadata", UnitMissReason::Schema, error)
+    })?;
+    #[cfg(test)]
+    LAST_MAPPED_METADATA_ADDRESS_FOR_TEST.with(|address| address.set(mapping.as_ptr() as usize));
     let backing: Arc<dyn MetadataBacking> = Arc::new(ReadOnlyMetadataMapping {
         mapping,
         _file: file,
@@ -1721,11 +1732,11 @@ impl ContainerCacheAuthority {
             loaded_binding_base = Some(binding_cell_base);
         }
         Ok(LoadedTranslationUnit {
+            lease: Arc::new(LoadedTranslationLease { handle }),
             metadata: metadata.into_loaded(),
             base,
             binding_base: loaded_binding_base,
             load_evidence,
-            lease: Arc::new(LoadedTranslationLease { handle }),
         })
     }
 
@@ -1965,6 +1976,7 @@ mod tests {
     use carrick_guest_mem::GuestVa;
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const MOV42_RET: [u8; 8] = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
 
@@ -2100,6 +2112,67 @@ mod tests {
 
     fn fixture_source_words() -> [u32; 1] {
         [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))]
+    }
+
+    #[derive(Debug)]
+    struct LeaseObservedMetadataBacking {
+        bytes: Vec<u8>,
+        lease: std::sync::Weak<LoadedTranslationLease>,
+        lease_alive_when_dropped: std::sync::Arc<AtomicBool>,
+    }
+
+    impl MetadataBacking for LeaseObservedMetadataBacking {
+        fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for LeaseObservedMetadataBacking {
+        fn drop(&mut self) {
+            self.lease_alive_when_dropped
+                .store(self.lease.upgrade().is_some(), Ordering::Release);
+        }
+    }
+
+    fn current_region_extended_info(address: usize) -> mach2::vm_region::vm_region_extended_info {
+        use mach2::kern_return::KERN_SUCCESS;
+        use mach2::mach_port::mach_port_deallocate;
+        use mach2::port::MACH_PORT_NULL;
+        use mach2::traps::mach_task_self;
+        use mach2::vm::mach_vm_region;
+        use mach2::vm_region::{VM_REGION_EXTENDED_INFO, VM_REGION_EXTENDED_INFO_COUNT};
+
+        let requested = address as mach2::vm_types::mach_vm_address_t;
+        let mut observed = requested;
+        let mut size = 0;
+        let mut info = mach2::vm_region::vm_region_extended_info::default();
+        let mut info_count = VM_REGION_EXTENDED_INFO_COUNT;
+        let mut object_name = MACH_PORT_NULL;
+        // SAFETY: this queries the current task for a live mapping address and
+        // supplies the exact flavor-specific output type and count.
+        let task = unsafe { mach_task_self() };
+        let result = unsafe {
+            mach_vm_region(
+                task,
+                &mut observed,
+                &mut size,
+                VM_REGION_EXTENDED_INFO,
+                (&raw mut info).cast::<i32>(),
+                &mut info_count,
+                &mut object_name,
+            )
+        };
+        if object_name != MACH_PORT_NULL {
+            // SAFETY: `mach_vm_region` returned this send right for `task`.
+            let _ = unsafe { mach_port_deallocate(task, object_name) };
+        }
+        assert_eq!(result, KERN_SUCCESS, "query mapped metadata VM region");
+        assert_eq!(
+            observed, requested,
+            "metadata address must begin its region"
+        );
+        assert_ne!(size, 0, "metadata VM region must be nonempty");
+        info
     }
 
     fn pipe_pair() -> [RawFd; 2] {
@@ -3132,5 +3205,68 @@ mod tests {
         assert!(metadata_drops.upgrade().is_some());
         drop(clone);
         assert!(metadata_drops.upgrade().is_none());
+    }
+
+    #[test]
+    fn mapped_metadata_uses_a_private_read_only_vm_region() {
+        use mach2::vm_prot::VM_PROT_READ;
+        use mach2::vm_region::SM_COW;
+
+        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let pending = fixture_pending();
+        authority
+            .publish_unit_with_metadata_mode(&pending, true)
+            .expect("publish V3 unit");
+        let stem = pending.key.file_stem().expect("unit stem");
+        let name = CString::new(format!("{stem}.metadata-v3")).expect("metadata name");
+        let (metadata, _) = map_and_validate_metadata(&authority.directory, &name, &pending.key)
+            .expect("map V3 metadata through production loader");
+        let address = LAST_MAPPED_METADATA_ADDRESS_FOR_TEST.with(std::cell::Cell::get);
+        assert_ne!(address, 0, "production mapping address must be observed");
+
+        let region = current_region_extended_info(address);
+
+        assert_eq!(region.protection, VM_PROT_READ);
+        assert_eq!(
+            region.share_mode, SM_COW,
+            "metadata mapping must be kernel-classified as COW"
+        );
+        drop(metadata);
+    }
+
+    #[test]
+    fn loaded_unit_releases_the_dyld_lease_before_metadata_backing() {
+        let manifest = fixture_manifest();
+        let bytes = encode_translation_metadata_v3(&manifest).expect("encode V3 metadata");
+        // SAFETY: a null path requests a valid handle for the current process;
+        // `LoadedTranslationLease::drop` balances this successful `dlopen`.
+        let handle = std::ptr::NonNull::new(unsafe {
+            libc::dlopen(std::ptr::null(), libc::RTLD_LAZY | libc::RTLD_LOCAL)
+        })
+        .expect("open current process image");
+        let lease = std::sync::Arc::new(LoadedTranslationLease { handle });
+        let lease_alive_when_dropped = std::sync::Arc::new(AtomicBool::new(true));
+        let backing: std::sync::Arc<dyn MetadataBacking> =
+            std::sync::Arc::new(LeaseObservedMetadataBacking {
+                bytes,
+                lease: std::sync::Arc::downgrade(&lease),
+                lease_alive_when_dropped: std::sync::Arc::clone(&lease_alive_when_dropped),
+            });
+        let metadata = ValidatedMappedTranslationMetadata::new(backing, &manifest.key)
+            .expect("validate V3 metadata");
+        let loaded = LoadedTranslationUnit {
+            lease,
+            metadata: LoadedTranslationMetadata::V3(std::sync::Arc::new(metadata)),
+            base: std::ptr::NonNull::dangling(),
+            binding_base: None,
+            load_evidence: TranslationMetadataLoadEvidence::default(),
+        };
+
+        drop(loaded);
+
+        assert!(
+            !lease_alive_when_dropped.load(Ordering::Acquire),
+            "dyld lease must be released before the mapped metadata backing"
+        );
     }
 }
