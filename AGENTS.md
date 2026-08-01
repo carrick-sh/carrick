@@ -258,6 +258,50 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
   and kill leftover `carrick run` procs first. Default guest `ubuntu:24.04` (frame
   pointers → stack walking works). Skill:
   [`.agents/skills/carrick-trace`](.agents/skills/carrick-trace).
+- **`.d` scripts are DURABLE ARTIFACTS, not scratch.** Everything under
+  [`scripts/dtrace/`](scripts/dtrace/) is kept, named for the question it
+  answers, and carries a header stating (a) what it measures, (b) the provider
+  ABI facts qualified live on the host it was written for, and (c) whether it
+  perturbs. Never delete one because an investigation ended — the next
+  investigation starts from it. When you learn a probe fact the hard way, write
+  it into the script header so nobody pays for it twice.
+- **`carrick trace` should PREVENT the traps below, not just expose probes.**
+  Every trap here has cost real hours; each one that can be mechanically
+  detected belongs in the harness, failing closed with a named error rather than
+  producing a plausible-looking empty result:
+  - **A listed probe is not a firing probe, and FBT is blind to LOCAL symbols.**
+    `dtrace -l` lists `fbt::vm_fault:entry` on arm64 macOS but it never fires.
+    The reason is not that the fault avoids `vm_fault` — it is that FBT
+    instruments the *exported* `_vm_fault`, which is merely an alias of
+    `_vm_fault_external` (`0xfffffe000742b0b8`), while the trap path
+    (`fleh_synchronous → sleh_synchronous → handle_user_abort`) calls the
+    **local** `_vm_fault_internal` (`0xfffffe00074210f8`, nm type `s`) — and
+    FBT exposes zero local symbols on this build. When a probe you are sure
+    about stays silent, **check the KDK dSYM for a local twin**
+    (`nm -a …kernel.release.t8132.dSYM/…` and compare addresses) before
+    concluding the code path does not run. Trap-context functions
+    (`handle_user_abort`, `arm_fast_fault`) are separately FBT-blacklisted, so
+    there is still no entry/return pair to time — those costs must be
+    **sampled, not bracketed**.
+  - **Kernel stack frames can be SYMBOLIZER ALIASES.** Several names resolve to
+    one address, and dtrace may print the misleading one: `IORWLockUnlock` IS
+    `lck_rw_done` (`0xfffffe0007377f88`), `IORWLockRead` IS
+    `lck_rw_lock_shared`, `IOLockLock` IS `lck_mtx_lock`. An "IOKit" frame in a
+    VM profile is usually plain rw-lock traffic. Confirm a suspicious frame by
+    address against the dSYM before building a story on its name.
+  - **Zero events means "the probe did not fire," never "it did not happen."**
+    A capture that yields nothing must be an error, not an empty summary.
+  - **`execname` scoping silently tracks nothing** the moment two arms are built
+    under different binary names. Cross-binary screens must key on carrick's own
+    `carrick*:::dsr-cache-*` lifecycle probes under `dtrace -Z`.
+  - **Provider ABIs differ per host/build and must be qualified live**, not
+    assumed (`sched:::preempt` does not exist on macOS; `vminfo:::as_fault`
+    arg2 IS the exact 16 KiB host-page base).
+  - **Kernel providers only against a live native guest** — never `dtrace -p`,
+    `-c`, pid-provider, or USDT fasttrap on a continuing native process.
+  - **Declare perturbation.** A probe on a 2M-events/run path can double `sys`
+    time; a script that perturbs must say so, and only same-instrument ratios
+    are then citable.
 - **When tracing perturbs a Heisenbug away, read the always-on event ring via
   `carrick-lldb`** — works live or from a core, with nothing pre-armed. Attach the
   **guest** process, not the orchestrator parent (the parent's ring is empty).
@@ -290,6 +334,130 @@ gcore-and-disassemble-the-JIT procedure, and the JIT-unwind TODO are in
 ---
 
 ## Engineering standards
+
+**The two gates. Nothing else matters if these fail: correctness, and
+"zero"-overhead.** Carrick's whole premise is running Linux binaries at
+host-native cost. A correct-but-slow runtime and a fast-but-wrong one are both
+dead ends, so every change is judged against those two first and against
+elegance, generality or effort saved second. Overhead is not a "later"
+concern — it is half the product.
+
+- **The overhead bar is WITHIN 2x of native-arm64 Docker** on the same workload.
+  That is the number to rank against. As of 2026-08-01 the native lane is
+  **~14.5x** on the cold go-build, so reaching the bar means removing roughly
+  93% of all non-guest CPU — every overhead bucket, not one of them. Rank work
+  by whether it can plausibly be a multiple, and be honest that a 3-15%
+  improvement does not move a 14.5x ratio. Evidence:
+  [`docs/perf-results/2026-08-01-native-wall-audit-and-fault-cost.md`](docs/perf-results/2026-08-01-native-wall-audit-and-fault-cost.md).
+- **The overhead workstream is one thing: "utilize Darwin in the most efficient
+  way to emulate Linux."** Carrick's own host userspace (36.9% of CPU) and the
+  kernel work it induces — page faults (25.7%) plus syscall bodies (9.9%) — are
+  not separate problems. They are the cost of LOWERING one Linux operation onto
+  Darwin primitives, measured on the two sides of the syscall boundary, and
+  together they are **72.5% of the budget**. Rank by the **amplification factor
+  of a single guest operation**, which is concrete and directly attackable
+  where a CPU percentage is not:
+  - guest `open` → **19.68 host opens** at HEAD (cap-std path re-walks), even
+    after `564dd281` cut it 41%;
+  - guest `mmap(MAP_PRIVATE, fd)` → a `pread` of the FULL mapping length into
+    fresh anon (`dispatch/mem.rs:2517`), instead of a host file-backed mmap;
+  - guest `execve` → 4 full ELF materializations + 3 SHA-256 passes + a host
+    self-re-exec, while the file-backed `map_prepared_for_plan`
+    (`mapped_memory.rs:1018`) sits marked `dead_code`;
+  - guest `MAP_FIXED|MAP_ANONYMOUS` → an unconditional full remap.
+  Drive each toward 1. **Do NOT assume carrick's own copies cause the fault
+  term** — the committed census refutes it: JIT first-touch is 2.08% of zfod and
+  inserted code 1.48%, so faults are dominated by the GUEST's own anonymous
+  memory. The lever there is making each guest page cheaper on Darwin, not
+  making carrick copy less.
+- **Use Go's runtime as a DUAL-PORT ORACLE for "what should this lower to on
+  Darwin?"** Go implements the same allocator abstractions (`sysAlloc`,
+  `sysReserve`, `sysMap`, `sysUnused`, `sysUsed`, `sysFault`, `sysFree`)
+  separately for `linux/arm64` and `darwin/arm64`, so diffing
+  `$GOROOT/src/runtime/mem_linux.go` against `mem_darwin.go` shows exactly how
+  one intent is expressed idiomatically on each OS. It is BSD-licensed — reading
+  it is explicitly fine, unlike the Linux kernel side. Other subsystems
+  (`os_darwin.go`, `sys_darwin.go`, signal and thread handling) serve the same
+  purpose.
+  - Worked example: **Go's Darwin port uses NO `mprotect` at all** for heap
+    management. Its whole vocabulary is `mmap(MAP_ANON|MAP_PRIVATE)` to
+    allocate, `mmap(PROT_NONE, …|MAP_FIXED)` to protect/fault,
+    `mmap(PROT_READ|WRITE, …|MAP_FIXED)` to commit, and the
+    **`MADV_FREE_REUSABLE` / `MADV_FREE_REUSE` pair** to decommit/recommit
+    (leaving the VM entry intact). `mem_linux.go` DOES use `mprotect`. Same
+    allocator, same intent, different primitive — because on Darwin `mprotect`
+    is the expensive way.
+  - The lesson generalizes: **translate the guest's INTENT, not its mechanism.**
+    A guest `mprotect(PROT_NONE)` on heap means "decommit"; faithfully
+    re-issuing a host `mprotect` reproduces a Linux idiom on the OS where it is
+    the wrong one. Ask what a native Darwin program wanting that semantic
+    actually calls, and lower to that.
+- **Correctness is not tradeable for overhead.** A guest-visible ABI guarantee
+  (e.g. anonymous `mmap` returning zeroed pages) is immovable — do not weaken
+  one behind a "provably safe" fast path. Find a lever that removes the work
+  instead of removing the guarantee. Note this usually costs nothing: mapping an
+  image file-backed, or letting Darwin's zero-fill deliver a pre-zeroed page
+  instead of memsetting it yourself, removes work AND keeps the guarantee.
+- **A perf claim is a HYPOTHESIS until it comes from a controlled,
+  single-variable experiment.** One knob at a time, everything else held —
+  including the core class. On Apple Silicon `hw.logicalcpu` is NOT homogeneous
+  (this host is 4 Performance + 6 Efficiency), so a concurrency sweep silently
+  changes which cores run the work and is never a clean variable. Anything less
+  than a controlled experiment is written as "suggests", never "confirmed".
+
+**No backward compatibility. We are our own ecosystem.** There is no external
+consumer to keep working, so do NOT carry a legacy path, a V2 beside a V3, a
+compatibility shim, or a deprecated spelling. Replace it and delete the old one.
+The cost of a second path is not the code — it is that every future measurement,
+test and reader now has two answers to reconcile.
+
+**Rust first, and extend OURSELVES rather than growing a tool zoo.** The first
+language you reach for is Rust, and the first home for a new capability is our
+own binary — a `carrick trace` profile or a `carrick debug` subcommand — not a
+new standalone script.
+
+- **D scripts** are for what only D can do, and they belong to a Rust profile
+  rather than standing alone: `carrick trace` hashes a profile's D program into
+  its output header (`program_sha256`), so the script becomes an authenticated
+  input with a Rust parser and validator around it. A new `.d` should arrive as
+  a new `TraceProfileKind`, not as a file someone runs by hand.
+- **Python** is for driving lldb, where it is the only in-process option.
+- Everything else — capture orchestration, parsing, validation, statistics,
+  report generation — is Rust in our own crates, where the type system, `just
+  ci`, and `-D warnings` apply. Ad-hoc shell/Python harnesses are untyped,
+  untested, ungated, and drift from the runtime they measure.
+- Rust owns the truth; the D script consumes it. `carrick debug
+  native-x86-layout` exists precisely so offsets are read from the running
+  binary instead of hardcoded into a `.d` — follow that pattern.
+
+**Look for what already exists before writing anything new.** This tree is large
+and has usually already solved the adjacent problem. Grep for the mechanism, the
+probe, the helper, the harness — and read it — before adding a parallel one. A
+second implementation is worse than a slightly-wrong first one, because now both
+drift. (Worked example: a fault-address census, its parser, and its test already
+existed as `scripts/dtrace/native-fault-attribution.d` +
+`scripts/perf/native_fault_directional.py` while a campaign doc was still
+recording the fault term as "blocked on instrumentation.")
+
+**Opt-OUT, not opt-in — a default-off mechanism is not shipped, it is
+abandoned.** This project has repeatedly built a mechanism, gated it behind
+`FEATURE=1`, and then left it dead for months: the whole container-lifetime
+shared-translation lane, the H004 direct-binding sidecar, and the artifact spike
+are all in the tree, compiled, tested and unreachable. That pattern hides
+regressions (nobody runs the arm), rots the code (it drifts from the default
+path), and lets a "landed" change never actually land.
+
+- New work defaults **ON**, with an exact `=0` escape hatch for bisection.
+- If it cannot be defaulted on, it is not finished — say so plainly rather than
+  merging it dark.
+- When a mechanism is MEASURED WORSE, **delete it**; do not park it behind a
+  flag. `git` is the version control — the code is recoverable, and a commit
+  message pointing at the measurement is worth more than dead code carrying an
+  implication that it might still be a good idea.
+- The same applies to tests: a test that no gate executes is not a test. Check
+  that a new suite actually runs (`carrick-cli` has no lib target, so its
+  in-file `mod tests` and integration suites are compiled by clippy and never
+  run by `just test`/`just test-integration`).
 
 - **NEVER read Linux kernel or other GPL source when implementing carrick.**
   Clean-room only: derive ABIs from man-pages/specs and the differential Docker
