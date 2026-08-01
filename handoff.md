@@ -264,7 +264,7 @@ The accepted-but-not-retained ignored artifact is
 It binds source commit `2361a31f`, signed binary SHA-256
 `3c48c133782c3acc8d5f171869a10f869567c0a064f9c3098afa1145990c62f2`,
 and the same exact arm64 Go-build manifest used by the maintained campaigns.
-Commit `1b6d1ea7` removes the typed bypass and its measurement controls. This is
+Commit `f45cc1bc` removes the typed bypass and its measurement controls. This is
 a useful negative result: validation is not the remaining owner at useful
 scale, and carrying its proof through the runtime would add complexity without
 a demonstrated total-CPU benefit.
