@@ -677,6 +677,57 @@ def nativeperf_frames_v3(pid=10, tid=11, era=12, exec_epoch=0):
     ]
 
 
+def nativeperf_frames_v4(pid=10, tid=11, era=12, exec_epoch=0):
+    prefix = f"NATIVEPERF1|thread|complete=1|pid={pid}|tid={tid}|era={era}|frame="
+    inherited = nativeperf_frames_v3(pid=pid, tid=tid, era=era, exec_epoch=exec_epoch)
+    by_frame = {
+        line.split("|frame=", 1)[1].split("|", 1)[0]: line for line in inherited
+    }
+    by_frame.update({
+        "resolver-shared": prefix
+        + "resolver-shared|shared_unit_lookups=3|shared_unit_hits=2|"
+        "shared_unit_loads=1|shared_blocks_mapped=6|shared_translations_avoided=4",
+        "resolver-metadata": prefix
+        + "resolver-metadata|shared_metadata_bytes_read=2468|"
+        "shared_metadata_bytes_mapped=1234|shared_metadata_validation_ns=37|"
+        "shared_mapped_immutable_records=6|shared_owned_immutable_records=5|"
+        "shared_guest_range_derivations=1|shared_direct_edge_group_builds=1",
+        "resolve-class": prefix
+        + "resolve-class|resolve_src_shared_tgt_shared=1|"
+        "resolve_src_shared_tgt_private=2|resolve_src_private_tgt_shared=3|"
+        "resolve_src_private_tgt_private=4|"
+        "resolve_private_to_shared_distinct_edges=5|"
+        "resolve_private_to_private_distinct_edges=6",
+        "direct-binding-gauge": prefix
+        + "direct-binding-gauge|db_owner_validation_failures=0|"
+        "db_authority_validation_failures=0|db_cas_wins=7|db_cas_losses=8|"
+        "db_stale_winner_clears=9|db_publication_retries=10",
+    })
+    return [
+        by_frame[frame]
+        for frame in (
+            "core",
+            "exits",
+            "sensitive",
+            "fusion-exec-a",
+            "fusion-exec-b",
+            "fusion-sites-a",
+            "fusion-sites-b",
+            "phases-a",
+            "phases-b",
+            "resolver-thread",
+            "resolver-process",
+            "resolver-times",
+            "resolver-shared",
+            "resolver-metadata",
+            "resolve-class",
+            "direct-binding-gauge",
+            "cache-gauge",
+            "process",
+        )
+    ]
+
+
 def nativeperf_frames_v3_with_exclusive(
     pid=10, tid=11, era=12, exec_epoch=0, *, executions=1, unique_sites=1
 ):
@@ -800,6 +851,88 @@ class NativePerfTests(unittest.TestCase):
 
 
 class NativePerfV2Tests(unittest.TestCase):
+    def test_v4_parses_the_exact_producer_shaped_metadata_contract(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v4())
+        budget.validate_profile(profile)
+        self.assertEqual(profile.version, 4)
+        self.assertEqual(len(profile.threads[0].frames), 18)
+        self.assertEqual(
+            {
+                field: profile.threads[0].value("resolver-metadata", field)
+                for field in (
+                    "shared_metadata_bytes_read",
+                    "shared_metadata_bytes_mapped",
+                    "shared_metadata_validation_ns",
+                    "shared_mapped_immutable_records",
+                    "shared_owned_immutable_records",
+                    "shared_guest_range_derivations",
+                    "shared_direct_edge_group_builds",
+                )
+            },
+            {
+                "shared_metadata_bytes_read": 2468,
+                "shared_metadata_bytes_mapped": 1234,
+                "shared_metadata_validation_ns": 37,
+                "shared_mapped_immutable_records": 6,
+                "shared_owned_immutable_records": 5,
+                "shared_guest_range_derivations": 1,
+                "shared_direct_edge_group_builds": 1,
+            },
+        )
+
+    def test_v4_rejects_missing_metadata_frame_or_nonexact_metadata_fields(self):
+        missing_frame = [
+            line
+            for line in nativeperf_frames_v4()
+            if "|frame=resolver-metadata|" not in line
+        ]
+        with self.assertRaisesRegex(
+            budget.BudgetError, "missing profile frames.*resolver-metadata"
+        ):
+            budget.parse_nativeperf(missing_frame)
+
+        missing_field = nativeperf_frames_v4()
+        metadata_index = next(
+            index
+            for index, line in enumerate(missing_field)
+            if "|frame=resolver-metadata|" in line
+        )
+        missing_field[metadata_index] = missing_field[metadata_index].replace(
+            "|shared_owned_immutable_records=5", ""
+        )
+        with self.assertRaisesRegex(
+            budget.BudgetError, "missing field.*shared_owned_immutable_records"
+        ):
+            budget.parse_nativeperf(missing_field)
+
+        unknown_field = nativeperf_frames_v4()
+        unknown_field[metadata_index] += "|surprise=1"
+        with self.assertRaisesRegex(budget.BudgetError, "unknown field.*surprise"):
+            budget.parse_nativeperf(unknown_field)
+
+    def test_v4_wire_round_trip_requires_all_seven_metadata_values(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v4())
+        encoded = budget.run_record_json(
+            budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        )
+        decoded = budget.parse_result_row(encoded)
+        self.assertEqual(decoded.profile, profile)
+        self.assertEqual(decoded.profile.version, 4)
+
+        missing = json.loads(json.dumps(encoded))
+        del missing["profile"]["threads"][0]["values"][
+            "resolver-metadata.shared_metadata_validation_ns"
+        ]
+        with self.assertRaisesRegex(budget.BudgetError, "profile value"):
+            budget.parse_result_row(missing)
+
+        unknown = json.loads(json.dumps(encoded))
+        unknown["profile"]["threads"][0]["values"][
+            "resolver-metadata.invented"
+        ] = 1
+        with self.assertRaisesRegex(budget.BudgetError, "profile value"):
+            budget.parse_result_row(unknown)
+
     def test_v3_reconciles_exclusive_fusion_execution_counts(self):
         profile = budget.parse_nativeperf(nativeperf_frames_v3())
         budget.validate_profile(profile)
