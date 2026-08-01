@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import tempfile
 import unittest
 
+from scripts.perf import native_pc_range_directional as directional
 from scripts.perf.native_pc_range_directional import ProfileError, analyze_raw
 
 
@@ -16,6 +18,129 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
             path = pathlib.Path(directory) / "profile.raw"
             path.write_text(raw, encoding="utf-8")
             return analyze_raw(path)
+
+    def complete_strict_capture(self) -> str:
+        return "\n".join(
+            (
+                "PCPROFILE1|config|sample_hz=197",
+                "PCPROFILE1|reset|pid=41|epoch=1",
+                "PCPROFILE1|identity|pid=41|epoch=1|euid=501|egid=20",
+                "PCPROFILE1|range|kind=private|pid=41|epoch=1|sequence=1|start=0x1000|end=0x2000",
+                "PCPROFILE1|range|kind=shared|pid=41|epoch=1|sequence=2|start=0x4000|end=0x5000",
+                "PCPROFILE1|host-range|pid=41|epoch=1|start=0x8000|end=0xa000",
+                "PCPROFILE1|sample|kind=user|pid=41|epoch=1|pc=0x1100|count=7",
+                "PCPROFILE1|sample|kind=user|pid=41|epoch=1|pc=0x4400|count=11",
+                "PCPROFILE1|sample|kind=user|pid=41|epoch=1|pc=0x9000|count=5",
+                "PCPROFILE1|sample|kind=kernel|pid=41|epoch=1|count=3",
+                "PCKSTACK1|begin|pid=41|epoch=1|count=3",
+                "kernel`vm_fault+0x10",
+                "kernel`arm_fast_fault+0x20",
+                "PCKSTACK1|end",
+                "PCLEAF2|pid=41|epoch=1|pc=0x4400|module=unit.dylib|symbol=unit.dylib`block_4|count=11",
+                "PCLEAF2|pid=41|epoch=1|pc=0x9000|module=carrick|symbol=carrick`host_leaf|count=5",
+                "PCPROFILE1|completion|target_exit=1|timed_out=0",
+            )
+        )
+
+    def test_strict_gate_accepts_identity_and_every_required_stream(self) -> None:
+        result = self.analyze(self.complete_strict_capture())
+        directional.validate_strict_capture(
+            result, expected_euid=501, expected_egid=20
+        )
+        self.assertEqual(
+            result["effective_identity"],
+            {"egids": [20], "euids": [501], "reported": 1},
+        )
+
+    def test_strict_gate_rejects_zero_usdt_provider_capture(self) -> None:
+        result = self.analyze(
+            "\n".join(
+                (
+                    "PCPROFILE1|config|sample_hz=197",
+                    "PCPROFILE1|completion|target_exit=1|timed_out=0",
+                )
+            )
+        )
+        with self.assertRaisesRegex(ProfileError, "reset stream"):
+            directional.validate_strict_capture(
+                result, expected_euid=501, expected_egid=20
+            )
+
+    def test_strict_gate_rejects_kernel_samples_without_reconciled_stacks(self) -> None:
+        raw = "\n".join(
+            line
+            for line in self.complete_strict_capture().splitlines()
+            if not line.startswith("PCKSTACK1|")
+            and not line.startswith("kernel`")
+        )
+        result = self.analyze(raw)
+        with self.assertRaisesRegex(ProfileError, "kernel PC/stack"):
+            directional.validate_strict_capture(
+                result, expected_euid=501, expected_egid=20
+            )
+
+    def test_strict_gate_rejects_root_identity_for_non_root_caller(self) -> None:
+        result = self.analyze(
+            self.complete_strict_capture().replace("euid=501|egid=20", "euid=0|egid=0")
+        )
+        with self.assertRaisesRegex(ProfileError, "effective identity"):
+            directional.validate_strict_capture(
+                result, expected_euid=501, expected_egid=20
+            )
+
+    def test_strict_cli_writes_json_only_after_all_gates_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            raw = root / "profile.raw"
+            output = root / "profile.json"
+            raw.write_text(self.complete_strict_capture(), encoding="utf-8")
+            self.assertEqual(
+                directional.main(
+                    [
+                        "--input",
+                        str(raw),
+                        "--output",
+                        str(output),
+                        "--strict",
+                        "--expected-euid",
+                        "501",
+                        "--expected-egid",
+                        "20",
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8"))["warnings"], []
+            )
+
+    def test_strict_cli_fails_nonzero_without_usdt_streams(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            raw = root / "profile.raw"
+            output = root / "profile.json"
+            raw.write_text(
+                "PCPROFILE1|config|sample_hz=197\n"
+                "PCPROFILE1|completion|target_exit=1|timed_out=0\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                directional.main(
+                    [
+                        "--input",
+                        str(raw),
+                        "--output",
+                        str(output),
+                        "--strict",
+                        "--expected-euid",
+                        "501",
+                        "--expected-egid",
+                        "20",
+                    ]
+                ),
+                2,
+            )
+            self.assertFalse(output.exists())
 
     def test_joins_user_samples_to_private_shared_and_host_ranges(self) -> None:
         result = self.analyze(
@@ -79,6 +204,25 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
         )
         self.assertEqual(result["completion"], {"target_exit": 1, "timed_out": 0})
         self.assertEqual(result["warnings"], [])
+
+    def test_parses_and_reconciles_exact_kernel_stacks(self) -> None:
+        result = self.analyze(self.complete_strict_capture())
+        self.assertEqual(
+            result["kernel_stack_capture"],
+            {"kernel_samples": 3, "stack_samples": 3, "stacks": 1},
+        )
+        self.assertEqual(
+            result["kernel_stacks"],
+            [
+                {
+                    "count": 3,
+                    "frames": [
+                        "kernel`vm_fault+0x10",
+                        "kernel`arm_fast_fault+0x20",
+                    ],
+                }
+            ],
+        )
 
     def test_joins_raw_host_pc_to_exact_process_image_offset(self) -> None:
         result = self.analyze(
@@ -205,6 +349,10 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
         )
         self.assertIn("@outside_user_pc[(pid_t)pid, current_epoch[pid]", script)
         self.assertIn("@private_user_pc[(pid_t)pid, current_epoch[pid]", script)
+        self.assertIn("@kernel_stack[(pid_t)pid, current_epoch[pid]", script)
+        self.assertIn("stack(24)", script)
+        self.assertIn("PCKSTACK1|begin|pid=%d|epoch=%d|count=%@u", script)
+        self.assertNotIn("trunc(@kernel_stack", script)
         self.assertNotIn("@user_pc[", script)
         self.assertNotIn("trunc(@outside_leaf", script)
 

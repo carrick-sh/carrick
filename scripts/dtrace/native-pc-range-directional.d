@@ -38,6 +38,8 @@ carrick*:::host-translated-range-reset
 	private_start[pid] = (uint64_t)0;
 	private_end[pid] = (uint64_t)0;
 	printf("PCPROFILE1|reset|pid=%d|epoch=%d\n", pid, arg0);
+	printf("PCPROFILE1|identity|pid=%d|epoch=%d|euid=%d|egid=%d\n",
+	    pid, arg0, uid, gid);
 }
 
 carrick*:::host-translated-private-range
@@ -111,6 +113,7 @@ profile-197
 /tracked[pid] && current_epoch[pid] != (uint64_t)0 && arg0 != 0/
 {
 	@kernel_pid[(pid_t)pid, current_epoch[pid]] = count();
+	@kernel_stack[(pid_t)pid, current_epoch[pid], stack(24)] = count();
 }
 
 proc:::exit
@@ -149,6 +152,8 @@ END
 	    @private_user_pc);
 	printa("PCPROFILE1|sample|kind=kernel|pid=%d|epoch=%d|count=%@u\n",
 	    @kernel_pid);
+	printa("PCKSTACK1|begin|pid=%d|epoch=%d|count=%@u\n%kPCKSTACK1|end\n",
+	    @kernel_stack);
 	printa("PCLEAF2|pid=%d|epoch=%d|pc=%#x|module=%A|symbol=%A|count=%@u\n",
 	    @outside_leaf);
 	printf("PCPROFILE1|completion|target_exit=%d|timed_out=%d\n",

@@ -22,6 +22,10 @@ from collections.abc import Sequence
 SCHEMA = "carrick.native-pc-range-directional.v2"
 PROTOCOL = "PCPROFILE1"
 LEAF_PROTOCOL = "PCLEAF2"
+KERNEL_STACK_PROTOCOL = "PCKSTACK1"
+KERNEL_STACK_BEGIN = re.compile(
+    rf"^{KERNEL_STACK_PROTOCOL}\|begin\|pid=(\d+)\|epoch=(\d+)\|count=(\d+)$"
+)
 
 
 class ProfileError(RuntimeError):
@@ -155,10 +159,61 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
     resets = 0
     user_samples: dict[tuple[int, int, int], int] = defaultdict(int)
     kernel_samples: dict[tuple[int, int], int] = defaultdict(int)
+    kernel_stack_samples: dict[tuple[int, int, tuple[str, ...]], int] = {}
     leaf_samples: dict[tuple[int, int, int, str, str], int] = {}
+    effective_identities: list[tuple[int, int, int, int]] = []
     completion: dict[str, int] | None = None
 
-    for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+    raw_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    profile_lines: list[tuple[int, str]] = []
+    index = 0
+    while index < len(raw_lines):
+        line = raw_lines[index]
+        line_number = index + 1
+        if line.startswith(f"{KERNEL_STACK_PROTOCOL}|begin|"):
+            matched = KERNEL_STACK_BEGIN.fullmatch(line)
+            if matched is None:
+                raise ProfileError(
+                    f"line {line_number}: malformed {KERNEL_STACK_PROTOCOL} header"
+                )
+            pid, epoch, count = (int(value) for value in matched.groups())
+            if pid <= 0 or epoch <= 0 or count <= 0:
+                raise ProfileError(
+                    f"line {line_number}: kernel stack pid/epoch/count must be positive"
+                )
+            frames: list[str] = []
+            index += 1
+            while index < len(raw_lines) and raw_lines[index] != (
+                f"{KERNEL_STACK_PROTOCOL}|end"
+            ):
+                frame = raw_lines[index].strip()
+                if frame:
+                    frames.append(frame)
+                index += 1
+            if index >= len(raw_lines):
+                raise ProfileError(
+                    f"line {line_number}: unterminated {KERNEL_STACK_PROTOCOL} record"
+                )
+            if not frames:
+                raise ProfileError(
+                    f"line {line_number}: kernel stack has no frames"
+                )
+            key = (pid, epoch, tuple(frames))
+            if key in kernel_stack_samples:
+                raise ProfileError(
+                    f"line {line_number}: duplicate {KERNEL_STACK_PROTOCOL} record"
+                )
+            kernel_stack_samples[key] = count
+            index += 1
+            continue
+        if line == f"{KERNEL_STACK_PROTOCOL}|end":
+            raise ProfileError(
+                f"line {line_number}: unexpected {KERNEL_STACK_PROTOCOL} terminator"
+            )
+        profile_lines.append((line_number, line))
+        index += 1
+
+    for line_number, line in profile_lines:
         if line.startswith(f"{LEAF_PROTOCOL}|"):
             fields = _parse_leaf_fields(line, line_number)
             pid = _integer(fields, "pid", line_number)
@@ -206,6 +261,16 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
                 )
             range_reported[kind] += 1
             ranges.add(TranslatedRange(pid, epoch, kind, start, end))
+        elif record == "identity":
+            pid = _integer(fields, "pid", line_number)
+            epoch = _integer(fields, "epoch", line_number)
+            euid = _integer(fields, "euid", line_number)
+            egid = _integer(fields, "egid", line_number)
+            if pid <= 0 or epoch <= 0 or euid < 0 or egid < 0:
+                raise ProfileError(
+                    f"line {line_number}: invalid effective identity"
+                )
+            effective_identities.append((pid, epoch, euid, egid))
         elif record == "host-range":
             pid = _integer(fields, "pid", line_number)
             epoch = _integer(fields, "epoch", line_number)
@@ -349,6 +414,10 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
 
     user_total = sum(user_samples.values())
     kernel_total = sum(kernel_samples.values())
+    kernel_stack_total = sum(kernel_stack_samples.values())
+    kernel_stacks_by_frames: Counter[tuple[str, ...]] = Counter()
+    for (_pid, _epoch, frames), count in kernel_stack_samples.items():
+        kernel_stacks_by_frames[frames] += count
     all_total = user_total + kernel_total
     samples = {
         "all": all_total,
@@ -426,15 +495,33 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
             host_binary_offsets.items(), key=lambda item: (-item[1], item[0])
         )
     ]
+    kernel_stacks = [
+        {"count": count, "frames": list(frames)}
+        for frames, count in sorted(
+            kernel_stacks_by_frames.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
 
     return {
         "completion": completion,
         "gating_eligible": False,
+        "effective_identity": {
+            "egids": sorted({identity[3] for identity in effective_identities}),
+            "euids": sorted({identity[2] for identity in effective_identities}),
+            "reported": len(effective_identities),
+        },
         "hot_host_global_pcs": hot_host_global_pcs,
         "hot_host_pcs": hot_host_pcs,
         "hot_translated_ranges": hot_translated_ranges,
         "host_binary_offsets": hot_host_binary_offsets,
         "host_leaves": host_leaves,
+        "kernel_stack_capture": {
+            "kernel_samples": kernel_total,
+            "stack_samples": kernel_stack_total,
+            "stacks": len(kernel_stacks_by_frames),
+        },
+        "kernel_stacks": kernel_stacks,
         "leaf_capture": {
             "expected_outside_private_samples": expected_outside_samples,
             "host_binary_raw_samples": host_binary_raw_samples,
@@ -465,10 +552,74 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
     }
 
 
+def validate_strict_capture(
+    result: dict[str, object], *, expected_euid: int, expected_egid: int
+) -> None:
+    """Reject any directional receipt that cannot prove a complete capture."""
+    ranges = result["ranges"]
+    host_ranges = result["host_text_ranges"]
+    samples = result["samples"]
+    leaf = result["leaf_capture"]
+    completion = result["completion"]
+    identity = result["effective_identity"]
+    kernel_stack_capture = result["kernel_stack_capture"]
+    assert isinstance(ranges, dict)
+    assert isinstance(host_ranges, dict)
+    assert isinstance(samples, dict)
+    assert isinstance(leaf, dict)
+    assert isinstance(completion, dict)
+    assert isinstance(identity, dict)
+    assert isinstance(kernel_stack_capture, dict)
+
+    failures: list[str] = []
+    if ranges["resets"] <= 0:
+        failures.append("missing reset stream")
+    if ranges["private_reported"] <= 0:
+        failures.append("missing private-range stream")
+    if ranges["shared_reported"] <= 0:
+        failures.append("missing shared-range stream")
+    if host_ranges["reported"] <= 0:
+        failures.append("missing host-range stream")
+    if samples["user"] <= 0 or samples["kernel"] <= 0:
+        failures.append("missing user or kernel sample stream")
+    if (
+        kernel_stack_capture["stack_samples"] <= 0
+        or kernel_stack_capture["stack_samples"]
+        != kernel_stack_capture["kernel_samples"]
+    ):
+        failures.append("kernel PC/stack samples do not reconcile exactly")
+    if (
+        leaf["expected_outside_private_samples"] <= 0
+        or leaf["observed_outside_private_samples"]
+        != leaf["expected_outside_private_samples"]
+    ):
+        failures.append("PC/leaf reconciliation is not exact")
+    if completion != {"target_exit": 1, "timed_out": 0}:
+        failures.append("target did not exit naturally exactly once")
+    warnings = result["warnings"]
+    if warnings != []:
+        failures.append(f"analyzer warnings are not empty: {warnings}")
+    if (
+        identity["reported"] <= 0
+        or identity["euids"] != [expected_euid]
+        or identity["egids"] != [expected_egid]
+    ):
+        failures.append(
+            "effective identity mismatch: "
+            f"expected euid={expected_euid} egid={expected_egid}, "
+            f"observed euids={identity['euids']} egids={identity['egids']}"
+        )
+    if failures:
+        raise ProfileError("strict capture failed: " + "; ".join(failures))
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path)
+    parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--expected-euid", type=int)
+    parser.add_argument("--expected-egid", type=int)
     return parser
 
 
@@ -476,6 +627,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
         result = analyze_raw(arguments.input)
+        if arguments.strict:
+            if arguments.expected_euid is None or arguments.expected_egid is None:
+                raise ProfileError(
+                    "strict capture requires expected effective uid and gid"
+                )
+            validate_strict_capture(
+                result,
+                expected_euid=arguments.expected_euid,
+                expected_egid=arguments.expected_egid,
+            )
     except (OSError, ProfileError) as error:
         print(f"native_pc_range_directional: {error}", file=sys.stderr)
         return 2

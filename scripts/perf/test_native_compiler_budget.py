@@ -758,7 +758,7 @@ class NativePerfTests(unittest.TestCase):
         budget.validate_profile(profile)
         self.assertEqual(profile.threads[0].gateway_entries, 2)
 
-    def test_profile_accepts_pre_read_counter_sensitive_frame_as_zero(self):
+    def test_profile_accepts_exact_legacy_eight_field_sensitive_shape(self):
         lines = nativeperf_frames()
         lines[2] = lines[2].replace("sensitive_read_counter=0|", "")
         profile = budget.parse_nativeperf(lines)
