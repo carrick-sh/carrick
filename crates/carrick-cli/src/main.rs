@@ -153,7 +153,61 @@ use crate::runtime_util::register_dtrace_probes;
 /// Async work (image pulls, summary reads) runs inside a short-lived
 /// current-thread runtime that drops before the trap loop even begins,
 /// so by the time fork can fire there is no tokio state to break.
+/// Heap-allocation census (`--features alloc-census`). `dhat` attributes every
+/// allocation to a call stack, which is the only way to answer "what allocates
+/// the ~20.5 GB of large-zone heap per `go build`" on this lane: all three
+/// EXTERNAL routes are measured dead (`ustack()` misresolves across ~70
+/// self-re-exec'd processes with independent ASLR slides and emits
+/// plausible-but-false symbols; `fbt::mach_vm_allocate` never fires;
+/// `syscall::mmap` sees only MAP_NORESERVE reservations because libmalloc
+/// sub-allocates a few large regions).
+#[cfg(feature = "alloc-census")]
+#[global_allocator]
+static ALLOC_CENSUS: dhat::Alloc = dhat::Alloc;
+
+/// One output file per process, because a cold `go build` runs ~70 of them.
+/// The profiler must outlive all guest work, so `main` holds it to the end; a
+/// process that `execve`s (carrick's guest-exec is a host self-re-exec) never
+/// drops it and writes nothing, which is expected -- the POST-exec image is the
+/// one that does the guest work and exits normally, so it is the one that
+/// reports.
+#[cfg(feature = "alloc-census")]
+static ALLOC_CENSUS_PROFILER: std::sync::Mutex<Option<dhat::Profiler>> =
+    std::sync::Mutex::new(None);
+
+/// `dhat` writes its JSON from `Profiler`'s `Drop`, and carrick's run paths end
+/// in `std::process::exit` (commands.rs:478/635/1035) to propagate the guest's
+/// status. `process::exit` runs libc `atexit` handlers but NOT `Drop` for
+/// `main`'s locals, so holding the profiler in a local writes NOTHING -- which
+/// is exactly what the first attempt did. Park it in a static and drop it from
+/// an `atexit` hook instead.
+#[cfg(feature = "alloc-census")]
+extern "C" fn write_alloc_census() {
+    if let Ok(mut slot) = ALLOC_CENSUS_PROFILER.lock() {
+        drop(slot.take());
+    }
+}
+
+#[cfg(feature = "alloc-census")]
+fn start_alloc_census() {
+    let dir = std::env::var("CARRICK_ALLOC_CENSUS_DIR").unwrap_or_else(|_| "/tmp".to_owned());
+    let pid = unsafe { libc::getpid() };
+    let profiler = dhat::Profiler::builder()
+        .file_name(std::path::PathBuf::from(dir).join(format!("dhat-{pid}.json")))
+        .build();
+    if let Ok(mut slot) = ALLOC_CENSUS_PROFILER.lock() {
+        *slot = Some(profiler);
+    }
+    // Per-pid file names, so the ~70 processes of one build cannot clobber each
+    // other and a forked child inheriting this handler is harmless.
+    unsafe {
+        libc::atexit(write_alloc_census);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "alloc-census")]
+    start_alloc_census();
     // FIRST, before any dispatch or fork: record this process as the one
     // true top-level `carrick` invocation. The NATIVEPERF supervisor record
     // (supervisor_perf) is gated on this pid — interactive `-t` runs fork a
