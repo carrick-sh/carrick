@@ -516,6 +516,21 @@ class NativeGoBuildTest(unittest.TestCase):
             "stdout": "cleanup stdout\n",
             "stderr": "",
         }
+        diagnostics_evidence = {
+            "status": 0,
+            "stdout": "snapshot complete\n",
+            "stderr": "",
+            "out_dir": str(directory / "target" / "perf" / "lldb-timeouts"),
+        }
+        timeout_order = []
+
+        def capture_timeout(*_args):
+            timeout_order.append("diagnostics")
+            return diagnostics_evidence
+
+        def cleanup_timeout(*_args):
+            timeout_order.append("cleanup")
+            return cleanup_evidence
 
         with (
             mock.patch.object(native_go_build.os, "getpid", return_value=123),
@@ -535,8 +550,14 @@ class NativeGoBuildTest(unittest.TestCase):
             ),
             mock.patch.object(
                 native_go_build,
+                "carrick_timeout_diagnostics",
+                create=True,
+                side_effect=capture_timeout,
+            ) as diagnostics,
+            mock.patch.object(
+                native_go_build,
                 "carrick_cleanup",
-                return_value=cleanup_evidence,
+                side_effect=cleanup_timeout,
             ) as cleanup,
             self.assertRaises(native_go_build.SampleEvidenceError) as caught,
         ):
@@ -551,7 +572,9 @@ class NativeGoBuildTest(unittest.TestCase):
             )
 
         self.assertEqual(captured.read_text(), "partial stdout\npartial stderr\n")
+        diagnostics.assert_called_once_with(directory, binary.resolve(), run_id)
         cleanup.assert_called_once_with(directory, run_id)
+        self.assertEqual(timeout_order, ["diagnostics", "cleanup"])
         row = caught.exception.sample
         self.assertEqual(row["run_id"], run_id)
         self.assertEqual(row["command"]["argv"][0], str(binary.resolve()))
@@ -561,6 +584,7 @@ class NativeGoBuildTest(unittest.TestCase):
         self.assertFalse(row["build_ok"])
         self.assertEqual(row["stdout"], "partial stdout\n")
         self.assertEqual(row["stderr"], "partial stderr\n")
+        self.assertEqual(row["timeout_diagnostics"], diagnostics_evidence)
         self.assertEqual(row["cleanup"], cleanup_evidence)
         self.assertEqual(row["provenance"], {"pre": pre, "post": post})
         self.assertGreaterEqual(row["elapsed_ms"], 0)
@@ -604,6 +628,49 @@ class NativeGoBuildTest(unittest.TestCase):
         self.assertEqual(row["stderr"], "partial stderr\n")
         self.assertEqual(row["cleanup"]["status"], 125)
         self.assertIn("cleanup launch failed", row["cleanup"]["stderr"])
+
+    def test_timeout_lldb_snapshot_has_an_exact_programmatic_opt_out(self):
+        directory, _ = self.install_fake_docker("arm64")
+        binary = directory / "immutable-arm" / "carrick"
+        binary.parent.mkdir()
+        binary.write_bytes(b"immutable arm\n")
+        timeout = subprocess.TimeoutExpired([str(binary), "run"], 5)
+        cleanup_evidence = {"status": 0, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(
+                native_go_build,
+                "repository_is_git",
+                return_value=False,
+            ),
+            mock.patch.object(
+                native_go_build.subprocess,
+                "run",
+                side_effect=timeout,
+            ),
+            mock.patch.object(
+                native_go_build,
+                "carrick_timeout_diagnostics",
+            ) as diagnostics,
+            mock.patch.object(
+                native_go_build,
+                "carrick_cleanup",
+                return_value=cleanup_evidence,
+            ),
+            self.assertRaises(native_go_build.SampleEvidenceError) as caught,
+        ):
+            native_go_build.run_sample(
+                directory,
+                "carrick",
+                index=1,
+                timeout_seconds=5,
+                binary=binary,
+                current_run_id="native-timeout-opt-out",
+                capture_timeout_diagnostics=False,
+            )
+
+        diagnostics.assert_not_called()
+        self.assertIsNone(caught.exception.sample["timeout_diagnostics"])
 
     def test_non_timeout_execution_exception_retains_current_sample_evidence(self):
         directory, _ = self.install_fake_docker("arm64")

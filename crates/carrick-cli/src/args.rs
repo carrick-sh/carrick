@@ -954,6 +954,24 @@ pub(crate) enum DebugCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+    /// Freeze and snapshot every process belonging to an already-running
+    /// scoped Carrick run. The processes remain stopped for the caller's
+    /// run-ID-scoped cleanup.
+    LldbSnapshot {
+        /// Exact `CARRICK_RUN_ID` / container name whose processes are captured.
+        #[arg(long = "run-id")]
+        run_id: String,
+        /// Directory for the lldb transcript, process census, and cores.
+        #[arg(long = "out-dir", default_value = "target/conformance/logs/lldb-runs")]
+        out_dir: PathBuf,
+        /// Path to `scripts/carrick_lldb.py`. Defaults to the repo script when
+        /// running from a checkout.
+        #[arg(long = "lldb-plugin")]
+        lldb_plugin: Option<PathBuf>,
+        /// Skip `process save-core`; still records event rings and backtraces.
+        #[arg(long = "no-core")]
+        no_core: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1102,6 +1120,24 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from(["carrick", "build", "--output", "/tmp/image.tar", ".",]).is_ok()
+        );
+    }
+
+    #[test]
+    fn lldb_snapshot_accepts_an_existing_scoped_run() {
+        assert!(
+            Cli::try_parse_from([
+                "carrick",
+                "debug",
+                "lldb-snapshot",
+                "--run-id",
+                "native-perf-timeout-1",
+                "--out-dir",
+                "/tmp/carrick-lldb",
+                "--no-core",
+            ])
+            .is_ok(),
+            "timeout diagnostics need a standalone snapshot command"
         );
     }
 }
