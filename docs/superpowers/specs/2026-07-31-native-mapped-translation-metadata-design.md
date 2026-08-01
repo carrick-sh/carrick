@@ -1,7 +1,6 @@
 # Native AArch64 mapped translation metadata V3
 
-**Status:** direction approved; implementation is gated on review of this
-written specification.
+**Status:** approved for implementation.
 **Lane:** Darwin/AArch64 native DSR only.
 **Primary workload:** conformance `go-build` with a cold `GOCACHE`.
 **Retention authority:** same-binary, eight-quad total-child-CPU ABBA.
@@ -59,6 +58,12 @@ and runtime representation for the entire top-level run. Absence or any value
 other than exact `0` selects V3. All descendants inherit the choice, so a run
 never mixes V2 and V3 units.
 
+Existing controls remain honest. `CARRICK_DSR_SHARED_RECOVERY_RUNS=0` is valid
+inside V3 and emits one-entry recovery spans instead of coalesced spans. The
+V2-only manifest-retention and fixed/varint wire overlays explicitly set
+`CARRICK_DSR_SHARED_MAPPED_METADATA=0`; they never silently measure V3 while
+claiming to exercise the old object graph.
+
 The cache is private and container-lifetime: a new top-level invocation starts
 empty and the owner removes it at lifecycle end. V3 therefore does not dual-read
 V2 entries. A schema or filename mismatch is a normal cache miss followed by
@@ -96,7 +101,7 @@ V3 contains these sections:
 |---|---|
 | block records | guest start, generation binding, code extent, flags, and slices into the following tables |
 | PC-map records | exact guest VA and unit-relative cache offset |
-| recovery runs | cache start, nonzero entry count, and recovery-action index |
+| recovery spans | cache start, nonzero entry count, and recovery-action index; entry-mode controls use count one |
 | recovery actions | explicit action tag and fixed canonical payload |
 | guest ranges | exact precomputed half-open ranges for each block |
 | direct bindings | source, target, kind, ordinal, stub extent, and edge-member index |
