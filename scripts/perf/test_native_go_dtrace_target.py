@@ -20,6 +20,18 @@ from native_go_dtrace_target import _has_carrick_proctitle
 
 
 class NativeGoDtraceTargetTests(unittest.TestCase):
+    def binary_identity(self) -> dict[str, object]:
+        return {
+            "bytes": 1,
+            "dof": {"address": 3, "offset": 4, "segment": "__TEXT", "size": 5},
+            "entitlements": {"com.apple.security.hypervisor": True},
+            "entitlements_sha256": "e" * 64,
+            "macho_uuid": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+            "path": str((native_go_dtrace_target.REPO / "target/release/carrick").resolve()),
+            "sha256": "b" * 64,
+            "text": {"fileoff": 0, "filesize": 10, "vmaddr": 0x100000000, "vmsize": 10},
+        }
+
     def strict_raw(self) -> str:
         return "\n".join(
             (
@@ -57,7 +69,10 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
                 output.write_text(raw, encoding="utf-8")
 
             def communicate(self):
-                return stdout, stderr
+                return (
+                    stdout,
+                    b"TRACECHILD1|euid=501|egid=20|groups=12,20\n" + stderr,
+                )
 
             def wait(self) -> int:
                 return self.returncode
@@ -74,6 +89,10 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
                     "v2",
                     "--run-id",
                     "capture-test",
+                    "--pair-id",
+                    "capture-pair",
+                    "--pair-ordinal",
+                    "1",
                     "--trace-script",
                     "scripts/dtrace/native-pc-range-directional.d",
                     "--trace-output",
@@ -91,6 +110,11 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             mock.patch.object(native_go_dtrace_target.os, "getegid", return_value=20),
             mock.patch.object(
                 native_go_dtrace_target.os, "getgroups", return_value=[20, 12]
+            ),
+            mock.patch.object(
+                native_go_dtrace_target.native_pc_range_risk,
+                "inspect_binary_identity",
+                return_value=self.binary_identity(),
             ),
             mock.patch("sys.stdout", io.StringIO()),
             mock.patch("sys.stderr", io.StringIO()),
@@ -172,6 +196,10 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
                     "v2",
                     "--run-id",
                     "metadata-v2-trace",
+                    "--pair-id",
+                    "trace-pair",
+                    "--pair-ordinal",
+                    "1",
                     "--trace-script",
                     "scripts/dtrace/native-pc-range-directional.d",
                     "--trace-output",
@@ -230,7 +258,10 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
                 raw_path.write_text(
                     NativeGoDtraceTargetTests().strict_raw(), encoding="utf-8"
                 )
-                return b"WORKLOAD_NS=123\nBUILD_OK\n", b"ok\n"
+                return (
+                    b"WORKLOAD_NS=123\nBUILD_OK\n",
+                    b"TRACECHILD1|euid=501|egid=20|groups=12,20\nok\n",
+                )
 
         with (
             mock.patch.object(
@@ -245,6 +276,10 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
                     "--mechanism-profile",
                     "--run-id",
                     "metadata-v2-standalone-trace",
+                    "--pair-id",
+                    "standalone-pair",
+                    "--pair-ordinal",
+                    "1",
                     "--trace-script",
                     "scripts/dtrace/native-pc-range-directional.d",
                     "--trace-output",
@@ -263,6 +298,11 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             mock.patch.object(native_go_dtrace_target.os, "getegid", return_value=20),
             mock.patch.object(
                 native_go_dtrace_target.os, "getgroups", return_value=[20, 12]
+            ),
+            mock.patch.object(
+                native_go_dtrace_target.native_pc_range_risk,
+                "inspect_binary_identity",
+                return_value=self.binary_identity(),
             ),
             mock.patch("sys.stdout", output),
         ):
@@ -331,7 +371,7 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
         )
         self.assertEqual(
             provenance["expected_effective_identity"],
-            {"egid": 20, "euid": 501, "supplementary_gids": [20, 12]},
+            {"egid": 20, "euid": 501, "supplementary_gids": [12, 20]},
         )
 
     def test_run_id_uses_the_established_conservative_capture_grammar(self) -> None:
@@ -409,11 +449,31 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             raw.with_suffix(".driver.out").read_bytes(),
             b"WORKLOAD_NS=123\nBUILD_OK\n",
         )
-        self.assertEqual(raw.with_suffix(".driver.err").read_bytes(), b"ok\n")
+        self.assertEqual(
+            raw.with_suffix(".driver.err").read_bytes(),
+            b"TRACECHILD1|euid=501|egid=20|groups=12,20\nok\n",
+        )
         receipt = json.loads(raw.with_suffix(".capture.json").read_text())
         self.assertEqual(receipt["status"], "passed")
-        self.assertEqual(receipt["expected_effective_identity"], {"egid": 20, "euid": 501})
-        self.assertEqual(receipt["observed_effective_identity"], {"egids": [20], "euids": [501], "reported": 1})
+        self.assertEqual(receipt["schema"], "carrick.native-go-dtrace-capture.v2")
+        self.assertEqual(
+            receipt["expected_effective_identity"],
+            {"egid": 20, "euid": 501, "supplementary_gids": [12, 20]},
+        )
+        self.assertEqual(
+            receipt["observed_effective_identity"],
+            receipt["expected_effective_identity"],
+        )
+        self.assertEqual(
+            receipt["pair"],
+            {"arm": "control", "id": "capture-pair", "order": 0, "ordinal": 1},
+        )
+        self.assertTrue(receipt["natural_completion"])
+        self.assertTrue(all(receipt["required_streams"].values()))
+        self.assertEqual(
+            receipt["binary"]["macho_uuid"],
+            "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+        )
 
     def test_standalone_capture_accepts_real_nativeperf1_mechanism_stream(self) -> None:
         result, _raw, temporary = self.run_standalone_fixture(
