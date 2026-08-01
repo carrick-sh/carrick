@@ -98,7 +98,9 @@ FRAME_FIELDS = {
     },
     "cache-gauge": {"cache_used_bytes", "cache_capacity_bytes"},
 }
-HISTORICAL_SENSITIVE_FIELDS = FRAME_FIELDS["sensitive"] - {
+# Accept exactly the legacy eight-field sensitive frame shape. This is a
+# versioned record contract; input path or provenance never changes parsing.
+LEGACY_EIGHT_FIELD_SENSITIVE_FIELDS = FRAME_FIELDS["sensitive"] - {
     "sensitive_read_counter"
 }
 REQUIRED_FRAMES = frozenset(FRAME_FIELDS)
@@ -998,7 +1000,7 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
             raise BudgetError("incomplete native profile record")
         frame = fields["frame"]
         extras = set(fields) - common
-        if frame == "sensitive" and extras == HISTORICAL_SENSITIVE_FIELDS:
+        if frame == "sensitive" and extras == LEGACY_EIGHT_FIELD_SENSITIVE_FIELDS:
             fields["sensitive_read_counter"] = "0"
             extras.add("sensitive_read_counter")
         version, frame_fields = _frame_contract(frame, extras)

@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import dataclasses
+import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -30,11 +33,47 @@ from scripts.perf.native_go_build import (
     RegistryTransport,
     build_command,
     variant_environment,
+    workload_ns_from_stdout,
 )
+from scripts.perf import native_pc_range_directional
 
 
 METADATA_MODE_MAPPED = "mapped"
 METADATA_MODE_V2 = "v2"
+RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,39}")
+DIRECT_DTRACE_ARG_PATTERN = re.compile(r"[A-Za-z0-9_./:=,+@%-]+")
+DTRACE_DIAGNOSTIC_PATTERNS = (
+    re.compile(r"(?im)^dtrace:\s"),
+    re.compile(r"(?i)failed to start process notifications"),
+    re.compile(r"(?im)^\s*\d+\s+drops?\b"),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class TraceIdentity:
+    euid: int
+    egid: int
+    supplementary_gids: tuple[int, ...]
+
+    @classmethod
+    def current(cls) -> TraceIdentity:
+        return cls(os.geteuid(), os.getegid(), tuple(os.getgroups()))
+
+    def receipt(self) -> dict[str, object]:
+        return {
+            "euid": self.euid,
+            "egid": self.egid,
+            "supplementary_gids": list(self.supplementary_gids),
+        }
+
+
+def validate_run_id(run_id: str) -> str:
+    """Apply the established conservative native-capture run-ID grammar."""
+    if RUN_ID_PATTERN.fullmatch(run_id) is None:
+        raise ValueError(
+            "run ID must be 1-40 conservative alphanumeric/hyphen characters"
+        )
+    return run_id
 
 
 def environment_for(*, metadata_mode: str) -> dict[str, str | None]:
@@ -80,16 +119,39 @@ def direct_carrick_command(
     *,
     run_id: str,
     overlay: dict[str, str | None],
+    identity: TraceIdentity | None = None,
 ) -> list[str]:
     """Forward scrubbed controls into a direct Carrick DTrace target."""
     if len(command) < 2 or command[1] != "run":
         raise ValueError("direct tracing requires a canonical Carrick run command")
+    selected_identity = identity or TraceIdentity.current()
     direct_run = [
         command[0],
-        "run",
-        "--forward-env",
-        f"CARRICK_RUN_ID={run_id}",
+        "__trace-child",
+        "--trace-uid",
+        str(selected_identity.euid),
+        "--trace-gid",
+        str(selected_identity.egid),
     ]
+    if selected_identity.supplementary_gids:
+        direct_run.extend(
+            (
+                "--trace-groups",
+                ",".join(str(gid) for gid in selected_identity.supplementary_gids),
+            )
+        )
+    direct_run.extend(
+        (
+            "--",
+            "run",
+        )
+    )
+    direct_run.extend(
+        (
+            "--forward-env",
+            f"CARRICK_RUN_ID={run_id}",
+        )
+    )
     for key, value in overlay.items():
         if value is not None:
             direct_run.extend(("--forward-env", f"{key}={value}"))
@@ -104,9 +166,15 @@ def standalone_dtrace_command(
     overlay: dict[str, str | None],
     trace_script: pathlib.Path,
     trace_output: pathlib.Path,
+    identity: TraceIdentity | None = None,
 ) -> list[str]:
     """Launch DTrace with Carrick as ``$target`` and no quoted argv fields."""
-    direct_run = direct_carrick_command(command, run_id=run_id, overlay=overlay)
+    direct_run = direct_carrick_command(
+        command,
+        run_id=run_id,
+        overlay=overlay,
+        identity=identity,
+    )
     if direct_run[-3:-1] != ["/bin/sh", "-c"]:
         raise ValueError("standalone DTrace requires the canonical guest shell")
     guest_script = direct_run[-1].encode()
@@ -116,8 +184,13 @@ def standalone_dtrace_command(
         + payload
         + "|base64${IFS}-d)"
     )
-    if any(any(character.isspace() for character in field) for field in direct_run):
-        raise ValueError("standalone DTrace command contains a quoted argv field")
+    unsafe_fields = [
+        field
+        for field in direct_run[:-1]
+        if DIRECT_DTRACE_ARG_PATTERN.fullmatch(field) is None
+    ]
+    if unsafe_fields:
+        raise ValueError("direct DTrace argv contains an unsafe dynamic field")
     return [
         "sudo",
         "-n",
@@ -130,6 +203,148 @@ def standalone_dtrace_command(
         "-c",
         " ".join(direct_run),
     ]
+
+
+def _sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _retained_artifact(path: pathlib.Path) -> dict[str, object]:
+    return {
+        "bytes": path.stat().st_size,
+        "path": str(path),
+        "sha256": _sha256(path),
+    }
+
+
+def _replay(stream: object, payload: bytes) -> None:
+    if not payload:
+        return
+    text = payload.decode("utf-8", errors="replace")
+    write = getattr(stream, "write")
+    write(text)
+    flush = getattr(stream, "flush", None)
+    if flush is not None:
+        flush()
+
+
+def _verify_standalone_capture(
+    *,
+    process: subprocess.Popen[bytes],
+    trace_output: pathlib.Path,
+    identity: TraceIdentity,
+) -> int:
+    """Retain and fail closed over every standalone capture evidence stream."""
+    stdout, stderr = process.communicate()
+    stdout_path = trace_output.with_suffix(".driver.out")
+    stderr_path = trace_output.with_suffix(".driver.err")
+    analysis_path = trace_output.with_suffix(".json")
+    receipt_path = trace_output.with_suffix(".capture.json")
+    stdout_path.write_bytes(stdout)
+    stderr_path.write_bytes(stderr)
+    _replay(sys.stdout, stdout)
+    _replay(sys.stderr, stderr)
+
+    decoded_stdout = stdout.decode("utf-8", errors="replace")
+    decoded_stderr = stderr.decode("utf-8", errors="replace")
+    failures: list[str] = []
+
+    build_markers = [
+        line for line in decoded_stdout.splitlines() if line.strip() == "BUILD_OK"
+    ]
+    if len(build_markers) != 1:
+        failures.append(
+            f"expected exactly one BUILD_OK marker, found {len(build_markers)}"
+        )
+    try:
+        workload_ns = workload_ns_from_stdout(decoded_stdout)
+    except ValueError as error:
+        workload_ns = None
+        failures.append(str(error))
+    guest_stderr = [
+        line.strip()
+        for line in decoded_stderr.splitlines()
+        if line.strip() and not line.startswith("NATIVEPERF1|")
+    ]
+    if guest_stderr != ["ok"]:
+        failures.append(f"expected exact guest stderr marker ['ok'], got {guest_stderr}")
+    if process.returncode != 0:
+        failures.append(f"DTrace exited with status {process.returncode}")
+
+    diagnostic_text = "\n".join((decoded_stdout, decoded_stderr))
+    matched_diagnostics = [
+        pattern.pattern
+        for pattern in DTRACE_DIAGNOSTIC_PATTERNS
+        if pattern.search(diagnostic_text) is not None
+    ]
+    if matched_diagnostics:
+        failures.append(
+            "DTrace diagnostics matched forbidden predicates: "
+            + ", ".join(matched_diagnostics)
+        )
+    if not trace_output.is_file():
+        failures.append("DTrace did not retain the requested raw capture")
+
+    analyzer_status: int | None = None
+    analysis: dict[str, object] | None = None
+    if trace_output.is_file():
+        analyzer_status = native_pc_range_directional.main(
+            [
+                "--input",
+                str(trace_output),
+                "--output",
+                str(analysis_path),
+                "--strict",
+                "--expected-euid",
+                str(identity.euid),
+                "--expected-egid",
+                str(identity.egid),
+            ]
+        )
+        if analyzer_status != 0:
+            failures.append(f"strict directional analyzer exited {analyzer_status}")
+        elif analysis_path.is_file():
+            analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+        else:
+            failures.append("strict directional analyzer retained no JSON receipt")
+
+    artifact_paths = (trace_output, stdout_path, stderr_path, analysis_path)
+    receipt = {
+        "analyzer_status": analyzer_status,
+        "artifacts": {
+            path.name: _retained_artifact(path)
+            for path in artifact_paths
+            if path.is_file()
+        },
+        "diagnostic_predicates": [
+            pattern.pattern for pattern in DTRACE_DIAGNOSTIC_PATTERNS
+        ],
+        "dtrace_status": process.returncode,
+        "expected_effective_identity": {
+            "egid": identity.egid,
+            "euid": identity.euid,
+        },
+        "failures": failures,
+        "matched_diagnostic_predicates": matched_diagnostics,
+        "observed_effective_identity": (
+            analysis.get("effective_identity") if analysis is not None else None
+        ),
+        "schema": "carrick.native-go-dtrace-capture.v1",
+        "status": "passed" if not failures else "failed",
+        "workload_ns": workload_ns,
+    }
+    receipt_path.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    if failures:
+        for failure in failures:
+            print(f"native_go_dtrace_target: {failure}", file=sys.stderr)
+        return 2
+    return 0
 
 
 def _has_carrick_proctitle(command: str, run_id: str) -> bool:
@@ -225,7 +440,7 @@ def main() -> int:
     parser.add_argument(
         "--trace-launcher",
         choices=("carrick-trace", "standalone"),
-        default="carrick-trace",
+        default="standalone",
         help="use carrick trace or make Carrick DTrace's direct target",
     )
     parser.add_argument(
@@ -241,6 +456,12 @@ def main() -> int:
     run_id = arguments.run_id or os.environ.get("CARRICK_RUN_ID")
     if not run_id:
         parser.error("CARRICK_RUN_ID must be set")
+    try:
+        run_id = validate_run_id(run_id)
+    except ValueError as error:
+        parser.error(str(error))
+
+    trace_identity = TraceIdentity.current()
 
     metadata_environment = environment_for(metadata_mode=arguments.metadata_mode)
     environment, overlay = variant_environment(
@@ -277,6 +498,7 @@ def main() -> int:
             {
                 "metadata_mode": arguments.metadata_mode,
                 "environment_overlay": overlay,
+                "expected_effective_identity": trace_identity.receipt(),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -298,6 +520,7 @@ def main() -> int:
                 overlay=overlay,
                 trace_script=arguments.trace_script,
                 trace_output=arguments.trace_output,
+                identity=trace_identity,
             )
         else:
             command = carrick_trace_command(
@@ -307,7 +530,27 @@ def main() -> int:
                 trace_script=arguments.trace_script,
                 trace_output=arguments.trace_output,
             )
-    process = subprocess.Popen(command, cwd=REPO, env=environment)
+    standalone_capture = (
+        arguments.trace_script is not None
+        and arguments.trace_launcher == "standalone"
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=REPO,
+        env=environment,
+        **(
+            {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+            if standalone_capture
+            else {}
+        ),
+    )
+    if standalone_capture:
+        assert arguments.trace_output is not None
+        return _verify_standalone_capture(
+            process=process,
+            trace_output=arguments.trace_output,
+            identity=trace_identity,
+        )
     if arguments.stop_child:
         if not _wait_for_carrick_proctitle(process, run_id):
             process.terminate()
