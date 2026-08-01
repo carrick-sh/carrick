@@ -1105,6 +1105,9 @@ struct PreparedSharedInstall {
     page_dependencies: carrick_dsr::cache::PreparedPageBlockDependencies,
     executable_range: gateway::PreparedExecutableRange,
     direct_binding_probe: DirectBindingUnitLoadedProbe,
+    metadata_load_evidence: crate::shared_cache::TranslationMetadataLoadEvidence,
+    guest_range_derivations: u64,
+    direct_edge_group_builds: u64,
 }
 
 struct PreparedSharedBlock {
@@ -1554,6 +1557,13 @@ pub struct ResolverStats {
     pub shared_unit_loads: u64,
     pub shared_blocks_mapped: u64,
     pub shared_translations_avoided: u64,
+    pub shared_metadata_bytes_read: u64,
+    pub shared_metadata_bytes_mapped: u64,
+    pub shared_metadata_validation_ns: u64,
+    pub shared_mapped_immutable_records: u64,
+    pub shared_owned_immutable_records: u64,
+    pub shared_guest_range_derivations: u64,
+    pub shared_direct_edge_group_builds: u64,
     /// `ResolveDirect` exits classified by whether the SOURCE (the branching
     /// instruction's guest PC) and the TARGET fall inside shared-unit code.
     /// Thread-scoped, like `direct_resolver_exits`.
@@ -1590,6 +1600,13 @@ pub enum ResolverStat {
     SharedUnitLoads,
     SharedBlocksMapped,
     SharedTranslationsAvoided,
+    SharedMetadataBytesRead,
+    SharedMetadataBytesMapped,
+    SharedMetadataValidationNs,
+    SharedMappedImmutableRecords,
+    SharedOwnedImmutableRecords,
+    SharedGuestRangeDerivations,
+    SharedDirectEdgeGroupBuilds,
     ResolveSrcSharedTgtShared,
     ResolveSrcSharedTgtPrivate,
     ResolveSrcPrivateTgtShared,
@@ -1597,7 +1614,7 @@ pub enum ResolverStat {
 }
 
 impl ResolverStat {
-    const ALL: [Self; 24] = [
+    const ALL: [Self; 31] = [
         Self::ResolverExits,
         Self::OneEntryHits,
         Self::Translations,
@@ -1618,6 +1635,13 @@ impl ResolverStat {
         Self::SharedUnitLoads,
         Self::SharedBlocksMapped,
         Self::SharedTranslationsAvoided,
+        Self::SharedMetadataBytesRead,
+        Self::SharedMetadataBytesMapped,
+        Self::SharedMetadataValidationNs,
+        Self::SharedMappedImmutableRecords,
+        Self::SharedOwnedImmutableRecords,
+        Self::SharedGuestRangeDerivations,
+        Self::SharedDirectEdgeGroupBuilds,
         Self::ResolveSrcSharedTgtShared,
         Self::ResolveSrcSharedTgtPrivate,
         Self::ResolveSrcPrivateTgtShared,
@@ -1646,6 +1670,13 @@ impl ResolverStat {
             Self::SharedUnitLoads => "shared_unit_loads",
             Self::SharedBlocksMapped => "shared_blocks_mapped",
             Self::SharedTranslationsAvoided => "shared_translations_avoided",
+            Self::SharedMetadataBytesRead => "shared_metadata_bytes_read",
+            Self::SharedMetadataBytesMapped => "shared_metadata_bytes_mapped",
+            Self::SharedMetadataValidationNs => "shared_metadata_validation_ns",
+            Self::SharedMappedImmutableRecords => "shared_mapped_immutable_records",
+            Self::SharedOwnedImmutableRecords => "shared_owned_immutable_records",
+            Self::SharedGuestRangeDerivations => "shared_guest_range_derivations",
+            Self::SharedDirectEdgeGroupBuilds => "shared_direct_edge_group_builds",
             Self::ResolveSrcSharedTgtShared => "resolve_src_shared_tgt_shared",
             Self::ResolveSrcSharedTgtPrivate => "resolve_src_shared_tgt_private",
             Self::ResolveSrcPrivateTgtShared => "resolve_src_private_tgt_shared",
@@ -1677,6 +1708,13 @@ impl ResolverStats {
             ResolverStat::SharedUnitLoads => self.shared_unit_loads,
             ResolverStat::SharedBlocksMapped => self.shared_blocks_mapped,
             ResolverStat::SharedTranslationsAvoided => self.shared_translations_avoided,
+            ResolverStat::SharedMetadataBytesRead => self.shared_metadata_bytes_read,
+            ResolverStat::SharedMetadataBytesMapped => self.shared_metadata_bytes_mapped,
+            ResolverStat::SharedMetadataValidationNs => self.shared_metadata_validation_ns,
+            ResolverStat::SharedMappedImmutableRecords => self.shared_mapped_immutable_records,
+            ResolverStat::SharedOwnedImmutableRecords => self.shared_owned_immutable_records,
+            ResolverStat::SharedGuestRangeDerivations => self.shared_guest_range_derivations,
+            ResolverStat::SharedDirectEdgeGroupBuilds => self.shared_direct_edge_group_builds,
             ResolverStat::ResolveSrcSharedTgtShared => self.resolve_src_shared_tgt_shared,
             ResolverStat::ResolveSrcSharedTgtPrivate => self.resolve_src_shared_tgt_private,
             ResolverStat::ResolveSrcPrivateTgtShared => self.resolve_src_private_tgt_shared,
@@ -1706,6 +1744,21 @@ impl ResolverStats {
             ResolverStat::SharedUnitLoads => self.shared_unit_loads = value,
             ResolverStat::SharedBlocksMapped => self.shared_blocks_mapped = value,
             ResolverStat::SharedTranslationsAvoided => self.shared_translations_avoided = value,
+            ResolverStat::SharedMetadataBytesRead => self.shared_metadata_bytes_read = value,
+            ResolverStat::SharedMetadataBytesMapped => self.shared_metadata_bytes_mapped = value,
+            ResolverStat::SharedMetadataValidationNs => self.shared_metadata_validation_ns = value,
+            ResolverStat::SharedMappedImmutableRecords => {
+                self.shared_mapped_immutable_records = value
+            }
+            ResolverStat::SharedOwnedImmutableRecords => {
+                self.shared_owned_immutable_records = value
+            }
+            ResolverStat::SharedGuestRangeDerivations => {
+                self.shared_guest_range_derivations = value
+            }
+            ResolverStat::SharedDirectEdgeGroupBuilds => {
+                self.shared_direct_edge_group_builds = value
+            }
             ResolverStat::ResolveSrcSharedTgtShared => self.resolve_src_shared_tgt_shared = value,
             ResolverStat::ResolveSrcSharedTgtPrivate => self.resolve_src_shared_tgt_private = value,
             ResolverStat::ResolveSrcPrivateTgtShared => self.resolve_src_private_tgt_shared = value,
@@ -1725,6 +1778,10 @@ impl ResolverStats {
                 self.invalid = Some(profile::ProfileError::CounterOverflow(stat.name()));
             }
         }
+    }
+
+    fn saturating_add(&mut self, stat: ResolverStat, value: u64) {
+        self.set(stat, self.get(stat).saturating_add(value));
     }
 
     fn add_elapsed(&mut self, stat: ResolverStat, elapsed: std::time::Duration) {
@@ -2137,6 +2194,13 @@ impl ThreadTranslator {
             shared_unit_loads: process.stats.shared_unit_loads,
             shared_blocks_mapped: process.stats.shared_blocks_mapped,
             shared_translations_avoided: process.stats.shared_translations_avoided,
+            shared_metadata_bytes_read: process.stats.shared_metadata_bytes_read,
+            shared_metadata_bytes_mapped: process.stats.shared_metadata_bytes_mapped,
+            shared_metadata_validation_ns: process.stats.shared_metadata_validation_ns,
+            shared_mapped_immutable_records: process.stats.shared_mapped_immutable_records,
+            shared_owned_immutable_records: process.stats.shared_owned_immutable_records,
+            shared_guest_range_derivations: process.stats.shared_guest_range_derivations,
+            shared_direct_edge_group_builds: process.stats.shared_direct_edge_group_builds,
             exclusive_fusion_sites: process.exclusive_fusion_site_counts(),
         }
     }
@@ -2208,6 +2272,13 @@ impl ThreadTranslator {
             shared_unit_loads: delta.shared_unit_loads,
             shared_blocks_mapped: delta.shared_blocks_mapped,
             shared_translations_avoided: delta.shared_translations_avoided,
+            shared_metadata_bytes_read: delta.shared_metadata_bytes_read,
+            shared_metadata_bytes_mapped: delta.shared_metadata_bytes_mapped,
+            shared_metadata_validation_ns: delta.shared_metadata_validation_ns,
+            shared_mapped_immutable_records: delta.shared_mapped_immutable_records,
+            shared_owned_immutable_records: delta.shared_owned_immutable_records,
+            shared_guest_range_derivations: delta.shared_guest_range_derivations,
+            shared_direct_edge_group_builds: delta.shared_direct_edge_group_builds,
             exclusive_fusion_sites: process.exclusive_fusion_site_counts(),
         })
     }
@@ -2301,6 +2372,13 @@ impl ThreadTranslator {
             shared_unit_loads: 0,
             shared_blocks_mapped: 0,
             shared_translations_avoided: 0,
+            shared_metadata_bytes_read: 0,
+            shared_metadata_bytes_mapped: 0,
+            shared_metadata_validation_ns: 0,
+            shared_mapped_immutable_records: 0,
+            shared_owned_immutable_records: 0,
+            shared_guest_range_derivations: 0,
+            shared_direct_edge_group_builds: 0,
             exclusive_fusion_sites: process_state.exclusive_fusion_site_counts(),
         })
     }
@@ -3024,6 +3102,7 @@ impl ProcessState {
             types::DsrError,
         >,
     ) -> Result<PreparedSharedInstall, types::DsrError> {
+        let metadata_load_evidence = unit.load_evidence;
         if let crate::shared_cache::LoadedTranslationMetadata::V2(manifest) = &unit.metadata {
             manifest.validate_ranges().map_err(|reason| {
                 types::DsrError::CachePolicy(format!(
@@ -3188,6 +3267,7 @@ impl ProcessState {
             ))
         })?;
         let mut guest_range_additions = Vec::new();
+        let mut guest_range_derivations = 0_u64;
         let mut dependency_records = Vec::new();
         dependency_records
             .try_reserve_exact(block_count)
@@ -3251,6 +3331,7 @@ impl ProcessState {
                         block.code_len as usize,
                         &map,
                     )?;
+                    guest_range_derivations = guest_range_derivations.saturating_add(1);
                     guest_range_additions
                         .try_reserve(guest_ranges.len())
                         .map_err(|error| {
@@ -3433,6 +3514,8 @@ impl ProcessState {
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::GuestUnion)?;
 
         let direct_binding = self.direct_bindings.prepare_loaded_unit(&unit)?;
+        let direct_edge_group_builds =
+            u64::try_from(direct_binding.edge_group_builds()).unwrap_or(u64::MAX);
         #[cfg(test)]
         shared_install_prepare_checkpoint(SharedInstallPrepareStage::DirectBinding)?;
 
@@ -3560,6 +3643,9 @@ impl ProcessState {
             page_dependencies,
             executable_range,
             direct_binding_probe,
+            metadata_load_evidence,
+            guest_range_derivations,
+            direct_edge_group_builds,
         })
     }
 
@@ -3608,6 +3694,9 @@ impl ProcessState {
             page_dependencies,
             executable_range,
             direct_binding_probe,
+            metadata_load_evidence,
+            guest_range_derivations,
+            direct_edge_group_builds,
         } = prepared;
         let block_count = blocks.len();
 
@@ -3669,6 +3758,48 @@ impl ProcessState {
             direct_binding_probe.record_count,
             direct_binding_probe.data_bytes,
         );
+        self.apply_shared_metadata_evidence(
+            metadata_load_evidence,
+            guest_range_derivations,
+            direct_edge_group_builds,
+        );
+    }
+
+    fn apply_shared_metadata_evidence(
+        &mut self,
+        evidence: crate::shared_cache::TranslationMetadataLoadEvidence,
+        guest_range_derivations: u64,
+        direct_edge_group_builds: u64,
+    ) {
+        for (stat, value) in [
+            (ResolverStat::SharedMetadataBytesRead, evidence.bytes_read),
+            (
+                ResolverStat::SharedMetadataBytesMapped,
+                evidence.bytes_mapped,
+            ),
+            (
+                ResolverStat::SharedMetadataValidationNs,
+                evidence.validation_ns,
+            ),
+            (
+                ResolverStat::SharedMappedImmutableRecords,
+                evidence.mapped_records,
+            ),
+            (
+                ResolverStat::SharedOwnedImmutableRecords,
+                evidence.owned_records,
+            ),
+            (
+                ResolverStat::SharedGuestRangeDerivations,
+                guest_range_derivations,
+            ),
+            (
+                ResolverStat::SharedDirectEdgeGroupBuilds,
+                direct_edge_group_builds,
+            ),
+        ] {
+            self.stats.saturating_add(stat, value);
+        }
     }
 
     #[cfg(test)]
@@ -4957,6 +5088,13 @@ impl ThreadTranslator {
             shared_unit_loads: process.shared_unit_loads,
             shared_blocks_mapped: process.shared_blocks_mapped,
             shared_translations_avoided: process.shared_translations_avoided,
+            shared_metadata_bytes_read: process.shared_metadata_bytes_read,
+            shared_metadata_bytes_mapped: process.shared_metadata_bytes_mapped,
+            shared_metadata_validation_ns: process.shared_metadata_validation_ns,
+            shared_mapped_immutable_records: process.shared_mapped_immutable_records,
+            shared_owned_immutable_records: process.shared_owned_immutable_records,
+            shared_guest_range_derivations: process.shared_guest_range_derivations,
+            shared_direct_edge_group_builds: process.shared_direct_edge_group_builds,
             invalid: self.stats.invalid.or(process.invalid),
             resolve_src_shared_tgt_shared: self.stats.resolve_src_shared_tgt_shared,
             resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
@@ -7768,6 +7906,87 @@ mod tests {
                 (GuestVa(0x400010), GuestVa(0x400014)),
             ]
         );
+    }
+
+    #[test]
+    fn resolver_stats_bind_mapped_metadata_evidence_only_at_commit() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+
+        let prepared = state
+            .prepare_shared_install(73, &memory, mapped_shared_install_unit(base))
+            .expect("prepare mapped shared install");
+        assert_eq!(state.stats.shared_metadata_bytes_mapped, 0);
+        assert_eq!(state.stats.shared_mapped_immutable_records, 0);
+
+        state.commit_shared_install(prepared);
+
+        assert_eq!(state.stats.shared_metadata_bytes_read, 0);
+        assert_eq!(state.stats.shared_metadata_bytes_mapped, 1_234);
+        assert_eq!(state.stats.shared_metadata_validation_ns, 37);
+        assert_eq!(state.stats.shared_mapped_immutable_records, 6);
+        assert_eq!(state.stats.shared_owned_immutable_records, 0);
+        assert_eq!(state.stats.shared_guest_range_derivations, 0);
+        assert_eq!(state.stats.shared_direct_edge_group_builds, 0);
+    }
+
+    #[test]
+    fn resolver_stats_bind_v2_metadata_evidence_only_at_commit() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
+        let mut unit = shared_install_unit(base);
+        unit.load_evidence = TranslationMetadataLoadEvidence {
+            mode: TranslationMetadataMode::V2,
+            bytes_read: 2_468,
+            bytes_mapped: 0,
+            validation_ns: 74,
+            mapped_records: 0,
+            owned_records: 5,
+        };
+
+        let prepared = state
+            .prepare_shared_install(73, &memory, unit)
+            .expect("prepare V2 shared install");
+        assert_eq!(state.stats.shared_metadata_bytes_read, 0);
+        assert_eq!(state.stats.shared_owned_immutable_records, 0);
+
+        state.commit_shared_install(prepared);
+
+        assert_eq!(state.stats.shared_metadata_bytes_read, 2_468);
+        assert_eq!(state.stats.shared_metadata_bytes_mapped, 0);
+        assert_eq!(state.stats.shared_metadata_validation_ns, 74);
+        assert_eq!(state.stats.shared_mapped_immutable_records, 0);
+        assert_eq!(state.stats.shared_owned_immutable_records, 5);
+        assert_eq!(state.stats.shared_guest_range_derivations, 1);
+        assert_eq!(state.stats.shared_direct_edge_group_builds, 1);
+    }
+
+    #[test]
+    fn resolver_stats_saturate_actual_preparation_work() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut state = process.state.write();
+        state.stats.shared_guest_range_derivations = u64::MAX - 1;
+        state.stats.shared_direct_edge_group_builds = u64::MAX - 2;
+
+        state.apply_shared_metadata_evidence(TranslationMetadataLoadEvidence::default(), 2, 3);
+
+        assert_eq!(state.stats.shared_guest_range_derivations, u64::MAX);
+        assert_eq!(state.stats.shared_direct_edge_group_builds, u64::MAX);
     }
 
     #[test]

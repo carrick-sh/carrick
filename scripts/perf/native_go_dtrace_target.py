@@ -9,6 +9,7 @@ Python process alive while Carrick runs as its child gives D scripts one stable
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import signal
@@ -28,6 +29,20 @@ from scripts.perf.native_go_build import (
     build_command,
     variant_environment,
 )
+
+
+METADATA_MODE_MAPPED = "mapped"
+METADATA_MODE_V2 = "v2"
+
+
+def environment_for(*, metadata_mode: str) -> dict[str, str | None]:
+    if metadata_mode == METADATA_MODE_MAPPED:
+        value = None
+    elif metadata_mode == METADATA_MODE_V2:
+        value = "0"
+    else:
+        raise ValueError(f"unknown metadata mode: {metadata_mode}")
+    return {"CARRICK_DSR_SHARED_MAPPED_METADATA": value}
 
 
 def _has_carrick_proctitle(command: str, run_id: str) -> bool:
@@ -70,6 +85,12 @@ def main() -> int:
         help="select the default shared manifest Arc or its exact deep-clone opt-out",
     )
     parser.add_argument(
+        "--metadata-mode",
+        choices=(METADATA_MODE_MAPPED, METADATA_MODE_V2),
+        default=METADATA_MODE_MAPPED,
+        help="map immutable metadata by default or select the exact V2 opt-out",
+    )
+    parser.add_argument(
         "--manifest-wire",
         choices=("fixed", "varint"),
         default="fixed",
@@ -109,11 +130,13 @@ def main() -> int:
     if not run_id:
         parser.error("CARRICK_RUN_ID must be set")
 
-    environment, _overlay = variant_environment(
+    metadata_environment = environment_for(metadata_mode=arguments.metadata_mode)
+    environment, overlay = variant_environment(
         os.environ,
         arguments.variant,
         ENGINE_CARRICK,
         {
+            **metadata_environment,
             "CARRICK_DSR_SHARED_MANIFEST_ARC": (
                 "0" if arguments.manifest_retention == "clone" else None
             ),
@@ -135,6 +158,18 @@ def main() -> int:
         },
     )
     environment["CARRICK_RUN_ID"] = run_id
+    print(
+        "TARGET_PROVENANCE="
+        + json.dumps(
+            {
+                "metadata_mode": arguments.metadata_mode,
+                "environment_overlay": overlay,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
     command = build_command(
         REPO,
         ENGINE_CARRICK,

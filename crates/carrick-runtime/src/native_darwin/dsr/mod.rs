@@ -883,6 +883,30 @@ mod tests {
             .write()
             .stats
             .add(super::ResolverStat::Translations, 7);
+        {
+            let mut state = process.state.write();
+            state
+                .stats
+                .add(super::ResolverStat::SharedMetadataBytesRead, 11);
+            state
+                .stats
+                .add(super::ResolverStat::SharedMetadataBytesMapped, 13);
+            state
+                .stats
+                .add(super::ResolverStat::SharedMetadataValidationNs, 17);
+            state
+                .stats
+                .add(super::ResolverStat::SharedMappedImmutableRecords, 19);
+            state
+                .stats
+                .add(super::ResolverStat::SharedOwnedImmutableRecords, 23);
+            state
+                .stats
+                .add(super::ResolverStat::SharedGuestRangeDerivations, 29);
+            state
+                .stats
+                .add(super::ResolverStat::SharedDirectEdgeGroupBuilds, 31);
+        }
         let first_frames = first.take_profile_frames().expect("first record");
         process
             .state
@@ -893,6 +917,18 @@ mod tests {
 
         assert_eq!(protocol_value(&first_frames, "translations"), 7);
         assert_eq!(protocol_value(&second_frames, "translations"), 5);
+        for (field, expected) in [
+            ("shared_metadata_bytes_read", 11),
+            ("shared_metadata_bytes_mapped", 13),
+            ("shared_metadata_validation_ns", 17),
+            ("shared_mapped_immutable_records", 19),
+            ("shared_owned_immutable_records", 23),
+            ("shared_guest_range_derivations", 29),
+            ("shared_direct_edge_group_builds", 31),
+        ] {
+            assert_eq!(protocol_value(&first_frames, field), expected, "{field}");
+            assert_eq!(protocol_value(&second_frames, field), 0, "{field}");
+        }
         assert_eq!(
             protocol_value(&first_frames, "translations")
                 + protocol_value(&second_frames, "translations"),
@@ -910,10 +946,9 @@ mod tests {
 
         let frames = thread.take_profile_frames().expect("attribution frames");
 
-        // 15, up from 14: `resolver-shared` publishes the container-lifetime
-        // translation counters, which existed in `ResolverStats` but were never
-        // emitted -- so whether sharing ever hit was unobservable.
-        assert_eq!(frames.len(), 17);
+        // `resolver-metadata` keeps the low-frequency mechanism evidence in a
+        // separate PIPE_BUF-bounded frame from the sharing counters.
+        assert_eq!(frames.len(), 18);
         assert!(frames.iter().any(|frame| frame.contains("|frame=process|")));
         assert!(
             frames
@@ -1454,8 +1489,8 @@ mod tests {
             let sibling_frames = frames_for_tid(&captured, SIBLING_TID);
             assert_eq!(
                 sibling_frames.len(),
-                17,
-                "the drain must emit the sibling's complete 17-frame record exactly once; \
+                18,
+                "the drain must emit the sibling's complete 18-frame record exactly once; \
                  captured stderr: {captured:?}"
             );
             for frame in [
@@ -1472,6 +1507,7 @@ mod tests {
                 "resolver-process",
                 "resolver-times",
                 "resolver-shared",
+                "resolver-metadata",
                 "resolve-class",
                 "direct-binding-gauge",
                 "cache-gauge",
@@ -1569,7 +1605,7 @@ mod tests {
             let frames = frames_for_tid(&captured, SELF_FLUSHED_TID);
             assert_eq!(
                 frames.len(),
-                17,
+                18,
                 "a self-flushed thread's record must appear exactly once (its own \
                  self-flush), never a second time from the leader's drain; captured: {captured:?}"
             );

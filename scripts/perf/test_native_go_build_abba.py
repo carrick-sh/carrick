@@ -1015,6 +1015,7 @@ class CampaignContractTest(unittest.TestCase):
 
         for key in (
             "CARRICK_DSR_DIRECT_BYTES",
+            "CARRICK_DSR_SHARED_MAPPED_METADATA",
             "CARRICK_DSR_SHARED_MANIFEST_ARC",
             "CARRICK_DSR_SHARED_MANIFEST_FIXED",
             "CARRICK_DSR_SHARED_SOURCE_FINGERPRINT_REUSE",

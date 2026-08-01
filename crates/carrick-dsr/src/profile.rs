@@ -799,6 +799,15 @@ pub struct ProfileSnapshot {
     pub shared_unit_loads: u64,
     pub shared_blocks_mapped: u64,
     pub shared_translations_avoided: u64,
+    /// Low-frequency mechanism evidence for loaded immutable translation
+    /// metadata. These counters do not provide timing authority.
+    pub shared_metadata_bytes_read: u64,
+    pub shared_metadata_bytes_mapped: u64,
+    pub shared_metadata_validation_ns: u64,
+    pub shared_mapped_immutable_records: u64,
+    pub shared_owned_immutable_records: u64,
+    pub shared_guest_range_derivations: u64,
+    pub shared_direct_edge_group_builds: u64,
     /// `ResolveDirect` exits classified by RANGE containment of the source and
     /// target guest PCs in shared-unit code. Thread-scoped deltas, summable.
     pub resolve_src_shared_tgt_shared: u64,
@@ -980,6 +989,19 @@ impl CompleteThreadRecord {
             resolver.shared_translations_avoided,
         );
         frames.push(shared);
+        let mut metadata = self.frame_header("resolver-metadata");
+        let _ = write!(
+            metadata,
+            "|shared_metadata_bytes_read={}|shared_metadata_bytes_mapped={}|shared_metadata_validation_ns={}|shared_mapped_immutable_records={}|shared_owned_immutable_records={}|shared_guest_range_derivations={}|shared_direct_edge_group_builds={}",
+            resolver.shared_metadata_bytes_read,
+            resolver.shared_metadata_bytes_mapped,
+            resolver.shared_metadata_validation_ns,
+            resolver.shared_mapped_immutable_records,
+            resolver.shared_owned_immutable_records,
+            resolver.shared_guest_range_derivations,
+            resolver.shared_direct_edge_group_builds,
+        );
+        frames.push(metadata);
         let mut resolve = self.frame_header("resolve-class");
         let _ = write!(
             resolve,
@@ -1528,7 +1550,7 @@ mod tests {
                 },
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 17);
+        assert_eq!(frames.len(), 18);
         assert!(frames[0].contains("|frame=core|"));
         assert!(frames[0].contains("|thread_cpu_ns=5"));
         let process = frames
@@ -1731,6 +1753,13 @@ mod tests {
                     shared_unit_loads: u64::MAX,
                     shared_blocks_mapped: u64::MAX,
                     shared_translations_avoided: u64::MAX,
+                    shared_metadata_bytes_read: u64::MAX,
+                    shared_metadata_bytes_mapped: u64::MAX,
+                    shared_metadata_validation_ns: u64::MAX,
+                    shared_mapped_immutable_records: u64::MAX,
+                    shared_owned_immutable_records: u64::MAX,
+                    shared_guest_range_derivations: u64::MAX,
+                    shared_direct_edge_group_builds: u64::MAX,
                     resolver_exits: u64::MAX,
                     one_entry_hits: u64::MAX,
                     translations: u64::MAX,
@@ -1754,7 +1783,7 @@ mod tests {
                 gauges,
             )
             .expect("bounded frames");
-        assert_eq!(frames.len(), 17);
+        assert_eq!(frames.len(), 18);
         for frame in frames {
             let transport_len = frame.len().checked_add(1).expect("newline length");
             assert!(
