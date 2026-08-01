@@ -8207,11 +8207,17 @@ mod tests {
             DirectBindingTargetPrefix, DirectBindingValidationReason, PrivateJitEpoch,
         };
         use crate::emit::DirectLinkKind;
+        use crate::mapped_metadata::{
+            BINDING_RECORD_V3_SIZE, MappedMetadataError, SectionKind,
+            ValidatedMappedTranslationMetadata, VecMetadataBacking, encode_translation_metadata_v3,
+        };
         use crate::shared_cache::{
-            AddressModeIdentity, DIRECT_BINDING_CELL_SIZE, DirectBindingLayout, ExecutableIdentity,
-            GuestCodeLen, ImageFileLen, ImageFileOffset, NativePageProfileIdentity,
-            SharedLoadedTranslationUnit, SourceFingerprint, TRANSLATION_UNIT_SCHEMA_V2,
-            TranslationUnitKey, TranslationUnitManifest, UnresolvedDirectBindingRecord,
+            AddressModeIdentity, DIRECT_BINDING_CELL_SIZE, DirectBindingLayout,
+            DirectBindingRelocation, ExecutableIdentity, GuestCodeLen, ImageFileLen,
+            ImageFileOffset, NativePageProfileIdentity, SharedLoadedTranslationUnit,
+            SourceFingerprint, TRANSLATION_UNIT_BINDING_EXPORT, TRANSLATION_UNIT_SCHEMA_V2,
+            TranslationMetadataLoadEvidence, TranslationUnitKey, TranslationUnitManifest,
+            UnresolvedDirectBindingRecord,
         };
         use crate::types::CodeGeneration;
         use carrick_guest_mem::GuestVa;
@@ -8257,10 +8263,12 @@ mod tests {
         ) -> UnitFixture {
             let base_export =
                 super::translation_unit_base_export(&unit_key).expect("keyed translation export");
-            let storage = std::iter::repeat_with(|| AtomicPtr::new(std::ptr::null_mut()))
-                .take(records.len())
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+            let storage = std::iter::repeat_with(|| {
+                AtomicPtr::new(std::ptr::null_mut::<DirectBindingTarget>())
+            })
+            .take(records.len())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
             let binding_base =
                 DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
             let binding_data_len = u64::try_from(
@@ -8317,6 +8325,287 @@ mod tests {
                 None,
                 Arc::new(()),
             )
+        }
+
+        fn mapped_direct_binding_manifest() -> TranslationUnitManifest {
+            let unit_key = key(72);
+            let records = vec![
+                record(GuestVa(0x4000), GuestVa(0x5000), 0),
+                record(GuestVa(0x4000), GuestVa(0x5000), 1),
+                record(GuestVa(0x6000), GuestVa(0x7000), 2),
+            ];
+            let binding_relocations = records
+                .iter()
+                .map(|record| DirectBindingRelocation {
+                    ordinal: record.ordinal,
+                    adrp_offset: record.stub_start + 20,
+                    add_offset: record.stub_start + 24,
+                    miss_adrp_offset: record.stub_start + 108,
+                    miss_add_offset: record.stub_start + 112,
+                    data_offset: record.ordinal.get() * DIRECT_BINDING_CELL_SIZE,
+                })
+                .collect();
+            let mut manifest = super::shared_install_manifest();
+            manifest.base_export =
+                super::translation_unit_base_export(&unit_key).expect("keyed translation export");
+            manifest.key = unit_key;
+            manifest.dylib_sha256 = [0x72; 32];
+            manifest.code_len = 0x1000;
+            manifest.binding_layout = DirectBindingLayout::SidecarV1;
+            manifest.binding_export = TRANSLATION_UNIT_BINDING_EXPORT.to_string();
+            manifest.binding_data_len = 3 * u64::from(DIRECT_BINDING_CELL_SIZE);
+            manifest.cell_size = DIRECT_BINDING_CELL_SIZE;
+            manifest.bindings = records;
+            manifest.binding_relocations = binding_relocations;
+            manifest
+        }
+
+        fn mapped_direct_binding_unit(manifest: &TranslationUnitManifest) -> UnitFixture {
+            let bytes = encode_translation_metadata_v3(manifest).expect("encode mapped bindings");
+            let metadata = ValidatedMappedTranslationMetadata::new(
+                Arc::new(VecMetadataBacking::new(bytes)),
+                &manifest.key,
+            )
+            .expect("validate mapped bindings");
+            let storage = std::iter::repeat_with(|| {
+                AtomicPtr::new(std::ptr::null_mut::<DirectBindingTarget>())
+            })
+            .take(manifest.bindings.len())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+            let binding_base =
+                DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
+            let unit = SharedLoadedTranslationUnit::new_mapped_with_binding_base(
+                metadata,
+                0x30_0000,
+                Some(binding_base),
+                TranslationMetadataLoadEvidence::default(),
+                Arc::new(()),
+            );
+            UnitFixture { storage, unit }
+        }
+
+        fn v2_direct_binding_unit(manifest: TranslationUnitManifest) -> UnitFixture {
+            let storage = std::iter::repeat_with(|| AtomicPtr::new(std::ptr::null_mut()))
+                .take(manifest.bindings.len())
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let binding_base =
+                DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
+            let unit = SharedLoadedTranslationUnit::new_with_binding_base(
+                manifest,
+                0x30_0000,
+                Some(binding_base),
+                Arc::new(()),
+            );
+            UnitFixture { storage, unit }
+        }
+
+        fn section_offset(bytes: &[u8], kind: SectionKind) -> usize {
+            let layout = crate::mapped_metadata::ValidatedLayout::parse(bytes)
+                .expect("encoded metadata layout");
+            usize::try_from(
+                layout
+                    .section(kind)
+                    .expect("encoded metadata section")
+                    .offset()
+                    .get(),
+            )
+            .expect("section offset fits usize")
+        }
+
+        fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn register_mapped_direct_binding_bytes(
+            registry: &mut DirectBindingRegistry,
+            manifest: &TranslationUnitManifest,
+            bytes: Vec<u8>,
+            binding_base: DirectBindingCellVa,
+        ) -> Result<Option<usize>, MappedMetadataError> {
+            let metadata = ValidatedMappedTranslationMetadata::new(
+                Arc::new(VecMetadataBacking::new(bytes)),
+                &manifest.key,
+            )?;
+            let unit = SharedLoadedTranslationUnit::new_mapped_with_binding_base(
+                metadata,
+                0x30_0000,
+                Some(binding_base),
+                TranslationMetadataLoadEvidence::default(),
+                Arc::new(()),
+            );
+            Ok(registry
+                .register_loaded_unit(&unit)
+                .expect("validated mapped direct-binding unit must prepare"))
+        }
+
+        #[test]
+        fn mapped_direct_binding_preparation_reuses_records_and_pre_grouped_edges() {
+            let manifest = mapped_direct_binding_manifest();
+            let mapped = mapped_direct_binding_unit(&manifest);
+            let mut mapped_registry = DirectBindingRegistry::new(true);
+            let prepared = mapped_registry
+                .prepare_loaded_unit(&mapped.unit)
+                .expect("prepare mapped direct bindings");
+            let first_cell = mapped.unit.binding_base.expect("mapped binding base");
+
+            assert_eq!(prepared.record_count(), 3);
+            assert_eq!(prepared.owned_record_count(), 0);
+            assert_eq!(prepared.edge_group_builds(), 0);
+            assert_eq!(prepared.cell_owner_count(), 3);
+            for index in 0..3_u32 {
+                assert_eq!(
+                    prepared.mapped_record_owner(index as usize),
+                    Some((
+                        index,
+                        DirectBindingCellVa::mapped(
+                            first_cell.get() + index as usize * DIRECT_BINDING_CELL_SIZE as usize,
+                        )
+                        .expect("indexed mapped cell"),
+                    )),
+                );
+            }
+            assert_eq!(
+                prepared.edge_members(GuestVa(0x4000), GuestVa(0x5000)),
+                &[(0, 0), (0, 1)]
+            );
+
+            let v2 = v2_direct_binding_unit(manifest);
+            let mut v2_registry = DirectBindingRegistry::new(true);
+            let v2_prepared = v2_registry
+                .prepare_loaded_unit(&v2.unit)
+                .expect("prepare V2 control bindings");
+            assert_eq!(v2_prepared.owned_record_count(), 3);
+            assert_eq!(v2_prepared.edge_group_builds(), 1);
+            assert_eq!(
+                v2_prepared.edge_members(GuestVa(0x4000), GuestVa(0x5000)),
+                prepared.edge_members(GuestVa(0x4000), GuestVa(0x5000)),
+            );
+
+            drop(mapped.unit);
+            assert_eq!(
+                prepared.record_count(),
+                3,
+                "prepared owner retains V3 lease"
+            );
+            assert_eq!(mapped.storage.len(), 3, "mapped cells remain live");
+            let unit_index = mapped_registry
+                .commit_loaded_unit(prepared)
+                .expect("mapped SidecarV1 owner");
+            let miss = DirectBindingMiss {
+                cell: first_cell,
+                ordinal: DirectBindingOrdinal::claimed(0),
+            };
+            assert_eq!(
+                mapped_registry
+                    .classify_cold_exit(
+                        GuestVa(0x4000),
+                        GuestVa(0x5000),
+                        DirectBindingExitMetadata::Mapped(miss),
+                    )
+                    .expect("mapped edge lookup"),
+                DirectBindingEligibility {
+                    unit: key(72),
+                    ordinal: DirectBindingOrdinal::claimed(0),
+                    cell: Some(first_cell),
+                }
+            );
+            assert_eq!(
+                mapped_registry
+                    .owner_key(miss, GuestVa(0x4000), GuestVa(0x5000))
+                    .expect("mapped owner validation")
+                    .ordinal,
+                DirectBindingOrdinal::claimed(0),
+            );
+
+            let epoch = PrivateJitEpoch::process_owner();
+            assert_eq!(
+                mapped_registry.publish(
+                    miss,
+                    GuestVa(0x4000),
+                    GuestVa(0x5000),
+                    private_target(GuestVa(0x5000), CodeGeneration::INITIAL, 0x80_7200, &epoch,),
+                ),
+                DirectBindingPublishOutcome::Published,
+            );
+            assert!(mapped_registry.is_published(unit_index, miss.ordinal));
+            assert_eq!(
+                mapped_registry.clear_inherited_after_fork().cells_cleared,
+                1
+            );
+            assert!(mapped.storage[0].load(Ordering::Acquire).is_null());
+
+            assert_eq!(
+                mapped_registry.publish(
+                    miss,
+                    GuestVa(0x4000),
+                    GuestVa(0x5000),
+                    private_target(GuestVa(0x5000), CodeGeneration::INITIAL, 0x80_7200, &epoch,),
+                ),
+                DirectBindingPublishOutcome::Published,
+            );
+            let exec = mapped_registry.clear_all_before_exec();
+            assert_eq!(exec.cells_cleared, 1);
+            assert_eq!(exec.units_dropped, 1);
+            assert!(mapped.storage[0].load(Ordering::Acquire).is_null());
+        }
+
+        #[test]
+        fn mapped_direct_binding_member_corruption_is_failure_atomic() {
+            let manifest = mapped_direct_binding_manifest();
+            let mut bytes =
+                encode_translation_metadata_v3(&manifest).expect("encode mapped bindings");
+            let member = section_offset(&bytes, SectionKind::EdgeMember);
+            put_u32(&mut bytes, member, 2);
+            let storage = std::iter::repeat_with(|| {
+                AtomicPtr::new(std::ptr::null_mut::<DirectBindingTarget>())
+            })
+            .take(manifest.bindings.len())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+            let binding_base =
+                DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
+            let mut registry = DirectBindingRegistry::new(true);
+            let before = registry.logical_snapshot_for_test();
+
+            let error =
+                register_mapped_direct_binding_bytes(&mut registry, &manifest, bytes, binding_base)
+                    .expect_err("member must not point at a binding on another edge");
+
+            assert_eq!(error, MappedMetadataError::EdgeBackReference);
+            assert_eq!(registry.logical_snapshot_for_test(), before);
+        }
+
+        #[test]
+        fn mapped_direct_binding_back_reference_corruption_is_failure_atomic() {
+            let manifest = mapped_direct_binding_manifest();
+            let mut bytes =
+                encode_translation_metadata_v3(&manifest).expect("encode mapped bindings");
+            let binding = section_offset(&bytes, SectionKind::Binding);
+            // `edge_member_index` is the final u64 in the fixed 40-byte V3 binding record.
+            put_u64(&mut bytes, binding + BINDING_RECORD_V3_SIZE - 8, 3);
+            let storage = std::iter::repeat_with(|| {
+                AtomicPtr::new(std::ptr::null_mut::<DirectBindingTarget>())
+            })
+            .take(manifest.bindings.len())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+            let binding_base =
+                DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
+            let mut registry = DirectBindingRegistry::new(true);
+            let before = registry.logical_snapshot_for_test();
+
+            let error =
+                register_mapped_direct_binding_bytes(&mut registry, &manifest, bytes, binding_base)
+                    .expect_err("binding must not point beyond the member table");
+
+            assert_eq!(error, MappedMetadataError::Binding);
+            assert_eq!(registry.logical_snapshot_for_test(), before);
         }
 
         pub(super) fn process_with_direct_bindings() -> ProcessTranslator {

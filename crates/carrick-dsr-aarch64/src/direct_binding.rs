@@ -291,10 +291,33 @@ impl Ord for DirectBindingOwnerKey {
     }
 }
 
-/// Exact record and loaded-unit index owning one mapped cell.
+/// Representation-aware record identity owned by one process-local cell.
+pub enum DirectBindingRecordOwner {
+    V2(UnresolvedDirectBindingRecord),
+    V3 { record_index: u32 },
+}
+
+impl DirectBindingRecordOwner {
+    fn resolve(
+        &self,
+        unit: &DirectBindingUnitOwner,
+    ) -> Option<(usize, UnresolvedDirectBindingRecord)> {
+        let record_index = match self {
+            Self::V2(record) => usize::try_from(record.ordinal.get()).ok()?,
+            Self::V3 { record_index } => usize::try_from(*record_index).ok()?,
+        };
+        let resolved = unit.record(record_index)?;
+        match self {
+            Self::V2(record) if record != &resolved => None,
+            Self::V2(_) | Self::V3 { .. } => Some((record_index, resolved)),
+        }
+    }
+}
+
+/// Exact record reference and loaded-unit index owning one mapped cell.
 pub struct DirectBindingOwner {
     unit_index: usize,
-    record: UnresolvedDirectBindingRecord,
+    record: DirectBindingRecordOwner,
     cell: DirectBindingCellVa,
 }
 
@@ -303,9 +326,49 @@ pub struct DirectBindingUnitOwner {
     key: TranslationUnitKey,
     binding_base: Option<DirectBindingCellVa>,
     binding_layout: DirectBindingLayout,
-    records: Box<[UnresolvedDirectBindingRecord]>,
+    owned_records: Box<[UnresolvedDirectBindingRecord]>,
     published_bitmap: Box<[u64]>,
     source_lease: SharedLoadedTranslationUnit,
+}
+
+impl DirectBindingUnitOwner {
+    /// Resolves one immutable binding record through its retained source lease.
+    ///
+    /// The V2 arm preserves the process-owned clone and also proves it still
+    /// matches the retained manifest. The V3 arm copies one record view from
+    /// the validated mapped table and never owns that table's records.
+    fn record(&self, index: usize) -> Option<UnresolvedDirectBindingRecord> {
+        match &self.source_lease.metadata {
+            crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => {
+                let owned = self.owned_records.get(index)?;
+                (manifest.bindings.get(index) == Some(owned)).then(|| owned.clone())
+            }
+            crate::shared_cache::LoadedTranslationMetadata::V3(metadata) => {
+                if self.binding_layout == DirectBindingLayout::Disabled
+                    || !self.owned_records.is_empty()
+                {
+                    return None;
+                }
+                metadata.binding(index).map(|binding| binding.record())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn record_count(&self) -> usize {
+        match &self.source_lease.metadata {
+            crate::shared_cache::LoadedTranslationMetadata::V2(_) => self.owned_records.len(),
+            crate::shared_cache::LoadedTranslationMetadata::V3(metadata) => {
+                if self.binding_layout == DirectBindingLayout::Disabled
+                    || !self.owned_records.is_empty()
+                {
+                    0
+                } else {
+                    metadata.binding_count()
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct PreparedDirectBindingUnit {
@@ -313,6 +376,8 @@ pub(crate) struct PreparedDirectBindingUnit {
     owner: DirectBindingUnitOwner,
     cell_owners: Vec<DirectBindingOwner>,
     edge_records: Vec<PreparedDirectBindingEdge>,
+    #[cfg(test)]
+    edge_group_builds: usize,
 }
 
 pub(crate) struct PreparedDirectBindingEdge {
@@ -324,6 +389,43 @@ pub(crate) struct PreparedDirectBindingEdge {
 impl PreparedDirectBindingUnit {
     pub(crate) const fn unit_index(&self) -> usize {
         self.unit_index
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_count(&self) -> usize {
+        self.owner.record_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owned_record_count(&self) -> usize {
+        self.owner.owned_records.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn edge_group_builds(&self) -> usize {
+        self.edge_group_builds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cell_owner_count(&self) -> usize {
+        self.cell_owners.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mapped_record_owner(&self, index: usize) -> Option<(u32, DirectBindingCellVa)> {
+        let owner = self.cell_owners.get(index)?;
+        match owner.record {
+            DirectBindingRecordOwner::V2(_) => None,
+            DirectBindingRecordOwner::V3 { record_index } => Some((record_index, owner.cell)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edge_members(&self, source: GuestVa, target: GuestVa) -> &[(usize, usize)] {
+        self.edge_records
+            .iter()
+            .find(|edge| edge.key == (source, target))
+            .map_or(&[], |edge| edge.records.as_slice())
     }
 }
 
@@ -580,33 +682,42 @@ impl DirectBindingRegistry {
         })?;
         let unit_index = self.units.len();
         if !self.enabled || unit.binding_layout() == DirectBindingLayout::Disabled {
-            let records = match &unit.metadata {
+            let owned_records = match &unit.metadata {
                 crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => {
                     manifest.bindings.clone().into_boxed_slice()
                 }
                 crate::shared_cache::LoadedTranslationMetadata::V3(_) => Box::new([]),
             };
+            let (edge_records, _edge_group_builds) = match &unit.metadata {
+                crate::shared_cache::LoadedTranslationMetadata::V2(_) => {
+                    (self.prepare_unit_edges(unit_index, &owned_records)?, 1)
+                }
+                crate::shared_cache::LoadedTranslationMetadata::V3(_) => (Vec::new(), 0),
+            };
             let owner = DirectBindingUnitOwner {
                 key: unit.key().clone(),
                 binding_base: None,
                 binding_layout: DirectBindingLayout::Disabled,
-                records,
+                owned_records,
                 published_bitmap: Box::new([]),
                 source_lease: unit.clone(),
             };
-            let edge_records = self.prepare_unit_edges(unit_index, &owner.records)?;
             return Ok(PreparedDirectBindingUnit {
                 unit_index,
                 owner,
                 cell_owners: Vec::new(),
                 edge_records,
+                #[cfg(test)]
+                edge_group_builds: _edge_group_builds,
             });
         }
-        let manifest = unit.metadata.v2().ok_or_else(|| {
-            DsrError::CachePolicy("mapped direct-binding metadata is unsupported".to_string())
-        })?;
-        if manifest.binding_layout != DirectBindingLayout::SidecarV1
-            || manifest.cell_size != DIRECT_BINDING_CELL_SIZE
+        if unit.binding_layout() != DirectBindingLayout::SidecarV1
+            || match &unit.metadata {
+                crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => manifest.cell_size,
+                crate::shared_cache::LoadedTranslationMetadata::V3(metadata) => {
+                    metadata.cell_size()
+                }
+            } != DIRECT_BINDING_CELL_SIZE
         {
             return Err(DsrError::CachePolicy(
                 "direct-binding unit has an unsupported cell layout".to_string(),
@@ -615,14 +726,19 @@ impl DirectBindingRegistry {
         let binding_base = unit.binding_base.ok_or_else(|| {
             DsrError::CachePolicy("direct-binding unit has no mapped cell base".to_string())
         })?;
-        let records = manifest.bindings.clone().into_boxed_slice();
-        let expected_len = records
-            .len()
+        let owned_records = match &unit.metadata {
+            crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => {
+                manifest.bindings.clone().into_boxed_slice()
+            }
+            crate::shared_cache::LoadedTranslationMetadata::V3(_) => Box::new([]),
+        };
+        let record_count = unit.binding_count();
+        let expected_len = record_count
             .checked_mul(DIRECT_BINDING_CELL_SIZE as usize)
             .ok_or_else(|| {
                 DsrError::CachePolicy("direct-binding cell range overflow".to_string())
             })?;
-        let binding_len = usize::try_from(manifest.binding_data_len).map_err(|_| {
+        let binding_len = usize::try_from(unit.binding_data_len()).map_err(|_| {
             DsrError::CachePolicy("direct-binding data length does not fit usize".to_string())
         })?;
         if binding_len != expected_len {
@@ -634,13 +750,40 @@ impl DirectBindingRegistry {
             DsrError::CachePolicy("direct-binding cell range overflow".to_string())
         })?;
         let mut owners = Vec::new();
-        owners.try_reserve(records.len()).map_err(|error| {
+        owners.try_reserve(record_count).map_err(|error| {
             DsrError::CachePolicy(format!(
                 "direct-binding cell owner reservation failed for {} records: {error}",
-                records.len()
+                record_count
             ))
         })?;
-        for record in &records {
+        for record_index in 0..record_count {
+            let (record, record_owner) = match &unit.metadata {
+                crate::shared_cache::LoadedTranslationMetadata::V2(_) => {
+                    let record = owned_records.get(record_index).cloned().ok_or_else(|| {
+                        DsrError::CachePolicy(format!(
+                            "direct-binding V2 record index {record_index} is invalid"
+                        ))
+                    })?;
+                    let owner = DirectBindingRecordOwner::V2(record.clone());
+                    (record, owner)
+                }
+                crate::shared_cache::LoadedTranslationMetadata::V3(metadata) => {
+                    let record_index = u32::try_from(record_index).map_err(|_| {
+                        DsrError::CachePolicy(
+                            "mapped direct-binding record index exceeds u32".to_string(),
+                        )
+                    })?;
+                    let record = metadata
+                        .binding(record_index as usize)
+                        .ok_or_else(|| {
+                            DsrError::CachePolicy(format!(
+                                "mapped direct-binding record index {record_index} is invalid"
+                            ))
+                        })?
+                        .record();
+                    (record, DirectBindingRecordOwner::V3 { record_index })
+                }
+            };
             let offset = usize::try_from(record.ordinal.get())
                 .ok()
                 .and_then(|ordinal| ordinal.checked_mul(DIRECT_BINDING_CELL_SIZE as usize))
@@ -684,11 +827,11 @@ impl DirectBindingRegistry {
             }
             owners.push(DirectBindingOwner {
                 unit_index,
-                record: record.clone(),
+                record: record_owner,
                 cell,
             });
         }
-        let bitmap_words = records.len().div_ceil(u64::BITS as usize);
+        let bitmap_words = record_count.div_ceil(u64::BITS as usize);
         let mut published_bitmap = Vec::new();
         published_bitmap
             .try_reserve_exact(bitmap_words)
@@ -698,20 +841,29 @@ impl DirectBindingRegistry {
                 ))
             })?;
         published_bitmap.resize(bitmap_words, 0);
+        let (edge_records, _edge_group_builds) = match &unit.metadata {
+            crate::shared_cache::LoadedTranslationMetadata::V2(_) => {
+                (self.prepare_unit_edges(unit_index, &owned_records)?, 1)
+            }
+            crate::shared_cache::LoadedTranslationMetadata::V3(metadata) => {
+                (self.prepare_mapped_unit_edges(unit_index, metadata)?, 0)
+            }
+        };
         let owner = DirectBindingUnitOwner {
-            key: manifest.key.clone(),
+            key: unit.key().clone(),
             binding_base: Some(binding_base),
             binding_layout: DirectBindingLayout::SidecarV1,
-            records,
+            owned_records,
             published_bitmap: published_bitmap.into_boxed_slice(),
             source_lease: unit.clone(),
         };
-        let edge_records = self.prepare_unit_edges(unit_index, &owner.records)?;
         Ok(PreparedDirectBindingUnit {
             unit_index,
             owner,
             cell_owners: owners,
             edge_records,
+            #[cfg(test)]
+            edge_group_builds: _edge_group_builds,
         })
     }
 
@@ -765,6 +917,89 @@ impl DirectBindingRegistry {
                 records,
                 existing,
             });
+        }
+        Ok(prepared)
+    }
+
+    fn prepare_mapped_unit_edges(
+        &mut self,
+        unit_index: usize,
+        metadata: &crate::mapped_metadata::ValidatedMappedTranslationMetadata,
+    ) -> Result<Vec<PreparedDirectBindingEdge>, DsrError> {
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(metadata.edge_group_count())
+            .map_err(|error| {
+                DsrError::CachePolicy(format!(
+                    "mapped direct-binding edge batch reservation failed for {} edges: {error}",
+                    metadata.edge_group_count()
+                ))
+            })?;
+        for group_index in 0..metadata.edge_group_count() {
+            let group = metadata.edge_group(group_index).ok_or_else(|| {
+                DsrError::CachePolicy(format!(
+                    "mapped direct-binding edge-group index {group_index} is invalid"
+                ))
+            })?;
+            let key = (group.source(), group.target());
+            let members = group.members();
+            let member_count = members.size_hint().1.ok_or_else(|| {
+                DsrError::CachePolicy(
+                    "mapped direct-binding edge-member count is unavailable".to_string(),
+                )
+            })?;
+            let mut records = Vec::new();
+            records.try_reserve_exact(member_count).map_err(|error| {
+                DsrError::CachePolicy(format!(
+                    "mapped direct-binding edge reservation failed for {member_count} records: {error}"
+                ))
+            })?;
+            for ordinal in members {
+                let binding_index = usize::try_from(ordinal.get()).map_err(|_| {
+                    DsrError::CachePolicy(
+                        "mapped direct-binding edge member does not fit usize".to_string(),
+                    )
+                })?;
+                let record = metadata
+                    .binding(binding_index)
+                    .ok_or_else(|| {
+                        DsrError::CachePolicy(format!(
+                            "mapped direct-binding edge member {binding_index} is invalid"
+                        ))
+                    })?
+                    .record();
+                if record.ordinal != ordinal || (record.source, record.target) != key {
+                    return Err(DsrError::CachePolicy(format!(
+                        "mapped direct-binding edge member {binding_index} has a corrupt back-reference"
+                    )));
+                }
+                records.push((unit_index, binding_index));
+            }
+            if records.len() != member_count {
+                return Err(DsrError::CachePolicy(format!(
+                    "mapped direct-binding edge group {group_index} has missing members"
+                )));
+            }
+            prepared.push(PreparedDirectBindingEdge {
+                key,
+                records,
+                existing: self.records_by_edge.contains_key(&key),
+            });
+        }
+
+        // All mapped records and their back-references are proven before any
+        // process-local destination capacity changes.
+        for edge in &prepared {
+            if edge.existing
+                && let Some(destination) = self.records_by_edge.get_mut(&edge.key)
+            {
+                destination.try_reserve(edge.records.len()).map_err(|error| {
+                    DsrError::CachePolicy(format!(
+                        "direct-binding existing edge reservation failed for {} records: {error}",
+                        edge.records.len()
+                    ))
+                })?;
+            }
         }
         Ok(prepared)
     }
@@ -829,7 +1064,7 @@ impl DirectBindingRegistry {
                 let Some(unit) = self.units.get(unit_index) else {
                     continue;
                 };
-                let Some(record) = unit.records.get(record_index) else {
+                let Some(record) = unit.record(record_index) else {
                     continue;
                 };
                 let eligible = record.ordinal == exact_miss.ordinal
@@ -838,7 +1073,11 @@ impl DirectBindingRegistry {
                         .get(&exact_miss.cell)
                         .is_some_and(|owner| {
                             owner.unit_index == unit_index
-                                && owner.record == *record
+                                && owner.record.resolve(unit).is_some_and(
+                                    |(owner_index, owner_record)| {
+                                        owner_index == record_index && owner_record == record
+                                    },
+                                )
                                 && owner.cell == exact_miss.cell
                         });
                 if eligible {
@@ -859,7 +1098,11 @@ impl DirectBindingRegistry {
             }
         };
         let unit = &self.units[unit_index];
-        let record = &unit.records[record_index];
+        let Some(record) = unit.record(record_index) else {
+            self.counters.owner_validation_failures =
+                self.counters.owner_validation_failures.saturating_add(1);
+            return Err(DirectBindingValidationReason::OwnerMismatch);
+        };
         let cell = match unit.binding_layout {
             DirectBindingLayout::Disabled => {
                 if miss.is_some() {
@@ -886,7 +1129,12 @@ impl DirectBindingRegistry {
                     return Err(DirectBindingValidationReason::OwnerMismatch);
                 };
                 if owner.unit_index != unit_index
-                    || owner.record != *record
+                    || !owner
+                        .record
+                        .resolve(unit)
+                        .is_some_and(|(owner_index, owner_record)| {
+                            owner_index == record_index && owner_record == record
+                        })
                     || owner.cell != miss.cell
                 {
                     self.counters.owner_validation_failures =
@@ -1066,6 +1314,9 @@ impl DirectBindingRegistry {
             return false;
         };
         let ordinal = ordinal.get() as usize;
+        if unit.record(ordinal).is_none() {
+            return false;
+        }
         let Some(word) = unit.published_bitmap.get(ordinal / u64::BITS as usize) else {
             return false;
         };
@@ -1196,8 +1447,8 @@ impl DirectBindingRegistry {
             descriptors_len: self.descriptors.len(),
             descriptors_capacity: self.descriptors.capacity(),
             incoming_len: self.incoming.len(),
-            records_address: unit.records.as_ptr() as usize,
-            records_len: unit.records.len(),
+            records_address: unit.owned_records.as_ptr() as usize,
+            records_len: unit.owned_records.len(),
             bitmap_address: unit.published_bitmap.as_ptr() as usize,
             bitmap_len: unit.published_bitmap.len(),
         }
@@ -1215,7 +1466,9 @@ impl DirectBindingRegistry {
                         unit.key.clone(),
                         unit.binding_base,
                         unit.binding_layout,
-                        unit.records.to_vec(),
+                        (0..unit.record_count())
+                            .filter_map(|index| unit.record(index))
+                            .collect(),
                         unit.published_bitmap.to_vec(),
                         unit.source_lease.key().clone(),
                         unit.source_lease.base,
@@ -1226,7 +1479,11 @@ impl DirectBindingRegistry {
             owners: self
                 .owners_by_cell
                 .iter()
-                .map(|(cell, owner)| (*cell, owner.unit_index, owner.record.clone()))
+                .filter_map(|(cell, owner)| {
+                    let unit = self.units.get(owner.unit_index)?;
+                    let (_, record) = owner.record.resolve(unit)?;
+                    Some((*cell, owner.unit_index, record))
+                })
                 .collect(),
             edges: self
                 .records_by_edge
@@ -1282,29 +1539,29 @@ impl DirectBindingRegistry {
             return None;
         }
         let owner = self.owners_by_cell.get(&miss.cell)?;
-        if owner.cell != miss.cell
-            || owner.record.ordinal != miss.ordinal
-            || owner.record.source != source
-            || owner.record.target != target
-        {
+        if owner.cell != miss.cell {
             return None;
         }
         let unit = self.units.get(owner.unit_index)?;
-        let record = unit.records.get(miss.ordinal.get() as usize)?;
+        let (owner_record_index, owner_record) = owner.record.resolve(unit)?;
+        if owner_record.ordinal != miss.ordinal
+            || owner_record.source != source
+            || owner_record.target != target
+        {
+            return None;
+        }
+        let record_index = usize::try_from(miss.ordinal.get()).ok()?;
+        let record = unit.record(record_index)?;
         let offset = usize::try_from(miss.ordinal.get())
             .ok()?
             .checked_mul(DIRECT_BINDING_CELL_SIZE as usize)?;
         let binding_base = unit.binding_base?;
         let expected_cell = DirectBindingCellVa::mapped(binding_base.get().checked_add(offset)?)?;
-        if record != &owner.record
+        if record != owner_record
+            || record_index != owner_record_index
             || expected_cell != miss.cell
             || unit.source_lease.key() != &unit.key
             || unit.source_lease.binding_base != Some(binding_base)
-            || !unit
-                .source_lease
-                .metadata
-                .v2()
-                .is_some_and(|manifest| manifest.bindings.as_slice() == unit.records.as_ref())
         {
             return None;
         }
@@ -1336,6 +1593,9 @@ impl DirectBindingRegistry {
             return false;
         };
         let ordinal = source.ordinal.get() as usize;
+        if unit.record(ordinal).is_none() {
+            return false;
+        }
         let Some(word) = unit.published_bitmap.get_mut(ordinal / u64::BITS as usize) else {
             return false;
         };
@@ -1354,6 +1614,7 @@ impl DirectBindingRegistry {
     ) {
         let ordinal = source.ordinal.get() as usize;
         let unit = &mut self.units[unit_index];
+        debug_assert!(unit.record(ordinal).is_some());
         unit.published_bitmap[ordinal / u64::BITS as usize] |=
             1_u64 << (ordinal % u64::BITS as usize);
         let descriptor = &self.descriptors[self.descriptors.len() - 1];
@@ -1379,14 +1640,13 @@ impl DirectBindingRegistry {
                 continue;
             };
             let mut last_page = None;
-            for (word_index, word) in unit.published_bitmap.iter_mut().enumerate() {
-                let mut published = *word;
-                *word = 0;
+            for word_index in 0..unit.published_bitmap.len() {
+                let mut published = std::mem::take(&mut unit.published_bitmap[word_index]);
                 while published != 0 {
                     let bit = published.trailing_zeros() as usize;
                     published &= published - 1;
                     let ordinal = word_index * u64::BITS as usize + bit;
-                    if ordinal >= unit.records.len() {
+                    if unit.record(ordinal).is_none() {
                         continue;
                     }
                     let address = binding_base.get() + ordinal * DIRECT_BINDING_CELL_SIZE as usize;
