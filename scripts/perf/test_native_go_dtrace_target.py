@@ -154,6 +154,29 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
         self.assertIsNone(mapped["CARRICK_DSR_SHARED_MAPPED_METADATA"])
         self.assertEqual(control["CARRICK_DSR_SHARED_MAPPED_METADATA"], "0")
 
+    def test_real_loaded_launcher_directional_and_risk_code_matches_source(self) -> None:
+        modules = (
+            native_go_dtrace_target,
+            native_go_dtrace_target.native_pc_range_directional,
+            native_go_dtrace_target.native_pc_range_risk,
+        )
+        for module in modules:
+            with self.subTest(module=module.__name__):
+                identity = (
+                    native_go_dtrace_target.native_pc_range_risk.authenticate_loaded_module_source(
+                        pathlib.Path(module.__file__), module.LOADED_MODULE_CODE
+                    )
+                )
+                self.assertEqual(identity["loaded_code"], module.LOADED_MODULE_CODE)
+                self.assertEqual(
+                    identity["loaded_code"]["digest_method"],
+                    "sha256-canonical-marshal-roundtrip-v1",
+                )
+                self.assertEqual(
+                    identity["source"]["path"],
+                    str(pathlib.Path(module.__file__).resolve()),
+                )
+
     def test_cli_records_metadata_mode_in_target_provenance(self) -> None:
         class CompletedProcess:
             def __init__(self, _command, *, cwd, env):
@@ -476,6 +499,24 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "failed")
         self.assertIn("drift", " ".join(receipt["failures"]))
 
+    def test_standalone_preflight_rejects_unauthenticated_loaded_source(self) -> None:
+        with mock.patch.object(
+            native_go_dtrace_target.native_pc_range_risk,
+            "authenticate_loaded_module_source",
+            create=True,
+            side_effect=ValueError("loaded module code does not match source"),
+        ):
+            result, raw, temporary = self.run_standalone_fixture(
+                self.strict_raw(),
+                b"WORKLOAD_NS=123\nBUILD_OK\n",
+                b"ok\n",
+            )
+        self.addCleanup(temporary.cleanup)
+        self.assertEqual(result, 2)
+        receipt = json.loads(raw.with_suffix(".capture.json").read_text())
+        self.assertEqual(receipt["status"], "failed")
+        self.assertIn("loaded module code", " ".join(receipt["failures"]))
+
     def test_standalone_capture_invalidates_stale_raw_before_failed_rerun(self) -> None:
         result, raw, temporary = self.run_standalone_fixture(
             self.strict_raw(),
@@ -590,6 +631,17 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             receipt["binary"]["macho_uuid"],
             "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
         )
+        self.assertEqual(
+            receipt["execution_identity"]["pre"],
+            receipt["execution_identity"]["post"],
+        )
+        for role in ("launcher", "analyzer"):
+            authority = receipt["execution_identity"]["pre"][role]
+            self.assertIn("source", authority)
+            self.assertEqual(
+                authority["loaded_code"]["digest_method"],
+                "sha256-canonical-marshal-roundtrip-v1",
+            )
 
     def test_standalone_capture_accepts_real_nativeperf1_mechanism_stream(self) -> None:
         result, _raw, temporary = self.run_standalone_fixture(

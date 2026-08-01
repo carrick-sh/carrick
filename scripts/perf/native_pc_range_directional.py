@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""Classify sampled native PCs against Carrick's translated-range catalog.
+from __future__ import annotations
+
+import hashlib
+import marshal
+import sys
+
+
+_module_frame = sys._getframe()
+LOADED_MODULE_CODE = {
+    "digest_method": "sha256-canonical-marshal-roundtrip-v1",
+    "filename": _module_frame.f_code.co_filename,
+    "flags": _module_frame.f_code.co_flags,
+    "marshal_sha256": hashlib.sha256(
+        marshal.dumps(marshal.loads(marshal.dumps(_module_frame.f_code)))
+    ).hexdigest(),
+    "marshal_version": marshal.version,
+    "optimize": sys.flags.optimize,
+    "python_cache_tag": sys.implementation.cache_tag,
+}
+del _module_frame
+
+
+__doc__ = """Classify sampled native PCs against Carrick's translated-range catalog.
 
 This is intentionally directional evidence. DTrace aggregates sampled
 ``(pid, PC)`` pairs without trying to unwind JIT frames; this analyzer joins
@@ -7,16 +29,20 @@ those PCs to the process-owned private/shared range announcements offline.
 It never claims gating eligibility.
 """
 
-from __future__ import annotations
 
 import argparse
 import dataclasses
 import json
 import pathlib
 import re
-import sys
 from collections import Counter, defaultdict
 from collections.abc import Sequence
+
+
+REPO = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
+
+from scripts.perf import native_pc_range_risk
 
 
 SCHEMA = "carrick.native-pc-range-directional.v2"
@@ -26,7 +52,6 @@ KERNEL_STACK_PROTOCOL = "PCKSTACK1"
 KERNEL_STACK_BEGIN = re.compile(
     rf"^{KERNEL_STACK_PROTOCOL}\|begin\|pid=(\d+)\|epoch=(\d+)\|count=(\d+)$"
 )
-
 
 class ProfileError(RuntimeError):
     """The directional capture is malformed or ownership is ambiguous."""
@@ -164,7 +189,8 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
     effective_identities: list[tuple[int, int, int, int]] = []
     completion: dict[str, int] | None = None
 
-    raw_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    raw_payload, input_artifact = native_pc_range_risk.stable_read(path)
+    raw_lines = raw_payload.decode("utf-8", errors="replace").splitlines()
     profile_lines: list[tuple[int, str]] = []
     index = 0
     while index < len(raw_lines):
@@ -531,6 +557,7 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
         "hot_translated_ranges": hot_translated_ranges,
         "host_binary_offsets": hot_host_binary_offsets,
         "host_leaves": host_leaves,
+        "input_artifact": input_artifact,
         "kernel_stack_capture": {
             "catalogs": kernel_catalogs,
             "kernel_samples": kernel_total,

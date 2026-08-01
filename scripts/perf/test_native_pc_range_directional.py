@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import tempfile
@@ -50,6 +51,19 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
         self.assertEqual(
             result["effective_identity"],
             {"egids": [20], "euids": [501], "reported": 1},
+        )
+
+    def test_analysis_binds_the_exact_stable_raw_input_generation(self) -> None:
+        raw = self.complete_strict_capture()
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "profile.raw"
+            payload = raw.encode()
+            path.write_bytes(payload)
+            result = analyze_raw(path)
+        self.assertEqual(result["input_artifact"]["bytes"], len(payload))
+        self.assertEqual(
+            result["input_artifact"]["sha256"],
+            hashlib.sha256(payload).hexdigest(),
         )
 
     def test_strict_gate_rejects_zero_usdt_provider_capture(self) -> None:
@@ -382,14 +396,46 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
             "PCLEAF2|pid=%d|epoch=%d|pc=%#x|module=%A|symbol=%A|count=%@u",
             script,
         )
-        self.assertIn("@outside_user_pc[(pid_t)pid, current_epoch[pid]", script)
-        self.assertIn("@private_user_pc[(pid_t)pid, current_epoch[pid]", script)
-        self.assertIn("@kernel_stack[(pid_t)pid, current_epoch[pid]", script)
         self.assertIn("stack(24)", script)
         self.assertIn("PCKSTACK1|begin|pid=%d|epoch=%d|count=%@u", script)
         self.assertNotIn("trunc(@kernel_stack", script)
         self.assertNotIn("@user_pc[", script)
         self.assertNotIn("trunc(@outside_leaf", script)
+
+    def test_dtrace_profile_snapshots_epoch_once_for_each_paired_stream(self) -> None:
+        script = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "scripts/dtrace/native-pc-range-directional.d"
+        ).read_text(encoding="utf-8")
+
+        def action_block(marker: str) -> str:
+            marker_offset = script.index(marker)
+            start = script.rfind("{", 0, marker_offset)
+            end = script.index("}", marker_offset)
+            return script[start : end + 1]
+
+        outside = action_block("@outside_user_pc[")
+        self.assertEqual(outside.count("current_epoch["), 1)
+        self.assertIn(
+            "this->sample_epoch = current_epoch[this->sample_pid];", outside
+        )
+        self.assertIn(
+            "@outside_user_pc[this->sample_pid, this->sample_epoch,", outside
+        )
+        self.assertIn(
+            "@outside_leaf[this->sample_pid, this->sample_epoch,", outside
+        )
+
+        kernel = action_block("@kernel_pid[")
+        self.assertEqual(kernel.count("current_epoch["), 1)
+        self.assertIn(
+            "this->sample_epoch = current_epoch[this->sample_pid];", kernel
+        )
+        self.assertIn("@kernel_pid[this->sample_pid, this->sample_epoch]", kernel)
+        self.assertIn(
+            "@kernel_stack[this->sample_pid, this->sample_epoch, stack(24)]",
+            kernel,
+        )
 
     def test_deduplicates_exact_fork_replay_ranges(self) -> None:
         result = self.analyze(

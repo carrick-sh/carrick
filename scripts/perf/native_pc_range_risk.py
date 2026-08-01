@@ -1,10 +1,30 @@
 #!/usr/bin/env python3
-"""Compare authenticated V2/V3 directional owner-risk capture pairs."""
-
 from __future__ import annotations
 
-import argparse
 import hashlib
+import marshal
+import sys
+
+
+_module_frame = sys._getframe()
+LOADED_MODULE_CODE = {
+    "digest_method": "sha256-canonical-marshal-roundtrip-v1",
+    "filename": _module_frame.f_code.co_filename,
+    "flags": _module_frame.f_code.co_flags,
+    "marshal_sha256": hashlib.sha256(
+        marshal.dumps(marshal.loads(marshal.dumps(_module_frame.f_code)))
+    ).hexdigest(),
+    "marshal_version": marshal.version,
+    "optimize": sys.flags.optimize,
+    "python_cache_tag": sys.implementation.cache_tag,
+}
+del _module_frame
+
+
+__doc__ = """Compare authenticated V2/V3 directional owner-risk capture pairs."""
+
+
+import argparse
 import itertools
 import json
 import os
@@ -12,7 +32,6 @@ import pathlib
 import plistlib
 import re
 import subprocess
-import sys
 import tempfile
 import xml.parsers.expat
 from collections import Counter
@@ -49,50 +68,130 @@ EXACT_REQUIRED_CONTROLS = {
 }
 
 
-def _sha256(path: pathlib.Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _marshal_code_sha256(code: object) -> str:
+    canonical = marshal.loads(marshal.dumps(code))
+    return _sha256_bytes(marshal.dumps(canonical))
+
+
+def stable_read(path: pathlib.Path) -> tuple[bytes, dict[str, object]]:
+    """Read and bind one immutable path generation from one open descriptor."""
+    requested = pathlib.Path(os.path.abspath(os.fspath(path)))
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(requested, flags)
+    try:
+        before = os.fstat(descriptor)
+        blocks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            blocks.append(block)
+        payload = b"".join(blocks)
+        after_read = os.fstat(descriptor)
+        sha256 = _sha256_bytes(payload)
+        path_after = os.stat(requested)
+        final = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = _stat_identity(before)
+    if (
+        identity != _stat_identity(after_read)
+        or identity != _stat_identity(final)
+        or identity != _stat_identity(path_after)
+        or len(payload) != final.st_size
+    ):
+        raise ValueError(f"artifact drifted or was replaced while reading: {requested}")
+    resolved = requested.resolve(strict=True)
+    if _stat_identity(os.stat(resolved)) != identity:
+        raise ValueError(f"artifact path identity drifted while reading: {requested}")
+    return payload, {
+        "bytes": len(payload),
+        "path": str(resolved),
+        "sha256": sha256,
+        "stat": {
+            "ctime_ns": final.st_ctime_ns,
+            "device": final.st_dev,
+            "inode": final.st_ino,
+            "mode": final.st_mode,
+            "mtime_ns": final.st_mtime_ns,
+            "size": final.st_size,
+        },
+    }
+
+
+def stable_read_json(
+    path: pathlib.Path,
+) -> tuple[object, dict[str, object]]:
+    payload, artifact = stable_read(path)
+    return json.loads(payload), artifact
 
 
 def _artifact(path: pathlib.Path) -> dict[str, object]:
-    absolute = path.resolve(strict=True)
-    before = absolute.stat()
-    sha256 = _sha256(absolute)
-    after = absolute.stat()
-    before_identity = (
-        before.st_dev,
-        before.st_ino,
-        before.st_mode,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-    )
-    after_identity = (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    )
-    if before_identity != after_identity:
-        raise ValueError(f"artifact drifted while hashing: {absolute}")
-    return {
-        "bytes": after.st_size,
-        "path": str(absolute),
-        "sha256": sha256,
-        "stat": {
-            "ctime_ns": after.st_ctime_ns,
-            "device": after.st_dev,
-            "inode": after.st_ino,
-            "mode": after.st_mode,
-            "mtime_ns": after.st_mtime_ns,
-            "size": after.st_size,
-        },
-    }
+    _payload, artifact = stable_read(path)
+    return artifact
+
+
+def authenticate_loaded_module_source(
+    path: pathlib.Path, loaded_code: object
+) -> dict[str, object]:
+    """Prove stable source bytes compile to the code this process executed."""
+    if not isinstance(loaded_code, dict):
+        raise ValueError("loaded module code identity is malformed")
+    filename = loaded_code.get("filename")
+    flags = loaded_code.get("flags")
+    optimize = loaded_code.get("optimize")
+    expected_digest = loaded_code.get("marshal_sha256")
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or not isinstance(flags, int)
+        or isinstance(flags, bool)
+        or not isinstance(optimize, int)
+        or isinstance(optimize, bool)
+        or optimize not in (0, 1, 2)
+        or not isinstance(expected_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+        or loaded_code.get("digest_method")
+        != "sha256-canonical-marshal-roundtrip-v1"
+        or loaded_code.get("marshal_version") != marshal.version
+        or loaded_code.get("python_cache_tag") != sys.implementation.cache_tag
+    ):
+        raise ValueError("loaded module code identity is malformed")
+    source, source_artifact = stable_read(path)
+    if pathlib.Path(filename).resolve(strict=True) != pathlib.Path(
+        str(source_artifact["path"])
+    ):
+        raise ValueError("loaded module code filename does not match source path")
+    try:
+        compiled = compile(
+            source,
+            filename,
+            "exec",
+            flags=flags,
+            dont_inherit=True,
+            optimize=optimize,
+        )
+    except (SyntaxError, ValueError) as error:
+        raise ValueError("loaded module source cannot be recompiled exactly") from error
+    observed_digest = _marshal_code_sha256(compiled)
+    if observed_digest != expected_digest:
+        raise ValueError("loaded module code does not match stable source")
+    return {"loaded_code": dict(loaded_code), "source": source_artifact}
 
 
 def atomic_write_json(path: pathlib.Path, payload: dict[str, object]) -> None:
@@ -100,6 +199,7 @@ def atomic_write_json(path: pathlib.Path, payload: dict[str, object]) -> None:
     destination = path.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: pathlib.Path | None = None
+    replaced = False
     try:
         with tempfile.NamedTemporaryFile(
             "w",
@@ -116,14 +216,66 @@ def atomic_write_json(path: pathlib.Path, payload: dict[str, object]) -> None:
             os.fsync(stream.fileno())
         os.replace(temporary_path, destination)
         temporary_path = None
+        replaced = True
         directory_fd = os.open(destination.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+    except BaseException as error:
+        if replaced:
+            try:
+                _revoke_replaced_json(destination)
+            except BaseException as revoke_error:
+                raise OSError(
+                    "atomic JSON publication failed and passed destination "
+                    "could not be revoked"
+                ) from revoke_error
+        raise error
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def _revoke_replaced_json(destination: pathlib.Path) -> None:
+    """Ensure a non-durable replacement cannot remain authoritative as passed."""
+    tombstone: pathlib.Path | None = None
+    try:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=destination.parent,
+                encoding="utf-8",
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                tombstone = pathlib.Path(stream.name)
+                json.dump(
+                    {
+                        "failures": ["atomic publication durability failed"],
+                        "status": "failed",
+                    },
+                    stream,
+                    indent=2,
+                    sort_keys=True,
+                )
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tombstone, destination)
+            tombstone = None
+    finally:
+        if tombstone is not None:
+            tombstone.unlink(missing_ok=True)
+    try:
+        observed, _artifact_identity = stable_read_json(destination)
+    except FileNotFoundError:
+        return
+    if not isinstance(observed, dict) or observed.get("status") == "passed":
+        raise OSError("atomic publication revocation left a passed destination")
 
 
 def invalidate_output(path: pathlib.Path) -> None:
@@ -446,19 +598,32 @@ def classify(
             raise ValueError("analysis has a malformed host leaf")
         consume(module, symbol, count, "named_leaf", None)
     persisted_symbolizations: list[dict[str, object]] = []
+    non_instruction_section_owners: list[dict[str, object]] = []
     non_instruction_section_samples = 0
     non_instruction_section_offsets = 0
     for offset, count in offsets:
         mapping = mappings[offset]
+        owner_kind = mapping.get("owner_kind")
         module, symbol = mapping.get("module"), mapping.get("symbol")
         if not isinstance(module, str) or not isinstance(symbol, str):
             raise ValueError("host binary offset has malformed exact symbolization")
-        offset_text = f"0x{offset:x}"
-        consume(module, symbol, count, "host_binary_offset", offset_text)
-        if mapping.get("owner_kind") == "non_instruction_section":
+        persisted = {**mapping, "count": count}
+        if owner_kind == "non_instruction_section":
+            if any(
+                not isinstance(mapping.get(key), str) or not mapping.get(key)
+                for key in ("section", "section_offset", "segment")
+            ):
+                raise ValueError("non-instruction section owner is malformed")
             non_instruction_section_samples += count
             non_instruction_section_offsets += 1
-        persisted_symbolizations.append({**mapping, "count": count})
+            non_instruction_section_owners.append(persisted)
+            persisted_symbolizations.append(persisted)
+            continue
+        if owner_kind != "instruction_symbol":
+            raise ValueError("host binary offset owner kind is malformed")
+        offset_text = f"0x{offset:x}"
+        consume(module, symbol, count, "host_binary_offset", offset_text)
+        persisted_symbolizations.append(persisted)
 
     kernel_stacks = analysis.get("kernel_stacks", [])
     if not isinstance(kernel_stacks, list):
@@ -509,6 +674,7 @@ def classify(
         "all_samples": all_samples,
         "categories": categories,
         "host_binary_offset_symbolizations": persisted_symbolizations,
+        "non_instruction_section_owners": non_instruction_section_owners,
         "non_instruction_section_offsets": non_instruction_section_offsets,
         "non_instruction_section_samples": non_instruction_section_samples,
     }
@@ -529,6 +695,11 @@ def _aggregate(classifications: list[dict[str, object]]) -> dict[str, object]:
         "all_samples": all_samples,
         "captures": len(classifications),
         "categories": categories,
+        "non_instruction_section_owners": [
+            owner
+            for row in classifications
+            for owner in row.get("non_instruction_section_owners", [])
+        ],
         "non_instruction_section_offsets": sum(
             int(row.get("non_instruction_section_offsets", 0))
             for row in classifications
@@ -540,13 +711,17 @@ def _aggregate(classifications: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
-def _validate_analysis(analysis: dict[str, object]) -> None:
+def _validate_analysis(
+    analysis: dict[str, object], raw_artifact: dict[str, object]
+) -> None:
     if analysis.get("schema") != "carrick.native-pc-range-directional.v2":
         raise ValueError("capture analysis schema is not directional v2")
     if analysis.get("warnings") != []:
         raise ValueError("capture analysis has warnings")
     if analysis.get("completion") != {"target_exit": 1, "timed_out": 0}:
         raise ValueError("capture did not complete naturally")
+    if analysis.get("input_artifact") != raw_artifact:
+        raise ValueError("capture analysis does not bind the exact raw input artifact")
     required = ("ranges", "host_text_ranges", "samples", "leaf_capture", "kernel_stack_capture")
     if any(not isinstance(analysis.get(key), dict) for key in required):
         raise ValueError("capture analysis is missing required stream receipts")
@@ -576,7 +751,7 @@ def overlay_authority(metadata_mode: str) -> tuple[dict[str, object], dict[str, 
         path = OVERLAY_PATHS[metadata_mode]
     except KeyError as error:
         raise ValueError(f"unknown metadata mode: {metadata_mode}") from error
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload, source_artifact = stable_read_json(path)
     if (
         not isinstance(payload, dict)
         or any(not isinstance(key, str) for key in payload)
@@ -585,7 +760,7 @@ def overlay_authority(metadata_mode: str) -> tuple[dict[str, object], dict[str, 
         raise ValueError(f"overlay authority is malformed: {path}")
     normalized = dict(payload)
     return {
-        "artifact": _artifact(path),
+        "artifact": source_artifact,
         "normalized_overlay": dict(normalized),
     }, normalized
 
@@ -605,17 +780,32 @@ def _validate_execution_identity(capture: dict[str, object]) -> None:
     before, after = execution.get("pre"), execution.get("post")
     if not isinstance(before, dict) or before != after:
         raise ValueError("capture pre/post execution identity drifted")
-    for role in ("analyzer", "launcher", "overlay_source", "trace_script"):
+    for role in ("analyzer", "launcher"):
+        recorded = before.get(role)
+        if not isinstance(recorded, dict):
+            raise ValueError(f"capture execution identity lacks {role}")
+        source = recorded.get("source")
+        loaded_code = recorded.get("loaded_code")
+        if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+            raise ValueError(f"capture execution identity lacks {role} source")
+        schema = recorded.get("schema") if role == "analyzer" else None
+        expected = authenticate_loaded_module_source(
+            pathlib.Path(str(source["path"])), loaded_code
+        )
+        authority = {key: recorded.get(key) for key in ("loaded_code", "source")}
+        if authority != expected:
+            raise ValueError(
+                f"capture execution {role} loaded-code identity drifted from source"
+            )
+        if role == "analyzer" and schema != "carrick.native-pc-range-directional.v2":
+            raise ValueError("capture analyzer schema drifted")
+    for role in ("overlay_source", "trace_script"):
         recorded = before.get(role)
         if not isinstance(recorded, dict) or not isinstance(recorded.get("path"), str):
             raise ValueError(f"capture execution identity lacks {role}")
-        schema = recorded.get("schema") if role == "analyzer" else None
         expected = _artifact(pathlib.Path(str(recorded["path"])))
-        artifact = {key: recorded.get(key) for key in expected}
-        if artifact != expected:
+        if recorded != expected:
             raise ValueError(f"capture execution {role} identity drifted from disk")
-        if role == "analyzer" and schema != "carrick.native-pc-range-directional.v2":
-            raise ValueError("capture analyzer schema drifted")
     binary = before.get("binary")
     if not isinstance(binary, dict) or binary != capture.get("binary"):
         raise ValueError("capture execution binary identity is malformed")
@@ -646,9 +836,15 @@ def _load_capture(
     *,
     expected_mode: str,
     expected_arm: str,
-) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
-    analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
-    capture = json.loads(capture_path.read_text(encoding="utf-8"))
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    analysis_value, analysis_artifact = stable_read_json(analysis_path)
+    capture_value, capture_artifact = stable_read_json(capture_path)
+    analysis, capture = analysis_value, capture_value
     if not isinstance(analysis, dict) or not isinstance(capture, dict):
         raise ValueError("analysis and capture roots must be JSON objects")
     if capture.get("schema") != CAPTURE_SCHEMA or capture.get("status") != "passed":
@@ -671,7 +867,11 @@ def _load_capture(
     for role, recorded in artifacts.items():
         if not isinstance(recorded, dict) or not isinstance(recorded.get("path"), str):
             raise ValueError(f"capture receipt has malformed {role} artifact")
-        current = _artifact(pathlib.Path(str(recorded["path"])))
+        current = (
+            analysis_artifact
+            if role == "analysis"
+            else _artifact(pathlib.Path(str(recorded["path"])))
+        )
         if current != recorded:
             raise ValueError(f"capture receipt {role} artifact drifted")
         verified_artifacts[role] = current
@@ -688,7 +888,7 @@ def _load_capture(
         or observed != expected
     ):
         raise ValueError("capture receipt has an unverified or root full identity")
-    _validate_analysis(analysis)
+    _validate_analysis(analysis, verified_artifacts["raw"])
     if capture.get("natural_completion") is not True or capture.get("required_streams") != {
         "host_range": True,
         "identity": True,
@@ -700,11 +900,13 @@ def _load_capture(
         "user_and_kernel_samples": True,
     }:
         raise ValueError("capture receipt does not authenticate natural completion and required streams")
-    return analysis, capture, verified_artifacts
+    return analysis, capture, verified_artifacts, capture_artifact
 
 
 def predecessor_binding(
-    capture_path: pathlib.Path, capture: dict[str, object]
+    capture_path: pathlib.Path,
+    capture: dict[str, object],
+    capture_artifact: dict[str, object] | None = None,
 ) -> dict[str, object]:
     chronology = capture.get("chronology")
     if not isinstance(chronology, dict):
@@ -713,7 +915,7 @@ def predecessor_binding(
     if not isinstance(completed, int) or isinstance(completed, bool) or completed <= 0:
         raise ValueError("predecessor capture completion timestamp is malformed")
     return {
-        "artifact": _artifact(capture_path),
+        "artifact": capture_artifact or _artifact(capture_path),
         "campaign_id": capture.get("campaign_id"),
         "completed_unix_ns": completed,
         "pair": capture.get("pair"),
@@ -727,7 +929,10 @@ def validate_chronology(
     capture: dict[str, object],
     *,
     expected_campaign_id: str | None,
-    expected_predecessor: tuple[pathlib.Path, dict[str, object]] | None,
+    expected_predecessor: tuple[
+        pathlib.Path, dict[str, object], dict[str, object]
+    ]
+    | None,
 ) -> str:
     campaign_id = capture.get("campaign_id")
     if not isinstance(campaign_id, str) or not campaign_id:
@@ -753,8 +958,12 @@ def validate_chronology(
         if predecessor is not None:
             raise ValueError("the first V2 control must be the sole chronology root")
     else:
-        predecessor_path, predecessor_capture = expected_predecessor
-        expected = predecessor_binding(predecessor_path, predecessor_capture)
+        predecessor_path, predecessor_capture, predecessor_artifact = (
+            expected_predecessor
+        )
+        expected = predecessor_binding(
+            predecessor_path, predecessor_capture, predecessor_artifact
+        )
         if predecessor != expected:
             raise ValueError("capture predecessor path, hash, status, identity, or order is not exact")
         predecessor_completed = expected["completed_unix_ns"]
@@ -871,7 +1080,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("V2 and V3 raw, analysis, and capture counts must match")
         if count < MINIMUM_PAIRS:
             raise ValueError(f"at least {MINIMUM_PAIRS} independent capture pairs are required")
-        risk_analyzer = _artifact(pathlib.Path(__file__))
+        risk_analyzer = authenticate_loaded_module_source(
+            pathlib.Path(__file__), LOADED_MODULE_CODE
+        )
         binary = inspect_binary_identity(arguments.binary)
         binary_sections = inspect_macho_sections(arguments.binary)
         symbolization_binary = {**binary, "sections": binary_sections}
@@ -886,36 +1097,63 @@ def main(argv: Sequence[str] | None = None) -> int:
         stable_determinants: dict[str, str] = {}
         ordinals: list[int] = []
         campaign_id: str | None = None
-        predecessor: tuple[pathlib.Path, dict[str, object]] | None = None
+        predecessor: tuple[
+            pathlib.Path, dict[str, object], dict[str, object]
+        ] | None = None
         for index in range(count):
-            loaded: list[tuple[dict[str, object], dict[str, object], dict[str, object]]] = []
+            loaded: list[
+                tuple[
+                    dict[str, object],
+                    dict[str, object],
+                    dict[str, object],
+                    dict[str, object],
+                ]
+            ] = []
             for mode, arm, raws, analyses, captures in (
                 ("v2", "control", arguments.v2_raw, arguments.v2_analysis, arguments.v2_capture),
                 ("mapped", "candidate", arguments.v3_raw, arguments.v3_analysis, arguments.v3_capture),
             ):
                 loaded.append(_load_capture(raws[index], analyses[index], captures[index], expected_mode=mode, expected_arm=arm))
-                capture_artifact = _artifact(captures[index])
+                capture_artifact = loaded[-1][3]
                 capture_path = str(capture_artifact["path"])
                 capture_hash = str(capture_artifact["sha256"])
                 if capture_path in artifact_paths or capture_hash in capture_hashes:
                     raise ValueError("capture receipts must have unique paths and hashes")
                 artifact_paths.add(capture_path)
                 capture_hashes.add(capture_hash)
-            (v2_analysis, v2_capture, v2_artifacts), (v3_analysis, v3_capture, v3_artifacts) = loaded
+            (
+                v2_analysis,
+                v2_capture,
+                v2_artifacts,
+                v2_capture_artifact,
+            ), (
+                v3_analysis,
+                v3_capture,
+                v3_artifacts,
+                v3_capture_artifact,
+            ) = loaded
             campaign_id = validate_chronology(
                 arguments.v2_capture[index],
                 v2_capture,
                 expected_campaign_id=campaign_id,
                 expected_predecessor=predecessor,
             )
-            predecessor = (arguments.v2_capture[index], v2_capture)
+            predecessor = (
+                arguments.v2_capture[index],
+                v2_capture,
+                v2_capture_artifact,
+            )
             campaign_id = validate_chronology(
                 arguments.v3_capture[index],
                 v3_capture,
                 expected_campaign_id=campaign_id,
                 expected_predecessor=predecessor,
             )
-            predecessor = (arguments.v3_capture[index], v3_capture)
+            predecessor = (
+                arguments.v3_capture[index],
+                v3_capture,
+                v3_capture_artifact,
+            )
             v2_pair, v3_pair = v2_capture["pair"], v3_capture["pair"]
             assert isinstance(v2_pair, dict) and isinstance(v3_pair, dict)
             if v2_pair.get("id") != v3_pair.get("id") or v2_pair.get("ordinal") != v3_pair.get("ordinal"):
@@ -964,14 +1202,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             v3_classifications.append(v3_classification)
             pairs.append((pair_id, ordinal, v2_classification, v3_classification))
             capture_evidence.append({
-                "candidate": {"artifacts": v3_artifacts, "receipt": _artifact(arguments.v3_capture[index])},
-                "control": {"artifacts": v2_artifacts, "receipt": _artifact(arguments.v2_capture[index])},
+                "candidate": {"artifacts": v3_artifacts, "receipt": v3_capture_artifact},
+                "control": {"artifacts": v2_artifacts, "receipt": v2_capture_artifact},
                 "ordinal": ordinal,
                 "pair_id": pair_id,
             })
         if ordinals != list(range(1, count + 1)) or len(set(ordinals)) != count:
             raise ValueError("capture pair ordinals must be unique and supplied in canonical order")
-        if _artifact(pathlib.Path(__file__)) != risk_analyzer:
+        if (
+            authenticate_loaded_module_source(
+                pathlib.Path(__file__), LOADED_MODULE_CODE
+            )
+            != risk_analyzer
+        ):
             raise ValueError("risk analyzer identity drifted during execution")
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"native_pc_range_risk: {error}", file=sys.stderr)
