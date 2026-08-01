@@ -264,10 +264,54 @@ so the next attempt starts from the fourth.
    footprint at all.
 
 **Therefore attribution must come from instrumenting carrick's own allocator in
-Rust** — a global-allocator shim counting allocations >= ~128 KiB by size and
-site — not from tracing it from outside. That is also what AGENTS.md mandates
-(Rust first, extend `carrick trace`/`carrick debug`), so the measurement route
-and the house rule agree.
+Rust**, not from tracing it from outside. That is also what AGENTS.md mandates
+(Rust first), so the measurement route and the house rule agree. Built as
+`--features alloc-census` (`dhat` as the global allocator, one JSON per pid).
+
+### What the census found
+
+~73% of carrick's heap traffic is the DSR block assembler, all of it allocated
+FRESH PER TRANSLATED BLOCK, against ~800k translations per cold build:
+
+| bytes | allocations | site |
+|---|---|---|
+| 3.63 GiB | 1,212,262 | `emit.rs:5777` `recovery.push(RecoveryEntry)` |
+| 1.06 GiB | 851,303 | `emit.rs:5498` `VecAssembler::new` + `entries` |
+| 0.18 GiB | 203,247 | `emit.rs:5834` |
+| 0.57 GiB | — | `dynasmrt` VecAssembler / reloc / label registries |
+
+Cumulative allocation (~20.4 GB scaled to all ~70 processes) is the same order
+as the measured 28.4 GB of zero-fill first touch, so allocation volume does
+largely translate into faults here rather than being absorbed by malloc reuse.
+
+### Correction: the "large zone" label is wrong
+
+The dominant sites average **1-3 KiB**, i.e. libmalloc's SMALL zone. The
+`0x7x_xxxx_xxxx` window is libmalloc's heap GENERALLY, not specifically the
+>= 128 KiB large zone -- the probe that named it only tested 200 KiB and 8 MiB
+and inferred the rest. The window DECOMPOSITION stands; its label does not.
+
+### The census's resolution limit — read before gating a change on it
+
+Two fixes to the largest site were tried and BOTH rejected on measurement:
+
+| arm | GiB/process | verdict |
+|---|---|---|
+| baseline (`Vec::new`) | 0.292 | — |
+| pre-size by emitted-word count | 0.449 | **+54%, regressed** |
+| thread-local scratch + one exact-size copy | 0.286 | -2%, within noise |
+
+Pre-sizing regressed because `recovery` is MOVED into `AssembledBlock` and
+retained, so over-allocation is retained too. Scratch reuse cannot help for the
+same reason -- the buffer escapes, so only the doubling ladder is avoidable,
+and that turned out not to be where the bytes were.
+
+**The instrument resolves large effects and not small ones.** Process coverage
+varied 23/25/34 across three runs of the identical workload, because a process
+that `execve`s never drops the profiler; that variance swamps anything under
+~10%. It caught a +54% regression immediately and could not adjudicate a 2%
+change. Before gating an allocation change on this census, close the `execve`
+blind spot (flush pre-exec) so coverage is complete rather than representative.
 
 Ruled out with measurements (do not re-litigate): `MADV_WILLNEED` as a populate
 primitive (identical fault count to memset, 262,315 vs 262,315, slightly slower);
