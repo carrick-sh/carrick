@@ -112,18 +112,67 @@ at the predeclared `0.05` threshold and is not a regression. For actual kernel
 time, the authoritative measurement is child-rusage `cpu_sys_s` above:
 `-3.3152680724087724%`, not the traced kernel sample rate.
 
-Task 7's production/correctness authority ran sequentially and passed
-`just fmt-check`, `just clippy`, `cargo test -p carrick-dsr-aarch64 --lib`
-(283), `cargo test -p carrick-native-darwin --lib` (45),
-`RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib` (1,128 passed, 5
-ignored), `RUST_TEST_THREADS=1 just ci`, `just build`, and native smoke
-conformance (23/23 full, 2/2 Node, 6/6 CPython; cached oracles and zero Docker
-runs). Final Task 7 evidence hardening additionally passed the full
-`scripts/perf` discovery (482), focused launcher/directional/risk tests (62),
-the DTrace compile smoke, focused trace-child test, warnings-denied CLI clippy,
-formatting, Python byte-compilation, and diff checks. Task 8 then rebuilt and
-signed clean source `6ccc6471` before freezing the receipt; no tracked source
-changed after preparation or during timing.
+Task 7's accepted production/correctness authority ran these exact commands
+sequentially; this is a durable command ledger of accepted prior outputs, not a
+request to rerun them during Task 8:
+
+```bash
+just fmt-check
+just clippy
+cargo test -p carrick-dsr-aarch64 --lib
+cargo test -p carrick-native-darwin --lib
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib
+RUST_TEST_THREADS=1 just ci
+just build
+codesign -d --entitlements :- target/release/carrick
+otool -l target/release/carrick | grep __dof_carrick
+just conformance-native smoke --workers 4
+just conformance-native smoke --workers 4 --ecosystem node
+just conformance-native smoke --workers 4 --ecosystem cpython
+```
+
+The accepted outputs were: formatting/clippy/CI/build/signing/entitlement/DOF
+all passed; `carrick-dsr-aarch64` passed 283, `carrick-native-darwin` passed 45,
+and serialized `carrick-runtime` passed 1,128 with 5 ignored. The full native
+smoke was 23/23 MATCH, Node was 2/2, and CPython was 6/6; every oracle was
+cached and Docker ran zero times.
+
+The Task 7 report also records this exact post-live evidence command and its
+243/243 result:
+
+```bash
+PYTHONPATH=scripts/perf python3 -m unittest \
+  scripts/perf/test_native_go_build.py \
+  scripts/perf/test_native_go_build_abba.py \
+  scripts/perf/test_native_go_dtrace_target.py \
+  scripts/perf/test_native_pc_range_directional.py \
+  scripts/perf/test_native_compiler_budget.py
+```
+
+Its final evidence-hardening round records these exact invocations against the
+retained tip:
+
+```bash
+cargo test -p carrick-cli trace_child
+cargo clippy -p carrick-cli --all-targets -- -D warnings
+just fmt-check
+git diff --check
+python3 -m py_compile \
+  scripts/perf/native_go_dtrace_target.py \
+  scripts/perf/native_pc_range_directional.py \
+  scripts/perf/native_pc_range_risk.py \
+  scripts/perf/test_native_go_dtrace_target.py \
+  scripts/perf/test_native_pc_range_directional.py \
+  scripts/perf/test_native_pc_range_risk.py
+```
+
+Those exact gates passed (trace-child 1/1); the same accepted report records
+62 focused launcher/directional/risk tests, the full `scripts/perf` discovery
+at 482 with zero failures/errors/skips, two semantic tests, and the DTrace
+compilation smoke as passed. It does not preserve shell argv for those four
+summaries, so this handoff does not invent approximate commands for them.
+Task 8 then rebuilt and signed clean source `6ccc6471` before freezing the
+receipt; no tracked source changed after preparation or during timing.
 
 Keep this incremental V2/V3 result separate from the earlier cumulative stack
 result. The prior direct cumulative improvement remains `15.5007%`; this new
