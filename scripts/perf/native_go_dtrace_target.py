@@ -27,15 +27,17 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from scripts.perf.native_go_build import (
+    DEFAULT_IMAGE,
     ENGINE_CARRICK,
     VARIANT_DEFAULT,
     VARIANT_SHARED,
     RegistryTransport,
     build_command,
+    guest_script,
     variant_environment,
     workload_ns_from_stdout,
 )
-from scripts.perf import native_pc_range_directional
+from scripts.perf import native_pc_range_directional, native_pc_range_risk
 
 
 METADATA_MODE_MAPPED = "mapped"
@@ -46,6 +48,9 @@ DTRACE_DIAGNOSTIC_PATTERNS = (
     re.compile(r"(?im)^dtrace:\s"),
     re.compile(r"(?i)failed to start process notifications"),
     re.compile(r"(?im)^\s*\d+\s+drops?\b"),
+)
+TRACE_CHILD_IDENTITY = re.compile(
+    r"^TRACECHILD1\|euid=(\d+)\|egid=(\d+)\|groups=([0-9,]*)$"
 )
 
 
@@ -63,7 +68,7 @@ class TraceIdentity:
         return {
             "euid": self.euid,
             "egid": self.egid,
-            "supplementary_gids": list(self.supplementary_gids),
+            "supplementary_gids": sorted(set(self.supplementary_gids)),
         }
 
 
@@ -214,10 +219,11 @@ def _sha256(path: pathlib.Path) -> str:
 
 
 def _retained_artifact(path: pathlib.Path) -> dict[str, object]:
+    absolute = path.resolve()
     return {
-        "bytes": path.stat().st_size,
-        "path": str(path),
-        "sha256": _sha256(path),
+        "bytes": absolute.stat().st_size,
+        "path": str(absolute),
+        "sha256": _sha256(absolute),
     }
 
 
@@ -237,6 +243,13 @@ def _verify_standalone_capture(
     process: subprocess.Popen[bytes],
     trace_output: pathlib.Path,
     identity: TraceIdentity,
+    run_id: str,
+    metadata_mode: str,
+    normalized_overlay: dict[str, str | None],
+    trace_script: pathlib.Path,
+    binary: pathlib.Path,
+    pair_id: str,
+    pair_ordinal: int,
 ) -> int:
     """Retain and fail closed over every standalone capture evidence stream."""
     stdout, stderr = process.communicate()
@@ -265,10 +278,41 @@ def _verify_standalone_capture(
     except ValueError as error:
         workload_ns = None
         failures.append(str(error))
+    child_identity_lines = [
+        line.strip()
+        for line in decoded_stderr.splitlines()
+        if line.startswith("TRACECHILD1|")
+    ]
+    observed_identity: dict[str, object] | None = None
+    if len(child_identity_lines) != 1:
+        failures.append(
+            "expected exactly one post-drop trace-child identity record, "
+            f"found {len(child_identity_lines)}"
+        )
+    else:
+        matched = TRACE_CHILD_IDENTITY.fullmatch(child_identity_lines[0])
+        if matched is None:
+            failures.append("post-drop trace-child identity record is malformed")
+        else:
+            euid, egid, groups = matched.groups()
+            observed_identity = {
+                "egid": int(egid),
+                "euid": int(euid),
+                "supplementary_gids": (
+                    [int(group) for group in groups.split(",")] if groups else []
+                ),
+            }
+            if observed_identity != identity.receipt():
+                failures.append(
+                    "post-drop trace-child full identity does not match caller: "
+                    f"expected={identity.receipt()} observed={observed_identity}"
+                )
     guest_stderr = [
         line.strip()
         for line in decoded_stderr.splitlines()
-        if line.strip() and not line.startswith("NATIVEPERF1|")
+        if line.strip()
+        and not line.startswith("NATIVEPERF1|")
+        and not line.startswith("TRACECHILD1|")
     ]
     if guest_stderr != ["ok"]:
         failures.append(f"expected exact guest stderr marker ['ok'], got {guest_stderr}")
@@ -312,29 +356,99 @@ def _verify_standalone_capture(
         else:
             failures.append("strict directional analyzer retained no JSON receipt")
 
-    artifact_paths = (trace_output, stdout_path, stderr_path, analysis_path)
+    binary_identity: dict[str, object] | None = None
+    try:
+        binary_identity = native_pc_range_risk.inspect_binary_identity(binary)
+    except (OSError, ValueError) as error:
+        failures.append(f"producing binary identity failed closed: {error}")
+
+    required_streams: dict[str, bool] | None = None
+    natural_completion = False
+    if analysis is not None:
+        ranges = analysis.get("ranges", {})
+        host_ranges = analysis.get("host_text_ranges", {})
+        samples = analysis.get("samples", {})
+        leaf = analysis.get("leaf_capture", {})
+        stacks = analysis.get("kernel_stack_capture", {})
+        completion = analysis.get("completion")
+        if all(
+            isinstance(value, dict)
+            for value in (ranges, host_ranges, samples, leaf, stacks)
+        ):
+            required_streams = {
+                "host_range": host_ranges.get("reported", 0) > 0,
+                "identity": analysis.get("effective_identity", {}).get("reported", 0)
+                > 0,
+                "kernel_pc_stack_per_catalog_exact": (
+                    stacks.get("per_catalog_exact") is True
+                    and stacks.get("kernel_samples") == stacks.get("stack_samples")
+                ),
+                "leaf_pc_exact": (
+                    leaf.get("expected_outside_private_samples", 0) > 0
+                    and leaf.get("expected_outside_private_samples")
+                    == leaf.get("observed_outside_private_samples")
+                ),
+                "private_range": ranges.get("private_reported", 0) > 0,
+                "reset": ranges.get("resets", 0) > 0,
+                "shared_range": ranges.get("shared_reported", 0) > 0,
+                "user_and_kernel_samples": (
+                    samples.get("user", 0) > 0 and samples.get("kernel", 0) > 0
+                ),
+            }
+        natural_completion = completion == {"target_exit": 1, "timed_out": 0}
+    if required_streams is None or not all(required_streams.values()):
+        failures.append("required stream authentication is incomplete")
+    if not natural_completion:
+        failures.append("capture did not authenticate exact natural completion")
+
+    analyzer_path = pathlib.Path(native_pc_range_directional.__file__).resolve()
+    trace_script = trace_script.resolve()
+    artifact_paths = {
+        "raw": trace_output,
+        "driver_stdout": stdout_path,
+        "driver_stderr": stderr_path,
+        "analysis": analysis_path,
+    }
+    arm = "control" if metadata_mode == METADATA_MODE_V2 else "candidate"
     receipt = {
+        "analyzer": {
+            **_retained_artifact(analyzer_path),
+            "schema": native_pc_range_directional.SCHEMA,
+        },
         "analyzer_status": analyzer_status,
         "artifacts": {
-            path.name: _retained_artifact(path)
-            for path in artifact_paths
+            role: _retained_artifact(path)
+            for role, path in artifact_paths.items()
             if path.is_file()
         },
+        "binary": binary_identity,
         "diagnostic_predicates": [
             pattern.pattern for pattern in DTRACE_DIAGNOSTIC_PATTERNS
         ],
         "dtrace_status": process.returncode,
-        "expected_effective_identity": {
-            "egid": identity.egid,
-            "euid": identity.euid,
-        },
+        "expected_effective_identity": identity.receipt(),
         "failures": failures,
         "matched_diagnostic_predicates": matched_diagnostics,
-        "observed_effective_identity": (
-            analysis.get("effective_identity") if analysis is not None else None
-        ),
-        "schema": "carrick.native-go-dtrace-capture.v1",
+        "metadata_mode": metadata_mode,
+        "natural_completion": natural_completion,
+        "normalized_overlay": normalized_overlay,
+        "observed_effective_identity": observed_identity,
+        "pair": {
+            "arm": arm,
+            "id": pair_id,
+            "order": 0 if arm == "control" else 1,
+            "ordinal": pair_ordinal,
+        },
+        "required_streams": required_streams,
+        "run_id": run_id,
+        "schema": native_pc_range_risk.CAPTURE_SCHEMA,
         "status": "passed" if not failures else "failed",
+        "trace_script": _retained_artifact(trace_script),
+        "workload": {
+            "guest_script_bytes": len(guest_script().encode()),
+            "guest_script_sha256": hashlib.sha256(guest_script().encode()).hexdigest(),
+            "image": DEFAULT_IMAGE,
+        },
         "workload_ns": workload_ns,
     }
     receipt_path.write_text(
@@ -448,11 +562,19 @@ def main() -> int:
         action="store_true",
         help="emit the NATIVEPERF mechanism counters for this run",
     )
+    parser.add_argument("--pair-id")
+    parser.add_argument("--pair-ordinal", type=int)
     arguments = parser.parse_args()
     if (arguments.trace_script is None) != (arguments.trace_output is None):
         parser.error("--trace-script and --trace-output must be supplied together")
     if arguments.stop_child and arguments.trace_script is not None:
         parser.error("--stop-child cannot be combined with trace mode")
+    if arguments.trace_script is not None and (
+        not arguments.pair_id
+        or arguments.pair_ordinal is None
+        or arguments.pair_ordinal <= 0
+    ):
+        parser.error("trace mode requires --pair-id and positive --pair-ordinal")
     run_id = arguments.run_id or os.environ.get("CARRICK_RUN_ID")
     if not run_id:
         parser.error("CARRICK_RUN_ID must be set")
@@ -550,6 +672,13 @@ def main() -> int:
             process=process,
             trace_output=arguments.trace_output,
             identity=trace_identity,
+            run_id=run_id,
+            metadata_mode=arguments.metadata_mode,
+            normalized_overlay=overlay,
+            trace_script=arguments.trace_script,
+            binary=REPO / "target/release/carrick",
+            pair_id=arguments.pair_id,
+            pair_ordinal=arguments.pair_ordinal,
         )
     if arguments.stop_child:
         if not _wait_for_carrick_proctitle(process, run_id):

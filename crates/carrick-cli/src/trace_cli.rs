@@ -41,6 +41,8 @@ use clap::Parser;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::ffi::{OsStr, OsString};
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+use std::io::Write;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::path::Path;
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -164,6 +166,19 @@ fn normalize_trace_groups(primary_gid: u32, groups: &[u32]) -> Vec<u32> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn trace_child_identity_record(euid: u32, egid: u32, groups: &[u32]) -> String {
+    let mut normalized = groups.to_vec();
+    normalized.sort_unstable();
+    normalized.dedup();
+    let groups = normalized
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("TRACECHILD1|euid={euid}|egid={egid}|groups={groups}")
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn exec_trace_child(
     trace_uid: u32,
     trace_gid: u32,
@@ -187,6 +202,18 @@ pub(crate) fn exec_trace_child(
         return Err(std::io::Error::last_os_error()).context("trace child failed to set uid");
     }
 
+    let observed_groups = current_supplementary_groups();
+    writeln!(
+        std::io::stderr().lock(),
+        "{}",
+        trace_child_identity_record(
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            &observed_groups,
+        )
+    )
+    .context("trace child failed to publish its post-drop identity")?;
+
     let mut argv = Vec::with_capacity(command.len() + 1);
     argv.push("carrick".to_owned());
     argv.extend(command.iter().cloned());
@@ -196,6 +223,14 @@ pub(crate) fn exec_trace_child(
 #[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_child_identity_record_is_sorted_and_exact() {
+        assert_eq!(
+            trace_child_identity_record(501, 20, &[20, 12, 20]),
+            "TRACECHILD1|euid=501|egid=20|groups=12,20"
+        );
+    }
 
     #[test]
     fn sudo_argv_preserves_profile_paths_identity_and_environment() {

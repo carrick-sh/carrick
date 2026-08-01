@@ -415,9 +415,24 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
     user_total = sum(user_samples.values())
     kernel_total = sum(kernel_samples.values())
     kernel_stack_total = sum(kernel_stack_samples.values())
+    kernel_stack_by_catalog: Counter[tuple[int, int]] = Counter()
     kernel_stacks_by_frames: Counter[tuple[str, ...]] = Counter()
-    for (_pid, _epoch, frames), count in kernel_stack_samples.items():
+    for (pid, epoch, frames), count in kernel_stack_samples.items():
+        kernel_stack_by_catalog[(pid, epoch)] += count
         kernel_stacks_by_frames[frames] += count
+    kernel_catalogs = [
+        {
+            "epoch": epoch,
+            "kernel_samples": kernel_samples.get((pid, epoch), 0),
+            "pid": pid,
+            "stack_samples": kernel_stack_by_catalog.get((pid, epoch), 0),
+        }
+        for pid, epoch in sorted(set(kernel_samples) | set(kernel_stack_by_catalog))
+    ]
+    kernel_per_catalog_exact = all(
+        catalog["kernel_samples"] == catalog["stack_samples"]
+        for catalog in kernel_catalogs
+    )
     all_total = user_total + kernel_total
     samples = {
         "all": all_total,
@@ -517,7 +532,9 @@ def analyze_raw(path: pathlib.Path) -> dict[str, object]:
         "host_binary_offsets": hot_host_binary_offsets,
         "host_leaves": host_leaves,
         "kernel_stack_capture": {
+            "catalogs": kernel_catalogs,
             "kernel_samples": kernel_total,
+            "per_catalog_exact": kernel_per_catalog_exact,
             "stack_samples": kernel_stack_total,
             "stacks": len(kernel_stacks_by_frames),
         },
@@ -588,6 +605,8 @@ def validate_strict_capture(
         != kernel_stack_capture["kernel_samples"]
     ):
         failures.append("kernel PC/stack samples do not reconcile exactly")
+    if not kernel_stack_capture["per_catalog_exact"]:
+        failures.append("kernel PC/stack samples do not reconcile per-catalog")
     if (
         leaf["expected_outside_private_samples"] <= 0
         or leaf["observed_outside_private_samples"]

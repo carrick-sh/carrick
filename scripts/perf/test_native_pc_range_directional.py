@@ -79,6 +79,28 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
                 result, expected_euid=501, expected_egid=20
             )
 
+    def test_strict_gate_rejects_counterbalanced_kernel_catalog_mismatches(self) -> None:
+        raw = self.complete_strict_capture().replace(
+            "PCPROFILE1|sample|kind=kernel|pid=41|epoch=1|count=3\n"
+            "PCKSTACK1|begin|pid=41|epoch=1|count=3",
+            "PCPROFILE1|sample|kind=kernel|pid=41|epoch=1|count=2\n"
+            "PCPROFILE1|sample|kind=kernel|pid=42|epoch=7|count=4\n"
+            "PCKSTACK1|begin|pid=41|epoch=1|count=4",
+        ).replace(
+            "PCKSTACK1|end\nPCLEAF2|",
+            "PCKSTACK1|end\n"
+            "PCKSTACK1|begin|pid=42|epoch=7|count=2\n"
+            "kernel`exception_return+0x8\n"
+            "PCKSTACK1|end\nPCLEAF2|",
+        )
+        result = self.analyze(raw)
+        self.assertEqual(result["kernel_stack_capture"]["kernel_samples"], 6)
+        self.assertEqual(result["kernel_stack_capture"]["stack_samples"], 6)
+        with self.assertRaisesRegex(ProfileError, "per-catalog"):
+            directional.validate_strict_capture(
+                result, expected_euid=501, expected_egid=20
+            )
+
     def test_strict_gate_rejects_root_identity_for_non_root_caller(self) -> None:
         result = self.analyze(
             self.complete_strict_capture().replace("euid=501|egid=20", "euid=0|egid=0")
@@ -209,7 +231,20 @@ class NativePcRangeDirectionalTests(unittest.TestCase):
         result = self.analyze(self.complete_strict_capture())
         self.assertEqual(
             result["kernel_stack_capture"],
-            {"kernel_samples": 3, "stack_samples": 3, "stacks": 1},
+            {
+                "catalogs": [
+                    {
+                        "epoch": 1,
+                        "kernel_samples": 3,
+                        "pid": 41,
+                        "stack_samples": 3,
+                    }
+                ],
+                "kernel_samples": 3,
+                "per_catalog_exact": True,
+                "stack_samples": 3,
+                "stacks": 1,
+            },
         )
         self.assertEqual(
             result["kernel_stacks"],
