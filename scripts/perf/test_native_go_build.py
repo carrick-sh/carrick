@@ -1107,6 +1107,33 @@ class NativeGoBuildTest(unittest.TestCase):
         overlay_directory = pathlib.Path(native_go_build.__file__).parent / "overlays"
         default = json.loads((overlay_directory / "native-default.json").read_text())
         shared = json.loads((overlay_directory / "native-shared.json").read_text())
+        expected_metadata_modes = {
+            "native-shared-manifest-clone.json": "0",
+            "native-shared-manifest-varint.json": "0",
+            "native-shared-metadata-v2.json": "0",
+        }
+        observed_overlay_names = set()
+
+        for overlay_path in sorted(overlay_directory.glob("native-*.json")):
+            with self.subTest(overlay=overlay_path.name):
+                observed_overlay_names.add(overlay_path.name)
+                overlay = json.loads(overlay_path.read_text())
+                self.assertIn(
+                    "CARRICK_DSR_SHARED_MAPPED_METADATA",
+                    overlay,
+                )
+                self.assertEqual(
+                    tuple(overlay),
+                    native_go_build.PERFORMANCE_CONTROL_KEYS,
+                )
+                self.assertEqual(
+                    overlay["CARRICK_DSR_SHARED_MAPPED_METADATA"],
+                    expected_metadata_modes.get(overlay_path.name),
+                )
+        self.assertLessEqual(
+            set(expected_metadata_modes),
+            observed_overlay_names,
+        )
 
         self.assertEqual(
             tuple(default),
@@ -1126,6 +1153,7 @@ class NativeGoBuildTest(unittest.TestCase):
             },
         )
         self.assertIsNone(shared["CARRICK_DSR_ARTIFACT_SPIKE"])
+        self.assertIsNone(shared["CARRICK_DSR_SHARED_MAPPED_METADATA"])
         self.assertEqual(
             native_go_build.fixed_variant_overlay(
                 native_go_build.VARIANT_DEFAULT

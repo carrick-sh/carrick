@@ -376,7 +376,6 @@ pub(crate) struct PreparedDirectBindingUnit {
     owner: DirectBindingUnitOwner,
     cell_owners: Vec<DirectBindingOwner>,
     edge_records: Vec<PreparedDirectBindingEdge>,
-    #[cfg(test)]
     edge_group_builds: usize,
 }
 
@@ -401,7 +400,6 @@ impl PreparedDirectBindingUnit {
         self.owner.owned_records.len()
     }
 
-    #[cfg(test)]
     pub(crate) const fn edge_group_builds(&self) -> usize {
         self.edge_group_builds
     }
@@ -698,7 +696,7 @@ impl DirectBindingRegistry {
                 }
                 crate::shared_cache::LoadedTranslationMetadata::V3(_) => Box::new([]),
             };
-            let (edge_records, _edge_group_builds) = match &unit.metadata {
+            let (edge_records, edge_group_builds) = match &unit.metadata {
                 crate::shared_cache::LoadedTranslationMetadata::V2(_) => {
                     (self.prepare_unit_edges(unit_index, &owned_records)?, 1)
                 }
@@ -720,8 +718,7 @@ impl DirectBindingRegistry {
                 owner,
                 cell_owners: Vec::new(),
                 edge_records,
-                #[cfg(test)]
-                edge_group_builds: _edge_group_builds,
+                edge_group_builds,
             });
         }
         if unit.binding_layout() != DirectBindingLayout::SidecarV1
@@ -859,7 +856,7 @@ impl DirectBindingRegistry {
                 ))
             })?;
         published_bitmap.resize(bitmap_words, 0);
-        let (edge_records, _edge_group_builds) = match &unit.metadata {
+        let (edge_records, edge_group_builds) = match &unit.metadata {
             crate::shared_cache::LoadedTranslationMetadata::V2(_) => {
                 (self.prepare_unit_edges(unit_index, &owned_records)?, 1)
             }
@@ -884,8 +881,7 @@ impl DirectBindingRegistry {
             owner,
             cell_owners: owners,
             edge_records,
-            #[cfg(test)]
-            edge_group_builds: _edge_group_builds,
+            edge_group_builds,
         })
     }
 
