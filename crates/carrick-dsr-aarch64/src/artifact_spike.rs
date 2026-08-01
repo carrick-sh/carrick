@@ -1092,21 +1092,21 @@ pub struct ArtifactRelocation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct PortableBiasedMemoryRecovery {
-    scratch_registers: [u32; 4],
-    scratch_count: u8,
-    base_scratch: u32,
-    base: BiasedBase,
-    base_coordinate: BiasedBaseCoordinate,
-    commit_base: bool,
-    virtual_x18_scratch: Option<u32>,
-    virtual_x28_scratch: Option<u32>,
-    virtual_reserved_scratch: Option<u32>,
-    instruction_complete: bool,
+pub(crate) struct PortableBiasedMemoryRecovery {
+    pub(crate) scratch_registers: [u32; 4],
+    pub(crate) scratch_count: u8,
+    pub(crate) base_scratch: u32,
+    pub(crate) base: BiasedBase,
+    pub(crate) base_coordinate: BiasedBaseCoordinate,
+    pub(crate) commit_base: bool,
+    pub(crate) virtual_x18_scratch: Option<u32>,
+    pub(crate) virtual_x28_scratch: Option<u32>,
+    pub(crate) virtual_reserved_scratch: Option<u32>,
+    pub(crate) instruction_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum PortableRecoveryAction {
+pub(crate) enum PortableRecoveryAction {
     Noop,
     RestoreGuestX17,
     RestoreGenerationGuardRegisters,
@@ -1174,6 +1174,19 @@ enum PortableRecoveryAction {
 }
 
 impl PortableRecoveryAction {
+    pub(crate) fn encode_v3(
+        self,
+    ) -> Result<crate::mapped_metadata::wire::WireRecoveryActionV3, DsrError> {
+        crate::mapped_metadata::wire::WireRecoveryActionV3::from_portable(self)
+    }
+
+    pub(crate) fn decode_v3(
+        wire: crate::mapped_metadata::wire::WireRecoveryActionV3,
+        host_bias: Option<u64>,
+    ) -> Result<RecoveryAction, DsrError> {
+        wire.into_recovery_action(host_bias)
+    }
+
     fn normalize(action: RecoveryAction, bindings: &ArtifactBindings) -> Result<Self, DsrError> {
         Ok(match action {
             RecoveryAction::Noop => Self::Noop,
@@ -1306,7 +1319,10 @@ impl PortableRecoveryAction {
         self.rebind_with(|value| bindings.value(value))
     }
 
-    fn rebind_with_host_bias(self, host_bias: Option<u64>) -> Result<RecoveryAction, DsrError> {
+    pub(crate) fn rebind_with_host_bias(
+        self,
+        host_bias: Option<u64>,
+    ) -> Result<RecoveryAction, DsrError> {
         self.rebind_with(|value| match (value, host_bias) {
             (ProcessValue::HostBias, Some(host_bias)) => Ok(host_bias),
             (ProcessValue::HostBias, None) => Err(DsrError::CachePolicy(
@@ -1462,6 +1478,10 @@ impl PortableRecoveryEntry {
         self.cache
     }
 
+    pub(crate) const fn action(self) -> PortableRecoveryAction {
+        self.action
+    }
+
     pub(crate) fn rebind_with_host_bias(
         self,
         host_bias: Option<u64>,
@@ -1472,9 +1492,9 @@ impl PortableRecoveryEntry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PortableRecoveryRun {
-    start: CacheOffset,
-    entry_count: NonZeroU32,
-    action: PortableRecoveryAction,
+    pub(crate) start: CacheOffset,
+    pub(crate) entry_count: NonZeroU32,
+    pub(crate) action: PortableRecoveryAction,
 }
 
 impl PortableRecoveryRun {
@@ -1763,6 +1783,14 @@ pub struct ArtifactTemplateMetadataCounts {
 }
 
 impl ArtifactTemplate {
+    pub(crate) fn pc_map_entries(&self) -> &[PcMapEntry] {
+        &self.map
+    }
+
+    pub(crate) fn portable_recovery(&self) -> &PortableRecoveryMetadata {
+        &self.recovery
+    }
+
     pub fn metadata_counts(&self) -> ArtifactTemplateMetadataCounts {
         ArtifactTemplateMetadataCounts {
             words: self.words.len(),
