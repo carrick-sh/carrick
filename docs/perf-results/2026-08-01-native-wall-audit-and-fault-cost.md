@@ -322,6 +322,58 @@ it takes MORE minor faults than anon).
 
 ---
 
+## 5 — Translation amortization: sized, attempted, and blocked
+
+`TranslationUnitKey` is ALREADY fully content-addressed (image digest, source
+fingerprint, page profile, address mode, `translator_abi`), so a unit's filename
+is stable across runs and nothing in it is run-specific. The cache it lives in,
+however, is a `tempfile` tempdir deleted at container teardown. That is the
+Rosetta 2 architecture with its defining property removed: translate once, key
+by code identity, persist, reuse on every later launch.
+
+**Measured redundancy** (`CARRICK_XLAT_CENSUS_DIR`, 34 processes, one cold build):
+
+| | |
+|---|---|
+| total translations | 433,249 |
+| sum of per-process distinct | 433,249 |
+| union of distinct guest VAs | 107,320 |
+| intra-process redundancy | **1.00x** |
+| cross-process redundancy | **4.04x** (an UPPER bound -- fixed PIE base aliases VAs across binaries) |
+
+The per-thread block cache is perfect; nothing is recoverable inside a process.
+Cross-run redundancy is unbounded (the same 107,320 blocks on every build of the
+same toolchain), which is why container-lifetime scope was the one window where
+the win is smallest.
+
+**Attempted: make the authority persistent.** Reverted, measured worse:
+
+| run | wall | vs baseline | units published |
+|---|---|---|---|
+| default path | 11,168 ms | — | — |
+| shared + persistent, cold | 17,670 ms | +58% | **0** |
+| shared + persistent, warm | 43,043 ms | **+285%** | **0** |
+
+**The blocker is not persistence, it is coverage.** `claim_recording`
+(`aot_cache.rs:1426`) implements a "second sighting" policy: the first time a
+unit key is seen it writes a `.seen` marker and declines to record; only a
+second sighting claims the builder. Across three runs the cache directory
+contained **exactly one key** -- the lane observed ONE translation unit for a
+workload with 107,320 distinct blocks, and published none. The 4x warm-run cost
+is the lane's per-lookup overhead applied to every translation against ~zero
+hits.
+
+So the existing shared-translation machinery is not a foundation for a
+persistent AOT cache. Rosetta translates a whole binary ahead of time at first
+exec; carrick discovers blocks lazily and only ever proposes units it has seen
+twice. Delivering this means rewriting the publication path around whole-image
+AOT translation, not changing where the directory lives.
+
+**Ceiling, for planning:** even PERFECT translation sharing removes 75% of
+translation work (~34% of thread CPU -> ~8%), worth roughly 15-25% of total CPU,
+i.e. 14.5x -> ~10-11.5x. The 2x bar needs 28.3 CPU-s to become 4.2. This is the
+largest lever identified and it does not reach the bar.
+
 ## Method caveats — read before citing any number here
 
 - **The fault instrument perturbs.** The `as_fault` probe fires ~2.1 M times,
