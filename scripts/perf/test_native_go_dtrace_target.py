@@ -55,10 +55,27 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
         )
 
     def run_standalone_fixture(
-        self, raw: str, stdout: bytes, stderr: bytes, *, dtrace_status: int = 0
+        self,
+        raw: str,
+        stdout: bytes,
+        stderr: bytes,
+        *,
+        dtrace_status: int = 0,
+        mechanism_profile: bool = True,
+        write_raw: bool = True,
+        preexisting_raw: str | None = None,
+        preexisting_receipt: dict[str, object] | None = None,
+        binary_identities: list[dict[str, object]] | None = None,
+        launch_error: bool = False,
     ) -> tuple[int, pathlib.Path, tempfile.TemporaryDirectory[str]]:
         temporary = tempfile.TemporaryDirectory()
         raw_path = pathlib.Path(temporary.name) / "capture.raw"
+        if preexisting_raw is not None:
+            raw_path.write_text(preexisting_raw, encoding="utf-8")
+        if preexisting_receipt is not None:
+            raw_path.with_suffix(".capture.json").write_text(
+                json.dumps(preexisting_receipt), encoding="utf-8"
+            )
 
         class CapturedProcess:
             returncode = dtrace_status
@@ -66,7 +83,8 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             def __init__(self, command, *, cwd, env, **kwargs):
                 del cwd, env, kwargs
                 output = pathlib.Path(command[command.index("-o") + 1])
-                output.write_text(raw, encoding="utf-8")
+                if write_raw:
+                    output.write_text(raw, encoding="utf-8")
 
             def communicate(self):
                 return (
@@ -77,34 +95,42 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             def wait(self) -> int:
                 return self.returncode
 
+        argv = [
+            "native_go_dtrace_target.py",
+            "--variant",
+            "shared",
+            "--metadata-mode",
+            "v2",
+            "--run-id",
+            "capture-test",
+            "--pair-id",
+            "capture-pair",
+            "--pair-ordinal",
+            "1",
+            "--campaign-id",
+            "capture-campaign",
+            "--arm",
+            "control",
+            "--trace-script",
+            "scripts/dtrace/native-pc-range-directional.d",
+            "--trace-output",
+            str(raw_path),
+            "--trace-launcher",
+            "standalone",
+        ]
+        if mechanism_profile:
+            argv.append("--mechanism-profile")
+        default_identity = self.binary_identity()
         with (
             mock.patch.object(
                 sys,
                 "argv",
-                [
-                    "native_go_dtrace_target.py",
-                    "--variant",
-                    "shared",
-                    "--metadata-mode",
-                    "v2",
-                    "--run-id",
-                    "capture-test",
-                    "--pair-id",
-                    "capture-pair",
-                    "--pair-ordinal",
-                    "1",
-                    "--trace-script",
-                    "scripts/dtrace/native-pc-range-directional.d",
-                    "--trace-output",
-                    str(raw_path),
-                    "--trace-launcher",
-                    "standalone",
-                ],
+                argv,
             ),
             mock.patch.object(
                 native_go_dtrace_target.subprocess,
                 "Popen",
-                side_effect=CapturedProcess,
+                side_effect=(OSError("launch failed") if launch_error else CapturedProcess),
             ),
             mock.patch.object(native_go_dtrace_target.os, "geteuid", return_value=501),
             mock.patch.object(native_go_dtrace_target.os, "getegid", return_value=20),
@@ -114,7 +140,7 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             mock.patch.object(
                 native_go_dtrace_target.native_pc_range_risk,
                 "inspect_binary_identity",
-                return_value=self.binary_identity(),
+                side_effect=binary_identities or [default_identity, default_identity],
             ),
             mock.patch("sys.stdout", io.StringIO()),
             mock.patch("sys.stderr", io.StringIO()),
@@ -200,6 +226,10 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
                     "trace-pair",
                     "--pair-ordinal",
                     "1",
+                    "--campaign-id",
+                    "standalone-campaign",
+                    "--arm",
+                    "control",
                     "--trace-script",
                     "scripts/dtrace/native-pc-range-directional.d",
                     "--trace-output",
@@ -280,6 +310,10 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
                     "standalone-pair",
                     "--pair-ordinal",
                     "1",
+                    "--campaign-id",
+                    "standalone-campaign",
+                    "--arm",
+                    "control",
                     "--trace-script",
                     "scripts/dtrace/native-pc-range-directional.d",
                     "--trace-output",
@@ -302,7 +336,7 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             mock.patch.object(
                 native_go_dtrace_target.native_pc_range_risk,
                 "inspect_binary_identity",
-                return_value=self.binary_identity(),
+                side_effect=[self.binary_identity(), self.binary_identity()],
             ),
             mock.patch("sys.stdout", output),
         ):
@@ -414,6 +448,88 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "failed")
         self.assertIn("BUILD_OK", receipt["failures"][0])
 
+    def test_standalone_capture_rejects_non_profile_overlay(self) -> None:
+        result, raw, temporary = self.run_standalone_fixture(
+            self.strict_raw(),
+            b"WORKLOAD_NS=123\nBUILD_OK\n",
+            b"ok\n",
+            mechanism_profile=False,
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertEqual(result, 2)
+        receipt = json.loads(raw.with_suffix(".capture.json").read_text())
+        self.assertEqual(receipt["status"], "failed")
+        self.assertIn("CARRICK_DSR_PROFILE", " ".join(receipt["failures"]))
+
+    def test_standalone_capture_rejects_binary_identity_drift_during_execution(self) -> None:
+        before = self.binary_identity()
+        after = {**before, "sha256": "c" * 64}
+        result, raw, temporary = self.run_standalone_fixture(
+            self.strict_raw(),
+            b"WORKLOAD_NS=123\nBUILD_OK\n",
+            b"ok\n",
+            binary_identities=[before, after],
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertEqual(result, 2)
+        receipt = json.loads(raw.with_suffix(".capture.json").read_text())
+        self.assertEqual(receipt["status"], "failed")
+        self.assertIn("drift", " ".join(receipt["failures"]))
+
+    def test_standalone_capture_invalidates_stale_raw_before_failed_rerun(self) -> None:
+        result, raw, temporary = self.run_standalone_fixture(
+            self.strict_raw(),
+            b"WORKLOAD_NS=123\nBUILD_OK\n",
+            b"ok\n",
+            write_raw=False,
+            preexisting_raw=self.strict_raw(),
+            preexisting_receipt={
+                "schema": "carrick.native-go-dtrace-capture.v3",
+                "status": "passed",
+            },
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertEqual(result, 2)
+        receipt = json.loads(raw.with_suffix(".capture.json").read_text())
+        self.assertEqual(receipt["status"], "failed")
+        self.assertIn("raw capture", " ".join(receipt["failures"]))
+
+    def test_standalone_capture_replaces_prior_pass_when_launch_fails(self) -> None:
+        result, raw, temporary = self.run_standalone_fixture(
+            self.strict_raw(),
+            b"",
+            b"",
+            launch_error=True,
+            preexisting_receipt={
+                "schema": "carrick.native-go-dtrace-capture.v3",
+                "status": "passed",
+            },
+        )
+        self.addCleanup(temporary.cleanup)
+        self.assertEqual(result, 2)
+        receipt = json.loads(raw.with_suffix(".capture.json").read_text())
+        self.assertEqual(receipt["status"], "failed")
+        self.assertIn("launch failed", " ".join(receipt["failures"]))
+
+    def test_invalidation_removes_passed_receipt_before_artifact_error(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        raw = pathlib.Path(temporary.name) / "blocked.raw"
+        raw.mkdir()
+        receipt = raw.with_suffix(".capture.json")
+        receipt.write_text(
+            json.dumps(
+                {
+                    "schema": "carrick.native-go-dtrace-capture.v3",
+                    "status": "passed",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(OSError):
+            native_go_dtrace_target._invalidate_capture_outputs(raw)
+        self.assertFalse(receipt.exists())
+
     def test_standalone_capture_fails_on_zero_usdt_provider_stream(self) -> None:
         result, raw, temporary = self.run_standalone_fixture(
             "PCPROFILE1|config|sample_hz=197\n"
@@ -455,7 +571,7 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
         )
         receipt = json.loads(raw.with_suffix(".capture.json").read_text())
         self.assertEqual(receipt["status"], "passed")
-        self.assertEqual(receipt["schema"], "carrick.native-go-dtrace-capture.v2")
+        self.assertEqual(receipt["schema"], "carrick.native-go-dtrace-capture.v3")
         self.assertEqual(
             receipt["expected_effective_identity"],
             {"egid": 20, "euid": 501, "supplementary_gids": [12, 20]},

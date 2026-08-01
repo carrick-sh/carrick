@@ -7,19 +7,22 @@ import argparse
 import hashlib
 import itertools
 import json
+import os
 import pathlib
 import plistlib
 import re
 import subprocess
 import sys
+import tempfile
 import xml.parsers.expat
 from collections import Counter
 from collections.abc import Sequence
 from fractions import Fraction
 
 
-SCHEMA = "carrick.native-pc-range-risk.v2"
-CAPTURE_SCHEMA = "carrick.native-go-dtrace-capture.v2"
+REPO = pathlib.Path(__file__).resolve().parents[2]
+SCHEMA = "carrick.native-pc-range-risk.v3"
+CAPTURE_SCHEMA = "carrick.native-go-dtrace-capture.v3"
 REGRESSION_METHOD = (
     "one-sided exact sign-flip permutation test over paired V3-V2 owner-rate "
     "deltas; alpha=0.05; capture pair is the independent unit"
@@ -35,6 +38,15 @@ PREDICATES = {
 }
 LOCK_PATTERN = re.compile(PREDICATES["locks"])
 MMAP_FAULT_PATTERN = re.compile(PREDICATES["mmap_fault"])
+OVERLAY_PATHS = {
+    "v2": REPO / "scripts/perf/overlays/native-shared-metadata-v2.json",
+    "mapped": REPO / "scripts/perf/overlays/native-shared.json",
+}
+EXACT_REQUIRED_CONTROLS = {
+    "CARRICK_DSR_DIRECT_BINDINGS": "1",
+    "CARRICK_DSR_PROFILE": "1",
+    "CARRICK_DSR_SHARED_TRANSLATION": "1",
+}
 
 
 def _sha256(path: pathlib.Path) -> str:
@@ -46,12 +58,76 @@ def _sha256(path: pathlib.Path) -> str:
 
 
 def _artifact(path: pathlib.Path) -> dict[str, object]:
-    absolute = path.resolve()
+    absolute = path.resolve(strict=True)
+    before = absolute.stat()
+    sha256 = _sha256(absolute)
+    after = absolute.stat()
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        raise ValueError(f"artifact drifted while hashing: {absolute}")
     return {
-        "bytes": absolute.stat().st_size,
+        "bytes": after.st_size,
         "path": str(absolute),
-        "sha256": _sha256(absolute),
+        "sha256": sha256,
+        "stat": {
+            "ctime_ns": after.st_ctime_ns,
+            "device": after.st_dev,
+            "inode": after.st_ino,
+            "mode": after.st_mode,
+            "mtime_ns": after.st_mtime_ns,
+            "size": after.st_size,
+        },
     }
+
+
+def atomic_write_json(path: pathlib.Path, payload: dict[str, object]) -> None:
+    """Publish JSON by same-directory fsync plus atomic replace."""
+    destination = path.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=destination.parent,
+            encoding="utf-8",
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = pathlib.Path(stream.name)
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, destination)
+        temporary_path = None
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def invalidate_output(path: pathlib.Path) -> None:
+    path.unlink(missing_ok=True)
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -124,6 +200,70 @@ def inspect_binary_identity(path: pathlib.Path) -> dict[str, object]:
     }
 
 
+def inspect_macho_sections(path: pathlib.Path) -> list[dict[str, object]]:
+    """Return exact Mach-O section bounds and typed instruction attributes."""
+    binary = path.resolve(strict=True)
+    otool = _run(["/usr/bin/otool", "-l", str(binary)]).stdout
+    matches = re.findall(
+        r"[ \t]+sectname ([^\s]+)\n"
+        r"[ \t]+segname ([^\s]+)\n"
+        r"[ \t]+addr (0x[0-9a-fA-F]+)\n"
+        r"[ \t]+size (0x[0-9a-fA-F]+)\n"
+        r"[ \t]+offset (\d+)\n"
+        r"(?:[ \t]+[^\n]*\n)*?"
+        r"[ \t]+flags (0x[0-9a-fA-F]+)",
+        otool,
+    )
+    if not matches:
+        raise ValueError("binary has no parseable Mach-O sections")
+    sections: list[dict[str, object]] = []
+    for name, segment, address_text, size_text, offset_text, flags_text in matches:
+        flags = int(flags_text, 16)
+        sections.append(
+            {
+                "address": int(address_text, 16),
+                "flags": flags,
+                "instruction": bool(flags & 0x80000400),
+                "name": name,
+                "offset": int(offset_text),
+                "segment": segment,
+                "size": int(size_text, 16),
+            }
+        )
+    sections.sort(key=lambda section: (int(section["address"]), str(section["segment"]), str(section["name"])))
+    for previous, current in zip(sections, sections[1:]):
+        if int(previous["address"]) + int(previous["size"]) > int(current["address"]):
+            raise ValueError("Mach-O section bounds overlap")
+    return sections
+
+
+def _section_for_address(
+    sections: object, address: int
+) -> dict[str, object] | None:
+    if not isinstance(sections, list):
+        raise ValueError("binary has malformed Mach-O section identity")
+    matches: list[dict[str, object]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            raise ValueError("binary has malformed Mach-O section identity")
+        start, size = section.get("address"), section.get("size")
+        instruction = section.get("instruction")
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(instruction, bool)
+        ):
+            raise ValueError("binary has malformed Mach-O section identity")
+        if start <= address < start + size:
+            matches.append(section)
+    if len(matches) > 1:
+        raise ValueError("binary address belongs to overlapping Mach-O sections")
+    return matches[0] if matches else None
+
+
 def symbolize_host_binary_offsets(
     binary: dict[str, object], offsets: Sequence[int]
 ) -> dict[int, dict[str, object]]:
@@ -143,22 +283,55 @@ def symbolize_host_binary_offsets(
         if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset < vmsize:
             raise ValueError(f"host binary offset is outside __TEXT: {offset!r}")
     addresses = [vmaddr + offset for offset in unique]
+    resolved: dict[int, dict[str, object]] = {}
+    atos_offsets: list[int] = []
+    atos_addresses: list[int] = []
+    sections = binary.get("sections", [])
+    for offset, address in zip(unique, addresses, strict=True):
+        section = _section_for_address(sections, address)
+        if section is None or section["instruction"] is True:
+            atos_offsets.append(offset)
+            atos_addresses.append(address)
+            continue
+        segment, name, section_start = (
+            section.get("segment"),
+            section.get("name"),
+            section.get("address"),
+        )
+        if (
+            not isinstance(segment, str)
+            or not isinstance(name, str)
+            or not isinstance(section_start, int)
+        ):
+            raise ValueError("binary has malformed Mach-O section identity")
+        section_offset = address - section_start
+        resolved[offset] = {
+            "absolute_address": f"0x{address:x}",
+            "module": pathlib.Path(path).name,
+            "offset": f"0x{offset:x}",
+            "owner_kind": "non_instruction_section",
+            "section": name,
+            "section_offset": f"0x{section_offset:x}",
+            "segment": segment,
+            "symbol": f"{segment},{name}+0x{section_offset:x}",
+        }
+    if not atos_offsets:
+        return resolved
     argv = [
         "/usr/bin/atos",
         "-o",
         path,
         "-l",
         f"0x{vmaddr:x}",
-        *(f"0x{address:x}" for address in addresses),
+        *(f"0x{address:x}" for address in atos_addresses),
     ]
     completed = _run(argv)
     if completed.stderr.strip():
         raise ValueError(f"atos emitted diagnostics: {completed.stderr.strip()}")
     lines = completed.stdout.splitlines()
-    if len(lines) != len(unique):
+    if len(lines) != len(atos_offsets):
         raise ValueError("atos result cardinality does not match normalized offsets")
-    resolved: dict[int, dict[str, object]] = {}
-    for offset, address, line in zip(unique, addresses, lines, strict=True):
+    for offset, address, line in zip(atos_offsets, atos_addresses, lines, strict=True):
         match = re.fullmatch(r"(.+?) \(in ([^)]+)\)(?: .*)?", line.strip())
         if match is None:
             raise ValueError(f"atos left offset 0x{offset:x} unresolved or ambiguous: {line!r}")
@@ -170,6 +343,7 @@ def symbolize_host_binary_offsets(
             "atos": line.strip(),
             "module": module,
             "offset": f"0x{offset:x}",
+            "owner_kind": "instruction_symbol",
             "symbol": symbol,
         }
     return resolved
@@ -272,6 +446,8 @@ def classify(
             raise ValueError("analysis has a malformed host leaf")
         consume(module, symbol, count, "named_leaf", None)
     persisted_symbolizations: list[dict[str, object]] = []
+    non_instruction_section_samples = 0
+    non_instruction_section_offsets = 0
     for offset, count in offsets:
         mapping = mappings[offset]
         module, symbol = mapping.get("module"), mapping.get("symbol")
@@ -279,6 +455,9 @@ def classify(
             raise ValueError("host binary offset has malformed exact symbolization")
         offset_text = f"0x{offset:x}"
         consume(module, symbol, count, "host_binary_offset", offset_text)
+        if mapping.get("owner_kind") == "non_instruction_section":
+            non_instruction_section_samples += count
+            non_instruction_section_offsets += 1
         persisted_symbolizations.append({**mapping, "count": count})
 
     kernel_stacks = analysis.get("kernel_stacks", [])
@@ -330,6 +509,8 @@ def classify(
         "all_samples": all_samples,
         "categories": categories,
         "host_binary_offset_symbolizations": persisted_symbolizations,
+        "non_instruction_section_offsets": non_instruction_section_offsets,
+        "non_instruction_section_samples": non_instruction_section_samples,
     }
 
 
@@ -344,7 +525,19 @@ def _aggregate(classifications: list[dict[str, object]]) -> dict[str, object]:
             "count": count,
             "per_1000_all_samples": round(count * 1000 / all_samples, 9),
         }
-    return {"all_samples": all_samples, "captures": len(classifications), "categories": categories}
+    return {
+        "all_samples": all_samples,
+        "captures": len(classifications),
+        "categories": categories,
+        "non_instruction_section_offsets": sum(
+            int(row.get("non_instruction_section_offsets", 0))
+            for row in classifications
+        ),
+        "non_instruction_section_samples": sum(
+            int(row.get("non_instruction_section_samples", 0))
+            for row in classifications
+        ),
+    }
 
 
 def _validate_analysis(analysis: dict[str, object]) -> None:
@@ -378,6 +571,74 @@ def _validate_analysis(analysis: dict[str, object]) -> None:
         raise ValueError("capture analysis lacks exact required streams")
 
 
+def overlay_authority(metadata_mode: str) -> tuple[dict[str, object], dict[str, str | None]]:
+    try:
+        path = OVERLAY_PATHS[metadata_mode]
+    except KeyError as error:
+        raise ValueError(f"unknown metadata mode: {metadata_mode}") from error
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or any(not isinstance(key, str) for key in payload)
+        or any(value is not None and not isinstance(value, str) for value in payload.values())
+    ):
+        raise ValueError(f"overlay authority is malformed: {path}")
+    normalized = dict(payload)
+    return {
+        "artifact": _artifact(path),
+        "normalized_overlay": dict(normalized),
+    }, normalized
+
+
+def expected_capture_overlay(metadata_mode: str) -> tuple[dict[str, object], dict[str, str | None]]:
+    authority, overlay = overlay_authority(metadata_mode)
+    overlay["CARRICK_DSR_PROFILE"] = "1"
+    if any(overlay.get(key) != value for key, value in EXACT_REQUIRED_CONTROLS.items()):
+        raise ValueError("overlay authority lacks exact shared/direct/profile controls")
+    return authority, overlay
+
+
+def _validate_execution_identity(capture: dict[str, object]) -> None:
+    execution = capture.get("execution_identity")
+    if not isinstance(execution, dict):
+        raise ValueError("capture lacks pre/post execution identity")
+    before, after = execution.get("pre"), execution.get("post")
+    if not isinstance(before, dict) or before != after:
+        raise ValueError("capture pre/post execution identity drifted")
+    for role in ("analyzer", "launcher", "overlay_source", "trace_script"):
+        recorded = before.get(role)
+        if not isinstance(recorded, dict) or not isinstance(recorded.get("path"), str):
+            raise ValueError(f"capture execution identity lacks {role}")
+        schema = recorded.get("schema") if role == "analyzer" else None
+        expected = _artifact(pathlib.Path(str(recorded["path"])))
+        artifact = {key: recorded.get(key) for key in expected}
+        if artifact != expected:
+            raise ValueError(f"capture execution {role} identity drifted from disk")
+        if role == "analyzer" and schema != "carrick.native-pc-range-directional.v2":
+            raise ValueError("capture analyzer schema drifted")
+    binary = before.get("binary")
+    if not isinstance(binary, dict) or binary != capture.get("binary"):
+        raise ValueError("capture execution binary identity is malformed")
+    if before.get("trace_script") != capture.get("trace_script"):
+        raise ValueError("capture execution trace-script identity is inconsistent")
+    if before.get("analyzer") != capture.get("analyzer"):
+        raise ValueError("capture execution analyzer identity is inconsistent")
+    overlay_source = capture.get("overlay_source")
+    if (
+        not isinstance(overlay_source, dict)
+        or before.get("overlay_source") != overlay_source.get("artifact")
+    ):
+        raise ValueError("capture execution overlay-source identity is inconsistent")
+
+
+def _validate_capture_overlay(capture: dict[str, object], metadata_mode: str) -> None:
+    expected_authority, expected_overlay = expected_capture_overlay(metadata_mode)
+    if capture.get("overlay_source") != expected_authority:
+        raise ValueError("capture overlay authority path, hash, stat, or payload drifted")
+    if capture.get("normalized_overlay") != expected_overlay:
+        raise ValueError("capture does not bind the exact shared/direct/profile overlay")
+
+
 def _load_capture(
     raw_path: pathlib.Path,
     analysis_path: pathlib.Path,
@@ -391,7 +652,7 @@ def _load_capture(
     if not isinstance(analysis, dict) or not isinstance(capture, dict):
         raise ValueError("analysis and capture roots must be JSON objects")
     if capture.get("schema") != CAPTURE_SCHEMA or capture.get("status") != "passed":
-        raise ValueError("capture receipt is not an authenticated passed v2 receipt")
+        raise ValueError("capture receipt is not an authenticated passed v3 receipt")
     if capture.get("metadata_mode") != expected_mode:
         raise ValueError(f"capture metadata mode must be {expected_mode}")
     pair = capture.get("pair")
@@ -417,14 +678,8 @@ def _load_capture(
     for role, supplied in (("raw", raw_path), ("analysis", analysis_path)):
         if verified_artifacts.get(role) != _artifact(supplied):
             raise ValueError(f"capture receipt does not bind supplied {role} artifact")
-    for determinant in ("trace_script", "analyzer"):
-        recorded = capture.get(determinant)
-        if not isinstance(recorded, dict) or not isinstance(recorded.get("path"), str):
-            raise ValueError(f"capture receipt has malformed {determinant} identity")
-        expected = _artifact(pathlib.Path(str(recorded["path"])))
-        recorded_artifact = {key: recorded.get(key) for key in ("bytes", "path", "sha256")}
-        if expected != recorded_artifact:
-            raise ValueError(f"capture {determinant} identity drifted from disk")
+    _validate_execution_identity(capture)
+    _validate_capture_overlay(capture, expected_mode)
     expected = capture.get("expected_effective_identity")
     observed = capture.get("observed_effective_identity")
     if (
@@ -446,6 +701,92 @@ def _load_capture(
     }:
         raise ValueError("capture receipt does not authenticate natural completion and required streams")
     return analysis, capture, verified_artifacts
+
+
+def predecessor_binding(
+    capture_path: pathlib.Path, capture: dict[str, object]
+) -> dict[str, object]:
+    chronology = capture.get("chronology")
+    if not isinstance(chronology, dict):
+        raise ValueError("predecessor capture lacks chronology")
+    completed = chronology.get("completed_unix_ns")
+    if not isinstance(completed, int) or isinstance(completed, bool) or completed <= 0:
+        raise ValueError("predecessor capture completion timestamp is malformed")
+    return {
+        "artifact": _artifact(capture_path),
+        "campaign_id": capture.get("campaign_id"),
+        "completed_unix_ns": completed,
+        "pair": capture.get("pair"),
+        "run_id": capture.get("run_id"),
+        "status": capture.get("status"),
+    }
+
+
+def validate_chronology(
+    capture_path: pathlib.Path,
+    capture: dict[str, object],
+    *,
+    expected_campaign_id: str | None,
+    expected_predecessor: tuple[pathlib.Path, dict[str, object]] | None,
+) -> str:
+    campaign_id = capture.get("campaign_id")
+    if not isinstance(campaign_id, str) or not campaign_id:
+        raise ValueError("capture campaign ID is malformed")
+    if expected_campaign_id is not None and campaign_id != expected_campaign_id:
+        raise ValueError("capture chronology crosses campaigns")
+    chronology = capture.get("chronology")
+    if not isinstance(chronology, dict):
+        raise ValueError("capture lacks authenticated chronology")
+    started, completed = chronology.get("started_unix_ns"), chronology.get(
+        "completed_unix_ns"
+    )
+    if (
+        not isinstance(started, int)
+        or isinstance(started, bool)
+        or not isinstance(completed, int)
+        or isinstance(completed, bool)
+        or not 0 < started < completed
+    ):
+        raise ValueError("capture chronology timestamps are malformed")
+    predecessor = chronology.get("predecessor")
+    if expected_predecessor is None:
+        if predecessor is not None:
+            raise ValueError("the first V2 control must be the sole chronology root")
+    else:
+        predecessor_path, predecessor_capture = expected_predecessor
+        expected = predecessor_binding(predecessor_path, predecessor_capture)
+        if predecessor != expected:
+            raise ValueError("capture predecessor path, hash, status, identity, or order is not exact")
+        predecessor_completed = expected["completed_unix_ns"]
+        assert isinstance(predecessor_completed, int)
+        if predecessor_completed >= started:
+            raise ValueError("capture chronology is not strictly increasing")
+    pair = capture.get("pair")
+    if not isinstance(pair, dict):
+        raise ValueError("capture chronology has malformed pair identity")
+    if expected_predecessor is None:
+        if pair.get("arm") != "control" or pair.get("ordinal") != 1:
+            raise ValueError("V3-first or non-pair-one chronology root is forbidden")
+    else:
+        predecessor_pair = expected_predecessor[1].get("pair")
+        assert isinstance(predecessor_pair, dict)
+        if pair.get("arm") == "candidate":
+            if (
+                predecessor_pair.get("arm") != "control"
+                or predecessor_pair.get("ordinal") != pair.get("ordinal")
+                or predecessor_pair.get("id") != pair.get("id")
+            ):
+                raise ValueError("candidate predecessor is not its exact V2 control")
+        elif pair.get("arm") == "control":
+            if (
+                predecessor_pair.get("arm") != "candidate"
+                or predecessor_pair.get("ordinal") != int(pair.get("ordinal", 0)) - 1
+            ):
+                raise ValueError("V2 predecessor is not the prior mapped candidate")
+        else:
+            raise ValueError("capture chronology has malformed arm")
+    del capture_path
+    return campaign_id
 
 
 def _fraction(value: Fraction) -> dict[str, object]:
@@ -512,6 +853,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
+        invalidate_output(arguments.output)
+    except OSError as error:
+        print(f"native_pc_range_risk: could not invalidate output: {error}", file=sys.stderr)
+        return 2
+    try:
         count = len(arguments.v2_raw)
         lengths = {
             count,
@@ -525,7 +871,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("V2 and V3 raw, analysis, and capture counts must match")
         if count < MINIMUM_PAIRS:
             raise ValueError(f"at least {MINIMUM_PAIRS} independent capture pairs are required")
+        risk_analyzer = _artifact(pathlib.Path(__file__))
         binary = inspect_binary_identity(arguments.binary)
+        binary_sections = inspect_macho_sections(arguments.binary)
+        symbolization_binary = {**binary, "sections": binary_sections}
         pairs: list[tuple[str, int, dict[str, object], dict[str, object]]] = []
         v2_classifications: list[dict[str, object]] = []
         v3_classifications: list[dict[str, object]] = []
@@ -536,6 +885,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         artifact_paths: set[str] = set()
         stable_determinants: dict[str, str] = {}
         ordinals: list[int] = []
+        campaign_id: str | None = None
+        predecessor: tuple[pathlib.Path, dict[str, object]] | None = None
         for index in range(count):
             loaded: list[tuple[dict[str, object], dict[str, object], dict[str, object]]] = []
             for mode, arm, raws, analyses, captures in (
@@ -551,6 +902,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 artifact_paths.add(capture_path)
                 capture_hashes.add(capture_hash)
             (v2_analysis, v2_capture, v2_artifacts), (v3_analysis, v3_capture, v3_artifacts) = loaded
+            campaign_id = validate_chronology(
+                arguments.v2_capture[index],
+                v2_capture,
+                expected_campaign_id=campaign_id,
+                expected_predecessor=predecessor,
+            )
+            predecessor = (arguments.v2_capture[index], v2_capture)
+            campaign_id = validate_chronology(
+                arguments.v3_capture[index],
+                v3_capture,
+                expected_campaign_id=campaign_id,
+                expected_predecessor=predecessor,
+            )
+            predecessor = (arguments.v3_capture[index], v3_capture)
             v2_pair, v3_pair = v2_capture["pair"], v3_capture["pair"]
             assert isinstance(v2_pair, dict) and isinstance(v3_pair, dict)
             if v2_pair.get("id") != v3_pair.get("id") or v2_pair.get("ordinal") != v3_pair.get("ordinal"):
@@ -587,8 +952,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError("capture normalized overlays are not the exact V2/mapped contrast")
             v2_offsets = _parse_offsets(v2_analysis)
             v3_offsets = _parse_offsets(v3_analysis)
-            v2_symbols = symbolize_host_binary_offsets(binary, [offset for offset, _ in v2_offsets])
-            v3_symbols = symbolize_host_binary_offsets(binary, [offset for offset, _ in v3_offsets])
+            v2_symbols = symbolize_host_binary_offsets(
+                symbolization_binary, [offset for offset, _ in v2_offsets]
+            )
+            v3_symbols = symbolize_host_binary_offsets(
+                symbolization_binary, [offset for offset, _ in v3_offsets]
+            )
             v2_classification = classify(v2_analysis, v2_symbols)
             v3_classification = classify(v3_analysis, v3_symbols)
             v2_classifications.append(v2_classification)
@@ -602,8 +971,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             })
         if ordinals != list(range(1, count + 1)) or len(set(ordinals)) != count:
             raise ValueError("capture pair ordinals must be unique and supplied in canonical order")
+        if _artifact(pathlib.Path(__file__)) != risk_analyzer:
+            raise ValueError("risk analyzer identity drifted during execution")
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"native_pc_range_risk: {error}", file=sys.stderr)
+        try:
+            atomic_write_json(
+                arguments.output,
+                {
+                    "failures": [str(error)],
+                    "schema": SCHEMA,
+                    "status": "failed",
+                },
+            )
+        except OSError as write_error:
+            print(
+                f"native_pc_range_risk: could not publish failed receipt: {write_error}",
+                file=sys.stderr,
+            )
         return 2
 
     v2, v3 = _aggregate(v2_classifications), _aggregate(v3_classifications)
@@ -611,19 +996,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     larger = [name for name in PREDICATES if comparisons[name]["v3_larger"]]
     supported = [name for name in PREDICATES if comparisons[name]["supported_v3_increase"]]
     receipt = {
-        "artifacts": {"binary": binary, "capture_pairs": capture_evidence},
+        "artifacts": {
+            "binary": binary,
+            "binary_sections": binary_sections,
+            "capture_pairs": capture_evidence,
+            "risk_analyzer": risk_analyzer,
+        },
         "capture_pairs": count,
+        "campaign_id": campaign_id,
         "comparisons": comparisons,
         "larger_v3_owners": larger,
         "predicates": PREDICATES,
         "regression_method": REGRESSION_METHOD,
         "schema": SCHEMA,
         "status": "failed" if supported else "passed",
+        "failures": (
+            ["supported V3 owner increases: " + ", ".join(supported)]
+            if supported
+            else []
+        ),
         "supported_v3_owner_increases": supported,
         "v2": {**v2, "captures_detail": v2_classifications},
         "v3": {**v3, "captures_detail": v3_classifications},
     }
-    arguments.output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        atomic_write_json(arguments.output, receipt)
+    except OSError as error:
+        print(f"native_pc_range_risk: could not publish receipt: {error}", file=sys.stderr)
+        return 2
     return 2 if supported else 0
 
 

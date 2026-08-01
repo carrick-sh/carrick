@@ -210,21 +210,108 @@ def standalone_dtrace_command(
     ]
 
 
-def _sha256(path: pathlib.Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _retained_artifact(path: pathlib.Path) -> dict[str, object]:
-    absolute = path.resolve()
+    return native_pc_range_risk._artifact(path)
+
+
+def _capture_paths(trace_output: pathlib.Path) -> dict[str, pathlib.Path]:
     return {
-        "bytes": absolute.stat().st_size,
-        "path": str(absolute),
-        "sha256": _sha256(absolute),
+        "raw": trace_output,
+        "driver_stdout": trace_output.with_suffix(".driver.out"),
+        "driver_stderr": trace_output.with_suffix(".driver.err"),
+        "analysis": trace_output.with_suffix(".json"),
+        "receipt": trace_output.with_suffix(".capture.json"),
     }
+
+
+def _invalidate_capture_outputs(trace_output: pathlib.Path) -> None:
+    paths = _capture_paths(trace_output)
+    for role in ("receipt", "analysis", "driver_stderr", "driver_stdout", "raw"):
+        paths[role].unlink(missing_ok=True)
+
+
+def _execution_identity(
+    *, binary: pathlib.Path, trace_script: pathlib.Path, overlay_path: pathlib.Path
+) -> dict[str, object]:
+    analyzer_path = pathlib.Path(native_pc_range_directional.__file__).resolve()
+    return {
+        "analyzer": {
+            **_retained_artifact(analyzer_path),
+            "schema": native_pc_range_directional.SCHEMA,
+        },
+        "binary": native_pc_range_risk.inspect_binary_identity(binary),
+        "launcher": _retained_artifact(pathlib.Path(__file__)),
+        "overlay_source": _retained_artifact(overlay_path),
+        "trace_script": _retained_artifact(trace_script),
+    }
+
+
+def _load_predecessor(
+    path: pathlib.Path,
+    *,
+    campaign_id: str,
+    pair_id: str,
+    pair_ordinal: int,
+    arm: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    before = _retained_artifact(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    after = _retained_artifact(path)
+    if before != after:
+        raise ValueError("predecessor capture drifted while loading")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != native_pc_range_risk.CAPTURE_SCHEMA
+        or payload.get("status") != "passed"
+        or payload.get("campaign_id") != campaign_id
+    ):
+        raise ValueError("predecessor is not a passed same-campaign v3 receipt")
+    pair = payload.get("pair")
+    if not isinstance(pair, dict):
+        raise ValueError("predecessor pair identity is malformed")
+    if arm == "candidate":
+        exact = (
+            pair.get("arm") == "control"
+            and pair.get("ordinal") == pair_ordinal
+            and pair.get("id") == pair_id
+        )
+    else:
+        exact = (
+            pair.get("arm") == "candidate"
+            and pair.get("ordinal") == pair_ordinal - 1
+        )
+    if not exact:
+        raise ValueError("predecessor arm, pair, or ordinal is not exact")
+    binding = native_pc_range_risk.predecessor_binding(path, payload)
+    return payload, binding
+
+
+def _publish_failed_capture(
+    receipt_path: pathlib.Path,
+    *,
+    campaign_id: str | None,
+    run_id: str,
+    pair_id: str | None,
+    pair_ordinal: int | None,
+    arm: str | None,
+    failures: list[str],
+) -> None:
+    native_pc_range_risk.atomic_write_json(
+        receipt_path,
+        {
+            "campaign_id": campaign_id,
+            "failures": failures,
+            "pair": {
+                "arm": arm,
+                "id": pair_id,
+                "order": 0 if arm == "control" else 1 if arm == "candidate" else None,
+                "ordinal": pair_ordinal,
+            },
+            "run_id": run_id,
+            "schema": native_pc_range_risk.CAPTURE_SCHEMA,
+            "status": "failed",
+        },
+    )
 
 
 def _replay(stream: object, payload: bytes) -> None:
@@ -250,13 +337,21 @@ def _verify_standalone_capture(
     binary: pathlib.Path,
     pair_id: str,
     pair_ordinal: int,
+    campaign_id: str,
+    arm: str,
+    predecessor_path: pathlib.Path | None,
+    predecessor_binding: dict[str, object] | None,
+    execution_pre: dict[str, object],
+    overlay_source: dict[str, object],
+    started_unix_ns: int,
 ) -> int:
     """Retain and fail closed over every standalone capture evidence stream."""
     stdout, stderr = process.communicate()
-    stdout_path = trace_output.with_suffix(".driver.out")
-    stderr_path = trace_output.with_suffix(".driver.err")
-    analysis_path = trace_output.with_suffix(".json")
-    receipt_path = trace_output.with_suffix(".capture.json")
+    paths = _capture_paths(trace_output)
+    stdout_path = paths["driver_stdout"]
+    stderr_path = paths["driver_stderr"]
+    analysis_path = paths["analysis"]
+    receipt_path = paths["receipt"]
     stdout_path.write_bytes(stdout)
     stderr_path.write_bytes(stderr)
     _replay(sys.stdout, stdout)
@@ -356,11 +451,30 @@ def _verify_standalone_capture(
         else:
             failures.append("strict directional analyzer retained no JSON receipt")
 
-    binary_identity: dict[str, object] | None = None
+    execution_post: dict[str, object] | None = None
     try:
-        binary_identity = native_pc_range_risk.inspect_binary_identity(binary)
+        execution_post = _execution_identity(
+            binary=binary,
+            trace_script=trace_script,
+            overlay_path=native_pc_range_risk.OVERLAY_PATHS[metadata_mode],
+        )
     except (OSError, ValueError) as error:
-        failures.append(f"producing binary identity failed closed: {error}")
+        failures.append(f"post-execution identity failed closed: {error}")
+    if execution_post is not None and execution_post != execution_pre:
+        failures.append("binary/script/analyzer identity drifted during execution")
+    if predecessor_path is not None:
+        try:
+            _predecessor, observed_binding = _load_predecessor(
+                predecessor_path,
+                campaign_id=campaign_id,
+                pair_id=pair_id,
+                pair_ordinal=pair_ordinal,
+                arm=arm,
+            )
+            if observed_binding != predecessor_binding:
+                failures.append("predecessor capture drifted during execution")
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            failures.append(f"post-execution predecessor authentication failed: {error}")
 
     required_streams: dict[str, bool] | None = None
     natural_completion = False
@@ -409,7 +523,7 @@ def _verify_standalone_capture(
         "driver_stderr": stderr_path,
         "analysis": analysis_path,
     }
-    arm = "control" if metadata_mode == METADATA_MODE_V2 else "candidate"
+    completed_unix_ns = time.time_ns()
     receipt = {
         "analyzer": {
             **_retained_artifact(analyzer_path),
@@ -421,17 +535,25 @@ def _verify_standalone_capture(
             for role, path in artifact_paths.items()
             if path.is_file()
         },
-        "binary": binary_identity,
+        "binary": execution_pre.get("binary"),
+        "campaign_id": campaign_id,
+        "chronology": {
+            "completed_unix_ns": completed_unix_ns,
+            "predecessor": predecessor_binding,
+            "started_unix_ns": started_unix_ns,
+        },
         "diagnostic_predicates": [
             pattern.pattern for pattern in DTRACE_DIAGNOSTIC_PATTERNS
         ],
         "dtrace_status": process.returncode,
         "expected_effective_identity": identity.receipt(),
+        "execution_identity": {"post": execution_post, "pre": execution_pre},
         "failures": failures,
         "matched_diagnostic_predicates": matched_diagnostics,
         "metadata_mode": metadata_mode,
         "natural_completion": natural_completion,
         "normalized_overlay": normalized_overlay,
+        "overlay_source": overlay_source,
         "observed_effective_identity": observed_identity,
         "pair": {
             "arm": arm,
@@ -451,9 +573,7 @@ def _verify_standalone_capture(
         },
         "workload_ns": workload_ns,
     }
-    receipt_path.write_text(
-        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    native_pc_range_risk.atomic_write_json(receipt_path, receipt)
     if failures:
         for failure in failures:
             print(f"native_go_dtrace_target: {failure}", file=sys.stderr)
@@ -564,6 +684,9 @@ def main() -> int:
     )
     parser.add_argument("--pair-id")
     parser.add_argument("--pair-ordinal", type=int)
+    parser.add_argument("--campaign-id")
+    parser.add_argument("--arm", choices=("control", "candidate"))
+    parser.add_argument("--predecessor-capture", type=pathlib.Path)
     arguments = parser.parse_args()
     if (arguments.trace_script is None) != (arguments.trace_output is None):
         parser.error("--trace-script and --trace-output must be supplied together")
@@ -575,11 +698,21 @@ def main() -> int:
         or arguments.pair_ordinal <= 0
     ):
         parser.error("trace mode requires --pair-id and positive --pair-ordinal")
+    standalone_capture = (
+        arguments.trace_script is not None
+        and arguments.trace_launcher == "standalone"
+    )
+    if standalone_capture and (not arguments.campaign_id or not arguments.arm):
+        parser.error("standalone trace mode requires --campaign-id and --arm")
     run_id = arguments.run_id or os.environ.get("CARRICK_RUN_ID")
     if not run_id:
         parser.error("CARRICK_RUN_ID must be set")
     try:
         run_id = validate_run_id(run_id)
+        if arguments.pair_id is not None:
+            validate_run_id(arguments.pair_id)
+        if arguments.campaign_id is not None:
+            validate_run_id(arguments.campaign_id)
     except ValueError as error:
         parser.error(str(error))
 
@@ -634,6 +767,80 @@ def main() -> int:
         binary=REPO / "target/release/carrick",
         registry_transport=RegistryTransport("localhost:5005", True),
     )
+    execution_pre: dict[str, object] | None = None
+    overlay_source: dict[str, object] | None = None
+    predecessor_binding: dict[str, object] | None = None
+    started_unix_ns: int | None = None
+    if standalone_capture:
+        assert arguments.trace_output is not None
+        assert arguments.trace_script is not None
+        assert arguments.campaign_id is not None
+        assert arguments.arm is not None
+        assert arguments.pair_id is not None
+        assert arguments.pair_ordinal is not None
+        paths = _capture_paths(arguments.trace_output)
+        try:
+            _invalidate_capture_outputs(arguments.trace_output)
+            overlay_source, expected_overlay = native_pc_range_risk.expected_capture_overlay(
+                arguments.metadata_mode
+            )
+            if overlay != expected_overlay:
+                raise ValueError(
+                    "standalone capture requires the exact overlay authority, including "
+                    "CARRICK_DSR_SHARED_TRANSLATION=1, CARRICK_DSR_DIRECT_BINDINGS=1, "
+                    "and CARRICK_DSR_PROFILE=1"
+                )
+            expected_arm = (
+                "control"
+                if arguments.metadata_mode == METADATA_MODE_V2
+                else "candidate"
+            )
+            if arguments.arm != expected_arm:
+                raise ValueError("capture arm does not match metadata mode")
+            if arguments.arm == "control" and arguments.pair_ordinal == 1:
+                if arguments.predecessor_capture is not None:
+                    raise ValueError("pair-one control is the sole root and has no predecessor")
+            else:
+                if arguments.predecessor_capture is None:
+                    raise ValueError("non-root capture requires --predecessor-capture")
+                _predecessor, predecessor_binding = _load_predecessor(
+                    arguments.predecessor_capture,
+                    campaign_id=arguments.campaign_id,
+                    pair_id=arguments.pair_id,
+                    pair_ordinal=arguments.pair_ordinal,
+                    arm=arguments.arm,
+                )
+            started_unix_ns = time.time_ns()
+            if (
+                predecessor_binding is not None
+                and int(predecessor_binding["completed_unix_ns"]) >= started_unix_ns
+            ):
+                raise ValueError("predecessor does not complete before capture start")
+            execution_pre = _execution_identity(
+                binary=REPO / "target/release/carrick",
+                trace_script=arguments.trace_script,
+                overlay_path=native_pc_range_risk.OVERLAY_PATHS[
+                    arguments.metadata_mode
+                ],
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            try:
+                _publish_failed_capture(
+                    paths["receipt"],
+                    campaign_id=arguments.campaign_id,
+                    run_id=run_id,
+                    pair_id=arguments.pair_id,
+                    pair_ordinal=arguments.pair_ordinal,
+                    arm=arguments.arm,
+                    failures=[str(error)],
+                )
+            except OSError as write_error:
+                print(
+                    f"native_go_dtrace_target: could not publish failed receipt: {write_error}",
+                    file=sys.stderr,
+                )
+            print(f"native_go_dtrace_target: {error}", file=sys.stderr)
+            return 2
     if arguments.trace_script is not None:
         if arguments.trace_launcher == "standalone":
             command = standalone_dtrace_command(
@@ -652,34 +859,76 @@ def main() -> int:
                 trace_script=arguments.trace_script,
                 trace_output=arguments.trace_output,
             )
-    standalone_capture = (
-        arguments.trace_script is not None
-        and arguments.trace_launcher == "standalone"
-    )
-    process = subprocess.Popen(
-        command,
-        cwd=REPO,
-        env=environment,
-        **(
-            {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
-            if standalone_capture
-            else {}
-        ),
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=REPO,
+            env=environment,
+            **(
+                {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+                if standalone_capture
+                else {}
+            ),
+        )
+    except OSError as error:
+        if standalone_capture:
+            assert arguments.trace_output is not None
+            _publish_failed_capture(
+                _capture_paths(arguments.trace_output)["receipt"],
+                campaign_id=arguments.campaign_id,
+                run_id=run_id,
+                pair_id=arguments.pair_id,
+                pair_ordinal=arguments.pair_ordinal,
+                arm=arguments.arm,
+                failures=[f"capture process launch failed: {error}"],
+            )
+            return 2
+        raise
     if standalone_capture:
         assert arguments.trace_output is not None
-        return _verify_standalone_capture(
-            process=process,
-            trace_output=arguments.trace_output,
-            identity=trace_identity,
-            run_id=run_id,
-            metadata_mode=arguments.metadata_mode,
-            normalized_overlay=overlay,
-            trace_script=arguments.trace_script,
-            binary=REPO / "target/release/carrick",
-            pair_id=arguments.pair_id,
-            pair_ordinal=arguments.pair_ordinal,
-        )
+        assert arguments.campaign_id is not None
+        assert arguments.arm is not None
+        assert execution_pre is not None
+        assert overlay_source is not None
+        assert started_unix_ns is not None
+        try:
+            return _verify_standalone_capture(
+                process=process,
+                trace_output=arguments.trace_output,
+                identity=trace_identity,
+                run_id=run_id,
+                metadata_mode=arguments.metadata_mode,
+                normalized_overlay=overlay,
+                trace_script=arguments.trace_script,
+                binary=REPO / "target/release/carrick",
+                pair_id=arguments.pair_id,
+                pair_ordinal=arguments.pair_ordinal,
+                campaign_id=arguments.campaign_id,
+                arm=arguments.arm,
+                predecessor_path=arguments.predecessor_capture,
+                predecessor_binding=predecessor_binding,
+                execution_pre=execution_pre,
+                overlay_source=overlay_source,
+                started_unix_ns=started_unix_ns,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            try:
+                _publish_failed_capture(
+                    _capture_paths(arguments.trace_output)["receipt"],
+                    campaign_id=arguments.campaign_id,
+                    run_id=run_id,
+                    pair_id=arguments.pair_id,
+                    pair_ordinal=arguments.pair_ordinal,
+                    arm=arguments.arm,
+                    failures=[f"capture verification failed: {error}"],
+                )
+            except OSError as write_error:
+                print(
+                    f"native_go_dtrace_target: could not publish failed receipt: {write_error}",
+                    file=sys.stderr,
+                )
+            print(f"native_go_dtrace_target: {error}", file=sys.stderr)
+            return 2
     if arguments.stop_child:
         if not _wait_for_carrick_proctitle(process, run_id):
             process.terminate()
