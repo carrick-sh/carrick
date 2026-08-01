@@ -1,10 +1,10 @@
 # Native-lane performance handoff
 
 **Date:** 2026-08-01
-**Branch:** `codex/native-performance-m1` (recovery-run evidence checkpoint
-`b0ddf87d`; performance/timeout checkpoint `47457f44`; qualified profile-v2
-checkpoint `edbdc530`; M1 correctness checkpoint `5020e509`; mapped-metadata
-V3 decision base `6ccc6471`)
+**Branch:** `codex/native-performance-m1` -> `main` (fast-forward checkpoint;
+recovery-run evidence `b0ddf87d`; timeout diagnostics `47457f44`; qualified
+profile-v2 `edbdc530`; M1 correctness `5020e509`; corrected mapped-metadata V3
+implementation `d7935114`)
 **Scope:** Darwin/aarch64 native DSR (`--exec-backend native`, the shipped
 default). No VMM/HVF/KVM/bhyve behaviour was touched.
 
@@ -24,12 +24,14 @@ its ignored raw trace receipts remain under `target/perf/`.
 ## Active performance checkpoint — retained shared-cache mechanisms
 
 The performance campaign now has direct cumulative, shared/default, and
-incremental V2/V3 measurements. The branch is still active and is **not
-merge-ready**: run-encoded recovery metadata and mapped translation metadata
-V3 are retained, the qualified v2 profiler has signed live proofs, and the
-retained shared-translation stack has a clean cumulative result. The full
-`>=30%` goal remains open, and the next retained-tip owner still requires a
-fresh default/shared attribution before another production candidate.
+incremental V2/V3 measurements. This implementation checkpoint is green and
+ready to fast-forward to `main`, but the performance campaign is still active:
+run-encoded recovery metadata and corrected mapped translation metadata V3 are
+retained, the qualified v2 profiler has signed live proofs, and the retained
+shared-translation stack has a clean cumulative result. The full `>=30%` goal
+remains open. The next candidate has a hard impact floor: it must have a
+supported path to at least `10%` end-to-end CPU or wall improvement, not merely
+reduce a narrow validation loop.
 
 Retained default-on changes, each with an exact `=0` opt-out, now remove:
 
@@ -42,23 +44,33 @@ Retained default-on changes, each with an exact `=0` opt-out, now remove:
   every descendant, replaced by one validated read-only mapped V3 sidecar; and
 - indirect copying of instruction bytes where the direct form is proven.
 
-### Mapped translation metadata V3 — retained by the first timing authority
+### Mapped translation metadata V3 — retained by the corrected authority
 
-Task 8 retains mapped translation metadata V3 default-on, with exact
-`CARRICK_DSR_SHARED_MAPPED_METADATA=0` as the V2 opt-out. This is the first and
-only V3 timing decision; Task 7's traced samples remain mechanism and
-secondary-risk evidence only.
+Mapped translation metadata V3 remains default-on within the shared-translation
+lane, with exact `CARRICK_DSR_SHARED_MAPPED_METADATA=0` as the V2 opt-out. The
+initial implementation used `memmap2::MmapOptions::map`, which produced a
+read-only `MAP_SHARED` region even though the design required
+`MAP_PRIVATE|PROT_READ`. Commits `bd7540ac` and `d7935114` corrected the mapping
+to copy-on-write private semantics, made dyld-lease teardown order explicit,
+fixed the digest-mismatch fixture, and scoped Mach-only test support to Darwin.
+A Mach VM-region test now proves `VM_PROT_READ` plus `SM_COW`; drop probes prove
+the dyld lease remains alive through metadata teardown.
 
-The single immutable same-binary receipt is
-`target/perf/mapped-metadata-arm/arm.json` (SHA-256
-`a53f2759608edb077d5b882787fecb85ed8ec4684be505d03774a24b3337cef1`).
+The original published artifact
+[`scripts/perf/evidence/native-mapped-metadata-v3-abba.json`](scripts/perf/evidence/native-mapped-metadata-v3-abba.json)
+measured the superseded `MAP_SHARED` implementation at `6ccc6471`. It remains
+historical evidence only and must not be cited as the current V3 authority.
+
+The corrected immutable same-binary receipt is
+`target/perf/mapped-metadata-private-arm-d7935114/arm.json` (SHA-256
+`060cca26eaec0117b4464f2455183f0fee2d1ab5536d3ff5c391537ed1904be8`).
 Both arms used that exact path and its read-only signed binary:
 
-- source commit `6ccc6471fe29a3bb4391777b7d76c45b33b98ec7` on
+- source commit `d793511410c941fe9466b4738ff363d206963aca` on
   `codex/native-performance-m1`, with empty source status;
 - binary SHA-256
-  `cf3f64f7086820c404bad6419501338418938816ccda010509cae25d0cd2ef7d`,
-  Mach-O UUID `88F99BAA-962F-31DA-9EF0-25DF0BB1F329`, entitlement SHA-256
+  `a41777473d75ebb0df9390f93bac767b9a06d27f29d69e39322fcc033f00ac20`,
+  Mach-O UUID `692757C9-59E7-332D-A197-F3864D5E2141`, entitlement SHA-256
   `c439c3ffbe9d1b486321de3360bd9f1368024751553ae131aa0490e4e49841dd`,
   strict codesign accepted, and `__dof_carrick` present;
 - exact arm64 image
@@ -71,27 +83,28 @@ Both arms used that exact path and its read-only signed binary:
   Their only difference is mapped metadata `"0"` versus normalized default
   `null`; shared translation and direct bindings remain exactly `"1"`.
 
-Campaign `46616-9c74e172bfc043998e0e2f6679e95e2e` ran the predeclared
-eight ABBA quads without a retry, splice, or selected run. It completed 2
+Campaign `75995-dbb8b14f16b64b23a0c3a007941c25a1` ran a fresh,
+unspliced set of eight ABBA quads. It completed 2
 excluded warmups plus all 32/32 measured samples and nine preflights. Every
 sample returned zero, emitted `BUILD_OK` exactly once, avoided timeout, cleaned
 up with status zero, and retained identical pre/post provenance. Every
-preflight recorded AC power under the authorized `--allow-battery` policy, the
-explicit no-warning thermal contract, empty busy/foreign/Docker-oracle state,
-and the exact receipt/image. The raw and exclusively published artifacts are
+preflight recorded Battery Power under the authorized `--allow-battery`
+policy, the explicit no-warning thermal contract, empty
+busy/foreign/Docker-oracle state, and the exact receipt/image. The raw and
+exclusively published artifacts are
 byte-identical at SHA-256
-`2839f8db60bcf7af25673128c478d83c210899d2d290301da11afde2b1924ba3`:
-[`scripts/perf/evidence/native-mapped-metadata-v3-abba.json`](scripts/perf/evidence/native-mapped-metadata-v3-abba.json).
+`6b6b78419d4a4d391d5342b1b443d7c841268b052ff4fe14e1ad19527c47b88e`:
+[`scripts/perf/evidence/native-mapped-metadata-v3-private-abba.json`](scripts/perf/evidence/native-mapped-metadata-v3-private-abba.json).
 
 The primary total-child-CPU gate and every secondary moved in V3's favor:
 
 | metric | V2 median | V3 median | V3/V2 ratio (movement) | wins | one-sided upper | two-sided interval | sign probability |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| total CPU `cpu_s` | `32.443216` | `31.385478` | `0.9687464359233304` (`-3.125356407666957%`) | `8/8` | `0.981387322486502` | `0.9500661395872914..0.9897549000382243` | `1/256` (`0.00390625`) |
-| user CPU `cpu_user_s` | `22.6670175` | `21.81597875` | `0.9702604623790994` (`-2.9739537620900647%`) | `8/8` | `0.9838363782239512` | `0.9471561990435181..0.9950829044289131` | `1/256` (`0.00390625`) |
-| system CPU `cpu_sys_s` | `9.78776675` | `9.53821025` | `0.9668473192759123` (`-3.3152680724087724%`) | `8/8` | `0.9756878210968964` | `0.9567891510903371..0.9773623110282287` | `1/256` (`0.00390625`) |
-| outer wall `elapsed_ms` | `14547.5` | `14221.0` | `0.9789933273908056` (`-2.100667260919442%`) | `8/8` | `0.9870290191931548` | `0.9695616325408822..0.9932260504779589` | `1/256` (`0.00390625`) |
-| guest workload `workload_ms` | `12641.5` | `12317.0` | `0.9744598048364301` (`-2.5540195163569868%`) | `8/8` | `0.9854613443622682` | `0.9661680911680912..0.993543531648578` | `1/256` (`0.00390625`) |
+| total CPU `cpu_s` | `32.7205275` | `31.8342200` | `0.9623953548920466` (`-3.760464510795336%`) | `7/8` | `0.9856085522576999` | `0.9478722904836884..0.9931111807559466` | `9/256` (`0.03515625`) |
+| user CPU `cpu_user_s` | `22.5795890` | `22.0263040` | `0.9636171547950005` (`-3.638284520499946%`) | `7/8` | `0.9875758909929790` | `0.9449311366409422..0.9913529929464772` | `9/256` (`0.03515625`) |
+| system CPU `cpu_sys_s` | `10.10353325` | `9.81125975` | `0.9678420005355608` (`-3.21579994644392%`) | `7/8` | `0.9883569304873058` | `0.9470984265023998..0.9970266165974714` | `9/256` (`0.03515625`) |
+| outer wall `elapsed_ms` | `14754.0` | `14435.25` | `0.9716786318058463` (`-2.832136819415365%`) | `7/8` | `0.9873923293102180` | `0.9582990758706876..0.9933562822719450` | `9/256` (`0.03515625`) |
+| guest workload `workload_ms` | `12778.0` | `12447.5` | `0.9677805185592670` (`-3.2219481440733055%`) | `7/8` | `0.9851296579205959` | `0.9471408538485510..0.9900784954377018` | `9/256` (`0.03515625`) |
 
 All five runner criteria are true: complete with eight quads, primary median
 below one, primary one-sided upper below one, primary exact sign probability
@@ -100,17 +113,32 @@ below `0.05`, and no supported secondary regression. The artifact's
 self-certify the external mechanism and correctness authorities. The project
 decision is **retain V3**, because those external gates are separately green.
 
-The accepted mechanism/secondary-risk authority is
-`target/perf/native-metadata-v3-nmv3r4c-risk.json`, SHA-256
-`f333e218c396769e07d2290ec3ee0abb5cc5c2a5f2549214abf851c414d0c273`.
+The corrected mechanism/secondary-risk authority is
+`target/perf/native-metadata-v3-nmv3r5a-risk.json`, SHA-256
+`0f512ea15e58f366c631f9f3afdf34782c44246616810551cfed6d1b82251ea9`.
 It is one authenticated five-pair chain with status `passed`, no failures, and
 `supported_v3_owner_increases=[]`. Mean V3-minus-V2 movement per 1,000 samples
-was dyld `-0.228608` (`p=7/8`), kernel `-4.554182` (`p=13/16`), locks
-`-0.412291` (`p=7/8`), malloc `-1.620070` (`p=13/16`), and mmap/fault
-`+0.071952` (`p=1/16`). The positive mmap/fault point estimate is unsupported
-at the predeclared `0.05` threshold and is not a regression. For actual kernel
-time, the authoritative measurement is child-rusage `cpu_sys_s` above:
-`-3.3152680724087724%`, not the traced kernel sample rate.
+was dyld `-0.103273` (`p=19/32`), kernel `+2.284103` (`p=3/8`), locks
+`+1.119697` (`p=1/16`), malloc `-3.036435` (`p=1`), and mmap/fault
+`-0.062537` (`p=7/8`). Neither positive point estimate meets the predeclared
+`0.05` support threshold, so neither is a regression. For actual kernel time,
+the authoritative measurement is child-rusage `cpu_sys_s` above:
+`-3.21579994644392%`, not the traced kernel sample rate.
+
+One earlier corrected-tip timing chain is deliberately failed and non-gating.
+Campaign `73358-75eff8af12294c7499eb1950fef9cb24` timed out at sample 9,
+quad 2 B2, after 180 seconds with only `0.322287` child CPU seconds
+(`0.020606` user, `0.301681` system). Its signature closely matches the
+preserved pre-V3 900-second B2 timeout (`0.321666` total, `0.020608` user,
+`0.301058` system). Automatic LLDB evidence shows the shell in
+`wait_native_proc_exit`, its child watcher in
+`native_publish_child_exit -> kick_all`, and the Go process parked across
+futex/netpoll waits. The exact compiler child could not be paused and was gone
+by LLDB's retry after the scoped `SIGCONT`. This supports a pre-existing
+child-exit/wakeup flake, not a deterministic private-metadata defect; the cause
+remains open.
+The accepted fresh campaign subsequently passed the same B2 position and all
+32 measured runs. Never splice either failed chain into accepted timing.
 
 Task 7's accepted production/correctness authority ran these exact commands
 sequentially; this is a durable command ledger of accepted prior outputs, not a
@@ -131,8 +159,8 @@ just conformance-native smoke --workers 4 --ecosystem node
 just conformance-native smoke --workers 4 --ecosystem cpython
 ```
 
-The accepted outputs were: formatting/clippy/CI/build/signing/entitlement/DOF
-all passed; `carrick-dsr-aarch64` passed 283, `carrick-native-darwin` passed 45,
+The corrected outputs were: formatting/clippy/CI/build/signing/entitlement/DOF
+all passed; `carrick-dsr-aarch64` passed 284, `carrick-native-darwin` passed 47,
 and serialized `carrick-runtime` passed 1,128 with 5 ignored. The full native
 smoke was 23/23 MATCH, Node was 2/2, and CPython was 6/6; every oracle was
 cached and Docker ran zero times.
@@ -171,24 +199,36 @@ Those exact gates passed (trace-child 1/1); the same accepted report records
 at 482 with zero failures/errors/skips, two semantic tests, and the DTrace
 compilation smoke as passed. It does not preserve shell argv for those four
 summaries, so this handoff does not invent approximate commands for them.
-Task 8 then rebuilt and signed clean source `6ccc6471` before freezing the
-receipt; no tracked source changed after preparation or during timing.
+The corrected authority then rebuilt and signed clean source `d7935114` before
+freezing the receipt; no tracked source changed after preparation or during
+timing. The full `scripts/perf` discovery passed 482/482 on that tip.
 
 Keep this incremental V2/V3 result separate from the earlier cumulative stack
-result. The prior direct cumulative improvement remains `15.5007%`; this new
-`3.125356407666957%` V2-to-V3 result is neither added to nor compounded with
-it, and no updated cumulative end-to-end result has been measured.
+result. The prior direct cumulative improvement remains `15.5007%`; the
+corrected `3.760464510795336%` V2-to-V3 result is neither added to nor
+compounded with it, and no updated cumulative end-to-end result has been
+measured.
 
-**Next measured owner:** re-qualify the retained V3 shared/default gap, then
-target the mapped-validation scan only if it remains supported. Across the
-accepted five V3 mechanism captures,
-`ValidatedMappedTranslationMetadata::validate_guest_ranges` carried `291`
-exact Carrick-offset samples and `validate_pc_map` carried `157`, ahead of
-`DirectBindingRegistry::prepare_loaded_unit` at `188`; these are directional
-owner counts, not savings. Do not promote the unsupported mmap/fault point
-estimate or compound the V3 result. A fresh retained-tip default/shared
-attribution must establish the next production boundary before another
-candidate reaches the same eight-quad total-CPU gate.
+**Next measured owner and impact floor:** first run a fresh corrected-tip
+default/shared attribution, then measure whole phases rather than isolated
+functions. Do not target `validate_guest_ranges` or another validation-only
+loop: the prior validation bypass measured only `-0.31%` total CPU and was
+correctly rejected. A production candidate now needs evidence for at least a
+`10%` end-to-end CPU or wall opportunity. The two live hypotheses are:
+
+1. collapse the repeated load/map/prepare lifecycle and recover execution
+   locality for the 400,000+ shared blocks currently spread over 54 separately
+   `dlopen`ed unit mappings, potentially through a larger packed code+metadata
+   representation; or
+2. if normal-run evidence supports it at the same scale, reduce the native
+   process/futex/epoll child-exit and wakeup lifecycle exposed by the timeout.
+
+Use DTrace/`carrick trace` to size complete dyld, mapping, preparation, fault,
+translated-execution, futex, epoll, and process-lifecycle buckets. Use LLDB for
+ambiguous wait topology. Reject any design whose removable measured share is
+below `10%`; the known sub-page `PROT_NONE` amplifier alone remains below that
+floor. Only the selected structural candidate advances to implementation and
+the same eight-quad total-child-CPU authority.
 
 The final two-binary cumulative campaign directly compared clean detached
 source commits `04b2222d` and `b0ddf87d`, with shared translation enabled on
