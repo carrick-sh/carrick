@@ -22,11 +22,12 @@ its ignored raw trace receipts remain under `target/perf/`.
 
 ## Active performance checkpoint — retained shared-cache mechanisms
 
-The performance campaign is now producing measured mechanism wins. The branch
-is still active and is **not merge-ready**: run-encoded recovery metadata is
-retained and the qualified v2 profiler has a signed live proof, but the retained
-stack still needs one clean cumulative old/new rerun and the shared/default gap
-must be remeasured.
+The performance campaign now has direct cumulative and shared/default
+measurements. The branch is still active and is **not merge-ready**:
+run-encoded recovery metadata is retained, the qualified v2 profiler has a
+signed live proof, and the retained shared-translation stack has a clean
+cumulative result, but the remaining shared-path user-CPU owner has not yet
+been isolated or improved.
 
 Retained default-on changes, each with an exact `=0` opt-out, now remove:
 
@@ -37,18 +38,47 @@ Retained default-on changes, each with an exact `=0` opt-out, now remove:
   by bounded Mach-O reads plus a signed key-specific export identity; and
 - indirect copying of instruction bytes where the direct form is proven.
 
-The clean cumulative old/new mechanism comparison before keyed dylib identity
-measured `-11.9%` guest workload, `-10.6%` outer wall, `-12.6%` user CPU,
-`-5.9%` system CPU, `-10.7%` peak RSS, and `-20.1%` page reclaims. A separate
-clean ABBA for keyed dylib identity added `-2.51%` guest workload and `-2.02%`
-wall with flat system CPU/RSS. Multiplying those independent effects projects
-about `-14.1%` cumulative workload, but that figure is explicitly a projection
-until the final combined binary is rerun. Run encoding then measured another
-`-8.48%` total CPU on the complete current stack; compounding the independent
-results projects roughly `-21.4%`, but this also remains a projection rather
-than an official old/new result. The last measured shared/default gap was
-`+16.46%`; keyed identity and run encoding should close much of it, but the
-current exact gap has not yet been measured.
+The final two-binary cumulative campaign directly compared clean detached
+source commits `04b2222d` and `b0ddf87d`, with shared translation enabled on
+both arms. Across eight complete ABBA quads the retained stack won `8/8` and
+measured a total-CPU ratio of `0.84499` (`-15.50%`; one-sided upper `0.87124`,
+two-sided interval `0.80496..0.88793`, sign probability `1/256`). User CPU fell
+`17.40%`, system CPU `10.84%`, outer wall `15.66%`, and guest workload `17.87%`.
+This direct result supersedes the former `~21.4%` compounded projection: the
+mechanisms overlap more than their isolated measurements implied.
+
+The adjacent same-binary campaign measured the current default path against
+the current shared path. Shared translation still costs `6.76%` total CPU
+(`8/8` quads favored default; two-sided ratio interval
+`1.02327..1.09442`), comprising `+8.49%` user CPU, `+2.93%` system CPU,
+`+6.22%` wall, and `+6.74%` guest workload. This replaces the older `+16.46%`
+gap: most of it is closed, but the remainder is statistically clear and is now
+predominantly user-space. The cumulative `-15.50%` result is therefore an
+official result for the shared-translation mechanism stack, not a claim that
+the shipped default path improved by the same amount.
+
+Both maintained artifacts are complete and accepted:
+
+- [`scripts/perf/evidence/native-cumulative-shared-prestack-current-battery-b0ddf87d.json`](scripts/perf/evidence/native-cumulative-shared-prestack-current-battery-b0ddf87d.json)
+  (SHA-256
+  `7e29dd76d856056f70f828c294431f517f88b9cff49cff6af92aacf5b9795f22`);
+- [`scripts/perf/evidence/native-default-shared-gap-battery-b0ddf87d.json`](scripts/perf/evidence/native-default-shared-gap-battery-b0ddf87d.json)
+  (SHA-256
+  `3cb40488e9e744f525bc0dd51641ef2ba8cee07d62675e433f34c666053abb96`).
+
+Each campaign contains eight quads plus excluded warmups and nine preflight
+receipts. All preflights record the user's explicit battery authorization,
+exact `Battery Power`, no thermal or performance warning, no foreign workload,
+and no Docker oracle. Both arms use the exact arm64 platform manifest
+`sha256:357a08793e683c6a174d3955c704a5194e825f38fcdcb91d1d4ee2bccd6b188b`.
+Docker's reset removed the old multi-platform index alias
+`sha256:6199806814040f05f24d1845b3198f82a2bb982d336ffb04aa4470861cb214d6`;
+the selected manifest, config, and layer blobs were rehydrated byte-for-byte
+from Carrick's cache, so the workload bytes did not drift. The cumulative
+artifact leaves `decision.retained=false` only because the statistics harness
+cannot self-certify the already-passed external mechanism and correctness
+gates. The gap artifact's `statistical_pass=false` correctly means the selected
+shared candidate regressed; it does not make the accepted comparison invalid.
 
 The maintained low-overhead syscall CPU tracer
 (`scripts/dtrace/native-syscall-cpu-directional.d` plus
@@ -167,24 +197,28 @@ The full gate exposed four stale keyed-export fixtures and two eager-recovery
 test helpers; both were corrected through the production validation key and a
 single representation-neutral recovery lookup seam before the green rerun.
 
-**Next:** run the exact old/new two-binary cumulative campaign and the current
-same-binary shared/default campaign. Battery power is explicitly authorized for
-this campaign as of this checkpoint; preserve the power state in each receipt
-and retain the existing thermal/load gates. Then use the accepted v2 profile to
-build one narrower, low-perturbation experiment around host-side user time and
-the genuine synchronization/kqueue frames. Advance a default-on candidate with
-an exact opt-out only after that experiment identifies the cost; do not infer
+**Next:** use DTrace to split the remaining `+8.49%` shared-path user-CPU cost
+into named host stacks versus translated execution with substantially less
+observer work than the full wall profiler. Keep lifecycle/drop accounting and
+symmetrically compare default/shared on the same signed binary. Use LLDB only
+where unresolved PCs need a ground-truth image/offset mapping. Then implement
+one red-first, default-on candidate with an exact opt-out and return it to the
+primary eight-quad total-child-CPU gate. Synchronization/kqueue kernel frames
+remain secondary until the user-space comparison is resolved; do not infer
 that PC-map compaction wins from address classification alone.
 
 Confidence that run encoding should stay is high (`~93%`) because statistical,
 mechanism, correctness, and signed-live operability evidence now agree.
-Confidence that the campaign has a meaningful cumulative native win is also
-high (`~92%`). Confidence that `DSRPROF2` can reliably select the next owner is
-now high (`~95%`) after the accepted zero-drop live run. Confidence in reaching
-the full `>=30%` total-CPU goal is moderate-to-high (`~70%`): the current stack
-projects around `21%`, leaving a real but bounded gap for host-side user time
-and remaining kernel ownership work. Confidence that shared/default parity is
-now close is about `70%` until the exact rerun.
+Confidence that the shared-translation campaign has a meaningful cumulative
+win is now very high (`~98%`) because the direct result won all eight quads and
+its upper interval remains well below parity. Confidence that the remaining
+shared/default regression is real is also very high (`~97%`), and confidence
+that `DSRPROF2` can reliably select the next owner remains high (`~95%`).
+Confidence in reaching the full `>=30%` total-CPU goal is now moderate
+(`~58%`): the direct stack result is `15.50%`, rather than the projected
+`~21%`, leaving about 14.5 points that require a new measured owner. The
+user-heavy shared/default delta and the `53.13%` host/unattributed user samples
+make further progress likely, but neither yet proves a production fix.
 
 ---
 
@@ -408,16 +442,15 @@ real-workload `DSRPROF2` capture proves production emission and qualification
 agree under the Go-build process tree. Use that capture, not the older PID-only
 `DSRPROF1` stream, to rank the next translation/kernel owner.
 
-**Next:** complete the explicitly battery-authorized cumulative old/new and
-shared/default CPU campaigns while preserving power and thermal metadata. In
-parallel with the resulting comparison, narrow the accepted birth-keyed
-PC-range and kernel/off-CPU summaries into one low-perturbation host-user or
-synchronization/kqueue hypothesis, then advance one default-on candidate with
-an exact opt-out to the primary ABBA total-child-CPU gate.
+**Next:** narrow the accepted birth-keyed PC-range evidence into one
+low-perturbation host-user hypothesis that explains the directly measured
+`+8.49%` shared user-CPU delta. Preserve lifecycle and DTrace loss authority,
+resolve ambiguous PCs with LLDB where necessary, then advance one default-on
+candidate with an exact opt-out to the primary ABBA total-child-CPU gate.
 
-The `>=30%` CPU goal remains open. Run encoding has now added a clean `-8.48%`
-total-CPU result; the combined-stack result is still awaiting direct
-measurement.
+The `>=30%` CPU goal remains open. The combined shared-translation stack now
+has a direct `-15.50%` total-CPU result; the next 14.5 points require a new
+measured owner rather than compounding prior projections.
 
 ---
 
