@@ -786,23 +786,113 @@ pub enum PublishOutcome {
     Existing,
 }
 
+#[derive(Clone, Debug)]
+pub enum LoadedTranslationMetadata {
+    V2(std::sync::Arc<TranslationUnitManifest>),
+    V3(std::sync::Arc<crate::mapped_metadata::ValidatedMappedTranslationMetadata>),
+}
+
+impl LoadedTranslationMetadata {
+    pub fn key(&self) -> &TranslationUnitKey {
+        match self {
+            Self::V2(manifest) => &manifest.key,
+            Self::V3(metadata) => metadata.key(),
+        }
+    }
+
+    pub fn code_len(&self) -> u64 {
+        match self {
+            Self::V2(manifest) => manifest.code_len,
+            Self::V3(metadata) => metadata.code_len(),
+        }
+    }
+
+    pub fn block_count(&self) -> usize {
+        match self {
+            Self::V2(manifest) => manifest.blocks.len(),
+            Self::V3(metadata) => metadata.block_count(),
+        }
+    }
+
+    pub fn binding_layout(&self) -> DirectBindingLayout {
+        match self {
+            Self::V2(manifest) => manifest.binding_layout,
+            Self::V3(metadata) => metadata.binding_layout(),
+        }
+    }
+
+    pub fn binding_count(&self) -> usize {
+        match self {
+            Self::V2(manifest) => manifest.bindings.len(),
+            Self::V3(metadata) => metadata.binding_count(),
+        }
+    }
+
+    pub fn binding_data_len(&self) -> u64 {
+        match self {
+            Self::V2(manifest) => manifest.binding_data_len,
+            Self::V3(metadata) => metadata.binding_data_len(),
+        }
+    }
+
+    pub fn v2(&self) -> Option<&Arc<TranslationUnitManifest>> {
+        match self {
+            Self::V2(manifest) => Some(manifest),
+            Self::V3(_) => None,
+        }
+    }
+
+    pub fn v3(&self) -> Option<&Arc<crate::mapped_metadata::ValidatedMappedTranslationMetadata>> {
+        match self {
+            Self::V2(_) => None,
+            Self::V3(metadata) => Some(metadata),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TranslationMetadataMode {
+    #[default]
+    V2,
+    V3,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TranslationMetadataLoadEvidence {
+    pub mode: TranslationMetadataMode,
+    pub bytes_read: u64,
+    pub bytes_mapped: u64,
+    pub validation_ns: u64,
+    pub mapped_records: u64,
+    pub owned_records: u64,
+}
+
 pub struct SharedLoadedTranslationUnit {
-    pub manifest: Arc<TranslationUnitManifest>,
+    pub metadata: LoadedTranslationMetadata,
     pub base: usize,
     pub binding_base: Option<DirectBindingCellVa>,
+    pub load_evidence: TranslationMetadataLoadEvidence,
     _lease: Arc<dyn Send + Sync>,
 }
 
 impl Clone for SharedLoadedTranslationUnit {
     fn clone(&self) -> Self {
         Self {
-            manifest: if shared_manifest_arc_enabled() {
-                Arc::clone(&self.manifest)
-            } else {
-                Arc::new((*self.manifest).clone())
+            metadata: match &self.metadata {
+                LoadedTranslationMetadata::V2(manifest) => {
+                    LoadedTranslationMetadata::V2(if shared_manifest_arc_enabled() {
+                        Arc::clone(manifest)
+                    } else {
+                        Arc::new((**manifest).clone())
+                    })
+                }
+                LoadedTranslationMetadata::V3(metadata) => {
+                    LoadedTranslationMetadata::V3(Arc::clone(metadata))
+                }
             },
             base: self.base,
             binding_base: self.binding_base,
+            load_evidence: self.load_evidence,
             _lease: Arc::clone(&self._lease),
         }
     }
@@ -815,9 +905,10 @@ impl SharedLoadedTranslationUnit {
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
         Self {
-            manifest: retain_loaded_manifest(manifest.into()),
+            metadata: LoadedTranslationMetadata::V2(retain_loaded_manifest(manifest.into())),
             base,
             binding_base: None,
+            load_evidence: TranslationMetadataLoadEvidence::default(),
             _lease: lease,
         }
     }
@@ -829,11 +920,54 @@ impl SharedLoadedTranslationUnit {
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
         Self {
-            manifest: retain_loaded_manifest(manifest.into()),
+            metadata: LoadedTranslationMetadata::V2(retain_loaded_manifest(manifest.into())),
             base,
             binding_base,
+            load_evidence: TranslationMetadataLoadEvidence::default(),
             _lease: lease,
         }
+    }
+
+    pub fn new_mapped(
+        metadata: impl Into<Arc<crate::mapped_metadata::ValidatedMappedTranslationMetadata>>,
+        base: usize,
+        load_evidence: TranslationMetadataLoadEvidence,
+        lease: Arc<dyn Send + Sync>,
+    ) -> Self {
+        Self::new_mapped_with_binding_base(metadata, base, None, load_evidence, lease)
+    }
+
+    pub fn new_mapped_with_binding_base(
+        metadata: impl Into<Arc<crate::mapped_metadata::ValidatedMappedTranslationMetadata>>,
+        base: usize,
+        binding_base: Option<DirectBindingCellVa>,
+        mut load_evidence: TranslationMetadataLoadEvidence,
+        lease: Arc<dyn Send + Sync>,
+    ) -> Self {
+        load_evidence.mode = TranslationMetadataMode::V3;
+        Self {
+            metadata: LoadedTranslationMetadata::V3(metadata.into()),
+            base,
+            binding_base,
+            load_evidence,
+            _lease: lease,
+        }
+    }
+
+    pub fn key(&self) -> &TranslationUnitKey {
+        self.metadata.key()
+    }
+
+    pub fn binding_layout(&self) -> DirectBindingLayout {
+        self.metadata.binding_layout()
+    }
+
+    pub fn binding_count(&self) -> usize {
+        self.metadata.binding_count()
+    }
+
+    pub fn binding_data_len(&self) -> u64 {
+        self.metadata.binding_data_len()
     }
 }
 
@@ -1307,8 +1441,10 @@ mod tests {
     fn loaded_unit_clones_share_the_immutable_manifest() {
         let unit = SharedLoadedTranslationUnit::new(manifest_v2_fixture(), 0x1000, Arc::new(()));
         let cloned = unit.clone();
+        let manifest = unit.metadata.v2().expect("V2 manifest");
+        let cloned_manifest = cloned.metadata.v2().expect("cloned V2 manifest");
 
-        assert!(std::ptr::eq(&unit.manifest.blocks, &cloned.manifest.blocks,));
+        assert!(std::ptr::eq(&manifest.blocks, &cloned_manifest.blocks));
     }
 
     #[test]

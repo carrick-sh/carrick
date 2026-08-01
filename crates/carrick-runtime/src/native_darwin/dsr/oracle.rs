@@ -6646,10 +6646,13 @@ fn translated_block_is_published_on_retirement_and_reused() {
             let Some(unit) = loaded.as_ref() else {
                 return Ok(None);
             };
-            if &unit.manifest.key != key {
+            if unit.key() != key {
                 return Err(UnitMissReason::ImageIdentity);
             }
-            unit.manifest.validate_source(source_words)?;
+            unit.metadata
+                .v2()
+                .ok_or(UnitMissReason::Schema)?
+                .validate_source(source_words)?;
             Ok(Some(unit.clone()))
         }
 
