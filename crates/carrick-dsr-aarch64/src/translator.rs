@@ -5815,8 +5815,8 @@ mod tests {
     use crate::emit::PcMapEntry;
     use crate::mapped_memory::NativeMappedMemory;
     use crate::mapped_metadata::{
-        MappedMetadataError, SectionKind, ValidatedLayout, ValidatedMappedTranslationMetadata,
-        VecMetadataBacking, encode_translation_metadata_v3,
+        MetadataBacking, ValidatedMappedTranslationMetadata, VecMetadataBacking,
+        encode_translation_metadata_v3,
     };
     use crate::shared_cache::{
         DirectBindingLayout, PortableBlockRecord, SharedLoadedTranslationUnit,
@@ -5833,6 +5833,7 @@ mod tests {
     use std::cell::RefCell;
     use std::ptr::NonNull;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     const PC: GuestVa = GuestVa(0x1000);
@@ -7114,6 +7115,32 @@ mod tests {
         )
     }
 
+    #[derive(Debug)]
+    struct DropCountingMetadataBacking {
+        bytes: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl MetadataBacking for DropCountingMetadataBacking {
+        fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for DropCountingMetadataBacking {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct DropCountingLease(Arc<AtomicUsize>);
+
+    impl Drop for DropCountingLease {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn shared_sensitive_install_unit(base: usize) -> SharedLoadedTranslationUnit {
         let block = |guest_start: GuestVa, generation_binding, entry_offset| {
             let map = pc_map(&[
@@ -7804,41 +7831,53 @@ mod tests {
     }
 
     #[test]
-    fn mapped_shared_unit_bad_guest_range_fails_before_logical_state_changes() {
+    fn mapped_shared_unit_bad_guest_range_fails_real_preparation_atomically() {
         let process =
             ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
         let mut recorder = TranslatedRangeRecorderFixture::default();
         process
             .activate_translated_range_catalog_with_recorder(&mut recorder)
             .expect("activate catalog");
-        let state = process.state.write();
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
         let before = state.shared_install_logical_snapshot_for_test();
+        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let manifest = shared_install_manifest();
-        let mut bytes = encode_translation_metadata_v3(&manifest).expect("encode mapped fixture");
-        let layout = ValidatedLayout::parse(&bytes).expect("parse mapped fixture layout");
-        let range_offset = usize::try_from(
-            layout
-                .section(SectionKind::GuestRange)
-                .expect("guest-range section")
-                .offset()
-                .get(),
+        let backing_drops = Arc::new(AtomicUsize::new(0));
+        let lease_drops = Arc::new(AtomicUsize::new(0));
+        let metadata = ValidatedMappedTranslationMetadata::new(
+            Arc::new(DropCountingMetadataBacking {
+                bytes: encode_translation_metadata_v3(&manifest).expect("encode mapped fixture"),
+                drops: Arc::clone(&backing_drops),
+            }),
+            &manifest.key,
         )
-        .expect("guest-range offset");
-        let range_end = u64::from_le_bytes(
-            bytes[range_offset + 8..range_offset + 16]
-                .try_into()
-                .expect("guest-range end"),
+        .expect("validate mapped fixture before arming the accessor fault");
+        metadata.arm_guest_range_access_fault_for_test();
+        let unit = SharedLoadedTranslationUnit::new_mapped(
+            metadata,
+            base,
+            TranslationMetadataLoadEvidence {
+                mode: TranslationMetadataMode::V3,
+                bytes_read: 0,
+                bytes_mapped: 1_234,
+                validation_ns: 37,
+                mapped_records: 6,
+                owned_records: 0,
+            },
+            Arc::new(DropCountingLease(Arc::clone(&lease_drops))),
         );
-        bytes[range_offset..range_offset + 8].copy_from_slice(&range_end.to_le_bytes());
+        assert_eq!(backing_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(lease_drops.load(Ordering::Relaxed), 0);
 
         assert!(matches!(
-            ValidatedMappedTranslationMetadata::new(
-                Arc::new(VecMetadataBacking::new(bytes)),
-                &manifest.key,
-            ),
-            Err(MappedMetadataError::GuestRange)
+            state.prepare_shared_install(73, &memory, unit),
+            Err(types::DsrError::CachePolicy(message))
+                if message.contains("mapped shared guest-range index 0 is invalid")
         ));
         assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
+        assert_eq!(backing_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(lease_drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]

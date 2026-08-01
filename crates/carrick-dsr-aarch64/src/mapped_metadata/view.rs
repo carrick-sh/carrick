@@ -1,5 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use carrick_guest_mem::GuestVa;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -48,6 +50,8 @@ pub struct ValidatedMappedTranslationMetadata {
     header: WireHeaderV3,
     counts: [usize; 12],
     counts_u64: [u64; 12],
+    #[cfg(test)]
+    guest_range_access_fault: AtomicBool,
 }
 
 impl fmt::Debug for ValidatedMappedTranslationMetadata {
@@ -91,6 +95,8 @@ impl ValidatedMappedTranslationMetadata {
             header,
             counts,
             counts_u64,
+            #[cfg(test)]
+            guest_range_access_fault: AtomicBool::new(false),
         };
         metadata.validate(expected_key)?;
         Ok(metadata)
@@ -179,6 +185,11 @@ impl ValidatedMappedTranslationMetadata {
             count: usize::try_from(wire.member_count.get()).ok()?,
             wire,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_guest_range_access_fault_for_test(&self) {
+        self.guest_range_access_fault.store(true, Ordering::Release);
     }
 
     fn validate(&self, expected_key: &TranslationUnitKey) -> Result<(), MappedMetadataError> {
@@ -821,6 +832,14 @@ impl<'a> MappedBlockView<'a> {
         self.guest_range_count
     }
     pub fn guest_range(self, relative: usize) -> Option<std::ops::Range<GuestVa>> {
+        #[cfg(test)]
+        if self
+            .metadata
+            .guest_range_access_fault
+            .load(Ordering::Acquire)
+        {
+            return None;
+        }
         if relative >= self.guest_range_count {
             return None;
         }
