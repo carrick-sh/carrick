@@ -1183,6 +1183,8 @@ mod tests {
                 recording_declined: 0,
                 skipped: BTreeMap::from([(LookupSkip::SegmentRepeat, 2)]),
                 misses: BTreeMap::from([(UnitMissReason::NoAuthority, 2)]),
+                load_ns: 0,
+                publish_ns: 0,
             };
         }
         if let Some(file) = scan.files.get_mut(1) {
@@ -1194,6 +1196,8 @@ mod tests {
                 recording_declined: 1,
                 skipped: BTreeMap::from([(LookupSkip::OutsideSegment, 2)]),
                 misses: BTreeMap::new(),
+                load_ns: 3_000_000,
+                publish_ns: 0,
             };
         }
         let report = aggregate(&scan, 8, None);
