@@ -1318,6 +1318,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     serde_json::to_string_pretty(&native_x86_layout_json())?
                 );
             }
+            // Parses text files only, so it is available wherever the binary is.
+            DebugCommand::XlatCensus {
+                dir,
+                top,
+                processes_observed,
+            } => crate::debug_census::run_xlat_census(&dir, top, processes_observed)?,
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
         Commands::TraceChild {

@@ -1906,10 +1906,13 @@ impl carrick_dsr_aarch64::shared_cache::TranslationUnitStore for ActiveContainer
         Option<carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit>,
         UnitMissReason,
     > {
+        // These two used to be `MissingPair`, i.e. indistinguishable from a
+        // genuine cache miss. A store-less descendant contributes zero coverage
+        // forever, so it has to be countable on its own.
         let active = CONTAINER_CACHE
             .lock()
-            .map_err(|_| UnitMissReason::MissingPair)?;
-        let authority = active.as_ref().ok_or(UnitMissReason::MissingPair)?;
+            .map_err(|_| UnitMissReason::StoreUnavailable)?;
+        let authority = active.as_ref().ok_or(UnitMissReason::NoAuthority)?;
         match authority.load_unit(key, source_words) {
             Ok(loaded) => Ok(Some(loaded.into_shared())),
             Err(error) if error.reason() == UnitMissReason::MissingPair => Ok(None),
@@ -1920,8 +1923,8 @@ impl carrick_dsr_aarch64::shared_cache::TranslationUnitStore for ActiveContainer
     fn publish(&self, pending: &PendingTranslationUnit) -> Result<PublishOutcome, UnitMissReason> {
         let active = CONTAINER_CACHE
             .lock()
-            .map_err(|_| UnitMissReason::MissingPair)?;
-        let authority = active.as_ref().ok_or(UnitMissReason::MissingPair)?;
+            .map_err(|_| UnitMissReason::StoreUnavailable)?;
+        let authority = active.as_ref().ok_or(UnitMissReason::NoAuthority)?;
         authority
             .publish_unit(pending)
             .map_err(|error| error.reason())
@@ -1979,6 +1982,17 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const MOV42_RET: [u8; 8] = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
+
+    /// `CONTAINER_CACHE` is one process-global slot, and `begin_container_cache`
+    /// refuses to install a second authority. Any test that asserts on whether
+    /// an authority is installed has to hold this.
+    static CACHE_SLOT: Mutex<()> = Mutex::new(());
+
+    fn cache_slot() -> std::sync::MutexGuard<'static, ()> {
+        CACHE_SLOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn fixture_pending() -> PendingTranslationUnit {
         let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
@@ -2343,8 +2357,39 @@ mod tests {
         assert!(!owns_cleanup(pid, pid.saturating_add(1)));
     }
 
+    /// The census counts these two outcomes in different buckets, and the
+    /// answer to "where did the shared lane's coverage go" depends on which one
+    /// a run reports. They used to be the same `UnitMissReason::MissingPair`.
+    #[test]
+    fn store_load_separates_no_authority_from_a_file_miss() {
+        use carrick_dsr_aarch64::shared_cache::TranslationUnitStore as _;
+
+        let _slot = cache_slot();
+        let store = ActiveContainerUnitStore;
+        let pending = fixture_pending();
+        let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
+
+        // No authority installed: nothing this process does could ever hit.
+        assert_eq!(
+            store.load(&pending.key, &source_words).err(),
+            Some(UnitMissReason::NoAuthority),
+        );
+
+        let session = begin_container_cache().expect("begin container cache");
+        // Authority installed, files absent: a genuine miss, and the only shape
+        // that reaches the recorder election.
+        assert!(matches!(store.load(&pending.key, &source_words), Ok(None)));
+        drop(session);
+
+        assert_eq!(
+            store.load(&pending.key, &source_words).err(),
+            Some(UnitMissReason::NoAuthority),
+        );
+    }
+
     #[test]
     fn creator_session_removes_cache_after_container_exit() {
+        let _slot = cache_slot();
         let session = begin_container_cache().expect("begin container cache");
         let path = container_cache_snapshot()
             .expect("snapshot container cache")

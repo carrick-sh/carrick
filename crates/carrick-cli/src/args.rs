@@ -912,6 +912,30 @@ pub(crate) enum DebugCommand {
     /// `scripts/native-x86-profile.py`. The running process's matching Carrick
     /// binary is authoritative; do not hardcode these offsets in D scripts.
     NativeX86Layout,
+    /// Aggregate the per-process translation census a native run wrote under
+    /// `CARRICK_XLAT_CENSUS_DIR` and print the result as JSON: translation
+    /// redundancy, distinct unit keys and their per-key block counts, the share
+    /// of blocks that fall inside a configured segment, and what the flush
+    /// lineage says about processes the census missed.
+    XlatCensus {
+        /// Directory holding the run's `xlat-<pid>-<stamp>-<seq>.txt` files.
+        dir: PathBuf,
+        /// Per-key rows to print. The key COUNT is never truncated.
+        #[arg(long = "top", default_value_t = 20)]
+        top: usize,
+        /// Process INCARNATIONS the run actually started, counted by other
+        /// means (the census cannot know: a process that dies by a fatal signal
+        /// writes nothing). Supplying it turns `processes.coverage` on.
+        ///
+        /// The unit must match `processes.incarnations` or the ratio is
+        /// meaningless: one incarnation is one process-image lifetime, so a pid
+        /// that performs carrick's host self-re-exec holds TWO, while a pid that
+        /// `execve`s in process holds ONE. A bare pid count is the wrong
+        /// denominator in the first case and the right one in the second.
+        /// `CARRICK_DSR_PROFILE`'s main-thread eras are counted the same way.
+        #[arg(long = "processes-observed")]
+        processes_observed: Option<u64>,
+    },
     /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
     /// (with DFSC for data aborts) so the operator doesn't have to hand-
     /// parse syndromes during an interactive session.

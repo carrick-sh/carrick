@@ -43,6 +43,13 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
                 serde_json::to_string_pretty(&native_x86_layout_json())?
             );
         }
+        DebugCommand::XlatCensus {
+            dir,
+            top,
+            processes_observed,
+        } => {
+            crate::debug_census::run_xlat_census(&dir, top, processes_observed)?;
+        }
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
             let value = if let Some(hex) = stripped

@@ -774,9 +774,28 @@ fn patch_same_unit_direct_link(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Why a translation-unit lookup did not produce a unit.
+///
+/// These are counted per process by the translation census
+/// (`crate::translator::xlat_census`), so a value here is an ANSWER to "where
+/// did the shared lane's coverage go", not just an error tag. That is why
+/// [`Self::NoAuthority`] and [`Self::StoreUnavailable`] are separate from
+/// [`Self::MissingPair`]: a process that never adopted the container cache and
+/// a process whose lookups genuinely missed on disk used to be indistinguishable
+/// at every observable point, which is exactly the conflation that made the
+/// "one key in the cache directory" result unattributable.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum UnitMissReason {
+    /// The unit's files are not present in the store. On the load path this is
+    /// a genuine cache miss.
     MissingPair,
+    /// No container cache authority is installed in THIS process, so no lookup
+    /// could have hit whatever the store holds. Distinct from a miss.
+    NoAuthority,
+    /// The store's own lock is poisoned: a thread panicked holding it. Neither
+    /// a miss nor an absent authority — a runtime fault that would otherwise
+    /// read as one of them.
+    StoreUnavailable,
     Schema,
     TranslatorAbi,
     ImageIdentity,
@@ -786,6 +805,68 @@ pub enum UnitMissReason {
     DylibDigest,
     ManifestRange,
     Dlopen,
+}
+
+impl UnitMissReason {
+    /// Every reason, in wire order. The census indexes its counters by
+    /// [`Self::index`], which is a position in this table.
+    pub const ALL: [Self; 12] = [
+        Self::MissingPair,
+        Self::NoAuthority,
+        Self::StoreUnavailable,
+        Self::Schema,
+        Self::TranslatorAbi,
+        Self::ImageIdentity,
+        Self::SourceFingerprint,
+        Self::AddressMode,
+        Self::PageProfile,
+        Self::DylibDigest,
+        Self::ManifestRange,
+        Self::Dlopen,
+    ];
+
+    /// Stable wire token used by the census file and by anything that reports
+    /// these to a human.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::MissingPair => "missing-pair",
+            Self::NoAuthority => "no-authority",
+            Self::StoreUnavailable => "store-unavailable",
+            Self::Schema => "schema",
+            Self::TranslatorAbi => "translator-abi",
+            Self::ImageIdentity => "image-identity",
+            Self::SourceFingerprint => "source-fingerprint",
+            Self::AddressMode => "address-mode",
+            Self::PageProfile => "page-profile",
+            Self::DylibDigest => "dylib-digest",
+            Self::ManifestRange => "manifest-range",
+            Self::Dlopen => "dlopen",
+        }
+    }
+
+    /// Inverse of [`Self::token`]. Fails closed on an unknown token so a census
+    /// written by a different build is reported rather than silently dropped.
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.token() == token)
+    }
+
+    /// Position in [`Self::ALL`]; the census's counter index.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::MissingPair => 0,
+            Self::NoAuthority => 1,
+            Self::StoreUnavailable => 2,
+            Self::Schema => 3,
+            Self::TranslatorAbi => 4,
+            Self::ImageIdentity => 5,
+            Self::SourceFingerprint => 6,
+            Self::AddressMode => 7,
+            Self::PageProfile => 8,
+            Self::DylibDigest => 9,
+            Self::ManifestRange => 10,
+            Self::Dlopen => 11,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1355,6 +1436,33 @@ mod tests {
     use crate::types::{CacheOffset, CodeGeneration, DirectExit, DirectKind};
     use carrick_dsr::address::NativeHostBias;
     use carrick_guest_mem::GuestVa;
+
+    /// The census indexes a fixed counter array by [`UnitMissReason::index`],
+    /// so a hand-written index that drifts from `ALL` would silently attribute
+    /// one reason's misses to another. Pin all three views together.
+    #[test]
+    fn miss_reason_table_indices_tokens_and_order_agree() {
+        for (position, reason) in UnitMissReason::ALL.into_iter().enumerate() {
+            assert_eq!(reason.index(), position, "{reason:?} index");
+            assert_eq!(
+                UnitMissReason::from_token(reason.token()),
+                Some(reason),
+                "{reason:?} token round trip"
+            );
+        }
+        let tokens: std::collections::BTreeSet<&str> = UnitMissReason::ALL
+            .into_iter()
+            .map(UnitMissReason::token)
+            .collect();
+        assert_eq!(tokens.len(), UnitMissReason::ALL.len(), "tokens are unique");
+        assert_eq!(UnitMissReason::from_token("not-a-reason"), None);
+        // The whole point of the split: these three used to be one value.
+        assert_ne!(UnitMissReason::NoAuthority, UnitMissReason::MissingPair);
+        assert_ne!(
+            UnitMissReason::StoreUnavailable,
+            UnitMissReason::MissingPair
+        );
+    }
 
     fn key(
         executable: ExecutableIdentity,

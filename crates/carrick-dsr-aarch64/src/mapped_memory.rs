@@ -802,15 +802,37 @@ impl NativeMappedMemory {
     ) -> Result<(), NativeMemoryError> {
         let artifact_enabled = crate::artifact_spike::enabled();
         let shared_enabled = crate::translator::shared_translation_runtime_enabled();
-        if !artifact_enabled && !shared_enabled {
+        // The translation census needs the SAME segment enumeration and the
+        // SAME `TranslationUnitKey`s the shared lane would mint, but it has to
+        // describe the DEFAULT path -- the lane is opt-in, so measuring only
+        // with it on would measure the other arm. Enumerating is pure (one
+        // SHA-256 over the executable spans) and installs no store, so the
+        // census arm below configures nothing the translator can act on.
+        //
+        // Consequence, deliberate: the enumeration below has several
+        // `Unsupported` arms that both call sites turn into a fatal
+        // `RuntimeError`, and arming the census is what first makes them
+        // reachable on the default path. That is fail-closed on purpose. The
+        // alternative -- swallowing the failure on the census-only arm -- emits
+        // a census whose header says `image=-` and whose every block classifies
+        // `outside`, i.e. 0% segment coverage, which is a plausible-looking
+        // WRONG answer to the exact question this instrument gates. A named
+        // abort is the lesser failure. It has not been observed to fire.
+        let census_enabled = crate::translator::xlat_census::armed();
+        if !artifact_enabled && !shared_enabled && !census_enabled {
             return Ok(());
         }
-        let translator = self.dsr_process_translator()?;
-        if artifact_enabled && let Some(digest) = executable_digest {
+        let translator = (artifact_enabled || shared_enabled)
+            .then(|| self.dsr_process_translator())
+            .transpose()?;
+        if artifact_enabled
+            && let Some(translator) = translator.as_ref()
+            && let Some(digest) = executable_digest
+        {
             translator
                 .configure_artifact_image_digest(digest)
                 .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
-            if !shared_enabled {
+            if !shared_enabled && !census_enabled {
                 return Ok(());
             }
         }
@@ -831,7 +853,8 @@ impl NativeMappedMemory {
                 merged.push(span);
             }
         }
-        let mut segments = shared_enabled.then(|| Vec::with_capacity(merged.len()));
+        let collect_segments = shared_enabled || census_enabled;
+        let mut segments = collect_segments.then(|| Vec::with_capacity(merged.len()));
         let mut identity = executable_digest.is_none().then(|| {
             let mut identity = Sha256::new();
             identity.update(b"carrick-mapped-executable-v1");
@@ -897,12 +920,15 @@ impl NativeMappedMemory {
                 "shared translation has no executable identity".to_string(),
             ));
         };
-        if artifact_enabled && executable_digest.is_none() {
+        if artifact_enabled
+            && executable_digest.is_none()
+            && let Some(translator) = translator.as_ref()
+        {
             translator
                 .configure_artifact_image_digest(digest)
                 .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))?;
         }
-        if !shared_enabled {
+        if !collect_segments {
             return Ok(());
         }
         let Some(segments) = segments else {
@@ -911,6 +937,11 @@ impl NativeMappedMemory {
             ));
         };
         if segments.is_empty() {
+            // No configurable segment for THIS image, but the census's image is
+            // a process-wide static and carrick's in-process `execve` keeps it.
+            // Clearing is what stops a successor's blocks from being attributed
+            // to its predecessor's unit stems under the fixed PIE base.
+            crate::translator::xlat_census::clear_image();
             return Ok(());
         }
         let page_profile = match page_profile {
@@ -927,16 +958,26 @@ impl NativeMappedMemory {
                 crate::shared_cache::AddressModeIdentity::biased(host_bias)
             }
         };
+        let configuration = crate::shared_cache::SharedImageConfig {
+            executable: crate::shared_cache::ExecutableIdentity::Digest(digest),
+            page_profile,
+            address_mode,
+            segments,
+        };
+        // Derives one unit stem per (image, segment) so `record` can attribute a
+        // block to a unit key without re-serializing and re-hashing the key on
+        // the translate path.
+        crate::translator::xlat_census::configure_image(&configuration);
+        if !shared_enabled {
+            return Ok(());
+        }
+        let Some(translator) = translator else {
+            return Err(NativeMemoryError::Unsupported(
+                "shared translation is enabled without a DSR process translator".to_string(),
+            ));
+        };
         translator
-            .configure_shared_image(
-                crate::shared_cache::SharedImageConfig {
-                    executable: crate::shared_cache::ExecutableIdentity::Digest(digest),
-                    page_profile,
-                    address_mode,
-                    segments,
-                },
-                store,
-            )
+            .configure_shared_image(configuration, store)
             .map_err(|error| NativeMemoryError::Unsupported(error.to_string()))
     }
 

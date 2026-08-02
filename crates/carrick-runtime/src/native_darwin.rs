@@ -2745,6 +2745,11 @@ fn finalize_native_process_exit(
     publish_native_shared_candidates(translator, memory);
     maybe_dump_code_snapshot(translator);
     translator.finalize_profile_epoch_at_process_exit();
+    // The translation census's only flush used to be a `libc::atexit` hook,
+    // which every native process-exit shape below skips: the container's pid 1
+    // and every fork child end at `libc::_exit`. This is the one seam all of
+    // them funnel through.
+    dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::ProcessExit);
 }
 
 /// Diagnostic-only: when `CARRICK_DSR_CODE_SNAPSHOT_DIR` names a directory,
@@ -3579,6 +3584,12 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             }
                             publish_native_shared_candidates(&translator, &memory);
                             translator.finalize_profile_epoch();
+                            // `begin_guest_exec` below ends in `libc::execve`,
+                            // which runs no `atexit` handler: without this the
+                            // pre-exec incarnation's translations vanish. The
+                            // successor keeps this pid, so the census filename
+                            // carries a timestamp discriminator too.
+                            dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::HostSelfReexec);
                             require_native_syscall_service_transition(
                                 service.terminal_handoff(),
                                 "host self-exec terminal handoff",
@@ -3716,6 +3727,12 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                             }
                         }
                         publish_native_shared_candidates(&translator, &memory);
+                        // In-process `execve` replaces guest memory but not
+                        // carrick's own statics, so without a flush here the
+                        // outgoing and incoming images' translations merge into
+                        // one census file -- and under a fixed PIE base their
+                        // VAs alias, making the merge invisible.
+                        dsr::xlat_census::flush(dsr::xlat_census::CensusFlush::InProcessExec);
                         // Exec quiescence has retired every sibling and no
                         // translated guest frame remains live. Clear the sole
                         // surviving thread's cached targets before mapped
