@@ -411,11 +411,16 @@ impl IndirectTargetCache {
             });
         let entry = &mut set.ways[way];
         // Same publication discipline as `publish`: unreachable while the
-        // payload is written, `guest` (the probe tag) last.
+        // payload is written, `guest` (the probe tag) last. Flavor-1 field
+        // roles follow the emitted `ldp x17, x19, [x15, #8]`: the tagged
+        // expected generation sits at offset 8 (odd — the flavor bit; a
+        // flavor-0 entry's offset-8 code address is even), the generation
+        // atomic at 16, and the TRUSTED-entry code address at 24 where its
+        // load overlaps the generation `ldar`.
         entry.guest = 0;
-        entry.cache = trusted_code;
+        entry.cache = (expected.get() << 1) | 1;
         entry.authority = generation_atomic;
-        entry.reserved = (expected.get() << 1) | 1;
+        entry.reserved = trusted_code;
         entry.guest = guest.raw();
     }
 

@@ -2193,12 +2193,14 @@ fn dsr_indirect_private_trusted_call_takes_the_fast_path() {
     // The fill must have chosen the private trusted flavor: bit 0 of the
     // entry's reserved word, with a non-null trusted-entry code address and
     // a live generation-atomic pointer.
-    let (trusted_code, generation_atomic, reserved) = fixture
+    // Field roles after the ldp packing: offset 8 = tagged expected (odd,
+    // the flavor bit), 16 = generation atomic, 24 = trusted code.
+    let (tagged_expected, generation_atomic, trusted_code) = fixture
         .translator
         .indirect_cache_entry_for_test(target)
         .expect("published indirect target entry");
     assert_eq!(
-        reserved & 1,
+        tagged_expected & 1,
         1,
         "a private target with a trusted entry must publish flavor 1"
     );
@@ -2274,11 +2276,15 @@ fn dsr_code_write_stales_private_trusted_indirect_entry() {
             .expect("resolve indirect target"),
         super::ThreadExit::Continue
     ));
-    let (_, _, reserved) = fixture
+    let (tagged_expected, _, _) = fixture
         .translator
         .indirect_cache_entry_for_test(target)
         .expect("published indirect target entry");
-    assert_eq!(reserved & 1, 1, "fixture must exercise the flavor-1 path");
+    assert_eq!(
+        tagged_expected & 1,
+        1,
+        "fixture must exercise the flavor-1 path"
+    );
     // Prove the fast path is live before staling it.
     snapshot.pc = code.raw();
     let hit = fixture
