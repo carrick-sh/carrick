@@ -684,12 +684,14 @@ impl Vfs for RootFsVfs {
                 mtime_nanos: 0,
             });
         }
-        if let Some(entry) = self.overlay.lookup_kind(path) {
-            // Prefer the backend's own metadata (the host backend
-            // reads real on-disk mode bits, so executables keep their
-            // 0o111). Fall back to defaults only if the backend can't
-            // produce metadata for an entry it just reported.
-            let backend_md = self.overlay.metadata(path);
+        // One combined backend pass: kind + metadata answered from a single
+        // contained open on the host backend (separate `lookup_kind` +
+        // `metadata` calls each re-walked the path). Prefer the backend's own
+        // metadata (the host backend reads real on-disk mode bits, so
+        // executables keep their 0o111); fall back to defaults only if the
+        // backend can't produce metadata for an entry it just reported.
+        let (entry_kind, backend_md) = self.overlay.lookup_kind_and_metadata(path);
+        if let Some(entry) = entry_kind {
             // FIFOs and AF_UNIX socket nodes are reported by the backend as
             // (present, empty) File entries, but their true kind lives in
             // `metadata`. Surface the special kind before the generic File arm.
