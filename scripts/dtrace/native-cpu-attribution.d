@@ -29,6 +29,9 @@
  * symbolication (`scripts/symbolicate.py`) — belt and braces for anything whose
  * process still managed to exit inside its own window.
  *
+ * THE TRACER IS ALSO NAMED `carrick`. See the `pid != $pid` note on the
+ * profile clauses: without it this script's largest bucket is itself.
+ *
  * Run:
  *   target/release/carrick trace -s scripts/dtrace/native-cpu-attribution.d \
  *     -o /tmp/cpu.txt -- run --exec-backend native <image> <cmd>...
@@ -73,8 +76,17 @@ carrick*:::guest-image-base
 	    arg0, arg1, arg2, copyinstr(arg3));
 }
 
+/*
+ * `pid != $pid` is LOAD-BEARING, not hygiene. `carrick trace` runs libdtrace
+ * IN-PROCESS, so the consumer is itself named `carrick` and an execname-only
+ * screen samples the profiler's own hot loop alongside the workload. Measured
+ * 2026-08-02: the consumer contributed 34,872 of 64,372 user samples (54%),
+ * and its symbol-free dyld-shared-cache PCs masqueraded as unsymbolized JIT
+ * code -- the single largest "finding" in that profile was the instrument.
+ * `$pid` is the consumer's pid, so this one clause removes it.
+ */
 profile-997
-/execname == "carrick" && arg1 != 0/
+/execname == "carrick" && pid != $pid && arg1 != 0/
 {
 	@total = count();
 	@win_frame[ufunc(arg1)] = count();
@@ -89,7 +101,7 @@ profile-997
 
 /* Kernel-side time, same population: a syscall storm shows up here, not above. */
 profile-997
-/execname == "carrick" && arg0 != 0/
+/execname == "carrick" && pid != $pid && arg0 != 0/
 {
 	@ktotal = count();
 	@win_kframe[func(arg0)] = count();
