@@ -774,16 +774,6 @@ fn patch_same_unit_direct_link(
     Ok(())
 }
 
-/// Why a translation-unit lookup did not produce a unit.
-///
-/// These are counted per process by the translation census
-/// (`crate::translator::xlat_census`), so a value here is an ANSWER to "where
-/// did the shared lane's coverage go", not just an error tag. That is why
-/// [`Self::NoAuthority`] and [`Self::StoreUnavailable`] are separate from
-/// [`Self::MissingPair`]: a process that never adopted the container cache and
-/// a process whose lookups genuinely missed on disk used to be indistinguishable
-/// at every observable point, which is exactly the conflation that made the
-/// "one key in the cache directory" result unattributable.
 /// Which manifest invariant a preflight rejected. `UnitMissReason::ManifestRange`
 /// collapses eight distinct checks into one value, which is fine for a load-path
 /// miss (any of them means "do not use this unit") but useless on the PUBLISH
@@ -820,6 +810,16 @@ impl ManifestDefect {
     }
 }
 
+/// Why a translation-unit lookup did not produce a unit.
+///
+/// These are counted per process by the translation census
+/// (`crate::translator::xlat_census`), so a value here is an ANSWER to "where
+/// did the shared lane's coverage go", not just an error tag. That is why
+/// [`Self::NoAuthority`] and [`Self::StoreUnavailable`] are separate from
+/// [`Self::MissingPair`]: a process that never adopted the container cache and
+/// a process whose lookups genuinely missed on disk used to be indistinguishable
+/// at every observable point, which is exactly the conflation that made the
+/// "one key in the cache directory" result unattributable.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum UnitMissReason {
     /// The unit's files are not present in the store. On the load path this is
