@@ -14,10 +14,13 @@ in scope.
 **Make carrick's emitted code materially faster — close the ~12x steady-state
 execution penalty.**
 
-The bar is *within 2x of native-arm64 Docker* on the same work. We are at **5.9x**
-on compute (was 10.9x before `bb17be5e`, Phase 1 of
-`docs/superpowers/specs/2026-08-01-steady-state-block-boundary-tax-design.md`),
-13.6x on a cold build, and 128x on a filesystem walk. Carrick's premise
+The bar is *within 2x of native-arm64 Docker* on the same work. We are at **3.8x**
+on compute (was 10.9x at the campaign's start; the phase ladder of
+`docs/superpowers/specs/2026-08-01-steady-state-block-boundary-tax-design.md`
+runs `bb17be5e` 5.9x -> `69754d31` 4.8x -> `e743cd8f` 3.8x, each with census,
+wall, suite and conformance-smoke gates in the commit),
+~13.6x on a cold build (translation-bound; untouched by these phases), and 128x
+on a filesystem walk. Carrick's premise
 is running unmodified Linux binaries at host-native cost, so this number is the
 product, not a metric about it — and people will benchmark us on whatever workload
 they choose, not the one we tuned.
