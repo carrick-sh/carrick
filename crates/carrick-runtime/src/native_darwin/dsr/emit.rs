@@ -434,7 +434,7 @@ mod tests {
         // (~599 MB of JIT output for one `go build`, and `memmove` + `memset` +
         // `sys_icache_invalidate` scale with it at 2.7% of total CPU), and this
         // is the cheapest regression detector for it.
-        assert_eq!(emitted.len(), 44);
+        assert_eq!(emitted.len(), 40);
         let original_words = [0xd503_201f, 0x9100_0400];
         let entry_word =
             unsafe { std::ptr::read_unaligned(emitted.entry().host().raw() as *const u32) };

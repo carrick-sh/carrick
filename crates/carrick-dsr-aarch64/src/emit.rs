@@ -2230,12 +2230,6 @@ fn emit_internal_fallthrough_edge(
             assembler,
             entries,
             guest,
-            0xf900_0000 | ((136 / 8) << 10) | (28 << 5) | 17,
-        )?;
-        emit_word(
-            assembler,
-            entries,
-            guest,
             0xf900_0000 | ((1128 / 8) << 10) | (28 << 5) | 17,
         )?;
         recovery.push(RecoveryEntry {
@@ -2286,7 +2280,7 @@ fn emit_internal_fallthrough_edge(
             assembler,
             entries,
             guest,
-            0xf940_0000 | ((136 / 8) << 10) | (28 << 5) | 17,
+            0xf940_0000 | ((1128 / 8) << 10) | (28 << 5) | 17,
         )?;
         return Ok(PendingTakenEdge {
             guest,
@@ -2313,11 +2307,6 @@ fn emit_internal_fallthrough_edge(
     // x17 from slot 136 and whose recovery entries read slot 1128. On the
     // fall-through these two stores do not run at all -- that, plus the entry
     // prologue they no longer reach, is the fusion's whole saving.
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x17, [x28, #136]
-    );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -5110,11 +5099,6 @@ fn emit_region_direct_exit(
     map_next(assembler, entries, map_guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; str x17, [x28, #136]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
         ; str x17, [x28, #1128]
     );
     let slot = current_offset(assembler)?;
@@ -5962,7 +5946,7 @@ fn assemble_block_inner(
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
-            ; ldr x17, [x28, #136]
+            ; ldr x17, [x28, #1128]
         );
         recovery.push(RecoveryEntry {
             cache: restore_x17,
@@ -6263,7 +6247,7 @@ fn assemble_block_inner(
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
-            ; ldr x17, [x28, #136]
+            ; ldr x17, [x28, #1128]
         );
         recovery.push(RecoveryEntry {
             cache: restore_x17,
@@ -6690,11 +6674,6 @@ fn assemble_block_inner(
         // segment's exit was consumed above as an internal edge.
         let terminal = plan.terminal_exit();
         let exit_guest = terminal.guest_pc();
-        map_next(&assembler, &mut entries, exit_guest)?;
-        dynasmrt::dynasm!(assembler
-            ; .arch aarch64
-            ; str x17, [x28, #136]
-        );
         map_next(&assembler, &mut entries, exit_guest)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
@@ -7705,7 +7684,7 @@ mod tests {
         );
         let (assembled, _plan) = super::tests::single_virtual_block(word);
         assert_eq!(
-            assembled.words[0], 0xF940_4791,
+            assembled.words[0], 0xF942_3791,
             "unguarded entry restores guest x17"
         );
         let expected = [
@@ -7853,7 +7832,7 @@ mod tests {
             &[
                 0xD280_00F1, // movz x17, #7
                 0xF902_3F91, // str x17, [x28, #1144]
-                0xF940_4791, // ldr x17, [x28, #136]
+                0xF942_3791, // ldr x17, [x28, #1128]
             ],
             "trusted entry words: {:#010x?}",
             &assembled.words[index..(index + 4).min(assembled.words.len())]
@@ -8236,7 +8215,6 @@ mod tests {
         .expect("assemble fused virtual conditional edge");
         let words = &assembled.words;
         let stable_staging = [
-            0xf900_4791, // str x17, [x28, #136] — canonical guest x17
             0xf902_3791, // str x17, [x28, #1128] — recovery guest x17
             0xf940_4f91, // ldr x17, [x28, #152] — guest x19
             0xb7f8_0051, // tbnz x17, #63, +2
@@ -8261,7 +8239,7 @@ mod tests {
             words[staging_index + stable_staging.len()..]
                 .iter()
                 .take(4)
-                .any(|word| *word == 0xf940_4791),
+                .any(|word| *word == 0xf942_3791),
             "fused fall-through must restore guest x17 before the next guest instruction"
         );
         let taken = assembled
@@ -8350,10 +8328,15 @@ mod tests {
                             .any(|word| context_store_slot(*word) == Some(slot)),
                         "{name} guard still spills to context slot {slot}: {words:08x?}"
                     );
+                    // Slot 1128 doubles as the guest-x17 authority at block
+                    // boundaries since the exit tails stopped double-storing;
+                    // the guard's OWN final restore reads it by design.
+                    let sanctioned_x17_restore = 0xf940_0000 | ((1128 / 8) << 10) | (28 << 5) | 17;
                     assert!(
                         !words
                             .iter()
-                            .any(|word| context_load_slot(*word) == Some(slot)),
+                            .any(|word| context_load_slot(*word) == Some(slot)
+                                && *word != sanctioned_x17_restore),
                         "{name} guard still reloads context slot {slot}: {words:08x?}"
                     );
                 }
@@ -9085,7 +9068,10 @@ mod tests {
                 let is_ctx =
                     (*word & 0xFFC0_03E0) == 0xF900_0380 || (*word & 0xFFC0_03E0) == 0xF940_0380;
                 let slot = ((*word >> 10) & 0xFFF) * 8;
-                is_ctx && matches!(slot, 1120 | 1128 | 1160 | 1168)
+                // The block entry's guest-x17 restore reads 1128 by design
+                // now that exit tails single-store; it is not a spill.
+                let entry_x17_restore = 0xf940_0000 | ((1128 / 8) << 10) | (28 << 5) | 17;
+                is_ctx && **word != entry_x17_restore && matches!(slot, 1120 | 1128 | 1160 | 1168)
             })
             .count();
         // Both arms are spelled out: the reserved switch is read once per
@@ -9649,29 +9635,30 @@ mod tests {
         // slot. The hop must clear all three.
         assert_eq!(
             words[edge + 1],
-            0x1400_0004,
+            0x1400_0003,
             "fall-through must branch over the taken prologue and the slot"
         );
         assert_eq!(
-            &words[edge + 2..edge + 4],
-            [0xf900_4791, 0xf902_3791],
-            "the x17 saves belong to the TAKEN path only"
+            words[edge + 2],
+            0xf902_3791,
+            "the x17 save belongs to the TAKEN path only"
         );
         assert_eq!(
-            words[edge + 4] & 0xfc00_0000,
+            words[edge + 3] & 0xfc00_0000,
             0x1400_0000,
             "taken patch slot is a `b`"
         );
         // ... and the hop lands on segment 1's copied `nop`.
         assert_eq!(
-            words[edge + 5],
+            words[edge + 4],
             0xd503_201f,
             "segment 1 body follows the edge"
         );
-        // Only then the terminal exit's own x17 saves.
+        // Only then the terminal exit's own x17 save (single-store: slot 1128
+        // is the boundary authority; the gateway maintains snapshot.x[17]).
         assert_eq!(
-            words[edge + 6],
-            0xf900_4791,
+            words[edge + 5],
+            0xf902_3791,
             "terminal exit saves guest x17"
         );
 
@@ -9686,7 +9673,7 @@ mod tests {
         let link = assembled.direct_links[0];
         assert_eq!(
             link.slot.get() as usize,
-            (edge + 4) * 4,
+            (edge + 3) * 4,
             "the link's slot is the emitted patch-slot word"
         );
         assert_eq!(link.source, GuestVa(0x4004));
@@ -9820,9 +9807,9 @@ mod tests {
                     source: GuestVa(0x4000),
                     target: GuestVa(0x5000),
                     kind: DirectLinkKind::Branch,
-                    slot: 12,
-                    stub_start: 16,
-                    stub_end: 272,
+                    slot: 8,
+                    stub_start: 12,
+                    stub_end: 268,
                     committed_link: None,
                 }],
             ),
@@ -9840,9 +9827,9 @@ mod tests {
                     source: GuestVa(0x4000),
                     target: GuestVa(0x5000),
                     kind: DirectLinkKind::Call,
-                    slot: 28,
-                    stub_start: 32,
-                    stub_end: 288,
+                    slot: 24,
+                    stub_start: 28,
+                    stub_end: 284,
                     committed_link: Some(0x4004),
                 }],
             ),
@@ -9861,18 +9848,18 @@ mod tests {
                         source: GuestVa(0x4000),
                         target: GuestVa(0x4004),
                         kind: DirectLinkKind::ConditionalFallthrough,
-                        slot: 16,
-                        stub_start: 24,
-                        stub_end: 280,
+                        slot: 12,
+                        stub_start: 20,
+                        stub_end: 276,
                         committed_link: None,
                     },
                     ExpectedDirectLink {
                         source: GuestVa(0x4000),
                         target: GuestVa(0x5000),
                         kind: DirectLinkKind::ConditionalTaken,
-                        slot: 20,
-                        stub_start: 280,
-                        stub_end: 536,
+                        slot: 16,
+                        stub_start: 276,
+                        stub_end: 532,
                         committed_link: None,
                     },
                 ],
@@ -9891,9 +9878,9 @@ mod tests {
                     source: GuestVa(0x4004),
                     target: GuestVa(0x4004),
                     kind: DirectLinkKind::Continue,
-                    slot: 12,
-                    stub_start: 16,
-                    stub_end: 272,
+                    slot: 8,
+                    stub_start: 12,
+                    stub_end: 268,
                     committed_link: None,
                 }],
             ),
@@ -9935,9 +9922,9 @@ mod tests {
                 source: GuestVa(0x7008),
                 target: GuestVa(0x7010),
                 kind: DirectLinkKind::Continue,
-                slot: 8,
-                stub_start: 12,
-                stub_end: 268,
+                slot: 4,
+                stub_start: 8,
+                stub_end: 264,
                 committed_link: None,
             }],
         );
