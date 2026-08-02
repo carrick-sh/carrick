@@ -2946,6 +2946,12 @@ impl ProcessTranslator {
         state.cache.after_fork_child();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
+        // The child inherited the parent's census by COW along with the warm
+        // block index, but it performed none of those translations. Leaving
+        // them would re-attribute the parent's whole set to every child once
+        // fork children started flushing (they die at `libc::_exit`, so they
+        // never used to write a file at all).
+        xlat_census::reset_after_fork();
         recorder.process_repaired();
         state.translated_ranges.replay_after_fork(recorder)?;
         let capacity = u64::try_from(state.cache.capacity_bytes()).unwrap_or(u64::MAX);
@@ -3029,10 +3035,15 @@ impl ProcessState {
         guest: carrick_guest_mem::GuestVa,
         generation: types::CodeGeneration,
     ) -> Result<Option<types::CacheVa>, types::DsrError> {
+        // Every early return below is counted, because "the store was never
+        // consulted" and "the store was consulted and missed" imply opposite
+        // fixes and were previously indistinguishable. See `xlat_census`.
         if generation != types::CodeGeneration::INITIAL {
+            xlat_census::record_lookup_skipped(xlat_census::LookupSkip::Regenerated);
             return Ok(None);
         }
         let Some(configuration) = &self.shared_translation else {
+            xlat_census::record_lookup_skipped(xlat_census::LookupSkip::LaneUnconfigured);
             return Ok(None);
         };
         let Some(segment) = configuration.image.segments.iter().find(|segment| {
@@ -3042,10 +3053,12 @@ impl ProcessState {
                 .checked_add(segment.guest_len.get())
                 .is_some_and(|end| (segment.guest_start.raw()..end).contains(&guest.raw()))
         }) else {
+            xlat_census::record_lookup_skipped(xlat_census::LookupSkip::OutsideSegment);
             return Ok(None);
         };
         let segment_start = segment.guest_start;
         if !self.shared_unit_segments_consulted.insert(segment_start) {
+            xlat_census::record_lookup_skipped(xlat_census::LookupSkip::SegmentRepeat);
             return Ok(None);
         }
         let key = configuration.image.key_for_segment(segment);
@@ -3053,14 +3066,22 @@ impl ProcessState {
         let store = Arc::clone(&configuration.store);
         self.stats.shared_unit_lookups = self.stats.shared_unit_lookups.saturating_add(1);
         let unit = match store.load(&key, &source_words) {
-            Ok(Some(unit)) => unit,
+            Ok(Some(unit)) => {
+                xlat_census::record_lookup_loaded();
+                unit
+            }
             Ok(None) => {
-                if store.claim_recording(&key) {
+                let claimed = store.claim_recording(&key);
+                xlat_census::record_lookup_file_miss(claimed);
+                if claimed {
                     self.shared_recording_segments.insert(segment_start);
                 }
                 return Ok(None);
             }
-            Err(_) => return Ok(None),
+            Err(reason) => {
+                xlat_census::record_lookup_miss(reason);
+                return Ok(None);
+            }
         };
         self.stats.shared_unit_loads = self.stats.shared_unit_loads.saturating_add(1);
         let prepared = match self.prepare_shared_install(tid, memory, unit) {
@@ -4514,7 +4535,7 @@ impl ProcessState {
                 emitted_bytes,
                 TranslationOutcome::Translated,
             );
-            xlat_census::record(guest.raw());
+            xlat_census::record(guest, block.start, block.end);
             if let Some(started) = publication_started {
                 self.stats
                     .add_elapsed(ResolverStat::TranslationPublicationNs, started.elapsed());
@@ -11490,33 +11511,886 @@ mod tests {
     }
 }
 
-/// Translation redundancy census: how much of a cold build's ~800k translations
-/// is the SAME guest code re-translated in a different process?
+/// Translation redundancy census: how much of a cold build's ~433k translations
+/// is the SAME guest code re-translated in a different process, and how much of
+/// it could a shared translation unit ever have served?
 ///
 /// This is the number that decides whether translation amortization is a
 /// 2x-of-Docker-class lever or a dead end, and no existing instrument answers
 /// it: `CARRICK_DSR_PROFILE` counts translations per process but says nothing
 /// about distinctness ACROSS processes, and the shared-translation lane's own
-/// 14% reduction (1,196,909 -> 1,031,914) reflects its 12.9% coverage ceiling
-/// rather than the underlying redundancy.
+/// 14% reduction (1,196,909 -> 1,031,914) reflects its coverage ceiling rather
+/// than the underlying redundancy.
 ///
-/// Env-gated on `CARRICK_XLAT_CENSUS_DIR` so it costs one branch when unset.
-/// Writes `xlat-<pid>.txt`: the total translation count, then every distinct
-/// guest VA translated by this process.
+/// Env-gated on `CARRICK_XLAT_CENSUS_DIR` so it costs one relaxed load and a
+/// branch when unset. Every record carries, besides the block's entry guest VA:
+///
+/// * the **translation unit identity** the block belongs to -- the `file_stem()`
+///   of the `TranslationUnitKey` the shared lane would mint for the containing
+///   segment. That is what turns a distinct-VA count into a distinct-unit-key
+///   count, which is the quantity the AOT-cache workstream is sized against.
+/// * the block's **coverage** relative to that segment
+///   ([`xlat_census::SegmentCoverage`]).
+///   The runtime uses two different containment predicates -- a unit LOOKUP
+///   keys on the entry VA alone (`try_load_shared_unit`) while today's
+///   PRODUCER only records a block whose whole range fits inside one segment
+///   (`record_portable_block_artifact`) -- so a single fraction would either
+///   overstate the ceiling or understate what is publishable. Both are
+///   derivable from these records.
+///
+/// ## Store attribution
+///
+/// A cache directory holding exactly ONE unit key is the finding this census
+/// exists to explain, and the coverage records above cannot explain it on their
+/// own: they say where the blocks were, not what the store did about them.
+/// [`xlat_census::CensusStore`] closes that gap by counting, per process, the
+/// outcome of every shared-unit lookup `try_load_shared_unit` attempts --
+/// including the ones that return before the store is touched at all.
+///
+/// The distinction that matters is between **never consulted** and
+/// **consulted and missed**, because they imply opposite fixes. A lookup is
+/// skipped for one of four reasons ([`xlat_census::LookupSkip`]) -- the code
+/// generation moved, the lane installed no configuration in this process, the
+/// block is outside every configured segment, or this process already consulted
+/// that segment once. Only a lookup that survives all four reaches
+/// `TranslationUnitStore::load`, and its result is then counted as loaded, a
+/// file miss (with the `claim_recording` election's verdict), or a typed
+/// [`crate::shared_cache::UnitMissReason`]. `no-authority` is a first-class
+/// reason rather than an alias of `missing-pair` precisely so a descendant that
+/// never adopted the container cache stops reading as a process whose lookups
+/// merely missed.
+///
+/// Two identities hold by construction and are re-checked at parse time, so a
+/// future return path added without a counter is caught rather than silently
+/// under-counting: `consulted == loaded + file_miss + sum(misses)` and
+/// `recording_claimed + recording_declined == file_miss`.
+///
+/// The image identity is installed from `configure_shared_translation`
+/// **whether or not the shared lane is enabled**, so the census describes the
+/// DEFAULT path rather than the lane-on arm. Enumerating segments costs one
+/// SHA-256 over the executable spans per process image, and is paid only when
+/// the census is armed.
+///
+/// ## Flush coverage
+///
+/// The dump used to be a bare `libc::atexit` hook, which on this lane fires for
+/// exactly ONE terminal path (the post-`execve` resume incarnation's
+/// `std::process::exit`). Every other guest process -- the container's pid 1,
+/// every fork child that exits without exec'ing, and the pre-exec incarnation
+/// of every fork+exec child -- dies at `libc::_exit` or `libc::execve` and lost
+/// its census entirely. Measured on a three-process shell fixture, that was
+/// 60.9% of translations recorded and pid 1 (37.7% of the total) invisible.
+///
+/// Flushing is now explicit at the two seams that own it: every process exit
+/// funnels through `finalize_native_process_exit`, and both `execve` shapes
+/// (the host self-re-exec and the in-process image replacement) flush before
+/// the old image is gone. [`xlat_census::flush`] DRAINS, so a later flush of an
+/// already-drained process writes nothing and the `atexit` hook survives only
+/// as a backstop.
+///
+/// **Still not covered, by construction:** a process killed by a fatal signal
+/// (guest SIGSEGV, `scripts/sudo/kill.sh`, the trap-limit kill) never runs any
+/// flush. A census taken over a run with kills is a lower bound and must say so.
 ///
 /// Caveat the consumer must apply: the native lane loads PIE guests at a FIXED
 /// base, so two DIFFERENT guest binaries can translate the same VA. A union
-/// over VAs therefore UNDER-counts distinct code and OVER-states redundancy.
-/// Read it alongside the per-process set sizes -- processes running the same
-/// binary have near-identical sets, which is what makes the grouping visible.
-pub(crate) mod xlat_census {
-    use std::collections::HashSet;
+/// over VAs therefore UNDER-counts distinct code and OVER-states redundancy --
+/// which is exactly why the unit stem is recorded beside it: stems are
+/// content-addressed and do not alias.
+pub mod xlat_census {
+    use crate::shared_cache::SharedImageConfig;
+    /// Part of the census file model: a `MISS` line's reason. Re-exported here
+    /// so an out-of-crate aggregator parses the census with the SAME typed
+    /// vocabulary the runtime wrote it with, instead of matching on strings.
+    pub use crate::shared_cache::UnitMissReason;
+    use carrick_guest_mem::GuestVa;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
-    static TOTAL: AtomicU64 = AtomicU64::new(0);
-    static DISTINCT: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    /// Schema tag on line 1 of every census file. Bump it when a field's
+    /// meaning changes; [`CensusFile::parse`] fails closed on anything else.
+    pub const CENSUS_SCHEMA: &str = "XLATCENSUS3";
+
+    /// Where a translated block sits relative to this process's configured
+    /// shared-translation segments.
+    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    pub enum SegmentCoverage {
+        /// The entry VA is outside every configured segment. No translation
+        /// unit of any design could serve this block: it is the population that
+        /// bounds the whole workstream from above.
+        Outside,
+        /// The entry VA is inside a segment but the block runs past that
+        /// segment's end. A unit lookup would hit; today's producer refuses to
+        /// record it.
+        EntryOnly,
+        /// The whole block lies inside one segment. This is the geometric
+        /// NECESSARY condition for `record_portable_block_artifact` to accept
+        /// the block; it is NOT sufficient, and must not be read as "today's
+        /// producer publishes this". Recording is additionally gated on an
+        /// `INITIAL` generation, a WON recorder election for the segment,
+        /// available source words, and a terminal exit outside the
+        /// `Unsupported`/`ExclusiveRegion` set -- so on the default (lane-off)
+        /// path the truly-published share of `Contained` is exactly zero.
+        Contained,
+    }
+
+    impl SegmentCoverage {
+        /// Wire token used in the census file.
+        pub const fn token(self) -> &'static str {
+            match self {
+                Self::Outside => "outside",
+                Self::EntryOnly => "entry",
+                Self::Contained => "contained",
+            }
+        }
+
+        fn from_token(token: &str) -> Option<Self> {
+            match token {
+                "outside" => Some(Self::Outside),
+                "entry" => Some(Self::EntryOnly),
+                "contained" => Some(Self::Contained),
+                _ => None,
+            }
+        }
+    }
+
+    /// Why a fresh translation never reached the shared-unit store.
+    ///
+    /// `ProcessState::try_load_shared_unit` runs on every block-index miss and
+    /// returns early for one of these four reasons. Counting them is what
+    /// separates "the store was consulted and missed" from "the store was never
+    /// consulted", which is the difference between a persistence problem and a
+    /// coverage problem.
+    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    pub enum LookupSkip {
+        /// The block's code generation is not `INITIAL`: guest code at this VA
+        /// was mutated, so no published unit can describe it.
+        Regenerated,
+        /// This process installed no shared-translation configuration. On the
+        /// default path that is simply the opt-in gate
+        /// (`CARRICK_DSR_SHARED_TRANSLATION`) being off; with the gate on it
+        /// means the image yielded no executable segment.
+        LaneUnconfigured,
+        /// The block's entry VA lies outside every configured segment -- the
+        /// population no unit of any design can serve.
+        OutsideSegment,
+        /// This process already consulted the containing segment once. The
+        /// runtime consults each segment at most once per process, so this is
+        /// the bulk of a warm process's translations and is NOT evidence of a
+        /// store problem.
+        SegmentRepeat,
+    }
+
+    impl LookupSkip {
+        /// Every skip reason, in wire order; the census counter index is a
+        /// position in this table.
+        pub const ALL: [Self; 4] = [
+            Self::Regenerated,
+            Self::LaneUnconfigured,
+            Self::OutsideSegment,
+            Self::SegmentRepeat,
+        ];
+
+        /// Wire token used in the census file.
+        pub const fn token(self) -> &'static str {
+            match self {
+                Self::Regenerated => "regenerated",
+                Self::LaneUnconfigured => "lane-unconfigured",
+                Self::OutsideSegment => "outside-segment",
+                Self::SegmentRepeat => "segment-repeat",
+            }
+        }
+
+        fn from_token(token: &str) -> Option<Self> {
+            Self::ALL.into_iter().find(|skip| skip.token() == token)
+        }
+
+        /// Position in [`Self::ALL`].
+        const fn index(self) -> usize {
+            match self {
+                Self::Regenerated => 0,
+                Self::LaneUnconfigured => 1,
+                Self::OutsideSegment => 2,
+                Self::SegmentRepeat => 3,
+            }
+        }
+    }
+
+    /// What this process's shared-unit lookups did.
+    ///
+    /// Empty (every field zero, both maps empty) for a process that performed
+    /// no translation at all. A process that translated always populates at
+    /// least one `skipped` bucket, because every block-index miss passes
+    /// through `try_load_shared_unit`.
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub struct CensusStore {
+        /// Lookups that reached `TranslationUnitStore::load`.
+        pub consulted: u64,
+        /// Lookups that returned a unit.
+        pub loaded: u64,
+        /// Lookups whose unit files were absent from the store.
+        pub file_miss: u64,
+        /// File misses where `claim_recording` elected this process as the
+        /// recorder. Today's election declines the FIRST sighting of a key, so
+        /// a run with `claimed == 0` and `declined > 0` says the election, not
+        /// the store, is where publication stops.
+        pub recording_claimed: u64,
+        /// File misses where `claim_recording` declined.
+        pub recording_declined: u64,
+        /// Lookups that never reached the store, by reason.
+        pub skipped: BTreeMap<LookupSkip, u64>,
+        /// Lookups the store refused, by typed reason.
+        pub misses: BTreeMap<UnitMissReason, u64>,
+    }
+
+    impl CensusStore {
+        /// True when this process recorded no lookup activity at all.
+        pub fn is_empty(&self) -> bool {
+            self.consulted == 0
+                && self.loaded == 0
+                && self.file_miss == 0
+                && self.recording_claimed == 0
+                && self.recording_declined == 0
+                && self.skipped.is_empty()
+                && self.misses.is_empty()
+        }
+
+        /// Lookups that never reached the store.
+        pub fn skipped_total(&self) -> u64 {
+            self.skipped
+                .values()
+                .fold(0u64, |sum, count| sum.saturating_add(*count))
+        }
+
+        /// Store refusals, summed over reasons.
+        pub fn miss_total(&self) -> u64 {
+            self.misses
+                .values()
+                .fold(0u64, |sum, count| sum.saturating_add(*count))
+        }
+    }
+
+    /// Which seam drained the census. Recorded so an aggregator can tell a
+    /// complete process record from a partial one without guessing.
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub enum CensusFlush {
+        /// `finalize_native_process_exit`: the last live thread of a guest
+        /// process retired. Covers the container's pid 1, `exit_group`, and
+        /// every fork child that exits without exec'ing.
+        ProcessExit,
+        /// A fork child is about to become another image through carrick's host
+        /// self-re-exec. `libc::execve` runs no `atexit` handler and the
+        /// successor keeps this pid.
+        HostSelfReexec,
+        /// A single-threaded `execve` replacing the image in place. carrick's
+        /// own statics survive it, so without this flush two guest images'
+        /// records would merge into one file under a fixed PIE base.
+        InProcessExec,
+        /// The `libc::atexit` backstop. Writes nothing when an explicit flush
+        /// already drained this process.
+        AtexitBackstop,
+    }
+
+    impl CensusFlush {
+        /// Wire token used in the census file header.
+        pub const fn token(self) -> &'static str {
+            match self {
+                Self::ProcessExit => "process-exit",
+                Self::HostSelfReexec => "host-self-reexec",
+                Self::InProcessExec => "in-process-exec",
+                Self::AtexitBackstop => "atexit-backstop",
+            }
+        }
+
+        fn from_token(token: &str) -> Option<Self> {
+            match token {
+                "process-exit" => Some(Self::ProcessExit),
+                "host-self-reexec" => Some(Self::HostSelfReexec),
+                "in-process-exec" => Some(Self::InProcessExec),
+                "atexit-backstop" => Some(Self::AtexitBackstop),
+                _ => None,
+            }
+        }
+    }
+
+    /// One configured executable segment and the translation-unit identity the
+    /// shared lane would key it on.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct CensusSegment {
+        pub guest_start: GuestVa,
+        pub guest_len: u64,
+        /// Hex `TranslationUnitKey::file_stem()`; `-` when the key could not be
+        /// serialized (which would also mean the lane could not publish it).
+        pub unit_stem: String,
+    }
+
+    /// The process image the records below belong to.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct CensusImage {
+        /// Hex `ExecutableIdentity::Digest`, or `-` for a `HostFile` identity.
+        pub identity: String,
+        pub segments: Vec<CensusSegment>,
+    }
+
+    /// One distinct (entry VA, segment, coverage) triple and how many fresh
+    /// translations this process spent on it.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct CensusRecord {
+        pub guest_va: GuestVa,
+        /// Index into [`CensusImage::segments`]; `None` when
+        /// [`SegmentCoverage::Outside`].
+        pub segment: Option<u32>,
+        pub coverage: SegmentCoverage,
+        pub translations: u64,
+    }
+
+    /// A single drained census, as written to `xlat-<pid>-<stamp>-<seq>.txt`.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct CensusFile {
+        pub pid: i32,
+        /// This process's flush ordinal, from 0.
+        pub sequence: u64,
+        pub reason: CensusFlush,
+        /// Fresh translations this process performed since the previous flush.
+        pub total: u64,
+        pub image: Option<CensusImage>,
+        pub records: Vec<CensusRecord>,
+        /// What this process's shared-unit lookups did. Drained by the same
+        /// flush, so a file is one process incarnation's complete story.
+        pub store: CensusStore,
+    }
+
+    /// A census file that does not parse. Fails closed: an aggregator must
+    /// report the bad file rather than silently averaging over fewer processes.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct CensusParseError {
+        /// 1-based line number.
+        pub line: usize,
+        pub reason: String,
+    }
+
+    impl std::fmt::Display for CensusParseError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "line {}: {}", self.line, self.reason)
+        }
+    }
+
+    impl std::error::Error for CensusParseError {}
+
+    impl CensusFile {
+        /// Render the census file's exact on-disk text.
+        pub fn render(&self) -> String {
+            use std::fmt::Write as _;
+            let (identity, segment_count) = self.image.as_ref().map_or(("-", 0usize), |image| {
+                (image.identity.as_str(), image.segments.len())
+            });
+            let mut out = format!(
+                "{CENSUS_SCHEMA}|pid={}|seq={}|reason={}|total={}|distinct={}|image={identity}|segments={segment_count}\n",
+                self.pid,
+                self.sequence,
+                self.reason.token(),
+                self.total,
+                self.records.len(),
+            );
+            let _ = writeln!(
+                out,
+                "STORE|consulted={}|loaded={}|file_miss={}|recording_claimed={}|recording_declined={}",
+                self.store.consulted,
+                self.store.loaded,
+                self.store.file_miss,
+                self.store.recording_claimed,
+                self.store.recording_declined,
+            );
+            for (skip, count) in &self.store.skipped {
+                let _ = writeln!(out, "SKIP|{}|{count}", skip.token());
+            }
+            for (reason, count) in &self.store.misses {
+                let _ = writeln!(out, "MISS|{}|{count}", reason.token());
+            }
+            if let Some(image) = &self.image {
+                for (index, segment) in image.segments.iter().enumerate() {
+                    let _ = writeln!(
+                        out,
+                        "SEG|{index}|{:#x}|{:#x}|{}",
+                        segment.guest_start.raw(),
+                        segment.guest_len,
+                        segment.unit_stem
+                    );
+                }
+            }
+            for record in &self.records {
+                let segment = record
+                    .segment
+                    .map_or_else(|| "-".to_string(), |index| index.to_string());
+                let _ = writeln!(
+                    out,
+                    "VA|{:#x}|{segment}|{}|{}",
+                    record.guest_va.raw(),
+                    record.coverage.token(),
+                    record.translations
+                );
+            }
+            out
+        }
+
+        /// Parse the text [`CensusFile::render`] produces. One definition of the
+        /// format, shared by the writer and by whatever aggregates it.
+        pub fn parse(text: &str) -> Result<Self, CensusParseError> {
+            let mut lines = text.lines().enumerate();
+            let (header_index, header) = lines.next().ok_or_else(|| CensusParseError {
+                line: 1,
+                reason: "census file is empty".to_string(),
+            })?;
+            let header_line = header_index.saturating_add(1);
+            let fields = parse_header(header, header_line)?;
+            let identity = field(&fields, "image", header_line)?.to_string();
+            let segment_count = parse_u64(field(&fields, "segments", header_line)?, header_line)?;
+            let mut file = Self {
+                pid: parse_i32(field(&fields, "pid", header_line)?, header_line)?,
+                sequence: parse_u64(field(&fields, "seq", header_line)?, header_line)?,
+                reason: CensusFlush::from_token(field(&fields, "reason", header_line)?)
+                    .ok_or_else(|| CensusParseError {
+                        line: header_line,
+                        reason: "unknown flush reason".to_string(),
+                    })?,
+                total: parse_u64(field(&fields, "total", header_line)?, header_line)?,
+                // `image=-` with `segments=0` is the "no image was configured"
+                // encoding; `configure_image` never installs an empty one.
+                image: (identity != "-" || segment_count != 0).then(|| CensusImage {
+                    identity,
+                    segments: Vec::new(),
+                }),
+                records: Vec::new(),
+                store: CensusStore::default(),
+            };
+            let distinct = parse_u64(field(&fields, "distinct", header_line)?, header_line)?;
+            let mut saw_store = false;
+            for (index, line) in lines {
+                let line_number = index.saturating_add(1);
+                let mut columns = line.split('|');
+                match columns.next() {
+                    Some("STORE") => {
+                        if saw_store {
+                            return Err(CensusParseError {
+                                line: line_number,
+                                reason: "census file has a second STORE line".to_string(),
+                            });
+                        }
+                        let mut parsed = parse_store(line, line_number)?;
+                        // Carry over any `SKIP`/`MISS` lines that preceded this
+                        // one. `parse_store` reads the scalar fields and returns
+                        // empty maps, so a wholesale `file.store = parsed` would
+                        // discard those counts silently -- and neither
+                        // construction identity below covers the maps, so the
+                        // loss would parse clean and report zero.
+                        parsed.skipped = std::mem::take(&mut file.store.skipped);
+                        parsed.misses = std::mem::take(&mut file.store.misses);
+                        file.store = parsed;
+                        saw_store = true;
+                    }
+                    Some("SKIP") => {
+                        let (skip, count) = parse_skip(&mut columns, line_number)?;
+                        let entry = file.store.skipped.entry(skip).or_insert(0);
+                        *entry = entry.saturating_add(count);
+                    }
+                    Some("MISS") => {
+                        let (reason, count) = parse_miss(&mut columns, line_number)?;
+                        let entry = file.store.misses.entry(reason).or_insert(0);
+                        *entry = entry.saturating_add(count);
+                    }
+                    Some("SEG") => {
+                        let segment = parse_segment(&mut columns, line_number)?;
+                        let image = file.image.as_mut().ok_or_else(|| CensusParseError {
+                            line: line_number,
+                            reason: "segment line without a configured image".to_string(),
+                        })?;
+                        image.segments.push(segment);
+                    }
+                    Some("VA") => file.records.push(parse_record(&mut columns, line_number)?),
+                    _ => {
+                        return Err(CensusParseError {
+                            line: line_number,
+                            reason: "expected a STORE, SKIP, MISS, SEG or VA line".to_string(),
+                        });
+                    }
+                }
+            }
+            if !saw_store {
+                return Err(CensusParseError {
+                    line: header_line,
+                    reason: "census file has no STORE line".to_string(),
+                });
+            }
+            // Identities that hold by construction at the recording site. A
+            // future early return added to `try_load_shared_unit` without a
+            // counter breaks one of them, so the parser is the backstop rather
+            // than the aggregate silently under-counting.
+            let accounted = file
+                .store
+                .loaded
+                .saturating_add(file.store.file_miss)
+                .saturating_add(file.store.miss_total());
+            if accounted != file.store.consulted {
+                return Err(CensusParseError {
+                    line: header_line,
+                    reason: format!(
+                        "store consulted={} but outcomes account for {accounted}",
+                        file.store.consulted
+                    ),
+                });
+            }
+            let elections = file
+                .store
+                .recording_claimed
+                .saturating_add(file.store.recording_declined);
+            if elections != file.store.file_miss {
+                return Err(CensusParseError {
+                    line: header_line,
+                    reason: format!(
+                        "store file_miss={} but {elections} recording elections were counted",
+                        file.store.file_miss
+                    ),
+                });
+            }
+            let declared_segments = usize::try_from(segment_count).unwrap_or(usize::MAX);
+            let actual_segments = file.image.as_ref().map_or(0, |image| image.segments.len());
+            if declared_segments != actual_segments {
+                return Err(CensusParseError {
+                    line: header_line,
+                    reason: format!(
+                        "header declares {declared_segments} segments, file has {actual_segments}"
+                    ),
+                });
+            }
+            if usize::try_from(distinct).unwrap_or(usize::MAX) != file.records.len() {
+                return Err(CensusParseError {
+                    line: header_line,
+                    reason: format!(
+                        "header declares {distinct} distinct entries, file has {}",
+                        file.records.len()
+                    ),
+                });
+            }
+            Ok(file)
+        }
+    }
+
+    fn parse_header(header: &str, line: usize) -> Result<Vec<(&str, &str)>, CensusParseError> {
+        let mut parts = header.split('|');
+        if parts.next() != Some(CENSUS_SCHEMA) {
+            return Err(CensusParseError {
+                line,
+                reason: format!("expected schema {CENSUS_SCHEMA}"),
+            });
+        }
+        parts
+            .map(|part| {
+                part.split_once('=').ok_or_else(|| CensusParseError {
+                    line,
+                    reason: format!("header field {part:?} is not key=value"),
+                })
+            })
+            .collect()
+    }
+
+    fn field<'a>(
+        fields: &[(&'a str, &'a str)],
+        name: &str,
+        line: usize,
+    ) -> Result<&'a str, CensusParseError> {
+        fields
+            .iter()
+            .find_map(|(key, value)| (*key == name).then_some(*value))
+            .ok_or_else(|| CensusParseError {
+                line,
+                reason: format!("header is missing {name}="),
+            })
+    }
+
+    fn parse_u64(value: &str, line: usize) -> Result<u64, CensusParseError> {
+        value.parse().map_err(|_| CensusParseError {
+            line,
+            reason: format!("{value:?} is not an unsigned integer"),
+        })
+    }
+
+    fn parse_i32(value: &str, line: usize) -> Result<i32, CensusParseError> {
+        value.parse().map_err(|_| CensusParseError {
+            line,
+            reason: format!("{value:?} is not a pid"),
+        })
+    }
+
+    fn parse_hex(value: &str, line: usize) -> Result<u64, CensusParseError> {
+        let digits = value.strip_prefix("0x").ok_or_else(|| CensusParseError {
+            line,
+            reason: format!("{value:?} is not 0x-prefixed hex"),
+        })?;
+        u64::from_str_radix(digits, 16).map_err(|_| CensusParseError {
+            line,
+            reason: format!("{value:?} is not hex"),
+        })
+    }
+
+    fn column<'a>(
+        columns: &mut impl Iterator<Item = &'a str>,
+        name: &str,
+        line: usize,
+    ) -> Result<&'a str, CensusParseError> {
+        columns.next().ok_or_else(|| CensusParseError {
+            line,
+            reason: format!("missing {name} column"),
+        })
+    }
+
+    fn parse_store(line_text: &str, line: usize) -> Result<CensusStore, CensusParseError> {
+        let mut parts = line_text.split('|');
+        if parts.next() != Some("STORE") {
+            return Err(CensusParseError {
+                line,
+                reason: "expected a STORE line".to_string(),
+            });
+        }
+        let fields = parts
+            .map(|part| {
+                part.split_once('=').ok_or_else(|| CensusParseError {
+                    line,
+                    reason: format!("store field {part:?} is not key=value"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CensusStore {
+            consulted: parse_u64(field(&fields, "consulted", line)?, line)?,
+            loaded: parse_u64(field(&fields, "loaded", line)?, line)?,
+            file_miss: parse_u64(field(&fields, "file_miss", line)?, line)?,
+            recording_claimed: parse_u64(field(&fields, "recording_claimed", line)?, line)?,
+            recording_declined: parse_u64(field(&fields, "recording_declined", line)?, line)?,
+            skipped: BTreeMap::new(),
+            misses: BTreeMap::new(),
+        })
+    }
+
+    fn parse_skip<'a>(
+        columns: &mut impl Iterator<Item = &'a str>,
+        line: usize,
+    ) -> Result<(LookupSkip, u64), CensusParseError> {
+        let token = column(columns, "skip reason", line)?;
+        let skip = LookupSkip::from_token(token).ok_or_else(|| CensusParseError {
+            line,
+            reason: format!("unknown lookup-skip reason {token:?}"),
+        })?;
+        let count = parse_u64(column(columns, "count", line)?, line)?;
+        Ok((skip, count))
+    }
+
+    fn parse_miss<'a>(
+        columns: &mut impl Iterator<Item = &'a str>,
+        line: usize,
+    ) -> Result<(UnitMissReason, u64), CensusParseError> {
+        let token = column(columns, "miss reason", line)?;
+        let reason = UnitMissReason::from_token(token).ok_or_else(|| CensusParseError {
+            line,
+            reason: format!("unknown unit-miss reason {token:?}"),
+        })?;
+        let count = parse_u64(column(columns, "count", line)?, line)?;
+        Ok((reason, count))
+    }
+
+    fn parse_segment<'a>(
+        columns: &mut impl Iterator<Item = &'a str>,
+        line: usize,
+    ) -> Result<CensusSegment, CensusParseError> {
+        let _index = column(columns, "index", line)?;
+        let guest_start = GuestVa(parse_hex(column(columns, "guest_start", line)?, line)?);
+        let guest_len = parse_hex(column(columns, "guest_len", line)?, line)?;
+        let unit_stem = column(columns, "unit_stem", line)?.to_string();
+        Ok(CensusSegment {
+            guest_start,
+            guest_len,
+            unit_stem,
+        })
+    }
+
+    fn parse_record<'a>(
+        columns: &mut impl Iterator<Item = &'a str>,
+        line: usize,
+    ) -> Result<CensusRecord, CensusParseError> {
+        let guest_va = GuestVa(parse_hex(column(columns, "guest_va", line)?, line)?);
+        let segment = match column(columns, "segment", line)? {
+            "-" => None,
+            raw => Some(raw.parse::<u32>().map_err(|_| CensusParseError {
+                line,
+                reason: format!("{raw:?} is not a segment index"),
+            })?),
+        };
+        let coverage =
+            SegmentCoverage::from_token(column(columns, "coverage", line)?).ok_or_else(|| {
+                CensusParseError {
+                    line,
+                    reason: "unknown coverage token".to_string(),
+                }
+            })?;
+        let translations = parse_u64(column(columns, "translations", line)?, line)?;
+        Ok(CensusRecord {
+            guest_va,
+            segment,
+            coverage,
+            translations,
+        })
+    }
+
+    #[derive(Default)]
+    struct CensusState {
+        total: u64,
+        records: BTreeMap<(GuestVa, Option<u32>, SegmentCoverage), u64>,
+        image: Option<CensusImage>,
+    }
+
+    /// Shared-unit lookup outcomes, as lock-free counters.
+    ///
+    /// Deliberately NOT inside [`CensusState`]'s mutex: `try_load_shared_unit`
+    /// runs on every block-index miss, so folding it into the same lock would
+    /// double the census's per-translation lock traffic. A relaxed add is
+    /// enough -- these are process-scoped totals read only at a flush seam,
+    /// never compared against each other mid-run.
+    struct StoreCounters {
+        consulted: AtomicU64,
+        loaded: AtomicU64,
+        file_miss: AtomicU64,
+        recording_claimed: AtomicU64,
+        recording_declined: AtomicU64,
+        skipped: [AtomicU64; LookupSkip::ALL.len()],
+        misses: [AtomicU64; UnitMissReason::ALL.len()],
+    }
+
+    static STORE_COUNTERS: StoreCounters = StoreCounters {
+        consulted: AtomicU64::new(0),
+        loaded: AtomicU64::new(0),
+        file_miss: AtomicU64::new(0),
+        recording_claimed: AtomicU64::new(0),
+        recording_declined: AtomicU64::new(0),
+        skipped: [const { AtomicU64::new(0) }; LookupSkip::ALL.len()],
+        misses: [const { AtomicU64::new(0) }; UnitMissReason::ALL.len()],
+    };
+
+    static STATE: OnceLock<Mutex<CensusState>> = OnceLock::new();
+    static FLUSH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     static ARMED: OnceLock<bool> = OnceLock::new();
+
+    fn state() -> &'static Mutex<CensusState> {
+        STATE.get_or_init(|| Mutex::new(CensusState::default()))
+    }
+
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take the counters and leave them at zero, so a second flush of the same
+    /// process writes nothing and cannot double-count.
+    fn drain_store_counters() -> CensusStore {
+        let read = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
+        let mut store = CensusStore {
+            consulted: read(&STORE_COUNTERS.consulted),
+            loaded: read(&STORE_COUNTERS.loaded),
+            file_miss: read(&STORE_COUNTERS.file_miss),
+            recording_claimed: read(&STORE_COUNTERS.recording_claimed),
+            recording_declined: read(&STORE_COUNTERS.recording_declined),
+            skipped: BTreeMap::new(),
+            misses: BTreeMap::new(),
+        };
+        for skip in LookupSkip::ALL {
+            if let Some(counter) = STORE_COUNTERS.skipped.get(skip.index()) {
+                let count = read(counter);
+                if count != 0 {
+                    store.skipped.insert(skip, count);
+                }
+            }
+        }
+        for reason in UnitMissReason::ALL {
+            if let Some(counter) = STORE_COUNTERS.misses.get(reason.index()) {
+                let count = read(counter);
+                if count != 0 {
+                    store.misses.insert(reason, count);
+                }
+            }
+        }
+        store
+    }
+
+    // The `bump_*` halves are separate from the `record_*` wrappers so the
+    // accumulation the census actually depends on is directly testable: the
+    // wrappers' `armed()` gate reads a process-wide `OnceLock`, and a test that
+    // set the environment to flip it would race every other test in the binary.
+    fn bump_skip(skip: LookupSkip) {
+        if let Some(counter) = STORE_COUNTERS.skipped.get(skip.index()) {
+            bump(counter);
+        }
+    }
+
+    fn bump_loaded() {
+        bump(&STORE_COUNTERS.consulted);
+        bump(&STORE_COUNTERS.loaded);
+    }
+
+    fn bump_file_miss(claimed: bool) {
+        bump(&STORE_COUNTERS.consulted);
+        bump(&STORE_COUNTERS.file_miss);
+        bump(if claimed {
+            &STORE_COUNTERS.recording_claimed
+        } else {
+            &STORE_COUNTERS.recording_declined
+        });
+    }
+
+    fn bump_miss(reason: UnitMissReason) {
+        bump(&STORE_COUNTERS.consulted);
+        if let Some(counter) = STORE_COUNTERS.misses.get(reason.index()) {
+            bump(counter);
+        }
+    }
+
+    /// A shared-unit lookup returned before touching the store.
+    ///
+    /// Called from `ProcessState::try_load_shared_unit`, once per fresh
+    /// translation that does not reach `TranslationUnitStore::load`.
+    pub fn record_lookup_skipped(skip: LookupSkip) {
+        if !armed() {
+            return;
+        }
+        arm_backstop();
+        bump_skip(skip);
+    }
+
+    /// The store served a unit.
+    pub fn record_lookup_loaded() {
+        if !armed() {
+            return;
+        }
+        arm_backstop();
+        bump_loaded();
+    }
+
+    /// The store had no files for this key, and `claim_recording` returned
+    /// `claimed`. The election's verdict rides along because "the store missed"
+    /// and "the store missed AND declined to let us record" are different
+    /// answers to why nothing was ever published.
+    pub fn record_lookup_file_miss(claimed: bool) {
+        if !armed() {
+            return;
+        }
+        arm_backstop();
+        bump_file_miss(claimed);
+    }
+
+    /// The store refused the key for a typed reason.
+    pub fn record_lookup_miss(reason: UnitMissReason) {
+        if !armed() {
+            return;
+        }
+        arm_backstop();
+        bump_miss(reason);
+    }
 
     fn census_dir() -> Option<&'static String> {
         static DIR: OnceLock<Option<String>> = OnceLock::new();
@@ -11524,36 +12398,586 @@ pub(crate) mod xlat_census {
             .as_ref()
     }
 
-    extern "C" fn dump() {
-        let Some(dir) = census_dir() else { return };
-        let Some(set) = DISTINCT.get() else { return };
-        let Ok(distinct) = set.lock() else { return };
-        let pid = unsafe { libc::getpid() };
-        let mut out = format!(
-            "XLAT|pid={pid}|total={}|distinct={}\n",
-            TOTAL.load(Ordering::Relaxed),
-            distinct.len()
-        );
-        for va in distinct.iter() {
-            out.push_str(&format!("{va:#x}\n"));
+    /// True when `CARRICK_XLAT_CENSUS_DIR` is set. Everything else in this
+    /// module is a no-op when it is not, so the default path pays one relaxed
+    /// load and a branch.
+    pub fn armed() -> bool {
+        census_dir().is_some()
+    }
+
+    fn hex_digest(digest: [u8; 32]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(digest.len().saturating_mul(2));
+        for byte in digest {
+            let _ = write!(out, "{byte:02x}");
         }
-        let _ = std::fs::write(format!("{dir}/xlat-{pid}.txt"), out);
+        out
+    }
+
+    /// Install the image whose blocks subsequent [`record`] calls belong to.
+    ///
+    /// Called from `NativeMappedMemory::configure_shared_translation` for every
+    /// process image, including each `execve` replacement, and independently of
+    /// `CARRICK_DSR_SHARED_TRANSLATION` -- the census's job is to describe the
+    /// default path. The stems are derived once per (image, segment) here
+    /// rather than per translation.
+    /// Forget the configured image, so a successor with no configurable segment
+    /// cannot inherit its predecessor's.
+    ///
+    /// carrick's in-process `execve` keeps this process's statics. Under the
+    /// fixed PIE base the successor's blocks land on the SAME guest VAs, so a
+    /// stale image would attribute them to another binary's unit stem — the one
+    /// thing the stem exists to prevent, and it would be silently wrong rather
+    /// than absent.
+    pub fn clear_image() {
+        if !armed() {
+            return;
+        }
+        if let Ok(mut state) = state().lock() {
+            state.image = None;
+        }
+    }
+
+    pub fn configure_image(image: &SharedImageConfig) {
+        if !armed() {
+            return;
+        }
+        if image.segments.is_empty() {
+            clear_image();
+            return;
+        }
+        let identity = image
+            .executable_digest()
+            .map_or_else(|| "-".to_string(), hex_digest);
+        let segments = image
+            .segments
+            .iter()
+            .map(|segment| CensusSegment {
+                guest_start: segment.guest_start,
+                guest_len: segment.guest_len.get(),
+                unit_stem: image
+                    .key_for_segment(segment)
+                    .file_stem()
+                    .unwrap_or_else(|_| "-".to_string()),
+            })
+            .collect();
+        if let Ok(mut state) = state().lock() {
+            state.image = Some(CensusImage { identity, segments });
+        }
+    }
+
+    /// Classify a translated block against the configured segments.
+    ///
+    /// Pure and separately tested because the runtime holds two different
+    /// containment predicates: a unit LOOKUP keys on the entry VA
+    /// (`try_load_shared_unit`), while the PRODUCER requires the whole block to
+    /// fit (`record_portable_block_artifact`). Reporting only one of them would
+    /// either overstate the ceiling or understate what is publishable today.
+    fn classify(
+        segments: &[CensusSegment],
+        entry: GuestVa,
+        block_start: GuestVa,
+        block_end: GuestVa,
+    ) -> (Option<u32>, SegmentCoverage) {
+        for (index, segment) in segments.iter().enumerate() {
+            let Some(segment_end) = segment.guest_start.raw().checked_add(segment.guest_len) else {
+                continue;
+            };
+            if entry.raw() < segment.guest_start.raw() || entry.raw() >= segment_end {
+                continue;
+            }
+            let coverage = if block_start.raw() >= segment.guest_start.raw()
+                && block_end.raw() <= segment_end
+            {
+                SegmentCoverage::Contained
+            } else {
+                SegmentCoverage::EntryOnly
+            };
+            return (u32::try_from(index).ok(), coverage);
+        }
+        (None, SegmentCoverage::Outside)
     }
 
     /// Called on every FRESH translation (never on a cache hit).
-    pub(crate) fn record(guest_va: u64) {
-        if census_dir().is_none() {
+    pub fn record(entry: GuestVa, block_start: GuestVa, block_end: GuestVa) {
+        if !armed() {
             return;
         }
-        TOTAL.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut distinct) = DISTINCT.get_or_init(|| Mutex::new(HashSet::new())).lock() {
-            distinct.insert(guest_va);
+        arm_backstop();
+        let Ok(mut state) = state().lock() else {
+            return;
+        };
+        state.total = state.total.saturating_add(1);
+        let key = {
+            let (segment, coverage) = state
+                .image
+                .as_ref()
+                .map_or((None, SegmentCoverage::Outside), |image| {
+                    classify(&image.segments, entry, block_start, block_end)
+                });
+            (entry, segment, coverage)
+        };
+        let count = state.records.entry(key).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    /// A `fork` child inherits `total`/`records` by COW but performs none of the
+    /// parent's translations. Without this reset the parent's whole set would be
+    /// re-attributed to every child and `sum(per-file total)` would stop being
+    /// the real translation count. The image survives: the child runs it.
+    pub fn reset_after_fork() {
+        if !armed() {
+            return;
         }
-        // carrick's run paths end in `std::process::exit`, which runs libc
-        // atexit handlers but not `Drop`, so the dump has to be an atexit hook.
+        // Same reasoning for the lookup counters: the child performed none of
+        // the parent's lookups, and `shared_unit_segments_consulted` is itself
+        // inherited, so leaving them would attribute the parent's consultations
+        // to a process that will never make one.
+        let _ = drain_store_counters();
+        // And for the flush ordinal. A child forked AFTER an in-process
+        // `execve` inherits its parent's non-zero sequence and writes its first
+        // file at `seq=1`, so it contributes no `seq=0` start -- which is the
+        // one thing the aggregator's whole lineage model keys on
+        // (`incarnations`, `flush_balance`, `reexec_successors_missing` in
+        // `carrick-cli/src/debug_census.rs`). Leaving it inherited made the
+        // instrument silently under-report coverage on any fixture where a
+        // process execs in place before forking (`sh -c '<one command>'`), and
+        // report it correctly on fixtures where it does not, which is the worst
+        // possible failure shape for a number that gates a KILL criterion.
+        FLUSH_SEQUENCE.store(0, Ordering::Relaxed);
+        if let Ok(mut state) = state().lock() {
+            state.total = 0;
+            state.records.clear();
+        }
+    }
+
+    /// Drain this process's records to `<dir>/xlat-<pid>-<stamp>-<seq>.txt`.
+    ///
+    /// Draining is what makes the seams composable: a second flush of an
+    /// already-drained process writes nothing, so the `atexit` backstop and the
+    /// explicit exit flush cannot double-count each other.
+    ///
+    /// The filename needs the timestamp because carrick's guest `execve` is a
+    /// host SELF-re-exec: the successor keeps this pid AND restarts the flush
+    /// sequence at 0, so `xlat-<pid>.txt` (or even `xlat-<pid>-<seq>.txt`) had
+    /// the pre-exec flush truncated by its own successor.
+    pub fn flush(reason: CensusFlush) {
+        let Some(dir) = census_dir() else {
+            return;
+        };
+        let Ok(mut guard) = state().lock() else {
+            return;
+        };
+        // Drained under the same guard the records are, so the two halves of a
+        // process's story cannot be split across two files.
+        let store = drain_store_counters();
+        if guard.total == 0 && store.is_empty() {
+            return;
+        }
+        let total = std::mem::take(&mut guard.total);
+        let records = std::mem::take(&mut guard.records);
+        let image = guard.image.clone();
+        drop(guard);
+        let pid = unsafe { libc::getpid() };
+        let sequence = FLUSH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let file = CensusFile {
+            pid,
+            sequence,
+            reason,
+            total,
+            image,
+            records: records
+                .into_iter()
+                .map(
+                    |((guest_va, segment, coverage), translations)| CensusRecord {
+                        guest_va,
+                        segment,
+                        coverage,
+                        translations,
+                    },
+                )
+                .collect(),
+            store,
+        };
+        let _ = std::fs::write(
+            format!("{dir}/xlat-{pid}-{stamp}-{sequence}.txt"),
+            file.render(),
+        );
+    }
+
+    extern "C" fn dump() {
+        flush(CensusFlush::AtexitBackstop);
+    }
+
+    fn arm_backstop() {
         ARMED.get_or_init(|| {
+            // Backstop only. Every native termination path that carries
+            // translations flushes explicitly (see `CensusFlush`); `atexit`
+            // covers the residual `std::process::exit` shapes and is free once
+            // an explicit flush has drained the state.
             unsafe { libc::atexit(dump) };
             true
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn segments() -> Vec<CensusSegment> {
+            vec![
+                CensusSegment {
+                    guest_start: GuestVa(0x40_0000),
+                    guest_len: 0x1000,
+                    unit_stem: "aa".repeat(32),
+                },
+                CensusSegment {
+                    guest_start: GuestVa(0x50_0000),
+                    guest_len: 0x40,
+                    unit_stem: "bb".repeat(32),
+                },
+            ]
+        }
+
+        #[test]
+        fn classify_separates_lookup_containment_from_producer_containment() {
+            let segments = segments();
+            // Wholly inside segment 0: publishable today.
+            assert_eq!(
+                classify(
+                    &segments,
+                    GuestVa(0x40_0010),
+                    GuestVa(0x40_0010),
+                    GuestVa(0x40_0020)
+                ),
+                (Some(0), SegmentCoverage::Contained)
+            );
+            // Entry inside segment 1, block runs past its end: a unit lookup
+            // would hit, today's producer refuses to record it.
+            assert_eq!(
+                classify(
+                    &segments,
+                    GuestVa(0x50_0030),
+                    GuestVa(0x50_0030),
+                    GuestVa(0x50_0080)
+                ),
+                (Some(1), SegmentCoverage::EntryOnly)
+            );
+            // Exactly abutting the segment end is still contained.
+            assert_eq!(
+                classify(
+                    &segments,
+                    GuestVa(0x50_0000),
+                    GuestVa(0x50_0000),
+                    GuestVa(0x50_0040)
+                ),
+                (Some(1), SegmentCoverage::Contained)
+            );
+            // Outside every segment: no unit could ever serve it.
+            assert_eq!(
+                classify(
+                    &segments,
+                    GuestVa(0x7f_0000),
+                    GuestVa(0x7f_0000),
+                    GuestVa(0x7f_0010)
+                ),
+                (None, SegmentCoverage::Outside)
+            );
+            // No configured image at all reads as Outside.
+            assert_eq!(
+                classify(
+                    &[],
+                    GuestVa(0x40_0010),
+                    GuestVa(0x40_0010),
+                    GuestVa(0x40_0020)
+                ),
+                (None, SegmentCoverage::Outside)
+            );
+        }
+
+        fn store() -> CensusStore {
+            CensusStore {
+                consulted: 4,
+                loaded: 1,
+                file_miss: 1,
+                recording_claimed: 0,
+                recording_declined: 1,
+                skipped: BTreeMap::from([
+                    (LookupSkip::LaneUnconfigured, 9),
+                    (LookupSkip::SegmentRepeat, 40),
+                ]),
+                misses: BTreeMap::from([(UnitMissReason::NoAuthority, 2)]),
+            }
+        }
+
+        #[test]
+        fn renders_the_record_shape() {
+            let file = CensusFile {
+                pid: 4242,
+                sequence: 1,
+                reason: CensusFlush::HostSelfReexec,
+                total: 5,
+                image: Some(CensusImage {
+                    identity: "cd".repeat(32),
+                    segments: vec![CensusSegment {
+                        guest_start: GuestVa(0x40_0000),
+                        guest_len: 0x1000,
+                        unit_stem: "aa".repeat(32),
+                    }],
+                }),
+                records: vec![
+                    CensusRecord {
+                        guest_va: GuestVa(0x40_0010),
+                        segment: Some(0),
+                        coverage: SegmentCoverage::Contained,
+                        translations: 3,
+                    },
+                    CensusRecord {
+                        guest_va: GuestVa(0x7f_0000),
+                        segment: None,
+                        coverage: SegmentCoverage::Outside,
+                        translations: 2,
+                    },
+                ],
+                store: store(),
+            };
+            let identity = "cd".repeat(32);
+            let stem = "aa".repeat(32);
+            let expected = format!(
+                "XLATCENSUS3|pid=4242|seq=1|reason=host-self-reexec|total=5|distinct=2|image={identity}|segments=1\n\
+                 STORE|consulted=4|loaded=1|file_miss=1|recording_claimed=0|recording_declined=1\n\
+                 SKIP|lane-unconfigured|9\n\
+                 SKIP|segment-repeat|40\n\
+                 MISS|no-authority|2\n\
+                 SEG|0|0x400000|0x1000|{stem}\n\
+                 VA|0x400010|0|contained|3\n\
+                 VA|0x7f0000|-|outside|2\n"
+            );
+            assert_eq!(file.render(), expected);
+            assert_eq!(CensusFile::parse(&expected), Ok(file));
+        }
+
+        #[test]
+        fn renders_a_process_that_never_configured_an_image() {
+            let file = CensusFile {
+                pid: 7,
+                sequence: 0,
+                reason: CensusFlush::ProcessExit,
+                total: 1,
+                image: None,
+                records: vec![CensusRecord {
+                    guest_va: GuestVa(0x1000),
+                    segment: None,
+                    coverage: SegmentCoverage::Outside,
+                    translations: 1,
+                }],
+                store: CensusStore {
+                    skipped: BTreeMap::from([(LookupSkip::LaneUnconfigured, 1)]),
+                    ..CensusStore::default()
+                },
+            };
+            let expected = "XLATCENSUS3|pid=7|seq=0|reason=process-exit|total=1|distinct=1|image=-|segments=0\n\
+                            STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0\n\
+                            SKIP|lane-unconfigured|1\n\
+                            VA|0x1000|-|outside|1\n";
+            assert_eq!(file.render(), expected);
+            assert_eq!(CensusFile::parse(expected), Ok(file));
+        }
+
+        #[test]
+        fn parse_fails_closed_on_a_truncated_or_mislabelled_file() {
+            const HEADER: &str = "XLATCENSUS3|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
+            const STORE: &str =
+                "STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0\n";
+            let cases = [
+                (String::new(), "empty"),
+                (
+                    "XLATCENSUS2|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n"
+                        .to_string(),
+                    "superseded schema",
+                ),
+                (
+                    format!("{HEADER}{STORE}").replace("distinct=0", "distinct=1"),
+                    "distinct mismatch",
+                ),
+                (
+                    format!("{HEADER}{STORE}").replace("process-exit", "fell-over"),
+                    "reason",
+                ),
+                (
+                    format!("{HEADER}{STORE}VA|400010|-|outside|1\n").replace("total=0", "total=1")
+                        .replace("distinct=0", "distinct=1"),
+                    "unprefixed hex",
+                ),
+                (
+                    format!("{HEADER}{STORE}SEG|0|0x1000|0x10|aa\n"),
+                    "segment without image",
+                ),
+                (HEADER.to_string(), "no STORE line"),
+                (
+                    format!("{HEADER}{STORE}SKIP|not-a-skip|1\n"),
+                    "unknown skip reason",
+                ),
+                (
+                    format!("{HEADER}{STORE}MISS|not-a-reason|1\n"),
+                    "unknown miss reason",
+                ),
+                (
+                    // consulted must equal loaded + file_miss + misses.
+                    format!("{HEADER}{STORE}").replace("consulted=0", "consulted=3"),
+                    "store outcomes do not account for consulted",
+                ),
+                (
+                    // A file miss always carries exactly one election verdict.
+                    format!("{HEADER}{STORE}")
+                        .replace("consulted=0|loaded=0|file_miss=0", "consulted=1|loaded=0|file_miss=1"),
+                    "file miss without an election verdict",
+                ),
+                (
+                    // Two STORE lines: the second used to overwrite the first
+                    // wholesale, so "last one wins" parsed clean.
+                    format!("{HEADER}{STORE}{STORE}"),
+                    "second STORE line",
+                ),
+            ];
+            for (text, what) in cases {
+                assert!(
+                    CensusFile::parse(&text).is_err(),
+                    "expected {what} to be rejected"
+                );
+            }
+        }
+
+        /// `SKIP`/`MISS` counts that precede the `STORE` line must survive it.
+        ///
+        /// The parser used to assign `file.store = parse_store(..)` wholesale,
+        /// and `parse_store` returns empty maps — so a reordered or
+        /// concatenated file silently lost every earlier `SKIP`/`MISS` count
+        /// AND still satisfied both construction identities, which do not cover
+        /// the maps. It parsed clean and reported zero.
+        #[test]
+        fn skip_counts_before_the_store_line_are_not_discarded_by_it() {
+            const HEADER: &str = "XLATCENSUS3|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
+            const STORE: &str =
+                "STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0\n";
+            let reordered = format!("{HEADER}SKIP|segment-repeat|7\nMISS|no-authority|0\n{STORE}");
+            let file = CensusFile::parse(&reordered).expect("reordered file parses");
+            assert_eq!(
+                file.store.skipped.get(&LookupSkip::SegmentRepeat).copied(),
+                Some(7)
+            );
+        }
+
+        /// A process that only ever LOADED shared units performs no fresh
+        /// translation, so its header `total` is 0. It must still be written,
+        /// or the one outcome that proves the lane worked would be the one the
+        /// census throws away.
+        #[test]
+        fn a_process_with_no_translations_but_store_activity_is_not_empty() {
+            assert!(CensusStore::default().is_empty());
+            let loaded_only = CensusStore {
+                consulted: 1,
+                loaded: 1,
+                ..CensusStore::default()
+            };
+            assert!(!loaded_only.is_empty());
+            let skipped_only = CensusStore {
+                skipped: BTreeMap::from([(LookupSkip::SegmentRepeat, 1)]),
+                ..CensusStore::default()
+            };
+            assert!(!skipped_only.is_empty());
+        }
+
+        /// The counters, the drain, and the wire format end to end -- through
+        /// the same `bump_*` helpers the recording wrappers call, so a drift
+        /// between "what the runtime counts" and "what the file says" fails
+        /// here rather than in a report nobody can reproduce.
+        #[test]
+        fn lookup_counters_accumulate_drain_and_survive_the_wire() {
+            // Any residue from an earlier assertion in this test binary would
+            // make the expected values wrong; the counters are process-global.
+            let _ = drain_store_counters();
+            bump_skip(LookupSkip::Regenerated);
+            bump_skip(LookupSkip::SegmentRepeat);
+            bump_skip(LookupSkip::SegmentRepeat);
+            bump_loaded();
+            bump_file_miss(true);
+            bump_file_miss(false);
+            bump_miss(UnitMissReason::NoAuthority);
+            bump_miss(UnitMissReason::Schema);
+
+            let drained = drain_store_counters();
+            assert_eq!(drained.consulted, 5, "loaded + file misses + refusals");
+            assert_eq!(drained.loaded, 1);
+            assert_eq!(drained.file_miss, 2);
+            assert_eq!(drained.recording_claimed, 1);
+            assert_eq!(drained.recording_declined, 1);
+            assert_eq!(
+                drained.skipped,
+                BTreeMap::from([(LookupSkip::Regenerated, 1), (LookupSkip::SegmentRepeat, 2),])
+            );
+            assert_eq!(
+                drained.misses,
+                BTreeMap::from([
+                    (UnitMissReason::NoAuthority, 1),
+                    (UnitMissReason::Schema, 1),
+                ])
+            );
+            assert_eq!(drained.skipped_total(), 3);
+            assert_eq!(drained.miss_total(), 2);
+            // Both identities the parser re-checks.
+            assert_eq!(
+                drained.loaded + drained.file_miss + drained.miss_total(),
+                drained.consulted
+            );
+            assert_eq!(
+                drained.recording_claimed + drained.recording_declined,
+                drained.file_miss
+            );
+
+            // Draining is what keeps a second flush from double-counting.
+            assert!(drain_store_counters().is_empty());
+
+            let file = CensusFile {
+                pid: 11,
+                sequence: 0,
+                reason: CensusFlush::ProcessExit,
+                total: 0,
+                image: None,
+                records: Vec::new(),
+                store: drained,
+            };
+            assert_eq!(CensusFile::parse(&file.render()), Ok(file));
+        }
+
+        #[test]
+        fn coverage_and_flush_tokens_round_trip() {
+            for coverage in [
+                SegmentCoverage::Outside,
+                SegmentCoverage::EntryOnly,
+                SegmentCoverage::Contained,
+            ] {
+                assert_eq!(
+                    SegmentCoverage::from_token(coverage.token()),
+                    Some(coverage)
+                );
+            }
+            for reason in [
+                CensusFlush::ProcessExit,
+                CensusFlush::HostSelfReexec,
+                CensusFlush::InProcessExec,
+                CensusFlush::AtexitBackstop,
+            ] {
+                assert_eq!(CensusFlush::from_token(reason.token()), Some(reason));
+            }
+            for skip in LookupSkip::ALL {
+                assert_eq!(LookupSkip::from_token(skip.token()), Some(skip));
+                assert_eq!(LookupSkip::ALL.get(skip.index()), Some(&skip));
+            }
+            assert_eq!(LookupSkip::from_token("segment_repeat"), None);
+        }
     }
 }

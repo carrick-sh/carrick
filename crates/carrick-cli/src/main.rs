@@ -122,6 +122,9 @@ mod commands;
 // `runtime::DebugStateSnapshot`; HVF-only.
 #[cfg(feature = "platform-macos")]
 mod debug;
+// `debug_census` only parses text files the native lane wrote, so — like
+// `debug_layout` and unlike `debug` — it is declared on every platform.
+mod debug_census;
 mod debug_layout;
 mod fs_setup;
 mod lifecycle;

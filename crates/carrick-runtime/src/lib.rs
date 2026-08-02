@@ -258,6 +258,18 @@ pub use carrick_mem::{elf, memory, page_table, vdso};
 // matching carrick binary is the authority; scripts must never duplicate the
 // offset because gateway state (notably XSAVE) changes its size.
 pub use carrick_dsr_x86::{X86DsrProfilerLayout, x86_dsr_profiler_layout};
+// The translation-redundancy census file model. The WRITER lives beside the
+// translator that produces the records; `carrick debug xlat-census` aggregates
+// them and must parse them with the SAME definition, so the format is exported
+// here rather than re-implemented in the CLI (which cannot depend on
+// carrick-dsr-aarch64 directly). Unconditional: carrick-dsr-aarch64 compiles on
+// every host, and reading a census captured on a Darwin/aarch64 rig is a
+// perfectly reasonable thing to do elsewhere.
+pub use carrick_dsr_aarch64::translator::xlat_census;
+// The guest-virtual address domain the census records are keyed on. Exported
+// beside `xlat_census` so an out-of-crate aggregator keys its sets on the typed
+// address instead of degrading them to `u64` at the crate boundary.
+pub use carrick_guest_mem::GuestVa;
 // guest_cpu/host_facts/host_mapping/host_proc/ulock were lifted into the leaf
 // crate `carrick-host` (Darwin host primitives — machine facts, __ulock, host
 // shared mappings, CPU accounting, libproc introspection; no dispatch/trap/VFS
