@@ -913,12 +913,60 @@ where
     })
 }
 
+/// Whether this load must produce a real content digest.
+///
+/// Hashing the executable is not free: it walks the whole file, and a cold
+/// `go build` execs ~61 tool processes over the same ~20 MB `compile`/`asm`/
+/// `link` binaries, which made `sha2::sha256::compress256` 6.99% of ALL CPU
+/// and 44% of carrick's own userspace
+/// (`docs/perf-results/2026-08-02-exec-dominates-the-build.jsonl`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecDigestPolicy {
+    /// Hash now. The self-reexec CHILD reloading through the legacy path must,
+    /// because its whole job is to compare the digest with the parent's.
+    Required,
+    /// Hash only if a consumer is armed. The PARENT does not yet know whether
+    /// the guard will run: it runs only when no prepared image is attached, and
+    /// that is decided later, in `begin_guest_exec`. Deferring keeps the guard
+    /// at full strength on the path that uses it and off the path that does not.
+    DeferredUnlessConsumed,
+}
+
+/// Whether anything will read an executable's content digest this run.
+///
+/// The three consumers each mint an `ExecutableIdentity`/`TranslationUnitKey`
+/// from it and are independently opt-in.
+fn executable_digest_is_consumed() -> bool {
+    carrick_dsr_aarch64::translator::shared_translation_runtime_enabled()
+        || carrick_dsr_aarch64::artifact_spike::enabled()
+        || carrick_dsr_aarch64::translator::xlat_census::armed()
+}
+
+/// Sentinel meaning "not hashed yet". `begin_guest_exec` fills it in if the
+/// prepared-image attach declines and the guard will therefore run.
+pub(crate) const DEFERRED_EXEC_DIGEST: [u8; 32] = [0_u8; 32];
+
+/// Hash a guest executable by path, for the deferred case.
+///
+/// Reads through the same dispatcher/host fallback pair the loader uses, so it
+/// sees exactly the bytes the loader saw and the child will see.
+pub(crate) fn exec_file_digest(dispatcher: &SyscallDispatcher, resolved: &str) -> Option<[u8; 32]> {
+    let bytes = dispatcher.read_exec_file(resolved).or_else(|| {
+        dispatcher
+            .exec_host_fs_fallback()
+            .then(|| std::fs::read(resolved).ok())
+            .flatten()
+    })?;
+    Some(sha2::Sha256::digest(&bytes).into())
+}
+
 fn load_native_execve_image(
     dispatcher: &SyscallDispatcher,
     path: &str,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
     plan: &ExecutionPlan,
+    digest_policy: ExecDigestPolicy,
 ) -> Result<LoadedNativeExecveImage, crate::linux_abi::LinuxErrno> {
     let geometry = plan
         .page_geometry
@@ -944,7 +992,12 @@ fn load_native_execve_image(
         .read_exec_file(&resolved)
         .or_else(|| host_read(&resolved))
         .ok_or(crate::linux_abi::LINUX_ENOENT)?;
-    let executable_digest: [u8; 32] = sha2::Sha256::digest(&file).into();
+    let executable_digest: [u8; 32] =
+        if digest_policy == ExecDigestPolicy::Required || executable_digest_is_consumed() {
+            sha2::Sha256::digest(&file).into()
+        } else {
+            DEFERRED_EXEC_DIGEST
+        };
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)
         .map_err(|_| crate::linux_abi::LINUX_ENOEXEC)?;
     let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
@@ -1076,6 +1129,8 @@ pub(crate) fn resume_guest_from_capsule(
             argv.clone(),
             env.clone(),
             &plan,
+            // The guard this reload feeds IS the digest comparison.
+            ExecDigestPolicy::Required,
         );
         if loaded.is_ok() {
             native_reexec_lifecycle(
@@ -3551,7 +3606,14 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     .collect();
                 let host_process_name = proc_argv.join(" ");
                 let proc_env = env.clone();
-                match load_native_execve_image(&dispatcher, &path, argv, env, &plan) {
+                match load_native_execve_image(
+                    &dispatcher,
+                    &path,
+                    argv,
+                    env,
+                    &plan,
+                    ExecDigestPolicy::DeferredUnlessConsumed,
+                ) {
                     Ok((
                         image,
                         relative_relocations,
@@ -14962,6 +15024,7 @@ mod tests {
             vec![path.as_os_str().as_encoded_bytes().to_vec()],
             Vec::new(),
             plan,
+            ExecDigestPolicy::Required,
         )
         .expect("load native resume fixture")
     }

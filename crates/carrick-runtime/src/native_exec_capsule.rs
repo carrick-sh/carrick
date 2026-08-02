@@ -430,6 +430,28 @@ pub(crate) fn begin_guest_exec(
         relative_relocations,
         plan.page_geometry.host_page_size,
     );
+    // Pay for the digest only if the guard that reads it will actually run.
+    //
+    // The child compares digests ONLY on the legacy resume path, i.e. when no
+    // prepared image is attached; with one attached it validates that artifact's
+    // checksum instead and never looks at this field. The parent could not know
+    // which case it was in at load time, so it hashed unconditionally - a full
+    // walk of a ~20 MB binary on all ~61 execs of a cold `go build`, and 6.99%
+    // of all CPU. By here the answer is known, so hash exactly when it matters.
+    //
+    // This does NOT weaken the guard: on the legacy path both sides now compute
+    // a real digest, exactly as before. `ExecDigestPolicy::Required` covers the
+    // child, and an armed consumer (shared translation, artifact spike, census)
+    // still forces the eager hash because those mint an identity from it.
+    if let Some(guest) = payload.guest_exec.as_mut()
+        && guest.prepared_image.is_none()
+        && guest.executable_digest == crate::native_darwin::DEFERRED_EXEC_DIGEST
+    {
+        guest.executable_digest =
+            crate::native_darwin::exec_file_digest(dispatcher, &guest.resolved_path).ok_or_else(
+                || anyhow::anyhow!("hash guest executable for legacy self-reexec resume"),
+            )?;
+    }
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("generate native exec capsule nonce: {error}"))?;
