@@ -142,7 +142,24 @@ stores.
    the dispatch's serial load chain (cache-base/tag/`ldar`), with two bounded
    levers queued: entry packing for `ldp`, and a WRITTEN-ARGUMENT-FIRST
    relaxation of the generation `ldar` to a plain load.
-2. **fs-walk, now ~82x (was 128x).** Three landed cuts: the stat cache consulted
+2. **fs-walk: in-guest ~18x (was 128x), TOTAL WALL 3.8x (was ~20x).**
+   Read `docs/perf-results/container-lifecycle-split.jsonl` before ranking
+   anything here - it separates container lifecycle from in-guest work, and the
+   two have different bars. Landed: stat-cache after dirfd resolution, child
+   sizes from the FIFO probe, fd-centric opens, trusted dirfd lanes + streamed
+   getdents, fts dot-stats, the plain-metadata gate (fail-closed marker), and
+   deferred scratch teardown (`cc337c99`) which took lifecycle 1,757 -> 633 ms.
+   Drained totals: carrick no-op 425 ms vs docker 160 ms (2.7x); fs-walk total
+   620 ms vs 163 ms (3.8x). What remains is bounded and measured: the create
+   phase is ~333 ms of `clonefileat` (per-run COW seed of the image namespace;
+   parallelising it measured NULL - APFS serialises it), and the in-guest half
+   is 57% host-kernel / 43% carrick dispatch, so the 2x in-guest bar cannot be
+   reached by cheapening dispatch alone. The two named levers are
+   `getattrlistbulk(2)` (serve find's per-child stats from the syscall that
+   enumerates them) and serving reads from the shared cache tree instead of
+   cloning it per run (conflicts with today's scratch-is-truth lanes).
+
+   *Superseded detail:* **fs-walk, once 82x.** Three landed cuts: the stat cache consulted
    after dirfd resolution, child sizes carried out of the FIFO-probe stat, and
    non-creating guest opens served from ONE contained openat with fd-derived
    metadata (`810bc6f4`, `9c5fc386`). The surviving ~27.7k host opens/run are
