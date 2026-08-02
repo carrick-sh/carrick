@@ -370,8 +370,23 @@ concern — it is half the product.
   11.5% (+6.1% dylibs), kernel 29.5%, guest-shaped JIT words 16.5%.**
   So **emitted code is the largest bucket on the build**, and "carrick's own
   userspace has never been attacked" is worth about a third of what that reading
-  implied. (The 36.4% predates the 2026-08-01 codegen phases and is now an
-  overestimate — re-measure before ranking off it.)
+  implied.
+- **Re-measured 2026-08-02 (supersedes the split above).** Sampling with the
+  tracer's own pid excluded — `native-cpu-attribution.d` screened on
+  `execname == "carrick"` and `carrick trace` runs libdtrace IN-PROCESS, so 54%
+  of the old profile was the profiler — gives **user 67.6% / kernel 32.4%**, and
+  within user **66.4% unsymbolized (the JIT cache), 13.3% carrick's Rust, 8.7%
+  memcpy/memset, 7.8% malloc**. Emitted-code execution is **~45% of all build
+  CPU**. The shape census (`scripts/perf/shape_classify.py`) puts the
+  DSR-overhead floor at **52.4% of executed emitted instructions, down from
+  81.3%**, and the residue is concentrated in ONE thing: slot 1128 is the
+  guest's virtualized **x17** (physical x17 is the DSR edge register), and every
+  direct edge publishes it (`str x17,[x28,#1128]`) and restores it
+  (`ldr x17,[x28,#1128]`). Those two words are **33.7% of executed emitted
+  instructions ≈ 15% of total build CPU** — one guest register round-tripping
+  through memory at every block transition. Note the ceiling this implies:
+  even PERFECT codegen leaves the build near 5x Docker, so the 2x bar needs the
+  kernel and host-userspace buckets too.
 - **The overhead workstream is still one thing: "utilize Darwin in the most
   efficient way to emulate Linux."** Carrick's host-side work and the kernel work
   it induces are not separate problems — they are the cost of LOWERING one Linux
