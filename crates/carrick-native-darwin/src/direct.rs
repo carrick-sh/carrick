@@ -181,6 +181,64 @@ fn island(ctx: u64, return_pc: u64) -> Vec<u32> {
     w
 }
 
+/// `mrs xd, tpidr_el0` (read the thread pointer).
+const fn mrs_tpidr_el0_word(rd: u32) -> u32 {
+    0xd53b_d040 | rd
+}
+/// `msr tpidr_el0, xn` (write the thread pointer).
+const fn msr_tpidr_el0_word(rn: u32) -> u32 {
+    0xd51b_d040 | rn
+}
+
+/// Decode a `tpidr_el0` access, if this word is one.
+fn tpidr_access(word: u32) -> Option<TpidrAccess> {
+    let reg = word & 0x1f;
+    if word == mrs_tpidr_el0_word(reg) {
+        Some(TpidrAccess::Read { reg })
+    } else if word == msr_tpidr_el0_word(reg) {
+        Some(TpidrAccess::Write { reg })
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TpidrAccess {
+    Read { reg: u32 },
+    Write { reg: u32 },
+}
+
+/// Emit a veneer that services one guest `tpidr_el0` access.
+///
+/// XNU rewrites `TPIDR_EL0` at the first trap return (probed), so a guest TLS
+/// base cannot live in the physical register. It lives in `slot` instead, and
+/// these veneers are the only things that touch it.
+///
+/// A READ needs no borrowed register at all: `mrs xd, tpidr_el0` was already
+/// going to overwrite `xd`, so the veneer materializes the slot address into
+/// that same register and loads through it.
+///
+/// A WRITE has to preserve its source register, so it borrows one 16-byte
+/// guest stack slot exactly as the syscall island does — using x0, or x1 when
+/// the source *is* x0.
+fn tpidr_veneer(access: TpidrAccess, slot: u64) -> Vec<u32> {
+    let mut w = Vec::with_capacity(12);
+    match access {
+        TpidrAccess::Read { reg } => {
+            w.extend_from_slice(&mov_imm64(reg, slot));
+            w.push(ldr_imm(reg, reg, 0));
+        }
+        TpidrAccess::Write { reg } => {
+            let scratch = if reg == 0 { 1 } else { 0 };
+            w.push(str_pre_sp(scratch));
+            w.extend_from_slice(&mov_imm64(scratch, slot));
+            w.push(str_imm(reg, scratch, 0));
+            w.push(ldr_post_sp(scratch));
+        }
+    }
+    w
+}
+
 /// Why an image cannot run on tier D.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectIneligible {
@@ -202,6 +260,15 @@ pub enum DirectIneligible {
     X18Access { vaddr: u64 },
     /// No executable segment, or nothing to patch.
     NoExecutableText,
+    /// An `ET_EXEC` image: its addresses are absolute, so it must load at its
+    /// own `p_vaddr`, and this loader places images wherever `MAP_JIT` lands.
+    ///
+    /// Not a limitation of the patcher — it is the `__PAGEZERO` wall. Probed
+    /// on this host: a small-`__PAGEZERO` main is SIGKILLed at exec, and
+    /// `mach_vm_deallocate` of the range reports success while leaving it
+    /// unmappable. The Go toolchain lives at 0x10000 and is therefore tier T's
+    /// by physics, whatever its instruction mix says.
+    FixedLoadAddress { vaddr: u64 },
 }
 
 impl std::fmt::Display for DirectIneligible {
@@ -213,6 +280,10 @@ impl std::fmt::Display for DirectIneligible {
             Self::TpidrAccess { vaddr } => write!(f, "tpidr_el0 access at {vaddr:#x}"),
             Self::X18Access { vaddr } => write!(f, "x18 access at {vaddr:#x}"),
             Self::NoExecutableText => write!(f, "no executable text"),
+            Self::FixedLoadAddress { vaddr } => write!(
+                f,
+                "ET_EXEC must load at its own vaddr {vaddr:#x}, which __PAGEZERO forbids"
+            ),
         }
     }
 }
@@ -261,6 +332,13 @@ fn instruction_names_x18(insn: &bad64::Instruction) -> bool {
 ///
 /// `svc` is NOT a disqualifier: patching it is the entire mechanism.
 pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, io::Error> {
+    // Placement before content: an image that cannot be put where it needs to
+    // be is refused however clean its instructions are.
+    const ET_EXEC: u64 = 2;
+    if read_u16(elf, 0x10)? == ET_EXEC {
+        let (lo, _) = load_span(elf)?;
+        return Ok(Err(DirectIneligible::FixedLoadAddress { vaddr: lo }));
+    }
     // Only real code: see `executable_sections` for why the PF_X segment is
     // the wrong unit. No section headers means nothing can be proved, so fail
     // closed rather than guess.
@@ -283,8 +361,12 @@ pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, i
             }
             match bad64::decode(word, site) {
                 Ok(insn) => {
+                    // `tpidr_el0` is veneered, not refused (see
+                    // `tpidr_veneer`). Only the shapes the veneer does not
+                    // model still disqualify.
                     if matches!(insn.op(), bad64::Op::MRS | bad64::Op::MSR)
                         && format!("{insn:?}").contains("TPIDR_EL0")
+                        && tpidr_access(word).is_none()
                     {
                         return Ok(Err(DirectIneligible::TpidrAccess { vaddr: site }));
                     }
@@ -315,6 +397,11 @@ pub struct DirectImage {
     entry: u64,
     context: Box<GuestContext>,
     svc_sites: usize,
+    tpidr_sites: usize,
+    /// The guest's TLS base. XNU will not hold it in `TPIDR_EL0`, so the
+    /// veneers read and write it here. One slot per image is correct while
+    /// tier D is single-threaded; threads need one per thread.
+    guest_tls: Box<u64>,
 }
 
 // SAFETY: the mapping is owned solely by this value and unmapped in `Drop`.
@@ -332,6 +419,14 @@ impl DirectImage {
     /// How many `svc #0` sites were patched.
     pub fn svc_sites(&self) -> usize {
         self.svc_sites
+    }
+    /// How many `tpidr_el0` accesses were veneered.
+    pub fn tpidr_sites(&self) -> usize {
+        self.tpidr_sites
+    }
+    /// The guest's TLS base, as the veneers see it.
+    pub fn guest_tls(&self) -> u64 {
+        *self.guest_tls
     }
     pub fn context(&mut self) -> &mut GuestContext {
         &mut self.context
@@ -385,6 +480,8 @@ impl DirectImage {
                 ..GuestContext::default()
             }),
             svc_sites: 0,
+            tpidr_sites: 0,
+            guest_tls: Box::new(0),
         };
         let bias = base as u64 - lo;
         image.entry = read_u64(elf, 0x18)? + bias;
@@ -429,12 +526,37 @@ impl DirectImage {
         let mut island_cursor = image_len.next_multiple_of(16);
         let ctx_addr = std::ptr::from_mut(self.context.as_mut()) as u64;
 
-        for (offset, filesz, _memsz, vaddr) in executable_segments(elf)? {
-            let end = (offset + filesz).min(elf.len());
-            let code = &elf[offset..end];
+        let tls_addr = std::ptr::from_mut(self.guest_tls.as_mut()) as u64;
+        // Patch over the same SECTIONS the scan proved, not the PF_X segment:
+        // patching a `.note` byte pattern that merely looks like `svc` would
+        // corrupt data the guest reads.
+        for (offset, size, vaddr) in executable_sections(elf)? {
+            let end = (offset + size).min(elf.len());
+            let Some(code) = elf.get(offset..end) else {
+                return Err(io::Error::other("executable section outside the file"));
+            };
             for (index, chunk) in code.chunks_exact(4).enumerate() {
                 let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 let site_vaddr = vaddr + (index * 4) as u64;
+                // `tpidr_el0` accesses are veneered in the same pass.
+                if let Some(access) = tpidr_access(word) {
+                    let site_host = (site_vaddr - lo) as usize;
+                    let veneer_host = island_cursor;
+                    let words = tpidr_veneer(access, tls_addr);
+                    let bytes = words.len() * 4;
+                    if veneer_host + bytes + 4 > self.len {
+                        return Err(io::Error::other("veneer budget exhausted"));
+                    }
+                    for (i, w) in words.iter().enumerate() {
+                        self.write_word(veneer_host + i * 4, *w);
+                    }
+                    let from = (veneer_host + bytes) as i64;
+                    self.write_word(veneer_host + bytes, b_rel((site_host as i64 + 4) - from));
+                    self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
+                    island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
+                    self.tpidr_sites += 1;
+                    continue;
+                }
                 if word != SVC_0 {
                     continue;
                 }
@@ -702,14 +824,25 @@ mod tests {
         ])
     }
 
-    static SEEN: std::sync::Mutex<Vec<(u64, [u64; 6])>> = std::sync::Mutex::new(Vec::new());
+    // Thread-local, not a global mutex: these tests run in parallel and the
+    // guest executes on the test's own thread, so per-thread state is both the
+    // correct scope and immune to one test's panic poisoning another's.
+    thread_local! {
+        static SEEN: std::cell::RefCell<Vec<(u64, [u64; 6])>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn seen_clear() {
+        SEEN.with(|seen| seen.borrow_mut().clear());
+    }
+    fn seen_snapshot() -> Vec<(u64, [u64; 6])> {
+        SEEN.with(|seen| seen.borrow().clone())
+    }
 
     extern "C" fn record_only(ctx: *mut GuestContext) {
         // SAFETY: the island passes the context this image was built with.
         let ctx = unsafe { &mut *ctx };
-        if let Ok(mut seen) = SEEN.lock() {
-            seen.push((ctx.syscall_nr(), ctx.args()));
-        }
+        SEEN.with(|seen| seen.borrow_mut().push((ctx.syscall_nr(), ctx.args())));
         ctx.set_return(ctx.args()[2] as i64);
     }
 
@@ -838,15 +971,13 @@ mod tests {
             .expect("load")
             .expect("eligible");
         assert_eq!(image.svc_sites(), 2);
-        if let Ok(mut seen) = SEEN.lock() {
-            seen.clear();
-        }
+        seen_clear();
         let entry = image.entry();
         // SAFETY: the image is patched, `entry` is inside it, and this fixture
         // returns through `ret` rather than exiting.
         unsafe { image.enter(entry) };
 
-        let seen = SEEN.lock().expect("seen");
+        let seen = seen_snapshot();
         assert_eq!(seen.len(), 2, "both syscalls reached the handler");
         assert_eq!(seen[0].0, 64, "first syscall number survived");
         let (nr, args) = seen[1];
@@ -856,11 +987,6 @@ mod tests {
         assert_eq!(args[2], 0xc3c3, "x11 preserved");
         assert_eq!(args[3], 0xd4d4, "x19 (callee-saved) preserved");
         assert_eq!(args[4], 0xe5e5, "x30 (link register) preserved");
-    }
-
-    /// `mrs xd, tpidr_el0`
-    const fn mrs_tpidr_el0(rd: u32) -> u32 {
-        0xd53b_d040 | rd
     }
 
     #[test]
@@ -886,15 +1012,21 @@ mod tests {
     }
 
     #[test]
-    fn scan_refuses_guest_tls() {
-        // Probed on this host: XNU does not preserve a userspace-written
-        // TPIDR_EL0, so guest TLS cannot run natively until M2 veneers it.
-        let code = vec![mrs_tpidr_el0(9), movz(8, 93, 0), SVC_0];
+    fn scan_accepts_tpidr_because_it_is_veneered() {
+        // XNU does not preserve a userspace `TPIDR_EL0` (probed), but the
+        // access is handled by a veneer rather than refused - so it must not
+        // disqualify an image. The `TpidrAccess` variant survives for shapes
+        // the veneer does not model.
+        let code = vec![
+            mrs_tpidr_el0_word(9),
+            msr_tpidr_el0_word(9),
+            movz(8, 93, 0),
+            SVC_0,
+        ];
         let elf = elf_with_code(&code);
-        assert_eq!(
-            scan_eligibility(&elf).expect("scan runs"),
-            Err(DirectIneligible::TpidrAccess { vaddr: 0x1000 }),
-            "tpidr_el0 access must disqualify"
+        assert!(
+            matches!(scan_eligibility(&elf).expect("scan runs"), Ok(1)),
+            "veneered tpidr accesses are eligible, and the svc site is counted"
         );
     }
 
@@ -929,6 +1061,83 @@ mod tests {
             matches!(scan_eligibility(&elf).expect("scan runs"), Ok(2)),
             "the clean fixture qualifies with both svc sites counted"
         );
+    }
+
+    /// Guest TLS must survive a write/read round-trip through the veneers.
+    ///
+    /// XNU rewrites `TPIDR_EL0` at the first trap return (probed), so the
+    /// guest's thread pointer cannot live in the register. The guest here
+    /// writes a value with `msr`, reads it back with `mrs`, and hands the
+    /// result to a syscall. If the veneers were wrong - wrong slot, clobbered
+    /// source register, or the borrow not undone - the recorded argument
+    /// differs from what was written.
+    #[test]
+    fn tpidr_veneers_round_trip_guest_tls() {
+        const CHECK_NR: u64 = 0x0ffe;
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30), // save Rust's return address
+            movz(9, 0xfeed, 0),
+            msr_tpidr_el0_word(9), // guest sets its thread pointer
+            movz(9, 0, 0),         // prove the read does not just see x9
+            mrs_tpidr_el0_word(11),
+            mov_reg(0, 11),
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            0xd65f_03c0, // ret
+        ];
+        let elf = elf_with_code(&code);
+        let image = DirectImage::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        assert_eq!(image.tpidr_sites(), 2, "both tpidr accesses were veneered");
+        assert_eq!(image.svc_sites(), 1);
+        seen_clear();
+        let entry = image.entry();
+        // SAFETY: patched image, entry inside it, fixture returns via `ret`.
+        unsafe { image.enter(entry) };
+
+        let seen = seen_snapshot();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].1[0], 0xfeed,
+            "the guest read back the thread pointer it wrote"
+        );
+        assert_eq!(
+            image.guest_tls(),
+            0xfeed,
+            "the write landed in the image's TLS slot, not the real register"
+        );
+    }
+
+    #[test]
+    fn tpidr_write_preserves_its_source_when_the_source_is_x0() {
+        // The write veneer borrows x0 for the slot address, so a guest that
+        // writes FROM x0 is the case that catches a naive implementation.
+        const CHECK_NR: u64 = 0x0ffd;
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30),
+            movz(0, 0xbeef, 0),
+            msr_tpidr_el0_word(0), // source IS the borrow register
+            mov_reg(1, 0),         // x0 must still hold 0xbeef here
+            mrs_tpidr_el0_word(2),
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            0xd65f_03c0,
+        ];
+        let elf = elf_with_code(&code);
+        let image = DirectImage::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        seen_clear();
+        let entry = image.entry();
+        // SAFETY: patched image, entry inside it.
+        unsafe { image.enter(entry) };
+        let seen = seen_snapshot();
+        let args = seen[0].1;
+        assert_eq!(args[1], 0xbeef, "x0 survived being the veneer's borrow");
+        assert_eq!(args[2], 0xbeef, "and the value round-tripped");
     }
 
     static CHILD_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);

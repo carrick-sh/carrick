@@ -31,6 +31,7 @@ fn main() {
                     DirectIneligible::TpidrAccess { .. } => "tpidr_el0",
                     DirectIneligible::UndecodableText { .. } => "undecodable",
                     DirectIneligible::NoExecutableText => "no-text",
+                    DirectIneligible::FixedLoadAddress { .. } => "ET_EXEC",
                 };
                 println!("{name:<24} tier T    [{bucket}] {reason}");
             }
