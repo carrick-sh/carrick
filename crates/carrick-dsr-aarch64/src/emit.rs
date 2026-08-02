@@ -1204,26 +1204,27 @@ fn emit_indirect_exit(
         ; cbnz x19, =>miss
         ; =>hit
     );
-    // Flavor gate: bit 0 of `reserved`. Flavor 1 (private trusted-entry
-    // target) validates the target page's generation inline — the same
-    // atomic the target's own guard would `ldar` — and branches straight to
-    // the TRUSTED entry, skipping the guard and the authority switch (a
-    // private→private hop never changes the installed cache authority).
-    // Flavor 0 (`reserved == 0`) takes the slow authority-switch path below.
+    // Flavor gate: bit 0 of the entry's offset-8 word, read as ONE pair with
+    // the generation-atomic address. A flavor-1 (private trusted-entry)
+    // payload is {tagged expected@8, gen_ptr@16, trusted code@24}: the tagged
+    // expected is odd by construction, while a flavor-0 entry keeps its code
+    // address at offset 8 — 4-byte aligned, so bit 0 is naturally clear and
+    // the slow authority-switch path below reads the historical layout
+    // untouched. Flavor 1 validates the target page's generation inline — the
+    // same atomic the target's own guard would `ldar` — and branches straight
+    // to the TRUSTED entry, skipping the guard and the authority switch (a
+    // private→private hop never changes the installed cache authority). The
+    // target PC in x17 dies here on the hit path; both miss edges reload it
+    // from the entry tag.
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x17, [x15, #24]
+        ; ldp x17, x19, [x15, #8]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; tbz x17, #0, =>slow
-    );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x19, [x15, #16]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
@@ -1241,11 +1242,12 @@ fn emit_indirect_exit(
         ; cbnz x19, =>stale_miss
     );
     // Non-null by fill construction: `publish_private_trusted` only writes a
-    // resolved trusted-entry address.
+    // resolved trusted-entry address. Issued after the generation eor so it
+    // overlaps the ldar's latency; only the branch depends on the check.
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x19, [x15, #8]
+        ; ldr x19, [x15, #24]
     );
     if let Some(link) = link {
         emit_mov_u64(
@@ -8079,6 +8081,21 @@ mod tests {
         assert!(
             words.contains(&0xc8df_fe73),
             "flavor-1 hit must ldar the generation atomic: {words:08x?}"
+        );
+        // The entry's payload is read as one pair: tagged-expected and the
+        // generation-atomic address land in x17/x19 together, and the code
+        // pointer lives at offset 24 where its load overlaps the ldar.
+        assert!(
+            words.contains(&0xa940_cdf1), // ldp x17, x19, [x15, #8]
+            "hit must pair expected+gen_ptr with ldp: {words:08x?}"
+        );
+        assert!(
+            words.contains(&0xf940_0df3), // ldr x19, [x15, #24]
+            "code must load from entry offset 24: {words:08x?}"
+        );
+        assert!(
+            !words.contains(&0xf940_0df1) && !words.contains(&0xf940_09f3),
+            "no separate flavor/gen-ptr loads may remain: {words:08x?}"
         );
         let trusted_branch = words
             .iter()

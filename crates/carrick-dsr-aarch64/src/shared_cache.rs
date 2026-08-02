@@ -16,7 +16,9 @@ use crate::emit::{DirectLinkKind, DirectStubEnvelope};
 // trusted-entry hit path, relocated authority switch) and the
 // `RestoreIndirectLean`/`RestoreIndirectLeanCall` recovery actions
 // (wire tags 22/23).
-pub const TRANSLATOR_ABI_CURRENT: u32 = 5;
+// 6: the indirect-cache entry's flavor-1 payload packed for paired loads
+// (tagged expected at offset 8, code at 24).
+pub const TRANSLATOR_ABI_CURRENT: u32 = 6;
 pub const TRANSLATION_UNIT_SCHEMA_V1: u32 = 1;
 pub const TRANSLATION_UNIT_SCHEMA_V2: u32 = 2;
 pub const DIRECT_BINDING_CELL_SIZE: u32 = 8;
