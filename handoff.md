@@ -14,8 +14,10 @@ in scope.
 **Make carrick's emitted code materially faster — close the ~12x steady-state
 execution penalty.**
 
-The bar is *within 2x of native-arm64 Docker* on the same work. We are at 10.9x on
-compute, 13.8x on a cold build, and 128x on a filesystem walk. Carrick's premise
+The bar is *within 2x of native-arm64 Docker* on the same work. We are at **5.9x**
+on compute (was 10.9x before `bb17be5e`, Phase 1 of
+`docs/superpowers/specs/2026-08-01-steady-state-block-boundary-tax-design.md`),
+13.6x on a cold build, and 128x on a filesystem walk. Carrick's premise
 is running unmodified Linux binaries at host-native cost, so this number is the
 product, not a metric about it — and people will benchmark us on whatever workload
 they choose, not the one we tuned.
@@ -25,8 +27,13 @@ Translation caching, AOT, and cross-process sharing were each sized this session
 and all leave ~10-11.5x, because steady-state execution is ~12x *independently* of
 how the code got there.
 
-**First step, and it blocks everything else: an executed-shape census on the
-compute workload.** See "Open" below — every codegen target is currently a guess.
+**The census exists now** (2026-08-01, `df14c939`): compute runs in Direct
+(identity) mode, 68% of JIT-resident CPU was DSR-inserted, split indirect-exit
+~30% / virtualized-register templates ~20% / entry guard ~13%. Phase 1 (the
+reserved-resident x19 template, `bb17be5e`) removed the template dances and took
+compute 10.9x -> 5.9x. The staged plan and its gates live in the design doc
+above; Phases 2 (trusted-entry chaining) and 3 (indirect-lookup slimming) target
+the two remaining inserted-word classes.
 
 ## Why the previous framing has to be dropped
 
