@@ -245,6 +245,15 @@ pub enum RecoveryAction {
     RestoreGenerationGuard,
     RestoreIndirectRegisters,
     RestoreIndirectResolver,
+    /// The lean indirect exit's hot path: only x15 (slot 1160) is spilled and
+    /// x17's guest value is authoritative in slot 1128 (universal exit tail).
+    /// The probe is flag-free and never touches x16 or x30, so recovery
+    /// restores exactly x15 and x17; `instruction_complete` stays false.
+    RestoreIndirectLean,
+    /// `RestoreIndirectLean` for a `blr` exit, whose link materialization
+    /// clobbers x30 after the up-front spill to slot 1168: restores x15, x17,
+    /// and x30.
+    RestoreIndirectLeanCall,
     RestoreScratch {
         register: u32,
     },
@@ -1053,6 +1062,21 @@ fn relocated_direct_word(
     Ok(relocated)
 }
 
+/// Record `action` for every emitted word in `[start, end)`.
+fn record_recovery_range(
+    recovery: &mut Vec<RecoveryEntry>,
+    start: CacheOffset,
+    end: CacheOffset,
+    action: RecoveryAction,
+) {
+    for offset in (start.get()..end.get()).step_by(4) {
+        recovery.push(RecoveryEntry {
+            cache: CacheOffset::published(offset),
+            action,
+        });
+    }
+}
+
 #[allow(
     clippy::needless_option_as_deref,
     reason = "indirect exit emission reborrows optional recording across its resolver paths"
@@ -1068,105 +1092,61 @@ fn emit_indirect_exit(
 ) -> Result<(), DsrError> {
     let register = gpr_index(exit.register)
         .ok_or_else(|| unsupported_action(plan, guest, 0, "indirect exit with non-GPR target"))?;
-    // Capture every scratch value before using physical x17 as the target
-    // register.  A kick may land on any following resolver instruction; its
-    // recovery entry must always point at a complete pre-instruction state.
+    let link = (exit.kind == super::types::IndirectKind::Call).then_some(exit.resume);
+    // The universal exit tail already committed guest x17 to slots 136 and
+    // 1128, so physical x17 is free scratch, and physical x19
+    // (`gateway::RESERVED_SCRATCH`) is carrick's for the whole of translated
+    // execution — no spill or restore for either. The hot path spills exactly
+    // ONE guest register, x15 (the probe pointer), plus x30 for a `blr`
+    // (whose link materialization clobbers it), and its probe compares with
+    // EOR/CBZ so guest NZCV is architecturally untouched end to end.
+    let lean_action = if link.is_some() {
+        RecoveryAction::RestoreIndirectLeanCall
+    } else {
+        RecoveryAction::RestoreIndirectLean
+    };
+    // The x15 spill carries no recovery: nothing is clobbered before it
+    // retires, and slot 1160 only becomes authoritative once it does.
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; str x15, [x28, #1160]
     );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x16, [x28, #1120]
-    );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x17, [x28, #1128]
-    );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x30, [x28, #1168]
-    );
-    if let Some(offset) = virtual_snapshot_offset(register) {
-        // Guest x17 is already saved above, so physical x17 is the stable
-        // scratch for a virtual target. Never stage this value through
-        // physical x18: Darwin may clear its platform register between the
-        // load and store, publishing a null indirect target. Every word in
-        // the x17 window carries recovery because an asynchronous kick must
-        // restore the guest's architectural x15/x16/x17 values.
+    if link.is_some() {
+        // x30 still holds the guest value and slot 1168 is not yet written,
+        // so this word is covered by the x15/x17-only action.
         recovery.push(RecoveryEntry {
             cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreIndirectRegisters,
+            action: RecoveryAction::RestoreIndirectLean,
         });
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x30, [x28, #1168]
+        );
+    }
+    let lean_start = current_offset(assembler)?;
+    if let Some(offset) = virtual_snapshot_offset(register) {
+        // A virtualized target (guest x18/x19/x28) loads from its context
+        // slot. Never stage it through physical x18: Darwin may clear its
+        // platform register asynchronously, publishing a null target.
         emit_word(
             assembler,
             entries,
             guest,
             0xf940_0000 | ((offset / 8) << 10) | (28 << 5) | 17,
         )?;
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreIndirectRegisters,
-        });
-        emit_word(
-            assembler,
-            entries,
-            guest,
-            0xf900_0000 | ((1080 / 8) << 10) | (28 << 5) | 17,
-        )?;
-        recovery.push(RecoveryEntry {
-            cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreIndirectRegisters,
-        });
     } else {
-        // Keep ordinary guest targets out of physical x18. Darwin does not
-        // reliably restore custom x18 across asynchronous signals, and V8's
-        // write-fault/invalidation traffic can interrupt this two-instruction
-        // window. Store the guest register directly into the context instead.
-        emit_word(
-            assembler,
-            entries,
-            guest,
-            0xf900_0000 | ((1080 / 8) << 10) | (28 << 5) | register,
-        )?;
+        // mov x17, xN (orr x17, xzr, xN) — the target PC in the exit's own
+        // Darwin-stable scratch.
+        emit_word(assembler, entries, guest, 0xaa00_03f1 | (register << 16))?;
     }
-    emit_word(assembler, entries, guest, 0xd53b_4210)?; // mrs x16, nzcv
-    let register_recovery = current_offset(assembler)?;
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x16, [x28, #936]
-    );
-    recovery.push(RecoveryEntry {
-        cache: register_recovery,
-        action: RecoveryAction::RestoreIndirectRegisters,
-    });
-    let full_recovery_start = current_offset(assembler)?;
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x17, [x28, #1080]
-    );
-    let link = (exit.kind == super::types::IndirectKind::Call).then_some(exit.resume);
-    if let Some(link) = link {
-        emit_mov_u64(
-            assembler,
-            entries,
-            guest,
-            30,
-            MaterializedValue::Guest(link.raw()),
-            recording.as_deref_mut(),
-        )?;
-    }
-    // A per-thread direct-mapped cache keeps repeated indirect calls and
-    // returns inside translated code. Restore every guest-visible scratch
-    // value on both hit and miss paths.
     let miss = assembler.new_dynamic_label();
     let hit = assembler.new_dynamic_label();
+    let slow = assembler.new_dynamic_label();
+    let stale_miss = assembler.new_dynamic_label();
+    let miss_exit = assembler.new_dynamic_label();
+    let slow_miss = assembler.new_dynamic_label();
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
@@ -1180,32 +1160,32 @@ fn emit_indirect_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; eor x16, x17, x17, LSR #12
+        ; eor x19, x17, x17, LSR #12
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ubfx x16, x16, #2, #super::gateway::INDIRECT_CACHE_INDEX_BITS
+        ; ubfx x19, x19, #2, #super::gateway::INDIRECT_CACHE_INDEX_BITS
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; add x15, x15, x16, LSL #super::gateway::INDIRECT_CACHE_ENTRY_SHIFT
+        ; add x15, x15, x19, LSL #super::gateway::INDIRECT_CACHE_ENTRY_SHIFT
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x16, [x15]
+        ; ldr x19, [x15]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; cmp x16, x17
+        ; eor x19, x19, x17
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; b.eq =>hit
+        ; cbz x19, =>hit
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
@@ -1215,98 +1195,122 @@ fn emit_indirect_exit(
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x16, [x15]
+        ; ldr x19, [x15]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; cmp x16, x17
+        ; eor x19, x19, x17
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; b.ne =>miss
+        ; cbnz x19, =>miss
         ; =>hit
     );
-    // The cache entry's generation belongs to the target page, not the source
-    // block in the current gateway context. The target block's first-instruction
-    // generation guard is the authoritative stale-code check.
+    // Flavor gate: bit 0 of `reserved`. Flavor 1 (private trusted-entry
+    // target) validates the target page's generation inline — the same
+    // atomic the target's own guard would `ldar` — and branches straight to
+    // the TRUSTED entry, skipping the guard and the authority switch (a
+    // private→private hop never changes the installed cache authority).
+    // Flavor 0 (`reserved == 0`) takes the slow authority-switch path below.
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x17, [x15, #8]
+        ; ldr x17, [x15, #24]
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; cbz x17, =>miss
-    );
-    let _ = emit_target_authority_switch(assembler, entries, guest, miss)?;
-    // Keep ordinary translated targets out of custom physical x18 entirely.
-    // Preserve the validated cache PC from physical x17 in the context while
-    // guest x15/x16/x17 and NZCV are restored, then reload and recheck it
-    // immediately before the branch.
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x17, [x28, #1072]
+        ; tbz x17, #0, =>slow
     );
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x16, [x28, #936]
+        ; ldr x19, [x15, #16]
     );
-    emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldar x19, [x19]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; eor x19, x19, x17, LSR #1
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbnz x19, =>stale_miss
+    );
+    // Non-null by fill construction: `publish_private_trusted` only writes a
+    // resolved trusted-entry address.
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x19, [x15, #8]
+    );
+    if let Some(link) = link {
+        emit_mov_u64(
+            assembler,
+            entries,
+            guest,
+            30,
+            MaterializedValue::Guest(link.raw()),
+            recording.as_deref_mut(),
+        )?;
+    }
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x15, [x28, #1160]
     );
+    // x17 and x19 arrive clobbered; the trusted entry re-materializes both
+    // (its generation publish rebuilds x17, and the guard vocabulary owns
+    // x19 outright).
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x16, [x28, #1120]
+        ; br x19
+        ; =>stale_miss
     );
-    // Keep the validated cache PC out of custom physical x18 for the final
-    // branch. Every translated block restores guest x17 at entry, so ordinary
-    // physical x17 can safely carry this internal edge.
+    // The flavor word overwrote x17; reload the guest target PC from the
+    // entry tag (x15 addresses the HIT way's entry base for either way),
+    // then fall into the miss path.
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x17, [x28, #1072]
-    );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; cbz x17, =>miss
-    );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; br x17
+        ; ldr x17, [x15]
         ; =>miss
     );
+    // Miss: stage the target (still in x17) for the resolver, restore x15,
+    // and build the typed ResolveIndirect exit. Guest x16, x30 (for a
+    // non-call exit) and NZCV were never touched on this route.
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
-        ; ldr x17, [x28, #1080]
+        ; str x17, [x28, #1080]
     );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x16, [x28, #936]
-    );
-    emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
     map_next(assembler, entries, guest)?;
     dynasmrt::dynasm!(assembler
         ; .arch aarch64
         ; ldr x15, [x28, #1160]
+        ; =>miss_exit
     );
-    map_next(assembler, entries, guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x16, [x28, #1120]
-    );
+    if let Some(link) = link {
+        // The architectural effect of the `blr` the resolver will complete:
+        // guest x30 = the return address. The slow-path route arrives here
+        // with x30 still holding the pre-call value.
+        emit_mov_u64(
+            assembler,
+            entries,
+            guest,
+            30,
+            MaterializedValue::Guest(link.raw()),
+            recording.as_deref_mut(),
+        )?;
+    }
     emit_mov_u64(
         assembler,
         entries,
@@ -1372,13 +1376,157 @@ fn emit_indirect_exit(
         ; .arch aarch64
         ; br x17
     );
-    let resolver_end = current_offset(assembler)?;
-    for offset in (full_recovery_start.get()..resolver_end.get()).step_by(4) {
-        recovery.push(RecoveryEntry {
-            cache: CacheOffset::published(offset),
-            action: RecoveryAction::RestoreIndirectResolver,
-        });
+    // Every hot-path and miss-staging word after the spills restores exactly
+    // what the lean sequence spends: x15 from 1160, x17 from 1128 (the
+    // universal exit tail's store), plus x30 from 1168 for a `blr`.
+    let lean_end = current_offset(assembler)?;
+    record_recovery_range(recovery, lean_start, lean_end, lean_action);
+    // Slow path (flavor 0): today's authority-switch machinery, relocated.
+    // It may spend more — x16, NZCV — so it re-establishes the FULL spill-
+    // slot discipline the RestoreIndirectRegisters/RestoreIndirectResolver
+    // actions expect (1120/1128/1160/1168/936) before using them.
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; =>slow
+    );
+    let slow_lean_start = current_offset(assembler)?;
+    if link.is_none() {
+        // A call exit spilled x30 up front; every other kind spills it here
+        // so RestoreIndirectResolver's unconditional x30 restore reads a
+        // live slot. x30 still holds the guest value on this word.
+        map_next(assembler, entries, guest)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; str x30, [x28, #1168]
+        );
     }
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x16, [x28, #1120]
+    );
+    let slow_registers_start = current_offset(assembler)?;
+    record_recovery_range(recovery, slow_lean_start, slow_registers_start, lean_action);
+    emit_word(assembler, entries, guest, 0xd53b_4210)?; // mrs x16, nzcv
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x16, [x28, #936]
+    );
+    let slow_resolver_start = current_offset(assembler)?;
+    record_recovery_range(
+        recovery,
+        slow_registers_start,
+        slow_resolver_start,
+        RecoveryAction::RestoreIndirectRegisters,
+    );
+    // x17 holds the flavor word here; reload the guest target PC from the
+    // entry tag (valid for either hit way) and stage it for the resolver, so
+    // every slow-route miss can exit without re-deriving it.
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x15]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #1080]
+    );
+    // The cache entry's guarded-entry pointer; the target block's own
+    // generation guard is the authoritative stale-code check on this path.
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x15, #8]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbz x17, =>slow_miss
+    );
+    let _ = emit_target_authority_switch(assembler, entries, guest, slow_miss)?;
+    // Keep ordinary translated targets out of custom physical x18 entirely.
+    // Preserve the validated cache PC from physical x17 in the context while
+    // guest x15/x16 and NZCV are restored, then reload and recheck it
+    // immediately before the branch.
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; str x17, [x28, #1072]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #936]
+    );
+    emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x15, [x28, #1160]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #1120]
+    );
+    if let Some(link) = link {
+        emit_mov_u64(
+            assembler,
+            entries,
+            guest,
+            30,
+            MaterializedValue::Guest(link.raw()),
+            recording.as_deref_mut(),
+        )?;
+    }
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x17, [x28, #1072]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; cbz x17, =>slow_miss
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; br x17
+        ; =>slow_miss
+    );
+    // A slow-route miss must undo the slow prologue's extra spends (x16 and
+    // NZCV) before joining the shared exit staging; 1080 is already staged.
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #936]
+    );
+    emit_word(assembler, entries, guest, 0xd51b_4210)?; // msr nzcv, x16
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x15, [x28, #1160]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; ldr x16, [x28, #1120]
+    );
+    map_next(assembler, entries, guest)?;
+    dynasmrt::dynasm!(assembler
+        ; .arch aarch64
+        ; b =>miss_exit
+    );
+    let slow_end = current_offset(assembler)?;
+    record_recovery_range(
+        recovery,
+        slow_resolver_start,
+        slow_end,
+        RecoveryAction::RestoreIndirectResolver,
+    );
     Ok(())
 }
 
@@ -7211,6 +7359,17 @@ pub fn recover_rewrite_state(
             snapshot.pstate = saved_generation_pstate;
             return Ok(());
         }
+        RecoveryAction::RestoreIndirectLean => {
+            snapshot.x[15] = saved_indirect_x15;
+            snapshot.x[17] = saved_context_scratch;
+            return Ok(());
+        }
+        RecoveryAction::RestoreIndirectLeanCall => {
+            snapshot.x[15] = saved_indirect_x15;
+            snapshot.x[17] = saved_context_scratch;
+            snapshot.x[30] = saved_indirect_x30;
+            return Ok(());
+        }
         RecoveryAction::RestoreDualVirtualReadOnly {
             x18_scratch,
             x28_scratch,
@@ -7795,34 +7954,137 @@ mod tests {
         .expect("assemble virtual indirect target");
         let words = &assembled.words;
 
-        let stable_staging = [
-            0xf940_4f91, // ldr x17, [x28, #152] — guest x19
-            0xf902_1f91, // str x17, [x28, #1080] — indirect target
-        ];
+        // The virtualized target (guest x19) loads straight into
+        // Darwin-stable x17 and stays there for the probe; the lean exit no
+        // longer stages it through slot 1080 up front.
         let staging_index = words
-            .windows(stable_staging.len())
-            .position(|window| window == stable_staging)
+            .iter()
+            .position(|word| *word == 0xf940_4f91) // ldr x17, [x28, #152]
             .unwrap_or_else(|| {
                 panic!("virtual indirect target must stay in Darwin-stable x17: {words:08x?}")
             });
         assert!(
-            !words.windows(2).any(|window| {
-                window
-                    == [
-                        0xf940_4f92, // ldr x18, [x28, #152]
-                        0xf902_1f92, // str x18, [x28, #1080]
-                    ]
-            }),
-            "Darwin may asynchronously clear physical x18 between these words"
+            !words.contains(&0xf940_4f92), // ldr x18, [x28, #152]
+            "Darwin may asynchronously clear physical x18; never stage the target there"
         );
+        // The staging word and the probe words after it must restore the
+        // guest's x15/x17/x30 on interruption (a blr exit spills x30 too).
         for word_index in staging_index..=staging_index + 2 {
             let offset = u32::try_from(word_index * 4).expect("test block offset");
             assert!(
                 assembled.recovery.iter().any(|entry| {
                     entry.cache.get() == offset
-                        && entry.action == RecoveryAction::RestoreIndirectRegisters
+                        && entry.action == RecoveryAction::RestoreIndirectLeanCall
                 }),
-                "x17 staging word {word_index} must restore guest x15/x16/x17 on interruption"
+                "x17 staging word {word_index} must restore guest x15/x17/x30 on interruption"
+            );
+        }
+    }
+
+    /// The Phase-3 lean indirect exit for a plain `br` exit: one x15 spill, a
+    /// flag-free probe, the flavor gate, the inline `ldar` generation check,
+    /// and a direct `br x19` to the trusted entry — with the NZCV round-trip
+    /// confined to the flavor-0 slow branch.
+    #[test]
+    fn indirect_exit_hot_path_is_flag_free_and_branches_through_x19() {
+        let plan = BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4004),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Indirect {
+                guest: GuestVa(0x4000),
+                word: 0xd61f_00a0, // br x5
+                exit: IndirectExit {
+                    kind: IndirectKind::Branch,
+                    register: bad64::Reg::X5,
+                    resume: GuestVa(0x4004),
+                },
+            },
+            extensions: Vec::new(),
+        };
+        let assembled = assemble_block_inner(
+            &plan,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble lean indirect exit");
+        let words = &assembled.words;
+
+        // Exactly ONE unconditional spill: x15 to slot 1160. No up-front x16
+        // (1120) or x30 (1168) spill on a branch exit; the universal tail
+        // already owns x17's slots.
+        assert_eq!(
+            words
+                .iter()
+                .filter(|word| **word == 0xf902_478f) // str x15, [x28, #1160]
+                .count(),
+            1,
+            "one x15 spill: {words:08x?}"
+        );
+        // The old up-front target staging (str x5 -> slot 1080) is gone.
+        assert!(
+            !words.contains(&0xf902_1f85), // str x5, [x28, #1080]
+            "the target stages through x17 at the miss edge, not up front: {words:08x?}"
+        );
+        // mov x17, x5 stages the target for the probe.
+        let staging_index = words
+            .iter()
+            .position(|word| *word == 0xaa05_03f1)
+            .unwrap_or_else(|| panic!("target must stage into x17: {words:08x?}"));
+        // Flavor gate: tbz x17, #0 to the slow branch.
+        assert!(
+            words
+                .iter()
+                .any(|word| (*word & 0xfff8_001f) == 0x3600_0011),
+            "flavor gate tbz x17, #0 missing: {words:08x?}"
+        );
+        // Inline generation validation: ldar x19, [x19].
+        assert!(
+            words.contains(&0xc8df_fe73),
+            "flavor-1 hit must ldar the generation atomic: {words:08x?}"
+        );
+        let trusted_branch = words
+            .iter()
+            .position(|word| *word == 0xd61f_0260) // br x19
+            .unwrap_or_else(|| panic!("flavor-1 hit must branch through x19: {words:08x?}"));
+        // A br exit spills x30 ONLY in the flavor-0 slow branch (for the
+        // resolver recovery action's unconditional x30 restore), never on
+        // the hot path.
+        assert!(
+            !words[..=trusted_branch].contains(&0xf902_4b9e), // str x30, [x28, #1168]
+            "a br exit must not spill x30 on the hot path: {words:08x?}"
+        );
+        // The hot path and probe are entirely flag-free: the ONLY NZCV
+        // round-trip lives in the flavor-0 slow branch, emitted after the
+        // hot path's final branch.
+        let mrs_indexes: Vec<usize> = words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| **word == 0xd53b_4210)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            mrs_indexes.len(),
+            1,
+            "exactly one mrs x16, nzcv (slow branch): {words:08x?}"
+        );
+        assert!(
+            mrs_indexes[0] > trusted_branch,
+            "the NZCV save belongs to the slow branch after the hot path: {words:08x?}"
+        );
+        // Every hot-path word from the staging through the trusted branch
+        // recovers with the lean action.
+        for word_index in staging_index..=trusted_branch {
+            let offset = u32::try_from(word_index * 4).expect("test block offset");
+            assert!(
+                assembled.recovery.iter().any(|entry| {
+                    entry.cache.get() == offset
+                        && entry.action == RecoveryAction::RestoreIndirectLean
+                }),
+                "hot-path word {word_index} must carry RestoreIndirectLean: {words:08x?}"
             );
         }
     }

@@ -12,7 +12,11 @@ use crate::emit::{DirectLinkKind, DirectStubEnvelope};
 
 // 4: the reserved-resident virtualization template (new emitted shapes and
 // the `CommitReservedResident` recovery action, wire tag 21).
-pub const TRANSLATOR_ABI_CURRENT: u32 = 4;
+// 5: the lean indirect-branch lookup (flag-free probe, flavor-gated
+// trusted-entry hit path, relocated authority switch) and the
+// `RestoreIndirectLean`/`RestoreIndirectLeanCall` recovery actions
+// (wire tags 22/23).
+pub const TRANSLATOR_ABI_CURRENT: u32 = 5;
 pub const TRANSLATION_UNIT_SCHEMA_V1: u32 = 1;
 pub const TRANSLATION_UNIT_SCHEMA_V2: u32 = 2;
 pub const DIRECT_BINDING_CELL_SIZE: u32 = 8;

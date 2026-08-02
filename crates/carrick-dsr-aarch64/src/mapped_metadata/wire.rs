@@ -346,6 +346,8 @@ impl WireRecoveryActionV3 {
             PortableRecoveryAction::CommitReservedResident { virtual_register } => {
                 (21, words(&[virtual_register]))
             }
+            PortableRecoveryAction::RestoreIndirectLean => (22, [0; 5]),
+            PortableRecoveryAction::RestoreIndirectLeanCall => (23, [0; 5]),
             PortableRecoveryAction::RecoverCounterRead(recovery) => {
                 let destination = match recovery.committed_scratch_destination {
                     None => 0,
@@ -566,6 +568,8 @@ impl WireRecoveryActionV3 {
             21 if unused(&p, 1) => PortableRecoveryAction::CommitReservedResident {
                 virtual_register: gpr_word(p[0])?,
             },
+            22 if unused(&p, 0) => PortableRecoveryAction::RestoreIndirectLean,
+            23 if unused(&p, 0) => PortableRecoveryAction::RestoreIndirectLeanCall,
             _ => return Err(MappedMetadataError::RecoveryAction),
         };
         Ok(action)
@@ -1415,6 +1419,8 @@ mod tests {
             PortableRecoveryAction::RestoreGenerationGuard,
             PortableRecoveryAction::RestoreIndirectRegisters,
             PortableRecoveryAction::RestoreIndirectResolver,
+            PortableRecoveryAction::RestoreIndirectLean,
+            PortableRecoveryAction::RestoreIndirectLeanCall,
             PortableRecoveryAction::RestoreScratch { register: 15 },
             PortableRecoveryAction::RestoreScratchInvalidBiasedLiteral { register: 16 },
             PortableRecoveryAction::RestoreScratchCompleted { register: 17 },

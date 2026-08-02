@@ -269,6 +269,21 @@ impl GenerationBinding {
     }
 }
 
+/// One way of the emitted-probe target cache. Two FLAVORS share the layout,
+/// discriminated by bit 0 of `reserved` (old-flavor entries always publish
+/// `reserved == 0`):
+///
+/// - **Flavor 0** (`reserved == 0`): `cache` is the target block's GUARDED
+///   entry and `authority` points at a [`TargetCacheAuthority`] record the
+///   emitted slow path validates and installs before branching.
+/// - **Flavor 1** (`reserved == (expected_generation << 1) | 1`): private
+///   trusted-entry targets only. `cache` is the TARGET'S TRUSTED ENTRY
+///   address (block entry + trusted offset, past the generation guard) and
+///   `authority` holds the ADDRESS of the target page's generation
+///   `AtomicU64` — the same cell the target's own guard would `ldar` — so
+///   the emitted hot path validates the generation inline and skips the
+///   authority switch entirely (a private→private hop never changes the
+///   installed cache authority).
 #[repr(C, align(16))]
 pub struct IndirectTargetCacheEntry {
     guest: u64,
@@ -362,6 +377,39 @@ impl IndirectTargetCache {
         entry.guest = 0;
         entry.cache = cache.host().raw() as u64;
         entry.authority = authority as usize as u64;
+        entry.reserved = 0;
+        entry.guest = guest.raw();
+    }
+
+    /// Publish the private trusted-entry FLAVOR (flavor 1, see
+    /// [`IndirectTargetCacheEntry`]): `trusted_code` is the target's trusted
+    /// entry address (block entry + trusted offset), `generation_atomic` the
+    /// address of the target page's generation `AtomicU64`, and `expected`
+    /// the generation the trusted entry was translated against. The emitted
+    /// hot path `ldar`s the atomic, compares against `reserved >> 1`, and
+    /// branches straight to `trusted_code` on a match.
+    pub fn publish_private_trusted(
+        &mut self,
+        guest: carrick_guest_mem::GuestVa,
+        trusted_code: u64,
+        generation_atomic: u64,
+        expected: CodeGeneration,
+    ) {
+        let set = &mut self.entries[indirect_cache_index(guest)];
+        let way = set
+            .ways
+            .iter()
+            .position(|entry| entry.guest == guest.raw() || entry.guest == 0)
+            .unwrap_or_else(|| {
+                usize::from(((guest.raw() >> (2 + INDIRECT_CACHE_INDEX_BITS)) & 1) != 0)
+            });
+        let entry = &mut set.ways[way];
+        // Same publication discipline as `publish`: unreachable while the
+        // payload is written, `guest` (the probe tag) last.
+        entry.guest = 0;
+        entry.cache = trusted_code;
+        entry.authority = generation_atomic;
+        entry.reserved = (expected.get() << 1) | 1;
         entry.guest = guest.raw();
     }
 
@@ -372,12 +420,24 @@ impl IndirectTargetCache {
                 entry.guest = 0;
                 entry.cache = 0;
                 entry.authority = 0;
+                entry.reserved = 0;
             }
         }
     }
 
     pub fn as_ptr(&self) -> *const IndirectTargetCacheEntry {
         self.entries.as_ptr().cast()
+    }
+
+    /// Test/diagnostic view of the way tagged `guest`:
+    /// `(cache, authority, reserved)`.
+    #[doc(hidden)]
+    pub fn entry_snapshot(&self, guest: carrick_guest_mem::GuestVa) -> Option<(u64, u64, u64)> {
+        self.entries[indirect_cache_index(guest)]
+            .ways
+            .iter()
+            .find(|entry| entry.guest == guest.raw())
+            .map(|entry| (entry.cache, entry.authority, entry.reserved))
     }
 }
 
