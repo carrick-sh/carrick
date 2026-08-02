@@ -41,35 +41,41 @@ and intervenes only at the syscall boundary: FreeBSD's Linuxulator, illumos
 lx-brand, WSL1. They are kernel-level; the question was whether userspace
 Darwin allows the same shape. The spikes below answer it.
 
-## 2. The static census: intervention is a 0.03% problem
+## 2. The static census: intervention is a 0.05% problem
 
 `cargo run -p carrick-dsr-aarch64 --example insn_census` over binaries
 extracted from the go-conformance image (committed as the example; numbers
 from this host):
 
-| file | insns | svc | x18 | tpidr | type |
+| file | insns | svc | x18 | tpidr | undec |
 |---|---|---|---|---|---|
-| compile | 2,314,615 | 38 | 0 | 2 | EXEC 0x9b020 |
-| asm | 495,166 | 37 | 1 | 2 | EXEC |
-| link | 653,801 | 38 | 0 | 2 | EXEC |
-| go | 1,444,460 | 37 | 3 | 2 | EXEC |
-| rm | 13,046 | 0 | 14 | 0 | DYN |
-| find | 46,336 | 0 | 97 | 0 | DYN |
-| libc.so.6 | 349,448 | 513 | 683 | 1,485 | DYN |
-| **total** | **5,316,872** | **663 (0.0125%)** | **798 (0.0150%)** | **1,493 (0.0281%)** | |
+| compile | 2,313,675 | 38 | 0 | 2 | 18 |
+| asm | 494,227 | 37 | 0 | 2 | 18 |
+| link | 652,859 | 38 | 0 | 2 | 18 |
+| go | 1,443,515 | 37 | 0 | 2 | 18 |
+| rm | 9,799 | 0 | 0 | 0 | 0 |
+| find | 35,267 | 0 | 46 | 0 | 0 |
+| libc.so.6 | 282,360 | 510 | 297 | 1,485 | 9 |
+| **total** | **5,231,702** | **660 (0.0126%)** | **343 (0.0066%)** | **1,493 (0.0285%)** | **81** |
 
-The entire Go toolchain — 4.9M instructions — needs ~150 svc patches, 4 x18
-patches and 8 TLS patches. Even libc, the densest case, is 0.77% total. The
-translator pays per-instruction overhead on 100% of the code to handle 0.03%
-of it.
+Combined, everything that cannot execute natively is **0.048%** of instructions.
+A Go tool binary needs 38 `svc` patches and 2 TLS veneers across 2.3M
+instructions, and no x18 handling at all. libc is the dense case at 0.8%.
 
-Caveat, fail-closed: bad64 leaves some words undecoded (2,166 in `rm`, 54,519
-in libc — mostly literal pools and newer SIMD). An undecoded word executes
-natively just fine; the risk is only a *missed* x18/tpidr access hiding in
-one. The patcher must therefore treat undecodable words in executable regions
-conservatively: a raw bit-pattern scan for register field 18 in the standard
-operand positions over-approximates (false positives just add veneers), and
-aarch64 ELF mapping symbols (`$x`/`$d`) identify literal pools when present.
+**Corrected 2026-08-02** (the first revision of this table was wrong): the
+census originally walked the PF_X `PT_LOAD`, which on every real toolchain
+binary starts at file offset 0 and therefore covers the ELF header, the program
+headers and `.note.*`. Decoding those as instructions inflated the tallies with
+data — x18 read 798 instead of 343, and "undecodable" read 65,157 instead of
+**81**. Both the census and the eligibility scan now walk SHF_EXECINSTR
+sections. The practical consequence is large: literal pools are not the obstacle
+they appeared to be, so mapping symbols (`$x`/`$d`) are not needed to make real
+binaries provable — only 81 words in 5.2M remain undecodable, and the scan
+refuses one only if its raw bits could name x18.
+
+A fully stripped binary (no section headers at all — `rm` in this corpus) has
+nothing the scan can prove and is refused; that is the fail-closed default, not
+a measurement.
 
 ## 3. The runtime probes: what Darwin allows
 
@@ -179,8 +185,20 @@ memory planner. The only difference is how guest code reaches syscalls.
 
 ## 7. Milestones
 
-- **M0 (done, this doc):** census + Darwin probes. Decision evidence
-  committed.
+- **M0 (done):** census + Darwin probes. Decision evidence committed.
+- **M1 (done, `58120136`):** `carrick-native-darwin::direct` loads an ELF into
+  `MAP_JIT`, patches every `svc` to a per-site island, and executes guest code
+  natively. A hand-assembled static PIE writes to a host pipe and exits 42
+  through its own syscalls; all guest registers survive an island round-trip;
+  non-`svc` words are byte-identical. Island round-trip costs **7 ns** against
+  the translated lane's ~290 ns syscall floor (mechanism only — the handler in
+  that benchmark does no dispatch).
+- **M1a (done):** fail-closed eligibility scan, run before anything is mapped.
+  Scanning the real corpus is what caught the segment-vs-section defect above.
+  Current verdict on real binaries: **all refused**, every one of them for a
+  genuine reason — the Go tools and libc on `tpidr_el0`, `find` on x18, `rm`
+  for being fully stripped. That is the honest gate on M2: the veneers are not
+  polish, they are the entry ticket for every real binary.
 - **M1:** tier D for static-PIE + brk-trap syscalls, behind
   `CARRICK_NATIVE_DIRECT` during bring-up only. Prove: dash/coreutils run
   end-to-end; conformance smoke green with the flag on; measure one-process

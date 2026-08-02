@@ -184,8 +184,17 @@ fn island(ctx: u64, return_pc: u64) -> Vec<u32> {
 /// Why an image cannot run on tier D.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectIneligible {
-    /// bad64 could not decode a word in an executable region, so an x18 or
-    /// `tpidr_el0` access cannot be ruled out. Fail closed: tier T owns it.
+    /// A word in an executable region could not be decoded AND its raw bits
+    /// could name x18, so an x18 access cannot be ruled out. Fail closed:
+    /// tier T owns the image.
+    ///
+    /// Undecodable does not mean malformed — most are literal pools and newer
+    /// SIMD encodings (bad64 leaves ~15% of libc undecoded). Refusing every
+    /// one of them would disqualify every real binary, so the scan
+    /// over-approximates instead: a word that cannot be decoded is only fatal
+    /// if register field 18 appears in a position an instruction could use it.
+    /// Discriminating code from data properly needs aarch64 mapping symbols
+    /// (`$x`/`$d`), which is what libc will require.
     UndecodableText { vaddr: u64, word: u32 },
     /// Guest TLS. M2 veneers these; M1 refuses them.
     TpidrAccess { vaddr: u64 },
@@ -206,6 +215,97 @@ impl std::fmt::Display for DirectIneligible {
             Self::NoExecutableText => write!(f, "no executable text"),
         }
     }
+}
+
+/// Does a raw word name x18 in any position an A64 instruction could?
+///
+/// Over-approximation used for words the decoder rejects: Rd/Rt (4:0),
+/// Rn (9:5), Rt2 (14:10) and Rm (20:16) are the standard register fields, so
+/// if none of them is 18 the word cannot touch x18 whatever it is.
+fn word_could_name_x18(word: u32) -> bool {
+    const X18: u32 = 18;
+    (word & 0x1f) == X18
+        || ((word >> 5) & 0x1f) == X18
+        || ((word >> 10) & 0x1f) == X18
+        || ((word >> 16) & 0x1f) == X18
+}
+
+/// Does a decoded instruction reference x18/w18 as an operand?
+fn instruction_names_x18(insn: &bad64::Instruction) -> bool {
+    use bad64::Operand as O;
+    insn.operands().iter().any(|operand| {
+        let regs: Vec<bad64::Reg> = match operand {
+            O::Reg { reg, .. } | O::QualReg { reg, .. } | O::ShiftReg { reg, .. } => vec![*reg],
+            O::MemReg(reg)
+            | O::MemOffset { reg, .. }
+            | O::MemPreIdx { reg, .. }
+            | O::MemPostIdxImm { reg, .. } => vec![*reg],
+            O::MemPostIdxReg(regs) => regs.to_vec(),
+            O::MemExt { regs, .. } => regs.to_vec(),
+            O::MultiReg { regs, .. } => regs.iter().flatten().copied().collect(),
+            _ => Vec::new(),
+        };
+        regs.iter()
+            .any(|reg| matches!(reg, bad64::Reg::X18 | bad64::Reg::W18))
+    })
+}
+
+/// Decide whether an image can run on tier D, WITHOUT mapping anything.
+///
+/// Runs before any allocation so a refusal costs nothing, and fails closed:
+/// anything the scan cannot prove safe is tier T's. The three disqualifiers
+/// are the three things a same-ISA guest cannot do on Darwin —
+/// x18 (the kernel rewrites the platform register at every trap return),
+/// `tpidr_el0` (probed: XNU does not preserve a userspace value), and text the
+/// decoder cannot rule out.
+///
+/// `svc` is NOT a disqualifier: patching it is the entire mechanism.
+pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, io::Error> {
+    // Only real code: see `executable_sections` for why the PF_X segment is
+    // the wrong unit. No section headers means nothing can be proved, so fail
+    // closed rather than guess.
+    let sections = executable_sections(elf)?;
+    if sections.is_empty() {
+        return Ok(Err(DirectIneligible::NoExecutableText));
+    }
+    let mut svc_sites = 0_usize;
+    for (offset, size, vaddr) in sections {
+        let end = (offset + size).min(elf.len());
+        let Some(code) = elf.get(offset..end) else {
+            return Err(io::Error::other("executable segment outside the file"));
+        };
+        for (index, chunk) in code.chunks_exact(4).enumerate() {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let site = vaddr + (index * 4) as u64;
+            if word == SVC_0 {
+                svc_sites += 1;
+                continue;
+            }
+            match bad64::decode(word, site) {
+                Ok(insn) => {
+                    if matches!(insn.op(), bad64::Op::MRS | bad64::Op::MSR)
+                        && format!("{insn:?}").contains("TPIDR_EL0")
+                    {
+                        return Ok(Err(DirectIneligible::TpidrAccess { vaddr: site }));
+                    }
+                    if instruction_names_x18(&insn) {
+                        return Ok(Err(DirectIneligible::X18Access { vaddr: site }));
+                    }
+                }
+                Err(_) if word_could_name_x18(word) => {
+                    return Ok(Err(DirectIneligible::UndecodableText { vaddr: site, word }));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    if svc_sites == 0 {
+        // Nothing to patch means nothing to run through carrick: a guest with
+        // no syscall can neither exit nor be observed, so treat it as a
+        // malformed input rather than silently executing it.
+        return Ok(Err(DirectIneligible::NoExecutableText));
+    }
+    Ok(Ok(svc_sites))
 }
 
 /// A loaded, patched, directly-executable guest image.
@@ -247,10 +347,13 @@ impl DirectImage {
         elf: &[u8],
         handler: extern "C" fn(*mut GuestContext),
     ) -> Result<Result<Self, DirectIneligible>, io::Error> {
-        let segments = executable_segments(elf)?;
-        if segments.is_empty() {
-            return Ok(Err(DirectIneligible::NoExecutableText));
+        // Fail closed BEFORE mapping: a refusal must cost no allocation, and
+        // an image that reaches the patcher is one the scan proved safe.
+        match scan_eligibility(elf)? {
+            Ok(_) => {}
+            Err(reason) => return Ok(Err(reason)),
         }
+        let segments = executable_segments(elf)?;
         // Span every PT_LOAD so guest-relative addressing stays intact, plus a
         // tail for islands.
         let (lo, hi) = load_span(elf)?;
@@ -461,6 +564,47 @@ fn executable_segments(elf: &[u8]) -> Result<Vec<(usize, usize, usize, u64)>, io
     Ok(out)
 }
 
+/// `(file_offset, size, vaddr)` for every section carrying SHF_EXECINSTR.
+///
+/// Scanning a PF_X `PT_LOAD` instead is wrong and quietly so: that segment
+/// starts at file offset 0 on every real toolchain binary, so it covers the
+/// ELF header, the program headers and `.note.*` — none of which are
+/// instructions. Decoding those as code produced a 100% false-refusal rate
+/// against the go-conformance binaries (the Go tools "failed" on their own ELF
+/// header at +0x3c; libc "failed" on the ASCII `GNU\0` in its build-id note).
+///
+/// Returns an empty vec when the file has no section headers, which is a real
+/// possibility for a fully stripped binary; the caller must then fail closed
+/// rather than fall back to segment scanning.
+fn executable_sections(elf: &[u8]) -> Result<Vec<(usize, usize, u64)>, io::Error> {
+    const SHF_EXECINSTR: u64 = 0x4;
+    const SHT_NOBITS: u64 = 8;
+    let shoff = read_u64(elf, 0x28)? as usize;
+    let shentsize = read_u16(elf, 0x3a)? as usize;
+    let shnum = read_u16(elf, 0x3c)? as usize;
+    if shoff == 0 || shnum == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        if elf.len() < sh + 0x28 {
+            return Err(io::Error::other("truncated section header"));
+        }
+        let sh_type = read_u64(elf, sh + 4)? & 0xffff_ffff;
+        let sh_flags = read_u64(elf, sh + 8)?;
+        if sh_flags & SHF_EXECINSTR == 0 || sh_type == SHT_NOBITS {
+            continue;
+        }
+        out.push((
+            read_u64(elf, sh + 0x18)? as usize,
+            read_u64(elf, sh + 0x20)? as usize,
+            read_u64(elf, sh + 0x10)?,
+        ));
+    }
+    Ok(out)
+}
+
 fn load_span(elf: &[u8]) -> Result<(u64, u64), io::Error> {
     let loads = all_load_segments(elf)?;
     let lo = loads
@@ -520,47 +664,42 @@ mod tests {
         elf[ph + 0x28..ph + 0x30].copy_from_slice(&(code_bytes.len() as u64).to_le_bytes());
         elf.resize(entry as usize, 0);
         elf.extend_from_slice(&code_bytes);
+
+        // A section header table with one SHF_EXECINSTR section covering the
+        // code. The scan walks sections, not the PF_X segment, so a fixture
+        // without these would be refused as unprovable - which is the correct
+        // fail-closed behaviour, and is why they are here.
+        let shoff = elf.len();
+        let mut shdrs = vec![0_u8; 64 * 2]; // [0] = SHT_NULL, [1] = .text
+        let text = 64;
+        shdrs[text + 0x04..text + 0x08].copy_from_slice(&1_u32.to_le_bytes()); // SHT_PROGBITS
+        shdrs[text + 0x08..text + 0x10].copy_from_slice(&0x6_u64.to_le_bytes()); // ALLOC|EXECINSTR
+        shdrs[text + 0x10..text + 0x18].copy_from_slice(&entry.to_le_bytes()); // sh_addr
+        shdrs[text + 0x18..text + 0x20].copy_from_slice(&entry.to_le_bytes()); // sh_offset
+        shdrs[text + 0x20..text + 0x28].copy_from_slice(&(code_bytes.len() as u64).to_le_bytes()); // sh_size
+        elf.extend_from_slice(&shdrs);
+        elf[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes()); // e_shoff
+        elf[0x3a..0x3c].copy_from_slice(&64_u16.to_le_bytes()); // e_shentsize
+        elf[0x3c..0x3e].copy_from_slice(&2_u16.to_le_bytes()); // e_shnum
         elf
     }
 
+    /// The M1 demo guest: write "ok\n" to fd 1, then exit 42.
     fn fixture_elf() -> Vec<u8> {
-        let code: Vec<u32> = vec![
+        elf_with_code(&[
             // "ok\n" onto the guest stack, so no PC-relative data is needed.
             movz(9, 0x6b6f, 0),  // 'o','k'
             movk(9, 0x000a, 16), // '\n'
-            str_pre_sp(9),       // str x9, [sp, #-16]!
-            mov_from_sp(1),      // x1 = buf
-            movz(0, 1, 0),       // x0 = fd 1
-            movz(2, 3, 0),       // x2 = len 3
-            movz(8, 64, 0),      // x8 = __NR_write
+            str_pre_sp(9),
+            mov_from_sp(1), // x1 = buf
+            movz(0, 1, 0),  // x0 = fd 1
+            movz(2, 3, 0),  // x2 = len 3
+            movz(8, 64, 0), // x8 = __NR_write
             SVC_0,
             movz(0, 42, 0), // x0 = 42
             movz(8, 93, 0), // x8 = __NR_exit
             SVC_0,
-        ];
-        let code_bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let entry: u64 = 0x1000;
-        let mut elf = vec![0_u8; 0x40 + 56];
-        elf[..4].copy_from_slice(b"\x7fELF");
-        elf[4] = 2; // ELF64
-        elf[5] = 1; // little endian
-        elf[6] = 1; // EI_VERSION
-        elf[0x10..0x12].copy_from_slice(&3_u16.to_le_bytes()); // ET_DYN
-        elf[0x12..0x14].copy_from_slice(&183_u16.to_le_bytes()); // EM_AARCH64
-        elf[0x18..0x20].copy_from_slice(&entry.to_le_bytes());
-        elf[0x20..0x28].copy_from_slice(&0x40_u64.to_le_bytes()); // e_phoff
-        elf[0x36..0x38].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
-        elf[0x38..0x3a].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
-        let ph = 0x40;
-        elf[ph..ph + 4].copy_from_slice(&1_u32.to_le_bytes()); // PT_LOAD
-        elf[ph + 4..ph + 8].copy_from_slice(&5_u32.to_le_bytes()); // PF_R|PF_X
-        elf[ph + 0x08..ph + 0x10].copy_from_slice(&entry.to_le_bytes()); // p_offset
-        elf[ph + 0x10..ph + 0x18].copy_from_slice(&entry.to_le_bytes()); // p_vaddr
-        elf[ph + 0x20..ph + 0x28].copy_from_slice(&(code_bytes.len() as u64).to_le_bytes());
-        elf[ph + 0x28..ph + 0x30].copy_from_slice(&(code_bytes.len() as u64).to_le_bytes());
-        elf.resize(entry as usize, 0);
-        elf.extend_from_slice(&code_bytes);
-        elf
+        ])
     }
 
     static SEEN: std::sync::Mutex<Vec<(u64, [u64; 6])>> = std::sync::Mutex::new(Vec::new());
@@ -717,6 +856,79 @@ mod tests {
         assert_eq!(args[2], 0xc3c3, "x11 preserved");
         assert_eq!(args[3], 0xd4d4, "x19 (callee-saved) preserved");
         assert_eq!(args[4], 0xe5e5, "x30 (link register) preserved");
+    }
+
+    /// `mrs xd, tpidr_el0`
+    const fn mrs_tpidr_el0(rd: u32) -> u32 {
+        0xd53b_d040 | rd
+    }
+
+    #[test]
+    fn scan_refuses_x18_and_names_the_site() {
+        let code = vec![
+            movz(0, 1, 0),
+            // `add x18, x18, #1` — Darwin rewrites x18 at every trap return,
+            // so a guest value cannot live there.
+            0x9100_0652,
+            movz(8, 93, 0),
+            SVC_0,
+        ];
+        let elf = elf_with_code(&code);
+        let verdict = scan_eligibility(&elf).expect("scan runs");
+        assert_eq!(
+            verdict,
+            Err(DirectIneligible::X18Access { vaddr: 0x1004 }),
+            "x18 access must disqualify, naming its address"
+        );
+        // And `load` must refuse rather than map-and-patch.
+        let loaded = DirectImage::load(&elf, record_only).expect("load runs");
+        assert!(matches!(loaded, Err(DirectIneligible::X18Access { .. })));
+    }
+
+    #[test]
+    fn scan_refuses_guest_tls() {
+        // Probed on this host: XNU does not preserve a userspace-written
+        // TPIDR_EL0, so guest TLS cannot run natively until M2 veneers it.
+        let code = vec![mrs_tpidr_el0(9), movz(8, 93, 0), SVC_0];
+        let elf = elf_with_code(&code);
+        assert_eq!(
+            scan_eligibility(&elf).expect("scan runs"),
+            Err(DirectIneligible::TpidrAccess { vaddr: 0x1000 }),
+            "tpidr_el0 access must disqualify"
+        );
+    }
+
+    #[test]
+    fn scan_refuses_undecodable_text_only_when_it_could_name_x18() {
+        // 0xffff_ffff does not decode. Its low five bits are 31, and every
+        // other register field reads 31 too, so it cannot name x18 - harmless
+        // whatever it is, and the scan must not refuse the image for it.
+        let benign = vec![0xffff_ffff, movz(8, 93, 0), SVC_0];
+        let elf = elf_with_code(&benign);
+        assert!(
+            matches!(scan_eligibility(&elf).expect("scan runs"), Ok(1)),
+            "an undecodable word that cannot name x18 is not a disqualifier"
+        );
+
+        // Same shape, but with register field Rd = 18: cannot be ruled out.
+        let suspicious = vec![0xffff_fff2, movz(8, 93, 0), SVC_0];
+        let elf = elf_with_code(&suspicious);
+        assert!(
+            matches!(
+                scan_eligibility(&elf).expect("scan runs"),
+                Err(DirectIneligible::UndecodableText { .. })
+            ),
+            "an undecodable word that could name x18 must fail closed"
+        );
+    }
+
+    #[test]
+    fn scan_counts_syscall_sites_on_a_clean_image() {
+        let elf = fixture_elf();
+        assert!(
+            matches!(scan_eligibility(&elf).expect("scan runs"), Ok(2)),
+            "the clean fixture qualifies with both svc sites counted"
+        );
     }
 
     static CHILD_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);

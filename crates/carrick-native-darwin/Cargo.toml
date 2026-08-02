@@ -15,6 +15,9 @@ workspace = true
 bincode.workspace = true
 carrick-dsr = { path = "../carrick-dsr" }
 carrick-dsr-aarch64 = { path = "../carrick-dsr-aarch64" }
+# Tier D's eligibility scan decodes guest text to find the 0.03% of words that
+# cannot execute on Darwin (x18, tpidr_el0). Same decoder the translator uses.
+bad64.workspace = true
 getrandom.workspace = true
 libc.workspace = true
 memmap2.workspace = true

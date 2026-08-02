@@ -30,7 +30,44 @@ fn read_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().expect("u64 slice"))
 }
 
+/// `(file_offset, size, vaddr)` of each SHF_EXECINSTR section.
+///
+/// Sections, not the PF_X `PT_LOAD`: that segment starts at file offset 0 on
+/// every real toolchain binary, so it also covers the ELF header, the program
+/// headers and `.note.*`. Decoding those as instructions inflates the x18 tally
+/// with ASCII and pointer bytes that merely happen to have 18 in a register
+/// field — the earlier revision of this census counted them.
+///
+/// Empty when the file is fully stripped of section headers; the caller then
+/// has nothing it can prove.
+fn exec_sections(elf: &[u8]) -> Vec<(usize, usize, u64)> {
+    const SHF_EXECINSTR: u64 = 0x4;
+    const SHT_NOBITS: u64 = 8;
+    let shoff = read_u64(elf, 0x28) as usize;
+    let shentsize = read_u16(elf, 0x3a) as usize;
+    let shnum = read_u16(elf, 0x3c) as usize;
+    if shoff == 0 || shnum == 0 || elf.len() < shoff + shnum * shentsize {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        let sh_type = read_u64(elf, sh + 4) & 0xffff_ffff;
+        let sh_flags = read_u64(elf, sh + 8);
+        if sh_flags & SHF_EXECINSTR == 0 || sh_type == SHT_NOBITS {
+            continue;
+        }
+        out.push((
+            read_u64(elf, sh + 0x18) as usize,
+            read_u64(elf, sh + 0x20) as usize,
+            read_u64(elf, sh + 0x10),
+        ));
+    }
+    out
+}
+
 /// `(file_offset, len, vaddr)` of each executable PT_LOAD.
+#[allow(dead_code)]
 fn exec_segments(elf: &[u8]) -> Vec<(usize, usize, u64)> {
     assert_eq!(&elf[..4], b"\x7fELF", "not an ELF");
     assert_eq!(elf[4], 2, "not ELF64");
@@ -87,7 +124,7 @@ fn main() {
         let entry = read_u64(&bytes, 0x18);
         let (mut insns, mut svc, mut x18, mut tpidr, mut bti, mut undecoded) =
             (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
-        for (offset, len, vaddr) in exec_segments(&bytes) {
+        for (offset, len, vaddr) in exec_sections(&bytes) {
             let end = (offset + len).min(bytes.len());
             let code = &bytes[offset..end];
             for maybe in bad64::disasm(code, vaddr) {
@@ -116,6 +153,9 @@ fn main() {
             }
         }
         let kind = if e_type == 2 { "EXEC" } else { "DYN " };
+        if insns == 0 {
+            eprintln!("note: {path} has no SHF_EXECINSTR sections (stripped?)");
+        }
         println!(
             "{:<44} {:>10} {:>7} {:>7} {:>7} {:>6} {:>6}  {kind} 0x{entry:x}",
             path.rsplit('/').next().unwrap_or(&path),
