@@ -723,60 +723,56 @@ fn emit_pc_relative_address(
             "PC-relative non-GPR destination",
         )
     })?;
-    let scratch = if register == 17 { 16 } else { 17 };
+    // Materialize the guest target through carrick-owned x19: minimal width,
+    // no spill, no reload, and nothing for recovery to restore (resuming at
+    // the instruction start simply re-runs the chain). The destination is
+    // written by exactly one architectural word at the end - the `mov` for an
+    // ordinary register, or the slot commit for a virtualized one, which
+    // reuses the reserved-resident recovery contract.
+    let reserved = crate::gateway::RESERVED_SCRATCH;
+    let value = relative.target.raw();
     emit_word(
         assembler,
         entries,
         guest,
-        0xf900_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch,
+        0xd280_0000 | (((value & 0xffff) as u32) << 5) | reserved,
     )?;
-    for halfword in 0..4_u32 {
+    let mut rest = value >> 16;
+    let mut hw = 1_u32;
+    while rest != 0 {
+        let half = (rest & 0xffff) as u32;
+        if half != 0 {
+            emit_word(
+                assembler,
+                entries,
+                guest,
+                0xf280_0000 | (hw << 21) | (half << 5) | reserved,
+            )?;
+        }
+        rest >>= 16;
+        hw += 1;
+    }
+    if let Some(offset) = virtual_snapshot_offset(register) {
         recovery.push(RecoveryEntry {
             cache: current_offset(assembler)?,
-            action: RecoveryAction::RestoreScratch { register: scratch },
+            action: RecoveryAction::CommitReservedResident {
+                virtual_register: register,
+            },
         });
-        let immediate = ((relative.target.raw() >> (halfword * 16)) & 0xffff) as u32;
-        let base = if halfword == 0 {
-            0xd280_0000
-        } else {
-            0xf280_0000
-        };
         emit_word(
             assembler,
             entries,
             guest,
-            base | (halfword << 21) | (immediate << 5) | scratch,
-        )?;
-    }
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratch { register: scratch },
-    });
-    if let Some(offset) = virtual_snapshot_offset(register) {
-        emit_word(
-            assembler,
-            entries,
-            guest,
-            0xf900_0000 | ((offset / 8) << 10) | (28 << 5) | scratch,
+            0xf900_0000 | ((offset / 8) << 10) | (28 << 5) | reserved,
         )?;
     } else {
         emit_word(
             assembler,
             entries,
             guest,
-            0xaa00_03e0 | (scratch << 16) | register,
+            0xaa00_03e0 | (reserved << 16) | register,
         )?;
     }
-    recovery.push(RecoveryEntry {
-        cache: current_offset(assembler)?,
-        action: RecoveryAction::RestoreScratchCompleted { register: scratch },
-    });
-    emit_word(
-        assembler,
-        entries,
-        guest,
-        0xf940_0000 | ((1120 / 8) << 10) | (28 << 5) | scratch,
-    )?;
     Ok(())
 }
 
@@ -1756,7 +1752,7 @@ pub(crate) fn rewrite_direct_binding_stub(
     ];
     let authority_fixed = [
         (9, 0xf902_1f91),  // str x17, [x28, #1080]
-        (10, 0xf942_3b8f), // ldr x15, [x28, #1136]
+        (10, 0xf942_7f8f), // ldr x15, [x28, #1272]
         (11, 0xb400_044f), // cbz x15, resolver
         (12, 0xca51_3230), // eor x16, x17, lsr #12
         (13, 0xd342_4210), // ubfx x16, x16, #2, #15
@@ -7874,6 +7870,65 @@ mod tests {
         assert_eq!(
             bound.trusted_entry, None,
             "shared-unit guards keep their blocks trusted-entry-free"
+        );
+    }
+
+    /// `adr x1, <target>` materializes through carrick-owned x19 - minimal
+    /// width, no spill, no ctx traffic - and writes the destination with one
+    /// architectural `mov`. A virtualized destination commits its slot with
+    /// the reserved-resident action instead.
+    #[test]
+    fn pc_relative_address_materializes_through_resident_x19() {
+        // adr x1, #+0x10 at guest 0x4_0000_9470: target 0x4_0000_9480.
+        let word = 0x1000_0081;
+        let action = super::super::decode::classify(word, GuestVa(0x4_0000_9470))
+            .expect("classify adr fixture");
+        let plan = BlockPlan {
+            start: GuestVa(0x4_0000_9470),
+            end: GuestVa(0x4_0000_9478),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest: GuestVa(0x4_0000_9470),
+                action,
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0x4_0000_9474),
+                resume: GuestVa(0x4_0000_9478),
+            },
+            extensions: Vec::new(),
+        };
+        let assembled = assemble_block_inner(
+            &plan,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble adr block");
+        let expected = [
+            0xD292_9013, // movz x19, #0x9480
+            0xF2C0_0093, // movk x19, #4, lsl #32
+            0xAA13_03E1, // mov x1, x19
+        ];
+        assert_eq!(
+            &assembled.words[1..4],
+            &expected,
+            "resident adr template words: {:#010x?}",
+            &assembled.words[..6.min(assembled.words.len())]
+        );
+        assert!(
+            !assembled
+                .words
+                .iter()
+                .any(|word| context_store_slot(*word) == Some(1120)
+                    || context_load_slot(*word) == Some(1120)),
+            "resident adr template touches no scratch spill slot"
+        );
+        assert_eq!(
+            assembled.recovery.len(),
+            1,
+            "only the block entry's x17 restore remains: {:?}",
+            assembled.recovery
         );
     }
 

@@ -67,7 +67,13 @@ pub const CTX_GUEST_RESERVED_SCRATCH: u32 = 152;
 /// the three in step.
 pub const CTX_GATEWAY_PHASE: u32 = 1152;
 
-pub const CTX_INDIRECT_CACHE: u32 = 1136;
+// 1272, not its historical 1136: the indirect-cache pointer is the hottest
+// READ in translated code (the dispatch sequence loads it per indirect
+// branch), and 1136's 64-byte line (1088..1151) also carries the most-written
+// slots in the context - the template spill pair (1120/1128) and the
+// generation publish (1144). It now lives on the read-mostly exit-address
+// line (1216..1279), whose only stores are cross-authority transitions.
+pub const CTX_INDIRECT_CACHE: u32 = 1272;
 pub const CTX_GENERATION: u32 = 1144;
 pub const CTX_ENFORCE_CACHE_AUTHORITY: u32 = 1156;
 pub const CTX_CACHE_START: u32 = 1176;
@@ -464,7 +470,9 @@ pub struct DsrContext {
     pub exit_link_pad: u32,
     pub rewrite_scratch: u64,
     pub rewrite_context_scratch: u64,
-    pub indirect_cache: *const IndirectTargetCacheEntry,
+    /// Former `indirect_cache` slot, retired to the pad role when the
+    /// pointer moved to the read-mostly line (see `CTX_INDIRECT_CACHE`).
+    pub retired_indirect_cache_pad: u64,
     pub generation: u64,
     /// Gateway phase: 1 entering, 0 translated code, 2 leaving after capture.
     pub entry_in_progress: u32,
@@ -491,8 +499,8 @@ pub struct DsrContext {
     pub exit_unsupported_addr: u64,
     pub exit_signal_addr: u64,
     pub generation_bindings: *const GenerationBinding,
-    /// Preserves the old 1280-byte ABI boundary before appended fields.
-    pub gateway_abi_tail_pad: u64,
+    /// Occupies the former ABI tail pad, preserving the 1280-byte boundary.
+    pub indirect_cache: *const IndirectTargetCacheEntry,
     pub direct_binding_cell: u64,
     pub direct_binding_ordinal: u32,
     pub direct_binding_present: u32,
@@ -611,7 +619,7 @@ impl DsrContext {
             exit_unsupported_addr,
             exit_signal_addr,
             generation_bindings: std::ptr::null(),
-            gateway_abi_tail_pad: 0,
+            retired_indirect_cache_pad: 0,
             direct_binding_cell: 0,
             direct_binding_ordinal: 0,
             direct_binding_present: 0,
@@ -671,7 +679,9 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, exit_link) == 1104);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_has_link) == 1112);
 const _: () = assert!(std::mem::offset_of!(DsrContext, rewrite_scratch) == 1120);
 const _: () = assert!(std::mem::offset_of!(DsrContext, rewrite_context_scratch) == 1128);
-const _: () = assert!(std::mem::offset_of!(DsrContext, indirect_cache) == 1136);
+const _: () = assert!(std::mem::offset_of!(DsrContext, retired_indirect_cache_pad) == 1136);
+const _: () =
+    assert!(std::mem::offset_of!(DsrContext, indirect_cache) == CTX_INDIRECT_CACHE as usize);
 const _: () = assert!(std::mem::offset_of!(DsrContext, generation) == 1144);
 const _: () = assert!(std::mem::offset_of!(DsrContext, entry_in_progress) == 1152);
 const _: () =
@@ -691,7 +701,7 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, exit_sensitive_addr) == 1
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_unsupported_addr) == 1248);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_signal_addr) == 1256);
 const _: () = assert!(std::mem::offset_of!(DsrContext, generation_bindings) == 1264);
-const _: () = assert!(std::mem::offset_of!(DsrContext, gateway_abi_tail_pad) == 1272);
+
 const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_cell) == 1280);
 const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_ordinal) == 1288);
 const _: () = assert!(std::mem::offset_of!(DsrContext, direct_binding_present) == 1292);
@@ -1330,7 +1340,7 @@ mod indirect_cache_tests {
             1200
         );
         assert_eq!(std::mem::offset_of!(DsrContext, generation_bindings), 1264);
-        assert_eq!(std::mem::offset_of!(DsrContext, gateway_abi_tail_pad), 1272);
+        assert_eq!(std::mem::offset_of!(DsrContext, indirect_cache), 1272);
         assert_eq!(std::mem::offset_of!(DsrContext, direct_binding_cell), 1280);
         assert_eq!(
             std::mem::offset_of!(DsrContext, direct_binding_ordinal),
