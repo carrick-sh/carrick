@@ -1144,14 +1144,22 @@ mod tests {
                 std::ptr::read_unaligned((emitted.entry().host().raw() + index * 4) as *const u32)
             })
             .collect::<Vec<_>>();
-        let direct_lr_store = 0xf900_0000 | ((1080 / 8) << 10) | (28 << 5) | 30; // str x30, [x28, #1080]
 
+        // The lean indirect exit stages the return target through
+        // Darwin-stable x17 (mov x17, x30) and publishes it to the resolver
+        // at the miss edge (str x17, [x28, #1080]) — never through physical
+        // x18, which Darwin may clear asynchronously.
         assert!(
-            words.contains(&direct_lr_store),
-            "return resolver must publish guest x30 directly"
+            words.contains(&0xaa1e_03f1), // mov x17, x30
+            "return resolver must stage guest x30 through Darwin-stable x17"
+        );
+        let resolver_target_store = 0xf900_0000 | ((1080 / 8) << 10) | (28 << 5) | 17;
+        assert!(
+            words.contains(&resolver_target_store), // str x17, [x28, #1080]
+            "return resolver must publish the staged target for the miss path"
         );
         assert!(
-            !words.contains(&0xaa1e_03f2),
+            !words.contains(&0xaa1e_03f2), // mov x18, x30
             "return resolver must not stage guest x30 through physical x18"
         );
     }
@@ -1207,35 +1215,55 @@ mod tests {
         )
         .expect("allocate translation cache");
         let emitted = emit_block_direct(&mut cache, &indirect).expect("emit indirect resolver");
-        let resolver = emitted
-            .recovery()
-            .iter()
-            .filter(|entry| {
-                matches!(
-                    entry.action,
-                    RecoveryAction::RestoreIndirectRegisters
-                        | RecoveryAction::RestoreIndirectResolver
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            matches!(
-                resolver.first().map(|entry| entry.action),
-                Some(RecoveryAction::RestoreIndirectRegisters)
-            ),
-            "resolver must publish its partial recovery point first"
-        );
-        assert!(
-            resolver
+        // The lean indirect exit's recovery layout: a contiguous band of
+        // RestoreIndirectLean over the hot path, the miss staging, and the
+        // slow branch's spill words; then EXACTLY the slow branch's NZCV
+        // capture pair under RestoreIndirectRegisters; then a contiguous
+        // RestoreIndirectResolver band to the end of the slow branch. No
+        // gaps anywhere between the first lean word and the last resolver
+        // word — a kick may land on any of them.
+        let band = |action: RecoveryAction| {
+            emitted
+                .recovery()
                 .iter()
-                .skip(1)
-                .all(|entry| entry.action == RecoveryAction::RestoreIndirectResolver),
-            "every instruction after the scratch snapshot must have full recovery"
+                .filter(|entry| entry.action == action)
+                .map(|entry| entry.cache.get())
+                .collect::<Vec<_>>()
+        };
+        let lean = band(RecoveryAction::RestoreIndirectLean);
+        let registers = band(RecoveryAction::RestoreIndirectRegisters);
+        let resolver = band(RecoveryAction::RestoreIndirectResolver);
+        assert!(!lean.is_empty(), "hot path must carry lean recovery");
+        assert!(
+            band(RecoveryAction::RestoreIndirectLeanCall).is_empty(),
+            "a return exit never clobbers x30, so no call-flavor recovery"
         );
         assert!(
-            resolver
-                .windows(2)
-                .all(|pair| pair[1].cache.get() == pair[0].cache.get() + 4),
+            lean.windows(2).all(|pair| pair[1] == pair[0] + 4),
+            "lean recovery must cover every hot-path instruction without gaps"
+        );
+        assert_eq!(
+            registers.len(),
+            2,
+            "the slow branch captures NZCV in exactly two covered words"
+        );
+        assert_eq!(
+            registers[0],
+            lean.last().copied().expect("nonempty lean band") + 4,
+            "the NZCV capture pair follows the lean band immediately"
+        );
+        assert_eq!(registers[1], registers[0] + 4);
+        assert!(
+            !resolver.is_empty(),
+            "the slow branch must carry full resolver recovery"
+        );
+        assert_eq!(
+            resolver[0],
+            registers[1] + 4,
+            "full recovery starts right after the NZCV capture"
+        );
+        assert!(
+            resolver.windows(2).all(|pair| pair[1] == pair[0] + 4),
             "resolver recovery metadata must cover every instruction without gaps"
         );
         assert!(

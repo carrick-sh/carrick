@@ -5130,6 +5130,59 @@ impl ThreadTranslator {
         )))
     }
 
+    /// Publish `target` into the per-thread indirect target cache, choosing
+    /// the entry FLAVOR (see `gateway::IndirectTargetCacheEntry`):
+    ///
+    /// - a PRIVATE-cache target with a trusted entry publishes flavor 1 —
+    ///   the trusted-entry code address plus the target page's generation
+    ///   atomic, so the emitted hot path validates staleness inline and
+    ///   lands past the guard;
+    /// - everything else (shared-unit targets, blocks without a trusted
+    ///   entry) keeps flavor 0: the guarded entry plus a
+    ///   `TargetCacheAuthority` the emitted slow path installs.
+    ///
+    /// Callable only after `translate()` returned — that call takes and
+    /// RELEASES the process-state write lock internally, so the short read
+    /// lock here cannot deadlock.
+    fn publish_indirect_target(
+        &mut self,
+        memory: &NativeMappedMemory,
+        target: carrick_guest_mem::GuestVa,
+        translated: &TranslationResult,
+    ) -> Result<(), types::DsrError> {
+        if self.process.private_target_authority.owns(translated.entry) {
+            let trusted = self
+                .process
+                .state
+                .read()
+                .trusted_entries
+                .get(&(target, translated.generation))
+                .copied();
+            if let Some(offset) = trusted {
+                // The same atomic the target's emitted guard materializes:
+                // the page-generation cell `memory.dsr_generation_observation`
+                // hands the translate/guard wiring. Its address is stable for
+                // the life of the generation table (entries are never
+                // removed), and fork/exec clear the indirect cache before a
+                // new table exists.
+                let observation = memory.dsr_generation_observation(target)?;
+                let generation_atomic = std::ptr::from_ref(observation.current_atomic()) as u64;
+                self.indirect_cache.publish_private_trusted(
+                    target,
+                    translated.entry.host().raw() as u64 + u64::from(offset.get()),
+                    generation_atomic,
+                    translated.generation,
+                );
+                return Ok(());
+            }
+        }
+        let authority =
+            self.target_cache_authority(target, translated.generation, translated.entry)?;
+        self.indirect_cache
+            .publish(target, translated.generation, translated.entry, authority);
+        Ok(())
+    }
+
     fn resolve_indirect<const PROFILE: bool>(
         &mut self,
         memory: &NativeMappedMemory,
@@ -5138,10 +5191,7 @@ impl ThreadTranslator {
     ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
         self.stats.add(ResolverStat::ResolverExits, 1);
         let translated = self.translate::<PROFILE>(memory, target)?;
-        let authority =
-            self.target_cache_authority(target, translated.generation, translated.entry)?;
-        self.indirect_cache
-            .publish(target, translated.generation, translated.entry, authority);
+        self.publish_indirect_target(memory, target, &translated)?;
         probes::dsr_cache_event(
             self.tid,
             probes::DsrCacheEventKind::TargetPublish,
@@ -5150,6 +5200,16 @@ impl ThreadTranslator {
             translated.cache_used_bytes,
         );
         Ok((translated.entry, translated.generation))
+    }
+
+    /// Test/diagnostic view of the indirect-cache way published for `guest`:
+    /// `(cache, authority, reserved)`.
+    #[doc(hidden)]
+    pub fn indirect_cache_entry_for_test(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Option<(u64, u64, u64)> {
+        self.indirect_cache.entry_snapshot(guest)
     }
 
     #[doc(hidden)]
@@ -5734,14 +5794,7 @@ impl ThreadTranslator {
                         return Err(error);
                     }
                 };
-                let authority =
-                    self.target_cache_authority(target, translated.generation, translated.entry)?;
-                self.indirect_cache.publish(
-                    target,
-                    translated.generation,
-                    translated.entry,
-                    authority,
-                );
+                self.publish_indirect_target(memory, target, &translated)?;
                 if let Ok(eligibility) = binding_eligibility
                     && let Some(cell) = eligibility.cell
                 {

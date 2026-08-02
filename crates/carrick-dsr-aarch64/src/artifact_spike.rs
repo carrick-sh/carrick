@@ -1113,6 +1113,8 @@ pub(crate) enum PortableRecoveryAction {
     RestoreGenerationGuard,
     RestoreIndirectRegisters,
     RestoreIndirectResolver,
+    RestoreIndirectLean,
+    RestoreIndirectLeanCall,
     RestoreScratch {
         register: u32,
     },
@@ -1200,6 +1202,8 @@ impl PortableRecoveryAction {
             RecoveryAction::RestoreGenerationGuard => Self::RestoreGenerationGuard,
             RecoveryAction::RestoreIndirectRegisters => Self::RestoreIndirectRegisters,
             RecoveryAction::RestoreIndirectResolver => Self::RestoreIndirectResolver,
+            RecoveryAction::RestoreIndirectLean => Self::RestoreIndirectLean,
+            RecoveryAction::RestoreIndirectLeanCall => Self::RestoreIndirectLeanCall,
             RecoveryAction::RestoreScratch { register } => Self::RestoreScratch { register },
             RecoveryAction::RestoreScratchInvalidBiasedLiteral { register } => {
                 Self::RestoreScratchInvalidBiasedLiteral { register }
@@ -1353,6 +1357,8 @@ impl PortableRecoveryAction {
             Self::RestoreGenerationGuard => RecoveryAction::RestoreGenerationGuard,
             Self::RestoreIndirectRegisters => RecoveryAction::RestoreIndirectRegisters,
             Self::RestoreIndirectResolver => RecoveryAction::RestoreIndirectResolver,
+            Self::RestoreIndirectLean => RecoveryAction::RestoreIndirectLean,
+            Self::RestoreIndirectLeanCall => RecoveryAction::RestoreIndirectLeanCall,
             Self::RestoreScratch { register } => RecoveryAction::RestoreScratch { register },
             Self::RestoreScratchInvalidBiasedLiteral { register } => {
                 RecoveryAction::RestoreScratchInvalidBiasedLiteral { register }

@@ -2147,6 +2147,201 @@ fn dsr_code_write_severs_incoming_private_links() {
     );
 }
 
+/// Phase 3's flavor-1 fast path, live through the production translator: a
+/// `blr` to a PRIVATE target with a trusted entry publishes the
+/// trusted-entry flavor into the per-thread indirect cache, and the next
+/// traversal chains through it — validating the page generation inline and
+/// landing past the target's guard — while still delivering the
+/// architectural link register.
+#[test]
+fn dsr_indirect_private_trusted_call_takes_the_fast_path() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    // Both blocks live on the fixture's single executable page.
+    let code = GuestVa(0x5_4000);
+    let target = GuestVa(code.raw() + 0x2000);
+    let mut words = vec![0xd503_201f_u32; 0x2000 / 4 + 1];
+    words[0] = 0xd63f_0020; // blr x1
+    *words.last_mut().expect("nonempty fixture words") = 0xd400_0001; // svc #0
+    let mut fixture = biased_translator_fixture(&words, code);
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = code.raw();
+    snapshot.x[1] = target.raw();
+    let prepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare indirect call source");
+    let miss = fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("execute indirect call miss");
+    assert_eq!(
+        miss.exit,
+        NativeDsrExit::ResolveIndirect {
+            source: code,
+            target,
+            link: Some(GuestVa(code.raw() + 4)),
+        }
+    );
+    assert!(matches!(
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared, miss)
+            .expect("resolve indirect call target"),
+        super::ThreadExit::Continue
+    ));
+    // The fill must have chosen the private trusted flavor: bit 0 of the
+    // entry's reserved word, with a non-null trusted-entry code address and
+    // a live generation-atomic pointer.
+    let (trusted_code, generation_atomic, reserved) = fixture
+        .translator
+        .indirect_cache_entry_for_test(target)
+        .expect("published indirect target entry");
+    assert_eq!(
+        reserved & 1,
+        1,
+        "a private target with a trusted entry must publish flavor 1"
+    );
+    assert_ne!(trusted_code, 0);
+    assert_ne!(generation_atomic, 0);
+
+    // Second traversal: the emitted probe hits the flavor-1 entry and chains
+    // straight into the target, which runs to its syscall exit with the
+    // guest link register set by the fast path's materialization.
+    snapshot.pc = code.raw();
+    snapshot.x[1] = target.raw();
+    snapshot.x[30] = 0x3030_3030_3030_3030;
+    let hit = fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("execute trusted-entry fast path");
+    assert_eq!(
+        hit.exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target.raw() + 4)
+        },
+        "a flavor-1 hit must chain into the target without a resolver exit"
+    );
+    assert_eq!(
+        snapshot.x[30],
+        code.raw() + 4,
+        "the fast path must still deliver the architectural link register"
+    );
+}
+
+/// The flavor-1 entry's inline generation check, live: after a guest code
+/// write bumps the TARGET's page, the SAME cache entry's next lookup must
+/// take the stale-miss edge and re-resolve through the gateway — never
+/// chain into the stale trusted entry — and the re-resolve republishes a
+/// fresh flavor-1 entry that chains again.
+#[test]
+fn dsr_code_write_stales_private_trusted_indirect_entry() {
+    let _signal_oracle = install_signal_handlers_for_oracle();
+    // Both blocks live on the fixture's single executable page: bumping the
+    // target's page also stales the source block, so the post-bump traversal
+    // re-prepares the source and the probe then consults the SAME (stale)
+    // flavor-1 cache entry.
+    let code = GuestVa(0x6_4000);
+    let target = GuestVa(code.raw() + 0x2000);
+    let mut words = vec![0xd503_201f_u32; 0x2000 / 4 + 1];
+    words[0] = 0xd61f_0020; // br x1
+    *words.last_mut().expect("nonempty fixture words") = 0xd400_0001; // svc #0
+    let mut fixture = biased_translator_fixture(&words, code);
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = code.raw();
+    snapshot.x[1] = target.raw();
+    let prepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare indirect source");
+    let miss = fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("execute indirect miss");
+    assert_eq!(
+        miss.exit,
+        NativeDsrExit::ResolveIndirect {
+            source: code,
+            target,
+            link: None,
+        }
+    );
+    assert!(matches!(
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared, miss)
+            .expect("resolve indirect target"),
+        super::ThreadExit::Continue
+    ));
+    let (_, _, reserved) = fixture
+        .translator
+        .indirect_cache_entry_for_test(target)
+        .expect("published indirect target entry");
+    assert_eq!(reserved & 1, 1, "fixture must exercise the flavor-1 path");
+    // Prove the fast path is live before staling it.
+    snapshot.pc = code.raw();
+    let hit = fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("execute trusted-entry fast path");
+    assert_eq!(
+        hit.exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target.raw() + 4)
+        }
+    );
+
+    // Bump the TARGET page: the entry's generation atomic now disagrees
+    // with the expected value baked into `reserved`. The source block goes
+    // stale with it (same page), so re-prepare — the fresh source block's
+    // probe then hits the STALE flavor-1 entry for the target.
+    fixture
+        .memory
+        .note_dsr_code_mutation(target.raw(), 4)
+        .expect("bump the target page")
+        .expect("nonempty bump");
+    snapshot.pc = code.raw();
+    let reprepared = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("re-prepare source after the bump");
+    let stale = fixture
+        .translator
+        .enter_prepared::<false>(reprepared, &mut snapshot)
+        .expect("execute stale trusted-entry lookup");
+    assert_eq!(
+        stale.exit,
+        NativeDsrExit::ResolveIndirect {
+            source: code,
+            target,
+            link: None,
+        },
+        "a bumped target page must take the stale-miss edge and re-resolve"
+    );
+    // The re-resolve republishes against the NEW generation and the chain
+    // works again.
+    assert!(matches!(
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, reprepared, stale)
+            .expect("re-resolve the bumped target"),
+        super::ThreadExit::Continue
+    ));
+    snapshot.pc = code.raw();
+    let rehit = fixture
+        .translator
+        .enter_prepared::<false>(reprepared, &mut snapshot)
+        .expect("execute re-resolved fast path");
+    assert_eq!(
+        rehit.exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target.raw() + 4)
+        },
+        "the republished entry must chain at the new generation"
+    );
+}
+
 #[test]
 fn dsr_direct_flow_linked_branch_stays_in_translated_code_and_preserves_x17() {
     let mut cache = TranslationCache::new(
