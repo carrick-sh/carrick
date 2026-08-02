@@ -151,6 +151,23 @@ pub trait FsBackend: Send + Sync {
     /// Metadata for an entry the backend owns. `None` falls through.
     fn metadata(&self, path: &str) -> Option<RootFsMetadata>;
 
+    /// One-pass `(lookup_kind, metadata)` for callers that need both answers
+    /// for the same path (the layered `Vfs::lookup`). The default preserves
+    /// the historical two-call pattern exactly — `metadata` is consulted only
+    /// when the kind probe says the backend owns the path — so counting/
+    /// wrapping backends observe identical call sequences. Disk backends
+    /// override this to derive both answers from ONE contained open instead
+    /// of two full path walks.
+    fn lookup_kind_and_metadata(
+        &self,
+        path: &str,
+    ) -> (Option<OverlayEntryKind>, Option<RootFsMetadata>) {
+        match self.lookup_kind(path) {
+            None => (None, None),
+            kind => (kind, self.metadata(path)),
+        }
+    }
+
     /// Read the file bytes for `path`. `None` if the backend doesn't
     /// have a file at that path.
     fn file_contents(&self, path: &str) -> Option<Vec<u8>>;
@@ -217,7 +234,13 @@ pub trait FsBackend: Send + Sync {
     }
 
     /// Whether this backend can contain named FIFO nodes that need special
-    /// `open(2)` handling. The host backend can; the memory backend cannot.
+    /// `open(2)` handling. The dispatcher runs a per-open FIFO metadata probe
+    /// only when this answers `true`, so a precise `false` removes a full
+    /// path walk from every ordinary open. The memory backend can never hold
+    /// one (`create_fifo` is unsupported there); the host backend answers
+    /// from a durable marker stamped by `create_fifo` (layer extraction skips
+    /// special tar entries, so guest `mknod` is the only FIFO source). The
+    /// conservative default is `true`.
     fn may_have_fifo_nodes(&self) -> bool {
         true
     }
@@ -1375,6 +1398,22 @@ pub struct HostFsBackend {
     /// The pid that owns current `watch_res_cache` fd entries; see the cache
     /// comment above.
     watch_cache_pid: std::sync::atomic::AtomicU32,
+    /// Sticky fast answer for [`FsBackend::may_have_fifo_nodes`]: once ANY
+    /// process is known to have created a FIFO under this scratch root the
+    /// answer is `true` forever with no syscall. `false` only means "consult
+    /// the durable root marker" — the in-process bool alone is NOT
+    /// fork-coherent (`mkfifo f` runs in one guest process, `cat f` in a
+    /// sibling), so the truth lives in [`CARRICK_HAS_FIFO_XATTR`] on the
+    /// scratch root and this is only a cache of a `true` reading.
+    fifo_seen: std::sync::atomic::AtomicBool,
+    /// The shared fs-structure generation ([`crate::fs_resolve_cache`]) at
+    /// which this process last read the root marker as ABSENT. FIFO creation
+    /// is a structural mutation (guest `mknodat`; `create_fifo` also bumps
+    /// directly), so "generation unchanged since the last absent reading"
+    /// proves no FIFO appeared anywhere — the per-open
+    /// `may_have_fifo_nodes` check is then one shared-atomic load, zero
+    /// syscalls. `0` = never checked (generation starts at 1).
+    fifo_absent_gen: std::sync::atomic::AtomicU64,
 }
 
 /// A cached `RealStat` plus the snapshot needed to revalidate it cheaply. The
@@ -1509,6 +1548,35 @@ fn overlay_enabled() -> bool {
     )
 }
 
+/// Outcome of [`HostFsBackend::fast_open_for_guest`] — the fd-centric fast
+/// path for a guest's own (non-creating, non-truncating) file open.
+#[cfg(target_os = "macos")]
+enum FastGuestOpen {
+    /// The open fd IS the guest's open: real access mode, containment- and
+    /// Unicode-alias-checked, `O_NONBLOCK` already cleared. `stat` is the
+    /// `fstat` of the same fd, so the caller derives every piece of metadata
+    /// it needs without another path walk.
+    Served {
+        fd: std::os::fd::OwnedFd,
+        stat: libc::stat,
+        kind: RootFsEntryKind,
+    },
+    /// The leaf is a symlink (`O_NOFOLLOW` → `ELOOP`). The caller must run
+    /// the `resolve_following` + cap-std path: an absolute symlink target has
+    /// to be re-rooted under the GUEST root, which the host kernel's own
+    /// resolution cannot do.
+    SymlinkLeaf,
+    /// The (contained) leaf is a FIFO. The caller must route to the
+    /// `open_fifo_nonblock` handling — NEVER to the cap-std slow path, whose
+    /// blocking `open(2)` of a writer-less FIFO would wedge the dispatcher.
+    Fifo,
+    /// Anything else (miss, escape, alias, exotic type, error): run the exact
+    /// cap-std slow path. A fast-path failure proves nothing about the guest
+    /// view — e.g. an intermediate ABSOLUTE symlink resolves against the host
+    /// root here but under the guest root on the slow path.
+    Fallback,
+}
+
 impl Drop for HostFsBackend {
     fn drop(&mut self) {
         let current = unsafe { libc::getpid() as u32 };
@@ -1595,6 +1663,8 @@ impl HostFsBackend {
             overlay_mount: None,
             watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
+            fifo_seen: std::sync::atomic::AtomicBool::new(false),
+            fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1637,6 +1707,8 @@ impl HostFsBackend {
             overlay_mount: None,
             watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
+            fifo_seen: std::sync::atomic::AtomicBool::new(false),
+            fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1715,6 +1787,8 @@ impl HostFsBackend {
             overlay_mount: None,
             watch_res_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
+            fifo_seen: std::sync::atomic::AtomicBool::new(false),
+            fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1851,6 +1925,228 @@ impl HostFsBackend {
             mode: override_mode.unwrap_or(if on_disk == 0 { default } else { on_disk }),
             size: if is_dir { 0 } else { st.st_size as usize },
         })
+    }
+
+    /// Fd-centric fast path for the guest's own file open (`open_raw_fd`),
+    /// sibling of [`HostFsBackend::fast_open_contained`]: ONE `openat` with
+    /// the REAL access mode replaces the probe stack (resolve_following's
+    /// per-component `symlink_metadata` walk plus the RW-then-RO double
+    /// cap-std walk) for the common regular-file case, and the returned fd is
+    /// the fd actually served to the guest. Restricted by the callers to
+    /// non-creating, non-truncating opens — creating opens keep the full
+    /// cap-std path per the sandbox rationale in
+    /// docs/fs-host-capstd-amplification.md.
+    ///
+    /// Unlike the `O_EVTONLY` probes, this IS the guest's open: a regular
+    /// file's atime advances exactly as a real `open(2)`+read would, which is
+    /// the faithful behavior for a served open.
+    #[cfg(target_os = "macos")]
+    fn fast_open_for_guest(&self, rel: &Path, write: bool) -> FastGuestOpen {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        if !self.fast_fs {
+            return FastGuestOpen::Fallback;
+        }
+        let Some(root_prefix) = self.root_prefix.as_deref() else {
+            return FastGuestOpen::Fallback;
+        };
+        let Ok(rel_c) = std::ffi::CString::new(rel.as_os_str().as_bytes()) else {
+            return FastGuestOpen::Fallback;
+        };
+        let dir_fd = self.dir.as_raw_fd();
+        // O_NONBLOCK: a racing FIFO at the leaf must never block this open
+        // (the FIFO-never-blocks-the-dispatcher rule); cleared again below
+        // before the fd is served. O_NOFOLLOW: a symlink leaf is the typed
+        // `SymlinkLeaf` outcome (ELOOP), not a host-side traversal — its
+        // absolute target must be re-rooted under the guest root by the slow
+        // path. O_NOCTTY: purely defensive — an intermediate absolute symlink
+        // can briefly land this open on an arbitrary host node before the
+        // containment check rejects it, and that probe must never acquire a
+        // controlling terminal.
+        let base = libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY;
+        let eloop = || std::io::Error::last_os_error().raw_os_error() == Some(libc::ELOOP);
+        // RW-first even for a read-only request, mirroring the slow path's
+        // rw_opts preference: HVF rejects hv_vm_map of a MAP_SHARED file VMA
+        // whose backing fd caps max-protection at read, so a guest O_RDONLY
+        // open still prefers an O_RDWR host fd (guest-visible writability is
+        // tracked separately in OpenDescription::HostFile). Scratch files are
+        // kept owner-writable (see CARRICK_MODE_XATTR), so the first attempt
+        // nearly always succeeds; the O_RDONLY retry covers directories
+        // (EISDIR) and genuinely host-read-only files.
+        let mut raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), libc::O_RDWR | base, 0) };
+        if raw < 0 {
+            if eloop() {
+                return FastGuestOpen::SymlinkLeaf;
+            }
+            if write {
+                // A write open that failed with its real access mode: let the
+                // cap-std path produce the exact error/None it does today.
+                return FastGuestOpen::Fallback;
+            }
+            raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), libc::O_RDONLY | base, 0) };
+            if raw < 0 {
+                return if eloop() {
+                    FastGuestOpen::SymlinkLeaf
+                } else {
+                    FastGuestOpen::Fallback
+                };
+            }
+        }
+        // SAFETY: `raw` is a freshly-opened owned fd; OwnedFd closes it on
+        // drop, covering every early return below.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(raw, &mut st) } != 0 {
+            return FastGuestOpen::Fallback;
+        }
+        // Containment BEFORE anything is served: the opened inode's real host
+        // path must live under the sandbox root, or an intermediate symlink
+        // escaped and the fd must be dropped unread (never serve bytes from
+        // an uncontained fd).
+        if !fd_contained_under(raw, root_prefix) {
+            return FastGuestOpen::Fallback;
+        }
+        // Byte-exact leaf-name guard against macOS's normalizing VFS, exactly
+        // as `lookup`/`metadata` do; ASCII names exit for free.
+        if !self.name_matches_on_disk(rel) {
+            return FastGuestOpen::Fallback;
+        }
+        let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+        let kind = if typ == libc::S_IFDIR as u32 {
+            RootFsEntryKind::Directory
+        } else if typ == libc::S_IFREG as u32 {
+            RootFsEntryKind::File
+        } else if typ == libc::S_IFIFO as u32 {
+            // Contained FIFO (a create race — the dispatcher normally
+            // intercepts FIFOs before the file-open path): the probe fd
+            // drops/closes and the caller routes to open_fifo_nonblock.
+            return FastGuestOpen::Fifo;
+        } else {
+            // Socket-marker files stat as S_IFREG (served above); a real
+            // socket/device node here means an escape-shaped oddity → the
+            // exact slow path.
+            return FastGuestOpen::Fallback;
+        };
+        // Clear the probe-only O_NONBLOCK so the served fd's status flags
+        // match a plain open(2). Regular files ignore O_NONBLOCK for I/O
+        // either way, and the guest's OWN requested flags (including its
+        // O_NONBLOCK, O_APPEND emulation) are tracked by the dispatcher in
+        // the OpenDescription, not read back from the host fd.
+        unsafe {
+            libc::fcntl(raw, libc::F_SETFL, 0);
+        }
+        FastGuestOpen::Served { fd, stat: st, kind }
+    }
+
+    /// A plain `O_RDONLY` fd on the sandbox root itself, for root-directory
+    /// xattr reads/writes. cap-std's dir handle is `O_PATH` on Linux and
+    /// `f*xattr` on an `O_PATH` fd is `EBADF` (see `with_entry_fd`), so
+    /// re-open `.` relative to it — valid on every host OS.
+    fn root_meta_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let raw = unsafe {
+            libc::openat(
+                self.dir.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return None;
+        }
+        // SAFETY: freshly-opened owned fd.
+        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+    }
+
+    /// Durable "a FIFO exists (or existed) under this root" marker read; see
+    /// [`FsBackend::may_have_fifo_nodes`] and the `fifo_seen` field docs.
+    fn root_fifo_marker(&self) -> FifoMarker {
+        use std::os::fd::AsRawFd;
+        let Some(fd) = self.root_meta_fd() else {
+            return FifoMarker::Unknown;
+        };
+        let mut v = [0u8; 4];
+        // SAFETY: valid fd, NUL-terminated name, in-bounds buffer.
+        let n = unsafe {
+            carrick_portable::fgetxattr(
+                fd.as_raw_fd(),
+                CARRICK_HAS_FIFO_XATTR.as_ptr() as *const libc::c_char,
+                v.as_mut_ptr() as *mut libc::c_void,
+                v.len(),
+            )
+        };
+        if n >= 0 {
+            return FifoMarker::Present;
+        }
+        if std::io::Error::last_os_error().raw_os_error() == Some(XATTR_ABSENT_ERRNO) {
+            FifoMarker::Absent
+        } else {
+            FifoMarker::Unknown
+        }
+    }
+
+    /// Stamp the durable FIFO marker on the sandbox root. Called by
+    /// `create_fifo` BEFORE the node exists, so no process can ever observe a
+    /// FIFO while `may_have_fifo_nodes` still answers false.
+    fn stamp_fifo_marker(&self) {
+        use std::os::fd::AsRawFd;
+        if let Some(fd) = self.root_meta_fd() {
+            fset_u32_xattr(fd.as_raw_fd(), CARRICK_HAS_FIFO_XATTR, 1);
+        }
+        self.fifo_seen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The cap-std slow path of [`FsBackend::open_raw_fd`]: manual leaf
+    /// symlink resolution (absolute targets re-rooted under the guest root)
+    /// followed by the confined cap-std open. Every open that the fd-centric
+    /// [`HostFsBackend::fast_open_for_guest`] cannot serve (creates,
+    /// truncates, symlink leaves, escapes, aliases, errors) lands here.
+    fn open_raw_fd_capstd(
+        &self,
+        path: &str,
+        write: bool,
+        create: bool,
+        trunc: bool,
+    ) -> Option<i32> {
+        use std::os::fd::IntoRawFd;
+        // Follow symlinks by hand first so an absolute symlink target (which
+        // cap-std refuses to traverse) resolves to the file under the guest
+        // root rather than opening the link itself.
+        let normalized = self.resolve_following(path)?;
+        // A tombstoned path is "deleted" in the layered view; don't
+        // resurrect it via a raw open.
+        let rel = Self::rel_path(&normalized)?;
+        let (dir, at_rel) = self.at(rel).ok()?;
+        if create
+            && let Some(parent) = at_rel.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            dir.create_dir_all(parent).ok()?;
+        }
+        let mut opts = cap_std::fs::OpenOptions::new();
+        opts.read(true);
+        if write {
+            opts.write(true);
+        }
+        opts.create(create).truncate(trunc);
+        let file = if !write && !trunc && !create {
+            // HVF rejects hv_vm_map of a MAP_SHARED file VMA whose backing fd
+            // only allows read max-protection. Prefer an O_RDWR host fd for
+            // Carrick-owned scratch files, while still recording guest
+            // writability separately in OpenDescription::HostFile.
+            let mut rw_opts = cap_std::fs::OpenOptions::new();
+            rw_opts.read(true).write(true);
+            dir.open_with(&at_rel, &rw_opts)
+                .or_else(|_| dir.open_with(&at_rel, &opts))
+                .ok()?
+        } else {
+            dir.open_with(&at_rel, &opts).ok()?
+        };
+        // Hand the kernel fd to the caller. `into_raw_fd` consumes the
+        // cap-std File without closing it, so the dispatcher owns the
+        // fd lifetime (it closes it on guest close()).
+        Some(file.into_std().into_raw_fd())
     }
 
     #[cfg(target_os = "macos")]
@@ -2385,6 +2681,37 @@ pub(crate) const CARRICK_RDEV_XATTR_NAME: &str = "user.carrick.rdev";
 const CARRICK_SOCKET_XATTR: &[u8] = b"user.carrick.socket\0";
 #[allow(dead_code)]
 pub(crate) const CARRICK_SOCKET_XATTR_NAME: &str = "user.carrick.socket";
+
+/// Marker xattr on the sandbox ROOT directory recording that a FIFO node has
+/// (at some point) been created under it — the durable truth behind
+/// [`FsBackend::may_have_fifo_nodes`]. It must be durable host state, not an
+/// in-process flag: carrick forks real host processes, so `mkfifo f` in one
+/// guest process followed by `cat f` in a SIBLING must still trigger the
+/// dispatcher's FIFO open interception (a plain open of a writer-less FIFO
+/// blocks and would wedge that sibling's dispatcher). It also survives
+/// `exec`-style re-attach of a detached container's scratch. Never removed
+/// (a deleted FIFO leaves the conservative `true` behind — a per-open probe
+/// resumes, which is the pre-marker behavior). Hidden from the guest's
+/// get/set/listxattr like every `user.carrick.*` name.
+const CARRICK_HAS_FIFO_XATTR: &[u8] = b"user.carrick.has_fifo\0";
+
+/// The errno that means "xattr not present" (as opposed to "this filesystem
+/// cannot do xattrs", which must fail CLOSED — see `root_fifo_marker`).
+#[cfg(target_os = "linux")]
+const XATTR_ABSENT_ERRNO: i32 = libc::ENODATA;
+#[cfg(not(target_os = "linux"))]
+const XATTR_ABSENT_ERRNO: i32 = libc::ENOATTR;
+
+/// Tri-state reading of [`CARRICK_HAS_FIFO_XATTR`]. `Unknown` (the marker
+/// mechanism itself failed, e.g. a host filesystem without `user.*` xattr
+/// support) is distinct from `Absent` so `may_have_fifo_nodes` can fail
+/// closed to the historical per-open probe instead of wrongly answering
+/// "no FIFOs" forever.
+enum FifoMarker {
+    Present,
+    Absent,
+    Unknown,
+}
 #[allow(dead_code)]
 pub(crate) const CARRICK_UID_XATTR_NAME: &str = "user.carrick.uid";
 #[allow(dead_code)]
@@ -3245,6 +3572,91 @@ impl FsBackend for HostFsBackend {
         None
     }
 
+    fn lookup_kind_and_metadata(
+        &self,
+        path: &str,
+    ) -> (Option<OverlayEntryKind>, Option<RootFsMetadata>) {
+        // The layered `Vfs::lookup` needs BOTH the overlay kind and the
+        // backend metadata; answered separately (`lookup_kind` then
+        // `metadata`) each ran its own contained open — two kernel walks for
+        // one question. Derive both from ONE `fast_open_contained` fd for the
+        // common regular-file/directory shapes (mirroring
+        // `fast_metadata_contained`); symlinks, FIFOs, aliases and misses
+        // keep the exact historical two-call pattern below.
+        #[cfg(target_os = "macos")]
+        if let Some(normalized) = normalize(path)
+            && let Some(rel) = Self::rel_path(&normalized)
+            && let Some((fd, st, kind)) = self.fast_open_contained(rel, false)
+        {
+            use std::os::fd::AsRawFd;
+            if !self.name_matches_on_disk(rel) {
+                // Host-aliased (Unicode-normalized) name: the Linux view is
+                // "no such entry", exactly as `lookup_kind`/`metadata` report.
+                return (None, None);
+            }
+            let is_dir = kind == RootFsEntryKind::Directory;
+            let (override_mode, _uid, _gid, is_socket) = fd_carrick_meta(fd.as_raw_fd());
+            let entry_kind = if is_dir {
+                OverlayEntryKind::Dir
+            } else {
+                OverlayEntryKind::File
+            };
+            let md_kind = if !is_dir && is_socket {
+                RootFsEntryKind::Socket
+            } else {
+                kind
+            };
+            let on_disk = st.st_mode as u32 & 0o7777;
+            let default = if is_dir { 0o755 } else { 0o644 };
+            return (
+                Some(entry_kind),
+                Some(RootFsMetadata {
+                    path: normalized,
+                    kind: md_kind,
+                    mode: override_mode.unwrap_or(if on_disk == 0 { default } else { on_disk }),
+                    size: if is_dir { 0 } else { st.st_size as usize },
+                }),
+            );
+        }
+        match self.lookup_kind(path) {
+            None => (None, None),
+            kind => (kind, self.metadata(path)),
+        }
+    }
+
+    fn may_have_fifo_nodes(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.fifo_seen.load(Relaxed) {
+            return true;
+        }
+        // Layer extraction never materialises FIFOs (special tar entries are
+        // skipped — see `extract_layer_entries`/`extract_to_dir`), so the only
+        // way a FIFO appears under this root is `create_fifo`, which stamps
+        // the durable root marker BEFORE creating the node and bumps the
+        // shared fs generation. Reading the generation first and the marker
+        // second makes the absent-stamp sound: a stamp taken at generation G
+        // proves the marker was absent at some point ≥ the G bump, and any
+        // later FIFO creation bumps past G.
+        let now = crate::fs_resolve_cache::current_generation();
+        if self.fifo_absent_gen.load(Relaxed) == now {
+            return false;
+        }
+        match self.root_fifo_marker() {
+            FifoMarker::Present => {
+                self.fifo_seen.store(true, Relaxed);
+                true
+            }
+            FifoMarker::Absent => {
+                self.fifo_absent_gen.store(now, Relaxed);
+                false
+            }
+            // The marker mechanism is unavailable (host fs without user
+            // xattrs): fail CLOSED to the historical per-open FIFO probe —
+            // a wrong `false` would send a FIFO open down the blocking path.
+            FifoMarker::Unknown => true,
+        }
+    }
+
     fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
         // Follow symlinks by hand so an absolute target resolves under the
         // guest root (cap-std won't traverse it). See `resolve_following`.
@@ -3325,6 +3737,16 @@ impl FsBackend for HostFsBackend {
             Some(pdir) => pdir.as_raw_fd(),
             None => self.dir.as_raw_fd(),
         };
+        // Ordering is load-bearing: (1) stamp the durable root marker, (2)
+        // bump the shared fs generation (invalidating every process's cached
+        // "no FIFOs" reading — the dispatch choke point bumps for guest
+        // mknodat too, but direct backend callers must be covered as well),
+        // (3) only then create the node. No process can observe the FIFO
+        // while `may_have_fifo_nodes` still answers false. A failed mkfifoat
+        // leaves a conservative stale-true marker behind — harmless (the
+        // per-open probe runs, as it always did before the marker existed).
+        self.stamp_fifo_marker();
+        crate::fs_resolve_cache::bump_generation();
         // Real named pipe on the cap-std scratch (fork-shareable, stats as
         // S_IFIFO). mkfifoat applies the host process umask; override it below
         // with the exact guest-requested mode so stat reports it faithfully.
@@ -3744,44 +4166,35 @@ impl FsBackend for HostFsBackend {
     }
 
     fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32> {
-        use std::os::fd::IntoRawFd;
-        // Follow symlinks by hand first so an absolute symlink target (which
-        // cap-std refuses to traverse) resolves to the file under the guest
-        // root rather than opening the link itself.
-        let normalized = self.resolve_following(path)?;
-        // A tombstoned path is "deleted" in the layered view; don't
-        // resurrect it via a raw open.
-        let rel = Self::rel_path(&normalized)?;
-        let (dir, at_rel) = self.at(rel).ok()?;
-        if create
-            && let Some(parent) = at_rel.parent()
-            && !parent.as_os_str().is_empty()
+        // Fd-centric fast path for the common non-creating, non-truncating
+        // open: ONE kernel-resolved openat with the real access mode replaces
+        // the resolve_following walk + double cap-std open. Creating and
+        // truncating opens keep the full cap-std path (sandboxed parent
+        // creation, exact O_TRUNC semantics).
+        #[cfg(target_os = "macos")]
+        if !create
+            && !trunc
+            && let Some(normalized) = normalize(path)
+            && let Some(rel) = Self::rel_path(&normalized)
         {
-            dir.create_dir_all(parent).ok()?;
+            match self.fast_open_for_guest(rel, write) {
+                FastGuestOpen::Served { fd, .. } => {
+                    use std::os::fd::IntoRawFd;
+                    return Some(fd.into_raw_fd());
+                }
+                // A FIFO discovered at open time (create race — the
+                // dispatcher normally intercepts FIFOs before this path):
+                // NEVER hand it to the cap-std slow path, whose blocking
+                // open of a writer-less FIFO would wedge the dispatcher.
+                // O_RDWR for a write request so the open can't ENXIO/block
+                // regardless of reader presence.
+                FastGuestOpen::Fifo => {
+                    return self.open_fifo_nonblock(path, if write { 2 } else { 0 });
+                }
+                FastGuestOpen::SymlinkLeaf | FastGuestOpen::Fallback => {}
+            }
         }
-        let mut opts = cap_std::fs::OpenOptions::new();
-        opts.read(true);
-        if write {
-            opts.write(true);
-        }
-        opts.create(create).truncate(trunc);
-        let file = if !write && !trunc && !create {
-            // HVF rejects hv_vm_map of a MAP_SHARED file VMA whose backing fd
-            // only allows read max-protection. Prefer an O_RDWR host fd for
-            // Carrick-owned scratch files, while still recording guest
-            // writability separately in OpenDescription::HostFile.
-            let mut rw_opts = cap_std::fs::OpenOptions::new();
-            rw_opts.read(true).write(true);
-            dir.open_with(&at_rel, &rw_opts)
-                .or_else(|_| dir.open_with(&at_rel, &opts))
-                .ok()?
-        } else {
-            dir.open_with(&at_rel, &opts).ok()?
-        };
-        // Hand the kernel fd to the caller. `into_raw_fd` consumes the
-        // cap-std File without closing it, so the dispatcher owns the
-        // fd lifetime (it closes it on guest close()).
-        Some(file.into_std().into_raw_fd())
+        self.open_raw_fd_capstd(path, write, create, trunc)
     }
 
     fn open_raw_fd_with_metadata(
@@ -3791,7 +4204,50 @@ impl FsBackend for HostFsBackend {
         create: bool,
         trunc: bool,
     ) -> Option<(i32, RootFsMetadata)> {
-        let fd = self.open_raw_fd(path, write, create, trunc)?;
+        // Same fast path as `open_raw_fd`, deriving the dispatch metadata
+        // from the SAME fd (fstat + one flistxattr-gated xattr pass) so the
+        // served open needs no separate lookup/metadata walk at all.
+        #[cfg(target_os = "macos")]
+        if !create
+            && !trunc
+            && let Some(normalized) = normalize(path)
+            && let Some(rel) = Self::rel_path(&normalized)
+        {
+            match self.fast_open_for_guest(rel, write) {
+                FastGuestOpen::Served { fd, stat, kind } => {
+                    if kind != RootFsEntryKind::File {
+                        // This API serves regular files only (the dispatcher
+                        // routes directories through the Directory arm); the
+                        // fd drops (closes) and the caller's `open_raw_fd`
+                        // fallback reproduces the historical behavior.
+                        return None;
+                    }
+                    use std::os::fd::{AsRawFd, IntoRawFd};
+                    let (override_mode, _uid, _gid, _is_socket) = fd_carrick_meta(fd.as_raw_fd());
+                    let on_disk_mode = stat.st_mode as u32 & 0o7777;
+                    let mode = override_mode.unwrap_or(if on_disk_mode == 0 {
+                        0o644
+                    } else {
+                        on_disk_mode
+                    });
+                    return Some((
+                        fd.into_raw_fd(),
+                        RootFsMetadata {
+                            path: std::path::Path::new(path).to_path_buf(),
+                            kind: RootFsEntryKind::File,
+                            mode,
+                            size: stat.st_size as usize,
+                        },
+                    ));
+                }
+                // Not a regular file: let the caller fall back to its
+                // metadata + `open_raw_fd` sequence (whose own Fifo route
+                // stays non-blocking).
+                FastGuestOpen::Fifo => return None,
+                FastGuestOpen::SymlinkLeaf | FastGuestOpen::Fallback => {}
+            }
+        }
+        let fd = self.open_raw_fd_capstd(path, write, create, trunc)?;
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
             unsafe { libc::close(fd) };
@@ -5229,6 +5685,181 @@ mod tests {
         let guard = b.watch_res_cache.lock();
         let entry = guard.get("/stress_fname").expect("cached watch source");
         assert!(entry.source_fd.is_some());
+    }
+
+    // -- fd-centric guest-open fast path (fast_open_for_guest) --------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_fast_open_serves_regular_file_fd_centrically() {
+        let (b, _scratch) = host_backend();
+        b.set_file_contents("/dir/file.txt", b"hello".to_vec())
+            .unwrap();
+        b.set_mode("/dir/file.txt", 0o640).unwrap();
+
+        match b.fast_open_for_guest(Path::new("dir/file.txt"), false) {
+            FastGuestOpen::Served { fd, stat, kind } => {
+                use std::os::fd::AsRawFd;
+                assert_eq!(kind, RootFsEntryKind::File);
+                assert_eq!(stat.st_size, 5);
+                let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+                assert_ne!(flags, -1);
+                // The probe-only O_NONBLOCK is cleared before the fd is
+                // served; regular files ignore it for I/O but the served
+                // fd's status flags stay faithful to a plain open(2).
+                assert_eq!(flags & libc::O_NONBLOCK, 0);
+                // RW-first host access even for a guest read-only request
+                // (HVF MAP_SHARED max-protection; guest writability is
+                // tracked separately by the dispatcher).
+                assert_eq!(flags & libc::O_ACCMODE, libc::O_RDWR);
+            }
+            _ => panic!("a plain regular file must take the fast path"),
+        }
+
+        // Through the trait surface: the served fd and the dispatch metadata
+        // come from the SAME open — mode from the guest-mode xattr, size from
+        // the same fstat — with no separate lookup/metadata walk.
+        let (fd, md) = b
+            .open_raw_fd_with_metadata("/dir/file.txt", false, false, false)
+            .unwrap();
+        assert_eq!(md.kind, RootFsEntryKind::File);
+        assert_eq!(md.mode, 0o640, "mode must come from the guest-mode xattr");
+        assert_eq!(md.size, 5);
+        let mut buf = [0u8; 8];
+        let n = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        unsafe { libc::close(fd) };
+        assert_eq!(&buf[..n as usize], b"hello");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_fast_open_symlink_leaf_falls_back_to_resolving_path() {
+        let (b, _scratch) = host_backend();
+        b.set_file_contents("/data/target.txt", b"via-link".to_vec())
+            .unwrap();
+        // ABSOLUTE target: the raw host openat would resolve it against the
+        // HOST root; only the resolve_following + cap-std fallback re-roots
+        // it under the guest root. O_NOFOLLOW makes the fast path hand it
+        // back as the typed SymlinkLeaf outcome.
+        b.symlink("/data/target.txt", "/link").unwrap();
+
+        assert!(matches!(
+            b.fast_open_for_guest(Path::new("link"), false),
+            FastGuestOpen::SymlinkLeaf
+        ));
+        let fd = b.open_raw_fd("/link", false, false, false).unwrap();
+        let mut buf = [0u8; 16];
+        let n = unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        unsafe { libc::close(fd) };
+        assert_eq!(&buf[..n as usize], b"via-link");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_fast_open_fifo_routes_to_nonblocking_open() {
+        let (b, _scratch) = host_backend();
+        b.create_fifo("/f", 0o600).unwrap();
+
+        assert!(matches!(
+            b.fast_open_for_guest(Path::new("f"), false),
+            FastGuestOpen::Fifo
+        ));
+        // A read open of a writer-less FIFO must return immediately with a
+        // NON-BLOCKING fd — a blocking open here wedges the dispatcher.
+        let fd = b.open_raw_fd("/f", false, false, false).unwrap();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        let rc = unsafe { libc::fstat(fd, &mut st) };
+        unsafe { libc::close(fd) };
+        assert_eq!(rc, 0);
+        assert_eq!(
+            st.st_mode as u32 & libc::S_IFMT as u32,
+            libc::S_IFIFO as u32
+        );
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_open_create_and_trunc_keep_the_capstd_path() {
+        let (b, _scratch) = host_backend();
+        // O_CREAT on a missing path: the fast path serves existing files
+        // only, so creation (including parent materialisation) must still
+        // work via cap-std.
+        let fd = b
+            .open_raw_fd("/new/nested/file", true, true, false)
+            .unwrap();
+        unsafe { libc::close(fd) };
+        assert!(b.metadata("/new/nested/file").is_some());
+        // O_TRUNC must truncate — the fast path is barred from truncating
+        // opens by construction.
+        b.set_file_contents("/t.txt", b"contents".to_vec()).unwrap();
+        let fd = b.open_raw_fd("/t.txt", true, false, true).unwrap();
+        unsafe { libc::close(fd) };
+        assert_eq!(b.metadata("/t.txt").unwrap().size, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_fast_open_containment_failure_falls_back_without_serving() {
+        let (b, _scratch) = host_backend();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("leak.txt"), b"host bytes").unwrap();
+        // An intermediate ABSOLUTE symlink pointing at a HOST directory: the
+        // raw openat follows it out of the sandbox, the F_GETPATH containment
+        // check rejects the fd (never serve bytes from an uncontained fd),
+        // and the slow path refuses the escape as before.
+        b.symlink(outside.path().to_str().unwrap(), "/esc").unwrap();
+        assert!(matches!(
+            b.fast_open_for_guest(Path::new("esc/leak.txt"), false),
+            FastGuestOpen::Fallback
+        ));
+        assert!(
+            b.open_raw_fd("/esc/leak.txt", false, false, false)
+                .is_none()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_fast_open_rejects_unicode_aliased_name() {
+        let (b, _scratch) = host_backend();
+        b.set_file_contents("/caf\u{e9}.txt", b"nfc".to_vec())
+            .unwrap();
+        // NFD spelling of the same name: macOS's normalizing VFS aliases it
+        // to the NFC file, but the Linux byte-exact view is "different
+        // (absent) file" — the fast path must refuse to serve it and defer
+        // to the slow path's existing semantics.
+        assert!(matches!(
+            b.fast_open_for_guest(Path::new("cafe\u{301}.txt"), false),
+            FastGuestOpen::Fallback
+        ));
+    }
+
+    // -- may_have_fifo_nodes durable marker ---------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_may_have_fifo_nodes_tracks_durable_marker() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let a = HostFsBackend::attach(scratch.path()).unwrap();
+        assert!(!a.may_have_fifo_nodes(), "fresh scratch has no FIFOs");
+        // Regular activity does not flip it, even across a structural
+        // generation bump (which forces a durable-marker re-read).
+        a.set_file_contents("/plain", b"x".to_vec()).unwrap();
+        crate::fs_resolve_cache::bump_generation();
+        assert!(!a.may_have_fifo_nodes());
+
+        a.create_fifo("/f", 0o600).unwrap();
+        assert!(a.may_have_fifo_nodes(), "creator sees its own FIFO");
+
+        // A SEPARATE handle on the same scratch — the stand-in for a sibling
+        // carrick process (`mkfifo f` in one guest process, `cat f` in
+        // another): the DURABLE marker must answer, where an in-process flag
+        // would silently say false and route the FIFO open down the blocking
+        // regular-file path.
+        let b = HostFsBackend::attach(scratch.path()).unwrap();
+        assert!(b.may_have_fifo_nodes());
     }
 
     /// Deep-path (> PATH_MAX) operations: a guest that mkdir/chdir's its way
