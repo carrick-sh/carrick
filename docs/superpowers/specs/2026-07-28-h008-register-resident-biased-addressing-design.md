@@ -114,9 +114,14 @@ span-1-exclusive addresses (e.g. `0x390_0000_0000`).
 
 ## 3. Spike 2 — trusted-entry direct chaining (deferred until Spike 1 lands)
 
-Direct links are only installed between blocks of the same generation, and
-invalidation already severs them; a chained transition therefore re-proves
-what the link's existence already witnesses. Emitting a second entry point
+~~Direct links are only installed between blocks of the same generation, and
+invalidation already severs them~~ (CORRECTED by the 2026-08-01 audit: links
+are routinely cross-generation — page generations are per-page from a global
+counter — and NOTHING severs them; the target's entry guard is the only
+invalidation mechanism. See
+`2026-08-01-steady-state-block-boundary-tax-design.md` Phase 2 for the
+corrected obligations.); a chained transition re-proves
+what the link's installation witnessed for the target's own page. Emitting a second entry point
 past the guard preamble (guard + its x16/x17 spills + NZCV round-trip) and
 pointing direct links at it removes ~9-10 words per chained transition —
 the whole per-iteration entry tax of hot loops.
