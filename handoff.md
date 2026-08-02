@@ -59,9 +59,9 @@ symmetrically. Measured on macOS 27 / t8132 / Apple Silicon (4 Performance +
 | workload | carrick | docker | ratio |
 |---|---|---|---|
 | startup (`true`) | 37 ms | ~0 ms | 37x (37 ms absolute — not a problem) |
-| **compute** (8M-iteration awk loop) | 1,196 ms | 110 ms | **10.9x** |
+| **compute** (8M-iteration awk loop) | 418 ms (was 1,196) | 110 ms | **3.8x** (was 10.9x) |
 | **fs-walk** (`find` over the Go tree) | 1,541 ms | 12 ms | **128x** |
-| build, cold GOCACHE | 11,199 ms | 812 ms | 13.8x |
+| build, cold GOCACHE | 11,550 ms | ~950 ms | ~12-13.6x (translation-bound) |
 
 There is no workload where carrick looks good. The build is a *composite* of the
 two problems above rather than a problem of its own.
@@ -133,14 +133,12 @@ stores.
 
 ## Open, ranked by what it settles
 
-1. **Executed-shape census on the compute workload.** `emitted_shape.py` measures
-   *emitted* words. On the build those approximate executed ones; on compute they
-   diverge completely, because stubs are emitted per edge but only executed when a
-   link is unpatched. H008 ran an executed census on the *build* — ctx-slot stores
-   43.2%, loads 20.4%, x17-materialize 13.9% — and nobody has run one on
-   steady-state compute. This blocks the codegen workstream: until it exists,
-   every target is a guess. `shape_classify.py` is already shared between the
-   emitted and sampled views.
+1. **DONE — the census exists and the ladder it ranked is landed** (phases
+   `bb17be5e`..`e743cd8f`; every record in
+   `docs/perf-results/native-dsr-shape-census.jsonl`). What remains on compute is
+   the dispatch's serial load chain (cache-base/tag/`ldar`), with two bounded
+   levers queued: entry packing for `ldp`, and a WRITTEN-ARGUMENT-FIRST
+   relaxation of the generation `ldar` to a plain load.
 2. **fs-walk at 128x.** The largest multiplier measured anywhere, with a known
    mechanism: **19.68 host `open`s per guest `open`** through the cap-std path,
    even after `564dd281` cut it 41%. Never ranked because nothing was measuring it.
