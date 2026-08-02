@@ -269,3 +269,16 @@ census must show the `ldar` stall (the post-4d dominant single stall) convert
 into wall time; conformance smoke must report no regressions. The escape
 hatch restores `ldar` at both sites from one switch so any field report can
 bisect the relaxation in isolation.
+
+**MEASURED OUTCOME (2026-08-01): NULL — code deliberately not landed.** The
+relaxation was implemented at all three sites, every suite ran green, and the
+quiet-box wall was 355 ms median against phase 4d's 356 ms: identical. The
+census had located the stall correctly but the remedy inference was wrong —
+the cost is the dependent load's LATENCY in the dispatch's serial chain,
+which a plain `ldr` pays identically; on this part the acquire flavor of an
+L1 hit is free. Per the no-neutral-knobs rule the switch was reverted before
+landing (evidence: jsonl record `ldar-relaxation-null-result`). The argument
+above stands as knowledge: the acquire is not load-bearing, and any future
+chain-restructuring may treat the generation read as an ordinary load. The
+remaining dispatch lever is the chain itself — fewer dependent hops, or
+hiding them under guest work.
