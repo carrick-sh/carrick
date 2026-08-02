@@ -32,10 +32,12 @@ mix, symbolicated host PCs, raw/symbolicated guest PCs, and sampled `memcpy`
 callers/sizes. A successful capture must end with `tracee_alive=true`,
 `executable_mappings_stable=true`, and `dtrace_clean=true`.
 
-**HARD GATE — never run `dtrace -p`, `pid$PID`, or Carrick USDT probes against a
-continuing native FreeBSD process.** Fasttrap detach killed a live Kaniko build
-with leaked `SIGTRAP`. The profiler deliberately uses only kernel `profile`,
-`syscall`, and `proc` providers filtered through a numeric PID set.
+**USDT and `pid$PID` probes against a continuing native process are allowed.**
+The hazard to respect is fasttrap DETACH, which once killed a live Kaniko build
+with a leaked `SIGTRAP` — so let a session exit on its own, and reach for the
+kernel-provider profiler below when the tracee is a long run you cannot afford
+to lose. That profiler deliberately uses only kernel `profile`, `syscall`, and
+`proc` providers filtered through a numeric PID set.
 
 For an unexplained fatal signal in a long build, start the reusable
 kernel-provider trace before the relevant descendants are created:
@@ -114,9 +116,9 @@ dtrace -Zq -c "…/native_run <elf>" \
   -n 'carrick*:::syscall-return { @[copyinstr(arg1)] = count(); } tick-3s { exit(0); }'
 ```
 
-`syscall-entry` arg0 is the CANONICAL number post-normalization. The hard gate
-above still applies: never `dtrace -p`, pid-provider, or USDT fasttrap probes on
-a continuing native process.
+`syscall-entry` arg0 is the CANONICAL number post-normalization. Per the note
+above, pid-provider and USDT probes are permitted here; only fasttrap detach on
+an unrepeatable run warrants falling back to kernel providers.
 
 **gcore + disassemble the JIT.** `gcore -c core PID`, then:
 

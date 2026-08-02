@@ -297,8 +297,15 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
   - **Provider ABIs differ per host/build and must be qualified live**, not
     assumed (`sched:::preempt` does not exist on macOS; `vminfo:::as_fault`
     arg2 IS the exact 16 KiB host-page base).
-  - **Kernel providers only against a live native guest** — never `dtrace -p`,
-    `-c`, pid-provider, or USDT fasttrap on a continuing native process.
+  - **USDT/pid-provider tracing of a live native guest is ALLOWED** — carrick's
+    own `carrick*:::` probes are the most direct instrument the native lane
+    has, and refusing them left whole subsystems (the shared-translation store
+    among them) measurable only by inference. Use `dtrace -Z` so probes in
+    not-yet-started processes still arm. The one real hazard is **fasttrap
+    detach**: an aborted session once leaked `SIGTRAP` into a continuing
+    FreeBSD tracee and killed a live Kaniko build, so let a session end on its
+    own rather than killing the consumer, and prefer kernel providers when the
+    tracee is a long, unrepeatable run you cannot afford to lose.
   - **Declare perturbation.** A probe on a 2M-events/run path can double `sys`
     time; a script that perturbs must say so, and only same-instrument ratios
     are then citable.
@@ -320,10 +327,11 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
 The x86_64 native lane (`carrick-runtime/src/native_freebsd.rs`, driver
 `runtime::run_elf_native_dispatch`) runs guest code from a JIT cache with the
 `carrick-dsr-x86` gateway. `carrick trace` targets the container/VMM run, not
-this bare in-process runner. **Never use `dtrace -p`, pid-provider probes, or
-USDT fasttrap probes on a continuing native process** — a detach leaked
-`SIGTRAP` and killed a live Kaniko build; the supported profiler
-(`sudo scripts/native-x86-profile.py PID`) uses kernel providers only. **Never
+this bare in-process runner. USDT and pid-provider probes on a continuing
+native process are permitted; the hazard to respect is **fasttrap detach**,
+which once leaked `SIGTRAP` and killed a live Kaniko build, so prefer the
+kernel-provider profiler (`sudo scripts/native-x86-profile.py PID`) when the
+tracee is a long run you cannot afford to lose. **Never
 hardcode the context offset** (XSAVE expansion moved it from 720 to 33024), and
 **the native-x86 gateway is zero-copy by contract** — 16,384/16,576-byte
 `memcpy` samples that scale with gateway entries are a performance-correctness
