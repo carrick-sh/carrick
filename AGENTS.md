@@ -383,12 +383,14 @@ concern — it is half the product.
   guest's virtualized **x17** (physical x17 is the DSR edge register, borrowed to
   hold virtual branch conditions), and every such edge publishes it
   (`str x17,[x28,#1128]`) and restores it (`ldr x17,[x28,#1128]`). The general
-  shape is guest-register MEMORY TRAFFIC: `ctx-load64` 25.0% + `ctx-store64`
-  8.7% = **33.7% of executed emitted instructions ≈ 15% of total build CPU** are
-  guest registers spilling and filling through the context. Slot 1128 is the
-  single biggest, at **15.1% of emitted instructions (~6.8% of total CPU)**; the
-  rest is the same pattern for other registers. The lever is register RESIDENCY
-  across instructions and blocks, not an x17 special case. Note the ceiling:
+  shape is `ctx-load64` 25.0% + `ctx-store64` 8.7% = **33.7% of executed emitted
+  instructions ≈ 15% of total build CPU**. Histogrammed by (slot, register),
+  that traffic is NOT general guest-register spilling — carrick keeps guest
+  registers in host registers — it is carrick saving and restoring the four
+  physical registers it BORROWS: **x17 ~21%, x19 ~9%, x15 ~3.3%, x16 ~0.2%**.
+  There is no register-allocation problem; there is a stolen-register problem,
+  and the borrow is gated on the emitter's own needs rather than on whether the
+  guest value is LIVE. Note the ceiling:
   even PERFECT codegen leaves the build near 5x Docker, so the 2x bar needs the
   kernel and host-userspace buckets too.
 - **The overhead workstream is still one thing: "utilize Darwin in the most
