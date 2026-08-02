@@ -65,14 +65,22 @@ pub fn try_seed_scratch(layer_paths: &[PathBuf], scratch: &Path) -> std::io::Res
     let cloned = clone_children_into(&entry, scratch)?;
     Ok(SeedOutcome {
         cloned,
-        cache_has_mode_xattrs: cloned && entry.join(META_XATTRS_SENTINEL).exists(),
+        // Fail closed: only an explicit clean marker lets the caller leave the
+        // metadata fast gate open.
+        cache_has_mode_xattrs: cloned && !entry.join(CLEAN_META_MARKER).exists(),
     })
 }
 
-/// Sidecar filename inside a digest-keyed cache entry recording that the
-/// extraction wrote per-entry `user.carrick.mode` xattrs (owner-unreadable
-/// tar modes). Filtered from guest view like every internal sidecar.
-pub const META_XATTRS_SENTINEL: &str = ".carrick_meta_xattrs";
+/// Sidecar filename inside a digest-keyed cache entry asserting the POSITIVE
+/// fact that its extraction wrote NO per-entry `user.carrick.mode` xattrs, so
+/// a host stat of any entry is the complete guest answer.
+///
+/// The marker is positive, not negative, deliberately: an entry written by an
+/// older carrick carries no marker at all, and absence must mean "unknown -
+/// assume metadata xattrs exist" rather than "clean". A negative marker would
+/// silently open the metadata fast gate over every pre-existing cache entry
+/// and serve host modes for files whose guest mode lives in an xattr.
+pub const CLEAN_META_MARKER: &str = ".carrick_clean_meta";
 
 /// Result of the per-run COW seed: whether the clone happened, and whether
 /// the cached tree carries metadata xattrs the backend must re-arm its root
@@ -80,6 +88,9 @@ pub const META_XATTRS_SENTINEL: &str = ".carrick_meta_xattrs";
 #[derive(Clone, Copy, Debug)]
 pub struct SeedOutcome {
     pub cloned: bool,
+    /// `true` when the seeded tree may carry per-entry guest metadata xattrs -
+    /// including the "this cache entry predates the clean marker" case, which
+    /// is indistinguishable from "it has them" and is treated as such.
     pub cache_has_mode_xattrs: bool,
 }
 
@@ -211,11 +222,11 @@ fn build_cache_entry(
             let _ = std::fs::remove_dir_all(&building);
             return Ok(false);
         }
-        Ok(stats) if stats.mode_xattrs > 0 => {
+        Ok(stats) if stats.mode_xattrs == 0 => {
             // Entry xattrs survive the per-run clone but a scratch-ROOT
-            // marker would not; persist the fact in the cache tree itself so
-            // every clone re-arms the backend's metadata-xattr marker.
-            let _ = std::fs::File::create(building.join(META_XATTRS_SENTINEL));
+            // marker would not, so the CLEAN fact is persisted in the cache
+            // tree itself. Absence keeps a clone conservative.
+            let _ = std::fs::File::create(building.join(CLEAN_META_MARKER));
         }
         Ok(_) => {}
     }

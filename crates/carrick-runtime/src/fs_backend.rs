@@ -3401,7 +3401,12 @@ const LINK_XATTR_SIDECAR_PREFIX: &str = ".carrick-lnkxattr.";
 /// Directory enumeration must hide these regardless of backend: they are
 /// metadata storage, not guest-visible files.
 pub(crate) fn is_internal_sidecar_name(name: &str) -> bool {
-    name.starts_with(LINK_OWNER_SIDECAR_PREFIX) || name.starts_with(LINK_XATTR_SIDECAR_PREFIX)
+    name.starts_with(LINK_OWNER_SIDECAR_PREFIX)
+        || name.starts_with(LINK_XATTR_SIDECAR_PREFIX)
+        // The layer cache's clean-metadata marker rides into the per-run
+        // scratch with the COW clone; it is carrick bookkeeping, never a
+        // guest-visible entry.
+        || name == crate::layer_cache::CLEAN_META_MARKER
 }
 
 /// Map a carrick xattr name (`b"user.carrick.uid\0"`) to its short sidecar key
