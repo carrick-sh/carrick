@@ -1189,7 +1189,7 @@ mod tests {
             Err(BackendError::Unsupported)
         }
 
-        fn child_names(&self, _dir: &str) -> Vec<(String, RootFsEntryKind)> {
+        fn child_names(&self, _dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)> {
             Vec::new()
         }
 

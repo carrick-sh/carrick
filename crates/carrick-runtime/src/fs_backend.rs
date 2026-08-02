@@ -299,7 +299,12 @@ pub trait FsBackend: Send + Sync {
 
     /// Immediate children of `dir` that the backend owns. Names only
     /// (the dispatcher pairs each with metadata via `metadata`).
-    fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind)>;
+    /// Directory children with, when the enumeration already learned it, the
+    /// child's size. The host backend's FIFO probe stats every non-directory
+    /// child anyway; carrying `st_size` out of that same stat lets directory
+    /// materialization skip a full contained open per file (measured: five
+    /// host syscalls per child on the fs-walk workload).
+    fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)>;
 
     /// Immediate children of `dir` that are tombstoned. The dispatcher
     /// uses this to filter rootfs-supplied entries.
@@ -1130,25 +1135,25 @@ impl FsBackend for MemoryBackend {
         Ok(())
     }
 
-    fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind)> {
+    fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)> {
         let Some(prefix) = normalize(dir) else {
             return Vec::new();
         };
         let inner = self.inner.read();
         let mut out = Vec::new();
-        for path in inner.files.keys() {
+        for (path, contents) in inner.files.iter() {
             if let Some(name) = child_name(&prefix, path) {
-                out.push((name, RootFsEntryKind::File));
+                out.push((name, RootFsEntryKind::File, Some(contents.len() as u64)));
             }
         }
         for path in inner.sockets.keys() {
             if let Some(name) = child_name(&prefix, path) {
-                out.push((name, RootFsEntryKind::Socket));
+                out.push((name, RootFsEntryKind::Socket, Some(0)));
             }
         }
         for path in inner.dirs.iter() {
             if let Some(name) = child_name(&prefix, path) {
-                out.push((name, RootFsEntryKind::Directory));
+                out.push((name, RootFsEntryKind::Directory, None));
             }
         }
         out
@@ -3530,7 +3535,7 @@ impl FsBackend for HostFsBackend {
         Ok(())
     }
 
-    fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind)> {
+    fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)> {
         let Some(normalized) = normalize(dir) else {
             return Vec::new();
         };
@@ -3561,30 +3566,29 @@ impl FsBackend for HostFsBackend {
             if is_internal_sidecar_name(&name) {
                 continue;
             }
-            let kind = match entry.file_type() {
-                Ok(ft) if ft.is_dir() => RootFsEntryKind::Directory,
-                Ok(ft) if ft.is_symlink() => RootFsEntryKind::Symlink,
+            let (kind, size) = match entry.file_type() {
+                Ok(ft) if ft.is_dir() => (RootFsEntryKind::Directory, None),
+                Ok(ft) if ft.is_symlink() => (RootFsEntryKind::Symlink, None),
                 _ => {
                     // cap-std's FileType only distinguishes dir/symlink, so a
                     // FIFO falls here. It MUST be classified as Fifo (via the
                     // raw mode — fstatat, no open): downstream readdir size
                     // lookup reads File contents, and opening a writer-less
                     // FIFO O_RDONLY blocks the dispatcher forever (the tst_test
-                    // framework-hang). S_IFIFO check keeps it path-based.
+                    // framework-hang). S_IFIFO check keeps it path-based. The
+                    // same stat carries st_size; hand it to the caller so
+                    // directory materialization needs no second walk per file.
                     use cap_std::fs::MetadataExt;
-                    let is_fifo = entry
-                        .metadata()
-                        .ok()
-                        .map(|m| m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32)
-                        .unwrap_or(false);
-                    if is_fifo {
-                        RootFsEntryKind::Fifo
-                    } else {
-                        RootFsEntryKind::File
+                    match entry.metadata() {
+                        Ok(m) if m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 => {
+                            (RootFsEntryKind::Fifo, Some(0))
+                        }
+                        Ok(m) => (RootFsEntryKind::File, Some(m.len())),
+                        Err(_) => (RootFsEntryKind::File, None),
                     }
                 }
             };
-            out.push((name, kind));
+            out.push((name, kind, size));
         }
         out
     }
@@ -4897,7 +4901,7 @@ pub fn layered_directory_entries(
         }
     }
 
-    for (name, kind) in overlay.child_names(dir) {
+    for (name, kind, known_size) in overlay.child_names(dir) {
         if is_internal_sidecar_name(&name) {
             continue;
         }
@@ -4931,7 +4935,10 @@ pub fn layered_directory_entries(
                 // broke mailbox.Maildir.clean()'s getatime-cutoff sweep. A pure
                 // stat preserves atime and avoids slurping every file just to
                 // learn its length.
-                let size = overlay.metadata(&path).map(|m| m.size).unwrap_or(0);
+                let size = known_size
+                    .and_then(|size| usize::try_from(size).ok())
+                    .or_else(|| overlay.metadata(&path).map(|m| m.size))
+                    .unwrap_or(0);
                 RootFsMetadata {
                     path: normalized,
                     kind,
@@ -5051,7 +5058,7 @@ mod tests {
         let mut names: Vec<String> = b
             .child_names("/var/lib/apt")
             .into_iter()
-            .map(|(n, _)| n)
+            .map(|(n, _, _)| n)
             .collect();
         names.sort();
         assert_eq!(names, vec!["lists".to_owned()]);
@@ -5263,7 +5270,11 @@ mod tests {
         let file = format!("{path}/hello.txt");
         b.set_file_contents(&file, b"deep".to_vec()).unwrap();
         assert_eq!(b.file_contents(&file).as_deref(), Some(&b"deep"[..]));
-        let names: Vec<String> = b.child_names(&path).into_iter().map(|(n, _)| n).collect();
+        let names: Vec<String> = b
+            .child_names(&path)
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
         assert_eq!(names, vec!["hello.txt".to_owned()]);
         let fd = b.open_raw_fd(&file, false, false, false).unwrap();
         unsafe { libc::close(fd) };

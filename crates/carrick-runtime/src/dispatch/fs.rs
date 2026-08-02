@@ -1158,6 +1158,21 @@ impl SyscallDispatcher {
         }
 
         let path = self.resolve_at_path(dirfd, path)?;
+        // Second stat-cache consult, AFTER dirfd resolution: find-style
+        // dirfd-relative stats (newfstatat(dirfd, name) on getdents output)
+        // failed the pre-resolution gate above and paid the full multi-walk
+        // slow path — measured at ~17.6 host calls per guest stat on the
+        // fs-walk workload. The resolved path is absolute by construction and
+        // the same gates apply; a cache hit implies a non-symlink entry
+        // (revalidation rejects S_IFLNK), so follow and no-follow coincide.
+        if !requires_dir
+            && !path.starts_with("/proc")
+            && !path.starts_with("/sys")
+            && !path.split('/').any(|c| c == "..")
+            && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(&path)
+        {
+            return Ok(self.stat_record_with_device(&path, &real));
+        }
         if let Some(contents) =
             crate::vfs::proc::synthetic_file(&path, &self.synthetic_proc_context())
         {
