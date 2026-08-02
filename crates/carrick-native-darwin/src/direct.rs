@@ -39,8 +39,8 @@ use std::io;
 /// Guest register file, saved by an island and restored on the way back.
 ///
 /// `repr(C)` and field order are load-bearing: the island addresses these by
-/// byte offset, and [`GuestContext::REG`] et al. are the single source for
-/// both sides.
+/// byte offset, and this type's private `REG`/`SP`/`PC`/`HANDLER` constants
+/// are the single source of those offsets for both sides.
 #[derive(Debug, Default, Clone, Copy)]
 #[repr(C)]
 pub struct GuestContext {
