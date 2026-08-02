@@ -204,3 +204,68 @@ fs-walk's 128x (cap-std amplification, separately ranked in the handoff),
 the biased-mode memory lowering (not exercised by compute; revisit against
 a non-PIE workload after Phase 1 lands the shared template repairs), and
 any weakening of guest-visible ABI guarantees.
+
+
+## 7. Soundness argument: the generation `ldar` can be a plain `ldr`
+
+*(Written before any code, per the campaign rule; the change this licenses is
+the Phase-4 follow-on that relaxes the acquire in the entry guard and the
+IBL's flavor-1 generation check, default-relaxed with `CARRICK_DSR_ACQUIRE_GEN=1`
+restoring the acquire for bisection.)*
+
+**Claim.** Replacing `ldar` with `ldr` at both generation-check sites preserves
+every invariant the system actually relies on. The acquire is a vestige of
+treating the check as a lock acquisition; it is a *versioned re-resolution
+hint*, and hints need bounded staleness, not ordering.
+
+**The writer's own ordering already forfeits what acquire would buy.** The
+code-write path bumps the page generation (Release store,
+`PageGenerationTable::note_guest_code_write`) *before* touching guest RAM
+(`invalidate_and_note_dsr_write`, mapped_memory.rs — "before touching guest
+RAM" is its documented contract). So even with acquire semantics, observing
+the bumped value has never implied observing the new code bytes; the pairing
+"acquire the version, then rely on what release published before it" does not
+describe this protocol. What actually re-synchronizes a stale reader is the
+MISS path: a mismatched check exits to the resolver, which retranslates from
+current guest memory under the translator's locks.
+
+**Coherence, not ordering, bounds staleness — and it already had to.** A plain
+load may be *reordered* relative to the reader's other accesses, but it cannot
+read an older value of the atomic than coherence delivers; propagation latency
+is identical for `ldr` and `ldar`. The system's accepted staleness window is
+already far larger than coherence latency: the guard checks only at block
+entry (mid-block staleness is tolerated for a full block body), Phase 2a's
+severing leaves a not-yet-severed-link window of one block body, and the
+guest's own architectural SMC contract (`IC IVAU`/`ISB`, or kernel
+membarrier/IPIs — without which stale execution is architecturally permitted
+indefinitely on real hardware) dominates all of these. A nanoseconds-scale
+reorder window on the version read adds nothing observable.
+
+**No cross-thread payload is consumed under the check.** The IBL entry
+(tag/expected/gen-pointer/code) is THREAD-PRIVATE, published by the same
+thread's resolver; the guard compares against an immediate baked at
+translation time. The only datum reached through a loaded pointer is the
+generation value itself, and an address-dependent load is ordered after the
+load of its address on AArch64 regardless of acquire. The branch target on a
+hit is JIT code whose publication was separately synchronized at install time
+(store + `sys_icache_invalidate`, and instruction fetch is not ordered by
+`ldar` anyway — the acquire never protected I-fetch).
+
+**The torn-bytes race is the guest's, and is unchanged.** A reader that misses
+while the writer is mid-copy can retranslate from partially written bytes —
+with or without acquire, today and after this change. On hardware,
+concurrently executing code being modified without the architectural
+synchronization sequence is the guest's own data race; guests that JIT
+correctly serialize against execution. Not a new risk and not a widened one.
+
+**Precedent.** QEMU's TCG reads its translation-block version state with plain
+loads and synchronizes invalidation through quiescence; DynamoRIO likewise
+does not pay an acquire per dispatch. The acquire-per-block-entry design is
+the outlier, not the norm.
+
+**Gates for the change.** The jitter/async-kick oracle suites and the 2a/2b/3
+live invalidation tests (sever, stale-entry re-resolve) must stay green; a
+census must show the `ldar` stall (the post-4d dominant single stall) convert
+into wall time; conformance smoke must report no regressions. The escape
+hatch restores `ldar` at both sites from one switch so any field report can
+bisect the relaxation in isolation.
