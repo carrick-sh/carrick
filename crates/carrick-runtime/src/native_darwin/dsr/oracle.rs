@@ -7178,7 +7178,10 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
             exit,
             NativeDsrExit::Fault {
                 signal: libc::SIGSEGV,
-                address: HostVa(136),
+                // The entry's guest-x17 reload reads slot 1128 (the boundary
+                // authority) since the exit tails went single-store; with
+                // physical x28 zeroed that is the absolute address it faults on.
+                address: HostVa(1128),
                 ..
             }
         ),

@@ -104,7 +104,8 @@ _carrick_dsr_enter_raw:
     // right answer for a kick that lands mid-entry.
     str wzr, [x28, #CTX_GATEWAY_PHASE]
     // Branch through physical x17, which every translated block restores from
-    // snapshot.x[17] at entry. Do not stage the cache entry in custom x18:
+    // the slot-1128 recovery channel at entry (seeded from snapshot.x[17] by
+    // DsrContext::new). Do not stage the cache entry in custom x18:
     // Darwin can lose that register across asynchronous signal/TLS traffic,
     // producing an instruction abort at PC zero before the block starts.
     ldr x17, [x28, #CTX_ENTRY]
@@ -179,6 +180,12 @@ carrick_dsr_exit_common:
     stp x25, x26, [x28, #200]
     str x27, [x28, #216]
     stp x29, x30, [x28, #232]
+    // Guest x17's snapshot slot: the hot exit tails stopped double-storing it,
+    // so copy the recovery channel (slot 1128, written by every block exit)
+    // into snapshot.x[17] here on the cold gateway path instead. The signal
+    // path never runs this: the C handler snapshots physical x17 directly.
+    ldr x17, [x28, #1128]
+    str x17, [x28, #136]
     mov x17, sp
     str x17, [x28, #SNAP_SP]
     ldr x17, [x28, #CTX_EXIT_TARGET]
