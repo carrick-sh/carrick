@@ -363,6 +363,7 @@ impl PreparedDirectBindingExecReset<'_, '_, '_> {
         state.blocks.clear();
         state.pending.clear();
         state.direct_link_incoming.clear();
+        state.trusted_entries.clear();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
         state.sensitive.clear();
@@ -982,6 +983,11 @@ pub struct ProcessState {
     /// dropped at publication (Phase 2 audit,
     /// docs/superpowers/specs/2026-08-01-steady-state-block-boundary-tax-design.md).
     pub direct_link_incoming: BTreeMap<u64, Vec<cache::LinkSite>>,
+    /// Trusted second entry points of PRIVATE blocks, keyed like `blocks`.
+    /// Patched direct links target `entry + offset`, skipping the generation
+    /// guard the link's existence (plus Phase 2a severing) makes redundant.
+    pub trusted_entries:
+        BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheOffset>,
     pub stats: ResolverStats,
     pub reported_stats: ResolverStats,
     pub sensitive: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), SensitiveMetadata>,
@@ -2642,6 +2648,7 @@ impl ProcessTranslator {
                 blocks: BTreeMap::new(),
                 pending: BTreeMap::new(),
                 direct_link_incoming: BTreeMap::new(),
+                trusted_entries: BTreeMap::new(),
                 stats: ResolverStats::default(),
                 reported_stats: ResolverStats::default(),
                 sensitive: BTreeMap::new(),
@@ -3927,6 +3934,7 @@ impl ProcessState {
         // two BTreeMap mutations for every newly translated block while
         // recording zero duplicate publications in production profiles.
         let emitted_len = emitted.len();
+        let trusted_entry = emitted.trusted_entry();
         let (map, links, recovery) = emitted.into_runtime_metadata();
         self.push_published(PublishedBlock {
             entry,
@@ -3939,6 +3947,9 @@ impl ProcessState {
             _generation: observation,
         });
         self.blocks.insert(key, entry);
+        if let Some(offset) = trusted_entry {
+            self.trusted_entries.insert(key, offset);
+        }
         self.dependencies.record(source_page, key.0, key.1);
         for link in links {
             let target_observation = memory.dsr_generation_observation(link.target)?;
@@ -3968,6 +3979,7 @@ impl ProcessState {
                 .map(|authority| authority.generation_bindings);
             match (self.blocks.get(&target_key).copied(), shared_bindings) {
                 (Some(target), None) => {
+                    let target = self.trusted_target(target_key, target);
                     self.patch_direct_link_if_reachable(site, target, link.target)?
                 }
                 (Some(target), Some(bindings)) => {
@@ -3985,6 +3997,7 @@ impl ProcessState {
             }
         }
         if let Some(sites) = self.pending.remove(&key) {
+            let entry = self.trusted_target(key, entry);
             for site in sites {
                 self.patch_direct_link_if_reachable(site, entry, key.0)?;
             }
@@ -4560,6 +4573,22 @@ impl ProcessState {
     /// there and exits. That is the same net `DirectBindingTable::invalidate_target`
     /// relies on when it pins descriptors so "a reader that acquired `expected`
     /// can safely reach the target's generation guard".
+    /// The address a patched direct link should target: the block's trusted
+    /// entry (past the guard) when it has one, its guarded entry otherwise
+    /// (shared-unit blocks and recorded blocks never expose one).
+    fn trusted_target(
+        &self,
+        key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
+        entry: types::CacheVa,
+    ) -> types::CacheVa {
+        match self.trusted_entries.get(&key) {
+            Some(offset) => types::CacheVa::published(carrick_guest_mem::HostVa(
+                entry.host().raw() + offset.get() as usize,
+            )),
+            None => entry,
+        }
+    }
+
     fn patch_direct_link_if_reachable(
         &mut self,
         site: cache::LinkSite,
