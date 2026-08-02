@@ -110,6 +110,12 @@ pub struct EmittedBlock {
     map: InstructionMap,
     direct_links: Vec<DirectLink>,
     recovery: Vec<RecoveryEntry>,
+    /// Offset of the trusted second entry point: past the generation guard,
+    /// at the words that publish this block's generation and reload guest
+    /// x17. Present only on private (`Absolute`-guarded, unrecorded) blocks;
+    /// patched direct links may target it because eager link severing
+    /// (Phase 2a) now invalidates links when their target's page bumps.
+    trusted_entry: Option<CacheOffset>,
 }
 
 struct AssembledBlock {
@@ -122,6 +128,7 @@ struct AssembledBlock {
     map: InstructionMap,
     direct_links: Vec<DirectLink>,
     recovery: Vec<RecoveryEntry>,
+    trusted_entry: Option<CacheOffset>,
 }
 
 fn direct_instruction_bytes_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
@@ -165,6 +172,7 @@ impl AssembledBlock {
             map: self.map,
             direct_links: self.direct_links,
             recovery: self.recovery,
+            trusted_entry: self.trusted_entry,
         })
     }
 }
@@ -466,7 +474,16 @@ impl EmittedBlock {
             map: InstructionMap::new(entries)?,
             direct_links,
             recovery,
+            // Artifact-loaded blocks are shared-unit material; they keep
+            // their guards and never expose a trusted entry.
+            trusted_entry: None,
         })
+    }
+
+    /// Trusted second entry point past the generation guard, when this block
+    /// has one (private Absolute-guarded blocks only).
+    pub const fn trusted_entry(&self) -> Option<CacheOffset> {
+        self.trusted_entry
     }
 
     pub const fn entry(&self) -> CacheVa {
@@ -5790,6 +5807,7 @@ fn assemble_block_inner(
     // That store was 15.1% of all sampled JIT instructions -- one per block
     // entry, against one per GATEWAY entry now, and a direct-linked chain runs
     // many blocks per gateway entry.
+    let mut trusted_entry: Option<CacheOffset> = None;
     let lean_guard = lean_generation_guard_enabled();
     let stale = guard.map(|_| assembler.new_dynamic_label());
     if !lean_guard {
@@ -6042,6 +6060,40 @@ fn assemble_block_inner(
             ; .arch aarch64
             ; cbnz x19, =>stale
         );
+        // Trusted second entry point (private Absolute-guarded blocks only):
+        // patched direct links land here, past the guard, because Phase 2a's
+        // eager severing invalidates the links themselves when the target's
+        // page bumps. The entrant's x17 holds guest x17 (dead: slots 136 and
+        // 1128 are authoritative at every exit), so re-materialize this
+        // block's generation into it -- the guarded fall-through rewrites the
+        // identical value -- and share the publish and x17 reload below.
+        if recording.is_none()
+            && let GenerationGuard::Absolute { expected, .. } = guard
+        {
+            trusted_entry = Some(current_offset(&assembler)?);
+            let mut value = expected.get();
+            emit_word(
+                &mut assembler,
+                &mut entries,
+                plan.start,
+                0xd280_0011 | (((value & 0xffff) as u32) << 5),
+            )?;
+            let mut hw = 1_u32;
+            value >>= 16;
+            while value != 0 {
+                let half = (value & 0xffff) as u32;
+                if half != 0 {
+                    emit_word(
+                        &mut assembler,
+                        &mut entries,
+                        plan.start,
+                        0xf280_0011 | (hw << 21) | (half << 5),
+                    )?;
+                }
+                value >>= 16;
+                hw += 1;
+            }
+        }
         // A direct-linked chain can enter the gateway from a different block
         // than the one that began this translated run. Publish this block's
         // generation so sensitive-exit metadata is resolved against the block
@@ -6871,6 +6923,7 @@ fn assemble_block_inner(
         .collect();
     let map = InstructionMap::new(entries)?;
     Ok(AssembledBlock {
+        trusted_entry,
         instruction_bytes: bytes,
         #[cfg(test)]
         words,
@@ -7615,6 +7668,53 @@ mod tests {
             Some(1120),
             "non-idempotent words keep the spill template: {:#010x?}",
             &assembled.words[..3.min(assembled.words.len())]
+        );
+    }
+
+    /// A private Absolute-guarded block exposes a trusted entry: past the
+    /// guard, at a minimal-width materialization of the block's generation
+    /// followed by the shared publish and guest-x17 reload. Binding-guarded
+    /// (shared-unit) blocks expose none.
+    #[test]
+    fn trusted_entry_publishes_generation_past_the_guard() {
+        let generation = std::sync::atomic::AtomicU64::new(7);
+        let assembled = assemble_block_inner(
+            &copy_plan(),
+            Some(GenerationGuard::new(
+                &generation,
+                CodeGeneration::claimed(7),
+            )),
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble trusted-entry block");
+        let offset = assembled
+            .trusted_entry
+            .expect("private absolute-guarded block has a trusted entry");
+        let index = offset.get() as usize / 4;
+        assert_eq!(
+            &assembled.words[index..index + 3],
+            &[
+                0xD280_00F1, // movz x17, #7
+                0xF902_3F91, // str x17, [x28, #1144]
+                0xF940_4791, // ldr x17, [x28, #136]
+            ],
+            "trusted entry words: {:#010x?}",
+            &assembled.words[index..(index + 4).min(assembled.words.len())]
+        );
+
+        let bound = assemble_block_inner(
+            &copy_plan(),
+            Some(GenerationGuard::binding(3, CodeGeneration::claimed(7))),
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble binding-guarded block");
+        assert_eq!(
+            bound.trusted_entry, None,
+            "shared-unit guards keep their blocks trusted-entry-free"
         );
     }
 
