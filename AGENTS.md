@@ -349,16 +349,33 @@ concern — it is half the product.
   by whether it can plausibly be a multiple, and be honest that a 3-15%
   improvement does not move a 14.5x ratio. Evidence:
   [`docs/perf-results/2026-08-01-native-wall-audit-and-fault-cost.md`](docs/perf-results/2026-08-01-native-wall-audit-and-fault-cost.md).
-- **The overhead workstream is one thing: "utilize Darwin in the most efficient
-  way to emulate Linux."** Carrick's own host userspace (36.9% of CPU) and the
-  kernel work it induces — page faults (25.7%) plus syscall bodies (9.9%) — are
-  not separate problems. They are the cost of LOWERING one Linux operation onto
-  Darwin primitives, measured on the two sides of the syscall boundary, and
-  together they are **72.5% of the budget**. Rank by the **amplification factor
+- **The build-lane CPU split, with the correction that supersedes it.** An
+  earlier reading of the budget put carrick's own host userspace at 36.9% of CPU
+  and inserted codegen at 18.6%, and that ranking was quoted here for months. It
+  is WRONG and was corrected in place by
+  `CORRECTION-user-module-split-codegen-IS-the-biggest-bucket` (`e63975d3`,
+  `docs/perf-results/native-dsr-shape-census.jsonl`): 58% of user PCs matched no
+  per-process JIT snapshot and were read as host code, when they were mostly
+  JIT. Measuring instead with `umod(uregs[R_PC])` — any PC in no Mach-O image IS
+  the `MAP_JIT` cache, so no snapshot join and no unwind is needed — gives
+  **JIT 52.9% of total CPU, inserted codegen ~36.4%, carrick's own host text
+  11.5% (+6.1% dylibs), kernel 29.5%, guest-shaped JIT words 16.5%.**
+  So **emitted code is the largest bucket on the build**, and "carrick's own
+  userspace has never been attacked" is worth about a third of what that reading
+  implied. (The 36.4% predates the 2026-08-01 codegen phases and is now an
+  overestimate — re-measure before ranking off it.)
+- **The overhead workstream is still one thing: "utilize Darwin in the most
+  efficient way to emulate Linux."** Carrick's host-side work and the kernel work
+  it induces are not separate problems — they are the cost of LOWERING one Linux
+  operation onto Darwin primitives, measured on the two sides of the syscall
+  boundary. Rank by the **amplification factor
   of a single guest operation**, which is concrete and directly attackable
   where a CPU percentage is not:
-  - guest `open` → **19.68 host opens** at HEAD (cap-std path re-walks), even
-    after `564dd281` cut it 41%;
+  - guest `open` → was **19.68 host opens** (cap-std path re-walks); the
+    2026-08-02 trusted-dirfd lanes cut the fs-walk workload to roughly one host
+    call per guest stat and took that workload's total wall from ~20x to 3.8x
+    (`docs/perf-results/container-lifecycle-split.jsonl`). Re-measure before
+    quoting a figure here;
   - guest `mmap(MAP_PRIVATE, fd)` → a `pread` of the FULL mapping length into
     fresh anon (`dispatch/mem.rs:2517`), instead of a host file-backed mmap;
   - guest `execve` → 4 full ELF materializations + 3 SHA-256 passes + a host
