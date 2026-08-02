@@ -324,6 +324,9 @@ pub enum NativeDsrExit {
         indirect_x15_scratch: u64,
         indirect_x30_scratch: u64,
         physical_x18: u64,
+        /// Interrupted physical x19 (`gateway::RESERVED_SCRATCH`), preserved
+        /// by the signal handler for the reserved-resident commit recovery.
+        physical_reserved: u64,
         gateway_phase: u32,
         biased_guest_fault_address: u64,
     },
@@ -334,6 +337,7 @@ pub enum NativeDsrExit {
         generation_pstate_scratch: u64,
         indirect_x15_scratch: u64,
         indirect_x30_scratch: u64,
+        physical_reserved: u64,
     },
     KickAtEntry {
         resume: GuestVa,

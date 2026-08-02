@@ -67,7 +67,9 @@ struct carrick_native_dsr_signal_context {
     uint64_t cache_end;
     uint64_t host_bias;
     uint64_t biased_guest_fault_address;
-    uint64_t biased_fault_pad;
+    /* Interrupted physical x19 (the DSR reserved scratch), stashed at
+       fault/kick capture for the reserved-resident commit recovery. */
+    uint64_t physical_reserved;
     /* Gateway exit entry points; see the Rust mirror. Appended, so every
        offset above is unchanged. */
     uint64_t exit_syscall_addr;
@@ -130,6 +132,8 @@ _Static_assert(offsetof(struct carrick_native_dsr_signal_context, host_bias) == 
                "DSR host bias offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, biased_guest_fault_address) == 1200,
                "DSR biased guest fault address offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, physical_reserved) == 1208,
+               "DSR signal physical reserved-scratch offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_syscall_addr) == 1216,
                "DSR gateway syscall exit address offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, generation_bindings) == 1264,
@@ -637,6 +641,8 @@ static void carrick_native_dsr_signal_handler(int sig, siginfo_t *info, void *ua
             // preserves its guest value.  Retain the interrupted physical x18
             // separately for diagnosing faults at the inline-cache branch.
             context->exit_link = uc->uc_mcontext->__ss.__x[18];
+            context->physical_reserved =
+                uc->uc_mcontext->__ss.__x[CARRICK_NATIVE_DSR_RESERVED_SCRATCH];
             context->exit_has_link = context->entry_in_progress;
             context->exit_target = uc->uc_mcontext->__ss.__pc;
             context->exit_source = uc->uc_mcontext->__ss.__pc;

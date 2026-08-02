@@ -188,7 +188,7 @@ mod tests {
 
         let mut snapshot = super::super::NativeUcontextSnapshot::default();
         snapshot.x[9] = 3;
-        super::recover_rewrite_state(&mut snapshot, completed, 0xaa, 0xbb, 0, 0, 0)
+        super::recover_rewrite_state(&mut snapshot, completed, 0xaa, 0xbb, 0, 0, 0, 0)
             .expect("recover wrapped writeback");
         assert_eq!(snapshot.x[0], 3_u64.wrapping_sub(0x80_0000_0000));
         assert_eq!(snapshot.x[9], 0xaa);
@@ -215,7 +215,7 @@ mod tests {
         let mut snapshot = super::super::NativeUcontextSnapshot::default();
         snapshot.x[17] = 0xaaaa;
         snapshot.x[16] = 0xbbbb;
-        super::recover_rewrite_state(&mut snapshot, action, 0x1717, 0x1616, 0, 0, 0)
+        super::recover_rewrite_state(&mut snapshot, action, 0x1717, 0x1616, 0, 0, 0, 0)
             .expect("recover biased exclusive scratch state");
         assert_eq!(snapshot.x[17], 0x1717);
         assert_eq!(snapshot.x[16], 0x1616);
@@ -254,7 +254,7 @@ mod tests {
                 biased_recovery_fixture(base, super::emit::BiasedBaseCoordinate::Host, true);
             let mut snapshot = super::super::NativeUcontextSnapshot::default();
             snapshot.x[9] = bias + guest;
-            super::recover_rewrite_state(&mut snapshot, action, 0xaa, 0xbb, 0, 0, 0)
+            super::recover_rewrite_state(&mut snapshot, action, 0xaa, 0xbb, 0, 0, 0, 0)
                 .expect("recover biased base");
             match base {
                 super::emit::BiasedBase::Register(16) => assert_eq!(snapshot.x[16], guest),

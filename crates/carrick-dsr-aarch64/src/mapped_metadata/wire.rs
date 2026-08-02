@@ -343,6 +343,9 @@ impl WireRecoveryActionV3 {
                     second_register,
                 ]),
             ),
+            PortableRecoveryAction::CommitReservedResident { virtual_register } => {
+                (21, words(&[virtual_register]))
+            }
             PortableRecoveryAction::RecoverCounterRead(recovery) => {
                 let destination = match recovery.committed_scratch_destination {
                     None => 0,
@@ -559,6 +562,9 @@ impl WireRecoveryActionV3 {
                     1 => Some(p[3]),
                     _ => return Err(MappedMetadataError::RecoveryAction),
                 },
+            },
+            21 if unused(&p, 1) => PortableRecoveryAction::CommitReservedResident {
+                virtual_register: gpr_word(p[0])?,
             },
             _ => return Err(MappedMetadataError::RecoveryAction),
         };

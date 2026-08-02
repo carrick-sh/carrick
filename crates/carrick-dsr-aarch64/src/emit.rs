@@ -291,6 +291,14 @@ pub enum RecoveryAction {
         first_register: u32,
         second_register: u32,
     },
+    /// The reserved-resident virtualization template's commit store: the
+    /// rewritten word has executed and its result for the virtualized
+    /// register is in physical x19 (`gateway::RESERVED_SCRATCH`), which the
+    /// signal handler preserves as `physical_reserved`. Recovery finishes the
+    /// commit into the snapshot; the instruction is complete.
+    CommitReservedResident {
+        virtual_register: u32,
+    },
     RecoverCounterRead(CounterReadRecovery),
     RecoverBiasedMemory(BiasedMemoryRecovery),
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
@@ -367,7 +375,8 @@ impl RecoveryAction {
             | Self::CommitVirtualizedAndRestoreScratch { .. }
             | Self::CommitVirtualizedAndRestoreScratchAndContext { .. }
             | Self::CommitDualVirtualAndRestore { .. }
-            | Self::CommitDualVirtualPairAndRestore { .. } => true,
+            | Self::CommitDualVirtualPairAndRestore { .. }
+            | Self::CommitReservedResident { .. } => true,
             Self::RecoverCounterRead(recovery) => recovery.instruction_complete,
             Self::RecoverBiasedMemory(recovery) => recovery.instruction_complete,
             _ => false,
@@ -2256,51 +2265,66 @@ fn emit_direct_exit(
     }
 }
 
+/// Rewrite every register-field mention of `virtual_register` in `word` onto
+/// `scratch`, verified by a decode round-trip: the candidate must keep the
+/// op, drop every `virtual_register` mention, and disassemble identically
+/// after renaming the scratch back. Returns the rewritten word only.
+fn rewritten_word_onto(
+    word: u32,
+    guest: GuestVa,
+    virtual_register: u32,
+    scratch: u32,
+) -> Option<u32> {
+    let original = bad64::decode(word, guest.raw()).ok()?;
+    if super::decode::decoded_operands_mention_gpr(word, guest, scratch) {
+        return None;
+    }
+    let fields = [0_u32, 5, 10, 16];
+    let replaceable = fields
+        .into_iter()
+        .filter(|shift| ((word >> shift) & 0x1f) == virtual_register)
+        .collect::<Vec<_>>();
+    for mask in 1_u32..(1_u32 << replaceable.len()) {
+        let mut candidate_word = word;
+        for (index, shift) in replaceable.iter().copied().enumerate() {
+            if mask & (1 << index) != 0 {
+                candidate_word = (candidate_word & !(0x1f << shift)) | (scratch << shift);
+            }
+        }
+        let Ok(candidate) = bad64::decode(candidate_word, guest.raw()) else {
+            continue;
+        };
+        if candidate.op() != original.op() {
+            continue;
+        }
+        if super::decode::decoded_operands_mention_gpr(candidate_word, guest, virtual_register) {
+            continue;
+        }
+        let virtual_x = format!("x{virtual_register}");
+        let virtual_w = format!("w{virtual_register}");
+        let normalized = candidate
+            .to_string()
+            .replace(&format!("x{scratch}"), &virtual_x)
+            .replace(&format!("w{scratch}"), &virtual_w);
+        if normalized == original.to_string() {
+            return Some(candidate_word);
+        }
+    }
+    None
+}
+
 fn rewritten_virtual_word(
     word: u32,
     guest: GuestVa,
     virtual_register: u32,
 ) -> Option<(u32, u32, u32)> {
-    let original = bad64::decode(word, guest.raw()).ok()?;
-    let fields = [0_u32, 5, 10, 16];
     for scratch in (9_u32..=17).rev() {
-        if super::decode::decoded_operands_mention_gpr(word, guest, scratch) {
-            continue;
-        }
-        let replaceable = fields
-            .into_iter()
-            .filter(|shift| ((word >> shift) & 0x1f) == virtual_register)
-            .collect::<Vec<_>>();
-        for mask in 1_u32..(1_u32 << replaceable.len()) {
-            let mut candidate_word = word;
-            for (index, shift) in replaceable.iter().copied().enumerate() {
-                if mask & (1 << index) != 0 {
-                    candidate_word = (candidate_word & !(0x1f << shift)) | (scratch << shift);
-                }
-            }
-            let Ok(candidate) = bad64::decode(candidate_word, guest.raw()) else {
-                continue;
-            };
-            if candidate.op() != original.op() {
-                continue;
-            }
-            if super::decode::decoded_operands_mention_gpr(candidate_word, guest, virtual_register)
-            {
-                continue;
-            }
-            let virtual_x = format!("x{virtual_register}");
-            let virtual_w = format!("w{virtual_register}");
-            let normalized = candidate
-                .to_string()
-                .replace(&format!("x{scratch}"), &virtual_x)
-                .replace(&format!("w{scratch}"), &virtual_w);
-            if normalized == original.to_string() {
-                let context_scratch = (9_u32..=17).rev().find(|candidate| {
-                    *candidate != scratch
-                        && !super::decode::decoded_operands_mention_gpr(word, guest, *candidate)
-                })?;
-                return Some((scratch, context_scratch, candidate_word));
-            }
+        if let Some(candidate_word) = rewritten_word_onto(word, guest, virtual_register, scratch) {
+            let context_scratch = (9_u32..=17).rev().find(|candidate| {
+                *candidate != scratch
+                    && !super::decode::decoded_operands_mention_gpr(word, guest, *candidate)
+            })?;
+            return Some((scratch, context_scratch, candidate_word));
         }
     }
     None
@@ -2524,6 +2548,236 @@ fn emit_dual_virtual(
     Ok(())
 }
 
+/// The reserved-resident lowering for one instruction naming one virtualized
+/// register: materialize the guest value into physical x19 (carrick-owned for
+/// the whole of translated execution, clobbered by every block entry's guard),
+/// run the rewritten word, and commit the slot only when the word writes the
+/// register.
+///
+/// ```text
+/// [ldr x19, [x28, #slot]]   ; only when the word READS the register
+/// <word, mentions -> x19>   ; the original word when the register IS x19
+/// [str x19, [x28, #slot]]   ; only when the word WRITES the register
+/// ```
+///
+/// Interruption contract: the template records no recovery entries except the
+/// commit store. Every word maps to the instruction's guest PC, so a fault or
+/// kick before the commit resumes at the instruction start and re-executes it
+/// against the still-authoritative slot — which is why eligibility demands
+/// idempotency (no written register other than the virtualized one may also
+/// be read; the virtualized register itself round-trips through the slot).
+/// At the commit store the word has executed, so the entry is
+/// `CommitReservedResident`: complete, with the result taken from the
+/// interrupted physical x19 the signal handler preserves.
+struct ReservedResidentPlan {
+    rewritten: u32,
+    needs_load: bool,
+    needs_store: bool,
+}
+
+/// GPR index for read/write tracking: `x0..x30`/`w0..w30` map to 0..30, the
+/// stack pointer to 31 (it can be written back and must join the idempotency
+/// check), and the zero registers to `None` (reads yield zero, writes vanish).
+fn resident_gpr_index(register: bad64::Reg) -> Option<u32> {
+    let raw = register as u32;
+    let x0 = bad64::Reg::X0 as u32;
+    let w0 = bad64::Reg::W0 as u32;
+    if (x0..=x0 + 30).contains(&raw) {
+        return Some(raw - x0);
+    }
+    if (w0..=w0 + 30).contains(&raw) {
+        return Some(raw - w0);
+    }
+    if register == bad64::Reg::SP || register == bad64::Reg::WSP {
+        return Some(31);
+    }
+    None
+}
+
+fn reserved_resident_plan(
+    word: u32,
+    guest: GuestVa,
+    virtual_register: u32,
+) -> Option<ReservedResidentPlan> {
+    use bad64::Op;
+    let decoded = bad64::decode(word, guest.raw()).ok()?;
+    let op = decoded.op();
+    let is_store = matches!(
+        op,
+        Op::STR | Op::STUR | Op::STRB | Op::STURB | Op::STRH | Op::STURH | Op::STP
+    );
+    let is_load = matches!(
+        op,
+        Op::LDR
+            | Op::LDUR
+            | Op::LDRB
+            | Op::LDURB
+            | Op::LDRH
+            | Op::LDURH
+            | Op::LDRSB
+            | Op::LDURSB
+            | Op::LDRSH
+            | Op::LDURSH
+            | Op::LDRSW
+            | Op::LDURSW
+            | Op::LDP
+    );
+    let is_prefetch = matches!(op, Op::PRFM | Op::PRFUM);
+    let flag_only = matches!(op, Op::CMP | Op::CMN | Op::TST | Op::CCMP | Op::CCMN);
+    let is_alu = flag_only
+        || matches!(
+            op,
+            Op::MOV
+                | Op::MVN
+                | Op::NEG
+                | Op::ADD
+                | Op::ADDS
+                | Op::SUB
+                | Op::SUBS
+                | Op::AND
+                | Op::ANDS
+                | Op::ORR
+                | Op::ORN
+                | Op::EOR
+                | Op::EON
+                | Op::BIC
+                | Op::BICS
+                | Op::LSL
+                | Op::LSR
+                | Op::ASR
+                | Op::ROR
+                | Op::MUL
+                | Op::MNEG
+                | Op::MADD
+                | Op::MSUB
+                | Op::SMULH
+                | Op::UMULH
+                | Op::SXTB
+                | Op::SXTH
+                | Op::SXTW
+                | Op::UXTB
+                | Op::UXTH
+                | Op::UBFX
+                | Op::UBFIZ
+                | Op::SBFX
+                | Op::SBFIZ
+                | Op::CSEL
+                | Op::CSINC
+                | Op::CSINV
+                | Op::CSNEG
+                | Op::CINC
+                | Op::CINV
+                | Op::CNEG
+                | Op::CSET
+                | Op::CSETM
+        );
+    if !(is_store || is_load || is_prefetch || is_alu) {
+        return None;
+    }
+    let mut reads = [false; 32];
+    let mut writes = [false; 32];
+    if is_alu {
+        let operands = decoded.operands();
+        let mut sources = operands;
+        if !flag_only {
+            let (destination, rest) = operands.split_first()?;
+            let bad64::Operand::Reg { reg, .. } = destination else {
+                return None;
+            };
+            if let Some(index) = resident_gpr_index(*reg) {
+                writes[index as usize] = true;
+            }
+            sources = rest;
+        }
+        for operand in sources {
+            match operand {
+                bad64::Operand::Reg { reg, .. }
+                | bad64::Operand::ShiftReg { reg, .. }
+                | bad64::Operand::QualReg { reg, .. } => {
+                    if let Some(index) = resident_gpr_index(*reg) {
+                        reads[index as usize] = true;
+                    }
+                }
+                bad64::Operand::Imm32 { .. }
+                | bad64::Operand::Imm64 { .. }
+                | bad64::Operand::Cond(_) => {}
+                _ => return None,
+            }
+        }
+    } else {
+        for operand in decoded.operands() {
+            match operand {
+                bad64::Operand::Reg { reg, .. } | bad64::Operand::QualReg { reg, .. } => {
+                    // A transfer register. Prefetch hints carry none; SIMD
+                    // transfers fall through `resident_gpr_index` as `None`.
+                    if let Some(index) = resident_gpr_index(*reg) {
+                        if is_load {
+                            writes[index as usize] = true;
+                        } else {
+                            reads[index as usize] = true;
+                        }
+                    }
+                }
+                bad64::Operand::MemReg(reg) | bad64::Operand::MemOffset { reg, .. } => {
+                    if let Some(index) = resident_gpr_index(*reg) {
+                        reads[index as usize] = true;
+                    }
+                }
+                bad64::Operand::MemPreIdx { reg, .. }
+                | bad64::Operand::MemPostIdxImm { reg, .. } => {
+                    if let Some(index) = resident_gpr_index(*reg) {
+                        reads[index as usize] = true;
+                        writes[index as usize] = true;
+                    }
+                }
+                bad64::Operand::MemExt { regs, .. } => {
+                    for register in regs {
+                        if let Some(index) = resident_gpr_index(*register) {
+                            reads[index as usize] = true;
+                        }
+                    }
+                }
+                bad64::Operand::ImplSpec { .. } | bad64::Operand::Name(_) => {}
+                _ => return None,
+            }
+        }
+    }
+    let virtual_index = usize::try_from(virtual_register).ok()?;
+    if !reads[virtual_index] && !writes[virtual_index] {
+        return None;
+    }
+    // Defense in depth: a word naming a second host-owned register belongs to
+    // the dual emitter, and one naming SP-as-31 collides with nothing here.
+    for owned in [18_u32, 28, crate::gateway::RESERVED_SCRATCH] {
+        if owned != virtual_register && (reads[owned as usize] || writes[owned as usize]) {
+            return None;
+        }
+    }
+    // Idempotency: resuming at the instruction start re-executes the word, so
+    // no written register other than the slot-backed virtualized one may feed
+    // back into the word's inputs.
+    for register in 0..32 {
+        if writes[register] && register != virtual_index && reads[register] {
+            return None;
+        }
+    }
+    let rewritten = if virtual_register == crate::gateway::RESERVED_SCRATCH {
+        word
+    } else {
+        rewritten_word_onto(
+            word,
+            guest,
+            virtual_register,
+            crate::gateway::RESERVED_SCRATCH,
+        )?
+    };
+    Some(ReservedResidentPlan {
+        rewritten,
+        needs_load: reads[virtual_index],
+        needs_store: writes[virtual_index],
+    })
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "virtual-register emission carries its explicit recovery contract"
@@ -2538,6 +2792,31 @@ fn emit_virtualized_register(
     snapshot_offset: u32,
     recovery: &mut Vec<RecoveryEntry>,
 ) -> Result<(), DsrError> {
+    if let Some(resident) = reserved_resident_plan(word, guest, virtual_register) {
+        let reserved = crate::gateway::RESERVED_SCRATCH;
+        if resident.needs_load {
+            emit_word(
+                assembler,
+                entries,
+                guest,
+                0xf940_0000 | ((snapshot_offset / 8) << 10) | (28 << 5) | reserved,
+            )?;
+        }
+        emit_word(assembler, entries, guest, resident.rewritten)?;
+        if resident.needs_store {
+            recovery.push(RecoveryEntry {
+                cache: current_offset(assembler)?,
+                action: RecoveryAction::CommitReservedResident { virtual_register },
+            });
+            emit_word(
+                assembler,
+                entries,
+                guest,
+                0xf900_0000 | ((snapshot_offset / 8) << 10) | (28 << 5) | reserved,
+            )?;
+        }
+        return Ok(());
+    }
     let (scratch, context_scratch, rewritten) =
         rewritten_virtual_word(word, guest, virtual_register).ok_or_else(|| {
             unsupported_action(
@@ -6623,6 +6902,10 @@ pub fn recovery_resume_pc(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recovery consumes every per-channel saved register the signal handler preserves"
+)]
 pub fn recover_rewrite_state(
     snapshot: &mut crate::snapshot::NativeUcontextSnapshot,
     action: RecoveryAction,
@@ -6631,6 +6914,7 @@ pub fn recover_rewrite_state(
     saved_generation_pstate: u64,
     saved_indirect_x15: u64,
     saved_indirect_x30: u64,
+    physical_reserved: u64,
 ) -> Result<(), crate::types::DsrError> {
     if let RecoveryAction::RestoreDirectBinding {
         capture_progress,
@@ -6831,6 +7115,20 @@ pub fn recover_rewrite_state(
     }
     let (register, context_register) = match action {
         RecoveryAction::Noop => return Ok(()),
+        RecoveryAction::CommitReservedResident { virtual_register } => {
+            let index = usize::try_from(virtual_register).map_err(|_| {
+                crate::types::DsrError::CachePolicy(
+                    "reserved-resident commit register overflow".to_string(),
+                )
+            })?;
+            let slot = snapshot.x.get_mut(index).ok_or_else(|| {
+                crate::types::DsrError::CachePolicy(format!(
+                    "reserved-resident commit x{virtual_register} is outside snapshot"
+                ))
+            })?;
+            *slot = physical_reserved;
+            return Ok(());
+        }
         RecoveryAction::RestoreGuestX17 => {
             snapshot.x[17] = saved_context_scratch;
             return Ok(());
@@ -7149,6 +7447,224 @@ mod tests {
     /// The context byte slot a 64-bit `ldr Xt, [x28, #imm]` reads.
     fn context_load_slot(word: u32) -> Option<u32> {
         ((word & 0xFFC0_03E0) == 0xF940_0380).then(|| ((word >> 10) & 0xFFF) * 8)
+    }
+
+    /// One virtualized guest instruction followed by a syscall exit, with no
+    /// generation guard, so the template's words sit at the front of the
+    /// assembled block.
+    fn single_virtual_block(word: u32) -> (AssembledBlock, BlockPlan) {
+        let action = super::super::decode::classify(word, GuestVa(0x4000))
+            .expect("classify single-virtual fixture word");
+        let plan = BlockPlan {
+            start: GuestVa(0x4000),
+            end: GuestVa(0x4008),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest: GuestVa(0x4000),
+                action,
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(0x4004),
+                resume: GuestVa(0x4008),
+            },
+            extensions: Vec::new(),
+        };
+        let assembled = assemble_block_inner(
+            &plan,
+            None,
+            EmitAddressMode::Direct,
+            DirectExitEmissionPolicy::PrivateGateway,
+            None,
+        )
+        .expect("assemble single-virtual fixture block");
+        (assembled, plan)
+    }
+
+    /// `ldrh w0, [x19, w23, uxtw #1]` — a read-only use of the reserved
+    /// register as a base. The resident template is two words: materialize
+    /// guest x19 into the (carrick-owned) physical x19 from its context slot,
+    /// then run the original word unchanged. No spills, no store-back, and no
+    /// recovery entries: every template word maps to the instruction's guest
+    /// PC and resuming there re-executes it from the authoritative slot.
+    #[test]
+    fn reserved_resident_read_only_base_is_two_words_with_no_recovery() {
+        let word = 0x7877_5A60;
+        assert_eq!(
+            bad64::decode(word, 0x4000)
+                .expect("fixture decodes")
+                .to_string(),
+            "ldrh w0, [x19, w23, uxtw #0x1]"
+        );
+        let (assembled, _plan) = super::tests::single_virtual_block(word);
+        assert_eq!(
+            assembled.words[0], 0xF940_4791,
+            "unguarded entry restores guest x17"
+        );
+        let expected = [
+            0xF940_4F93, // ldr x19, [x28, #152]
+            word,
+        ];
+        assert_eq!(
+            &assembled.words[1..3],
+            &expected,
+            "resident read-only template words: {:#010x?}",
+            &assembled.words[..4.min(assembled.words.len())]
+        );
+        assert_eq!(
+            assembled.recovery.len(),
+            1,
+            "the only recovery entry is the block entry's x17 restore: {:?}",
+            assembled.recovery
+        );
+        assert_eq!(
+            assembled.recovery[0].action,
+            RecoveryAction::RestoreGuestX17
+        );
+    }
+
+    /// `mov x28, x26` — a write-only definition of virtualized guest x28.
+    /// The resident template renames the destination onto physical x19 and
+    /// commits the slot; the only recovery entry is the commit store, which
+    /// is complete-with-commit (`snapshot.x[28]` takes the interrupted
+    /// physical x19).
+    #[test]
+    fn reserved_resident_write_only_definition_commits_without_loading() {
+        let word = 0xAA1A_03FC;
+        assert_eq!(
+            bad64::decode(word, 0x4000)
+                .expect("fixture decodes")
+                .to_string(),
+            "mov x28, x26"
+        );
+        let (assembled, _plan) = super::tests::single_virtual_block(word);
+        let expected = [
+            0xAA1A_03F3, // mov x19, x26
+            0xF900_7393, // str x19, [x28, #224]
+        ];
+        assert_eq!(
+            &assembled.words[1..3],
+            &expected,
+            "resident write-only template words: {:#010x?}",
+            &assembled.words[..4.min(assembled.words.len())]
+        );
+        assert_eq!(
+            assembled.recovery.len(),
+            2,
+            "the entry x17 restore plus exactly the commit entry: {:?}",
+            assembled.recovery
+        );
+        assert_eq!(
+            assembled.recovery[1].action,
+            RecoveryAction::CommitReservedResident {
+                virtual_register: 28
+            }
+        );
+        assert_eq!(assembled.recovery[1].cache.get(), 8);
+        assert!(assembled.recovery[1].action.instruction_complete());
+    }
+
+    /// `ldr w23, [x28], #8` — mawk's bytecode fetch: virtualized guest x28 as
+    /// a post-index writeback base. Load the slot, run the rewritten word,
+    /// commit the updated base. Three words against the historical eight.
+    #[test]
+    fn reserved_resident_writeback_base_is_three_words_with_commit() {
+        let word = 0xB840_8797;
+        assert_eq!(
+            bad64::decode(word, 0x4000)
+                .expect("fixture decodes")
+                .to_string(),
+            "ldr w23, [x28], #0x8"
+        );
+        let (assembled, _plan) = super::tests::single_virtual_block(word);
+        let expected = [
+            0xF940_7393, // ldr x19, [x28, #224]
+            0xB840_8677, // ldr w23, [x19], #8
+            0xF900_7393, // str x19, [x28, #224]
+        ];
+        assert_eq!(
+            &assembled.words[1..4],
+            &expected,
+            "resident writeback template words: {:#010x?}",
+            &assembled.words[..5.min(assembled.words.len())]
+        );
+        assert_eq!(assembled.recovery.len(), 2);
+        assert_eq!(
+            assembled.recovery[1].action,
+            RecoveryAction::CommitReservedResident {
+                virtual_register: 28
+            }
+        );
+        assert_eq!(assembled.recovery[1].cache.get(), 12);
+    }
+
+    /// `ldr x0, [x0, x19]` — the loaded destination feeds the address, so
+    /// re-executing after the access is wrong. The resident template must
+    /// refuse it and leave the historical spill template in place.
+    #[test]
+    fn reserved_resident_rejects_destination_feeding_the_address() {
+        let word = 0xF873_6800;
+        assert_eq!(
+            bad64::decode(word, 0x4000)
+                .expect("fixture decodes")
+                .to_string(),
+            "ldr x0, [x0, x19]"
+        );
+        let (assembled, _plan) = super::tests::single_virtual_block(word);
+        assert_eq!(
+            context_store_slot(assembled.words[1]),
+            Some(1120),
+            "non-idempotent words keep the spill template: {:#010x?}",
+            &assembled.words[..3.min(assembled.words.len())]
+        );
+    }
+
+    /// A kick landing on the resident template's commit store arrives after
+    /// the rewritten word executed, so recovery finishes the commit from the
+    /// interrupted physical x19 and resumes past the instruction.
+    #[test]
+    fn commit_reserved_resident_takes_the_interrupted_physical_x19() {
+        let mut snapshot = crate::snapshot::NativeUcontextSnapshot::default();
+        snapshot.x[28] = 0x1111;
+        recover_rewrite_state(
+            &mut snapshot,
+            RecoveryAction::CommitReservedResident {
+                virtual_register: 28,
+            },
+            0xdead,
+            0xdead,
+            0xdead,
+            0xdead,
+            0xdead,
+            0x4_2000,
+        )
+        .expect("commit reserved resident");
+        assert_eq!(snapshot.x[28], 0x4_2000);
+        assert!(
+            RecoveryAction::CommitReservedResident {
+                virtual_register: 28
+            }
+            .instruction_complete()
+        );
+    }
+
+    /// `movk x28, #1` reads and writes its destination through the immediate
+    /// insert; it is not on the resident allowlist and must fall back.
+    #[test]
+    fn reserved_resident_rejects_read_modify_write_movk() {
+        let word = 0xF280_003C;
+        assert_eq!(
+            bad64::decode(word, 0x4000)
+                .expect("fixture decodes")
+                .to_string(),
+            "movk x28, #0x1"
+        );
+        let (assembled, _plan) = super::tests::single_virtual_block(word);
+        assert_eq!(
+            context_store_slot(assembled.words[1]),
+            Some(1120),
+            "movk keeps the spill template: {:#010x?}",
+            &assembled.words[..3.min(assembled.words.len())]
+        );
     }
 
     #[test]
@@ -7893,6 +8409,7 @@ mod tests {
                 0,
                 0,
                 0,
+                0,
             )
             .expect("recover multi-chunk materialization boundary");
             assert_eq!(
@@ -7997,6 +8514,7 @@ mod tests {
                 RecoveryAction::RecoverBiasedMemory(action),
                 0x1111_1111_1111_1111,
                 0x2222_2222_2222_2222,
+                0,
                 0,
                 0,
                 0,
@@ -8446,6 +8964,7 @@ mod tests {
                 saved_nzcv,
                 saved_x15,
                 saved_x30,
+                0,
             )
             .map_err(|error| format!("offset {offset} recovery failed: {error}"))?;
             let expected_x30 = committed_link.unwrap_or(original.x[30]);
@@ -9120,6 +9639,7 @@ mod tests {
                 stale_nzcv,
                 saved_x15,
                 saved_x30,
+                0,
             )
             .unwrap_or_else(|error| panic!("{case}: recover capture prefix: {error}"));
 
@@ -9408,6 +9928,7 @@ mod tests {
             0x6000_0000,
             0x15,
             0x30,
+            0,
         )
         .expect("recover direct-binding preamble");
 
