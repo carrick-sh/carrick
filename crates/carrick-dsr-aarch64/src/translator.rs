@@ -2876,7 +2876,10 @@ impl ProcessTranslator {
                 candidates,
                 binding_layout,
             )?;
-            let outcome = store.publish(&pending).map_err(|reason| {
+            let publish_started = std::time::Instant::now();
+            let publish_result = store.publish(&pending);
+            xlat_census::record_publish_ns(publish_started.elapsed().as_nanos() as u64);
+            let outcome = publish_result.map_err(|reason| {
                 types::DsrError::CachePolicy(format!(
                     "shared translation publication failed: {reason:?}"
                 ))
@@ -3065,7 +3068,10 @@ impl ProcessState {
         let source_words = Arc::clone(&segment.source_words);
         let store = Arc::clone(&configuration.store);
         self.stats.shared_unit_lookups = self.stats.shared_unit_lookups.saturating_add(1);
-        let unit = match store.load(&key, &source_words) {
+        let load_started = std::time::Instant::now();
+        let load_result = store.load(&key, &source_words);
+        xlat_census::record_load_ns(load_started.elapsed().as_nanos() as u64);
+        let unit = match load_result {
             Ok(Some(unit)) => {
                 xlat_census::record_lookup_loaded();
                 unit
@@ -11742,6 +11748,14 @@ pub mod xlat_census {
         pub skipped: BTreeMap<LookupSkip, u64>,
         /// Lookups the store refused, by typed reason.
         pub misses: BTreeMap<UnitMissReason, u64>,
+        /// Wall nanoseconds this process spent inside
+        /// `TranslationUnitStore::load` (open, map, validate). Paid by every
+        /// process that consults, whether or not it gets a unit.
+        pub load_ns: u64,
+        /// Wall nanoseconds this process spent inside
+        /// `TranslationUnitStore::publish` (encode, write, link, sign). Paid
+        /// only by the elected recorder.
+        pub publish_ns: u64,
     }
 
     impl CensusStore {
@@ -11895,12 +11909,14 @@ pub mod xlat_census {
             );
             let _ = writeln!(
                 out,
-                "STORE|consulted={}|loaded={}|file_miss={}|recording_claimed={}|recording_declined={}",
+                "STORE|consulted={}|loaded={}|file_miss={}|recording_claimed={}|recording_declined={}|load_ns={}|publish_ns={}",
                 self.store.consulted,
                 self.store.loaded,
                 self.store.file_miss,
                 self.store.recording_claimed,
                 self.store.recording_declined,
+                self.store.load_ns,
+                self.store.publish_ns,
             );
             for (skip, count) in &self.store.skipped {
                 let _ = writeln!(out, "SKIP|{}|{count}", skip.token());
@@ -12168,6 +12184,8 @@ pub mod xlat_census {
             recording_declined: parse_u64(field(&fields, "recording_declined", line)?, line)?,
             skipped: BTreeMap::new(),
             misses: BTreeMap::new(),
+            load_ns: parse_u64(field(&fields, "load_ns", line)?, line)?,
+            publish_ns: parse_u64(field(&fields, "publish_ns", line)?, line)?,
         })
     }
 
@@ -12262,6 +12280,8 @@ pub mod xlat_census {
         recording_declined: AtomicU64,
         skipped: [AtomicU64; LookupSkip::ALL.len()],
         misses: [AtomicU64; UnitMissReason::ALL.len()],
+        load_ns: AtomicU64,
+        publish_ns: AtomicU64,
     }
 
     static STORE_COUNTERS: StoreCounters = StoreCounters {
@@ -12272,6 +12292,8 @@ pub mod xlat_census {
         recording_declined: AtomicU64::new(0),
         skipped: [const { AtomicU64::new(0) }; LookupSkip::ALL.len()],
         misses: [const { AtomicU64::new(0) }; UnitMissReason::ALL.len()],
+        load_ns: AtomicU64::new(0),
+        publish_ns: AtomicU64::new(0),
     };
 
     static STATE: OnceLock<Mutex<CensusState>> = OnceLock::new();
@@ -12298,6 +12320,8 @@ pub mod xlat_census {
             recording_declined: read(&STORE_COUNTERS.recording_declined),
             skipped: BTreeMap::new(),
             misses: BTreeMap::new(),
+            load_ns: read(&STORE_COUNTERS.load_ns),
+            publish_ns: read(&STORE_COUNTERS.publish_ns),
         };
         for skip in LookupSkip::ALL {
             if let Some(counter) = STORE_COUNTERS.skipped.get(skip.index()) {
@@ -12363,6 +12387,30 @@ pub mod xlat_census {
     }
 
     /// The store served a unit.
+    /// Accumulate wall time spent inside `TranslationUnitStore::load`.
+    ///
+    /// Timed at the CALL, not inside the store, so it covers open, map and
+    /// validate for hits and misses alike - the term a consulting process pays
+    /// whether or not it gets a unit back.
+    pub fn record_load_ns(elapsed: u64) {
+        if !armed() {
+            return;
+        }
+        arm_backstop();
+        STORE_COUNTERS.load_ns.fetch_add(elapsed, Ordering::Relaxed);
+    }
+
+    /// Accumulate wall time spent inside `TranslationUnitStore::publish`.
+    pub fn record_publish_ns(elapsed: u64) {
+        if !armed() {
+            return;
+        }
+        arm_backstop();
+        STORE_COUNTERS
+            .publish_ns
+            .fetch_add(elapsed, Ordering::Relaxed);
+    }
+
     pub fn record_lookup_loaded() {
         if !armed() {
             return;
@@ -12710,6 +12758,8 @@ pub mod xlat_census {
                     (LookupSkip::SegmentRepeat, 40),
                 ]),
                 misses: BTreeMap::from([(UnitMissReason::NoAuthority, 2)]),
+                load_ns: 1_500_000,
+                publish_ns: 2_500_000,
             }
         }
 
@@ -12748,7 +12798,7 @@ pub mod xlat_census {
             let stem = "aa".repeat(32);
             let expected = format!(
                 "XLATCENSUS3|pid=4242|seq=1|reason=host-self-reexec|total=5|distinct=2|image={identity}|segments=1\n\
-                 STORE|consulted=4|loaded=1|file_miss=1|recording_claimed=0|recording_declined=1\n\
+                 STORE|consulted=4|loaded=1|file_miss=1|recording_claimed=0|recording_declined=1|load_ns=1500000|publish_ns=2500000\n\
                  SKIP|lane-unconfigured|9\n\
                  SKIP|segment-repeat|40\n\
                  MISS|no-authority|2\n\
@@ -12780,7 +12830,7 @@ pub mod xlat_census {
                 },
             };
             let expected = "XLATCENSUS3|pid=7|seq=0|reason=process-exit|total=1|distinct=1|image=-|segments=0\n\
-                            STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0\n\
+                            STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n\
                             SKIP|lane-unconfigured|1\n\
                             VA|0x1000|-|outside|1\n";
             assert_eq!(file.render(), expected);
@@ -12790,8 +12840,7 @@ pub mod xlat_census {
         #[test]
         fn parse_fails_closed_on_a_truncated_or_mislabelled_file() {
             const HEADER: &str = "XLATCENSUS3|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
-            const STORE: &str =
-                "STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0\n";
+            const STORE: &str = "STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
             let cases = [
                 (String::new(), "empty"),
                 (
@@ -12861,8 +12910,7 @@ pub mod xlat_census {
         #[test]
         fn skip_counts_before_the_store_line_are_not_discarded_by_it() {
             const HEADER: &str = "XLATCENSUS3|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
-            const STORE: &str =
-                "STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0\n";
+            const STORE: &str = "STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
             let reordered = format!("{HEADER}SKIP|segment-repeat|7\nMISS|no-authority|0\n{STORE}");
             let file = CensusFile::parse(&reordered).expect("reordered file parses");
             assert_eq!(
