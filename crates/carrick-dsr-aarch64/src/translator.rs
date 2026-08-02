@@ -362,6 +362,7 @@ impl PreparedDirectBindingExecReset<'_, '_, '_> {
         state.clear_published();
         state.blocks.clear();
         state.pending.clear();
+        state.direct_link_incoming.clear();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
         state.sensitive.clear();
@@ -973,6 +974,14 @@ pub struct ProcessState {
     pub blocks: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheVa>,
     pub pending:
         BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), Vec<cache::LinkSite>>,
+    /// Reverse of every PRIVATE direct link `patch_direct_link_if_reachable`
+    /// installs: target guest 4 KiB page -> patched slots. Severed eagerly
+    /// when a guest code write bumps a page generation, restoring the
+    /// unpatched `b +1` fall-into-stub word so the next traversal resolves
+    /// through the gateway. Net-new state: link metadata was previously
+    /// dropped at publication (Phase 2 audit,
+    /// docs/superpowers/specs/2026-08-01-steady-state-block-boundary-tax-design.md).
+    pub direct_link_incoming: BTreeMap<u64, Vec<cache::LinkSite>>,
     pub stats: ResolverStats,
     pub reported_stats: ResolverStats,
     pub sensitive: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), SensitiveMetadata>,
@@ -2632,6 +2641,7 @@ impl ProcessTranslator {
                 artifact_store: artifact_spike::store_if_enabled()?,
                 blocks: BTreeMap::new(),
                 pending: BTreeMap::new(),
+                direct_link_incoming: BTreeMap::new(),
                 stats: ResolverStats::default(),
                 reported_stats: ResolverStats::default(),
                 sensitive: BTreeMap::new(),
@@ -2735,6 +2745,15 @@ impl ProcessTranslator {
             .write()
             .translated_ranges
             .activate_if_dormant_with_recorder(recorder)
+    }
+
+    /// Sever recorded private direct links into `range`; see
+    /// [`ProcessState::sever_direct_links_in`].
+    pub fn sever_direct_links_in(
+        &self,
+        range: std::ops::Range<carrick_guest_mem::GuestVa>,
+    ) -> Result<usize, types::DsrError> {
+        self.state.write().sever_direct_links_in(range)
     }
 
     pub fn cache_host_range(&self) -> std::ops::Range<u64> {
@@ -3948,7 +3967,9 @@ impl ProcessState {
                 .get(&target_key)
                 .map(|authority| authority.generation_bindings);
             match (self.blocks.get(&target_key).copied(), shared_bindings) {
-                (Some(target), None) => self.patch_direct_link_if_reachable(site, target)?,
+                (Some(target), None) => {
+                    self.patch_direct_link_if_reachable(site, target, link.target)?
+                }
                 (Some(target), Some(bindings)) => {
                     self.patch_shared_edge_via_binding_trampoline(
                         site,
@@ -3965,7 +3986,7 @@ impl ProcessState {
         }
         if let Some(sites) = self.pending.remove(&key) {
             for site in sites {
-                self.patch_direct_link_if_reachable(site, entry)?;
+                self.patch_direct_link_if_reachable(site, entry, key.0)?;
             }
         }
         Ok(TranslationResult {
@@ -4543,10 +4564,15 @@ impl ProcessState {
         &mut self,
         site: cache::LinkSite,
         target: types::CacheVa,
+        target_guest: carrick_guest_mem::GuestVa,
     ) -> Result<(), types::DsrError> {
         match encode_aarch64_direct_branch(site, target) {
             Ok(word) => {
                 self.cache.patch_code_word(site, word)?;
+                self.direct_link_incoming
+                    .entry(target_guest.raw() & !0xfff)
+                    .or_default()
+                    .push(site);
                 Ok(())
             }
             Err(types::DsrError::CachePolicy(reason))
@@ -4556,6 +4582,36 @@ impl ProcessState {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Sever every recorded private direct link whose TARGET lies in a guest
+    /// page overlapping `range`, restoring the unpatched `b +1` word so the
+    /// next traversal falls into the stub and resolves through the gateway.
+    /// Runs from the mapped-memory code-write path AFTER the generation
+    /// bump; a racing entry through a not-yet-severed link is bounded by one
+    /// block body -- the same window the entry guard tolerates today.
+    pub(crate) fn sever_direct_links_in(
+        &mut self,
+        range: std::ops::Range<carrick_guest_mem::GuestVa>,
+    ) -> Result<usize, types::DsrError> {
+        const UNPATCHED_FALL_INTO_STUB: u32 = 0x1400_0001;
+        let first = range.start.raw() & !0xfff;
+        let last = range.end.raw().saturating_add(0xfff) & !0xfff;
+        let pages: Vec<u64> = self
+            .direct_link_incoming
+            .range(first..last)
+            .map(|(page, _)| *page)
+            .collect();
+        let mut severed = 0;
+        for page in pages {
+            if let Some(sites) = self.direct_link_incoming.remove(&page) {
+                for site in sites {
+                    self.cache.patch_code_word(site, UNPATCHED_FALL_INTO_STUB)?;
+                    severed += 1;
+                }
+            }
+        }
+        Ok(severed)
     }
 
     /// Patch a private -> shared edge through a trampoline that installs the
@@ -4633,7 +4689,7 @@ impl ProcessState {
             _generation: observation.clone(),
         });
         if reachable {
-            self.patch_direct_link_if_reachable(site, published.entry())?;
+            self.patch_direct_link_if_reachable(site, published.entry(), target_guest)?;
         }
         Ok(())
     }

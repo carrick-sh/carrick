@@ -2071,6 +2071,83 @@ fn syscall_plan(start: GuestVa, word: u32) -> BlockPlan {
 }
 
 #[test]
+fn dsr_code_write_severs_incoming_private_links() {
+    // b +8 at A chains to the svc block at A+8 once linked; a guest code
+    // write to the target page must sever that link so the STALE source
+    // falls into its stub (ResolveDirect) instead of chaining into stale
+    // target code.
+    // The target sits on the NEXT 16 KiB page: bumping it must leave the
+    // source's page (and so its entry guard) untouched, or the guard would
+    // mask whether the slot itself was severed.
+    let code = GuestVa(0x3_4000);
+    let target = GuestVa(code.raw() + 16 * 1024);
+    let mut words = vec![0xd503_201f_u32; 16 * 1024 / 4 + 1];
+    words[0] = 0x1400_0000 | (16 * 1024 / 4); // b +16 KiB
+    *words.last_mut().expect("nonempty fixture words") = 0xd400_0001; // svc #0
+    let mut fixture = biased_translator_fixture(&words, code);
+    let mut stack = vec![0_u8; 16 * 1024];
+    let mut snapshot = seeded_snapshot(stack.as_mut_ptr() as u64 + stack.len() as u64);
+    snapshot.pc = code.raw();
+    let prepared_source = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare sever source");
+    let miss = fixture
+        .translator
+        .enter_prepared::<false>(prepared_source, &mut snapshot)
+        .expect("execute sever-source miss");
+    assert!(matches!(
+        miss.exit,
+        NativeDsrExit::ResolveDirect { target: resolved, .. } if resolved == target
+    ));
+    assert!(matches!(
+        fixture
+            .translator
+            .finish_exit(&fixture.memory, &mut snapshot, prepared_source, miss)
+            .expect("translate sever target and patch the link"),
+        super::ThreadExit::Continue
+    ));
+    snapshot.pc = code.raw();
+    let linked = fixture
+        .translator
+        .prepare_entry::<false>(&fixture.memory, &snapshot)
+        .expect("prepare linked source");
+    let chained = fixture
+        .translator
+        .enter_prepared::<false>(linked, &mut snapshot)
+        .expect("execute chained source");
+    assert_eq!(
+        chained.exit,
+        NativeDsrExit::Syscall {
+            resume: GuestVa(target.raw() + 4)
+        },
+        "the patched link must chain straight into the target"
+    );
+    fixture
+        .memory
+        .note_dsr_code_mutation(target.raw(), 4)
+        .expect("bump the target page")
+        .expect("nonempty bump");
+    snapshot.pc = code.raw();
+    let stale = fixture
+        .translator
+        .enter_prepared::<false>(linked, &mut snapshot)
+        .expect("execute stale source after sever");
+    // Distinguish the severed slot from a guard catch: the slot's stub
+    // reports the SOURCE block's branch as the resolve source, while the
+    // stale target's guard would report source == target.
+    assert!(
+        matches!(
+            stale.exit,
+            NativeDsrExit::ResolveDirect { source, target: resolved, .. }
+                if resolved == target && source == code
+        ),
+        "the severed slot must fall into its stub, not chain or guard-exit: {:?}",
+        stale.exit
+    );
+}
+
+#[test]
 fn dsr_direct_flow_linked_branch_stays_in_translated_code_and_preserves_x17() {
     let mut cache = TranslationCache::new(
         32 * 1024,
