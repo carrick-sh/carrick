@@ -19,8 +19,11 @@ on compute (was 10.9x at the campaign's start; the phase ladder of
 `docs/superpowers/specs/2026-08-01-steady-state-block-boundary-tax-design.md`
 runs `bb17be5e` 5.9x -> `69754d31` 4.8x -> `e743cd8f` 3.8x, each with census,
 wall, suite and conformance-smoke gates in the commit),
-~13.6x on a cold build (translation-bound; untouched by these phases), and 128x
-on a filesystem walk. Carrick's premise
+~13.6x on a cold build (translation-bound; untouched by these phases), and ~82x
+on a filesystem walk (was 128x; the fs workstream's three commits `810bc6f4` +
+`9c5fc386` cut 1,541 ms to 987 ms, and the surviving term is attributed with
+file:line precision in task notes and target/perf/fswalk-amp3.raw - the
+dispatch-level resolution stack, not the backend open). Carrick's premise
 is running unmodified Linux binaries at host-native cost, so this number is the
 product, not a metric about it — and people will benchmark us on whatever workload
 they choose, not the one we tuned.
@@ -139,9 +142,15 @@ stores.
    the dispatch's serial load chain (cache-base/tag/`ldar`), with two bounded
    levers queued: entry packing for `ldp`, and a WRITTEN-ARGUMENT-FIRST
    relaxation of the generation `ldar` to a plain load.
-2. **fs-walk at 128x.** The largest multiplier measured anywhere, with a known
-   mechanism: **19.68 host `open`s per guest `open`** through the cap-std path,
-   even after `564dd281` cut it 41%. Never ranked because nothing was measuring it.
+2. **fs-walk, now ~82x (was 128x).** Three landed cuts: the stat cache consulted
+   after dirfd resolution, child sizes carried out of the FIFO-probe stat, and
+   non-creating guest opens served from ONE contained openat with fd-derived
+   metadata (`810bc6f4`, `9c5fc386`). The surviving ~27.7k host opens/run are
+   the DISPATCH-level resolution stack (anchor re-verify at fs.rs:4516,
+   validate_parents_fast, canonicalize probes, and child_names re-walking a
+   just-opened directory); the next slice - dirfd-anchor trust with generation
+   invalidation + passing the opened fd into directory materialization - is
+   specified in the session task notes.
 3. **Whether the 2x bar is reachable at all**, given steady-state is ~12x.
 
 ## Decisions that need a human
