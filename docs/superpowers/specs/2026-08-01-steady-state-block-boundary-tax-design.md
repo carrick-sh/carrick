@@ -132,14 +132,45 @@ a strict subset). Expected on compute: a large cut of the 47.3%
 ctx-load+store share; wall from 10.9x toward ~8x.
 
 **Phase 2 — trusted-entry chaining.** Second entry point past the guard;
-patched direct links (and Phase 3's validated cache hits) target it. The
-obligation moves to invalidation: sever or repatch incoming links before
-old code can be re-entered (DirectLink metadata already records every
-link; add the reverse index), and confirm fork/exec reset paths clear
-trusted entries with the links they already clear. Also publish the
-executing-generation slot (1144) at the trusted entry if anything consumes
-it mid-block — audit first. Removes ~13 words from 100% of hot-loop
-entries; guard remains for gateway/untrusted entries.
+patched PRIVATE direct links target it. The 2026-08-01 audit (see the
+`phase2-audit` notes below) corrected three assumptions, and the H008 doc's
+"invalidation already severs them" line, before code was written:
+
+- **The trusted entry is 2 words, not 0.** Ctx slot 1144
+  (`DsrContext.generation`) is consumed by sensitive-exit dispatch
+  (`state.sensitive` is keyed `(GuestVa, CodeGeneration)` and never pruned),
+  and every gateway wrapper seeds it with a stale INITIAL — skipping the
+  publish silently resolves a *previous* generation's metadata. The trusted
+  entry publishes its block's generation (materialize + `str`), then falls
+  into the body. Honest saving: ~11 of the 13 guard words.
+- **Links are not same-generation and nothing severs them today.** The
+  guard at every entry IS the invalidation mechanism; `DirectLink` metadata
+  is dropped at publication (`translator.rs:3917`), so the reverse index is
+  net-new state, modeled on `DirectBindingTable::incoming`. Severing must be
+  EAGER at generation-bump time (a code-write observer from
+  `mapped_memory`'s bump path into the process translator), not part of the
+  lazy reap in `translate()` — a hot loop through a trusted entry would
+  otherwise run stale forever. Sever = repatch the slot to the `b +1`
+  fall-into-stub form; the next traversal resolves through the gateway and
+  retranslates.
+- **The stale window stays one block body, no kick needed.** A loop's back
+  edge is itself an incoming link taken every iteration, so eager severing
+  of every link into a bumped page bounds any thread's stale execution to
+  the remainder of its current block plus at most one non-stale block —
+  the same order as today's guard-at-entry window, which already tolerates
+  mid-block staleness (blocks are single-page by construction).
+- **Shared units are out.** Intra-unit links are baked into immutable
+  dyld-mapped code with no repatch path; `BindingIndex`-guarded blocks keep
+  their guards, and the private→shared trampoline keeps targeting the
+  guarded entry. Only the two private patch sites move to the trusted
+  entry.
+- **Fork/exec are already clean** (fork agrees at the instant and inherits
+  COW state; exec discards blocks, links, and the cache cursor), and at
+  every patched slot guest x17 is already committed to slots 136/1128, so
+  recovery entries in the skipped preamble are simply never reached.
+- **Phase 3 may NOT point indirect-cache hits at the trusted entry** until
+  `IndirectTargetCacheEntry` carries and checks a generation — the JIT
+  cache discards it today and relies on the target's guard.
 
 **Phase 3 — indirect-branch lookup slimming.** Flag-free probe
 (`eor`+`cbnz` / `sub`+`cbz` instead of `cmp`+`b.eq`) so the NZCV
