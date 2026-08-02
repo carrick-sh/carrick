@@ -36,8 +36,58 @@ impl SyscallDispatcher {
             return Ok(outcome);
         }
 
+        if let Some(outcome) = self.fast_trusted_dirfd_f_ok(dirfd, &path, mode, flags) {
+            return Ok(outcome);
+        }
+
         let path = self.resolve_at_path(dirfd, &path)?;
         Ok(self.access_resolved_path(&path, mode, flags))
+    }
+
+    /// Trusted-dirfd sibling of [`Self::fast_root_f_ok_absolute`]: a root
+    /// `faccessat(dirfd, name, F_OK)` through a TRUSTED host dirfd is ONE
+    /// `fstatat(host_dirfd, name, AT_NOFOLLOW)`. A symlink child falls back —
+    /// F_OK follows the link, and following must resolve under the GUEST
+    /// root, not the host's. Missing is authoritative (the scratch is the
+    /// merged truth and no mount claims the path).
+    fn fast_trusted_dirfd_f_ok(
+        &self,
+        dirfd: u64,
+        path: &str,
+        mode: u64,
+        flags: u64,
+    ) -> Option<DispatchOutcome> {
+        if mode != 0 || flags != 0 {
+            return None;
+        }
+        let name = Self::trusted_lane_component(path)?;
+        let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
+        self.trusted_child_path(&dir_path, name)?;
+        // access(2) checks the REAL ids; mirror `fast_root_f_ok_absolute`.
+        if self.cred_snapshot().ruid != 0 {
+            return None;
+        }
+        let name_c = std::ffi::CString::new(name).ok()?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                host_dir.raw(),
+                name_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+                Some(DispatchOutcome::errno(LINUX_ENOENT))
+            } else {
+                None
+            };
+        }
+        if st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32 {
+            return None;
+        }
+        Some(DispatchOutcome::Returned { value: 0 })
     }
 
     fn fast_root_f_ok_absolute(

@@ -822,6 +822,36 @@ impl std::fmt::Debug for PidfdWatch {
     }
 }
 
+/// A TRUSTED host dirfd backing an `OpenDescription::Directory` on the
+/// `--fs host` fast lane. Trust flows ONLY from the contained fast path:
+/// the fd was opened under the sandbox root with a byte-exact `F_GETPATH`
+/// containment proof (no symlink, Unicode alias, or escape anywhere in the
+/// chain) and the directory is outside every synthetic/VFS mount. The
+/// dispatcher may then service single-component `openat`/`newfstatat`/
+/// `faccessat` DIRECTLY against this fd (a single `O_NOFOLLOW` component
+/// under a contained dir cannot escape), and `getdents64` may stream the
+/// directory from it. The fd is `HostFdRef`-owned (closed with the last
+/// description clone) and `O_CLOEXEC` host-side, and — like every host fd —
+/// survives `libc::fork` (the fd table is per-process already).
+#[derive(Debug, Clone)]
+pub(super) struct TrustedHostDir {
+    pub(super) fd: HostFdRef,
+    /// True once `entries` has been materialized from this fd (one streamed
+    /// readdir batch, no per-child stat). Cleared by an `lseek(0, SEEK_SET)`
+    /// rewind so the next `getdents64` takes a FRESH snapshot (matching
+    /// Linux, where a rewound getdents re-reads the directory).
+    pub(super) entries_loaded: bool,
+}
+
+impl TrustedHostDir {
+    pub(super) fn new(fd: HostFdRef) -> Self {
+        Self {
+            fd,
+            entries_loaded: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum OpenDescription {
     File {
@@ -840,6 +870,11 @@ pub(super) enum OpenDescription {
         metadata: RootFsMetadata,
         entries: Vec<RootFsDirEntry>,
         offset: usize,
+        /// `Some` iff this directory rides the `--fs host` trusted-dirfd fast
+        /// lane (see [`TrustedHostDir`]). `None` keeps every historical path:
+        /// VFS-mount dirs, the memory backend, and any open the contained
+        /// fast path could not prove.
+        trusted_host_dir: Option<TrustedHostDir>,
     },
     SyntheticFile {
         base: OpenDescriptionBase,
@@ -1236,7 +1271,7 @@ pub(super) enum XattrTarget {
     Fd(Fd),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StatRecord {
     pub(super) ino: u64,
     pub(super) mode: u32,

@@ -1135,6 +1135,16 @@ impl SyscallDispatcher {
             return Err(LINUX_ENOENT);
         }
 
+        // `--fs host` trusted-dirfd fast lane: `newfstatat(dirfd, name)` on
+        // getdents output — the other half of the fs-walk hot loop — served
+        // straight off the trusted host dirfd, skipping `resolve_at_path`
+        // (anchor re-verify + parent validation) and the layered stat stack.
+        // A single component can never carry the trailing-slash directory
+        // forcing handled below.
+        if let Some(result) = self.try_trusted_dirfd_stat(dirfd, path) {
+            return result;
+        }
+
         // A trailing "/" or "/." forces directory semantics on the FINAL
         // component: the symlink is FOLLOWED even under AT_SYMLINK_NOFOLLOW
         // (lstat("link/") of a symlink-to-dir reports the directory, not the
@@ -1444,6 +1454,13 @@ impl SyscallDispatcher {
         if path.is_empty() {
             return Ok(DispatchOutcome::errno(LINUX_ENOENT));
         }
+        // `--fs host` trusted-dirfd fast lane: a single-component,
+        // non-creating openat through a trusted directory fd is served
+        // DIRECTLY against the host dirfd — the fs-walk hot loop — skipping
+        // `resolve_at_path` and the layered open stack entirely.
+        if let Some(outcome) = self.try_trusted_dirfd_openat(dirfd, path, flags) {
+            return Ok(outcome);
+        }
         // A trailing slash forces directory semantics on the final component.
         // Linux's open(2): `O_CREAT` of a path that ends in `/` can NEVER
         // create a regular file there (a directory name is implied) and fails
@@ -1679,6 +1696,23 @@ impl SyscallDispatcher {
         } else {
             true
         };
+        // `--fs host` trusted-dirfd lane SEED: an O_DIRECTORY read-only open
+        // outside every mount gets ONE contained openat + containment proof —
+        // no eager per-child materialization, no double kind probe below —
+        // and carries the trusted host dirfd the walk's dirfd-relative
+        // recursion rides on. Gated on O_DIRECTORY so a regular-file open
+        // never pays a wasted directory probe (fts/opendir walks always pass
+        // it); gated on root because the DAC/O_NOATIME checks further down
+        // are no-ops only for euid 0.
+        if !want_create
+            && !want_trunc
+            && !writable_request
+            && open_flags.contains(LinuxOpenFlags::DIRECTORY)
+            && self.cred_snapshot().euid == 0
+            && let Some(outcome) = self.try_open_trusted_dir(&path, flags)
+        {
+            return Ok(outcome);
+        }
         // Validate O_DIRECTORY before a mount can apply O_TRUNC/O_CREAT. Linux
         // rejects a non-directory without mutating it; checking only after
         // `try_vfs_open` had already truncated or created bind-mounted files.
@@ -1955,6 +1989,10 @@ impl SyscallDispatcher {
                     entries,
                     offset: 0,
                     base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                    // The trusted lane (`try_open_trusted_dir`) already
+                    // declined this open (mount/inotify/backend), so the
+                    // description keeps the historical untrusted model.
+                    trusted_host_dir: None,
                 }
             }
             Ok(crate::vfs::rootfs::OpenDispatchResult::NotFoundCreate) => {
@@ -2099,6 +2137,438 @@ impl SyscallDispatcher {
             self.dnotify_child(&record_path, LinuxDnotifyMask::CREATE);
         }
         Ok(DispatchOutcome::Returned { value: fd as i64 })
+    }
+
+    // === Trusted-dirfd fast lane (`--fs host`) ===
+    //
+    // A directory opened through the host backend's contained fast path
+    // carries a TRUSTED host dirfd (see [`TrustedHostDir`]): its real host
+    // path byte-equals sandbox_root + guest path, so a SINGLE-component child
+    // name resolved against it with `O_NOFOLLOW` cannot escape (no "..", no
+    // symlink following) — structural containment, NO per-op `F_GETPATH`.
+    // That serves the fs-walk hot loop (openat / newfstatat / faccessat on
+    // getdents output, and getdents itself) at host-syscall parity instead of
+    // paying the per-op dispatch resolution stack (anchor re-verify,
+    // validate_parents_fast, canonicalize probe, layered stat). Trust only
+    // ever flows from the contained fast path; the VFS synthetic mounts and
+    // the memory backend keep today's paths.
+
+    /// The single path component `path` names, when the trusted-dirfd lane
+    /// may serve it: non-empty, no '/', not "."/"..", within NAME_MAX, and
+    /// ASCII — a non-ASCII leaf could be a Unicode alias of a
+    /// differently-normalized on-disk name, which only the slow path's
+    /// byte-exact readdir guard can reject.
+    pub(super) fn trusted_lane_component(path: &str) -> Option<&str> {
+        if path.is_empty()
+            || path.len() > 255
+            || !path.is_ascii()
+            || path == "."
+            || path == ".."
+            || path.contains('/')
+        {
+            return None;
+        }
+        Some(path)
+    }
+
+    /// The guest directory path + trusted host dirfd behind guest fd `dirfd`,
+    /// when its open description is a trusted Directory. `None` for AT_FDCWD,
+    /// negative fds, and every untrusted description.
+    pub(super) fn trusted_dir_of(&self, dirfd: u64) -> Option<(String, HostFdRef)> {
+        let fd = dirfd as i32;
+        if fd < 0 {
+            return None; // AT_FDCWD and friends
+        }
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::Directory {
+                path,
+                trusted_host_dir: Some(trusted),
+                ..
+            } => Some((path.clone(), trusted.fd.clone())),
+            _ => None,
+        }
+    }
+
+    /// Compose `dir/name` and gate it for the trusted lane: the child must be
+    /// outside every synthetic tree and VFS mount (a bind mount or /proc /sys
+    /// /dev target under the trusted dir is claimed by its mount, never by
+    /// the scratch). `None` ⇒ the caller takes the full path.
+    pub(super) fn trusted_child_path(&self, dir: &str, name: &str) -> Option<String> {
+        let full = if dir == "/" {
+            format!("/{name}")
+        } else {
+            format!("{dir}/{name}")
+        };
+        if full.starts_with("/proc") || full.starts_with("/sys") || full.starts_with("/dev") {
+            return None;
+        }
+        if self.fs.vfs_mounts.resolve(&full).is_some() {
+            return None;
+        }
+        Some(full)
+    }
+
+    /// `--fs host` trusted directory open — the lane SEED. A plain read-only
+    /// directory open outside every mount is served by ONE contained
+    /// `openat(O_DIRECTORY)` with a byte-exact containment proof
+    /// ([`FsBackend::open_trusted_dir_fd`]), skipping `open_for_dispatch`'s
+    /// eager per-child directory materialization entirely (entries stream on
+    /// the first getdents64). `find`-style walks open the walk root once by
+    /// absolute path, then recurse `openat(dirfd, name)` through
+    /// [`Self::try_trusted_dirfd_openat`], which keeps every served child
+    /// directory on the lane. Every dispatch-level gate (DAC, O_NOATIME, the
+    /// FIFO interception) has already run when this is consulted.
+    fn try_open_trusted_dir(&self, path: &str, flags: u64) -> Option<DispatchOutcome> {
+        use std::os::fd::IntoRawFd;
+        // The layered rootfs union and inotify hooks must keep today's path;
+        // chroot rebases absolute resolution, so keep the lane out of it.
+        if self.fs.rootfs_vfs.rootfs.is_some() || !self.fs.inotify_registry.is_empty() {
+            return None;
+        }
+        if self
+            .io
+            .chroot_root
+            .read()
+            .as_deref()
+            .is_some_and(|root| root != "/")
+        {
+            return None;
+        }
+        if path.starts_with("/proc") || path.starts_with("/sys") || path.starts_with("/dev") {
+            return None;
+        }
+        if self.fs.vfs_mounts.resolve(path).is_some() {
+            return None;
+        }
+        let host_fd = self.fs.rootfs_vfs.overlay.open_trusted_dir_fd(path)?;
+        crate::probes::path_open(path, 0, 0);
+        let metadata = RootFsMetadata {
+            path: Path::new(path).to_path_buf(),
+            kind: RootFsEntryKind::Directory,
+            // Parity with open_for_dispatch's Directory arm, which reports a
+            // fixed 0o755 on directory open descriptions.
+            mode: 0o755,
+            size: 0,
+        };
+        let description = OpenDescription::Directory {
+            path: path.to_owned(),
+            metadata,
+            entries: Vec::new(),
+            offset: 0,
+            base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+            trusted_host_dir: Some(TrustedHostDir::new(HostFdRef::new(host_fd.into_raw_fd()))),
+        };
+        let open_file = OpenFile {
+            description: Arc::new(RwLock::new(description)),
+            fd_flags: linux_fd_flags_from_open_flags(flags),
+        };
+        let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
+            return Some(DispatchOutcome::errno(linux_errno::EMFILE));
+        };
+        Some(DispatchOutcome::Returned { value: fd as i64 })
+    }
+
+    /// Single-component `openat` through a TRUSTED host dirfd: service the
+    /// open DIRECTLY against the host dirfd (one openat + fstat + one
+    /// flistxattr-gated xattr peek), skipping `resolve_at_path` and the
+    /// layered open stack. `None` ⇒ take the full path. A served directory is
+    /// itself trusted (the walk's recursion stays on the lane); symlink
+    /// children (`ELOOP`), FIFOs, marker nodes, and every surprise fall back
+    /// to the exact slow path.
+    fn try_trusted_dirfd_openat(
+        &self,
+        dirfd: u64,
+        path: &str,
+        flags: u64,
+    ) -> Option<DispatchOutcome> {
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+        let open_flags = LinuxOpenFlags::from_bits_retain(flags);
+        // Creating/truncating opens and the special modes keep the full path
+        // (sandboxed parent creation, exact O_TRUNC, O_TMPFILE/O_PATH
+        // modeling).
+        if open_flags.intersects(
+            LinuxOpenFlags::CREAT
+                | LinuxOpenFlags::TRUNC
+                | LinuxOpenFlags::EXCL
+                | LinuxOpenFlags::TMPFILE
+                | LinuxOpenFlags::PATH,
+        ) {
+            return None;
+        }
+        let name = Self::trusted_lane_component(path)?;
+        let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
+        let full = self.trusted_child_path(&dir_path, name)?;
+        // inotify watches need the slow path's IN_OPEN bookkeeping; a
+        // non-root euid needs its DAC checks (root — the overwhelming
+        // default — bypasses both DAC and search permission).
+        if !self.fs.inotify_registry.is_empty() || self.cred_snapshot().euid != 0 {
+            return None;
+        }
+        let access = flags & LINUX_O_ACCMODE;
+        let write = access == LINUX_O_WRONLY || access == LINUX_O_RDWR;
+        let name_c = std::ffi::CString::new(name).ok()?;
+        // Mirrors `fast_open_for_guest`: O_NONBLOCK so a racing FIFO can
+        // never block the dispatcher; O_NOFOLLOW so a symlink child is ELOOP
+        // (the slow path re-roots its target under the GUEST root); O_NOCTTY
+        // defensively; RW-first even for read-only requests (HVF rejects
+        // hv_vm_map of a MAP_SHARED file VMA whose backing fd caps
+        // max-protection at read).
+        let base = libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY;
+        let last_errno = || std::io::Error::last_os_error().raw_os_error();
+        let mut raw =
+            unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), libc::O_RDWR | base, 0) };
+        if raw < 0 {
+            if last_errno() == Some(libc::ELOOP) {
+                return None; // symlink child → full path (guest O_NOFOLLOW → ELOOP there)
+            }
+            if write {
+                // A missing name is AUTHORITATIVE under a trusted dir: the
+                // scratch is the merged truth, no mount claims the path, and
+                // O_CREAT was excluded above. Every other error → slow path.
+                return if last_errno() == Some(libc::ENOENT) {
+                    Some(DispatchOutcome::errno(LINUX_ENOENT))
+                } else {
+                    None
+                };
+            }
+            raw =
+                unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), libc::O_RDONLY | base, 0) };
+            if raw < 0 {
+                return if last_errno() == Some(libc::ENOENT) {
+                    Some(DispatchOutcome::errno(LINUX_ENOENT))
+                } else {
+                    None
+                };
+            }
+        }
+        // SAFETY: freshly-opened owned fd; drop closes it on every fallback.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(raw, &mut st) } != 0 {
+            return None;
+        }
+        let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+        if typ == libc::S_IFDIR as u32 {
+            // Write-intent dir opens never reach here (the O_RDWR attempt
+            // fails EISDIR → fallback → the slow path's exact EISDIR).
+            crate::probes::path_open(&full, 0, 0);
+            let metadata = RootFsMetadata {
+                path: Path::new(&full).to_path_buf(),
+                kind: RootFsEntryKind::Directory,
+                mode: 0o755,
+                size: 0,
+            };
+            let description = OpenDescription::Directory {
+                path: full,
+                metadata,
+                entries: Vec::new(),
+                offset: 0,
+                base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                // Single-component + O_NOFOLLOW under a trusted dir preserves
+                // the byte-exact anchor: the served dir is itself trusted.
+                trusted_host_dir: Some(TrustedHostDir::new(HostFdRef::new(fd.into_raw_fd()))),
+            };
+            let open_file = OpenFile {
+                description: Arc::new(RwLock::new(description)),
+                fd_flags: linux_fd_flags_from_open_flags(flags),
+            };
+            let Ok(new_fd) = self.install_fd_at_or_above(0, open_file) else {
+                return Some(DispatchOutcome::errno(linux_errno::EMFILE));
+            };
+            return Some(DispatchOutcome::Returned {
+                value: new_fd as i64,
+            });
+        }
+        if typ != libc::S_IFREG as u32 {
+            // FIFO (must route through the non-blocking FIFO machinery),
+            // real device/socket nodes: exact slow path. The O_NONBLOCK
+            // probe fd closes here without ever blocking.
+            return None;
+        }
+        if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
+            // O_DIRECTORY of a regular child: authoritative ENOTDIR.
+            return Some(DispatchOutcome::errno(LINUX_ENOTDIR));
+        }
+        // Marker nodes (bound AF_UNIX sockets, mknod devices) carry their
+        // guest TYPE in xattrs; the slow path owns their open semantics.
+        let (override_mode, _uid, _gid, is_socket) = crate::fs_backend::fd_carrick_meta(raw);
+        if is_socket || override_mode.is_some_and(|m| m & LINUX_S_IFMT != 0) {
+            return None;
+        }
+        let on_disk_mode = st.st_mode as u32 & 0o7777;
+        let mode = override_mode
+            .map(|m| m & 0o7777)
+            .unwrap_or(if on_disk_mode == 0 {
+                0o644
+            } else {
+                on_disk_mode
+            });
+        // Clear the probe-only O_NONBLOCK, then track host-side nonblocking
+        // exactly as the slow HostFile arm does; the guest's OWN flags live
+        // in the description, not the host fd.
+        unsafe {
+            libc::fcntl(raw, libc::F_SETFL, 0);
+        }
+        crate::dispatch::net::set_host_nonblocking(raw);
+        crate::probes::path_open(&full, st.st_size as u64, 0);
+        let metadata = RootFsMetadata {
+            path: Path::new(&full).to_path_buf(),
+            kind: RootFsEntryKind::File,
+            mode,
+            size: st.st_size as usize,
+        };
+        let description = OpenDescription::HostFile {
+            host_fd: HostFdRef::new(fd.into_raw_fd()),
+            metadata,
+            base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+            writable: write,
+        };
+        let open_file = OpenFile {
+            description: Arc::new(RwLock::new(description)),
+            fd_flags: linux_fd_flags_from_open_flags(flags),
+        };
+        let Ok(new_fd) = self.install_fd_at_or_above(0, open_file) else {
+            return Some(DispatchOutcome::errno(linux_errno::EMFILE));
+        };
+        // readlink(/proc/self/fd/N) recovers the guest path from
+        // fd_open_paths for host-fd-backed descriptions (slow-arm parity).
+        self.record_fd_open_path(new_fd, full);
+        Some(DispatchOutcome::Returned {
+            value: new_fd as i64,
+        })
+    }
+
+    /// Single-component `newfstatat`/`statx` through a TRUSTED host dirfd:
+    /// one `fstatat(host_dirfd, name, AT_SYMLINK_NOFOLLOW)` plus (on a
+    /// regular-file/dir hit) one no-atime leaf open for the carrick xattr
+    /// metadata — replacing the anchor re-verify + parent validation + the
+    /// layered stat stack. A non-symlink hit makes follow and no-follow
+    /// coincide, so the caller's AT_SYMLINK_NOFOLLOW needs no case split; a
+    /// symlink child falls back (exact lstat semantics INCLUDING the
+    /// link-owner xattrs stay on the slow path). Missing is authoritative
+    /// (`Some(Err(ENOENT))`); `None` ⇒ take the full path.
+    fn try_trusted_dirfd_stat(
+        &self,
+        dirfd: u64,
+        path: &str,
+    ) -> Option<Result<StatRecord, LinuxErrno>> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let name = Self::trusted_lane_component(path)?;
+        let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
+        let full = self.trusted_child_path(&dir_path, name)?;
+        // A non-root euid needs the ancestor search-permission checks.
+        if self.cred_snapshot().euid != 0 {
+            return None;
+        }
+        let name_c = std::ffi::CString::new(name).ok()?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                host_dir.raw(),
+                name_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+                Some(Err(LINUX_ENOENT))
+            } else {
+                None
+            };
+        }
+        let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+        let is_dir = typ == libc::S_IFDIR as u32;
+        if !is_dir && typ != libc::S_IFREG as u32 {
+            // Symlink (follow-vs-lstat + link-owner xattrs), FIFO (must never
+            // be opened), real device: exact slow path.
+            return None;
+        }
+        // Carrick metadata (mode/owner/socket) via one flistxattr-gated pass
+        // on a no-atime fd — the same fill pattern (and the same benign
+        // fstatat→openat window) as the stat cache's
+        // `stat_cache_get_or_fill`.
+        #[cfg(target_os = "macos")]
+        const O_EVTONLY: libc::c_int = 0x8000;
+        #[cfg(not(target_os = "macos"))]
+        const O_EVTONLY: libc::c_int = libc::O_RDONLY;
+        let leaf_flags = O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        let raw = unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), leaf_flags, 0) };
+        if raw < 0 {
+            return None;
+        }
+        // SAFETY: freshly-opened owned fd, closed on drop.
+        let leaf = unsafe { OwnedFd::from_raw_fd(raw) };
+        let (override_mode, uid, gid, is_socket) = crate::fs_backend::fd_carrick_meta(raw);
+        drop(leaf);
+        let kind = if is_dir {
+            RootFsEntryKind::Directory
+        } else if is_socket {
+            RootFsEntryKind::Socket
+        } else {
+            RootFsEntryKind::File
+        };
+        let on_disk_mode = st.st_mode as u32 & 0o7777;
+        let default_mode = if is_dir { 0o755 } else { 0o644 };
+        let real = crate::fs_backend::RealStat {
+            kind,
+            ino: st.st_ino,
+            nlink: st.st_nlink as u32,
+            // The override is carried VERBATIM (device markers keep their
+            // type bits) — `stat_record_with_device` below recovers them,
+            // exactly like the stat-cache hit path.
+            mode: override_mode.unwrap_or(if on_disk_mode == 0 {
+                default_mode
+            } else {
+                on_disk_mode
+            }),
+            uid: uid.unwrap_or(0),
+            gid: gid.unwrap_or(0),
+            size: st.st_size as u64,
+            atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
+            mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
+            ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
+        };
+        Some(Ok(self.stat_record_with_device(&full, &real)))
+    }
+
+    /// Materialize a trusted directory's entries: STREAM the host dirfd (one
+    /// readdir batch — d_name/d_type/d_ino straight off the kernel, zero
+    /// per-child stats) when nothing can make the raw stream lie about the
+    /// guest view, else the exact layered merge. Runs once per description
+    /// (again after an lseek-0 rewind refresh).
+    fn materialize_trusted_dir_entries(
+        &self,
+        dir_path: &str,
+        trusted: &mut TrustedHostDir,
+        entries: &mut Vec<RootFsDirEntry>,
+    ) {
+        let streamed = if self.fs.rootfs_vfs.rootfs.is_none()
+            && !self
+                .fs
+                .rootfs_vfs
+                .overlay
+                .dir_has_overlay_interference(dir_path)
+        {
+            read_host_dir_entries(trusted.fd.raw(), dir_path)
+        } else {
+            None
+        };
+        *entries = match streamed {
+            Some(list) => list,
+            // Interference (marker nodes) or a stream surprise (DT_UNKNOWN):
+            // the layered path classifies each child exactly, as today. A
+            // directory deleted since the open reads as empty.
+            None => crate::overlay::layered_directory_entries(
+                self.fs.rootfs_vfs.overlay.as_ref(),
+                self.fs.rootfs_vfs.rootfs.as_ref(),
+                dir_path,
+            )
+            .unwrap_or_default(),
+        };
+        trusted.entries_loaded = true;
     }
 
     /// Render `/proc/self/fdinfo/N` (proc_pid_fdinfo(5)): pos, the open flags
@@ -2639,6 +3109,9 @@ impl SyscallDispatcher {
                         entries: rootfs_entries,
                         offset: 0,
                         base: OpenDescriptionBase::new(status_flags as u64),
+                        // VFS-mount (synthetic) directories never take the
+                        // trusted host-dirfd lane.
+                        trusted_host_dir: None,
                     })),
                     linux_fd_flags_from_open_flags(flags),
                 );
@@ -7266,11 +7739,23 @@ impl SyscallDispatcher {
                 entries,
                 offset,
                 path,
+                trusted_host_dir,
                 ..
             } = &mut *open
             else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+
+            // Trusted lane: materialize entries LAZILY on the first read —
+            // streamed off the host dirfd (d_type/d_ino straight from the
+            // kernel, zero per-child stats) when nothing interferes, the
+            // exact layered merge otherwise. Directory opens that never call
+            // getdents (walk anchors) pay nothing.
+            if let Some(trusted) = trusted_host_dir
+                && !trusted.entries_loaded
+            {
+                this.materialize_trusted_dir_entries(path, trusted, entries);
+            }
 
             // Real Linux getdents64 always returns `.` (self) and `..` (parent)
             // first. Synthesize them on the READ path only — NOT in
@@ -7387,6 +7872,20 @@ impl SyscallDispatcher {
                 }
             }
 
+            // A trusted directory materializes lazily; a SEEK_END that needs
+            // the entry count must see the real entries first.
+            if whence == LINUX_SEEK_END
+                && let OpenDescription::Directory {
+                    entries,
+                    path,
+                    trusted_host_dir: Some(trusted),
+                    ..
+                } = &mut *open
+                && !trusted.entries_loaded
+            {
+                this.materialize_trusted_dir_entries(path, trusted, entries);
+            }
+
             let (current, end) = match &*open {
                 OpenDescription::File {
                     contents, offset, ..
@@ -7455,6 +7954,21 @@ impl SyscallDispatcher {
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::Netlink { .. } => {}
+            }
+            // A rewind of a trusted directory drops the materialized snapshot
+            // so the next getdents64 streams a FRESH view (Linux re-reads the
+            // directory after rewinddir; untrusted descriptions keep their
+            // historical open-time snapshot).
+            if next == 0
+                && let OpenDescription::Directory {
+                    entries,
+                    trusted_host_dir: Some(trusted),
+                    ..
+                } = &mut *open
+                && trusted.entries_loaded
+            {
+                entries.clear();
+                trusted.entries_loaded = false;
             }
             Ok(DispatchOutcome::Returned { value: next })
 
@@ -11562,6 +12076,115 @@ impl SyscallDispatcher {
     }
 }
 
+/// One streamed readdir batch of a TRUSTED host dirfd, translated to the
+/// `RootFsDirEntry` shape `getdents64`'s `dirent64_record` encoder consumes —
+/// `d_name`/`d_type`/`d_ino` straight off the kernel, zero per-child stats.
+/// `dup` + `fdopendir` so the `DIR*` lifecycle (its own buffer, `closedir`)
+/// never touches the description fd's state. Skips "."/".." (the getdents
+/// handler synthesizes deterministic dot entries) and carrick's internal
+/// sidecar names. `None` on any surprise (`DT_UNKNOWN`, an unmappable type,
+/// `fdopendir` failure) ⇒ the caller takes the exact layered path.
+#[cfg(target_os = "macos")]
+fn read_host_dir_entries(host_dir_fd: i32, dir_path: &str) -> Option<Vec<RootFsDirEntry>> {
+    struct Dirp(*mut libc::DIR);
+    impl Drop for Dirp {
+        fn drop(&mut self) {
+            // SAFETY: closes the DIR* (and its adopted dup'd fd) exactly once.
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    // SAFETY: dup a private fd for the DIR* to adopt; the description's own
+    // fd (and its seek state) stays untouched.
+    let dup = unsafe { libc::dup(host_dir_fd) };
+    if dup < 0 {
+        return None;
+    }
+    let raw_dirp = unsafe { libc::fdopendir(dup) };
+    if raw_dirp.is_null() {
+        // SAFETY: fdopendir did not adopt the fd, so it is still ours.
+        unsafe {
+            libc::close(dup);
+        }
+        return None;
+    }
+    let dirp = Dirp(raw_dirp);
+    // fdopendir adopts the fd's CURRENT offset; the dup shares the
+    // original's, so rewind to read the whole directory.
+    unsafe { libc::rewinddir(dirp.0) };
+    let mut out = Vec::new();
+    loop {
+        // SAFETY: dirp.0 is a live DIR*; readdir returns null at end.
+        let ent = unsafe { libc::readdir(dirp.0) };
+        if ent.is_null() {
+            break;
+        }
+        // SAFETY: `ent` points at the DIR*'s current record; d_name is
+        // NUL-terminated within the struct.
+        let (d_type, d_ino, name_bytes) = unsafe {
+            let e = &*ent;
+            (
+                e.d_type,
+                e.d_ino,
+                std::ffi::CStr::from_ptr(e.d_name.as_ptr()).to_bytes(),
+            )
+        };
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        // On-disk names are valid UTF-8 by construction (APFS rejects raw
+        // non-UTF-8; undecodable guest names live in the reversible escape
+        // form — see `fs_backend::normalize`), so this lossy read matches
+        // `child_names` byte-for-byte.
+        let name = String::from_utf8_lossy(name_bytes).into_owned();
+        if crate::fs_backend::is_internal_sidecar_name(&name) {
+            continue;
+        }
+        let kind = match d_type {
+            libc::DT_DIR => RootFsEntryKind::Directory,
+            libc::DT_REG => RootFsEntryKind::File,
+            libc::DT_LNK => RootFsEntryKind::Symlink,
+            libc::DT_FIFO => RootFsEntryKind::Fifo,
+            libc::DT_SOCK => RootFsEntryKind::Socket,
+            libc::DT_CHR => RootFsEntryKind::CharDevice,
+            // DT_UNKNOWN / DT_BLK / anything else: the stream cannot answer
+            // d_type faithfully — layered path for the WHOLE directory.
+            _ => return None,
+        };
+        let path = if dir_path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{dir_path}/{name}")
+        };
+        out.push(RootFsDirEntry {
+            name,
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from(path),
+                kind,
+                // getdents64 consumes only `kind` (→ d_type), the name and
+                // the ino; mode/size mirror the layered merge's defaults for
+                // entries it does not open.
+                mode: if kind == RootFsEntryKind::Directory {
+                    0o755
+                } else {
+                    0o644
+                },
+                size: 0,
+            },
+            ino: d_ino,
+        });
+    }
+    Some(out)
+}
+
+/// Trusted host dirfds are only ever minted by the macOS `--fs host` fast
+/// path; the streaming reader is unreachable elsewhere.
+#[cfg(not(target_os = "macos"))]
+fn read_host_dir_entries(_host_dir_fd: i32, _dir_path: &str) -> Option<Vec<RootFsDirEntry>> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11702,6 +12325,7 @@ mod tests {
                 entries: Vec::new(),
                 offset: 0,
                 base: OpenDescriptionBase::new(0),
+                trusted_host_dir: None,
             })),
             fd_flags: 0,
         }
@@ -11758,6 +12382,462 @@ mod tests {
                 .unwrap(),
             DispatchOutcome::errno(LINUX_EACCES)
         );
+    }
+
+    // === Trusted-dirfd fast lane (`--fs host`) ===
+
+    /// Host-backend dispatcher over a fixture walk tree:
+    /// `/walk/{file.txt, sub/deep.txt, link -> file.txt, fifo,
+    /// .carrick-lnkown.ghost}`. The sidecar name must stay invisible to the
+    /// guest; the FIFO exercises the never-blocking-open invariant.
+    #[cfg(target_os = "macos")]
+    fn trusted_lane_fixture() -> (tempfile::TempDir, SyscallDispatcher) {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .unwrap();
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        backend.make_dir("/walk").unwrap();
+        backend.make_dir("/walk/sub").unwrap();
+        backend
+            .set_file_contents("/walk/file.txt", b"hello lane".to_vec())
+            .unwrap();
+        backend
+            .set_file_contents("/walk/sub/deep.txt", b"deep".to_vec())
+            .unwrap();
+        backend.symlink("file.txt", "/walk/link").unwrap();
+        backend.create_fifo("/walk/fifo", 0o644).unwrap();
+        backend
+            .set_file_contents("/walk/.carrick-lnkown.ghost", b"sidecar".to_vec())
+            .unwrap();
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        (scratch, dispatcher)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn lane_syscall(
+        dispatcher: &mut SyscallDispatcher,
+        memory: &mut LinearMemory,
+        nr: u64,
+        args: [u64; 6],
+    ) -> i64 {
+        let reporter = CompatReporter::default();
+        match dispatcher
+            .dispatch(
+                SyscallRequest::new(nr, SyscallArgs::from(args)),
+                memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            DispatchOutcome::Errno { errno } => -i64::from(errno.get()),
+            other => panic!("unexpected dispatch outcome: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn lane_openat(
+        dispatcher: &mut SyscallDispatcher,
+        memory: &mut LinearMemory,
+        dirfd: u64,
+        path: &str,
+        flags: u64,
+    ) -> i64 {
+        memory
+            .write_bytes(0x4000, format!("{path}\0").as_bytes())
+            .unwrap();
+        lane_syscall(dispatcher, memory, 56, [dirfd, 0x4000, flags, 0, 0, 0])
+    }
+
+    #[cfg(target_os = "macos")]
+    fn lane_dir_is_trusted(dispatcher: &SyscallDispatcher, fd: i64) -> bool {
+        let open_file = dispatcher.open_file(fd as i32).unwrap();
+        let open = open_file.description.read();
+        matches!(
+            &*open,
+            OpenDescription::Directory {
+                trusted_host_dir: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Drain getdents64 through the dispatcher and parse the guest-visible
+    /// `(name, d_type)` records (dot entries included).
+    #[cfg(target_os = "macos")]
+    fn lane_getdents(
+        dispatcher: &mut SyscallDispatcher,
+        memory: &mut LinearMemory,
+        fd: i64,
+    ) -> Vec<(String, u8)> {
+        let mut out = Vec::new();
+        loop {
+            let n = lane_syscall(dispatcher, memory, 61, [fd as u64, 0x8000, 4096, 0, 0, 0]);
+            assert!(n >= 0, "getdents64 failed: {n}");
+            if n == 0 {
+                break;
+            }
+            let buf = memory.read_bytes(0x8000, n as usize).unwrap();
+            let mut pos = 0usize;
+            while pos < buf.len() {
+                let reclen = u16::from_le_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+                let d_type = buf[pos + 18];
+                let name_bytes = &buf[pos + LINUX_DIRENT64_HEADER_SIZE..pos + reclen];
+                let end = name_bytes.iter().position(|&b| b == 0).unwrap();
+                out.push((
+                    String::from_utf8(name_bytes[..end].to_vec()).unwrap(),
+                    d_type,
+                ));
+                pos += reclen;
+            }
+        }
+        out
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_dirfd_lane_serves_walk_and_recurses() {
+        let (_scratch, mut dispatcher) = trusted_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+        let root = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(root >= 0, "open /walk: {root}");
+        assert!(
+            lane_dir_is_trusted(&dispatcher, root),
+            "absolute O_DIRECTORY open must seed the trusted lane"
+        );
+
+        let sub = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            root as u64,
+            "sub",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(sub >= 0, "openat(root, sub): {sub}");
+        assert!(
+            lane_dir_is_trusted(&dispatcher, sub),
+            "a lane-served child directory must itself be trusted (walk recursion)"
+        );
+
+        let file = lane_openat(&mut dispatcher, &mut memory, sub as u64, "deep.txt", 0);
+        assert!(file >= 0, "openat(sub, deep.txt): {file}");
+        {
+            let open_file = dispatcher.open_file(file as i32).unwrap();
+            let open = open_file.description.read();
+            assert!(
+                matches!(&*open, OpenDescription::HostFile { .. }),
+                "lane-served regular file must be a HostFile, got {open:?}"
+            );
+        }
+        // The served fd carries the real bytes.
+        let n = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [file as u64, 0x9000, 64, 0, 0, 0],
+        );
+        assert_eq!(n, 4);
+        assert_eq!(memory.read_bytes(0x9000, 4).unwrap(), b"deep");
+
+        // A missing single component is authoritative ENOENT from the lane.
+        assert_eq!(
+            lane_openat(&mut dispatcher, &mut memory, root as u64, "nope", 0),
+            -i64::from(LINUX_ENOENT.get())
+        );
+        // O_DIRECTORY of a regular child is authoritative ENOTDIR.
+        assert_eq!(
+            lane_openat(
+                &mut dispatcher,
+                &mut memory,
+                root as u64,
+                "file.txt",
+                LINUX_O_DIRECTORY
+            ),
+            -i64::from(LINUX_ENOTDIR.get())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_dirfd_lane_falls_back_for_special_shapes() {
+        let (_scratch, mut dispatcher) = trusted_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let root = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(lane_dir_is_trusted(&dispatcher, root));
+
+        // Multi-component and ".." names take (and succeed via) the full path.
+        let multi = lane_openat(&mut dispatcher, &mut memory, root as u64, "sub/deep.txt", 0);
+        assert!(multi >= 0, "multi-component openat: {multi}");
+        let up = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            root as u64,
+            "..",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(up >= 0, "dotdot openat: {up}");
+
+        // A symlink child falls back and is FOLLOWED (the lane would ELOOP).
+        let via_link = lane_openat(&mut dispatcher, &mut memory, root as u64, "link", 0);
+        assert!(via_link >= 0, "symlink-child openat: {via_link}");
+        let n = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [via_link as u64, 0x9000, 64, 0, 0, 0],
+        );
+        assert_eq!(n, 10);
+        assert_eq!(memory.read_bytes(0x9000, 10).unwrap(), b"hello lane");
+
+        // O_CREAT falls back and actually creates.
+        let created = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            root as u64,
+            "made.txt",
+            LINUX_O_CREAT | LINUX_O_WRONLY,
+        );
+        assert!(created >= 0, "O_CREAT openat: {created}");
+        assert!(dispatcher.layered_metadata("/walk/made.txt").is_ok());
+
+        // A FIFO child must route to the non-blocking FIFO machinery — a
+        // HostPipe, never a HostFile, and never a blocking open.
+        let fifo = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            root as u64,
+            "fifo",
+            LINUX_O_RDWR,
+        );
+        assert!(fifo >= 0, "fifo openat: {fifo}");
+        {
+            let open_file = dispatcher.open_file(fifo as i32).unwrap();
+            let open = open_file.description.read();
+            assert!(
+                matches!(&*open, OpenDescription::HostPipe { .. }),
+                "FIFO child must be a HostPipe, got {open:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_dirfd_stat_matches_slow_path() {
+        let (_scratch, mut dispatcher) = trusted_lane_fixture();
+        // A carrick mode xattr (setuid bits) + owner xattrs must merge into
+        // the fast-lane record exactly as the slow path merges them.
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_mode("/walk/file.txt", 0o4711)
+            .unwrap();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_owner("/walk/file.txt", 7, 9)
+            .unwrap();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let root = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(lane_dir_is_trusted(&dispatcher, root));
+
+        // A mknod device MARKER: the mode xattr carries the S_IFCHR type bits
+        // verbatim and the rdev xattr the raw dev_t — the fast lane must
+        // recover both through `stat_record_with_device` like the slow path.
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .create_device("/walk/dev0", LINUX_S_IFCHR | 0o600, 0x0103)
+            .unwrap();
+
+        for name in ["file.txt", "sub", "link", "fifo", "dev0"] {
+            let fast = dispatcher.path_stat_record(root as u64, name, LINUX_AT_SYMLINK_NOFOLLOW);
+            let slow = dispatcher.path_stat_record(
+                LINUX_AT_FDCWD,
+                &format!("/walk/{name}"),
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            );
+            assert_eq!(fast, slow, "fast/slow stat divergence for {name:?}");
+        }
+        let dev = dispatcher
+            .path_stat_record(root as u64, "dev0", LINUX_AT_SYMLINK_NOFOLLOW)
+            .unwrap();
+        assert_eq!(dev.mode & LINUX_S_IFMT, LINUX_S_IFCHR);
+        assert_eq!(dev.rdev, 0x0103);
+        // Missing child: authoritative ENOENT, identical to the slow path.
+        assert_eq!(
+            dispatcher.path_stat_record(root as u64, "gone", 0),
+            Err(LINUX_ENOENT)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_getdents_streams_layered_identical_entries() {
+        let (_scratch, mut dispatcher) = trusted_lane_fixture();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let root = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(lane_dir_is_trusted(&dispatcher, root));
+        // Streaming preconditions hold on this fixture (a real FIFO is not
+        // interference; the sidecar is name-filtered by the stream itself).
+        assert!(
+            !dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .dir_has_overlay_interference("/walk")
+        );
+
+        let mut streamed = lane_getdents(&mut dispatcher, &mut memory, root);
+        assert_eq!(streamed.first().map(|(n, _)| n.as_str()), Some("."));
+        assert_eq!(streamed.get(1).map(|(n, _)| n.as_str()), Some(".."));
+        streamed.retain(|(n, _)| n != "." && n != "..");
+        streamed.sort();
+
+        let mut layered: Vec<(String, u8)> = crate::overlay::layered_directory_entries(
+            dispatcher.fs.rootfs_vfs.overlay.as_ref(),
+            None,
+            "/walk",
+        )
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.name, linux_dirent_type(e.metadata.kind)))
+        .collect();
+        layered.sort();
+
+        assert_eq!(streamed, layered);
+        assert!(
+            !streamed.iter().any(|(n, _)| n.starts_with(".carrick-")),
+            "sidecar names must never reach the guest: {streamed:?}"
+        );
+        assert!(
+            streamed
+                .iter()
+                .any(|(n, t)| n == "fifo" && *t == linux_dirent_type(RootFsEntryKind::Fifo)),
+            "FIFO child must stream as DT_FIFO without being opened"
+        );
+        assert!(
+            streamed
+                .iter()
+                .any(|(n, t)| n == "link" && *t == linux_dirent_type(RootFsEntryKind::Symlink))
+        );
+        assert!(
+            streamed
+                .iter()
+                .any(|(n, t)| n == "sub" && *t == linux_dirent_type(RootFsEntryKind::Directory))
+        );
+
+        // Rewind refreshes: a child created AFTER the first drain appears on
+        // the re-read (Linux rewinddir semantics).
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/walk/late.txt", b"x".to_vec())
+            .unwrap();
+        let seek = lane_syscall(
+            &mut dispatcher,
+            &mut memory,
+            62,
+            [root as u64, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(seek, 0);
+        let refreshed = lane_getdents(&mut dispatcher, &mut memory, root);
+        assert!(
+            refreshed.iter().any(|(n, _)| n == "late.txt"),
+            "rewound trusted getdents must take a fresh snapshot: {refreshed:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn socket_marker_disables_streaming_and_keeps_layered_parity() {
+        let (_scratch, mut dispatcher) = trusted_lane_fixture();
+        // A bound AF_UNIX socket node is a MARKER regular file whose guest
+        // TYPE lives in an xattr; its presence must disable streaming (fail
+        // closed to the layered path) so getdents can never diverge from the
+        // layered truth.
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .create_socket("/walk/sock", 0o755)
+            .unwrap();
+        assert!(
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .dir_has_overlay_interference("/walk")
+        );
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+        let root = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            "/walk",
+            LINUX_O_DIRECTORY,
+        );
+        assert!(lane_dir_is_trusted(&dispatcher, root));
+        // getdents through the trusted fd equals the layered merge exactly.
+        // (Note the HOST layered path itself reports a socket MARKER as
+        // DT_REG — child_names cannot classify markers without a per-child
+        // open; stat is where S_IFSOCK is recovered. The lane preserves that
+        // behavior bit-for-bit.)
+        let mut entries = lane_getdents(&mut dispatcher, &mut memory, root);
+        entries.retain(|(n, _)| n != "." && n != "..");
+        entries.sort();
+        let mut layered: Vec<(String, u8)> = crate::overlay::layered_directory_entries(
+            dispatcher.fs.rootfs_vfs.overlay.as_ref(),
+            None,
+            "/walk",
+        )
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.name, linux_dirent_type(e.metadata.kind)))
+        .collect();
+        layered.sort();
+        assert_eq!(entries, layered);
+        assert!(entries.iter().any(|(n, _)| n == "sock"));
+
+        // The fast STAT lane recovers S_IFSOCK from the marker xattr exactly
+        // like the slow path.
+        let fast = dispatcher
+            .path_stat_record(root as u64, "sock", LINUX_AT_SYMLINK_NOFOLLOW)
+            .unwrap();
+        assert_eq!(fast.mode & LINUX_S_IFMT, LINUX_S_IFSOCK);
+        let slow = dispatcher
+            .path_stat_record(LINUX_AT_FDCWD, "/walk/sock", LINUX_AT_SYMLINK_NOFOLLOW)
+            .unwrap();
+        assert_eq!(fast, slow);
     }
 
     #[test]

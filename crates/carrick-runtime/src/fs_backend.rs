@@ -540,6 +540,34 @@ pub trait FsBackend: Send + Sync {
         ParentResolve::Slow
     }
 
+    /// Open a TRUSTED host dirfd on the directory at guest `path`, for the
+    /// dispatcher's dirfd-relative fast lane. `Some` ONLY when the backend can
+    /// prove, byte-exactly, that the opened inode's real host path equals
+    /// `sandbox_root + path` — i.e. no symlink, Unicode alias, or sandbox
+    /// escape anywhere in the chain — so that a later single-component
+    /// `openat(fd, name, O_NOFOLLOW)` is structurally contained with NO
+    /// per-op containment check. The returned fd is `O_CLOEXEC|O_DIRECTORY`
+    /// and owned by the caller. Default: `None` (no kernel namespace to
+    /// anchor trust in — the memory backend can never take this lane).
+    fn open_trusted_dir_fd(&self, _path: &str) -> Option<std::os::fd::OwnedFd> {
+        None
+    }
+
+    /// `true` when the overlay's own bookkeeping could make a RAW host
+    /// directory stream lie about the guest view of `dir` — i.e. `getdents`
+    /// must take the layered (per-child classified) path instead of streaming
+    /// `d_type`/`d_ino` straight off the host dirfd. For the host backend the
+    /// scratch tree IS the merged truth (the rootfs is materialized, deletions
+    /// are real unlinks), so the only interference is MARKER nodes whose
+    /// guest-visible type differs from their on-disk type: AF_UNIX socket
+    /// nodes (`create_socket`) and mknod device nodes (`create_device`), both
+    /// regular files on disk. Sidecar files are name-filtered by the stream
+    /// itself and are not interference. Default: `true` (fail closed — a
+    /// backend that cannot prove otherwise keeps today's layered path).
+    fn dir_has_overlay_interference(&self, _dir: &str) -> bool {
+        true
+    }
+
     /// Human-readable backend name for `--fs` reporting. Default is
     /// the impl's `type_name`-style identifier.
     fn name(&self) -> &'static str {
@@ -1414,6 +1442,19 @@ pub struct HostFsBackend {
     /// `may_have_fifo_nodes` check is then one shared-atomic load, zero
     /// syscalls. `0` = never checked (generation starts at 1).
     fifo_absent_gen: std::sync::atomic::AtomicU64,
+    /// Sticky fast answer for [`FsBackend::dir_has_overlay_interference`]:
+    /// once ANY process is known to have created a MARKER node (AF_UNIX
+    /// socket / mknod device — regular files whose guest-visible type lives
+    /// in xattrs) the raw getdents stream would lie about `d_type`, so the
+    /// answer is `true` forever with no syscall. Mirrors `fifo_seen`: the
+    /// durable truth is [`CARRICK_HAS_MARKER_NODES_XATTR`] on the scratch
+    /// root; this bool caches only a `true` reading.
+    marker_seen: std::sync::atomic::AtomicBool,
+    /// Shared fs-structure generation at which this process last read the
+    /// marker-node root xattr as ABSENT; mirrors `fifo_absent_gen`
+    /// (`create_socket`/`create_device` stamp the marker and bump the
+    /// generation BEFORE creating the node).
+    marker_absent_gen: std::sync::atomic::AtomicU64,
 }
 
 /// A cached `RealStat` plus the snapshot needed to revalidate it cheaply. The
@@ -1665,6 +1706,8 @@ impl HostFsBackend {
             watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
             fifo_seen: std::sync::atomic::AtomicBool::new(false),
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            marker_seen: std::sync::atomic::AtomicBool::new(false),
+            marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1709,6 +1752,8 @@ impl HostFsBackend {
             watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
             fifo_seen: std::sync::atomic::AtomicBool::new(false),
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            marker_seen: std::sync::atomic::AtomicBool::new(false),
+            marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1789,6 +1834,8 @@ impl HostFsBackend {
             watch_cache_pid: std::sync::atomic::AtomicU32::new(0),
             fifo_seen: std::sync::atomic::AtomicBool::new(false),
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            marker_seen: std::sync::atomic::AtomicBool::new(false),
+            marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2058,43 +2105,59 @@ impl HostFsBackend {
         Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
     }
 
-    /// Durable "a FIFO exists (or existed) under this root" marker read; see
-    /// [`FsBackend::may_have_fifo_nodes`] and the `fifo_seen` field docs.
-    fn root_fifo_marker(&self) -> FifoMarker {
+    /// Durable sandbox-root marker read (tri-state; see [`RootMarker`]). Backs
+    /// both [`FsBackend::may_have_fifo_nodes`] ([`CARRICK_HAS_FIFO_XATTR`]) and
+    /// [`FsBackend::dir_has_overlay_interference`]
+    /// ([`CARRICK_HAS_MARKER_NODES_XATTR`]).
+    fn root_marker_xattr(&self, name: &[u8]) -> RootMarker {
         use std::os::fd::AsRawFd;
         let Some(fd) = self.root_meta_fd() else {
-            return FifoMarker::Unknown;
+            return RootMarker::Unknown;
         };
         let mut v = [0u8; 4];
         // SAFETY: valid fd, NUL-terminated name, in-bounds buffer.
         let n = unsafe {
             carrick_portable::fgetxattr(
                 fd.as_raw_fd(),
-                CARRICK_HAS_FIFO_XATTR.as_ptr() as *const libc::c_char,
+                name.as_ptr() as *const libc::c_char,
                 v.as_mut_ptr() as *mut libc::c_void,
                 v.len(),
             )
         };
         if n >= 0 {
-            return FifoMarker::Present;
+            return RootMarker::Present;
         }
         if std::io::Error::last_os_error().raw_os_error() == Some(XATTR_ABSENT_ERRNO) {
-            FifoMarker::Absent
+            RootMarker::Absent
         } else {
-            FifoMarker::Unknown
+            RootMarker::Unknown
         }
+    }
+
+    /// Stamp a durable marker xattr on the sandbox root. Called BEFORE the
+    /// node that motivates it exists, so no process can ever observe the node
+    /// while the corresponding query still answers "none".
+    fn stamp_root_marker(&self, name: &[u8], seen: &std::sync::atomic::AtomicBool) {
+        use std::os::fd::AsRawFd;
+        if let Some(fd) = self.root_meta_fd() {
+            fset_u32_xattr(fd.as_raw_fd(), name, 1);
+        }
+        seen.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Stamp the durable FIFO marker on the sandbox root. Called by
     /// `create_fifo` BEFORE the node exists, so no process can ever observe a
     /// FIFO while `may_have_fifo_nodes` still answers false.
     fn stamp_fifo_marker(&self) {
-        use std::os::fd::AsRawFd;
-        if let Some(fd) = self.root_meta_fd() {
-            fset_u32_xattr(fd.as_raw_fd(), CARRICK_HAS_FIFO_XATTR, 1);
-        }
-        self.fifo_seen
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stamp_root_marker(CARRICK_HAS_FIFO_XATTR, &self.fifo_seen);
+    }
+
+    /// Stamp the durable marker-node marker (socket/device marker files whose
+    /// guest type lives in xattrs) on the sandbox root. Called by
+    /// `create_socket`/`create_device` BEFORE the node exists, so no process
+    /// can stream a directory while a marker node is observable in it.
+    fn stamp_marker_node_marker(&self) {
+        self.stamp_root_marker(CARRICK_HAS_MARKER_NODES_XATTR, &self.marker_seen);
     }
 
     /// The cap-std slow path of [`FsBackend::open_raw_fd`]: manual leaf
@@ -2695,6 +2758,19 @@ pub(crate) const CARRICK_SOCKET_XATTR_NAME: &str = "user.carrick.socket";
 /// get/set/listxattr like every `user.carrick.*` name.
 const CARRICK_HAS_FIFO_XATTR: &[u8] = b"user.carrick.has_fifo\0";
 
+/// Marker xattr on the sandbox ROOT directory recording that a MARKER node —
+/// an AF_UNIX socket node (`create_socket`) or a mknod device node
+/// (`create_device`), both regular files whose guest-visible TYPE lives in
+/// xattrs — has (at some point) been created under it. The durable truth
+/// behind [`FsBackend::dir_has_overlay_interference`]: while absent, a raw
+/// host directory stream's `d_type` is guest-faithful for every entry, so
+/// `getdents64` may stream straight off a trusted host dirfd. Same durability
+/// rationale and never-removed conservatism as [`CARRICK_HAS_FIFO_XATTR`]
+/// (carrick forks real host processes; `bind()` in one process must disable
+/// streaming in every sibling). Hidden from the guest's xattr syscalls like
+/// every `user.carrick.*` name.
+const CARRICK_HAS_MARKER_NODES_XATTR: &[u8] = b"user.carrick.has_marker_nodes\0";
+
 /// The errno that means "xattr not present" (as opposed to "this filesystem
 /// cannot do xattrs", which must fail CLOSED — see `root_fifo_marker`).
 #[cfg(target_os = "linux")]
@@ -2702,12 +2778,13 @@ const XATTR_ABSENT_ERRNO: i32 = libc::ENODATA;
 #[cfg(not(target_os = "linux"))]
 const XATTR_ABSENT_ERRNO: i32 = libc::ENOATTR;
 
-/// Tri-state reading of [`CARRICK_HAS_FIFO_XATTR`]. `Unknown` (the marker
-/// mechanism itself failed, e.g. a host filesystem without `user.*` xattr
-/// support) is distinct from `Absent` so `may_have_fifo_nodes` can fail
-/// closed to the historical per-open probe instead of wrongly answering
-/// "no FIFOs" forever.
-enum FifoMarker {
+/// Tri-state reading of a sandbox-root marker xattr ([`CARRICK_HAS_FIFO_XATTR`]
+/// / [`CARRICK_HAS_MARKER_NODES_XATTR`]). `Unknown` (the marker mechanism
+/// itself failed, e.g. a host filesystem without `user.*` xattr support) is
+/// distinct from `Absent` so the consumers can fail closed (per-open FIFO
+/// probe resumes; getdents streaming stays off) instead of wrongly answering
+/// "none" forever.
+enum RootMarker {
     Present,
     Absent,
     Unknown,
@@ -2840,7 +2917,9 @@ pub(crate) fn fget_rdev_xattr(fd: std::os::fd::RawFd) -> Option<u64> {
 /// node), so this collapses the typical 3–4 reads to one list + one read; a
 /// file with no carrick xattrs costs just the list. Falls back to direct reads
 /// if the name buffer is too small (a file with unusually many xattrs).
-fn fd_carrick_meta(fd: std::os::fd::RawFd) -> (Option<u32>, Option<u32>, Option<u32>, bool) {
+pub(crate) fn fd_carrick_meta(
+    fd: std::os::fd::RawFd,
+) -> (Option<u32>, Option<u32>, Option<u32>, bool) {
     let mut names = [0u8; 1024];
     let n = unsafe {
         carrick_portable::flistxattr(fd, names.as_mut_ptr() as *mut libc::c_char, names.len())
@@ -3641,19 +3720,52 @@ impl FsBackend for HostFsBackend {
         if self.fifo_absent_gen.load(Relaxed) == now {
             return false;
         }
-        match self.root_fifo_marker() {
-            FifoMarker::Present => {
+        match self.root_marker_xattr(CARRICK_HAS_FIFO_XATTR) {
+            RootMarker::Present => {
                 self.fifo_seen.store(true, Relaxed);
                 true
             }
-            FifoMarker::Absent => {
+            RootMarker::Absent => {
                 self.fifo_absent_gen.store(now, Relaxed);
                 false
             }
             // The marker mechanism is unavailable (host fs without user
             // xattrs): fail CLOSED to the historical per-open FIFO probe —
             // a wrong `false` would send a FIFO open down the blocking path.
-            FifoMarker::Unknown => true,
+            RootMarker::Unknown => true,
+        }
+    }
+
+    fn dir_has_overlay_interference(&self, _dir: &str) -> bool {
+        // The scratch tree is the merged truth for the host backend (rootfs
+        // materialized, deletions are real unlinks), so the only thing that
+        // can make a raw host directory stream lie is a MARKER node (socket/
+        // device — a regular file whose guest type lives in xattrs). Tracked
+        // root-level like the FIFO marker: `create_socket`/`create_device`
+        // stamp the durable root xattr and bump the shared generation BEFORE
+        // creating the node, so "generation unchanged since the last absent
+        // reading" proves no marker node appeared anywhere. Coarse (any
+        // marker node anywhere disables streaming everywhere) but exact —
+        // and walk workloads do not bind sockets or mknod devices.
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.marker_seen.load(Relaxed) {
+            return true;
+        }
+        let now = crate::fs_resolve_cache::current_generation();
+        if self.marker_absent_gen.load(Relaxed) == now {
+            return false;
+        }
+        match self.root_marker_xattr(CARRICK_HAS_MARKER_NODES_XATTR) {
+            RootMarker::Present => {
+                self.marker_seen.store(true, Relaxed);
+                true
+            }
+            RootMarker::Absent => {
+                self.marker_absent_gen.store(now, Relaxed);
+                false
+            }
+            // Marker mechanism unavailable: fail CLOSED (no streaming).
+            RootMarker::Unknown => true,
         }
     }
 
@@ -3784,6 +3896,13 @@ impl FsBackend for HostFsBackend {
                 .create_dir_all(parent)
                 .map_err(|_| BackendError::Io)?;
         }
+        // Ordering is load-bearing (mirrors `create_fifo`): (1) stamp the
+        // durable root marker, (2) bump the shared fs generation, (3) only
+        // then create the node — so no process can stream a getdents batch
+        // that misreports this node's type while
+        // `dir_has_overlay_interference` still answers false.
+        self.stamp_marker_node_marker();
+        crate::fs_resolve_cache::bump_generation();
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true);
         self.dir
@@ -3809,6 +3928,9 @@ impl FsBackend for HostFsBackend {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
+        // Marker + generation BEFORE the node exists (see `create_socket`).
+        self.stamp_marker_node_marker();
+        crate::fs_resolve_cache::bump_generation();
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true);
         dir.open_with(&at_rel, &opts)
@@ -5037,6 +5159,74 @@ impl FsBackend for HostFsBackend {
         }
     }
 
+    fn open_trusted_dir_fd(&self, path: &str) -> Option<std::os::fd::OwnedFd> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            use std::os::unix::ffi::OsStrExt;
+            if !self.fast_fs {
+                return None;
+            }
+            let root_prefix = self.root_prefix.as_deref()?;
+            let normalized = normalize(path)?;
+            let dir_fd = self.dir.as_raw_fd();
+            // O_NOFOLLOW: the dispatcher hands us an already symlink-resolved
+            // path, so a symlink leaf here is unexpected — reject rather than
+            // traverse. O_NONBLOCK is moot for a directory but harmless.
+            let oflags = libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK;
+            let (raw, expected) = if normalized.as_os_str().is_empty() {
+                // The sandbox root itself (guest "/"): trivially contained.
+                let raw = unsafe { libc::openat(dir_fd, c".".as_ptr(), oflags, 0) };
+                (raw, root_prefix.as_bytes().to_vec())
+            } else {
+                let rel_c = std::ffi::CString::new(normalized.as_os_str().as_bytes()).ok()?;
+                let raw = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), oflags, 0) };
+                let mut expected =
+                    Vec::with_capacity(root_prefix.len() + 1 + normalized.as_os_str().len());
+                expected.extend_from_slice(root_prefix.as_bytes());
+                expected.push(b'/');
+                expected.extend_from_slice(normalized.as_os_str().as_bytes());
+                (raw, expected)
+            };
+            if raw < 0 {
+                return None;
+            }
+            // SAFETY: freshly-opened owned fd; closes on every early return.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            // Trust needs the BYTE-EXACT identity check (`F_GETPATH` equals
+            // sandbox_root + path), not mere prefix containment: an in-sandbox
+            // intermediate symlink or a Unicode-aliased component would leave
+            // the fd contained but anchored at a DIFFERENT directory than the
+            // recorded guest path, and every later single-component op would
+            // silently resolve there. Any difference ⇒ untrusted.
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            if unsafe {
+                libc::fcntl(
+                    fd.as_raw_fd(),
+                    libc::F_GETPATH,
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                )
+            } < 0
+            {
+                return None;
+            }
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if &buf[..end] != expected.as_slice() {
+                return None;
+            }
+            Some(fd)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
     fn stat_cache_lookup(&self, path: &str) -> Option<RealStat> {
         // Disabled / non-macOS short-circuits via stat_cache_active() == false.
         if !self.stat_cache_active() {
@@ -5581,6 +5771,62 @@ mod tests {
         let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
             .unwrap();
         (HostFsBackend::from_existing_dir(dir), scratch)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn open_trusted_dir_fd_trusts_only_byte_exact_paths() {
+        let (b, _scratch) = host_backend();
+        b.make_dir("/real").unwrap();
+        b.make_dir("/real/sub").unwrap();
+        b.symlink("real", "/alias").unwrap();
+        b.create_file("/plain").unwrap();
+
+        // Real contained directories (and the root itself) are trusted.
+        assert!(b.open_trusted_dir_fd("/real").is_some());
+        assert!(b.open_trusted_dir_fd("/real/sub").is_some());
+        assert!(b.open_trusted_dir_fd("/").is_some());
+        // A lexical normalization still lands on the byte-exact path.
+        assert!(b.open_trusted_dir_fd("/real/../real/sub").is_some());
+
+        // Never trusted: a symlink LEAF (O_NOFOLLOW), a symlink-REDIRECTED
+        // chain (F_GETPATH differs from the guest spelling), a regular file
+        // (O_DIRECTORY), and a missing path.
+        assert!(b.open_trusted_dir_fd("/alias").is_none());
+        assert!(b.open_trusted_dir_fd("/alias/sub").is_none());
+        assert!(b.open_trusted_dir_fd("/plain").is_none());
+        assert!(b.open_trusted_dir_fd("/missing").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn marker_nodes_flip_dir_overlay_interference() {
+        let (b, scratch) = host_backend();
+        b.make_dir("/walk").unwrap();
+        // Fresh scratch: nothing can make a raw stream lie (a real FIFO has
+        // a faithful DT_FIFO, so it is NOT interference).
+        assert!(!b.dir_has_overlay_interference("/walk"));
+        b.create_fifo("/walk/pipe", 0o644).unwrap();
+        assert!(!b.dir_has_overlay_interference("/walk"));
+        // A socket MARKER node (regular file whose guest type lives in an
+        // xattr) must disable streaming everywhere, durably.
+        b.create_socket("/walk/sock", 0o755).unwrap();
+        assert!(b.dir_has_overlay_interference("/walk"));
+        assert!(b.dir_has_overlay_interference("/elsewhere"));
+        // ... including for a SIBLING backend on the same scratch (the
+        // fork-coherence property: the truth is the root xattr, not the
+        // in-process bool).
+        let reattached = HostFsBackend::attach(scratch.path()).unwrap();
+        assert!(reattached.dir_has_overlay_interference("/walk"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn device_marker_flips_dir_overlay_interference() {
+        let (b, _scratch) = host_backend();
+        assert!(!b.dir_has_overlay_interference("/"));
+        b.create_device("/nulldev", 0o020666, 0x0103).unwrap();
+        assert!(b.dir_has_overlay_interference("/"));
     }
 
     #[cfg(target_os = "macos")]
