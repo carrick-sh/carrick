@@ -954,12 +954,33 @@ impl NativeMappedMemory {
                 address,
                 length: len,
             })?;
-        self.dsr_generations
-            .note_guest_code_write(
-                carrick_guest_mem::GuestVa(address)..carrick_guest_mem::GuestVa(end),
-            )
-            .map(Some)
-            .map_err(|error| MemoryError::HostMap(error.to_string()))
+        let range = carrick_guest_mem::GuestVa(address)..carrick_guest_mem::GuestVa(end);
+        let bumped = self
+            .dsr_generations
+            .note_guest_code_write(range.clone())
+            .map_err(|error| MemoryError::HostMap(error.to_string()))?;
+        // Sever incoming private direct links into the bumped pages AFTER
+        // the bump, so a racing entry through a not-yet-severed link lands in
+        // a block whose guard (or, once trusted entries exist, whose one-body
+        // stale window) already covers it. Without this the entry guard is
+        // the only invalidation mechanism.
+        // Default ON; `CARRICK_DSR_LINK_SEVER=0` is the bisection hatch.
+        static SEVER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sever = *SEVER.get_or_init(|| {
+            std::env::var_os("CARRICK_DSR_LINK_SEVER").as_deref() != Some(std::ffi::OsStr::new("0"))
+        });
+        if let Some(translator) = self.dsr_translator.as_ref().filter(|_| sever) {
+            // The generation table invalidates whole pages; sever at the same
+            // granularity or a link into an unbumped-bytes/bumped-page block
+            // would survive its block's invalidation.
+            let mask = self.host_page_size.saturating_sub(1);
+            let page_range = carrick_guest_mem::GuestVa(address & !mask)
+                ..carrick_guest_mem::GuestVa(end.saturating_add(mask) & !mask);
+            translator
+                .sever_direct_links_in(page_range)
+                .map_err(|error| MemoryError::HostMap(format!("direct-link sever: {error}")))?;
+        }
+        Ok(Some(bumped))
     }
 
     pub fn dsr_generation_observation(
