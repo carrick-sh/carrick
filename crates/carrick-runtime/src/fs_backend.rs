@@ -1662,11 +1662,135 @@ impl Drop for HostFsBackend {
                 }
             }
 
+            // Reclaim the run's scratch OFF the exit path. Measured: a no-op
+            // container spends 1,310 ms of its 1,772 ms after the guest has
+            // exited, almost all of it unlinking the image's ~26k files
+            // (docs/perf-results/container-lifecycle-split.jsonl) - pure wall
+            // the user waits through for a tree nobody will read again.
+            if let Some(scratch) = self._scratch.take() {
+                defer_remove_tree(scratch.keep());
+            }
             if let Some(path) = self._attached_cleanup_path.take() {
-                let _ = std::fs::remove_dir_all(path);
+                defer_remove_tree(path);
             }
         }
     }
+}
+
+/// Whether scratch reclamation is handed to a detached reaper instead of
+/// blocking process exit. Default ON; `CARRICK_FS_DEFERRED_TEARDOWN=0` is the
+/// exact escape hatch (AGENTS.md).
+fn deferred_teardown_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_FS_DEFERRED_TEARDOWN").as_deref()
+            != Some(std::ffi::OsStr::new("0"))
+    })
+}
+
+/// Remove a scratch tree without paying for it on this process's wall:
+/// rename it aside (one O(1) same-directory rename) so the name is free
+/// immediately, then hand the unlinking to a detached `/bin/rm -rf` that
+/// outlives us. `posix_spawn` is used rather than `fork` deliberately - this
+/// runs at teardown in a process with live threads and Darwin's
+/// CoreFoundation is fork-unsafe.
+///
+/// Every failure mode degrades to the historical synchronous removal, and the
+/// renamed tree keeps its `.carrick.lock`, so `sweep_orphans` on a later run
+/// reclaims anything a reaper missed. Nothing can leak permanently.
+fn defer_remove_tree(path: PathBuf) {
+    if !deferred_teardown_enabled() {
+        let _ = std::fs::remove_dir_all(&path);
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        let _ = std::fs::remove_dir_all(&path);
+        return;
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let aside = parent.join(format!(".carrick-reap-{}-{stamp}", unsafe {
+        libc::getpid()
+    }));
+    let target = match std::fs::rename(&path, &aside) {
+        Ok(()) => aside,
+        // Cross-device or a racing sweeper: fall back to removing in place.
+        Err(_) => path,
+    };
+    if spawn_detached_reaper(&target).is_err() {
+        let _ = std::fs::remove_dir_all(&target);
+    }
+}
+
+/// `posix_spawn("/bin/rm", ["-rf", target])`, detached: no `waitpid`, so the
+/// child is reparented to init as this process exits.
+fn spawn_detached_reaper(target: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let program = std::ffi::CString::new("/bin/rm").map_err(std::io::Error::other)?;
+    let arg0 = std::ffi::CString::new("rm").map_err(std::io::Error::other)?;
+    let arg1 = std::ffi::CString::new("-rf").map_err(std::io::Error::other)?;
+    let arg2 =
+        std::ffi::CString::new(target.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    let argv = [
+        arg0.as_ptr(),
+        arg1.as_ptr(),
+        arg2.as_ptr(),
+        std::ptr::null(),
+    ];
+    // The reaper MUST NOT inherit our stdio. A detached child holding the
+    // write end of a parent's capture pipe keeps that pipe open after carrick
+    // exits, so anything reading our output (the conformance harness, a shell
+    // `$(...)`, CI) blocks until the unlink finishes - which would hand back
+    // exactly the wall this change removes, disguised as carrick being slow.
+    // Point all three descriptors at /dev/null instead.
+    let devnull = std::ffi::CString::new("/dev/null").map_err(std::io::Error::other)?;
+    let mut actions = std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
+    // SAFETY: init before use; destroyed on every return path below.
+    if unsafe { libc::posix_spawn_file_actions_init(actions.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut actions = unsafe { actions.assume_init() };
+    let mut rc = 0;
+    for fd in 0..3 {
+        // SAFETY: `actions` is initialized; `devnull` outlives the spawn.
+        let add = unsafe {
+            libc::posix_spawn_file_actions_addopen(
+                &mut actions,
+                fd,
+                devnull.as_ptr(),
+                libc::O_RDWR,
+                0,
+            )
+        };
+        if add != 0 {
+            rc = add;
+        }
+    }
+    let mut pid: libc::pid_t = 0;
+    if rc == 0 {
+        // SAFETY: `argv` is NUL-terminated with live CStrings; `actions`
+        // redirects stdio; a null attr pointer keeps default signal handling.
+        rc = unsafe {
+            libc::posix_spawn(
+                &mut pid,
+                program.as_ptr(),
+                &actions,
+                std::ptr::null(),
+                argv.as_ptr() as *const *mut libc::c_char,
+                std::ptr::null(),
+            )
+        };
+    }
+    // SAFETY: initialized above, not used after this point.
+    unsafe {
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+    }
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for HostFsBackend {
@@ -5567,6 +5691,17 @@ fn sweep_orphans(scratch_root: &Path) {
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
+            continue;
+        }
+        // A tree renamed aside by `defer_remove_tree` whose reaper died before
+        // finishing: reclaim it outright. The name is carrick's own and can
+        // only be produced by that path, so no live run owns it.
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".carrick-reap-"))
+        {
+            let _ = std::fs::remove_dir_all(&path);
             continue;
         }
         let lock_path = path.join(".carrick.lock");
