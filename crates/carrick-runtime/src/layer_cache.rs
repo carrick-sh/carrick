@@ -38,22 +38,49 @@ const CACHE_FORMAT_VERSION: &[u8] = b"v2-hardlink-replacement";
 /// cache for `layer_paths`. Returns `Ok(true)` when the scratch was populated
 /// via the cache, `Ok(false)` when the cache is unusable and the caller should
 /// extract directly. Never partially populates the scratch on the `false` path.
-pub fn try_seed_scratch(layer_paths: &[PathBuf], scratch: &Path) -> std::io::Result<bool> {
+pub fn try_seed_scratch(layer_paths: &[PathBuf], scratch: &Path) -> std::io::Result<SeedOutcome> {
     if layer_paths.is_empty() {
-        return Ok(false);
+        return Ok(SeedOutcome {
+            cloned: false,
+            cache_has_mode_xattrs: false,
+        });
     }
     // The per-run scratch is a TempDir created directly under the scratch root,
     // so its parent IS the scratch root. The cache lives beside it (same volume).
     let Some(scratch_root) = scratch.parent() else {
-        return Ok(false);
+        return Ok(SeedOutcome {
+            cloned: false,
+            cache_has_mode_xattrs: false,
+        });
     };
     let cache_root = scratch_root.join(CACHE_DIR);
     let entry = cache_root.join(stack_key(layer_paths)?);
 
     if !entry.exists() && !build_cache_entry(layer_paths, &cache_root, &entry)? {
-        return Ok(false);
+        return Ok(SeedOutcome {
+            cloned: false,
+            cache_has_mode_xattrs: false,
+        });
     }
-    clone_children_into(&entry, scratch)
+    let cloned = clone_children_into(&entry, scratch)?;
+    Ok(SeedOutcome {
+        cloned,
+        cache_has_mode_xattrs: cloned && entry.join(META_XATTRS_SENTINEL).exists(),
+    })
+}
+
+/// Sidecar filename inside a digest-keyed cache entry recording that the
+/// extraction wrote per-entry `user.carrick.mode` xattrs (owner-unreadable
+/// tar modes). Filtered from guest view like every internal sidecar.
+pub const META_XATTRS_SENTINEL: &str = ".carrick_meta_xattrs";
+
+/// Result of the per-run COW seed: whether the clone happened, and whether
+/// the cached tree carries metadata xattrs the backend must re-arm its root
+/// marker for (the scratch-root xattr does not survive cloning CHILDREN).
+#[derive(Clone, Copy, Debug)]
+pub struct SeedOutcome {
+    pub cloned: bool,
+    pub cache_has_mode_xattrs: bool,
 }
 
 /// Linux-only: compose the per-run rootfs as an overlayfs mount instead of a
@@ -179,9 +206,18 @@ fn build_cache_entry(
             .map_err(|e| e.to_string())?;
         crate::rootfs::extract_layer_paths_to_dir(layer_paths, &dir).map_err(|e| e.to_string())
     })();
-    if extracted.is_err() {
-        let _ = std::fs::remove_dir_all(&building);
-        return Ok(false);
+    match &extracted {
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&building);
+            return Ok(false);
+        }
+        Ok(stats) if stats.mode_xattrs > 0 => {
+            // Entry xattrs survive the per-run clone but a scratch-ROOT
+            // marker would not; persist the fact in the cache tree itself so
+            // every clone re-arms the backend's metadata-xattr marker.
+            let _ = std::fs::File::create(building.join(META_XATTRS_SENTINEL));
+        }
+        Ok(_) => {}
     }
     match std::fs::rename(&building, entry) {
         Ok(()) => Ok(true),
@@ -670,7 +706,7 @@ mod tests {
     #[test]
     fn empty_layers_declines_cache() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!try_seed_scratch(&[], dir.path()).unwrap());
+        assert!(!try_seed_scratch(&[], dir.path()).unwrap().cloned);
     }
 
     #[test]

@@ -862,6 +862,17 @@ fn linux_if_nametoindex(name: &str) -> Option<i32> {
 /// LOOPBACK/POINTOPOINT/RUNNING/NOARP/PROMISC) share values across BSD and
 /// Linux; MULTICAST differs (BSD 0x8000 vs Linux 0x1000) — translate by name
 /// via the host's `libc::IFF_*` so this is correct on every host.
+/// Whether the `--fs host` trusted-dirfd fast lane is armed. Default ON;
+/// `CARRICK_FS_TRUSTED_LANE=0` is the exact escape hatch (AGENTS.md: new work
+/// ships on, with one switch that restores the historical path for
+/// bisection). Read once per process.
+fn trusted_fs_lane_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_FS_TRUSTED_LANE").as_deref() != Some(std::ffi::OsStr::new("0"))
+    })
+}
+
 fn host_iff_to_linux(flags_host: u32) -> u16 {
     // The Linux IFF_* consts are u32 in carrick-abi; `ifr_flags` is a u16
     // field, and every translated bit (<= 0x1000) fits the narrow width.
@@ -2222,6 +2233,15 @@ impl SyscallDispatcher {
     /// FIFO interception) has already run when this is consulted.
     fn try_open_trusted_dir(&self, path: &str, flags: u64) -> Option<DispatchOutcome> {
         use std::os::fd::IntoRawFd;
+        // Default ON with an exact `=0` escape hatch (AGENTS.md): this is the
+        // SEED of the whole trusted-dirfd lane — with no directory ever
+        // trusted, every dependent fast path (`try_trusted_dirfd_openat`,
+        // `try_trusted_dirfd_stat`, the F_OK lane, streamed getdents) falls
+        // back to the resolving path on its own, so one switch bisects the
+        // entire lane against the historical behaviour.
+        if !trusted_fs_lane_enabled() {
+            return None;
+        }
         // The layered rootfs union and inotify hooks must keep today's path;
         // chroot rebases absolute resolution, so keep the lane out of it.
         if self.fs.rootfs_vfs.rootfs.is_some() || !self.fs.inotify_registry.is_empty() {
@@ -2317,32 +2337,64 @@ impl SyscallDispatcher {
         // max-protection at read).
         let base = libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NOCTTY;
         let last_errno = || std::io::Error::last_os_error().raw_os_error();
-        let mut raw =
-            unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), libc::O_RDWR | base, 0) };
-        if raw < 0 {
-            if last_errno() == Some(libc::ELOOP) {
-                return None; // symlink child → full path (guest O_NOFOLLOW → ELOOP there)
-            }
-            if write {
-                // A missing name is AUTHORITATIVE under a trusted dir: the
-                // scratch is the merged truth, no mount claims the path, and
-                // O_CREAT was excluded above. Every other error → slow path.
-                return if last_errno() == Some(libc::ENOENT) {
-                    Some(DispatchOutcome::errno(LINUX_ENOENT))
-                } else {
-                    None
-                };
-            }
-            raw =
-                unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), libc::O_RDONLY | base, 0) };
+        // A read-only O_DIRECTORY request (every walker's dir open) needs no
+        // RW-first probe: directories always refuse O_RDWR with EISDIR, so
+        // the probe was a guaranteed wasted openat. Open the directory
+        // directly; the kernel's O_DIRECTORY gives authoritative ENOTDIR.
+        let raw = if open_flags.contains(LinuxOpenFlags::DIRECTORY) && !write {
+            let raw = unsafe {
+                libc::openat(
+                    host_dir.raw(),
+                    name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | base,
+                )
+            };
             if raw < 0 {
-                return if last_errno() == Some(libc::ENOENT) {
-                    Some(DispatchOutcome::errno(LINUX_ENOENT))
-                } else {
-                    None
+                // ONLY a missing name is authoritative. ENOTDIR here does NOT
+                // mean the guest's answer is ENOTDIR: this probe carries
+                // O_NOFOLLOW, and macOS reports ENOTDIR (not ELOOP) for a
+                // SYMLINK-to-directory child under O_DIRECTORY|O_NOFOLLOW —
+                // which the guest, having asked for neither O_NOFOLLOW nor a
+                // refusal, must see FOLLOWED to the target directory. Serving
+                // ENOTDIR broke test_glob's symlink cases. Everything except
+                // ENOENT falls back to the resolving slow path.
+                return match last_errno() {
+                    Some(libc::ENOENT) => Some(DispatchOutcome::errno(LINUX_ENOENT)),
+                    _ => None,
                 };
             }
-        }
+            raw
+        } else {
+            let mut raw =
+                unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), libc::O_RDWR | base, 0) };
+            if raw < 0 {
+                if last_errno() == Some(libc::ELOOP) {
+                    return None; // symlink child → full path (guest O_NOFOLLOW → ELOOP there)
+                }
+                if write {
+                    // A missing name is AUTHORITATIVE under a trusted dir: the
+                    // scratch is the merged truth, no mount claims the path,
+                    // and O_CREAT was excluded above. Every other error →
+                    // slow path.
+                    return if last_errno() == Some(libc::ENOENT) {
+                        Some(DispatchOutcome::errno(LINUX_ENOENT))
+                    } else {
+                        None
+                    };
+                }
+                raw = unsafe {
+                    libc::openat(host_dir.raw(), name_c.as_ptr(), libc::O_RDONLY | base, 0)
+                };
+                if raw < 0 {
+                    return if last_errno() == Some(libc::ENOENT) {
+                        Some(DispatchOutcome::errno(LINUX_ENOENT))
+                    } else {
+                        None
+                    };
+                }
+            }
+            raw
+        };
         // SAFETY: freshly-opened owned fd; drop closes it on every fallback.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -2393,7 +2445,14 @@ impl SyscallDispatcher {
         }
         // Marker nodes (bound AF_UNIX sockets, mknod devices) carry their
         // guest TYPE in xattrs; the slow path owns their open semantics.
-        let (override_mode, _uid, _gid, is_socket) = crate::fs_backend::fd_carrick_meta(raw);
+        // With the root markers proving no metadata xattrs or marker nodes
+        // exist anywhere, the pass is skipped outright.
+        let (override_mode, _uid, _gid, is_socket) =
+            if self.fs.rootfs_vfs.overlay.serves_plain_metadata() {
+                (None, None, None, false)
+            } else {
+                crate::fs_backend::fd_carrick_meta(raw)
+            };
         if is_socket || override_mode.is_some_and(|m| m & LINUX_S_IFMT != 0) {
             return None;
         }
@@ -2455,6 +2514,50 @@ impl SyscallDispatcher {
         path: &str,
     ) -> Option<Result<StatRecord, LinuxErrno>> {
         use std::os::fd::{FromRawFd, OwnedFd};
+        // fts walkers (GNU find, and every fts-based tool) stat each
+        // directory they descend as "." relative to the directory's OWN fd.
+        // The trusted dir IS the object: serve fstat(host_dirfd) directly —
+        // no component gate, no leaf probe (the metadata pass reads the
+        // already-open fd when metadata xattrs may exist anywhere).
+        if path == "." {
+            let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
+            if self.cred_snapshot().euid != 0 {
+                return None;
+            }
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(host_dir.raw(), &mut st) } != 0 {
+                return None;
+            }
+            if st.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
+                return None;
+            }
+            let (override_mode, uid, gid, _) = if self.fs.rootfs_vfs.overlay.serves_plain_metadata()
+            {
+                (None, None, None, false)
+            } else {
+                crate::fs_backend::fd_carrick_meta(host_dir.raw())
+            };
+            let on_disk_mode = st.st_mode as u32 & 0o7777;
+            let real = crate::fs_backend::RealStat {
+                kind: RootFsEntryKind::Directory,
+                ino: st.st_ino,
+                nlink: st.st_nlink as u32,
+                mode: override_mode
+                    .map(|m| m & 0o7777)
+                    .unwrap_or(if on_disk_mode == 0 {
+                        0o755
+                    } else {
+                        on_disk_mode
+                    }),
+                uid: uid.unwrap_or(0),
+                gid: gid.unwrap_or(0),
+                size: st.st_size as u64,
+                atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
+                mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
+                ctime: (st.st_ctime, carrick_portable::stat_ctime_nsec(&st)),
+            };
+            return Some(Ok(self.stat_record_with_device(&dir_path, &real)));
+        }
         let name = Self::trusted_lane_component(path)?;
         let (dir_path, host_dir) = self.trusted_dir_of(dirfd)?;
         let full = self.trusted_child_path(&dir_path, name)?;
@@ -2489,20 +2592,29 @@ impl SyscallDispatcher {
         // Carrick metadata (mode/owner/socket) via one flistxattr-gated pass
         // on a no-atime fd — the same fill pattern (and the same benign
         // fstatat→openat window) as the stat cache's
-        // `stat_cache_get_or_fill`.
-        #[cfg(target_os = "macos")]
-        const O_EVTONLY: libc::c_int = 0x8000;
-        #[cfg(not(target_os = "macos"))]
-        const O_EVTONLY: libc::c_int = libc::O_RDONLY;
-        let leaf_flags = O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-        let raw = unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), leaf_flags, 0) };
-        if raw < 0 {
-            return None;
-        }
-        // SAFETY: freshly-opened owned fd, closed on drop.
-        let leaf = unsafe { OwnedFd::from_raw_fd(raw) };
-        let (override_mode, uid, gid, is_socket) = crate::fs_backend::fd_carrick_meta(raw);
-        drop(leaf);
+        // `stat_cache_get_or_fill`. Skipped entirely when the root markers
+        // prove NO entry anywhere carries metadata xattrs or marker nodes:
+        // the fstatat above is then the complete guest answer, and the whole
+        // stat costs ONE host syscall.
+        let (override_mode, uid, gid, is_socket) =
+            if self.fs.rootfs_vfs.overlay.serves_plain_metadata() {
+                (None, None, None, false)
+            } else {
+                #[cfg(target_os = "macos")]
+                const O_EVTONLY: libc::c_int = 0x8000;
+                #[cfg(not(target_os = "macos"))]
+                const O_EVTONLY: libc::c_int = libc::O_RDONLY;
+                let leaf_flags = O_EVTONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+                let raw = unsafe { libc::openat(host_dir.raw(), name_c.as_ptr(), leaf_flags, 0) };
+                if raw < 0 {
+                    return None;
+                }
+                // SAFETY: freshly-opened owned fd, closed on drop.
+                let leaf = unsafe { OwnedFd::from_raw_fd(raw) };
+                let meta = crate::fs_backend::fd_carrick_meta(raw);
+                drop(leaf);
+                meta
+            };
         let kind = if is_dir {
             RootFsEntryKind::Directory
         } else if is_socket {

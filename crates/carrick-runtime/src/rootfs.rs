@@ -204,6 +204,11 @@ pub struct ExtractStats {
     pub dirs: u64,
     pub symlinks: u64,
     pub skipped_special: u64,
+    /// Entries whose tar mode was owner-unreadable and therefore had to be
+    /// preserved in a `user.carrick.mode` xattr (rare). Non-zero means the
+    /// backend must stamp its metadata-xattr root marker so the fast stat
+    /// lanes keep probing per entry.
+    pub mode_xattrs: u64,
 }
 
 /// Stream OCI layer blobs (gzip or raw tar) directly into `dir`, applying
@@ -308,6 +313,7 @@ fn apply_tar_to_dir<R: Read>(
                 let _ =
                     dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode | 0o700));
                 crate::fs_backend::write_mode_xattr(dir, &path, true, mode);
+                stats.mode_xattrs += 1;
             } else {
                 let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode));
             }
@@ -336,6 +342,7 @@ fn apply_tar_to_dir<R: Read>(
                 let _ =
                     dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode | 0o600));
                 crate::fs_backend::write_mode_xattr(dir, &path, false, mode);
+                stats.mode_xattrs += 1;
             } else {
                 let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode));
             }
