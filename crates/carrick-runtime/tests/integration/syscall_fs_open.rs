@@ -181,7 +181,14 @@ impl FsBackend for CountingMemoryBackend {
         self.inner.mark_deleted(path)
     }
 
-    fn child_names(&self, dir: &str) -> Vec<(String, carrick_runtime::rootfs::RootFsEntryKind)> {
+    fn child_names(
+        &self,
+        dir: &str,
+    ) -> Vec<(
+        String,
+        carrick_runtime::rootfs::RootFsEntryKind,
+        Option<u64>,
+    )> {
         self.inner.child_names(dir)
     }
 
