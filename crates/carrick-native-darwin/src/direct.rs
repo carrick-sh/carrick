@@ -221,22 +221,182 @@ enum TpidrAccess {
 /// A WRITE has to preserve its source register, so it borrows one 16-byte
 /// guest stack slot exactly as the syscall island does — using x0, or x1 when
 /// the source *is* x0.
-fn tpidr_veneer(access: TpidrAccess, slot: u64) -> Vec<u32> {
-    let mut w = Vec::with_capacity(12);
+fn tpidr_veneer(access: TpidrAccess, tls_slot: u64, x18_slot: u64) -> Vec<u32> {
+    let mut w = Vec::with_capacity(16);
     match access {
+        // x18 as the destination is not a normal register case: depositing the
+        // guest's TLS into the physical platform register would hand it to
+        // Darwin to overwrite. Guest x18 lives in its own slot, so this is a
+        // slot-to-slot move and touches neither special register.
+        TpidrAccess::Read { reg: 18 } => {
+            w.push(stp_pre_sp(0, 1));
+            w.extend_from_slice(&mov_imm64(0, tls_slot));
+            w.push(ldr_imm(0, 0, 0));
+            w.extend_from_slice(&mov_imm64(1, x18_slot));
+            w.push(str_imm(0, 1, 0));
+            w.push(ldp_post_sp(0, 1));
+        }
+        TpidrAccess::Write { reg: 18 } => {
+            w.push(stp_pre_sp(0, 1));
+            w.extend_from_slice(&mov_imm64(0, x18_slot));
+            w.push(ldr_imm(0, 0, 0));
+            w.extend_from_slice(&mov_imm64(1, tls_slot));
+            w.push(str_imm(0, 1, 0));
+            w.push(ldp_post_sp(0, 1));
+        }
         TpidrAccess::Read { reg } => {
-            w.extend_from_slice(&mov_imm64(reg, slot));
+            w.extend_from_slice(&mov_imm64(reg, tls_slot));
             w.push(ldr_imm(reg, reg, 0));
         }
         TpidrAccess::Write { reg } => {
             let scratch = if reg == 0 { 1 } else { 0 };
             w.push(str_pre_sp(scratch));
-            w.extend_from_slice(&mov_imm64(scratch, slot));
+            w.extend_from_slice(&mov_imm64(scratch, tls_slot));
             w.push(str_imm(reg, scratch, 0));
             w.push(ldr_post_sp(scratch));
         }
     }
     w
+}
+
+/// `stp xt1, xt2, [sp, #-16]!`
+const fn stp_pre_sp(rt1: u32, rt2: u32) -> u32 {
+    0xa980_0000 | ((0x7e_u32 & 0x7f) << 15) | (rt2 << 10) | (31 << 5) | rt1
+}
+/// `ldp xt1, xt2, [sp], #16`
+const fn ldp_post_sp(rt1: u32, rt2: u32) -> u32 {
+    0xa8c0_0000 | ((2_u32 & 0x7f) << 15) | (rt2 << 10) | (31 << 5) | rt1
+}
+
+/// GPR ordinal for an X- or W-form register, or `None` for anything else.
+fn reg_index(reg: bad64::Reg) -> Option<(u32, bool)> {
+    let raw = reg as u32;
+    let x0 = bad64::Reg::X0 as u32;
+    let w0 = bad64::Reg::W0 as u32;
+    if (x0..=x0 + 30).contains(&raw) {
+        return Some((raw - x0, true));
+    }
+    if (w0..=w0 + 30).contains(&raw) {
+        return Some((raw - w0, false));
+    }
+    None
+}
+
+/// Registers named by one operand, in order.
+fn operand_regs(operand: &bad64::Operand) -> Vec<bad64::Reg> {
+    use bad64::Operand as O;
+    match operand {
+        O::Reg { reg, .. } | O::QualReg { reg, .. } | O::ShiftReg { reg, .. } => vec![*reg],
+        O::MemReg(reg)
+        | O::MemOffset { reg, .. }
+        | O::MemPreIdx { reg, .. }
+        | O::MemPostIdxImm { reg, .. } => vec![*reg],
+        O::MemPostIdxReg(regs) => regs.to_vec(),
+        O::MemExt { regs, .. } => regs.to_vec(),
+        O::MultiReg { regs, .. } => regs.iter().flatten().copied().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every GPR an instruction names.
+fn instruction_regs(insn: &bad64::Instruction) -> Vec<u32> {
+    insn.operands()
+        .iter()
+        .flat_map(operand_regs)
+        .filter_map(|reg| reg_index(reg).map(|(index, _)| index))
+        .collect()
+}
+
+/// Rewrite `word` so every x18 operand names `scratch` instead, or `None` if
+/// that cannot be proved safe.
+///
+/// The substitution itself is a blind bit edit of the four standard register
+/// fields — Rd/Rt (4:0), Rn (9:5), Rt2 (14:10), Rm (20:16). Those positions
+/// hold immediates in some encodings, so a blind edit can silently corrupt
+/// one. The edit is therefore VERIFIED by decoding the result and requiring,
+/// operand by operand: the same opcode, the same operand shapes, every
+/// register equal to the original with x18 mapped to `scratch`, and every
+/// NON-register operand byte-identical. A textual comparison would be simpler
+/// and wrong — `add x5, x18, #0x18` contains the register's spelling inside an
+/// immediate.
+///
+/// Returning `None` costs the image a tier-T fallback, which is the right way
+/// to be wrong.
+fn substitute_x18(word: u32, scratch: u32) -> Option<u32> {
+    let original = bad64::decode(word, 0).ok()?;
+    let mut rewritten_word = word;
+    for shift in [0_u32, 5, 10, 16] {
+        if (word >> shift) & 0x1f == 18 {
+            rewritten_word = (rewritten_word & !(0x1f << shift)) | (scratch << shift);
+        }
+    }
+    if rewritten_word == word {
+        return None; // nothing substituted: x18 was not in a standard field
+    }
+    let rewritten = bad64::decode(rewritten_word, 0).ok()?;
+    if original.op() != rewritten.op() {
+        return None;
+    }
+    let (before, after) = (original.operands(), rewritten.operands());
+    if before.len() != after.len() {
+        return None;
+    }
+    for (a, b) in before.iter().zip(after.iter()) {
+        let (ra, rb) = (operand_regs(a), operand_regs(b));
+        if ra.is_empty() && rb.is_empty() {
+            // No registers here, so this operand must be untouched.
+            if format!("{a:?}") != format!("{b:?}") {
+                return None;
+            }
+            continue;
+        }
+        if ra.len() != rb.len() {
+            return None;
+        }
+        for (x, y) in ra.iter().zip(rb.iter()) {
+            let (Some((ix, wide_x)), Some((iy, wide_y))) = (reg_index(*x), reg_index(*y)) else {
+                if x != y {
+                    return None;
+                }
+                continue;
+            };
+            let expected = if ix == 18 { scratch } else { ix };
+            if iy != expected || wide_x != wide_y {
+                return None;
+            }
+        }
+    }
+    Some(rewritten_word)
+}
+
+/// Emit a veneer that runs one x18-using instruction against a memory slot.
+///
+/// Darwin rewrites the platform register at every trap return, so a guest x18
+/// value cannot live there; it lives in `slot`. The veneer borrows two
+/// registers the instruction does not name — one to hold the slot address, one
+/// to stand in for x18 — runs the rewritten instruction, and writes the
+/// stand-in back.
+///
+/// The write-back is UNCONDITIONAL by design. If the instruction only read
+/// x18, the stand-in still holds the value that was loaded, so storing it back
+/// is a no-op; that removes the need to classify reads from writes, which is
+/// where a shape-by-shape implementation would accumulate mistakes.
+fn x18_veneer(rewritten: u32, value_reg: u32, addr_reg: u32, slot: u64) -> Vec<u32> {
+    let mut w = Vec::with_capacity(12);
+    w.push(stp_pre_sp(value_reg, addr_reg));
+    w.extend_from_slice(&mov_imm64(addr_reg, slot));
+    w.push(ldr_imm(value_reg, addr_reg, 0));
+    w.push(rewritten);
+    w.push(str_imm(value_reg, addr_reg, 0));
+    w.push(ldp_post_sp(value_reg, addr_reg));
+    w
+}
+
+/// Pick two registers the instruction does not name, avoiding x18 and SP/XZR.
+fn pick_scratch_pair(insn: &bad64::Instruction) -> Option<(u32, u32)> {
+    let used = instruction_regs(insn);
+    let mut free = (0..=30_u32).filter(|r| *r != 18 && !used.contains(r));
+    Some((free.next()?, free.next()?))
 }
 
 /// Why an image cannot run on tier D.
@@ -303,22 +463,15 @@ fn word_could_name_x18(word: u32) -> bool {
 
 /// Does a decoded instruction reference x18/w18 as an operand?
 fn instruction_names_x18(insn: &bad64::Instruction) -> bool {
-    use bad64::Operand as O;
-    insn.operands().iter().any(|operand| {
-        let regs: Vec<bad64::Reg> = match operand {
-            O::Reg { reg, .. } | O::QualReg { reg, .. } | O::ShiftReg { reg, .. } => vec![*reg],
-            O::MemReg(reg)
-            | O::MemOffset { reg, .. }
-            | O::MemPreIdx { reg, .. }
-            | O::MemPostIdxImm { reg, .. } => vec![*reg],
-            O::MemPostIdxReg(regs) => regs.to_vec(),
-            O::MemExt { regs, .. } => regs.to_vec(),
-            O::MultiReg { regs, .. } => regs.iter().flatten().copied().collect(),
-            _ => Vec::new(),
-        };
-        regs.iter()
-            .any(|reg| matches!(reg, bad64::Reg::X18 | bad64::Reg::W18))
-    })
+    instruction_regs(insn).contains(&18)
+}
+
+/// Can this x18-using instruction be veneered? Both halves must succeed: two
+/// free registers, and a substitution that verifies.
+fn x18_is_veneerable(insn: &bad64::Instruction, word: u32) -> bool {
+    pick_scratch_pair(insn)
+        .and_then(|(value, _)| substitute_x18(word, value))
+        .is_some()
 }
 
 /// Decide whether an image can run on tier D, WITHOUT mapping anything.
@@ -370,7 +523,17 @@ pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, i
                     {
                         return Ok(Err(DirectIneligible::TpidrAccess { vaddr: site }));
                     }
-                    if instruction_names_x18(&insn) {
+                    // x18 is veneered when the instruction can be rewritten
+                    // against a memory slot and that rewrite VERIFIES; only
+                    // the shapes that fail verification disqualify. A
+                    // `tpidr_el0` access naming x18 is already handled by the
+                    // tpidr veneer above, and must NOT be rewritten here -
+                    // substituting its register would leave a real `mrs`
+                    // reading Darwin's thread pointer instead of the guest's.
+                    if tpidr_access(word).is_none()
+                        && instruction_names_x18(&insn)
+                        && !x18_is_veneerable(&insn, word)
+                    {
                         return Ok(Err(DirectIneligible::X18Access { vaddr: site }));
                     }
                 }
@@ -381,12 +544,11 @@ pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, i
             }
         }
     }
-    if svc_sites == 0 {
-        // Nothing to patch means nothing to run through carrick: a guest with
-        // no syscall can neither exit nor be observed, so treat it as a
-        // malformed input rather than silently executing it.
-        return Ok(Err(DirectIneligible::NoExecutableText));
-    }
+    // ZERO `svc` sites is normal, not a defect: a dynamically linked program
+    // makes its syscalls through libc, so its own text contains none. libc is
+    // patched when it is loaded. An earlier revision refused such images as
+    // "no executable text", which wrongly disqualified every ordinary
+    // dynamically linked binary in the corpus.
     Ok(Ok(svc_sites))
 }
 
@@ -398,10 +560,15 @@ pub struct DirectImage {
     context: Box<GuestContext>,
     svc_sites: usize,
     tpidr_sites: usize,
+    x18_sites: usize,
     /// The guest's TLS base. XNU will not hold it in `TPIDR_EL0`, so the
     /// veneers read and write it here. One slot per image is correct while
     /// tier D is single-threaded; threads need one per thread.
     guest_tls: Box<u64>,
+    /// The guest's x18. Darwin rewrites the physical register at every trap
+    /// return, so the guest's value lives here and the veneers move it in and
+    /// out around each use.
+    guest_x18: Box<u64>,
 }
 
 // SAFETY: the mapping is owned solely by this value and unmapped in `Drop`.
@@ -423,6 +590,14 @@ impl DirectImage {
     /// How many `tpidr_el0` accesses were veneered.
     pub fn tpidr_sites(&self) -> usize {
         self.tpidr_sites
+    }
+    /// How many x18-using instructions were veneered.
+    pub fn x18_sites(&self) -> usize {
+        self.x18_sites
+    }
+    /// The guest's x18, as the veneers see it.
+    pub fn guest_x18(&self) -> u64 {
+        *self.guest_x18
     }
     /// The guest's TLS base, as the veneers see it.
     pub fn guest_tls(&self) -> u64 {
@@ -481,7 +656,9 @@ impl DirectImage {
             }),
             svc_sites: 0,
             tpidr_sites: 0,
+            x18_sites: 0,
             guest_tls: Box::new(0),
+            guest_x18: Box::new(0),
         };
         let bias = base as u64 - lo;
         image.entry = read_u64(elf, 0x18)? + bias;
@@ -527,6 +704,7 @@ impl DirectImage {
         let ctx_addr = std::ptr::from_mut(self.context.as_mut()) as u64;
 
         let tls_addr = std::ptr::from_mut(self.guest_tls.as_mut()) as u64;
+        let x18_addr = std::ptr::from_mut(self.guest_x18.as_mut()) as u64;
         // Patch over the same SECTIONS the scan proved, not the PF_X segment:
         // patching a `.note` byte pattern that merely looks like `svc` would
         // corrupt data the guest reads.
@@ -542,7 +720,7 @@ impl DirectImage {
                 if let Some(access) = tpidr_access(word) {
                     let site_host = (site_vaddr - lo) as usize;
                     let veneer_host = island_cursor;
-                    let words = tpidr_veneer(access, tls_addr);
+                    let words = tpidr_veneer(access, tls_addr, x18_addr);
                     let bytes = words.len() * 4;
                     if veneer_host + bytes + 4 > self.len {
                         return Err(io::Error::other("veneer budget exhausted"));
@@ -555,6 +733,38 @@ impl DirectImage {
                     self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
                     island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
                     self.tpidr_sites += 1;
+                    continue;
+                }
+                // x18 uses are veneered in the same pass.
+                if word != SVC_0
+                    && let Ok(insn) = bad64::decode(word, site_vaddr)
+                    && instruction_names_x18(&insn)
+                {
+                    // `tpidr_el0` accesses were handled above; reaching here
+                    // with one would rewrite it into a real system-register
+                    // read of Darwin's thread pointer.
+                    debug_assert!(tpidr_access(word).is_none());
+                    let Some((value_reg, addr_reg)) = pick_scratch_pair(&insn) else {
+                        return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
+                    };
+                    let Some(rewritten) = substitute_x18(word, value_reg) else {
+                        return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
+                    };
+                    let site_host = (site_vaddr - lo) as usize;
+                    let veneer_host = island_cursor;
+                    let words = x18_veneer(rewritten, value_reg, addr_reg, x18_addr);
+                    let bytes = words.len() * 4;
+                    if veneer_host + bytes + 4 > self.len {
+                        return Err(io::Error::other("veneer budget exhausted"));
+                    }
+                    for (i, w) in words.iter().enumerate() {
+                        self.write_word(veneer_host + i * 4, *w);
+                    }
+                    let from = (veneer_host + bytes) as i64;
+                    self.write_word(veneer_host + bytes, b_rel((site_host as i64 + 4) - from));
+                    self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
+                    island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
+                    self.x18_sites += 1;
                     continue;
                 }
                 if word != SVC_0 {
@@ -990,25 +1200,39 @@ mod tests {
     }
 
     #[test]
-    fn scan_refuses_x18_and_names_the_site() {
-        let code = vec![
-            movz(0, 1, 0),
-            // `add x18, x18, #1` — Darwin rewrites x18 at every trap return,
-            // so a guest value cannot live there.
-            0x9100_0652,
-            movz(8, 93, 0),
+    fn tpidr_read_into_x18_moves_slot_to_slot() {
+        // `mrs x18, tpidr_el0` names BOTH special registers. Depositing the
+        // guest's TLS into the physical x18 would hand it to Darwin to
+        // overwrite, and rewriting it as an x18 instruction would leave a real
+        // `mrs` reading Darwin's thread pointer. It must be a slot-to-slot
+        // move instead.
+        const CHECK_NR: u64 = 0x0ffb;
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30),
+            movz(9, 0xcafe, 0),
+            msr_tpidr_el0_word(9), // guest TLS = 0xcafe
+            0xd53b_d052,           // mrs x18, tpidr_el0
+            mov_reg(0, 18),        // read it back out of the x18 slot
+            movz(8, CHECK_NR as u32, 0),
             SVC_0,
+            mov_reg(30, 20),
+            0xd65f_03c0,
         ];
         let elf = elf_with_code(&code);
-        let verdict = scan_eligibility(&elf).expect("scan runs");
+        let image = DirectImage::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        seen_clear();
+        let entry = image.entry();
+        // SAFETY: patched image, entry inside it, fixture returns via `ret`.
+        unsafe { image.enter(entry) };
+        let seen = seen_snapshot();
         assert_eq!(
-            verdict,
-            Err(DirectIneligible::X18Access { vaddr: 0x1004 }),
-            "x18 access must disqualify, naming its address"
+            seen[0].1[0], 0xcafe,
+            "TLS reached the guest's x18 slot without touching either real register"
         );
-        // And `load` must refuse rather than map-and-patch.
-        let loaded = DirectImage::load(&elf, record_only).expect("load runs");
-        assert!(matches!(loaded, Err(DirectIneligible::X18Access { .. })));
+        assert_eq!(image.guest_x18(), 0xcafe);
+        assert_eq!(image.guest_tls(), 0xcafe);
     }
 
     #[test]
@@ -1138,6 +1362,71 @@ mod tests {
         let args = seen[0].1;
         assert_eq!(args[1], 0xbeef, "x0 survived being the veneer's borrow");
         assert_eq!(args[2], 0xbeef, "and the value round-tripped");
+    }
+
+    #[test]
+    fn x18_substitution_verifies_and_rejects_corrupted_rewrites() {
+        // `add x18, x18, #1` — both register fields are x18 and must move.
+        let add_x18 = 0x9100_0652;
+        let rewritten = substitute_x18(add_x18, 5).expect("add x18,x18,#1 is veneerable");
+        let decoded = bad64::decode(rewritten, 0).expect("rewritten decodes");
+        assert_eq!(decoded.op(), bad64::Op::ADD);
+        assert_eq!(
+            instruction_regs(&decoded),
+            vec![5, 5],
+            "both x18 operands became the scratch register"
+        );
+
+        // A word with no x18 in a standard field must not be claimed.
+        assert!(
+            substitute_x18(0x9100_0400, 5).is_none(),
+            "an instruction without x18 is not a substitution candidate"
+        );
+    }
+
+    #[test]
+    fn x18_veneer_runs_the_instruction_against_the_slot() {
+        // The guest increments x18 twice and reports it. x18 never lives in
+        // the physical register - Darwin would overwrite it - so the value has
+        // to survive entirely in the image's slot.
+        const CHECK_NR: u64 = 0x0ffc;
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30),
+            movz(18, 7, 0), // x18 = 7        (writes x18)
+            0x9100_0652,    // add x18, x18, #1   -> 8
+            0x9100_0652,    // add x18, x18, #1   -> 9
+            mov_reg(0, 18), // x0 = x18       (reads x18)
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            0xd65f_03c0,
+        ];
+        let elf = elf_with_code(&code);
+        let image = DirectImage::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        assert_eq!(
+            image.x18_sites(),
+            4,
+            "every x18-using instruction was veneered"
+        );
+        seen_clear();
+        let entry = image.entry();
+        // SAFETY: patched image, entry inside it, fixture returns via `ret`.
+        unsafe { image.enter(entry) };
+        let seen = seen_snapshot();
+        assert_eq!(seen[0].1[0], 9, "x18 arithmetic ran against the slot");
+        assert_eq!(image.guest_x18(), 9, "and the slot holds the final value");
+    }
+
+    #[test]
+    fn scan_accepts_veneerable_x18_and_still_refuses_the_rest() {
+        let veneerable = vec![0x9100_0652, movz(8, 93, 0), SVC_0];
+        let elf = elf_with_code(&veneerable);
+        assert!(
+            matches!(scan_eligibility(&elf).expect("scan runs"), Ok(1)),
+            "a veneerable x18 instruction no longer disqualifies"
+        );
     }
 
     static CHILD_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
