@@ -22,6 +22,10 @@
 
 pub mod aot;
 pub mod aot_cache;
+/// Tier D: run guest code directly, patching only `svc`/x18/`tpidr_el0`.
+/// aarch64-only — the whole premise is same-ISA execution.
+#[cfg(target_arch = "aarch64")]
+pub mod direct;
 pub mod jit;
 
 #[cfg(target_arch = "aarch64")]
