@@ -111,3 +111,46 @@ Even if every emitted word were guest-shaped, emitted CPU falls from ~45% to
 ~21% and the build lands near **5x** Docker, not 2x. The kernel term (32.4%) and
 carrick's own userspace have to come down as well. This work is the largest
 single item, not a sufficient one.
+
+---
+
+## 7. Fix A was BUILT and MEASURED NULL — reverted (2026-08-02)
+
+Implemented, gated, and removed the same day. Recording it here so nobody
+rebuilds it.
+
+**What was built.** `emit_internal_fallthrough_edge` borrowed
+`RESERVED_SCRATCH` (x19) for the condition instead of physical x17, which let
+the fall-through reload `ldr x17,[x28,#1128]` be dropped entirely. Guest x17 is
+never clobbered, so nothing needs restoring.
+
+**Correctness lesson, learned the expensive way.** The first attempt ALSO
+dropped the leading `str x17,[x28,#1128]`, reasoning that it existed only to
+protect the borrowed register. It does not: it is the **publish half of the edge
+protocol**, because a linked slot branches straight into the target block's
+prologue, which reloads guest x17 from that slot. Dropping it compiled, passed
+all 304 unit tests, and then failed the first real `go build` with
+`go: error obtaining buildID for go tool compile: exit status 2` and a fault
+dump. Unit tests do not cover the edge protocol; only a live guest does. This is
+the concrete case behind "Definition of Done = live-verified end-to-end".
+
+**The measurement.** Paired A/B against the parent commit, same box, alternating,
+`go build` of a one-file main:
+
+| arm | samples (ms) | median |
+|---|---|---|
+| x19 borrow, no reload | 10575, 10408, 10397 | **10408** |
+| baseline | 10500, 10469, 10465 | **10469** |
+
+0.6% — inside the noise. **Null, so reverted** rather than parked behind a flag.
+
+**What that tells the next attempt.** The slot-1128 traffic is 15.1% of executed
+emitted instructions, but this edge's reload is evidently a small share of it.
+The remaining `[x28, #1128]` emission sites are the terminal exit tail
+(`emit.rs:2315`), the non-lean prologue pair (`emit.rs:5951/5975`), the
+context-scratch save/restore (`2613/2692/2982/2989`) and the bias path
+(`5293/5540`). **Attribute the 15.1% per SITE before writing more code** — the
+shape census gives a per-word histogram but not a per-emission-site one, and
+without that split the next change is another guess. Adding site attribution
+(e.g. tagging emitted words with their emission site in the snapshot metadata)
+is the actual next task, and it is cheap compared to another null spike.
