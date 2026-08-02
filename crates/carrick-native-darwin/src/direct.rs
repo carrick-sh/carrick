@@ -1429,6 +1429,56 @@ mod tests {
         );
     }
 
+    /// A handler with a REAL frame must round-trip like the trivial one.
+    ///
+    /// Diagnostic for the tier-D bridge, which loops forever when the island
+    /// calls a handler that reads a thread-local and owns a large local. If
+    /// this passes, the island is sound under a heavy handler and the bridge's
+    /// bug is in the bridge; if it loops, the island itself cannot survive a
+    /// handler that uses the guest's stack.
+    #[test]
+    fn island_survives_a_handler_with_a_real_frame() {
+        thread_local! {
+            static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        extern "C" fn heavy(ctx: *mut GuestContext) {
+            // A thread-local read plus a kilobyte of frame: the shape the
+            // dispatcher has, without the dispatcher.
+            let seen = DEPTH.with(|d| {
+                d.set(d.get() + 1);
+                d.get()
+            });
+            let mut scratch = [0_u64; 128];
+            for (index, slot) in scratch.iter_mut().enumerate() {
+                *slot = index as u64 ^ u64::from(seen);
+            }
+            // SAFETY: the island passes the context this image was built with.
+            let ctx = unsafe { &mut *ctx };
+            ctx.set_return(scratch[7] as i64);
+            assert!(seen < 100, "handler re-entered {seen} times: island loops");
+        }
+
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30),
+            movz(8, 64, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            0xd65f_03c0, // ret
+        ];
+        let elf = elf_with_code(&code);
+        let image = DirectImage::load(&elf, heavy)
+            .expect("load")
+            .expect("eligible");
+        let entry = image.entry();
+        // SAFETY: patched image, entry inside it, fixture returns via `ret`.
+        unsafe { image.enter(entry) };
+        assert_eq!(
+            DEPTH.with(std::cell::Cell::get),
+            1,
+            "the guest took exactly one syscall and returned"
+        );
+    }
+
     static CHILD_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
     /// Minimal syscall service for the M1 proof: `write` and `exit`.
