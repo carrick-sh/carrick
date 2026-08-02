@@ -2657,11 +2657,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
     fn keyed_dylib_identity_rejects_another_valid_signed_unit() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let first = fixture_pending();
@@ -2835,9 +2830,6 @@ mod tests {
         assert_eq!(v3.load_evidence.owned_records, 0);
     }
 
-    #[test]
-    #[test]
-    #[test]
     #[test]
     fn mapped_metadata_and_dylib_pair_rejects_either_lone_half() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
