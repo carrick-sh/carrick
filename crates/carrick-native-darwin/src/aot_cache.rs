@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use carrick_dsr_aarch64::direct_binding::{DirectBindingCellRef, DirectBindingCellVa};
 use carrick_dsr_aarch64::mapped_metadata::{
@@ -32,9 +32,6 @@ const MAX_MAPPED_METADATA_BYTES: u64 = MANIFEST_DECODE_LIMIT as u64;
 const AOT_SEGMENT_PAGE_SIZE: u64 = 16 * 1024;
 
 static CONTAINER_CACHE: Mutex<Option<ContainerCacheAuthority>> = Mutex::new(None);
-static FIXED_WIDTH_MANIFEST_ENABLED: OnceLock<bool> = OnceLock::new();
-static KEYED_DYLIB_IDENTITY_ENABLED: OnceLock<bool> = OnceLock::new();
-static MAPPED_METADATA_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[cfg(test)]
 thread_local! {
@@ -169,45 +166,6 @@ impl MetadataBacking for ReadOnlyMetadataMapping {
     }
 }
 
-#[allow(
-    clippy::large_enum_variant,
-    reason = "V2 retains the established decoded-manifest path and delays its sole Arc allocation until load succeeds"
-)]
-enum ValidatedUnitMetadata {
-    V2(TranslationUnitManifest),
-    V3(Arc<ValidatedMappedTranslationMetadata>),
-}
-
-impl ValidatedUnitMetadata {
-    fn code_len(&self) -> u64 {
-        match self {
-            Self::V2(manifest) => manifest.code_len,
-            Self::V3(metadata) => metadata.code_len(),
-        }
-    }
-
-    fn binding_data_len(&self) -> u64 {
-        match self {
-            Self::V2(manifest) => manifest.binding_data_len,
-            Self::V3(metadata) => metadata.binding_data_len(),
-        }
-    }
-
-    fn binding_count(&self) -> usize {
-        match self {
-            Self::V2(manifest) => manifest.bindings.len(),
-            Self::V3(metadata) => metadata.binding_count(),
-        }
-    }
-
-    fn into_loaded(self) -> LoadedTranslationMetadata {
-        match self {
-            Self::V2(manifest) => LoadedTranslationMetadata::V2(Arc::new(manifest)),
-            Self::V3(metadata) => LoadedTranslationMetadata::V3(metadata),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct LoadedTranslationLease {
     handle: std::ptr::NonNull<libc::c_void>,
@@ -241,96 +199,6 @@ impl Drop for UnitFileLock {
         let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
 }
-
-fn fixed_width_manifest_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("0"))
-}
-
-fn fixed_width_manifest_enabled() -> bool {
-    *FIXED_WIDTH_MANIFEST_ENABLED.get_or_init(|| {
-        let value = std::env::var_os("CARRICK_DSR_SHARED_MANIFEST_FIXED");
-        fixed_width_manifest_enabled_from(value.as_deref())
-    })
-}
-
-fn keyed_dylib_identity_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("0"))
-}
-
-fn keyed_dylib_identity_enabled() -> bool {
-    *KEYED_DYLIB_IDENTITY_ENABLED.get_or_init(|| {
-        let value = std::env::var_os("CARRICK_DSR_SHARED_DYLIB_KEYED_IDENTITY");
-        keyed_dylib_identity_enabled_from(value.as_deref())
-    })
-}
-
-fn mapped_metadata_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("0"))
-}
-
-fn mapped_metadata_enabled() -> bool {
-    *MAPPED_METADATA_ENABLED.get_or_init(|| {
-        let value = std::env::var_os("CARRICK_DSR_SHARED_MAPPED_METADATA");
-        mapped_metadata_enabled_from(value.as_deref())
-    })
-}
-
-fn encode_manifest_with_fixed_width(
-    manifest: &TranslationUnitManifest,
-    fixed_width: bool,
-) -> Result<Vec<u8>, std::io::Error> {
-    if fixed_width {
-        bincode::serde::encode_to_vec(
-            manifest,
-            bincode::config::standard()
-                .with_fixed_int_encoding()
-                .with_limit::<MANIFEST_DECODE_LIMIT>(),
-        )
-    } else {
-        bincode::serde::encode_to_vec(
-            manifest,
-            bincode::config::standard().with_limit::<MANIFEST_DECODE_LIMIT>(),
-        )
-    }
-    .map_err(|error| invalid_data(format!("encode translation unit manifest: {error}")))
-}
-
-fn encode_manifest(manifest: &TranslationUnitManifest) -> Result<Vec<u8>, std::io::Error> {
-    encode_manifest_with_fixed_width(manifest, fixed_width_manifest_enabled())
-}
-
-fn decode_manifest_with_fixed_width(
-    bytes: &[u8],
-    fixed_width: bool,
-) -> Result<TranslationUnitManifest, std::io::Error> {
-    let decoded = if fixed_width {
-        bincode::serde::decode_from_slice(
-            bytes,
-            bincode::config::standard()
-                .with_fixed_int_encoding()
-                .with_limit::<MANIFEST_DECODE_LIMIT>(),
-        )
-    } else {
-        bincode::serde::decode_from_slice(
-            bytes,
-            bincode::config::standard().with_limit::<MANIFEST_DECODE_LIMIT>(),
-        )
-    };
-    let (manifest, consumed) = decoded
-        .map_err(|error| invalid_data(format!("decode translation unit manifest: {error}")))?;
-    if consumed != bytes.len() {
-        return Err(invalid_data(format!(
-            "translation unit manifest has {} trailing bytes",
-            bytes.len().saturating_sub(consumed),
-        )));
-    }
-    Ok(manifest)
-}
-
-fn decode_manifest(bytes: &[u8]) -> Result<TranslationUnitManifest, std::io::Error> {
-    decode_manifest_with_fixed_width(bytes, fixed_width_manifest_enabled())
-}
-
 fn mapped_metadata_miss_reason(error: &MappedMetadataError) -> UnitMissReason {
     match error {
         MappedMetadataError::Key => UnitMissReason::ImageIdentity,
@@ -432,56 +300,6 @@ fn open_metadata_at(directory: &File, name: &CStr) -> Result<(File, usize), Unit
     })?;
     Ok((file, length))
 }
-
-fn owned_immutable_record_count(manifest: &TranslationUnitManifest) -> Result<u64, UnitStoreError> {
-    // V2 owns only its manifest tables. Guest ranges and edge/index tables are
-    // derived by consumers and therefore are not counted as retained records.
-    let mut records = manifest
-        .blocks
-        .len()
-        .checked_add(manifest.bindings.len())
-        .and_then(|count| count.checked_add(manifest.binding_relocations.len()))
-        .ok_or_else(|| {
-            UnitStoreError::new(
-                "count owned metadata records",
-                UnitMissReason::ManifestRange,
-            )
-        })?;
-    for block in &manifest.blocks {
-        let counts = block.template.metadata_counts();
-        let recovery_records = if counts.recovery_runs == 0 {
-            counts.recovery_entries
-        } else {
-            counts.recovery_runs
-        };
-        let template_records = counts
-            .words
-            .checked_add(counts.pc_map_entries)
-            .and_then(|count| count.checked_add(recovery_records))
-            .and_then(|count| count.checked_add(counts.direct_links))
-            .and_then(|count| count.checked_add(counts.relocations))
-            .and_then(|count| count.checked_add(counts.source_words))
-            .ok_or_else(|| {
-                UnitStoreError::new(
-                    "count owned metadata records",
-                    UnitMissReason::ManifestRange,
-                )
-            })?;
-        records = records.checked_add(template_records).ok_or_else(|| {
-            UnitStoreError::new(
-                "count owned metadata records",
-                UnitMissReason::ManifestRange,
-            )
-        })?;
-    }
-    u64::try_from(records).map_err(|_| {
-        UnitStoreError::new(
-            "count owned metadata records",
-            UnitMissReason::ManifestRange,
-        )
-    })
-}
-
 fn map_and_validate_metadata(
     directory: &File,
     name: &CStr,
@@ -873,32 +691,19 @@ fn loaded_segment_range(
 }
 
 fn validate_loaded_binding_cells_atomically(
-    metadata: &ValidatedUnitMetadata,
+    metadata: &ValidatedMappedTranslationMetadata,
     binding_base: DirectBindingCellVa,
 ) -> Result<(), UnitMissReason> {
     let binding_len =
         usize::try_from(metadata.binding_data_len()).map_err(|_| UnitMissReason::ManifestRange)?;
-    let (cell_size, binding_count) = match metadata {
-        ValidatedUnitMetadata::V2(manifest) => {
-            manifest.validate_ranges()?;
-            (
-                usize::try_from(manifest.cell_size).map_err(|_| UnitMissReason::ManifestRange)?,
-                manifest.bindings.len(),
-            )
-        }
-        ValidatedUnitMetadata::V3(mapped) => (
-            usize::try_from(mapped.cell_size()).map_err(|_| UnitMissReason::ManifestRange)?,
-            mapped.binding_count(),
-        ),
-    };
+    let cell_size =
+        usize::try_from(metadata.cell_size()).map_err(|_| UnitMissReason::ManifestRange)?;
+    let binding_count = metadata.binding_count();
     for index in 0..binding_count {
-        let binding = match metadata {
-            ValidatedUnitMetadata::V2(manifest) => manifest.bindings.get(index).cloned(),
-            ValidatedUnitMetadata::V3(mapped) => {
-                mapped.binding(index).map(|binding| binding.record())
-            }
-        }
-        .ok_or(UnitMissReason::ManifestRange)?;
+        let binding = metadata
+            .binding(index)
+            .map(|binding| binding.record())
+            .ok_or(UnitMissReason::ManifestRange)?;
         let ordinal =
             usize::try_from(binding.ordinal.get()).map_err(|_| UnitMissReason::ManifestRange)?;
         let offset = ordinal
@@ -939,42 +744,33 @@ fn code_word(code: &[u8], offset: u32) -> Result<u32, UnitMissReason> {
 }
 
 fn validate_loaded_binding_code(
-    metadata: &ValidatedUnitMetadata,
+    metadata: &ValidatedMappedTranslationMetadata,
     code: &[u8],
 ) -> Result<(), UnitMissReason> {
-    match metadata {
-        ValidatedUnitMetadata::V2(manifest) => manifest.validate_binding_code(code),
-        ValidatedUnitMetadata::V3(mapped) => {
-            // Relocations address a binding's SIDECAR CELL. A unit with no
-            // cell machinery (`Disabled` layout, i.e. `binding_data_len == 0`)
-            // carries bindings but no relocations, so walking one per binding
-            // reads records that do not exist and rejects a unit carrick just
-            // published. Third instance of the same producer/validator
-            // disagreement that kept this lane at zero published units; the
-            // V2 arm never had it because it iterates the relocations
-            // themselves.
-            if mapped.binding_data_len() == 0 {
-                return Ok(());
+    // Relocations address a binding's SIDECAR CELL. A unit with no cell
+    // machinery (`Disabled` layout, i.e. `binding_data_len == 0`) carries
+    // bindings but no relocations, so walking one per binding reads records
+    // that do not exist and rejects a unit carrick just published.
+    if metadata.binding_data_len() == 0 {
+        return Ok(());
+    }
+    for index in 0..metadata.binding_count() {
+        let relocation = metadata
+            .binding(index)
+            .ok_or(UnitMissReason::ManifestRange)?
+            .relocation();
+        for (adrp_offset, add_offset) in [
+            (relocation.adrp_offset, relocation.add_offset),
+            (relocation.miss_adrp_offset, relocation.miss_add_offset),
+        ] {
+            let adrp = code_word(code, adrp_offset)?;
+            let add = code_word(code, add_offset)?;
+            if adrp & 0x9f00_001f != 0x9000_000f || add & 0xffc0_03ff != 0x9100_01ef {
+                return Err(UnitMissReason::ManifestRange);
             }
-            for index in 0..mapped.binding_count() {
-                let relocation = mapped
-                    .binding(index)
-                    .ok_or(UnitMissReason::ManifestRange)?
-                    .relocation();
-                for (adrp_offset, add_offset) in [
-                    (relocation.adrp_offset, relocation.add_offset),
-                    (relocation.miss_adrp_offset, relocation.miss_add_offset),
-                ] {
-                    let adrp = code_word(code, adrp_offset)?;
-                    let add = code_word(code, add_offset)?;
-                    if adrp & 0x9f00_001f != 0x9000_000f || add & 0xffc0_03ff != 0x9100_01ef {
-                        return Err(UnitMissReason::ManifestRange);
-                    }
-                }
-            }
-            Ok(())
         }
     }
+    Ok(())
 }
 
 fn manifest_for_pending(
@@ -1148,14 +944,6 @@ impl ContainerCacheAuthority {
         &self,
         pending: &PendingTranslationUnit,
     ) -> Result<PublishOutcome, UnitStoreError> {
-        self.publish_unit_with_metadata_mode(pending, mapped_metadata_enabled())
-    }
-
-    fn publish_unit_with_metadata_mode(
-        &self,
-        pending: &PendingTranslationUnit,
-        mapped_metadata: bool,
-    ) -> Result<PublishOutcome, UnitStoreError> {
         if pending.code.is_empty()
             || pending.code.len() > MAX_TRANSLATION_UNIT_CODE_BYTES
             || !pending.code.len().is_multiple_of(4)
@@ -1226,8 +1014,7 @@ impl ContainerCacheAuthority {
         // the per-key lock only after signing made every loser pay the full
         // signing cost even though exactly one pair could be published.
         let _lock = self.lock_unit(&stem)?;
-        let (final_dylib, final_metadata) =
-            self.final_paths_with_metadata_mode(&stem, mapped_metadata);
+        let (final_dylib, final_metadata) = self.final_paths(&stem);
         if final_dylib.is_file() && final_metadata.is_file() {
             return Ok(PublishOutcome::Existing);
         }
@@ -1324,26 +1111,20 @@ impl ContainerCacheAuthority {
         manifest
             .validate_ranges()
             .map_err(|reason| UnitStoreError::new("validate manifest", reason))?;
-        let metadata_bytes = if mapped_metadata {
-            encode_translation_metadata_v3(&manifest).map_err(|error| {
-                tracing::warn!(
-                    bindings = manifest.bindings.len(),
-                    relocations = manifest.binding_relocations.len(),
-                    binding_ordinals = ?manifest.bindings.iter().map(|b| b.ordinal.get())
-                        .take(8).collect::<Vec<_>>(),
-                    relocation_ordinals = ?manifest.binding_relocations.iter()
-                        .map(|r| r.ordinal.get()).take(8).collect::<Vec<_>>(),
-                    layout = ?manifest.binding_layout,
-                    error = ?error,
-                    "mapped metadata encode rejected a freshly packed unit"
-                );
-                mapped_metadata_error("encode mapped metadata", error)
-            })?
-        } else {
-            encode_manifest(&manifest).map_err(|error| {
-                UnitStoreError::with_source("encode manifest", UnitMissReason::Schema, error)
-            })?
-        };
+        let metadata_bytes = encode_translation_metadata_v3(&manifest).map_err(|error| {
+            tracing::warn!(
+                bindings = manifest.bindings.len(),
+                relocations = manifest.binding_relocations.len(),
+                binding_ordinals = ?manifest.bindings.iter().map(|b| b.ordinal.get())
+                    .take(8).collect::<Vec<_>>(),
+                relocation_ordinals = ?manifest.binding_relocations.iter()
+                    .map(|r| r.ordinal.get()).take(8).collect::<Vec<_>>(),
+                layout = ?manifest.binding_layout,
+                error = ?error,
+                "mapped metadata encode rejected a freshly packed unit"
+            );
+            mapped_metadata_error("encode mapped metadata", error)
+        })?;
         let mut metadata_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
             UnitStoreError::with_source(
                 "create metadata temporary",
@@ -1372,24 +1153,24 @@ impl ContainerCacheAuthority {
                 error,
             )
         })?;
-        if mapped_metadata {
-            let temporary_name = metadata_temp
-                .path()
-                .file_name()
-                .ok_or_else(|| {
-                    UnitStoreError::new("derive metadata temporary name", UnitMissReason::Schema)
-                })?
-                .as_bytes();
-            let temporary_name = CString::new(temporary_name).map_err(|error| {
-                UnitStoreError::with_source(
-                    "encode metadata temporary name",
-                    UnitMissReason::Schema,
-                    error,
-                )
-            })?;
-            let _validated =
-                map_and_validate_metadata(&self.directory, &temporary_name, &pending.key)?;
-        }
+        // Preflight the unit through the READER before it is published, so a
+        // producer/reader disagreement fails here instead of silently yielding
+        // a store that never loads.
+        let temporary_name = metadata_temp
+            .path()
+            .file_name()
+            .ok_or_else(|| {
+                UnitStoreError::new("derive metadata temporary name", UnitMissReason::Schema)
+            })?
+            .as_bytes();
+        let temporary_name = CString::new(temporary_name).map_err(|error| {
+            UnitStoreError::with_source(
+                "encode metadata temporary name",
+                UnitMissReason::Schema,
+                error,
+            )
+        })?;
+        let _validated = map_and_validate_metadata(&self.directory, &temporary_name, &pending.key)?;
 
         std::fs::rename(dylib_temp.path(), &final_dylib).map_err(|error| {
             UnitStoreError::with_source("publish dylib", UnitMissReason::MissingPair, error)
@@ -1405,8 +1186,7 @@ impl ContainerCacheAuthority {
             UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
         })?;
         let _lock = self.lock_unit(&stem)?;
-        let (dylib, metadata) =
-            self.final_paths_with_metadata_mode(&stem, mapped_metadata_enabled());
+        let (dylib, metadata) = self.final_paths(&stem);
         if dylib.is_file() && metadata.is_file() {
             return Ok(false);
         }
@@ -1470,138 +1250,47 @@ impl ContainerCacheAuthority {
         expected_key: &TranslationUnitKey,
         source_words: &[u32],
     ) -> Result<LoadedTranslationUnit, UnitStoreError> {
-        self.load_unit_with_metadata_mode(
-            expected_key,
-            source_words,
-            keyed_dylib_identity_enabled(),
-            mapped_metadata_enabled(),
-        )
+        self.load_unit_inner(expected_key, source_words)
     }
 
-    #[cfg(test)]
-    fn load_unit_with_keyed_identity(
+    fn load_unit_inner(
         &self,
         expected_key: &TranslationUnitKey,
         source_words: &[u32],
-        keyed_identity: bool,
-    ) -> Result<LoadedTranslationUnit, UnitStoreError> {
-        self.load_unit_with_metadata_mode(
-            expected_key,
-            source_words,
-            keyed_identity,
-            mapped_metadata_enabled(),
-        )
-    }
-
-    fn load_unit_with_metadata_mode(
-        &self,
-        expected_key: &TranslationUnitKey,
-        source_words: &[u32],
-        keyed_identity: bool,
-        mapped_metadata: bool,
     ) -> Result<LoadedTranslationUnit, UnitStoreError> {
         let stem = expected_key.file_stem().map_err(|error| {
             UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
         })?;
-        let (dylib_path, metadata_path) =
-            self.final_paths_with_metadata_mode(&stem, mapped_metadata);
+        let (dylib_path, metadata_path) = self.final_paths(&stem);
         if !dylib_path.is_file() || !metadata_path.is_file() {
             return Err(UnitStoreError::new(
                 "locate translation unit",
                 UnitMissReason::MissingPair,
             ));
         }
-        let (metadata, load_evidence) = if mapped_metadata {
-            let metadata_name = CString::new(format!("{stem}.metadata-v3")).map_err(|error| {
-                UnitStoreError::with_source(
-                    "encode mapped metadata name",
-                    UnitMissReason::Schema,
-                    error,
-                )
-            })?;
-            let (metadata, evidence) =
-                map_and_validate_metadata(&self.directory, &metadata_name, expected_key)?;
-            (ValidatedUnitMetadata::V3(metadata), evidence)
-        } else {
-            // Exact `CARRICK_DSR_SHARED_MAPPED_METADATA=0` control: retain the
-            // established path read, bincode decode, manifest validation, and
-            // owned `Arc` construction without routing through V3 helpers.
-            let manifest_bytes = std::fs::read(&metadata_path).map_err(|error| {
-                UnitStoreError::with_source("read manifest", UnitMissReason::Schema, error)
-            })?;
-            let manifest: TranslationUnitManifest =
-                decode_manifest(&manifest_bytes).map_err(|error| {
-                    UnitStoreError::with_source("decode manifest", UnitMissReason::Schema, error)
-                })?;
-            manifest
-                .validate_ranges()
-                .map_err(|reason| UnitStoreError::new("validate manifest", reason))?;
-            if &manifest.key != expected_key {
-                return Err(UnitStoreError::new(
-                    "validate unit identity",
-                    UnitMissReason::ImageIdentity,
-                ));
-            }
-            let owned_records = owned_immutable_record_count(&manifest)?;
-            let bytes_read = u64::try_from(manifest_bytes.len()).map_err(|_| {
-                UnitStoreError::new("measure manifest read", UnitMissReason::ManifestRange)
-            })?;
-            (
-                ValidatedUnitMetadata::V2(manifest),
-                TranslationMetadataLoadEvidence {
-                    mode: TranslationMetadataMode::V2,
-                    bytes_read,
-                    bytes_mapped: 0,
-                    validation_ns: 0,
-                    mapped_records: 0,
-                    owned_records,
-                },
+        let metadata_name = CString::new(format!("{stem}.metadata-v3")).map_err(|error| {
+            UnitStoreError::with_source(
+                "encode mapped metadata name",
+                UnitMissReason::Schema,
+                error,
             )
-        };
-        if !shared_source_fingerprint_reuse_enabled() {
-            match &metadata {
-                ValidatedUnitMetadata::V2(manifest) => manifest
-                    .validate_source(source_words)
-                    .map_err(|reason| UnitStoreError::new("validate unit source", reason))?,
-                ValidatedUnitMetadata::V3(_) => {
-                    if expected_key.source_fingerprint()
-                        != SourceFingerprint::from_words(source_words)
-                    {
-                        return Err(UnitStoreError::new(
-                            "validate unit source",
-                            UnitMissReason::SourceFingerprint,
-                        ));
-                    }
-                }
-            }
+        })?;
+        let (metadata, load_evidence) =
+            map_and_validate_metadata(&self.directory, &metadata_name, expected_key)?;
+        if !shared_source_fingerprint_reuse_enabled()
+            && expected_key.source_fingerprint() != SourceFingerprint::from_words(source_words)
+        {
+            return Err(UnitStoreError::new(
+                "validate unit source",
+                UnitMissReason::SourceFingerprint,
+            ));
         }
-        let ranges = if keyed_identity {
-            // The exact key is part of the signed Mach-O export name. `dlopen`
-            // validates the signed image and the later `dlsym` of that exact
-            // export binds it to this already-validated manifest. Reading only
-            // the bounded load-command prefix here avoids pulling a 60+ MiB
-            // unit through every descendant merely to rediscover its digest.
-            translation_ranges_from_file(&dylib_path)?
-        } else {
-            // Exact opt-out for A/B qualification and diagnosis.
-            let dylib = std::fs::read(&dylib_path).map_err(|error| {
-                UnitStoreError::with_source("read dylib", UnitMissReason::DylibDigest, error)
-            })?;
-            let digest: [u8; 32] = Sha256::digest(&dylib).into();
-            let expected_digest = match &metadata {
-                ValidatedUnitMetadata::V2(manifest) => manifest.dylib_sha256,
-                ValidatedUnitMetadata::V3(mapped) => mapped.dylib_sha256(),
-            };
-            if digest != expected_digest {
-                return Err(UnitStoreError::new(
-                    "validate dylib digest",
-                    UnitMissReason::DylibDigest,
-                ));
-            }
-            translation_ranges(&dylib).map_err(|reason| {
-                UnitStoreError::new("validate translation unit sections", reason)
-            })?
-        };
+        // The exact key is part of the signed Mach-O export name. `dlopen`
+        // validates the signed image and the later `dlsym` of that exact export
+        // binds it to this already-validated manifest. Reading only the bounded
+        // load-command prefix avoids pulling a 60+ MiB unit through every
+        // descendant merely to rediscover its digest.
+        let ranges = translation_ranges_from_file(&dylib_path)?;
         let code_len = usize::try_from(metadata.code_len()).map_err(|_| {
             UnitStoreError::new(
                 "validate translation code length",
@@ -1706,10 +1395,7 @@ impl ContainerCacheAuthority {
         }
         let mut loaded_binding_base = None;
         if metadata.binding_data_len() != 0 {
-            let binding_export = match &metadata {
-                ValidatedUnitMetadata::V2(manifest) => manifest.binding_export.as_str(),
-                ValidatedUnitMetadata::V3(_) => TRANSLATION_UNIT_BINDING_EXPORT,
-            };
+            let binding_export = TRANSLATION_UNIT_BINDING_EXPORT;
             let binding_symbol = CString::new(binding_export.as_bytes()).map_err(|error| {
                 let _ = unsafe { libc::dlclose(handle.as_ptr()) };
                 UnitStoreError::with_source("encode binding export", UnitMissReason::Dlopen, error)
@@ -1797,7 +1483,7 @@ impl ContainerCacheAuthority {
         }
         Ok(LoadedTranslationUnit {
             lease: Arc::new(LoadedTranslationLease { handle }),
-            metadata: metadata.into_loaded(),
+            metadata: LoadedTranslationMetadata::V3(metadata),
             base,
             binding_base: loaded_binding_base,
             load_evidence,
@@ -1825,24 +1511,10 @@ impl ContainerCacheAuthority {
         Ok(UnitFileLock(lock))
     }
 
-    #[cfg(test)]
     fn final_paths(&self, stem: &str) -> (PathBuf, PathBuf) {
-        self.final_paths_with_metadata_mode(stem, mapped_metadata_enabled())
-    }
-
-    fn final_paths_with_metadata_mode(
-        &self,
-        stem: &str,
-        mapped_metadata: bool,
-    ) -> (PathBuf, PathBuf) {
-        let metadata_suffix = if mapped_metadata {
-            "metadata-v3"
-        } else {
-            "manifest"
-        };
         (
             self.path.join(format!("{stem}.dylib")),
-            self.path.join(format!("{stem}.{metadata_suffix}")),
+            self.path.join(format!("{stem}.metadata-v3")),
         )
     }
 
@@ -2104,8 +1776,7 @@ mod tests {
         let mapped = ValidatedMappedTranslationMetadata::new(backing, &key)
             .expect("a disabled-layout unit validates as mapped metadata");
 
-        let metadata = ValidatedUnitMetadata::V3(Arc::new(mapped));
-        validate_loaded_binding_code(&metadata, &code)
+        validate_loaded_binding_code(&mapped, &code)
             .expect("a cell-free unit needs no binding-code validation");
     }
     use super::*;
@@ -2735,16 +2406,11 @@ mod tests {
         cell.publish_null(target)
             .expect("atomically publish descriptor");
 
-        let validated_metadata = match &first.metadata {
-            LoadedTranslationMetadata::V2(manifest) => {
-                ValidatedUnitMetadata::V2((**manifest).clone())
-            }
-            LoadedTranslationMetadata::V3(metadata) => {
-                ValidatedUnitMetadata::V3(std::sync::Arc::clone(metadata))
-            }
+        let LoadedTranslationMetadata::V3(validated_metadata) = &first.metadata else {
+            panic!("units publish and load as mapped V3 metadata");
         };
         assert_eq!(
-            validate_loaded_binding_cells_atomically(&validated_metadata, binding_base),
+            validate_loaded_binding_cells_atomically(validated_metadata, binding_base),
             Err(UnitMissReason::ManifestRange),
             "atomic revalidation must observe the published descriptor"
         );
@@ -2991,68 +2657,10 @@ mod tests {
     }
 
     #[test]
-    fn manifest_wire_format_is_materially_smaller_than_json() {
-        let manifest = fixture_manifest();
-        let json = serde_json::to_vec(&manifest).expect("encode comparison JSON");
-        let encoded = encode_manifest(&manifest).expect("encode compact manifest");
-        let decoded = decode_manifest(&encoded).expect("decode compact manifest");
-
-        assert_eq!(decoded, manifest);
-        assert!(
-            encoded.len().saturating_mul(2) < json.len(),
-            "compact manifest is {} bytes versus {} bytes of JSON",
-            encoded.len(),
-            json.len(),
-        );
-    }
-
     #[test]
-    fn fixed_width_manifest_wire_round_trips() {
-        let manifest = fixture_manifest();
-        let encoded =
-            encode_manifest_with_fixed_width(&manifest, true).expect("encode fixed-width manifest");
-        let decoded =
-            decode_manifest_with_fixed_width(&encoded, true).expect("decode fixed-width manifest");
-
-        assert_eq!(decoded, manifest);
-    }
-
     #[test]
-    fn fixed_width_manifest_encoding_is_default_on_with_an_exact_opt_out() {
-        assert!(fixed_width_manifest_enabled_from(None));
-        assert!(fixed_width_manifest_enabled_from(Some(
-            std::ffi::OsStr::new("1")
-        )));
-        assert!(!fixed_width_manifest_enabled_from(Some(
-            std::ffi::OsStr::new("0")
-        )));
-    }
-
     #[test]
-    fn mapped_metadata_is_default_on_with_an_exact_opt_out() {
-        assert!(mapped_metadata_enabled_from(None));
-        assert!(mapped_metadata_enabled_from(Some(std::ffi::OsStr::new(
-            "1"
-        ))));
-        assert!(mapped_metadata_enabled_from(Some(std::ffi::OsStr::new(
-            "false"
-        ))));
-        assert!(!mapped_metadata_enabled_from(Some(std::ffi::OsStr::new(
-            "0"
-        ))));
-    }
-
     #[test]
-    fn keyed_dylib_identity_is_default_on_with_an_exact_opt_out() {
-        assert!(keyed_dylib_identity_enabled_from(None));
-        assert!(keyed_dylib_identity_enabled_from(Some(
-            std::ffi::OsStr::new("1")
-        )));
-        assert!(!keyed_dylib_identity_enabled_from(Some(
-            std::ffi::OsStr::new("0")
-        )));
-    }
-
     #[test]
     fn keyed_dylib_identity_rejects_another_valid_signed_unit() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
@@ -3082,7 +2690,7 @@ mod tests {
 
         assert_eq!(
             authority
-                .load_unit_with_keyed_identity(&first.key, &fixture_source_words(), true)
+                .load_unit(&first.key, &fixture_source_words())
                 .expect_err("another key's signed dylib must not load")
                 .reason(),
             UnitMissReason::Dlopen
@@ -3147,13 +2755,11 @@ mod tests {
         let pending = fixture_pending();
 
         assert_eq!(
-            authority
-                .publish_unit_with_metadata_mode(&pending, true)
-                .expect("publish V3 unit"),
+            authority.publish_unit(&pending).expect("publish V3 unit"),
             PublishOutcome::Winner
         );
         let stem = pending.key.file_stem().expect("unit stem");
-        let (_, metadata_path) = authority.final_paths_with_metadata_mode(&stem, true);
+        let (_, metadata_path) = authority.final_paths(&stem);
         assert_eq!(
             metadata_path.extension().and_then(std::ffi::OsStr::to_str),
             Some("metadata-v3")
@@ -3161,7 +2767,7 @@ mod tests {
         assert!(!authority.path().join(format!("{stem}.manifest")).exists());
 
         let loaded = authority
-            .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, true)
+            .load_unit(&pending.key, &fixture_source_words())
             .expect("load V3 unit");
         let LoadedTranslationMetadata::V3(metadata) = &loaded.metadata else {
             panic!("default mapped load must retain V3 metadata");
@@ -3187,11 +2793,9 @@ mod tests {
     fn mapped_metadata_uses_the_bounded_open_extent() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending();
-        authority
-            .publish_unit_with_metadata_mode(&pending, true)
-            .expect("publish V3 unit");
+        authority.publish_unit(&pending).expect("publish V3 unit");
         let stem = pending.key.file_stem().expect("unit stem");
-        let (_, metadata_path) = authority.final_paths_with_metadata_mode(&stem, true);
+        let (_, metadata_path) = authority.final_paths(&stem);
         let bounded_len = std::fs::metadata(&metadata_path)
             .expect("stat V3 metadata before bounded open")
             .len();
@@ -3208,7 +2812,7 @@ mod tests {
         });
 
         let loaded = authority
-            .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, true)
+            .load_unit(&pending.key, &fixture_source_words())
             .expect("map only the extent accepted by bounded open");
 
         assert_eq!(loaded.load_evidence.bytes_mapped, bounded_len);
@@ -3219,10 +2823,10 @@ mod tests {
         let pending = fixture_pending_with_complete_metadata_tables();
         let v3_authority = ContainerCacheAuthority::create().expect("create V3 cache authority");
         v3_authority
-            .publish_unit_with_metadata_mode(&pending, true)
+            .publish_unit(&pending)
             .expect("publish complete V3 metadata fixture");
         let v3 = v3_authority
-            .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, true)
+            .load_unit(&pending.key, &fixture_source_words())
             .expect("load complete V3 metadata fixture");
         assert_eq!(
             v3.load_evidence.mapped_records, 15,
@@ -3232,86 +2836,19 @@ mod tests {
     }
 
     #[test]
-    fn owned_metadata_evidence_counts_only_retained_manifest_tables() {
-        let pending = fixture_pending_with_complete_metadata_tables();
-        let v2_authority = ContainerCacheAuthority::create().expect("create V2 cache authority");
-        v2_authority
-            .publish_unit_with_metadata_mode(&pending, false)
-            .expect("publish complete V2 metadata fixture");
-        let v2 = v2_authority
-            .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, false)
-            .expect("load complete V2 metadata fixture");
-        assert_eq!(v2.load_evidence.mapped_records, 0);
-        assert_eq!(
-            v2.load_evidence.owned_records, 6,
-            "V2 counts only its physically retained block, PC, recovery, binding, and relocation records"
-        );
-    }
-
     #[test]
-    fn exact_mapped_metadata_opt_out_preserves_v2_writer_and_loader() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
-        let pending = fixture_pending();
-
-        authority
-            .publish_unit_with_metadata_mode(&pending, false)
-            .expect("publish V2 unit");
-        let stem = pending.key.file_stem().expect("unit stem");
-        let (_, manifest_path) = authority.final_paths_with_metadata_mode(&stem, false);
-        let manifest_len = std::fs::metadata(&manifest_path)
-            .expect("stat V2 manifest")
-            .len();
-        assert_eq!(
-            manifest_path.extension().and_then(std::ffi::OsStr::to_str),
-            Some("manifest")
-        );
-        assert!(
-            !authority
-                .path()
-                .join(format!("{stem}.metadata-v3"))
-                .exists()
-        );
-
-        let loaded = authority
-            .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, false)
-            .expect("load V2 unit");
-        assert!(matches!(loaded.metadata, LoadedTranslationMetadata::V2(_)));
-        assert_eq!(loaded.load_evidence.mode, TranslationMetadataMode::V2);
-        assert_eq!(loaded.load_evidence.bytes_read, manifest_len);
-        assert_eq!(loaded.load_evidence.bytes_mapped, 0);
-        assert_eq!(loaded.load_evidence.mapped_records, 0);
-        assert_eq!(loaded.load_evidence.owned_records, 2);
-    }
-
     #[test]
-    fn loaded_unit_conversion_preserves_v2_evidence() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
-        let pending = fixture_pending();
-        authority
-            .publish_unit_with_metadata_mode(&pending, false)
-            .expect("publish V2 unit");
-        let loaded = authority
-            .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, false)
-            .expect("load V2 unit");
-        let expected = loaded.load_evidence;
-
-        let shared = loaded.into_shared();
-
-        assert!(matches!(shared.metadata, LoadedTranslationMetadata::V2(_)));
-        assert_eq!(shared.load_evidence, expected);
-    }
-
     #[test]
     fn mapped_metadata_and_dylib_pair_rejects_either_lone_half() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending();
         let stem = pending.key.file_stem().expect("unit stem");
-        let (dylib, metadata) = authority.final_paths_with_metadata_mode(&stem, true);
+        let (dylib, metadata) = authority.final_paths(&stem);
 
         std::fs::write(&metadata, b"metadata only").expect("write lone V3 metadata");
         assert_eq!(
             authority
-                .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, true)
+                .load_unit(&pending.key, &fixture_source_words())
                 .expect_err("lone V3 metadata must miss")
                 .reason(),
             UnitMissReason::MissingPair
@@ -3320,7 +2857,7 @@ mod tests {
         std::fs::write(&dylib, MOV42_RET).expect("write lone dylib");
         assert_eq!(
             authority
-                .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, true)
+                .load_unit(&pending.key, &fixture_source_words())
                 .expect_err("lone dylib must miss")
                 .reason(),
             UnitMissReason::MissingPair
@@ -3331,11 +2868,9 @@ mod tests {
     fn corrupt_v3_metadata_is_typed_before_dylib_authority() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending();
-        authority
-            .publish_unit_with_metadata_mode(&pending, true)
-            .expect("publish V3 unit");
+        authority.publish_unit(&pending).expect("publish V3 unit");
         let stem = pending.key.file_stem().expect("unit stem");
-        let (dylib, metadata) = authority.final_paths_with_metadata_mode(&stem, true);
+        let (dylib, metadata) = authority.final_paths(&stem);
         std::fs::OpenOptions::new()
             .write(true)
             .open(&metadata)
@@ -3346,7 +2881,7 @@ mod tests {
 
         assert_eq!(
             authority
-                .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, true)
+                .load_unit(&pending.key, &fixture_source_words())
                 .expect_err("corrupt V3 metadata must miss before dylib")
                 .reason(),
             UnitMissReason::Schema
@@ -3358,12 +2893,12 @@ mod tests {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending_with_binding_sidecar();
         authority
-            .publish_unit_with_metadata_mode(&pending, true)
+            .publish_unit(&pending)
             .expect("publish V3 sidecar");
         let stem = pending.key.file_stem().expect("unit stem");
-        let (dylib_path, metadata_path) = authority.final_paths_with_metadata_mode(&stem, true);
+        let (dylib_path, metadata_path) = authority.final_paths(&stem);
         let loaded = authority
-            .load_unit_with_metadata_mode(&pending.key, &fixture_source_words(), true, true)
+            .load_unit(&pending.key, &fixture_source_words())
             .expect("load V3 sidecar");
         let LoadedTranslationMetadata::V3(metadata) = loaded.metadata else {
             panic!("loaded sidecar must retain V3 metadata");
@@ -3407,9 +2942,7 @@ mod tests {
 
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending();
-        authority
-            .publish_unit_with_metadata_mode(&pending, true)
-            .expect("publish V3 unit");
+        authority.publish_unit(&pending).expect("publish V3 unit");
         let stem = pending.key.file_stem().expect("unit stem");
         let name = CString::new(format!("{stem}.metadata-v3")).expect("metadata name");
         let (metadata, _) = map_and_validate_metadata(&authority.directory, &name, &pending.key)
