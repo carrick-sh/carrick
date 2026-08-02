@@ -357,6 +357,19 @@ the scratch does not become.
 
 Nothing else may be planned in detail until this lands. Deliverables:
 
+> **CORRECTION (2026-08-02, measured).** Deliverable 1 below names the wrong
+> mechanism, and a fix built against it was implemented, measured, and reverted
+> unlanded. carrick's guest `execve` does **not** host-`execve`: it loads the
+> new image in-process (`runtime.rs` `load_execve_image`), and the only host
+> `execve` in the tree (`native_exec_capsule.rs`) is not taken by a cold
+> `go build`. Hooking that path produced **no** coverage change (23 census
+> files, inside the documented 23/25/34 band, and no pid wrote twice). The
+> ~70 processes of a build are host **forks**, so the blind spot is a forked
+> child that leaves via `_exit` without running `atexit` — that is what Phase 0
+> must actually close. One real defect was found along the way and is worth
+> fixing regardless: census file names are keyed on pid alone, so any path that
+> does keep a pid across images would silently overwrite its own census.
+>
 1. **Close the census's `execve` blind spot.** `crates/carrick-cli/src/main.rs:174-206`
    parks the `dhat::Profiler` in a static and drops it from a libc `atexit`
    hook, so a process that `execve`s (carrick's guest-exec is a host
