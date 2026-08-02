@@ -516,7 +516,18 @@ impl ValidatedMappedTranslationMetadata {
     fn validate_bindings(&self) -> Result<(), MappedMetadataError> {
         let header = self.header();
         let bindings = self.count_u64(SectionKind::Binding);
-        if self.count_u64(SectionKind::BindingRelocation) != bindings
+        // Relocations are SIDECAR-LAYOUT machinery: they patch the ADRP/ADD
+        // pairs that address a binding's cell. A `Disabled` layout has no
+        // cells, so the producer emits none - `PendingTranslationUnit::pack`
+        // returns an empty relocation vector for it and
+        // `TranslationUnitManifest::validate_ranges` requires exactly that.
+        // Demanding one relocation per binding REGARDLESS of layout made this
+        // reader reject every `Disabled` unit carrick produced, which is why
+        // the shared-translation lane published zero units across an entire
+        // build while every other precondition held.
+        let sidecar = header.binding_layout.get() == 1;
+        let expected_relocations = if sidecar { bindings } else { 0 };
+        if self.count_u64(SectionKind::BindingRelocation) != expected_relocations
             || self.count_u64(SectionKind::EdgeMember) != bindings
         {
             return Err(MappedMetadataError::BindingRelocation);
@@ -525,9 +536,14 @@ impl ValidatedMappedTranslationMetadata {
             return Err(MappedMetadataError::Binding);
         }
         match header.binding_layout.get() {
-            0 if bindings == 0
-                && header.binding_data_len.get() == 0
-                && header.cell_size.get() == 0 => {}
+            // `Disabled` means no sidecar CELLS - not "no bindings". A unit
+            // still records its unresolved cross-unit edges so a loader knows
+            // which stubs exist; `pack` builds exactly that, and
+            // `validate_ranges`'s own Disabled arm checks only that the cell
+            // machinery (export, data length, cell size, relocations) is
+            // absent. Requiring `bindings == 0` here contradicted the producer
+            // and rejected every unit it built.
+            0 if header.binding_data_len.get() == 0 && header.cell_size.get() == 0 => {}
             1 if header.cell_size.get() == DIRECT_BINDING_CELL_SIZE
                 && header.binding_data_len.get()
                     == bindings
@@ -551,42 +567,46 @@ impl ValidatedMappedTranslationMetadata {
                 return Err(MappedMetadataError::Binding);
             }
             previous_stub_end = Some(binding.stub_end.get());
-            let relocation = self
-                .record_checked::<WireBindingRelocationV3>(SectionKind::BindingRelocation, index)?;
-            let expected_offsets = [
-                binding.stub_start.get().checked_add(20),
-                binding.stub_start.get().checked_add(24),
-                binding.stub_start.get().checked_add(108),
-                binding.stub_start.get().checked_add(112),
-            ];
-            if relocation.ordinal.get() != expected
-                || [
-                    Some(relocation.adrp_offset.get()),
-                    Some(relocation.add_offset.get()),
-                    Some(relocation.miss_adrp_offset.get()),
-                    Some(relocation.miss_add_offset.get()),
-                ] != expected_offsets
-                || relocation.data_offset.get()
-                    != expected
-                        .checked_mul(DIRECT_BINDING_CELL_SIZE)
-                        .ok_or(MappedMetadataError::BindingRelocation)?
-            {
-                return Err(MappedMetadataError::BindingRelocation);
-            }
-            for offset in [
-                relocation.adrp_offset.get(),
-                relocation.add_offset.get(),
-                relocation.miss_adrp_offset.get(),
-                relocation.miss_add_offset.get(),
-            ] {
-                let instruction_end = offset
-                    .checked_add(4)
-                    .ok_or(MappedMetadataError::BindingRelocation)?;
-                if offset < binding.stub_start.get()
-                    || instruction_end > binding.stub_end.get()
-                    || u64::from(instruction_end) > self.code_len()
+            if sidecar {
+                let relocation = self.record_checked::<WireBindingRelocationV3>(
+                    SectionKind::BindingRelocation,
+                    index,
+                )?;
+                let expected_offsets = [
+                    binding.stub_start.get().checked_add(20),
+                    binding.stub_start.get().checked_add(24),
+                    binding.stub_start.get().checked_add(108),
+                    binding.stub_start.get().checked_add(112),
+                ];
+                if relocation.ordinal.get() != expected
+                    || [
+                        Some(relocation.adrp_offset.get()),
+                        Some(relocation.add_offset.get()),
+                        Some(relocation.miss_adrp_offset.get()),
+                        Some(relocation.miss_add_offset.get()),
+                    ] != expected_offsets
+                    || relocation.data_offset.get()
+                        != expected
+                            .checked_mul(DIRECT_BINDING_CELL_SIZE)
+                            .ok_or(MappedMetadataError::BindingRelocation)?
                 {
                     return Err(MappedMetadataError::BindingRelocation);
+                }
+                for offset in [
+                    relocation.adrp_offset.get(),
+                    relocation.add_offset.get(),
+                    relocation.miss_adrp_offset.get(),
+                    relocation.miss_add_offset.get(),
+                ] {
+                    let instruction_end = offset
+                        .checked_add(4)
+                        .ok_or(MappedMetadataError::BindingRelocation)?;
+                    if offset < binding.stub_start.get()
+                        || instruction_end > binding.stub_end.get()
+                        || u64::from(instruction_end) > self.code_len()
+                    {
+                        return Err(MappedMetadataError::BindingRelocation);
+                    }
                 }
             }
             let member_index = usize_index(
@@ -1660,6 +1680,60 @@ pub(super) mod tests {
             )
             .expect_err("binding target index must be an exact permutation"),
             super::MappedMetadataError::Binding,
+        );
+    }
+
+    /// A `Disabled` binding layout that RETAINS its bindings - the shape
+    /// `PendingTranslationUnit::pack` actually produces for a real image, and
+    /// the shape no test covered until publication was measured emitting zero
+    /// units across an entire go build.
+    ///
+    /// `pack` builds binding records for every unresolved cross-unit edge and
+    /// emits NO relocations when there are no sidecar cells;
+    /// `TranslationUnitManifest::validate_ranges` accepts exactly that. This
+    /// reader used to demand `bindings == 0` for the layout AND one relocation
+    /// per binding regardless of layout, so it rejected every unit carrick
+    /// built. Red against the pre-fix reader with
+    /// `MappedMetadataError::{Binding, BindingRelocation}`.
+    fn disabled_layout_manifest_with_bindings() -> TranslationUnitManifest {
+        let mut manifest = mapped_manifest_fixture();
+        manifest.binding_layout = DirectBindingLayout::Disabled;
+        manifest.binding_export.clear();
+        manifest.binding_data_len = 0;
+        manifest.cell_size = 0;
+        // Bindings STAY. Relocations do not - there are no cells to patch.
+        manifest.binding_relocations.clear();
+        manifest
+    }
+
+    #[test]
+    fn disabled_layout_keeps_its_bindings_and_still_validates() {
+        let manifest = disabled_layout_manifest_with_bindings();
+        assert!(
+            !manifest.bindings.is_empty(),
+            "the fixture must exercise bindings under a disabled layout",
+        );
+        manifest
+            .validate_ranges()
+            .expect("the producer's own validator accepts this manifest");
+        let bytes = encode_translation_metadata_v3(&manifest).expect("encode disabled-layout unit");
+        ValidatedMappedTranslationMetadata::new(
+            Arc::new(VecMetadataBacking::new(bytes)),
+            &manifest.key,
+        )
+        .expect("a unit the producer accepts must survive its own reader");
+    }
+
+    #[test]
+    fn disabled_layout_still_rejects_sidecar_cell_machinery() {
+        // The relaxation must not become "anything goes": a disabled layout
+        // carrying cell data is still a defect.
+        let mut manifest = disabled_layout_manifest_with_bindings();
+        manifest.cell_size = 8;
+        let encoded = encode_translation_metadata_v3(&manifest);
+        assert!(
+            encoded.is_err(),
+            "cell machinery under a disabled layout must not encode",
         );
     }
 }

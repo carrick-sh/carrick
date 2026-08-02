@@ -14,6 +14,7 @@ use carrick_dsr_aarch64::mapped_metadata::{
     MappedMetadataError, MetadataBacking, ValidatedMappedTranslationMetadata,
     encode_translation_metadata_v3,
 };
+use carrick_dsr_aarch64::shared_cache::ManifestDefect;
 pub use carrick_dsr_aarch64::shared_cache::PublishOutcome;
 use carrick_dsr_aarch64::shared_cache::{
     LoadedTranslationMetadata, LoadedTranslationProtection, MAX_TRANSLATION_UNIT_CODE_BYTES,
@@ -944,6 +945,17 @@ fn validate_loaded_binding_code(
     match metadata {
         ValidatedUnitMetadata::V2(manifest) => manifest.validate_binding_code(code),
         ValidatedUnitMetadata::V3(mapped) => {
+            // Relocations address a binding's SIDECAR CELL. A unit with no
+            // cell machinery (`Disabled` layout, i.e. `binding_data_len == 0`)
+            // carries bindings but no relocations, so walking one per binding
+            // reads records that do not exist and rejects a unit carrick just
+            // published. Third instance of the same producer/validator
+            // disagreement that kept this lane at zero published units; the
+            // V2 arm never had it because it iterates the relocations
+            // themselves.
+            if mapped.binding_data_len() == 0 {
+                return Ok(());
+            }
             for index in 0..mapped.binding_count() {
                 let relocation = mapped
                     .binding(index)
@@ -1161,11 +1173,51 @@ impl ContainerCacheAuthority {
             )
         })?;
         let preflight_manifest = manifest_for_pending(pending, [0; 32], &base_export);
+        // Name the broken invariant. This preflight rejects a unit CARRICK
+        // ITSELF just built, so "ManifestRange" alone says only that the
+        // producer and its validator disagree - which is exactly the state a
+        // cold go build has been in (33 publication attempts, 0 units, 30 of
+        // them ManifestRange with no further detail).
+        if let Err(defect) = preflight_manifest.validate_ranges_detailed() {
+            return Err(UnitStoreError::new(
+                match defect {
+                    ManifestDefect::Schema => "validate pending unit: schema",
+                    ManifestDefect::TranslatorAbi => "validate pending unit: translator abi",
+                    ManifestDefect::BaseExport => "validate pending unit: base export",
+                    ManifestDefect::CodeLen => "validate pending unit: code length",
+                    ManifestDefect::BlockGeometry => "validate pending unit: block geometry",
+                    ManifestDefect::BlockGuestDuplicate => {
+                        "validate pending unit: duplicate block guest start"
+                    }
+                    ManifestDefect::BlockExtentOverlap => {
+                        "validate pending unit: overlapping block extents"
+                    }
+                    ManifestDefect::BindingOrdinal => "validate pending unit: binding ordinal",
+                    ManifestDefect::BindingGeometry => "validate pending unit: binding geometry",
+                    ManifestDefect::BindingOwnerDuplicate => {
+                        "validate pending unit: duplicate binding stub owner"
+                    }
+                    ManifestDefect::BindingOrder => "validate pending unit: binding stub order",
+                    ManifestDefect::BindingTargetInUnit => {
+                        "validate pending unit: binding target is inside this unit"
+                    }
+                    ManifestDefect::BindingLayoutDisabled => {
+                        "validate pending unit: disabled binding layout carries data"
+                    }
+                    ManifestDefect::BindingLayoutSidecar => {
+                        "validate pending unit: sidecar binding layout"
+                    }
+                    ManifestDefect::BindingRelocation => {
+                        "validate pending unit: binding relocation"
+                    }
+                },
+                defect.reason(),
+            ));
+        }
         preflight_manifest
-            .validate_ranges()
-            .and_then(|()| preflight_manifest.validate_binding_data(&pending.binding_data))
+            .validate_binding_data(&pending.binding_data)
             .and_then(|()| preflight_manifest.validate_binding_code(&pending.code))
-            .map_err(|reason| UnitStoreError::new("validate pending unit", reason))?;
+            .map_err(|reason| UnitStoreError::new("validate pending unit payload", reason))?;
         let stem = pending.key.file_stem().map_err(|error| {
             UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
         })?;
@@ -1273,8 +1325,20 @@ impl ContainerCacheAuthority {
             .validate_ranges()
             .map_err(|reason| UnitStoreError::new("validate manifest", reason))?;
         let metadata_bytes = if mapped_metadata {
-            encode_translation_metadata_v3(&manifest)
-                .map_err(|error| mapped_metadata_error("encode mapped metadata", error))?
+            encode_translation_metadata_v3(&manifest).map_err(|error| {
+                tracing::warn!(
+                    bindings = manifest.bindings.len(),
+                    relocations = manifest.binding_relocations.len(),
+                    binding_ordinals = ?manifest.bindings.iter().map(|b| b.ordinal.get())
+                        .take(8).collect::<Vec<_>>(),
+                    relocation_ordinals = ?manifest.binding_relocations.iter()
+                        .map(|r| r.ordinal.get()).take(8).collect::<Vec<_>>(),
+                    layout = ?manifest.binding_layout,
+                    error = ?error,
+                    "mapped metadata encode rejected a freshly packed unit"
+                );
+                mapped_metadata_error("encode mapped metadata", error)
+            })?
         } else {
             encode_manifest(&manifest).map_err(|error| {
                 UnitStoreError::with_source("encode manifest", UnitMissReason::Schema, error)
@@ -1916,7 +1980,17 @@ impl carrick_dsr_aarch64::shared_cache::TranslationUnitStore for ActiveContainer
         match authority.load_unit(key, source_words) {
             Ok(loaded) => Ok(Some(loaded.into_shared())),
             Err(error) if error.reason() == UnitMissReason::MissingPair => Ok(None),
-            Err(error) => Err(error.reason()),
+            Err(error) => {
+                // Same reasoning as the publish side: the trait narrows to a
+                // bare reason, so the context naming the rejected invariant
+                // would be lost exactly where a silent load failure hides.
+                tracing::warn!(
+                    error = %error,
+                    reason = ?error.reason(),
+                    "shared translation refused to load a unit it published"
+                );
+                Err(error.reason())
+            }
         }
     }
 
@@ -1925,9 +1999,19 @@ impl carrick_dsr_aarch64::shared_cache::TranslationUnitStore for ActiveContainer
             .lock()
             .map_err(|_| UnitMissReason::StoreUnavailable)?;
         let authority = active.as_ref().ok_or(UnitMissReason::NoAuthority)?;
-        authority
-            .publish_unit(pending)
-            .map_err(|error| error.reason())
+        authority.publish_unit(pending).map_err(|error| {
+            // The trait returns a bare reason, so the context naming WHICH
+            // invariant broke would be lost right here - and publication
+            // failing silently is exactly how this lane published zero units
+            // across an entire build without anyone noticing. Surface it
+            // before narrowing.
+            tracing::warn!(
+                error = %error,
+                reason = ?error.reason(),
+                "shared translation rejected a unit carrick itself built"
+            );
+            error.reason()
+        })
     }
 
     fn claim_recording(&self, key: &TranslationUnitKey) -> bool {
@@ -1960,6 +2044,70 @@ fn owns_cleanup(creator_pid: i32, current_pid: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The load path must accept a unit whose layout has no sidecar cells.
+    ///
+    /// `PendingTranslationUnit::pack` emits bindings but NO relocations under a
+    /// `Disabled` layout, and both the producer's `validate_ranges` and the V2
+    /// load arm agree with that. The V3 arm walked one relocation per BINDING
+    /// instead, so it read records that do not exist and refused a unit carrick
+    /// had just published - the last link in the chain that held the shared
+    /// translation lane at zero loaded units. Red against the pre-fix arm with
+    /// `UnitMissReason::ManifestRange`.
+    #[test]
+    fn disabled_layout_units_need_no_binding_code_validation() {
+        // Start from the sidecar fixture purely to inherit a NON-EMPTY binding
+        // list, then strip the cell machinery: bindings without relocations is
+        // exactly the shape a `Disabled` unit publishes.
+        let mut pending = fixture_pending_with_binding_sidecar();
+        pending.binding_layout = DirectBindingLayout::Disabled;
+        pending.binding_export.clear();
+        pending.binding_data_len = 0;
+        pending.cell_size = 0;
+        pending.binding_relocations.clear();
+        pending.binding_data.clear();
+        assert!(
+            !pending.bindings.is_empty(),
+            "the shape under test is bindings WITHOUT relocations",
+        );
+
+        let base_export =
+            translation_unit_base_export(&pending.key).expect("keyed translation export");
+        let manifest = TranslationUnitManifest {
+            schema: TRANSLATION_UNIT_SCHEMA_V2,
+            key: pending.key,
+            dylib_sha256: [0x22; 32],
+            base_export,
+            code_len: pending.code.len() as u64,
+            blocks: pending.blocks,
+            binding_layout: pending.binding_layout,
+            binding_export: pending.binding_export,
+            binding_data_len: pending.binding_data_len,
+            cell_size: pending.cell_size,
+            bindings: pending.bindings,
+            binding_relocations: pending.binding_relocations,
+        };
+        manifest
+            .validate_ranges()
+            .expect("a disabled-layout unit is well formed");
+
+        let code = vec![0_u8; manifest.code_len as usize];
+
+        // V3 SPECIFICALLY: the V2 arm iterates the (empty) relocation list and
+        // was never wrong. Building V2 here would pass against the pre-fix code
+        // and prove nothing.
+        let bytes = carrick_dsr_aarch64::mapped_metadata::encode_translation_metadata_v3(&manifest)
+            .expect("encode a disabled-layout unit");
+        let key = manifest.key;
+        let backing: Arc<dyn MetadataBacking> =
+            Arc::new(carrick_dsr_aarch64::mapped_metadata::VecMetadataBacking::new(bytes));
+        let mapped = ValidatedMappedTranslationMetadata::new(backing, &key)
+            .expect("a disabled-layout unit validates as mapped metadata");
+
+        let metadata = ValidatedUnitMetadata::V3(Arc::new(mapped));
+        validate_loaded_binding_code(&metadata, &code)
+            .expect("a cell-free unit needs no binding-code validation");
+    }
     use super::*;
     use carrick_dsr::address::NativeHostBias;
     use carrick_dsr_aarch64::artifact_spike::{ArtifactBindings, ArtifactTemplate};

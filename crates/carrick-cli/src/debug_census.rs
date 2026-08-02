@@ -299,6 +299,12 @@ pub(crate) struct StoreSection {
     pub processes_that_loaded: u64,
     /// Census files that won at least one recording election.
     pub processes_that_claimed_recording: u64,
+    /// Milliseconds summed across processes inside store `load`. This is
+    /// CONCURRENT across processes, so it is a CPU-cost total and not a wall
+    /// term - compare it against the run's total CPU, never its wall.
+    pub load_ms_total: u64,
+    /// Milliseconds summed across processes inside store `publish`.
+    pub publish_ms_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -599,6 +605,8 @@ fn store_section(files: &[CensusFile]) -> StoreSection {
     let mut processes_that_consulted = 0u64;
     let mut processes_without_authority = 0u64;
     let mut processes_that_loaded = 0u64;
+    let mut load_ns_total = 0u64;
+    let mut publish_ns_total = 0u64;
     let mut processes_that_claimed_recording = 0u64;
 
     for file in files {
@@ -607,6 +615,8 @@ fn store_section(files: &[CensusFile]) -> StoreSection {
         loaded = loaded.saturating_add(store.loaded);
         file_miss = file_miss.saturating_add(store.file_miss);
         recording_claimed = recording_claimed.saturating_add(store.recording_claimed);
+        load_ns_total = load_ns_total.saturating_add(store.load_ns);
+        publish_ns_total = publish_ns_total.saturating_add(store.publish_ns);
         recording_declined = recording_declined.saturating_add(store.recording_declined);
         for (skip, count) in &store.skipped {
             let entry = skipped.entry(*skip).or_insert(0);
@@ -668,6 +678,8 @@ fn store_section(files: &[CensusFile]) -> StoreSection {
         processes_without_authority,
         processes_that_loaded,
         processes_that_claimed_recording,
+        load_ms_total: load_ns_total / 1_000_000,
+        publish_ms_total: publish_ns_total / 1_000_000,
     }
 }
 

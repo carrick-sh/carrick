@@ -784,6 +784,42 @@ fn patch_same_unit_direct_link(
 /// a process whose lookups genuinely missed on disk used to be indistinguishable
 /// at every observable point, which is exactly the conflation that made the
 /// "one key in the cache directory" result unattributable.
+/// Which manifest invariant a preflight rejected. `UnitMissReason::ManifestRange`
+/// collapses eight distinct checks into one value, which is fine for a load-path
+/// miss (any of them means "do not use this unit") but useless on the PUBLISH
+/// path, where the same value means "carrick built a unit its own validator
+/// refuses" and the operator needs to know which rule broke. Measured: a cold
+/// go build makes 33 recording claims, attempts 33 publications, and publishes
+/// zero units, 30 of them rejected as `ManifestRange` with no further detail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestDefect {
+    Schema,
+    TranslatorAbi,
+    BaseExport,
+    CodeLen,
+    BlockGeometry,
+    BlockGuestDuplicate,
+    BlockExtentOverlap,
+    BindingOrdinal,
+    BindingGeometry,
+    BindingOwnerDuplicate,
+    BindingOrder,
+    BindingTargetInUnit,
+    BindingLayoutDisabled,
+    BindingLayoutSidecar,
+    BindingRelocation,
+}
+
+impl ManifestDefect {
+    pub const fn reason(self) -> UnitMissReason {
+        match self {
+            Self::Schema | Self::BaseExport | Self::CodeLen => UnitMissReason::Schema,
+            Self::TranslatorAbi => UnitMissReason::TranslatorAbi,
+            _ => UnitMissReason::ManifestRange,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum UnitMissReason {
     /// The unit's files are not present in the store. On the load path this is
@@ -1172,57 +1208,75 @@ impl TranslationUnitManifest {
         Ok(())
     }
 
+    /// Load-path form: any defect is one `UnitMissReason` and the unit is not
+    /// used. Publication should call [`Self::validate_ranges_detailed`], whose
+    /// error names the specific broken invariant.
     pub fn validate_ranges(&self) -> Result<(), UnitMissReason> {
+        self.validate_ranges_detailed()
+            .map_err(ManifestDefect::reason)
+    }
+
+    pub fn validate_ranges_detailed(&self) -> Result<(), ManifestDefect> {
         if self.schema != TRANSLATION_UNIT_SCHEMA_V2 {
-            return Err(UnitMissReason::Schema);
+            return Err(ManifestDefect::Schema);
         }
         if self.key.translator_abi() != TRANSLATOR_ABI_CURRENT {
-            return Err(UnitMissReason::TranslatorAbi);
+            return Err(ManifestDefect::TranslatorAbi);
         }
         let expected_base_export =
-            translation_unit_base_export(&self.key).map_err(|_| UnitMissReason::Schema)?;
-        if self.base_export != expected_base_export
-            || self.code_len == 0
-            || self.code_len > MAX_TRANSLATION_UNIT_CODE_BYTES as u64
-        {
-            return Err(UnitMissReason::Schema);
+            translation_unit_base_export(&self.key).map_err(|_| ManifestDefect::Schema)?;
+        if self.base_export != expected_base_export {
+            return Err(ManifestDefect::BaseExport);
+        }
+        if self.code_len == 0 || self.code_len > MAX_TRANSLATION_UNIT_CODE_BYTES as u64 {
+            return Err(ManifestDefect::CodeLen);
         }
         let mut guest_starts = BTreeSet::new();
         let mut cache_extents = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
             let end = u64::from(block.entry_offset)
                 .checked_add(u64::from(block.code_len))
-                .ok_or(UnitMissReason::ManifestRange)?;
+                .ok_or(ManifestDefect::BlockGeometry)?;
             if block.code_len == 0
                 || !block.entry_offset.is_multiple_of(4)
                 || !block.code_len.is_multiple_of(4)
                 || end > self.code_len
-                || !guest_starts.insert(block.guest_start)
             {
-                return Err(UnitMissReason::ManifestRange);
+                return Err(ManifestDefect::BlockGeometry);
+            }
+            if !guest_starts.insert(block.guest_start) {
+                return Err(ManifestDefect::BlockGuestDuplicate);
             }
             cache_extents.push((u64::from(block.entry_offset), end));
         }
         cache_extents.sort_unstable();
         if cache_extents.windows(2).any(|pair| pair[0].1 > pair[1].0) {
-            return Err(UnitMissReason::ManifestRange);
+            return Err(ManifestDefect::BlockExtentOverlap);
         }
         let same_unit_targets = guest_starts;
         let mut owners = BTreeSet::new();
         let mut previous_stub_end = None;
         for (index, binding) in self.bindings.iter().enumerate() {
             let expected_ordinal =
-                u32::try_from(index).map_err(|_| UnitMissReason::ManifestRange)?;
-            if binding.ordinal.get() != expected_ordinal
-                || !binding.stub_start.is_multiple_of(4)
+                u32::try_from(index).map_err(|_| ManifestDefect::BindingOrdinal)?;
+            if binding.ordinal.get() != expected_ordinal {
+                return Err(ManifestDefect::BindingOrdinal);
+            }
+            if !binding.stub_start.is_multiple_of(4)
                 || !binding.stub_end.is_multiple_of(4)
                 || binding.stub_start >= binding.stub_end
                 || u64::from(binding.stub_end) > self.code_len
-                || !owners.insert(binding.stub_start)
-                || previous_stub_end.is_some_and(|end| end > binding.stub_start)
-                || same_unit_targets.contains(&binding.target)
             {
-                return Err(UnitMissReason::ManifestRange);
+                return Err(ManifestDefect::BindingGeometry);
+            }
+            if !owners.insert(binding.stub_start) {
+                return Err(ManifestDefect::BindingOwnerDuplicate);
+            }
+            if previous_stub_end.is_some_and(|end| end > binding.stub_start) {
+                return Err(ManifestDefect::BindingOrder);
+            }
+            if same_unit_targets.contains(&binding.target) {
+                return Err(ManifestDefect::BindingTargetInUnit);
             }
             previous_stub_end = Some(binding.stub_end);
         }
@@ -1233,14 +1287,14 @@ impl TranslationUnitManifest {
                     || self.cell_size != 0
                     || !self.binding_relocations.is_empty()
                 {
-                    return Err(UnitMissReason::ManifestRange);
+                    return Err(ManifestDefect::BindingLayoutDisabled);
                 }
             }
             DirectBindingLayout::SidecarV1 => {
                 let expected_len = u64::try_from(self.bindings.len())
                     .ok()
                     .and_then(|count| count.checked_mul(u64::from(DIRECT_BINDING_CELL_SIZE)))
-                    .ok_or(UnitMissReason::ManifestRange)?;
+                    .ok_or(ManifestDefect::BindingLayoutSidecar)?;
                 if self.binding_export != TRANSLATION_UNIT_BINDING_EXPORT
                     || self.cell_size != DIRECT_BINDING_CELL_SIZE
                     || !self
@@ -1249,21 +1303,21 @@ impl TranslationUnitManifest {
                     || self.binding_data_len != expected_len
                     || self.binding_relocations.len() != self.bindings.len()
                 {
-                    return Err(UnitMissReason::ManifestRange);
+                    return Err(ManifestDefect::BindingLayoutSidecar);
                 }
                 let mut relocation_ordinals = BTreeSet::new();
                 for relocation in &self.binding_relocations {
                     let ordinal = usize::try_from(relocation.ordinal.get())
-                        .map_err(|_| UnitMissReason::ManifestRange)?;
+                        .map_err(|_| ManifestDefect::BindingLayoutSidecar)?;
                     let binding = self
                         .bindings
                         .get(ordinal)
-                        .ok_or(UnitMissReason::ManifestRange)?;
+                        .ok_or(ManifestDefect::BindingLayoutSidecar)?;
                     let expected_data_offset = relocation
                         .ordinal
                         .get()
                         .checked_mul(DIRECT_BINDING_CELL_SIZE)
-                        .ok_or(UnitMissReason::ManifestRange)?;
+                        .ok_or(ManifestDefect::BindingLayoutSidecar)?;
                     let offsets = [
                         relocation.adrp_offset,
                         relocation.add_offset,
@@ -1272,7 +1326,7 @@ impl TranslationUnitManifest {
                     ];
                     let expected_offsets =
                         expected_direct_binding_relocation_offsets(binding.stub_start)
-                            .ok_or(UnitMissReason::ManifestRange)?;
+                            .ok_or(ManifestDefect::BindingLayoutSidecar)?;
                     if !relocation_ordinals.insert(relocation.ordinal)
                         || relocation.data_offset != expected_data_offset
                         || offsets != expected_offsets
@@ -1283,7 +1337,7 @@ impl TranslationUnitManifest {
                                 || u64::from(*offset) + 4 > self.code_len
                         })
                     {
-                        return Err(UnitMissReason::ManifestRange);
+                        return Err(ManifestDefect::BindingLayoutSidecar);
                     }
                 }
             }
