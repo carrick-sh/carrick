@@ -79,7 +79,9 @@ struct carrick_native_dsr_signal_context {
     uint64_t exit_unsupported_addr;
     uint64_t exit_signal_addr;
     const void *generation_bindings;
-    uint64_t gateway_abi_tail_pad;
+    /* The DSR indirect-cache pointer, relocated here (read-mostly line)
+       from the store-heavy 1136 slot; opaque to the signal handler. */
+    uint64_t indirect_cache_hot;
     uint64_t direct_binding_cell;
     uint32_t direct_binding_ordinal;
     uint32_t direct_binding_present;
@@ -138,8 +140,8 @@ _Static_assert(offsetof(struct carrick_native_dsr_signal_context, exit_syscall_a
                "DSR gateway syscall exit address offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, generation_bindings) == 1264,
                "DSR generation binding pointer offset");
-_Static_assert(offsetof(struct carrick_native_dsr_signal_context, gateway_abi_tail_pad) == 1272,
-               "DSR gateway ABI tail pad offset");
+_Static_assert(offsetof(struct carrick_native_dsr_signal_context, indirect_cache_hot) == 1272,
+               "DSR relocated indirect-cache pointer offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, direct_binding_cell) == 1280,
                "DSR direct binding cell offset");
 _Static_assert(offsetof(struct carrick_native_dsr_signal_context, direct_binding_ordinal) == 1288,
