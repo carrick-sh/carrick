@@ -568,6 +568,14 @@ pub trait FsBackend: Send + Sync {
         true
     }
 
+    /// True iff a host stat of a plain entry is the complete guest-visible
+    /// answer (no chmod/chown metadata xattrs, no marker nodes anywhere), so
+    /// dispatch fast lanes may skip their per-entry xattr probe. Fail-closed
+    /// default: only backends that track the markers may say true.
+    fn serves_plain_metadata(&self) -> bool {
+        false
+    }
+
     /// Human-readable backend name for `--fs` reporting. Default is
     /// the impl's `type_name`-style identifier.
     fn name(&self) -> &'static str {
@@ -1455,6 +1463,12 @@ pub struct HostFsBackend {
     /// (`create_socket`/`create_device` stamp the marker and bump the
     /// generation BEFORE creating the node).
     marker_absent_gen: std::sync::atomic::AtomicU64,
+    /// Sticky fast answer for "does any entry carry guest metadata xattrs"
+    /// (mode/uid/gid): mirrors `marker_seen`/`marker_absent_gen` over
+    /// [`CARRICK_HAS_META_XATTRS_XATTR`], stamped by `set_mode`/`set_owner`
+    /// BEFORE the first xattr write.
+    meta_xattr_seen: std::sync::atomic::AtomicBool,
+    meta_xattr_absent_gen: std::sync::atomic::AtomicU64,
 }
 
 /// A cached `RealStat` plus the snapshot needed to revalidate it cheaply. The
@@ -1708,6 +1722,8 @@ impl HostFsBackend {
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_seen: std::sync::atomic::AtomicBool::new(false),
             marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
+            meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1754,6 +1770,8 @@ impl HostFsBackend {
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_seen: std::sync::atomic::AtomicBool::new(false),
             marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
+            meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1836,6 +1854,8 @@ impl HostFsBackend {
             fifo_absent_gen: std::sync::atomic::AtomicU64::new(0),
             marker_seen: std::sync::atomic::AtomicBool::new(false),
             marker_absent_gen: std::sync::atomic::AtomicU64::new(0),
+            meta_xattr_seen: std::sync::atomic::AtomicBool::new(false),
+            meta_xattr_absent_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2502,17 +2522,25 @@ impl HostFsBackend {
         // (the production path); tests using `from_existing_dir` have no path to
         // anchor the cache against and fall straight through.
         if let Some(scratch) = self._scratch.as_ref().map(|t| t.path().to_path_buf())
-            && matches!(
-                crate::layer_cache::try_seed_scratch(paths, &scratch),
-                Ok(true)
-            )
+            && let Ok(seed) = crate::layer_cache::try_seed_scratch(paths, &scratch)
+            && seed.cloned
         {
             // The clone reproduces the same on-disk tree a direct extraction
             // would; per-file ExtractStats aren't recovered for a cache hit.
+            // Entry xattrs cloned with the tree; the cache's sentinel says
+            // whether any exist, re-arming the metadata-xattr root marker the
+            // scratch-root clone cannot carry.
+            if seed.cache_has_mode_xattrs {
+                self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
+            }
             return Ok(crate::rootfs::ExtractStats::default());
         }
-        crate::rootfs::extract_layer_paths_to_dir(paths, &self.dir)
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        let stats = crate::rootfs::extract_layer_paths_to_dir(paths, &self.dir)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        if stats.mode_xattrs > 0 {
+            self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
+        }
+        Ok(stats)
     }
 
     fn rel_path(normalized: &Path) -> Option<&Path> {
@@ -2770,6 +2798,12 @@ const CARRICK_HAS_FIFO_XATTR: &[u8] = b"user.carrick.has_fifo\0";
 /// streaming in every sibling). Hidden from the guest's xattr syscalls like
 /// every `user.carrick.*` name.
 const CARRICK_HAS_MARKER_NODES_XATTR: &[u8] = b"user.carrick.has_marker_nodes\0";
+/// Root marker: some entry carries per-file guest METADATA xattrs (mode from
+/// chmod, uid/gid from chown). While ABSENT, a host stat of a plain entry IS
+/// the guest-visible answer, so the trusted dispatch lanes may skip their
+/// per-entry xattr probe entirely. Device/socket marker nodes stamp their own
+/// mode xattrs but are covered by [`CARRICK_HAS_MARKER_NODES_XATTR`].
+const CARRICK_HAS_META_XATTRS_XATTR: &[u8] = b"user.carrick.has_meta_xattrs\0";
 
 /// The errno that means "xattr not present" (as opposed to "this filesystem
 /// cannot do xattrs", which must fail CLOSED — see `root_fifo_marker`).
@@ -2812,6 +2846,19 @@ fn is_guest_xattr_namespace(name: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
+fn fremove_xattr(fd: std::os::fd::RawFd, name: &[u8]) {
+    // Best-effort: ENOATTR (no stale override) is the common case.
+    unsafe {
+        libc::fremovexattr(fd, name.as_ptr() as *const libc::c_char, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fremove_xattr(fd: std::os::fd::RawFd, name: &[u8]) {
+    let _ = carrick_portable::fd_remove_xattr(fd, name);
+}
+
 fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
     let v = val.to_le_bytes();
     // Portable fd-xattr (carrick-portable maps the Darwin position/options args).
@@ -3736,6 +3783,30 @@ impl FsBackend for HostFsBackend {
         }
     }
 
+    fn serves_plain_metadata(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Plain iff NEITHER marker is set: no chmod/chown metadata xattrs AND
+        // no socket/device marker nodes (whose own mode xattrs ride the
+        // marker-nodes flag). Fail CLOSED (false) when markers are unknown.
+        if self.meta_xattr_seen.load(Relaxed) {
+            return false;
+        }
+        let now = crate::fs_resolve_cache::current_generation();
+        let meta_absent = self.meta_xattr_absent_gen.load(Relaxed) == now
+            || match self.root_marker_xattr(CARRICK_HAS_META_XATTRS_XATTR) {
+                RootMarker::Present => {
+                    self.meta_xattr_seen.store(true, Relaxed);
+                    return false;
+                }
+                RootMarker::Absent => {
+                    self.meta_xattr_absent_gen.store(now, Relaxed);
+                    true
+                }
+                RootMarker::Unknown => false,
+            };
+        meta_absent && !self.dir_has_overlay_interference("/")
+    }
+
     fn dir_has_overlay_interference(&self, _dir: &str) -> bool {
         // The scratch tree is the merged truth for the host backend (rootfs
         // materialized, deletions are real unlinks), so the only thing that
@@ -4657,16 +4728,49 @@ impl FsBackend for HostFsBackend {
             }
             return Ok(());
         }
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let is_symlink = meta.as_ref().map(|m| m.is_symlink()).unwrap_or(false);
+        // An owner-representable mode (carrick keeps read+search on its own
+        // scratch entry) is applied NATIVELY: the on-disk bits ARE the guest
+        // answer, no xattr, and — load-bearing for the walk fast lanes — no
+        // metadata-xattr root marker gets stamped, so `serves_plain_metadata`
+        // survives ordinary boot-time chmods (mkdir -m 1777 /tmp and friends).
+        // Mirrors the extraction policy in rootfs.rs. Any stale override from
+        // an earlier unrepresentable chmod is removed so stat cannot keep
+        // serving it.
+        // Native only when the OWNER keeps full use of the entry: carrick (a
+        // non-root macOS process) must always be able to re-open its own
+        // scratch files for WRITING too - a root guest ignores permission
+        // bits, so chmod 444 followed by open(O_WRONLY) must succeed, which
+        // the host would refuse if 444 were applied natively. Anything less
+        // than owner-rw (files) / owner-rwx (dirs) keeps the xattr override.
+        let owner_ok = if is_dir {
+            mode & 0o700 == 0o700
+        } else {
+            mode & 0o600 == 0o600
+        };
+        if owner_ok
+            && !is_symlink
+            && dir
+                .set_permissions(rel, Permissions::from_mode(mode))
+                .is_ok()
+        {
+            let _ = with_entry_fd(&dir, rel, is_dir, true, |fd| {
+                fremove_xattr(fd, CARRICK_MODE_XATTR);
+            });
+            return Ok(());
+        }
         // Force owner rwx on the REAL file so carrick (a non-root macOS
         // process) can always still open/stat/unlink it, then record the
         // guest-visible mode in an xattr ON the file (see CARRICK_MODE_XATTR).
-        let is_dir = meta.map(|m| m.is_dir()).unwrap_or(false);
         let _ = dir.set_permissions(rel, Permissions::from_mode(mode | 0o700));
+        self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
         write_mode_xattr(&dir, rel, is_dir, mode);
         Ok(())
     }
 
     fn set_owner(&self, path: &str, uid: u32, gid: u32) -> Result<(), BackendError> {
+        self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;

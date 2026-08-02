@@ -2755,7 +2755,7 @@ impl ProcessTranslator {
     }
 
     /// Sever recorded private direct links into `range`; see
-    /// [`ProcessState::sever_direct_links_in`].
+    /// `ProcessState::sever_direct_links_in` (private).
     pub fn sever_direct_links_in(
         &self,
         range: std::ops::Range<carrick_guest_mem::GuestVa>,
