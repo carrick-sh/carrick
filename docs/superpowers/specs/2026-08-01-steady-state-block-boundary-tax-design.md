@@ -282,3 +282,25 @@ above stands as knowledge: the acquire is not load-bearing, and any future
 chain-restructuring may treat the generation read as an ordinary load. The
 remaining dispatch lever is the chain itself — fewer dependent hops, or
 hiding them under guest work.
+
+
+## 8. Where the compute lane stands, and why this design is closed
+
+Two consecutive chain hypotheses measured null after phase 4d (jsonl records
+`ldar-relaxation-null-result`, `dispatch-chain-restructuring-null-result`):
+relaxing the generation read's acquire, and removing a full L1 level from the
+probe (direct xN compare + paired tag/flavor load + hoisted gen-pointer
+load). Both were implemented, suite-green, and wall-identical to 4d's
+356 ms. The refuted model: dispatch cost is not load-chain depth — the
+out-of-order window already overlaps the probe's levels. What remains is the
+polymorphic indirect branch itself (whose mispredicts native hardware also
+pays, but each of ours re-steers through a longer path) and ~40% genuine
+guest work.
+
+**Compute: 1,153 ms / 10.9x at the census -> 356 ms / 3.2x at close**, via
+phases 1 (resident templates), 2a/2b (severing + trusted entries), 3
+(flag-free trusted IBL), 4a (resident ADR), 4b (indirect-cache pointer off
+the store-heavy line), 4c (single-store exit tail), 4d (entry ldp packing).
+The taxes this design named are removed or reduced to their latency floor;
+further compute work has speculative expected value, while fs-walk (128x)
+and the translation-bound build (~12x) hold the evidence-ranked multiples.
