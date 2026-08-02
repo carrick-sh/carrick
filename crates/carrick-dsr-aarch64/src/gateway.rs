@@ -415,7 +415,10 @@ pub struct DsrContext {
     pub cache_end: u64,
     pub host_bias: u64,
     pub biased_guest_fault_address: u64,
-    pub biased_fault_pad: u64,
+    /// Interrupted physical x19 (`RESERVED_SCRATCH`), stashed by the signal
+    /// handler for the reserved-resident commit recovery. Occupies the former
+    /// `biased_fault_pad`, so every later offset is unchanged.
+    pub physical_reserved: u64,
     /// The six gateway exit entry points, so emitted code can REACH them
     /// without EMBEDDING them. Guest processes self-reexec with different ASLR
     /// slides, so a gateway address baked into a block pins that block to the
@@ -540,7 +543,7 @@ impl DsrContext {
             cache_end: cache_end as u64,
             host_bias: address_mode.bias(),
             biased_guest_fault_address: 0,
-            biased_fault_pad: 0,
+            physical_reserved: 0,
             exit_syscall_addr,
             exit_direct_addr,
             exit_indirect_addr,
@@ -620,6 +623,7 @@ const _: () = assert!(std::mem::offset_of!(DsrContext, cache_start) == 1176);
 const _: () = assert!(std::mem::offset_of!(DsrContext, cache_end) == 1184);
 const _: () = assert!(std::mem::offset_of!(DsrContext, host_bias) == 1192);
 const _: () = assert!(std::mem::offset_of!(DsrContext, biased_guest_fault_address) == 1200);
+const _: () = assert!(std::mem::offset_of!(DsrContext, physical_reserved) == 1208);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_syscall_addr) == 1216);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_direct_addr) == 1224);
 const _: () = assert!(std::mem::offset_of!(DsrContext, exit_indirect_addr) == 1232);
@@ -1014,6 +1018,7 @@ mod native_gateway {
                 indirect_x15_scratch: context.indirect_x15_scratch,
                 indirect_x30_scratch: context.indirect_x30_scratch,
                 physical_x18: context.exit_link,
+                physical_reserved: context.physical_reserved,
                 gateway_phase: context.exit_has_link,
                 biased_guest_fault_address: context.biased_guest_fault_address,
             },
@@ -1024,6 +1029,7 @@ mod native_gateway {
                 generation_pstate_scratch: context.generation_pstate_scratch,
                 indirect_x15_scratch: context.indirect_x15_scratch,
                 indirect_x30_scratch: context.indirect_x30_scratch,
+                physical_reserved: context.physical_reserved,
             },
             6 => NativeDsrExit::Sensitive {
                 guest_pc: carrick_guest_mem::GuestVa(context.exit_source),
@@ -1439,6 +1445,7 @@ mod indirect_cache_tests {
                 indirect_x15_scratch: 0,
                 indirect_x30_scratch: 0,
                 physical_x18: 0,
+                physical_reserved: 0,
                 gateway_phase: 0,
                 biased_guest_fault_address: 0,
             },
@@ -1449,6 +1456,7 @@ mod indirect_cache_tests {
                 generation_pstate_scratch: 0,
                 indirect_x15_scratch: 0,
                 indirect_x30_scratch: 0,
+                physical_reserved: 0,
             },
             NativeDsrExit::KickAtEntry { resume: guest },
             NativeDsrExit::StaleGeneration {

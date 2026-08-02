@@ -1641,6 +1641,7 @@ mod tests {
                     0,
                     0,
                     0,
+                    0,
                 )
                 .expect("recover biased exclusive boundary");
 

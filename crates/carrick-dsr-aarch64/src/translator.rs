@@ -5874,6 +5874,7 @@ impl ThreadTranslator {
                 indirect_x15_scratch,
                 indirect_x30_scratch,
                 physical_x18,
+                physical_reserved,
                 gateway_phase,
                 biased_guest_fault_address,
             } => {
@@ -5907,6 +5908,7 @@ impl ThreadTranslator {
                         generation_pstate_scratch,
                         indirect_x15_scratch,
                         indirect_x30_scratch,
+                        physical_reserved,
                     )?;
                 }
                 snapshot.pc = recovery_resume_pc(guest_pc, recovery)?;
@@ -5948,6 +5950,7 @@ impl ThreadTranslator {
                 generation_pstate_scratch,
                 indirect_x15_scratch,
                 indirect_x30_scratch,
+                physical_reserved,
             } => {
                 let (guest_pc, recovery) = self.guest_pc_for_cache(resume)?;
                 if let Some(recovery) = recovery {
@@ -5959,6 +5962,7 @@ impl ThreadTranslator {
                         generation_pstate_scratch,
                         indirect_x15_scratch,
                         indirect_x30_scratch,
+                        physical_reserved,
                     )?;
                 }
                 self.last_kick = Some((guest_pc, recovery));
@@ -11295,6 +11299,7 @@ mod tests {
                     indirect_x15_scratch: 0,
                     indirect_x30_scratch: 0,
                     physical_x18: 0,
+                    physical_reserved: 0,
                     gateway_phase: 0,
                     biased_guest_fault_address: 0,
                 },
@@ -11308,6 +11313,7 @@ mod tests {
                     generation_pstate_scratch: 0,
                     indirect_x15_scratch: 0,
                     indirect_x30_scratch: 0,
+                    physical_reserved: 0,
                 },
                 (DsrExitKind::Kick, target.raw(), 0, 5),
             ),

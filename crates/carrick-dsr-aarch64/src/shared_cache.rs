@@ -10,7 +10,9 @@ use std::sync::{Arc, OnceLock};
 use crate::direct_binding::{DirectBindingCellVa, DirectBindingOrdinal};
 use crate::emit::{DirectLinkKind, DirectStubEnvelope};
 
-pub const TRANSLATOR_ABI_CURRENT: u32 = 3;
+// 4: the reserved-resident virtualization template (new emitted shapes and
+// the `CommitReservedResident` recovery action, wire tag 21).
+pub const TRANSLATOR_ABI_CURRENT: u32 = 4;
 pub const TRANSLATION_UNIT_SCHEMA_V1: u32 = 1;
 pub const TRANSLATION_UNIT_SCHEMA_V2: u32 = 2;
 pub const DIRECT_BINDING_CELL_SIZE: u32 = 8;

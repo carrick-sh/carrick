@@ -1163,6 +1163,9 @@ pub(crate) enum PortableRecoveryAction {
         first_register: u32,
         second_register: u32,
     },
+    CommitReservedResident {
+        virtual_register: u32,
+    },
     RecoverCounterRead(super::emit::CounterReadRecovery),
     RecoverBiasedMemory(PortableBiasedMemoryRecovery),
     RecoverBiasedExclusive(BiasedExclusiveRecovery),
@@ -1278,6 +1281,9 @@ impl PortableRecoveryAction {
                 first_register,
                 second_register,
             },
+            RecoveryAction::CommitReservedResident { virtual_register } => {
+                Self::CommitReservedResident { virtual_register }
+            }
             RecoveryAction::RecoverCounterRead(recovery) => Self::RecoverCounterRead(recovery),
             RecoveryAction::RecoverBiasedMemory(recovery) => {
                 let bound_bias = bindings.value(ProcessValue::HostBias)?;
@@ -1428,6 +1434,9 @@ impl PortableRecoveryAction {
                 first_register,
                 second_register,
             },
+            Self::CommitReservedResident { virtual_register } => {
+                RecoveryAction::CommitReservedResident { virtual_register }
+            }
             Self::RecoverCounterRead(recovery) => RecoveryAction::RecoverCounterRead(recovery),
             Self::RecoverBiasedMemory(recovery) => {
                 let raw_bias = binding(ProcessValue::HostBias)?;

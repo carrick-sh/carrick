@@ -754,6 +754,7 @@ fn biased_recovery_matrix_at(bias: u64) {
                     generation_pstate_scratch,
                     indirect_x15_scratch,
                     indirect_x30_scratch,
+                    physical_reserved: 0,
                 },
             };
             let completed = action.instruction_complete();
@@ -1670,6 +1671,7 @@ fn dsr_virtual_counter_kicks_retry_before_and_preserve_after_commit() {
                 generation_pstate_scratch,
                 indirect_x15_scratch,
                 indirect_x30_scratch,
+                physical_reserved: 0,
             },
         };
 
@@ -6821,6 +6823,7 @@ fn dsr_signal_fault_reconstructs_copied_instruction_pc() {
         indirect_x15_scratch: 0,
         indirect_x30_scratch: 0,
         physical_x18: 0,
+        physical_reserved: 0,
         gateway_phase: 0,
         biased_guest_fault_address: 0,
     };
@@ -6890,6 +6893,7 @@ fn dsr_signal_fault_recovers_context_when_physical_x28_is_zero() {
         indirect_x15_scratch: 0,
         indirect_x30_scratch: 0,
         physical_x18: 0,
+        physical_reserved: 0,
         gateway_phase: 0,
         biased_guest_fault_address: 0,
     };
@@ -7013,6 +7017,7 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
         generation_pstate_scratch: 0,
         indirect_x15_scratch: 0,
         indirect_x30_scratch: 0,
+        physical_reserved: 0,
     };
 
     enter_translated(emitted.entry(), &mut snapshot, &mut exit)
@@ -7034,6 +7039,7 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
         generation_pstate_scratch,
         indirect_x15_scratch,
         indirect_x30_scratch,
+        physical_reserved,
     } = exit
     else {
         unreachable!("matched kick above")
@@ -7054,6 +7060,7 @@ fn dsr_concurrency_kick_exits_guarded_linked_loop_without_corrupting_guest_state
             generation_pstate_scratch,
             indirect_x15_scratch,
             indirect_x30_scratch,
+            physical_reserved,
         )
         .expect("recover interrupted generation guard");
     }
@@ -7517,6 +7524,7 @@ fn live_compact_writeback_kick_sweep(
             generation_pstate_scratch: 0,
             indirect_x15_scratch: 0,
             indirect_x30_scratch: 0,
+            physical_reserved: 0,
         };
 
         armed.store(round, Ordering::Release);
@@ -7609,6 +7617,7 @@ fn live_compact_writeback_kick_sweep(
                 generation_pstate_scratch,
                 indirect_x15_scratch,
                 indirect_x30_scratch,
+                physical_reserved,
             } => {
                 sweep.in_block_kicks += 1;
                 let raw = resume.raw();
@@ -7637,6 +7646,7 @@ fn live_compact_writeback_kick_sweep(
                         generation_pstate_scratch,
                         indirect_x15_scratch,
                         indirect_x30_scratch,
+                        physical_reserved,
                     )
                     .expect("recover the interrupted compact writeback");
                 }
@@ -7655,6 +7665,7 @@ fn live_compact_writeback_kick_sweep(
                 generation_pstate_scratch,
                 indirect_x15_scratch,
                 indirect_x30_scratch,
+                physical_reserved,
                 ..
             } => {
                 sweep.faults += 1;
@@ -7683,6 +7694,7 @@ fn live_compact_writeback_kick_sweep(
                         generation_pstate_scratch,
                         indirect_x15_scratch,
                         indirect_x30_scratch,
+                        physical_reserved,
                     )
                     .expect("recover the faulted compact writeback");
                 }
@@ -8157,6 +8169,7 @@ fn live_biased_exclusive_kick_sweep(
             generation_pstate_scratch: 0,
             indirect_x15_scratch: 0,
             indirect_x30_scratch: 0,
+            physical_reserved: 0,
         };
 
         armed.store(
@@ -8185,6 +8198,7 @@ fn live_biased_exclusive_kick_sweep(
                 generation_pstate_scratch,
                 indirect_x15_scratch,
                 indirect_x30_scratch,
+                physical_reserved,
             } => {
                 sweep.in_region_kicks += 1;
                 let raw = resume.raw();
@@ -8217,6 +8231,7 @@ fn live_biased_exclusive_kick_sweep(
                         generation_pstate_scratch,
                         indirect_x15_scratch,
                         indirect_x30_scratch,
+                        physical_reserved,
                     )
                     .expect("recover the interrupted fused exclusive region");
                 }
@@ -8696,6 +8711,7 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
         indirect_x15_scratch: 0,
         indirect_x30_scratch: 0,
         physical_x18: 0,
+        physical_reserved: 0,
         gateway_phase: 0,
         biased_guest_fault_address: 0,
     };
@@ -8720,22 +8736,20 @@ fn dsr_signal_fault_recovers_scratch_in_expanded_x18_load() {
         u32::try_from(cache_pc.raw() - emitted.entry().host().raw() as u64)
             .expect("expanded fault offset"),
     );
+    // The reserved-resident template records no recovery entry for its load:
+    // the faulting word has not retired, the signal handler preserves the
+    // slot-authoritative x18/x19/x28 in the snapshot, and resuming at the
+    // instruction start re-executes against the slot. Nothing to undo.
     let recovery = emitted
         .recovery()
         .iter()
         .find(|entry| entry.cache == offset)
-        .expect("expanded instruction recovery")
-        .action;
-    super::recover_rewrite_state(
-        &mut snapshot,
-        recovery,
-        rewrite_scratch,
-        rewrite_context_scratch,
-        original.pstate,
-        original.x[15],
-        original.x[30],
-    )
-    .expect("recover expanded x18 scratch");
+        .map(|entry| entry.action);
+    assert_eq!(
+        recovery, None,
+        "the resident template's faulting word carries no recovery action"
+    );
+    let _ = (rewrite_scratch, rewrite_context_scratch);
     assert_eq!(snapshot.x[18], original_x18);
     for index in 0..31 {
         if index != 0 {
@@ -8787,6 +8801,7 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
         indirect_x15_scratch: 0,
         indirect_x30_scratch: 0,
         physical_x18: 0,
+        physical_reserved: 0,
         gateway_phase: 0,
         biased_guest_fault_address: 0,
     };
@@ -8819,6 +8834,7 @@ fn dsr_signal_fault_preserves_destination_in_expanded_literal_load() {
         original.pstate,
         original.x[15],
         original.x[30],
+        original.x[19],
     )
     .expect("recover literal scratch");
     assert_eq!(snapshot.x, original.x);
