@@ -851,11 +851,14 @@ pub(crate) fn native_tier_census(event: &str, image: &str, detail: &str) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(
-            file,
-            "pid={} event={event} image={image} detail={detail}",
+        // ONE O_APPEND write per line (the exec_stamps discipline):
+        // `writeln!` straight into the file issues several writes, and
+        // concurrent guest processes interleaved them into torn lines.
+        let line = format!(
+            "pid={} event={event} image={image} detail={detail}\n",
             std::process::id()
         );
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
