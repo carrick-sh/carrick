@@ -34,6 +34,11 @@ use carrick_native_darwin::direct::GuestContext;
 
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
 
+/// Apple Silicon's host page size. On the identity tier this IS the guest's
+/// page size (`AT_PAGESZ`, brk/mmap granularity): guest mappings are host
+/// mappings, so nothing smaller is protectable or mappable.
+const HOST_PAGE_SIZE: u64 = 16 * 1024;
+
 /// Guest memory for a directly-executed image: guest addresses ARE host
 /// addresses.
 ///
@@ -124,11 +129,23 @@ impl DirectStack {
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(main_elf, EM_AARCH64)
             .map_err(std::io::Error::other)?
             .with_load_bias(main_bias);
-        let auxv = carrick_mem::memory::linux_auxv_from_load_plan_with_vdso(
+        let mut auxv = carrick_mem::memory::linux_auxv_from_load_plan_with_vdso(
             &plan,
             interpreter_base,
             false,
         );
+        // AT_PAGESZ must be the HOST page size on the identity tier: guest
+        // mappings ARE host mappings, so every size/alignment libc derives
+        // from it must be host-granular. The default 4096 made glibc round
+        // its RELRO bounds to 4 KiB and the host mprotect EINVALed — ld.so
+        // itself reported "cannot apply additional memory protection after
+        // relocation" and exited 127.
+        for entry in &mut auxv {
+            if entry.a_type == carrick_abi::LINUX_AT_PAGESZ {
+                *entry =
+                    carrick_abi::LinuxAuxvEntry::new(carrick_abi::LINUX_AT_PAGESZ, HOST_PAGE_SIZE);
+            }
+        }
         let len = Self::SIZE;
         // SAFETY: fresh anonymous host mapping; the kernel picks the address.
         let base = unsafe {
@@ -225,12 +242,42 @@ enum ServiceVerdict {
     Leave,
 }
 
+/// The identity tier's program break: a lazily created host reservation the
+/// guest's `brk(2)` grows into.
+///
+/// Linux puts the initial break after the main image's bss; the VALUE is
+/// unobservable to a correct guest (it only uses what `brk` returns), so the
+/// identity tier reserves an arbitrary host range instead. Growth commits
+/// pages (`mprotect` RW over untouched reservation = zero-fill on first
+/// touch); shrink REPLACES the released pages with a fresh `PROT_NONE`
+/// mapping so a later regrowth re-delivers zeros — the anonymous-memory
+/// guarantee is immovable.
+struct IdentityBrk {
+    base: u64,
+    current: u64,
+}
+
+impl IdentityBrk {
+    /// 1 GiB of reserved (PROT_NONE, uncommitted) break headroom.
+    const RESERVE: usize = 1 << 30;
+}
+
 /// A directly-executed guest plus the dispatcher that serves it.
 pub struct DirectRunner {
     dispatcher: SyscallDispatcher,
     memory: IdentityMemory,
     outcome: Option<DirectRunOutcome>,
     syscalls: u64,
+    brk: Option<IdentityBrk>,
+}
+
+impl Drop for DirectRunner {
+    fn drop(&mut self) {
+        if let Some(brk) = &self.brk {
+            // SAFETY: this runner owns the reservation.
+            unsafe { libc::munmap(brk.base as usize as *mut libc::c_void, IdentityBrk::RESERVE) };
+        }
+    }
 }
 
 impl DirectRunner {
@@ -240,6 +287,7 @@ impl DirectRunner {
             memory,
             outcome: None,
             syscalls: 0,
+            brk: None,
         }
     }
 
@@ -253,10 +301,216 @@ impl DirectRunner {
         &self.dispatcher
     }
 
+    /// Identity lowering of the guest's MEMORY-MODEL syscalls.
+    ///
+    /// On tier D, guest VA IS host VA, so the only correct service for mmap
+    /// and friends is the host's own primitive: the shared dispatcher's
+    /// memory subsystem models a boot-mapped guest arena (the VMM lanes'
+    /// world) and hands out guest VAs with NO host mapping behind them.
+    /// Proven by fault: real ld.so's first malloc received `0x6000000010`
+    /// from the arena and its memset SIGBUSed (lldb: `str q0, [x0]`,
+    /// x0=0x6000000010, x8 still 222). This is not a second dispatcher —
+    /// it is the tier's memory model, exactly as the HostAlias plumbing is
+    /// the VMM lanes'; every non-memory syscall still goes to the one
+    /// shared dispatcher.
+    ///
+    /// Fails closed, never approximates:
+    /// - `PROT_EXEC` anywhere -> the run LEAVES named (guest-created
+    ///   executable memory is the scan+patch boundary, roadmap item 5);
+    /// - file-backed mmap -> LEAVES named (needs guest-fd -> host-fd
+    ///   translation; letting the dispatcher "succeed" with an arena
+    ///   address would be a delayed crash, not a service);
+    /// - `brk`/`mremap` -> LEAVE named until implemented identity-style.
+    fn service_identity_memory(&mut self, ctx: &GuestContext) -> Option<ServiceVerdict> {
+        use carrick_abi::{LinuxMmapFlags, LinuxProtFlags};
+        let number = ctx.syscall_nr();
+        let [a0, a1, a2, a3, _a4, a5] = ctx.args();
+        let unsupported = |this: &mut Self, what: &str| {
+            this.outcome = Some(DirectRunOutcome::Unsupported {
+                syscall: number,
+                outcome: what.to_string(),
+            });
+            Some(ServiceVerdict::Leave)
+        };
+        let host_errno = || -> ServiceVerdict {
+            let host = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL);
+            ServiceVerdict::Resume(crate::host_to_linux_errno(host).guest_retval())
+        };
+        let host_prot = |prot: LinuxProtFlags| -> i32 {
+            let mut host = 0;
+            if prot.contains(LinuxProtFlags::READ) {
+                host |= libc::PROT_READ;
+            }
+            if prot.contains(LinuxProtFlags::WRITE) {
+                host |= libc::PROT_WRITE;
+            }
+            host
+        };
+        match number {
+            // mmap(addr, len, prot, flags, fd, off)
+            222 => {
+                let prot = LinuxProtFlags::from_bits_truncate(a2);
+                let flags = LinuxMmapFlags::from_bits_truncate(a3);
+                if prot.contains(LinuxProtFlags::EXEC) {
+                    return unsupported(self, "mmap(PROT_EXEC): tier D scan+patch boundary");
+                }
+                if !flags.contains(LinuxMmapFlags::ANONYMOUS) {
+                    return unsupported(self, "file-backed mmap on tier D");
+                }
+                let mut host_flags = libc::MAP_ANON;
+                host_flags |= if flags.contains(LinuxMmapFlags::SHARED) {
+                    libc::MAP_SHARED
+                } else {
+                    libc::MAP_PRIVATE
+                };
+                if flags.contains(LinuxMmapFlags::FIXED) {
+                    host_flags |= libc::MAP_FIXED;
+                }
+                // SAFETY: identity tier — the guest's address space IS this
+                // process's, so a host mmap is the exact semantic.
+                let mapped = unsafe {
+                    libc::mmap(
+                        a0 as usize as *mut libc::c_void,
+                        a1 as usize,
+                        host_prot(prot),
+                        host_flags,
+                        -1,
+                        a5 as i64 as libc::off_t,
+                    )
+                };
+                Some(if mapped == libc::MAP_FAILED {
+                    host_errno()
+                } else {
+                    ServiceVerdict::Resume(mapped as i64)
+                })
+            }
+            // munmap(addr, len)
+            215 => {
+                // SAFETY: as above; the guest unmaps within its own space.
+                let rc = unsafe { libc::munmap(a0 as usize as *mut libc::c_void, a1 as usize) };
+                Some(if rc == 0 {
+                    ServiceVerdict::Resume(0)
+                } else {
+                    host_errno()
+                })
+            }
+            // mprotect(addr, len, prot)
+            226 => {
+                let prot = LinuxProtFlags::from_bits_truncate(a2);
+                if prot.contains(LinuxProtFlags::EXEC) {
+                    return unsupported(self, "mprotect(PROT_EXEC): tier D scan+patch boundary");
+                }
+                // SAFETY: as above.
+                let rc = unsafe {
+                    libc::mprotect(
+                        a0 as usize as *mut libc::c_void,
+                        a1 as usize,
+                        host_prot(prot),
+                    )
+                };
+                Some(if rc == 0 {
+                    ServiceVerdict::Resume(0)
+                } else {
+                    host_errno()
+                })
+            }
+            // brk(addr) — the FIRST syscall real ld.so makes.
+            214 => Some(self.service_identity_brk(a0)),
+            // mremap: the dispatcher's arena answer is poison on the identity
+            // tier (an address with no host mapping), so fail closed with the
+            // gap NAMED instead of falling through.
+            216 => unsupported(self, "mremap on tier D (identity mremap not built yet)"),
+            _ => None,
+        }
+    }
+
+    /// `brk(2)`, identity-style (see [`IdentityBrk`]). Linux semantics: on
+    /// any failure or out-of-range request, return the CURRENT break —
+    /// `brk` never errnos.
+    fn service_identity_brk(&mut self, addr: u64) -> ServiceVerdict {
+        const PAGE: u64 = HOST_PAGE_SIZE;
+        if self.brk.is_none() {
+            // SAFETY: fresh PROT_NONE reservation, kernel-chosen address.
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    IdentityBrk::RESERVE,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if base == libc::MAP_FAILED {
+                // No break exists and none can: park the run with the reason
+                // named rather than inventing an address.
+                self.outcome = Some(DirectRunOutcome::Unsupported {
+                    syscall: 214,
+                    outcome: "brk reservation failed".to_string(),
+                });
+                return ServiceVerdict::Leave;
+            }
+            let base = base as u64;
+            self.brk = Some(IdentityBrk {
+                base,
+                current: base,
+            });
+        }
+        let Some(brk) = self.brk.as_mut() else {
+            // Populated just above; this arm keeps the no-panic gate total.
+            // "No change" is brk's own failure semantic, and with no break
+            // the current break is 0.
+            return ServiceVerdict::Resume(0);
+        };
+        let (lo, hi) = (brk.base, brk.base + IdentityBrk::RESERVE as u64);
+        if addr < lo || addr > hi {
+            return ServiceVerdict::Resume(brk.current as i64);
+        }
+        let committed = (brk.current - lo).next_multiple_of(PAGE);
+        let wanted = (addr - lo).next_multiple_of(PAGE);
+        if wanted > committed {
+            // SAFETY: committing untouched reservation pages; zero-fill on
+            // first touch preserves the anonymous-memory guarantee.
+            let rc = unsafe {
+                libc::mprotect(
+                    (lo + committed) as usize as *mut libc::c_void,
+                    (wanted - committed) as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+            if rc != 0 {
+                return ServiceVerdict::Resume(brk.current as i64);
+            }
+        } else if wanted < committed {
+            // SAFETY: replacing released break pages with a fresh PROT_NONE
+            // mapping so a later regrowth re-delivers ZEROS.
+            let remapped = unsafe {
+                libc::mmap(
+                    (lo + wanted) as usize as *mut libc::c_void,
+                    (committed - wanted) as usize,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            if remapped == libc::MAP_FAILED {
+                return ServiceVerdict::Resume(brk.current as i64);
+            }
+        }
+        brk.current = addr;
+        ServiceVerdict::Resume(addr as i64)
+    }
+
     /// Service one syscall from a tier-D island.
     fn service(&mut self, ctx: &GuestContext) -> ServiceVerdict {
         self.syscalls += 1;
         let number = ctx.syscall_nr();
+        if let Some(verdict) = self.service_identity_memory(ctx) {
+            return verdict;
+        }
         let request = SyscallRequest::from_raw(carrick_hal::RawSyscall {
             number: CanonicalNr(number),
             args: ctx.args(),
@@ -749,6 +1003,98 @@ mod tests {
             runner.dispatcher().stdout(),
             b"dyn\n",
             "the main image's write went through the dispatcher after the handoff"
+        );
+    }
+
+    /// Milestone: a REAL dynamically linked binary on tier D. The fixture is
+    /// cross-compiled with the host's aarch64-linux-gnu toolchain
+    /// (`-nostdlib -pie` with an explicit `--dynamic-linker`), and the
+    /// interpreter is the toolchain sysroot's REAL glibc ld.so — real
+    /// relocation processing, real TLS setup, real syscalls through the real
+    /// dispatcher, veneered tpidr/x18 and patched `svc` throughout. The run
+    /// must end with the MAIN image's exit(42) leaving through the handler.
+    ///
+    /// Skips (loudly) when the cross toolchain is not installed; on the
+    /// canonical dev host it runs (`brew install aarch64-unknown-linux-gnu`).
+    #[test]
+    fn real_glibc_ld_so_runs_a_dynamic_binary_on_tier_d() {
+        let probe = std::process::Command::new("aarch64-linux-gnu-gcc")
+            .arg("-print-sysroot")
+            .output();
+        let Ok(output) = probe else {
+            eprintln!("skipping: aarch64-linux-gnu-gcc not on PATH");
+            return;
+        };
+        assert!(output.status.success(), "-print-sysroot failed");
+        let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let ld_path = format!("{sysroot}/lib/ld-linux-aarch64.so.1");
+        let ld_bytes = std::fs::read(&ld_path).expect("sysroot ships ld.so");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("dyn.c");
+        std::fs::write(
+            &src,
+            r#"
+__attribute__((naked)) void _start(void) {
+    __asm__ volatile(
+        "mov x0, #42\n"
+        "mov x8, #93\n"
+        "svc #0\n");
+}
+"#,
+        )
+        .expect("write fixture source");
+        let out = dir.path().join("dyn");
+        let compile = std::process::Command::new("aarch64-linux-gnu-gcc")
+            .args(["-nostdlib", "-pie", "-fpic", "-o"])
+            .arg(&out)
+            .arg(&src)
+            .arg("-Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1")
+            .output()
+            .expect("cross gcc runs");
+        assert!(
+            compile.status.success(),
+            "fixture compile failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let main_elf = std::fs::read(&out).expect("read fixture");
+
+        let group = DirectLoadGroup::load_with_interpreter(
+            &main_elf,
+            |path| {
+                assert_eq!(path, "/lib/ld-linux-aarch64.so.1");
+                Ok(ld_bytes.clone())
+            },
+            island_handler(),
+        )
+        .expect("load")
+        .expect("real ld.so and the fixture are both tier-D eligible");
+        let interp = group.interpreter().expect("interpreter mapped");
+        let stack = DirectStack::build(
+            &main_elf,
+            group.main().bias(),
+            Some(interp.bias()),
+            &[b"dyn-real".to_vec()],
+            &[],
+        )
+        .expect("stack builds");
+
+        let mut runner =
+            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = group.entry_pc();
+        let sp = stack.sp();
+        // SAFETY: both images are patched and built with `island_handler`;
+        // the guest leaves through its exit.
+        unsafe { with_runner(&mut runner, || group.enter_on_stack(entry, sp)) };
+        assert_eq!(
+            runner.outcome(),
+            Some(&DirectRunOutcome::Exited { code: 42 }),
+            "real ld.so ran to the main image, which exited through the \
+             handler (syscalls serviced: {}; guest stdout: {:?}; guest \
+             stderr: {:?})",
+            runner.syscalls(),
+            String::from_utf8_lossy(&runner.dispatcher().stdout()),
+            String::from_utf8_lossy(&runner.dispatcher().stderr()),
         );
     }
 
