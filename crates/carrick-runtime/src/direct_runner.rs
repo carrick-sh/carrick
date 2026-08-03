@@ -2,7 +2,7 @@
 //!
 //! Tier D (`carrick_native_darwin::direct`) runs guest code natively and sends
 //! every patched `svc` to a handler. This module is what that handler calls:
-//! the same [`SyscallDispatcher`] the translated lane uses, so the two tiers
+//! the same `SyscallDispatcher` the translated lane uses, so the two tiers
 //! differ only in how guest code REACHES a syscall, never in what a syscall
 //! means. One dispatcher is the point — a second implementation would give
 //! every future conformance result two answers to reconcile.
@@ -10,7 +10,7 @@
 //! # Guest VA is host VA
 //!
 //! The guest executes in carrick's own address space, so a pointer it hands to
-//! a syscall is already a valid host pointer. [`IdentityMemory`] is therefore a
+//! a syscall is already a valid host pointer. `IdentityMemory` is therefore a
 //! near-empty `GuestMemory`: no translation table, no guest-physical mapping,
 //! no alias window. That is the structural simplification direct execution
 //! buys, and it is why this file is short.
