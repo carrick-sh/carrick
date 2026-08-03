@@ -3011,6 +3011,14 @@ impl ProcessTranslator {
         state.cache.after_fork_child();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
+        // The recording claim is the PARENT's: the store's builder election
+        // names the parent pid, and the parent publishes its own candidate
+        // batch at its exit or exec. A child that keeps the COW-inherited
+        // claim and batch republishes the same unit at its own exec — the
+        // "concurrent publishers" term the 2026-08-03 scoreboard correction
+        // measured at +6.4 ms per exec across a parallel go build.
+        state.shared_recording_segments.clear();
+        state.shared_candidates.clear();
         // The child inherited the parent's census by COW along with the warm
         // block index, but it performed none of those translations. Leaving
         // them would re-attribute the parent's whole set to every child once
@@ -9966,6 +9974,37 @@ mod tests {
             assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
             assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
             libc::WEXITSTATUS(status)
+        }
+
+        /// A fork child inherits the parent's recording claim and candidate
+        /// batches by COW, but the store's builder election belongs to the
+        /// PARENT pid: the child republishing the inherited batch at its own
+        /// exec/exit is exactly the "concurrent publishers" term the
+        /// 2026-08-03 scoreboard correction measured (+6.4 ms per exec on the
+        /// parallel build, with the parent publishing the same unit anyway).
+        #[test]
+        fn fork_child_drops_inherited_recording_claims_and_candidates() {
+            let (_fixture, process, source, _target) = one_published_binding(31);
+            process
+                .activate_translated_range_catalog()
+                .expect("activate catalog");
+            {
+                let mut state = process.state.write();
+                state.shared_recording_segments.insert(source);
+                state.shared_candidates.insert(source, Vec::new());
+            }
+
+            process.after_fork_child().expect("fork repair");
+
+            let state = process.state.read();
+            assert!(
+                state.shared_recording_segments.is_empty(),
+                "the recording claim belongs to the parent pid, not the child"
+            );
+            assert!(
+                state.shared_candidates.is_empty(),
+                "inherited candidate batches must not be republished by the child"
+            );
         }
 
         struct ForkChildPipeRecorder<'a> {
