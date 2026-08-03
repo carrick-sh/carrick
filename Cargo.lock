@@ -640,6 +640,7 @@ dependencies = [
 name = "carrick-native-darwin"
 version = "0.1.0"
 dependencies = [
+ "bad64",
  "bincode",
  "carrick-dsr",
  "carrick-dsr-aarch64",
