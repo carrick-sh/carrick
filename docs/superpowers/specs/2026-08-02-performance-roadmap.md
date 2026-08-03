@@ -64,15 +64,21 @@ execs 61 times and computes little. Neither track helps the other's shape.
 
 Nothing real runs on tier D yet. In order:
 
-1. **Exit path.** `GuestContext::pc` is informational because the island's
-   return leg is a CONSTANT branch — which is exactly what makes it
-   register-free. Signal delivery and `execve` need a real exit: a gateway like
-   the DSR one, or islands that branch indirectly through a scratch slot.
-   Until this exists a guest can only leave by calling `exit`.
-2. **Guest-leave contract.** The fixture bug that blocked the bridge for a full
-   session (a guest returning to Rust with SP unbalanced) was a symptom of
-   there being no stated contract. Write it down: a tier-D guest leaves through
-   the handler, never by returning.
+1. **Exit path — DONE.** `GuestContext::pc` was informational because the
+   island's return leg is a CONSTANT branch — which is exactly what makes it
+   register-free. The landed shape is the gateway, not the scratch-slot
+   indirect branch: the resume leg stays a constant branch (an indirect
+   resume would need a register and every register is the guest's), and each
+   island grew a LEAVE leg that restores the host stack discipline `enter`
+   now captures and `ret`s to `enter`'s caller with the guest parked in its
+   context. The bridge leaves on `Exit`/`Execve`/every unimplemented outcome.
+   Design doc M1b has the red-first test names.
+2. **Guest-leave contract — DONE.** The fixture bug that blocked the bridge
+   for a full session (a guest returning to Rust with SP unbalanced) was a
+   symptom of there being no stated contract. Now written down where the
+   mechanism lives (`carrick_native_darwin::direct` module doc, the
+   `direct_runner` bridge header, and the design doc §6): a tier-D guest
+   leaves through the handler, never by returning.
 3. **Dynamic linking.** `ld.so` is more PIE mappings through the same loader,
    plus TLS initialisation now that `tpidr_el0` is veneered.
 4. **Threads.** `guest_tls`/`guest_x18` are per-image today; they must be
@@ -107,6 +113,25 @@ Three sized items, largest first:
 | file-backed image mapping (kill ~2.6 ms/MB materialization) | ~1.5-2 s |
 | zygote / no self-re-exec (kill the fixed ~18 ms) | ~1.1 s |
 | cheap shared-unit load (MAP_JIT copy instead of signed dylib + `dlopen`; publishing currently shells out to `codesign` twice) | ~0.8 s |
+
+> **Correction (2026-08-03, exec lane) — the "fixed ~18 ms" item is measured
+> at 8.5-9.0 ms and is mostly Darwin's exec floor.** Untraced decomposition
+> ([2026-08-03 perf-results](../../perf-results/2026-08-03-native-exec-fixed-cost-decomposition.md)):
+> 5.3 ms is kernel execve + dyld (of which ~1.8 ms is the floor for ANY
+> binary, ~1.6 ms teardown of the dying guest's resident pages, ~0.9 ms
+> CF/HVF/dtrace initializers, ~0.8 ms carrick-binary premium) and only
+> ~3.2 ms is carrick's own code, already spread thin. The zygote shape
+> cannot exist under the standing constraints: the libdispatch finding
+> (2026-07-13 self-reexec design) forces a real exec before the new image may
+> create threads, and PID preservation forbids handing off to a pooled
+> process. What WAS in this item and landed: the prepared-artifact payload
+> digest was ~1.5-2 ms/MB per exec (hashing image bytes twice), i.e. a
+> per-MB term misfiled as fixed — now metadata-only by default
+> (`CARRICK_EXEC_FAST=0` hatch), which A/B suggests is worth more than this
+> item's original ~1.1 s estimate on the cold build. The residual fixed chain
+> (~8.5 ms × 61 execs ≈ 0.5 s) is near its floor; chained fixups, DOF
+> stripping, and symbol stripping were each measured at ~0.1 ms or less and
+> rejected.
 
 **Gate:** paired A/B on the cold `go build` with arms alternating, plus the
 20-exec microbenchmark. Both, because they have disagreed before.

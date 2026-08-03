@@ -524,6 +524,7 @@ pub(crate) mod container_policy;
 // `crate::runtime::…` call-site paths resolve on every platform).
 pub mod debug_state;
 #[cfg(feature = "platform-macos")]
+pub mod exec_stamps;
 pub mod execute;
 pub mod pty_relay;
 pub mod rootfs;

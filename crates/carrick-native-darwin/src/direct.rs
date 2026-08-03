@@ -33,6 +33,27 @@
 //! Guest VA *is* host VA: the guest runs in carrick's own address space, so a
 //! pointer the guest passes to a syscall needs no translation. That is the
 //! structural simplification direct execution buys over the translator.
+//!
+//! # The guest-leave contract
+//!
+//! A tier-D guest leaves guest execution ONLY through the handler. The handler
+//! requests it (`GuestContext::request_leave`) and the island's LEAVE LEG —
+//! never the guest's own code — restores the host's stack discipline (SP and
+//! link register, captured by `DirectImage::enter` at the moment of entry)
+//! and returns to `enter`'s caller. At that point the guest's complete
+//! register file, SP included, sits in the `GuestContext` exactly as it was
+//! at the syscall, with `pc` naming the resume site — which is precisely the
+//! state `exit`/`execve`/signal orchestration needs.
+//!
+//! A guest must never return to Rust with its own stack discipline: it does
+//! not know the host's, and getting it wrong hands Rust a corrupt stack whose
+//! failure surfaces arbitrarily far away (the SP-unbalanced fixture blocked
+//! the dispatcher bridge for a full session — EXC_BAD_ACCESS with PC on the
+//! stack, firing or not depending on what the caller did next). The one
+//! sanctioned exception is a hand-written TEST fixture exercising island
+//! mechanics below the runner: such a fixture may `ret` only with SP exactly
+//! balanced and x30 preserved, and nothing above the fixture layer may rely
+//! on that shape.
 
 use std::io;
 
@@ -50,13 +71,24 @@ pub struct GuestContext {
     pub sp: u64,
     /// Where the island returns to: the instruction after the patched `svc`.
     ///
-    /// INFORMATIONAL in M1. The island's return leg is a constant branch -
-    /// that is what lets it resume without a scratch register - so writing
-    /// this field does not redirect control. Redirection (signal delivery,
-    /// `execve`) needs the M2 exit path.
+    /// The island's RESUME leg is a constant branch - that is what lets it
+    /// resume without a scratch register - so writing this field does not
+    /// redirect a resume. On a handler-requested LEAVE it is the record of
+    /// where the guest stopped: `pc` plus the register file is the complete
+    /// parked state that `execve`/signal orchestration re-enters from.
     pub pc: u64,
     /// `extern "C" fn(*mut GuestContext)`, called with the context in x0.
     pub handler: u64,
+    /// Host SP at guest entry, captured by [`DirectImage::enter`]. The
+    /// island's leave leg restores it before returning to Rust.
+    host_sp: u64,
+    /// Host return address for the leave leg: the landing point after
+    /// `enter`'s `blr`, identical to what `blr` hands the guest in x30.
+    host_lr: u64,
+    /// Leave request word. The handler sets it via [`Self::request_leave`];
+    /// the island consults it once after the handler call and the leave leg
+    /// clears it (`str xzr`) so the next entry starts disarmed.
+    leave: u64,
 }
 
 impl GuestContext {
@@ -64,10 +96,30 @@ impl GuestContext {
     const SP: u32 = 31 * 8;
     const PC: u32 = 32 * 8;
     const HANDLER: u32 = 33 * 8;
+    const HOST_SP: u32 = 34 * 8;
+    const HOST_LR: u32 = 35 * 8;
+    const LEAVE: u32 = 36 * 8;
 
     /// The aarch64 Linux syscall number register is x8.
     pub fn syscall_nr(&self) -> u64 {
         self.x[8]
+    }
+
+    /// Ask the island to LEAVE guest execution when this handler returns.
+    ///
+    /// The island's leave leg restores the host stack discipline captured at
+    /// entry and returns to [`DirectImage::enter`]'s caller instead of
+    /// resuming the guest. The guest's full register file stays parked in
+    /// this context (see the module-level guest-leave contract). Do NOT also
+    /// call [`Self::set_return`] on the leave path: the parked state should
+    /// be the guest's own at the syscall, not a fabricated return value.
+    pub fn request_leave(&mut self) {
+        self.leave = 1;
+    }
+
+    /// Whether a leave is pending (diagnostic; the leave leg clears it).
+    pub fn leave_requested(&self) -> bool {
+        self.leave != 0
     }
 
     /// Linux passes syscall arguments in x0..x5.
@@ -127,6 +179,13 @@ fn b_rel(offset: i64) -> u32 {
     let imm26 = ((offset >> 2) as u32) & 0x03ff_ffff;
     0x1400_0000 | imm26
 }
+/// `cbnz xt, <pc + offset>`; `offset` must be 4-byte aligned, within ±1 MiB.
+fn cbnz(rt: u32, offset: i64) -> u32 {
+    let imm19 = ((offset >> 2) as u32) & 0x0007_ffff;
+    0xb500_0000 | (imm19 << 5) | rt
+}
+/// `ret` (through x30).
+const RET: u32 = 0xd65f_03c0;
 
 /// Materialize a 64-bit constant into `rd` (4 words, no literal pool).
 fn mov_imm64(rd: u32, value: u64) -> [u32; 4] {
@@ -141,7 +200,10 @@ fn mov_imm64(rd: u32, value: u64) -> [u32; 4] {
 /// `svc #0`.
 pub const SVC_0: u32 = 0xd400_0001;
 
-/// Emit one syscall island.
+/// Emit one syscall island. Returns the words plus the index of the RESUME
+/// BRANCH slot, which the caller fills with a constant `b` back to `site+4`
+/// (its encoding depends on where the island lands, which only the caller
+/// knows).
 ///
 /// `ctx` is the absolute address of the [`GuestContext`]; `return_pc` is the
 /// guest address to resume at (the instruction after the patched `svc`).
@@ -150,8 +212,18 @@ pub const SVC_0: u32 = 0xd400_0001;
 /// stack slot, then holds the context pointer for the whole island. Every
 /// other guest register is stored through it. x0's own guest value is
 /// recovered from the borrowed slot (which also restores SP) and stored last.
-fn island(ctx: u64, return_pc: u64) -> Vec<u32> {
-    let mut w = Vec::with_capacity(80);
+///
+/// The island has TWO exits. The RESUME leg restores the full guest register
+/// file and takes the constant branch — full transparency, no scratch
+/// register, which is why `GuestContext::pc` cannot redirect a resume (an
+/// indirect branch would need a register and every register is the guest's).
+/// The LEAVE leg, taken when the handler requested it, restores nothing into
+/// the CPU: the guest's state is already parked in the context, so it only
+/// re-arms the leave word, restores the HOST stack discipline captured by
+/// `enter`, and `ret`s to the caller of `enter` — a gateway exit, the same
+/// shape as the DSR gateway's status returns.
+fn island(ctx: u64, return_pc: u64) -> (Vec<u32>, usize) {
+    let mut w = Vec::with_capacity(96);
     // Free x0 by borrowing a guest stack slot, then point it at the context.
     w.push(str_pre_sp(0));
     w.extend_from_slice(&mov_imm64(0, ctx));
@@ -182,6 +254,12 @@ fn island(ctx: u64, return_pc: u64) -> Vec<u32> {
     // layout. The address is a patch-time constant, so re-materializing costs
     // four words and cannot be clobbered by anything.
     w.extend_from_slice(&mov_imm64(0, ctx));
+    // Did the handler request a LEAVE? x1 is dead here (restored below), and
+    // the branch is patched after emission so the distance is computed, not
+    // hand-counted.
+    w.push(ldr_imm(1, 0, GuestContext::LEAVE));
+    let leave_branch = w.len();
+    w.push(0); // cbnz x1, <leave leg> — patched below
     // Restore. SP first (through x1, restored after), then x30..x1, then x0.
     w.push(ldr_imm(1, 0, GuestContext::SP));
     w.push(mov_to_sp(1));
@@ -189,7 +267,21 @@ fn island(ctx: u64, return_pc: u64) -> Vec<u32> {
         w.push(ldr_imm(r, 0, GuestContext::REG + r * 8));
     }
     w.push(ldr_imm(0, 0, GuestContext::REG));
-    w
+    let resume_slot = w.len();
+    w.push(0); // constant `b site+4` — written by the caller
+    // The LEAVE leg. x0 still holds the context pointer (the cbnz runs before
+    // the restore sequence). Re-arm the leave word so the next entry starts
+    // disarmed, then restore the host stack discipline captured by `enter`
+    // and return to `enter`'s caller. Guest registers are NOT reloaded: the
+    // guest is leaving, and its parked state lives in the context.
+    let leave_leg = w.len();
+    w[leave_branch] = cbnz(1, ((leave_leg - leave_branch) * 4) as i64);
+    w.push(str_imm(31, 0, GuestContext::LEAVE)); // str xzr — re-arm
+    w.push(ldr_imm(1, 0, GuestContext::HOST_SP));
+    w.push(mov_to_sp(1));
+    w.push(ldr_imm(30, 0, GuestContext::HOST_LR));
+    w.push(RET);
+    (w, resume_slot)
 }
 
 /// `mrs xd, tpidr_el0` (read the thread pointer).
@@ -440,6 +532,16 @@ pub enum DirectIneligible {
     /// unmappable. The Go toolchain lives at 0x10000 and is therefore tier T's
     /// by physics, whatever its instruction mix says.
     FixedLoadAddress { vaddr: u64 },
+    /// A `PT_INTERP` image: it must be entered through its interpreter
+    /// (ld.so), which this loader cannot map yet. Refused with the
+    /// interpreter named rather than loaded and entered at its own entry —
+    /// which would run unrelocated PLT/GOT code and fault far from the cause.
+    ///
+    /// This is the fail-closed edge of Phase 1 item 3 (dynamic linking):
+    /// ld.so is more PIE mappings through this same loader plus TLS init, but
+    /// until that chain exists, and until the per-image `guest_tls`/
+    /// `guest_x18` slots become per-load-group, a dynamic image is tier T's.
+    NeedsInterpreter { path: String },
 }
 
 impl std::fmt::Display for DirectIneligible {
@@ -455,6 +557,9 @@ impl std::fmt::Display for DirectIneligible {
                 f,
                 "ET_EXEC must load at its own vaddr {vaddr:#x}, which __PAGEZERO forbids"
             ),
+            Self::NeedsInterpreter { path } => {
+                write!(f, "needs interpreter {path}, which tier D cannot map yet")
+            }
         }
     }
 }
@@ -502,6 +607,12 @@ pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, i
     if read_u16(elf, 0x10)? == ET_EXEC {
         let (lo, _) = load_span(elf)?;
         return Ok(Err(DirectIneligible::FixedLoadAddress { vaddr: lo }));
+    }
+    // A PT_INTERP image must be ENTERED through its interpreter; loading it
+    // alone and jumping to its own entry would run unrelocated code. Refuse
+    // with the interpreter named until the ld.so chain exists.
+    if let Some(path) = interpreter_path(elf)? {
+        return Ok(Err(DirectIneligible::NeedsInterpreter { path }));
     }
     // Only real code: see `executable_sections` for why the PF_X segment is
     // the wrong unit. No section headers means nothing can be proved, so fail
@@ -798,7 +909,7 @@ impl DirectImage {
                 }
                 let site_host = (site_vaddr - lo) as usize;
                 let island_host = island_cursor;
-                let words = island(ctx_addr, site_vaddr + bias + 4);
+                let (words, resume_slot) = island(ctx_addr, site_vaddr + bias + 4);
                 let island_bytes = words.len() * 4;
                 if island_host + island_bytes > self.len {
                     return Err(io::Error::other("island budget exhausted"));
@@ -806,16 +917,13 @@ impl DirectImage {
                 for (i, w) in words.iter().enumerate() {
                     self.write_word(island_host + i * 4, *w);
                 }
-                // Return leg: a constant branch back to the next instruction.
-                let from = (island_host + island_bytes) as i64;
-                self.write_word(
-                    island_host + island_bytes,
-                    b_rel((site_host as i64 + 4) - from),
-                );
+                // Resume leg: a constant branch back to the next instruction,
+                // written into the slot the island reserved for it.
+                let resume_at = island_host + resume_slot * 4;
+                self.write_word(resume_at, b_rel((site_host as i64 + 4) - resume_at as i64));
                 // Entry leg: replace the `svc` itself.
                 self.write_word(site_host, b_rel(island_host as i64 - site_host as i64));
-                island_cursor = island_host + island_bytes + 4;
-                island_cursor = island_cursor.next_multiple_of(4);
+                island_cursor = (island_host + island_bytes).next_multiple_of(4);
                 self.svc_sites += 1;
             }
         }
@@ -849,13 +957,15 @@ impl DirectImage {
         jit_write_protect(true);
     }
 
-    /// Jump to `pc` with the current context's registers. Never returns
-    /// normally in M1: the guest leaves through the handler.
+    /// Jump to `pc`. Returns when the guest LEAVES through the handler
+    /// ([`GuestContext::request_leave`] — see the module-level guest-leave
+    /// contract), or when a test fixture `ret`s with SP balanced.
     ///
     /// # Safety
     /// The image must be fully patched, and `pc` must be an address inside it.
     pub unsafe fn enter(&self, pc: u64) {
         self.arm_current_thread();
+        let ctx = std::ptr::from_ref::<GuestContext>(self.context.as_ref()) as u64;
         // Enter through asm that declares the guest clobbers every
         // callee-saved register, NOT as a plain `extern "C"` call.
         //
@@ -882,9 +992,24 @@ impl DirectImage {
                 // x19 and x29 cannot be named as clobbers - LLVM reserves both
                 // - so preserve them by hand around the guest.
                 "stp x19, x29, [sp, #-16]!",
-                "blr {entry}",
+                // Capture the HOST stack discipline for the island leave leg:
+                // SP as it stands at guest entry, and the same landing point
+                // `blr` itself hands the guest in x30. The leave leg restores
+                // this SP and `ret`s to this LR, so a handler-requested leave
+                // is indistinguishable, to the code below, from a balanced
+                // fixture `ret`.
+                "mov x9, sp",
+                "str x9, [x1, #{host_sp}]",
+                "adr x9, 2f",
+                "str x9, [x1, #{host_lr}]",
+                "blr x0",
+                "2:",
                 "ldp x19, x29, [sp], #16",
-                entry = in(reg) pc,
+                host_sp = const GuestContext::HOST_SP,
+                host_lr = const GuestContext::HOST_LR,
+                in("x0") pc,
+                in("x1") ctx,
+                out("x9") _,
                 out("x20") _, out("x21") _, out("x22") _, out("x23") _,
                 out("x24") _, out("x25") _, out("x26") _, out("x27") _,
                 out("x28") _,
@@ -942,6 +1067,35 @@ fn all_load_segments(elf: &[u8]) -> Result<Vec<(usize, usize, usize, u64)>, io::
         ));
     }
     Ok(out)
+}
+
+/// The `PT_INTERP` path, if the image declares one.
+///
+/// The segment's file bytes are the NUL-terminated interpreter path (e.g.
+/// `/lib/ld-linux-aarch64.so.1`). A declared-but-unreadable path is an error,
+/// not `None`: fail closed rather than misread a malformed image as static.
+fn interpreter_path(elf: &[u8]) -> Result<Option<String>, io::Error> {
+    const PT_INTERP: u64 = 3;
+    let phoff = read_u64(elf, 0x20)? as usize;
+    let phentsize = read_u16(elf, 0x36)? as usize;
+    let phnum = read_u16(elf, 0x38)? as usize;
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
+        if read_u16(elf, ph)? != PT_INTERP {
+            continue;
+        }
+        let offset = read_u64(elf, ph + 0x08)? as usize;
+        let filesz = read_u64(elf, ph + 0x20)? as usize;
+        let bytes = elf
+            .get(offset..offset + filesz)
+            .ok_or_else(|| io::Error::other("PT_INTERP outside the file"))?;
+        let end = bytes
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(|| io::Error::other("PT_INTERP path is not NUL-terminated"))?;
+        return Ok(Some(String::from_utf8_lossy(&bytes[..end]).into_owned()));
+    }
+    Ok(None)
 }
 
 /// PT_LOADs carrying PF_X.
@@ -1599,6 +1753,84 @@ mod tests {
             HITS.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the guest took its syscall on a thread that never loaded the image"
+        );
+    }
+
+    /// A `PT_INTERP` image must be refused with the interpreter NAMED, not
+    /// loaded and entered at its own entry: without ld.so mapped, its
+    /// unrelocated PLT/GOT code would fault far from the cause. This is the
+    /// fail-closed edge of dynamic linking — the scan already knowing WHICH
+    /// interpreter is required is the first ingredient of the future chain.
+    #[test]
+    fn scan_refuses_a_dynamic_image_and_names_its_interpreter() {
+        let mut elf = elf_with_code(&[movz(8, 93, 0), SVC_0]);
+        // Interpreter path appended past the section headers (nothing after
+        // it reads by offset), and a second program header in the padding
+        // between the first phdr and the code at 0x1000.
+        let interp = b"/lib/ld-linux-aarch64.so.1\0";
+        let interp_off = elf.len();
+        elf.extend_from_slice(interp);
+        let ph = 0x40 + 56;
+        elf[ph..ph + 4].copy_from_slice(&3_u32.to_le_bytes()); // PT_INTERP
+        elf[ph + 0x08..ph + 0x10].copy_from_slice(&(interp_off as u64).to_le_bytes());
+        elf[ph + 0x20..ph + 0x28].copy_from_slice(&(interp.len() as u64).to_le_bytes());
+        elf[0x38..0x3a].copy_from_slice(&2_u16.to_le_bytes()); // e_phnum = 2
+        assert!(
+            matches!(
+                scan_eligibility(&elf).expect("scan runs"),
+                Err(DirectIneligible::NeedsInterpreter { ref path })
+                    if path == "/lib/ld-linux-aarch64.so.1"
+            ),
+            "a dynamic image fails closed with its interpreter named"
+        );
+    }
+
+    /// A handler-requested LEAVE returns control to `enter`'s caller through
+    /// the island's leave leg, with the guest parked at the syscall.
+    ///
+    /// This is the guest-leave contract's mechanism (see the module doc): the
+    /// handler calls `request_leave`, and the island — not the guest —
+    /// restores the host stack discipline captured at entry and `ret`s to
+    /// Rust. The poison syscall after the leave site must never be serviced,
+    /// the parked `pc` must name the resume site, and the leave word must be
+    /// re-armed for the next entry.
+    #[test]
+    fn handler_requested_leave_parks_the_guest_and_returns_to_rust() {
+        extern "C" fn leave_now(ctx: *mut GuestContext) {
+            // SAFETY: the island passes the context this image was built with.
+            let ctx = unsafe { &mut *ctx };
+            SEEN.with(|seen| seen.borrow_mut().push((ctx.syscall_nr(), ctx.args())));
+            ctx.request_leave();
+        }
+        let code: Vec<u32> = vec![
+            movz(0, 7, 0),
+            movz(8, 93, 0), // exit(7)
+            SVC_0,
+            // POISON: must never run - a broken leave resumes here.
+            movz(8, 64, 0),
+            SVC_0,
+            0xd65f_03c0, // ret - reached only if BOTH leaves fail
+        ];
+        let elf = elf_with_code(&code);
+        let mut image = DirectImage::load(&elf, leave_now)
+            .expect("load")
+            .expect("eligible");
+        seen_clear();
+        let entry = image.entry();
+        // SAFETY: patched image, entry inside it; the leave leg returns here.
+        unsafe { image.enter(entry) };
+        let seen = seen_snapshot();
+        assert_eq!(seen.len(), 1, "the guest left AT the first syscall");
+        assert_eq!(seen[0].0, 93);
+        assert_eq!(seen[0].1[0], 7, "the exit code is parked in the context");
+        assert_eq!(
+            image.context().pc,
+            entry + 3 * 4,
+            "ctx.pc names the resume site the guest was parked at"
+        );
+        assert!(
+            !image.context().leave_requested(),
+            "the leave leg re-armed the flag for the next entry"
         );
     }
 

@@ -32,6 +32,7 @@ fn main() {
                     DirectIneligible::UndecodableText { .. } => "undecodable",
                     DirectIneligible::NoExecutableText => "no-text",
                     DirectIneligible::FixedLoadAddress { .. } => "ET_EXEC",
+                    DirectIneligible::NeedsInterpreter { .. } => "dynamic",
                 };
                 println!("{name:<24} tier T    [{bucket}] {reason}");
             }
