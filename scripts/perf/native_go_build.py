@@ -770,6 +770,12 @@ def carrick_timeout_diagnostics(
             str(binary),
             "debug",
             "lldb-snapshot",
+            # The timeout path has 180 seconds for every scoped process.
+            # Modified-memory cores for a cold Go build can consume that
+            # whole budget and strand the more useful event rings/backtraces
+            # in lldb's buffered output. Preserve stacks first; a focused
+            # follow-up can capture a core once the wedged process is known.
+            "--no-core",
             "--run-id",
             run_id,
             "--out-dir",
