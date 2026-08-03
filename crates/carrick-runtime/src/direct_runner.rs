@@ -30,7 +30,7 @@
 
 use carrick_abi::{CanonicalNr, LinuxGuestAbi, NativeNr};
 use carrick_guest_mem::{GuestMemory, MemoryError};
-use carrick_native_darwin::direct::GuestContext;
+use carrick_native_darwin::direct::{DirectLoadGroup, GuestContext};
 
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
 
@@ -315,16 +315,16 @@ impl DirectRunner {
     /// shared dispatcher.
     ///
     /// Fails closed, never approximates:
-    /// - `PROT_EXEC` anywhere -> the run LEAVES named (guest-created
-    ///   executable memory is the scan+patch boundary, roadmap item 5);
-    /// - file-backed mmap -> LEAVES named (needs guest-fd -> host-fd
-    ///   translation; letting the dispatcher "succeed" with an arena
-    ///   address would be a delayed crash, not a service);
-    /// - `brk`/`mremap` -> LEAVE named until implemented identity-style.
+    /// - `PROT_EXEC` content the scan+patch window pipeline cannot prove —
+    ///   `MAP_FIXED` exec mmaps, anonymous exec mmaps, `mprotect(PROT_EXEC)`
+    ///   outside a patched tier-D mapping — LEAVES named;
+    /// - `MAP_SHARED` file mmap -> LEAVES named (a private copy would break
+    ///   the sharing contract);
+    /// - `mremap` -> LEAVES named until implemented identity-style.
     fn service_identity_memory(&mut self, ctx: &GuestContext) -> Option<ServiceVerdict> {
         use carrick_abi::{LinuxMmapFlags, LinuxProtFlags};
         let number = ctx.syscall_nr();
-        let [a0, a1, a2, a3, _a4, a5] = ctx.args();
+        let [a0, a1, a2, a3, a4, a5] = ctx.args();
         let unsupported = |this: &mut Self, what: &str| {
             this.outcome = Some(DirectRunOutcome::Unsupported {
                 syscall: number,
@@ -332,32 +332,37 @@ impl DirectRunner {
             });
             Some(ServiceVerdict::Leave)
         };
-        let host_errno = || -> ServiceVerdict {
-            let host = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EINVAL);
-            ServiceVerdict::Resume(crate::host_to_linux_errno(host).guest_retval())
-        };
-        let host_prot = |prot: LinuxProtFlags| -> i32 {
-            let mut host = 0;
-            if prot.contains(LinuxProtFlags::READ) {
-                host |= libc::PROT_READ;
-            }
-            if prot.contains(LinuxProtFlags::WRITE) {
-                host |= libc::PROT_WRITE;
-            }
-            host
-        };
         match number {
             // mmap(addr, len, prot, flags, fd, off)
             222 => {
                 let prot = LinuxProtFlags::from_bits_truncate(a2);
                 let flags = LinuxMmapFlags::from_bits_truncate(a3);
-                if prot.contains(LinuxProtFlags::EXEC) {
-                    return unsupported(self, "mmap(PROT_EXEC): tier D scan+patch boundary");
-                }
                 if !flags.contains(LinuxMmapFlags::ANONYMOUS) {
-                    return unsupported(self, "file-backed mmap on tier D");
+                    if flags.contains(LinuxMmapFlags::SHARED) {
+                        return unsupported(self, "MAP_SHARED file mmap on tier D");
+                    }
+                    if a5 % HOST_PAGE_SIZE != 0 {
+                        // The identity tier's page size IS the host's
+                        // (`AT_PAGESZ` says so), so a file offset must be
+                        // host-page aligned to be mappable at all.
+                        return Some(ServiceVerdict::Resume(
+                            crate::host_to_linux_errno(libc::EINVAL).guest_retval(),
+                        ));
+                    }
+                    if prot.contains(LinuxProtFlags::EXEC) {
+                        return Some(self.service_exec_file_mmap(flags, a4, a5, a1));
+                    }
+                    return Some(self.service_data_file_mmap(a0, a1, prot, flags, a4, a5));
+                }
+                if prot.contains(LinuxProtFlags::EXEC) {
+                    // Fresh anonymous pages have no content to patch; a
+                    // guest that wants executable memory must publish it
+                    // through a PROT_EXEC flip (or is an RWX-without-flip
+                    // JIT, which is tier T's by design).
+                    return unsupported(
+                        self,
+                        "anonymous mmap(PROT_EXEC) on tier D (RWX-without-flip is tier T's)",
+                    );
                 }
                 let mut host_flags = libc::MAP_ANON;
                 host_flags |= if flags.contains(LinuxMmapFlags::SHARED) {
@@ -381,40 +386,82 @@ impl DirectRunner {
                     )
                 };
                 Some(if mapped == libc::MAP_FAILED {
-                    host_errno()
+                    host_errno_verdict()
                 } else {
+                    // A MAP_FIXED anon punch into a tier-D mapping (ld.so's
+                    // bss tail over a window) voids patched coverage there.
+                    if flags.contains(LinuxMmapFlags::FIXED)
+                        && let Some(group) = active_group()
+                    {
+                        group.note_plain_replacement(mapped as u64, a1);
+                    }
                     ServiceVerdict::Resume(mapped as i64)
                 })
             }
             // munmap(addr, len)
             215 => {
+                // A hole in a tier-D mapping is no longer patched text;
+                // whatever lands there later must not inherit coverage.
+                if let Some(group) = active_group() {
+                    group.note_plain_replacement(a0, a1);
+                }
                 // SAFETY: as above; the guest unmaps within its own space.
                 let rc = unsafe { libc::munmap(a0 as usize as *mut libc::c_void, a1 as usize) };
                 Some(if rc == 0 {
                     ServiceVerdict::Resume(0)
                 } else {
-                    host_errno()
+                    host_errno_verdict()
                 })
             }
             // mprotect(addr, len, prot)
             226 => {
                 let prot = LinuxProtFlags::from_bits_truncate(a2);
                 if prot.contains(LinuxProtFlags::EXEC) {
-                    return unsupported(self, "mprotect(PROT_EXEC): tier D scan+patch boundary");
+                    // Inside a patched tier-D mapping the pages are ALREADY
+                    // executable and their text was patched at map time, so
+                    // the flip adds nothing — approving it keeps
+                    // W^X-disciplined guests alive (ld.so re-mprotects
+                    // libc's text R|X after relocation for BTI hardening).
+                    // Anywhere else the bytes are unpatched: fail closed.
+                    if active_group().is_some_and(|group| group.covers_patched_executable(a0, a1)) {
+                        return Some(ServiceVerdict::Resume(0));
+                    }
+                    return unsupported(
+                        self,
+                        "mprotect(PROT_EXEC) outside a patched tier-D mapping",
+                    );
                 }
+                let target = host_prot(prot);
                 // SAFETY: as above.
                 let rc = unsafe {
-                    libc::mprotect(
-                        a0 as usize as *mut libc::c_void,
-                        a1 as usize,
-                        host_prot(prot),
-                    )
+                    libc::mprotect(a0 as usize as *mut libc::c_void, a1 as usize, target)
                 };
-                Some(if rc == 0 {
-                    ServiceVerdict::Resume(0)
-                } else {
-                    host_errno()
-                })
+                if rc != 0 {
+                    // Darwin refuses EVERY mprotect on MAP_JIT pages —
+                    // probed EACCES for any target protection, armed or not
+                    // — and ld.so's segment-hole `mprotect(PROT_NONE)` lands
+                    // exactly there. When the range is still original window
+                    // pages, lower the protection change to a
+                    // preserve-and-replace; anything else keeps the host's
+                    // verdict.
+                    let errno = std::io::Error::last_os_error().raw_os_error();
+                    if errno == Some(libc::EACCES)
+                        && active_group()
+                            .is_some_and(|group| group.covers_patched_executable(a0, a1))
+                    {
+                        return Some(self.replace_jit_pages_with_protection(a0, a1, target));
+                    }
+                    return Some(host_errno_verdict());
+                }
+                // A writability flip over patched text means the guest may
+                // rewrite it: void its coverage so a later EXEC flip cannot
+                // bless stale patches.
+                if prot.contains(LinuxProtFlags::WRITE)
+                    && let Some(group) = active_group()
+                {
+                    group.note_plain_replacement(a0, a1);
+                }
+                Some(ServiceVerdict::Resume(0))
             }
             // brk(addr) — the FIRST syscall real ld.so makes.
             214 => Some(self.service_identity_brk(a0)),
@@ -424,6 +471,251 @@ impl DirectRunner {
             216 => unsupported(self, "mremap on tier D (identity mremap not built yet)"),
             _ => None,
         }
+    }
+
+    /// `mmap(PROT_EXEC, fd)`: guest-created executable memory, serviced
+    /// through the load group's scan+patch window pipeline (roadmap Phase 1
+    /// item 5 — this is how ld.so maps libc.so.6's text). The file content
+    /// comes through the dispatcher's own fd table, so whatever backend the
+    /// file lives on (VFS overlay, host dir, synthetic) feeds the same
+    /// pipeline. Refusals LEAVE named — tier T owns what the scan cannot
+    /// prove.
+    fn service_exec_file_mmap(
+        &mut self,
+        flags: carrick_abi::LinuxMmapFlags,
+        fd: u64,
+        offset: u64,
+        len: u64,
+    ) -> ServiceVerdict {
+        let leave = |this: &mut Self, what: String| -> ServiceVerdict {
+            this.outcome = Some(DirectRunOutcome::Unsupported {
+                syscall: 222,
+                outcome: what,
+            });
+            ServiceVerdict::Leave
+        };
+        if flags.contains(carrick_abi::LinuxMmapFlags::FIXED) {
+            // A MAP_FIXED exec mapping lands inside an EXISTING mapping at a
+            // guest-chosen address, which MAP_JIT cannot honor (it rejects
+            // MAP_FIXED, probed). No real 2-segment library needs it; the
+            // 4-segment R/RX/R/RW layout will, and names itself here.
+            return leave(
+                self,
+                "mmap(MAP_FIXED|PROT_EXEC, fd) into an existing mapping on tier D".to_string(),
+            );
+        }
+        let Some(group) = active_group() else {
+            return leave(
+                self,
+                "mmap(PROT_EXEC, fd) with no tier-D load group installed".to_string(),
+            );
+        };
+        let file = match self.read_guest_file_all(fd) {
+            Ok(file) => file,
+            Err(retval) => return ServiceVerdict::Resume(retval),
+        };
+        let Ok(len_usize) = usize::try_from(len) else {
+            return ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EINVAL).guest_retval());
+        };
+        match group.map_exec_file_window(&file, offset, len_usize) {
+            Ok(Ok(base)) => ServiceVerdict::Resume(base as i64),
+            Ok(Err(reason)) => leave(
+                self,
+                format!("mmap(PROT_EXEC, fd): tier D window scan refused: {reason}"),
+            ),
+            Err(error) => leave(self, format!("mmap(PROT_EXEC, fd): {error}")),
+        }
+    }
+
+    /// A PRIVATE file-backed data mapping (ld.so's `MAP_FIXED` data
+    /// segments, read-only header windows): fresh anonymous pages plus a
+    /// dispatcher read of the file window. MAP_PRIVATE means writes never
+    /// reach the file and later file changes need not appear, so the copy IS
+    /// the semantic; bytes past EOF stay zero, mmap's own rule. Content is
+    /// read BEFORE any address-space mutation so an fd error fails the mmap
+    /// without having clobbered guest pages.
+    fn service_data_file_mmap(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: carrick_abi::LinuxProtFlags,
+        flags: carrick_abi::LinuxMmapFlags,
+        fd: u64,
+        offset: u64,
+    ) -> ServiceVerdict {
+        let Ok(len_usize) = usize::try_from(len) else {
+            return ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EINVAL).guest_retval());
+        };
+        let bytes = match self.read_guest_file(fd, offset, len_usize) {
+            Ok(bytes) => bytes,
+            Err(retval) => return ServiceVerdict::Resume(retval),
+        };
+        let mut host_flags = libc::MAP_ANON | libc::MAP_PRIVATE;
+        if flags.contains(carrick_abi::LinuxMmapFlags::FIXED) {
+            host_flags |= libc::MAP_FIXED;
+        }
+        // SAFETY: identity tier; a MAP_FIXED target is the guest replacing
+        // its own pages (ld.so mapping data over its text reservation).
+        let mapped = unsafe {
+            libc::mmap(
+                addr as usize as *mut libc::c_void,
+                len_usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                host_flags,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return host_errno_verdict();
+        }
+        if flags.contains(carrick_abi::LinuxMmapFlags::FIXED)
+            && let Some(group) = active_group()
+        {
+            group.note_plain_replacement(mapped as u64, len);
+        }
+        // SAFETY: `bytes.len() == len_usize` and the mapping was just
+        // created RW at `mapped`.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), len_usize) };
+        let final_prot = host_prot(prot);
+        if final_prot != (libc::PROT_READ | libc::PROT_WRITE) {
+            // SAFETY: narrowing the mapping just created to the guest's prot.
+            let rc = unsafe { libc::mprotect(mapped, len_usize, final_prot) };
+            if rc != 0 {
+                return host_errno_verdict();
+            }
+        }
+        ServiceVerdict::Resume(mapped as i64)
+    }
+
+    /// Change the protection of tier-D window pages by REPLACING them:
+    /// Darwin's `mprotect` refuses MAP_JIT pages outright (probed: EACCES
+    /// for every target protection), so the only way to honor a guest
+    /// protection change inside a window is to swap the pages for plain
+    /// ones. Contents are preserved — stash the (readable) JIT bytes, map
+    /// plain anon RW in place, copy back, then apply the requested
+    /// protection — so the guest-visible mprotect guarantee holds even
+    /// through a PROT_NONE round trip. The replaced range loses
+    /// patched-executable coverage: plain pages cannot execute, and a later
+    /// PROT_EXEC flip on them fails closed by the containment rule.
+    ///
+    /// The caller guarantees the range is still original window pages
+    /// (`covers_patched_executable`), which is what makes the stash read
+    /// safe: original MAP_JIT pages are always readable (no mprotect ever
+    /// succeeded on them, and they were created R+W+X).
+    fn replace_jit_pages_with_protection(
+        &mut self,
+        addr: u64,
+        len: u64,
+        target: i32,
+    ) -> ServiceVerdict {
+        let Ok(len_usize) = usize::try_from(len) else {
+            return ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EINVAL).guest_retval());
+        };
+        let mut stash = vec![0_u8; len_usize];
+        // SAFETY: the caller proved the range lies in original (readable)
+        // window pages, and the guest is parked in the handler.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                addr as usize as *const u8,
+                stash.as_mut_ptr(),
+                len_usize,
+            );
+        }
+        // SAFETY: replacing the guest's own window pages in place.
+        let mapped = unsafe {
+            libc::mmap(
+                addr as usize as *mut libc::c_void,
+                len_usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return host_errno_verdict();
+        }
+        if let Some(group) = active_group() {
+            group.note_plain_replacement(addr, len);
+        }
+        // SAFETY: fresh RW pages at `addr`, sized `len_usize`.
+        unsafe { std::ptr::copy_nonoverlapping(stash.as_ptr(), mapped.cast::<u8>(), len_usize) };
+        if target != (libc::PROT_READ | libc::PROT_WRITE) {
+            // SAFETY: plain pages now; any non-EXEC protection is honored.
+            let rc = unsafe { libc::mprotect(mapped, len_usize, target) };
+            if rc != 0 {
+                return host_errno_verdict();
+            }
+        }
+        ServiceVerdict::Resume(0)
+    }
+
+    /// Dispatch a runner-synthesized syscall (`fstat`/`pread64` for the mmap
+    /// file services) through the one shared dispatcher — the same fd
+    /// semantics every guest read gets. Errno outcomes come back as the
+    /// guest retval to fail the surrounding mmap with; any non-value outcome
+    /// is EIO (these numbers cannot fork or exit).
+    fn dispatch_synthesized(&mut self, number: u64, args: [u64; 6]) -> Result<i64, i64> {
+        let request = SyscallRequest::from_raw(carrick_hal::RawSyscall {
+            number: CanonicalNr(number),
+            args,
+            guest_abi: LinuxGuestAbi::Aarch64,
+            native_number: NativeNr(number),
+        });
+        let reporter = crate::compat::CompatReporter::default();
+        match self
+            .dispatcher
+            .dispatch(request, &mut self.memory, &reporter)
+        {
+            Ok(DispatchOutcome::Returned { value }) => Ok(value),
+            Ok(DispatchOutcome::Errno { errno }) => Err(errno.guest_retval()),
+            _ => Err(crate::host_to_linux_errno(libc::EIO).guest_retval()),
+        }
+    }
+
+    /// The byte length of the guest file behind `fd`, via `fstat(2)`.
+    fn guest_file_len(&mut self, fd: u64) -> Result<u64, i64> {
+        use zerocopy::FromBytes as _;
+        let mut stat_bytes = [0_u8; core::mem::size_of::<carrick_abi::LinuxStat>()];
+        let addr = stat_bytes.as_mut_ptr() as u64;
+        // fstat(fd, statbuf); the dispatcher writes the guest's aarch64
+        // `struct stat` through the identity memory into our buffer.
+        self.dispatch_synthesized(80, [fd, addr, 0, 0, 0, 0])?;
+        let stat = carrick_abi::LinuxStat::read_from_bytes(&stat_bytes)
+            .map_err(|_| crate::host_to_linux_errno(libc::EIO).guest_retval())?;
+        Ok(stat.st_size.max(0) as u64)
+    }
+
+    /// Read `[offset, offset + len)` of the guest file behind `fd` via
+    /// `pread64(2)` — offset-neutral, so the guest's own file position is
+    /// undisturbed. A short read leaves the tail zeroed (mmap's
+    /// beyond-EOF semantic).
+    fn read_guest_file(&mut self, fd: u64, offset: u64, len: usize) -> Result<Vec<u8>, i64> {
+        let mut out = vec![0_u8; len];
+        let mut done = 0_usize;
+        while done < len {
+            let addr = out.as_mut_ptr() as u64 + done as u64;
+            let n = self.dispatch_synthesized(
+                67,
+                [fd, addr, (len - done) as u64, offset + done as u64, 0, 0],
+            )?;
+            if n <= 0 {
+                break;
+            }
+            done += n as usize;
+        }
+        Ok(out)
+    }
+
+    /// The whole guest file behind `fd`: `fstat` for the length, `pread64`
+    /// for the bytes. The exec-window pipeline needs the full file because
+    /// the section headers that place the code live at its end.
+    fn read_guest_file_all(&mut self, fd: u64) -> Result<Vec<u8>, i64> {
+        let len = self.guest_file_len(fd)?;
+        let len = usize::try_from(len)
+            .map_err(|_| crate::host_to_linux_errno(libc::EINVAL).guest_retval())?;
+        self.read_guest_file(fd, 0, len)
     }
 
     /// `brk(2)`, identity-style (see [`IdentityBrk`]). Linux semantics: on
@@ -548,6 +840,29 @@ impl DirectRunner {
     }
 }
 
+/// Lower a guest protection to the host's non-executable bits. EXEC never
+/// reaches here: every EXEC path is routed to the scan+patch pipeline or
+/// fails closed before protection is applied.
+fn host_prot(prot: carrick_abi::LinuxProtFlags) -> i32 {
+    use carrick_abi::LinuxProtFlags;
+    let mut host = 0;
+    if prot.contains(LinuxProtFlags::READ) {
+        host |= libc::PROT_READ;
+    }
+    if prot.contains(LinuxProtFlags::WRITE) {
+        host |= libc::PROT_WRITE;
+    }
+    host
+}
+
+/// Resume the guest with the host's errno, translated to Linux's.
+fn host_errno_verdict() -> ServiceVerdict {
+    let host = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EINVAL);
+    ServiceVerdict::Resume(crate::host_to_linux_errno(host).guest_retval())
+}
+
 thread_local! {
     /// The runner serving the guest executing on THIS thread.
     ///
@@ -556,6 +871,21 @@ thread_local! {
     /// when tier D grows threads.
     static ACTIVE: std::cell::Cell<*mut DirectRunner> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// The load group of that guest, installed alongside the runner: the
+    /// identity memory services need it for the mmap(PROT_EXEC) window
+    /// pipeline and the mprotect(PROT_EXEC) containment rule.
+    static ACTIVE_GROUP: std::cell::Cell<*const DirectLoadGroup> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// The load group installed for the guest on this thread, if any.
+fn active_group<'a>() -> Option<&'a DirectLoadGroup> {
+    let group = ACTIVE_GROUP.with(std::cell::Cell::get);
+    // SAFETY: `with_runner` installs the pointer for exactly the window in
+    // which the guest can call back and clears it before returning, and the
+    // reference is only used inside handler-called services within that
+    // window.
+    unsafe { group.as_ref() }
 }
 
 /// The handler a tier-D image is built with.
@@ -581,14 +911,22 @@ pub fn island_handler() -> extern "C" fn(*mut GuestContext) {
     dispatch_from_island
 }
 
-/// Install `runner` for the current thread while `body` runs the guest.
+/// Install `runner` and `group` for the current thread while `body` runs the
+/// guest.
 ///
 /// # Safety
-/// `body` must enter an image built with [`island_handler`].
-pub unsafe fn with_runner<R>(runner: &mut DirectRunner, body: impl FnOnce() -> R) -> R {
-    let previous = ACTIVE.with(|slot| slot.replace(std::ptr::from_mut(runner)));
+/// `body` must enter an image (or runtime window) of `group`, built with
+/// [`island_handler`].
+pub unsafe fn with_runner<R>(
+    runner: &mut DirectRunner,
+    group: &DirectLoadGroup,
+    body: impl FnOnce() -> R,
+) -> R {
+    let previous_runner = ACTIVE.with(|slot| slot.replace(std::ptr::from_mut(runner)));
+    let previous_group = ACTIVE_GROUP.with(|slot| slot.replace(std::ptr::from_ref(group)));
     let result = body();
-    ACTIVE.with(|slot| slot.set(previous));
+    ACTIVE.with(|slot| slot.set(previous_runner));
+    ACTIVE_GROUP.with(|slot| slot.set(previous_group));
     result
 }
 
@@ -657,7 +995,7 @@ mod tests {
             DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         let entry = group.main().entry();
         // SAFETY: the image is patched and built with `island_handler`.
-        unsafe { with_runner(&mut runner, || group.enter(entry)) };
+        unsafe { with_runner(&mut runner, &group, || group.enter(entry)) };
 
         assert_eq!(runner.syscalls(), 1, "exactly one syscall was serviced");
         assert_eq!(
@@ -701,7 +1039,7 @@ mod tests {
             DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         let entry = group.main().entry();
         // SAFETY: the image is patched and built with `island_handler`.
-        unsafe { with_runner(&mut runner, || group.enter(entry)) };
+        unsafe { with_runner(&mut runner, &group, || group.enter(entry)) };
 
         assert_eq!(
             runner.outcome(),
@@ -756,7 +1094,7 @@ mod tests {
             DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         let entry = group.main().entry();
         // SAFETY: the image is patched and built with `island_handler`.
-        unsafe { with_runner(&mut runner, || group.enter(entry)) };
+        unsafe { with_runner(&mut runner, &group, || group.enter(entry)) };
 
         assert!(
             matches!(
@@ -866,7 +1204,7 @@ mod tests {
         let sp = stack.sp();
         // SAFETY: the image is patched and built with `island_handler`; the
         // guest leaves through its exit.
-        unsafe { with_runner(&mut runner, || group.enter_on_stack(entry, sp)) };
+        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
         assert_eq!(
             runner.outcome(),
             Some(&DirectRunOutcome::Exited { code: 2 }),
@@ -992,7 +1330,7 @@ mod tests {
         let sp = stack.sp();
         // SAFETY: both images are patched and built with `island_handler`;
         // the guest leaves through its exit.
-        unsafe { with_runner(&mut runner, || group.enter_on_stack(entry, sp)) };
+        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
         assert_eq!(
             runner.outcome(),
             Some(&DirectRunOutcome::Exited { code: 42 }),
@@ -1085,7 +1423,7 @@ __attribute__((naked)) void _start(void) {
         let sp = stack.sp();
         // SAFETY: both images are patched and built with `island_handler`;
         // the guest leaves through its exit.
-        unsafe { with_runner(&mut runner, || group.enter_on_stack(entry, sp)) };
+        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
         assert_eq!(
             runner.outcome(),
             Some(&DirectRunOutcome::Exited { code: 42 }),
@@ -1104,18 +1442,18 @@ __attribute__((naked)) void _start(void) {
         );
     }
 
-    /// The `/bin/dash` FRONTIER, pinned: a real libc-linked binary
-    /// (`DT_NEEDED libc.so.6`). ld.so runs, SEARCHES for libc through the
-    /// dispatcher's VFS (16 candidate openats — the whole fs path works),
-    /// FINDS it, reads its headers — and its first mapping request is
-    /// `mmap(PROT_EXEC, fd)`: guest-created executable memory, the
-    /// scan+patch-at-mmap boundary that is roadmap Phase 1 item 5. The run
-    /// must stop THERE, on the identity model's named fail-closed edge, not
-    /// somewhere random. When item 5 lands (scan+patch the mapped file
-    /// pages, plus guest-fd -> host-fd translation for the data mappings),
-    /// this test is the one that changes.
+    /// The former `/bin/dash` frontier, now CROSSED: a real libc-linked
+    /// binary (`DT_NEEDED libc.so.6`). ld.so runs, finds the real libc.so.6
+    /// through the dispatcher's VFS, maps its text with `mmap(PROT_EXEC,
+    /// fd)` — the scan+patch window boundary, roadmap Phase 1 item 5 — maps
+    /// its data segments `MAP_FIXED` over the reservation (guest-fd reads
+    /// through the one fd table), relocates, runs glibc's full startup, and
+    /// the program's `main` returns 41 out through the handler.
+    ///
+    /// Until item 5 landed, this test pinned the fail-closed stop at the
+    /// named `mmap(PROT_EXEC, fd)` gap; its history is the red-first proof.
     #[test]
-    fn dt_needed_binary_stops_at_the_named_exec_mmap_gap() {
+    fn dt_needed_binary_runs_through_the_exec_mmap_boundary() {
         let probe = std::process::Command::new("aarch64-linux-gnu-gcc")
             .arg("-print-sysroot")
             .output();
@@ -1160,7 +1498,7 @@ __attribute__((naked)) void _start(void) {
             group.main().bias(),
             Some(interp.bias()),
             &[b"hello-libc".to_vec()],
-            &[],
+            &[b"LD_DEBUG=all".to_vec()],
         )
         .expect("stack builds");
 
@@ -1184,18 +1522,23 @@ __attribute__((naked)) void _start(void) {
         let mut runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
         let entry = group.entry_pc();
         let sp = stack.sp();
-        // SAFETY: patched images built with `island_handler`; the run leaves
-        // through the named identity-model gap.
-        unsafe { with_runner(&mut runner, || group.enter_on_stack(entry, sp)) };
-        assert!(
-            matches!(
-                runner.outcome(),
-                Some(&DirectRunOutcome::Unsupported { syscall: 222, ref outcome })
-                    if outcome.contains("PROT_EXEC")
-            ),
-            "the run stops AT the named exec-mmap gap, nowhere else \
-             (outcome: {:?}; stderr: {:?})",
+        if std::env::var_os("TIERD_DEBUG_PAUSE").is_some() {
+            eprintln!(
+                "TIERD INTERP_BASE={:#x} pid={}",
+                group.interpreter().expect("interp").base(),
+                std::process::id()
+            );
+            std::thread::sleep(std::time::Duration::from_secs(25));
+        }
+        // SAFETY: patched images built with `island_handler`; the guest
+        // leaves through its exit.
+        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
+        assert_eq!(
             runner.outcome(),
+            Some(&DirectRunOutcome::Exited { code: 41 }),
+            "real ld.so mapped libc through the exec-mmap window and main \
+             returned 41 (syscalls: {}; stderr: {:?})",
+            runner.syscalls(),
             String::from_utf8_lossy(&runner.dispatcher().stderr()),
         );
     }
