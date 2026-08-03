@@ -145,13 +145,29 @@ const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
 /// structural: attached RECORDED-TEMPLATE units run materially slower than
 /// natively-emitted code on compute-bound paths — the awk-8M compute shape
 /// regresses 358 → ~594 ms (+65%, counterbalanced ABBA n=8,
-/// 2026-08-03 final scoreboard) once busybox's units attach, against a
-/// ~3% cold-build win and an 11% serial-micro win. Per the two-gates rule
-/// that trade cannot ship as a default. The election/persistence mechanics
-/// ARE sound (the old opt-in transport's 30% parallel-build regression is
-/// fixed by fork-claim clearing, first-miss election, per-host
-/// persistence); the re-flip condition is template code quality reaching
-/// parity on hot loops (superblock-fusion loss is the recorded suspect).
+/// 2026-08-03 final scoreboard; reproduced +72-78% on 2026-08-03 lane G)
+/// once busybox's units attach, against a ~3% cold-build win and an 11%
+/// serial-micro win. Per the two-gates rule that trade cannot ship as a
+/// default. The election/persistence mechanics ARE sound (the old opt-in
+/// transport's 30% parallel-build regression is fixed by fork-claim
+/// clearing, first-miss election, per-host persistence).
+///
+/// The quality delta is PROVEN at instruction level, and it is NOT fusion
+/// (`docs/perf-results/2026-08-03-store-template-parity-mechanism.md`):
+/// superblock and exclusive fusion are identical across arms. It is the
+/// BLOCK-ENTRY shape. A native block's patched direct links land at its
+/// TRUSTED ENTRY — three instructions past the generation guard — while a
+/// unit block is `GenerationGuard::BindingIndex`-guarded with no trusted
+/// entry, so every patched edge (the hot-loop back-edge included) re-runs
+/// an 11-instruction guard whose 4-deep dependent chain ends in an `ldar`.
+/// The re-flip condition is therefore: units carry NATIVE-emission
+/// templates (Absolute guard relocations + trusted entry + private-gateway
+/// exits — the recording tap of `emit_block_recording_artifact_optional`,
+/// word-identical by
+/// `emit::tests::recorded_emission_is_word_identical_to_native_emission`)
+/// and the install replays them per block through `publish_emitted`, in
+/// place of `record_portable_block_artifact`'s authority-mode emission and
+/// the copy-transport's trampoline/binding-table registration.
 pub fn persistent_store_runtime_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
