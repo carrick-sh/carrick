@@ -2,30 +2,22 @@
 //!
 //! # The store
 //!
-//! Units live in ONE host directory (`persistent_store_root`: the
-//! `~/.carrick` convention, translator-ABI versioned) that outlives every
-//! container: a unit is published once per key ever, every later exec of
-//! the same binary — in this run or any future one — attaches instead of
-//! translating, and the unit key's content bindings (`source_fingerprint`
-//! over the mapped text, `code_sha256` over the published bytes) keep a
-//! stale or colliding unit from ever executing. Recording is elected
-//! first-miss-claims per unit (`claim_recording`), publication is
-//! winner-takes-all under a non-blocking per-unit `flock`, and a
-//! size-capped LRU prune runs once per container begin. A host whose cache
-//! directory cannot be prepared falls back to the pre-persistence per-run
-//! tempdir.
+//! Units live in one translator-ABI-versioned host directory that outlives
+//! every container. A valid unit may be sparse: an attached process that
+//! reaches an uncovered block can win a nonblocking builder lease and merge
+//! its canonical artifact into the existing set. Sequential publishers
+//! reload under the per-unit lock, so pathname content grows monotonically
+//! unless a byte-level conflict or a capacity/preflight gate preserves the
+//! old inode. A size-capped LRU prune runs once per container begin.
 //!
 //! # The transport
 //!
-//! A published unit is a PAIR of plain files in the store:
-//! `{stem}.code` (the concatenated per-block NATIVE-EMISSION template words,
-//! relocation immediates zeroed) and `{stem}.metadata-v5` (the serialized
-//! manifest: per-block relocations, trusted entries, direct links, PC maps,
-//! and recovery, carrying `code_sha256` over the exact code bytes). Loading
-//! maps the code read-only, digest-verifies it against the metadata, and
-//! hands both to the translator, which REPLAYS each block into its own
-//! per-process `MAP_JIT` translation cache through `publish_emitted` — an
-//! installed block is indistinguishable from a natively-translated one.
+//! A published unit is one `{stem}.unit-v1` inode containing a fixed bundle
+//! header, V6 block index/metadata, and digest-bound translated code. Loading
+//! opens it with `O_NOFOLLOW`, validates a regular exact extent, and maps the
+//! whole inode `MAP_PRIVATE|PROT_READ`. Metadata stays lazy and `source_base`
+//! points at the code offset inside that same mapping; the translator replays
+//! selected blocks into its existing per-process `MAP_JIT` cache.
 //!
 //! # Why not a signed dylib (the previous transport)
 //!
@@ -46,11 +38,12 @@
 //!
 //! # Crash safety
 //!
-//! Both halves are written to `NamedTempFile`s, flushed, fsync'd, preflighted
-//! through the READER (metadata), and atomically renamed into place — a
-//! half-written unit is never loadable, and the digest binds the code file
-//! to the metadata that describes it (a stale orphan from a crashed publish
-//! can never pair with fresh metadata).
+//! A complete deterministic union is written to a mode-0600 same-directory
+//! temporary, fsync'd, deep-preflighted through the production reader, and
+//! atomically renamed over the final path before the directory is fsync'd.
+//! Old readers pin the old inode; new readers observe either the complete old
+//! or complete new union. Directory-sync failure is reported without rolling
+//! back already-visible content.
 
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
@@ -61,26 +54,30 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use carrick_dsr_aarch64::shared_cache::ManifestDefect;
+use carrick_dsr_aarch64::pending_augmentation::RecordingOwner;
 pub use carrick_dsr_aarch64::shared_cache::PublishOutcome;
 use carrick_dsr_aarch64::shared_cache::{
-    MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit, SourceFingerprint,
-    TranslationMetadataLoadEvidence, TranslationUnitKey, TranslationUnitManifest, UnitMissReason,
-    decode_translation_unit_metadata, encode_translation_unit_metadata,
+    DecodedUnitBundle, MergeKind, MergeOutcome, MergeRefusal, PendingTranslationUnit,
+    SourceFingerprint, TranslationMetadataLoadEvidence, TranslationUnitKey,
+    TranslationUnitManifest, UnitMissReason, UnitStoreFailure, UnitStoreFailureClass,
+    decode_unit_bundle_v1, encode_unit_bundle_v1, merge_normalized_artifacts,
     shared_source_fingerprint_reuse_enabled,
 };
-use sha2::{Digest, Sha256};
 
 const AUTHORITY_MARKER: &str = ".carrick-authority";
 const AUTHORITY_NONCE_LEN: usize = 16;
-const MANIFEST_DECODE_LIMIT: usize = 256 * 1024 * 1024;
-const MAX_MAPPED_METADATA_BYTES: u64 = MANIFEST_DECODE_LIMIT as u64;
+const MAX_MAPPED_UNIT_BUNDLE_BYTES: u64 = (104 + 7 + 64 * 1024 * 1024 + 256 * 1024 * 1024) as u64;
+const UNIT_V1_SUFFIX: &str = ".unit-v1";
+const BUILDER_MAGIC_V1: [u8; 8] = *b"CXBLDR1\0";
+const BUILDER_SCHEMA_V1: u32 = 1;
+const BUILDER_RECORD_BYTES_V1: usize = 112;
+const UNIT_STEM_BYTES: usize = 64;
 /// A recording claim older than this is stale even if its pid looks alive:
 /// pids recycle across the runs a persistent store outlives, and no
 /// legitimate recorder runs this long before publishing at exit or exec.
 const BUILDER_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-/// Total `{stem}.code` + `{stem}.metadata-v5` bytes the store may retain;
-/// beyond it the oldest pairs (by modification time, refreshed on load) are
+/// Total current-ABI `.unit-v1` bytes the store may retain; beyond it the
+/// oldest inodes (by modification time, refreshed on load) are
 /// evicted at container begin. A whole go toolchain's units measure in tens
 /// of MiB, so this cap is generous without being unbounded.
 const STORE_SIZE_CAP_BYTES: u64 = 1024 * 1024 * 1024;
@@ -89,6 +86,19 @@ const STORE_SIZE_CAP_BYTES: u64 = 1024 * 1024 * 1024;
 const AUX_FILE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 /// Unrenamed publication temporaries older than this are crash leftovers.
 const TEMP_FILE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordingClaim {
+    pub owner: RecordingOwner,
+    pub stale_takeover: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    Won(RecordingClaim),
+    LiveOwner,
+    Yielded,
+}
 
 /// Where the persistent unit store lives: `$CARRICK_DSR_STORE_DIR` when set
 /// (tests, bisection), else the carrick home convention shared with the
@@ -166,32 +176,45 @@ fn read_or_publish_marker(
     Err(invalid_data("cache authority marker kept vanishing"))
 }
 
-/// One published unit pair as the pruner sees it.
-struct StoredPair {
+/// One current-ABI atomic unit as the pruner sees it.
+struct StoredUnit {
     stem: String,
     bytes: u64,
-    newest_modified: std::time::SystemTime,
+    modified: std::time::SystemTime,
 }
 
-/// Bound the store: remove crash leftovers (aged temporaries, orphaned
-/// election files, half pairs, the retired `.seen` markers) and evict the
-/// oldest complete pairs until total pair bytes fit under `cap_bytes`.
+fn current_unit_stem(name: &str) -> Option<&str> {
+    let stem = name.strip_suffix(UNIT_V1_SUFFIX)?;
+    is_unit_stem(stem).then_some(stem)
+}
+
+fn is_unit_stem(stem: &str) -> bool {
+    stem.len() == UNIT_STEM_BYTES
+        && stem
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Bound the current ABI store: remove aged temporaries/auxiliary files and
+/// evict the oldest complete `.unit-v1` inodes until their total bytes fit.
+/// Retired suffixes are outside this ABI directory's accounting and are
+/// ignored rather than reinterpreted as current content.
 /// Best-effort by design — every removal races benignly with concurrent
-/// runs (loads pin inodes; a vanished pair is an ordinary miss), so errors
+/// runs (loads pin inodes; a vanished unit is an ordinary miss), so errors
 /// are swallowed rather than failing the container.
 fn prune_store(directory: &File, path: &Path, cap_bytes: u64) {
     let Ok(entries) = std::fs::read_dir(path) else {
         return;
     };
-    let mut code_halves = std::collections::BTreeMap::new();
-    let mut metadata_halves = std::collections::BTreeMap::new();
+    let mut units = Vec::new();
+    let mut total_bytes = 0_u64;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if name == AUTHORITY_MARKER {
             continue;
         }
-        let Ok(identity) = entry.metadata() else {
+        let Ok(identity) = std::fs::symlink_metadata(entry.path()) else {
             continue;
         };
         let age = identity
@@ -199,14 +222,21 @@ fn prune_store(directory: &File, path: &Path, cap_bytes: u64) {
             .ok()
             .and_then(|modified| modified.elapsed().ok())
             .unwrap_or_default();
-        if let Some(stem) = name.strip_suffix(".code") {
-            code_halves.insert(stem.to_owned(), identity);
-        } else if let Some(stem) = name.strip_suffix(".metadata-v5") {
-            metadata_halves.insert(stem.to_owned(), identity);
-        } else if name.ends_with(".seen") || name.ends_with(".metadata-v3") {
-            // Retired formats: the recurrence-deferral marker and the
-            // pre-native-tap mapped metadata. Never produced again.
-            let _ = std::fs::remove_file(entry.path());
+        if let Some(stem) = current_unit_stem(name) {
+            if identity.file_type().is_file() {
+                total_bytes = total_bytes.saturating_add(identity.len());
+                units.push(StoredUnit {
+                    stem: stem.to_owned(),
+                    bytes: identity.len(),
+                    modified: identity.modified().unwrap_or(std::time::UNIX_EPOCH),
+                });
+            }
+        } else if name.ends_with(".code")
+            || name.ends_with(".metadata-v5")
+            || name.ends_with(".metadata-v3")
+            || name.ends_with(".seen")
+        {
+            // Retired formats are deliberately not current-ABI content.
         } else if name.ends_with(".builder") || name.ends_with(".lock") {
             if age > AUX_FILE_TTL {
                 let _ = std::fs::remove_file(entry.path());
@@ -217,67 +247,24 @@ fn prune_store(directory: &File, path: &Path, cap_bytes: u64) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-    let mut pairs = Vec::new();
-    let mut total_bytes = 0_u64;
-    for (stem, code_identity) in &code_halves {
-        let Some(metadata_identity) = metadata_halves.get(stem) else {
-            // A half pair is either a publication in flight (young) or a
-            // crash leftover (old). Only the old ones are removable.
-            if code_identity
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > TEMP_FILE_TTL)
-            {
-                let _ = std::fs::remove_file(path.join(format!("{stem}.code")));
-            }
-            continue;
-        };
-        let bytes = code_identity.len().saturating_add(metadata_identity.len());
-        let newest_modified = code_identity
-            .modified()
-            .ok()
-            .into_iter()
-            .chain(metadata_identity.modified().ok())
-            .max()
-            .unwrap_or(std::time::UNIX_EPOCH);
-        total_bytes = total_bytes.saturating_add(bytes);
-        pairs.push(StoredPair {
-            stem: stem.clone(),
-            bytes,
-            newest_modified,
-        });
-    }
-    for (stem, metadata_identity) in &metadata_halves {
-        if !code_halves.contains_key(stem)
-            && metadata_identity
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > TEMP_FILE_TTL)
-        {
-            let _ = std::fs::remove_file(path.join(format!("{stem}.metadata-v5")));
-        }
-    }
     if total_bytes <= cap_bytes {
         return;
     }
-    pairs.sort_by_key(|pair| pair.newest_modified);
-    for pair in pairs {
+    units.sort_by_key(|unit| unit.modified);
+    for unit in units {
         if total_bytes <= cap_bytes {
             break;
         }
         // Evict under the unit lock so a concurrent publisher or claimant of
         // this stem is not raced; busy means in use — skip it this round.
-        let Some(lock) = try_lock_stem_for_prune(directory, path, &pair.stem) else {
+        let Some(lock) = try_lock_stem_for_prune(directory, path, &unit.stem) else {
             continue;
         };
-        let _ = std::fs::remove_file(path.join(format!("{}.code", pair.stem)));
-        let _ = std::fs::remove_file(path.join(format!("{}.metadata-v5", pair.stem)));
-        let _ = std::fs::remove_file(path.join(format!("{}.builder", pair.stem)));
+        let _ = std::fs::remove_file(path.join(format!("{}{}", unit.stem, UNIT_V1_SUFFIX)));
+        let _ = std::fs::remove_file(path.join(format!("{}.builder", unit.stem)));
         drop(lock);
-        let _ = std::fs::remove_file(path.join(format!("{}.lock", pair.stem)));
-        total_bytes = total_bytes.saturating_sub(pair.bytes);
+        let _ = std::fs::remove_file(path.join(format!("{}.lock", unit.stem)));
+        total_bytes = total_bytes.saturating_sub(unit.bytes);
     }
 }
 
@@ -300,16 +287,44 @@ static CONTAINER_CACHE: Mutex<Option<ContainerCacheAuthority>> = Mutex::new(None
 
 #[cfg(test)]
 thread_local! {
-    static AFTER_BOUNDED_METADATA_OPEN_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    static AFTER_BOUNDED_UNIT_OPEN_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
-    static LAST_MAPPED_METADATA_ADDRESS_FOR_TEST: std::cell::Cell<usize> = const {
-        std::cell::Cell::new(0)
+    static PUBLICATION_FAULT_FOR_TEST: std::cell::Cell<Option<PublicationFault>> = const {
+        std::cell::Cell::new(None)
     };
 }
 
 #[cfg(test)]
-fn arm_after_bounded_metadata_open_for_test(hook: impl FnOnce() + 'static) {
-    AFTER_BOUNDED_METADATA_OPEN_FOR_TEST.with(|armed| {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationFault {
+    BeforeTempSync,
+    BeforePreflight,
+    BeforeRename,
+    DirectorySync,
+}
+
+#[cfg(test)]
+fn arm_publication_fault(fault: PublicationFault) {
+    PUBLICATION_FAULT_FOR_TEST.with(|armed| {
+        assert!(armed.replace(Some(fault)).is_none(), "fault already armed");
+    });
+}
+
+#[cfg(test)]
+fn take_publication_fault(fault: PublicationFault) -> bool {
+    PUBLICATION_FAULT_FOR_TEST.with(|armed| {
+        if armed.get() == Some(fault) {
+            armed.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+fn arm_after_bounded_unit_open_for_test(hook: impl FnOnce() + 'static) {
+    AFTER_BOUNDED_UNIT_OPEN_FOR_TEST.with(|armed| {
         assert!(
             armed.borrow_mut().replace(Box::new(hook)).is_none(),
             "bounded metadata-open hook was already armed"
@@ -318,8 +333,8 @@ fn arm_after_bounded_metadata_open_for_test(hook: impl FnOnce() + 'static) {
 }
 
 #[cfg(test)]
-fn run_after_bounded_metadata_open_for_test() {
-    AFTER_BOUNDED_METADATA_OPEN_FOR_TEST.with(|armed| {
+fn run_after_bounded_unit_open_for_test() {
+    AFTER_BOUNDED_UNIT_OPEN_FOR_TEST.with(|armed| {
         if let Some(hook) = armed.borrow_mut().take() {
             hook();
         }
@@ -329,6 +344,7 @@ fn run_after_bounded_metadata_open_for_test() {
 #[derive(Debug)]
 pub struct UnitStoreError {
     operation: &'static str,
+    class: UnitStoreFailureClass,
     reason: UnitMissReason,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
@@ -337,6 +353,7 @@ impl UnitStoreError {
     fn new(operation: &'static str, reason: UnitMissReason) -> Self {
         Self {
             operation,
+            class: UnitStoreFailureClass::Validation,
             reason,
             source: None,
         }
@@ -349,8 +366,29 @@ impl UnitStoreError {
     ) -> Self {
         Self {
             operation,
+            class: UnitStoreFailureClass::Validation,
             reason,
             source: Some(Box::new(source)),
+        }
+    }
+
+    fn io_with_source(
+        operation: &'static str,
+        reason: UnitMissReason,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            operation,
+            class: UnitStoreFailureClass::Io,
+            reason,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    const fn failure(&self) -> UnitStoreFailure {
+        UnitStoreFailure {
+            class: self.class,
+            reason: self.reason,
         }
     }
 
@@ -383,9 +421,9 @@ impl std::error::Error for UnitStoreError {
 
 #[derive(Debug)]
 pub struct LoadedTranslationUnit {
-    // Fields drop in declaration order. Release the source lease (the code
-    // file mapping) last, after nothing else can reference it.
-    lease: Arc<CodeSourceLease>,
+    // Fields drop in declaration order. Release the whole-bundle mapping
+    // last, after neither metadata nor code can reference it.
+    lease: Arc<UnitBundleLease>,
     pub manifest: Arc<TranslationUnitManifest>,
     /// Readable source bytes for the translator's per-block replay. Nothing
     /// executes here — see `SharedLoadedTranslationUnit::source_base`.
@@ -405,13 +443,19 @@ impl LoadedTranslationUnit {
     }
 }
 
-/// Pins one loaded unit's backing: the read-only private mapping of
-/// `{stem}.code` (and the inode under it, which publication never writes in
-/// place — only whole-file renames).
+/// Pins one loaded unit's backing: one read-only private `.unit-v1` mapping
+/// and the inode under it. Publication never writes in place; replacement is
+/// a whole-inode rename, so an old reader remains valid across augmentation.
 #[derive(Debug)]
-struct CodeSourceLease {
+struct UnitBundleLease {
     _mapping: memmap2::Mmap,
     _file: File,
+}
+
+impl AsRef<[u8]> for UnitBundleLease {
+    fn as_ref(&self) -> &[u8] {
+        &self._mapping
+    }
 }
 
 // SAFETY: `source_base` addresses the immutable read-only mapping owned by
@@ -427,67 +471,92 @@ impl Drop for UnitFileLock {
         let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
 }
-fn open_metadata_at(directory: &File, name: &CStr) -> Result<(File, usize), UnitStoreError> {
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        let reason = if error.raw_os_error() == Some(libc::ENOENT) {
-            UnitMissReason::MissingPair
-        } else {
-            UnitMissReason::Schema
-        };
-        return Err(UnitStoreError::with_source(
-            "open mapped metadata",
-            reason,
-            error,
-        ));
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
-    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(file.as_raw_fd(), status.as_mut_ptr()) } != 0 {
-        return Err(UnitStoreError::with_source(
-            "stat mapped metadata",
-            UnitMissReason::Schema,
-            std::io::Error::last_os_error(),
-        ));
-    }
-    let status = unsafe { status.assume_init() };
-    if status.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(UnitStoreError::new(
-            "validate mapped metadata file type",
-            UnitMissReason::Schema,
-        ));
-    }
-    let length = u64::try_from(status.st_size).map_err(|_| {
-        UnitStoreError::new(
-            "validate mapped metadata size",
-            UnitMissReason::ManifestRange,
-        )
-    })?;
-    if length == 0 || length > MAX_MAPPED_METADATA_BYTES {
-        return Err(UnitStoreError::new(
-            "validate mapped metadata size",
-            UnitMissReason::ManifestRange,
-        ));
-    }
-    let length = usize::try_from(length).map_err(|_| {
-        UnitStoreError::new(
-            "validate mapped metadata size",
-            UnitMissReason::ManifestRange,
-        )
-    })?;
-    Ok((file, length))
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BuilderRecord {
+    owner: RecordingOwner,
+    created_unix_ns: i64,
+    stem: String,
 }
 
-/// Open one published unit half by name inside the authority directory:
+enum BuilderState {
+    Absent,
+    Malformed,
+    Valid(BuilderRecord),
+}
+
+fn encode_builder_record(record: &BuilderRecord) -> Result<[u8; BUILDER_RECORD_BYTES_V1], ()> {
+    if !is_unit_stem(&record.stem) {
+        return Err(());
+    }
+    let mut bytes = [0_u8; BUILDER_RECORD_BYTES_V1];
+    bytes[0..8].copy_from_slice(&BUILDER_MAGIC_V1);
+    bytes[8..12].copy_from_slice(&BUILDER_SCHEMA_V1.to_le_bytes());
+    bytes[12..16].copy_from_slice(&(BUILDER_RECORD_BYTES_V1 as u32).to_le_bytes());
+    bytes[16..20].copy_from_slice(&record.owner.pid.to_le_bytes());
+    bytes[24..40].copy_from_slice(&record.owner.incarnation);
+    bytes[40..48].copy_from_slice(&record.created_unix_ns.to_le_bytes());
+    bytes[48..].copy_from_slice(record.stem.as_bytes());
+    Ok(bytes)
+}
+
+fn decode_builder_record(bytes: &[u8], expected_stem: &str) -> Option<BuilderRecord> {
+    if bytes.len() != BUILDER_RECORD_BYTES_V1
+        || bytes.get(0..8) != Some(&BUILDER_MAGIC_V1)
+        || u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) != BUILDER_SCHEMA_V1
+        || u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?) as usize
+            != BUILDER_RECORD_BYTES_V1
+        || u32::from_le_bytes(bytes.get(20..24)?.try_into().ok()?) != 0
+        || bytes.get(48..)? != expected_stem.as_bytes()
+    {
+        return None;
+    }
+    Some(BuilderRecord {
+        owner: RecordingOwner {
+            pid: i32::from_le_bytes(bytes.get(16..20)?.try_into().ok()?),
+            incarnation: bytes.get(24..40)?.try_into().ok()?,
+        },
+        created_unix_ns: i64::from_le_bytes(bytes.get(40..48)?.try_into().ok()?),
+        stem: expected_stem.to_owned(),
+    })
+}
+
+fn unix_now_ns() -> Result<i64, UnitStoreFailure> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| UnitStoreFailure {
+            class: UnitStoreFailureClass::Validation,
+            reason: UnitMissReason::Schema,
+        })?;
+    i64::try_from(elapsed.as_nanos()).map_err(|_| UnitStoreFailure {
+        class: UnitStoreFailureClass::Validation,
+        reason: UnitMissReason::Schema,
+    })
+}
+
+fn owner_pid_is_live(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+struct BuilderReleaseGuard<'authority> {
+    authority: &'authority ContainerCacheAuthority,
+    stem: String,
+    owner: RecordingOwner,
+}
+
+impl Drop for BuilderReleaseGuard<'_> {
+    fn drop(&mut self) {
+        self.authority.release_builder(&self.stem, self.owner);
+    }
+}
+
+/// Open one published bundle by name inside the authority directory:
 /// `O_NOFOLLOW`, regular-file-only, with its exact byte length. `ENOENT` is a
-/// `MissingPair` (a genuine cache miss); everything else is schema-shaped.
+/// genuine unit miss; everything else fails closed as schema-shaped.
 fn open_unit_regular_file_at(
     directory: &File,
     name: &CStr,
@@ -496,7 +565,7 @@ fn open_unit_regular_file_at(
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
@@ -506,17 +575,17 @@ fn open_unit_regular_file_at(
         } else {
             UnitMissReason::Schema
         };
-        return Err(UnitStoreError::with_source(
-            "open translation code",
-            reason,
-            error,
-        ));
+        return Err(if error.raw_os_error() == Some(libc::ELOOP) {
+            UnitStoreError::with_source("open translation unit bundle", reason, error)
+        } else {
+            UnitStoreError::io_with_source("open translation unit bundle", reason, error)
+        });
     }
     let file = unsafe { File::from_raw_fd(fd) };
     let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstat(file.as_raw_fd(), status.as_mut_ptr()) } != 0 {
-        return Err(UnitStoreError::with_source(
-            "stat translation code",
+        return Err(UnitStoreError::io_with_source(
+            "stat translation unit bundle",
             UnitMissReason::Schema,
             std::io::Error::last_os_error(),
         ));
@@ -524,7 +593,7 @@ fn open_unit_regular_file_at(
     let status = unsafe { status.assume_init() };
     if status.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(UnitStoreError::new(
-            "validate translation code file type",
+            "validate translation unit bundle file type",
             UnitMissReason::Schema,
         ));
     }
@@ -533,77 +602,61 @@ fn open_unit_regular_file_at(
         .and_then(|length| usize::try_from(length).ok())
         .ok_or_else(|| {
             UnitStoreError::new(
-                "validate translation code size",
+                "validate translation unit bundle size",
                 UnitMissReason::ManifestRange,
             )
         })?;
     Ok((file, length))
 }
 
-/// Map and validate one unit's serialized metadata through the READER path
-/// (used both at load and as the publish preflight): decode the header and
-/// fixed-width index fail-closed, require the exact expected key, and
-/// re-run the INDEX invariants. Per-block blobs stay undecoded — this is
-/// what makes the per-exec attach proportional to the block count instead
-/// of the metadata size. The publish preflight layers `validate_deep` on
-/// top (see `publish_unit`); a corrupt blob served to a loader fails
-/// closed at that block's replay.
-///
-/// The mmap (not a read) is load-bearing twice over: the manifest keeps
-/// the mapping alive for on-demand blob decode, and untouched cold bytes
-/// are never paged in at all.
-fn read_and_validate_metadata(
+fn read_and_validate_bundle(
     directory: &File,
     name: &CStr,
     expected_key: &TranslationUnitKey,
 ) -> Result<
     (
-        Arc<TranslationUnitManifest>,
+        Arc<UnitBundleLease>,
+        DecodedUnitBundle,
         TranslationMetadataLoadEvidence,
     ),
     UnitStoreError,
 > {
-    let (file, length) = open_metadata_at(directory, name)?;
+    let (file, length) = open_unit_regular_file_at(directory, name)?;
     #[cfg(test)]
-    run_after_bounded_metadata_open_for_test();
-    // SAFETY: `map_copy_read_only` requests `MAP_PRIVATE|PROT_READ`. The
-    // private cache authority never writes a published inode in place
-    // (publication and repair replace pathnames by whole-file rename), the
-    // mmap length is the exact bounded extent accepted by the fstat in
-    // `open_metadata_at` (a test-only seam may append past it; the mapping
-    // cannot see those bytes), and the mapping is kept alive inside the
-    // manifest for the lifetime of every on-demand blob decode.
+    run_after_bounded_unit_open_for_test();
+    if length == 0 || length as u64 > MAX_MAPPED_UNIT_BUNDLE_BYTES {
+        return Err(UnitStoreError::new(
+            "validate unit bundle size",
+            UnitMissReason::ManifestRange,
+        ));
+    }
+    // SAFETY: the exact fstat-bounded regular inode is mapped
+    // MAP_PRIVATE|PROT_READ and retained with its descriptor. Publication
+    // replaces the pathname atomically and never mutates this inode.
     let mapping = unsafe {
         memmap2::MmapOptions::new()
             .len(length)
             .map_copy_read_only(&file)
     }
     .map_err(|error| {
-        UnitStoreError::with_source("map unit metadata", UnitMissReason::Schema, error)
+        UnitStoreError::io_with_source("map unit bundle", UnitMissReason::CodeMapping, error)
     })?;
+    let lease = Arc::new(UnitBundleLease {
+        _mapping: mapping,
+        _file: file,
+    });
     let validation_started = std::time::Instant::now();
-    let manifest = decode_translation_unit_metadata(Arc::new(mapping))
-        .map_err(|reason| UnitStoreError::new("decode unit metadata", reason))?;
-    if manifest.key != *expected_key {
-        return Err(UnitStoreError::new(
-            "validate unit metadata key",
-            UnitMissReason::ImageIdentity,
-        ));
-    }
-    manifest
-        .validate_ranges()
-        .map_err(|reason| UnitStoreError::new("validate unit metadata ranges", reason))?;
+    let backing: Arc<dyn AsRef<[u8]> + Send + Sync> = lease.clone();
+    let decoded = decode_unit_bundle_v1(backing, expected_key)
+        .map_err(|reason| UnitStoreError::new("decode unit bundle", reason))?;
     let validation_ns = u64::try_from(validation_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let owned_records = manifest.blocks().len() as u64;
-    Ok((
-        Arc::new(manifest),
-        TranslationMetadataLoadEvidence {
-            bytes_read: 0,
-            bytes_mapped: u64::try_from(length).unwrap_or(u64::MAX),
-            validation_ns,
-            owned_records,
-        },
-    ))
+    let evidence = TranslationMetadataLoadEvidence {
+        bytes_read: 0,
+        bytes_mapped: u64::try_from(length).unwrap_or(u64::MAX),
+        validation_ns,
+        owned_records: decoded.block_count() as u64,
+    };
+    Ok((lease, decoded, evidence))
 }
 
 /// Identity required to adopt one container's cache directory after host
@@ -658,9 +711,9 @@ impl ContainerCacheAuthority {
 
     /// Open (creating if absent) the persistent unit store rooted at `root`.
     ///
-    /// The directory outlives every container: publication is publish-once
-    /// per unit key FOREVER, and a second `carrick run` of the same image
-    /// attaches instead of translating. The authority nonce lives in the
+    /// The directory outlives every container: publication atomically grows
+    /// each unit's normalized block set, and a second `carrick run` of the
+    /// same image replays stored blocks instead of retranslating. The authority nonce lives in the
     /// store's marker file so descendants of any run can validate adoption
     /// against the same identity. Pruning (size cap + stale auxiliary files)
     /// runs here, once per container, in the supervisor.
@@ -816,258 +869,271 @@ impl ContainerCacheAuthority {
         &self,
         pending: &PendingTranslationUnit,
     ) -> Result<PublishOutcome, UnitStoreError> {
-        let (pending_code, pending_blocks) = pending.pack_legacy_pair().map_err(|error| {
-            UnitStoreError::with_source(
-                "pack pending legacy pair",
-                UnitMissReason::Schema,
-                invalid_data(format!("{error:?}")),
-            )
-        })?;
-        if pending_code.is_empty() {
-            return Ok(PublishOutcome::Existing);
-        }
-        if pending_code.len() > MAX_TRANSLATION_UNIT_CODE_BYTES
-            || !pending_code.len().is_multiple_of(4)
-        {
-            return Err(UnitStoreError::new(
-                "validate pending unit",
-                UnitMissReason::ManifestRange,
-            ));
-        }
-        // Digest the raw code FIRST so the metadata half binds the exact
-        // bytes the code half will carry: a loader that ever pairs a stale
-        // orphan with fresh metadata fails the digest instead of running
-        // code its metadata does not describe.
-        let code_sha256: [u8; 32] = Sha256::digest(&pending_code).into();
-        let metadata_bytes = Arc::new(
-            encode_translation_unit_metadata(
-                &pending.key,
-                code_sha256,
-                pending_code.len() as u64,
-                &pending_blocks,
-            )
-            .map_err(|error| {
-                tracing::warn!(
-                    blocks = pending.blocks.len(),
-                    error = ?error,
-                    "unit metadata encode rejected a freshly packed unit"
-                );
-                UnitStoreError::with_source(
-                    "encode unit metadata",
-                    UnitMissReason::Schema,
-                    invalid_data(format!("{error:?}")),
-                )
-            })?,
-        );
-        let manifest = decode_translation_unit_metadata(
-            Arc::clone(&metadata_bytes) as Arc<dyn AsRef<[u8]> + Send + Sync>
-        )
-        .map_err(|reason| UnitStoreError::new("decode freshly encoded unit metadata", reason))?;
-        // Name the broken invariant. This preflight rejects a unit CARRICK
-        // ITSELF just built, so "ManifestRange" alone says only that the
-        // producer and its validator disagree - which is exactly the state a
-        // cold go build has been in (33 publication attempts, 0 units, 30 of
-        // them ManifestRange with no further detail). `validate_deep`
-        // decodes EVERY hot and cold blob: publication is rare and off the
-        // hot path, and it is the last moment a producer/reader
-        // disagreement can be named rather than read as a store that never
-        // loads.
-        if let Err(defect) = manifest.validate_deep() {
-            return Err(UnitStoreError::new(
-                match defect {
-                    ManifestDefect::Schema => "validate pending unit: schema",
-                    ManifestDefect::TranslatorAbi => "validate pending unit: translator abi",
-                    ManifestDefect::BaseExport => "validate pending unit: base export",
-                    ManifestDefect::CodeLen => "validate pending unit: code length",
-                    ManifestDefect::BlockGeometry => "validate pending unit: block geometry",
-                    ManifestDefect::BlockGuestDuplicate => {
-                        "validate pending unit: duplicate block guest start"
-                    }
-                    ManifestDefect::BlockExtentOverlap => {
-                        "validate pending unit: overlapping block extents"
-                    }
-                    ManifestDefect::BlockTemplate => {
-                        "validate pending unit: block template metadata"
-                    }
-                },
-                defect.reason(),
-            ));
-        }
-        let stem = pending.key.file_stem().map_err(|error| {
-            UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
-        })?;
-        // Winner selection precedes all file emission. Toolchain workloads
-        // retire many identical siblings at once; every loser should pay one
-        // lock round-trip, not a full unit emission — and a HELD lock means a
-        // rival is emitting this same unit right now, so yielding (not
-        // waiting) is the correct, non-blocking answer.
-        let Some(_lock) = self.try_lock_unit(&stem)? else {
-            return Ok(PublishOutcome::Yielded);
+        let claim = RecordingClaim {
+            owner: RecordingOwner {
+                pid: unsafe { libc::getpid() },
+                incarnation: [0x4c; 16],
+            },
+            stale_takeover: false,
         };
-        let (final_code, final_metadata) = self.final_paths(&stem);
-        if final_code.is_file() && final_metadata.is_file() {
-            return Ok(PublishOutcome::Existing);
+        let outcome = self
+            .merge(pending, &claim)
+            .map_err(|failure| UnitStoreError::new("merge unit bundle", failure.reason))?;
+        match outcome.kind {
+            MergeKind::Created | MergeKind::Merged | MergeKind::Repaired => {
+                Ok(PublishOutcome::Winner)
+            }
+            MergeKind::Unchanged => Ok(PublishOutcome::Existing),
+            MergeKind::Yielded => Ok(PublishOutcome::Yielded),
+            MergeKind::Refused(refusal) => Err(UnitStoreError::new(
+                "merge unit bundle refused",
+                match refusal {
+                    MergeRefusal::Conflict { .. } | MergeRefusal::Capacity => {
+                        UnitMissReason::ManifestRange
+                    }
+                    MergeRefusal::Preflight(reason) => reason,
+                },
+            )),
         }
-        if final_code.exists() {
-            std::fs::remove_file(&final_code).map_err(|error| {
-                UnitStoreError::with_source(
-                    "remove partial code file",
-                    UnitMissReason::MissingPair,
-                    error,
-                )
-            })?;
-        }
-        if final_metadata.exists() {
-            std::fs::remove_file(&final_metadata).map_err(|error| {
-                UnitStoreError::with_source(
-                    "remove partial metadata",
-                    UnitMissReason::MissingPair,
-                    error,
-                )
-            })?;
-        }
-        let mut code_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
-            UnitStoreError::with_source("create code temporary", UnitMissReason::MissingPair, error)
-        })?;
-        code_temp.write_all(&pending_code).map_err(|error| {
-            UnitStoreError::with_source("write code temporary", UnitMissReason::MissingPair, error)
-        })?;
-        code_temp.flush().map_err(|error| {
-            UnitStoreError::with_source("flush code temporary", UnitMissReason::MissingPair, error)
-        })?;
-        code_temp.as_file().sync_all().map_err(|error| {
-            UnitStoreError::with_source("sync code temporary", UnitMissReason::MissingPair, error)
-        })?;
-        let mut metadata_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
-            UnitStoreError::with_source(
-                "create metadata temporary",
-                UnitMissReason::MissingPair,
-                error,
-            )
-        })?;
-        metadata_temp.write_all(&metadata_bytes).map_err(|error| {
-            UnitStoreError::with_source(
-                "write metadata temporary",
-                UnitMissReason::MissingPair,
-                error,
-            )
-        })?;
-        metadata_temp.flush().map_err(|error| {
-            UnitStoreError::with_source(
-                "flush metadata temporary",
-                UnitMissReason::MissingPair,
-                error,
-            )
-        })?;
-        metadata_temp.as_file().sync_all().map_err(|error| {
-            UnitStoreError::with_source(
-                "sync metadata temporary",
-                UnitMissReason::MissingPair,
-                error,
-            )
-        })?;
-        // Preflight the unit through the READER before it is published, so a
-        // producer/reader disagreement fails here instead of silently yielding
-        // a store that never loads.
-        let temporary_name = metadata_temp
-            .path()
-            .file_name()
-            .ok_or_else(|| {
-                UnitStoreError::new("derive metadata temporary name", UnitMissReason::Schema)
-            })?
-            .as_bytes();
-        let temporary_name = CString::new(temporary_name).map_err(|error| {
-            UnitStoreError::with_source(
-                "encode metadata temporary name",
-                UnitMissReason::Schema,
-                error,
-            )
-        })?;
-        let _validated =
-            read_and_validate_metadata(&self.directory, &temporary_name, &pending.key)?;
-
-        std::fs::rename(code_temp.path(), &final_code).map_err(|error| {
-            UnitStoreError::with_source("publish code", UnitMissReason::MissingPair, error)
-        })?;
-        std::fs::rename(metadata_temp.path(), &final_metadata).map_err(|error| {
-            UnitStoreError::with_source("publish metadata", UnitMissReason::MissingPair, error)
-        })?;
-        Ok(PublishOutcome::Winner)
     }
 
-    /// Elect the ONE process that records portable templates for this unit.
-    ///
-    /// The first process to miss claims immediately: with a persistent store
-    /// the publication amortizes across every future exec and run, so the
-    /// retired `.seen` deferral ("prove the unit recurs first") only delayed
-    /// the unit past the second exec's exit — too late for a parallel
-    /// build's serial exec trains. A live claim (its `.builder` pid alive
-    /// and the file younger than `BUILDER_CLAIM_TTL`) blocks rivals, so
-    /// concurrent processes translate privately WITHOUT recording or
-    /// publishing; a dead or aged claim is taken over. Never blocks: a busy
-    /// unit lock means another process is deciding right now, and "do not
-    /// record" is always a correct answer.
-    pub fn claim_recording(&self, key: &TranslationUnitKey) -> Result<bool, UnitStoreError> {
+    #[allow(dead_code)]
+    /// Elect one recorder without waiting. Existing units remain claimable:
+    /// a process may augment a sparse bundle after an attached-unit gap.
+    pub fn claim_recording(
+        &self,
+        key: &TranslationUnitKey,
+        owner: &RecordingOwner,
+    ) -> Result<ClaimOutcome, UnitStoreFailure> {
         let stem = key.file_stem().map_err(|error| {
-            UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
+            let _ = error;
+            UnitStoreFailure {
+                class: UnitStoreFailureClass::Validation,
+                reason: UnitMissReason::Schema,
+            }
         })?;
-        let Some(_lock) = self.try_lock_unit(&stem)? else {
-            return Ok(false);
+        let Some(_lock) = self
+            .try_lock_unit(&stem)
+            .map_err(|error| UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: error.reason(),
+            })?
+        else {
+            return Ok(ClaimOutcome::Yielded);
         };
-        let (code, metadata) = self.final_paths(&stem);
-        if code.is_file() && metadata.is_file() {
-            return Ok(false);
+        let now = unix_now_ns()?;
+        let state = self.read_builder(&stem)?;
+        let stale_takeover = !matches!(state, BuilderState::Absent);
+        if let BuilderState::Valid(record) = &state {
+            let age = now.checked_sub(record.created_unix_ns);
+            let ttl = i64::try_from(BUILDER_CLAIM_TTL.as_nanos()).unwrap_or(i64::MAX);
+            if age.is_some_and(|age| age >= 0 && age < ttl) && owner_pid_is_live(record.owner.pid) {
+                return Ok(ClaimOutcome::LiveOwner);
+            }
         }
-        let builder = self.path.join(format!("{stem}.builder"));
-        let claim_is_live = std::fs::metadata(&builder).is_ok_and(|identity| {
-            let fresh = identity
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age < BUILDER_CLAIM_TTL);
-            // A pid recycled across runs can stay "alive" forever against a
-            // persistent store; age above is the final arbiter.
-            fresh
-                && std::fs::read_to_string(&builder)
-                    .ok()
-                    .and_then(|owner| owner.trim().parse::<i32>().ok())
-                    .is_some_and(|owner| {
-                        let rc = unsafe { libc::kill(owner, 0) };
-                        rc == 0
-                            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-                    })
-        });
-        if claim_is_live {
-            return Ok(false);
+        let record = BuilderRecord {
+            owner: *owner,
+            created_unix_ns: now,
+            stem: stem.clone(),
+        };
+        self.write_builder(&record)?;
+        Ok(ClaimOutcome::Won(RecordingClaim {
+            owner: *owner,
+            stale_takeover,
+        }))
+    }
+
+    /// Reload the newest pathname under the unit lock, union canonical
+    /// artifacts, and publish one fully preflighted inode by atomic rename.
+    pub fn merge(
+        &self,
+        pending: &PendingTranslationUnit,
+        claim: &RecordingClaim,
+    ) -> Result<MergeOutcome, UnitStoreFailure> {
+        let stem = pending.key.file_stem().map_err(|_| UnitStoreFailure {
+            class: UnitStoreFailureClass::Validation,
+            reason: UnitMissReason::Schema,
+        })?;
+        let _release = BuilderReleaseGuard {
+            authority: self,
+            stem: stem.clone(),
+            owner: claim.owner,
+        };
+        if pending.blocks.is_empty() {
+            return Ok(MergeOutcome {
+                kind: MergeKind::Unchanged,
+                blocks_added: 0,
+                duplicates: 0,
+                post_rename_sync_failed: false,
+            });
         }
-        let mut builder_file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(builder)
-            .map_err(|error| {
-                UnitStoreError::with_source(
-                    "claim unit recording",
-                    UnitMissReason::MissingPair,
-                    error,
-                )
+        let Some(_lock) = self
+            .try_lock_unit(&stem)
+            .map_err(|error| UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: error.reason(),
+            })?
+        else {
+            return Ok(MergeOutcome {
+                kind: MergeKind::Yielded,
+                blocks_added: 0,
+                duplicates: 0,
+                post_rename_sync_failed: false,
+            });
+        };
+
+        let name =
+            CString::new(format!("{stem}{UNIT_V1_SUFFIX}")).map_err(|_| UnitStoreFailure {
+                class: UnitStoreFailureClass::Validation,
+                reason: UnitMissReason::Schema,
             })?;
-        write!(builder_file, "{}", unsafe { libc::getpid() }).map_err(|error| {
-            UnitStoreError::with_source(
-                "write unit recording owner",
-                UnitMissReason::MissingPair,
-                error,
-            )
+        let current = match read_and_validate_bundle(&self.directory, &name, &pending.key) {
+            Ok((_lease, decoded, _evidence)) => match decoded.validate_deep() {
+                Ok(()) => Some(decoded.artifacts().map_err(|reason| UnitStoreFailure {
+                    class: UnitStoreFailureClass::Validation,
+                    reason,
+                })?),
+                Err(_) => None,
+            },
+            Err(error) if error.reason() == UnitMissReason::MissingPair => Some(Vec::new()),
+            Err(error) if error.class == UnitStoreFailureClass::Validation => None,
+            Err(error) => return Err(error.failure()),
+        };
+        let repairing = current.is_none();
+        let existing = current.unwrap_or_default();
+        let union = match merge_normalized_artifacts(&existing, &pending.blocks) {
+            Ok(union) => union,
+            Err(refusal) => {
+                return Ok(MergeOutcome {
+                    kind: MergeKind::Refused(refusal),
+                    blocks_added: 0,
+                    duplicates: 0,
+                    post_rename_sync_failed: false,
+                });
+            }
+        };
+        if !repairing && !existing.is_empty() && union.blocks_added == 0 {
+            return Ok(MergeOutcome {
+                kind: MergeKind::Unchanged,
+                blocks_added: 0,
+                duplicates: union.duplicates,
+                post_rename_sync_failed: false,
+            });
+        }
+        let bundle = match encode_unit_bundle_v1(&pending.key, &union.blocks) {
+            Ok(bundle) => bundle,
+            Err(_) => {
+                return Ok(MergeOutcome {
+                    kind: MergeKind::Refused(MergeRefusal::Preflight(
+                        UnitMissReason::ManifestRange,
+                    )),
+                    blocks_added: 0,
+                    duplicates: union.duplicates,
+                    post_rename_sync_failed: false,
+                });
+            }
+        };
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(&self.path).map_err(|_| UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: UnitMissReason::MissingPair,
+            })?;
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: UnitMissReason::MissingPair,
+            })?;
+        temporary.write_all(&bundle).map_err(|_| UnitStoreFailure {
+            class: UnitStoreFailureClass::Io,
+            reason: UnitMissReason::MissingPair,
         })?;
-        builder_file.flush().map_err(|error| {
-            UnitStoreError::with_source(
-                "flush unit recording owner",
-                UnitMissReason::MissingPair,
-                error,
-            )
+        temporary.flush().map_err(|_| UnitStoreFailure {
+            class: UnitStoreFailureClass::Io,
+            reason: UnitMissReason::MissingPair,
         })?;
-        Ok(true)
+        #[cfg(test)]
+        if take_publication_fault(PublicationFault::BeforeTempSync) {
+            return Err(UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: UnitMissReason::MissingPair,
+            });
+        }
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|_| UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: UnitMissReason::MissingPair,
+            })?;
+        let temporary_name = temporary
+            .path()
+            .file_name()
+            .and_then(|name| CString::new(name.as_bytes()).ok())
+            .ok_or(UnitStoreFailure {
+                class: UnitStoreFailureClass::Validation,
+                reason: UnitMissReason::Schema,
+            })?;
+        #[cfg(test)]
+        if take_publication_fault(PublicationFault::BeforePreflight) {
+            return Ok(MergeOutcome {
+                kind: MergeKind::Refused(MergeRefusal::Preflight(UnitMissReason::Schema)),
+                blocks_added: 0,
+                duplicates: union.duplicates,
+                post_rename_sync_failed: false,
+            });
+        }
+        let (_lease, decoded, _evidence) =
+            match read_and_validate_bundle(&self.directory, &temporary_name, &pending.key) {
+                Ok(decoded) => decoded,
+                Err(error) if error.class == UnitStoreFailureClass::Validation => {
+                    return Ok(MergeOutcome {
+                        kind: MergeKind::Refused(MergeRefusal::Preflight(error.reason())),
+                        blocks_added: 0,
+                        duplicates: union.duplicates,
+                        post_rename_sync_failed: false,
+                    });
+                }
+                Err(error) => return Err(error.failure()),
+            };
+        if let Err(reason) = decoded.validate_deep() {
+            return Ok(MergeOutcome {
+                kind: MergeKind::Refused(MergeRefusal::Preflight(reason)),
+                blocks_added: 0,
+                duplicates: union.duplicates,
+                post_rename_sync_failed: false,
+            });
+        }
+        #[cfg(test)]
+        if take_publication_fault(PublicationFault::BeforeRename) {
+            return Err(UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: UnitMissReason::MissingPair,
+            });
+        }
+        std::fs::rename(temporary.path(), self.final_path(&stem)).map_err(|_| {
+            UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: UnitMissReason::MissingPair,
+            }
+        })?;
+        #[cfg(test)]
+        let injected_directory_sync = take_publication_fault(PublicationFault::DirectorySync);
+        #[cfg(not(test))]
+        let injected_directory_sync = false;
+        let post_rename_sync_failed = injected_directory_sync || self.directory.sync_all().is_err();
+        let kind = if repairing {
+            MergeKind::Repaired
+        } else if existing.is_empty() {
+            MergeKind::Created
+        } else {
+            MergeKind::Merged
+        };
+        Ok(MergeOutcome {
+            kind,
+            blocks_added: union.blocks_added,
+            duplicates: union.duplicates,
+            post_rename_sync_failed,
+        })
     }
 
     pub fn load_unit(
@@ -1086,18 +1152,6 @@ impl ContainerCacheAuthority {
         let stem = expected_key.file_stem().map_err(|error| {
             UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
         })?;
-        let (code_path, metadata_path) = self.final_paths(&stem);
-        if !code_path.is_file() || !metadata_path.is_file() {
-            return Err(UnitStoreError::new(
-                "locate translation unit",
-                UnitMissReason::MissingPair,
-            ));
-        }
-        let metadata_name = CString::new(format!("{stem}.metadata-v5")).map_err(|error| {
-            UnitStoreError::with_source("encode unit metadata name", UnitMissReason::Schema, error)
-        })?;
-        let (manifest, load_evidence) =
-            read_and_validate_metadata(&self.directory, &metadata_name, expected_key)?;
         if !shared_source_fingerprint_reuse_enabled()
             && expected_key.source_fingerprint() != SourceFingerprint::from_words(source_words)
         {
@@ -1106,63 +1160,29 @@ impl ContainerCacheAuthority {
                 UnitMissReason::SourceFingerprint,
             ));
         }
-        let code_len = usize::try_from(manifest.code_len).map_err(|_| {
-            UnitStoreError::new(
-                "validate translation code length",
-                UnitMissReason::ManifestRange,
-            )
+        let name = CString::new(format!("{stem}{UNIT_V1_SUFFIX}")).map_err(|error| {
+            UnitStoreError::with_source("encode unit bundle name", UnitMissReason::Schema, error)
         })?;
-        let code_name = CString::new(format!("{stem}.code")).map_err(|error| {
-            UnitStoreError::with_source("encode code name", UnitMissReason::Schema, error)
+        let (lease, decoded, load_evidence) =
+            read_and_validate_bundle(&self.directory, &name, expected_key)?;
+        let source = lease
+            .as_ref()
+            .as_ref()
+            .as_ptr()
+            .wrapping_add(decoded.code_offset());
+        let source_base = std::ptr::NonNull::new(source.cast_mut()).ok_or_else(|| {
+            UnitStoreError::new("map unit bundle code", UnitMissReason::CodeMapping)
         })?;
-        let (code_file, code_file_len) = open_unit_regular_file_at(&self.directory, &code_name)?;
-        // The file must be EXACTLY the declared code extent: publication
-        // writes nothing else into it, so any difference means it is not the
-        // file this metadata describes.
-        if code_file_len != code_len || code_len == 0 || code_len > MAX_TRANSLATION_UNIT_CODE_BYTES
-        {
-            return Err(UnitStoreError::new(
-                "validate translation code extent",
-                UnitMissReason::ManifestRange,
-            ));
-        }
-        // SAFETY: `map_copy_read_only` requests `MAP_PRIVATE|PROT_READ`. The
-        // private cache authority never writes a published inode in place
-        // (publication and repair replace pathnames by whole-file rename),
-        // the mmap length is the exact bounded extent accepted by the fstat
-        // in `open_unit_regular_file_at`, and `_file` pins the inode for the
-        // mapping's lifetime.
-        let mapping = unsafe {
-            memmap2::MmapOptions::new()
-                .len(code_len)
-                .map_copy_read_only(&code_file)
-        }
-        .map_err(|error| {
-            UnitStoreError::with_source("map translation code", UnitMissReason::CodeMapping, error)
-        })?;
-        // The digest binds this code file to this metadata: a mismatch means
-        // a stale orphan or torn repair race, and running such bytes under
-        // this metadata's pc-maps would be memory-unsafe.
-        let digest: [u8; 32] = Sha256::digest(&mapping[..]).into();
-        if digest != manifest.code_sha256 {
-            return Err(UnitStoreError::new(
-                "verify translation code digest",
-                UnitMissReason::CodeDigest,
-            ));
-        }
-        // Refresh the pair's modification time so the pruner's LRU order
-        // reflects USE, not publication age. Timestamps only: the mapped
-        // content bytes are still never written in place. Best-effort — a
-        // failed touch costs eviction order, never correctness.
-        let _ = unsafe { libc::futimens(code_file.as_raw_fd(), std::ptr::null()) };
-        let source_base = std::ptr::NonNull::new(mapping.as_ptr().cast_mut()).ok_or_else(|| {
-            UnitStoreError::new("map translation code", UnitMissReason::CodeMapping)
-        })?;
+        let manifest = Arc::new(
+            decoded
+                .translation_manifest()
+                .map_err(|reason| UnitStoreError::new("build unit replay view", reason))?,
+        );
+        // Refresh only inode timestamps for LRU accounting. Bundle content is
+        // immutable and old mappings remain pinned across replacement.
+        let _ = unsafe { libc::futimens(lease._file.as_raw_fd(), std::ptr::null()) };
         Ok(LoadedTranslationUnit {
-            lease: Arc::new(CodeSourceLease {
-                _mapping: mapping,
-                _file: code_file,
-            }),
+            lease,
             manifest,
             source_base,
             load_evidence,
@@ -1182,14 +1202,14 @@ impl ContainerCacheAuthority {
             .mode(0o600)
             .open(self.path.join(format!("{stem}.lock")))
             .map_err(|error| {
-                UnitStoreError::with_source("open unit lock", UnitMissReason::MissingPair, error)
+                UnitStoreError::io_with_source("open unit lock", UnitMissReason::MissingPair, error)
             })?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
                 return Ok(None);
             }
-            return Err(UnitStoreError::with_source(
+            return Err(UnitStoreError::io_with_source(
                 "lock unit",
                 UnitMissReason::MissingPair,
                 error,
@@ -1198,11 +1218,100 @@ impl ContainerCacheAuthority {
         Ok(Some(UnitFileLock(lock)))
     }
 
-    fn final_paths(&self, stem: &str) -> (PathBuf, PathBuf) {
-        (
-            self.path.join(format!("{stem}.code")),
-            self.path.join(format!("{stem}.metadata-v5")),
+    fn read_builder(&self, stem: &str) -> Result<BuilderState, UnitStoreFailure> {
+        let name = CString::new(format!("{stem}.builder")).map_err(|_| UnitStoreFailure {
+            class: UnitStoreFailureClass::Validation,
+            reason: UnitMissReason::Schema,
+        })?;
+        let fd = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(BuilderState::Absent),
+                Some(libc::ELOOP) => Ok(BuilderState::Malformed),
+                _ => Err(UnitStoreFailure {
+                    class: UnitStoreFailureClass::Io,
+                    reason: UnitMissReason::MissingPair,
+                }),
+            };
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let identity = file.metadata().map_err(|_| UnitStoreFailure {
+            class: UnitStoreFailureClass::Io,
+            reason: UnitMissReason::MissingPair,
+        })?;
+        if !identity.file_type().is_file() || identity.mode() & 0o777 != 0o600 {
+            return Ok(BuilderState::Malformed);
+        }
+        let mut bytes = Vec::new();
+        file.take((BUILDER_RECORD_BYTES_V1 + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: UnitMissReason::MissingPair,
+            })?;
+        Ok(match decode_builder_record(&bytes, stem) {
+            Some(record) => BuilderState::Valid(record),
+            None => BuilderState::Malformed,
+        })
+    }
+
+    fn write_builder(&self, record: &BuilderRecord) -> Result<(), UnitStoreFailure> {
+        let bytes = encode_builder_record(record).map_err(|()| UnitStoreFailure {
+            class: UnitStoreFailureClass::Validation,
+            reason: UnitMissReason::Schema,
+        })?;
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(&self.path).map_err(|_| UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: UnitMissReason::MissingPair,
+            })?;
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: UnitMissReason::MissingPair,
+            })?;
+        temporary.write_all(&bytes).map_err(|_| UnitStoreFailure {
+            class: UnitStoreFailureClass::Io,
+            reason: UnitMissReason::MissingPair,
+        })?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|_| UnitStoreFailure {
+                class: UnitStoreFailureClass::Io,
+                reason: UnitMissReason::MissingPair,
+            })?;
+        std::fs::rename(
+            temporary.path(),
+            self.path.join(format!("{}.builder", record.stem)),
         )
+        .map_err(|_| UnitStoreFailure {
+            class: UnitStoreFailureClass::Io,
+            reason: UnitMissReason::MissingPair,
+        })
+    }
+
+    fn release_builder(&self, stem: &str, owner: RecordingOwner) {
+        let Ok(Some(_lock)) = self.try_lock_unit(stem) else {
+            return;
+        };
+        let Ok(BuilderState::Valid(record)) = self.read_builder(stem) else {
+            return;
+        };
+        if record.owner == owner {
+            let _ = std::fs::remove_file(self.path.join(format!("{stem}.builder")));
+        }
+    }
+
+    fn final_path(&self, stem: &str) -> PathBuf {
+        self.path.join(format!("{stem}{UNIT_V1_SUFFIX}"))
     }
 
     #[cfg(test)]
@@ -1354,15 +1463,21 @@ impl carrick_dsr_aarch64::shared_cache::TranslationUnitStore for ActiveContainer
     }
 
     fn claim_recording(&self, key: &TranslationUnitKey) -> bool {
+        let owner = RecordingOwner {
+            pid: unsafe { libc::getpid() },
+            // Transitional trait adapter until Task 4 passes the process
+            // incarnation owned by `PendingAugmentation`.
+            incarnation: [0x4c; 16],
+        };
         CONTAINER_CACHE
             .lock()
             .ok()
             .and_then(|active| {
                 active
                     .as_ref()
-                    .and_then(|authority| authority.claim_recording(key).ok())
+                    .and_then(|authority| authority.claim_recording(key, &owner).ok())
             })
-            .unwrap_or(false)
+            .is_some_and(|outcome| matches!(outcome, ClaimOutcome::Won(_)))
     }
 }
 
@@ -1390,7 +1505,8 @@ mod tests {
     use carrick_dsr_aarch64::emit::PcMapEntry;
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
-        NativePageProfileIdentity, PortableBlockCandidate, SourceFingerprint,
+        MAX_TRANSLATION_UNIT_CODE_BYTES, NativePageProfileIdentity, PortableBlockCandidate,
+        SourceFingerprint,
     };
     use carrick_dsr_aarch64::types::{CacheOffset, CodeGeneration};
     use carrick_guest_mem::GuestVa;
@@ -1439,9 +1555,9 @@ mod tests {
         let key = TranslationUnitKey::for_segment(
             ExecutableIdentity::Digest([0x11; 32]),
             ImageFileOffset::new(0),
-            ImageFileLen::new(8).expect("nonzero file length"),
+            ImageFileLen::new(0x1000).expect("nonzero file length"),
             GuestVa(0x400000),
-            GuestCodeLen::new(8).expect("nonzero guest length"),
+            GuestCodeLen::new(0x1000).expect("nonzero guest length"),
             SourceFingerprint::from_words(&source_words),
             NativePageProfileIdentity::Native16k,
             AddressModeIdentity::biased(
@@ -1463,6 +1579,36 @@ mod tests {
 
     fn fixture_source_words() -> [u32; 1] {
         [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))]
+    }
+
+    fn fixture_pending_at(guest_start: u64, first_word: u32) -> PendingTranslationUnit {
+        let mut pending = fixture_pending();
+        let block = &mut pending.blocks[0];
+        block.guest_start = GuestVa(guest_start);
+        block.source_end = GuestVa(guest_start + 8);
+        block.code[..4].copy_from_slice(&first_word.to_le_bytes());
+        pending
+    }
+
+    fn fixture_owner(seed: u8) -> carrick_dsr_aarch64::pending_augmentation::RecordingOwner {
+        carrick_dsr_aarch64::pending_augmentation::RecordingOwner {
+            pid: unsafe { libc::getpid() },
+            incarnation: [seed; 16],
+        }
+    }
+
+    fn claim_fixture(
+        authority: &ContainerCacheAuthority,
+        pending: &PendingTranslationUnit,
+        seed: u8,
+    ) -> RecordingClaim {
+        match authority
+            .claim_recording(&pending.key, &fixture_owner(seed))
+            .expect("claim recording")
+        {
+            ClaimOutcome::Won(claim) => claim,
+            outcome => panic!("expected won claim, got {outcome:?}"),
+        }
     }
 
     fn current_region_extended_info(address: usize) -> mach2::vm_region::vm_region_extended_info {
@@ -1498,9 +1644,9 @@ mod tests {
             let _ = unsafe { mach_port_deallocate(task, object_name) };
         }
         assert_eq!(result, KERN_SUCCESS, "query mapped metadata VM region");
-        assert_eq!(
-            observed, requested,
-            "metadata address must begin its region"
+        assert!(
+            observed <= requested && requested < observed.saturating_add(size),
+            "requested address must lie inside its VM region"
         );
         assert_ne!(size, 0, "metadata VM region must be nonempty");
         info
@@ -1716,7 +1862,7 @@ mod tests {
         assert_eq!(result, -1);
     }
 
-    /// With a persistent store, publish-once amortizes across every future
+    /// With a persistent store, the accumulated unit amortizes across every future
     /// run and exec, so the first process to MISS a unit must claim its
     /// recording. The retired `.seen` deferral ("prove the unit recurs in
     /// this container first") pushed publication past the SECOND exec's exit
@@ -1726,17 +1872,22 @@ mod tests {
     fn first_file_miss_claims_recording_immediately() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
+        let owner = fixture_owner(0x51);
         assert!(
-            authority
-                .claim_recording(&pending.key)
-                .expect("first claim"),
+            matches!(
+                authority
+                    .claim_recording(&pending.key, &owner)
+                    .expect("first claim"),
+                ClaimOutcome::Won(_)
+            ),
             "the first process to miss must claim recording"
         );
         // The claim is sticky: the same (still live) claimant blocks rivals.
-        assert!(
-            !authority
-                .claim_recording(&pending.key)
+        assert_eq!(
+            authority
+                .claim_recording(&pending.key, &owner)
                 .expect("second claim"),
+            ClaimOutcome::LiveOwner,
             "a live claim must not be handed out twice"
         );
     }
@@ -1756,9 +1907,15 @@ mod tests {
         set_file_age(&builder, std::time::Duration::from_secs(60 * 60));
 
         assert!(
-            authority
-                .claim_recording(&pending.key)
-                .expect("claim over stale builder"),
+            matches!(
+                authority
+                    .claim_recording(&pending.key, &fixture_owner(0x52))
+                    .expect("claim over stale builder"),
+                ClaimOutcome::Won(RecordingClaim {
+                    stale_takeover: true,
+                    ..
+                })
+            ),
             "an hour-old claim is stale regardless of pid liveness"
         );
     }
@@ -1783,12 +1940,12 @@ mod tests {
             .load_unit(&pending.key, &fixture_source_words())
             .expect("load unit published by the previous authority");
         assert_eq!(loaded.manifest.key, pending.key);
-        assert!(
-            !second
-                .claim_recording(&pending.key)
+        assert!(matches!(
+            second
+                .claim_recording(&pending.key, &fixture_owner(0x53))
                 .expect("claim against a published unit"),
-            "a published unit needs no recorder"
-        );
+            ClaimOutcome::Won(_)
+        ));
         assert_eq!(
             second.publish_unit(&pending).expect("republish unit"),
             PublishOutcome::Existing
@@ -1807,11 +1964,10 @@ mod tests {
         assert_eq!(second.authority_nonce, first_nonce);
     }
 
-    /// A truncated metadata half — a torn copy, a bad disk — must fail
-    /// closed to a load miss reason, never a panic, and the pair must
-    /// remain repairable by a later publish.
+    /// A truncated atomic bundle must fail closed and remain repairable by a
+    /// later merge from valid pending data.
     #[test]
-    fn corrupt_metadata_fails_closed_and_republish_repairs() {
+    fn truncated_bundle_fails_closed_and_republish_repairs() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         assert_eq!(
@@ -1819,32 +1975,29 @@ mod tests {
             PublishOutcome::Winner
         );
         let stem = pending.key.file_stem().expect("unit stem");
-        let metadata_path = authority.path().join(format!("{stem}.metadata-v5"));
-        let intact = std::fs::read(&metadata_path).expect("read metadata");
-        std::fs::write(&metadata_path, &intact[..intact.len() / 2]).expect("truncate metadata");
+        let unit_path = authority.final_path(&stem);
+        let intact = std::fs::read(&unit_path).expect("read bundle");
+        std::fs::write(&unit_path, &intact[..intact.len() / 2]).expect("truncate bundle");
 
         let error = authority
             .load_unit(&pending.key, &fixture_source_words())
-            .expect_err("truncated metadata must not load");
+            .expect_err("truncated bundle must not load");
         assert_ne!(error.reason(), UnitMissReason::MissingPair);
 
-        // The pair exists (corrupt), so publish takes the repair path:
-        // remove-and-replace under the unit lock.
-        std::fs::remove_file(authority.path().join(format!("{stem}.code")))
-            .expect("break the pair so publish repairs it");
+        let claim = claim_fixture(&authority, &pending, 0x56);
         assert_eq!(
-            authority.publish_unit(&pending).expect("republish"),
-            PublishOutcome::Winner
+            authority.merge(&pending, &claim).expect("repair").kind,
+            MergeKind::Repaired
         );
         authority
             .load_unit(&pending.key, &fixture_source_words())
             .expect("repaired unit loads");
     }
 
-    /// The size cap evicts oldest-used pairs first and leaves the store
+    /// The size cap evicts oldest-used unit inodes first and leaves the store
     /// under the cap; the authority marker survives pruning.
     #[test]
-    fn prune_evicts_oldest_pairs_down_to_the_cap() {
+    fn prune_evicts_oldest_units_down_to_the_cap() {
         let (store, authority) = persistent_fixture_authority();
         let old = fixture_pending();
         let mut new = fixture_pending();
@@ -1872,36 +2025,26 @@ mod tests {
         );
         let old_stem = old.key.file_stem().expect("old stem");
         let new_stem = new.key.file_stem().expect("new stem");
-        for suffix in [".code", ".metadata-v5"] {
-            set_file_age(
-                &store.path().join(format!("{old_stem}{suffix}")),
-                std::time::Duration::from_secs(3 * 60 * 60),
-            );
-        }
+        set_file_age(
+            &authority.final_path(&old_stem),
+            std::time::Duration::from_secs(3 * 60 * 60),
+        );
 
         // A cap of one byte forces eviction of everything not in use; the
-        // oldest pair goes first and eviction stops at the cap — here after
-        // both, so assert the ORDER by capping between the two pair sizes.
-        let pair_bytes = |stem: &str| -> u64 {
-            [".code", ".metadata-v5"]
-                .iter()
-                .map(|suffix| {
-                    std::fs::metadata(store.path().join(format!("{stem}{suffix}")))
-                        .expect("pair half")
-                        .len()
-                })
-                .sum()
-        };
-        let keep_bytes = pair_bytes(&new_stem);
+        // oldest unit goes first and eviction stops at the cap — here after
+        // both, so assert the ORDER by capping between the two unit sizes.
+        let keep_bytes = std::fs::metadata(authority.final_path(&new_stem))
+            .expect("new unit")
+            .len();
         prune_store(authority.directory(), store.path(), keep_bytes);
 
         assert!(
-            !store.path().join(format!("{old_stem}.code")).exists(),
-            "the oldest pair must be evicted"
+            !authority.final_path(&old_stem).exists(),
+            "the oldest unit must be evicted"
         );
         assert!(
-            store.path().join(format!("{new_stem}.code")).is_file(),
-            "the newest pair must survive"
+            authority.final_path(&new_stem).is_file(),
+            "the newest unit must survive"
         );
         assert!(store.path().join(AUTHORITY_MARKER).is_file());
         authority
@@ -1909,8 +2052,8 @@ mod tests {
             .expect("survivor still loads");
     }
 
-    /// Legacy `.seen` markers (the retired recurrence deferral) and aged
-    /// publication temporaries are crash leftovers the pruner removes.
+    /// Aged publication temporaries are crash leftovers; retired suffixes
+    /// remain outside current-ABI accounting.
     #[test]
     fn prune_removes_retired_and_aged_auxiliary_files() {
         let (store, authority) = persistent_fixture_authority();
@@ -1927,7 +2070,10 @@ mod tests {
 
         prune_store(authority.directory(), store.path(), STORE_SIZE_CAP_BYTES);
 
-        assert!(!seen.exists(), "legacy .seen markers are always removed");
+        assert!(
+            seen.exists(),
+            "retired suffixes are ignored by ABI-9 pruning"
+        );
         assert!(
             fresh_temp.exists(),
             "a young temporary may be a publication in flight"
@@ -1962,7 +2108,7 @@ mod tests {
             PublishOutcome::Existing | PublishOutcome::Yielded => 1,
         });
         assert_eq!(outcomes[0], PublishOutcome::Winner);
-        // The loser either saw the winner's finished pair (Existing) or its
+        // The loser either saw the winner's finished unit (Existing) or its
         // held lock (Yielded) — both are non-blocking single-publisher
         // outcomes.
         assert!(
@@ -1980,19 +2126,14 @@ mod tests {
             .expect("load published unit");
         assert_eq!(loaded.manifest.key, pending.key);
         let stem = pending.key.file_stem().expect("unit stem");
-        assert!(
-            authority
-                .path()
-                .join(format!("{stem}.metadata-v5"))
-                .is_file()
-        );
+        assert!(authority.final_path(&stem).is_file());
         // The copy transport hands out READABLE source bytes; nothing at
         // this address is executable. The translator copies them into its
         // own MAP_JIT cache.
-        let (pending_code, _) = pending.pack_legacy_pair().expect("pack fixture code");
-        let source =
-            unsafe { std::slice::from_raw_parts(loaded.source_base.as_ptr(), pending_code.len()) };
-        assert_eq!(source, pending_code.as_slice());
+        let source = unsafe {
+            std::slice::from_raw_parts(loaded.source_base.as_ptr(), pending.blocks[0].code.len())
+        };
+        assert_eq!(source, pending.blocks[0].code.as_ref());
         assert!(
             std::fs::read_dir(authority.path())
                 .expect("read cache directory")
@@ -2023,11 +2164,9 @@ mod tests {
         );
     }
 
-    /// The digest in the metadata binds the code file to the metadata that
-    /// describes it: swapping in another unit's (equally valid) code file
-    /// must fail the digest, not run bytes under the wrong pc-maps.
+    /// A complete but foreign unit inode must fail its complete key binding.
     #[test]
-    fn code_digest_rejects_another_units_substituted_code_file() {
+    fn bundle_rejects_another_units_substituted_inode() {
         let (_store, authority) = persistent_fixture_authority();
         let first = fixture_pending();
         let mut second = fixture_pending();
@@ -2049,18 +2188,16 @@ mod tests {
         authority
             .publish_unit(&second)
             .expect("publish second unit");
-        let (first_code, _) =
-            authority.final_paths(&first.key.file_stem().expect("first unit stem"));
-        let (second_code, _) =
-            authority.final_paths(&second.key.file_stem().expect("second unit stem"));
-        std::fs::copy(second_code, first_code).expect("substitute valid code file");
+        let first_path = authority.final_path(&first.key.file_stem().expect("first unit stem"));
+        let second_path = authority.final_path(&second.key.file_stem().expect("second unit stem"));
+        std::fs::copy(second_path, first_path).expect("substitute valid unit inode");
 
         assert_eq!(
             authority
                 .load_unit(&first.key, &fixture_source_words())
-                .expect_err("another unit's code file must not load")
+                .expect_err("another unit's inode must not load")
                 .reason(),
-            UnitMissReason::CodeDigest
+            UnitMissReason::ImageIdentity
         );
     }
 
@@ -2068,40 +2205,47 @@ mod tests {
     /// with a persistent store the FIRST claim wins
     /// (`first_file_miss_claims_recording_immediately`) and this test pins
     /// the remaining property: one live claim excludes the herd, and a
-    /// finished pair needs no recorder at all.
+    /// finished unit needs no recorder at all.
     #[test]
     fn one_live_recorder_excludes_the_herd() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
+        let owner = fixture_owner(0x54);
 
-        assert!(
+        let claim = match authority
+            .claim_recording(&pending.key, &owner)
+            .expect("elect first observer")
+        {
+            ClaimOutcome::Won(claim) => claim,
+            outcome => panic!("unexpected claim outcome: {outcome:?}"),
+        };
+        assert_eq!(claim.owner, owner);
+        assert_eq!(
             authority
-                .claim_recording(&pending.key)
-                .expect("elect first observer"),
-            "the first process to miss owns recording"
-        );
-        assert!(
-            !authority
-                .claim_recording(&pending.key)
+                .claim_recording(&pending.key, &owner)
                 .expect("observe live recorder"),
+            ClaimOutcome::LiveOwner,
             "a live recorder must exclude the thundering herd"
         );
         assert_eq!(
-            authority.publish_unit(&pending).expect("publish unit"),
-            PublishOutcome::Winner
+            authority
+                .merge(&pending, &claim)
+                .expect("publish unit")
+                .kind,
+            MergeKind::Created
         );
-        assert!(
-            !authority
-                .claim_recording(&pending.key)
+        assert!(matches!(
+            authority
+                .claim_recording(&pending.key, &fixture_owner(0x55))
                 .expect("claim against a published unit"),
-            "a published unit needs no recorder"
-        );
+            ClaimOutcome::Won(_)
+        ));
     }
 
-    /// The published pair is raw code beside mapped metadata — no Mach-O, no
-    /// signature, no dylib anywhere in the store.
+    /// Publication is exactly one deterministic bundle inode — no pair,
+    /// Mach-O, signature, or dylib anywhere in the store.
     #[test]
-    fn published_pair_is_raw_code_beside_mapped_metadata() {
+    fn published_unit_is_one_deterministic_bundle() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         assert_eq!(
@@ -2109,20 +2253,34 @@ mod tests {
             PublishOutcome::Winner
         );
         let stem = pending.key.file_stem().expect("unit stem");
-        let (code_path, metadata_path) = authority.final_paths(&stem);
-        let (pending_code, _) = pending.pack_legacy_pair().expect("pack fixture code");
+        let unit_path = authority.final_path(&stem);
+        let expected =
+            encode_unit_bundle_v1(&pending.key, &pending.blocks).expect("encode expected bundle");
         assert_eq!(
-            std::fs::read(&code_path).expect("read published code"),
-            pending_code,
-            "the code half is the raw translated bytes, verbatim"
+            std::fs::read(&unit_path).expect("read published unit"),
+            expected,
+            "published bytes are the deterministic unit-v1 encoding"
         );
-        assert!(metadata_path.is_file());
+        assert_eq!(
+            std::fs::metadata(&unit_path)
+                .expect("stat published unit")
+                .mode()
+                & 0o777,
+            0o600,
+            "the final inode retains the private temporary's mode"
+        );
         assert!(
             std::fs::read_dir(authority.path())
                 .expect("read cache directory")
                 .filter_map(Result::ok)
-                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".dylib")),
-            "the copy transport publishes no dylib"
+                .all(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !name.ends_with(".code")
+                        && !name.ends_with(".metadata-v5")
+                        && !name.ends_with(".dylib")
+                }),
+            "the atomic transport publishes no retired half or dylib"
         );
     }
 
@@ -2132,10 +2290,11 @@ mod tests {
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish unit");
         let stem = pending.key.file_stem().expect("unit stem");
-        let (code_path, _) = authority.final_paths(&stem);
-        let mut bytes = std::fs::read(&code_path).expect("read published code");
-        bytes[0] ^= 0x01;
-        std::fs::write(&code_path, bytes).expect("flip one code byte");
+        let unit_path = authority.final_path(&stem);
+        let mut bytes = std::fs::read(&unit_path).expect("read published unit");
+        let code_offset = u64::from_le_bytes(bytes[48..56].try_into().expect("code offset"));
+        bytes[code_offset as usize] ^= 0x01;
+        std::fs::write(&unit_path, bytes).expect("flip one code byte");
 
         assert_eq!(
             authority
@@ -2147,31 +2306,32 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_a_code_file_with_the_wrong_extent() {
+    fn load_rejects_a_unit_file_with_the_wrong_extent() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish unit");
         let stem = pending.key.file_stem().expect("unit stem");
-        let (code_path, _) = authority.final_paths(&stem);
-        let mut bytes = std::fs::read(&code_path).expect("read published code");
+        let unit_path = authority.final_path(&stem);
+        let mut bytes = std::fs::read(&unit_path).expect("read published unit");
         bytes.extend_from_slice(&[0; 4]);
-        std::fs::write(&code_path, bytes).expect("grow the code file");
+        std::fs::write(&unit_path, bytes).expect("grow the unit file");
 
         assert_eq!(
             authority
                 .load_unit(&pending.key, &fixture_source_words())
-                .expect_err("a grown code file is not the described extent")
+                .expect_err("a grown unit file is not the described extent")
                 .reason(),
-            UnitMissReason::ManifestRange
+            UnitMissReason::Schema
         );
     }
 
     #[test]
-    fn partial_publish_pair_is_never_loadable() {
+    fn abi9_ignores_each_lone_abi8_pair_half() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         let stem = pending.key.file_stem().expect("unit stem");
-        let (code, manifest) = authority.final_paths(&stem);
+        let code = authority.path().join(format!("{stem}.code"));
+        let manifest = authority.path().join(format!("{stem}.metadata-v5"));
         let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
 
         std::fs::write(&manifest, b"{}").expect("write lone manifest");
@@ -2194,7 +2354,7 @@ mod tests {
     }
 
     #[test]
-    fn published_unit_maps_serialized_metadata_with_mapped_evidence() {
+    fn published_unit_maps_whole_bundle_with_mapped_evidence() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
 
@@ -2203,55 +2363,45 @@ mod tests {
             PublishOutcome::Winner
         );
         let stem = pending.key.file_stem().expect("unit stem");
-        let (_, metadata_path) = authority.final_paths(&stem);
-        assert_eq!(
-            metadata_path.extension().and_then(std::ffi::OsStr::to_str),
-            Some("metadata-v5")
-        );
-        assert!(
-            !authority
-                .path()
-                .join(format!("{stem}.metadata-v3"))
-                .exists()
-        );
+        let unit_path = authority.final_path(&stem);
+        assert!(unit_path.is_file());
 
         let loaded = authority
             .load_unit(&pending.key, &fixture_source_words())
             .expect("load unit");
         assert_eq!(loaded.manifest.blocks().len(), 1);
         assert_eq!(loaded.manifest.blocks()[0].guest_start, GuestVa(0x400000));
-        // v5 maps the metadata instead of reading it: untouched cold
-        // blobs are never paged in, and the mapping backs on-demand
-        // per-block decode for the manifest's lifetime.
+        // V6 maps the one bundle instead of reading it: untouched cold blobs
+        // stay lazy and the same mapping backs code plus on-demand metadata.
         assert_eq!(loaded.load_evidence.bytes_read, 0);
         assert_eq!(
             loaded.load_evidence.bytes_mapped,
-            std::fs::metadata(metadata_path)
-                .expect("stat unit metadata")
+            std::fs::metadata(unit_path)
+                .expect("stat unit bundle")
                 .len()
         );
         assert!(loaded.load_evidence.owned_records > 0);
     }
 
     #[test]
-    fn unit_metadata_maps_the_bounded_open_extent() {
+    fn unit_bundle_maps_the_bounded_open_extent() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish unit");
         let stem = pending.key.file_stem().expect("unit stem");
-        let (_, metadata_path) = authority.final_paths(&stem);
-        let bounded_len = std::fs::metadata(&metadata_path)
-            .expect("stat unit metadata before bounded open")
+        let unit_path = authority.final_path(&stem);
+        let bounded_len = std::fs::metadata(&unit_path)
+            .expect("stat unit bundle before bounded open")
             .len();
-        arm_after_bounded_metadata_open_for_test({
-            let metadata_path = metadata_path.clone();
+        arm_after_bounded_unit_open_for_test({
+            let unit_path = unit_path.clone();
             move || {
                 std::fs::OpenOptions::new()
                     .append(true)
-                    .open(metadata_path)
-                    .expect("open unit metadata after bounded open")
+                    .open(unit_path)
+                    .expect("open unit bundle after bounded open")
                     .write_all(&[0xa5; 16])
-                    .expect("grow unit metadata after bounded open");
+                    .expect("grow unit bundle after bounded open");
             }
         });
 
@@ -2263,11 +2413,12 @@ mod tests {
     }
 
     #[test]
-    fn mapped_metadata_and_code_pair_rejects_either_lone_half() {
+    fn abi9_ignores_retired_pair_halves_independently() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         let stem = pending.key.file_stem().expect("unit stem");
-        let (code, metadata) = authority.final_paths(&stem);
+        let code = authority.path().join(format!("{stem}.code"));
+        let metadata = authority.path().join(format!("{stem}.metadata-v5"));
 
         std::fs::write(&metadata, b"metadata only").expect("write lone V3 metadata");
         assert_eq!(
@@ -2289,26 +2440,563 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_v3_metadata_is_typed_before_the_code_half() {
+    fn corrupt_unit_v1_magic_is_typed_before_payload_use() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
-        authority.publish_unit(&pending).expect("publish V3 unit");
+        authority.publish_unit(&pending).expect("publish unit-v1");
         let stem = pending.key.file_stem().expect("unit stem");
-        let (code, metadata) = authority.final_paths(&stem);
+        let unit_path = authority.final_path(&stem);
         std::fs::OpenOptions::new()
             .write(true)
-            .open(&metadata)
-            .expect("open V3 metadata")
+            .open(&unit_path)
+            .expect("open unit-v1")
             .write_all(b"BROKEN!!")
-            .expect("corrupt V3 magic");
-        std::fs::write(code, b"garbage bytes").expect("corrupt code half");
+            .expect("corrupt unit-v1 magic");
 
         assert_eq!(
             authority
                 .load_unit(&pending.key, &fixture_source_words())
-                .expect_err("corrupt V3 metadata must miss before the code half")
+                .expect_err("corrupt unit-v1 must fail before payload use")
                 .reason(),
             UnitMissReason::Schema
         );
+    }
+
+    #[test]
+    fn unit_v1_load_pins_one_read_only_private_inode() {
+        use mach2::vm_prot::VM_PROT_READ;
+
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let claim = claim_fixture(&authority, &pending, 0x11);
+        assert_eq!(
+            authority.merge(&pending, &claim).expect("create unit"),
+            MergeOutcome {
+                kind: MergeKind::Created,
+                blocks_added: 1,
+                duplicates: 0,
+                post_rename_sync_failed: false,
+            }
+        );
+
+        let loaded = authority
+            .load_unit(&pending.key, &fixture_source_words())
+            .expect("load unit-v1");
+        let region = current_region_extended_info(loaded.source_base.as_ptr() as usize);
+        assert_eq!(region.protection, VM_PROT_READ);
+        let source = unsafe {
+            std::slice::from_raw_parts(loaded.source_base.as_ptr(), pending.blocks[0].code.len())
+        };
+        assert_eq!(source, pending.blocks[0].code.as_ref());
+        let stem = pending.key.file_stem().expect("unit stem");
+        assert!(authority.final_path(&stem).is_file());
+        assert_eq!(
+            std::fs::read_dir(authority.path())
+                .expect("read store")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".unit-v1"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unit_v1_load_rejects_symlink_directory_and_nonregular_file() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let stem = pending.key.file_stem().expect("unit stem");
+        let final_path = authority.final_path(&stem);
+        let target = authority.path().join("foreign");
+        std::fs::write(&target, b"foreign").expect("write symlink target");
+        std::os::unix::fs::symlink(&target, &final_path).expect("create unit symlink");
+        assert_eq!(
+            authority
+                .load_unit(&pending.key, &fixture_source_words())
+                .expect_err("symlink must fail closed")
+                .reason(),
+            UnitMissReason::Schema
+        );
+        std::fs::remove_file(&final_path).expect("remove symlink");
+
+        std::fs::create_dir(&final_path).expect("create unit directory");
+        assert_eq!(
+            authority
+                .load_unit(&pending.key, &fixture_source_words())
+                .expect_err("directory must fail closed")
+                .reason(),
+            UnitMissReason::Schema
+        );
+        std::fs::remove_dir(&final_path).expect("remove unit directory");
+
+        let fifo_path = CString::new(final_path.as_os_str().as_bytes()).expect("path without NUL");
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) },
+            0,
+            "create nonregular unit fifo"
+        );
+        assert_eq!(
+            authority
+                .load_unit(&pending.key, &fixture_source_words())
+                .expect_err("nonregular file must fail closed")
+                .reason(),
+            UnitMissReason::Schema
+        );
+        std::fs::remove_file(final_path).expect("remove unit fifo");
+    }
+
+    #[test]
+    fn unit_v1_old_reader_survives_atomic_replacement() {
+        let (_store, authority) = persistent_fixture_authority();
+        let first = fixture_pending();
+        let first_claim = claim_fixture(&authority, &first, 0x21);
+        authority.merge(&first, &first_claim).expect("create unit");
+        let old = authority
+            .load_unit(&first.key, &fixture_source_words())
+            .expect("load old inode");
+        let old_source = old.source_base;
+
+        let second = fixture_pending_at(0x400100, 0x5280_0560);
+        let second_claim = claim_fixture(&authority, &second, 0x22);
+        assert_eq!(
+            authority
+                .merge(&second, &second_claim)
+                .expect("augment unit")
+                .kind,
+            MergeKind::Merged
+        );
+
+        assert_eq!(old.manifest.blocks().len(), 1);
+        let old_bytes =
+            unsafe { std::slice::from_raw_parts(old_source.as_ptr(), first.blocks[0].code.len()) };
+        assert_eq!(old_bytes, first.blocks[0].code.as_ref());
+    }
+
+    #[test]
+    fn unit_v1_new_reader_sees_complete_union_after_replacement() {
+        let (_store, authority) = persistent_fixture_authority();
+        let first = fixture_pending();
+        let first_claim = claim_fixture(&authority, &first, 0x31);
+        authority.merge(&first, &first_claim).expect("create unit");
+        let second = fixture_pending_at(0x400100, 0x5280_0560);
+        let second_claim = claim_fixture(&authority, &second, 0x32);
+        authority
+            .merge(&second, &second_claim)
+            .expect("augment unit");
+
+        let loaded = authority
+            .load_unit(&first.key, &fixture_source_words())
+            .expect("load replacement inode");
+        assert_eq!(
+            loaded
+                .manifest
+                .blocks()
+                .iter()
+                .map(|block| block.guest_start)
+                .collect::<Vec<_>>(),
+            vec![GuestVa(0x400000), GuestVa(0x400100)]
+        );
+    }
+
+    #[test]
+    fn pruner_counts_and_removes_only_unit_v1_files_in_current_abi() {
+        let (store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let claim = claim_fixture(&authority, &pending, 0x41);
+        authority.merge(&pending, &claim).expect("create unit");
+        let stem = pending.key.file_stem().expect("unit stem");
+        let old_code = store.path().join(format!("{stem}.code"));
+        let old_metadata = store.path().join(format!("{stem}.metadata-v5"));
+        let uppercase_unit = store.path().join(format!("{}.unit-v1", "A".repeat(64)));
+        std::fs::write(&old_code, b"retired code").expect("write retired code");
+        std::fs::write(&old_metadata, b"retired metadata").expect("write retired metadata");
+        std::fs::write(&uppercase_unit, b"foreign spelling").expect("write uppercase unit");
+
+        prune_store(authority.directory(), store.path(), 0);
+
+        assert!(!authority.final_path(&stem).exists());
+        assert!(
+            old_code.is_file(),
+            "retired suffix is outside ABI-9 pruning"
+        );
+        assert!(
+            old_metadata.is_file(),
+            "retired suffix is outside ABI-9 pruning"
+        );
+        assert!(
+            uppercase_unit.is_file(),
+            "only the canonical lowercase stem spelling is current-ABI content"
+        );
+    }
+
+    #[test]
+    fn abi9_ignores_abi8_code_and_metadata_v5_pairs() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let stem = pending.key.file_stem().expect("unit stem");
+        std::fs::write(
+            authority.path().join(format!("{stem}.code")),
+            b"retired ABI-8 code",
+        )
+        .expect("write retired code");
+        std::fs::write(
+            authority.path().join(format!("{stem}.metadata-v5")),
+            b"retired ABI-8 metadata",
+        )
+        .expect("write retired metadata");
+
+        assert_eq!(
+            authority
+                .load_unit(&pending.key, &fixture_source_words())
+                .expect_err("ABI-9 must ignore an ABI-8 pair")
+                .reason(),
+            UnitMissReason::MissingPair
+        );
+    }
+
+    #[test]
+    fn live_owner_blocks_claim_without_waiting() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        assert!(matches!(
+            authority
+                .claim_recording(&pending.key, &fixture_owner(0x61))
+                .expect("first claim"),
+            ClaimOutcome::Won(_)
+        ));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            authority
+                .claim_recording(&pending.key, &fixture_owner(0x62))
+                .expect("contending claim"),
+            ClaimOutcome::LiveOwner
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn busy_unit_lock_returns_yielded_without_waiting() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let stem = pending.key.file_stem().expect("unit stem");
+        let _held = authority
+            .try_lock_unit(&stem)
+            .expect("open unit lock")
+            .expect("hold unit lock");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            authority
+                .claim_recording(&pending.key, &fixture_owner(0x63))
+                .expect("busy claim"),
+            ClaimOutcome::Yielded
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn dead_aged_malformed_and_future_builder_records_are_taken_over() {
+        enum StaleFixture {
+            Dead,
+            Aged,
+            Malformed,
+            Future,
+        }
+        for (index, fixture) in [
+            StaleFixture::Dead,
+            StaleFixture::Aged,
+            StaleFixture::Malformed,
+            StaleFixture::Future,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_store, authority) = persistent_fixture_authority();
+            let pending = fixture_pending();
+            let stem = pending.key.file_stem().expect("unit stem");
+            let now = unix_now_ns().expect("current Unix time");
+            match fixture {
+                StaleFixture::Malformed => {
+                    let path = authority.path().join(format!("{stem}.builder"));
+                    std::fs::write(&path, b"malformed").expect("write malformed builder");
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .expect("set builder mode");
+                }
+                StaleFixture::Dead | StaleFixture::Aged | StaleFixture::Future => {
+                    let (pid, created_unix_ns) = match fixture {
+                        StaleFixture::Dead => (i32::MAX, now),
+                        StaleFixture::Aged => (
+                            unsafe { libc::getpid() },
+                            now - i64::try_from(BUILDER_CLAIM_TTL.as_nanos())
+                                .expect("TTL fits i64")
+                                - 1,
+                        ),
+                        StaleFixture::Future => {
+                            (unsafe { libc::getpid() }, now + 60 * 60 * 1_000_000_000)
+                        }
+                        StaleFixture::Malformed => unreachable!(),
+                    };
+                    authority
+                        .write_builder(&BuilderRecord {
+                            owner: RecordingOwner {
+                                pid,
+                                incarnation: [0xa0 + index as u8; 16],
+                            },
+                            created_unix_ns,
+                            stem: stem.clone(),
+                        })
+                        .expect("write stale builder");
+                }
+            }
+            assert!(matches!(
+                authority
+                    .claim_recording(&pending.key, &fixture_owner(0x70 + index as u8))
+                    .expect("take over stale builder"),
+                ClaimOutcome::Won(RecordingClaim {
+                    stale_takeover: true,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn matching_owner_releases_builder_on_every_clean_merge_return() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let stem = pending.key.file_stem().expect("unit stem");
+        let builder = authority.path().join(format!("{stem}.builder"));
+
+        let mut empty = pending.clone();
+        empty.blocks.clear();
+        let claim = claim_fixture(&authority, &empty, 0x81);
+        assert_eq!(
+            authority.merge(&empty, &claim).expect("empty merge").kind,
+            MergeKind::Unchanged
+        );
+        assert!(!builder.exists());
+
+        let claim = claim_fixture(&authority, &pending, 0x82);
+        assert_eq!(
+            authority
+                .merge(&pending, &claim)
+                .expect("create merge")
+                .kind,
+            MergeKind::Created
+        );
+        assert!(!builder.exists());
+
+        let claim = claim_fixture(&authority, &pending, 0x83);
+        assert_eq!(
+            authority
+                .merge(&pending, &claim)
+                .expect("duplicate merge")
+                .kind,
+            MergeKind::Unchanged
+        );
+        assert!(!builder.exists());
+
+        let mut conflict = pending.clone();
+        conflict.blocks[0].code[0] ^= 1;
+        let claim = claim_fixture(&authority, &conflict, 0x84);
+        assert!(matches!(
+            authority
+                .merge(&conflict, &claim)
+                .expect("conflict merge")
+                .kind,
+            MergeKind::Refused(MergeRefusal::Conflict { .. })
+        ));
+        assert!(!builder.exists());
+    }
+
+    #[test]
+    fn stale_owner_cannot_unlink_successor_builder() {
+        let (_store, authority) = persistent_fixture_authority();
+        let mut pending = fixture_pending();
+        let stale_claim = claim_fixture(&authority, &pending, 0x91);
+        let stem = pending.key.file_stem().expect("unit stem");
+        let successor = fixture_owner(0x92);
+        authority
+            .write_builder(&BuilderRecord {
+                owner: successor,
+                created_unix_ns: unix_now_ns().expect("current Unix time"),
+                stem: stem.clone(),
+            })
+            .expect("install successor builder");
+        pending.blocks.clear();
+
+        authority
+            .merge(&pending, &stale_claim)
+            .expect("stale owner clean return");
+
+        match authority
+            .read_builder(&stem)
+            .expect("read successor builder")
+        {
+            BuilderState::Valid(record) => assert_eq!(record.owner, successor),
+            _ => panic!("successor builder was removed"),
+        }
+    }
+
+    #[test]
+    fn existing_unit_does_not_refuse_a_new_recording_claim() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let first = claim_fixture(&authority, &pending, 0xa1);
+        authority.merge(&pending, &first).expect("create unit");
+        assert!(matches!(
+            authority
+                .claim_recording(&pending.key, &fixture_owner(0xa2))
+                .expect("claim existing unit"),
+            ClaimOutcome::Won(_)
+        ));
+    }
+
+    #[test]
+    fn sequential_publishers_reload_and_preserve_both_unions() {
+        let (_store, authority) = persistent_fixture_authority();
+        let first = fixture_pending();
+        let second = fixture_pending_at(0x400100, 0x5280_0560);
+        let first_claim = claim_fixture(&authority, &first, 0xb1);
+        let second_claim = RecordingClaim {
+            owner: fixture_owner(0xb2),
+            stale_takeover: false,
+        };
+        authority.merge(&first, &first_claim).expect("first merge");
+        authority
+            .merge(&second, &second_claim)
+            .expect("second stale-snapshot merge");
+        let loaded = authority
+            .load_unit(&first.key, &fixture_source_words())
+            .expect("load union");
+        assert_eq!(loaded.manifest.blocks().len(), 2);
+    }
+
+    #[test]
+    fn exact_duplicate_merge_is_unchanged_and_counted() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let first = claim_fixture(&authority, &pending, 0xc1);
+        authority.merge(&pending, &first).expect("create unit");
+        let duplicate = claim_fixture(&authority, &pending, 0xc2);
+        assert_eq!(
+            authority
+                .merge(&pending, &duplicate)
+                .expect("duplicate merge"),
+            MergeOutcome {
+                kind: MergeKind::Unchanged,
+                blocks_added: 0,
+                duplicates: 1,
+                post_rename_sync_failed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn corrupt_final_is_replaced_only_by_valid_pending_data() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let first = claim_fixture(&authority, &pending, 0xd1);
+        authority.merge(&pending, &first).expect("create unit");
+        let stem = pending.key.file_stem().expect("unit stem");
+        let path = authority.final_path(&stem);
+        let mut corrupt = std::fs::read(&path).expect("read unit");
+        corrupt[0] ^= 1;
+        std::fs::write(&path, corrupt).expect("corrupt final unit");
+        let repair = claim_fixture(&authority, &pending, 0xd2);
+        assert_eq!(
+            authority
+                .merge(&pending, &repair)
+                .expect("repair unit")
+                .kind,
+            MergeKind::Repaired
+        );
+        authority
+            .load_unit(&pending.key, &fixture_source_words())
+            .expect("load repaired unit");
+    }
+
+    #[test]
+    fn conflict_capacity_and_preflight_preserve_old_valid_bundle() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let first = claim_fixture(&authority, &pending, 0xe1);
+        authority.merge(&pending, &first).expect("create unit");
+        let stem = pending.key.file_stem().expect("unit stem");
+        let path = authority.final_path(&stem);
+        let original = std::fs::read(&path).expect("read original unit");
+
+        let mut conflict = pending.clone();
+        conflict.blocks[0].code[0] ^= 1;
+        let claim = claim_fixture(&authority, &conflict, 0xe2);
+        assert!(matches!(
+            authority.merge(&conflict, &claim).expect("conflict").kind,
+            MergeKind::Refused(MergeRefusal::Conflict { .. })
+        ));
+        assert_eq!(std::fs::read(&path).expect("read after conflict"), original);
+
+        let mut over_cap = fixture_pending_at(0x400100, 0x5280_0560);
+        over_cap.blocks[0].code =
+            vec![0_u8; MAX_TRANSLATION_UNIT_CODE_BYTES + 4].into_boxed_slice();
+        let claim = claim_fixture(&authority, &over_cap, 0xe3);
+        assert_eq!(
+            authority.merge(&over_cap, &claim).expect("capacity").kind,
+            MergeKind::Refused(MergeRefusal::Capacity)
+        );
+        assert_eq!(std::fs::read(&path).expect("read after capacity"), original);
+
+        let addition = fixture_pending_at(0x400100, 0x5280_0560);
+        let claim = claim_fixture(&authority, &addition, 0xe4);
+        arm_publication_fault(PublicationFault::BeforePreflight);
+        assert!(matches!(
+            authority.merge(&addition, &claim).expect("preflight").kind,
+            MergeKind::Refused(MergeRefusal::Preflight(_))
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read after preflight"),
+            original
+        );
+    }
+
+    #[test]
+    fn post_rename_directory_sync_error_keeps_visible_union_and_reports_it() {
+        let (_store, authority) = persistent_fixture_authority();
+        let first = fixture_pending();
+        let claim = claim_fixture(&authority, &first, 0xf1);
+        authority.merge(&first, &claim).expect("create unit");
+        let second = fixture_pending_at(0x400100, 0x5280_0560);
+        let claim = claim_fixture(&authority, &second, 0xf2);
+        arm_publication_fault(PublicationFault::DirectorySync);
+        let outcome = authority.merge(&second, &claim).expect("merge unit");
+        assert_eq!(outcome.kind, MergeKind::Merged);
+        assert!(outcome.post_rename_sync_failed);
+        let loaded = authority
+            .load_unit(&first.key, &fixture_source_words())
+            .expect("load visible post-rename union");
+        assert_eq!(loaded.manifest.blocks().len(), 2);
+    }
+
+    #[test]
+    fn pre_rename_faults_leave_every_new_reader_on_the_complete_old_inode() {
+        let (_store, authority) = persistent_fixture_authority();
+        let first = fixture_pending();
+        let claim = claim_fixture(&authority, &first, 0xf3);
+        authority.merge(&first, &claim).expect("create unit");
+        let stem = first.key.file_stem().expect("unit stem");
+        let path = authority.final_path(&stem);
+        let original = std::fs::read(&path).expect("read original inode");
+        let addition = fixture_pending_at(0x400100, 0x5280_0560);
+
+        for (seed, fault) in [
+            (0xf4, PublicationFault::BeforeTempSync),
+            (0xf5, PublicationFault::BeforeRename),
+        ] {
+            let claim = claim_fixture(&authority, &addition, seed);
+            arm_publication_fault(fault);
+            assert!(authority.merge(&addition, &claim).is_err());
+            assert_eq!(std::fs::read(&path).expect("read retained inode"), original);
+            let loaded = authority
+                .load_unit(&first.key, &fixture_source_words())
+                .expect("load complete old inode");
+            assert_eq!(loaded.manifest.blocks().len(), 1);
+        }
     }
 }
