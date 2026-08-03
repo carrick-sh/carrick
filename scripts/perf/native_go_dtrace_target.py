@@ -725,6 +725,11 @@ def main() -> int:
         action="store_true",
         help="emit the NATIVEPERF mechanism counters for this run",
     )
+    parser.add_argument(
+        "--xlat-census-dir",
+        type=pathlib.Path,
+        help="arm the per-process translation census in an existing empty directory",
+    )
     parser.add_argument("--pair-id")
     parser.add_argument("--pair-ordinal", type=int)
     parser.add_argument("--campaign-id")
@@ -759,6 +764,14 @@ def main() -> int:
     except ValueError as error:
         parser.error(str(error))
 
+    xlat_census_dir: pathlib.Path | None = None
+    if arguments.xlat_census_dir is not None:
+        xlat_census_dir = arguments.xlat_census_dir.resolve()
+        if not xlat_census_dir.is_dir():
+            parser.error("--xlat-census-dir must name an existing directory")
+        if any(xlat_census_dir.iterdir()):
+            parser.error("--xlat-census-dir must be empty")
+
     trace_identity = TraceIdentity.current()
 
     metadata_environment = environment_for(metadata_mode=arguments.metadata_mode)
@@ -790,12 +803,17 @@ def main() -> int:
         },
     )
     environment["CARRICK_RUN_ID"] = run_id
+    if xlat_census_dir is not None:
+        environment["CARRICK_XLAT_CENSUS_DIR"] = str(xlat_census_dir)
     print(
         "TARGET_PROVENANCE="
         + json.dumps(
             {
                 "metadata_mode": arguments.metadata_mode,
                 "environment_overlay": overlay,
+                "xlat_census_dir": (
+                    str(xlat_census_dir) if xlat_census_dir is not None else None
+                ),
                 "expected_effective_identity": trace_identity.receipt(),
             },
             sort_keys=True,
