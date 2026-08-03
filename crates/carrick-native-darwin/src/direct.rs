@@ -767,8 +767,12 @@ impl DirectImage {
             }
         }
         // Islands live past the image, inside the same mapping, so a `b` from
-        // any site reaches them well within ±128 MiB.
-        let mut island_cursor = image_len.next_multiple_of(16);
+        // any site reaches them well within ±128 MiB. PAGE-aligned, not
+        // 16-byte-aligned: the island tail must never share a host page with
+        // the image's last segment, because a writable last segment's pages
+        // get replaced with plain (non-JIT) mappings and would take the
+        // islands with them.
+        let mut island_cursor = image_len.next_multiple_of(HOST_PAGE);
         // Patch over the same SECTIONS the scan proved, not the PF_X segment:
         // patching a `.note` byte pattern that merely looks like `svc` would
         // corrupt data the guest reads.
@@ -867,7 +871,91 @@ impl DirectImage {
             );
         }
     }
+
+    /// Move every WRITABLE `PT_LOAD` out of the `MAP_JIT` region.
+    ///
+    /// `pthread_jit_write_protect_np` is per-thread and REGION-GLOBAL: with
+    /// the executing thread armed for execution, every page of a `MAP_JIT`
+    /// mapping is non-writable, data pages included. A real guest's first
+    /// act is to write its own data — ld.so self-relocates its GOT before
+    /// its first syscall — which SIGBUSed the whole image until data left
+    /// the JIT region. Each writable segment's page range is replaced IN
+    /// PLACE with a plain anonymous mapping (`MAP_FIXED` over the JIT
+    /// pages — allowed; only `MAP_JIT` itself rejects `MAP_FIXED`), and
+    /// every load segment's file bytes intersecting the range are
+    /// re-copied. Fresh anonymous pages deliver the BSS zeros.
+    ///
+    /// Fails closed when a writable segment shares a host page with
+    /// executable text: such a page cannot be both plainly writable and
+    /// JIT-executable. Real toolchain binaries align segments apart
+    /// (p_align 64 KiB), so this refusal is theoretical in practice.
+    fn replace_writable_segments(&mut self, elf: &[u8], lo: u64) -> Result<(), io::Error> {
+        let writable = writable_load_segments(elf)?;
+        if writable.is_empty() {
+            return Ok(());
+        }
+        let exec_page_ranges: Vec<(usize, usize)> = executable_sections(elf)?
+            .iter()
+            .map(|(_, size, vaddr)| {
+                let start = (*vaddr - lo) as usize / HOST_PAGE * HOST_PAGE;
+                let end = ((*vaddr - lo) as usize + size).next_multiple_of(HOST_PAGE);
+                (start, end)
+            })
+            .collect();
+        for (_, _, memsz, vaddr) in writable {
+            let dst = (vaddr - lo) as usize;
+            let page_start = dst / HOST_PAGE * HOST_PAGE;
+            let page_end = (dst + memsz).next_multiple_of(HOST_PAGE).min(self.len);
+            if exec_page_ranges
+                .iter()
+                .any(|(start, end)| page_start < *end && *start < page_end)
+            {
+                return Err(io::Error::other(
+                    "writable segment shares a host page with executable text",
+                ));
+            }
+            // SAFETY: replacing pages inside this image's own mapping with a
+            // fresh plain anonymous mapping at the same address.
+            let mapped = unsafe {
+                libc::mmap(
+                    self.base.add(page_start).cast(),
+                    page_end - page_start,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            // Re-copy every load segment's file bytes that fall inside the
+            // replaced pages (page rounding can pull a neighbouring
+            // read-only segment's tail into the range).
+            for (offset, filesz, _, seg_vaddr) in all_load_segments(elf)? {
+                let seg_dst = (seg_vaddr - lo) as usize;
+                let end = (offset + filesz).min(elf.len());
+                let copy_start = seg_dst.max(page_start);
+                let copy_end = (seg_dst + (end - offset)).min(page_end);
+                if copy_start < copy_end {
+                    // SAFETY: the range lies inside the mapping and the file.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            elf.as_ptr().add(offset + (copy_start - seg_dst)),
+                            self.base.add(copy_start),
+                            copy_end - copy_start,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
+/// Apple Silicon's host page size, which is the granularity of the
+/// writable-segment replacement and the island tail's alignment.
+const HOST_PAGE: usize = 16 * 1024;
 
 impl Drop for DirectImage {
     fn drop(&mut self) {
@@ -1037,6 +1125,10 @@ impl DirectLoadGroup {
         jit_write_protect(true);
         // SAFETY: the region was just written; publish it to the i-cache.
         unsafe { sys_icache_invalidate(base.cast(), len) };
+        let result = match result {
+            Ok(Ok(())) => image.replace_writable_segments(elf, lo).map(Ok),
+            other => other,
+        };
         match result {
             Ok(Ok(())) => {
                 self.images.push(image);
@@ -1314,6 +1406,31 @@ fn interpreter_path(elf: &[u8]) -> Result<Option<String>, io::Error> {
         return Ok(Some(String::from_utf8_lossy(&bytes[..end]).into_owned()));
     }
     Ok(None)
+}
+
+/// PT_LOADs carrying PF_W (`(file_offset, filesz, memsz, vaddr)`).
+fn writable_load_segments(elf: &[u8]) -> Result<Vec<(usize, usize, usize, u64)>, io::Error> {
+    const PF_W: u64 = 2;
+    let phoff = read_u64(elf, 0x20)? as usize;
+    let phentsize = read_u16(elf, 0x36)? as usize;
+    let phnum = read_u16(elf, 0x38)? as usize;
+    let mut out = Vec::new();
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
+        if read_u16(elf, ph)? != 1 {
+            continue;
+        }
+        if read_u16(elf, ph + 4)? & PF_W == 0 {
+            continue;
+        }
+        out.push((
+            read_u64(elf, ph + 0x08)? as usize,
+            read_u64(elf, ph + 0x20)? as usize,
+            read_u64(elf, ph + 0x28)? as usize,
+            read_u64(elf, ph + 0x10)?,
+        ));
+    }
+    Ok(out)
 }
 
 /// PT_LOADs carrying PF_X.
@@ -2055,6 +2172,94 @@ mod tests {
             !group.context().leave_requested(),
             "the leave leg re-armed the flag for the next entry"
         );
+    }
+
+    /// A guest must be able to WRITE its own data segment. `pthread_jit_
+    /// write_protect_np` is per-thread and REGION-GLOBAL: with the thread
+    /// armed for execution, every MAP_JIT page is non-writable — so data
+    /// staying in the JIT region SIGBUSes the first store (real ld.so died
+    /// in its own self-relocation, before its first syscall). The loader
+    /// must move writable segments to plain pages AND preserve their file
+    /// bytes; this fixture checks both: it reads the segment's initial
+    /// value (proves the re-copy), overwrites it (proves writability), and
+    /// reads it back.
+    #[test]
+    fn guest_writes_to_its_own_data_segment() {
+        const CHECK_NR: u64 = 0x0ff8;
+        // Its own 16 KiB page apart from text: mapping offsets are
+        // `vaddr - lo` with lo = 0x1000, so 0x8000 lands at offset 0x7000 —
+        // host page 1 — while text sits in page 0.
+        const DATA_VADDR: u64 = 0x8000;
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30),
+            // adr x1, data — byte offset from THIS instruction (at 0x1004).
+            adr(1, (DATA_VADDR - (0x1000 + 4)) as i64),
+            ldr_imm(2, 1, 0), // x2 = initial value (file bytes survived)
+            movz(3, 0xbeef, 0),
+            str_imm(3, 1, 0), // the store that SIGBUSes on JIT pages
+            ldr_imm(4, 1, 0), // x4 = written value
+            mov_reg(0, 2),
+            mov_reg(1, 4),
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            RET,
+        ];
+        let elf = elf_with_code_and_data(&code, DATA_VADDR, &0x1122_3344_u64.to_le_bytes());
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        seen_clear();
+        let entry = group.main().entry();
+        // SAFETY: patched image, entry inside it, fixture returns via `ret`.
+        unsafe { group.enter(entry) };
+        let seen = seen_snapshot();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].1[0], 0x1122_3344,
+            "the data segment's FILE bytes survived the plain-page replacement"
+        );
+        assert_eq!(
+            seen[0].1[1], 0xbeef,
+            "the guest wrote and re-read its own data segment"
+        );
+    }
+
+    /// `adr xd, <pc + offset>`
+    fn adr(rd: u32, offset: i64) -> u32 {
+        let imm = offset as u32;
+        0x1000_0000 | ((imm & 0x3) << 29) | (((imm >> 2) & 0x7_ffff) << 5) | rd
+    }
+
+    /// [`elf_with_code`], plus a READ+WRITE `PT_LOAD` at `data_vaddr`
+    /// carrying `data` (both file offset and vaddr are `data_vaddr`).
+    fn elf_with_code_and_data(code: &[u32], data_vaddr: u64, data: &[u8]) -> Vec<u8> {
+        let mut elf = elf_with_code(code);
+        // A second program header slot: the builder leaves room only for
+        // one, so append the phdr AT THE TABLE'S END by rewriting e_phnum
+        // and relocating nothing — the table at 0x40 has exactly one entry
+        // and the code starts at 0x1000, leaving padding for a second.
+        let ph = 0x40 + 56;
+        elf[ph..ph + 4].copy_from_slice(&1_u32.to_le_bytes()); // PT_LOAD
+        elf[ph + 4..ph + 8].copy_from_slice(&6_u32.to_le_bytes()); // PF_R|PF_W
+        elf[ph + 0x08..ph + 0x10].copy_from_slice(&data_vaddr.to_le_bytes());
+        elf[ph + 0x10..ph + 0x18].copy_from_slice(&data_vaddr.to_le_bytes());
+        elf[ph + 0x20..ph + 0x28].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        elf[ph + 0x28..ph + 0x30].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        elf[0x38..0x3a].copy_from_slice(&2_u16.to_le_bytes()); // e_phnum = 2
+        // The data bytes live at file offset == vaddr; the file is shorter
+        // than that (sections were appended at the old end), so pad and
+        // REWRITE e_shoff-relative structures? No — the section table was
+        // already consumed by the loader via absolute offsets, and nothing
+        // after this point re-reads it by position past the data. Extend the
+        // file to place the bytes.
+        if elf.len() < data_vaddr as usize {
+            elf.resize(data_vaddr as usize, 0);
+            elf.extend_from_slice(data);
+        } else {
+            panic!("fixture layout: sections ran past the data vaddr");
+        }
+        elf
     }
 
     /// Process entry runs on a PREPARED stack: `enter_on_stack` must switch
