@@ -543,6 +543,61 @@ static bool carrick_native_executable_range_catalog_contains(
     return false;
 }
 
+enum carrick_native_dsr_kick_transition {
+    CARRICK_NATIVE_DSR_KICK_RETURN_COMMON = 1,
+    CARRICK_NATIVE_DSR_KICK_PRESERVE_EXIT = 2,
+    CARRICK_NATIVE_DSR_KICK_AT_ENTRY = 3,
+    CARRICK_NATIVE_DSR_KICK_CAPTURE = 4,
+};
+
+static enum carrick_native_dsr_kick_transition
+carrick_native_dsr_classify_kick(
+    const struct carrick_native_dsr_signal_context *context,
+    uintptr_t interrupted_pc) {
+    uintptr_t common_start = (uintptr_t)carrick_dsr_exit_common_start;
+    uintptr_t common_end = (uintptr_t)carrick_dsr_exit_common_end;
+    if (context->exit_status != 0 &&
+        interrupted_pc >= common_start && interrupted_pc < common_end) {
+        return CARRICK_NATIVE_DSR_KICK_RETURN_COMMON;
+    }
+    if (context->entry_in_progress == 2 ||
+        context->exit_status == 4 || context->exit_status == 5) {
+        return CARRICK_NATIVE_DSR_KICK_PRESERVE_EXIT;
+    }
+    if (context->entry_in_progress == 1 ||
+        (context->entry_in_progress == 0 &&
+         (interrupted_pc < context->cache_start ||
+          interrupted_pc >= context->cache_end) &&
+         !carrick_native_executable_range_catalog_contains(
+             context->executable_range_catalog,
+             interrupted_pc))) {
+        return CARRICK_NATIVE_DSR_KICK_AT_ENTRY;
+    }
+    return CARRICK_NATIVE_DSR_KICK_CAPTURE;
+}
+
+/* Test seam for the exact production kick-transition classifier. The capture
+   arm writes only the fields needed to model a first asynchronous kick; live
+   signal tests cover the full mcontext snapshot. */
+uint32_t carrick_native_dsr_test_apply_kick_transition(
+    void *opaque,
+    uintptr_t interrupted_pc) {
+    struct carrick_native_dsr_signal_context *context = opaque;
+    enum carrick_native_dsr_kick_transition transition =
+        carrick_native_dsr_classify_kick(context, interrupted_pc);
+    if (transition == CARRICK_NATIVE_DSR_KICK_AT_ENTRY) {
+        context->exit_target = context->snapshot.pc;
+        context->exit_source = 0;
+        context->exit_status = 8;
+    } else if (transition == CARRICK_NATIVE_DSR_KICK_CAPTURE) {
+        context->snapshot.pc = interrupted_pc;
+        context->exit_target = interrupted_pc;
+        context->exit_source = interrupted_pc;
+        context->exit_status = 5;
+    }
+    return (uint32_t)transition;
+}
+
 static void carrick_native_dsr_signal_handler(int sig, siginfo_t *info, void *uap) {
     int32_t event_kind = CARRICK_NATIVE_EVENT_SIGNAL;
     if (sig == SIGPIPE) {
@@ -580,8 +635,12 @@ static void carrick_native_dsr_signal_handler(int sig, siginfo_t *info, void *ua
         struct carrick_native_dsr_signal_context *context =
             carrick_native_active_dsr_context;
         uintptr_t interrupted_pc = uc->uc_mcontext->__ss.__pc;
-        uintptr_t common_start = (uintptr_t)carrick_dsr_exit_common_start;
-        uintptr_t common_end = (uintptr_t)carrick_dsr_exit_common_end;
+        enum carrick_native_dsr_kick_transition kick_transition =
+            event_kind == CARRICK_NATIVE_EVENT_KICK
+                ? carrick_native_dsr_classify_kick(context, interrupted_pc)
+                : ((context->exit_status == 4 || context->exit_status == 5)
+                       ? CARRICK_NATIVE_DSR_KICK_PRESERVE_EXIT
+                       : CARRICK_NATIVE_DSR_KICK_CAPTURE);
         // An emitted exit publishes its typed status before branching into the
         // stable context-save gateway. A kick in that short window is already
         // at a host boundary: replacing the published exit with a Kick would
@@ -591,9 +650,7 @@ static void carrick_native_dsr_signal_handler(int sig, siginfo_t *info, void *ua
         // kick delivery blocked and its physical context register reasserted.
         // carrick_native_dsr_enter_host_abi performs the normal idempotent mask
         // transition before Rust observes the queued Linux signal.
-        if (event_kind == CARRICK_NATIVE_EVENT_KICK &&
-            context->exit_status != 0 &&
-            interrupted_pc >= common_start && interrupted_pc < common_end) {
+        if (kick_transition == CARRICK_NATIVE_DSR_KICK_RETURN_COMMON) {
             if (sigaddset(&uc->uc_sigmask, SIGPIPE) != 0) {
                 _exit(128 + sig);
             }
@@ -603,21 +660,13 @@ static void carrick_native_dsr_signal_handler(int sig, siginfo_t *info, void *ua
         // Preserve the first interrupted cache PC and register snapshot. If
         // the recovery gateway itself faults, overwriting them would turn the
         // useful guest fault into an unmappable gateway address.
-        if (event_kind == CARRICK_NATIVE_EVENT_KICK &&
-            context->entry_in_progress == 2) {
-            // The stable gateway already captured every guest register and
-            // published a typed exit, then a kick interrupted the host-mask
-            // transition itself.  Abandon that host frame through the signal
-            // exit below without replacing the completed guest exit with the
-            // host library PC.
-        } else if (event_kind == CARRICK_NATIVE_EVENT_KICK &&
-                   (context->entry_in_progress == 1 ||
-                    (context->entry_in_progress == 0 &&
-                     (interrupted_pc < context->cache_start ||
-                      interrupted_pc >= context->cache_end) &&
-                     !carrick_native_executable_range_catalog_contains(
-                         context->executable_range_catalog,
-                         interrupted_pc)))) {
+        if (kick_transition == CARRICK_NATIVE_DSR_KICK_PRESERVE_EXIT) {
+            // Either the stable gateway already captured every guest register,
+            // or a preceding asynchronous fault/kick captured the authoritative
+            // cache PC and register snapshot. Abandon this later host frame
+            // through the signal exit below without relabeling that cache PC as
+            // a KickAtEntry guest resume address.
+        } else if (kick_transition == CARRICK_NATIVE_DSR_KICK_AT_ENTRY) {
             // The kick became deliverable while the gateway was still inside
             // pthread_sigmask, or a stale active-context window exposed a host
             // PC while phase zero claimed translated execution. No translated
@@ -629,7 +678,7 @@ static void carrick_native_dsr_signal_handler(int sig, siginfo_t *info, void *ua
             context->exit_target = context->snapshot.pc;
             context->exit_source = 0;
             context->exit_status = 8;
-        } else if (context->exit_status != 4 && context->exit_status != 5) {
+        } else if (kick_transition == CARRICK_NATIVE_DSR_KICK_CAPTURE) {
             carrick_native_snapshot_mcontext(
                 &context->snapshot,
                 uc->uc_mcontext,

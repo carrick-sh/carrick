@@ -5173,7 +5173,6 @@ struct FusedRegionKickSweep {
     retry_index: usize,
     in_region_kicks: u64,
     entry_kicks: u64,
-    stale_entry_kicks: u64,
     clobbered_address: u64,
     clobbered_bias: u64,
 }
@@ -5537,7 +5536,6 @@ fn live_biased_exclusive_kick_sweep(
         retry_index,
         in_region_kicks: 0,
         entry_kicks: 0,
-        stale_entry_kicks: 0,
         clobbered_address: 0,
         clobbered_bias: 0,
     };
@@ -5670,18 +5668,13 @@ fn live_biased_exclusive_kick_sweep(
             NativeDsrExit::KickAtEntry { resume } => {
                 // The kick became deliverable outside translated code; the
                 // handler must hand back the untouched guest snapshot. A
-                // retried SIGPIPE that lands in the gateway's exit window
-                // republishes the FIRST kick's captured host PC (a harness
-                // artifact of kicking a thread that has no one-shot
-                // `NativeKickState` bound); count those separately rather than
-                // asserting on a snapshot the handler already replaced.
+                // repeated SIGPIPE after an in-region kick must preserve that
+                // first status-5 exit instead of relabeling its captured cache
+                // PC as an entry-time guest resume address.
                 sweep.entry_kicks += 1;
-                if resume == guest_code {
-                    assert_eq!(snapshot.x[address_index], GUEST_ADDRESS_SCRATCH);
-                    assert_eq!(snapshot.x[bias_index], GUEST_BIAS_SCRATCH);
-                } else {
-                    sweep.stale_entry_kicks += 1;
-                }
+                assert_eq!(resume, guest_code, "entry kick leaked a host cache PC");
+                assert_eq!(snapshot.x[address_index], GUEST_ADDRESS_SCRATCH);
+                assert_eq!(snapshot.x[bias_index], GUEST_BIAS_SCRATCH);
             }
             other => panic!("fused region must only leave through a kick, got {other:?}"),
         }
@@ -5694,13 +5687,12 @@ fn live_biased_exclusive_kick_sweep(
     );
 
     eprintln!(
-        "body_len={body_len}: {iteration} entries, {} in-region kicks, {} at entry \
-         ({} stale), {} SIGPIPEs; {} distinct landing words of {} emitted \
+        "body_len={body_len}: {iteration} entries, {} in-region kicks, {} at entry, \
+         {} SIGPIPEs; {} distinct landing words of {} emitted \
          (setup={}, body={}, store={}, retry_branch={}, retry_edge={}); \
          clobbered before recovery: address={}, bias={}; landings={:?}",
         sweep.in_region_kicks,
         sweep.entry_kicks,
-        sweep.stale_entry_kicks,
         delivered.load(Ordering::Relaxed),
         sweep.landings.len(),
         sweep.emitted_words,
@@ -5871,6 +5863,67 @@ fn dsr_pending_kick_during_gateway_entry_keeps_guest_pc() {
         matches!(exit, NativeDsrExit::KickAtEntry { resume } if resume == guest),
         "entry kick must preserve the guest resume PC, got {exit:?}"
     );
+}
+
+#[test]
+fn dsr_second_kick_before_signal_exit_keeps_the_first_cache_exit() {
+    unsafe extern "C" {
+        fn carrick_native_dsr_test_apply_kick_transition(
+            context: *mut libc::c_void,
+            interrupted_pc: usize,
+        ) -> u32;
+    }
+
+    const PRESERVE_EXIT: u32 = 2;
+    const CAPTURE: u32 = 4;
+    let guest = GuestVa(0x1c_320);
+    let cache_start = 0x10_7000_0000_usize;
+    let cache_pc = cache_start + 0x33_6538;
+    let host_gateway_pc = 0x1_0000_usize;
+    let mut snapshot = seeded_snapshot(0x20_0000);
+    snapshot.pc = guest.raw();
+    let mut context = super::gateway::DsrContext::new(
+        snapshot,
+        super::types::CacheVa::published(HostVa(cache_start)),
+        NativeDsrExit::Syscall { resume: guest },
+        std::ptr::null(),
+        CodeGeneration::INITIAL,
+        cache_start,
+        cache_start + 64 * 1024 * 1024,
+        crate::native_darwin::address::NativeAddressMode::Direct,
+    );
+    context.entry_in_progress = 0;
+
+    let first = unsafe {
+        carrick_native_dsr_test_apply_kick_transition(
+            (&mut context as *mut super::gateway::DsrContext).cast(),
+            cache_pc,
+        )
+    };
+    assert_eq!(
+        first, CAPTURE,
+        "the first cache kick must capture its host PC"
+    );
+    assert_eq!(context.exit_status, 5);
+    assert_eq!(context.exit_target, cache_pc as u64);
+    assert_eq!(context.snapshot.pc, cache_pc as u64);
+
+    let second = unsafe {
+        carrick_native_dsr_test_apply_kick_transition(
+            (&mut context as *mut super::gateway::DsrContext).cast(),
+            host_gateway_pc,
+        )
+    };
+    assert_eq!(
+        second, PRESERVE_EXIT,
+        "a repeated kick before phase two must preserve the first typed cache exit"
+    );
+    assert_eq!(
+        context.exit_status, 5,
+        "the first typed kick remains authoritative"
+    );
+    assert_eq!(context.exit_target, cache_pc as u64);
+    assert_eq!(context.snapshot.pc, cache_pc as u64);
 }
 
 #[test]
