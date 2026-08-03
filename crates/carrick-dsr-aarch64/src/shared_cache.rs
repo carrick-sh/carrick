@@ -72,10 +72,20 @@ fn shared_recovery_runs_enabled() -> bool {
     })
 }
 
+/// The direct-binding sidecar is DEFAULT ON (`CARRICK_DSR_DIRECT_BINDINGS=0`
+/// to disable): it is load-bearing for the default persistent store. Without
+/// cells, a copied unit's unresolved direct branches exit to the resolver on
+/// EVERY execution — measured on the warm cold-go-build: 35.0 M gateway
+/// entries / 16.5 M direct-resolver exits and a 12.1 s wall against the
+/// store-off arm's 3.6 M / 0.77 M / 9.6 s. With the sidecar the same warm
+/// build runs 3.0 M entries / 0.50 M exits at 9.4 s — fewer round-trips than
+/// store-off, at ~1 M fewer translations. Both consumers of this gate are
+/// shared-lane surfaces (the registry only carries records once a unit
+/// registers), so the hatch only matters when units load.
 pub fn direct_binding_runtime_enabled() -> bool {
     *DIRECT_BINDING_RUNTIME_ENABLED.get_or_init(|| {
         std::env::var_os("CARRICK_DSR_DIRECT_BINDINGS").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
+            != Some(std::ffi::OsStr::new("0"))
     })
 }
 
@@ -603,6 +613,15 @@ impl PendingTranslationUnit {
             })
             .collect::<Result<Vec<_>, crate::types::DsrError>>()?;
 
+        // An empty sidecar is not a layout — the store allocates no cell
+        // block for zero binding bytes, and the registry then fatally
+        // refuses the unit at load ("no mapped cell base"). A unit whose
+        // direct links all resolved inside the unit demotes to `Disabled`.
+        let binding_layout = if bindings.is_empty() {
+            DirectBindingLayout::Disabled
+        } else {
+            binding_layout
+        };
         let (binding_export, cell_size, binding_data, binding_relocations) = match binding_layout {
             DirectBindingLayout::Disabled => (String::new(), 0, Vec::new(), Vec::new()),
             DirectBindingLayout::SidecarV1 => {
@@ -2025,6 +2044,15 @@ mod tests {
         assert!(pending.bindings.is_empty());
         assert!(pending.binding_data.is_empty());
         assert!(pending.binding_relocations.is_empty());
+        // An empty sidecar is not a layout — it is a fatal load: the store
+        // allocates no cell block for `binding_data_len == 0`, and the
+        // registry then refuses the unit ("no mapped cell base"), killing
+        // the guest that loaded it. A unit whose links all resolved at pack
+        // demotes to `Disabled`.
+        assert_eq!(pending.binding_layout, DirectBindingLayout::Disabled);
+        assert!(pending.binding_export.is_empty());
+        assert_eq!(pending.cell_size, 0);
+        assert_eq!(pending.binding_data_len, 0);
     }
 
     #[test]
