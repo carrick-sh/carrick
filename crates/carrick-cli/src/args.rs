@@ -937,6 +937,25 @@ pub(crate) enum DebugCommand {
         #[arg(long = "processes-observed")]
         processes_observed: Option<u64>,
     },
+    /// Validate a lossless trusted-entry route trace against atomic retirement
+    /// snapshots and export route residency plus projected total-CPU shares.
+    TrustedRouteCensus {
+        /// Raw `carrick trace --profile trusted-route` output.
+        #[arg(long)]
+        trace: PathBuf,
+        /// The matching `carrick.trusted-route-capture.v1` receipt.
+        #[arg(long)]
+        capture: PathBuf,
+        /// Directory containing v2 snapshot JSON commit markers and `.bin`s.
+        #[arg(long)]
+        snapshots: PathBuf,
+        /// Receipt-bound fraction of total CPU attributed to emitted JIT code.
+        #[arg(long = "jit-share")]
+        jit_share: f64,
+        /// Atomically publish the report here instead of writing it to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
     /// (with DFSC for data aborts) so the operator doesn't have to hand-
     /// parse syndromes during an interactive session.
@@ -1163,6 +1182,38 @@ mod tests {
             ])
             .is_ok(),
             "timeout diagnostics need a standalone snapshot command"
+        );
+    }
+
+    #[test]
+    fn trusted_route_census_requires_all_evidence_inputs() {
+        assert!(
+            Cli::try_parse_from([
+                "carrick",
+                "debug",
+                "trusted-route-census",
+                "--trace",
+                "/tmp/trace.raw",
+                "--capture",
+                "/tmp/capture.json",
+                "--snapshots",
+                "/tmp/snapshots",
+                "--jit-share",
+                "0.46505",
+                "--output",
+                "/tmp/report.json",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "carrick",
+                "debug",
+                "trusted-route-census",
+                "--trace",
+                "/tmp/trace.raw",
+            ])
+            .is_err()
         );
     }
 }

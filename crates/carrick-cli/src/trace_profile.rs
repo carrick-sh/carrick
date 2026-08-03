@@ -2483,7 +2483,7 @@ pub(crate) struct ProfileProvenance {
     pub(crate) host: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TrustedRouteCaptureReceipt {
     pub(crate) schema: String,
@@ -2526,7 +2526,7 @@ impl TrustedRouteCaptureReceipt {
         Self::from_bytes(&raw, drops, provenance)
     }
 
-    fn from_bytes(
+    pub(crate) fn from_bytes(
         raw: &[u8],
         drops: ProfileCaptureStatus,
         provenance: ProfileProvenance,
@@ -2621,10 +2621,10 @@ impl TrustedRouteCaptureReceipt {
                     if section != Some(TrustedRouteSection::Pc) {
                         bail!("misplaced PC row at line {}", index + 1);
                     }
-                    let samples = parse_trusted_route_pc(line)
+                    let row = parse_trusted_route_pc(line)
                         .with_context(|| format!("invalid PC row at line {}", index + 1))?;
                     pc_samples = pc_samples
-                        .checked_add(samples)
+                        .checked_add(row.samples)
                         .ok_or_else(|| anyhow!("trusted-route PC population overflow"))?;
                     pc_rows = pc_rows
                         .checked_add(1)
@@ -2726,12 +2726,19 @@ fn parse_trusted_route_region(line: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_trusted_route_pc(line: &str) -> Result<u64> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TrustedRoutePcRow {
+    pub(crate) pid: u32,
+    pub(crate) pc: u64,
+    pub(crate) samples: u64,
+}
+
+pub(crate) fn parse_trusted_route_pc(line: &str) -> Result<TrustedRoutePcRow> {
     let mut fields = line.split_ascii_whitespace();
     if fields.next() != Some("PC") {
         bail!("PC row lacks PC prefix");
     }
-    fields
+    let pid = fields
         .next()
         .ok_or_else(|| anyhow!("PC row lacks pid"))?
         .parse::<u32>()
@@ -2741,7 +2748,7 @@ fn parse_trusted_route_pc(line: &str) -> Result<u64> {
         .and_then(|value| value.strip_prefix("0x"))
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("PC row lacks hexadecimal PC"))?;
-    u64::from_str_radix(pc, 16).context("PC row has invalid PC")?;
+    let pc = u64::from_str_radix(pc, 16).context("PC row has invalid PC")?;
     let samples = fields
         .next()
         .ok_or_else(|| anyhow!("PC row lacks sample count"))?
@@ -2753,7 +2760,7 @@ fn parse_trusted_route_pc(line: &str) -> Result<u64> {
     if samples == 0 {
         bail!("PC row has zero samples");
     }
-    Ok(samples)
+    Ok(TrustedRoutePcRow { pid, pc, samples })
 }
 
 fn parse_shape_fields(line: &str, prefix: &str) -> Result<BTreeMap<String, String>> {
