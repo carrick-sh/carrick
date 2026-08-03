@@ -28,6 +28,7 @@ pub mod emulate;
 pub mod esr;
 pub mod gateway;
 pub mod mapped_memory;
+pub mod pending_augmentation;
 pub mod prot_ranges;
 // The prepared-image schema moved to `carrick-dsr` (the platform-neutral
 // crate) as part of the staged native-backend extraction: it is ISA-free
