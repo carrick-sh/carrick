@@ -2759,7 +2759,13 @@ fn build_v2_profile_summary(
     });
     let mut kernel_stack_samples = 0_u64;
     let mut offcpu_stack_population = BTreeMap::<String, (u64, u64)>::new();
+    let mut raw_stack_keys = BTreeSet::<(RawProcessImageKey, String, Vec<String>)>::new();
+    let mut presented_stacks =
+        BTreeMap::<(String, u64, String, Vec<String>), (u64, Option<u64>)>::new();
     for stack in validator.stacks {
+        if !raw_stack_keys.insert((stack.key, stack.kind.clone(), stack.frames.clone())) {
+            bail!("duplicate DSRSTACK2 record for one process-image key");
+        }
         let pid = instance_for(stack.key)?;
         let (phase, value_ns) = if let Some(kind) = stack.kind.strip_prefix("offcpu-") {
             let population = offcpu_stack_population.entry(kind.to_owned()).or_default();
@@ -2787,14 +2793,32 @@ fn build_v2_profile_summary(
                 .ok_or_else(|| anyhow!("DSRPROF2 kernel stack population overflow"))?;
             ("cpu-kernel-stack".to_owned(), None)
         };
+        let presented = presented_stacks
+            .entry((phase, pid, stack.kind, stack.frames))
+            .or_insert((0, value_ns.map(|_| 0)));
+        presented.0 = presented
+            .0
+            .checked_add(stack.count)
+            .ok_or_else(|| anyhow!("DSRPROF2 presented stack count overflow"))?;
+        match (&mut presented.1, value_ns) {
+            (Some(total_ns), Some(value_ns)) => {
+                *total_ns = total_ns
+                    .checked_add(value_ns)
+                    .ok_or_else(|| anyhow!("DSRPROF2 presented stack duration overflow"))?;
+            }
+            (None, None) => {}
+            _ => bail!("DSRPROF2 presented stack changed metric shape"),
+        }
+    }
+    for ((phase, pid, kind, frames), (count, value_ns)) in presented_stacks {
         metrics.push(ProfileOutputMetric {
-            scope: v2_profile_scope(phase, Some(pid), Some(stack.kind.clone()), None),
+            scope: v2_profile_scope(phase, Some(pid), Some(kind.clone()), None),
             metric: ProfileMetric::StackTrace {
-                state: stack.kind,
+                state: kind,
                 pid: Some(pid),
-                count: Some(stack.count),
+                count: Some(count),
                 value_ns,
-                frames: stack.frames,
+                frames,
             },
             sampling_interval: None,
         });
@@ -3744,6 +3768,84 @@ mod tests {
                 && row["metric"]["pid"] == 1
         }));
         assert_eq!(rows.last().unwrap()["metric"]["type"], "completion");
+    }
+
+    #[test]
+    fn dsrprof2_summary_coalesces_identical_stacks_across_exec_images() {
+        let mut lines = include_str!("../tests/fixtures/dsrprof2-valid.raw")
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let completion = lines
+            .iter()
+            .position(|line| line.starts_with("DSRPROF2|complete|"))
+            .expect("completion row");
+        lines.splice(
+            completion..completion,
+            [
+                "DSRPROF2|cpu-kernel|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|class=kernel-named-syscall|pc=0xfffffe0010030030|count=1",
+                "DSRSTACK2|begin|pid=101|start_sec=11|start_usec=21|image=1|epoch=1|kind=kernel-named-syscall|count=1|total_ns=0",
+                "",
+                "0xfffffe0010030030",
+                "0xfffffe0010040040",
+                "DSRSTACK2|end",
+                "DSRPROF2|cpu-kernel|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|class=kernel-named-syscall|pc=0xfffffe0010030030|count=1",
+                "DSRSTACK2|begin|pid=101|start_sec=11|start_usec=21|image=2|epoch=0|kind=kernel-named-syscall|count=1|total_ns=0",
+                "",
+                "0xfffffe0010030030",
+                "0xfffffe0010040040",
+                "DSRSTACK2|end",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+
+        let summary = ProfileSummary::from_lines(lines, ProfileCaptureStatus::default())
+            .expect("DSRPROF2 summary");
+        let matching = summary
+            .json_rows()
+            .into_iter()
+            .map(|row| serde_json::to_value(row).expect("serialize DSRPROF2 summary row"))
+            .filter(|row| {
+                row["scope"]["phase"] == "cpu-kernel-stack"
+                    && row["scope"]["pid"] == 2
+                    && row["metric"]["frames"]
+                        == serde_json::json!(["0xfffffe0010030030", "0xfffffe0010040040"])
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0]["metric"]["count"], 2);
+    }
+
+    #[test]
+    fn dsrprof2_summary_rejects_duplicate_stack_within_one_image() {
+        let raw = include_str!("../tests/fixtures/dsrprof2-valid.raw")
+            .replacen(
+                "class=kernel-named-syscall|pc=0xfffffe0010010010|count=2",
+                "class=kernel-named-syscall|pc=0xfffffe0010010010|count=3",
+                1,
+            )
+            .replacen(
+                "DSRPROF2|process-create|",
+                concat!(
+                    "DSRSTACK2|begin|pid=100|start_sec=10|start_usec=20|image=1|epoch=0|kind=kernel-named-syscall|count=1|total_ns=0\n",
+                    "\n",
+                    "0xfffffe0010010010\n",
+                    "0xfffffe0010020020\n",
+                    "DSRSTACK2|end\n",
+                    "DSRPROF2|process-create|"
+                ),
+                1,
+            );
+
+        let error = ProfileSummary::from_lines(raw.lines(), ProfileCaptureStatus::default())
+            .expect_err("an exact raw stack duplicate must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate DSRSTACK2 record for one process-image key")
+        );
     }
 
     #[test]
