@@ -3870,10 +3870,11 @@ fn generation_guard_preserves_guest_scratch_registers_and_flags() {
 #[test]
 fn published_shared_block_prevents_second_process_translation() {
     use carrick_dsr_aarch64::shared_cache::{
-        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
-        NativePageProfileIdentity, PortableBlockRecord, PublishOutcome, SharedExecutableSegment,
-        SharedImageConfig, SharedLoadedTranslationUnit, SourceFingerprint, TranslationUnitKey,
-        TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
+        AddressModeIdentity, ClaimOutcome, ExecutableIdentity, GuestCodeLen, ImageFileLen,
+        ImageFileOffset, MergeKind, MergeOutcome, NativePageProfileIdentity, PortableBlockRecord,
+        RecordingClaim, SharedExecutableSegment, SharedImageConfig, SharedLoadedTranslationUnit,
+        SourceFingerprint, TranslationUnitKey, TranslationUnitManifest, TranslationUnitStore,
+        UnitMissReason,
     };
 
     #[derive(Clone)]
@@ -3890,11 +3891,25 @@ fn published_shared_block_prevents_second_process_translation() {
             Ok(Some(self.unit.clone()))
         }
 
-        fn publish(
+        fn claim_recording(
+            &self,
+            _key: &TranslationUnitKey,
+            _owner: &carrick_dsr_aarch64::pending_augmentation::RecordingOwner,
+        ) -> Result<ClaimOutcome, carrick_dsr_aarch64::shared_cache::UnitStoreFailure> {
+            Ok(ClaimOutcome::LiveOwner)
+        }
+
+        fn merge(
             &self,
             _pending: &carrick_dsr_aarch64::shared_cache::PendingTranslationUnit,
-        ) -> Result<PublishOutcome, UnitMissReason> {
-            Ok(PublishOutcome::Existing)
+            _claim: &RecordingClaim,
+        ) -> Result<MergeOutcome, carrick_dsr_aarch64::shared_cache::UnitStoreFailure> {
+            Ok(MergeOutcome {
+                kind: MergeKind::Unchanged,
+                blocks_added: 0,
+                duplicates: 0,
+                post_rename_sync_failed: false,
+            })
         }
     }
 
@@ -4038,12 +4053,13 @@ fn published_shared_block_prevents_second_process_translation() {
 }
 
 #[test]
-fn translated_block_is_published_on_retirement_and_reused() {
+fn next_process_replays_merged_bytes_relocations_pc_maps_and_recovery() {
     use carrick_dsr_aarch64::shared_cache::{
-        AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
-        NativePageProfileIdentity, PendingTranslationUnit, PublishOutcome, SharedExecutableSegment,
-        SharedImageConfig, SharedLoadedTranslationUnit, TranslationUnitKey, TranslationUnitStore,
-        UnitMissReason, decode_unit_bundle_v1, encode_unit_bundle_v1,
+        AddressModeIdentity, ClaimOutcome, ExecutableIdentity, GuestCodeLen, ImageFileLen,
+        ImageFileOffset, MergeKind, MergeOutcome, NativePageProfileIdentity,
+        PendingTranslationUnit, RecordingClaim, SharedExecutableSegment, SharedImageConfig,
+        SharedLoadedTranslationUnit, TranslationUnitKey, TranslationUnitStore, UnitMissReason,
+        decode_unit_bundle_v1, encode_unit_bundle_v1,
     };
 
     #[derive(Default)]
@@ -4068,13 +4084,30 @@ fn translated_block_is_published_on_retirement_and_reused() {
             Ok(Some(unit.clone()))
         }
 
-        fn publish(
+        fn claim_recording(
+            &self,
+            _key: &TranslationUnitKey,
+            owner: &carrick_dsr_aarch64::pending_augmentation::RecordingOwner,
+        ) -> Result<ClaimOutcome, carrick_dsr_aarch64::shared_cache::UnitStoreFailure> {
+            Ok(ClaimOutcome::Won(RecordingClaim {
+                owner: *owner,
+                stale_takeover: false,
+            }))
+        }
+
+        fn merge(
             &self,
             pending: &PendingTranslationUnit,
-        ) -> Result<PublishOutcome, UnitMissReason> {
+            _claim: &RecordingClaim,
+        ) -> Result<MergeOutcome, carrick_dsr_aarch64::shared_cache::UnitStoreFailure> {
             let mut loaded = self.loaded.lock().expect("lock retirement fixture");
             if loaded.is_some() {
-                return Ok(PublishOutcome::Existing);
+                return Ok(MergeOutcome {
+                    kind: MergeKind::Unchanged,
+                    blocks_added: 0,
+                    duplicates: pending.blocks.len() as u64,
+                    post_rename_sync_failed: false,
+                });
             }
             // The store persists one READABLE bundle; nothing executes in
             // place. Install replays its code into the loading process's own
@@ -4094,7 +4127,12 @@ fn translated_block_is_published_on_retirement_and_reused() {
                 .expect("construct retirement replay manifest");
             let lease: Arc<dyn Send + Sync> = bundle;
             *loaded = Some(SharedLoadedTranslationUnit::new(manifest, base, lease));
-            Ok(PublishOutcome::Winner)
+            Ok(MergeOutcome {
+                kind: MergeKind::Created,
+                blocks_added: pending.blocks.len() as u64,
+                duplicates: 0,
+                post_rename_sync_failed: false,
+            })
         }
     }
 
@@ -4148,13 +4186,16 @@ fn translated_block_is_published_on_retirement_and_reused() {
         assert_eq!(snapshot.x[0], expected);
         assert!(matches!(exit.exit, NativeDsrExit::Syscall { .. }));
         assert_eq!(first.translator.resolver_stats().translations, 1);
+        first
+            .translator
+            .process
+            .publish_shared_candidates(&first.memory);
         assert_eq!(
             first
                 .translator
-                .process
-                .publish_shared_candidates(&first.memory)
-                .expect("publish first-process candidates"),
-            vec![PublishOutcome::Winner]
+                .resolver_stats()
+                .shared_unit_initial_publish,
+            1
         );
     }
 

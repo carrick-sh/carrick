@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
+use crate::pending_augmentation::RecordingOwner;
+
 mod unit_bundle;
 pub use unit_bundle::{
     DecodedUnitBundle, MergeKind, MergeOutcome, MergeRefusal, NormalizedUnion, StoredBlockArtifact,
@@ -389,6 +391,19 @@ pub struct PendingTranslationUnit {
     pub blocks: Vec<StoredBlockArtifact>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordingClaim {
+    pub owner: RecordingOwner,
+    pub stale_takeover: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    Won(RecordingClaim),
+    LiveOwner,
+    Yielded,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortableBlockCandidate {
     pub guest_start: GuestVa,
@@ -401,6 +416,12 @@ pub struct PortableBlockCandidate {
 }
 
 impl PendingTranslationUnit {
+    pub(crate) fn normalize_candidate(
+        candidate: PortableBlockCandidate,
+    ) -> Result<StoredBlockArtifact, crate::types::DsrError> {
+        StoredBlockArtifact::from_candidate(candidate, shared_recovery_runs_enabled())
+    }
+
     pub fn pack(
         key: TranslationUnitKey,
         candidates: Vec<PortableBlockCandidate>,
@@ -556,16 +577,6 @@ impl UnitMissReason {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PublishOutcome {
-    Winner,
-    Existing,
-    /// Another process held the unit's store lock: it is emitting this same
-    /// unit right now, so this publisher dropped its copy instead of
-    /// blocking on a rival's emission.
-    Yielded,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TranslationMetadataLoadEvidence {
     pub bytes_read: u64,
@@ -643,15 +654,17 @@ pub trait TranslationUnitStore: Send + Sync {
         source_words: &[u32],
     ) -> Result<Option<SharedLoadedTranslationUnit>, UnitMissReason>;
 
-    fn publish(&self, pending: &PendingTranslationUnit) -> Result<PublishOutcome, UnitMissReason>;
+    fn claim_recording(
+        &self,
+        key: &TranslationUnitKey,
+        owner: &RecordingOwner,
+    ) -> Result<ClaimOutcome, UnitStoreFailure>;
 
-    /// Elect at most one portable-template recorder after a unit has proven
-    /// that it recurs in this container. The default keeps fixture and
-    /// non-Darwin stores simple; Darwin persists the election in the private
-    /// container cache directory.
-    fn claim_recording(&self, _key: &TranslationUnitKey) -> bool {
-        true
-    }
+    fn merge(
+        &self,
+        pending: &PendingTranslationUnit,
+        claim: &RecordingClaim,
+    ) -> Result<MergeOutcome, UnitStoreFailure>;
 }
 
 #[derive(Clone, Debug)]

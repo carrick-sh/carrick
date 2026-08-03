@@ -179,6 +179,22 @@ fn persistent_store_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("0"))
 }
 
+/// Existing-unit augmentation is default-on. Exact `=0` suppresses only a
+/// claim caused by a gap in a valid attached unit; a true missing file still
+/// claims and seeds the same sparse initial bundle in both control arms.
+pub fn store_augmentation_runtime_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        store_augmentation_enabled_from(
+            std::env::var_os("CARRICK_DSR_STORE_AUGMENTATION").as_deref(),
+        )
+    })
+}
+
+fn store_augmentation_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
 /// Encode the AArch64 `B` instruction that links `site` to `target`.
 ///
 /// The guest-ISA half of the pre-extraction `patch_direct_branch`: the
@@ -379,9 +395,7 @@ impl PreparedDirectBindingExecReset<'_, '_, '_> {
         state.dependencies = cache::PageBlockDependencies::default();
         state.shared_translation = None;
         state.shared_unit_segments_consulted.clear();
-        state.shared_recording_segments.clear();
-        state.shared_candidates.clear();
-        state.shared_publish_attempted = false;
+        state.pending_augmentation.reset_after_fork_child();
         state.cache.reset_after_fork_for_exec();
         recorder(DirectBindingResetEvent::PrivateCursorReset);
         clear_stats
@@ -872,7 +886,8 @@ pub struct ProcessState {
     artifact_image_digest: Option<[u8; 32]>,
     shared_translation: Option<SharedTranslationConfiguration>,
     shared_unit_segments_consulted: BTreeSet<carrick_guest_mem::GuestVa>,
-    shared_recording_segments: BTreeSet<carrick_guest_mem::GuestVa>,
+    pending_augmentation: crate::pending_augmentation::PendingAugmentation,
+    store_augmentation_enabled: bool,
     /// Units this process attached from the store, blocks NOT yet replayed.
     /// A block is replayed into the private cache on its FIRST lookup
     /// (`replay_attached_unit_block`), so an exec that touches a fraction of
@@ -885,9 +900,6 @@ pub struct ProcessState {
     /// block index in `blocks` then owns the lookup), when its page
     /// regenerates, or when its unit is detached after a replay refusal.
     attached_unit_blocks: BTreeMap<carrick_guest_mem::GuestVa, AttachedUnitBlock>,
-    shared_candidates:
-        BTreeMap<carrick_guest_mem::GuestVa, Vec<crate::shared_cache::PortableBlockCandidate>>,
-    shared_publish_attempted: bool,
     executable_ranges: gateway::ExecutableRangeCatalog,
     /// Guest blocks one emitted block may fuse (1 = no superblock formation).
     /// Resolved once from `block::superblock_segment_limit()`; the only site
@@ -1085,6 +1097,23 @@ pub struct ResolverStats {
     pub shared_owned_immutable_records: u64,
     pub shared_guest_range_derivations: u64,
     pub shared_direct_edge_group_builds: u64,
+    pub shared_augment_claim_won: u64,
+    pub shared_augment_claim_live_lost: u64,
+    pub shared_augment_claim_yielded: u64,
+    pub shared_augment_claim_stale_takeover: u64,
+    pub shared_augment_claim_error: u64,
+    pub shared_unit_initial_publish: u64,
+    pub shared_unit_merge: u64,
+    pub shared_unit_blocks_added: u64,
+    pub shared_unit_duplicate_coalesced: u64,
+    pub shared_unit_conflict: u64,
+    pub shared_unit_repair: u64,
+    pub shared_unit_capacity_refused: u64,
+    pub shared_unit_preflight_refused: u64,
+    pub shared_unit_io_failed: u64,
+    pub shared_unit_validation_failed: u64,
+    pub shared_unit_empty_release: u64,
+    pub shared_unit_post_rename_sync_failed: u64,
     /// `ResolveDirect` exits classified by whether the SOURCE (the branching
     /// instruction's guest PC) and the TARGET fall inside shared-unit code.
     /// Thread-scoped, like `direct_resolver_exits`.
@@ -1129,6 +1158,23 @@ pub enum ResolverStat {
     SharedOwnedImmutableRecords,
     SharedGuestRangeDerivations,
     SharedDirectEdgeGroupBuilds,
+    SharedAugmentClaimWon,
+    SharedAugmentClaimLiveLost,
+    SharedAugmentClaimYielded,
+    SharedAugmentClaimStaleTakeover,
+    SharedAugmentClaimError,
+    SharedUnitInitialPublish,
+    SharedUnitMerge,
+    SharedUnitBlocksAdded,
+    SharedUnitDuplicateCoalesced,
+    SharedUnitConflict,
+    SharedUnitRepair,
+    SharedUnitCapacityRefused,
+    SharedUnitPreflightRefused,
+    SharedUnitIoFailed,
+    SharedUnitValidationFailed,
+    SharedUnitEmptyRelease,
+    SharedUnitPostRenameSyncFailed,
     ResolveSrcSharedTgtShared,
     ResolveSrcSharedTgtPrivate,
     ResolveSrcPrivateTgtShared,
@@ -1136,7 +1182,7 @@ pub enum ResolverStat {
 }
 
 impl ResolverStat {
-    const ALL: [Self; 32] = [
+    const ALL: [Self; 49] = [
         Self::ResolverExits,
         Self::OneEntryHits,
         Self::Translations,
@@ -1165,6 +1211,23 @@ impl ResolverStat {
         Self::SharedOwnedImmutableRecords,
         Self::SharedGuestRangeDerivations,
         Self::SharedDirectEdgeGroupBuilds,
+        Self::SharedAugmentClaimWon,
+        Self::SharedAugmentClaimLiveLost,
+        Self::SharedAugmentClaimYielded,
+        Self::SharedAugmentClaimStaleTakeover,
+        Self::SharedAugmentClaimError,
+        Self::SharedUnitInitialPublish,
+        Self::SharedUnitMerge,
+        Self::SharedUnitBlocksAdded,
+        Self::SharedUnitDuplicateCoalesced,
+        Self::SharedUnitConflict,
+        Self::SharedUnitRepair,
+        Self::SharedUnitCapacityRefused,
+        Self::SharedUnitPreflightRefused,
+        Self::SharedUnitIoFailed,
+        Self::SharedUnitValidationFailed,
+        Self::SharedUnitEmptyRelease,
+        Self::SharedUnitPostRenameSyncFailed,
         Self::ResolveSrcSharedTgtShared,
         Self::ResolveSrcSharedTgtPrivate,
         Self::ResolveSrcPrivateTgtShared,
@@ -1201,6 +1264,23 @@ impl ResolverStat {
             Self::SharedOwnedImmutableRecords => "shared_owned_immutable_records",
             Self::SharedGuestRangeDerivations => "shared_guest_range_derivations",
             Self::SharedDirectEdgeGroupBuilds => "shared_direct_edge_group_builds",
+            Self::SharedAugmentClaimWon => "shared_augment_claim_won",
+            Self::SharedAugmentClaimLiveLost => "shared_augment_claim_live_lost",
+            Self::SharedAugmentClaimYielded => "shared_augment_claim_yielded",
+            Self::SharedAugmentClaimStaleTakeover => "shared_augment_claim_stale_takeover",
+            Self::SharedAugmentClaimError => "shared_augment_claim_error",
+            Self::SharedUnitInitialPublish => "shared_unit_initial_publish",
+            Self::SharedUnitMerge => "shared_unit_merge",
+            Self::SharedUnitBlocksAdded => "shared_unit_blocks_added",
+            Self::SharedUnitDuplicateCoalesced => "shared_unit_duplicate_coalesced",
+            Self::SharedUnitConflict => "shared_unit_conflict",
+            Self::SharedUnitRepair => "shared_unit_repair",
+            Self::SharedUnitCapacityRefused => "shared_unit_capacity_refused",
+            Self::SharedUnitPreflightRefused => "shared_unit_preflight_refused",
+            Self::SharedUnitIoFailed => "shared_unit_io_failed",
+            Self::SharedUnitValidationFailed => "shared_unit_validation_failed",
+            Self::SharedUnitEmptyRelease => "shared_unit_empty_release",
+            Self::SharedUnitPostRenameSyncFailed => "shared_unit_post_rename_sync_failed",
             Self::ResolveSrcSharedTgtShared => "resolve_src_shared_tgt_shared",
             Self::ResolveSrcSharedTgtPrivate => "resolve_src_shared_tgt_private",
             Self::ResolveSrcPrivateTgtShared => "resolve_src_private_tgt_shared",
@@ -1240,6 +1320,27 @@ impl ResolverStats {
             ResolverStat::SharedOwnedImmutableRecords => self.shared_owned_immutable_records,
             ResolverStat::SharedGuestRangeDerivations => self.shared_guest_range_derivations,
             ResolverStat::SharedDirectEdgeGroupBuilds => self.shared_direct_edge_group_builds,
+            ResolverStat::SharedAugmentClaimWon => self.shared_augment_claim_won,
+            ResolverStat::SharedAugmentClaimLiveLost => self.shared_augment_claim_live_lost,
+            ResolverStat::SharedAugmentClaimYielded => self.shared_augment_claim_yielded,
+            ResolverStat::SharedAugmentClaimStaleTakeover => {
+                self.shared_augment_claim_stale_takeover
+            }
+            ResolverStat::SharedAugmentClaimError => self.shared_augment_claim_error,
+            ResolverStat::SharedUnitInitialPublish => self.shared_unit_initial_publish,
+            ResolverStat::SharedUnitMerge => self.shared_unit_merge,
+            ResolverStat::SharedUnitBlocksAdded => self.shared_unit_blocks_added,
+            ResolverStat::SharedUnitDuplicateCoalesced => self.shared_unit_duplicate_coalesced,
+            ResolverStat::SharedUnitConflict => self.shared_unit_conflict,
+            ResolverStat::SharedUnitRepair => self.shared_unit_repair,
+            ResolverStat::SharedUnitCapacityRefused => self.shared_unit_capacity_refused,
+            ResolverStat::SharedUnitPreflightRefused => self.shared_unit_preflight_refused,
+            ResolverStat::SharedUnitIoFailed => self.shared_unit_io_failed,
+            ResolverStat::SharedUnitValidationFailed => self.shared_unit_validation_failed,
+            ResolverStat::SharedUnitEmptyRelease => self.shared_unit_empty_release,
+            ResolverStat::SharedUnitPostRenameSyncFailed => {
+                self.shared_unit_post_rename_sync_failed
+            }
             ResolverStat::ResolveSrcSharedTgtShared => self.resolve_src_shared_tgt_shared,
             ResolverStat::ResolveSrcSharedTgtPrivate => self.resolve_src_shared_tgt_private,
             ResolverStat::ResolveSrcPrivateTgtShared => self.resolve_src_private_tgt_shared,
@@ -1284,6 +1385,29 @@ impl ResolverStats {
             }
             ResolverStat::SharedDirectEdgeGroupBuilds => {
                 self.shared_direct_edge_group_builds = value
+            }
+            ResolverStat::SharedAugmentClaimWon => self.shared_augment_claim_won = value,
+            ResolverStat::SharedAugmentClaimLiveLost => self.shared_augment_claim_live_lost = value,
+            ResolverStat::SharedAugmentClaimYielded => self.shared_augment_claim_yielded = value,
+            ResolverStat::SharedAugmentClaimStaleTakeover => {
+                self.shared_augment_claim_stale_takeover = value
+            }
+            ResolverStat::SharedAugmentClaimError => self.shared_augment_claim_error = value,
+            ResolverStat::SharedUnitInitialPublish => self.shared_unit_initial_publish = value,
+            ResolverStat::SharedUnitMerge => self.shared_unit_merge = value,
+            ResolverStat::SharedUnitBlocksAdded => self.shared_unit_blocks_added = value,
+            ResolverStat::SharedUnitDuplicateCoalesced => {
+                self.shared_unit_duplicate_coalesced = value
+            }
+            ResolverStat::SharedUnitConflict => self.shared_unit_conflict = value,
+            ResolverStat::SharedUnitRepair => self.shared_unit_repair = value,
+            ResolverStat::SharedUnitCapacityRefused => self.shared_unit_capacity_refused = value,
+            ResolverStat::SharedUnitPreflightRefused => self.shared_unit_preflight_refused = value,
+            ResolverStat::SharedUnitIoFailed => self.shared_unit_io_failed = value,
+            ResolverStat::SharedUnitValidationFailed => self.shared_unit_validation_failed = value,
+            ResolverStat::SharedUnitEmptyRelease => self.shared_unit_empty_release = value,
+            ResolverStat::SharedUnitPostRenameSyncFailed => {
+                self.shared_unit_post_rename_sync_failed = value
             }
             ResolverStat::ResolveSrcSharedTgtShared => self.resolve_src_shared_tgt_shared = value,
             ResolverStat::ResolveSrcSharedTgtPrivate => self.resolve_src_shared_tgt_private = value,
@@ -2177,11 +2301,10 @@ impl ProcessTranslator {
                 artifact_image_digest: None,
                 shared_translation: None,
                 shared_unit_segments_consulted: BTreeSet::new(),
-                shared_recording_segments: BTreeSet::new(),
+                pending_augmentation: crate::pending_augmentation::PendingAugmentation::new(),
+                store_augmentation_enabled: store_augmentation_runtime_enabled(),
                 attached_units: Vec::new(),
                 attached_unit_blocks: BTreeMap::new(),
-                shared_candidates: BTreeMap::new(),
-                shared_publish_attempted: false,
                 executable_ranges: gateway::ExecutableRangeCatalog::new(
                     cache_range.start,
                     cache_range.end,
@@ -2310,57 +2433,108 @@ impl ProcessTranslator {
         Ok(())
     }
 
-    pub fn publish_shared_candidates(
-        &self,
-        memory: &NativeMappedMemory,
-    ) -> Result<Vec<crate::shared_cache::PublishOutcome>, types::DsrError> {
-        let (configuration, mut batches) = {
+    pub fn publish_shared_candidates(&self, memory: &NativeMappedMemory) {
+        let (store, batches) = {
             let mut state = self.state.write();
-            if state.shared_publish_attempted {
-                return Ok(Vec::new());
-            }
-            state.shared_publish_attempted = true;
             let Some(configuration) = state.shared_translation.as_ref() else {
-                return Ok(Vec::new());
+                state.pending_augmentation.reset_after_fork_child();
+                return;
             };
-            let configuration = (
-                configuration.image.clone(),
-                Arc::clone(&configuration.store),
-            );
-            let batches = std::mem::take(&mut state.shared_candidates);
-            (configuration, batches)
+            let store = Arc::clone(&configuration.store);
+            let Some(batches) = state.pending_augmentation.drain_committed_units() else {
+                return;
+            };
+            (store, batches)
         };
-        let (image, store) = configuration;
-        let mut outcomes = Vec::new();
-        for segment in &image.segments {
-            let Some(candidates) = batches.remove(&segment.guest_start) else {
-                continue;
-            };
-            if candidates.is_empty()
-                || candidates.iter().any(|candidate| {
-                    match memory.dsr_generation_observation(candidate.guest_start) {
-                        Ok(observation) => observation.expected() != types::CodeGeneration::INITIAL,
-                        Err(_) => true,
-                    }
-                })
-            {
-                continue;
+        for mut batch in batches {
+            if batch.capacity_refused {
+                self.record_store_stat(ResolverStat::SharedUnitCapacityRefused, 1);
             }
-            let pending = crate::shared_cache::PendingTranslationUnit::pack(
-                image.key_for_segment(segment),
-                candidates,
-            )?;
+            let before = batch.pending.blocks.len();
+            batch.pending.blocks.retain(|block| {
+                memory
+                    .dsr_generation_observation(block.guest_start)
+                    .is_ok_and(|observation| {
+                        observation.expected() == types::CodeGeneration::INITIAL
+                    })
+            });
+            let skipped = before.saturating_sub(batch.pending.blocks.len());
+            if skipped != 0 {
+                self.record_store_stat(
+                    ResolverStat::SharedUnitValidationFailed,
+                    u64::try_from(skipped).unwrap_or(u64::MAX),
+                );
+            }
+            if batch.pending.blocks.is_empty() {
+                self.record_store_stat(ResolverStat::SharedUnitEmptyRelease, 1);
+            }
             let publish_started = std::time::Instant::now();
-            let publish_result = store.publish(&pending);
+            let publish_result = store.merge(&batch.pending, &batch.claim);
             xlat_census::record_publish_ns(publish_started.elapsed().as_nanos() as u64);
-            let outcome = publish_result.map_err(|reason| {
-                types::DsrError::CachePolicy(format!(
-                    "shared translation publication failed: {reason:?}"
-                ))
-            })?;
-            outcomes.push(outcome);
+            match publish_result {
+                Ok(outcome) => self.record_merge_outcome(outcome),
+                Err(failure) => {
+                    self.record_store_stat(
+                        match failure.class {
+                            crate::shared_cache::UnitStoreFailureClass::Io => {
+                                ResolverStat::SharedUnitIoFailed
+                            }
+                            crate::shared_cache::UnitStoreFailureClass::Validation => {
+                                ResolverStat::SharedUnitValidationFailed
+                            }
+                        },
+                        1,
+                    );
+                    tracing::warn!(
+                        class = ?failure.class,
+                        reason = ?failure.reason,
+                        "shared translation merge failed; guest execution is unaffected"
+                    );
+                }
+            }
         }
-        Ok(outcomes)
+    }
+
+    fn record_store_stat(&self, stat: ResolverStat, value: u64) {
+        self.state.write().stats.saturating_add(stat, value);
+        xlat_census::record_store_stat(stat, value);
+    }
+
+    fn record_merge_outcome(&self, outcome: crate::shared_cache::MergeOutcome) {
+        use crate::shared_cache::{MergeKind, MergeRefusal};
+
+        match outcome.kind {
+            MergeKind::Created => self.record_store_stat(ResolverStat::SharedUnitInitialPublish, 1),
+            MergeKind::Merged => self.record_store_stat(ResolverStat::SharedUnitMerge, 1),
+            MergeKind::Repaired => self.record_store_stat(ResolverStat::SharedUnitRepair, 1),
+            MergeKind::Unchanged => {}
+            MergeKind::Yielded => tracing::debug!("shared translation merge yielded to writer"),
+            MergeKind::Refused(MergeRefusal::Conflict { guest_start }) => {
+                self.record_store_stat(ResolverStat::SharedUnitConflict, 1);
+                tracing::warn!(
+                    guest_start = guest_start.raw(),
+                    "shared translation merge refused a conflicting block"
+                );
+            }
+            MergeKind::Refused(MergeRefusal::Capacity) => {
+                self.record_store_stat(ResolverStat::SharedUnitCapacityRefused, 1)
+            }
+            MergeKind::Refused(MergeRefusal::Preflight(reason)) => {
+                self.record_store_stat(ResolverStat::SharedUnitPreflightRefused, 1);
+                tracing::warn!(
+                    reason = ?reason,
+                    "shared translation merge failed publication preflight"
+                );
+            }
+        }
+        self.record_store_stat(ResolverStat::SharedUnitBlocksAdded, outcome.blocks_added);
+        self.record_store_stat(
+            ResolverStat::SharedUnitDuplicateCoalesced,
+            outcome.duplicates,
+        );
+        if outcome.post_rename_sync_failed {
+            self.record_store_stat(ResolverStat::SharedUnitPostRenameSyncFailed, 1);
+        }
     }
 
     #[doc(hidden)]
@@ -2403,8 +2577,7 @@ impl ProcessTranslator {
         // claim and batch republishes the same unit at its own exec — the
         // "concurrent publishers" term the 2026-08-03 scoreboard correction
         // measured at +6.4 ms per exec across a parallel go build.
-        state.shared_recording_segments.clear();
-        state.shared_candidates.clear();
+        state.pending_augmentation.reset_after_fork_child();
         // The child inherited the parent's census by COW along with the warm
         // block index, but it performed none of those translations. Leaving
         // them would re-attribute the parent's whole set to every child once
@@ -2471,6 +2644,103 @@ impl ProcessTranslator {
 }
 
 impl ProcessState {
+    fn add_store_stat(&mut self, stat: ResolverStat, value: u64) {
+        self.stats.saturating_add(stat, value);
+        xlat_census::record_store_stat(stat, value);
+    }
+
+    fn claim_shared_segment(
+        &mut self,
+        key: &crate::shared_cache::TranslationUnitKey,
+        segment_end: carrick_guest_mem::GuestVa,
+        store: &Arc<dyn crate::shared_cache::TranslationUnitStore>,
+    ) -> bool {
+        use crate::pending_augmentation::SegmentClaimState;
+        use crate::shared_cache::ClaimOutcome;
+
+        if matches!(
+            self.pending_augmentation.segment_state(key),
+            Some(SegmentClaimState::ClaimWon | SegmentClaimState::ClaimLost)
+        ) {
+            return false;
+        }
+        let owner = match self.pending_augmentation.recording_owner() {
+            Ok(owner) => owner,
+            Err(error) => {
+                self.add_store_stat(ResolverStat::SharedAugmentClaimError, 1);
+                let _ = self.pending_augmentation.track_segment(
+                    key.clone(),
+                    segment_end,
+                    SegmentClaimState::ClaimLost,
+                    None,
+                );
+                tracing::warn!(%error, "shared translation claim owner creation failed");
+                return false;
+            }
+        };
+        match store.claim_recording(key, &owner) {
+            Ok(ClaimOutcome::Won(claim)) => {
+                self.add_store_stat(ResolverStat::SharedAugmentClaimWon, 1);
+                if claim.stale_takeover {
+                    self.add_store_stat(ResolverStat::SharedAugmentClaimStaleTakeover, 1);
+                }
+                if let Err(error) = self.pending_augmentation.track_segment(
+                    key.clone(),
+                    segment_end,
+                    SegmentClaimState::ClaimWon,
+                    Some(claim),
+                ) {
+                    self.add_store_stat(ResolverStat::SharedAugmentClaimError, 1);
+                    tracing::warn!(%error, "shared translation claim could not be retained");
+                    return false;
+                }
+                true
+            }
+            Ok(ClaimOutcome::LiveOwner) => {
+                self.add_store_stat(ResolverStat::SharedAugmentClaimLiveLost, 1);
+                let _ = self.pending_augmentation.track_segment(
+                    key.clone(),
+                    segment_end,
+                    SegmentClaimState::ClaimLost,
+                    None,
+                );
+                false
+            }
+            Ok(ClaimOutcome::Yielded) => {
+                self.add_store_stat(ResolverStat::SharedAugmentClaimYielded, 1);
+                let _ = self.pending_augmentation.track_segment(
+                    key.clone(),
+                    segment_end,
+                    SegmentClaimState::ClaimLost,
+                    None,
+                );
+                false
+            }
+            Err(failure) => {
+                self.add_store_stat(ResolverStat::SharedAugmentClaimError, 1);
+                self.add_store_stat(
+                    match failure.class {
+                        crate::shared_cache::UnitStoreFailureClass::Io => {
+                            ResolverStat::SharedUnitIoFailed
+                        }
+                        crate::shared_cache::UnitStoreFailureClass::Validation => {
+                            ResolverStat::SharedUnitValidationFailed
+                        }
+                    },
+                    1,
+                );
+                tracing::warn!(class = ?failure.class, reason = ?failure.reason, "shared translation claim failed");
+                let _ = self.pending_augmentation.track_segment(
+                    key.clone(),
+                    segment_end,
+                    SegmentClaimState::ClaimLost,
+                    None,
+                );
+                false
+            }
+        }
+    }
+
     fn try_load_shared_unit(
         &mut self,
         memory: &NativeMappedMemory,
@@ -2499,6 +2769,11 @@ impl ProcessState {
             return Ok(None);
         };
         let segment_start = segment.guest_start;
+        let segment_end =
+            carrick_guest_mem::GuestVa(segment_start.raw().saturating_add(segment.guest_len.get()));
+        let key = configuration.image.key_for_segment(segment);
+        let source_words = Arc::clone(&segment.source_words);
+        let store = Arc::clone(&configuration.store);
         if !self.shared_unit_segments_consulted.insert(segment_start) {
             // The segment's store consult already happened; the only thing a
             // repeat lookup can be served from is an ATTACHED unit's
@@ -2514,17 +2789,29 @@ impl ProcessState {
                     xlat_census::record_lookup_skipped(xlat_census::LookupSkip::Regenerated);
                     Ok(None)
                 }
-                AttachedReplayOutcome::NotCovered
-                | AttachedReplayOutcome::Capacity
-                | AttachedReplayOutcome::Refused => {
+                AttachedReplayOutcome::NotCovered => {
+                    if self.store_augmentation_enabled {
+                        if self.pending_augmentation.segment_state(&key)
+                            == Some(crate::pending_augmentation::SegmentClaimState::Attached)
+                        {
+                            let _ = self.pending_augmentation.track_segment(
+                                key.clone(),
+                                segment_end,
+                                crate::pending_augmentation::SegmentClaimState::Uncovered,
+                                None,
+                            );
+                        }
+                        let _ = self.claim_shared_segment(&key, segment_end, &store);
+                    }
+                    xlat_census::record_lookup_skipped(xlat_census::LookupSkip::SegmentRepeat);
+                    Ok(None)
+                }
+                AttachedReplayOutcome::Capacity | AttachedReplayOutcome::Refused => {
                     xlat_census::record_lookup_skipped(xlat_census::LookupSkip::SegmentRepeat);
                     Ok(None)
                 }
             };
         }
-        let key = configuration.image.key_for_segment(segment);
-        let source_words = Arc::clone(&segment.source_words);
-        let store = Arc::clone(&configuration.store);
         self.stats.shared_unit_lookups = self.stats.shared_unit_lookups.saturating_add(1);
         let load_started = std::time::Instant::now();
         let load_result = store.load(&key, &source_words);
@@ -2535,21 +2822,28 @@ impl ProcessState {
                 unit
             }
             Ok(None) => {
-                let claimed = store.claim_recording(&key);
+                let claimed = self.claim_shared_segment(&key, segment_end, &store);
                 xlat_census::record_lookup_file_miss(claimed);
-                if claimed {
-                    self.shared_recording_segments.insert(segment_start);
-                }
                 return Ok(None);
             }
             Err(reason) => {
                 xlat_census::record_lookup_miss(reason);
+                if self.store_augmentation_enabled {
+                    let _ = self.claim_shared_segment(&key, segment_end, &store);
+                }
                 return Ok(None);
             }
         };
         self.stats.shared_unit_loads = self.stats.shared_unit_loads.saturating_add(1);
         match self.attach_shared_unit(unit) {
-            Ok(()) => {}
+            Ok(()) => {
+                let _ = self.pending_augmentation.track_segment(
+                    key.clone(),
+                    segment_end,
+                    crate::pending_augmentation::SegmentClaimState::Attached,
+                    None,
+                );
+            }
             // A unit the attach validators refuse (a stale store shape, bad
             // geometry) must fail closed to private translation, never kill
             // the guest that consulted the store. The warn — not silence —
@@ -2561,6 +2855,9 @@ impl ProcessState {
                     guest = guest.raw(),
                     "shared unit refused at attach; translating privately"
                 );
+                if self.store_augmentation_enabled {
+                    let _ = self.claim_shared_segment(&key, segment_end, &store);
+                }
                 return Ok(None);
             }
             Err(error) => return Err(error),
@@ -2570,8 +2867,23 @@ impl ProcessState {
         // census identity.
         match self.replay_attached_unit_block(memory, guest)? {
             AttachedReplayOutcome::Replayed(entry) => Ok(Some(entry)),
-            AttachedReplayOutcome::NotCovered
-            | AttachedReplayOutcome::Regenerated
+            AttachedReplayOutcome::NotCovered => {
+                if self.store_augmentation_enabled {
+                    if self.pending_augmentation.segment_state(&key)
+                        == Some(crate::pending_augmentation::SegmentClaimState::Attached)
+                    {
+                        let _ = self.pending_augmentation.track_segment(
+                            key.clone(),
+                            segment_end,
+                            crate::pending_augmentation::SegmentClaimState::Uncovered,
+                            None,
+                        );
+                    }
+                    let _ = self.claim_shared_segment(&key, segment_end, &store);
+                }
+                Ok(None)
+            }
+            AttachedReplayOutcome::Regenerated
             | AttachedReplayOutcome::Capacity
             | AttachedReplayOutcome::Refused => Ok(None),
         }
@@ -3291,11 +3603,12 @@ impl ProcessState {
             );
             let emit_started = self.profiling.then(std::time::Instant::now);
             let emitted_result = (|| {
-                let portable_segment = self
-                    .shared_translation
-                    .as_ref()
-                    .and_then(|configuration| {
-                        configuration.image.segments.iter().find(|segment| {
+                let portable_segment = self.shared_translation.as_ref().and_then(|configuration| {
+                    configuration
+                        .image
+                        .segments
+                        .iter()
+                        .find(|segment| {
                             let segment_end = segment
                                 .guest_start
                                 .raw()
@@ -3305,8 +3618,8 @@ impl ProcessState {
                                     && block.end.raw() <= end
                             })
                         })
-                    })
-                    .map(|segment| segment.guest_start);
+                        .map(|segment| configuration.image.key_for_segment(segment))
+                });
                 // Fused (superblock) plans ARE in scope for the unit lane.
                 // Superblock formation extends only along the FALL-THROUGH
                 // edge and stops at `page_end`, so a fused plan is contiguous
@@ -3318,8 +3631,9 @@ impl ProcessState {
                 // below: that lowering owns its whole block and is not a
                 // segment.
                 let unit_candidate_segment = if generation == types::CodeGeneration::INITIAL
-                    && let Some(segment) = portable_segment
-                    && self.shared_recording_segments.contains(&segment)
+                    && let Some(key) = portable_segment
+                    && self.pending_augmentation.segment_state(&key)
+                        == Some(crate::pending_augmentation::SegmentClaimState::ClaimWon)
                     && matches!(
                         block.terminal_exit(),
                         block::PlannedExit::Syscall { .. }
@@ -3328,7 +3642,7 @@ impl ProcessState {
                             | block::PlannedExit::Sensitive { .. }
                             | block::PlannedExit::Continue { .. }
                     ) {
-                    Some(segment)
+                    Some(key)
                 } else {
                     None
                 };
@@ -3372,8 +3686,8 @@ impl ProcessState {
                     )
                 };
                 let portable_candidate = match (unit_candidate_segment, artifact.as_ref()) {
-                    (Some(segment), Some(artifact)) => Some((
-                        segment,
+                    (Some(key), Some(artifact)) => Some((
+                        key,
                         crate::shared_cache::PortableBlockCandidate {
                             guest_start: block.start,
                             source_end: block.end,
@@ -3441,11 +3755,18 @@ impl ProcessState {
                         observed: observation.current().get(),
                     });
                 }
-                if let Some((segment, candidate)) = portable_candidate {
-                    self.shared_candidates
-                        .entry(segment)
-                        .or_default()
-                        .push(candidate);
+                if let Some((key, candidate)) = portable_candidate {
+                    match crate::shared_cache::PendingTranslationUnit::normalize_candidate(
+                        candidate,
+                    ) {
+                        Ok(artifact) => {
+                            let _ = self.pending_augmentation.append(&key, artifact);
+                        }
+                        Err(error) => {
+                            self.add_store_stat(ResolverStat::SharedUnitValidationFailed, 1);
+                            tracing::warn!(%error, "shared translation candidate normalization failed");
+                        }
+                    }
                 }
                 if let Some(started) = translation_started {
                     self.stats
@@ -3997,41 +4318,22 @@ impl ThreadTranslator {
     #[doc(hidden)]
     pub fn resolver_stats(&self) -> ResolverStats {
         let process = self.process.state.read().stats;
-        ResolverStats {
-            resolver_exits: self.stats.resolver_exits,
-            one_entry_hits: self.stats.one_entry_hits,
-            translations: process.translations,
-            duplicate_publications: process.duplicate_publications,
-            gateway_entries: self.stats.gateway_entries,
-            syscall_exits: self.stats.syscall_exits,
-            direct_resolver_exits: self.stats.direct_resolver_exits,
-            cache_lookups: process.cache_lookups,
-            cache_lookup_hits: process.cache_lookup_hits,
-            invalidated_blocks: process.invalidated_blocks,
-            translation_ns: process.translation_ns,
-            translation_decode_ns: process.translation_decode_ns,
-            translation_plan_ns: process.translation_plan_ns,
-            translation_emit_ns: process.translation_emit_ns,
-            translation_publication_ns: process.translation_publication_ns,
-            shared_unit_lookups: process.shared_unit_lookups,
-            shared_unit_hits: process.shared_unit_hits,
-            shared_unit_loads: process.shared_unit_loads,
-            shared_blocks_mapped: process.shared_blocks_mapped,
-            shared_translations_avoided: process.shared_translations_avoided,
-            shared_blocks_attached: process.shared_blocks_attached,
-            shared_metadata_bytes_read: process.shared_metadata_bytes_read,
-            shared_metadata_bytes_mapped: process.shared_metadata_bytes_mapped,
-            shared_metadata_validation_ns: process.shared_metadata_validation_ns,
-            shared_mapped_immutable_records: process.shared_mapped_immutable_records,
-            shared_owned_immutable_records: process.shared_owned_immutable_records,
-            shared_guest_range_derivations: process.shared_guest_range_derivations,
-            shared_direct_edge_group_builds: process.shared_direct_edge_group_builds,
-            invalid: self.stats.invalid.or(process.invalid),
-            resolve_src_shared_tgt_shared: self.stats.resolve_src_shared_tgt_shared,
-            resolve_src_shared_tgt_private: self.stats.resolve_src_shared_tgt_private,
-            resolve_src_private_tgt_shared: self.stats.resolve_src_private_tgt_shared,
-            resolve_src_private_tgt_private: self.stats.resolve_src_private_tgt_private,
+        let mut combined = process;
+        for stat in [
+            ResolverStat::ResolverExits,
+            ResolverStat::OneEntryHits,
+            ResolverStat::GatewayEntries,
+            ResolverStat::SyscallExits,
+            ResolverStat::DirectResolverExits,
+            ResolverStat::ResolveSrcSharedTgtShared,
+            ResolverStat::ResolveSrcSharedTgtPrivate,
+            ResolverStat::ResolveSrcPrivateTgtShared,
+            ResolverStat::ResolveSrcPrivateTgtPrivate,
+        ] {
+            combined.set(stat, self.stats.get(stat));
         }
+        combined.invalid = self.stats.invalid.or(process.invalid);
+        combined
     }
 
     #[doc(hidden)]
@@ -4763,6 +5065,13 @@ mod tests {
             super::persistent_store_enabled_from(Some(std::ffi::OsStr::new("false"))),
             "only exact =0 is the rollback hatch"
         );
+        assert!(super::store_augmentation_enabled_from(None));
+        assert!(!super::store_augmentation_enabled_from(Some(
+            std::ffi::OsStr::new("0")
+        )));
+        assert!(super::store_augmentation_enabled_from(Some(
+            std::ffi::OsStr::new("false")
+        )));
     }
 
     #[test]
@@ -5621,6 +5930,9 @@ mod tests {
         struct LookupFixtureStore {
             unit: std::sync::Mutex<Option<SharedLoadedTranslationUnit>>,
             loads: std::sync::atomic::AtomicU64,
+            claims: std::sync::atomic::AtomicU64,
+            claim_mode: std::sync::atomic::AtomicU8,
+            merges: std::sync::atomic::AtomicU64,
         }
 
         impl crate::shared_cache::TranslationUnitStore for LookupFixtureStore {
@@ -5635,12 +5947,50 @@ mod tests {
                 Ok(self.unit.lock().expect("fixture unit lock").clone())
             }
 
-            fn publish(
+            fn claim_recording(
+                &self,
+                _key: &TranslationUnitKey,
+                owner: &crate::pending_augmentation::RecordingOwner,
+            ) -> Result<crate::shared_cache::ClaimOutcome, crate::shared_cache::UnitStoreFailure>
+            {
+                self.claims
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match self.claim_mode.load(std::sync::atomic::Ordering::Relaxed) {
+                    1 => Ok(crate::shared_cache::ClaimOutcome::LiveOwner),
+                    2 => Ok(crate::shared_cache::ClaimOutcome::Yielded),
+                    3 => Err(crate::shared_cache::UnitStoreFailure {
+                        class: crate::shared_cache::UnitStoreFailureClass::Io,
+                        reason: crate::shared_cache::UnitMissReason::StoreUnavailable,
+                    }),
+                    _ => Ok(crate::shared_cache::ClaimOutcome::Won(
+                        crate::shared_cache::RecordingClaim {
+                            owner: *owner,
+                            stale_takeover: false,
+                        },
+                    )),
+                }
+            }
+
+            fn merge(
                 &self,
                 _pending: &PendingTranslationUnit,
-            ) -> Result<crate::shared_cache::PublishOutcome, crate::shared_cache::UnitMissReason>
+                _claim: &crate::shared_cache::RecordingClaim,
+            ) -> Result<crate::shared_cache::MergeOutcome, crate::shared_cache::UnitStoreFailure>
             {
-                Ok(crate::shared_cache::PublishOutcome::Existing)
+                self.merges
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.claim_mode.load(std::sync::atomic::Ordering::Relaxed) == 4 {
+                    return Err(crate::shared_cache::UnitStoreFailure {
+                        class: crate::shared_cache::UnitStoreFailureClass::Validation,
+                        reason: crate::shared_cache::UnitMissReason::Schema,
+                    });
+                }
+                Ok(crate::shared_cache::MergeOutcome {
+                    kind: crate::shared_cache::MergeKind::Unchanged,
+                    blocks_added: 0,
+                    duplicates: 0,
+                    post_rename_sync_failed: false,
+                })
             }
         }
 
@@ -5664,6 +6014,9 @@ mod tests {
             let store = Arc::new(LookupFixtureStore {
                 unit: std::sync::Mutex::new(Some(unit)),
                 loads: std::sync::atomic::AtomicU64::new(0),
+                claims: std::sync::atomic::AtomicU64::new(0),
+                claim_mode: std::sync::atomic::AtomicU8::new(0),
+                merges: std::sync::atomic::AtomicU64::new(0),
             });
             let translator =
                 ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator");
@@ -6148,6 +6501,286 @@ mod tests {
             assert!(
                 stale.contains(&key),
                 "installed block must be registered for page invalidation: {stale:?}"
+            );
+        }
+
+        #[test]
+        fn loaded_unit_gap_attempts_one_claim_and_records_current_block() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (a, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let (b, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_B));
+            let fixture = lookup_fixture(vec![a]);
+            assert!(
+                lookup(&fixture, &memory, BLOCK_A)
+                    .expect("load A")
+                    .is_some()
+            );
+            assert_eq!(lookup(&fixture, &memory, BLOCK_B).expect("gap B"), None);
+            assert_eq!(
+                fixture
+                    .store
+                    .claims
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            let mut state = fixture.translator.state.write();
+            let artifact = PendingTranslationUnit::normalize_candidate(b).expect("normalize B");
+            assert_eq!(
+                state.pending_augmentation.append(&unit_key(), artifact),
+                crate::pending_augmentation::PendingAppendOutcome::Appended
+            );
+            let batches = state
+                .pending_augmentation
+                .drain_committed_units()
+                .expect("first drain");
+            assert_eq!(batches[0].pending.blocks[0].guest_start, BLOCK_B);
+        }
+
+        #[test]
+        fn loaded_unit_gap_control_off_never_claims_or_records() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (a, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let fixture = lookup_fixture(vec![a]);
+            fixture.translator.state.write().store_augmentation_enabled = false;
+            assert!(
+                lookup(&fixture, &memory, BLOCK_A)
+                    .expect("load A")
+                    .is_some()
+            );
+            assert_eq!(lookup(&fixture, &memory, BLOCK_B).expect("gap B"), None);
+            assert_eq!(
+                fixture
+                    .store
+                    .claims
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+            assert!(
+                fixture
+                    .translator
+                    .state
+                    .write()
+                    .pending_augmentation
+                    .drain_committed_units()
+                    .expect("first drain")
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn missing_unit_claims_and_initially_publishes_in_both_control_modes() {
+            for enabled in [false, true] {
+                let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+                let (a, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+                let fixture = lookup_fixture(vec![a.clone()]);
+                *fixture.store.unit.lock().expect("unit lock") = None;
+                fixture.translator.state.write().store_augmentation_enabled = enabled;
+                assert_eq!(lookup(&fixture, &memory, BLOCK_A).expect("file miss"), None);
+                assert_eq!(
+                    fixture
+                        .store
+                        .claims
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    1
+                );
+                let artifact = PendingTranslationUnit::normalize_candidate(a)
+                    .expect("normalize current block");
+                assert_eq!(
+                    fixture
+                        .translator
+                        .state
+                        .write()
+                        .pending_augmentation
+                        .append(&unit_key(), artifact),
+                    crate::pending_augmentation::PendingAppendOutcome::Appended
+                );
+                fixture.translator.publish_shared_candidates(&memory);
+                assert_eq!(
+                    fixture
+                        .store
+                        .merges
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    1
+                );
+            }
+        }
+
+        #[test]
+        fn live_and_yielded_claim_losers_never_record_or_retry() {
+            for mode in [1, 2] {
+                let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+                let (a, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+                let fixture = lookup_fixture(vec![a]);
+                *fixture.store.unit.lock().expect("unit lock") = None;
+                fixture
+                    .store
+                    .claim_mode
+                    .store(mode, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(
+                    lookup(&fixture, &memory, BLOCK_A).expect("first miss"),
+                    None
+                );
+                assert_eq!(
+                    lookup(&fixture, &memory, BLOCK_B).expect("repeat gap"),
+                    None
+                );
+                assert_eq!(
+                    fixture
+                        .store
+                        .claims
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    1
+                );
+                assert!(
+                    fixture
+                        .translator
+                        .state
+                        .write()
+                        .pending_augmentation
+                        .drain_committed_units()
+                        .expect("first drain")
+                        .is_empty()
+                );
+            }
+        }
+
+        #[test]
+        fn exec_and_exit_each_merge_at_most_once_per_incarnation() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (a, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let fixture = lookup_fixture(vec![a]);
+            *fixture.store.unit.lock().expect("unit lock") = None;
+            assert_eq!(lookup(&fixture, &memory, BLOCK_A).expect("file miss"), None);
+            fixture.translator.publish_shared_candidates(&memory);
+            fixture.translator.publish_shared_candidates(&memory);
+            assert_eq!(
+                fixture
+                    .store
+                    .merges
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+        }
+
+        #[test]
+        fn store_errors_are_counted_and_never_escape_as_dsr_error() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (a, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let fixture = lookup_fixture(vec![a]);
+            *fixture.store.unit.lock().expect("unit lock") = None;
+            fixture
+                .store
+                .claim_mode
+                .store(3, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                lookup(&fixture, &memory, BLOCK_A).expect("claim error is nonfatal"),
+                None
+            );
+            let stats = fixture.translator.state.read().stats;
+            assert_eq!(stats.shared_augment_claim_error, 1);
+            assert_eq!(stats.shared_unit_io_failed, 1);
+
+            let (a, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let fixture = lookup_fixture(vec![a.clone()]);
+            *fixture.store.unit.lock().expect("unit lock") = None;
+            fixture
+                .store
+                .claim_mode
+                .store(4, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(lookup(&fixture, &memory, BLOCK_A).expect("file miss"), None);
+            let artifact = PendingTranslationUnit::normalize_candidate(a).expect("normalize A");
+            assert_eq!(
+                fixture
+                    .translator
+                    .state
+                    .write()
+                    .pending_augmentation
+                    .append(&unit_key(), artifact),
+                crate::pending_augmentation::PendingAppendOutcome::Appended
+            );
+            fixture.translator.publish_shared_candidates(&memory);
+            assert_eq!(
+                fixture
+                    .translator
+                    .state
+                    .read()
+                    .stats
+                    .shared_unit_validation_failed,
+                1
+            );
+        }
+
+        #[test]
+        fn winner_records_subsequent_eligible_gaps_in_same_segment() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let block_c = GuestVa(BLOCK_B.raw() + 0x100);
+            let (a, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let (b, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_B));
+            let (c, _, _) = record_candidate(&memory, &syscall_plan(block_c));
+            let fixture = lookup_fixture(vec![a]);
+            assert!(
+                lookup(&fixture, &memory, BLOCK_A)
+                    .expect("load A")
+                    .is_some()
+            );
+            assert_eq!(lookup(&fixture, &memory, BLOCK_B).expect("gap B"), None);
+            let mut state = fixture.translator.state.write();
+            for candidate in [b, c] {
+                let artifact = PendingTranslationUnit::normalize_candidate(candidate)
+                    .expect("normalize subsequent gap");
+                assert_eq!(
+                    state.pending_augmentation.append(&unit_key(), artifact),
+                    crate::pending_augmentation::PendingAppendOutcome::Appended
+                );
+            }
+            let batches = state
+                .pending_augmentation
+                .drain_committed_units()
+                .expect("first drain");
+            assert_eq!(batches[0].pending.blocks.len(), 2);
+            assert_eq!(
+                fixture
+                    .store
+                    .claims
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+        }
+
+        #[test]
+        fn regenerated_outside_segment_and_guest_jit_blocks_never_record() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (a, _, _) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let fixture = lookup_fixture(vec![a]);
+            assert_eq!(
+                fixture
+                    .translator
+                    .state
+                    .write()
+                    .try_load_shared_unit(&memory, BLOCK_A, CodeGeneration::claimed(2))
+                    .expect("regenerated lookup"),
+                None
+            );
+            assert_eq!(
+                lookup(&fixture, &memory, GuestVa(0x80_0000)).expect("outside"),
+                None
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .claims
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+            assert!(
+                fixture
+                    .translator
+                    .state
+                    .write()
+                    .pending_augmentation
+                    .drain_committed_units()
+                    .expect("first drain")
+                    .is_empty()
             );
         }
     }
@@ -6672,7 +7305,9 @@ pub mod xlat_census {
     /// V4: the STORE line gained `replayed=` (lookups served by lazily
     /// replaying a block from an already-attached unit), and `segment-repeat`
     /// narrowed to "consulted segment, block NOT covered by its unit".
-    pub const CENSUS_SCHEMA: &str = "XLATCENSUS4";
+    /// V5: the STORE line gained the exact 17 typed claim, augmentation,
+    /// merge, refusal, and failure counters used by the monotonic unit store.
+    pub const CENSUS_SCHEMA: &str = "XLATCENSUS5";
 
     /// Where a translated block sits relative to this process's configured
     /// shared-translation segments.
@@ -6816,6 +7451,23 @@ pub mod xlat_census {
         /// `TranslationUnitStore::publish` (encode, write, link, sign). Paid
         /// only by the elected recorder.
         pub publish_ns: u64,
+        pub shared_augment_claim_won: u64,
+        pub shared_augment_claim_live_lost: u64,
+        pub shared_augment_claim_yielded: u64,
+        pub shared_augment_claim_stale_takeover: u64,
+        pub shared_augment_claim_error: u64,
+        pub shared_unit_initial_publish: u64,
+        pub shared_unit_merge: u64,
+        pub shared_unit_blocks_added: u64,
+        pub shared_unit_duplicate_coalesced: u64,
+        pub shared_unit_conflict: u64,
+        pub shared_unit_repair: u64,
+        pub shared_unit_capacity_refused: u64,
+        pub shared_unit_preflight_refused: u64,
+        pub shared_unit_io_failed: u64,
+        pub shared_unit_validation_failed: u64,
+        pub shared_unit_empty_release: u64,
+        pub shared_unit_post_rename_sync_failed: u64,
     }
 
     impl CensusStore {
@@ -6829,6 +7481,27 @@ pub mod xlat_census {
                 && self.recording_declined == 0
                 && self.skipped.is_empty()
                 && self.misses.is_empty()
+                && [
+                    self.shared_augment_claim_won,
+                    self.shared_augment_claim_live_lost,
+                    self.shared_augment_claim_yielded,
+                    self.shared_augment_claim_stale_takeover,
+                    self.shared_augment_claim_error,
+                    self.shared_unit_initial_publish,
+                    self.shared_unit_merge,
+                    self.shared_unit_blocks_added,
+                    self.shared_unit_duplicate_coalesced,
+                    self.shared_unit_conflict,
+                    self.shared_unit_repair,
+                    self.shared_unit_capacity_refused,
+                    self.shared_unit_preflight_refused,
+                    self.shared_unit_io_failed,
+                    self.shared_unit_validation_failed,
+                    self.shared_unit_empty_release,
+                    self.shared_unit_post_rename_sync_failed,
+                ]
+                .into_iter()
+                .all(|count| count == 0)
         }
 
         /// Lookups that never reached the store.
@@ -6970,7 +7643,7 @@ pub mod xlat_census {
             );
             let _ = writeln!(
                 out,
-                "STORE|consulted={}|loaded={}|replayed={}|file_miss={}|recording_claimed={}|recording_declined={}|load_ns={}|publish_ns={}",
+                "STORE|consulted={}|loaded={}|replayed={}|file_miss={}|recording_claimed={}|recording_declined={}|load_ns={}|publish_ns={}|shared_augment_claim_won={}|shared_augment_claim_live_lost={}|shared_augment_claim_yielded={}|shared_augment_claim_stale_takeover={}|shared_augment_claim_error={}|shared_unit_initial_publish={}|shared_unit_merge={}|shared_unit_blocks_added={}|shared_unit_duplicate_coalesced={}|shared_unit_conflict={}|shared_unit_repair={}|shared_unit_capacity_refused={}|shared_unit_preflight_refused={}|shared_unit_io_failed={}|shared_unit_validation_failed={}|shared_unit_empty_release={}|shared_unit_post_rename_sync_failed={}",
                 self.store.consulted,
                 self.store.loaded,
                 self.store.replayed,
@@ -6979,6 +7652,23 @@ pub mod xlat_census {
                 self.store.recording_declined,
                 self.store.load_ns,
                 self.store.publish_ns,
+                self.store.shared_augment_claim_won,
+                self.store.shared_augment_claim_live_lost,
+                self.store.shared_augment_claim_yielded,
+                self.store.shared_augment_claim_stale_takeover,
+                self.store.shared_augment_claim_error,
+                self.store.shared_unit_initial_publish,
+                self.store.shared_unit_merge,
+                self.store.shared_unit_blocks_added,
+                self.store.shared_unit_duplicate_coalesced,
+                self.store.shared_unit_conflict,
+                self.store.shared_unit_repair,
+                self.store.shared_unit_capacity_refused,
+                self.store.shared_unit_preflight_refused,
+                self.store.shared_unit_io_failed,
+                self.store.shared_unit_validation_failed,
+                self.store.shared_unit_empty_release,
+                self.store.shared_unit_post_rename_sync_failed,
             );
             for (skip, count) in &self.store.skipped {
                 let _ = writeln!(out, "SKIP|{}|{count}", skip.token());
@@ -7238,6 +7928,41 @@ pub mod xlat_census {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        const STORE_FIELDS: [&str; 25] = [
+            "consulted",
+            "loaded",
+            "replayed",
+            "file_miss",
+            "recording_claimed",
+            "recording_declined",
+            "load_ns",
+            "publish_ns",
+            "shared_augment_claim_won",
+            "shared_augment_claim_live_lost",
+            "shared_augment_claim_yielded",
+            "shared_augment_claim_stale_takeover",
+            "shared_augment_claim_error",
+            "shared_unit_initial_publish",
+            "shared_unit_merge",
+            "shared_unit_blocks_added",
+            "shared_unit_duplicate_coalesced",
+            "shared_unit_conflict",
+            "shared_unit_repair",
+            "shared_unit_capacity_refused",
+            "shared_unit_preflight_refused",
+            "shared_unit_io_failed",
+            "shared_unit_validation_failed",
+            "shared_unit_empty_release",
+            "shared_unit_post_rename_sync_failed",
+        ];
+        let actual: std::collections::BTreeSet<_> = fields.iter().map(|(name, _)| *name).collect();
+        let expected: std::collections::BTreeSet<_> = STORE_FIELDS.into_iter().collect();
+        if fields.len() != STORE_FIELDS.len() || actual != expected {
+            return Err(CensusParseError {
+                line,
+                reason: "STORE fields do not exactly match XLATCENSUS5".to_string(),
+            });
+        }
         Ok(CensusStore {
             consulted: parse_u64(field(&fields, "consulted", line)?, line)?,
             loaded: parse_u64(field(&fields, "loaded", line)?, line)?,
@@ -7249,6 +7974,62 @@ pub mod xlat_census {
             misses: BTreeMap::new(),
             load_ns: parse_u64(field(&fields, "load_ns", line)?, line)?,
             publish_ns: parse_u64(field(&fields, "publish_ns", line)?, line)?,
+            shared_augment_claim_won: parse_u64(
+                field(&fields, "shared_augment_claim_won", line)?,
+                line,
+            )?,
+            shared_augment_claim_live_lost: parse_u64(
+                field(&fields, "shared_augment_claim_live_lost", line)?,
+                line,
+            )?,
+            shared_augment_claim_yielded: parse_u64(
+                field(&fields, "shared_augment_claim_yielded", line)?,
+                line,
+            )?,
+            shared_augment_claim_stale_takeover: parse_u64(
+                field(&fields, "shared_augment_claim_stale_takeover", line)?,
+                line,
+            )?,
+            shared_augment_claim_error: parse_u64(
+                field(&fields, "shared_augment_claim_error", line)?,
+                line,
+            )?,
+            shared_unit_initial_publish: parse_u64(
+                field(&fields, "shared_unit_initial_publish", line)?,
+                line,
+            )?,
+            shared_unit_merge: parse_u64(field(&fields, "shared_unit_merge", line)?, line)?,
+            shared_unit_blocks_added: parse_u64(
+                field(&fields, "shared_unit_blocks_added", line)?,
+                line,
+            )?,
+            shared_unit_duplicate_coalesced: parse_u64(
+                field(&fields, "shared_unit_duplicate_coalesced", line)?,
+                line,
+            )?,
+            shared_unit_conflict: parse_u64(field(&fields, "shared_unit_conflict", line)?, line)?,
+            shared_unit_repair: parse_u64(field(&fields, "shared_unit_repair", line)?, line)?,
+            shared_unit_capacity_refused: parse_u64(
+                field(&fields, "shared_unit_capacity_refused", line)?,
+                line,
+            )?,
+            shared_unit_preflight_refused: parse_u64(
+                field(&fields, "shared_unit_preflight_refused", line)?,
+                line,
+            )?,
+            shared_unit_io_failed: parse_u64(field(&fields, "shared_unit_io_failed", line)?, line)?,
+            shared_unit_validation_failed: parse_u64(
+                field(&fields, "shared_unit_validation_failed", line)?,
+                line,
+            )?,
+            shared_unit_empty_release: parse_u64(
+                field(&fields, "shared_unit_empty_release", line)?,
+                line,
+            )?,
+            shared_unit_post_rename_sync_failed: parse_u64(
+                field(&fields, "shared_unit_post_rename_sync_failed", line)?,
+                line,
+            )?,
         })
     }
 
@@ -7346,6 +8127,7 @@ pub mod xlat_census {
         misses: [AtomicU64; UnitMissReason::ALL.len()],
         load_ns: AtomicU64,
         publish_ns: AtomicU64,
+        augmentation: [AtomicU64; 17],
     }
 
     static STORE_COUNTERS: StoreCounters = StoreCounters {
@@ -7359,6 +8141,7 @@ pub mod xlat_census {
         misses: [const { AtomicU64::new(0) }; UnitMissReason::ALL.len()],
         load_ns: AtomicU64::new(0),
         publish_ns: AtomicU64::new(0),
+        augmentation: [const { AtomicU64::new(0) }; 17],
     };
 
     static STATE: OnceLock<Mutex<CensusState>> = OnceLock::new();
@@ -7388,6 +8171,23 @@ pub mod xlat_census {
             misses: BTreeMap::new(),
             load_ns: read(&STORE_COUNTERS.load_ns),
             publish_ns: read(&STORE_COUNTERS.publish_ns),
+            shared_augment_claim_won: read(&STORE_COUNTERS.augmentation[0]),
+            shared_augment_claim_live_lost: read(&STORE_COUNTERS.augmentation[1]),
+            shared_augment_claim_yielded: read(&STORE_COUNTERS.augmentation[2]),
+            shared_augment_claim_stale_takeover: read(&STORE_COUNTERS.augmentation[3]),
+            shared_augment_claim_error: read(&STORE_COUNTERS.augmentation[4]),
+            shared_unit_initial_publish: read(&STORE_COUNTERS.augmentation[5]),
+            shared_unit_merge: read(&STORE_COUNTERS.augmentation[6]),
+            shared_unit_blocks_added: read(&STORE_COUNTERS.augmentation[7]),
+            shared_unit_duplicate_coalesced: read(&STORE_COUNTERS.augmentation[8]),
+            shared_unit_conflict: read(&STORE_COUNTERS.augmentation[9]),
+            shared_unit_repair: read(&STORE_COUNTERS.augmentation[10]),
+            shared_unit_capacity_refused: read(&STORE_COUNTERS.augmentation[11]),
+            shared_unit_preflight_refused: read(&STORE_COUNTERS.augmentation[12]),
+            shared_unit_io_failed: read(&STORE_COUNTERS.augmentation[13]),
+            shared_unit_validation_failed: read(&STORE_COUNTERS.augmentation[14]),
+            shared_unit_empty_release: read(&STORE_COUNTERS.augmentation[15]),
+            shared_unit_post_rename_sync_failed: read(&STORE_COUNTERS.augmentation[16]),
         };
         for skip in LookupSkip::ALL {
             if let Some(counter) = STORE_COUNTERS.skipped.get(skip.index()) {
@@ -7479,6 +8279,36 @@ pub mod xlat_census {
         STORE_COUNTERS
             .publish_ns
             .fetch_add(elapsed, Ordering::Relaxed);
+    }
+
+    /// Record one typed monotonic-store outcome. The resolver profile is the
+    /// always-on authority; the census mirrors these values when armed.
+    pub fn record_store_stat(stat: super::ResolverStat, value: u64) {
+        if !armed() {
+            return;
+        }
+        let index = match stat {
+            super::ResolverStat::SharedAugmentClaimWon => 0,
+            super::ResolverStat::SharedAugmentClaimLiveLost => 1,
+            super::ResolverStat::SharedAugmentClaimYielded => 2,
+            super::ResolverStat::SharedAugmentClaimStaleTakeover => 3,
+            super::ResolverStat::SharedAugmentClaimError => 4,
+            super::ResolverStat::SharedUnitInitialPublish => 5,
+            super::ResolverStat::SharedUnitMerge => 6,
+            super::ResolverStat::SharedUnitBlocksAdded => 7,
+            super::ResolverStat::SharedUnitDuplicateCoalesced => 8,
+            super::ResolverStat::SharedUnitConflict => 9,
+            super::ResolverStat::SharedUnitRepair => 10,
+            super::ResolverStat::SharedUnitCapacityRefused => 11,
+            super::ResolverStat::SharedUnitPreflightRefused => 12,
+            super::ResolverStat::SharedUnitIoFailed => 13,
+            super::ResolverStat::SharedUnitValidationFailed => 14,
+            super::ResolverStat::SharedUnitEmptyRelease => 15,
+            super::ResolverStat::SharedUnitPostRenameSyncFailed => 16,
+            _ => return,
+        };
+        arm_backstop();
+        STORE_COUNTERS.augmentation[index].fetch_add(value, Ordering::Relaxed);
     }
 
     pub fn record_lookup_loaded() {
@@ -7842,6 +8672,7 @@ pub mod xlat_census {
                 misses: BTreeMap::from([(UnitMissReason::NoAuthority, 2)]),
                 load_ns: 1_500_000,
                 publish_ns: 2_500_000,
+                ..CensusStore::default()
             }
         }
 
@@ -7879,8 +8710,8 @@ pub mod xlat_census {
             let identity = "cd".repeat(32);
             let stem = "aa".repeat(32);
             let expected = format!(
-                "XLATCENSUS4|pid=4242|seq=1|reason=host-self-reexec|total=5|distinct=2|image={identity}|segments=1\n\
-                 STORE|consulted=4|loaded=1|replayed=7|file_miss=1|recording_claimed=0|recording_declined=1|load_ns=1500000|publish_ns=2500000\n\
+                "XLATCENSUS5|pid=4242|seq=1|reason=host-self-reexec|total=5|distinct=2|image={identity}|segments=1\n\
+                 STORE|consulted=4|loaded=1|replayed=7|file_miss=1|recording_claimed=0|recording_declined=1|load_ns=1500000|publish_ns=2500000|shared_augment_claim_won=0|shared_augment_claim_live_lost=0|shared_augment_claim_yielded=0|shared_augment_claim_stale_takeover=0|shared_augment_claim_error=0|shared_unit_initial_publish=0|shared_unit_merge=0|shared_unit_blocks_added=0|shared_unit_duplicate_coalesced=0|shared_unit_conflict=0|shared_unit_repair=0|shared_unit_capacity_refused=0|shared_unit_preflight_refused=0|shared_unit_io_failed=0|shared_unit_validation_failed=0|shared_unit_empty_release=0|shared_unit_post_rename_sync_failed=0\n\
                  SKIP|lane-unconfigured|9\n\
                  SKIP|segment-repeat|40\n\
                  MISS|no-authority|2\n\
@@ -7911,8 +8742,8 @@ pub mod xlat_census {
                     ..CensusStore::default()
                 },
             };
-            let expected = "XLATCENSUS4|pid=7|seq=0|reason=process-exit|total=1|distinct=1|image=-|segments=0\n\
-                            STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n\
+            let expected = "XLATCENSUS5|pid=7|seq=0|reason=process-exit|total=1|distinct=1|image=-|segments=0\n\
+                            STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0|shared_augment_claim_won=0|shared_augment_claim_live_lost=0|shared_augment_claim_yielded=0|shared_augment_claim_stale_takeover=0|shared_augment_claim_error=0|shared_unit_initial_publish=0|shared_unit_merge=0|shared_unit_blocks_added=0|shared_unit_duplicate_coalesced=0|shared_unit_conflict=0|shared_unit_repair=0|shared_unit_capacity_refused=0|shared_unit_preflight_refused=0|shared_unit_io_failed=0|shared_unit_validation_failed=0|shared_unit_empty_release=0|shared_unit_post_rename_sync_failed=0\n\
                             SKIP|lane-unconfigured|1\n\
                             VA|0x1000|-|outside|1\n";
             assert_eq!(file.render(), expected);
@@ -7921,8 +8752,8 @@ pub mod xlat_census {
 
         #[test]
         fn parse_fails_closed_on_a_truncated_or_mislabelled_file() {
-            const HEADER: &str = "XLATCENSUS4|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
-            const STORE: &str = "STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
+            const HEADER: &str = "XLATCENSUS5|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
+            const STORE: &str = "STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0|shared_augment_claim_won=0|shared_augment_claim_live_lost=0|shared_augment_claim_yielded=0|shared_augment_claim_stale_takeover=0|shared_augment_claim_error=0|shared_unit_initial_publish=0|shared_unit_merge=0|shared_unit_blocks_added=0|shared_unit_duplicate_coalesced=0|shared_unit_conflict=0|shared_unit_repair=0|shared_unit_capacity_refused=0|shared_unit_preflight_refused=0|shared_unit_io_failed=0|shared_unit_validation_failed=0|shared_unit_empty_release=0|shared_unit_post_rename_sync_failed=0\n";
             let cases = [
                 (String::new(), "empty"),
                 (
@@ -7931,7 +8762,7 @@ pub mod xlat_census {
                     "superseded schema",
                 ),
                 (
-                    // V3 files lack `replayed=`; a V4 parser must refuse them
+                    // V3 files lack `replayed=`; a current parser must refuse them
                     // rather than default the field.
                     "XLATCENSUS3|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n"
                         .to_string(),
@@ -7962,6 +8793,13 @@ pub mod xlat_census {
                 (
                     format!("{HEADER}{STORE}MISS|not-a-reason|1\n"),
                     "unknown miss reason",
+                ),
+                (
+                    format!("{HEADER}{STORE}").replace(
+                        "publish_ns=0|",
+                        "publish_ns=0|unknown_v5_counter=0|",
+                    ),
+                    "unknown V5 STORE field",
                 ),
                 (
                     // consulted must equal loaded + file_miss + misses.
@@ -8000,8 +8838,8 @@ pub mod xlat_census {
         /// the maps. It parsed clean and reported zero.
         #[test]
         fn skip_counts_before_the_store_line_are_not_discarded_by_it() {
-            const HEADER: &str = "XLATCENSUS4|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
-            const STORE: &str = "STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
+            const HEADER: &str = "XLATCENSUS5|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
+            const STORE: &str = "STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0|shared_augment_claim_won=0|shared_augment_claim_live_lost=0|shared_augment_claim_yielded=0|shared_augment_claim_stale_takeover=0|shared_augment_claim_error=0|shared_unit_initial_publish=0|shared_unit_merge=0|shared_unit_blocks_added=0|shared_unit_duplicate_coalesced=0|shared_unit_conflict=0|shared_unit_repair=0|shared_unit_capacity_refused=0|shared_unit_preflight_refused=0|shared_unit_io_failed=0|shared_unit_validation_failed=0|shared_unit_empty_release=0|shared_unit_post_rename_sync_failed=0\n";
             let reordered = format!("{HEADER}SKIP|segment-repeat|7\nMISS|no-authority|0\n{STORE}");
             let file = CensusFile::parse(&reordered).expect("reordered file parses");
             assert_eq!(

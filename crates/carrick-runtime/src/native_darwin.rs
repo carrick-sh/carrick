@@ -3310,12 +3310,9 @@ fn publish_native_shared_candidates(
     translator: &dsr::ThreadTranslator,
     memory: &SharedNativeMemory,
 ) {
-    let result = {
+    {
         let memory = memory.read();
-        translator.process.publish_shared_candidates(&memory)
-    };
-    if let Err(error) = result {
-        tracing::warn!(%error, "native shared translation publication fell back to JIT");
+        translator.process.publish_shared_candidates(&memory);
     }
 }
 
