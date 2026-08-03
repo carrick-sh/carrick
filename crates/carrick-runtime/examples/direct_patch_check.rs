@@ -60,11 +60,10 @@ fn main() {
         println!("\nVERDICT: word is neither svc nor a branch — mapping is not what we think.");
     }
 
-    // Does the island's baked context address still match the real one?
-    let mut group = group;
-    let real_ctx = group.context_address();
-    // Follow the patched branch rather than guessing where the island is:
-    // the svc site holds `b <island>`, so its imm26 gives the offset.
+    // Does the island resolve the PER-THREAD context (TSD chain) rather
+    // than a baked address? Follow the patched branch rather than guessing
+    // where the island is: the svc site holds `b <island>`, so its imm26
+    // gives the offset.
     let mapped = unsafe {
         std::slice::from_raw_parts(
             group.main().base() as *const u32,
@@ -84,32 +83,34 @@ fn main() {
         "island[0] = {:#010x}  (expect str x0,[sp,#-16]!)",
         island_word(0)
     );
-    let baked = {
-        let mut value = 0_u64;
-        for (index, word) in (0..4).map(|i| (i, island_word(1 + i))) {
-            // movz/movk: imm16 sits at bits 20:5, the shift at bits 22:21.
-            let imm16 = u64::from((word >> 5) & 0xffff);
-            let shift = ((word >> 21) & 0x3) * 16;
-            value |= imm16 << shift;
-            let _ = index;
-        }
-        value
-    };
-    println!("island-baked ctx = {baked:#x}");
-    println!("real ctx address = {real_ctx:#x}");
     println!(
-        "MATCH: {}",
-        if baked == real_ctx {
-            "yes"
+        "island[1] = {:#010x}  (expect mrs x0,tpidrro_el0 — the per-thread resolve)",
+        island_word(1)
+    );
+    println!(
+        "TSD RESOLVE: {}",
+        if island_word(1) == 0xd53b_d060 {
+            "yes — the island addresses this thread's slots"
         } else {
-            "NO — islands restore through the wrong memory"
+            "NO — the island does not begin with the TSD chain"
         }
     );
 
     println!("\nentering the guest on the MAIN thread...");
     let entry = group.main().entry();
+    let slots = match group.install_thread_slots() {
+        Ok(slots) => slots,
+        Err(error) => {
+            println!("install main-thread slots failed: {error}");
+            return;
+        }
+    };
     // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-    unsafe { group.enter(entry) };
+    if let Err(error) = unsafe { group.enter(entry) } {
+        println!("enter failed: {error}");
+        return;
+    }
+    drop(slots);
     println!(
         "returned; handler hits = {}",
         HITS.load(std::sync::atomic::Ordering::Relaxed)
@@ -128,8 +129,16 @@ fn main() {
             // SAFETY: patched image, entry inside it. `enter` arms this thread for
             // MAP_JIT execution, which is the whole point of the experiment.
         } else {
-            // SAFETY: patched image, entry inside it.
-            unsafe { group.enter(entry) };
+            match group.install_thread_slots() {
+                Ok(slots) => {
+                    // SAFETY: patched image, entry inside it.
+                    if let Err(error) = unsafe { group.enter(entry) } {
+                        println!("  spawned: enter failed: {error}");
+                    }
+                    drop(slots);
+                }
+                Err(error) => println!("  spawned: install slots failed: {error}"),
+            }
         }
         println!("  spawned: guest returned");
         if std::env::var_os("CARRICK_NO_RUN").is_some() {

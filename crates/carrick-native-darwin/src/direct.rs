@@ -205,8 +205,12 @@ pub const SVC_0: u32 = 0xd400_0001;
 /// (its encoding depends on where the island lands, which only the caller
 /// knows).
 ///
-/// `ctx` is the absolute address of the [`GuestContext`]; `return_pc` is the
-/// guest address to resume at (the instruction after the patched `svc`).
+/// `tsd` locates the CURRENT THREAD's [`DirectThreadSlots`] (whose
+/// [`GuestContext`] sits at offset 0, so the resolved pointer IS the context
+/// pointer); `return_pc` is the guest address to resume at (the instruction
+/// after the patched `svc`). Resolving per entry instead of baking one
+/// context address is what makes one emitted island serve every guest
+/// thread.
 ///
 /// Register discipline, in order: x0 is freed by borrowing one 16-byte guest
 /// stack slot, then holds the context pointer for the whole island. Every
@@ -222,11 +226,12 @@ pub const SVC_0: u32 = 0xd400_0001;
 /// re-arms the leave word, restores the HOST stack discipline captured by
 /// `enter`, and `ret`s to the caller of `enter` — a gateway exit, the same
 /// shape as the DSR gateway's status returns.
-fn island(ctx: u64, return_pc: u64) -> (Vec<u32>, usize) {
+fn island(tsd: TsdSlot, return_pc: u64) -> (Vec<u32>, usize) {
     let mut w = Vec::with_capacity(96);
-    // Free x0 by borrowing a guest stack slot, then point it at the context.
+    // Free x0 by borrowing a guest stack slot, then point it at this
+    // thread's context (= its slots, context at offset 0).
     w.push(str_pre_sp(0));
-    w.extend_from_slice(&mov_imm64(0, ctx));
+    w.extend_from_slice(&tsd_resolve(0, tsd));
     // Save x1..x30 through the context pointer.
     for r in 1..=30_u32 {
         w.push(str_imm(r, 0, GuestContext::REG + r * 8));
@@ -251,9 +256,10 @@ fn island(ctx: u64, return_pc: u64) -> (Vec<u32>, usize) {
     // branched into the stack (EXC_BAD_ACCESS code=2 with PC on the stack).
     // Whether x0 survived depended on the handler's codegen, so the failure
     // looked like it depended on the crate, the handler's weight and the heap
-    // layout. The address is a patch-time constant, so re-materializing costs
-    // four words and cannot be clobbered by anything.
-    w.extend_from_slice(&mov_imm64(0, ctx));
+    // layout. The chain is three re-executable words and cannot be clobbered
+    // by anything (the handler runs on this same thread, so TPIDRRO_EL0 and
+    // the TSD slot are unchanged).
+    w.extend_from_slice(&tsd_resolve(0, tsd));
     // Did the handler request a LEAVE? x1 is dead here (restored below), and
     // the branch is patched after emission so the distance is computed, not
     // hand-counted.
@@ -292,6 +298,273 @@ const fn mrs_tpidr_el0_word(rd: u32) -> u32 {
 const fn msr_tpidr_el0_word(rn: u32) -> u32 {
     0xd51b_d040 | rn
 }
+/// `mrs xd, tpidrro_el0` — the EL0-READABLE thread register Darwin points at
+/// the current thread's TSD array (probed on this host: `TPIDRRO_EL0` == the
+/// base `pthread_getspecific` indexes, low 3 bits zero; the cpu number lives
+/// in `TPIDR_EL0`). This is how a veneer reaches PER-THREAD slots without a
+/// free register: the destination register it was already going to write.
+const fn mrs_tpidrro_el0_word(rd: u32) -> u32 {
+    0xd53b_d060 | rd
+}
+/// `and xd, xn, #0xffff_ffff_ffff_fff8` — strip the low 3 bits. Historical
+/// Darwin kept the cpu number there; on this host they read zero, so the mask
+/// is a no-op that keeps the veneer correct on both layouts (the TSD base is
+/// at least 8-aligned in either). Encoding: 64-bit AND (immediate), N=1,
+/// immr=61, imms=60 (a 61-one run rotated to cover bits 63..3).
+const fn and_imm_clear_low3(rd: u32, rn: u32) -> u32 {
+    0x927d_f000 | (rn << 5) | rd
+}
+
+// ------------------------------------------------------- per-thread slots
+
+/// The Darwin TSD slot that carries the executing thread's
+/// [`DirectThreadSlots`] pointer.
+///
+/// A `pthread_key_create` key on Darwin IS a direct index into the per-thread
+/// TSD array whose base `TPIDRRO_EL0` holds (Apple libpthread's
+/// `_os_tsd_get_direct`; APSL, clean for this project). That makes the key a
+/// PATCH-TIME CONSTANT the veneers can bake in, while the value it indexes is
+/// per-thread — exactly the split per-thread guest state needs: one emitted
+/// image, private slots per thread.
+///
+/// Construction only through [`thread_slots_tsd`], which PROVES the layout on
+/// this host before handing the key out (fail closed, never assume).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TsdSlot {
+    key: libc::pthread_key_t,
+    /// `key * 8`: the byte offset the veneers' `ldr` encodes. Bounded at
+    /// creation to the LDR scaled-imm12 range so emission cannot truncate.
+    byte_offset: u32,
+}
+
+impl TsdSlot {
+    /// The raw pthread key, escaping only to `pthread_{get,set}specific`.
+    fn key(self) -> libc::pthread_key_t {
+        self.key
+    }
+}
+
+/// `mrs TPIDRRO_EL0` from Rust, for the layout proof (the veneers emit the
+/// same read as guest-visible code).
+fn read_tpidrro_el0() -> u64 {
+    let value: u64;
+    // SAFETY: TPIDRRO_EL0 is EL0-readable by architecture; no memory or
+    // flags are touched.
+    unsafe {
+        std::arch::asm!("mrs {v}, TPIDRRO_EL0", v = out(reg) value,
+                        options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Prove, on the CALLING thread, that the veneers' addressing chain —
+/// `(TPIDRRO_EL0 & !7) + key*8` — reads exactly what `pthread_setspecific`
+/// stored for `key`. This is the fail-closed gate on the whole per-thread
+/// design: if Darwin's TSD layout ever changes shape, tier D refuses to load
+/// rather than dereference garbage from every veneer.
+fn prove_tsd_layout_on_current_thread(key: libc::pthread_key_t) -> Result<(), String> {
+    let sentinel = 0xC0FF_EE00_0000_0000_u64 | key;
+    // SAFETY: plain libc TSD calls on a key this process created.
+    let rc = unsafe { libc::pthread_setspecific(key, sentinel as usize as *const libc::c_void) };
+    if rc != 0 {
+        return Err(format!("pthread_setspecific failed: {rc}"));
+    }
+    let base = read_tpidrro_el0() & !7;
+    // SAFETY: the TSD array extends at least `key` slots — libpthread
+    // allocated the key — and `base` is this thread's TSD base if the layout
+    // holds; the comparison below is what decides whether it does.
+    let via_register = unsafe { *((base + key * 8) as *const u64) };
+    // SAFETY: as above.
+    let via_libc = unsafe { libc::pthread_getspecific(key) } as u64;
+    // SAFETY: clear the probe value again.
+    unsafe { libc::pthread_setspecific(key, std::ptr::null()) };
+    if via_register != sentinel || via_libc != sentinel {
+        return Err(format!(
+            "TPIDRRO_EL0 TSD layout unproven: via_register={via_register:#x} \
+             via_libc={via_libc:#x} sentinel={sentinel:#x}"
+        ));
+    }
+    Ok(())
+}
+
+/// The process-global TSD slot for tier D's per-thread guest state, created
+/// once and PROVEN before use: the layout check runs on the creating thread
+/// AND on a freshly spawned one (a layout that held only on already-running
+/// threads would be exactly the trap to fail closed on). `Err` is sticky —
+/// a host that fails the proof refuses every tier-D image, named.
+pub fn thread_slots_tsd() -> Result<TsdSlot, String> {
+    static SLOT: std::sync::OnceLock<Result<TsdSlot, String>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| {
+        let mut key: libc::pthread_key_t = 0;
+        // No destructor: slot values are owned by [`InstalledThreadSlots`]
+        // guards, which clear the slot before thread end.
+        // SAFETY: plain pthread_key_create out-param call.
+        let rc = unsafe { libc::pthread_key_create(&mut key, None) };
+        if rc != 0 {
+            return Err(format!("pthread_key_create failed: {rc}"));
+        }
+        let byte_offset = key as u64 * 8;
+        // LDR (unsigned scaled imm12, 8-byte scale) reaches 32760.
+        let byte_offset = u32::try_from(byte_offset)
+            .ok()
+            .filter(|offset| *offset <= 32760)
+            .ok_or_else(|| format!("TSD key {key} out of LDR-immediate range"))?;
+        prove_tsd_layout_on_current_thread(key)?;
+        std::thread::spawn(move || prove_tsd_layout_on_current_thread(key))
+            .join()
+            .map_err(|_| "TSD layout probe thread panicked".to_string())??;
+        Ok(TsdSlot { key, byte_offset })
+    })
+    .clone()
+}
+
+/// One guest thread's private tier-D state: the [`GuestContext`] its islands
+/// spill into and the `tpidr_el0`/x18 values its veneers read and write.
+///
+/// `repr(C)` with `context` FIRST is load-bearing: the emitted addressing
+/// chain resolves the slots pointer and uses it directly as the context
+/// pointer (offset 0), and reaches the TLS/x18 cells at the constant offsets
+/// below.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DirectThreadSlots {
+    /// The thread's island-parked register file (offset 0 by contract).
+    pub context: GuestContext,
+    /// The thread's guest `tpidr_el0`. XNU will not hold it in the physical
+    /// register, so the veneers keep it here.
+    pub guest_tls: u64,
+    /// The thread's guest x18. Darwin rewrites the physical platform
+    /// register at every trap return, so the value lives here.
+    pub guest_x18: u64,
+}
+
+impl DirectThreadSlots {
+    /// Byte offset of `guest_tls`, baked into the veneers.
+    const TLS_OFF: u32 = std::mem::offset_of!(DirectThreadSlots, guest_tls) as u32;
+    /// Byte offset of `guest_x18`, baked into the veneers.
+    const X18_OFF: u32 = std::mem::offset_of!(DirectThreadSlots, guest_x18) as u32;
+
+    /// Fresh slots for one thread, wired to `handler`.
+    pub fn new(handler: extern "C" fn(*mut GuestContext)) -> Self {
+        Self {
+            context: GuestContext {
+                handler: handler as usize as u64,
+                ..GuestContext::default()
+            },
+            guest_tls: 0,
+            guest_x18: 0,
+        }
+    }
+}
+
+// The emitted `ldr`s encode these as scaled imm12 offsets; `context` at 0 is
+// what lets the resolved slots pointer BE the context pointer.
+const _: () = assert!(std::mem::offset_of!(DirectThreadSlots, context) == 0);
+const _: () =
+    assert!(DirectThreadSlots::TLS_OFF.is_multiple_of(8) && DirectThreadSlots::TLS_OFF <= 32760);
+const _: () =
+    assert!(DirectThreadSlots::X18_OFF.is_multiple_of(8) && DirectThreadSlots::X18_OFF <= 32760);
+
+/// RAII installation of one thread's [`DirectThreadSlots`] into the process
+/// TSD slot: while this guard lives, veneers and islands executing on THIS
+/// host thread address the boxed slots. Dropping clears the TSD slot and
+/// frees the box, so a stale pointer can never be reached by a later guest.
+pub struct InstalledThreadSlots {
+    /// Owned allocation, held raw so the emitted code's writes through the
+    /// TSD pointer and the guard's reads name the same memory without a
+    /// `Box` aliasing claim.
+    slots: *mut DirectThreadSlots,
+    key: libc::pthread_key_t,
+}
+
+impl InstalledThreadSlots {
+    /// Install `slots` for the current thread. Fails when the TSD slot is
+    /// unavailable or already occupied (nested guests on one thread are not
+    /// a supported shape — that would alias two register files).
+    pub fn install(slots: Box<DirectThreadSlots>) -> io::Result<Self> {
+        let tsd = thread_slots_tsd().map_err(io::Error::other)?;
+        // SAFETY: reading this thread's own slot of a proven key.
+        let occupied = !unsafe { libc::pthread_getspecific(tsd.key()) }.is_null();
+        if occupied {
+            return Err(io::Error::other(
+                "tier-D thread slots already installed on this thread",
+            ));
+        }
+        let slots = Box::into_raw(slots);
+        // SAFETY: publishing the freshly leaked pointer into this thread's
+        // own slot.
+        let rc = unsafe { libc::pthread_setspecific(tsd.key(), slots.cast()) };
+        if rc != 0 {
+            // SAFETY: re-own the allocation the TSD never accepted.
+            drop(unsafe { Box::from_raw(slots) });
+            return Err(io::Error::other(format!(
+                "pthread_setspecific failed: {rc}"
+            )));
+        }
+        Ok(Self {
+            slots,
+            key: tsd.key(),
+        })
+    }
+
+    /// The installed slots (the guest must be parked — i.e. not executing on
+    /// this thread — for the values to be stable).
+    pub fn slots(&self) -> &DirectThreadSlots {
+        // SAFETY: the guard owns the allocation; the guest writes through
+        // the same pointer only while running, per the doc contract.
+        unsafe { &*self.slots }
+    }
+
+    /// Mutable access for seeding a thread's initial state (clone children).
+    pub fn slots_mut(&mut self) -> &mut DirectThreadSlots {
+        // SAFETY: as [`Self::slots`], plus the exclusive borrow.
+        unsafe { &mut *self.slots }
+    }
+
+    /// Uninstall and hand the slots back (the parked state survives the
+    /// guard, e.g. for post-run assertions).
+    pub fn into_slots(self) -> Box<DirectThreadSlots> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: clearing this thread's own slot.
+        unsafe { libc::pthread_setspecific(this.key, std::ptr::null()) };
+        // SAFETY: re-owning the allocation `install` leaked.
+        unsafe { Box::from_raw(this.slots) }
+    }
+}
+
+impl Drop for InstalledThreadSlots {
+    fn drop(&mut self) {
+        // SAFETY: clearing this thread's own slot, then re-owning the
+        // allocation `install` leaked.
+        unsafe {
+            libc::pthread_setspecific(self.key, std::ptr::null());
+            drop(Box::from_raw(self.slots));
+        }
+    }
+}
+
+/// The slots installed for the CURRENT thread, if any (null when no guard is
+/// live). The pointer is only meaningful on the thread that installed it.
+pub fn current_thread_slots_ptr() -> *mut DirectThreadSlots {
+    match thread_slots_tsd() {
+        // SAFETY: reading this thread's own slot of a proven key.
+        Ok(tsd) => unsafe { libc::pthread_getspecific(tsd.key()) }.cast(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Emit the three-word chain that resolves the current thread's
+/// [`DirectThreadSlots`] pointer into `reg`: read `TPIDRRO_EL0`, strip the
+/// historical cpu-number bits, load the proven TSD slot. This is the whole
+/// per-thread mechanism — every veneer and island prefixes its slot access
+/// with it, so one emitted image serves any number of threads.
+fn tsd_resolve(reg: u32, tsd: TsdSlot) -> [u32; 3] {
+    [
+        mrs_tpidrro_el0_word(reg),
+        and_imm_clear_low3(reg, reg),
+        ldr_imm(reg, reg, tsd.byte_offset),
+    ]
+}
 
 /// Decode a `tpidr_el0` access, if this word is one.
 fn tpidr_access(word: u32) -> Option<TpidrAccess> {
@@ -314,17 +587,20 @@ enum TpidrAccess {
 /// Emit a veneer that services one guest `tpidr_el0` access.
 ///
 /// XNU rewrites `TPIDR_EL0` at the first trap return (probed), so a guest TLS
-/// base cannot live in the physical register. It lives in `slot` instead, and
-/// these veneers are the only things that touch it.
+/// base cannot live in the physical register. It lives in the CURRENT
+/// THREAD's [`DirectThreadSlots`] (resolved through `tsd` — see
+/// [`tsd_resolve`]), and these veneers are the only things that touch it.
 ///
 /// A READ needs no borrowed register at all: `mrs xd, tpidr_el0` was already
-/// going to overwrite `xd`, so the veneer materializes the slot address into
+/// going to overwrite `xd`, so the veneer resolves the slots pointer into
 /// that same register and loads through it.
 ///
 /// A WRITE has to preserve its source register, so it borrows one 16-byte
 /// guest stack slot exactly as the syscall island does — using x0, or x1 when
 /// the source *is* x0.
-fn tpidr_veneer(access: TpidrAccess, tls_slot: u64, x18_slot: u64) -> Vec<u32> {
+fn tpidr_veneer(access: TpidrAccess, tsd: TsdSlot) -> Vec<u32> {
+    const TLS: u32 = DirectThreadSlots::TLS_OFF;
+    const X18: u32 = DirectThreadSlots::X18_OFF;
     let mut w = Vec::with_capacity(16);
     match access {
         // x18 as the destination is not a normal register case: depositing the
@@ -333,29 +609,27 @@ fn tpidr_veneer(access: TpidrAccess, tls_slot: u64, x18_slot: u64) -> Vec<u32> {
         // slot-to-slot move and touches neither special register.
         TpidrAccess::Read { reg: 18 } => {
             w.push(stp_pre_sp(0, 1));
-            w.extend_from_slice(&mov_imm64(0, tls_slot));
-            w.push(ldr_imm(0, 0, 0));
-            w.extend_from_slice(&mov_imm64(1, x18_slot));
-            w.push(str_imm(0, 1, 0));
+            w.extend_from_slice(&tsd_resolve(0, tsd));
+            w.push(ldr_imm(1, 0, TLS));
+            w.push(str_imm(1, 0, X18));
             w.push(ldp_post_sp(0, 1));
         }
         TpidrAccess::Write { reg: 18 } => {
             w.push(stp_pre_sp(0, 1));
-            w.extend_from_slice(&mov_imm64(0, x18_slot));
-            w.push(ldr_imm(0, 0, 0));
-            w.extend_from_slice(&mov_imm64(1, tls_slot));
-            w.push(str_imm(0, 1, 0));
+            w.extend_from_slice(&tsd_resolve(0, tsd));
+            w.push(ldr_imm(1, 0, X18));
+            w.push(str_imm(1, 0, TLS));
             w.push(ldp_post_sp(0, 1));
         }
         TpidrAccess::Read { reg } => {
-            w.extend_from_slice(&mov_imm64(reg, tls_slot));
-            w.push(ldr_imm(reg, reg, 0));
+            w.extend_from_slice(&tsd_resolve(reg, tsd));
+            w.push(ldr_imm(reg, reg, TLS));
         }
         TpidrAccess::Write { reg } => {
             let scratch = if reg == 0 { 1 } else { 0 };
             w.push(str_pre_sp(scratch));
-            w.extend_from_slice(&mov_imm64(scratch, tls_slot));
-            w.push(str_imm(reg, scratch, 0));
+            w.extend_from_slice(&tsd_resolve(scratch, tsd));
+            w.push(str_imm(reg, scratch, TLS));
             w.push(ldr_post_sp(scratch));
         }
     }
@@ -621,11 +895,11 @@ fn instruction_is_pc_relative(insn: &bad64::Instruction) -> bool {
 /// edges leave through patch-time-constant branches — the returned indices
 /// are the `b` slots for TAKEN (the original target) and FALL-THROUGH
 /// (site + 4), which only the caller can encode.
-fn x18_branch_veneer(word: u32, slot: u64) -> (Vec<u32>, usize, usize) {
+fn x18_branch_veneer(word: u32, tsd: TsdSlot) -> (Vec<u32>, usize, usize) {
     let mut w = Vec::with_capacity(12);
     w.push(str_pre_sp(0));
-    w.extend_from_slice(&mov_imm64(0, slot));
-    w.push(ldr_imm(0, 0, 0));
+    w.extend_from_slice(&tsd_resolve(0, tsd));
+    w.push(ldr_imm(0, 0, DirectThreadSlots::X18_OFF));
     // The original condition — size/op/bit bits preserved — retargeted at
     // x0 and a fixed +3 words (over the fall-through restore+branch).
     let stripped = if cond_branch_on_x18(word) {
@@ -644,13 +918,13 @@ fn x18_branch_veneer(word: u32, slot: u64) -> (Vec<u32>, usize, usize) {
 }
 
 /// Veneer for `adr`/`adrp` into x18: the computed address is a patch-time
-/// constant, materialized straight into the slot.
-fn x18_pc_address_veneer(value: u64, slot: u64) -> Vec<u32> {
+/// constant, materialized straight into the current thread's x18 slot.
+fn x18_pc_address_veneer(value: u64, tsd: TsdSlot) -> Vec<u32> {
     let mut w = Vec::with_capacity(12);
     w.push(stp_pre_sp(0, 1));
     w.extend_from_slice(&mov_imm64(0, value));
-    w.extend_from_slice(&mov_imm64(1, slot));
-    w.push(str_imm(0, 1, 0));
+    w.extend_from_slice(&tsd_resolve(1, tsd));
+    w.push(str_imm(0, 1, DirectThreadSlots::X18_OFF));
     w.push(ldp_post_sp(0, 1));
     w
 }
@@ -658,22 +932,22 @@ fn x18_pc_address_veneer(value: u64, slot: u64) -> Vec<u32> {
 /// Emit a veneer that runs one x18-using instruction against a memory slot.
 ///
 /// Darwin rewrites the platform register at every trap return, so a guest x18
-/// value cannot live there; it lives in `slot`. The veneer borrows two
-/// registers the instruction does not name — one to hold the slot address, one
-/// to stand in for x18 — runs the rewritten instruction, and writes the
-/// stand-in back.
+/// value cannot live there; it lives in the current thread's
+/// [`DirectThreadSlots`]. The veneer borrows two registers the instruction
+/// does not name — one to hold the slots pointer, one to stand in for x18 —
+/// runs the rewritten instruction, and writes the stand-in back.
 ///
 /// The write-back is UNCONDITIONAL by design. If the instruction only read
 /// x18, the stand-in still holds the value that was loaded, so storing it back
 /// is a no-op; that removes the need to classify reads from writes, which is
 /// where a shape-by-shape implementation would accumulate mistakes.
-fn x18_veneer(rewritten: u32, value_reg: u32, addr_reg: u32, slot: u64) -> Vec<u32> {
+fn x18_veneer(rewritten: u32, value_reg: u32, addr_reg: u32, tsd: TsdSlot) -> Vec<u32> {
     let mut w = Vec::with_capacity(12);
     w.push(stp_pre_sp(value_reg, addr_reg));
-    w.extend_from_slice(&mov_imm64(addr_reg, slot));
-    w.push(ldr_imm(value_reg, addr_reg, 0));
+    w.extend_from_slice(&tsd_resolve(addr_reg, tsd));
+    w.push(ldr_imm(value_reg, addr_reg, DirectThreadSlots::X18_OFF));
     w.push(rewritten);
-    w.push(str_imm(value_reg, addr_reg, 0));
+    w.push(str_imm(value_reg, addr_reg, DirectThreadSlots::X18_OFF));
     w.push(ldp_post_sp(value_reg, addr_reg));
     w
 }
@@ -733,6 +1007,13 @@ pub enum DirectIneligible {
     /// fail-closed edge when the kernel places the island arena too far from
     /// the guest's fixed text address.
     IslandOutOfRange { vaddr: u64 },
+    /// This HOST failed the per-thread addressing proof: the veneers reach
+    /// per-thread slots through `(TPIDRRO_EL0 & !7) + key*8`, and
+    /// [`thread_slots_tsd`] could not verify that chain against
+    /// `pthread_{set,get}specific` (a changed Darwin TSD layout, or key
+    /// exhaustion). Every image is refused — dereferencing an unproven chain
+    /// from every veneer is the one thing tier D must never do.
+    HostTsdLayoutUnproven { reason: String },
 }
 
 impl std::fmt::Display for DirectIneligible {
@@ -753,6 +1034,9 @@ impl std::fmt::Display for DirectIneligible {
             }
             Self::IslandOutOfRange { vaddr } => {
                 write!(f, "island for site {vaddr:#x} out of ±128 MiB branch range")
+            }
+            Self::HostTsdLayoutUnproven { reason } => {
+                write!(f, "host TSD layout unproven for per-thread slots: {reason}")
             }
         }
     }
@@ -1009,9 +1293,7 @@ impl DirectImage {
         elf: &[u8],
         lo: u64,
         bias: u64,
-        ctx_addr: u64,
-        tls_addr: u64,
-        x18_addr: u64,
+        tsd: TsdSlot,
     ) -> Result<Result<(), DirectIneligible>, io::Error> {
         let (_, hi) = load_span(elf)?;
         let image_len = (hi - lo) as usize;
@@ -1048,9 +1330,7 @@ impl DirectImage {
             let Some(code) = elf.get(offset..end) else {
                 return Err(io::Error::other("executable section outside the file"));
             };
-            match self.patch_executable_words(
-                code, vaddr, lo, bias, &mut arena, ctx_addr, tls_addr, x18_addr,
-            )? {
+            match self.patch_executable_words(code, vaddr, lo, bias, &mut arena, tsd)? {
                 Ok(()) => {}
                 Err(reason) => return Ok(Err(reason)),
             }
@@ -1070,7 +1350,6 @@ impl DirectImage {
     /// `lo` maps that domain to text-mapping byte offsets (`host = vaddr -
     /// lo`), and `bias` maps it to runtime addresses (`runtime = vaddr +
     /// bias`). A branch that cannot reach in ±128 MiB refuses the image.
-    #[allow(clippy::too_many_arguments)]
     fn patch_executable_words(
         &mut self,
         code: &[u8],
@@ -1078,9 +1357,7 @@ impl DirectImage {
         lo: u64,
         bias: u64,
         arena: &mut IslandArena,
-        ctx_addr: u64,
-        tls_addr: u64,
-        x18_addr: u64,
+        tsd: TsdSlot,
     ) -> Result<Result<(), DirectIneligible>, io::Error> {
         // Runtime address of a text byte offset. The text mapping is always
         // `self.base`; the arena may or may not be the same mapping.
@@ -1092,7 +1369,7 @@ impl DirectImage {
             if let Some(access) = tpidr_access(word) {
                 let site_host = (site_vaddr - lo) as usize;
                 let veneer_cursor = arena.cursor;
-                let words = tpidr_veneer(access, tls_addr, x18_addr);
+                let words = tpidr_veneer(access, tsd);
                 let bytes = words.len() * 4;
                 if veneer_cursor + bytes + 4 > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
@@ -1131,7 +1408,7 @@ impl DirectImage {
                     return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
                 }
                 let veneer_cursor = arena.cursor;
-                let (words, taken_slot, fallthrough_slot) = x18_branch_veneer(word, x18_addr);
+                let (words, taken_slot, fallthrough_slot) = x18_branch_veneer(word, tsd);
                 let bytes = words.len() * 4;
                 if veneer_cursor + bytes > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
@@ -1169,7 +1446,7 @@ impl DirectImage {
                 let site_host = (site_vaddr - lo) as usize;
                 let value = pc_relative_address_value(word, site_vaddr + bias);
                 let veneer_cursor = arena.cursor;
-                let words = x18_pc_address_veneer(value, x18_addr);
+                let words = x18_pc_address_veneer(value, tsd);
                 let bytes = words.len() * 4;
                 if veneer_cursor + bytes + 4 > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
@@ -1214,7 +1491,7 @@ impl DirectImage {
                 };
                 let site_host = (site_vaddr - lo) as usize;
                 let veneer_cursor = arena.cursor;
-                let words = x18_veneer(rewritten, value_reg, addr_reg, x18_addr);
+                let words = x18_veneer(rewritten, value_reg, addr_reg, tsd);
                 let bytes = words.len() * 4;
                 if veneer_cursor + bytes + 4 > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
@@ -1242,7 +1519,7 @@ impl DirectImage {
             }
             let site_host = (site_vaddr - lo) as usize;
             let island_cursor = arena.cursor;
-            let (words, resume_slot) = island(ctx_addr, site_vaddr + bias + 4);
+            let (words, resume_slot) = island(tsd, site_vaddr + bias + 4);
             let island_bytes = words.len() * 4;
             if island_cursor + island_bytes > arena.len {
                 return Err(io::Error::other("island budget exhausted"));
@@ -1376,30 +1653,24 @@ impl Drop for DirectImage {
     }
 }
 
-/// A guest's load group: every image it executes, plus the ONE coherent slot
-/// set they all share.
+/// A guest's load group: every image it executes, plus the addressing that
+/// gives each THREAD of that guest its own slot set.
 ///
-/// The slots are per-GROUP, not per-image, because the group is one guest:
-/// ld.so and the main image are separate mappings, but a thread pointer the
-/// interpreter's veneers write must be the same one the main image's veneers
-/// read. Per-image slots would give one thread two TLS values depending on
-/// which mapping its PC happens to be in — incoherent by construction. The
-/// same argument covers the `GuestContext`: `enter` captures the host stack
-/// discipline in it, and an island in ANY member image must restore that same
-/// capture on a leave.
-///
-/// One slot set per group is correct while tier D is single-threaded; threads
-/// share a load group but need private TLS/x18/context (roadmap Phase 1
-/// item 4).
+/// Slots are per-THREAD (roadmap Phase 1 item 4): every veneer and island in
+/// every member image resolves the executing thread's [`DirectThreadSlots`]
+/// through the proven process-global TSD slot ([`thread_slots_tsd`]), so ld.so
+/// and the main image — one guest — share one coherent view PER THREAD, and
+/// two guest threads never alias a TLS value, an x18 value, or a parked
+/// register file. The group itself carries only what is genuinely shared:
+/// the mapped images, the handler new thread slots are wired to, and the
+/// window/replacement bookkeeping.
 pub struct DirectLoadGroup {
-    context: Box<GuestContext>,
-    /// The guest's TLS base. XNU will not hold it in `TPIDR_EL0`, so the
-    /// veneers of every member image read and write it here.
-    guest_tls: Box<u64>,
-    /// The guest's x18. Darwin rewrites the physical register at every trap
-    /// return, so the value lives here and the veneers move it in and out
-    /// around each use.
-    guest_x18: Box<u64>,
+    /// The handler every thread's context is wired to (islands load it from
+    /// the per-thread context, so this is the template value).
+    handler: extern "C" fn(*mut GuestContext),
+    /// The proven TSD slot the emitted code resolves per-thread slots
+    /// through — a patch-time constant shared by every member image.
+    tsd: TsdSlot,
     images: Vec<DirectImage>,
     /// Index of the interpreter image, when the main image declared
     /// `PT_INTERP` and [`Self::load_with_interpreter`] mapped it.
@@ -1417,9 +1688,10 @@ pub struct DirectLoadGroup {
     replaced: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
-/// Lock a group Mutex without poisoning semantics: the guarded state is
-/// only ever mutated by the single thread the guest runs on, so a poisoned
-/// lock means a panic already unwound past us and the data is still sound.
+/// Lock a group Mutex without poisoning semantics: the guarded state is only
+/// ever mutated by guest threads parked in the handler (never mid-guest), so
+/// a poisoned lock means a panic already unwound past us and the data is
+/// still sound.
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -1429,6 +1701,12 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 // SAFETY: the images' mappings are owned solely by this value, and the slot
 // boxes move with it.
 unsafe impl Send for DirectLoadGroup {}
+// SAFETY: shared access from multiple guest threads is the per-thread design
+// (roadmap item 4): the raw image pointers are written only during
+// construction and window mapping (under the jit-write-protect discipline,
+// before any guest thread can reach the new mapping), and all runtime-mutable
+// bookkeeping (`windows`, `replaced`) is behind Mutexes.
+unsafe impl Sync for DirectLoadGroup {}
 
 impl DirectLoadGroup {
     /// Load `elf` as the group's MAIN image, patch it, make it executable.
@@ -1441,7 +1719,10 @@ impl DirectLoadGroup {
         elf: &[u8],
         handler: extern "C" fn(*mut GuestContext),
     ) -> Result<Result<Self, DirectIneligible>, io::Error> {
-        let mut group = Self::empty(handler);
+        let mut group = match Self::empty(handler) {
+            Ok(group) => group,
+            Err(reason) => return Ok(Err(reason)),
+        };
         match group.load_image(elf)? {
             Ok(_) => Ok(Ok(group)),
             Err(reason) => Ok(Err(reason)),
@@ -1465,7 +1746,10 @@ impl DirectLoadGroup {
         resolve_interpreter: impl FnOnce(&str) -> Result<Vec<u8>, io::Error>,
         handler: extern "C" fn(*mut GuestContext),
     ) -> Result<Result<Self, DirectIneligible>, io::Error> {
-        let mut group = Self::empty(handler);
+        let mut group = match Self::empty(handler) {
+            Ok(group) => group,
+            Err(reason) => return Ok(Err(reason)),
+        };
         match group.load_image_inner(main_elf, true)? {
             Ok(_) => {}
             Err(reason) => return Ok(Err(reason)),
@@ -1480,19 +1764,19 @@ impl DirectLoadGroup {
         Ok(Ok(group))
     }
 
-    fn empty(handler: extern "C" fn(*mut GuestContext)) -> Self {
-        Self {
-            context: Box::new(GuestContext {
-                handler: handler as usize as u64,
-                ..GuestContext::default()
-            }),
-            guest_tls: Box::new(0),
-            guest_x18: Box::new(0),
+    /// Fail closed BEFORE any image work: a host whose per-thread addressing
+    /// chain cannot be proven must refuse every tier-D image, named.
+    fn empty(handler: extern "C" fn(*mut GuestContext)) -> Result<Self, DirectIneligible> {
+        let tsd = thread_slots_tsd()
+            .map_err(|reason| DirectIneligible::HostTsdLayoutUnproven { reason })?;
+        Ok(Self {
+            handler,
+            tsd,
             images: Vec::new(),
             interpreter: None,
             windows: std::sync::Mutex::new(Vec::new()),
             replaced: std::sync::Mutex::new(Vec::new()),
-        }
+        })
     }
 
     /// Load one more image into the group, sharing the group's slot set.
@@ -1549,14 +1833,10 @@ impl DirectLoadGroup {
             x18_sites: 0,
             island_mapping: None,
         };
-        let ctx_addr = std::ptr::from_mut(self.context.as_mut()) as u64;
-        let tls_addr = std::ptr::from_mut(self.guest_tls.as_mut()) as u64;
-        let x18_addr = std::ptr::from_mut(self.guest_x18.as_mut()) as u64;
-
         // Patching happens with the region writable and no guest thread able
         // to enter it, so there is no cross-modifying-code hazard.
         jit_write_protect(false);
-        let result = image.copy_and_patch(elf, lo, bias, ctx_addr, tls_addr, x18_addr);
+        let result = image.copy_and_patch(elf, lo, bias, self.tsd);
         jit_write_protect(true);
         // SAFETY: the region was just written; publish it to the i-cache.
         unsafe { sys_icache_invalidate(base.cast(), len) };
@@ -1645,9 +1925,6 @@ impl DirectLoadGroup {
             x18_sites: 0,
             island_mapping: None,
         };
-        let ctx_addr = std::ptr::from_ref::<GuestContext>(self.context.as_ref()) as u64;
-        let tls_addr = std::ptr::from_ref::<u64>(self.guest_tls.as_ref()) as u64;
-        let x18_addr = std::ptr::from_ref::<u64>(self.guest_x18.as_ref()) as u64;
         // Copy and patch with the region writable and no guest thread able
         // to enter it — this thread is typically still ARMED for execution
         // from the load-time patching, so even the plain byte copy must sit
@@ -1691,9 +1968,7 @@ impl DirectLoadGroup {
                 image.base as u64,
                 0,
                 &mut arena,
-                ctx_addr,
-                tls_addr,
-                x18_addr,
+                self.tsd,
             ) {
                 Ok(Ok(())) => {}
                 Ok(Err(reason)) => {
@@ -1801,9 +2076,6 @@ impl DirectLoadGroup {
             x18_sites: 0,
             island_mapping: Some((arena_ptr, arena_len)),
         };
-        let ctx_addr = std::ptr::from_ref::<GuestContext>(self.context.as_ref()) as u64;
-        let tls_addr = std::ptr::from_ref::<u64>(self.guest_tls.as_ref()) as u64;
-        let x18_addr = std::ptr::from_ref::<u64>(self.guest_x18.as_ref()) as u64;
         // Copy the window's file bytes; past EOF stays zero (mmap semantic).
         let offset_usize = offset as usize;
         if offset_usize < file.len() {
@@ -1832,9 +2104,7 @@ impl DirectLoadGroup {
                 image.base as u64,
                 0,
                 &mut arena,
-                ctx_addr,
-                tls_addr,
-                x18_addr,
+                self.tsd,
             ) {
                 Ok(Ok(())) => {}
                 Ok(Err(reason)) => {
@@ -2014,27 +2284,23 @@ impl DirectLoadGroup {
         self.interpreter().unwrap_or_else(|| self.main()).entry()
     }
 
-    /// The guest's x18, as the veneers see it.
-    pub fn guest_x18(&self) -> u64 {
-        *self.guest_x18
-    }
-    /// The guest's TLS base, as the veneers see it.
-    pub fn guest_tls(&self) -> u64 {
-        *self.guest_tls
+    /// The handler every thread's slots are wired to (the value
+    /// [`Self::load`] was given).
+    pub fn handler(&self) -> extern "C" fn(*mut GuestContext) {
+        self.handler
     }
 
-    /// The address the ISLANDS were built to use for the context.
-    ///
-    /// Diagnostic: the islands materialize this as a patch-time constant, so
-    /// it must equal `context_address()`. A mismatch means the context moved
-    /// after patching, which would make every island restore the guest through
-    /// the wrong memory.
-    pub fn context_address(&mut self) -> u64 {
-        std::ptr::from_mut(self.context.as_mut()) as u64
+    /// Fresh, uninstalled per-thread slots wired to this group's handler —
+    /// the template a runner seeds for a clone child before installing them
+    /// on the child's host thread.
+    pub fn new_thread_slots(&self) -> Box<DirectThreadSlots> {
+        Box::new(DirectThreadSlots::new(self.handler))
     }
 
-    pub fn context(&mut self) -> &mut GuestContext {
-        &mut self.context
+    /// Allocate AND install fresh slots for the current thread — the one
+    /// call a thread makes before entering any image of this group.
+    pub fn install_thread_slots(&self) -> io::Result<InstalledThreadSlots> {
+        InstalledThreadSlots::install(self.new_thread_slots())
     }
 
     /// Arm THIS thread to execute the group's `MAP_JIT` pages.
@@ -2053,16 +2319,34 @@ impl DirectLoadGroup {
         jit_write_protect(true);
     }
 
+    /// The current thread's installed context, or a NAMED refusal — entering
+    /// a guest without per-thread slots would have every veneer and island
+    /// dereference a null TSD slot.
+    fn current_context_for_enter(&self) -> io::Result<u64> {
+        let slots = current_thread_slots_ptr();
+        if slots.is_null() {
+            return Err(io::Error::other(
+                "no tier-D thread slots installed on this thread \
+                 (DirectLoadGroup::install_thread_slots first)",
+            ));
+        }
+        // `context` sits at offset 0 of the slots by `repr(C)` contract.
+        Ok(slots as u64)
+    }
+
     /// Jump to `pc`. Returns when the guest LEAVES through the handler
     /// ([`GuestContext::request_leave`] — see the module-level guest-leave
-    /// contract), or when a test fixture `ret`s with SP balanced.
+    /// contract), or when a test fixture `ret`s with SP balanced. Fails
+    /// closed (no guest instruction runs) when this thread has no installed
+    /// [`DirectThreadSlots`].
     ///
     /// # Safety
     /// Every member image must be fully patched, and `pc` must be an address
-    /// inside one of them.
-    pub unsafe fn enter(&self, pc: u64) {
+    /// inside one of them (or a runtime stub of this group, e.g. the parked
+    /// entry of [`Self::enter_parked`]).
+    pub unsafe fn enter(&self, pc: u64) -> io::Result<()> {
+        let ctx = self.current_context_for_enter()?;
         self.arm_current_thread();
-        let ctx = std::ptr::from_ref::<GuestContext>(self.context.as_ref()) as u64;
         // Enter through asm that declares the guest clobbers every
         // callee-saved register, NOT as a plain `extern "C"` call.
         //
@@ -2115,6 +2399,7 @@ impl DirectLoadGroup {
                 clobber_abi("C"),
             );
         }
+        Ok(())
     }
 
     /// Jump to `pc` with the guest's stack pointer switched to `sp`.
@@ -2138,9 +2423,9 @@ impl DirectLoadGroup {
     /// As [`Self::enter`], plus: the guest MUST leave through the handler
     /// (guest-leave contract). The fixture-style balanced `ret` is NOT
     /// survivable here — it would land in Rust still on the guest stack.
-    pub unsafe fn enter_on_stack(&self, pc: u64, sp: u64) {
+    pub unsafe fn enter_on_stack(&self, pc: u64, sp: u64) -> io::Result<()> {
+        let ctx = self.current_context_for_enter()?;
         self.arm_current_thread();
-        let ctx = std::ptr::from_ref::<GuestContext>(self.context.as_ref()) as u64;
         // Same gateway shape as `enter` (see the clobber discussion there);
         // the differences are the SP switch after the host capture and the
         // register scrub before the branch.
@@ -2186,6 +2471,103 @@ impl DirectLoadGroup {
                 clobber_abi("C"),
             );
         }
+        Ok(())
+    }
+
+    /// Enter a guest thread whose COMPLETE state is parked in the current
+    /// thread's installed [`DirectThreadSlots`] — the clone-child entry: the
+    /// runner seeds the child's context (parent register file, x0 = 0, SP =
+    /// the clone stack, `pc` = the resume site), installs the slots on the
+    /// spawned host thread, and calls this.
+    ///
+    /// The mechanism is the island RESUME leg, emitted at runtime as a
+    /// per-entry stub NEAR the resume pc (both branch legs are patch-time
+    /// constants, so the stub is fully register-transparent: the guest wakes
+    /// with every GPR, SP and pc exactly as parked). Fails closed — no guest
+    /// instruction runs — when no slots are installed or no stub slot exists
+    /// within `b` range of the resume pc.
+    ///
+    /// # Safety
+    /// As [`Self::enter`], plus: the parked context must be a genuine guest
+    /// state for THIS group (its pc inside a patched member image), and the
+    /// guest must leave through the handler (guest-leave contract).
+    pub unsafe fn enter_parked(&self) -> io::Result<()> {
+        let ctx = self.current_context_for_enter()?;
+        // SAFETY: `current_context_for_enter` proved the slots pointer; the
+        // guest is not running on this thread yet, so the read is stable.
+        let pc = unsafe { (*(ctx as usize as *const GuestContext)).pc };
+        let stub = ParkedEntryStub::build(ctx, pc)?;
+        // SAFETY: caller contract; the stub is patched, published and
+        // i-cache-invalidated by `build`.
+        unsafe { self.enter(stub.entry()) }
+    }
+}
+
+/// The runtime-emitted resume stub behind [`DirectLoadGroup::enter_parked`]:
+/// one page of plain memory holding `materialize ctx; restore SP, x30..x0;
+/// b resume_pc`. Placed near the resume pc (the final leg is a constant `b`,
+/// the same fail-closed placement problem as a `MAP_FIXED` window's island
+/// arena), made R+X before use, unmapped on drop — by which time the guest
+/// has long left it (the stub is only ever executed once, at entry).
+struct ParkedEntryStub {
+    base: *mut u8,
+    len: usize,
+}
+
+impl ParkedEntryStub {
+    fn build(ctx: u64, pc: u64) -> io::Result<Self> {
+        let len = HOST_PAGE;
+        let Some(base) = DirectLoadGroup::place_island_arena_near(pc, 0, len) else {
+            return Err(io::Error::other(format!(
+                "no parked-entry stub slot within b-range of resume pc {pc:#x}"
+            )));
+        };
+        let mut w: Vec<u32> = Vec::with_capacity(40);
+        // x0 carries the context pointer while every other register is
+        // restored through it — the island resume leg's exact discipline.
+        w.extend_from_slice(&mov_imm64(0, ctx));
+        w.push(ldr_imm(1, 0, GuestContext::SP));
+        w.push(mov_to_sp(1));
+        for r in (1..=30_u32).rev() {
+            w.push(ldr_imm(r, 0, GuestContext::REG + r * 8));
+        }
+        w.push(ldr_imm(0, 0, GuestContext::REG));
+        let branch_at = base as u64 + (w.len() * 4) as u64;
+        let delta = pc as i64 - branch_at as i64;
+        if !b_in_range(delta) {
+            // SAFETY: undo the placement this constructor claimed.
+            unsafe { libc::munmap(base.cast(), len) };
+            return Err(io::Error::other(format!(
+                "parked-entry stub landed out of b-range of resume pc {pc:#x}"
+            )));
+        }
+        w.push(b_rel(delta));
+        // SAFETY: writing the stub into the fresh RW page just mapped.
+        unsafe {
+            std::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), base, w.len() * 4);
+        }
+        // SAFETY: flipping the plain page R+X (allowed under ad-hoc signing —
+        // the MAP_FIXED window pipeline's probed precedent), then publishing.
+        unsafe {
+            if libc::mprotect(base.cast(), len, libc::PROT_READ | libc::PROT_EXEC) != 0 {
+                let error = io::Error::last_os_error();
+                libc::munmap(base.cast(), len);
+                return Err(error);
+            }
+            sys_icache_invalidate(base.cast(), len);
+        }
+        Ok(Self { base, len })
+    }
+
+    fn entry(&self) -> u64 {
+        self.base as u64
+    }
+}
+
+impl Drop for ParkedEntryStub {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the mapping.
+        unsafe { libc::munmap(self.base.cast(), self.len) };
     }
 }
 
@@ -2506,6 +2888,16 @@ mod tests {
         ctx.set_return(ctx.args()[2] as i64);
     }
 
+    /// Install fresh slots for this thread, enter the (balanced-ret) fixture,
+    /// and hand back the slots for post-run assertions.
+    fn enter_with_slots(group: &DirectLoadGroup, entry: u64) -> Box<DirectThreadSlots> {
+        let guard = group.install_thread_slots().expect("install thread slots");
+        // SAFETY: the image is patched and `entry` is inside it; fixtures
+        // driven through this helper return via a balanced `ret`.
+        unsafe { group.enter(entry) }.expect("enter");
+        guard.into_slots()
+    }
+
     #[test]
     fn patches_every_svc_site_and_leaves_other_words_verbatim() {
         let elf = fixture_elf();
@@ -2566,7 +2958,7 @@ mod tests {
             CHILD_PIPE.store(fds[1], std::sync::atomic::Ordering::SeqCst);
             let entry = group.main().entry();
             // SAFETY: the image is patched and `entry` is inside it.
-            unsafe { group.enter(entry) };
+            enter_with_slots(&group, entry);
             // SAFETY: the guest must leave through `exit`, never here.
             unsafe { libc::_exit(91) };
         }
@@ -2636,7 +3028,7 @@ mod tests {
         let entry = group.main().entry();
         // SAFETY: the image is patched, `entry` is inside it, and this fixture
         // returns through `ret` rather than exiting.
-        unsafe { group.enter(entry) };
+        enter_with_slots(&group, entry);
 
         let seen = seen_snapshot();
         assert_eq!(seen.len(), 2, "both syscalls reached the handler");
@@ -2675,15 +3067,14 @@ mod tests {
             .expect("eligible");
         seen_clear();
         let entry = group.main().entry();
-        // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { group.enter(entry) };
+        let slots = enter_with_slots(&group, entry);
         let seen = seen_snapshot();
         assert_eq!(
             seen[0].1[0], 0xcafe,
             "TLS reached the guest's x18 slot without touching either real register"
         );
-        assert_eq!(group.guest_x18(), 0xcafe);
-        assert_eq!(group.guest_tls(), 0xcafe);
+        assert_eq!(slots.guest_x18, 0xcafe);
+        assert_eq!(slots.guest_tls, 0xcafe);
     }
 
     #[test]
@@ -2773,8 +3164,7 @@ mod tests {
         assert_eq!(group.main().svc_sites(), 1);
         seen_clear();
         let entry = group.main().entry();
-        // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { group.enter(entry) };
+        let slots = enter_with_slots(&group, entry);
 
         let seen = seen_snapshot();
         assert_eq!(seen.len(), 1);
@@ -2783,9 +3173,8 @@ mod tests {
             "the guest read back the thread pointer it wrote"
         );
         assert_eq!(
-            group.guest_tls(),
-            0xfeed,
-            "the write landed in the group's TLS slot, not the real register"
+            slots.guest_tls, 0xfeed,
+            "the write landed in this thread's TLS slot, not the real register"
         );
     }
 
@@ -2812,11 +3201,64 @@ mod tests {
         seen_clear();
         let entry = group.main().entry();
         // SAFETY: patched image, entry inside it.
-        unsafe { group.enter(entry) };
+        enter_with_slots(&group, entry);
         let seen = seen_snapshot();
         let args = seen[0].1;
         assert_eq!(args[1], 0xbeef, "x0 survived being the veneer's borrow");
         assert_eq!(args[2], 0xbeef, "and the value round-tripped");
+    }
+
+    /// Per-thread slots (roadmap Phase 1 item 4): ONE emitted image, run on
+    /// two host threads with separate [`InstalledThreadSlots`], must give each
+    /// thread a PRIVATE `tpidr_el0`. The guest increments its own thread
+    /// pointer (`mrs` → add → `msr`), so after both runs each thread's
+    /// installed slots must hold its own seed + 1 — a load-group-shared slot
+    /// leaves the installed slots untouched (or gives both threads one
+    /// value), which is exactly the incoherence this test pins.
+    #[test]
+    fn veneers_address_per_thread_slots() {
+        /// `add x10, x10, #1`
+        const ADD_X10_1: u32 = 0x9100_0000 | (1 << 10) | (10 << 5) | 10;
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30), // save Rust's return address
+            mrs_tpidr_el0_word(10),
+            ADD_X10_1,
+            msr_tpidr_el0_word(10),
+            mov_reg(30, 20),
+            0xd65f_03c0, // ret (balanced fixture)
+        ];
+        let elf = elf_with_code(&code);
+        let group = std::sync::Arc::new(
+            DirectLoadGroup::load(&elf, record_only)
+                .expect("load")
+                .expect("eligible"),
+        );
+        assert_eq!(group.main().tpidr_sites(), 2);
+
+        let run_with_seed = |group: &DirectLoadGroup, seed: u64| -> u64 {
+            let mut slots = Box::new(DirectThreadSlots::new(record_only));
+            slots.guest_tls = seed;
+            let guard = InstalledThreadSlots::install(slots).expect("install");
+            let entry = group.main().entry();
+            // SAFETY: patched image, entry inside it, fixture returns via
+            // `ret` with SP balanced.
+            unsafe { group.enter(entry) }.expect("enter");
+            guard.into_slots().guest_tls
+        };
+
+        let on_main = run_with_seed(&group, 0x1000);
+        let group_for_thread = std::sync::Arc::clone(&group);
+        let on_spawned = std::thread::spawn(move || run_with_seed(&group_for_thread, 0x2000))
+            .join()
+            .expect("spawned run");
+        assert_eq!(
+            on_main, 0x1001,
+            "the main thread's veneers read+wrote ITS installed slots"
+        );
+        assert_eq!(
+            on_spawned, 0x2001,
+            "the spawned thread's veneers read+wrote ITS installed slots"
+        );
     }
 
     #[test]
@@ -2908,11 +3350,10 @@ mod tests {
         );
         seen_clear();
         let entry = group.main().entry();
-        // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { group.enter(entry) };
+        let slots = enter_with_slots(&group, entry);
         let seen = seen_snapshot();
         assert_eq!(seen[0].1[0], 9, "x18 arithmetic ran against the slot");
-        assert_eq!(group.guest_x18(), 9, "and the slot holds the final value");
+        assert_eq!(slots.guest_x18, 9, "and the slot holds the final value");
     }
 
     #[test]
@@ -2967,7 +3408,7 @@ mod tests {
             .expect("eligible");
         let entry = group.main().entry();
         // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { group.enter(entry) };
+        enter_with_slots(&group, entry);
         assert_eq!(
             DEPTH.with(std::cell::Cell::get),
             1,
@@ -3010,7 +3451,7 @@ mod tests {
         let entry = group.main().entry();
         std::thread::spawn(move || {
             // SAFETY: patched image, entry inside it; `enter` arms this thread.
-            unsafe { group.enter(entry) };
+            enter_with_slots(&group, entry);
             // Drop on the executing thread too: isolating it showed the abort
             // happens during the run regardless, so this keeps the reproducer
             // faithful to what the bridge does.
@@ -3081,24 +3522,25 @@ mod tests {
             0xd65f_03c0, // ret - reached only if BOTH leaves fail
         ];
         let elf = elf_with_code(&code);
-        let mut group = DirectLoadGroup::load(&elf, leave_now)
+        let group = DirectLoadGroup::load(&elf, leave_now)
             .expect("load")
             .expect("eligible");
         seen_clear();
         let entry = group.main().entry();
-        // SAFETY: patched image, entry inside it; the leave leg returns here.
-        unsafe { group.enter(entry) };
+        // The leave leg returns here with the guest parked in this thread's
+        // slots.
+        let slots = enter_with_slots(&group, entry);
         let seen = seen_snapshot();
         assert_eq!(seen.len(), 1, "the guest left AT the first syscall");
         assert_eq!(seen[0].0, 93);
         assert_eq!(seen[0].1[0], 7, "the exit code is parked in the context");
         assert_eq!(
-            group.context().pc,
+            slots.context.pc,
             entry + 3 * 4,
             "ctx.pc names the resume site the guest was parked at"
         );
         assert!(
-            !group.context().leave_requested(),
+            !slots.context.leave_requested(),
             "the leave leg re-armed the flag for the next entry"
         );
     }
@@ -3141,7 +3583,7 @@ mod tests {
         seen_clear();
         let entry = group.main().entry();
         // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { group.enter(entry) };
+        enter_with_slots(&group, entry);
         let seen = seen_snapshot();
         assert_eq!(seen.len(), 1);
         assert_eq!(
@@ -3235,9 +3677,10 @@ mod tests {
         assert_eq!(sp % 16, 0, "Vec<u64> backing is 16-aligned on this host");
         seen_clear();
         let entry = group.main().entry();
+        let _slots = group.install_thread_slots().expect("install thread slots");
         // SAFETY: patched image, entry inside it; the handler requests a
         // leave, which is the only sanctioned exit from a custom stack.
-        unsafe { group.enter_on_stack(entry, sp) };
+        unsafe { group.enter_on_stack(entry, sp) }.expect("enter");
         let seen = seen_snapshot();
         assert_eq!(seen.len(), 1, "the guest reached its syscall and left");
         assert_eq!(
@@ -3248,7 +3691,8 @@ mod tests {
     }
 
     /// The load-group seam: EVERY image in a guest's load group shares ONE
-    /// coherent slot set — one `GuestContext`, one TLS slot, one x18 slot.
+    /// coherent slot set PER THREAD — one `GuestContext`, one TLS slot, one
+    /// x18 slot, all in the thread's installed [`DirectThreadSlots`].
     ///
     /// This is the prerequisite for dynamic linking: ld.so and the main image
     /// are separate mappings but ONE guest. With per-image slots, TLS written
@@ -3288,11 +3732,15 @@ mod tests {
         seen_clear();
         let writer_entry = group.main().entry();
         let reader_entry = group.image(reader_index).entry();
+        // ONE installed slot set across both entries: the coherence under
+        // test is per-thread, not per-image.
+        let guard = group.install_thread_slots().expect("install thread slots");
         // SAFETY: both images are patched and the entries are inside them.
         unsafe {
-            group.enter(writer_entry);
-            group.enter(reader_entry);
+            group.enter(writer_entry).expect("enter writer");
+            group.enter(reader_entry).expect("enter reader");
         }
+        let slots = guard.into_slots();
         let seen = seen_snapshot();
         assert_eq!(seen.len(), 1);
         assert_eq!(
@@ -3303,8 +3751,8 @@ mod tests {
             seen[0].1[1], 7,
             "x18 written in one image is read coherently from another"
         );
-        assert_eq!(group.guest_tls(), 0xcafe);
-        assert_eq!(group.guest_x18(), 7);
+        assert_eq!(slots.guest_tls, 0xcafe);
+        assert_eq!(slots.guest_x18, 7);
     }
 
     /// `cbz w18, target` (ld-2.28's `do_lookup_x` hash-bucket test) is
@@ -3338,7 +3786,7 @@ mod tests {
             seen_clear();
             let entry = group.main().entry();
             // SAFETY: patched image, entry inside it, fixture rets balanced.
-            unsafe { group.enter(entry) };
+            enter_with_slots(&group, entry);
             seen_snapshot()[0].1[0]
         };
         assert_eq!(
@@ -3389,7 +3837,7 @@ mod tests {
             seen_clear();
             let entry = group.main().entry();
             // SAFETY: patched image, entry inside it, fixture rets balanced.
-            unsafe { group.enter(entry) };
+            enter_with_slots(&group, entry);
             seen_snapshot()[0].1[0]
         };
         assert_eq!(run(2), 0xbeef, "tbnz x18 #1 with the bit set is taken");
@@ -3421,8 +3869,7 @@ mod tests {
             .expect("eligible");
         seen_clear();
         let entry = group.main().entry();
-        // SAFETY: patched image, entry inside it, fixture rets balanced.
-        unsafe { group.enter(entry) };
+        let slots = enter_with_slots(&group, entry);
         let site = entry + 4; // the adrp is the second word
         let expected = (site & !0xfff) + 0x1000;
         assert_eq!(
@@ -3430,7 +3877,7 @@ mod tests {
             expected,
             "adrp x18 delivered the SITE's page, not the veneer's"
         );
-        assert_eq!(group.guest_x18(), expected);
+        assert_eq!(slots.guest_x18, expected);
     }
 
     /// Any OTHER PC-relative instruction naming x18 must refuse the image:
@@ -3476,9 +3923,9 @@ mod tests {
     /// goes through the SAME scan/patch pipeline as a load-time image. The
     /// window here carries a syscall, a `tpidr_el0` write and an x18 use, so
     /// the test proves all three patch classes are wired: the island reaches
-    /// the group's handler, and the veneers hit the GROUP's slots (the
+    /// the group's handler, and the veneers hit the THREAD's slots (the
     /// coherence dynamic linking depends on — ld.so's veneers and libc's
-    /// must see one TLS).
+    /// must see one TLS on one thread).
     #[test]
     fn exec_window_patches_syscall_sites_and_executes() {
         const CHECK_NR: u64 = 0x0ff7;
@@ -3502,15 +3949,15 @@ mod tests {
             .expect("window maps")
             .expect("window is eligible");
         seen_clear();
-        // SAFETY: the window is patched and its code starts at +0x1000 (the
-        // fixture ELF's text file offset); the fixture returns via `ret`.
-        unsafe { group.enter(base + 0x1000) };
+        // The window's code starts at +0x1000 (the fixture ELF's text file
+        // offset); the fixture returns via `ret`.
+        let slots = enter_with_slots(&group, base + 0x1000);
         let seen = seen_snapshot();
         assert_eq!(seen.len(), 1, "the window's syscall reached the handler");
         assert_eq!(seen[0].0, CHECK_NR);
-        assert_eq!(seen[0].1[0], 7, "x18 ran against the group slot");
-        assert_eq!(group.guest_tls(), 0xcafe, "tpidr wrote the group slot");
-        assert_eq!(group.guest_x18(), 7);
+        assert_eq!(seen[0].1[0], 7, "x18 ran against the thread slot");
+        assert_eq!(slots.guest_tls, 0xcafe, "tpidr wrote the thread slot");
+        assert_eq!(slots.guest_x18, 7);
         assert!(
             group.covers_patched_executable(base + 0x1000, window_code.len() as u64 * 4),
             "the window counts as patched-executable coverage"

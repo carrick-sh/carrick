@@ -97,10 +97,20 @@ fn main() {
             }
         };
         let entry = group.main().entry();
+        let _slots = match group.install_thread_slots() {
+            Ok(slots) => slots,
+            Err(error) => {
+                println!("{label:<26} ERROR  {error}");
+                return f64::NAN;
+            }
+        };
         // Warm the mapping so the first run's page faults are not in the number.
         let started = std::time::Instant::now();
         // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { group.enter(entry) };
+        if let Err(error) = unsafe { group.enter(entry) } {
+            println!("{label:<26} ERROR  {error}");
+            return f64::NAN;
+        }
         let elapsed = started.elapsed();
         let per_iter_ns = elapsed.as_secs_f64() * 1e9 / ITERS as f64;
         let delta = match baseline {
