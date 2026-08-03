@@ -29,9 +29,14 @@ five-sample Carrick-then-Docker run in
 
 This is still the official ratio. Reaching 3x requires removing another 71.28%
 of Carrick's current workload wall (a 3.4815x reduction); reaching the 2x
-product bar requires removing 80.85% (5.2223x). The older shape table remains
-useful only as historical direction: compute was ~3.3x and fs-walk ~19.4x, but
-both must be rerun before being quoted as current.
+product bar requires removing 80.85% (5.2223x).
+
+The required current-default three-sample workload spread is also complete:
+compute **3.3868x**, fs-walk **18.9286x**, 20-exec `compile -V` **72.1579x**,
+and cold build **10.8761x**. It confirms the band but does not replace the
+five-sample official result. Startup rounded Docker to zero milliseconds and
+has no citable ratio. Full provenance and raw samples:
+[`docs/perf-results/2026-08-03-current-default-workload-spread.md`](docs/perf-results/2026-08-03-current-default-workload-spread.md).
 
 The latest campaign tested monotonic augmentation of already-published
 translation units. Its mechanism was real: private translations fell 56.0%
@@ -93,13 +98,17 @@ state. Same-binary regression screens and an official ratio refresh were
 intentionally skipped: a candidate that already regresses the primary workload
 cannot be rescued by secondary screens.
 
-1. **Re-attribute the current default before selecting another fix.** Use the
-   supported DTrace/USDT profiles on the now-default-on store, with the tracer's
-   own PID excluded, and re-run the emitted-shape census. Prior profiles put
-   emitted JIT execution near 45% of build CPU and stolen-register context
-   traffic near 15% of total CPU, but those are pre-current-store numbers and
-   must be requalified. Use LLDB/core evidence for any crash or silent process
-   loss. Pursue only a freshly measured >=10% end-to-end opportunity.
+1. **Finish the approved trusted-entry route attribution before selecting a
+   fix.** Current-default DTrace requalification is complete: JIT execution is
+   46.505% of total CPU; context loads/stores are 34.3% of matched emitted
+   instructions (a separate-run projection of 15.95% total CPU); and the
+   generation-materialize/publish/guest-x17-reload sequence is 26.23% of
+   matched emitted instructions (projected 12.2% total CPU). Its three arrival
+   routes are still conflated. The diagnostic design is committed at
+   [`docs/superpowers/specs/2026-08-03-trusted-entry-route-attribution-design.md`](docs/superpowers/specs/2026-08-03-trusted-entry-route-attribution-design.md)
+   and awaits written-spec review before its TDD implementation plan. Use
+   LLDB/core evidence for any crash or silent process loss. Pursue only a
+   freshly measured >=10% end-to-end opportunity.
 2. **Keep eager full translation as a deferred future design, not the next
    patch.** Translating a complete eligible image once up front could amortize
    publication and avoid the losing per-process merge path measured here. It
@@ -122,9 +131,14 @@ cannot be rescued by secondary screens.
 - **High (95%):** the official shipped-default result remains 10.4446x. No
   rejected candidate code is retained and no projection was substituted for a
   fresh Carrick/Docker run.
-- **Medium (70%):** emitted-code/stolen-register traffic remains the largest
-  actionable next bucket. It was previously measured, but must be re-profiled
-  on the current default before committing to a design.
+- **High (95%):** emitted JIT execution is the largest freshly measured CPU
+  bucket at 46.505% of all build CPU.
+- **High (85%):** the common trusted-entry sequence is a specific hotspot at
+  26.23% of matched JIT samples, projected at 12.2% total CPU. This is a
+  separate-run projection, not timing.
+- **Medium (60%):** one arrival route supports a >=10% end-to-end production
+  candidate. The route split exists to replace this uncertainty with measured
+  shares before changing semantics.
 
 ## Discipline that earned its keep (do not relearn these)
 
@@ -149,8 +163,9 @@ cannot be rescued by secondary screens.
 
 ## Branch state at handoff
 
-`291359b4` is the narrow rejection cleanup. The evidence/handoff update is the
-only intended follow-up change. The worktree must be clean after that commit;
-nothing has been pushed and local `main` has not moved. Target-only raw ABBA,
-mechanism, signed-binary, and store receipts remain under
-`target/perf/native-store-augmentation/` and are intentionally not committed.
+`291359b4` is the narrow rejection cleanup; `5b89272b` is the approved
+diagnostic design. The current-default spread evidence and this handoff update
+are the only subsequent source changes. Nothing has been pushed and local
+`main` has not moved. Target-only raw ABBA, mechanism, signed-binary, store,
+attribution, and scoreboard receipts remain under `target/perf/` and are
+intentionally not committed.
