@@ -128,18 +128,55 @@ Nothing real runs on tier D yet. In order:
 libc on tier D, exit 0, `hi`). `python3 -I -S -c 'print(1)'` — **MET**
 (real CPython 3.12, ~436 syscalls). `python3 -c 'threading.Thread(...)'`
 — **MET multi-threaded** (item 4 landed: per-thread slots via the proven
-TSD chain, full unrestricted CPython startup). Remaining for Phase 2: the
-native conformance smoke green with tier D forced on — which first needs
-tier D WIRED into the shipped native driver (`run_elf_native_dispatch`
-never reaches `direct_runner`; the in-process gates are the only
-executions), plus fork/execve/signal delivery and fd-wait outcomes, which
-every real multi-process workload hits immediately.
+TSD chain, full unrestricted CPython startup).
 **Worth:** zero directly. Everything in Phase 2 depends on it.
 
 ### Phase 2 — tier D default-on (the compute win)
 
 Flip eligible images to tier D with an exact `=0` hatch, per the
 opt-out-not-opt-in rule.
+
+**Status 2026-08-03 (lane K): WIRED, opt-in; default flip blocked on the
+named gaps below.** Landed (`a59ad4a5`): the exec-time tier decision in the
+shipped driver (launch AND `resume_guest_from_capsule`, so every exec'd
+image is re-decided), fork (CoW host fork — identity memory makes the
+kernel's copy the child's guest state), vfork (CoW + true parent
+suspension; the CLONE_VM sharing half is a DOCUMENTED divergence —
+posix_spawn's failed-exec errno write-back is lost), execve through the
+existing capsule self-re-exec, blocking fd/proc/sleep waits on the
+per-thread waiter, MAP_SHARED file mmaps as real host MAP_SHARED maps, and
+kernel-verified guest-memory copies (`mach_vm_read_overwrite` — the
+identity tier's copy_from_user). Live-verified through the shipped binary:
+`sh -c 'echo hi'`, a three-generation vfork+exec chain, and the Go
+toolchain refusing (ET_EXEC) onto tier T, all census-tagged
+(`CARRICK_TIER_CENSUS`).
+
+**Smoke evidence (2026-08-03, one sample each, sibling lane concurrent):**
+control (tier D off, same binary) = **23/23 MATCH, no regressions**;
+tier D forced on (`CARRICK_NATIVE_DIRECT=1`) = **19 gating failures**, all
+attributable to named tier-D gaps, none to the DSR lane:
+
+- **Async signal delivery + sigreturn (the big one).** `timeout(1)` parks
+  in `sigsuspend` (leaves at `WaitOnSignals`) → every LTP case is Empty;
+  Go test binaries are PIE and DO run tier D, then leave at
+  `SignalThread` (SIGURG — Go's own async preemption) or MT fork.
+  cpython-subprocess/-threading Empty for the same class.
+- **Multithreaded fork** (`go-runtime`, cpython): needs the sibling
+  quiesce the DSR lane has.
+- **`BlockingRecordLock`** (cpython-fcntl): a small runner arm.
+- **Undecodable word `0x38764d52`** (a `bad64` decode gap whose bits can
+  name x18): refuses node's main binary at scan and CPython extension
+  `.so`s at the `mmap(PROT_EXEC)` window → mid-run leaves. Decoding that
+  one shape (or proving it x18-free) recovers node + cpython extensions.
+- Node's failures under tier-D-on are its tier-D CHILDREN (node itself
+  ran tier T); with children fixed node stays tier T until the word above
+  is handled.
+
+The four MATCHes under tier-D-on include cpython-glob/json/math running
+ON tier D at full workload scale. Directional only (concurrent load, one
+sample): cpython-math fell below the 10x outlier bar under tier D (15.31x
+in the control) and glob read 13.30x vs 16.65x — consistent with the
+estimate below, not yet a controlled measurement.
 
 **Gate:** conformance smoke, plus the outlier ratios the smoke already prints —
 node 22-23x and cpython 14-17x today, both PIE and both dominated by emitted
