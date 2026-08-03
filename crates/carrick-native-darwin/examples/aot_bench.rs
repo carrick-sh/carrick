@@ -22,14 +22,13 @@ use std::time::Instant;
 use carrick_dsr::address::NativeHostBias;
 use carrick_dsr_aarch64::artifact_spike::{ArtifactBindings, ArtifactTemplate};
 use carrick_dsr_aarch64::emit::PcMapEntry;
-use carrick_dsr_aarch64::pending_augmentation::RecordingOwner;
 use carrick_dsr_aarch64::shared_cache::TranslationUnitStore as _;
 use carrick_dsr_aarch64::shared_cache::{
     AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
-    NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate, SourceFingerprint,
+    NativePageProfileIdentity, PendingTranslationUnit, PortableBlockRecord, SourceFingerprint,
     TranslationUnitKey,
 };
-use carrick_dsr_aarch64::types::{CacheOffset, CodeGeneration};
+use carrick_dsr_aarch64::types::CacheOffset;
 use carrick_guest_mem::GuestVa;
 use carrick_native_darwin::aot_cache::{ActiveContainerUnitStore, begin_container_cache_at};
 
@@ -50,12 +49,8 @@ fn unit_code(bytes: usize) -> Vec<u8> {
 fn pending_of_size(bytes: usize, seed: u8) -> PendingTranslationUnit {
     let code = unit_code(bytes);
     let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
-    let words = code
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
-        .collect();
     let template = ArtifactTemplate::normalize(
-        words,
+        Vec::new(),
         vec![PcMapEntry {
             guest: GuestVa(0x40_0000),
             cache: CacheOffset::published(0),
@@ -67,30 +62,30 @@ fn pending_of_size(bytes: usize, seed: u8) -> PendingTranslationUnit {
         None,
         &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
     )
-    .expect("bench block metadata");
-    let key = TranslationUnitKey::for_segment(
-        ExecutableIdentity::Digest([seed; 32]),
-        ImageFileOffset::new(0),
-        ImageFileLen::new(bytes as u64).expect("nonzero file length"),
-        GuestVa(0x40_0000),
-        GuestCodeLen::new(bytes as u64).expect("nonzero guest length"),
-        SourceFingerprint::from_words(&source_words),
-        NativePageProfileIdentity::Native16k,
-        AddressModeIdentity::biased(
-            NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
+    .expect("bench block metadata")
+    .into_runtime_metadata_only();
+    PendingTranslationUnit {
+        key: TranslationUnitKey::for_segment(
+            ExecutableIdentity::Digest([seed; 32]),
+            ImageFileOffset::new(0),
+            ImageFileLen::new(bytes as u64).expect("nonzero file length"),
+            GuestVa(0x40_0000),
+            GuestCodeLen::new(bytes as u64).expect("nonzero guest length"),
+            SourceFingerprint::from_words(&source_words),
+            NativePageProfileIdentity::Native16k,
+            AddressModeIdentity::biased(
+                NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
+            ),
         ),
-    );
-    PendingTranslationUnit::pack(
-        key,
-        vec![PortableBlockCandidate {
+        code: code.clone(),
+        blocks: vec![PortableBlockRecord {
             guest_start: GuestVa(0x40_0000),
-            source_end: GuestVa(0x40_0000 + bytes as u64),
-            generation: CodeGeneration::INITIAL,
+            entry_offset: 0,
+            code_len: u32::try_from(code.len()).expect("bench unit fits u32"),
             requires_sensitive_metadata: false,
             template,
         }],
-    )
-    .expect("pack bench pending unit")
+    }
 }
 
 fn median(mut v: Vec<u128>) -> u128 {
@@ -111,21 +106,7 @@ fn main() {
         let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
 
         let t0 = Instant::now();
-        let owner = RecordingOwner {
-            pid: std::process::id() as i32,
-            incarnation: [0x5a; 16],
-        };
-        let claim = match store
-            .claim_recording(&pending.key, &owner)
-            .expect("claim bench unit")
-        {
-            carrick_dsr_aarch64::shared_cache::ClaimOutcome::Won(claim) => claim,
-            outcome => {
-                eprintln!("bench claim was not won: {outcome:?}");
-                std::process::exit(2);
-            }
-        };
-        store.merge(&pending, &claim).expect("publish bench unit");
+        store.publish(&pending).expect("publish bench unit");
         let publish_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         let t0 = Instant::now();

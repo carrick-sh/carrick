@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use carrick_dsr_aarch64::shared_cache::{
-    TranslationUnitManifest, decode_unit_bundle_v1_for_diagnostics,
+    TranslationUnitManifest, decode_translation_unit_metadata,
 };
 
-const SCHEMA: &str = "carrick.native-manifest-census.v4";
+const SCHEMA: &str = "carrick.native-manifest-census.v3";
 
 fn manifest_paths(arguments: impl IntoIterator<Item = String>) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
@@ -21,7 +21,7 @@ fn manifest_paths(arguments: impl IntoIterator<Item = String>) -> Result<Vec<Pat
                 let candidate = entry.path();
                 if candidate
                     .extension()
-                    .is_some_and(|extension| extension == "unit-v1")
+                    .is_some_and(|extension| extension == "manifest")
                 {
                     paths.push(candidate);
                 }
@@ -33,20 +33,19 @@ fn manifest_paths(arguments: impl IntoIterator<Item = String>) -> Result<Vec<Pat
     paths.sort();
     paths.dedup();
     if paths.is_empty() {
-        return Err("usage: native_manifest_census <unit-v1-or-directory> [...]".to_string());
+        return Err("usage: native_manifest_census <manifest-or-directory> [...]".to_string());
     }
     Ok(paths)
 }
 
-/// Decode through THE current runtime bundle wire, not a private bincode
-/// configuration. This is deliberately the diagnostics-only decoder: the
-/// persistent load path binds the embedded key to its expected executable.
+/// Decode through THE runtime wire (`decode_translation_unit_metadata`), not
+/// a private bincode config: this example once carried its own fixed-int
+/// decode and silently rotted when the store moved to the magic-prefixed
+/// varint wire — an offline tool that cannot read the real store measures
+/// nothing.
 fn decode_manifest(bytes: Vec<u8>) -> Result<TranslationUnitManifest, String> {
-    let decoded = decode_unit_bundle_v1_for_diagnostics(std::sync::Arc::new(bytes))
-        .map_err(|reason| format!("decode unit-v1 bundle: {reason:?}"))?;
-    decoded
-        .translation_manifest()
-        .map_err(|reason| format!("construct unit-v1 replay view: {reason:?}"))
+    decode_translation_unit_metadata(std::sync::Arc::new(bytes))
+        .map_err(|reason| format!("decode unit metadata: {reason:?}"))
 }
 
 fn census(path: &Path) -> Result<serde_json::Value, String> {
@@ -66,7 +65,7 @@ fn census(path: &Path) -> Result<serde_json::Value, String> {
         .iter()
         .filter(|block| block.requires_sensitive_metadata)
         .count();
-    // The V6 metadata attributes itself: every payload byte belongs to exactly
+    // The v5 wire attributes itself: every payload byte belongs to exactly
     // one block's HOT (replay) or COLD (fault-reconstruction) blob.
     let hot_blob_bytes: usize = manifest
         .blocks()
@@ -79,12 +78,9 @@ fn census(path: &Path) -> Result<serde_json::Value, String> {
         .map(|block| block.cold_blob_len())
         .sum();
     let block_metadata_bytes = hot_blob_bytes + cold_blob_bytes;
-    let code_bytes = usize::try_from(manifest.code_len)
-        .map_err(|_| "unit code length exceeds usize".to_string())?;
-    let other_bundle_bytes = file_bytes
+    let other_manifest_bytes = file_bytes
         .checked_sub(block_metadata_bytes)
-        .and_then(|bytes| bytes.checked_sub(code_bytes))
-        .ok_or_else(|| "bundle attribution exceeds file size".to_string())?;
+        .ok_or_else(|| "manifest attribution exceeds file size".to_string())?;
     let mut metadata_counts = carrick_dsr_aarch64::artifact_spike::ArtifactTemplateMetadataCounts {
         words: 0,
         pc_map_entries: 0,
@@ -111,9 +107,9 @@ fn census(path: &Path) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
         "schema": SCHEMA,
         "path": path,
-        "bundle_bytes": file_bytes,
+        "manifest_bytes": file_bytes,
         "code_bytes": manifest.code_len,
-        "bundle_to_code_ratio": file_bytes as f64 / manifest.code_len as f64,
+        "manifest_to_code_ratio": file_bytes as f64 / manifest.code_len as f64,
         "block_count": block_count,
         "sensitive_block_count": sensitive_block_count,
         "block_metadata_bytes": block_metadata_bytes,
@@ -127,7 +123,7 @@ fn census(path: &Path) -> Result<serde_json::Value, String> {
         "retained_direct_link_count": metadata_counts.direct_links,
         "retained_relocation_count": metadata_counts.relocations,
         "retained_source_word_count": metadata_counts.source_words,
-        "other_bundle_bytes": other_bundle_bytes,
+        "other_manifest_bytes": other_manifest_bytes,
     }))
 }
 

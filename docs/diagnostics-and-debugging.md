@@ -299,12 +299,6 @@ lldb -o "attach <pid>" \
 lldb -c /tmp/c.core target/release/carrick \
   -o "command script import scripts/carrick_lldb.py" \
   -o "carrick eventring" -o "thread backtrace all"
-
-# Inspect the release-committed prefix of claimed translation units. This is
-# export-only: it never writes the persistent store or resumes the process.
-(lldb) carrick xlat-pending
-(lldb) carrick xlat-pending --output /absolute/path/pending
-# The second form writes mode-0600 pending.json and pending.bin atomically.
 ```
 
 A wedged thread's `bt` plus the ring usually pins the bug immediately (e.g. a
@@ -314,30 +308,18 @@ relocated carrick-internal fds (an epoll instance's kqueue, eventfd/pidfd/wake-
 pipe backings): a guest blocking on one is parked on an internal object.
 
 The plugin (`scripts/carrick_lldb.py`) registers a `carrick` command with these
-subcommands: **`eventring`** and **`xlat-pending`** (need only a target +
-process/core), and the
+subcommands: **`eventring`** (needs only a target + process/core), and the
 guest-mapping helpers **`where`**, **`mappings`**, **`gva <addr>`**,
 **`decode-esr <hex>`**, **`info`**, **`load-state <path>`**.
 
 > [!WARNING]
-> Cores must be `--style modified-memory` (or `full`), never `stack`. The ring
-> and pending-translation root/chunks are `.data`/heap state, not on any stack,
-> so a `stack` core reads back
+> Cores must be `--style modified-memory` (or `full`), never `stack`. The ring is
+> a `.data`/`.bss` static, not on any stack, so a `stack` core reads back
 > `core file does not contain <addr>`. `modified-memory` captures the dirty pages
 > (ring + Rust statics) but skips the multi-GB clean guest aperture, staying
 > ~100 MB. The build must also retain symbols (`carrick eventring` resolves
 > `event_ring::{RING,IDX}` by symbol name) — the default release keeps them; a
 > stripped binary breaks the reader.
-
-`xlat-pending` validates the export ABI independently of the persistent-unit
-format and reads only release-committed units, chunks, and records. If a later
-page is absent from a modified-memory core, it returns the valid prefix with
-`complete=false` and the first unreadable address. An unreadable root is never
-reported as an empty result: it names the stack-only-core problem and requests
-a modified-memory or full core. Exported `.bin` files use `CXLATE1\0`, which no
-persistent `unit-v1` reader accepts; the JSON binds the binary by SHA-256 and
-includes the source identity, Mach-O UUID, and SHA-256 of the symbol-bearing
-executable.
 
 ### Guest address-space mapping: the debug-state JSON
 
