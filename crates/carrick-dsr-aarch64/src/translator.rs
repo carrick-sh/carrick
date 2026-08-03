@@ -30,23 +30,6 @@ use crate::snapshot::NativeUcontextSnapshot;
 use crate::{artifact_spike, block, emit, gateway, types};
 use carrick_dsr::host::NativeHostJit;
 
-/// Preserve the typed read failure while naming the control-flow boundary
-/// that supplied its would-be guest PC. Translation failures are cold, so the
-/// diagnostic string is allocated only after a read has already failed; the
-/// production translation fast path pays no formatting or state-tracking cost.
-fn with_memory_read_origin(
-    error: types::DsrError,
-    origin: impl FnOnce() -> String,
-) -> types::DsrError {
-    match error {
-        types::DsrError::MemoryRead { pc, detail } => types::DsrError::MemoryRead {
-            pc,
-            detail: format!("{detail}; translation-origin={}", origin()),
-        },
-        other => other,
-    }
-}
-
 /// Projection of a [`types::NativeDsrExit`] onto the probe tuple, retargeted
 /// onto `carrick_dsr::probes`' mirrored `DsrExitKind` when the translator
 /// orchestration (its only consumer) moved into this crate. Verbatim mapping
@@ -1452,6 +1435,45 @@ fn sibling_profiles() -> &'static Mutex<HashMap<i32, SiblingSlot>> {
 }
 
 impl ThreadTranslator {
+    /// Preserve the typed read failure while naming both the control-flow
+    /// boundary that supplied its would-be guest PC and whether that value is
+    /// actually a host JIT-cache address. Translation failures are cold, so
+    /// the range lookup and formatting happen only after a read has failed;
+    /// the production translation fast path pays no extra work.
+    fn with_memory_read_origin(
+        &self,
+        error: types::DsrError,
+        origin: impl FnOnce() -> String,
+    ) -> types::DsrError {
+        match error {
+            types::DsrError::MemoryRead { pc, detail } => {
+                let cache_range = self.process.cache_host_range();
+                let cache_contains = cache_range.contains(&pc);
+                let cache_reverse = if cache_contains {
+                    match self.guest_pc_for_cache(carrick_guest_mem::GuestVa(pc)) {
+                        Ok((guest, recovery)) => {
+                            format!("guest=0x{:x} recovery={recovery:?}", guest.raw())
+                        }
+                        Err(error) => format!("error={error}"),
+                    }
+                } else {
+                    "not-attempted".to_string()
+                };
+                types::DsrError::MemoryRead {
+                    pc,
+                    detail: format!(
+                        "{detail}; translation-origin={}; cache-range=0x{:x}..0x{:x}; \
+                         cache-contains={cache_contains}; cache-reverse={cache_reverse}",
+                        origin(),
+                        cache_range.start,
+                        cache_range.end,
+                    ),
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Test-only convenience constructor (kept always-compiled:
     /// `cfg(test)` does not cross crates, and the runtime's still-resident
     /// JIT-entangled test suites construct translators through this).
@@ -3938,7 +3960,7 @@ impl ThreadTranslator {
     ) -> Result<(types::CacheVa, types::CodeGeneration), types::DsrError> {
         self.stats.add(ResolverStat::ResolverExits, 1);
         let translated = self.translate::<PROFILE>(memory, target).map_err(|error| {
-            with_memory_read_origin(error, || {
+            self.with_memory_read_origin(error, || {
                 format!(
                     "indirect-resolver source=0x{:x} target=0x{:x}",
                     source.raw(),
@@ -4261,7 +4283,7 @@ impl ThreadTranslator {
             // guest VA and `translate` overwrites it below with the fresh
             // generation.
             let translated = self.translate::<PROFILE>(memory, guest).map_err(|error| {
-                with_memory_read_origin(error, || {
+                self.with_memory_read_origin(error, || {
                     format!("prepare-entry guest=0x{:x}", guest.raw())
                 })
             })?;
@@ -4435,7 +4457,7 @@ impl ThreadTranslator {
                             target.raw(),
                             error.probe_outcome(),
                         );
-                        return Err(with_memory_read_origin(error, || {
+                        return Err(self.with_memory_read_origin(error, || {
                             format!(
                                 "direct-resolver source=0x{:x} target=0x{:x}",
                                 source.raw(),
@@ -4757,6 +4779,25 @@ mod tests {
                 .contains("translation-origin=prepare-entry guest=0x107336538"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn prepare_memory_read_reports_when_the_would_be_guest_pc_is_in_the_jit_cache() {
+        let process = Arc::new(
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator"),
+        );
+        let cache_pc = process.cache_host_range().start;
+        let mut translator = ThreadTranslator::for_process(process, 42);
+        let memory = crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut snapshot = super::NativeUcontextSnapshot::default();
+        snapshot.pc = cache_pc;
+
+        let error = match translator.prepare_entry::<false>(&memory, &snapshot) {
+            Err(error) => error,
+            Ok(_) => panic!("a JIT host PC must not be translated as a guest PC"),
+        };
+
+        assert!(error.to_string().contains("cache-contains=true"), "{error}");
     }
 
     #[test]
