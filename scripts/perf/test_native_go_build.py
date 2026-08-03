@@ -672,6 +672,28 @@ class NativeGoBuildTest(unittest.TestCase):
         diagnostics.assert_not_called()
         self.assertIsNone(caught.exception.sample["timeout_diagnostics"])
 
+    def test_timeout_lldb_snapshot_prioritizes_stacks_over_core(self):
+        directory, _ = self.install_fake_docker("arm64")
+        binary = directory / "immutable-arm" / "carrick"
+        binary.parent.mkdir()
+        binary.write_bytes(b"immutable arm\n")
+        completed = subprocess.CompletedProcess([], 0, "captured\n", "")
+
+        with mock.patch.object(
+            native_go_build.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            evidence = native_go_build.carrick_timeout_diagnostics(
+                directory,
+                binary,
+                "native-timeout-stack-first",
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("--no-core", command)
+        self.assertEqual(evidence["status"], 0)
+
     def test_non_timeout_execution_exception_retains_current_sample_evidence(self):
         directory, _ = self.install_fake_docker("arm64")
         execution_error = UnicodeDecodeError(
