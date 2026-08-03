@@ -53,6 +53,7 @@ fn main() {
                     DirectIneligible::NeedsInterpreter { .. } => "dynamic",
                     DirectIneligible::IslandOutOfRange { .. } => "island-range",
                     DirectIneligible::HostTsdLayoutUnproven { .. } => "host-tsd",
+                    DirectIneligible::HostRuntimeStubUnavailable { .. } => "host-stub",
                 };
                 println!("{name:<24} tier T    [{bucket}] {reason}");
             }

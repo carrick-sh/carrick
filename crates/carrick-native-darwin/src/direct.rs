@@ -186,6 +186,41 @@ fn cbnz(rt: u32, offset: i64) -> u32 {
 }
 /// `ret` (through x30).
 const RET: u32 = 0xd65f_03c0;
+/// `ldr qt, [xn, #byte_offset]` (128-bit SIMD&FP load, unsigned scaled
+/// imm12 — the offset must be a multiple of 16 to encode; the ADDRESS may be
+/// 8-aligned, unaligned SIMD loads do not fault on this configuration).
+const fn ldr_q_imm(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+    0x3dc0_0000 | ((byte_offset / 16) << 10) | (rn << 5) | rt
+}
+/// `msr nzcv, xt` — install the condition flags from bits 31:28 of `xt`
+/// (the same bit positions PSTATE/SPSR carry them in).
+const fn msr_nzcv(rt: u32) -> u32 {
+    0xd51b_4200 | rt
+}
+/// `msr fpsr, xt`.
+const fn msr_fpsr(rt: u32) -> u32 {
+    0xd51b_4420 | rt
+}
+/// `msr fpcr, xt`.
+const fn msr_fpcr(rt: u32) -> u32 {
+    0xd51b_4400 | rt
+}
+/// `mrs xt, nzcv` / `mrs xt, fpsr` / `mrs xt, fpcr`.
+const fn mrs_nzcv(rt: u32) -> u32 {
+    0xd53b_4200 | rt
+}
+const fn mrs_fpsr(rt: u32) -> u32 {
+    0xd53b_4420 | rt
+}
+const fn mrs_fpcr(rt: u32) -> u32 {
+    0xd53b_4400 | rt
+}
+/// `stp qt1, qt2, [xn, #byte_offset]` (128-bit SIMD&FP pair, signed
+/// offset scaled by 16; `byte_offset` must be a multiple of 16, within
+/// ±1008).
+const fn stp_q_imm(rt1: u32, rt2: u32, rn: u32, byte_offset: u32) -> u32 {
+    0xad00_0000 | (((byte_offset / 16) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
 
 /// Materialize a 64-bit constant into `rd` (4 words, no literal pool).
 fn mov_imm64(rd: u32, value: u64) -> [u32; 4] {
@@ -283,6 +318,31 @@ fn island(tsd: TsdSlot, return_pc: u64) -> (Vec<u32>, usize) {
     let leave_leg = w.len();
     w[leave_branch] = cbnz(1, ((leave_leg - leave_branch) * 4) as i64);
     w.push(str_imm(31, 0, GuestContext::LEAVE)); // str xzr — re-arm
+    // Park the PHYSICAL FP/SIMD file + FPSR/FPCR + NZCV into the slots'
+    // resume extras (context == slots, offset 0). This is the ONLY point
+    // where the vector file can be read with guest fidelity: any later Rust
+    // frame may have spilled a callee-saved q register for its own use, so a
+    // "live" capture inside the delivery call chain reads that frame's
+    // temporary, not the guest's value (observed: d8 came back as an
+    // ancestor frame's spill). Fidelity here is the host C ABI's — q8-q15
+    // low halves exact through the handler chain, the rest best-effort —
+    // which is precisely the tier's recorded SIMD-across-islands level.
+    // Signal delivery builds the sigframe's fpsimd record from this park;
+    // leaves that deliver no signal simply overwrite it next time.
+    for i in 0..16_u32 {
+        w.push(stp_q_imm(
+            2 * i,
+            2 * i + 1,
+            0,
+            DirectThreadSlots::PARKED_FP_V_OFF + 32 * i,
+        ));
+    }
+    w.push(mrs_fpsr(1));
+    w.push(str_imm(1, 0, DirectThreadSlots::PARKED_FP_FPSR_OFF));
+    w.push(mrs_fpcr(1));
+    w.push(str_imm(1, 0, DirectThreadSlots::PARKED_FP_FPCR_OFF));
+    w.push(mrs_nzcv(1));
+    w.push(str_imm(1, 0, DirectThreadSlots::PARKED_FP_PSTATE_OFF));
     w.push(ldr_imm(1, 0, GuestContext::HOST_SP));
     w.push(mov_to_sp(1));
     w.push(ldr_imm(30, 0, GuestContext::HOST_LR));
@@ -436,6 +496,53 @@ pub struct DirectThreadSlots {
     /// The thread's guest x18. Darwin rewrites the physical platform
     /// register at every trap return, so the value lives here.
     pub guest_x18: u64,
+    /// Aligns the FP blocks below so their `v` arrays sit at 16-multiple
+    /// offsets (`stp q`/`ldr q` immediate encoding requirement).
+    pub _fp_align: u64,
+    /// FP/SIMD + flags state PARKED BY THE ISLAND LEAVE LEG on every leave
+    /// (its `restore` word is unused). Written ONLY by emitted code, read by
+    /// the runner's signal machinery — the single-writer split from
+    /// `resume_extras` is load-bearing: a sigreturn ARMS `resume_extras`
+    /// with the frame's state and then leaves, and that leave's own park
+    /// must not clobber what was just armed (it did, when both were one
+    /// block — the handler's clobbered d8 overwrote the frame's value).
+    pub parked_fp: ParkedResumeExtras,
+    /// Extra machine state the RUNNER arms for the next parked re-entry —
+    /// see [`ParkedResumeExtras`]. Written only by the runner.
+    pub resume_extras: ParkedResumeExtras,
+}
+
+/// Machine state beyond the GPR file, in two per-thread instances with one
+/// writer each ([`DirectThreadSlots::parked_fp`] — the island leave leg's
+/// capture; [`DirectThreadSlots::resume_extras`] — the runner's restore
+/// request for the next [`DirectLoadGroup::enter_parked`]).
+///
+/// Islands deliberately park x0-x30+SP only (a syscall boundary does not
+/// preserve caller-saved vector state through the Rust handler anyway), but
+/// signal delivery needs the guest's FP file for the frame's fpsimd record,
+/// and `rt_sigreturn` must restore EXACTLY the state the signal frame
+/// carries — a guest handler legitimately clobbers caller-saved V registers
+/// and may even mutate the frame's copies, and Linux applies the frame
+/// verbatim. The runner sets `restore` = 1 on `resume_extras`; the next
+/// [`ParkedEntryStub`] emission reads the flag (Rust-side, guest parked),
+/// emits the extra loads, and clears it so ordinary parked entries (clone
+/// children, handler entry) stay GPR-only.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParkedResumeExtras {
+    /// 1 = the next parked entry restores everything below; cleared at stub
+    /// emission. Unused in the leave-leg capture instance.
+    pub restore: u64,
+    /// PSTATE image; only the NZCV bits (31:28) are architecturally
+    /// restorable from EL0 and only they are applied.
+    pub pstate: u64,
+    pub fpsr: u64,
+    pub fpcr: u64,
+    /// Pads `v` to a 16-multiple offset within the struct — `stp q`/`ldr q`
+    /// immediates can only ENCODE offsets that are multiples of 16.
+    pub _pad: [u64; 2],
+    /// q0..q31, little-endian bytes.
+    pub v: [[u8; 16]; 32],
 }
 
 impl DirectThreadSlots {
@@ -443,6 +550,30 @@ impl DirectThreadSlots {
     const TLS_OFF: u32 = std::mem::offset_of!(DirectThreadSlots, guest_tls) as u32;
     /// Byte offset of `guest_x18`, baked into the veneers.
     const X18_OFF: u32 = std::mem::offset_of!(DirectThreadSlots, guest_x18) as u32;
+    /// Byte offsets of the leave-leg FP capture block (`parked_fp`), baked
+    /// into every island's leave leg.
+    const PARKED_FP_PSTATE_OFF: u32 = (std::mem::offset_of!(DirectThreadSlots, parked_fp)
+        + std::mem::offset_of!(ParkedResumeExtras, pstate))
+        as u32;
+    const PARKED_FP_FPSR_OFF: u32 = (std::mem::offset_of!(DirectThreadSlots, parked_fp)
+        + std::mem::offset_of!(ParkedResumeExtras, fpsr))
+        as u32;
+    const PARKED_FP_FPCR_OFF: u32 = (std::mem::offset_of!(DirectThreadSlots, parked_fp)
+        + std::mem::offset_of!(ParkedResumeExtras, fpcr))
+        as u32;
+    const PARKED_FP_V_OFF: u32 = (std::mem::offset_of!(DirectThreadSlots, parked_fp)
+        + std::mem::offset_of!(ParkedResumeExtras, v)) as u32;
+    /// Byte offsets of the runner-armed restore block (`resume_extras`),
+    /// baked into the stub's conditional restore block.
+    const EXTRAS_PSTATE_OFF: u32 = (std::mem::offset_of!(DirectThreadSlots, resume_extras)
+        + std::mem::offset_of!(ParkedResumeExtras, pstate))
+        as u32;
+    const EXTRAS_FPSR_OFF: u32 = (std::mem::offset_of!(DirectThreadSlots, resume_extras)
+        + std::mem::offset_of!(ParkedResumeExtras, fpsr)) as u32;
+    const EXTRAS_FPCR_OFF: u32 = (std::mem::offset_of!(DirectThreadSlots, resume_extras)
+        + std::mem::offset_of!(ParkedResumeExtras, fpcr)) as u32;
+    const EXTRAS_V_OFF: u32 = (std::mem::offset_of!(DirectThreadSlots, resume_extras)
+        + std::mem::offset_of!(ParkedResumeExtras, v)) as u32;
 
     /// Fresh slots for one thread, wired to `handler`.
     pub fn new(handler: extern "C" fn(*mut GuestContext)) -> Self {
@@ -453,6 +584,9 @@ impl DirectThreadSlots {
             },
             guest_tls: 0,
             guest_x18: 0,
+            _fp_align: 0,
+            parked_fp: ParkedResumeExtras::default(),
+            resume_extras: ParkedResumeExtras::default(),
         }
     }
 }
@@ -464,6 +598,26 @@ const _: () =
     assert!(DirectThreadSlots::TLS_OFF.is_multiple_of(8) && DirectThreadSlots::TLS_OFF <= 32760);
 const _: () =
     assert!(DirectThreadSlots::X18_OFF.is_multiple_of(8) && DirectThreadSlots::X18_OFF <= 32760);
+// `ldr q` (unsigned scaled imm12) requires a 16-multiple offset to encode;
+// the GPR `ldr`s require 8-multiples. The last V slot must stay reachable.
+const _: () = assert!(
+    DirectThreadSlots::EXTRAS_V_OFF.is_multiple_of(16)
+        && DirectThreadSlots::EXTRAS_V_OFF + 31 * 16 <= 65520
+);
+const _: () = assert!(
+    DirectThreadSlots::EXTRAS_PSTATE_OFF.is_multiple_of(8)
+        && DirectThreadSlots::EXTRAS_FPCR_OFF <= 32760
+);
+// The leave leg's `stp q` pairs use the SIGNED-offset form (scaled imm7,
+// max +1008), so the capture block must sit low in the slots.
+const _: () = assert!(
+    DirectThreadSlots::PARKED_FP_V_OFF.is_multiple_of(16)
+        && DirectThreadSlots::PARKED_FP_V_OFF + 30 * 16 <= 1008
+);
+const _: () = assert!(
+    DirectThreadSlots::PARKED_FP_PSTATE_OFF.is_multiple_of(8)
+        && DirectThreadSlots::PARKED_FP_FPCR_OFF <= 32760
+);
 
 /// RAII installation of one thread's [`DirectThreadSlots`] into the process
 /// TSD slot: while this guard lives, veneers and islands executing on THIS
@@ -1014,6 +1168,11 @@ pub enum DirectIneligible {
     /// exhaustion). Every image is refused — dereferencing an unproven chain
     /// from every veneer is the one thing tier D must never do.
     HostTsdLayoutUnproven { reason: String },
+    /// The host refused a runtime stub the group cannot run without (the
+    /// `rt_sigreturn` trampoline page). Refused up front, named: a group
+    /// without it would run until its first delivered signal and then have
+    /// no return path for the handler.
+    HostRuntimeStubUnavailable { reason: String },
 }
 
 impl std::fmt::Display for DirectIneligible {
@@ -1037,6 +1196,9 @@ impl std::fmt::Display for DirectIneligible {
             }
             Self::HostTsdLayoutUnproven { reason } => {
                 write!(f, "host TSD layout unproven for per-thread slots: {reason}")
+            }
+            Self::HostRuntimeStubUnavailable { reason } => {
+                write!(f, "host refused a required runtime stub: {reason}")
             }
         }
     }
@@ -1729,6 +1891,80 @@ pub struct DirectLoadGroup {
     /// never bless unpatched bytes just because they sit inside a window's
     /// original extent.
     replaced: std::sync::Mutex<Vec<(u64, u64)>>,
+    /// The group's `rt_sigreturn` trampoline (see [`SigreturnTrampoline`]).
+    sigreturn: SigreturnTrampoline,
+}
+
+/// The kernel-vDSO-shaped `rt_sigreturn` trampoline every tier-D group
+/// carries: `movz x8, #139` followed by a standard syscall island.
+///
+/// On aarch64 Linux the sigaction ABI has NO `sa_restorer` in practice —
+/// glibc registers none and every handler returns through the kernel's vDSO
+/// `__kernel_rt_sigreturn` (`mov x8, #139; svc #0`). Tier D maps no vDSO, so
+/// signal delivery points the handler's x30 here instead: the handler's
+/// `ret` lands on the `movz`, falls into the island, and the dispatcher sees
+/// a genuine `rt_sigreturn(2)`. The island's resume leg is emitted (it must
+/// encode) but is never taken — `rt_sigreturn` always LEAVES through the
+/// handler so the restored frame state re-enters via a parked-entry stub.
+struct SigreturnTrampoline {
+    base: *mut u8,
+    len: usize,
+}
+
+impl SigreturnTrampoline {
+    fn build(tsd: TsdSlot) -> io::Result<Self> {
+        let len = HOST_PAGE;
+        // SAFETY: fresh anonymous RW page; kernel-chosen address (the
+        // trampoline is fully self-contained — its only branch targets are
+        // inside this page).
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let base = base.cast::<u8>();
+        let mut w: Vec<u32> = Vec::with_capacity(96);
+        w.push(movz(8, 139, 0)); // x8 = __NR_rt_sigreturn
+        // The island falls through directly after the movz. Its recorded
+        // resume pc is the trampoline base itself (never resumed to — the
+        // sigreturn service always leaves), and the emitted resume branch
+        // targets the base so the constant `b` trivially encodes in-range.
+        let island_at = w.len();
+        let (island_words, resume_slot) = island(tsd, base as u64);
+        w.extend_from_slice(&island_words);
+        let branch_at = base as u64 + ((island_at + resume_slot) * 4) as u64;
+        w[island_at + resume_slot] = b_rel(base as i64 - branch_at as i64);
+        // SAFETY: writing the words into the fresh RW page just mapped.
+        unsafe {
+            std::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), base, w.len() * 4);
+        }
+        // SAFETY: flip R+X (the ParkedEntryStub/window precedent under
+        // ad-hoc signing), then publish to the i-cache.
+        unsafe {
+            if libc::mprotect(base.cast(), len, libc::PROT_READ | libc::PROT_EXEC) != 0 {
+                let error = io::Error::last_os_error();
+                libc::munmap(base.cast(), len);
+                return Err(error);
+            }
+            sys_icache_invalidate(base.cast(), len);
+        }
+        Ok(Self { base, len })
+    }
+}
+
+impl Drop for SigreturnTrampoline {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the mapping.
+        unsafe { libc::munmap(self.base.cast(), self.len) };
+    }
 }
 
 /// Lock a group Mutex without poisoning semantics: the guarded state is only
@@ -1812,6 +2048,15 @@ impl DirectLoadGroup {
     fn empty(handler: extern "C" fn(*mut GuestContext)) -> Result<Self, DirectIneligible> {
         let tsd = thread_slots_tsd()
             .map_err(|reason| DirectIneligible::HostTsdLayoutUnproven { reason })?;
+        let sigreturn = SigreturnTrampoline::build(tsd).map_err(|error| {
+            // No trampoline means no signal delivery for any guest of this
+            // group — refuse the whole group, named, rather than load an
+            // image whose first delivered signal would have nowhere to
+            // return through.
+            DirectIneligible::HostRuntimeStubUnavailable {
+                reason: format!("sigreturn trampoline: {error}"),
+            }
+        })?;
         Ok(Self {
             handler,
             tsd,
@@ -1819,7 +2064,15 @@ impl DirectLoadGroup {
             interpreter: None,
             windows: std::sync::Mutex::new(Vec::new()),
             replaced: std::sync::Mutex::new(Vec::new()),
+            sigreturn,
         })
+    }
+
+    /// The group's `rt_sigreturn` trampoline entry — the address signal
+    /// delivery installs as the handler's return (x30) when the sigaction
+    /// registered no explicit `sa_restorer` (aarch64's universal case).
+    pub fn sigreturn_trampoline(&self) -> u64 {
+        self.sigreturn.base as u64
     }
 
     /// Load one more image into the group, sharing the group's slot set.
@@ -2567,10 +2820,36 @@ impl ParkedEntryStub {
                 "no parked-entry stub slot within b-range of resume pc {pc:#x}"
             )));
         };
-        let mut w: Vec<u32> = Vec::with_capacity(40);
+        // The context IS the slots (offset 0 by `repr(C)` contract), so the
+        // parked-resume extras flag is readable through it. The guest is
+        // parked on THIS thread, so the read (and the clear below) is stable.
+        // Raw-pointer accesses, not a `&mut` borrow: the installed-slots
+        // guard and the emitted code address the same memory.
+        let slots = ctx as usize as *mut DirectThreadSlots;
+        // SAFETY: `ctx` is the current thread's installed slots pointer.
+        let restore_extras = unsafe { (*slots).resume_extras.restore != 0 };
+        // One-shot: ordinary parked entries (clone children, signal-handler
+        // entry) stay GPR-only; only the entry the runner ARMED (sigreturn)
+        // restores the extras.
+        // SAFETY: as above.
+        unsafe { (*slots).resume_extras.restore = 0 };
+        let mut w: Vec<u32> = Vec::with_capacity(96);
         // x0 carries the context pointer while every other register is
         // restored through it — the island resume leg's exact discipline.
         w.extend_from_slice(&mov_imm64(0, ctx));
+        if restore_extras {
+            // Condition flags + FP/SIMD state, restored BEFORE the GPRs while
+            // x1 is still scratch (it is reloaded by the GPR sequence below).
+            w.push(ldr_imm(1, 0, DirectThreadSlots::EXTRAS_PSTATE_OFF));
+            w.push(msr_nzcv(1));
+            w.push(ldr_imm(1, 0, DirectThreadSlots::EXTRAS_FPSR_OFF));
+            w.push(msr_fpsr(1));
+            w.push(ldr_imm(1, 0, DirectThreadSlots::EXTRAS_FPCR_OFF));
+            w.push(msr_fpcr(1));
+            for i in 0..32_u32 {
+                w.push(ldr_q_imm(i, 0, DirectThreadSlots::EXTRAS_V_OFF + i * 16));
+            }
+        }
         w.push(ldr_imm(1, 0, GuestContext::SP));
         w.push(mov_to_sp(1));
         for r in (1..=30_u32).rev() {

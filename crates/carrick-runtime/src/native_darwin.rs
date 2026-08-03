@@ -231,7 +231,7 @@ enum NativeWaitResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeSignalWaitResult {
+pub(crate) enum NativeSignalWaitResult {
     Ready,
     Interrupted,
     TimedOut,
@@ -501,6 +501,15 @@ fn native_publish_child_exit(child: i32) {
 /// KVM/bhyve/NVMM fallback shape with the same native fire action. Stateless:
 /// the kicker is resolved at fire time from `NATIVE_PROCESS_KICKER`.
 struct NativeTimerDelivery;
+
+/// Register [`NativeTimerDelivery`] as the process's `TimerDelivery` (set-once;
+/// later calls are ignored). The DSR boot registers it inline; tier D's runner
+/// calls this so a directly-executed guest's `setitimer`/`timer_settime` arms
+/// the same fallback threads — without it a tier-D `timeout(1)` never receives
+/// its SIGALRM.
+pub(crate) fn ensure_native_timer_delivery() {
+    crate::timer_delivery::register_delivery(Arc::new(NativeTimerDelivery));
+}
 
 impl carrick_hal::TimerDelivery for NativeTimerDelivery {
     fn arm_itimer(
@@ -6553,7 +6562,7 @@ fn wait_native_signals(
     }
 }
 
-fn native_signal_wait_pending(
+pub(crate) fn native_signal_wait_pending(
     dispatcher: &SyscallDispatcher,
     tid: crate::thread::ThreadId,
     wait_set: carrick_abi::SigSet,
@@ -7646,7 +7655,7 @@ fn native_arm_child_exit_watch(child: i32) {
     }
 }
 
-fn native_poll_child_exit_watches() {
+pub(crate) fn native_poll_child_exit_watches() {
     for child in carrick_signal_core::child_watch::tracked_pids() {
         if !native_child_status_ready(child) {
             continue;
