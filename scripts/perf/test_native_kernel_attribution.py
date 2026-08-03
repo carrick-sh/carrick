@@ -76,6 +76,20 @@ def pc_row(run_id: str, count: int, source_pc: int) -> dict[str, object]:
     }
 
 
+def v2_pc_row(
+    run_id: str,
+    count: int,
+    source_pc: int,
+    *,
+    pid: int,
+    kind: str,
+) -> dict[str, object]:
+    row = pc_row(run_id, count, source_pc)
+    row["scope"]["pid"] = pid
+    row["scope"]["kind"] = kind
+    return row
+
+
 def family_frames(name: str, suffix: str = "") -> list[str]:
     return [
         f"kernel`{name}_leaf+0x10",
@@ -110,6 +124,22 @@ def stack_row(
     }
 
 
+def v2_stack_row(
+    run_id: str,
+    count: int,
+    frames: list[str],
+    *,
+    pid: int,
+    kind: str,
+) -> dict[str, object]:
+    row = stack_row(run_id, count, frames)
+    row["scope"]["pid"] = pid
+    row["scope"]["kind"] = kind
+    row["metric"]["state"] = kind
+    row["metric"]["pid"] = pid
+    return row
+
+
 def completion_row(run_id: str) -> dict[str, object]:
     return {
         **base_row(run_id),
@@ -122,6 +152,57 @@ def completion_row(run_id: str) -> dict[str, object]:
             "target_pc": None,
         },
         "metric": {"type": "completion"},
+    }
+
+
+def sampled_kernel_overlay_row(run_id: str) -> dict[str, object]:
+    addresses = [
+        0xFFFFFE0010000010,
+        0xFFFFFE0010001010,
+        0xFFFFFE0010002010,
+        0xFFFFFE0010003010,
+    ]
+    names = ["alpha_leaf", "alpha_entry", "thread_call_run", "machine_idle"]
+    symbols = [
+        {
+            "address": address,
+            "symbol": name,
+            "symbol_start": address - 0x10,
+            "symbol_size": 0x100,
+            "offset": 0x10,
+        }
+        for address, name in zip(addresses, names, strict=True)
+    ]
+    return {
+        **base_row(run_id),
+        "scope": {},
+        "metric": {
+            "type": "sampled-kernel-symbols",
+            "overlay": {
+                "schema": "carrick.sampled-kernel-symbols.v1",
+                "identity": {
+                    "osversion": "fixture-osversion",
+                    "version": "fixture-version",
+                    "uuid": "fixture-uuid",
+                    "machine": "arm64",
+                    "bootsessionuuid": "fixture-boot-session",
+                },
+                "requested_sha256": (
+                    "1fae8c24b9585343e8c0c8eb46fc0c9b974535c3e687f196472a6a79cc42d7da"
+                ),
+                "requested_count": 4,
+                "resolved_sha256": (
+                    "1fae8c24b9585343e8c0c8eb46fc0c9b974535c3e687f196472a6a79cc42d7da"
+                ),
+                "resolved_count": 4,
+                "unresolved_sha256": (
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                ),
+                "unresolved_count": 0,
+                "symbols": symbols,
+                "unresolved": [],
+            },
+        },
     }
 
 
@@ -336,6 +417,170 @@ class NativeKernelAttributionTests(unittest.TestCase):
         self.assertEqual(
             document["evidence_errors"],
             ["run 1 kernel PC count 100 does not equal kernel stack count 99"],
+        )
+
+    def test_v2_kernel_identity_is_scoped_by_process_and_sample_class(self) -> None:
+        def scoped_rows(run_id: str) -> list[dict[str, object]]:
+            frames = family_frames("alpha")
+            return [
+                v2_pc_row(
+                    run_id,
+                    60,
+                    0xFFFFFE0012345000,
+                    pid=1,
+                    kind="kernel-named-syscall",
+                ),
+                v2_pc_row(
+                    run_id,
+                    40,
+                    0xFFFFFE0012345000,
+                    pid=1,
+                    kind="kernel-non-syscall",
+                ),
+                v2_stack_row(
+                    run_id,
+                    60,
+                    frames,
+                    pid=1,
+                    kind="kernel-named-syscall",
+                ),
+                v2_stack_row(
+                    run_id,
+                    40,
+                    frames,
+                    pid=1,
+                    kind="kernel-non-syscall",
+                ),
+                completion_row(run_id),
+            ]
+
+        document = self.analyze_rows(scoped_rows("run-a"), scoped_rows("run-b"))
+
+        self.assertEqual(document["result"], "selectable")
+        self.assertEqual(document["runs"][0]["kernel_pc_count"], 100)
+        self.assertEqual(document["runs"][0]["kernel_stack_count"], 100)
+        self.assertEqual(document["selected_family"]["counts"], [100, 100])
+
+    def test_duplicate_v2_kernel_scope_rejects_even_when_totals_reconcile(self) -> None:
+        frames = family_frames("alpha")
+        first = [
+            v2_pc_row(
+                "run-a",
+                50,
+                0xFFFFFE0012345000,
+                pid=1,
+                kind="kernel-named-syscall",
+            ),
+            v2_pc_row(
+                "run-a",
+                50,
+                0xFFFFFE0012345000,
+                pid=1,
+                kind="kernel-named-syscall",
+            ),
+            v2_stack_row(
+                "run-a",
+                50,
+                frames,
+                pid=1,
+                kind="kernel-named-syscall",
+            ),
+            v2_stack_row(
+                "run-a",
+                50,
+                frames,
+                pid=1,
+                kind="kernel-named-syscall",
+            ),
+            completion_row("run-a"),
+        ]
+
+        document = self.analyze_rows(
+            first,
+            profile_rows("run-b", [("alpha", 100)]),
+        )
+
+        self.assertEqual(document["result"], "rejected")
+        self.assertEqual(
+            document["evidence_errors"],
+            ["run 1 line 2 duplicates a kernel PC scope"],
+        )
+
+    def test_sampled_kernel_overlay_resolves_raw_v2_stack_families(self) -> None:
+        def overlay_rows(run_id: str) -> list[dict[str, object]]:
+            frames = [
+                "0xfffffe0010000010",
+                "0xfffffe0010001010",
+                "0xfffffe0010002010",
+                "0xfffffe0010003010",
+            ]
+            return [
+                v2_pc_row(
+                    run_id,
+                    100,
+                    0xFFFFFE0010000010,
+                    pid=1,
+                    kind="kernel-named-syscall",
+                ),
+                v2_stack_row(
+                    run_id,
+                    100,
+                    frames,
+                    pid=1,
+                    kind="kernel-named-syscall",
+                ),
+                sampled_kernel_overlay_row(run_id),
+                completion_row(run_id),
+            ]
+
+        document = self.analyze_rows(overlay_rows("run-a"), overlay_rows("run-b"))
+
+        self.assertEqual(document["result"], "selectable")
+        self.assertEqual(
+            document["selected_family"]["family"],
+            "kernel`alpha_leaf | kernel`alpha_entry | "
+            "kernel`thread_call_run | kernel`machine_idle",
+        )
+        self.assertEqual(
+            document["runs"][0]["symbolized_leaf_share"],
+            {"numerator": 1, "denominator": 1},
+        )
+
+    def test_sampled_kernel_overlay_hash_mutation_rejects(self) -> None:
+        first = [
+            v2_pc_row(
+                "run-a",
+                100,
+                0xFFFFFE0010000010,
+                pid=1,
+                kind="kernel-named-syscall",
+            ),
+            v2_stack_row(
+                "run-a",
+                100,
+                [
+                    "0xfffffe0010000010",
+                    "0xfffffe0010001010",
+                    "0xfffffe0010002010",
+                    "0xfffffe0010003010",
+                ],
+                pid=1,
+                kind="kernel-named-syscall",
+            ),
+            sampled_kernel_overlay_row("run-a"),
+            completion_row("run-a"),
+        ]
+        first[2]["metric"]["overlay"]["requested_sha256"] = "0" * 64
+
+        document = self.analyze_rows(
+            first,
+            profile_rows("run-b", [("alpha", 100)]),
+        )
+
+        self.assertEqual(document["result"], "rejected")
+        self.assertEqual(
+            document["evidence_errors"],
+            ["run 1 sampled kernel overlay counts or hashes are not canonical"],
         )
 
     def test_checked_u64_addition_rejects_max_plus_one(self) -> None:

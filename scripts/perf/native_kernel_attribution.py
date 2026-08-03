@@ -23,6 +23,7 @@ from typing import Any, Sequence
 INPUT_SCHEMA = "carrick.dsr-profile.v1"
 OUTPUT_SCHEMA = "carrick.native-kernel-attribution.v1"
 PROFILE = "native-wall"
+SAMPLED_KERNEL_SYMBOL_SCHEMA = "carrick.sampled-kernel-symbols.v1"
 U64_MAX = (1 << 64) - 1
 
 MIN_SYMBOLIZED_LEAVES = Fraction(19, 20)
@@ -46,6 +47,7 @@ DROP_FIELDS = (
     "other_drops",
 )
 HEX_OFFSET = re.compile(r"\+0[xX][0-9a-fA-F]+$")
+RAW_ADDRESS = re.compile(r"0[xX][0-9a-fA-F]+")
 
 
 class EvidenceError(ValueError):
@@ -185,6 +187,149 @@ def normalize_stack_family(frames: Sequence[str]) -> str | None:
     return " | ".join(symbolized[:4])
 
 
+def _address_set_sha256(addresses: Sequence[int]) -> str:
+    digest = hashlib.sha256()
+    for address in addresses:
+        digest.update(address.to_bytes(8, "big"))
+    return digest.hexdigest()
+
+
+def _sampled_kernel_overlay(
+    rows: Sequence[dict[str, Any]],
+    description: str,
+) -> tuple[dict[int, str], set[int]] | None:
+    overlay_rows = [
+        row
+        for row in rows
+        if isinstance(row.get("metric"), dict)
+        and row["metric"].get("type") == "sampled-kernel-symbols"
+    ]
+    if not overlay_rows:
+        return None
+    if len(overlay_rows) != 1:
+        raise EvidenceError(f"{description} has multiple sampled kernel overlays")
+    metric = _mapping(overlay_rows[0].get("metric"), f"{description} overlay metric")
+    overlay = _mapping(metric.get("overlay"), f"{description} sampled kernel overlay")
+    if overlay.get("schema") != SAMPLED_KERNEL_SYMBOL_SCHEMA:
+        raise EvidenceError(f"{description} sampled kernel overlay schema is wrong")
+    identity = _mapping(
+        overlay.get("identity"),
+        f"{description} sampled kernel identity",
+    )
+    for field in ("osversion", "version", "uuid", "machine", "bootsessionuuid"):
+        value = identity.get(field)
+        if not isinstance(value, str) or not value or "\0" in value:
+            raise EvidenceError(
+                f"{description} sampled kernel identity {field} is malformed"
+            )
+
+    raw_symbols = overlay.get("symbols")
+    raw_unresolved = overlay.get("unresolved")
+    if not isinstance(raw_symbols, list) or not isinstance(raw_unresolved, list):
+        raise EvidenceError(f"{description} sampled kernel overlay rows are malformed")
+
+    symbols: dict[int, str] = {}
+    resolved_addresses: list[int] = []
+    for index, value in enumerate(raw_symbols, 1):
+        symbol = _mapping(value, f"{description} sampled kernel symbol {index}")
+        address = _nonnegative_u64(
+            symbol.get("address"),
+            f"{description} sampled kernel symbol {index} address",
+        )
+        symbol_start = _nonnegative_u64(
+            symbol.get("symbol_start"),
+            f"{description} sampled kernel symbol {index} start",
+        )
+        symbol_size = _positive_u64(
+            symbol.get("symbol_size"),
+            f"{description} sampled kernel symbol {index} size",
+        )
+        offset = _nonnegative_u64(
+            symbol.get("offset"),
+            f"{description} sampled kernel symbol {index} offset",
+        )
+        name = symbol.get("symbol")
+        if not isinstance(name, str) or not name or "\0" in name or "\n" in name:
+            raise EvidenceError(
+                f"{description} sampled kernel symbol {index} name is malformed"
+            )
+        if symbol_start > U64_MAX - symbol_size:
+            raise EvidenceError(
+                f"{description} sampled kernel symbol {index} range overflows"
+            )
+        if not symbol_start <= address < symbol_start + symbol_size:
+            raise EvidenceError(
+                f"{description} sampled kernel symbol {index} misses its address"
+            )
+        if offset != address - symbol_start:
+            raise EvidenceError(
+                f"{description} sampled kernel symbol {index} offset is wrong"
+            )
+        if address in symbols:
+            raise EvidenceError(
+                f"{description} sampled kernel overlay duplicates a resolved address"
+            )
+        symbols[address] = name
+        resolved_addresses.append(address)
+
+    unresolved_addresses: list[int] = []
+    for index, value in enumerate(raw_unresolved, 1):
+        unresolved = _mapping(
+            value,
+            f"{description} unresolved kernel address {index}",
+        )
+        address = _nonnegative_u64(
+            unresolved.get("address"),
+            f"{description} unresolved kernel address {index}",
+        )
+        if unresolved.get("status") != -1 or unresolved.get("dtrace_errno") != 1015:
+            raise EvidenceError(
+                f"{description} unresolved kernel address {index} has an invalid status"
+            )
+        unresolved_addresses.append(address)
+
+    if resolved_addresses != sorted(set(resolved_addresses)) or (
+        unresolved_addresses != sorted(set(unresolved_addresses))
+    ):
+        raise EvidenceError(
+            f"{description} sampled kernel overlay address order is not canonical"
+        )
+    resolved = set(resolved_addresses)
+    unresolved = set(unresolved_addresses)
+    if resolved.intersection(unresolved):
+        raise EvidenceError(
+            f"{description} sampled kernel overlay address partition overlaps"
+        )
+    requested_addresses = sorted(resolved.union(unresolved))
+    requested_count = _nonnegative_u64(
+        overlay.get("requested_count"),
+        f"{description} sampled kernel requested count",
+    )
+    resolved_count = _nonnegative_u64(
+        overlay.get("resolved_count"),
+        f"{description} sampled kernel resolved count",
+    )
+    unresolved_count = _nonnegative_u64(
+        overlay.get("unresolved_count"),
+        f"{description} sampled kernel unresolved count",
+    )
+    if (
+        requested_count != len(requested_addresses)
+        or resolved_count != len(resolved_addresses)
+        or unresolved_count != len(unresolved_addresses)
+        or overlay.get("requested_sha256")
+        != _address_set_sha256(requested_addresses)
+        or overlay.get("resolved_sha256")
+        != _address_set_sha256(resolved_addresses)
+        or overlay.get("unresolved_sha256")
+        != _address_set_sha256(unresolved_addresses)
+    ):
+        raise EvidenceError(
+            f"{description} sampled kernel overlay counts or hashes are not canonical"
+        )
+    return symbols, set(requested_addresses)
+
+
 def _parse_jsonl(path: pathlib.Path, raw: bytes, run_number: int) -> RunEvidence:
     description = f"run {run_number}"
     try:
@@ -216,6 +361,9 @@ def _parse_jsonl(path: pathlib.Path, raw: bytes, run_number: int) -> RunEvidence
         )
     provenance = _validate_provenance(first, description)
     completion = _validate_completion(first.get("completion"), description)
+    overlay = _sampled_kernel_overlay(rows, description)
+    overlay_symbols = {} if overlay is None else overlay[0]
+    overlay_requested = None if overlay is None else overlay[1]
 
     pc_total = 0
     stack_total = 0
@@ -223,8 +371,9 @@ def _parse_jsonl(path: pathlib.Path, raw: bytes, run_number: int) -> RunEvidence
     family_counts: dict[str, int] = {}
     family_stacks: dict[str, list[StackSample]] = defaultdict(list)
     completion_rows = 0
-    seen_pcs: set[int] = set()
-    seen_stacks: set[tuple[str, ...]] = set()
+    raw_kernel_addresses: set[int] = set()
+    seen_pcs: set[tuple[int | None, str | None, int]] = set()
+    seen_stacks: set[tuple[int | None, str | None, tuple[str, ...]]] = set()
 
     for line_number, row in enumerate(rows, 1):
         row_description = f"{description} line {line_number}"
@@ -254,19 +403,54 @@ def _parse_jsonl(path: pathlib.Path, raw: bytes, run_number: int) -> RunEvidence
                 scope.get("source_pc"),
                 f"{row_description} kernel PC",
             )
-            if source_pc in seen_pcs:
-                raise EvidenceError(f"{row_description} duplicates a kernel PC")
-            seen_pcs.add(source_pc)
+            pid_value = scope.get("pid")
+            pid = (
+                None
+                if pid_value is None
+                else _positive_u64(pid_value, f"{row_description} kernel PC pid")
+            )
+            kind_value = scope.get("kind")
+            if kind_value is not None and (
+                not isinstance(kind_value, str) or not kind_value
+            ):
+                raise EvidenceError(f"{row_description} kernel PC kind is malformed")
+            pc_identity = (pid, kind_value, source_pc)
+            if pc_identity in seen_pcs:
+                raise EvidenceError(
+                    f"{row_description} duplicates a kernel PC scope"
+                )
+            seen_pcs.add(pc_identity)
+            raw_kernel_addresses.add(source_pc)
             pc_total = _checked_add(pc_total, count, f"{description} kernel PC count")
         elif phase == "cpu-kernel-stack":
             if metric_type != "stack-trace":
                 raise EvidenceError(f"{row_description} kernel stack is not a stack-trace")
-            if "pid" in metric or "value_ns" in metric:
+            if "value_ns" in metric:
                 raise EvidenceError(
-                    f"{row_description} kernel stack has pid or value_ns"
+                    f"{row_description} kernel stack has value_ns"
                 )
-            if scope.get("pid") is not None:
-                raise EvidenceError(f"{row_description} kernel stack has a scope pid")
+            pid_value = scope.get("pid")
+            pid = (
+                None
+                if pid_value is None
+                else _positive_u64(pid_value, f"{row_description} kernel stack pid")
+            )
+            if pid is None:
+                if "pid" in metric:
+                    raise EvidenceError(
+                        f"{row_description} unscoped kernel stack has a metric pid"
+                    )
+            elif metric.get("pid") != pid:
+                raise EvidenceError(
+                    f"{row_description} kernel stack pid disagrees with its scope"
+                )
+            kind_value = scope.get("kind")
+            if not isinstance(kind_value, str) or not kind_value:
+                raise EvidenceError(f"{row_description} kernel stack kind is malformed")
+            if metric.get("state") != kind_value:
+                raise EvidenceError(
+                    f"{row_description} kernel stack state disagrees with its scope"
+                )
             count = _positive_u64(
                 metric.get("count"),
                 f"{row_description} kernel stack count",
@@ -278,10 +462,41 @@ def _parse_jsonl(path: pathlib.Path, raw: bytes, run_number: int) -> RunEvidence
                 or any(not isinstance(frame, str) or not frame for frame in raw_frames)
             ):
                 raise EvidenceError(f"{row_description} kernel stack frames are malformed")
-            frames = tuple(raw_frames)
-            if frames in seen_stacks:
-                raise EvidenceError(f"{row_description} duplicates a kernel stack")
-            seen_stacks.add(frames)
+            raw_frames_tuple = tuple(raw_frames)
+            stack_identity = (pid, kind_value, raw_frames_tuple)
+            if stack_identity in seen_stacks:
+                raise EvidenceError(
+                    f"{row_description} duplicates a kernel stack scope"
+                )
+            seen_stacks.add(stack_identity)
+            if overlay is None:
+                frames = raw_frames_tuple
+            else:
+                addressed_frames: list[int] = []
+                for frame in raw_frames_tuple:
+                    if RAW_ADDRESS.fullmatch(frame) is None:
+                        raise EvidenceError(
+                            f"{row_description} overlaid kernel stack frame is not raw"
+                        )
+                    address = int(frame, 16)
+                    if address > U64_MAX:
+                        raise EvidenceError(
+                            f"{row_description} overlaid kernel stack frame exceeds u64"
+                        )
+                    addressed_frames.append(address)
+                    raw_kernel_addresses.add(address)
+                frames = tuple(
+                    (
+                        f"kernel`{overlay_symbols[address]}"
+                        if address in overlay_symbols
+                        else frame
+                    )
+                    for address, frame in zip(
+                        addressed_frames,
+                        raw_frames_tuple,
+                        strict=True,
+                    )
+                )
             stack_total = _checked_add(
                 stack_total,
                 count,
@@ -300,6 +515,11 @@ def _parse_jsonl(path: pathlib.Path, raw: bytes, run_number: int) -> RunEvidence
                     f"{description} family count",
                 )
                 family_stacks[family].append(StackSample(count, frames))
+
+    if overlay_requested is not None and raw_kernel_addresses != overlay_requested:
+        raise EvidenceError(
+            f"{description} sampled kernel overlay does not match profile addresses"
+        )
 
     if completion_rows != 1:
         raise EvidenceError(
