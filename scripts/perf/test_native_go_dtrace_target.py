@@ -222,6 +222,106 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             "0",
         )
 
+    def test_cli_arms_xlat_census_with_explicit_empty_directory(self) -> None:
+        captured_environment: dict[str, str] = {}
+
+        class CompletedProcess:
+            def __init__(self, _command, *, cwd, env):
+                del cwd
+                captured_environment.update(env)
+
+            def wait(self) -> int:
+                return 0
+
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as temporary:
+            census_dir = pathlib.Path(temporary) / "census"
+            census_dir.mkdir()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "native_go_dtrace_target.py",
+                        "--run-id",
+                        "xlat-census-test",
+                        "--xlat-census-dir",
+                        str(census_dir),
+                    ],
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    native_go_dtrace_target.subprocess,
+                    "Popen",
+                    side_effect=CompletedProcess,
+                ),
+                mock.patch("sys.stdout", output),
+            ):
+                self.assertEqual(native_go_dtrace_target.main(), 0)
+
+            expected = str(census_dir.resolve())
+            self.assertEqual(
+                captured_environment["CARRICK_XLAT_CENSUS_DIR"], expected
+            )
+            provenance = json.loads(
+                output.getvalue().strip().removeprefix("TARGET_PROVENANCE=")
+            )
+            self.assertEqual(provenance["xlat_census_dir"], expected)
+
+    def test_cli_rejects_missing_xlat_census_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = pathlib.Path(temporary) / "missing"
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "native_go_dtrace_target.py",
+                        "--run-id",
+                        "xlat-census-missing",
+                        "--xlat-census-dir",
+                        str(missing),
+                    ],
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    native_go_dtrace_target.subprocess,
+                    "Popen",
+                    return_value=mock.Mock(wait=mock.Mock(return_value=0)),
+                ),
+                mock.patch("sys.stderr", io.StringIO()),
+                self.assertRaisesRegex(SystemExit, "2"),
+            ):
+                native_go_dtrace_target.main()
+
+    def test_cli_rejects_nonempty_xlat_census_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            census_dir = pathlib.Path(temporary) / "census"
+            census_dir.mkdir()
+            (census_dir / "prior.txt").write_text("stale", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "native_go_dtrace_target.py",
+                        "--run-id",
+                        "xlat-census-nonempty",
+                        "--xlat-census-dir",
+                        str(census_dir),
+                    ],
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    native_go_dtrace_target.subprocess,
+                    "Popen",
+                    return_value=mock.Mock(wait=mock.Mock(return_value=0)),
+                ),
+                mock.patch("sys.stderr", io.StringIO()),
+                self.assertRaisesRegex(SystemExit, "2"),
+            ):
+                native_go_dtrace_target.main()
+
     def test_carrick_trace_mode_preserves_run_and_forwards_exact_controls(self) -> None:
         captured_command: list[str] = []
 
