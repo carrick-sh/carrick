@@ -14,6 +14,19 @@
 //! near-empty `GuestMemory`: no translation table, no guest-physical mapping,
 //! no alias window. That is the structural simplification direct execution
 //! buys, and it is why this file is short.
+//!
+//! # How a run ends: the guest-leave contract
+//!
+//! A tier-D guest leaves through the handler, never by returning to Rust with
+//! its own stack discipline (the full contract lives in
+//! `carrick_native_darwin::direct`). Concretely for this runner: any dispatch
+//! outcome that ends or suspends the run — `Exit`, and every outcome tier D
+//! does not implement yet (`Execve`, `Fork`, signal delivery, blocking waits)
+//! — makes the handler request a leave. The island's leave leg then returns
+//! control to `DirectImage::enter`'s caller with the guest's complete state
+//! parked in its context, and `DirectRunner::outcome` names why the run
+//! stopped. The guest is never resumed past such a syscall with a fabricated
+//! errno.
 
 use carrick_abi::{CanonicalNr, LinuxGuestAbi, NativeNr};
 use carrick_guest_mem::{GuestMemory, MemoryError};
@@ -75,12 +88,23 @@ pub enum DirectRunOutcome {
     },
     /// The dispatcher produced an outcome tier D does not implement yet
     /// (blocking waits, fork, execve, signal delivery). Named rather than
-    /// approximated: the translated lane's loop services these, and tier D has
-    /// to grow the same handling before it can claim them.
+    /// approximated: the guest LEAVES through the island's leave leg with its
+    /// full state parked in the context — never resumed with a fabricated
+    /// errno — and the translated lane's loop shows what tier D has to grow
+    /// before it can claim these outcomes.
     Unsupported {
         syscall: u64,
         outcome: String,
     },
+}
+
+/// What the island should do when the handler returns.
+enum ServiceVerdict {
+    /// Write `x0` and resume the guest at the instruction after the `svc`.
+    Resume(i64),
+    /// Leave guest execution: the run's outcome is recorded and the guest's
+    /// state stays parked in the context (guest-leave contract).
+    Leave,
 }
 
 /// A directly-executed guest plus the dispatcher that serves it.
@@ -111,8 +135,8 @@ impl DirectRunner {
         &self.dispatcher
     }
 
-    /// Service one syscall from a tier-D island; returns the guest's x0.
-    fn service(&mut self, ctx: &GuestContext) -> i64 {
+    /// Service one syscall from a tier-D island.
+    fn service(&mut self, ctx: &GuestContext) -> ServiceVerdict {
         self.syscalls += 1;
         let number = ctx.syscall_nr();
         let request = SyscallRequest::from_raw(carrick_hal::RawSyscall {
@@ -128,25 +152,25 @@ impl DirectRunner {
             .dispatcher
             .dispatch(request, &mut self.memory, &reporter)
         {
-            Ok(DispatchOutcome::Returned { value }) => value,
-            Ok(DispatchOutcome::Errno { errno }) => errno.guest_retval(),
+            Ok(DispatchOutcome::Returned { value }) => ServiceVerdict::Resume(value),
+            Ok(DispatchOutcome::Errno { errno }) => ServiceVerdict::Resume(errno.guest_retval()),
             Ok(DispatchOutcome::Exit { code }) => {
                 self.outcome = Some(DirectRunOutcome::Exited { code });
-                0
+                ServiceVerdict::Leave
             }
             Ok(other) => {
                 self.outcome = Some(DirectRunOutcome::Unsupported {
                     syscall: number,
                     outcome: format!("{other:?}"),
                 });
-                crate::linux_abi::LINUX_ENOSYS.guest_retval()
+                ServiceVerdict::Leave
             }
             Err(error) => {
                 self.outcome = Some(DirectRunOutcome::Unsupported {
                     syscall: number,
                     outcome: error.to_string(),
                 });
-                crate::linux_abi::LINUX_ENOSYS.guest_retval()
+                ServiceVerdict::Leave
             }
         }
     }
@@ -171,8 +195,13 @@ extern "C" fn dispatch_from_island(ctx: *mut GuestContext) {
     // SAFETY: `with_runner` installs this runner for exactly the window in
     // which the guest can call back, and the island owns `ctx` for this call.
     let (runner, ctx) = unsafe { (&mut *runner, &mut *ctx) };
-    let value = runner.service(ctx);
-    ctx.set_return(value);
+    match runner.service(ctx) {
+        ServiceVerdict::Resume(value) => ctx.set_return(value),
+        // The guest's own state at the syscall stays parked in the context —
+        // no fabricated return value — and the island's leave leg returns
+        // control to `enter`'s caller (guest-leave contract).
+        ServiceVerdict::Leave => ctx.request_leave(),
+    }
 }
 
 /// Build a tier-D image with this so its syscalls reach the real dispatcher.
@@ -263,6 +292,115 @@ mod tests {
             runner.dispatcher().stdout(),
             b"hi\n",
             "the guest's own write(2) reached the real dispatcher"
+        );
+    }
+
+    /// The guest-leave contract, enforced at the syscall that ends the run:
+    /// `exit(2)` must LEAVE through the handler, not merely be recorded while
+    /// the guest keeps executing whatever bytes follow the `svc`. The poison
+    /// write after the exit would be serviced by a runner without an exit
+    /// path, so the assertions below are red against exactly that defect.
+    #[test]
+    fn exit_leaves_through_the_handler_instead_of_running_past_it() {
+        const NR_EXIT: u32 = 93;
+        let elf = elf_with_code(&[
+            mov_reg(20, 30), // stash the incoming link register
+            movz(0, 7, 0),   // exit code 7
+            movz(8, NR_EXIT, 0),
+            SVC_0,
+            // POISON: everything from here on must never execute. A runner
+            // without a real exit path resumes the guest here and services
+            // this write, which is the observable difference.
+            movz(9, 0x4141, 0), // "AA"
+            str_pre_sp(9),
+            mov_from_sp(1),
+            movz(0, 1, 0),
+            movz(2, 2, 0),
+            movz(8, NR_WRITE, 0),
+            SVC_0,
+            ADD_SP_16,
+            mov_reg(30, 20),
+            0xd65f_03c0, // ret — reached only when the exit path is broken
+        ]);
+        let image = DirectImage::load(&elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        let mut runner =
+            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = image.entry();
+        // SAFETY: the image is patched and built with `island_handler`.
+        unsafe { with_runner(&mut runner, || image.enter(entry)) };
+
+        assert_eq!(
+            runner.outcome(),
+            Some(&DirectRunOutcome::Exited { code: 7 }),
+            "the exit was recorded"
+        );
+        assert_eq!(
+            runner.syscalls(),
+            1,
+            "the guest left AT the exit; the poison write never reached the dispatcher"
+        );
+        assert_eq!(
+            runner.dispatcher().stdout(),
+            b"",
+            "no poison bytes: the guest did not run past its own exit"
+        );
+    }
+
+    /// `execve(2)` is the syscall the roadmap names as needing a real exit:
+    /// the dispatcher resolves path/argv/envp and hands back an `Execve`
+    /// outcome the RUNNER must act on, which tier D cannot yet — so the guest
+    /// must leave through the handler with its full state parked in the
+    /// context, not resume with a fabricated errno.
+    #[test]
+    fn execve_leaves_through_the_handler_with_the_guest_parked_at_the_syscall() {
+        const NR_EXECVE: u32 = 221;
+        const NR_EXIT: u32 = 93;
+        let elf = elf_with_code(&[
+            mov_reg(20, 30),
+            movz(9, 0x782f, 0), // "/x" + NUL padding
+            str_pre_sp(9),
+            mov_from_sp(0), // x0 = pathname
+            str_pre_sp(31), // NULL terminator word (str xzr)
+            mov_from_sp(1), // x1 = argv (empty, NULL-terminated)
+            mov_reg(2, 1),  // x2 = envp = same empty array
+            movz(8, NR_EXECVE, 0),
+            SVC_0,
+            // POISON: a broken exit path resumes here and this exit(9)
+            // overwrites the recorded outcome, which the assertion catches.
+            movz(0, 9, 0),
+            movz(8, NR_EXIT, 0),
+            SVC_0,
+            ADD_SP_16,
+            ADD_SP_16,
+            mov_reg(30, 20),
+            0xd65f_03c0, // ret
+        ]);
+        let image = DirectImage::load(&elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        let mut runner =
+            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = image.entry();
+        // SAFETY: the image is patched and built with `island_handler`.
+        unsafe { with_runner(&mut runner, || image.enter(entry)) };
+
+        assert!(
+            matches!(
+                runner.outcome(),
+                Some(&DirectRunOutcome::Unsupported {
+                    syscall: 221,
+                    ref outcome
+                }) if outcome.contains("Execve")
+            ),
+            "the run stopped AT the execve with the outcome named: {:?}",
+            runner.outcome()
+        );
+        assert_eq!(
+            runner.syscalls(),
+            1,
+            "the guest left AT the execve; the poison exit never ran"
         );
     }
 
