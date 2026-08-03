@@ -5312,6 +5312,10 @@ struct DirectBindingLiveFixture {
     source: GuestVa,
     target: GuestVa,
     _cache_session: carrick_native_darwin::aot_cache::ContainerCacheSession,
+    /// Keeps the hermetic store directory alive for the session above:
+    /// the persistent-store authority resolves units by path, so the root
+    /// must outlive every load the test performs.
+    _cache_root: tempfile::TempDir,
     stack: Vec<u8>,
 }
 
@@ -5489,8 +5493,10 @@ fn direct_binding_live_fixture(
     .expect("pack live direct-binding target");
     assert_eq!(source_pending.bindings.len(), 1);
 
-    let cache_session = carrick_native_darwin::aot_cache::begin_container_cache()
-        .expect("begin live sidecar cache");
+    let cache_root = tempfile::tempdir().expect("create test store root");
+    let cache_session =
+        carrick_native_darwin::aot_cache::begin_container_cache_at(cache_root.path())
+            .expect("begin live sidecar cache");
     let store = Arc::new(carrick_native_darwin::aot_cache::ActiveContainerUnitStore);
     if source_shared {
         assert_eq!(
@@ -5547,6 +5553,7 @@ fn direct_binding_live_fixture(
         source,
         target,
         _cache_session: cache_session,
+        _cache_root: cache_root,
         stack: vec![0_u8; 16 * 1024],
     }
 }
@@ -6720,8 +6727,10 @@ fn direct_binding_generation_change_clears_and_rebinds() {
     .expect("pack direct-binding sidecar");
     assert_eq!(pending.bindings.len(), 1);
 
+    let cache_root = tempfile::tempdir().expect("create test store root");
     let _cache_session =
-        carrick_native_darwin::aot_cache::begin_container_cache().expect("begin container cache");
+        carrick_native_darwin::aot_cache::begin_container_cache_at(cache_root.path())
+            .expect("begin container cache");
     let store = Arc::new(carrick_native_darwin::aot_cache::ActiveContainerUnitStore);
     assert_eq!(
         store.publish(&pending).expect("publish sidecar unit"),

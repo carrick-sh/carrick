@@ -848,6 +848,10 @@ impl UnitMissReason {
 pub enum PublishOutcome {
     Winner,
     Existing,
+    /// Another process held the unit's store lock: it is emitting this same
+    /// unit right now, so this publisher dropped its copy instead of
+    /// blocking on a rival's emission.
+    Yielded,
 }
 
 #[derive(Clone, Debug)]

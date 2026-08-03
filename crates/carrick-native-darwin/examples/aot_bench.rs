@@ -30,7 +30,7 @@ use carrick_dsr_aarch64::shared_cache::{
 };
 use carrick_dsr_aarch64::types::CacheOffset;
 use carrick_guest_mem::GuestVa;
-use carrick_native_darwin::aot_cache::{ActiveContainerUnitStore, begin_container_cache};
+use carrick_native_darwin::aot_cache::{ActiveContainerUnitStore, begin_container_cache_at};
 
 /// `mov w0, #42 ; ret`
 const MOV42_RET: [u8; 8] = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
@@ -101,7 +101,10 @@ fn median(mut v: Vec<u128>) -> u128 {
 }
 
 fn main() {
-    let _session = begin_container_cache().expect("begin bench cache session");
+    // A private store root: bench keys are deterministic, and a warm real
+    // store would turn every publish into Existing and skew the numbers.
+    let bench_root = tempfile::tempdir().expect("create bench store root");
+    let _session = begin_container_cache_at(bench_root.path()).expect("begin bench cache session");
     let store = ActiveContainerUnitStore;
     println!("size_mb publish_ms load_cold_ms load_warm_p50_ms load_warm_mb_per_s");
     for (index, size_mb) in [1_usize, 6, 16].into_iter().enumerate() {
