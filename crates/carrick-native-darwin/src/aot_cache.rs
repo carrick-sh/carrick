@@ -816,9 +816,18 @@ impl ContainerCacheAuthority {
         &self,
         pending: &PendingTranslationUnit,
     ) -> Result<PublishOutcome, UnitStoreError> {
-        if pending.code.is_empty()
-            || pending.code.len() > MAX_TRANSLATION_UNIT_CODE_BYTES
-            || !pending.code.len().is_multiple_of(4)
+        let (pending_code, pending_blocks) = pending.pack_legacy_pair().map_err(|error| {
+            UnitStoreError::with_source(
+                "pack pending legacy pair",
+                UnitMissReason::Schema,
+                invalid_data(format!("{error:?}")),
+            )
+        })?;
+        if pending_code.is_empty() {
+            return Ok(PublishOutcome::Existing);
+        }
+        if pending_code.len() > MAX_TRANSLATION_UNIT_CODE_BYTES
+            || !pending_code.len().is_multiple_of(4)
         {
             return Err(UnitStoreError::new(
                 "validate pending unit",
@@ -829,13 +838,13 @@ impl ContainerCacheAuthority {
         // bytes the code half will carry: a loader that ever pairs a stale
         // orphan with fresh metadata fails the digest instead of running
         // code its metadata does not describe.
-        let code_sha256: [u8; 32] = Sha256::digest(&pending.code).into();
+        let code_sha256: [u8; 32] = Sha256::digest(&pending_code).into();
         let metadata_bytes = Arc::new(
             encode_translation_unit_metadata(
                 &pending.key,
                 code_sha256,
-                pending.code.len() as u64,
-                &pending.blocks,
+                pending_code.len() as u64,
+                &pending_blocks,
             )
             .map_err(|error| {
                 tracing::warn!(
@@ -920,7 +929,7 @@ impl ContainerCacheAuthority {
         let mut code_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
             UnitStoreError::with_source("create code temporary", UnitMissReason::MissingPair, error)
         })?;
-        code_temp.write_all(&pending.code).map_err(|error| {
+        code_temp.write_all(&pending_code).map_err(|error| {
             UnitStoreError::with_source("write code temporary", UnitMissReason::MissingPair, error)
         })?;
         code_temp.flush().map_err(|error| {
@@ -1381,9 +1390,9 @@ mod tests {
     use carrick_dsr_aarch64::emit::PcMapEntry;
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
-        NativePageProfileIdentity, SourceFingerprint,
+        NativePageProfileIdentity, PortableBlockCandidate, SourceFingerprint,
     };
-    use carrick_dsr_aarch64::types::CacheOffset;
+    use carrick_dsr_aarch64::types::{CacheOffset, CodeGeneration};
     use carrick_guest_mem::GuestVa;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::PermissionsExt;
@@ -1403,8 +1412,12 @@ mod tests {
 
     fn fixture_pending() -> PendingTranslationUnit {
         let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
+        let words = MOV42_RET
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect();
         let template = ArtifactTemplate::normalize(
-            Vec::new(),
+            words,
             vec![
                 PcMapEntry {
                     guest: GuestVa(0x400000),
@@ -1422,30 +1435,30 @@ mod tests {
             None,
             &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
         )
-        .expect("fixture block metadata")
-        .into_runtime_metadata_only();
-        PendingTranslationUnit {
-            key: TranslationUnitKey::for_segment(
-                ExecutableIdentity::Digest([0x11; 32]),
-                ImageFileOffset::new(0),
-                ImageFileLen::new(8).expect("nonzero file length"),
-                GuestVa(0x400000),
-                GuestCodeLen::new(8).expect("nonzero guest length"),
-                SourceFingerprint::from_words(&source_words),
-                NativePageProfileIdentity::Native16k,
-                AddressModeIdentity::biased(
-                    NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
-                ),
+        .expect("fixture block metadata");
+        let key = TranslationUnitKey::for_segment(
+            ExecutableIdentity::Digest([0x11; 32]),
+            ImageFileOffset::new(0),
+            ImageFileLen::new(8).expect("nonzero file length"),
+            GuestVa(0x400000),
+            GuestCodeLen::new(8).expect("nonzero guest length"),
+            SourceFingerprint::from_words(&source_words),
+            NativePageProfileIdentity::Native16k,
+            AddressModeIdentity::biased(
+                NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
             ),
-            code: MOV42_RET.to_vec(),
-            blocks: vec![carrick_dsr_aarch64::shared_cache::PortableBlockRecord {
+        );
+        PendingTranslationUnit::pack(
+            key,
+            vec![PortableBlockCandidate {
                 guest_start: GuestVa(0x400000),
-                entry_offset: 0,
-                code_len: 8,
+                source_end: GuestVa(0x400008),
+                generation: CodeGeneration::INITIAL,
                 requires_sensitive_metadata: false,
                 template,
             }],
-        }
+        )
+        .expect("pack fixture pending unit")
     }
 
     fn fixture_source_words() -> [u32; 1] {
@@ -1976,9 +1989,10 @@ mod tests {
         // The copy transport hands out READABLE source bytes; nothing at
         // this address is executable. The translator copies them into its
         // own MAP_JIT cache.
+        let (pending_code, _) = pending.pack_legacy_pair().expect("pack fixture code");
         let source =
-            unsafe { std::slice::from_raw_parts(loaded.source_base.as_ptr(), pending.code.len()) };
-        assert_eq!(source, pending.code.as_slice());
+            unsafe { std::slice::from_raw_parts(loaded.source_base.as_ptr(), pending_code.len()) };
+        assert_eq!(source, pending_code.as_slice());
         assert!(
             std::fs::read_dir(authority.path())
                 .expect("read cache directory")
@@ -2018,7 +2032,7 @@ mod tests {
         let first = fixture_pending();
         let mut second = fixture_pending();
         // Same length, different bytes: `mov w0, #43 ; ret`.
-        second.code[..4].copy_from_slice(&0x5280_0560_u32.to_le_bytes());
+        second.blocks[0].code[..4].copy_from_slice(&0x5280_0560_u32.to_le_bytes());
         second.key = TranslationUnitKey::for_segment(
             ExecutableIdentity::Digest([0x33; 32]),
             ImageFileOffset::new(0),
@@ -2096,9 +2110,10 @@ mod tests {
         );
         let stem = pending.key.file_stem().expect("unit stem");
         let (code_path, metadata_path) = authority.final_paths(&stem);
+        let (pending_code, _) = pending.pack_legacy_pair().expect("pack fixture code");
         assert_eq!(
             std::fs::read(&code_path).expect("read published code"),
-            pending.code,
+            pending_code,
             "the code half is the raw translated bytes, verbatim"
         );
         assert!(metadata_path.is_file());

@@ -4079,13 +4079,14 @@ fn translated_block_is_published_on_retirement_and_reused() {
             // The store persists READABLE bytes; nothing executes at this
             // address. The install replays them into the loading process's
             // own cache.
-            let code: Arc<Vec<u8>> = Arc::new(pending.code.clone());
+            let (code, records) = pending.pack_legacy_pair().expect("pack legacy test pair");
+            let code: Arc<Vec<u8>> = Arc::new(code);
             let base = code.as_ptr() as usize;
             let manifest = TranslationUnitManifest::from_blocks(
                 &pending.key,
                 [0x33; 32],
-                pending.code.len() as u64,
-                &pending.blocks,
+                code.len() as u64,
+                &records,
             )
             .expect("round-trip retirement manifest");
             let lease: Arc<dyn Send + Sync> = code;
