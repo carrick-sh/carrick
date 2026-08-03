@@ -524,7 +524,7 @@ pub struct DirectThreadSlots {
 /// carries — a guest handler legitimately clobbers caller-saved V registers
 /// and may even mutate the frame's copies, and Linux applies the frame
 /// verbatim. The runner sets `restore` = 1 on `resume_extras`; the next
-/// [`ParkedEntryStub`] emission reads the flag (Rust-side, guest parked),
+/// `ParkedEntryStub` emission reads the flag (Rust-side, guest parked),
 /// emits the extra loads, and clears it so ordinary parked entries (clone
 /// children, handler entry) stay GPR-only.
 #[repr(C)]

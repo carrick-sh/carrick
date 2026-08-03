@@ -284,8 +284,8 @@ pub struct PortableBlockRecord {
 
 /// One block of a loaded unit as the fixed-width index describes it. The
 /// hot/cold blob extents are parsed alongside but stay private: blob bytes
-/// are reached through [`TranslationUnitManifest::block_hot`] /
-/// [`TranslationUnitManifest::block_cold`], never raw.
+/// are reached through the manifest's private `block_hot` / `block_cold`
+/// accessors, never raw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnitBlockIndexEntry {
     pub guest_start: GuestVa,
