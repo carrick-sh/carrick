@@ -953,6 +953,83 @@ mod tests {
     use super::*;
     use carrick_native_darwin::direct::DirectLoadGroup;
 
+    /// The STRETCH gate: real CPython 3.12 running `print(1)` end to end on
+    /// tier D. `python3.12` is a real, PIE, dynamically linked interpreter
+    /// from the debian-based `python:3.12-slim` image; its real ld.so maps
+    /// libc, libm, and the 6.6 MB `libpython3.12.so` through the exec-mmap
+    /// window pipeline (both the whole-span and MAP_FIXED strategies), and
+    /// CPython's full C runtime initializes, imports the frozen `encodings`
+    /// codec from the staged stdlib, evaluates `print(1)`, and exits 0 with
+    /// `1\n` on stdout — all through the one dispatcher, single-threaded.
+    ///
+    /// Runs from a rootfs staged on disk under `target/tierd-live/pyroot`
+    /// (skips loudly when absent). Staging, from the cached OCI layers:
+    /// `bin/python3.12` + `lib/libpython3.12.so.1.0` into `usr/local/{bin,
+    /// lib}`, the interpreter/libc/libm into `lib`, `lib64`, `usr/lib` (the
+    /// default search path, since `$ORIGIN` RUNPATH cannot resolve without a
+    /// real `/proc/self/exe`), and the full `python3.12` stdlib under
+    /// `usr/local/lib`.
+    #[test]
+    fn real_cpython_prints_through_tier_d() {
+        let root = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/tierd-live/pyroot"
+        );
+        let (Ok(py), Ok(ld)) = (
+            std::fs::read(format!("{root}/usr/local/bin/python3.12")),
+            std::fs::read(format!("{root}/lib/ld-linux-aarch64.so.1")),
+        ) else {
+            eprintln!("skipping: no python rootfs under target/tierd-live/pyroot (see test doc)");
+            return;
+        };
+        let group =
+            DirectLoadGroup::load_with_interpreter(&py, |_| Ok(ld.clone()), island_handler())
+                .expect("load")
+                .expect("python and its ld.so are tier-D eligible");
+        let interp = group.interpreter().expect("interpreter mapped");
+        let stack = DirectStack::build(
+            &py,
+            group.main().bias(),
+            Some(interp.bias()),
+            &[
+                b"python3".to_vec(),
+                b"-I".to_vec(),
+                b"-S".to_vec(),
+                b"-c".to_vec(),
+                b"print(1)".to_vec(),
+            ],
+            &[b"PYTHONHOME=/usr/local".to_vec()],
+        )
+        .expect("stack builds");
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(
+            crate::fs_backend::HostFsBackend::from_existing_dir(
+                cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+                    .expect("open python rootfs"),
+            ),
+        ));
+        let mut runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
+        let entry = group.entry_pc();
+        let sp = stack.sp();
+        // SAFETY: patched images built with `island_handler`; the guest
+        // leaves through its exit.
+        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
+        assert_eq!(
+            runner.outcome(),
+            Some(&DirectRunOutcome::Exited { code: 0 }),
+            "CPython evaluated print(1) and exited 0 on tier D (syscalls: {}; \
+             stdout: {:?}; stderr: {:?})",
+            runner.syscalls(),
+            String::from_utf8_lossy(&runner.dispatcher().stdout()),
+            String::from_utf8_lossy(&runner.dispatcher().stderr()),
+        );
+        assert_eq!(
+            runner.dispatcher().stdout(),
+            b"1\n",
+            "print(1) reached stdout through the one dispatcher"
+        );
+    }
+
     const NR_WRITE: u32 = 64;
     const SVC_0: u32 = 0xd400_0001;
 

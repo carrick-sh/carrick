@@ -1774,28 +1774,23 @@ impl DirectLoadGroup {
             return Err(io::Error::last_os_error());
         }
         let text = text.cast::<u8>();
-        // A separate island arena, kernel-placed; branch range decides whether
-        // it can serve this text.
+        // A separate island arena. It MUST land within ±128 MiB of every
+        // patched site or the `b` to its island cannot encode; an unhinted
+        // `mmap` sometimes lands far (kernel-dependent), which would refuse a
+        // perfectly good image non-deterministically. So place it NEAR the
+        // text and verify: every branch spans at most `|arena - text| +
+        // window_len + arena_len`, so requiring that under the branch range
+        // guarantees the patcher's per-branch checks all pass.
         let arena_len = (64 * 1024 + ranges.iter().map(|(_, size)| size).sum::<usize>())
             .next_multiple_of(HOST_PAGE);
-        // SAFETY: fresh plain anonymous mapping for islands.
-        let arena_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                arena_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
+        let arena_ptr = match Self::place_island_arena_near(text as u64, window_len, arena_len) {
+            Some(ptr) => ptr,
+            None => {
+                // SAFETY: undo the text mapping before failing closed.
+                unsafe { libc::munmap(text.cast(), window_len) };
+                return Ok(Err(DirectIneligible::IslandOutOfRange { vaddr: addr }));
+            }
         };
-        if arena_ptr == libc::MAP_FAILED {
-            let err = io::Error::last_os_error();
-            // SAFETY: undo the text mapping this constructor made.
-            unsafe { libc::munmap(text.cast(), window_len) };
-            return Err(err);
-        }
-        let arena_ptr = arena_ptr.cast::<u8>();
         let mut image = DirectImage {
             base: text,
             len: window_len,
@@ -1882,6 +1877,71 @@ impl DirectLoadGroup {
         let mapped = image.base as u64;
         lock(&self.windows).push(image);
         Ok(Ok(mapped))
+    }
+
+    /// Place the island arena for a `MAP_FIXED` window so every branch
+    /// between the text at `[text, text + window_len)` and an island in the
+    /// arena encodes in ±128 MiB. An unhinted `mmap` lands wherever the
+    /// allocator's cursor sits — often far, and across several library
+    /// reservations even beyond ±128 MiB — so it cannot be trusted.
+    ///
+    /// Instead this PROBES the address space around the text for a free slot:
+    /// macOS honors an mmap HINT when the target range is free (probed), so a
+    /// mapping that comes back EXACTLY at the hint proves that slot was free
+    /// and claims it; one that lands elsewhere means the hint was occupied,
+    /// so it is released and the next offset tried. Sweeping just past the
+    /// text and just below it in arena-sized steps finds the nearest free
+    /// in-range slot deterministically. Returns `None` (fail closed) only if
+    /// no free slot exists within range — a real but rare condition, never a
+    /// mis-encoded branch.
+    fn place_island_arena_near(text: u64, window_len: usize, arena_len: usize) -> Option<*mut u8> {
+        let reach =
+            |arena: u64| -> u64 { arena.abs_diff(text) + window_len as u64 + arena_len as u64 };
+        let arena_u = arena_len as u64;
+        // Candidate slots: alternating above (past the text) and below, at
+        // increasing arena-sized offsets, all staying inside ±128 MiB.
+        let mut candidates: Vec<u64> = Vec::new();
+        let mut above = (text + window_len as u64).next_multiple_of(HOST_PAGE as u64);
+        let mut below = text.saturating_sub(arena_u) / HOST_PAGE as u64 * HOST_PAGE as u64;
+        while candidates.len() < 4096 {
+            let above_ok = reach(above) < B_RANGE as u64;
+            let below_ok = below != 0 && reach(below) < B_RANGE as u64;
+            if !above_ok && !below_ok {
+                break;
+            }
+            if above_ok {
+                candidates.push(above);
+                above += arena_u;
+            }
+            if below_ok {
+                candidates.push(below);
+                below = below.saturating_sub(arena_u);
+            }
+        }
+        for hint in candidates {
+            // SAFETY: hinted plain anonymous mapping. WITHOUT MAP_FIXED the
+            // kernel may relocate, so a result not exactly at the hint means
+            // the slot was occupied — released and skipped, never clobbered.
+            let p = unsafe {
+                libc::mmap(
+                    hint as usize as *mut libc::c_void,
+                    arena_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                continue;
+            }
+            if p as u64 == hint && (reach(hint) as i64) < B_RANGE {
+                return Some(p.cast());
+            }
+            // SAFETY: occupied (relocated) or out of range; release and skip.
+            unsafe { libc::munmap(p, arena_len) };
+        }
+        None
     }
 
     /// Is `[addr, addr + len)` entirely inside ONE tier-D executable mapping
