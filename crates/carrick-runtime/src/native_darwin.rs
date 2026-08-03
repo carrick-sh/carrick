@@ -15172,8 +15172,11 @@ mod tests {
 
     #[test]
     fn native_prepared_resume_corruption_is_fatal_without_legacy_loader() {
-        use std::os::unix::fs::FileExt;
-
+        // Metadata corruption (payload bytes are outside the default artifact
+        // digest — see `ArtifactDigestCoverage`): a tampered RECORD must stay
+        // fatal on resume and must never fall back to the legacy loader,
+        // because the legacy path would execute different bytes from those
+        // validated before the point of no return.
         let (image, relocations, plan) = native_prepared_mapping_fixture(false);
         let artifact = match crate::native_prepared_image::prepare(
             &image,
@@ -15187,12 +15190,9 @@ mod tests {
                 panic!("corruption fixture is ineligible: {reason:?}")
             }
         };
-        artifact
-            .file
-            .write_all_at(&[0], 0)
-            .expect("corrupt first initialized artifact byte");
         let record = crate::native_prepared_image::resume_record_for_test(artifact)
-            .expect("create corrupt inherited record");
+            .expect("create corrupt inherited record")
+            .with_flipped_auxv_byte_for_test();
         let loader_calls = Cell::new(0_u32);
         let error = match select_resumed_image(Some(record), [0; 32], || {
             loader_calls.set(loader_calls.get() + 1);
