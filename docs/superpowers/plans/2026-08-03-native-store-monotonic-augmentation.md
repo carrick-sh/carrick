@@ -19,7 +19,7 @@
 - One final bundle is one inode. Readers stay lockless and pin whichever complete inode they opened; writers lock, reload, union, preflight, and atomically rename.
 - The append-only pending representation is canonical. Publication and debugger export read its release-committed prefix; neither creates a second artifact copy.
 - Core handling is export-only. No importer, replay command, recovery hook, store rename trick, or store mutation from a core/export is permitted.
-- The temporary `CARRICK_DSR_STORE_AUGMENT=0` hatch is evidence-only. Exact `0` suppresses augmentation of an attached unit but still permits first publication on a true file miss. Remove the hatch, its overlays, and its performance-control entry before the retained implementation is finalized.
+- The temporary `CARRICK_DSR_STORE_AUGMENTATION=0` hatch is evidence-only. Exact `0` suppresses augmentation of an attached unit but still permits first publication on a true file miss. Remove the hatch, its overlays, and its performance-control entry before the retained implementation is finalized.
 - AC versus battery is recorded metadata, never an inclusion/exclusion rule. Thermal/load/core-placement gates remain authoritative.
 - Never run Carrick and Docker concurrently. Build runnable binaries with `just build`, prove the exact binary hash/signature/DOF section, and serialize Carrick before Docker.
 - Use red-first tests. Keep each implementation commit narrow, independently compiling, and verified. Preserve unrelated worktree state.
@@ -704,7 +704,7 @@ native_go_build_abba.py run:
   --active-store-dir target/perf/native-store-augmentation/abba/active-store
 ```
 
-Before every warmup and measured sample, ABBA restores the seed into the same active store pathname. Both arm overlays set the identical `CARRICK_DSR_STORE_DIR`; only `CARRICK_DSR_STORE_AUGMENT` differs. No arm inherits another sample's merged store.
+Before every warmup and measured sample, ABBA restores the seed into the same active store pathname. Both arm overlays set the identical `CARRICK_DSR_STORE_DIR`; only `CARRICK_DSR_STORE_AUGMENTATION` differs. No arm inherits another sample's merged store.
 
 - [ ] **Step 1: Write failing DTrace-target control tests**
 
@@ -747,7 +747,7 @@ Expected red: run arguments and seed receipts do not exist; the current decision
 
 - [ ] **Step 3: Add the temporary performance control key and overlays**
 
-Add `CARRICK_DSR_STORE_AUGMENT` to `PERFORMANCE_CONTROL_KEYS`, semantic overlays, and every JSON overlay with `null` unless explicitly selected. Create each new overlay by copying the complete exact key set from `native-default.json`: set persistent store to `"1"` in both, augmentation to `"0"` only in control and `null` in candidate, and leave store directory `null` because the receipt-bound runner injects the identical active path into both. Partial overlay objects are forbidden.
+Add `CARRICK_DSR_STORE_AUGMENTATION` to `PERFORMANCE_CONTROL_KEYS`, semantic overlays, and every JSON overlay with `null` unless explicitly selected. Create each new overlay by copying the complete exact key set from `native-default.json`: set persistent store to `"1"` in both, augmentation to `"0"` only in control and `null` in candidate, and leave store directory `null` because the receipt-bound runner injects the identical active path into both. Partial overlay objects are forbidden.
 
 - [ ] **Step 4: Implement validated seed hashing/restoration**
 
@@ -861,7 +861,7 @@ RUST_TEST_THREADS=1 just ci
 just conformance-native smoke --workers 4 --flake-retries 1
 ```
 
-Expected: `just ci` passes. Native smoke has no candidate-only DIFF/CRASH/TIMEOUT; compare any flip with the same binary under `CARRICK_DSR_STORE_AUGMENT=0` and with pre-change/current HEAD before attribution.
+Expected: `just ci` passes. Native smoke has no candidate-only DIFF/CRASH/TIMEOUT; compare any flip with the same binary under `CARRICK_DSR_STORE_AUGMENTATION=0` and with pre-change/current HEAD before attribution.
 
 - [ ] **Step 5: Commit any gate-only correction**
 
@@ -1018,12 +1018,12 @@ Record exact invocation/output paths and confirm no Carrick/Docker overlap.
 
 - [ ] **Step 4: Remove the evidence-only hatch after a retain decision**
 
-Delete `CARRICK_DSR_STORE_AUGMENT` parsing and its control branch from the translator. Remove the key from `PERFORMANCE_CONTROL_KEYS`, all overlays, DTrace-target arguments, ABBA-specific overlay handling, documentation, and the two temporary overlay files. Update tests so default monotonic augmentation is the sole shipped path.
+Delete `CARRICK_DSR_STORE_AUGMENTATION` parsing and its control branch from the translator. Remove the key from `PERFORMANCE_CONTROL_KEYS`, all overlays, DTrace-target arguments, ABBA-specific overlay handling, documentation, and the two temporary overlay files. Update tests so default monotonic augmentation is the sole shipped path.
 
 Run:
 
 ```bash
-rg -n 'CARRICK_DSR_STORE_AUGMENT|store-augment-(control|candidate)|store-augmentation' \
+rg -n 'CARRICK_DSR_STORE_AUGMENTATION|store-augment-(control|candidate)|store-augmentation' \
   crates scripts docs --glob '!docs/perf-results/2026-08-03-native-store-monotonic-augmentation.md' \
   --glob '!docs/superpowers/specs/2026-08-03-native-store-monotonic-augmentation-design.md' \
   --glob '!docs/superpowers/plans/2026-08-03-native-store-monotonic-augmentation.md'
