@@ -1496,6 +1496,58 @@ mod tests {
         );
     }
 
+    /// A guest must run on a thread that did not load it.
+    ///
+    /// `pthread_jit_write_protect_np` is per-thread on Apple Silicon, so the
+    /// loading thread is armed as a side effect and a load-then-enter on ONE
+    /// thread hides whether a pure executor thread works. Every libtest test
+    /// runs on a spawned thread, so this is also the shape the tier-D bridge
+    /// has to survive.
+    #[test]
+    #[ignore = "KNOWN FAILURE, tier D blocker: a guest loaded on one thread and \
+                entered from another aborts (signal 6, with a malloc error \
+                reported earlier in the same shape), even with the executing \
+                thread armed via `arm_current_thread`. Suppressing the drop does \
+                NOT help, so the corruption happens during the RUN, not teardown. \
+                Kept runnable (`cargo test -- --ignored guest_runs_on_a_thread`) \
+                because every libtest test runs on a spawned thread, which is \
+                exactly why the dispatcher bridge could not be wired."]
+    fn guest_runs_on_a_thread_that_did_not_load_it() {
+        static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        extern "C" fn count(ctx: *mut GuestContext) {
+            HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: the island passes the context this image was built with.
+            unsafe { (*ctx).set_return(0) };
+        }
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30),
+            movz(8, 93, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            0xd65f_03c0, // ret
+        ];
+        // Load HERE, execute THERE.
+        let image = DirectImage::load(&elf_with_code(&code), count)
+            .expect("load")
+            .expect("eligible");
+        let entry = image.entry();
+        std::thread::spawn(move || {
+            // SAFETY: patched image, entry inside it; `enter` arms this thread.
+            unsafe { image.enter(entry) };
+            // Drop on the executing thread too: isolating it showed the abort
+            // happens during the run regardless, so this keeps the reproducer
+            // faithful to what the bridge does.
+            drop(image);
+        })
+        .join()
+        .expect("executor thread");
+        assert_eq!(
+            HITS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the guest took its syscall on a thread that never loaded the image"
+        );
+    }
+
     static CHILD_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
     /// Minimal syscall service for the M1 proof: `write` and `exit`.
