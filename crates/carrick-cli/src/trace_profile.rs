@@ -2690,6 +2690,25 @@ fn build_v2_profile_summary(
 
     for (key, epoch) in &validator.epochs {
         let pid = Some(instance_for(*key)?);
+        for range in &epoch.ranges {
+            let kind = match range.kind {
+                V2RangeKind::Private => "private",
+                V2RangeKind::Shared { .. } => "shared",
+            };
+            add_v2_exact_metric(
+                &mut grouped,
+                ProfileScope {
+                    phase: Some("jit-range".to_owned()),
+                    pid,
+                    tid: None,
+                    kind: Some(kind.to_owned()),
+                    source_pc: Some(range.start),
+                    target_pc: Some(range.end),
+                },
+                Some(1),
+                None,
+            )?;
+        }
         for (kind, base) in [
             ("host", epoch.host_image_base),
             ("guest", epoch.guest_image_base),
@@ -3757,6 +3776,24 @@ mod tests {
             exact("elapsed", None, None).unwrap()["metric"]["total_ns"],
             60_000_000
         );
+        let private_range = rows
+            .iter()
+            .find(|row| {
+                row["scope"]["phase"] == "jit-range"
+                    && row["scope"]["pid"] == 1
+                    && row["scope"]["kind"] == "private"
+                    && row["scope"]["source_pc"] == 0x1000
+                    && row["scope"]["target_pc"] == 0x2000
+            })
+            .expect("private translated range");
+        assert_eq!(private_range["metric"]["count"], 1);
+        assert!(rows.iter().any(|row| {
+            row["scope"]["phase"] == "jit-range"
+                && row["scope"]["pid"] == 1
+                && row["scope"]["kind"] == "shared"
+                && row["scope"]["source_pc"] == 0x3000
+                && row["scope"]["target_pc"] == 0x3800
+        }));
         assert!(rows.iter().any(|row| {
             row["scope"]["phase"] == "offcpu-voluntary-stack"
                 && row["scope"]["pid"] == 1
