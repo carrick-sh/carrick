@@ -97,9 +97,11 @@ Nothing real runs on tier D yet. In order:
    Darwin TSD slot (`(TPIDRRO_EL0 & !7) + key*8`, a `pthread_key_create`
    key — the layout is PROVEN at first use on the creating thread and a
    fresh one, and a host that fails the proof refuses every image, named).
-   The chain costs 3 instructions where the old per-group veneers
-   materialized a 4-instruction constant, so the +0.28 ns tpidr path got
-   cheaper, not dearer. A thread-creating clone spawns a host thread whose
+   The chain is 3 instructions where the old per-group veneers
+   materialized a 4-instruction constant, but it trades an independent
+   mov chain for a dependent load pair — per-use cost is UNMEASURED
+   (this lane ran no paired benchmarks); treat the +0.28 ns tpidr figure
+   as needing re-measurement, not as preserved. A thread-creating clone spawns a host thread whose
    guest enters through a runtime-emitted parked-entry stub (the island
    resume leg's exact register-transparent shape) with the full parent
    register file, x0 = 0, `CLONE_SETTLS` in its own TLS slot; `exit(2)`
