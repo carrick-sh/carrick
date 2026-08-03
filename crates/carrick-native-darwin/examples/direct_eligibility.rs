@@ -34,6 +34,7 @@ fn main() {
                     DirectIneligible::FixedLoadAddress { .. } => "ET_EXEC",
                     DirectIneligible::NeedsInterpreter { .. } => "dynamic",
                     DirectIneligible::IslandOutOfRange { .. } => "island-range",
+                    DirectIneligible::HostTsdLayoutUnproven { .. } => "host-tsd",
                 };
                 println!("{name:<24} tier T    [{bucket}] {reason}");
             }

@@ -15,24 +15,52 @@
 //! no alias window. That is the structural simplification direct execution
 //! buys, and it is why this file is short.
 //!
+//! # Threads
+//!
+//! A guest `clone(CLONE_VM|CLONE_THREAD)` spawns a real host thread whose
+//! guest enters tier D with its own `DirectThreadSlots` (roadmap Phase 1
+//! item 4): the emitted veneers and islands resolve per-thread state through
+//! Darwin's TSD (`carrick_native_darwin::direct::thread_slots_tsd`), so one
+//! patched image serves every thread. Syscalls dispatch through
+//! `dispatch_threaded` — the same thread-aware path the DSR native lane uses
+//! — with this runner's `ThreadRegistry` and `FutexTable`; `exit(2)` from a
+//! non-last thread retires just that thread (CLEARTID write + futex wake),
+//! and `FUTEX_WAIT` parks on the shared table.
+//!
 //! # How a run ends: the guest-leave contract
 //!
 //! A tier-D guest leaves through the handler, never by returning to Rust with
 //! its own stack discipline (the full contract lives in
 //! `carrick_native_darwin::direct`). Concretely for this runner: any dispatch
-//! outcome that ends or suspends the run — `Exit`, and every outcome tier D
-//! does not implement yet (`Execve`, `Fork`, signal delivery, blocking waits)
-//! — makes the handler request a leave. The island's leave leg then returns
-//! control to `DirectLoadGroup::enter`'s caller with the guest's complete state
-//! parked in its context, and `DirectRunner::outcome` names why the run
-//! stopped. The guest is never resumed past such a syscall with a fabricated
-//! errno.
+//! outcome that ends or suspends the run — `Exit`, a thread's `ThreadExit`,
+//! and every outcome tier D does not implement yet (`Execve`, `Fork`, signal
+//! delivery, fd waits) — makes the handler request a leave. The island's
+//! leave leg then returns control to `DirectLoadGroup::enter`'s caller with
+//! the guest's complete state parked in its per-thread context, and
+//! `DirectRunner::outcome` names why the run stopped. The guest is never
+//! resumed past such a syscall with a fabricated errno.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use carrick_abi::{CanonicalNr, LinuxGuestAbi, NativeNr};
 use carrick_guest_mem::{GuestMemory, MemoryError};
-use carrick_native_darwin::direct::{DirectLoadGroup, GuestContext};
+use carrick_native_darwin::direct::{
+    DirectLoadGroup, DirectThreadSlots, GuestContext, InstalledThreadSlots,
+    current_thread_slots_ptr,
+};
 
 use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
+use crate::thread::ThreadId;
+
+/// Lock without poisoning semantics: the guarded state is only mutated by
+/// guest threads parked in the handler, so a poisoned lock means a panic
+/// already unwound past us and the data is still sound.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Apple Silicon's host page size. On the identity tier this IS the guest's
 /// page size (`AT_PAGESZ`, brk/mmap granularity): guest mappings are host
@@ -222,7 +250,7 @@ pub enum DirectRunOutcome {
         code: i32,
     },
     /// The dispatcher produced an outcome tier D does not implement yet
-    /// (blocking waits, fork, execve, signal delivery). Named rather than
+    /// (fd waits, fork, execve, signal delivery). Named rather than
     /// approximated: the guest LEAVES through the island's leave leg with its
     /// full state parked in the context — never resumed with a fabricated
     /// errno — and the translated lane's loop shows what tier D has to grow
@@ -262,18 +290,85 @@ impl IdentityBrk {
     const RESERVE: usize = 1 << 30;
 }
 
+/// One plain anonymous PRIVATE RW mapping this runner created for the guest,
+/// tracked so `mremap` can be serviced with PROOF instead of guesswork: the
+/// identity tier keeps no general mapping table, and moving or growing a
+/// mapping is only sound when its backing is known to be private anonymous
+/// memory whose contents a copy preserves. Any protection change over a
+/// tracked range untracks it (`mremap` there fails closed).
+#[derive(Debug, Clone, Copy)]
+struct AnonRwRange {
+    base: u64,
+    end: u64,
+}
+
+/// Remove `[lo, hi)` from the tracked ranges, splitting an entry that
+/// straddles it.
+fn subtract_anon_range(table: &mut Vec<AnonRwRange>, lo: u64, hi: u64) {
+    if lo >= hi {
+        return;
+    }
+    let mut split = Vec::new();
+    table.retain_mut(|entry| {
+        if entry.end <= lo || hi <= entry.base {
+            return true;
+        }
+        if entry.base < lo && hi < entry.end {
+            split.push(AnonRwRange {
+                base: hi,
+                end: entry.end,
+            });
+            entry.end = lo;
+            return true;
+        }
+        if entry.base < lo {
+            entry.end = lo;
+            return true;
+        }
+        if hi < entry.end {
+            entry.base = hi;
+            return true;
+        }
+        false
+    });
+    table.extend(split);
+}
+
 /// A directly-executed guest plus the dispatcher that serves it.
+///
+/// Shared (`&self`) by every guest THREAD of the run: syscalls dispatch
+/// through [`SyscallDispatcher::dispatch_threaded`] — the same thread-aware
+/// path the DSR native lane uses — with this runner's own `ThreadRegistry`
+/// and `FutexTable`, and all runner state is behind atomics/mutexes.
 pub struct DirectRunner {
     dispatcher: SyscallDispatcher,
     memory: IdentityMemory,
-    outcome: Option<DirectRunOutcome>,
-    syscalls: u64,
-    brk: Option<IdentityBrk>,
+    /// The PROCESS outcome, first-wins: `exit_group`, a named unsupported
+    /// leave, or (when the last thread leaves via `exit(2)`) that thread's
+    /// code.
+    outcome: Mutex<Option<DirectRunOutcome>>,
+    /// Set with a process-ending outcome so futex-parked guest threads
+    /// retire instead of blocking a run that is over.
+    exiting: AtomicBool,
+    syscalls: AtomicU64,
+    brk: Mutex<Option<IdentityBrk>>,
+    /// Plain anonymous private RW mappings this runner created — the only
+    /// ranges `mremap` is provably safe to service (see [`AnonRwRange`]).
+    anon_rw: Mutex<Vec<AnonRwRange>>,
+    /// One guest thread = one host thread; tids come from here (main tid =
+    /// host pid, exactly the native lane's convention).
+    registry: crate::thread::ThreadRegistry,
+    /// Private-futex parking for this guest, shared with the dispatcher's
+    /// futex handler so waits and wakes meet in one table.
+    futex: crate::thread::FutexTable,
+    /// Host threads spawned for guest `clone(CLONE_THREAD)`s; joined by
+    /// [`with_runner`] before it returns.
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Drop for DirectRunner {
     fn drop(&mut self) {
-        if let Some(brk) = &self.brk {
+        if let Some(brk) = lock(&self.brk).as_ref() {
             // SAFETY: this runner owns the reservation.
             unsafe { libc::munmap(brk.base as usize as *mut libc::c_void, IdentityBrk::RESERVE) };
         }
@@ -285,20 +380,85 @@ impl DirectRunner {
         Self {
             dispatcher,
             memory,
-            outcome: None,
-            syscalls: 0,
-            brk: None,
+            outcome: Mutex::new(None),
+            exiting: AtomicBool::new(false),
+            syscalls: AtomicU64::new(0),
+            brk: Mutex::new(None),
+            anon_rw: Mutex::new(Vec::new()),
+            registry: crate::thread::ThreadRegistry::new(ThreadId::main_from_host_pid()),
+            futex: crate::thread::FutexTable::new(),
+            threads: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn outcome(&self) -> Option<&DirectRunOutcome> {
-        self.outcome.as_ref()
+    pub fn outcome(&self) -> Option<DirectRunOutcome> {
+        lock(&self.outcome).clone()
     }
     pub fn syscalls(&self) -> u64 {
-        self.syscalls
+        self.syscalls.load(Ordering::Relaxed)
     }
     pub fn dispatcher(&self) -> &SyscallDispatcher {
         &self.dispatcher
+    }
+
+    /// The registry key of the guest thread running on THIS host thread
+    /// (installed by [`with_runner`] / the clone spawn path).
+    fn current_tid(&self) -> ThreadId {
+        let tid = ACTIVE_TID.with(std::cell::Cell::get);
+        if tid == ThreadId::NONE {
+            self.registry.main_tid()
+        } else {
+            tid
+        }
+    }
+
+    /// Record a PROCESS-ending outcome (first one wins) and nudge parked
+    /// guest threads so they observe it and retire.
+    fn end_process(&self, outcome: DirectRunOutcome) {
+        let mut slot = lock(&self.outcome);
+        if slot.is_none() {
+            *slot = Some(outcome);
+        }
+        drop(slot);
+        self.exiting.store(true, Ordering::SeqCst);
+        self.futex.notify_signal_pending();
+    }
+
+    /// One thread's `exit(2)` bookkeeping — Linux's CLEARTID contract (write
+    /// 0, wake one futex waiter: pthread_join's wait) plus registry/signal
+    /// teardown. When this was the LAST live thread the process ends with
+    /// this thread's code.
+    fn finish_thread_bookkeeping(&self, tid: ThreadId, code: i32) {
+        if let Some(address) = self.registry.clear_child_tid(tid)
+            && address != 0
+        {
+            let mut memory = self.memory;
+            let _ = memory.write_bytes_raw(address, &0_i32.to_le_bytes());
+            self.futex.wake(address, 1);
+        }
+        let last = self.registry.exit(tid);
+        self.dispatcher.forget_thread_signal_state(tid);
+        if last {
+            let mut slot = lock(&self.outcome);
+            if slot.is_none() {
+                *slot = Some(DirectRunOutcome::Exited { code });
+            }
+        }
+    }
+
+    /// Join every host thread spawned for a guest clone. Called by
+    /// [`with_runner`] after the main guest thread leaves, so the returned
+    /// outcome is final and no spawned thread outlives the borrows it holds.
+    fn join_guest_threads(&self) {
+        loop {
+            let handles = std::mem::take(&mut *lock(&self.threads));
+            if handles.is_empty() {
+                return;
+            }
+            for handle in handles {
+                let _ = handle.join();
+            }
+        }
     }
 
     /// Identity lowering of the guest's MEMORY-MODEL syscalls.
@@ -320,13 +480,15 @@ impl DirectRunner {
     ///   outside a patched tier-D mapping — LEAVES named;
     /// - `MAP_SHARED` file mmap -> LEAVES named (a private copy would break
     ///   the sharing contract);
-    /// - `mremap` -> LEAVES named until implemented identity-style.
-    fn service_identity_memory(&mut self, ctx: &GuestContext) -> Option<ServiceVerdict> {
+    /// - `mremap` is serviced ONLY inside a mapping this runner can PROVE is
+    ///   plain anonymous RW (its own tracked creations, protection never
+    ///   changed) — anything else LEAVES named.
+    fn service_identity_memory(&self, ctx: &GuestContext) -> Option<ServiceVerdict> {
         use carrick_abi::{LinuxMmapFlags, LinuxProtFlags};
         let number = ctx.syscall_nr();
         let [a0, a1, a2, a3, a4, a5] = ctx.args();
-        let unsupported = |this: &mut Self, what: &str| {
-            this.outcome = Some(DirectRunOutcome::Unsupported {
+        let unsupported = |this: &Self, what: &str| {
+            this.end_process(DirectRunOutcome::Unsupported {
                 syscall: number,
                 outcome: what.to_string(),
             });
@@ -395,6 +557,21 @@ impl DirectRunner {
                     {
                         group.note_plain_replacement(mapped as u64, a1);
                     }
+                    // Track plain anonymous PRIVATE RW creations — the only
+                    // ranges mremap can later be proven safe on. A FIXED
+                    // overwrite untracks whatever it replaced first.
+                    let end = (mapped as u64).saturating_add(a1.next_multiple_of(HOST_PAGE_SIZE));
+                    let mut table = lock(&self.anon_rw);
+                    subtract_anon_range(&mut table, mapped as u64, end);
+                    if !flags.contains(LinuxMmapFlags::SHARED)
+                        && host_prot(prot) == (libc::PROT_READ | libc::PROT_WRITE)
+                    {
+                        table.push(AnonRwRange {
+                            base: mapped as u64,
+                            end,
+                        });
+                    }
+                    drop(table);
                     ServiceVerdict::Resume(mapped as i64)
                 })
             }
@@ -408,6 +585,11 @@ impl DirectRunner {
                 // SAFETY: as above; the guest unmaps within its own space.
                 let rc = unsafe { libc::munmap(a0 as usize as *mut libc::c_void, a1 as usize) };
                 Some(if rc == 0 {
+                    subtract_anon_range(
+                        &mut lock(&self.anon_rw),
+                        a0,
+                        a0.saturating_add(a1.next_multiple_of(HOST_PAGE_SIZE)),
+                    );
                     ServiceVerdict::Resume(0)
                 } else {
                     host_errno_verdict()
@@ -461,16 +643,162 @@ impl DirectRunner {
                 {
                     group.note_plain_replacement(a0, a1);
                 }
+                // A protection change away from RW UNTRACKS the range for
+                // mremap purposes: the proof "plain anonymous RW" no longer
+                // holds there.
+                if target != (libc::PROT_READ | libc::PROT_WRITE) {
+                    subtract_anon_range(
+                        &mut lock(&self.anon_rw),
+                        a0,
+                        a0.saturating_add(a1.next_multiple_of(HOST_PAGE_SIZE)),
+                    );
+                }
                 Some(ServiceVerdict::Resume(0))
             }
             // brk(addr) — the FIRST syscall real ld.so makes.
             214 => Some(self.service_identity_brk(a0)),
-            // mremap: the dispatcher's arena answer is poison on the identity
-            // tier (an address with no host mapping), so fail closed with the
-            // gap NAMED instead of falling through.
-            216 => unsupported(self, "mremap on tier D (identity mremap not built yet)"),
+            // mremap(old, old_size, new_size, flags, new_addr)
+            216 => Some(self.service_identity_mremap(a0, a1, a2, a3)),
             _ => None,
         }
+    }
+
+    /// `mremap(2)`, identity-style, and ONLY where its semantics are
+    /// provable: `[old, old+old_size)` must lie inside one mapping this
+    /// runner created as plain anonymous PRIVATE RW and whose protection
+    /// never changed ([`AnonRwRange`]). For such memory a shrink is a tail
+    /// unmap, an in-place grow is a hint-probed adjacent anon mapping (the
+    /// kernel relocating the hint proves the space was occupied — never a
+    /// clobber), and a `MREMAP_MAYMOVE` move is map-copy-unmap (private
+    /// anonymous contents survive a copy by definition). Everything else —
+    /// untracked ranges, `MREMAP_FIXED`/`DONTUNMAP`, growth without
+    /// `MAYMOVE` that cannot extend in place — fails Linux-shaped (ENOMEM)
+    /// or LEAVES named, never approximates.
+    fn service_identity_mremap(
+        &self,
+        old_addr: u64,
+        old_size: u64,
+        new_size: u64,
+        flags: u64,
+    ) -> ServiceVerdict {
+        const MREMAP_MAYMOVE: u64 = 1;
+        let einval =
+            || ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EINVAL).guest_retval());
+        let enomem =
+            || ServiceVerdict::Resume(crate::host_to_linux_errno(libc::ENOMEM).guest_retval());
+        if flags & !MREMAP_MAYMOVE != 0 {
+            // MREMAP_FIXED / MREMAP_DONTUNMAP: not modeled — fail closed.
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: 216,
+                outcome: format!("mremap flags {flags:#x} on tier D"),
+            });
+            return ServiceVerdict::Leave;
+        }
+        if !old_addr.is_multiple_of(HOST_PAGE_SIZE) || old_size == 0 || new_size == 0 {
+            return einval();
+        }
+        let old_len = old_size.next_multiple_of(HOST_PAGE_SIZE);
+        let new_len = new_size.next_multiple_of(HOST_PAGE_SIZE);
+        let old_end = old_addr.saturating_add(old_len);
+        let mut table = lock(&self.anon_rw);
+        let tracked = table
+            .iter()
+            .any(|entry| old_addr >= entry.base && old_end <= entry.end);
+        if !tracked {
+            drop(table);
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: 216,
+                outcome: "mremap outside a provably plain anonymous RW mapping on tier D"
+                    .to_string(),
+            });
+            return ServiceVerdict::Leave;
+        }
+        if new_len == old_len {
+            return ServiceVerdict::Resume(old_addr as i64);
+        }
+        if new_len < old_len {
+            // SAFETY: releasing the tail of the guest's own tracked mapping.
+            let rc = unsafe {
+                libc::munmap(
+                    (old_addr + new_len) as usize as *mut libc::c_void,
+                    (old_len - new_len) as usize,
+                )
+            };
+            if rc != 0 {
+                return host_errno_verdict();
+            }
+            subtract_anon_range(&mut table, old_addr + new_len, old_end);
+            return ServiceVerdict::Resume(old_addr as i64);
+        }
+        // Grow. Try in place first: a hinted (non-FIXED) anon mmap comes back
+        // AT the hint iff the range was free — the probed pattern the island
+        // arena placement already relies on — so success extends the mapping
+        // and a relocated result is released untouched.
+        let grow_len = (new_len - old_len) as usize;
+        // SAFETY: hinted anonymous mapping; without MAP_FIXED the kernel
+        // relocates instead of clobbering when the range is occupied.
+        let grown = unsafe {
+            libc::mmap(
+                old_end as usize as *mut libc::c_void,
+                grow_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if grown != libc::MAP_FAILED && grown as u64 == old_end {
+            subtract_anon_range(
+                &mut table,
+                old_addr,
+                old_end.saturating_add(grow_len as u64),
+            );
+            table.push(AnonRwRange {
+                base: old_addr,
+                end: old_end + grow_len as u64,
+            });
+            return ServiceVerdict::Resume(old_addr as i64);
+        }
+        if grown != libc::MAP_FAILED {
+            // Occupied: give the relocated probe back.
+            // SAFETY: unmapping the mapping just created above.
+            unsafe { libc::munmap(grown, grow_len) };
+        }
+        if flags & MREMAP_MAYMOVE == 0 {
+            return enomem();
+        }
+        // Move: fresh anon RW, copy the old contents (private anonymous
+        // memory — the copy IS the semantic), release the old range.
+        // SAFETY: fresh kernel-placed anonymous mapping.
+        let moved = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                new_len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if moved == libc::MAP_FAILED {
+            return enomem();
+        }
+        // SAFETY: the old range is tracked RW (readable) and the new mapping
+        // was just created RW at `moved` with `new_len >= old_len`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                old_addr as usize as *const u8,
+                moved.cast::<u8>(),
+                old_len as usize,
+            );
+            libc::munmap(old_addr as usize as *mut libc::c_void, old_len as usize);
+        }
+        subtract_anon_range(&mut table, old_addr, old_end);
+        table.push(AnonRwRange {
+            base: moved as u64,
+            end: moved as u64 + new_len,
+        });
+        ServiceVerdict::Resume(moved as i64)
     }
 
     /// `mmap(PROT_EXEC, fd)`: guest-created executable memory, serviced
@@ -481,15 +809,15 @@ impl DirectRunner {
     /// pipeline. Refusals LEAVE named — tier T owns what the scan cannot
     /// prove.
     fn service_exec_file_mmap(
-        &mut self,
+        &self,
         addr: u64,
         flags: carrick_abi::LinuxMmapFlags,
         fd: u64,
         offset: u64,
         len: u64,
     ) -> ServiceVerdict {
-        let leave = |this: &mut Self, what: String| -> ServiceVerdict {
-            this.outcome = Some(DirectRunOutcome::Unsupported {
+        let leave = |this: &Self, what: String| -> ServiceVerdict {
+            this.end_process(DirectRunOutcome::Unsupported {
                 syscall: 222,
                 outcome: what,
             });
@@ -537,7 +865,7 @@ impl DirectRunner {
     /// read BEFORE any address-space mutation so an fd error fails the mmap
     /// without having clobbered guest pages.
     fn service_data_file_mmap(
-        &mut self,
+        &self,
         addr: u64,
         len: u64,
         prot: carrick_abi::LinuxProtFlags,
@@ -606,7 +934,7 @@ impl DirectRunner {
     /// safe: original MAP_JIT pages are always readable (no mprotect ever
     /// succeeded on them, and they were created R+W+X).
     fn replace_jit_pages_with_protection(
-        &mut self,
+        &self,
         addr: u64,
         len: u64,
         target: i32,
@@ -658,7 +986,7 @@ impl DirectRunner {
     /// semantics every guest read gets. Errno outcomes come back as the
     /// guest retval to fail the surrounding mmap with; any non-value outcome
     /// is EIO (these numbers cannot fork or exit).
-    fn dispatch_synthesized(&mut self, number: u64, args: [u64; 6]) -> Result<i64, i64> {
+    fn dispatch_synthesized(&self, number: u64, args: [u64; 6]) -> Result<i64, i64> {
         let request = SyscallRequest::from_raw(carrick_hal::RawSyscall {
             number: CanonicalNr(number),
             args,
@@ -666,10 +994,15 @@ impl DirectRunner {
             native_number: NativeNr(number),
         });
         let reporter = crate::compat::CompatReporter::default();
-        match self
-            .dispatcher
-            .dispatch(request, &mut self.memory, &reporter)
-        {
+        let mut memory = self.memory;
+        match self.dispatcher.dispatch_threaded(
+            request,
+            &mut memory,
+            &reporter,
+            self.current_tid(),
+            &self.registry,
+            &self.futex,
+        ) {
             Ok(DispatchOutcome::Returned { value }) => Ok(value),
             Ok(DispatchOutcome::Errno { errno }) => Err(errno.guest_retval()),
             _ => Err(crate::host_to_linux_errno(libc::EIO).guest_retval()),
@@ -677,7 +1010,7 @@ impl DirectRunner {
     }
 
     /// The byte length of the guest file behind `fd`, via `fstat(2)`.
-    fn guest_file_len(&mut self, fd: u64) -> Result<u64, i64> {
+    fn guest_file_len(&self, fd: u64) -> Result<u64, i64> {
         use zerocopy::FromBytes as _;
         let mut stat_bytes = [0_u8; core::mem::size_of::<carrick_abi::LinuxStat>()];
         let addr = stat_bytes.as_mut_ptr() as u64;
@@ -693,7 +1026,7 @@ impl DirectRunner {
     /// `pread64(2)` — offset-neutral, so the guest's own file position is
     /// undisturbed. A short read leaves the tail zeroed (mmap's
     /// beyond-EOF semantic).
-    fn read_guest_file(&mut self, fd: u64, offset: u64, len: usize) -> Result<Vec<u8>, i64> {
+    fn read_guest_file(&self, fd: u64, offset: u64, len: usize) -> Result<Vec<u8>, i64> {
         let mut out = vec![0_u8; len];
         let mut done = 0_usize;
         while done < len {
@@ -713,7 +1046,7 @@ impl DirectRunner {
     /// The whole guest file behind `fd`: `fstat` for the length, `pread64`
     /// for the bytes. The exec-window pipeline needs the full file because
     /// the section headers that place the code live at its end.
-    fn read_guest_file_all(&mut self, fd: u64) -> Result<Vec<u8>, i64> {
+    fn read_guest_file_all(&self, fd: u64) -> Result<Vec<u8>, i64> {
         let len = self.guest_file_len(fd)?;
         let len = usize::try_from(len)
             .map_err(|_| crate::host_to_linux_errno(libc::EINVAL).guest_retval())?;
@@ -723,9 +1056,10 @@ impl DirectRunner {
     /// `brk(2)`, identity-style (see [`IdentityBrk`]). Linux semantics: on
     /// any failure or out-of-range request, return the CURRENT break —
     /// `brk` never errnos.
-    fn service_identity_brk(&mut self, addr: u64) -> ServiceVerdict {
+    fn service_identity_brk(&self, addr: u64) -> ServiceVerdict {
         const PAGE: u64 = HOST_PAGE_SIZE;
-        if self.brk.is_none() {
+        let mut brk_slot = lock(&self.brk);
+        if brk_slot.is_none() {
             // SAFETY: fresh PROT_NONE reservation, kernel-chosen address.
             let base = unsafe {
                 libc::mmap(
@@ -738,21 +1072,22 @@ impl DirectRunner {
                 )
             };
             if base == libc::MAP_FAILED {
+                drop(brk_slot);
                 // No break exists and none can: park the run with the reason
                 // named rather than inventing an address.
-                self.outcome = Some(DirectRunOutcome::Unsupported {
+                self.end_process(DirectRunOutcome::Unsupported {
                     syscall: 214,
                     outcome: "brk reservation failed".to_string(),
                 });
                 return ServiceVerdict::Leave;
             }
             let base = base as u64;
-            self.brk = Some(IdentityBrk {
+            *brk_slot = Some(IdentityBrk {
                 base,
                 current: base,
             });
         }
-        let Some(brk) = self.brk.as_mut() else {
+        let Some(brk) = brk_slot.as_mut() else {
             // Populated just above; this arm keeps the no-panic gate total.
             // "No change" is brk's own failure semantic, and with no break
             // the current break is 0.
@@ -799,8 +1134,8 @@ impl DirectRunner {
     }
 
     /// Service one syscall from a tier-D island.
-    fn service(&mut self, ctx: &GuestContext) -> ServiceVerdict {
-        self.syscalls += 1;
+    fn service(&self, ctx: &GuestContext) -> ServiceVerdict {
+        self.syscalls.fetch_add(1, Ordering::Relaxed);
         let number = ctx.syscall_nr();
         if let Some(verdict) = self.service_identity_memory(ctx) {
             return verdict;
@@ -814,41 +1149,75 @@ impl DirectRunner {
             native_number: NativeNr(number),
         });
         let reporter = crate::compat::CompatReporter::default();
-        match self
-            .dispatcher
-            .dispatch(request, &mut self.memory, &reporter)
-        {
+        let tid = self.current_tid();
+        let mut memory = self.memory;
+        match self.dispatcher.dispatch_threaded(
+            request,
+            &mut memory,
+            &reporter,
+            tid,
+            &self.registry,
+            &self.futex,
+        ) {
             Ok(DispatchOutcome::Returned { value }) => ServiceVerdict::Resume(value),
             Ok(DispatchOutcome::Errno { errno }) => ServiceVerdict::Resume(errno.guest_retval()),
             Ok(DispatchOutcome::Exit { code }) => {
-                self.outcome = Some(DirectRunOutcome::Exited { code });
+                self.end_process(DirectRunOutcome::Exited { code });
                 ServiceVerdict::Leave
             }
-            // A thread-creating clone is the roadmap Phase 1 item 4 boundary:
-            // tier D's TLS/x18/context slots are per-LOAD-GROUP, coherent for
-            // a single-threaded guest but NOT per-thread. Spawning a second
-            // guest thread here would have both threads read one TLS base —
-            // incoherent by construction — so tier D fails CLOSED with the
-            // boundary named rather than run an unsound thread. Single-
-            // threaded guests (dash, cpython's own `-c`) never reach this.
-            Ok(DispatchOutcome::CloneThread { .. }) => {
-                self.outcome = Some(DirectRunOutcome::Unsupported {
-                    syscall: number,
-                    outcome: "thread-creating clone: tier D slots are per-load-group, \
-                              not per-thread (roadmap Phase 1 item 4)"
-                        .to_string(),
-                });
+            // `exit(2)` from a thread that is not the last: retire THIS
+            // thread only (CLEARTID write + wake is pthread_join's other
+            // half), leaving the process running.
+            Ok(DispatchOutcome::ThreadExit { code }) => {
+                self.finish_thread_bookkeeping(tid, code);
                 ServiceVerdict::Leave
+            }
+            // Roadmap Phase 1 item 4: a thread-creating clone spawns a host
+            // thread whose guest enters tier D with its OWN DirectThreadSlots
+            // (the veneers address per-thread state through the proven TSD
+            // chain), parked at the parent's resume site with x0 = 0.
+            Ok(DispatchOutcome::CloneThread {
+                stack,
+                tls,
+                flags: _,
+                parent_tid_addr,
+                child_tid_addr,
+                clear_child_tid_addr,
+            }) => self.service_clone_thread(
+                ctx,
+                tid,
+                stack,
+                tls,
+                parent_tid_addr,
+                child_tid_addr,
+                clear_child_tid_addr,
+            ),
+            // FUTEX_WAIT whose value check passed under the dispatcher lock:
+            // park on the shared table (the dispatcher's wake side uses the
+            // same one). The only interrupt source tier D has is process
+            // exit, so an interrupted wait retires the thread.
+            Ok(DispatchOutcome::FutexWait { wait, timeout }) => {
+                match self
+                    .futex
+                    .wait_prepared_for_thread(wait, timeout, tid, &|| {
+                        self.exiting.load(Ordering::SeqCst)
+                    }) {
+                    crate::thread::FutexWaitOutcome::Woken => ServiceVerdict::Resume(0),
+                    crate::thread::FutexWaitOutcome::TimedOut => {
+                        ServiceVerdict::Resume(crate::linux_abi::LINUX_ETIMEDOUT.guest_retval())
+                    }
+                    crate::thread::FutexWaitOutcome::Interrupted => ServiceVerdict::Leave,
+                }
             }
             Ok(other) => {
-                self.outcome = Some(DirectRunOutcome::Unsupported {
+                self.end_process(DirectRunOutcome::Unsupported {
                     syscall: number,
                     outcome: format!("{other:?}"),
                 });
                 ServiceVerdict::Leave
             }
             Err(error) => {
-                self.outcome = Some(DirectRunOutcome::Unsupported {
+                self.end_process(DirectRunOutcome::Unsupported {
                     syscall: number,
                     outcome: error.to_string(),
                 });
@@ -856,7 +1225,117 @@ impl DirectRunner {
             }
         }
     }
+
+    /// Spawn a guest thread for `clone(CLONE_VM|CLONE_THREAD)`.
+    ///
+    /// The child's [`DirectThreadSlots`] are seeded on the PARENT (so any
+    /// failure surfaces as the clone's errno, never a half-started thread):
+    /// full parent register file with x0 = 0 (the child's clone return
+    /// value — glibc's clone.S reads fn/arg out of copied registers, so the
+    /// whole file is load-bearing), SP = the caller's child stack, pc = the
+    /// parent's resume site, TLS = `CLONE_SETTLS`'s value or inherited,
+    /// x18 inherited. The spawned host thread installs the slots and enters
+    /// through the parked-entry stub ([`DirectLoadGroup::enter_parked`]).
+    #[allow(clippy::too_many_arguments)]
+    fn service_clone_thread(
+        &self,
+        ctx: &GuestContext,
+        parent_tid: ThreadId,
+        stack: u64,
+        tls: Option<u64>,
+        parent_tid_addr: u64,
+        child_tid_addr: u64,
+        clear_child_tid_addr: u64,
+    ) -> ServiceVerdict {
+        let Some(group) = active_group() else {
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: ctx.syscall_nr(),
+                outcome: "thread clone with no tier-D load group installed".to_string(),
+            });
+            return ServiceVerdict::Leave;
+        };
+        let parent_slots = current_thread_slots_ptr();
+        if parent_slots.is_null() {
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: ctx.syscall_nr(),
+                outcome: "thread clone with no installed parent thread slots".to_string(),
+            });
+            return ServiceVerdict::Leave;
+        }
+        // SAFETY: the parent's own installed slots; its guest is parked in
+        // this handler, so the values are stable.
+        let (parent_tls, parent_x18) =
+            unsafe { ((*parent_slots).guest_tls, (*parent_slots).guest_x18) };
+        let mut slots = group.new_thread_slots();
+        slots.context.x = ctx.x;
+        slots.context.x[0] = 0;
+        slots.context.sp = stack;
+        slots.context.pc = ctx.pc;
+        slots.guest_tls = tls.unwrap_or(parent_tls);
+        slots.guest_x18 = parent_x18;
+
+        let tid = self.registry.register_child(clear_child_tid_addr);
+        self.dispatcher.inherit_thread_signal_mask(parent_tid, tid);
+        let tid_bytes = tid.raw().to_le_bytes();
+        let mut memory = self.memory;
+        if parent_tid_addr != 0 {
+            let _ = memory.write_bytes_raw(parent_tid_addr, &tid_bytes);
+        }
+        if child_tid_addr != 0 {
+            let _ = memory.write_bytes_raw(child_tid_addr, &tid_bytes);
+        }
+
+        let runner_ptr = SendPtr(std::ptr::from_ref(self));
+        let group_ptr = SendGroupPtr(std::ptr::from_ref(group));
+        let spawned = std::thread::Builder::new()
+            .name(format!("tierd-guest-{tid}"))
+            .spawn(move || {
+                let (runner_ptr, group_ptr) = (runner_ptr, group_ptr);
+                // SAFETY: `with_runner` joins every spawned guest thread
+                // before returning, and its caller keeps the runner and the
+                // group alive across it — so both pointers outlive this
+                // thread.
+                let (runner, group) = unsafe { (&*runner_ptr.0, &*group_ptr.0) };
+                let Ok(guard) = InstalledThreadSlots::install(slots) else {
+                    // The child never ran a guest instruction: retire it so
+                    // a joiner is not left waiting on a tid that will never
+                    // clear.
+                    runner.finish_thread_bookkeeping(tid, 0);
+                    return;
+                };
+                let _thread_ctx = install_thread_context(runner, group, tid);
+                // SAFETY: the parked context was seeded from the parent's
+                // state at a patched svc site of this group, and the guest
+                // leaves through the handler.
+                if unsafe { group.enter_parked() }.is_err() {
+                    runner.finish_thread_bookkeeping(tid, 0);
+                }
+                drop(guard);
+            });
+        match spawned {
+            Ok(handle) => {
+                lock(&self.threads).push(handle);
+                ServiceVerdict::Resume(i64::from(tid.raw()))
+            }
+            Err(_) => {
+                self.registry.exit(tid);
+                self.dispatcher.forget_thread_signal_state(tid);
+                ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EAGAIN).guest_retval())
+            }
+        }
+    }
 }
+
+/// Raw runner pointer that crosses into a spawned guest thread; safety is
+/// argued at the spawn site (join-before-return).
+struct SendPtr(*const DirectRunner);
+// SAFETY: see the spawn site — the pointee outlives the thread by the
+// join-before-return contract, and DirectRunner's shared state is Sync.
+unsafe impl Send for SendPtr {}
+/// As [`SendPtr`], for the load group.
+struct SendGroupPtr(*const DirectLoadGroup);
+// SAFETY: as above.
+unsafe impl Send for SendGroupPtr {}
 
 /// Lower a guest protection to the host's non-executable bits. EXEC never
 /// reaches here: every EXEC path is routed to the scan+patch pipeline or
@@ -885,25 +1364,57 @@ thread_local! {
     /// The runner serving the guest executing on THIS thread.
     ///
     /// A directly-executed guest runs on the host thread that entered it, so
-    /// "which runner" is exactly a per-thread question - and it stays correct
-    /// when tier D grows threads.
-    static ACTIVE: std::cell::Cell<*mut DirectRunner> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// "which runner" is exactly a per-thread question — every guest thread
+    /// installs the SAME runner, and its own tid alongside.
+    static ACTIVE: std::cell::Cell<*const DirectRunner> =
+        const { std::cell::Cell::new(std::ptr::null()) };
     /// The load group of that guest, installed alongside the runner: the
     /// identity memory services need it for the mmap(PROT_EXEC) window
     /// pipeline and the mprotect(PROT_EXEC) containment rule.
     static ACTIVE_GROUP: std::cell::Cell<*const DirectLoadGroup> =
         const { std::cell::Cell::new(std::ptr::null()) };
+    /// The registry key of the guest thread running here (`ThreadId::NONE`
+    /// when nothing is installed).
+    static ACTIVE_TID: std::cell::Cell<ThreadId> =
+        const { std::cell::Cell::new(ThreadId::NONE) };
 }
 
 /// The load group installed for the guest on this thread, if any.
 fn active_group<'a>() -> Option<&'a DirectLoadGroup> {
     let group = ACTIVE_GROUP.with(std::cell::Cell::get);
-    // SAFETY: `with_runner` installs the pointer for exactly the window in
-    // which the guest can call back and clears it before returning, and the
-    // reference is only used inside handler-called services within that
-    // window.
+    // SAFETY: `install_thread_context` installs the pointer for exactly the
+    // window in which the guest can call back and clears it before the
+    // thread ends, and the reference is only used inside handler-called
+    // services within that window.
     unsafe { group.as_ref() }
+}
+
+/// RAII installation of the per-thread runner/group/tid context; restores
+/// the previous values on drop.
+struct ThreadContextGuard {
+    previous_runner: *const DirectRunner,
+    previous_group: *const DirectLoadGroup,
+    previous_tid: ThreadId,
+}
+
+fn install_thread_context(
+    runner: &DirectRunner,
+    group: &DirectLoadGroup,
+    tid: ThreadId,
+) -> ThreadContextGuard {
+    ThreadContextGuard {
+        previous_runner: ACTIVE.with(|slot| slot.replace(std::ptr::from_ref(runner))),
+        previous_group: ACTIVE_GROUP.with(|slot| slot.replace(std::ptr::from_ref(group))),
+        previous_tid: ACTIVE_TID.with(|slot| slot.replace(tid)),
+    }
+}
+
+impl Drop for ThreadContextGuard {
+    fn drop(&mut self) {
+        ACTIVE.with(|slot| slot.set(self.previous_runner));
+        ACTIVE_GROUP.with(|slot| slot.set(self.previous_group));
+        ACTIVE_TID.with(|slot| slot.set(self.previous_tid));
+    }
 }
 
 /// The handler a tier-D image is built with.
@@ -912,9 +1423,10 @@ extern "C" fn dispatch_from_island(ctx: *mut GuestContext) {
     if runner.is_null() || ctx.is_null() {
         return;
     }
-    // SAFETY: `with_runner` installs this runner for exactly the window in
-    // which the guest can call back, and the island owns `ctx` for this call.
-    let (runner, ctx) = unsafe { (&mut *runner, &mut *ctx) };
+    // SAFETY: `install_thread_context` installs this runner for exactly the
+    // window in which the guest can call back, and the island owns `ctx` for
+    // this call.
+    let (runner, ctx) = unsafe { (&*runner, &mut *ctx) };
     match runner.service(ctx) {
         ServiceVerdict::Resume(value) => ctx.set_return(value),
         // The guest's own state at the syscall stays parked in the context —
@@ -929,23 +1441,26 @@ pub fn island_handler() -> extern "C" fn(*mut GuestContext) {
     dispatch_from_island
 }
 
-/// Install `runner` and `group` for the current thread while `body` runs the
-/// guest.
+/// Install the MAIN guest thread's slots and runner context, run `body` (the
+/// enter call), then JOIN every guest thread the run spawned and hand back
+/// the main thread's parked slots for inspection.
 ///
 /// # Safety
 /// `body` must enter an image (or runtime window) of `group`, built with
-/// [`island_handler`].
+/// [`island_handler`], and the caller keeps `runner` and `group` alive until
+/// this returns (spawned guest threads borrow both; the join before
+/// returning is what bounds those borrows).
 pub unsafe fn with_runner<R>(
-    runner: &mut DirectRunner,
+    runner: &DirectRunner,
     group: &DirectLoadGroup,
     body: impl FnOnce() -> R,
-) -> R {
-    let previous_runner = ACTIVE.with(|slot| slot.replace(std::ptr::from_mut(runner)));
-    let previous_group = ACTIVE_GROUP.with(|slot| slot.replace(std::ptr::from_ref(group)));
+) -> std::io::Result<(R, Box<DirectThreadSlots>)> {
+    let slots = group.install_thread_slots()?;
+    let context = install_thread_context(runner, group, runner.registry.main_tid());
     let result = body();
-    ACTIVE.with(|slot| slot.set(previous_runner));
-    ACTIVE_GROUP.with(|slot| slot.set(previous_group));
-    result
+    drop(context);
+    runner.join_guest_threads();
+    Ok((result, slots.into_slots()))
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -1008,15 +1523,18 @@ mod tests {
                     .expect("open python rootfs"),
             ),
         ));
-        let mut runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
+        let runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
         let entry = group.entry_pc();
         let sp = stack.sp();
         // SAFETY: patched images built with `island_handler`; the guest
         // leaves through its exit.
-        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
         assert_eq!(
             runner.outcome(),
-            Some(&DirectRunOutcome::Exited { code: 0 }),
+            Some(DirectRunOutcome::Exited { code: 0 }),
             "CPython evaluated print(1) and exited 0 on tier D (syscalls: {}; \
              stdout: {:?}; stderr: {:?})",
             runner.syscalls(),
@@ -1027,6 +1545,90 @@ mod tests {
             runner.dispatcher().stdout(),
             b"1\n",
             "print(1) reached stdout through the one dispatcher"
+        );
+    }
+
+    /// The MULTI-THREADED gate (roadmap Phase 1 item 4, live-verified): real
+    /// CPython 3.12 creates a real `threading.Thread`. glibc's
+    /// `pthread_create` issues `clone(CLONE_VM|CLONE_THREAD|CLONE_SETTLS|
+    /// CLONE_CHILD_CLEARTID)`, the child enters tier D on its own host thread
+    /// with PRIVATE `DirectThreadSlots` (its `CLONE_SETTLS` value in its own
+    /// TLS slot — the veneers resolving per-thread state through the proven
+    /// TSD chain), the GIL handoff runs on real futex wait/wake through the
+    /// runner's shared table, `t.join()` parks on the CLEARTID word, and the
+    /// child's `exit(2)` retires as a `ThreadExit`. The main thread then
+    /// prints a value computed IN the child — proof the second thread really
+    /// executed guest code — and exits 0.
+    ///
+    /// Deliberately WITHOUT `-I -S`: full CPython startup (site import
+    /// included) runs on tier D here, so the gate is the unrestricted
+    /// interpreter, not a trimmed one. glibc's realloc grows its mmapped
+    /// chunks with `mremap` on this path — serviced by the identity tier's
+    /// tracked-anonymous-RW lowering, which this gate therefore also covers.
+    ///
+    /// Same staged rootfs as [`real_cpython_prints_through_tier_d`] (loud
+    /// skip when absent).
+    #[test]
+    fn real_cpython_runs_threads_through_tier_d() {
+        let root = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/tierd-live/pyroot"
+        );
+        let (Ok(py), Ok(ld)) = (
+            std::fs::read(format!("{root}/usr/local/bin/python3.12")),
+            std::fs::read(format!("{root}/lib/ld-linux-aarch64.so.1")),
+        ) else {
+            eprintln!("skipping: no python rootfs under target/tierd-live/pyroot (see test doc)");
+            return;
+        };
+        let group =
+            DirectLoadGroup::load_with_interpreter(&py, |_| Ok(ld.clone()), island_handler())
+                .expect("load")
+                .expect("python and its ld.so are tier-D eligible");
+        let interp = group.interpreter().expect("interpreter mapped");
+        let program = b"import threading\n\
+                        r = []\n\
+                        t = threading.Thread(target=r.append, args=(41,))\n\
+                        t.start()\n\
+                        t.join()\n\
+                        print(r[0] + 1)\n";
+        let stack = DirectStack::build(
+            &py,
+            group.main().bias(),
+            Some(interp.bias()),
+            &[b"python3".to_vec(), b"-c".to_vec(), program.to_vec()],
+            &[b"PYTHONHOME=/usr/local".to_vec()],
+        )
+        .expect("stack builds");
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(
+            crate::fs_backend::HostFsBackend::from_existing_dir(
+                cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+                    .expect("open python rootfs"),
+            ),
+        ));
+        let runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
+        let entry = group.entry_pc();
+        let sp = stack.sp();
+        // SAFETY: patched images built with `island_handler`; every thread
+        // leaves through the handler.
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 0 }),
+            "CPython ran a threading.Thread and exited 0 on tier D \
+             (syscalls: {}; stdout: {:?}; stderr: {:?})",
+            runner.syscalls(),
+            String::from_utf8_lossy(&runner.dispatcher().stdout()),
+            String::from_utf8_lossy(&runner.dispatcher().stderr()),
+        );
+        assert_eq!(
+            runner.dispatcher().stdout(),
+            b"42\n",
+            "the printed value was computed IN the spawned guest thread"
         );
     }
 
@@ -1086,11 +1688,13 @@ mod tests {
             .expect("load")
             .expect("eligible");
         assert_eq!(group.main().svc_sites(), 1);
-        let mut runner =
-            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         let entry = group.main().entry();
         // SAFETY: the image is patched and built with `island_handler`.
-        unsafe { with_runner(&mut runner, &group, || group.enter(entry)) };
+        unsafe { with_runner(&runner, &group, || group.enter(entry)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
 
         assert_eq!(runner.syscalls(), 1, "exactly one syscall was serviced");
         assert_eq!(
@@ -1130,15 +1734,17 @@ mod tests {
         let group = DirectLoadGroup::load(&elf, island_handler())
             .expect("load")
             .expect("eligible");
-        let mut runner =
-            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         let entry = group.main().entry();
         // SAFETY: the image is patched and built with `island_handler`.
-        unsafe { with_runner(&mut runner, &group, || group.enter(entry)) };
+        unsafe { with_runner(&runner, &group, || group.enter(entry)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
 
         assert_eq!(
             runner.outcome(),
-            Some(&DirectRunOutcome::Exited { code: 7 }),
+            Some(DirectRunOutcome::Exited { code: 7 }),
             "the exit was recorded"
         );
         assert_eq!(
@@ -1185,16 +1791,18 @@ mod tests {
         let group = DirectLoadGroup::load(&elf, island_handler())
             .expect("load")
             .expect("eligible");
-        let mut runner =
-            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         let entry = group.main().entry();
         // SAFETY: the image is patched and built with `island_handler`.
-        unsafe { with_runner(&mut runner, &group, || group.enter(entry)) };
+        unsafe { with_runner(&runner, &group, || group.enter(entry)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
 
         assert!(
             matches!(
                 runner.outcome(),
-                Some(&DirectRunOutcome::Unsupported {
+                Some(DirectRunOutcome::Unsupported {
                     syscall: 221,
                     ref outcome
                 }) if outcome.contains("Execve")
@@ -1293,16 +1901,18 @@ mod tests {
         );
 
         // Now the guest's own view.
-        let mut runner =
-            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         let entry = group.main().entry();
         let sp = stack.sp();
         // SAFETY: the image is patched and built with `island_handler`; the
         // guest leaves through its exit.
-        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
         assert_eq!(
             runner.outcome(),
-            Some(&DirectRunOutcome::Exited { code: 2 }),
+            Some(DirectRunOutcome::Exited { code: 2 }),
             "the guest read argc == 2 through its own SP"
         );
         assert_eq!(
@@ -1419,16 +2029,18 @@ mod tests {
             "AT_ENTRY is the MAIN image's biased entry, reachable from the interpreter"
         );
 
-        let mut runner =
-            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         let entry = group.entry_pc();
         let sp = stack.sp();
         // SAFETY: both images are patched and built with `island_handler`;
         // the guest leaves through its exit.
-        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
         assert_eq!(
             runner.outcome(),
-            Some(&DirectRunOutcome::Exited { code: 42 }),
+            Some(DirectRunOutcome::Exited { code: 42 }),
             "the MAIN image ran and exited through the handler (99 = interpreter \
              found no AT_ENTRY; anything else = the chain broke earlier)"
         );
@@ -1512,16 +2124,18 @@ __attribute__((naked)) void _start(void) {
         )
         .expect("stack builds");
 
-        let mut runner =
-            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         let entry = group.entry_pc();
         let sp = stack.sp();
         // SAFETY: both images are patched and built with `island_handler`;
         // the guest leaves through its exit.
-        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
+        let (entered, slots) =
+            unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+                .expect("with_runner");
+        entered.expect("enter");
         assert_eq!(
             runner.outcome(),
-            Some(&DirectRunOutcome::Exited { code: 42 }),
+            Some(DirectRunOutcome::Exited { code: 42 }),
             "real ld.so ran to the main image, which exited through the \
              handler (syscalls serviced: {}; guest stdout: {:?}; guest \
              stderr: {:?})",
@@ -1530,10 +2144,9 @@ __attribute__((naked)) void _start(void) {
             String::from_utf8_lossy(&runner.dispatcher().stderr()),
         );
         assert_ne!(
-            group.guest_tls(),
-            0,
-            "real ld.so initialized TLS through the veneers into the \
-             LOAD-GROUP slot (glibc's TLS_INIT_TP is an `msr tpidr_el0`)"
+            slots.guest_tls, 0,
+            "real ld.so initialized TLS through the veneers into the main \
+             thread's slots (glibc's TLS_INIT_TP is an `msr tpidr_el0`)"
         );
     }
 
@@ -1614,15 +2227,18 @@ __attribute__((naked)) void _start(void) {
             .expect("place libc");
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.set_fs_backend(Box::new(backend));
-        let mut runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
+        let runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
         let entry = group.entry_pc();
         let sp = stack.sp();
         // SAFETY: patched images built with `island_handler`; the guest
         // leaves through its exit.
-        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
         assert_eq!(
             runner.outcome(),
-            Some(&DirectRunOutcome::Exited { code: 41 }),
+            Some(DirectRunOutcome::Exited { code: 41 }),
             "real ld.so mapped libc through the exec-mmap window and main \
              returned 41 (syscalls: {}; stderr: {:?})",
             runner.syscalls(),
@@ -1703,15 +2319,18 @@ __attribute__((naked)) void _start(void) {
         }
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.set_fs_backend(Box::new(backend));
-        let mut runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
+        let runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
         let entry = group.entry_pc();
         let sp = stack.sp();
         // SAFETY: patched images built with `island_handler`; the guest
         // leaves through its exit.
-        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
         assert_eq!(
             runner.outcome(),
-            Some(&DirectRunOutcome::Exited { code: 0 }),
+            Some(DirectRunOutcome::Exited { code: 0 }),
             "dash -c 'echo hi' ran end to end on tier D (syscalls: {}; \
              stdout: {:?}; stderr: {:?})",
             runner.syscalls(),
@@ -1725,54 +2344,104 @@ __attribute__((naked)) void _start(void) {
         );
     }
 
-    /// A thread-creating `clone(2)` LEAVES named at the item-4 boundary:
-    /// tier D's TLS/x18/context slots are per-load-group, not per-thread, so
-    /// spawning a second guest thread would be unsound. A single-threaded
-    /// guest never reaches this; a `pthread_create`-shaped clone
-    /// (`CLONE_VM|CLONE_THREAD|CLONE_SIGHAND`) must fail closed, not run.
+    /// Roadmap Phase 1 item 4, FLIPPED: the formerly pinned fail-closed
+    /// boundary (`thread_creating_clone_leaves_at_the_per_thread_boundary`,
+    /// `5a6422cb`) is gone — a `pthread_create`-shaped clone now RUNS. The
+    /// fixture is the raw pthread_join shape end to end: the parent mmaps a
+    /// child stack, clones with `CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID`
+    /// targeting a word on its own stack, and spins until the runner's
+    /// thread-exit bookkeeping CLEARS that word (Linux's CLEARTID contract);
+    /// the child — full parent register file, x0 = 0, its own stack — writes
+    /// through the shared dispatcher and leaves via `exit(2)` as a
+    /// `ThreadExit` (not process exit). Against the pre-item-4 runner this
+    /// test is red at the clone (the run left `Unsupported`); the SETTID
+    /// word doubles as proof the parent observed the child's tid.
     #[test]
-    fn thread_creating_clone_leaves_at_the_per_thread_boundary() {
+    fn thread_creating_clone_runs_the_child_on_private_slots() {
+        const NR_MMAP: u32 = 222;
         const NR_CLONE: u32 = 220;
-        const NR_EXIT: u32 = 93;
-        // flags = CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_FS|CLONE_FILES,
-        // the pthread shape the dispatcher classifies as CloneThread.
-        const FLAGS: u32 = 0x100 | 0x1_0000 | 0x800 | 0x200 | 0x400;
+        const NR_WRITE_C: u32 = 64;
+        const NR_EXIT_THREAD: u32 = 93;
+        const NR_EXIT_GROUP: u32 = 94;
+        // CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD
+        // |CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID.
+        const FLAGS: u32 = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x0020_0000 | 0x0100_0000;
+        /// `add xd, xn, xm`
+        const fn add_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+            0x8b00_0000 | (rm << 16) | (rn << 5) | rd
+        }
+        /// `cbz xt, <pc + offset>`
+        const fn cbz_rel(rt: u32, offset: i32) -> u32 {
+            0xb400_0000 | (((offset as u32 >> 2) & 0x7ffff) << 5) | rt
+        }
         let elf = elf_with_code(&[
-            mov_reg(20, 30),
+            //  0: parent — mmap a 128 KiB child stack.
+            movz(0, 0, 0),
+            movz(1, 0x2, 16), // len 0x20000
+            movz(2, 3, 0),    // PROT_READ|WRITE
+            movz(3, 0x22, 0), // MAP_PRIVATE|MAP_ANONYMOUS
+            movz(4, 0, 0),    // fd (ignored for anon)
+            movz(5, 0, 0),    // offset
+            movz(8, NR_MMAP, 0),
+            SVC_0,            //  7: x0 = stack base
+            movz(9, 0x2, 16), //  8
+            add_reg(9, 0, 9), //  9: x9 = stack TOP
+            str_pre_sp(31),   // 10: ctid word = 0 at [sp] (str xzr)
+            mov_from_sp(4),   // 11: x4 = &ctid (SETTID + CLEARTID target)
             movz(0, FLAGS & 0xffff, 0),
-            movk(0, FLAGS >> 16, 16), // x0 = flags
-            movz(1, 0x1000, 0),       // x1 = a nonzero child stack
-            movz(2, 0, 0),
-            movz(3, 0, 0),
-            movz(4, 0, 0),
+            movk(0, FLAGS >> 16, 16), // 13: x0 = flags
+            mov_reg(1, 9),            // 14: x1 = child stack top
+            movz(2, 0, 0),            // 15: ptid unused
+            movz(3, 0, 0),            // 16: no CLONE_SETTLS
             movz(8, NR_CLONE, 0),
-            SVC_0,
-            // POISON: a runner that ran an unsound thread would resume here.
-            movz(0, 5, 0),
-            movz(8, NR_EXIT, 0),
-            SVC_0,
+            SVC_0,                     // 18: parent: x0 = tid; child: x0 = 0
+            cbz_rel(0, (25 - 19) * 4), // 19: child -> its own leg
+            // parent join: SETTID stamped a nonzero tid BEFORE the clone
+            // returned, so the spin only ends when the child's exit CLEARS it.
+            ldr_sp_imm(9, 0),          // 20
+            cbnz_rel(9, -4),           // 21: while ctid != 0
+            movz(0, 5, 0),             // 22
+            movz(8, NR_EXIT_GROUP, 0), // 23
+            SVC_0,                     // 24: process exit 5
+            // child leg: write "c\n" from ITS OWN stack, exit(7) as a THREAD.
+            movz(9, 0x0a63, 0), // 25: 'c','\n'
+            str_pre_sp(9),      // 26
+            mov_from_sp(1),     // 27
+            movz(0, 1, 0),      // 28
+            movz(2, 2, 0),      // 29
+            movz(8, NR_WRITE_C, 0),
+            SVC_0,         // 31
+            movz(0, 7, 0), // 32
+            movz(8, NR_EXIT_THREAD, 0),
+            SVC_0, // 34: ThreadExit -> CLEARTID wake
         ]);
         let group = DirectLoadGroup::load(&elf, island_handler())
             .expect("load")
             .expect("eligible");
-        let mut runner =
-            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let runner = DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
         let entry = group.main().entry();
-        // SAFETY: patched image built with `island_handler`.
-        unsafe { with_runner(&mut runner, &group, || group.enter(entry)) };
-        assert!(
-            matches!(
-                runner.outcome(),
-                Some(&DirectRunOutcome::Unsupported { syscall: 220, ref outcome })
-                    if outcome.contains("per-thread") && outcome.contains("item 4")
-            ),
-            "the thread clone left AT the per-thread boundary, named: {:?}",
-            runner.outcome()
+        // SAFETY: patched image built with `island_handler`; both threads
+        // leave through the handler (exit / exit_group).
+        unsafe { with_runner(&runner, &group, || group.enter(entry)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 5 }),
+            "the parent joined its thread and exit_grouped (syscalls: {})",
+            runner.syscalls(),
         );
         assert_eq!(
-            runner.syscalls(),
-            1,
-            "the guest left AT the clone; the poison exit never ran"
+            runner.dispatcher().stdout(),
+            b"c\n",
+            "the CHILD THREAD's write reached the one shared dispatcher"
+        );
+        assert!(
+            runner.syscalls() >= 5,
+            "mmap + clone + child write + child exit + exit_group all serviced \
+             (got {})",
+            runner.syscalls()
         );
     }
 

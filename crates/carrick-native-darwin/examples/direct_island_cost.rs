@@ -73,9 +73,19 @@ fn main() {
     };
     println!("patched {} svc site(s)", group.main().svc_sites());
     let entry = group.main().entry();
+    let _slots = match group.install_thread_slots() {
+        Ok(slots) => slots,
+        Err(error) => {
+            eprintln!("install thread slots failed: {error}");
+            return;
+        }
+    };
     let started = std::time::Instant::now();
     // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-    unsafe { group.enter(entry) };
+    if let Err(error) = unsafe { group.enter(entry) } {
+        eprintln!("enter failed: {error}");
+        return;
+    }
     let elapsed = started.elapsed();
 
     let calls = CALLS.load(Ordering::Relaxed);
