@@ -131,3 +131,46 @@ is why this did not land in the same day as the emission-parity half. Until
 the unit pipeline records the native tap, the store stays opt-in and the
 gate doc comment on `persistent_store_runtime_enabled` names this exact
 condition.
+
+## LANDED (2026-08-03, lane G2)
+
+The re-flip condition above is implemented: units carry the native
+recording tap (`ArtifactTemplate` per block over unbaked `.code` words,
+`{stem}.metadata-v4`, `TRANSLATOR_ABI_CURRENT = 7`) and
+`ProcessState::install_shared_unit` replays each block through
+`publish_emitted`. The `BindingIndex` guard, `PortableUnitAuthority`
+emission, edge trampolines, direct-binding cell sidecar, and the V2/V3
+metadata split are deleted.
+
+Evidence (same binary, warm hermetic store, alternating arms, host-env
+knobs; a sibling lane ran concurrently so wall numbers are "suggests"; raw
+artifacts `target/laneg-g2-abba-20260803.log`,
+`target/laneg-g2-disas-samples-20260803.txt`, harnesses
+`target/laneg-g2-abba.sh` / `target/laneg-g2-disas2.sh`):
+
+- awk-8M compute (the shape that forced opt-in, image awk = mawk): store
+  OFF mean 361.5 ms / median 361.0; store ON (warm attach) mean 362.4 /
+  median 355.1, n=8 per arm counterbalanced — **parity** (+0.2% mean,
+  -1.6% median) against the pre-fix +65-78%.
+- lldb on the live warm guest: attached blocks show the lean Absolute
+  guard (`eor`/`cbnz`) followed by the 3-instruction trusted entry
+  (`mov x17,#0x0; str x17,[x28,#0x478]; ldr x17,[x28,#0x468]`), and
+  patched direct branches land EXACTLY at trusted entries
+  (`b 0x107058a9c` -> entry at `0x107058a9c`). Six sampled 320-insn
+  windows contain ZERO `CTX_GENERATION_BINDINGS` loads (the only
+  `#0x4f0` references are the retained private indirect-authority
+  STORES). Word identity and trusted-entry registration are pinned
+  hermetically by `translator::tests::native_tap_unit_install`.
+- Attach counters: warm run `shared_unit_hits=2`,
+  `shared_blocks_mapped=1255`, `shared_metadata_bytes_read=436259`,
+  validation 1.16 ms — the serialized-manifest read path replaces the V3
+  mmap.
+- CAVEAT for the flip: the coarse cold-build single-run check
+  (`target/laneg-g2-build-20260803.log`, hello-world `go build`, A B B A)
+  suggests store ON ~+4.5% (9.63/9.84 s vs 9.31/9.33 s) — the per-exec
+  serialized-metadata decode + per-block replay replaced the mmap'd V3
+  install, so the old ~3% cold-build win is NOT confirmed to survive.
+  Candidate follow-ups if a quiet-box ABBA confirms it: lazy per-block
+  install on first lookup, or a zero-copy record layout for the v4 wire.
+  The default therefore stays opt-in until the coordinator's central
+  quiet-box ABBA covers BOTH the compute shape and the build lane.
