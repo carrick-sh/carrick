@@ -558,7 +558,7 @@ Add invariant tests that fail aggregation when a recurring-contained workload ha
 cargo test -p carrick-dsr-aarch64 loaded_unit_gap_ --lib
 cargo test -p carrick-dsr-aarch64 next_process_replays_merged --lib
 cargo test -p carrick-dsr-aarch64 resolver_stat --lib
-cargo test -p carrick-cli debug_census --lib
+cargo test -p carrick-cli --bin carrick debug_census
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime native_darwin --lib
 just fmt-check
 ```
@@ -821,7 +821,7 @@ cargo test -p carrick-dsr-aarch64 shared_cache::tests --lib
 cargo test -p carrick-dsr-aarch64 pending_augmentation::tests --lib
 cargo test -p carrick-dsr-aarch64 loaded_unit_gap_ --lib
 cargo test -p carrick-native-darwin aot_cache::tests --lib
-cargo test -p carrick-cli debug_census --lib
+cargo test -p carrick-cli --bin carrick debug_census
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime native_darwin --lib
 python3 scripts/test_carrick_lldb_xlat.py
 python3 scripts/perf/test_native_go_build.py
