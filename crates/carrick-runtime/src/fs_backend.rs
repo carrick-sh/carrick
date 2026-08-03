@@ -172,6 +172,18 @@ pub trait FsBackend: Send + Sync {
     /// have a file at that path.
     fn file_contents(&self, path: &str) -> Option<Vec<u8>>;
 
+    /// Read at most `max` leading bytes of the file at `path`. `None` exactly
+    /// when [`FsBackend::file_contents`] would return `None`; an existing empty
+    /// file yields `Some(vec![])`. The default materializes the whole file and
+    /// truncates — disk backends override it with a bounded read so existence
+    /// and shebang probes on a multi-MB executable stop paying a full read.
+    fn file_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
+        self.file_contents(path).map(|mut bytes| {
+            bytes.truncate(max);
+            bytes
+        })
+    }
+
     /// Return a cheap shared snapshot for an in-memory file when the backend
     /// can expose one without materializing the whole payload.
     fn shared_file_contents(&self, _path: &str) -> Option<SharedFileContents> {
@@ -3981,6 +3993,21 @@ impl FsBackend for HostFsBackend {
         Some(buf)
     }
 
+    fn file_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
+        // Bounded sibling of `file_contents`: same resolution, but reads at
+        // most `max` bytes. The execve path probes existence and the `#!`
+        // head this way, so a 20 MB `go` tool no longer costs a full read
+        // per probe.
+        let normalized = self.resolve_following(path)?;
+        let rel = Self::rel_path(&normalized)?;
+        let (dir, at_rel) = self.at(rel).ok()?;
+        let mut buf = Vec::new();
+        let file = dir.open(&at_rel).ok()?;
+        let mut bounded = std::io::Read::take(file, max as u64);
+        bounded.read_to_end(&mut buf).ok()?;
+        Some(buf)
+    }
+
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
@@ -5914,6 +5941,24 @@ mod tests {
         assert_eq!(bytes, b"abcd");
     }
 
+    fn scenario_file_head_matches_contents_prefix<B: FsBackend>(b: &mut B) {
+        b.create_file("/bin/script").unwrap();
+        b.set_file_contents("/bin/script", b"#!/bin/sh -e\nbody".to_vec())
+            .unwrap();
+        b.create_file("/bin/empty").unwrap();
+
+        // Head == prefix of the full contents, for every clamp point.
+        assert_eq!(b.file_head("/bin/script", 2).as_deref(), Some(&b"#!"[..]));
+        assert_eq!(
+            b.file_head("/bin/script", 256).as_deref(),
+            Some(&b"#!/bin/sh -e\nbody"[..])
+        );
+        // Existence contract: Some(empty) for an existing empty file,
+        // None exactly when file_contents is None.
+        assert_eq!(b.file_head("/bin/empty", 256).as_deref(), Some(&[][..]));
+        assert!(b.file_head("/bin/missing", 256).is_none());
+    }
+
     fn scenario_unlink_hides_rootfs_path<B: FsBackend>(b: &mut B) {
         // Simulate a rootfs-backed path by tombstoning it; the
         // dispatcher does this in `unlinkat` for files that live in
@@ -5964,6 +6009,11 @@ mod tests {
     #[test]
     fn memory_open_create_write_read() {
         scenario_open_create_write_read(&mut MemoryBackend::new());
+    }
+
+    #[test]
+    fn memory_file_head_matches_contents_prefix() {
+        scenario_file_head_matches_contents_prefix(&mut MemoryBackend::new());
     }
 
     #[test]
@@ -6419,6 +6469,38 @@ mod tests {
     fn host_open_create_write_read() {
         let (mut b, _scratch) = host_backend();
         scenario_open_create_write_read(&mut b);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_file_head_matches_contents_prefix() {
+        let (mut b, _scratch) = host_backend();
+        scenario_file_head_matches_contents_prefix(&mut b);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_file_head_follows_symlinks_like_file_contents() {
+        // The execve path resolves symlinked executables (busybox/coreutils)
+        // through the SAME layered reader for the existence probe and the
+        // loader read; the bounded head must follow the link identically.
+        let (b, _scratch) = host_backend();
+        b.create_file("/bin/tool").unwrap();
+        b.set_file_contents("/bin/tool", b"\x7fELF-payload".to_vec())
+            .unwrap();
+        b.symlink("tool", "/bin/alias").unwrap();
+
+        assert_eq!(
+            b.file_head("/bin/alias", 4).as_deref(),
+            Some(&b"\x7fELF"[..])
+        );
+        assert_eq!(
+            b.file_head("/bin/alias", 4),
+            b.file_contents("/bin/alias").map(|mut v| {
+                v.truncate(4);
+                v
+            })
+        );
     }
 
     #[cfg(target_os = "macos")]

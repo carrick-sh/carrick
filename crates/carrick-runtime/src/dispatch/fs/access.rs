@@ -276,10 +276,12 @@ impl SyscallDispatcher {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn check_exec_target(&self, path: &str) -> Result<(), LinuxErrno> {
         // Existence via the SAME layered reader the loader uses, so a symlinked
-        // executable (busybox/coreutils) is followed identically here. A bare
+        // executable (busybox/coreutils) is followed identically here — but
+        // bounded to a single byte: this is an existence probe, and the full
+        // read walked the whole multi-MB tool binary once per exec. A bare
         // RunElf boot may additionally read the literal host path.
         let host_fallback = self.exec_host_fs_fallback();
-        let exists = self.read_exec_file(path).is_some()
+        let exists = self.read_exec_file_head(path, 1).is_some()
             || (host_fallback
                 && std::fs::metadata(path)
                     .map(|m| m.is_file())
