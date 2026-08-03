@@ -7601,6 +7601,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
         )
         .expect("shared block metadata")
@@ -7741,6 +7742,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                None,
                 &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
             )
             .expect("shared sensitive block metadata")

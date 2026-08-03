@@ -1240,6 +1240,7 @@ pub(super) mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             &bindings,
         )
         .expect("first template")
@@ -1264,6 +1265,7 @@ pub(super) mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             &bindings,
         )
         .expect("second template")
@@ -1370,6 +1372,7 @@ pub(super) mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             &bindings,
         )
         .expect("large template")
