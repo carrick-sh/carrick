@@ -6041,15 +6041,23 @@ fn dsr_phase_zero_host_kick_keeps_original_guest_snapshot() {
     let mut exit = NativeDsrExit::Syscall {
         resume: GuestVa(guest.raw() + 4),
     };
+    let private_authority = super::gateway::TargetCacheAuthority::new(
+        emitted.entry().host().raw(),
+        emitted.entry().host().raw() + emitted.len(),
+        std::ptr::null(),
+    );
 
     unsafe { carrick_native_dsr_test_phase_zero_host_kick_once() };
-    super::gateway::enter_translated_with_cache_range(
+    // Exercise the exact production gateway arm. Installed persistent-store
+    // blocks replay into the private JIT, so `ThreadTranslator::enter_prepared`
+    // enters through this trusted-private helper rather than the generic
+    // range-bearing arm.
+    super::gateway::enter_translated_with_trusted_private_cache(
         emitted.entry(),
         &mut snapshot,
         &mut exit,
         &indirect,
-        emitted.entry().host().raw(),
-        emitted.entry().host().raw() + emitted.len(),
+        &private_authority,
         crate::native_darwin::address::NativeAddressMode::Direct,
     )
     .expect("classify phase-zero host kick");

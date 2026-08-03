@@ -879,6 +879,7 @@ mod native_gateway {
         snapshot: &mut NativeUcontextSnapshot,
         exit: &mut NativeDsrExit,
         indirect_cache: &IndirectTargetCache,
+        private_authority: &TargetCacheAuthority,
         address_mode: carrick_dsr::address::NativeAddressMode,
     ) -> Result<(), DsrError> {
         enter_translated_raw(
@@ -887,8 +888,8 @@ mod native_gateway {
             exit,
             indirect_cache.as_ptr(),
             CodeGeneration::INITIAL,
-            0,
-            usize::MAX,
+            private_authority.cache_start as usize,
+            private_authority.cache_end as usize,
             address_mode,
             std::ptr::null(),
             std::ptr::null(),
@@ -1082,6 +1083,7 @@ mod native_gateway {
         _snapshot: &mut NativeUcontextSnapshot,
         _exit: &mut NativeDsrExit,
         _indirect_cache: &IndirectTargetCache,
+        _private_authority: &TargetCacheAuthority,
         _address_mode: carrick_dsr::address::NativeAddressMode,
     ) -> Result<(), DsrError> {
         Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
