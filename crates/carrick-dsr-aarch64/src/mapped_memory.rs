@@ -29,7 +29,7 @@ use carrick_mem::memory::{AddressSpace, MemoryLayout, MemoryRegion};
 use sha2::{Digest, Sha256};
 
 use crate::prepared_image::{
-    NativeRelativeRelocation, PreparedImageFileBacking, ValidatedPreparedImage,
+    NativeRelativeRelocation, PreparedRegionBackingResolved, ValidatedPreparedImage,
     native_region_copy_window,
 };
 
@@ -4510,7 +4510,7 @@ pub fn map_region(
 pub fn map_prepared_region_extent(
     region_index: usize,
     region: &MemoryRegion,
-    backing: PreparedImageFileBacking,
+    backing: PreparedRegionBackingResolved,
     prepared: &ValidatedPreparedImage,
     exec_map_dsr_tid: Option<i32>,
     native_layout: &NativeLayout,
@@ -4533,10 +4533,15 @@ pub fn map_prepared_region_extent(
         prepared.host_page_size(),
         "prepared artifact region extent",
     )?;
-    if backing.artifact_extent.get() != expected_extent {
+    let recorded_extent = match &backing {
+        PreparedRegionBackingResolved::Artifact(backing) => backing.artifact_extent.get(),
+        PreparedRegionBackingResolved::ExecutableFile {
+            artifact_extent, ..
+        } => artifact_extent.get(),
+    };
+    if recorded_extent != expected_extent {
         return Err(NativeMemoryError::Unsupported(format!(
-            "prepared-map: region {region_index} extent mismatch: artifact=0x{:x}, expected=0x{expected_extent:x}",
-            backing.artifact_extent.get()
+            "prepared-map: region {region_index} extent mismatch: artifact=0x{recorded_extent:x}, expected=0x{expected_extent:x}"
         )));
     }
     let length = usize::try_from(expected_extent).map_err(|_| {
@@ -4544,10 +4549,52 @@ pub fn map_prepared_region_extent(
             "prepared-map: region {region_index} is too large: 0x{expected_extent:x}"
         ))
     })?;
-    let artifact_offset = libc::off_t::try_from(backing.artifact_offset.get()).map_err(|_| {
+    // Resolve which fd and offset supply the region's initialized bytes, plus
+    // how much of the extent is file-mapped. Artifact regions map their whole
+    // extent from the sparse artifact. Executable-file regions map only the
+    // page-rounded window and take the remainder (BSS beyond the window's
+    // last page) as fresh anonymous zero-fill below.
+    let (source_fd, source_offset, file_map_len, zero_lead, zero_tail_start) = match &backing {
+        PreparedRegionBackingResolved::Artifact(backing) => (
+            prepared.file_fd(),
+            backing.artifact_offset.get(),
+            length,
+            0_u64,
+            None,
+        ),
+        PreparedRegionBackingResolved::ExecutableFile { window, .. } => {
+            let executable_fd = prepared.executable_file_fd().ok_or_else(|| {
+                NativeMemoryError::Unsupported(format!(
+                    "prepared-map: region {region_index} names an executable window without a validated executable fd"
+                ))
+            })?;
+            let file_map_len = align_up_u64(
+                window.file_bytes(),
+                prepared.host_page_size(),
+                "prepared executable window extent",
+            )?;
+            let file_map_len = usize::try_from(file_map_len).map_err(|_| {
+                NativeMemoryError::Unsupported(format!(
+                    "prepared-map: region {region_index} window is too large"
+                ))
+            })?;
+            if file_map_len > length {
+                return Err(NativeMemoryError::Unsupported(format!(
+                    "prepared-map: region {region_index} window 0x{file_map_len:x} exceeds extent 0x{length:x}"
+                )));
+            }
+            (
+                executable_fd,
+                window.file_offset(),
+                file_map_len,
+                window.zero_lead(),
+                Some(window.file_bytes()),
+            )
+        }
+    };
+    let source_offset = libc::off_t::try_from(source_offset).map_err(|_| {
         NativeMemoryError::Unsupported(format!(
-            "prepared-map: region {region_index} artifact offset is not representable: 0x{:x}",
-            backing.artifact_offset.get()
+            "prepared-map: region {region_index} file offset is not representable: 0x{source_offset:x}"
         ))
     })?;
     let host_start = native_layout
@@ -4561,16 +4608,16 @@ pub fn map_prepared_region_extent(
         length_u64,
     );
     let flags = native_layout
-        .fixed_mapping_flags(host_start, length, libc::MAP_PRIVATE)
+        .fixed_mapping_flags(host_start, file_map_len, libc::MAP_PRIVATE)
         .map_err(|error| NativeMemoryError::Unsupported(format!("prepared-map: {error}")))?;
     let mapped = unsafe {
         libc::mmap(
             address,
-            length,
+            file_map_len,
             libc::PROT_READ | libc::PROT_WRITE,
             flags,
-            prepared.file_fd(),
-            artifact_offset,
+            source_fd,
+            source_offset,
         )
     };
     if mapped == libc::MAP_FAILED {
@@ -4580,13 +4627,80 @@ pub fn map_prepared_region_extent(
         )));
     }
     if mapped != address {
-        unsafe { libc::munmap(mapped, length) };
+        unsafe { libc::munmap(mapped, file_map_len) };
         return Err(NativeMemoryError::Unsupported(format!(
             "prepared-map: mmap region {region_index} returned {:p}, expected {:p}",
             mapped, address
         )));
     }
-    rollback.track_mapping(host_start, length);
+    rollback.track_mapping(host_start, file_map_len);
+    if length > file_map_len {
+        // The extent past the file window is anonymous zero-fill (BSS): the
+        // kernel delivers pre-zeroed pages on demand, keeping the Linux
+        // anonymous-memory guarantee without touching them here.
+        let anon_start = carrick_guest_mem::HostVa(host_start.raw() + file_map_len);
+        let anon_len = length - file_map_len;
+        let anon_address = anon_start.raw() as *mut libc::c_void;
+        let anon_flags = native_layout
+            .fixed_mapping_flags(
+                anon_start,
+                anon_len,
+                libc::MAP_ANON | MAP_NORESERVE | libc::MAP_PRIVATE,
+            )
+            .map_err(|error| NativeMemoryError::Unsupported(format!("prepared-map: {error}")))?;
+        let anon_mapped = unsafe {
+            libc::mmap(
+                anon_address,
+                anon_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                anon_flags,
+                -1,
+                0,
+            )
+        };
+        if anon_mapped == libc::MAP_FAILED {
+            return Err(last_io_error(&format!(
+                "prepared-map: anon tail region {region_index} 0x{:x}..0x{:x}",
+                region.start, region.end
+            )));
+        }
+        if anon_mapped != anon_address {
+            unsafe { libc::munmap(anon_mapped, anon_len) };
+            return Err(NativeMemoryError::Unsupported(format!(
+                "prepared-map: anon tail region {region_index} returned {anon_mapped:p}, expected {anon_address:p}"
+            )));
+        }
+        rollback.track_mapping(anon_start, anon_len);
+    }
+    // Restore the loader's byte image inside the file-mapped window: the
+    // pre-segment lead (`region.start .. p_vaddr`) and the padzero tail
+    // (`p_vaddr + p_filesz .. page end`) hold file bytes after the mmap but
+    // are ZERO in the materialized image Linux (and carrick's anonymous
+    // loader) present. Both writes dirty at most one page each via COW.
+    if zero_lead > 0 {
+        let lead = usize::try_from(zero_lead).map_err(|_| {
+            NativeMemoryError::Unsupported(format!(
+                "prepared-map: region {region_index} zero lead is too large"
+            ))
+        })?;
+        unsafe { std::ptr::write_bytes(mapped.cast::<u8>(), 0, lead.min(file_map_len)) };
+    }
+    if let Some(tail_start) = zero_tail_start {
+        let tail_start = usize::try_from(tail_start).map_err(|_| {
+            NativeMemoryError::Unsupported(format!(
+                "prepared-map: region {region_index} window tail is too large"
+            ))
+        })?;
+        if tail_start < file_map_len {
+            unsafe {
+                std::ptr::write_bytes(
+                    mapped.cast::<u8>().add(tail_start),
+                    0,
+                    file_map_len - tail_start,
+                )
+            };
+        }
+    }
     native_exec_map_detail(
         exec_map_dsr_tid,
         carrick_dsr::probes::DsrCacheLifecyclePhase::ExecMapMmapEnd,

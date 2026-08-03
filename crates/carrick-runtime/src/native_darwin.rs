@@ -804,7 +804,98 @@ type LoadedNativeExecveImage = (
     String,
     Vec<Vec<u8>>,
     [u8; 32],
+    Option<crate::native_prepared_image::PreparedExecutableBacking>,
 );
+
+/// Whether `load_native_execve_image` should open the executable's host file
+/// and derive per-region mmap windows for the prepared-image transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecFileBackingPolicy {
+    /// The forked-child self-reexec path: the resumed process maps eligible
+    /// regions MAP_PRIVATE from the executable fd instead of a prepared
+    /// artifact copy.
+    Compute,
+    /// The in-process exec and legacy resume reload paths map from
+    /// materialized bytes; opening the file would be dead weight.
+    Skip,
+}
+
+/// Default-ON; `CARRICK_EXEC_FILE_BACKED=0` is the exact bisection hatch that
+/// restores the artifact-copy path for every region.
+fn exec_file_backing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CARRICK_EXEC_FILE_BACKED").as_deref() != Some(std::ffi::OsStr::new("0"))
+    })
+}
+
+/// Compute the per-region executable-file windows for the FINAL exec image
+/// (post interpreter/vdso/stack), parallel to `image.regions()`.
+///
+/// A region gets a window exactly when it is one of the MAIN executable's
+/// `PT_LOAD` segments and the mapping can reproduce the loader's bytes from
+/// the file alone: page-congruent (`p_vaddr ≡ p_offset` mod host page),
+/// non-empty file payload contained in the file. Interpreter, vdso, vvar and
+/// stack regions never match a main-plan segment and stay artifact-backed.
+/// Any planning surprise fails closed to `None` (= the artifact-copy path).
+fn native_exec_file_windows(
+    image: &AddressSpace,
+    elf_bytes: &[u8],
+    pie_base: u64,
+    host_page_size: u64,
+    exec_file_len: u64,
+) -> Vec<Option<crate::native_prepared_image::PreparedExecRegionWindow>> {
+    use carrick_mem::elf::ElfType;
+
+    let mut windows = vec![None; image.regions().len()];
+    let Ok(mut plan) = carrick_mem::elf::plan_elf_load_bytes(elf_bytes) else {
+        return windows;
+    };
+    if plan.e_type == ElfType::Dyn {
+        plan = plan.with_load_bias(pie_base);
+    }
+    let mask = host_page_size - 1;
+    for (index, region) in image.regions().iter().enumerate() {
+        let matched = plan.segments.iter().find(|segment| {
+            let Some(segment_end) = segment.virtual_address.checked_add(segment.memory_size) else {
+                return false;
+            };
+            segment.memory_size > 0
+                && segment.virtual_address & !mask == region.start
+                && segment_end.checked_add(mask).map(|end| end & !mask) == Some(region.end)
+        });
+        let Some(segment) = matched else {
+            continue;
+        };
+        // Page congruence is what makes a single mmap land the payload at
+        // its in-page offset; without it only the copy path is correct.
+        if segment.virtual_address & mask != segment.file_offset & mask {
+            continue;
+        }
+        if segment.file_size == 0 {
+            continue; // pure BSS: the sparse artifact extent is already free
+        }
+        let zero_lead = segment.virtual_address & mask;
+        let Some(file_offset) = segment.file_offset.checked_sub(zero_lead) else {
+            continue;
+        };
+        let Some(file_bytes) = zero_lead.checked_add(segment.file_size) else {
+            continue;
+        };
+        let within_file = file_offset
+            .checked_add(file_bytes)
+            .is_some_and(|end| end <= exec_file_len);
+        if !within_file {
+            continue;
+        }
+        windows[index] = Some(crate::native_prepared_image::PreparedExecRegionWindow {
+            file_offset,
+            file_bytes,
+            zero_lead,
+        });
+    }
+    windows
+}
 
 enum NativeImageSource {
     Legacy {
@@ -898,7 +989,7 @@ where
         });
     }
 
-    let (image, relative_relocations, resolved, _resolved_argv, executable_digest) =
+    let (image, relative_relocations, resolved, _resolved_argv, executable_digest, _exec_backing) =
         legacy_loader()
             .map_err(|errno| anyhow::anyhow!("reload guest executable failed: {errno:?}"))?;
     if executable_digest != expected_executable_digest {
@@ -967,6 +1058,7 @@ fn load_native_execve_image(
     env: Vec<Vec<u8>>,
     plan: &ExecutionPlan,
     digest_policy: ExecDigestPolicy,
+    file_backing: ExecFileBackingPolicy,
 ) -> Result<LoadedNativeExecveImage, crate::linux_abi::LinuxErrno> {
     let geometry = plan
         .page_geometry
@@ -988,10 +1080,27 @@ fn load_native_execve_image(
             None
         }
     };
-    let file = dispatcher
-        .read_exec_file(&resolved)
-        .or_else(|| host_read(&resolved))
-        .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+    // When the overlay backend can serve the executable as a real host fd,
+    // read the image THROUGH that fd: the prepared transport maps eligible
+    // regions MAP_PRIVATE from the same inode, so bytes and mapping cannot
+    // diverge across layers.
+    let exec_host_file = (file_backing == ExecFileBackingPolicy::Compute
+        && exec_file_backing_enabled())
+    .then(|| dispatcher.open_exec_host_file(&resolved))
+    .flatten();
+    let file = match &exec_host_file {
+        Some(host_file) => {
+            let mut bytes = Vec::new();
+            let mut reader: &std::fs::File = host_file;
+            std::io::Read::read_to_end(&mut reader, &mut bytes)
+                .map_err(|_| crate::linux_abi::LINUX_EIO)?;
+            bytes
+        }
+        None => dispatcher
+            .read_exec_file(&resolved)
+            .or_else(|| host_read(&resolved))
+            .ok_or(crate::linux_abi::LINUX_ENOENT)?,
+    };
     let executable_digest: [u8; 32] =
         if digest_policy == ExecDigestPolicy::Required || executable_digest_is_consumed() {
             sha2::Sha256::digest(&file).into()
@@ -1032,12 +1141,32 @@ fn load_native_execve_image(
             geometry.linux_page_size,
         )
         .map_err(|_| crate::linux_abi::LINUX_ENOENT)?;
+    // Windows are derived against the FINAL region list (post interpreter/
+    // vdso/stack) so they stay parallel to `image.regions()` all the way into
+    // `prepare`.
+    let exec_backing = exec_host_file.and_then(|host_file| {
+        let file_len = host_file.metadata().ok()?.len();
+        let windows = native_exec_file_windows(
+            &image,
+            &file,
+            NATIVE_DARWIN_PIE_BASE,
+            geometry.host_page_size,
+            file_len,
+        );
+        windows.iter().any(Option::is_some).then(|| {
+            crate::native_prepared_image::PreparedExecutableBacking {
+                file: host_file,
+                windows,
+            }
+        })
+    });
     Ok((
         image,
         relative_relocations,
         resolved,
         resolved_argv,
         executable_digest,
+        exec_backing,
     ))
 }
 
@@ -1131,6 +1260,8 @@ pub(crate) fn resume_guest_from_capsule(
             &plan,
             // The guard this reload feeds IS the digest comparison.
             ExecDigestPolicy::Required,
+            // This child maps from materialized bytes; windows are dead here.
+            ExecFileBackingPolicy::Skip,
         );
         if loaded.is_ok() {
             native_reexec_lifecycle(
@@ -3606,6 +3737,8 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     .collect();
                 let host_process_name = proc_argv.join(" ");
                 let proc_env = env.clone();
+                let forked_child_exec =
+                    NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire);
                 match load_native_execve_image(
                     &dispatcher,
                     &path,
@@ -3613,6 +3746,14 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     env,
                     &plan,
                     ExecDigestPolicy::DeferredUnlessConsumed,
+                    // Only the forked-child self-reexec transport maps regions
+                    // from the executable fd; the in-process replacement below
+                    // maps materialized bytes.
+                    if forked_child_exec {
+                        ExecFileBackingPolicy::Compute
+                    } else {
+                        ExecFileBackingPolicy::Skip
+                    },
                 ) {
                     Ok((
                         image,
@@ -3620,6 +3761,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                         resolved,
                         resolved_argv,
                         executable_digest,
+                        exec_backing,
                     )) => {
                         if NATIVE_FORKED_GUEST_CHILD.load(std::sync::atomic::Ordering::Acquire) {
                             if let Err(reason) = dispatcher.validate_native_reexec_fd_state() {
@@ -3660,6 +3802,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                                 &dispatcher,
                                 &image,
                                 &relative_relocations,
+                                exec_backing,
                                 resolved.clone(),
                                 resolved_argv,
                                 capsule_env,
@@ -14357,7 +14500,7 @@ mod tests {
         host_page_size: u64,
     ) -> crate::native_prepared_image::ValidatedPreparedImage {
         let artifact =
-            match crate::native_prepared_image::prepare(image, relocations, host_page_size)
+            match crate::native_prepared_image::prepare(image, relocations, host_page_size, None)
                 .expect("prepare mapping artifact")
             {
                 crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => {
@@ -14367,7 +14510,7 @@ mod tests {
                     panic!("mapping fixture is ineligible: {reason:?}")
                 }
             };
-        crate::native_prepared_image::validate_artifact_for_test(artifact)
+        crate::native_prepared_image::validate_artifact_for_test(*artifact)
             .expect("validate mapping artifact")
     }
 
@@ -14716,6 +14859,261 @@ mod tests {
         });
     }
 
+    /// A 16 KiB-congruent ET_EXEC fixture written to a REAL file, shaped to
+    /// exercise every executable-file-window path at once:
+    /// - `p_offset` = 0x4000 ≡ `p_vaddr` = 0x400000 (mod 16 KiB) → eligible;
+    /// - `p_memsz` = 0x4100 > `p_filesz` → padzero tail in the file page AND
+    ///   an anonymous BSS page past the window;
+    /// - 0x40 sentinel bytes in the FILE just past `p_filesz` that Linux's
+    ///   loader must NOT let the guest see (they must read zero).
+    fn file_backed_fixture_elf(words: &[u32]) -> Vec<u8> {
+        const CODE_OFFSET: usize = 0x4000;
+        const GUEST_BASE: u64 = 0x40_0000;
+        let code_len = std::mem::size_of_val(words);
+        let mut elf = vec![0_u8; CODE_OFFSET + code_len + 0x40];
+        elf[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        write_u16(&mut elf, 16, goblin::elf::header::ET_EXEC);
+        write_u16(&mut elf, 18, 183); // EM_AARCH64
+        write_u32(&mut elf, 20, 1);
+        write_u64(&mut elf, 24, GUEST_BASE);
+        write_u64(&mut elf, 32, 64); // program-header offset
+        write_u16(&mut elf, 52, 64);
+        write_u16(&mut elf, 54, 56);
+        write_u16(&mut elf, 56, 1);
+        write_u32(&mut elf, 64, 1); // PT_LOAD
+        write_u32(&mut elf, 68, 5); // PF_R | PF_X
+        write_u64(&mut elf, 72, CODE_OFFSET as u64);
+        write_u64(&mut elf, 80, GUEST_BASE);
+        write_u64(&mut elf, 88, GUEST_BASE);
+        write_u64(&mut elf, 96, code_len as u64); // p_filesz
+        write_u64(&mut elf, 104, 0x4100); // p_memsz: BSS past the file page
+        write_u64(&mut elf, 112, 0x1_0000);
+        for (index, word) in words.iter().copied().enumerate() {
+            write_u32(&mut elf, CODE_OFFSET + index * 4, word);
+        }
+        // Sentinel FILE bytes past p_filesz: present on disk, must never be
+        // guest-visible (Linux padzero zeroes the tail of the last file page).
+        for byte in &mut elf[CODE_OFFSET + code_len..] {
+            *byte = 0xAA;
+        }
+        elf
+    }
+
+    struct FileBackedFixture {
+        image: AddressSpace,
+        plan: ExecutionPlan,
+        elf_file: tempfile::NamedTempFile,
+    }
+
+    fn native_file_backed_fixture() -> FileBackedFixture {
+        dsr::install_test_host_jit();
+        let plan = native16k_test_plan();
+        let words = [0xd65f_03c0]; // ret
+        let elf_bytes = file_backed_fixture_elf(&words);
+        let mut elf_file = tempfile::NamedTempFile::new().expect("create file-backed fixture");
+        std::io::Write::write_all(&mut elf_file, &elf_bytes).expect("write file-backed fixture");
+        let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
+            &elf_bytes,
+            &|_| None,
+            NATIVE_DARWIN_PIE_BASE,
+            plan.page_geometry.host_page_size,
+        )
+        .expect("load file-backed fixture")
+        .with_vdso_auxv(true);
+        let image = with_native_vdso(image)
+            .expect("add file-backed native vDSO")
+            .with_linux_initial_stack_page_size(
+                [b"file-backed-mapping".as_slice()],
+                [b"MODE=parity".as_slice()],
+                plan.page_geometry.linux_page_size,
+            )
+            .expect("add file-backed mapping stack");
+        FileBackedFixture {
+            image,
+            plan,
+            elf_file,
+        }
+    }
+
+    /// prepare + resume-validate the fixture THROUGH the executable-file
+    /// windows, asserting the windows actually engaged (a vacuously
+    /// artifact-backed pass would prove nothing).
+    fn validated_file_backed_fixture(
+        fixture: &FileBackedFixture,
+    ) -> crate::native_prepared_image::ValidatedPreparedImage {
+        let elf_bytes = std::fs::read(fixture.elf_file.path()).expect("read fixture elf");
+        let host_file = std::fs::File::open(fixture.elf_file.path()).expect("open fixture elf");
+        let file_len = host_file.metadata().expect("fixture metadata").len();
+        let windows = native_exec_file_windows(
+            &fixture.image,
+            &elf_bytes,
+            NATIVE_DARWIN_PIE_BASE,
+            fixture.plan.page_geometry.host_page_size,
+            file_len,
+        );
+        assert_eq!(
+            windows.iter().flatten().count(),
+            1,
+            "the fixture's PT_LOAD must qualify for a file window: {windows:?}"
+        );
+        let backing = crate::native_prepared_image::PreparedExecutableBacking {
+            file: host_file,
+            windows,
+        };
+        let artifact = match crate::native_prepared_image::prepare(
+            &fixture.image,
+            &[],
+            fixture.plan.page_geometry.host_page_size,
+            Some(backing),
+        )
+        .expect("prepare file-backed artifact")
+        {
+            crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => *artifact,
+            crate::native_prepared_image::PreparedImageDisposition::Ineligible(reason) => {
+                panic!("file-backed fixture is ineligible: {reason:?}")
+            }
+        };
+        assert!(artifact.executable_file.is_some());
+        let validated = crate::native_prepared_image::validate_artifact_for_test(artifact)
+            .expect("validate file-backed artifact");
+        assert!(
+            validated.backings.iter().any(|backing| matches!(
+                backing,
+                crate::native_prepared_image::PreparedRegionBackingResolved::ExecutableFile { .. }
+            )),
+            "validated image lost its executable-file backing"
+        );
+        validated
+    }
+
+    #[test]
+    fn native_file_backed_mapping_matches_anonymous_bytes() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let fixture = native_file_backed_fixture();
+
+            // Reference: the byte-materializing anonymous mapping.
+            let legacy = NativeMappedMemory::map_for_plan(
+                &fixture.image,
+                native_memory_layout(),
+                fixture.plan.page_geometry.host_page_size,
+                fixture.plan.page_geometry.linux_page_size,
+                fixture.plan.page_geometry,
+                &[],
+            )
+            .expect("map anonymous file-backed fixture");
+            let legacy_bytes = native_mapping_region_bytes(&legacy, &fixture.image);
+            let legacy_protections = legacy.protections.snapshot_all();
+            retire_native_test_mapping(&legacy);
+            drop(legacy);
+
+            let validated = validated_file_backed_fixture(&fixture);
+            let prepared = NativeMappedMemory::map_prepared_for_plan(
+                &validated,
+                native_memory_layout(),
+                fixture.plan.page_geometry,
+            )
+            .expect("map file-backed fixture");
+
+            // Byte-for-byte equality proves the whole window contract at
+            // once: the zero lead before p_vaddr, the file payload, the
+            // padzero tail over the on-disk 0xAA sentinels, and the
+            // anonymous BSS page past the window.
+            assert_eq!(
+                native_mapping_region_bytes(&prepared, &validated.image),
+                legacy_bytes
+            );
+            assert_eq!(prepared.protections.snapshot_all(), legacy_protections);
+
+            // The guest-visible padzero contract, spelled out: the file holds
+            // 0xAA sentinels past p_filesz, the guest must read zero there.
+            let code_end = 0x40_0000_u64 + 4; // one `ret` word
+            let tail = prepared
+                .read_bytes(code_end, 0x40)
+                .expect("read padzero tail");
+            assert!(
+                tail.iter().all(|byte| *byte == 0),
+                "file sentinel bytes leaked past p_filesz: {tail:?}"
+            );
+            // And the BSS page past the file window is zero as well.
+            let bss = prepared
+                .read_bytes(0x40_4000, 0x100)
+                .expect("read BSS past the file window");
+            assert!(bss.iter().all(|byte| *byte == 0));
+
+            // Mapping survives closing both fds (MAP_PRIVATE keeps the vnode).
+            drop(validated);
+            assert_eq!(
+                prepared
+                    .read_bytes(0x40_0000, 4)
+                    .expect("mapping survives fd close"),
+                0xd65f_03c0_u32.to_le_bytes()
+            );
+            set_native_test_vvar_words(None);
+        });
+    }
+
+    #[test]
+    fn native_file_backed_mapping_is_cow_isolated_across_repeat_execs() {
+        fork_test(|| {
+            set_native_test_vvar_words(Some(Vec::new()));
+            let fixture = native_file_backed_fixture();
+            let original_elf = std::fs::read(fixture.elf_file.path()).expect("read fixture elf");
+
+            // Exec #1: map file-backed, then dirty the mapped text through
+            // the host alias (a guest self-write would do the same).
+            let validated = validated_file_backed_fixture(&fixture);
+            let prepared = NativeMappedMemory::map_prepared_for_plan(
+                &validated,
+                native_memory_layout(),
+                fixture.plan.page_geometry,
+            )
+            .expect("map file-backed fixture (exec #1)");
+            let host = prepared
+                .host_address(carrick_guest_mem::GuestVa(0x40_0000))
+                .expect("host address of mapped text");
+            unsafe {
+                let text = host.raw() as *mut u8;
+                // The region was finalized R-X; make it writable the way the
+                // guest's own mprotect(PROT_WRITE) would before poking it.
+                assert_eq!(
+                    libc::mprotect(text.cast(), 0x4000, libc::PROT_READ | libc::PROT_WRITE),
+                    0
+                );
+                std::ptr::write_bytes(text, 0x5A, 64);
+            }
+
+            // CoW isolation: the guest write never reaches the file.
+            assert_eq!(
+                std::fs::read(fixture.elf_file.path()).expect("re-read fixture elf"),
+                original_elf,
+                "a MAP_PRIVATE guest write leaked into the executable file"
+            );
+
+            retire_native_test_mapping(&prepared);
+            drop(prepared);
+            drop(validated);
+
+            // Exec #2 of the SAME image: a fresh prepare/validate/map must
+            // see pristine file bytes, not exec #1's dirtied pages.
+            let validated = validated_file_backed_fixture(&fixture);
+            let prepared = NativeMappedMemory::map_prepared_for_plan(
+                &validated,
+                native_memory_layout(),
+                fixture.plan.page_geometry,
+            )
+            .expect("map file-backed fixture (exec #2)");
+            assert_eq!(
+                prepared
+                    .read_bytes(0x40_0000, 4)
+                    .expect("read exec #2 text"),
+                0xd65f_03c0_u32.to_le_bytes(),
+                "exec #2 saw exec #1's private write"
+            );
+            set_native_test_vvar_words(None);
+        });
+    }
+
     fn assert_prepared_mapping_failure_cleans_up(
         failpoint: NativePreparedMappingFailpoint,
         expected: &str,
@@ -15025,6 +15423,7 @@ mod tests {
             Vec::new(),
             plan,
             ExecDigestPolicy::Required,
+            ExecFileBackingPolicy::Skip,
         )
         .expect("load native resume fixture")
     }
@@ -15035,7 +15434,7 @@ mod tests {
         host_page_size: u64,
     ) -> crate::native_prepared_image::NativePreparedImageV1 {
         let artifact =
-            match crate::native_prepared_image::prepare(image, relocations, host_page_size)
+            match crate::native_prepared_image::prepare(image, relocations, host_page_size, None)
                 .expect("prepare resume artifact")
             {
                 crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => {
@@ -15045,7 +15444,7 @@ mod tests {
                     panic!("resume fixture is ineligible: {reason:?}")
                 }
             };
-        crate::native_prepared_image::resume_record_for_test(artifact)
+        crate::native_prepared_image::resume_record_for_test(*artifact)
             .expect("create inherited resume record")
     }
 
@@ -15173,10 +15572,11 @@ mod tests {
             &image,
             &relocations,
             plan.page_geometry.host_page_size,
+            None,
         )
         .expect("prepare corruption artifact")
         {
-            crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => artifact,
+            crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => *artifact,
             crate::native_prepared_image::PreparedImageDisposition::Ineligible(reason) => {
                 panic!("corruption fixture is ineligible: {reason:?}")
             }
