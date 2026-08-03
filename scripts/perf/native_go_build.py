@@ -14,6 +14,8 @@ import platform
 import resource
 import re
 import secrets
+import shutil
+import stat
 import statistics
 import subprocess
 import sys
@@ -58,6 +60,7 @@ PERFORMANCE_CONTROL_KEYS = (
     "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH",
     "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS",
     "CARRICK_DSR_STORE_DIR",
+    "CARRICK_DSR_STORE_AUGMENTATION",
     "CARRICK_ARTIFACT",
     "CARRICK_DISABLE_VDSO",
     "CARRICK_VDSO_MODE",
@@ -318,6 +321,361 @@ def sha256_file(path: pathlib.Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+SPARSE_STORE_TREE_SCHEMA = "carrick.sparse-store-tree.v1"
+SPARSE_STORE_RESTORE_SCHEMA = "carrick.sparse-store-restore.v1"
+SPARSE_STORE_VALIDATOR_SCHEMA = "carrick.native-manifest-census.v4"
+SPARSE_STORE_UNIT_NAME = re.compile(r"^[0-9a-f]{64}\.unit-v1$")
+
+
+def _immutable_executable_receipt(path: pathlib.Path) -> dict[str, object]:
+    if path.is_symlink():
+        raise ValueError(f"sparse-store validator must not be a symlink: {path}")
+    resolved = path.resolve(strict=True)
+    metadata = resolved.stat()
+    mode = stat.S_IMODE(metadata.st_mode)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"sparse-store validator is not regular: {resolved}")
+    if metadata.st_nlink != 1:
+        raise ValueError(f"sparse-store validator link count is not one: {resolved}")
+    if mode & 0o022:
+        raise ValueError(f"sparse-store validator is group/other writable: {resolved}")
+    if mode & 0o111 == 0:
+        raise ValueError(f"sparse-store validator is not executable: {resolved}")
+    first = sha256_file(resolved)
+    after = resolved.stat()
+    second = sha256_file(resolved)
+    if (
+        (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or first != second
+    ):
+        raise ValueError(f"sparse-store validator changed while hashing: {resolved}")
+    return {
+        "path": str(resolved),
+        "mode": mode,
+        "size": metadata.st_size,
+        "sha256": first,
+    }
+
+
+def _sparse_store_entries(
+    root: pathlib.Path,
+    *,
+    require_read_only: bool,
+) -> list[dict[str, object]]:
+    if root.is_symlink():
+        raise ValueError(f"sparse store root must not be a symlink: {root}")
+    resolved = root.resolve(strict=True)
+    root_metadata = resolved.stat()
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError(f"sparse store root is not a directory: {resolved}")
+    if stat.S_IMODE(root_metadata.st_mode) & 0o022:
+        raise ValueError(f"sparse store root is group/other writable: {resolved}")
+    entries: list[dict[str, object]] = []
+    with os.scandir(resolved) as iterator:
+        directory_entries = sorted(iterator, key=lambda entry: entry.name)
+    for entry in directory_entries:
+        relative = pathlib.PurePosixPath(entry.name)
+        if (
+            relative.is_absolute()
+            or len(relative.parts) != 1
+            or relative.name in {"", ".", ".."}
+        ):
+            raise ValueError(f"sparse store entry has path traversal: {entry.name!r}")
+        if entry.is_symlink():
+            raise ValueError(f"sparse store entry is a symlink: {entry.name}")
+        metadata = entry.stat(follow_symlinks=False)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"sparse store entry is not regular: {entry.name}")
+        if metadata.st_nlink != 1:
+            raise ValueError(f"sparse store entry link count is not one: {entry.name}")
+        if mode & 0o022:
+            raise ValueError(
+                f"sparse store entry is group/other writable: {entry.name}"
+            )
+        if require_read_only and mode & 0o222:
+            raise ValueError(f"sparse store seed entry is not read-only: {entry.name}")
+        if SPARSE_STORE_UNIT_NAME.fullmatch(entry.name) is None:
+            raise ValueError(f"sparse store entry has unexpected unit name: {entry.name}")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(entry.path, flags)
+        try:
+            before = os.fstat(descriptor)
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_before != identity_after or size != before.st_size:
+            raise ValueError(f"sparse store entry changed while hashing: {entry.name}")
+        entries.append(
+            {
+                "path": entry.name,
+                "type": "regular",
+                "mode": mode,
+                "size": size,
+                "sha256": digest.hexdigest(),
+            }
+        )
+    if not entries:
+        raise ValueError("sparse store must contain at least one .unit-v1 file")
+    return entries
+
+
+def _sparse_store_tree_hash(entries: list[dict[str, object]]) -> str:
+    encoded = json.dumps(
+        entries,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _run_sparse_store_validator(
+    root: pathlib.Path,
+    entries: list[dict[str, object]],
+    validator: pathlib.Path,
+) -> None:
+    result = subprocess.run(
+        [str(validator), str(root)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(
+            "production sparse-store validation failed: "
+            + (result.stderr.strip() or result.stdout.strip())
+        )
+    records: list[dict[str, object]] = []
+    for line in result.stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError("production sparse-store validator emitted invalid JSON") from error
+        if not isinstance(record, dict):
+            raise ValueError("production sparse-store validator record is not an object")
+        records.append(record)
+    expected_paths = {
+        str((root / str(entry["path"])).resolve()) for entry in entries
+    }
+    observed_paths = {
+        str(pathlib.Path(str(record.get("path"))).resolve())
+        for record in records
+        if record.get("schema") == SPARSE_STORE_VALIDATOR_SCHEMA
+        and isinstance(record.get("path"), str)
+    }
+    if len(records) != len(entries) or observed_paths != expected_paths:
+        raise ValueError(
+            "production sparse-store validation did not cover every exact unit"
+        )
+
+
+def validate_sparse_store_tree(
+    root: pathlib.Path,
+    *,
+    validator: pathlib.Path,
+    require_read_only: bool = False,
+) -> dict[str, object]:
+    """Hash and production-decode one stable, flat unit-v1 store tree."""
+    resolved = root.resolve(strict=True)
+    validator_receipt = _immutable_executable_receipt(validator)
+    first = _sparse_store_entries(
+        resolved,
+        require_read_only=require_read_only,
+    )
+    _run_sparse_store_validator(
+        resolved,
+        first,
+        pathlib.Path(str(validator_receipt["path"])),
+    )
+    second = _sparse_store_entries(
+        resolved,
+        require_read_only=require_read_only,
+    )
+    if first != second:
+        raise ValueError("sparse store changed across its validation double hash")
+    if _immutable_executable_receipt(validator) != validator_receipt:
+        raise ValueError("sparse-store validator changed during validation")
+    return {
+        "schema": SPARSE_STORE_TREE_SCHEMA,
+        "root": str(resolved),
+        "tree_sha256": _sparse_store_tree_hash(first),
+        "entries": first,
+        "validator": validator_receipt,
+    }
+
+
+def _require_campaign_descendant(
+    path: pathlib.Path,
+    campaign_root: pathlib.Path,
+    description: str,
+) -> pathlib.Path:
+    resolved_root = campaign_root.resolve(strict=True)
+    resolved = path.resolve(strict=False)
+    try:
+        relative = resolved.relative_to(resolved_root)
+    except ValueError as error:
+        raise ValueError(f"{description} must be under campaign root") from error
+    if not relative.parts:
+        raise ValueError(f"{description} cannot be the campaign root")
+    return resolved
+
+
+def _remove_owned_directory(path: pathlib.Path, identity: tuple[int, int]) -> None:
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != identity:
+        raise RuntimeError(f"refusing to remove drifted campaign directory: {path}")
+    shutil.rmtree(path)
+
+
+def _fsync_directory(path: pathlib.Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def restore_sparse_store_seed(
+    seed: pathlib.Path,
+    active: pathlib.Path,
+    *,
+    campaign_root: pathlib.Path,
+    validator: pathlib.Path,
+) -> dict[str, object]:
+    """Atomically restore an immutable seed at one stable active-store path."""
+    resolved_root = campaign_root.resolve(strict=True)
+    resolved_seed = _require_campaign_descendant(seed, resolved_root, "store seed")
+    resolved_active = _require_campaign_descendant(active, resolved_root, "active store")
+    if resolved_seed == resolved_active:
+        raise ValueError("store seed and active store must be distinct paths")
+    seed_receipt = validate_sparse_store_tree(
+        resolved_seed,
+        validator=validator,
+        require_read_only=True,
+    )
+    active_parent = resolved_active.parent
+    active_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _require_campaign_descendant(active_parent, resolved_root, "active store parent")
+    if active_parent.is_symlink() or not active_parent.is_dir():
+        raise ValueError("active store parent must be a real directory")
+    token = f"{os.getpid()}.{secrets.token_hex(16)}"
+    staging = active_parent / f".{resolved_active.name}.{token}.staging"
+    quarantine = active_parent / f".{resolved_active.name}.{token}.quarantine"
+    staging.mkdir(mode=0o700)
+    staging_identity = (staging.stat().st_dev, staging.stat().st_ino)
+    quarantined_identity: tuple[int, int] | None = None
+    try:
+        for entry in seed_receipt["entries"]:
+            assert isinstance(entry, dict)
+            name = str(entry["path"])
+            source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            source_flags |= getattr(os, "O_NOFOLLOW", 0)
+            source_fd = os.open(resolved_seed / name, source_flags)
+            destination_fd = os.open(
+                staging / name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                int(entry["mode"]),
+            )
+            digest = hashlib.sha256()
+            copied = 0
+            try:
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(destination_fd, view)
+                        view = view[written:]
+                    digest.update(chunk)
+                    copied += len(chunk)
+                os.fchmod(destination_fd, int(entry["mode"]))
+                os.fsync(destination_fd)
+            finally:
+                os.close(destination_fd)
+                os.close(source_fd)
+            if copied != entry["size"] or digest.hexdigest() != entry["sha256"]:
+                raise ValueError(f"sparse store seed changed while copying: {name}")
+        directory = os.open(staging, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        if os.path.lexists(resolved_active):
+            metadata = resolved_active.lstat()
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError("active store replacement target is not a directory")
+            quarantined_identity = (metadata.st_dev, metadata.st_ino)
+            os.replace(resolved_active, quarantine)
+        try:
+            os.replace(staging, resolved_active)
+        except Exception:
+            if quarantined_identity is not None and not os.path.lexists(resolved_active):
+                os.replace(quarantine, resolved_active)
+                quarantined_identity = None
+                _fsync_directory(active_parent)
+            raise
+        _fsync_directory(active_parent)
+        active_receipt = validate_sparse_store_tree(
+            resolved_active,
+            validator=validator,
+            require_read_only=True,
+        )
+        seed_after = validate_sparse_store_tree(
+            resolved_seed,
+            validator=validator,
+            require_read_only=True,
+        )
+        if (
+            seed_receipt["tree_sha256"] != seed_after["tree_sha256"]
+            or seed_receipt["entries"] != seed_after["entries"]
+            or seed_receipt["tree_sha256"] != active_receipt["tree_sha256"]
+            or seed_receipt["entries"] != active_receipt["entries"]
+        ):
+            raise ValueError("restored active store does not exactly match immutable seed")
+        if quarantined_identity is not None:
+            _remove_owned_directory(quarantine, quarantined_identity)
+            quarantined_identity = None
+            _fsync_directory(active_parent)
+        return {
+            "schema": SPARSE_STORE_RESTORE_SCHEMA,
+            "seed": seed_receipt,
+            "active": active_receipt,
+            "validator": seed_receipt["validator"],
+            "restored_at_unix_ns": time.time_ns(),
+        }
+    finally:
+        if staging.exists():
+            _remove_owned_directory(staging, staging_identity)
 
 
 def git_output(repo: pathlib.Path, *args: str) -> str:

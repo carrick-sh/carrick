@@ -84,6 +84,7 @@ DEFAULT_ON_ZERO_OPT_OUT_KEYS = frozenset(
         "CARRICK_DSR_SHARED_DYLIB_KEYED_IDENTITY",
         "CARRICK_DSR_SHARED_RECOVERY_LAZY",
         "CARRICK_DSR_SHARED_RECOVERY_RUNS",
+        "CARRICK_DSR_STORE_AUGMENTATION",
     )
 )
 DEFAULT_OFF_ONE_OPT_IN_KEYS = frozenset(
@@ -463,18 +464,16 @@ def _checked_command(command: list[str], description: str) -> subprocess.Complet
     return result
 
 
-def _darwin_power_preflight(*, allow_battery: bool = False) -> dict[str, object]:
-    if type(allow_battery) is not bool:
-        raise ValueError("allow_battery must be a bool")
+def _darwin_power_preflight() -> dict[str, object]:
     battery = _checked_command(["pmset", "-g", "batt"], "pmset battery preflight")
     battery_lines = [line.strip() for line in battery.stdout.splitlines() if line.strip()]
     on_ac = any("Now drawing from 'AC Power'" in line for line in battery_lines)
     on_battery = any(
         "Now drawing from 'Battery Power'" in line for line in battery_lines
     )
-    if not on_ac and not (allow_battery and on_battery):
+    if not on_ac and not on_battery:
         raise RuntimeError(
-            "native performance campaign requires AC Power: "
+            "native performance campaign could not identify the power source: "
             + battery.stdout.strip()
         )
 
@@ -522,8 +521,6 @@ def _darwin_power_preflight(*, allow_battery: bool = False) -> dict[str, object]
         )
     return {
         "power_source": "AC Power" if on_ac else "Battery Power",
-        "battery_allowed": allow_battery,
-        "battery_authorized": allow_battery and on_battery,
         "battery_output": battery.stdout,
         "thermal_output": thermal.stdout,
         "thermal_contract": (
@@ -646,7 +643,6 @@ def _campaign_preflight(
     *,
     image_ref: str,
     known_receipt_binaries: tuple[pathlib.Path, ...],
-    allow_battery: bool = False,
 ) -> dict[str, object]:
     verified_control = load_and_verify_arm(control.receipt.path)
     verified_candidate = load_and_verify_arm(candidate.receipt.path)
@@ -686,7 +682,7 @@ def _campaign_preflight(
     )
 
     native_go_build.reject_ambient_carrick(os.environ, {})
-    power = _darwin_power_preflight(allow_battery=allow_battery)
+    power = _darwin_power_preflight()
     busy_reasons = native_go_build.busy_host_reasons()
     if busy_reasons:
         raise RuntimeError(
@@ -888,6 +884,7 @@ def _campaign_decision(
 ) -> dict[str, object]:
     metrics = statistics_payload["metrics"]
     primary = metrics["cpu_s"]
+    wall = metrics["workload_ms"]
     secondary = [
         metric
         for name, metric in metrics.items()
@@ -897,10 +894,13 @@ def _campaign_decision(
         "complete_with_eight_quads": (
             complete and statistics_payload["quad_count"] >= 8
         ),
-        "total_cpu_median_below_one": primary["median_quad_ratio"] < 1.0,
-        "total_cpu_one_sided_upper_below_one": (
-            primary["bootstrap"]["one_sided_upper"] < 1.0
+        "total_cpu_median_at_most_point_90": (
+            primary["median_quad_ratio"] <= 0.90
         ),
+        "total_cpu_two_sided_interval_below_one": (
+            primary["bootstrap"]["two_sided_upper"] < 1.0
+        ),
+        "workload_wall_median_below_one": wall["median_quad_ratio"] < 1.0,
         "total_cpu_sign_probability_below_0_05": _exact_probability_below(
             primary["sign_test"]["probability"],
             numerator=1,
@@ -945,17 +945,45 @@ def _exact_probability_below(
     return actual_numerator * denominator < numerator * actual_denominator
 
 
+def bind_active_store(
+    control: ArmSpec,
+    candidate: ArmSpec,
+    active_store_dir: pathlib.Path,
+) -> tuple[ArmSpec, ArmSpec]:
+    """Inject one exact active-store path into both immutable arm overlays."""
+    active = str(active_store_dir.resolve())
+
+    def bind(arm: ArmSpec) -> ArmSpec:
+        environment = _validated_environment(arm)
+        recorded = environment["CARRICK_DSR_STORE_DIR"]
+        if recorded is not None and pathlib.Path(recorded).resolve() != pathlib.Path(active):
+            raise ValueError(
+                f"{arm.label} overlay store path conflicts with active-store receipt"
+            )
+        environment["CARRICK_DSR_STORE_DIR"] = active
+        return dataclasses.replace(
+            arm,
+            environment=tuple(
+                (key, environment[key])
+                for key in native_go_build.PERFORMANCE_CONTROL_KEYS
+            ),
+        )
+
+    return bind(control), bind(candidate)
+
+
 def run_campaign(
     harness_repo: pathlib.Path,
     control: ArmSpec,
     candidate: ArmSpec,
     output: pathlib.Path,
     *,
+    store_seed_dir: pathlib.Path,
+    active_store_dir: pathlib.Path,
     quads: int = 8,
     cooldown_seconds: float = 2.0,
     timeout_seconds: int = 900,
     image_ref: str = native_go_build.DEFAULT_IMAGE,
-    allow_battery: bool = False,
 ) -> dict[str, object]:
     if type(quads) is not int or quads < 8:
         raise ValueError("official campaigns require at least eight quads")
@@ -974,8 +1002,22 @@ def run_campaign(
         raise ValueError("cooldown_seconds must be finite and nonnegative")
     if type(image_ref) is not str or not image_ref:
         raise ValueError("image_ref must be nonempty")
-    if type(allow_battery) is not bool:
-        raise ValueError("allow_battery must be a bool")
+    campaign_store_root = (
+        harness_repo / "target/perf/native-store-augmentation"
+    ).resolve()
+    store_validator = (
+        harness_repo / "target/release/examples/native_manifest_census"
+    ).resolve()
+    if not campaign_store_root.is_dir():
+        raise ValueError(
+            "native-store campaign root must already exist: "
+            f"{campaign_store_root}"
+        )
+    control, candidate = bind_active_store(
+        control,
+        candidate,
+        active_store_dir,
+    )
     mode = validate_arm_mode(control, candidate)
     null_control_control = (
         control.receipt.path.resolve() == candidate.receipt.path.resolve()
@@ -1010,7 +1052,12 @@ def run_campaign(
             "cooldown_seconds": float(cooldown_seconds),
             "timeout_seconds": timeout_seconds,
             "image_ref": image_ref,
-            "allow_battery": allow_battery,
+            "sparse_store": {
+                "seed_dir": str(store_seed_dir.resolve()),
+                "active_store_dir": str(active_store_dir.resolve()),
+                "validator": str(store_validator.resolve()),
+                "seed": None,
+            },
             "executed_image_ref": None,
             "registry_transport": None,
             "schedule": "excluded-a-b-then-a1-b1-b2-a2-v1",
@@ -1050,7 +1097,6 @@ def run_campaign(
             candidate,
             image_ref=image_ref,
             known_receipt_binaries=known_receipt_binaries,
-            allow_battery=allow_battery,
         )
         artifact["preflights"].append(initial_preflight)
         executed_image_ref = str(initial_preflight["executed_image_ref"])
@@ -1062,6 +1108,12 @@ def run_campaign(
                 "registry transport drifted from campaign image identity"
             )
         artifact["identity"]["executed_image_ref"] = executed_image_ref
+        initial_store = native_go_build.validate_sparse_store_tree(
+            store_seed_dir,
+            validator=store_validator,
+            require_read_only=True,
+        )
+        artifact["identity"]["sparse_store"]["seed"] = initial_store
         native_go_build.write_json_atomic(output, artifact)
         for sample_index, position in enumerate(positions, start=1):
             if position["position"] == "a1":
@@ -1070,7 +1122,6 @@ def run_campaign(
                     candidate,
                     image_ref=image_ref,
                     known_receipt_binaries=known_receipt_binaries,
-                    allow_battery=allow_battery,
                 )
                 if (
                     quad_preflight["executed_image_ref"]
@@ -1089,6 +1140,21 @@ def run_campaign(
                 artifact["preflights"].append(quad_preflight)
                 native_go_build.write_json_atomic(output, artifact)
             arm = control if position["arm"] == "A" else candidate
+            restore_receipt = native_go_build.restore_sparse_store_seed(
+                store_seed_dir,
+                active_store_dir,
+                campaign_root=campaign_store_root,
+                validator=store_validator,
+            )
+            if (
+                restore_receipt["seed"]["tree_sha256"]
+                != initial_store["tree_sha256"]
+                or restore_receipt["seed"]["entries"]
+                != initial_store["entries"]
+                or restore_receipt["active"]["tree_sha256"]
+                != initial_store["tree_sha256"]
+            ):
+                raise RuntimeError("sparse-store seed or restore receipt drifted")
             sample_run_id = (
                 f"native-go-build-abba-{campaign_id}-{position['phase']}"
             )
@@ -1111,6 +1177,7 @@ def run_campaign(
                     _annotated_sample(error.sample, position),
                 ) from error
             annotated = _annotated_sample(sample, position)
+            annotated["sparse_store_restore"] = restore_receipt
             try:
                 _validate_sample_evidence(
                     annotated,
@@ -2217,14 +2284,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     run.add_argument("--cooldown-seconds", type=float, default=2.0)
     run.add_argument("--timeout-seconds", type=int, default=900)
     run.add_argument("--image", default=native_go_build.DEFAULT_IMAGE)
-    run.add_argument(
-        "--allow-battery",
-        action="store_true",
-        help=(
-            "accept an explicitly authorized Battery Power source while "
-            "retaining thermal/load gates and power evidence"
-        ),
-    )
+    run.add_argument("--store-seed-dir", required=True, type=pathlib.Path)
+    run.add_argument("--active-store-dir", required=True, type=pathlib.Path)
     run.add_argument("--output", required=True, type=pathlib.Path)
     publish = subcommands.add_parser(
         "publish",
@@ -2270,7 +2331,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cooldown_seconds=args.cooldown_seconds,
                 timeout_seconds=args.timeout_seconds,
                 image_ref=args.image,
-                allow_battery=args.allow_battery,
+                store_seed_dir=args.store_seed_dir,
+                active_store_dir=args.active_store_dir,
             )
         except CampaignEvidenceError as error:
             print(

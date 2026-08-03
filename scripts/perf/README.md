@@ -30,11 +30,36 @@ image, host, environment, and idle-state preflight before every execution. An
 official run excludes one warm-up per arm and measures at least eight
 A1/B1/B2/A2 quads; its primary metric is total child CPU from
 `RUSAGE_CHILDREN`, which is a floor rather than a wall-time or throughput
-claim. AC power is required by default. When the operator explicitly authorizes
-battery operation, `run --allow-battery` records both that authorization and
-the real `pmset` power output while retaining every thermal, load, compiler,
-foreign-workload, and Docker-oracle rejection. The approved loopback registry
-is plain HTTP `localhost:5005`, forwarded
+claim. The real `pmset` power source is retained as metadata; AC versus battery
+does not accept or reject a campaign. Thermal, load, compiler,
+foreign-workload, and Docker-oracle gates remain exclusions.
+
+Sparse-store augmentation campaigns additionally require an immutable seed, a
+stable active-store path, and the production Rust `unit-v1` reader:
+
+```sh
+cargo build --release -p carrick-native-darwin \
+  --example native_manifest_census
+python3 scripts/perf/native_go_build_abba.py run \
+  --store-seed-dir target/perf/native-store-augmentation/mechanism/seed \
+  --active-store-dir target/perf/native-store-augmentation/abba/active-store \
+  --control-overlay scripts/perf/overlays/native-store-augment-control.json \
+  --candidate-overlay scripts/perf/overlays/native-store-augment-candidate.json \
+  ...
+```
+
+The seed is never a Carrick store directly. Before both excluded warmups and
+every A1/B1/B2/A2 sample, the harness production-decodes and double-hashes the
+read-only seed, atomically restores it at the same active pathname for both
+arms, and binds the seed and restored hashes into the campaign receipt. Thus a
+candidate's merged units cannot leak into a later control or candidate sample.
+
+For a mechanism capture, pass the same active store explicitly to
+`native_go_dtrace_target.py` with `--variant shared --store-dir <path>` and
+`--store-augmentation on|off`. The store tree and exact hatch value are bound
+in `TARGET_PROVENANCE` before Carrick launches.
+
+The approved loopback registry is plain HTTP `localhost:5005`, forwarded
 only through the evidence-visible
 `CARRICK_INSECURE_REGISTRIES=localhost:5005` contract; an ambient host setting
 fails preflight. The accepted M1 control/control receipt is
