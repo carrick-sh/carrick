@@ -413,63 +413,246 @@ fn instruction_regs(insn: &bad64::Instruction) -> Vec<u32> {
 /// Rewrite `word` so every x18 operand names `scratch` instead, or `None` if
 /// that cannot be proved safe.
 ///
-/// The substitution itself is a blind bit edit of the four standard register
-/// fields — Rd/Rt (4:0), Rn (9:5), Rt2 (14:10), Rm (20:16). Those positions
-/// hold immediates in some encodings, so a blind edit can silently corrupt
-/// one. The edit is therefore VERIFIED by decoding the result and requiring,
-/// operand by operand: the same opcode, the same operand shapes, every
-/// register equal to the original with x18 mapped to `scratch`, and every
-/// NON-register operand byte-identical. A textual comparison would be simpler
-/// and wrong — `add x5, x18, #0x18` contains the register's spelling inside an
-/// immediate.
+/// The candidate edits are bit edits of the four standard register fields —
+/// Rd/Rt (4:0), Rn (9:5), Rt2 (14:10), Rm (20:16). A position reading 18 is
+/// not necessarily a register: those bits hold immediates, extend options or
+/// fixed patterns in some encodings (libc's `ldrb w18, [x3, w4, sxtw]` has
+/// 18 in bits 14:10 as its extend/S bits), so every SUBSET of the matching
+/// positions is tried and each candidate is VERIFIED by decoding: the same
+/// opcode, the same operand shapes, every register equal to the original
+/// with x18 mapped to `scratch`, and every NON-register operand
+/// byte-identical. Under-rewriting leaves an x18 the verifier demands become
+/// `scratch`; over-rewriting corrupts a non-register field and changes the
+/// decode — either way the candidate dies, so an accepted one is proven. A
+/// textual comparison would be simpler and wrong — `add x5, x18, #0x18`
+/// contains the register's spelling inside an immediate.
 ///
 /// Returning `None` costs the image a tier-T fallback, which is the right way
 /// to be wrong.
 fn substitute_x18(word: u32, scratch: u32) -> Option<u32> {
     let original = bad64::decode(word, 0).ok()?;
-    let mut rewritten_word = word;
-    for shift in [0_u32, 5, 10, 16] {
-        if (word >> shift) & 0x1f == 18 {
-            rewritten_word = (rewritten_word & !(0x1f << shift)) | (scratch << shift);
+    let positions: Vec<u32> = [0_u32, 5, 10, 16]
+        .into_iter()
+        .filter(|shift| (word >> shift) & 0x1f == 18)
+        .collect();
+    if positions.is_empty() {
+        return None; // x18 is not in any standard field
+    }
+    // Try the full set first: for most encodings every matching position IS
+    // the register use (`add x18, x18, #1` must move both).
+    for subset in (1_u32..(1 << positions.len())).rev() {
+        let mut rewritten_word = word;
+        for (bit, shift) in positions.iter().enumerate() {
+            if subset & (1 << bit) != 0 {
+                rewritten_word = (rewritten_word & !(0x1f << shift)) | (scratch << shift);
+            }
+        }
+        if substitution_verifies(&original, rewritten_word, scratch) {
+            return Some(rewritten_word);
         }
     }
-    if rewritten_word == word {
-        return None; // nothing substituted: x18 was not in a standard field
-    }
-    let rewritten = bad64::decode(rewritten_word, 0).ok()?;
+    None
+}
+
+/// Does `rewritten_word` decode to exactly `original` with x18 mapped to
+/// `scratch`? See [`substitute_x18`] for why this is the acceptance test.
+fn substitution_verifies(original: &bad64::Instruction, rewritten_word: u32, scratch: u32) -> bool {
+    let Ok(rewritten) = bad64::decode(rewritten_word, 0) else {
+        return false;
+    };
     if original.op() != rewritten.op() {
-        return None;
+        return false;
     }
     let (before, after) = (original.operands(), rewritten.operands());
-    if before.len() != after.len() {
-        return None;
+    before.len() == after.len()
+        && before
+            .iter()
+            .zip(after.iter())
+            .all(|(a, b)| operands_match_with_substitution(a, b, scratch))
+}
+
+/// Operand equality with x18 mapped to `scratch`: registers compare through
+/// the mapping, and EVERY non-register attribute — shift kind and amount,
+/// extend qualifier, immediates, labels, arrangement — must be identical.
+/// Register bit positions overlap option/extend bits in some encodings, so
+/// a regs-only comparison accepts corrupted addressing modes: `add x20, x0,
+/// w18, uxtw #2` rewritten wholesale became `..., uxtb #1` and "verified",
+/// which walked libc's hash chain at half stride and made `_res` vanish.
+fn operands_match_with_substitution(a: &bad64::Operand, b: &bad64::Operand, scratch: u32) -> bool {
+    use bad64::Operand as O;
+    let regs_match = |ra: &[bad64::Reg], rb: &[bad64::Reg]| -> bool {
+        ra.len() == rb.len()
+            && ra
+                .iter()
+                .zip(rb.iter())
+                .all(|(x, y)| match (reg_index(*x), reg_index(*y)) {
+                    (Some((ix, wide_x)), Some((iy, wide_y))) => {
+                        let expected = if ix == 18 { scratch } else { ix };
+                        iy == expected && wide_x == wide_y
+                    }
+                    _ => x == y,
+                })
+    };
+    match (a, b) {
+        (O::ShiftReg { reg: ra, shift: sa }, O::ShiftReg { reg: rb, shift: sb }) => {
+            regs_match(&[*ra], &[*rb]) && sa == sb
+        }
+        (O::QualReg { reg: ra, qual: qa }, O::QualReg { reg: rb, qual: qb }) => {
+            regs_match(&[*ra], &[*rb]) && qa == qb
+        }
+        (
+            O::Reg {
+                reg: ra,
+                arrspec: aa,
+            },
+            O::Reg {
+                reg: rb,
+                arrspec: ab,
+            },
+        ) => regs_match(&[*ra], &[*rb]) && aa == ab,
+        (O::MemReg(ra), O::MemReg(rb)) => regs_match(&[*ra], &[*rb]),
+        (
+            O::MemOffset {
+                reg: ra,
+                offset: oa,
+                mul_vl: ma,
+                arrspec: aa,
+            },
+            O::MemOffset {
+                reg: rb,
+                offset: ob,
+                mul_vl: mb,
+                arrspec: ab,
+            },
+        ) => regs_match(&[*ra], &[*rb]) && oa == ob && ma == mb && aa == ab,
+        (O::MemPreIdx { reg: ra, imm: ia }, O::MemPreIdx { reg: rb, imm: ib }) => {
+            regs_match(&[*ra], &[*rb]) && ia == ib
+        }
+        (O::MemPostIdxImm { reg: ra, imm: ia }, O::MemPostIdxImm { reg: rb, imm: ib }) => {
+            regs_match(&[*ra], &[*rb]) && ia == ib
+        }
+        (O::MemPostIdxReg(ra), O::MemPostIdxReg(rb)) => regs_match(ra, rb),
+        (
+            O::MemExt {
+                regs: ra,
+                shift: sa,
+                arrspec: aa,
+            },
+            O::MemExt {
+                regs: rb,
+                shift: sb,
+                arrspec: ab,
+            },
+        ) => regs_match(ra, rb) && sa == sb && aa == ab,
+        (
+            O::MultiReg {
+                regs: ra,
+                arrspec: aa,
+            },
+            O::MultiReg {
+                regs: rb,
+                arrspec: ab,
+            },
+        ) => {
+            let ra: Vec<bad64::Reg> = ra.iter().flatten().copied().collect();
+            let rb: Vec<bad64::Reg> = rb.iter().flatten().copied().collect();
+            regs_match(&ra, &rb) && aa == ab
+        }
+        // Everything else carries no GPR to map (immediates, labels,
+        // conditions, system registers, SME/SIMD element forms): the
+        // operands must be IDENTICAL, and a variant mismatch is a refusal.
+        (a, b) => a == b,
     }
-    for (a, b) in before.iter().zip(after.iter()) {
-        let (ra, rb) = (operand_regs(a), operand_regs(b));
-        if ra.is_empty() && rb.is_empty() {
-            // No registers here, so this operand must be untouched.
-            if format!("{a:?}") != format!("{b:?}") {
-                return None;
-            }
-            continue;
-        }
-        if ra.len() != rb.len() {
-            return None;
-        }
-        for (x, y) in ra.iter().zip(rb.iter()) {
-            let (Some((ix, wide_x)), Some((iy, wide_y))) = (reg_index(*x), reg_index(*y)) else {
-                if x != y {
-                    return None;
-                }
-                continue;
-            };
-            let expected = if ix == 18 { scratch } else { ix };
-            if iy != expected || wide_x != wide_y {
-                return None;
-            }
-        }
+}
+
+/// Is this word `cbz`/`cbnz` (either register size) conditioned on x18?
+const fn cond_branch_on_x18(word: u32) -> bool {
+    (word & 0x7e00_0000) == 0x3400_0000 && (word & 0x1f) == 18
+}
+/// Is this word `tbz`/`tbnz` testing a bit of x18?
+const fn test_bit_branch_on_x18(word: u32) -> bool {
+    (word & 0x7e00_0000) == 0x3600_0000 && (word & 0x1f) == 18
+}
+/// Is this word `adr`/`adrp` writing x18?
+const fn pc_relative_address_to_x18(word: u32) -> bool {
+    (word & 0x1f00_0000) == 0x1000_0000 && (word & 0x1f) == 18
+}
+
+/// Sign-extended BYTE offset of a `cbz`/`cbnz` word.
+fn cond_branch_offset(word: u32) -> i64 {
+    let imm19 = ((word >> 5) & 0x7_ffff) as i64;
+    ((imm19 << 45) >> 45) * 4
+}
+/// Sign-extended BYTE offset of a `tbz`/`tbnz` word.
+fn test_bit_branch_offset(word: u32) -> i64 {
+    let imm14 = ((word >> 5) & 0x3fff) as i64;
+    ((imm14 << 50) >> 50) * 4
+}
+/// The value an `adr`/`adrp` computes at runtime `site` — a patch-time
+/// constant. adrp's page arithmetic uses the ENCODING's 4 KiB pages, which
+/// is pure arithmetic on the pc and independent of the host page size.
+fn pc_relative_address_value(word: u32, site: u64) -> u64 {
+    let immlo = ((word >> 29) & 0x3) as i64;
+    let immhi = ((word >> 5) & 0x7_ffff) as i64;
+    let imm21 = (((immhi << 2) | immlo) << 43) >> 43;
+    if word & 0x8000_0000 != 0 {
+        (site & !0xfff).wrapping_add((imm21 << 12) as u64)
+    } else {
+        site.wrapping_add(imm21 as u64)
     }
-    Some(rewritten_word)
+}
+
+/// Does a decoded instruction have a PC-relative (label) operand?
+///
+/// The GENERIC x18 veneer relocates its instruction to the veneer's
+/// address, so a pc-relative word would compute from the WRONG pc — `cbz
+/// w18` in ld-2.28's `do_lookup_x` branched into veneer space and silently
+/// emptied libc's hash table. Label-operand instructions are only
+/// veneerable through the dedicated shapes below; everything else fails
+/// closed.
+fn instruction_is_pc_relative(insn: &bad64::Instruction) -> bool {
+    insn.operands()
+        .iter()
+        .any(|op| matches!(op, bad64::Operand::Label(_)))
+}
+
+/// Veneer for `cbz`/`cbnz`/`tbz`/`tbnz` on x18: the CONDITION runs against
+/// the slot value (borrowed x0, stack-restored on both edges), and both
+/// edges leave through patch-time-constant branches — the returned indices
+/// are the `b` slots for TAKEN (the original target) and FALL-THROUGH
+/// (site + 4), which only the caller can encode.
+fn x18_branch_veneer(word: u32, slot: u64) -> (Vec<u32>, usize, usize) {
+    let mut w = Vec::with_capacity(12);
+    w.push(str_pre_sp(0));
+    w.extend_from_slice(&mov_imm64(0, slot));
+    w.push(ldr_imm(0, 0, 0));
+    // The original condition — size/op/bit bits preserved — retargeted at
+    // x0 and a fixed +3 words (over the fall-through restore+branch).
+    let stripped = if cond_branch_on_x18(word) {
+        (word & !((0x7_ffff << 5) | 0x1f)) | (3 << 5)
+    } else {
+        (word & !((0x3fff << 5) | 0x1f)) | (3 << 5)
+    };
+    w.push(stripped);
+    w.push(ldr_post_sp(0));
+    let fallthrough_slot = w.len();
+    w.push(0); // b site+4 — patched by the caller
+    w.push(ldr_post_sp(0));
+    let taken_slot = w.len();
+    w.push(0); // b original_target — patched by the caller
+    (w, taken_slot, fallthrough_slot)
+}
+
+/// Veneer for `adr`/`adrp` into x18: the computed address is a patch-time
+/// constant, materialized straight into the slot.
+fn x18_pc_address_veneer(value: u64, slot: u64) -> Vec<u32> {
+    let mut w = Vec::with_capacity(12);
+    w.push(stp_pre_sp(0, 1));
+    w.extend_from_slice(&mov_imm64(0, value));
+    w.extend_from_slice(&mov_imm64(1, slot));
+    w.push(str_imm(0, 1, 0));
+    w.push(ldp_post_sp(0, 1));
+    w
 }
 
 /// Emit a veneer that runs one x18-using instruction against a memory slot.
@@ -689,12 +872,24 @@ fn scan_executable_words(code: &[u8], vaddr0: u64) -> Result<usize, DirectInelig
                 // access naming x18 is already handled by the tpidr veneer
                 // above, and must NOT be rewritten here - substituting its
                 // register would leave a real `mrs` reading Darwin's thread
-                // pointer instead of the guest's.
-                if tpidr_access(word).is_none()
-                    && instruction_names_x18(&insn)
-                    && !x18_is_veneerable(&insn, word)
-                {
-                    return Err(DirectIneligible::X18Access { vaddr: site });
+                // pointer instead of the guest's. PC-relative words are
+                // veneerable ONLY through the dedicated branch/adr shapes:
+                // the generic veneer relocates its instruction, which would
+                // compute from the veneer's pc.
+                if tpidr_access(word).is_none() && instruction_names_x18(&insn) {
+                    let veneerable = if cond_branch_on_x18(word)
+                        || test_bit_branch_on_x18(word)
+                        || pc_relative_address_to_x18(word)
+                    {
+                        true
+                    } else if instruction_is_pc_relative(&insn) {
+                        false
+                    } else {
+                        x18_is_veneerable(&insn, word)
+                    };
+                    if !veneerable {
+                        return Err(DirectIneligible::X18Access { vaddr: site });
+                    }
                 }
             }
             Err(_) if word_could_name_x18(word) => {
@@ -858,6 +1053,63 @@ impl DirectImage {
                 self.tpidr_sites += 1;
                 continue;
             }
+            // Conditional branches ON x18 (cbz/cbnz/tbz/tbnz) get the
+            // dedicated branch veneer: the condition tests the slot, and
+            // both edges leave through patch-time-constant branches.
+            if cond_branch_on_x18(word) || test_bit_branch_on_x18(word) {
+                let site_host = (site_vaddr - lo) as usize;
+                let branch_offset = if cond_branch_on_x18(word) {
+                    cond_branch_offset(word)
+                } else {
+                    test_bit_branch_offset(word)
+                };
+                let target_host = site_host as i64 + branch_offset;
+                if target_host < 0 || target_host as usize >= self.len {
+                    // A branch out of the mapping cannot be retargeted.
+                    return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
+                }
+                let veneer_host = *island_cursor;
+                let (words, taken_slot, fallthrough_slot) = x18_branch_veneer(word, x18_addr);
+                let bytes = words.len() * 4;
+                if veneer_host + bytes > self.len {
+                    return Err(io::Error::other("veneer budget exhausted"));
+                }
+                for (i, w) in words.iter().enumerate() {
+                    self.write_word(veneer_host + i * 4, *w);
+                }
+                let fallthrough_at = veneer_host + fallthrough_slot * 4;
+                self.write_word(
+                    fallthrough_at,
+                    b_rel((site_host as i64 + 4) - fallthrough_at as i64),
+                );
+                let taken_at = veneer_host + taken_slot * 4;
+                self.write_word(taken_at, b_rel(target_host - taken_at as i64));
+                self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
+                *island_cursor = (veneer_host + bytes).next_multiple_of(4);
+                self.x18_sites += 1;
+                continue;
+            }
+            // adr/adrp INTO x18: the computed address is a patch-time
+            // constant for this site, materialized into the slot.
+            if pc_relative_address_to_x18(word) {
+                let site_host = (site_vaddr - lo) as usize;
+                let value = pc_relative_address_value(word, site_vaddr + bias);
+                let veneer_host = *island_cursor;
+                let words = x18_pc_address_veneer(value, x18_addr);
+                let bytes = words.len() * 4;
+                if veneer_host + bytes + 4 > self.len {
+                    return Err(io::Error::other("veneer budget exhausted"));
+                }
+                for (i, w) in words.iter().enumerate() {
+                    self.write_word(veneer_host + i * 4, *w);
+                }
+                let from = (veneer_host + bytes) as i64;
+                self.write_word(veneer_host + bytes, b_rel((site_host as i64 + 4) - from));
+                self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
+                *island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
+                self.x18_sites += 1;
+                continue;
+            }
             // x18 uses are veneered in the same pass.
             if word != SVC_0
                 && let Ok(insn) = bad64::decode(word, site_vaddr)
@@ -867,6 +1119,11 @@ impl DirectImage {
                 // with one would rewrite it into a real system-register
                 // read of Darwin's thread pointer.
                 debug_assert!(tpidr_access(word).is_none());
+                // The scan refused unhandled pc-relative shapes; keep the
+                // patcher fail-closed on them independently.
+                if instruction_is_pc_relative(&insn) {
+                    return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
+                }
                 let Some((value_reg, addr_reg)) = pick_scratch_pair(&insn) else {
                     return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
                 };
@@ -2248,6 +2505,47 @@ mod tests {
         );
     }
 
+    /// The verifier must compare NON-register operand attributes too. In
+    /// `add x20, x0, w18, uxtw #2` (ld-2.28's do_lookup_x chain step,
+    /// 0x8b324814) bits 14:10 spell the extend option and shift — and ALSO
+    /// read 18. Rewriting them alongside Rm produced `add x20, x0, w1,
+    /// uxtb #1`, and a regs-only comparison VERIFIED it: same opcode, same
+    /// operand shapes, same registers. The corrupted extend walked libc's
+    /// hash chain at half stride and `_res` silently vanished. Only the
+    /// Rm-only rewrite, extend preserved, may verify.
+    #[test]
+    fn x18_substitution_preserves_extend_and_shift_attributes() {
+        let add_ext = 0x8b32_4814_u32; // add x20, x0, w18, uxtw #2
+        let rewritten = substitute_x18(add_ext, 1).expect("Rm-only rewrite verifies");
+        assert_eq!(
+            rewritten, 0x8b21_4814,
+            "only Rm moves; the uxtw #2 extend bits stay intact"
+        );
+    }
+
+    /// A field position can read 18 WITHOUT being a register field. libc's
+    /// `ldrb w18, [x3, w4, sxtw]` (0x3864c872) has bits[14:10] == 18, but
+    /// they are the extend option/S/fixed bits of the register-offset form —
+    /// only Rt (bits 4:0) actually names w18. A blind all-fields rewrite
+    /// corrupts the addressing mode and the verifier rejects it, which
+    /// wrongly refused the whole libc window. The substitution must find the
+    /// subset of positions that IS the register use.
+    #[test]
+    fn x18_substitution_survives_a_non_register_field_reading_18() {
+        let ldrb = 0x3864_c872_u32; // ldrb w18, [x3, w4, sxtw]
+        let rewritten = substitute_x18(ldrb, 5).expect("only Rt names x18; substitutable");
+        assert_eq!(
+            rewritten, 0x3864_c865,
+            "Rt moved to w5, the extend bits untouched"
+        );
+        let decoded = bad64::decode(rewritten, 0).expect("rewritten decodes");
+        assert_eq!(
+            instruction_regs(&decoded),
+            vec![5, 3, 4],
+            "destination is the scratch, the address registers are untouched"
+        );
+    }
+
     #[test]
     fn x18_veneer_runs_the_instruction_against_the_slot() {
         // The guest increments x18 twice and reports it. x18 never lives in
@@ -2675,6 +2973,171 @@ mod tests {
         assert_eq!(group.guest_x18(), 7);
     }
 
+    /// `cbz w18, target` (ld-2.28's `do_lookup_x` hash-bucket test) is
+    /// PC-RELATIVE: relocating it into a veneer would branch relative to the
+    /// VENEER's pc — silent garbage (this exact word made `_res` vanish from
+    /// libc's hash table). The branch veneer must test the SLOT and route
+    /// both edges to patch-time-constant targets. This test runs both edges:
+    /// taken (x18 == 0) and fall-through (x18 != 0), for cbz and cbnz.
+    #[test]
+    fn x18_conditional_branch_veneers_route_both_edges() {
+        const CHECK_NR: u64 = 0x0ff6;
+        // cbz x18 -> +3: taken when x18 == 0.
+        let taken_marker = |cond_word: fn(u32, i64) -> u32, x18_value: u32| -> u64 {
+            let code: Vec<u32> = vec![
+                mov_reg(20, 30),
+                movz(18, x18_value, 0), // via the generic veneer
+                cond_word(18, 3 * 4),   // -> the 0xbeef arm
+                movz(9, 0xdead, 0),     // fall-through arm
+                b_rel_word(2 * 4),      // -> join
+                movz(9, 0xbeef, 0),     // taken arm
+                mov_reg(0, 9),          // join
+                movz(8, CHECK_NR as u32, 0),
+                SVC_0,
+                mov_reg(30, 20),
+                RET,
+            ];
+            let elf = elf_with_code(&code);
+            let group = DirectLoadGroup::load(&elf, record_only)
+                .expect("load")
+                .expect("eligible");
+            seen_clear();
+            let entry = group.main().entry();
+            // SAFETY: patched image, entry inside it, fixture rets balanced.
+            unsafe { group.enter(entry) };
+            seen_snapshot()[0].1[0]
+        };
+        assert_eq!(
+            taken_marker(cbz_x, 0),
+            0xbeef,
+            "cbz x18 with a zero slot takes the ORIGINAL target"
+        );
+        assert_eq!(
+            taken_marker(cbz_x, 7),
+            0xdead,
+            "cbz x18 with a nonzero slot falls through to site+4"
+        );
+        assert_eq!(
+            taken_marker(cbnz_x, 7),
+            0xbeef,
+            "cbnz x18 with a nonzero slot takes the ORIGINAL target"
+        );
+        assert_eq!(
+            taken_marker(cbnz_x, 0),
+            0xdead,
+            "cbnz x18 with a zero slot falls through"
+        );
+    }
+
+    /// tbz/tbnz on x18: same PC-relative hazard, same slot-tested veneer —
+    /// libc has ten of these.
+    #[test]
+    fn x18_test_bit_branch_veneers_route_both_edges() {
+        const CHECK_NR: u64 = 0x0ff5;
+        let run = |x18_value: u32| -> u64 {
+            let code: Vec<u32> = vec![
+                mov_reg(20, 30),
+                movz(18, x18_value, 0),
+                tbnz_x(18, 1, 3 * 4), // bit 1 -> the 0xbeef arm
+                movz(9, 0xdead, 0),
+                b_rel_word(2 * 4),
+                movz(9, 0xbeef, 0),
+                mov_reg(0, 9),
+                movz(8, CHECK_NR as u32, 0),
+                SVC_0,
+                mov_reg(30, 20),
+                RET,
+            ];
+            let elf = elf_with_code(&code);
+            let group = DirectLoadGroup::load(&elf, record_only)
+                .expect("load")
+                .expect("eligible");
+            seen_clear();
+            let entry = group.main().entry();
+            // SAFETY: patched image, entry inside it, fixture rets balanced.
+            unsafe { group.enter(entry) };
+            seen_snapshot()[0].1[0]
+        };
+        assert_eq!(run(2), 0xbeef, "tbnz x18 #1 with the bit set is taken");
+        assert_eq!(
+            run(4),
+            0xdead,
+            "tbnz x18 #1 with the bit clear falls through"
+        );
+    }
+
+    /// `adrp x18, page`: the result is a patch-time constant (the SITE's
+    /// 4 KiB page plus the immediate), so the veneer materializes it into
+    /// the slot — running a relocated adrp would compute the VENEER's page.
+    #[test]
+    fn x18_adrp_veneer_materializes_the_site_page() {
+        const CHECK_NR: u64 = 0x0ff4;
+        let code: Vec<u32> = vec![
+            mov_reg(20, 30),
+            adrp_x(18, 1), // x18 = (site page) + 0x1000
+            mov_reg(0, 18),
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            RET,
+        ];
+        let elf = elf_with_code(&code);
+        let group = DirectLoadGroup::load(&elf, record_only)
+            .expect("load")
+            .expect("eligible");
+        seen_clear();
+        let entry = group.main().entry();
+        // SAFETY: patched image, entry inside it, fixture rets balanced.
+        unsafe { group.enter(entry) };
+        let site = entry + 4; // the adrp is the second word
+        let expected = (site & !0xfff) + 0x1000;
+        assert_eq!(
+            seen_snapshot()[0].1[0],
+            expected,
+            "adrp x18 delivered the SITE's page, not the veneer's"
+        );
+        assert_eq!(group.guest_x18(), expected);
+    }
+
+    /// Any OTHER PC-relative instruction naming x18 must refuse the image:
+    /// relocation into a veneer would silently compute from the wrong pc.
+    /// `ldr x18, <literal>` is the canonical unhandled shape.
+    #[test]
+    fn scan_refuses_unhandled_pc_relative_x18_shapes() {
+        // ldr x18, <pc+8>: 0x58000052 (literal load, imm19 = 2).
+        let code = vec![0x5800_0052, movz(8, 93, 0), SVC_0];
+        let elf = elf_with_code(&code);
+        assert!(
+            matches!(
+                scan_eligibility(&elf).expect("scan runs"),
+                Err(DirectIneligible::X18Access { .. })
+            ),
+            "a pc-relative literal load into x18 fails closed"
+        );
+    }
+
+    /// `cbz x`: 0xb4000000 | imm19 << 5 | rt.
+    fn cbz_x(rt: u32, offset: i64) -> u32 {
+        0xb400_0000 | ((((offset >> 2) as u32) & 0x7_ffff) << 5) | rt
+    }
+    /// `cbnz x`: 0xb5000000 | imm19 << 5 | rt.
+    fn cbnz_x(rt: u32, offset: i64) -> u32 {
+        0xb500_0000 | ((((offset >> 2) as u32) & 0x7_ffff) << 5) | rt
+    }
+    /// `tbnz xt, #bit, <offset>` (bit < 32 keeps b5 clear).
+    fn tbnz_x(rt: u32, bit: u32, offset: i64) -> u32 {
+        0x3700_0000 | (bit << 19) | ((((offset >> 2) as u32) & 0x3fff) << 5) | rt
+    }
+    /// `adrp xd, <pages>`: immhi:immlo pages relative to the site's page.
+    fn adrp_x(rd: u32, pages: u32) -> u32 {
+        0x9000_0000 | ((pages & 0x3) << 29) | (((pages >> 2) & 0x7_ffff) << 5) | rd
+    }
+    /// Unconditional `b` by byte offset (test-local; the emitter's `b_rel`
+    /// is for patch plumbing).
+    fn b_rel_word(offset: i64) -> u32 {
+        b_rel(offset)
+    }
+
     /// The `mmap(PROT_EXEC, fd)` boundary: a file window mapped at RUNTIME
     /// goes through the SAME scan/patch pipeline as a load-time image. The
     /// window here carries a syscall, a `tpidr_el0` write and an x18 use, so
@@ -2767,6 +3230,61 @@ mod tests {
         assert!(
             !group.covers_patched_executable(base + 0x1000, HOST_PAGE as u64 * 2),
             "a range straddling the replacement loses coverage"
+        );
+    }
+
+    /// A REAL libc.so.6 window must be byte-identical to the file outside
+    /// the executable sections: the dynamic tables (.gnu.hash, .dynsym,
+    /// .dynstr, .gnu.version*) all live in the R+X segment ld.so maps
+    /// PROT_EXEC, and a single corrupted byte there makes symbols vanish
+    /// from the hash table with no fault. Skips loudly without the cross
+    /// sysroot.
+    #[test]
+    fn exec_window_of_real_libc_keeps_non_code_bytes_verbatim() {
+        let probe = std::process::Command::new("aarch64-linux-gnu-gcc")
+            .arg("-print-sysroot")
+            .output();
+        let Ok(output) = probe else {
+            eprintln!("skipping: aarch64-linux-gnu-gcc not on PATH");
+            return;
+        };
+        let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let libc = std::fs::read(format!("{sysroot}/lib/libc.so.6")).expect("sysroot libc");
+        let group = DirectLoadGroup::load(&fixture_elf(), record_only)
+            .expect("load main")
+            .expect("eligible");
+        // ld.so's first mapping: the whole load span from offset 0.
+        let window_len = 0x0016_0000; // past the R+X segment's 0x1575f4
+        let base = group
+            .map_exec_file_window(&libc, 0, window_len)
+            .expect("window maps")
+            .expect("libc window is eligible") as *const u8;
+        let exec_ranges: Vec<(usize, usize)> = executable_sections(&libc)
+            .expect("sections parse")
+            .iter()
+            .map(|(offset, size, _)| (*offset, offset + size))
+            .collect();
+        // SAFETY: reading back the window just mapped.
+        let mapped = unsafe { std::slice::from_raw_parts(base, window_len) };
+        let mut mismatches = 0_usize;
+        for (offset, (mapped_byte, file_byte)) in
+            mapped.iter().zip(libc[..window_len].iter()).enumerate()
+        {
+            let in_exec = exec_ranges
+                .iter()
+                .any(|(start, end)| offset >= *start && offset < *end);
+            if !in_exec && mapped_byte != file_byte {
+                if mismatches == 0 {
+                    eprintln!(
+                        "first non-code mismatch at {offset:#x}: mapped {mapped_byte:#04x} file {file_byte:#04x}"
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "non-code bytes of the libc window must be verbatim"
         );
     }
 
