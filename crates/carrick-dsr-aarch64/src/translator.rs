@@ -372,6 +372,7 @@ impl PreparedDirectBindingExecReset<'_, '_, '_> {
         state.pending.clear();
         state.direct_link_incoming.clear();
         state.trusted_entries.clear();
+        state.trusted_route_entries.clear();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
         state.sensitive.clear();
@@ -856,6 +857,8 @@ pub struct ProcessState {
     /// guard the link's existence (plus Phase 2a severing) makes redundant.
     pub trusted_entries:
         BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), types::CacheOffset>,
+    pub trusted_route_entries:
+        BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), TrustedRouteEntries>,
     pub stats: ResolverStats,
     pub reported_stats: ResolverStats,
     pub sensitive: BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), SensitiveMetadata>,
@@ -893,6 +896,16 @@ pub struct ProcessState {
     /// Resolved once from `block::superblock_segment_limit()`; the only site
     /// that reads the switch, so planner and emitter tests stay deterministic.
     superblock_segments: usize,
+    trusted_route_split: emit::TrustedRouteSplit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrustedRouteEntries {
+    pub fallthrough: types::CacheVa,
+    pub direct: types::CacheVa,
+    pub indirect: types::CacheVa,
+    pub sequence_bytes: u32,
+    pub common_body: types::CacheVa,
 }
 
 struct SharedTranslationConfiguration {
@@ -2142,6 +2155,14 @@ impl ProcessTranslator {
         capacity: usize,
         host: &'static dyn NativeHostJit,
     ) -> Result<Self, types::DsrError> {
+        Self::new_with_host_and_route_split(capacity, host, emit::trusted_route_split_enabled())
+    }
+
+    fn new_with_host_and_route_split(
+        capacity: usize,
+        host: &'static dyn NativeHostJit,
+        trusted_route_split: emit::TrustedRouteSplit,
+    ) -> Result<Self, types::DsrError> {
         artifact_spike::ensure_authority_if_enabled()?;
         let cache = cache::TranslationCache::new(capacity, host)?;
         let cache_range = cache.host_range();
@@ -2165,6 +2186,7 @@ impl ProcessTranslator {
                 pending: BTreeMap::new(),
                 direct_link_incoming: BTreeMap::new(),
                 trusted_entries: BTreeMap::new(),
+                trusted_route_entries: BTreeMap::new(),
                 stats: ResolverStats::default(),
                 reported_stats: ResolverStats::default(),
                 sensitive: BTreeMap::new(),
@@ -2187,6 +2209,7 @@ impl ProcessTranslator {
                     cache_range.end,
                 )?,
                 superblock_segments: block::superblock_segment_limit(),
+                trusted_route_split,
             }),
         };
         probes::dsr_cache_capacity(
@@ -2720,7 +2743,13 @@ impl ProcessState {
                 types::DsrError::CachePolicy(format!("shared unit hot blob refused: {reason:?}"))
             })
             .and_then(|hot| {
-                artifact_spike::replay_unit_block(&mut self.cache, words, hot, &bindings)
+                artifact_spike::replay_unit_block(
+                    &mut self.cache,
+                    words,
+                    hot,
+                    &bindings,
+                    self.trusted_route_split,
+                )
             });
         let emitted = match replayed {
             Ok(emitted) => emitted,
@@ -2946,6 +2975,31 @@ impl ProcessState {
         // recording zero duplicate publications in production profiles.
         let emitted_len = emitted.len();
         let trusted_entry = emitted.trusted_entry();
+        let trusted_routes = emitted
+            .trusted_routes()
+            .map(|routes| {
+                let absolute = |offset: types::CacheOffset| {
+                    entry
+                        .host()
+                        .raw()
+                        .checked_add(offset.get() as usize)
+                        .map(carrick_guest_mem::HostVa)
+                        .map(types::CacheVa::published)
+                        .ok_or_else(|| {
+                            types::DsrError::CachePolicy(
+                                "trusted route absolute address overflow".to_string(),
+                            )
+                        })
+                };
+                Ok::<TrustedRouteEntries, types::DsrError>(TrustedRouteEntries {
+                    fallthrough: absolute(routes.fallthrough)?,
+                    direct: absolute(routes.direct)?,
+                    indirect: absolute(routes.indirect)?,
+                    sequence_bytes: routes.sequence_bytes,
+                    common_body: absolute(routes.common_body)?,
+                })
+            })
+            .transpose()?;
         let (map, links, recovery) = emitted.into_runtime_metadata();
         // A unit-replayed block's emission carries EMPTY map/recovery (its
         // fault metadata lives undecoded in the unit); the caller supplies
@@ -2960,6 +3014,9 @@ impl ProcessState {
         self.blocks.insert(key, entry);
         if let Some(offset) = trusted_entry {
             self.trusted_entries.insert(key, offset);
+        }
+        if let Some(routes) = trusted_routes {
+            self.trusted_route_entries.insert(key, routes);
         }
         self.dependencies.record(source_page, key.0, key.1);
         for link in links {
@@ -3353,20 +3410,22 @@ impl ProcessState {
                 // candidate IS the native emission — not a second
                 // authority-mode assembly.
                 let (emitted, artifact) = if artifact_eligible || unit_candidate_segment.is_some() {
-                    emit::emit_block_recording_artifact_optional(
+                    emit::emit_block_recording_artifact_optional_with_route_split(
                         &mut self.cache,
                         &block,
                         emit::GenerationGuard::new(observation.current_atomic(), generation),
                         memory.address_mode().into(),
                         artifact_source_words.clone().unwrap_or_default(),
+                        self.trusted_route_split,
                     )?
                 } else {
                     (
-                        emit::emit_block_with_generation(
+                        emit::emit_block_with_generation_and_route_split(
                             &mut self.cache,
                             &block,
                             emit::GenerationGuard::new(observation.current_atomic(), generation),
                             memory.address_mode().into(),
+                            self.trusted_route_split,
                         )?,
                         None,
                     )
@@ -3547,6 +3606,9 @@ impl ProcessState {
         key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
         entry: types::CacheVa,
     ) -> types::CacheVa {
+        if let Some(routes) = self.trusted_route_entries.get(&key) {
+            return routes.direct;
+        }
         match self.trusted_entries.get(&key) {
             Some(offset) => types::CacheVa::published(carrick_guest_mem::HostVa(
                 entry.host().raw() + offset.get() as usize,
@@ -3923,14 +3985,22 @@ impl ThreadTranslator {
         translated: &TranslationResult,
     ) -> Result<(), types::DsrError> {
         if self.process.private_target_authority.owns(translated.entry) {
-            let trusted = self
-                .process
-                .state
-                .read()
-                .trusted_entries
-                .get(&(target, translated.generation))
-                .copied();
-            if let Some(offset) = trusted {
+            let trusted_code = {
+                let state = self.process.state.read();
+                state
+                    .trusted_route_entries
+                    .get(&(target, translated.generation))
+                    .map(|routes| routes.indirect.host().raw() as u64)
+                    .or_else(|| {
+                        state
+                            .trusted_entries
+                            .get(&(target, translated.generation))
+                            .map(|offset| {
+                                translated.entry.host().raw() as u64 + u64::from(offset.get())
+                            })
+                    })
+            };
+            if let Some(trusted_code) = trusted_code {
                 // The same atomic the target's emitted guard materializes:
                 // the page-generation cell `memory.dsr_generation_observation`
                 // hands the translate/guard wiring. Its address is stable for
@@ -3941,7 +4011,7 @@ impl ThreadTranslator {
                 let generation_atomic = std::ptr::from_ref(observation.current_atomic()) as u64;
                 self.indirect_cache.publish_private_trusted(
                     target,
-                    translated.entry.host().raw() as u64 + u64::from(offset.get()),
+                    trusted_code,
                     generation_atomic,
                     translated.generation,
                 );
@@ -5577,16 +5647,25 @@ mod tests {
             memory: &NativeMappedMemory,
             plan: &BlockPlan,
         ) -> (PortableBlockCandidate, emit::EmittedBlock, Vec<u32>) {
+            record_candidate_with_route_split(memory, plan, emit::TrustedRouteSplit::Disabled)
+        }
+
+        fn record_candidate_with_route_split(
+            memory: &NativeMappedMemory,
+            plan: &BlockPlan,
+            route_split: emit::TrustedRouteSplit,
+        ) -> (PortableBlockCandidate, emit::EmittedBlock, Vec<u32>) {
             let observation = memory
                 .dsr_generation_observation(plan.start)
                 .expect("record-time observation");
             let mut scratch = crate::test_jit::test_cache(256 * 1024);
-            let (emitted, artifact) = emit::emit_block_recording_artifact(
+            let (emitted, artifact) = emit::emit_block_recording_artifact_with_route_split(
                 &mut scratch,
                 plan,
                 emit::GenerationGuard::new(observation.current_atomic(), CodeGeneration::INITIAL),
                 emit::EmitAddressMode::Direct,
                 vec![0xd503_201f],
+                route_split,
             )
             .expect("record native-tap candidate");
             // Capture the reference words BEFORE any patching can occur.
@@ -5657,12 +5736,24 @@ mod tests {
             unit: SharedLoadedTranslationUnit,
             code: Arc<Vec<u8>>,
         ) -> LookupFixture {
+            fixture_for_unit_with_route_split(unit, code, emit::TrustedRouteSplit::Disabled)
+        }
+
+        fn fixture_for_unit_with_route_split(
+            unit: SharedLoadedTranslationUnit,
+            code: Arc<Vec<u8>>,
+            route_split: emit::TrustedRouteSplit,
+        ) -> LookupFixture {
             let store = Arc::new(LookupFixtureStore {
                 unit: std::sync::Mutex::new(Some(unit)),
                 loads: std::sync::atomic::AtomicU64::new(0),
             });
-            let translator =
-                ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator");
+            let translator = ProcessTranslator::new_with_host_and_route_split(
+                256 * 1024,
+                &TEST_HOST_JIT,
+                route_split,
+            )
+            .expect("translator");
             translator
                 .configure_shared_image(
                     crate::shared_cache::SharedImageConfig {
@@ -5690,6 +5781,13 @@ mod tests {
         /// Build a unit from `candidates`, round-trip it through the wire, and
         /// serve it through a `fixture_for_unit` translator.
         fn lookup_fixture(candidates: Vec<PortableBlockCandidate>) -> LookupFixture {
+            lookup_fixture_with_route_split(candidates, emit::TrustedRouteSplit::Disabled)
+        }
+
+        fn lookup_fixture_with_route_split(
+            candidates: Vec<PortableBlockCandidate>,
+            route_split: emit::TrustedRouteSplit,
+        ) -> LookupFixture {
             let pending = PendingTranslationUnit::pack(unit_key(), candidates).expect("pack unit");
             // Round-trip the manifest through the exact wire the store
             // persists, so serde of relocations, trusted entries, direct
@@ -5709,7 +5807,7 @@ mod tests {
                 code.as_ptr() as usize,
                 Arc::clone(&code) as Arc<dyn Send + Sync>,
             );
-            fixture_for_unit(unit, code)
+            fixture_for_unit_with_route_split(unit, code, route_split)
         }
 
         /// Look one guest block up through the shared lane, as `translate`'s
@@ -5955,11 +6053,23 @@ mod tests {
             memory: &NativeMappedMemory,
             candidates: Vec<PortableBlockCandidate>,
         ) -> Result<LookupFixture, types::DsrError> {
+            attach_and_replay_all_with_route_split(
+                memory,
+                candidates,
+                emit::TrustedRouteSplit::Disabled,
+            )
+        }
+
+        fn attach_and_replay_all_with_route_split(
+            memory: &NativeMappedMemory,
+            candidates: Vec<PortableBlockCandidate>,
+            route_split: emit::TrustedRouteSplit,
+        ) -> Result<LookupFixture, types::DsrError> {
             let guests: Vec<GuestVa> = candidates
                 .iter()
                 .map(|candidate| candidate.guest_start)
                 .collect();
-            let fixture = lookup_fixture(candidates);
+            let fixture = lookup_fixture_with_route_split(candidates, route_split);
             for guest in guests {
                 lookup(&fixture, memory, guest)?;
             }
@@ -6045,6 +6155,105 @@ mod tests {
             }
             let installed_b = read_words(entry_b, target_words.len() * 4);
             assert_eq!(installed_b, target_words);
+        }
+
+        #[test]
+        fn diagnostic_replay_routes_direct_links_to_only_the_direct_copy() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (branch, native_branch, branch_words) = record_candidate_with_route_split(
+                &memory,
+                &branch_plan(BLOCK_A, BLOCK_B),
+                emit::TrustedRouteSplit::Enabled,
+            );
+            let (target, _native_target, _target_words) = record_candidate_with_route_split(
+                &memory,
+                &syscall_plan(BLOCK_B),
+                emit::TrustedRouteSplit::Enabled,
+            );
+            let link = native_branch.direct_links()[0];
+
+            let installed = attach_and_replay_all_with_route_split(
+                &memory,
+                vec![branch, target],
+                emit::TrustedRouteSplit::Enabled,
+            )
+            .expect("replay diagnostic two-block unit");
+            let state = installed.translator.state.read();
+            let entry_a = *state
+                .blocks
+                .get(&(BLOCK_A, CodeGeneration::INITIAL))
+                .expect("installed branch block");
+            let routes_b = *state
+                .trusted_route_entries
+                .get(&(BLOCK_B, CodeGeneration::INITIAL))
+                .expect("target diagnostic routes");
+
+            assert_ne!(routes_b.fallthrough, routes_b.direct);
+            assert_ne!(routes_b.direct, routes_b.indirect);
+            let installed_a = read_words(entry_a, branch_words.len() * 4);
+            let slot_index = (link.slot.get() / 4) as usize;
+            let expected_branch = encode_aarch64_direct_branch(
+                cache::LinkSite {
+                    source: entry_a,
+                    slot: link.slot,
+                },
+                routes_b.direct,
+            )
+            .expect("encode diagnostic direct route");
+            assert_eq!(
+                installed_a[slot_index], expected_branch,
+                "patched direct link must land only at the direct route copy"
+            );
+        }
+
+        #[test]
+        fn diagnostic_flavor_one_publication_uses_only_the_indirect_copy() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (target, _native_target, _target_words) = record_candidate_with_route_split(
+                &memory,
+                &syscall_plan(BLOCK_B),
+                emit::TrustedRouteSplit::Enabled,
+            );
+            let installed = attach_and_replay_all_with_route_split(
+                &memory,
+                vec![target],
+                emit::TrustedRouteSplit::Enabled,
+            )
+            .expect("replay diagnostic target");
+            let process = Arc::new(installed.translator);
+            let (entry, routes) = {
+                let state = process.state.read();
+                (
+                    *state
+                        .blocks
+                        .get(&(BLOCK_B, CodeGeneration::INITIAL))
+                        .expect("installed target block"),
+                    *state
+                        .trusted_route_entries
+                        .get(&(BLOCK_B, CodeGeneration::INITIAL))
+                        .expect("target diagnostic routes"),
+                )
+            };
+            let translated = crate::translator::TranslationResult {
+                entry,
+                generation: CodeGeneration::INITIAL,
+                outcome: crate::translator::TranslationOutcome::SharedUnit,
+                emitted_bytes: 0,
+                cache_used_bytes: 0,
+            };
+            let mut thread = crate::translator::ThreadTranslator::for_process(process, 17);
+            thread
+                .publish_indirect_target(&memory, BLOCK_B, &translated)
+                .expect("publish flavor-1 target");
+            let (_tagged_generation, _generation_atomic, trusted_code) = thread
+                .indirect_cache
+                .entry_snapshot(BLOCK_B)
+                .expect("published indirect cache entry");
+            assert_eq!(
+                trusted_code,
+                routes.indirect.host().raw() as u64,
+                "flavor-1 cache must publish only the indirect route copy"
+            );
         }
 
         #[test]
