@@ -1819,7 +1819,18 @@ impl AddressSpace {
     }
 }
 
-fn build_linux_initial_stack(
+/// Serialize the Linux initial-stack image: argv/envp strings, `AT_RANDOM`
+/// bytes, `AT_PLATFORM`, the argc/argv/envp pointer arrays and the auxv, laid
+/// out downward from `stack_top` exactly as execve(2) would. Returns the
+/// backing region, the initial SP (16-aligned, pointing at argc), and the
+/// exact auxv byte image (`/proc/self/auxv`'s content).
+///
+/// The addresses written into the arrays are `stack_top`-relative, so the
+/// caller decides the address space: the VMM lanes pass a guest VA and map
+/// the region there; the native tier-D runner passes a HOST address and
+/// copies the bytes to it (guest VA is host VA on that tier). Public for the
+/// latter — one stack serializer, not a second drifting copy.
+pub fn build_linux_initial_stack(
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
     auxv: &[LinuxAuxvEntry],
@@ -3202,7 +3213,20 @@ fn linux_auxv_from_load_plan(
     linux_auxv_from_load_plan_with_vdso(plan, interpreter_base, true)
 }
 
-fn linux_auxv_from_load_plan_with_vdso(
+/// The Linux auxv for a planned ELF load: `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`
+/// from the plan, `AT_ENTRY` = the plan's (biased) entry, `AT_BASE` only when
+/// an interpreter base is given (a bogus `AT_BASE` on a static target and a
+/// missing one on a dynamic target are both real, shipped bug shapes), plus
+/// the identity/HWCAP/CLKTCK boilerplate every guest expects.
+///
+/// `include_vdso` advertises carrick's vDSO via `AT_SYSINFO_EHDR` at
+/// `LINUX_VDSO_BASE`; pass `false` on any lane that does not actually map the
+/// vDSO there (tier D today) — advertising an unmapped vDSO crashes libc.
+///
+/// Public for the native tier-D runner, which places images at host-chosen
+/// addresses and builds its exec stack in host memory: ONE auxv builder, not
+/// a second drifting copy.
+pub fn linux_auxv_from_load_plan_with_vdso(
     plan: &LoadPlan,
     interpreter_base: Option<u64>,
     include_vdso: bool,
