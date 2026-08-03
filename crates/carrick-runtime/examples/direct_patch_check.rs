@@ -76,9 +76,22 @@ fn main() {
     HITS.store(0, std::sync::atomic::Ordering::Relaxed);
     let handle = std::thread::spawn(move || {
         let entry = image.entry();
-        // SAFETY: patched image, entry inside it. `enter` arms this thread for
-        // MAP_JIT execution, which is the whole point of the experiment.
-        unsafe { image.enter(entry) };
+        let run_guest = std::env::var_os("CARRICK_NO_RUN").is_none();
+        println!("  spawned: about to enter (run_guest={run_guest})");
+        if !run_guest {
+            // SAFETY: patched image, entry inside it. `enter` arms this thread for
+            // MAP_JIT execution, which is the whole point of the experiment.
+        } else {
+            // SAFETY: patched image, entry inside it.
+            unsafe { image.enter(entry) };
+        }
+        println!("  spawned: guest returned");
+        if std::env::var_os("CARRICK_NO_RUN").is_some() {
+            println!("  spawned: (guest was skipped)");
+        }
+        println!("  spawned: dropping image on this thread...");
+        drop(image);
+        println!("  spawned: drop survived");
     });
     match handle.join() {
         Ok(()) => println!(
