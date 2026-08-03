@@ -625,9 +625,164 @@ mod tests {
         );
     }
 
+    /// The interpreter chain, end to end on synthetic images: the main image
+    /// declares `PT_INTERP`, the loader maps the resolved interpreter as a
+    /// SECOND image in the same load group, entry goes to the INTERPRETER,
+    /// and the interpreter finds the main image the only way the real ld.so
+    /// can — by walking the stack past argv and envp into the auxv and
+    /// branching to `AT_ENTRY`. The main image then exits through the
+    /// handler. A wrong stack layout, a missing/wrong `AT_ENTRY` or
+    /// `AT_BASE`, or entry at the wrong image all fail this test loudly (the
+    /// interpreter exits 99 if the auxv has no `AT_ENTRY`).
+    #[test]
+    fn interpreter_chain_reaches_the_main_image_through_the_auxv() {
+        const NR_EXIT: u32 = 93;
+        // The "interpreter": skip argc/argv/envp, scan the auxv for AT_ENTRY
+        // (a_type 9), `br` to its value; exit(99) at AT_NULL. Word indices in
+        // the comments; branch offsets are (target - here) * 4.
+        let interp_code: Vec<u32> = vec![
+            ldr_sp_imm(1, 0),          //  0: x1 = argc
+            add_imm(2, 31, 8),         //  1: x2 = &argv[0]
+            add_lsl3(2, 2, 1),         //  2: x2 += argc * 8
+            add_imm(2, 2, 8),          //  3: skip argv's NULL
+            ldr_post8(3, 2),           //  4: x3 = *x2++, an envp entry
+            cbnz_rel(3, -4),           //  5: while x3 != 0 goto 4
+            ldr_post8(3, 2),           //  6: a_type
+            ldr_post8(4, 2),           //  7: a_val
+            cmp_imm(3, 9),             //  8: AT_ENTRY?
+            b_eq_rel((14 - 9) * 4),    //  9: -> the br at 14
+            cbnz_rel(3, (6 - 10) * 4), // 10: not AT_NULL: next pair
+            movz(0, 99, 0),            // 11: AT_NULL, no AT_ENTRY
+            movz(8, NR_EXIT, 0),       // 12
+            SVC_0,                     // 13
+            br_reg(4),                 // 14: hand control to the main image
+        ];
+        // The main image writes through the dispatcher and exits 42 — proof
+        // it ran AFTER the interpreter handoff, with the stack intact.
+        let main_code: Vec<u32> = vec![
+            movz(9, 0x7964, 0),  // 'd','y'
+            movk(9, 0x0a6e, 16), // 'n','\n'
+            str_pre_sp(9),
+            mov_from_sp(1),
+            movz(0, 1, 0),
+            movz(2, 4, 0),
+            movz(8, NR_WRITE, 0),
+            SVC_0,
+            movz(0, 42, 0),
+            movz(8, NR_EXIT, 0),
+            SVC_0,
+        ];
+        let main_elf = elf_with_code_and_interp(&main_code, Some(b"/lib/fake-ld.so.1"));
+        let interp_elf = elf_with_code(&interp_code);
+        let group = DirectLoadGroup::load_with_interpreter(
+            &main_elf,
+            |path| {
+                assert_eq!(path, "/lib/fake-ld.so.1", "the PT_INTERP path is resolved");
+                Ok(interp_elf.clone())
+            },
+            island_handler(),
+        )
+        .expect("load")
+        .expect("eligible");
+        let interp = group.interpreter().expect("the interpreter was mapped");
+        assert_ne!(
+            interp.base(),
+            group.main().base(),
+            "two images, two mappings, one load group"
+        );
+        assert_eq!(
+            group.entry_pc(),
+            interp.entry(),
+            "process entry is the INTERPRETER's entry"
+        );
+
+        let stack = DirectStack::build(
+            &main_elf,
+            group.main().bias(),
+            Some(interp.bias()),
+            &[b"dyn-fixture".to_vec()],
+            &[],
+        )
+        .expect("stack builds");
+        // Rust-side: AT_BASE is the interpreter's load bias — ld.so requires
+        // it to find itself (a missing AT_BASE was a real carrick bug).
+        // Layout for argc=1, no envp: argc(0) argv0(1) NULL(2) NULL(3) auxv(4..).
+        // SAFETY: reading back the stack allocation just built.
+        let word = |offset_words: u64| -> u64 {
+            unsafe { *((stack.sp() + offset_words * 8) as *const u64) }
+        };
+        let mut auxv = std::collections::HashMap::new();
+        let mut cursor = 4;
+        loop {
+            let (a_type, a_val) = (word(cursor), word(cursor + 1));
+            if a_type == carrick_abi::LINUX_AT_NULL {
+                break;
+            }
+            auxv.insert(a_type, a_val);
+            cursor += 2;
+        }
+        assert_eq!(
+            auxv.get(&carrick_abi::LINUX_AT_BASE),
+            Some(&interp.bias()),
+            "AT_BASE is the interpreter's load bias"
+        );
+        assert_eq!(
+            auxv.get(&carrick_abi::LINUX_AT_ENTRY),
+            Some(&group.main().entry()),
+            "AT_ENTRY is the MAIN image's biased entry, reachable from the interpreter"
+        );
+
+        let mut runner =
+            DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
+        let entry = group.entry_pc();
+        let sp = stack.sp();
+        // SAFETY: both images are patched and built with `island_handler`;
+        // the guest leaves through its exit.
+        unsafe { with_runner(&mut runner, || group.enter_on_stack(entry, sp)) };
+        assert_eq!(
+            runner.outcome(),
+            Some(&DirectRunOutcome::Exited { code: 42 }),
+            "the MAIN image ran and exited through the handler (99 = interpreter \
+             found no AT_ENTRY; anything else = the chain broke earlier)"
+        );
+        assert_eq!(
+            runner.dispatcher().stdout(),
+            b"dyn\n",
+            "the main image's write went through the dispatcher after the handoff"
+        );
+    }
+
     /// `ldr xt, [sp, #imm]`
     const fn ldr_sp_imm(rt: u32, byte_offset: u32) -> u32 {
         0xf940_0000 | ((byte_offset / 8) << 10) | (31 << 5) | rt
+    }
+    /// `add xd, xn, #imm` (rn = 31 reads SP)
+    const fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
+        0x9100_0000 | (imm12 << 10) | (rn << 5) | rd
+    }
+    /// `add xd, xn, xm, lsl #3`
+    const fn add_lsl3(rd: u32, rn: u32, rm: u32) -> u32 {
+        0x8b00_0000 | (rm << 16) | (3 << 10) | (rn << 5) | rd
+    }
+    /// `ldr xt, [xn], #8`
+    const fn ldr_post8(rt: u32, rn: u32) -> u32 {
+        0xf840_0400 | (8 << 12) | (rn << 5) | rt
+    }
+    /// `cbnz xt, <pc + offset>`
+    const fn cbnz_rel(rt: u32, offset: i32) -> u32 {
+        0xb500_0000 | (((offset as u32 >> 2) & 0x7ffff) << 5) | rt
+    }
+    /// `cmp xn, #imm` (SUBS XZR)
+    const fn cmp_imm(rn: u32, imm12: u32) -> u32 {
+        0xf100_0000 | (imm12 << 10) | (rn << 5) | 31
+    }
+    /// `b.eq <pc + offset>`
+    const fn b_eq_rel(offset: i32) -> u32 {
+        0x5400_0000 | (((offset as u32 >> 2) & 0x7ffff) << 5)
+    }
+    /// `br xn`
+    const fn br_reg(rn: u32) -> u32 {
+        0xd61f_0000 | (rn << 5)
     }
 
     /// Minimal ET_DYN wrapper with a section header table, which tier D's
@@ -639,9 +794,16 @@ mod tests {
     /// derive `AT_PHDR` — a fixture whose phdrs sit outside every segment
     /// would rightly get no `AT_PHDR` at all.
     fn elf_with_code(code: &[u32]) -> Vec<u8> {
+        elf_with_code_and_interp(code, None)
+    }
+
+    /// As [`elf_with_code`], plus an optional `PT_INTERP` naming the given
+    /// interpreter path — the shape of every real dynamically linked binary.
+    fn elf_with_code_and_interp(code: &[u32], interp: Option<&[u8]>) -> Vec<u8> {
         let code_bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
         let entry: u64 = 0x1000;
-        let headers_len: u64 = 0x40 + 2 * 56;
+        let phnum: u64 = if interp.is_some() { 3 } else { 2 };
+        let headers_len: u64 = 0x40 + phnum * 56;
         let mut elf = vec![0_u8; headers_len as usize];
         elf[..4].copy_from_slice(b"\x7fELF");
         elf[4] = 2;
@@ -652,7 +814,7 @@ mod tests {
         elf[0x18..0x20].copy_from_slice(&entry.to_le_bytes());
         elf[0x20..0x28].copy_from_slice(&0x40_u64.to_le_bytes());
         elf[0x36..0x38].copy_from_slice(&56_u16.to_le_bytes());
-        elf[0x38..0x3a].copy_from_slice(&2_u16.to_le_bytes());
+        elf[0x38..0x3a].copy_from_slice(&(phnum as u16).to_le_bytes());
         // PT_LOAD [0]: the headers, read-only at vaddr 0.
         let ph = 0x40;
         elf[ph..ph + 4].copy_from_slice(&1_u32.to_le_bytes());
@@ -681,6 +843,17 @@ mod tests {
         elf[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes());
         elf[0x3a..0x3c].copy_from_slice(&64_u16.to_le_bytes());
         elf[0x3c..0x3e].copy_from_slice(&2_u16.to_le_bytes());
+        // PT_INTERP [2]: path bytes appended past the section headers
+        // (nothing after them reads by offset), NUL-terminated.
+        if let Some(path) = interp {
+            let interp_off = elf.len();
+            elf.extend_from_slice(path);
+            elf.push(0);
+            let ph = 0x40 + 2 * 56;
+            elf[ph..ph + 4].copy_from_slice(&3_u32.to_le_bytes());
+            elf[ph + 0x08..ph + 0x10].copy_from_slice(&(interp_off as u64).to_le_bytes());
+            elf[ph + 0x20..ph + 0x28].copy_from_slice(&((path.len() + 1) as u64).to_le_bytes());
+        }
         elf
     }
 }

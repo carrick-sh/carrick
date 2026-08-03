@@ -603,6 +603,19 @@ fn x18_is_veneerable(insn: &bad64::Instruction, word: u32) -> bool {
 ///
 /// `svc` is NOT a disqualifier: patching it is the entire mechanism.
 pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, io::Error> {
+    scan_eligibility_inner(elf, false)
+}
+
+/// The scan, with the one policy knob the interpreter chain needs: a group
+/// load via [`DirectLoadGroup::load_with_interpreter`] RESOLVES `PT_INTERP`
+/// (the interpreter becomes a second member image), so the main image is
+/// scanned with `interpreter_resolved = true`. Everything else — x18, tpidr,
+/// undecodable text, ET_EXEC placement — fails closed identically on both
+/// paths.
+fn scan_eligibility_inner(
+    elf: &[u8],
+    interpreter_resolved: bool,
+) -> Result<Result<usize, DirectIneligible>, io::Error> {
     // Placement before content: an image that cannot be put where it needs to
     // be is refused however clean its instructions are.
     const ET_EXEC: u64 = 2;
@@ -612,8 +625,8 @@ pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, i
     }
     // A PT_INTERP image must be ENTERED through its interpreter; loading it
     // alone and jumping to its own entry would run unrelocated code. Refuse
-    // with the interpreter named until the ld.so chain exists.
-    if let Some(path) = interpreter_path(elf)? {
+    // with the interpreter named unless the caller is the chain that maps it.
+    if !interpreter_resolved && let Some(path) = interpreter_path(elf)? {
         return Ok(Err(DirectIneligible::NeedsInterpreter { path }));
     }
     // Only real code: see `executable_sections` for why the PF_X segment is
@@ -888,6 +901,9 @@ pub struct DirectLoadGroup {
     /// around each use.
     guest_x18: Box<u64>,
     images: Vec<DirectImage>,
+    /// Index of the interpreter image, when the main image declared
+    /// `PT_INTERP` and [`Self::load_with_interpreter`] mapped it.
+    interpreter: Option<usize>,
 }
 
 // SAFETY: the images' mappings are owned solely by this value, and the slot
@@ -905,7 +921,47 @@ impl DirectLoadGroup {
         elf: &[u8],
         handler: extern "C" fn(*mut GuestContext),
     ) -> Result<Result<Self, DirectIneligible>, io::Error> {
-        let mut group = Self {
+        let mut group = Self::empty(handler);
+        match group.load_image(elf)? {
+            Ok(_) => Ok(Ok(group)),
+            Err(reason) => Ok(Err(reason)),
+        }
+    }
+
+    /// Load `main_elf`, and when it declares `PT_INTERP`, resolve the named
+    /// interpreter (through `resolve_interpreter` — the runner owns path
+    /// lookup, this loader owns mapping) and load it as a second member
+    /// image. Process entry becomes the INTERPRETER's entry
+    /// ([`Self::entry_pc`]); the interpreter finds the main image through the
+    /// auxv (`AT_ENTRY`/`AT_PHDR`/`AT_BASE`), which the runner builds.
+    ///
+    /// A static-PIE main (no `PT_INTERP`) loads exactly as [`Self::load`]
+    /// does — one path for both shapes, no second pipeline. The interpreter
+    /// itself is scanned with the standalone rules (a real ld.so has no
+    /// `PT_INTERP` of its own; one that DID declare one would fail closed
+    /// with it named).
+    pub fn load_with_interpreter(
+        main_elf: &[u8],
+        resolve_interpreter: impl FnOnce(&str) -> Result<Vec<u8>, io::Error>,
+        handler: extern "C" fn(*mut GuestContext),
+    ) -> Result<Result<Self, DirectIneligible>, io::Error> {
+        let mut group = Self::empty(handler);
+        match group.load_image_inner(main_elf, true)? {
+            Ok(_) => {}
+            Err(reason) => return Ok(Err(reason)),
+        }
+        if let Some(path) = interpreter_path(main_elf)? {
+            let interp_elf = resolve_interpreter(&path)?;
+            match group.load_image_inner(&interp_elf, false)? {
+                Ok(index) => group.interpreter = Some(index),
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+        Ok(Ok(group))
+    }
+
+    fn empty(handler: extern "C" fn(*mut GuestContext)) -> Self {
+        Self {
             context: Box::new(GuestContext {
                 handler: handler as usize as u64,
                 ..GuestContext::default()
@@ -913,10 +969,7 @@ impl DirectLoadGroup {
             guest_tls: Box::new(0),
             guest_x18: Box::new(0),
             images: Vec::new(),
-        };
-        match group.load_image(elf)? {
-            Ok(_) => Ok(Ok(group)),
-            Err(reason) => Ok(Err(reason)),
+            interpreter: None,
         }
     }
 
@@ -926,9 +979,17 @@ impl DirectLoadGroup {
     /// arrives: a second PIE through the same scan/patch pipeline, veneered
     /// against the SAME TLS/x18 slots and the same context.
     pub fn load_image(&mut self, elf: &[u8]) -> Result<Result<usize, DirectIneligible>, io::Error> {
+        self.load_image_inner(elf, false)
+    }
+
+    fn load_image_inner(
+        &mut self,
+        elf: &[u8],
+        interpreter_resolved: bool,
+    ) -> Result<Result<usize, DirectIneligible>, io::Error> {
         // Fail closed BEFORE mapping: a refusal must cost no allocation, and
         // an image that reaches the patcher is one the scan proved safe.
-        match scan_eligibility(elf)? {
+        match scan_eligibility_inner(elf, interpreter_resolved)? {
             Ok(_) => {}
             Err(reason) => return Ok(Err(reason)),
         }
@@ -995,6 +1056,19 @@ impl DirectLoadGroup {
     /// image is index 0).
     pub fn image(&self, index: usize) -> &DirectImage {
         &self.images[index]
+    }
+
+    /// The interpreter image, when the main image declared `PT_INTERP` and
+    /// [`Self::load_with_interpreter`] mapped it.
+    pub fn interpreter(&self) -> Option<&DirectImage> {
+        self.interpreter.map(|index| &self.images[index])
+    }
+
+    /// Where process execution BEGINS: the interpreter's entry when one is
+    /// mapped (ld.so runs first and hands control to the main image via the
+    /// auxv's `AT_ENTRY`), the main image's entry otherwise.
+    pub fn entry_pc(&self) -> u64 {
+        self.interpreter().unwrap_or_else(|| self.main()).entry()
     }
 
     /// The guest's x18, as the veneers see it.
@@ -2013,12 +2087,17 @@ mod tests {
         let group = DirectLoadGroup::load(&elf, record_and_leave)
             .expect("load")
             .expect("eligible");
-        // A 16-aligned guest stack. SP points INTO the allocation with
-        // headroom below it — the island borrows a 16-byte slot below SP, so
-        // an SP at the allocation's base would push past the front edge.
-        let mut stack = vec![0_u64; 64];
-        stack[32] = 0xfeed_face_cafe_f00d;
-        let sp = std::ptr::from_ref(&stack[32]) as u64;
+        // A 16-aligned guest stack. SP points INTO the allocation with REAL
+        // headroom below it: the island borrows a 16-byte slot below SP and —
+        // more importantly — the Rust HANDLER runs on the guest stack, so its
+        // frames (thread-local access, Vec push, allocator calls) need
+        // kilobytes, not words. An earlier 256-byte headroom corrupted the
+        // heap below the Vec and died heap-layout-dependently (SIGBUS or a
+        // later SIGKILL), which is exactly the failure shape this comment is
+        // here to prevent.
+        let mut stack = vec![0_u64; 16 * 1024];
+        stack[16 * 1024 - 8] = 0xfeed_face_cafe_f00d;
+        let sp = std::ptr::from_ref(&stack[16 * 1024 - 8]) as u64;
         assert_eq!(sp % 16, 0, "Vec<u64> backing is 16-aligned on this host");
         seen_clear();
         let entry = group.main().entry();
