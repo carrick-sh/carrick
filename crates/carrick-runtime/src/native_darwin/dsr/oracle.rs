@@ -4042,8 +4042,8 @@ fn translated_block_is_published_on_retirement_and_reused() {
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
         NativePageProfileIdentity, PendingTranslationUnit, PublishOutcome, SharedExecutableSegment,
-        SharedImageConfig, SharedLoadedTranslationUnit, TranslationUnitKey,
-        TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
+        SharedImageConfig, SharedLoadedTranslationUnit, TranslationUnitKey, TranslationUnitStore,
+        UnitMissReason, decode_unit_bundle_v1, encode_unit_bundle_v1,
     };
 
     #[derive(Default)]
@@ -4076,20 +4076,23 @@ fn translated_block_is_published_on_retirement_and_reused() {
             if loaded.is_some() {
                 return Ok(PublishOutcome::Existing);
             }
-            // The store persists READABLE bytes; nothing executes at this
-            // address. The install replays them into the loading process's
-            // own cache.
-            let (code, records) = pending.pack_legacy_pair().expect("pack legacy test pair");
-            let code: Arc<Vec<u8>> = Arc::new(code);
-            let base = code.as_ptr() as usize;
-            let manifest = TranslationUnitManifest::from_blocks(
-                &pending.key,
-                [0x33; 32],
-                code.len() as u64,
-                &records,
-            )
-            .expect("round-trip retirement manifest");
-            let lease: Arc<dyn Send + Sync> = code;
+            // The store persists one READABLE bundle; nothing executes in
+            // place. Install replays its code into the loading process's own
+            // JIT cache while the lease pins the complete backing extent.
+            let bundle: Arc<Vec<u8>> = Arc::new(
+                encode_unit_bundle_v1(&pending.key, &pending.blocks)
+                    .expect("encode retirement unit-v1"),
+            );
+            let backing: Arc<dyn AsRef<[u8]> + Send + Sync> = bundle.clone();
+            let decoded =
+                decode_unit_bundle_v1(backing, &pending.key).expect("decode retirement unit-v1");
+            let base = (bundle.as_ptr() as usize)
+                .checked_add(decoded.code_offset())
+                .expect("retirement code base");
+            let manifest = decoded
+                .translation_manifest()
+                .expect("construct retirement replay manifest");
+            let lease: Arc<dyn Send + Sync> = bundle;
             *loaded = Some(SharedLoadedTranslationUnit::new(manifest, base, lease));
             Ok(PublishOutcome::Winner)
         }

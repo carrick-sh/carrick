@@ -1,5 +1,7 @@
 use super::{
-    MAX_TRANSLATION_UNIT_CODE_BYTES, PortableBlockCandidate, TranslationUnitKey, UnitMissReason,
+    MAX_TRANSLATION_UNIT_CODE_BYTES, PortableBlockCandidate, TRANSLATOR_ABI_CURRENT,
+    TranslationUnitKey, TranslationUnitManifest, UnitBlockIndexEntry, UnitMissReason, UnitPayload,
+    translation_unit_base_export,
 };
 use crate::artifact_spike::{ArtifactTemplate, UnitBlockColdWire, UnitBlockHotWire};
 use crate::types::{CodeGeneration, DsrError};
@@ -153,8 +155,11 @@ struct WireMetadataHeaderV6 {
 pub struct DecodedUnitBundle {
     backing: Arc<dyn AsRef<[u8]> + Send + Sync>,
     key: TranslationUnitKey,
+    code_sha256: [u8; 32],
     code_offset: usize,
+    code_len: usize,
     payload_offset: usize,
+    payload_len: usize,
     blocks: Vec<DecodedBlockV6>,
 }
 
@@ -178,6 +183,49 @@ impl DecodedUnitBundle {
 
     pub fn code_offset(&self) -> usize {
         self.code_offset
+    }
+
+    pub fn code_len(&self) -> usize {
+        self.code_len
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Build the runtime's lazy replay view over this mapped V6 bundle.
+    /// Both metadata and code retain the same backing mapping; no block
+    /// payload or translated code bytes are copied on attach.
+    pub fn translation_manifest(&self) -> Result<TranslationUnitManifest, UnitMissReason> {
+        let mut index = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            index.push(UnitBlockIndexEntry {
+                guest_start: block.guest_start,
+                entry_offset: u32::try_from(block.code_offset)
+                    .map_err(|_| UnitMissReason::ManifestRange)?,
+                code_len: u32::try_from(block.code_len)
+                    .map_err(|_| UnitMissReason::ManifestRange)?,
+                requires_sensitive_metadata: block.requires_sensitive_metadata,
+                payload_offset: block.hot_offset,
+                hot_len: block.hot_len,
+                cold_len: block.cold_len,
+            });
+        }
+        let base_export =
+            translation_unit_base_export(&self.key).map_err(|_| UnitMissReason::Schema)?;
+        Ok(TranslationUnitManifest {
+            schema: TRANSLATION_UNIT_SCHEMA_V6,
+            key: self.key.clone(),
+            code_sha256: self.code_sha256,
+            base_export,
+            code_len: self.code_len as u64,
+            index,
+            payload: UnitPayload {
+                bytes: Arc::clone(&self.backing),
+                start: self.payload_offset,
+                len: self.payload_len,
+            },
+        })
     }
 
     pub fn artifacts(&self) -> Result<Vec<StoredBlockArtifact>, UnitMissReason> {
@@ -220,6 +268,21 @@ impl DecodedUnitBundle {
                 })
             })
             .collect()
+    }
+
+    /// Publication-only validation of every hot/cold record. Attach stays
+    /// proportional to the fixed index and decodes a block only when replay
+    /// or fault reconstruction asks for it.
+    pub fn validate_deep(&self) -> Result<(), UnitMissReason> {
+        for artifact in self.artifacts()? {
+            let template = artifact.decode_template()?;
+            let code_len =
+                u32::try_from(artifact.code.len()).map_err(|_| UnitMissReason::ManifestRange)?;
+            if !template.replay_metadata_fits_code_len(code_len) {
+                return Err(UnitMissReason::ManifestRange);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -380,6 +443,23 @@ pub fn decode_unit_bundle_v1(
     backing: Arc<dyn AsRef<[u8]> + Send + Sync>,
     expected_key: &TranslationUnitKey,
 ) -> Result<DecodedUnitBundle, UnitMissReason> {
+    decode_unit_bundle_v1_inner(backing, Some(expected_key))
+}
+
+/// Decode a current-ABI bundle using its embedded key for offline diagnostics.
+/// Persistent stores must use [`decode_unit_bundle_v1`] so the caller's
+/// executable identity, source fingerprint, page profile, and address mode
+/// remain authoritative.
+pub fn decode_unit_bundle_v1_for_diagnostics(
+    backing: Arc<dyn AsRef<[u8]> + Send + Sync>,
+) -> Result<DecodedUnitBundle, UnitMissReason> {
+    decode_unit_bundle_v1_inner(backing, None)
+}
+
+fn decode_unit_bundle_v1_inner(
+    backing: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    expected_key: Option<&TranslationUnitKey>,
+) -> Result<DecodedUnitBundle, UnitMissReason> {
     let bytes = backing.as_ref().as_ref();
     if bytes.get(0..8) != Some(&UNIT_BUNDLE_MAGIC_V1) {
         return Err(UnitMissReason::Schema);
@@ -390,7 +470,10 @@ pub fn decode_unit_bundle_v1(
     {
         return Err(UnitMissReason::Schema);
     }
-    if read_u32(bytes, 24)? != expected_key.translator_abi() {
+    let outer_abi = read_u32(bytes, 24)?;
+    if outer_abi != TRANSLATOR_ABI_CURRENT
+        || expected_key.is_some_and(|key| key.translator_abi() != TRANSLATOR_ABI_CURRENT)
+    {
         return Err(UnitMissReason::TranslatorAbi);
     }
     let file_len = to_usize(read_u64(bytes, 16)?)?;
@@ -430,7 +513,12 @@ pub fn decode_unit_bundle_v1(
     let code = bytes
         .get(code_offset..code_end)
         .ok_or(UnitMissReason::ManifestRange)?;
-    if Sha256::digest(code).as_slice() != bytes.get(72..104).ok_or(UnitMissReason::Schema)? {
+    let code_sha256: [u8; 32] = bytes
+        .get(72..104)
+        .ok_or(UnitMissReason::Schema)?
+        .try_into()
+        .map_err(|_| UnitMissReason::Schema)?;
+    if Sha256::digest(code).as_slice() != code_sha256 {
         return Err(UnitMissReason::CodeDigest);
     }
     let metadata_bytes = bytes
@@ -456,7 +544,12 @@ pub fn decode_unit_bundle_v1(
     if consumed != header_bytes.len() || to_usize(header.block_count)? != block_count {
         return Err(UnitMissReason::Schema);
     }
-    validate_key(&header.key, expected_key)?;
+    if header.key.translator_abi() != TRANSLATOR_ABI_CURRENT {
+        return Err(UnitMissReason::TranslatorAbi);
+    }
+    if let Some(expected_key) = expected_key {
+        validate_key(&header.key, expected_key)?;
+    }
     let index_len = block_count
         .checked_mul(UNIT_BLOCK_INDEX_ROW_BYTES_V6)
         .ok_or(UnitMissReason::ManifestRange)?;
@@ -476,6 +569,12 @@ pub fn decode_unit_bundle_v1(
     let payload = metadata_bytes
         .get(payload_start..)
         .ok_or(UnitMissReason::Schema)?;
+    let segment_end = header
+        .key
+        .guest_va_start
+        .raw()
+        .checked_add(header.key.guest_va_len.get())
+        .ok_or(UnitMissReason::ManifestRange)?;
     let mut blocks = Vec::with_capacity(block_count);
     let mut payload_offset = 0_usize;
     let mut expected_code_offset = 0_usize;
@@ -495,6 +594,12 @@ pub fn decode_unit_bundle_v1(
         if flags & !UNIT_BLOCK_FLAG_SENSITIVE != 0
             || previous_guest_start.is_some_and(|previous| previous >= guest_start)
             || block_code_offset != expected_code_offset
+            || generation != CodeGeneration::INITIAL
+            || guest_start.raw() < header.key.guest_va_start.raw()
+            || source_end.raw() <= guest_start.raw()
+            || source_end.raw() > segment_end
+            || block_code_len == 0
+            || !block_code_len.is_multiple_of(4)
         {
             return Err(UnitMissReason::ManifestRange);
         }
@@ -537,13 +642,15 @@ pub fn decode_unit_bundle_v1(
     let decoded = DecodedUnitBundle {
         backing,
         key: header.key,
+        code_sha256,
         code_offset,
+        code_len,
         payload_offset: metadata_offset
             .checked_add(payload_start)
             .ok_or(UnitMissReason::ManifestRange)?,
+        payload_len,
         blocks,
     };
-    validate_decoded_artifacts(expected_key, &decoded)?;
     Ok(decoded)
 }
 
@@ -592,23 +699,6 @@ fn validate_artifacts(
         return Err(DsrError::CachePolicy(
             "translation unit exceeds a bundle capacity cap".to_string(),
         ));
-    }
-    Ok(())
-}
-
-fn validate_decoded_artifacts(
-    key: &TranslationUnitKey,
-    decoded: &DecodedUnitBundle,
-) -> Result<(), UnitMissReason> {
-    let artifacts = decoded.artifacts()?;
-    validate_artifacts(key, &artifacts).map_err(|_| UnitMissReason::ManifestRange)?;
-    for artifact in artifacts {
-        let template = artifact.decode_template()?;
-        let code_len =
-            u32::try_from(artifact.code.len()).map_err(|_| UnitMissReason::ManifestRange)?;
-        if !template.replay_metadata_fits_code_len(code_len) {
-            return Err(UnitMissReason::ManifestRange);
-        }
     }
     Ok(())
 }
@@ -791,6 +881,9 @@ mod tests {
         assert_eq!(forward, repeated, "the same set has stable bytes");
         assert_eq!(forward, reverse, "input order cannot affect bundle bytes");
 
+        let diagnostic = decode_unit_bundle_v1_for_diagnostics(Arc::new(forward.clone()))
+            .expect("decode current bundle for offline diagnostics");
+        assert_eq!(diagnostic.key(), &key);
         let decoded =
             decode_unit_bundle_v1(Arc::new(forward), &key).expect("decode production bundle");
         assert_eq!(
@@ -838,6 +931,13 @@ mod tests {
         let mut bad_abi = valid.clone();
         bad_abi[24..28].copy_from_slice(&(key.translator_abi() + 1).to_le_bytes());
         assert_eq!(decode_error(bad_abi, &key), UnitMissReason::TranslatorAbi);
+
+        let mut diagnostic_bad_abi = valid.clone();
+        diagnostic_bad_abi[24..28].copy_from_slice(&(key.translator_abi() + 1).to_le_bytes());
+        assert!(matches!(
+            decode_unit_bundle_v1_for_diagnostics(Arc::new(diagnostic_bad_abi)),
+            Err(UnitMissReason::TranslatorAbi)
+        ));
 
         assert_eq!(
             decode_error(valid, &fixture_key_with_digest(0x44)),

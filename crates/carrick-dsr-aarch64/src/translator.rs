@@ -5509,7 +5509,7 @@ mod tests {
             AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
             NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate,
             SharedLoadedTranslationUnit, SourceFingerprint, TranslationUnitKey,
-            decode_translation_unit_metadata, encode_translation_unit_metadata,
+            decode_unit_bundle_v1, encode_unit_bundle_v1,
         };
         use crate::translator::{
             AttachedReplayOutcome, ProcessTranslator, encode_aarch64_direct_branch,
@@ -5695,23 +5695,19 @@ mod tests {
         /// serve it through a `fixture_for_unit` translator.
         fn lookup_fixture(candidates: Vec<PortableBlockCandidate>) -> LookupFixture {
             let pending = PendingTranslationUnit::pack(unit_key(), candidates).expect("pack unit");
-            let (code, records) = pending.pack_legacy_pair().expect("pack legacy test pair");
-            // Round-trip the manifest through the exact wire the store
-            // persists, so serde of relocations, trusted entries, direct
-            // links, and run-encoded recovery is part of what this proves.
-            let bytes = encode_translation_unit_metadata(
-                &pending.key,
-                [0; 32],
-                code.len() as u64,
-                &records,
-            )
-            .expect("encode manifest");
-            let manifest =
-                decode_translation_unit_metadata(Arc::new(bytes)).expect("decode manifest");
-            let code = Arc::new(code);
+            let code = Arc::new(
+                encode_unit_bundle_v1(&pending.key, &pending.blocks).expect("encode unit-v1"),
+            );
+            let backing: Arc<dyn AsRef<[u8]> + Send + Sync> = code.clone();
+            let decoded =
+                decode_unit_bundle_v1(backing, &pending.key).expect("decode unit-v1 fixture");
+            let source_base = code.as_ptr() as usize + decoded.code_offset();
+            let manifest = decoded
+                .translation_manifest()
+                .expect("build V6 replay view");
             let unit = SharedLoadedTranslationUnit::new(
                 manifest,
-                code.as_ptr() as usize,
+                source_base,
                 Arc::clone(&code) as Arc<dyn Send + Sync>,
             );
             fixture_for_unit(unit, code)
@@ -6058,25 +6054,24 @@ mod tests {
             let (candidate, _native, _words) = record_candidate(&memory, &syscall_plan(BLOCK_A));
             let pending =
                 PendingTranslationUnit::pack(unit_key(), vec![candidate]).expect("pack unit");
-            let (mut code, records) = pending.pack_legacy_pair().expect("pack legacy test pair");
-            let manifest = crate::shared_cache::TranslationUnitManifest::from_blocks(
-                &pending.key,
-                [0; 32],
-                code.len() as u64,
-                &records,
-            )
-            .expect("round-trip corrupt-image manifest");
+            let bundle = Arc::new(
+                encode_unit_bundle_v1(&pending.key, &pending.blocks).expect("encode unit-v1"),
+            );
+            let backing: Arc<dyn AsRef<[u8]> + Send + Sync> = bundle.clone();
+            let decoded =
+                decode_unit_bundle_v1(backing, &pending.key).expect("decode unit-v1 fixture");
+            let manifest = decoded
+                .translation_manifest()
+                .expect("build V6 replay view");
+            let mut code = pending.blocks[0].code.to_vec();
             // Corrupt the first relocation site (the guard's
             // generation-address materialization): replay's opcode
             // validation must refuse rather than publish wrong code.
-            let first_relocation_word = records
-                .iter()
-                .find_map(|block| {
-                    block
-                        .template
-                        .first_relocation_word_for_test()
-                        .map(|offset| (block.entry_offset / 4 + offset) as usize)
-                })
+            let first_relocation_word = pending.blocks[0]
+                .decode_template()
+                .expect("decode normalized fixture metadata")
+                .first_relocation_word_for_test()
+                .map(|offset| offset as usize)
                 .expect("native tap records process relocations");
             code[first_relocation_word * 4..first_relocation_word * 4 + 4]
                 .copy_from_slice(&0xd503_201f_u32.to_le_bytes());
