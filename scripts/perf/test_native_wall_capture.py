@@ -585,7 +585,7 @@ class LifecycleCaptureFixtureTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
-                "CARRICK_DSR_SHARED_TRANSLATION": "1",
+                "CARRICK_DSR_PERSISTENT_STORE": "1",
                 "CARRICK_DSR_DIRECT_BINDINGS": "1",
                 "CARRICK_DSR_PROFILE": "ambient",
                 "CARRICK_FUTURE_CONTROL": "must-not-leak",
@@ -733,7 +733,7 @@ class LifecycleCaptureFixtureTests(unittest.TestCase):
 
         self.next_attempt()
         overlay = json.loads(self.overlay.read_text())
-        overlay["CARRICK_DSR_SHARED_TRANSLATION"] = "1"
+        overlay["CARRICK_DSR_PERSISTENT_STORE"] = "1"
         self.overlay.write_text(json.dumps(overlay))
         with self.assertRaisesRegex(self.module.EvidenceError, "sharing-disabled"):
             self.capture()

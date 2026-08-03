@@ -877,7 +877,7 @@ class CampaignContractTest(unittest.TestCase):
         candidate_receipt = self.receipt("candidate")
         default = self.overlay()
         shared = self.overlay(
-            CARRICK_DSR_SHARED_TRANSLATION="1",
+            CARRICK_DSR_PERSISTENT_STORE="1",
             CARRICK_DSR_DIRECT_BINDINGS="1",
         )
 
@@ -912,7 +912,7 @@ class CampaignContractTest(unittest.TestCase):
     def test_two_binary_mode_rejects_equal_legacy_candidate_overlays(self):
         legacy_candidate = self.overlay(
             CARRICK_DSR_ARTIFACT_SPIKE="1",
-            CARRICK_DSR_SHARED_TRANSLATION="1",
+            CARRICK_DSR_PERSISTENT_STORE="1",
             CARRICK_DSR_DIRECT_BINDINGS="1",
         )
 
@@ -951,7 +951,7 @@ class CampaignContractTest(unittest.TestCase):
         drifted = dataclasses.replace(receipt, binary_sha256="f" * 64)
         legacy_candidate = self.overlay(
             CARRICK_DSR_ARTIFACT_SPIKE="1",
-            CARRICK_DSR_SHARED_TRANSLATION="1",
+            CARRICK_DSR_PERSISTENT_STORE="1",
             CARRICK_DSR_DIRECT_BINDINGS="1",
         )
 
@@ -969,7 +969,7 @@ class CampaignContractTest(unittest.TestCase):
     def test_same_binary_accepts_equal_complete_overlay_for_null_proof(self):
         receipt = self.receipt("control")
         shared = self.overlay(
-            CARRICK_DSR_SHARED_TRANSLATION="1",
+            CARRICK_DSR_PERSISTENT_STORE="1",
             CARRICK_DSR_DIRECT_BINDINGS="1",
         )
 
@@ -1009,7 +1009,7 @@ class CampaignContractTest(unittest.TestCase):
     def test_same_binary_accepts_declared_default_on_zero_opt_outs(self):
         receipt = self.receipt("control")
         candidate = self.overlay(
-            CARRICK_DSR_SHARED_TRANSLATION="1",
+            CARRICK_DSR_PERSISTENT_STORE="1",
             CARRICK_DSR_DIRECT_BINDINGS="1",
         )
 
@@ -1025,7 +1025,7 @@ class CampaignContractTest(unittest.TestCase):
         ):
             with self.subTest(key=key):
                 control = self.overlay(
-                    CARRICK_DSR_SHARED_TRANSLATION="1",
+                    CARRICK_DSR_PERSISTENT_STORE="1",
                     CARRICK_DSR_DIRECT_BINDINGS="1",
                     **{key: "0"},
                 )

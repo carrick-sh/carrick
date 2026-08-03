@@ -139,12 +139,23 @@ fn active_host_jit() -> Result<&'static dyn NativeHostJit, types::DsrError> {
 }
 const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
 
-pub fn shared_translation_runtime_enabled() -> bool {
+/// The persistent per-image translation store is DEFAULT ON; the exact
+/// escape hatch is `CARRICK_DSR_PERSISTENT_STORE=0` (bisection, A/B arms).
+/// This replaces the retired opt-in `CARRICK_DSR_SHARED_TRANSLATION=1`
+/// spelling: the opt-in transport was measured 30% WORSE on the parallel
+/// cold go build (concurrent publishers, recording deferred past the second
+/// exec — 2026-08-03 scoreboard correction), and the fixes to that shape
+/// are structural (fork-claim clearing, first-miss election, per-host
+/// persistence), not a flag.
+pub fn persistent_store_runtime_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("CARRICK_DSR_SHARED_TRANSLATION").as_deref()
-            == Some(std::ffi::OsStr::new("1"))
+        persistent_store_enabled_from(std::env::var_os("CARRICK_DSR_PERSISTENT_STORE").as_deref())
     })
+}
+
+fn persistent_store_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
 }
 
 /// Encode the AArch64 `B` instruction that links `site` to `target`.
@@ -412,6 +423,15 @@ pub struct PreparedEntry {
     generation_bindings: usize,
     generation_binding_count: usize,
     executable_range_catalog: *const gateway::ExecutableRangeCatalogHeader,
+    /// Whether THIS process has any shared translation unit installed.
+    /// Monotone within an exec epoch (exec reset drops units and thread
+    /// caches together), so a `false` read at prepare proves this thread's
+    /// indirect cache holds no shared-unit target and the trusted
+    /// private-cache gateway entry stays sound. Replaces the old
+    /// env-flag proxy, which forced every entry of every process onto the
+    /// validating arms the moment the lane was enabled — even in processes
+    /// that never installed a unit.
+    has_shared_units: bool,
 }
 
 pub struct PreparedExit {
@@ -5726,6 +5746,7 @@ impl ThreadTranslator {
             .filter(|authority| authority.owns(entry));
         let cache_range = state.cache.host_range();
         let executable_range_catalog = state.executable_ranges.header_ptr();
+        let has_shared_units = !state.loaded_shared_units.is_empty();
         drop(state);
         let prepared = PreparedEntry {
             entry,
@@ -5737,6 +5758,7 @@ impl ThreadTranslator {
             generation_binding_count: shared
                 .map_or(0, |authority| authority.generation_binding_count),
             executable_range_catalog,
+            has_shared_units,
         };
         if PROFILE {
             probes::dsr_prepare_end(
@@ -5777,48 +5799,48 @@ impl ThreadTranslator {
                 prepared.generation.get(),
             );
         }
-        let gateway_result =
-            if prepared.generation_binding_count == 0 && !shared_translation_runtime_enabled() {
-                gateway::enter_translated_with_trusted_private_cache(
-                    prepared.entry,
-                    snapshot,
-                    &mut exit,
-                    &self.indirect_cache,
-                    prepared.address_mode,
-                )
-            } else if prepared.generation_binding_count == 0 {
-                gateway::enter_translated_with_cache_range_and_catalog(
-                    prepared.entry,
-                    snapshot,
-                    &mut exit,
-                    &self.indirect_cache,
-                    prepared.cache_start,
-                    prepared.cache_end,
-                    prepared.address_mode,
-                    prepared.executable_range_catalog,
-                )
-            } else {
-                // SAFETY: `ProcessState::loaded_shared_units` owns the boxed table
-                // for the entire configured image lifetime. Exec reset cannot run
-                // concurrently with an active prepared entry.
-                let bindings = unsafe {
-                    std::slice::from_raw_parts(
-                        prepared.generation_bindings as *const gateway::GenerationBinding,
-                        prepared.generation_binding_count,
-                    )
-                };
-                gateway::enter_translated_with_cache_range_and_generation_bindings_and_catalog(
-                    prepared.entry,
-                    snapshot,
-                    &mut exit,
-                    &self.indirect_cache,
-                    prepared.cache_start,
-                    prepared.cache_end,
-                    prepared.address_mode,
-                    bindings,
-                    prepared.executable_range_catalog,
+        let gateway_result = if prepared.generation_binding_count == 0 && !prepared.has_shared_units
+        {
+            gateway::enter_translated_with_trusted_private_cache(
+                prepared.entry,
+                snapshot,
+                &mut exit,
+                &self.indirect_cache,
+                prepared.address_mode,
+            )
+        } else if prepared.generation_binding_count == 0 {
+            gateway::enter_translated_with_cache_range_and_catalog(
+                prepared.entry,
+                snapshot,
+                &mut exit,
+                &self.indirect_cache,
+                prepared.cache_start,
+                prepared.cache_end,
+                prepared.address_mode,
+                prepared.executable_range_catalog,
+            )
+        } else {
+            // SAFETY: `ProcessState::loaded_shared_units` owns the boxed table
+            // for the entire configured image lifetime. Exec reset cannot run
+            // concurrently with an active prepared entry.
+            let bindings = unsafe {
+                std::slice::from_raw_parts(
+                    prepared.generation_bindings as *const gateway::GenerationBinding,
+                    prepared.generation_binding_count,
                 )
             };
+            gateway::enter_translated_with_cache_range_and_generation_bindings_and_catalog(
+                prepared.entry,
+                snapshot,
+                &mut exit,
+                &self.indirect_cache,
+                prepared.cache_start,
+                prepared.cache_end,
+                prepared.address_mode,
+                bindings,
+                prepared.executable_range_catalog,
+            )
+        };
         if let Err(error) = gateway_result {
             if PROFILE {
                 probes::dsr_run_end(
@@ -6315,6 +6337,21 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     const PC: GuestVa = GuestVa(0x1000);
+
+    /// The persistent store is opt-OUT: unset means ON, and `=0` is the
+    /// exact escape hatch. Pinned on the pure parser because the runtime
+    /// gate caches the environment in a `OnceLock`.
+    #[test]
+    fn persistent_store_default_and_hatch_parse() {
+        assert!(super::persistent_store_enabled_from(None), "default is ON");
+        assert!(
+            !super::persistent_store_enabled_from(Some(std::ffi::OsStr::new("0"))),
+            "=0 is the exact hatch"
+        );
+        assert!(super::persistent_store_enabled_from(Some(
+            std::ffi::OsStr::new("1")
+        )));
+    }
 
     struct TestHostJit;
 
@@ -11914,10 +11951,9 @@ pub mod xlat_census {
         /// The block's code generation is not `INITIAL`: guest code at this VA
         /// was mutated, so no published unit can describe it.
         Regenerated,
-        /// This process installed no shared-translation configuration. On the
-        /// default path that is simply the opt-in gate
-        /// (`CARRICK_DSR_SHARED_TRANSLATION`) being off; with the gate on it
-        /// means the image yielded no executable segment.
+        /// This process installed no shared-translation configuration: the
+        /// hatch (`CARRICK_DSR_PERSISTENT_STORE=0`) is set, or the image
+        /// yielded no executable segment.
         LaneUnconfigured,
         /// The block's entry VA lies outside every configured segment -- the
         /// population no unit of any design can serve.
@@ -12707,9 +12743,9 @@ pub mod xlat_census {
     ///
     /// Called from `NativeMappedMemory::configure_shared_translation` for every
     /// process image, including each `execve` replacement, and independently of
-    /// `CARRICK_DSR_SHARED_TRANSLATION` -- the census's job is to describe the
-    /// default path. The stems are derived once per (image, segment) here
-    /// rather than per translation.
+    /// the `CARRICK_DSR_PERSISTENT_STORE` hatch -- the census's job is to
+    /// describe whichever arm is running. The stems are derived once per
+    /// (image, segment) here rather than per translation.
     /// Forget the configured image, so a successor with no configurable segment
     /// cannot inherit its predecessor's.
     ///

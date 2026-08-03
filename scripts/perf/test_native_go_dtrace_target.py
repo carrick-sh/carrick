@@ -287,7 +287,7 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             if value == "--forward-env"
         }
         self.assertIn("CARRICK_RUN_ID=metadata-v2-trace", forwarded)
-        self.assertIn("CARRICK_DSR_SHARED_TRANSLATION=1", forwarded)
+        self.assertIn("CARRICK_DSR_PERSISTENT_STORE=1", forwarded)
         self.assertIn("CARRICK_DSR_DIRECT_BINDINGS=1", forwarded)
         self.assertIn("CARRICK_DSR_SHARED_MAPPED_METADATA=0", forwarded)
         self.assertEqual(run_command[0:3], ["run", "--exec-backend", "native"])
@@ -410,7 +410,7 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
         self.assertIn(
             "CARRICK_RUN_ID=metadata-v2-standalone-trace", forwarded
         )
-        self.assertIn("CARRICK_DSR_SHARED_TRANSLATION=1", forwarded)
+        self.assertIn("CARRICK_DSR_PERSISTENT_STORE=1", forwarded)
         self.assertIn("CARRICK_DSR_DIRECT_BINDINGS=1", forwarded)
         self.assertIn("CARRICK_DSR_SHARED_MAPPED_METADATA=0", forwarded)
         self.assertIn("CARRICK_DSR_PROFILE=1", forwarded)
@@ -657,7 +657,7 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             ["/tmp/carrick", "run", "--exec-backend", "native"],
             run_id="metadata-v2-exec",
             overlay={
-                "CARRICK_DSR_SHARED_TRANSLATION": "1",
+                "CARRICK_DSR_PERSISTENT_STORE": "1",
                 "CARRICK_DSR_SHARED_MAPPED_METADATA": "0",
                 "CARRICK_DSR_PROFILE": "1",
                 "CARRICK_DSR_SHARED_MANIFEST_ARC": None,
@@ -688,7 +688,7 @@ class NativeGoDtraceTargetTests(unittest.TestCase):
             forwarded,
             {
                 "CARRICK_RUN_ID=metadata-v2-exec",
-                "CARRICK_DSR_SHARED_TRANSLATION=1",
+                "CARRICK_DSR_PERSISTENT_STORE=1",
                 "CARRICK_DSR_SHARED_MAPPED_METADATA=0",
                 "CARRICK_DSR_PROFILE=1",
             },

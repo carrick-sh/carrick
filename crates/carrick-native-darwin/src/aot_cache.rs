@@ -817,7 +817,15 @@ impl ContainerCacheAuthority {
     /// ephemeral directory if the host location cannot be prepared. The
     /// fallback keeps `begin_container_cache` infallible-in-practice: a
     /// broken cache directory costs persistence, never the container.
+    ///
+    /// The `CARRICK_DSR_PERSISTENT_STORE=0` hatch restores the
+    /// pre-persistence lifecycle exactly: a per-run tempdir, removed at
+    /// container exit, that the (equally hatched-off) translator lane never
+    /// consults.
     fn create() -> std::io::Result<Self> {
+        if !carrick_dsr_aarch64::translator::persistent_store_runtime_enabled() {
+            return Self::create_ephemeral();
+        }
         match Self::open_persistent_at(&persistent_store_root()) {
             Ok(authority) => Ok(authority),
             Err(error) => {

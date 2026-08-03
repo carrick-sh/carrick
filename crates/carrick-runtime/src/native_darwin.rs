@@ -1026,9 +1026,10 @@ enum ExecDigestPolicy {
 /// Whether anything will read an executable's content digest this run.
 ///
 /// The three consumers each mint an `ExecutableIdentity`/`TranslationUnitKey`
-/// from it and are independently opt-in.
+/// from it. The persistent translation store is default-on
+/// (`CARRICK_DSR_PERSISTENT_STORE=0` disables); the other two are opt-in.
 fn executable_digest_is_consumed() -> bool {
-    carrick_dsr_aarch64::translator::shared_translation_runtime_enabled()
+    carrick_dsr_aarch64::translator::persistent_store_runtime_enabled()
         || carrick_dsr_aarch64::artifact_spike::enabled()
         || carrick_dsr_aarch64::translator::xlat_census::armed()
 }

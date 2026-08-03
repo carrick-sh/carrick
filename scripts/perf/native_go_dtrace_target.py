@@ -830,7 +830,7 @@ def main() -> int:
             if overlay != expected_overlay:
                 raise ValueError(
                     "standalone capture requires the exact overlay authority, including "
-                    "CARRICK_DSR_SHARED_TRANSLATION=1, CARRICK_DSR_DIRECT_BINDINGS=1, "
+                    "CARRICK_DSR_PERSISTENT_STORE=1, CARRICK_DSR_DIRECT_BINDINGS=1, "
                     "and CARRICK_DSR_PROFILE=1"
                 )
             expected_arm = (

@@ -133,7 +133,7 @@ class NativeGoBuildScreenTest(unittest.TestCase):
         ambient = {
             "PATH": "/bin",
             "CARRICK_DSR_PROFILE": "1",
-            "CARRICK_DSR_KEEP_CONTAINER_CACHE": "1",
+            "CARRICK_DSR_STORE_DIR": "1",
         }
 
         environment, _ = native_go_build.variant_environment(
@@ -141,14 +141,14 @@ class NativeGoBuildScreenTest(unittest.TestCase):
         )
 
         self.assertNotIn("CARRICK_DSR_PROFILE", environment)
-        self.assertNotIn("CARRICK_DSR_KEEP_CONTAINER_CACHE", environment)
+        self.assertNotIn("CARRICK_DSR_STORE_DIR", environment)
 
     def test_candidate_cli_uses_only_the_fixed_candidate_overlay(self):
         with mock.patch.dict(
             os.environ,
             {
                 "CARRICK_DSR_PROFILE": "1",
-                "CARRICK_DSR_KEEP_CONTAINER_CACHE": "1",
+                "CARRICK_DSR_STORE_DIR": "1",
             },
             clear=False,
         ):
@@ -163,12 +163,12 @@ class NativeGoBuildScreenTest(unittest.TestCase):
             enabled,
             {
                 "CARRICK_DSR_ARTIFACT_SPIKE",
-                "CARRICK_DSR_SHARED_TRANSLATION",
+                "CARRICK_DSR_PERSISTENT_STORE",
                 "CARRICK_DSR_DIRECT_BINDINGS",
             },
         )
         self.assertNotIn("CARRICK_DSR_PROFILE", environment)
-        self.assertNotIn("CARRICK_DSR_KEEP_CONTAINER_CACHE", environment)
+        self.assertNotIn("CARRICK_DSR_STORE_DIR", environment)
         self.assertEqual(
             native_go_build.parse_args(["--variant", "candidate"]).variant,
             "candidate",

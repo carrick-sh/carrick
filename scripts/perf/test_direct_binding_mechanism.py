@@ -227,7 +227,7 @@ class MechanismFixture:
                 and key
                 in {
                     "CARRICK_DSR_ARTIFACT_SPIKE",
-                    "CARRICK_DSR_SHARED_TRANSLATION",
+                    "CARRICK_DSR_PERSISTENT_STORE",
                     "CARRICK_DSR_DIRECT_BINDINGS",
                     "CARRICK_DSR_PROFILE",
                 }
@@ -237,7 +237,7 @@ class MechanismFixture:
                     and key
                     in {
                         "CARRICK_DSR_ARTIFACT_SPIKE",
-                        "CARRICK_DSR_SHARED_TRANSLATION",
+                        "CARRICK_DSR_PERSISTENT_STORE",
                         "CARRICK_DSR_PROFILE",
                     }
                     else None

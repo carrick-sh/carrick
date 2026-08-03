@@ -525,9 +525,10 @@ pub struct DirectBindingRegistry {
     /// nothing -- the iterator is empty and an empty `Vec` does not allocate --
     /// which is why it went unnoticed: the scan only has records to walk when
     /// shared translation is on. Measured cost of that asymmetry on one cold
-    /// go-build: 17-50x slower with `CARRICK_DSR_SHARED_TRANSLATION=1` (>300 s
-    /// against 17.2 s and 18.8 s controls), with the seven hottest user stacks
-    /// all being this function.
+    /// go-build: 17-50x slower with the shared lane enabled (then the opt-in
+    /// `CARRICK_DSR_SHARED_TRANSLATION=1`, now the default-on persistent
+    /// store; >300 s against 17.2 s and 18.8 s controls), with the seven
+    /// hottest user stacks all being this function.
     ///
     /// Unit indices stay valid because `units` is only ever pushed to or
     /// cleared wholesale -- never removed from individually.
