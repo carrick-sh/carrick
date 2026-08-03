@@ -9,7 +9,9 @@
 
 #[cfg(target_arch = "aarch64")]
 fn main() {
-    use carrick_native_darwin::direct::{DirectIneligible, scan_eligibility};
+    use carrick_native_darwin::direct::{
+        DirectIneligible, scan_eligibility, scan_eligibility_as_interpreted,
+    };
 
     let mut eligible = 0_usize;
     let mut refused = 0_usize;
@@ -23,6 +25,22 @@ fn main() {
             Ok(Ok(sites)) => {
                 eligible += 1;
                 println!("{name:<24} ELIGIBLE  {sites} svc site(s) to patch");
+            }
+            // A dynamic image is loadable through the interpreter chain
+            // (`load_with_interpreter`), so its real standing is its OWN
+            // text's verdict — report that, not a blanket "dynamic".
+            Ok(Err(DirectIneligible::NeedsInterpreter { path })) => {
+                match scan_eligibility_as_interpreted(&bytes) {
+                    Ok(Ok(sites)) => {
+                        eligible += 1;
+                        println!("{name:<24} ELIGIBLE  {sites} svc site(s), dynamic via {path}");
+                    }
+                    Ok(Err(reason)) => {
+                        refused += 1;
+                        println!("{name:<24} tier T    [dynamic-main] {reason}");
+                    }
+                    Err(error) => println!("{name:<24} ERROR     {error}"),
+                }
             }
             Ok(Err(reason)) => {
                 refused += 1;
