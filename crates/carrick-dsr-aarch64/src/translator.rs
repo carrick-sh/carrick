@@ -360,6 +360,8 @@ impl PreparedDirectBindingExecReset<'_, '_, '_> {
         state.executable_ranges.reset_head_to_private();
         recorder(DirectBindingResetEvent::ExecutableRangeHeadReset);
         recorder(DirectBindingResetEvent::UnitsDropped);
+        state.attached_units.clear();
+        state.attached_unit_blocks.clear();
         state.executable_ranges.drop_shared_nodes();
         recorder(DirectBindingResetEvent::ExecutableRangeNodesDropped);
         state.clear_published();
@@ -868,6 +870,18 @@ pub struct ProcessState {
     shared_translation: Option<SharedTranslationConfiguration>,
     shared_unit_segments_consulted: BTreeSet<carrick_guest_mem::GuestVa>,
     shared_recording_segments: BTreeSet<carrick_guest_mem::GuestVa>,
+    /// Units this process attached from the store, blocks NOT yet replayed.
+    /// A block is replayed into the private cache on its FIRST lookup
+    /// (`replay_attached_unit_block`), so an exec that touches a fraction of
+    /// a unit never pays for the rest. Each unit pins its `.code` mapping
+    /// (and, for the store path, its metadata mapping) for the process
+    /// lifetime; fork children inherit both by COW and keep replaying.
+    attached_units: Vec<crate::shared_cache::SharedLoadedTranslationUnit>,
+    /// Guest block start -> (unit, block) for every not-yet-replayed block of
+    /// every attached unit. An entry is removed when its block replays (the
+    /// block index in `blocks` then owns the lookup), when its page
+    /// regenerates, or when its unit is detached after a replay refusal.
+    attached_unit_blocks: BTreeMap<carrick_guest_mem::GuestVa, AttachedUnitBlock>,
     shared_candidates:
         BTreeMap<carrick_guest_mem::GuestVa, Vec<crate::shared_cache::PortableBlockCandidate>>,
     shared_publish_attempted: bool,
@@ -881,6 +895,32 @@ pub struct ProcessState {
 struct SharedTranslationConfiguration {
     image: crate::shared_cache::SharedImageConfig,
     store: Arc<dyn crate::shared_cache::TranslationUnitStore>,
+}
+
+/// One not-yet-replayed block of an attached unit: indices into
+/// `ProcessState::attached_units` and that unit's manifest block table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttachedUnitBlock {
+    unit: u32,
+    block: u32,
+}
+
+/// What one `replay_attached_unit_block` call did, so the LOOKUP path can
+/// census each lookup exactly once (a fresh consult is already counted as
+/// `consulted`/`loaded`; only a store-bypassing repeat records its outcome).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachedReplayOutcome {
+    /// The block replayed and published; the lookup is served.
+    Replayed(types::CacheVa),
+    /// No attached unit covers this guest VA (never recorded by a unit, or
+    /// its entry was dropped by an earlier per-block failure).
+    NotCovered,
+    /// The page regenerated; no INITIAL-keyed entry can serve it again.
+    Regenerated,
+    /// The private cache is out of room; translate privately instead.
+    Capacity,
+    /// Replay validation refused the unit's bytes; the unit is detached.
+    Refused,
 }
 
 const fn translation_source_words_required(
@@ -970,8 +1010,13 @@ pub struct ResolverStats {
     pub shared_unit_lookups: u64,
     pub shared_unit_hits: u64,
     pub shared_unit_loads: u64,
+    /// Blocks REPLAYED from attached units (on first lookup), not blocks
+    /// made available — that is `shared_blocks_attached`. The gap between
+    /// the two is exactly the replay work lazy install avoided.
     pub shared_blocks_mapped: u64,
     pub shared_translations_avoided: u64,
+    /// Blocks indexed at unit attach, available for lazy replay.
+    pub shared_blocks_attached: u64,
     pub shared_metadata_bytes_read: u64,
     pub shared_metadata_bytes_mapped: u64,
     pub shared_metadata_validation_ns: u64,
@@ -1015,6 +1060,7 @@ pub enum ResolverStat {
     SharedUnitLoads,
     SharedBlocksMapped,
     SharedTranslationsAvoided,
+    SharedBlocksAttached,
     SharedMetadataBytesRead,
     SharedMetadataBytesMapped,
     SharedMetadataValidationNs,
@@ -1029,7 +1075,7 @@ pub enum ResolverStat {
 }
 
 impl ResolverStat {
-    const ALL: [Self; 31] = [
+    const ALL: [Self; 32] = [
         Self::ResolverExits,
         Self::OneEntryHits,
         Self::Translations,
@@ -1050,6 +1096,7 @@ impl ResolverStat {
         Self::SharedUnitLoads,
         Self::SharedBlocksMapped,
         Self::SharedTranslationsAvoided,
+        Self::SharedBlocksAttached,
         Self::SharedMetadataBytesRead,
         Self::SharedMetadataBytesMapped,
         Self::SharedMetadataValidationNs,
@@ -1085,6 +1132,7 @@ impl ResolverStat {
             Self::SharedUnitLoads => "shared_unit_loads",
             Self::SharedBlocksMapped => "shared_blocks_mapped",
             Self::SharedTranslationsAvoided => "shared_translations_avoided",
+            Self::SharedBlocksAttached => "shared_blocks_attached",
             Self::SharedMetadataBytesRead => "shared_metadata_bytes_read",
             Self::SharedMetadataBytesMapped => "shared_metadata_bytes_mapped",
             Self::SharedMetadataValidationNs => "shared_metadata_validation_ns",
@@ -1123,6 +1171,7 @@ impl ResolverStats {
             ResolverStat::SharedUnitLoads => self.shared_unit_loads,
             ResolverStat::SharedBlocksMapped => self.shared_blocks_mapped,
             ResolverStat::SharedTranslationsAvoided => self.shared_translations_avoided,
+            ResolverStat::SharedBlocksAttached => self.shared_blocks_attached,
             ResolverStat::SharedMetadataBytesRead => self.shared_metadata_bytes_read,
             ResolverStat::SharedMetadataBytesMapped => self.shared_metadata_bytes_mapped,
             ResolverStat::SharedMetadataValidationNs => self.shared_metadata_validation_ns,
@@ -1159,6 +1208,7 @@ impl ResolverStats {
             ResolverStat::SharedUnitLoads => self.shared_unit_loads = value,
             ResolverStat::SharedBlocksMapped => self.shared_blocks_mapped = value,
             ResolverStat::SharedTranslationsAvoided => self.shared_translations_avoided = value,
+            ResolverStat::SharedBlocksAttached => self.shared_blocks_attached = value,
             ResolverStat::SharedMetadataBytesRead => self.shared_metadata_bytes_read = value,
             ResolverStat::SharedMetadataBytesMapped => self.shared_metadata_bytes_mapped = value,
             ResolverStat::SharedMetadataValidationNs => self.shared_metadata_validation_ns = value,
@@ -1597,6 +1647,7 @@ impl ThreadTranslator {
             shared_unit_loads: process.stats.shared_unit_loads,
             shared_blocks_mapped: process.stats.shared_blocks_mapped,
             shared_translations_avoided: process.stats.shared_translations_avoided,
+            shared_blocks_attached: process.stats.shared_blocks_attached,
             shared_metadata_bytes_read: process.stats.shared_metadata_bytes_read,
             shared_metadata_bytes_mapped: process.stats.shared_metadata_bytes_mapped,
             shared_metadata_validation_ns: process.stats.shared_metadata_validation_ns,
@@ -1663,6 +1714,7 @@ impl ThreadTranslator {
             shared_unit_loads: delta.shared_unit_loads,
             shared_blocks_mapped: delta.shared_blocks_mapped,
             shared_translations_avoided: delta.shared_translations_avoided,
+            shared_blocks_attached: delta.shared_blocks_attached,
             shared_metadata_bytes_read: delta.shared_metadata_bytes_read,
             shared_metadata_bytes_mapped: delta.shared_metadata_bytes_mapped,
             shared_metadata_validation_ns: delta.shared_metadata_validation_ns,
@@ -1751,6 +1803,7 @@ impl ThreadTranslator {
             shared_unit_loads: 0,
             shared_blocks_mapped: 0,
             shared_translations_avoided: 0,
+            shared_blocks_attached: 0,
             shared_metadata_bytes_read: 0,
             shared_metadata_bytes_mapped: 0,
             shared_metadata_validation_ns: 0,
@@ -2025,6 +2078,8 @@ impl ProcessTranslator {
                 shared_translation: None,
                 shared_unit_segments_consulted: BTreeSet::new(),
                 shared_recording_segments: BTreeSet::new(),
+                attached_units: Vec::new(),
+                attached_unit_blocks: BTreeMap::new(),
                 shared_candidates: BTreeMap::new(),
                 shared_publish_attempted: false,
                 executable_ranges: gateway::ExecutableRangeCatalog::new(
@@ -2345,8 +2400,27 @@ impl ProcessState {
         };
         let segment_start = segment.guest_start;
         if !self.shared_unit_segments_consulted.insert(segment_start) {
-            xlat_census::record_lookup_skipped(xlat_census::LookupSkip::SegmentRepeat);
-            return Ok(None);
+            // The segment's store consult already happened; the only thing a
+            // repeat lookup can be served from is an ATTACHED unit's
+            // not-yet-replayed block. This lookup never touches the store, so
+            // it records its own census outcome — exactly one record per
+            // lookup, `replayed` or a skip.
+            return match self.replay_attached_unit_block(memory, guest)? {
+                AttachedReplayOutcome::Replayed(entry) => {
+                    xlat_census::record_lookup_replayed();
+                    Ok(Some(entry))
+                }
+                AttachedReplayOutcome::Regenerated => {
+                    xlat_census::record_lookup_skipped(xlat_census::LookupSkip::Regenerated);
+                    Ok(None)
+                }
+                AttachedReplayOutcome::NotCovered
+                | AttachedReplayOutcome::Capacity
+                | AttachedReplayOutcome::Refused => {
+                    xlat_census::record_lookup_skipped(xlat_census::LookupSkip::SegmentRepeat);
+                    Ok(None)
+                }
+            };
         }
         let key = configuration.image.key_for_segment(segment);
         let source_words = Arc::clone(&segment.source_words);
@@ -2374,56 +2448,42 @@ impl ProcessState {
             }
         };
         self.stats.shared_unit_loads = self.stats.shared_unit_loads.saturating_add(1);
-        match self.install_shared_unit(memory, unit) {
+        match self.attach_shared_unit(unit) {
             Ok(()) => {}
-            Err(types::DsrError::GenerationChanged { .. }) => return Ok(None),
-            // The install replays into this process's own cache; a full
-            // cache means "translate privately" (which will fail the same
-            // way if truly out of room), never a hard guest error.
-            Err(types::DsrError::CacheCapacity { .. }) => return Ok(None),
-            // A unit the installer's own validators refuse (a stale store
-            // shape, a corrupt template) must fail closed to private
-            // translation, never kill the guest that consulted the store.
-            // Blocks replayed before the refusal are VALID native blocks
-            // (each one passed replay validation), so a partial install is
-            // exactly "some blocks were already translated". The warn — not
-            // silence — is what keeps a store that never installs from
-            // reading as a plain miss.
+            // A unit the attach validators refuse (a stale store shape, bad
+            // geometry) must fail closed to private translation, never kill
+            // the guest that consulted the store. The warn — not silence —
+            // is what keeps a store that never attaches from reading as a
+            // plain miss.
             Err(types::DsrError::CachePolicy(reason)) => {
                 tracing::warn!(
                     reason,
                     guest = guest.raw(),
-                    "shared unit refused at install; translating privately"
+                    "shared unit refused at attach; translating privately"
                 );
                 return Ok(None);
             }
             Err(error) => return Err(error),
         }
-        let result = self.blocks.get(&(guest, generation)).copied();
-        if result.is_some() {
-            self.stats.shared_unit_hits = self.stats.shared_unit_hits.saturating_add(1);
-            self.stats.shared_translations_avoided =
-                self.stats.shared_translations_avoided.saturating_add(1);
+        // This lookup is already censused as a store consult (`loaded`); its
+        // replay outcome must not add a second record to the per-lookup
+        // census identity.
+        match self.replay_attached_unit_block(memory, guest)? {
+            AttachedReplayOutcome::Replayed(entry) => Ok(Some(entry)),
+            AttachedReplayOutcome::NotCovered
+            | AttachedReplayOutcome::Regenerated
+            | AttachedReplayOutcome::Capacity
+            | AttachedReplayOutcome::Refused => Ok(None),
         }
-        Ok(result)
     }
 
-    /// Install a loaded unit by replaying each block's recorded native
-    /// emission into this process's own cache and publishing it through
-    /// `publish_emitted` — THE publication point — so an installed block is
-    /// INDISTINGUISHABLE from a natively-translated one: Absolute guard,
-    /// trusted entry registered, pending links patched, incoming links
-    /// severable, page dependencies recorded. No binding tables, no edge
-    /// trampolines, no separate shared indexes.
-    ///
-    /// Per-block skips (an already-present block, a regenerated page) are
-    /// not errors: the remaining blocks still install, and a skipped guest
-    /// PC falls back to private translation. Any validation failure aborts
-    /// the remainder of the unit fail-closed; blocks already replayed are
-    /// valid native blocks and stay.
-    fn install_shared_unit(
+    /// Attach a loaded unit for LAZY per-block replay: validate its manifest
+    /// fail-closed, index every block by guest start, and pin the unit (its
+    /// lease keeps the `.code` bytes mapped). No block is replayed here —
+    /// `replay_attached_unit_block` replays each on its first lookup, so an
+    /// exec pays replay cost only for the blocks it actually reaches.
+    fn attach_shared_unit(
         &mut self,
-        memory: &NativeMappedMemory,
         unit: crate::shared_cache::SharedLoadedTranslationUnit,
     ) -> Result<(), types::DsrError> {
         let metadata_load_evidence = unit.load_evidence;
@@ -2432,88 +2492,194 @@ impl ProcessState {
                 "loaded shared translation manifest is invalid: {reason:?}"
             ))
         })?;
-        let code_len = usize::try_from(unit.manifest.code_len).map_err(|_| {
-            types::DsrError::CachePolicy(
+        if usize::try_from(unit.manifest.code_len).is_err() {
+            return Err(types::DsrError::CachePolicy(
                 "shared translation range length does not fit usize".to_string(),
-            )
-        })?;
+            ));
+        }
         let source_base = unit.source_base;
         if source_base == 0 || !source_base.is_multiple_of(4) {
             return Err(types::DsrError::CachePolicy(format!(
                 "shared translation source address is unusable: 0x{source_base:x}"
             )));
         }
-        // SAFETY: `TranslationUnitStore::load` contract — `source_base`
-        // addresses `code_len` readable bytes kept alive by the unit's
-        // lease, and `code_len` was bounds-checked against the metadata just
-        // above. The lease only needs to outlive this install: every block
-        // is COPIED into the private cache by replay.
-        let source = unsafe { std::slice::from_raw_parts(source_base as *const u8, code_len) };
-        let mode: emit::EmitAddressMode = memory.address_mode().into();
-        let manifest = Arc::clone(&unit.manifest);
-        let mut installed = 0_u64;
-        for block in &manifest.blocks {
-            let key = (block.guest_start, types::CodeGeneration::INITIAL);
-            if self.blocks.contains_key(&key) {
-                continue;
-            }
-            let observation = memory.dsr_generation_observation(block.guest_start)?;
-            if observation.expected() != types::CodeGeneration::INITIAL {
-                continue;
-            }
-            let start = usize::try_from(block.entry_offset).map_err(|_| {
-                types::DsrError::CachePolicy(
-                    "shared block entry offset does not fit usize".to_string(),
-                )
+        let unit_index = u32::try_from(self.attached_units.len()).map_err(|_| {
+            types::DsrError::CachePolicy("attached unit count exceeds u32".to_string())
+        })?;
+        let mut indexed = 0_u64;
+        for (block_index, block) in unit.manifest.blocks.iter().enumerate() {
+            let block_index = u32::try_from(block_index).map_err(|_| {
+                types::DsrError::CachePolicy("attached unit block index exceeds u32".to_string())
             })?;
-            let end = start
-                .checked_add(block.code_len as usize)
-                .filter(|end| *end <= code_len)
-                .ok_or_else(|| {
-                    types::DsrError::CachePolicy("shared block extent exceeds its unit".to_string())
-                })?;
-            let words = source[start..end]
-                .chunks_exact(4)
-                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-                .collect::<Vec<_>>();
-            let bindings = artifact_spike::ArtifactBindings::for_replay(
-                observation.current_atomic() as *const std::sync::atomic::AtomicU64 as u64,
-                types::CodeGeneration::INITIAL.get(),
-                mode,
-            )?;
-            // Sensitive-exit metadata is not part of the template (it is
-            // plan-derived), so re-plan the block to harvest it BEFORE the
-            // block becomes reachable.
-            if block.requires_sensitive_metadata {
-                self.harvest_unit_block_sensitive_metadata(memory, block.guest_start)?;
-            }
-            let emitted = artifact_spike::replay_unit_block(
-                &mut self.cache,
-                words,
-                block.template.clone().into_unit_replay_parts(),
-                &bindings,
-            )?;
-            if observation.current() != types::CodeGeneration::INITIAL {
-                // The page regenerated between observation and replay: a
-                // block published under the INITIAL key could never be
-                // looked up. Skip it; the replayed extent is unreachable.
-                continue;
-            }
-            let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
-            self.publish_emitted(
-                memory,
-                key,
-                observation.page(),
-                observation,
-                emitted,
-                emitted_bytes,
-                TranslationOutcome::SharedUnit,
-            )?;
-            installed = installed.saturating_add(1);
+            // First-attached wins: configured segments are disjoint, so a
+            // collision would mean two units claim one guest VA — serving
+            // the first-attached one is deterministic either way.
+            self.attached_unit_blocks
+                .entry(block.guest_start)
+                .or_insert(AttachedUnitBlock {
+                    unit: unit_index,
+                    block: block_index,
+                });
+            indexed = indexed.saturating_add(1);
         }
-        self.stats.shared_blocks_mapped = self.stats.shared_blocks_mapped.saturating_add(installed);
+        self.stats.shared_blocks_attached =
+            self.stats.shared_blocks_attached.saturating_add(indexed);
+        self.attached_units.push(unit);
         self.apply_shared_metadata_evidence(metadata_load_evidence);
         Ok(())
+    }
+
+    /// Replay ONE attached-unit block — the one `guest` names — through
+    /// `publish_emitted`, THE publication point, so a replayed block is
+    /// INDISTINGUISHABLE from a natively-translated one: Absolute guard,
+    /// trusted entry registered, pending links patched, incoming links
+    /// severable, page dependencies recorded.
+    ///
+    /// Fail-closed per block: a regenerated page or a full cache drops the
+    /// block's index entry and falls back to private translation; a replay
+    /// VALIDATION refusal (corrupt words, an opcode mismatch) detaches the
+    /// whole unit — blocks already replayed passed validation and stay, and
+    /// every remaining lookup translates privately.
+    ///
+    /// Census-free by design: the caller records exactly one census outcome
+    /// per LOOKUP, and a fresh consult is already counted before it replays.
+    fn replay_attached_unit_block(
+        &mut self,
+        memory: &NativeMappedMemory,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Result<AttachedReplayOutcome, types::DsrError> {
+        let Some(&AttachedUnitBlock { unit, block }) = self.attached_unit_blocks.get(&guest) else {
+            return Ok(AttachedReplayOutcome::NotCovered);
+        };
+        let Some(attached) = self.attached_units.get(unit as usize) else {
+            return Err(types::DsrError::CachePolicy(format!(
+                "attached unit index {unit} is out of bounds"
+            )));
+        };
+        // Clone the Arc'd manifest handle and copy the scalars so the borrow
+        // of `self.attached_units` ends before the `&mut self` replay calls.
+        let manifest = Arc::clone(&attached.manifest);
+        let source_base = attached.source_base;
+        let Some(record) = manifest.blocks.get(block as usize) else {
+            return Err(types::DsrError::CachePolicy(format!(
+                "attached unit block index {block} is out of bounds"
+            )));
+        };
+        debug_assert_eq!(record.guest_start, guest);
+        let code_len = usize::try_from(manifest.code_len).map_err(|_| {
+            types::DsrError::CachePolicy(
+                "shared translation range length does not fit usize".to_string(),
+            )
+        })?;
+        let key = (guest, types::CodeGeneration::INITIAL);
+        let observation = memory.dsr_generation_observation(guest)?;
+        if observation.expected() != types::CodeGeneration::INITIAL {
+            // The page regenerated after attach: no INITIAL-keyed block can
+            // ever be looked up again, so the entry is dead.
+            self.attached_unit_blocks.remove(&guest);
+            return Ok(AttachedReplayOutcome::Regenerated);
+        }
+        let start = usize::try_from(record.entry_offset).map_err(|_| {
+            types::DsrError::CachePolicy("shared block entry offset does not fit usize".to_string())
+        })?;
+        let end = start
+            .checked_add(record.code_len as usize)
+            .filter(|end| *end <= code_len)
+            .ok_or_else(|| {
+                types::DsrError::CachePolicy("shared block extent exceeds its unit".to_string())
+            })?;
+        // SAFETY: `TranslationUnitStore::load` contract — `source_base`
+        // addresses `code_len` readable bytes pinned by the attached unit's
+        // lease, held in `self.attached_units` for the process lifetime, and
+        // `start..end` was bounds-checked against `code_len` just above. The
+        // block's words are COPIED into the private cache by replay.
+        let source = unsafe { std::slice::from_raw_parts(source_base as *const u8, code_len) };
+        let words = source[start..end]
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect::<Vec<_>>();
+        let mode: emit::EmitAddressMode = memory.address_mode().into();
+        let bindings = artifact_spike::ArtifactBindings::for_replay(
+            observation.current_atomic() as *const std::sync::atomic::AtomicU64 as u64,
+            types::CodeGeneration::INITIAL.get(),
+            mode,
+        )?;
+        // Sensitive-exit metadata is not part of the template (it is
+        // plan-derived), so re-plan the block to harvest it BEFORE the
+        // block becomes reachable.
+        if record.requires_sensitive_metadata {
+            self.harvest_unit_block_sensitive_metadata(memory, guest)?;
+        }
+        let replayed = artifact_spike::replay_unit_block(
+            &mut self.cache,
+            words,
+            record.template.clone().into_unit_replay_parts(),
+            &bindings,
+        );
+        let emitted = match replayed {
+            Ok(emitted) => emitted,
+            // Replay validation refused the recorded bytes. The unit is
+            // suspect as a whole: detach it fail-closed so no other block
+            // of it can publish, and translate privately from here on.
+            Err(types::DsrError::CachePolicy(reason)) => {
+                tracing::warn!(
+                    reason,
+                    guest = guest.raw(),
+                    "shared unit block refused at replay; detaching unit and \
+                     translating privately"
+                );
+                self.attached_unit_blocks
+                    .retain(|_, entry| entry.unit != unit);
+                return Ok(AttachedReplayOutcome::Refused);
+            }
+            // A full cache means "translate privately" (which will fail the
+            // same way if truly out of room), never a hard guest error.
+            Err(types::DsrError::CacheCapacity { .. }) => {
+                self.attached_unit_blocks.remove(&guest);
+                return Ok(AttachedReplayOutcome::Capacity);
+            }
+            Err(error) => return Err(error),
+        };
+        if observation.current() != types::CodeGeneration::INITIAL {
+            // The page regenerated between observation and replay: a block
+            // published under the INITIAL key could never be looked up. The
+            // replayed extent is unreachable; the entry is dead.
+            self.attached_unit_blocks.remove(&guest);
+            return Ok(AttachedReplayOutcome::Regenerated);
+        }
+        let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
+        match self.publish_emitted(
+            memory,
+            key,
+            observation.page(),
+            observation,
+            emitted,
+            emitted_bytes,
+            TranslationOutcome::SharedUnit,
+        ) {
+            Ok(_) => {}
+            Err(types::DsrError::GenerationChanged { .. }) => {
+                self.attached_unit_blocks.remove(&guest);
+                return Ok(AttachedReplayOutcome::Regenerated);
+            }
+            Err(types::DsrError::CacheCapacity { .. }) => {
+                self.attached_unit_blocks.remove(&guest);
+                return Ok(AttachedReplayOutcome::Capacity);
+            }
+            Err(error) => return Err(error),
+        }
+        self.attached_unit_blocks.remove(&guest);
+        self.stats.shared_blocks_mapped = self.stats.shared_blocks_mapped.saturating_add(1);
+        self.stats.shared_translations_avoided =
+            self.stats.shared_translations_avoided.saturating_add(1);
+        self.stats.shared_unit_hits = self.stats.shared_unit_hits.saturating_add(1);
+        let Some(&entry) = self.blocks.get(&key) else {
+            return Err(types::DsrError::CachePolicy(format!(
+                "replayed block 0x{:x} did not publish into the private cache",
+                guest.raw()
+            )));
+        };
+        Ok(AttachedReplayOutcome::Replayed(entry))
     }
 
     /// Re-plan a unit block whose terminal exit carries sensitive metadata
@@ -3668,6 +3834,7 @@ impl ThreadTranslator {
             shared_unit_loads: process.shared_unit_loads,
             shared_blocks_mapped: process.shared_blocks_mapped,
             shared_translations_avoided: process.shared_translations_avoided,
+            shared_blocks_attached: process.shared_blocks_attached,
             shared_metadata_bytes_read: process.shared_metadata_bytes_read,
             shared_metadata_bytes_mapped: process.shared_metadata_bytes_mapped,
             shared_metadata_validation_ns: process.shared_metadata_validation_ns,
@@ -5060,7 +5227,9 @@ mod tests {
             SharedLoadedTranslationUnit, SourceFingerprint, TranslationUnitKey,
             decode_translation_unit_metadata, encode_translation_unit_metadata,
         };
-        use crate::translator::{ProcessTranslator, encode_aarch64_direct_branch};
+        use crate::translator::{
+            AttachedReplayOutcome, ProcessTranslator, encode_aarch64_direct_branch,
+        };
         use crate::types::{CodeGeneration, DirectExit, DirectKind};
         use crate::{emit, types};
         use carrick_dsr::cache;
@@ -5161,15 +5330,84 @@ mod tests {
                 .collect()
         }
 
-        struct InstalledUnit {
+        /// Serves exactly one pre-built unit; counts store consults so tests
+        /// can pin "attached once, replayed per lookup".
+        struct LookupFixtureStore {
+            unit: std::sync::Mutex<Option<SharedLoadedTranslationUnit>>,
+            loads: std::sync::atomic::AtomicU64,
+        }
+
+        impl crate::shared_cache::TranslationUnitStore for LookupFixtureStore {
+            fn load(
+                &self,
+                _key: &TranslationUnitKey,
+                _source_words: &[u32],
+            ) -> Result<Option<SharedLoadedTranslationUnit>, crate::shared_cache::UnitMissReason>
+            {
+                self.loads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(self.unit.lock().expect("fixture unit lock").clone())
+            }
+
+            fn publish(
+                &self,
+                _pending: &PendingTranslationUnit,
+            ) -> Result<crate::shared_cache::PublishOutcome, crate::shared_cache::UnitMissReason>
+            {
+                Ok(crate::shared_cache::PublishOutcome::Existing)
+            }
+        }
+
+        struct LookupFixture {
             translator: ProcessTranslator,
+            store: Arc<LookupFixtureStore>,
             _code: Arc<Vec<u8>>,
         }
 
-        fn pack_round_trip_and_install(
-            memory: &NativeMappedMemory,
-            candidates: Vec<PortableBlockCandidate>,
-        ) -> Result<InstalledUnit, types::DsrError> {
+        /// The segment's source words: `unit_key()` fingerprints exactly this
+        /// pair, so `key_for_segment` derives the same key the unit carries.
+        const SEGMENT_SOURCE_WORDS: [u32; 2] = [0x1400_0001, 0xd400_0001];
+
+        /// Configure a translator whose shared lane serves `unit` through the
+        /// REAL lookup path (`try_load_shared_unit`), not a direct install
+        /// call.
+        fn fixture_for_unit(
+            unit: SharedLoadedTranslationUnit,
+            code: Arc<Vec<u8>>,
+        ) -> LookupFixture {
+            let store = Arc::new(LookupFixtureStore {
+                unit: std::sync::Mutex::new(Some(unit)),
+                loads: std::sync::atomic::AtomicU64::new(0),
+            });
+            let translator =
+                ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator");
+            translator
+                .configure_shared_image(
+                    crate::shared_cache::SharedImageConfig {
+                        executable: ExecutableIdentity::Digest([0x7a; 32]),
+                        page_profile: NativePageProfileIdentity::Native16k,
+                        address_mode: AddressModeIdentity::Direct,
+                        segments: vec![crate::shared_cache::SharedExecutableSegment::new(
+                            ImageFileOffset::new(0),
+                            ImageFileLen::new(0x4000).expect("file length"),
+                            BLOCK_A,
+                            GuestCodeLen::new(0x4000).expect("guest length"),
+                            SEGMENT_SOURCE_WORDS.to_vec().into(),
+                        )],
+                    },
+                    Arc::clone(&store) as Arc<dyn crate::shared_cache::TranslationUnitStore>,
+                )
+                .expect("configure shared lookup fixture");
+            LookupFixture {
+                translator,
+                store,
+                _code: code,
+            }
+        }
+
+        /// Build a unit from `candidates`, round-trip it through the wire, and
+        /// serve it through a `fixture_for_unit` translator.
+        fn lookup_fixture(candidates: Vec<PortableBlockCandidate>) -> LookupFixture {
             let pending = PendingTranslationUnit::pack(unit_key(), candidates).expect("pack unit");
             // Round-trip the manifest through the exact wire the store
             // persists, so serde of relocations, trusted entries, direct
@@ -5192,13 +5430,201 @@ mod tests {
                 code.as_ptr() as usize,
                 Arc::clone(&code) as Arc<dyn Send + Sync>,
             );
-            let translator =
-                ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator");
-            translator.state.write().install_shared_unit(memory, unit)?;
-            Ok(InstalledUnit {
-                translator,
-                _code: code,
-            })
+            fixture_for_unit(unit, code)
+        }
+
+        /// Look one guest block up through the shared lane, as `translate`'s
+        /// miss path would.
+        fn lookup(
+            fixture: &LookupFixture,
+            memory: &NativeMappedMemory,
+            guest: GuestVa,
+        ) -> Result<Option<types::CacheVa>, types::DsrError> {
+            fixture.translator.state.write().try_load_shared_unit(
+                memory,
+                guest,
+                CodeGeneration::INITIAL,
+            )
+        }
+
+        #[test]
+        fn a_lookup_replays_only_the_looked_up_block() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (a, _native_a, words_a) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let (b, _native_b, words_b) = record_candidate(&memory, &syscall_plan(BLOCK_B));
+            let fixture = lookup_fixture(vec![a, b]);
+
+            let entry_a = fixture
+                .translator
+                .state
+                .write()
+                .try_load_shared_unit(&memory, BLOCK_A, CodeGeneration::INITIAL)
+                .expect("lookup A")
+                .expect("A must be served from the unit");
+            {
+                let state = fixture.translator.state.read();
+                assert_eq!(
+                    state.blocks.get(&(BLOCK_A, CodeGeneration::INITIAL)),
+                    Some(&entry_a)
+                );
+                assert!(
+                    !state
+                        .blocks
+                        .contains_key(&(BLOCK_B, CodeGeneration::INITIAL)),
+                    "attach must NOT eagerly replay a block that was never looked up"
+                );
+                assert_eq!(
+                    state.stats.shared_blocks_mapped, 1,
+                    "shared_blocks_mapped counts blocks REPLAYED, not blocks attached"
+                );
+                assert_eq!(read_words(entry_a, words_a.len() * 4), words_a);
+            }
+
+            let entry_b = fixture
+                .translator
+                .state
+                .write()
+                .try_load_shared_unit(&memory, BLOCK_B, CodeGeneration::INITIAL)
+                .expect("lookup B")
+                .expect("B must replay from the ATTACHED unit on its first lookup");
+            let state = fixture.translator.state.read();
+            assert_eq!(read_words(entry_b, words_b.len() * 4), words_b);
+            assert_eq!(
+                fixture
+                    .store
+                    .loads
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the store is consulted once per segment; later lookups replay \
+                 from the attached unit"
+            );
+            assert_eq!(state.stats.shared_blocks_mapped, 2);
+            assert_eq!(
+                state.stats.shared_translations_avoided, 2,
+                "every replayed block avoided one fresh translation"
+            );
+        }
+
+        /// The census contract rides on `AttachedReplayOutcome`: the lookup
+        /// path records exactly one census outcome per lookup from this
+        /// value, so its semantics are pinned here — served, not-covered,
+        /// consumed-entry, and regenerated — hermetically, without arming
+        /// the process-global census.
+        #[test]
+        fn replay_outcomes_distinguish_served_uncovered_and_regenerated() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (a, _native_a, _words_a) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let (b, _native_b, _words_b) = record_candidate(&memory, &syscall_plan(BLOCK_B));
+            // Recorded while the page is still INITIAL; attached only after
+            // the regeneration below.
+            let (a2, _native_a2, _words_a2) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let (b2, _native_b2, _words_b2) = record_candidate(&memory, &syscall_plan(BLOCK_B));
+            let fixture = lookup_fixture(vec![a, b]);
+
+            // Consult once so the unit attaches (the consult path's census
+            // record is `loaded`, not `replayed`).
+            fixture
+                .translator
+                .state
+                .write()
+                .try_load_shared_unit(&memory, BLOCK_A, CodeGeneration::INITIAL)
+                .expect("lookup A")
+                .expect("A must be served from the unit");
+
+            let mut state = fixture.translator.state.write();
+            // A VA inside the segment that no recorded block starts at.
+            let uncovered = GuestVa(BLOCK_A.raw() + 0x40);
+            assert_eq!(
+                state
+                    .replay_attached_unit_block(&memory, uncovered)
+                    .expect("uncovered lookup"),
+                AttachedReplayOutcome::NotCovered,
+                "a VA no unit block starts at must not be served"
+            );
+            let served = state
+                .replay_attached_unit_block(&memory, BLOCK_B)
+                .expect("replay B");
+            let entry_b = *state
+                .blocks
+                .get(&(BLOCK_B, CodeGeneration::INITIAL))
+                .expect("B published");
+            assert_eq!(
+                served,
+                AttachedReplayOutcome::Replayed(entry_b),
+                "a first lookup of an attached block replays and serves it"
+            );
+            assert_eq!(
+                state
+                    .replay_attached_unit_block(&memory, BLOCK_B)
+                    .expect("replay B again"),
+                AttachedReplayOutcome::NotCovered,
+                "a replayed block's index entry is consumed; the private \
+                 cache owns later lookups"
+            );
+
+            // Regenerate BLOCK_A's page AFTER attach: its still-indexed
+            // entry is dead and must report so (and be dropped).
+            let observation = memory
+                .dsr_generation_observation(BLOCK_A)
+                .expect("observe page");
+            observation.current_atomic().store(
+                CodeGeneration::INITIAL.get() + 1,
+                std::sync::atomic::Ordering::Release,
+            );
+            // BLOCK_A itself already replayed via the consult; attach the
+            // pre-regeneration recording in a fresh process instead. (BLOCK_A
+            // and BLOCK_B share the fixture page, so the consult below also
+            // reports the regeneration rather than serving B.)
+            drop(state);
+            let second = lookup_fixture(vec![a2, b2]);
+            assert_eq!(
+                second
+                    .translator
+                    .state
+                    .write()
+                    .try_load_shared_unit(&memory, BLOCK_B, CodeGeneration::INITIAL)
+                    .expect("consult via B"),
+                None,
+                "a regenerated page must not serve an INITIAL-keyed block"
+            );
+            assert_eq!(
+                second
+                    .translator
+                    .state
+                    .write()
+                    .replay_attached_unit_block(&memory, BLOCK_A)
+                    .expect("replay A on a regenerated page"),
+                AttachedReplayOutcome::Regenerated,
+                "a regenerated page's attached entry reports Regenerated"
+            );
+            assert_eq!(
+                second
+                    .translator
+                    .state
+                    .write()
+                    .replay_attached_unit_block(&memory, BLOCK_A)
+                    .expect("replay A after the drop"),
+                AttachedReplayOutcome::NotCovered,
+                "a regenerated entry is dropped, not retried"
+            );
+        }
+
+        /// Attach a packed unit and replay EVERY candidate block by looking
+        /// each one up — the lazy equivalent of the old eager whole-unit
+        /// install, for tests that assert on the fully-replayed state.
+        fn attach_and_replay_all(
+            memory: &NativeMappedMemory,
+            candidates: Vec<PortableBlockCandidate>,
+        ) -> Result<LookupFixture, types::DsrError> {
+            let guests: Vec<GuestVa> = candidates
+                .iter()
+                .map(|candidate| candidate.guest_start)
+                .collect();
+            let fixture = lookup_fixture(candidates);
+            for guest in guests {
+                lookup(&fixture, memory, guest)?;
+            }
+            Ok(fixture)
         }
 
         #[test]
@@ -5211,8 +5637,8 @@ mod tests {
                 .trusted_entry()
                 .expect("native tap records the trusted entry");
 
-            let installed = pack_round_trip_and_install(&memory, vec![candidate])
-                .expect("install native-tap unit");
+            let installed =
+                attach_and_replay_all(&memory, vec![candidate]).expect("replay native-tap unit");
             let state = installed.translator.state.read();
             let key = (BLOCK_A, CodeGeneration::INITIAL);
             let entry = *state.blocks.get(&key).expect("installed block");
@@ -5239,8 +5665,8 @@ mod tests {
                 record_candidate(&memory, &syscall_plan(BLOCK_B));
             let link = native_branch.direct_links()[0];
 
-            let installed = pack_round_trip_and_install(&memory, vec![branch, target])
-                .expect("install two-block unit");
+            let installed = attach_and_replay_all(&memory, vec![branch, target])
+                .expect("replay two-block unit");
             let state = installed.translator.state.read();
             let entry_a = *state
                 .blocks
@@ -5319,17 +5745,25 @@ mod tests {
                 code.as_ptr() as usize,
                 Arc::clone(&code) as Arc<dyn Send + Sync>,
             );
-            let translator =
-                ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator");
-            let result = translator.state.write().install_shared_unit(&memory, unit);
+            let fixture = fixture_for_unit(unit, code);
+            // Replay validation refuses the corrupt words: the lookup FALLS
+            // BACK to private translation (no guest-visible error) and the
+            // unit is detached so no other block of it can publish.
+            let first = lookup(&fixture, &memory, BLOCK_A).expect("lookup survives refusal");
+            assert_eq!(first, None, "a refused block must fall back, not serve");
             assert!(
-                matches!(result, Err(types::DsrError::CachePolicy(ref message))
-                    if message.contains("opcode mismatch")),
-                "corrupt code must fail closed: {result:?}"
-            );
-            assert!(
-                translator.state.read().blocks.is_empty(),
+                fixture.translator.state.read().blocks.is_empty(),
                 "no block may publish from a refused unit"
+            );
+            let second = lookup(&fixture, &memory, BLOCK_A).expect("second lookup");
+            assert_eq!(second, None, "a detached unit must not retry replay");
+            assert_eq!(
+                fixture
+                    .store
+                    .loads
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the refusal must not re-consult the store"
             );
         }
 
@@ -5346,8 +5780,8 @@ mod tests {
                 std::sync::atomic::Ordering::Release,
             );
 
-            let installed = pack_round_trip_and_install(&memory, vec![candidate])
-                .expect("install skips the stale block");
+            let installed = attach_and_replay_all(&memory, vec![candidate])
+                .expect("lookup skips the stale block");
             let state = installed.translator.state.read();
             assert!(
                 state.blocks.is_empty(),
@@ -5360,8 +5794,8 @@ mod tests {
         fn install_registers_page_dependencies_for_invalidation() {
             let memory = NativeMappedMemory::shared_install_test_fixture(4096);
             let (candidate, _native, _words) = record_candidate(&memory, &syscall_plan(BLOCK_A));
-            let installed = pack_round_trip_and_install(&memory, vec![candidate])
-                .expect("install native-tap unit");
+            let installed =
+                attach_and_replay_all(&memory, vec![candidate]).expect("replay native-tap unit");
             let mut state = installed.translator.state.write();
             let key = (BLOCK_A, CodeGeneration::INITIAL);
             assert!(state.blocks.contains_key(&key));
@@ -5895,7 +6329,10 @@ pub mod xlat_census {
 
     /// Schema tag on line 1 of every census file. Bump it when a field's
     /// meaning changes; [`CensusFile::parse`] fails closed on anything else.
-    pub const CENSUS_SCHEMA: &str = "XLATCENSUS3";
+    /// V4: the STORE line gained `replayed=` (lookups served by lazily
+    /// replaying a block from an already-attached unit), and `segment-repeat`
+    /// narrowed to "consulted segment, block NOT covered by its unit".
+    pub const CENSUS_SCHEMA: &str = "XLATCENSUS4";
 
     /// Where a translated block sits relative to this process's configured
     /// shared-translation segments.
@@ -5959,10 +6396,11 @@ pub mod xlat_census {
         /// The block's entry VA lies outside every configured segment -- the
         /// population no unit of any design can serve.
         OutsideSegment,
-        /// This process already consulted the containing segment once. The
-        /// runtime consults each segment at most once per process, so this is
-        /// the bulk of a warm process's translations and is NOT evidence of a
-        /// store problem.
+        /// This process already consulted the containing segment once, and
+        /// the block is NOT served by an attached unit (outside the unit's
+        /// recorded set, dropped after a per-block refusal, or no unit
+        /// loaded). Lookups an attached unit DOES serve are counted as
+        /// `replayed` on the STORE line, not here.
         SegmentRepeat,
     }
 
@@ -6013,6 +6451,10 @@ pub mod xlat_census {
         pub consulted: u64,
         /// Lookups that returned a unit.
         pub loaded: u64,
+        /// Lookups served WITHOUT touching the store, by replaying a block
+        /// from an already-attached unit on its first lookup. Not part of
+        /// the `consulted` identity — the store was not consulted.
+        pub replayed: u64,
         /// Lookups whose unit files were absent from the store.
         pub file_miss: u64,
         /// File misses where `claim_recording` elected this process as the
@@ -6041,6 +6483,7 @@ pub mod xlat_census {
         pub fn is_empty(&self) -> bool {
             self.consulted == 0
                 && self.loaded == 0
+                && self.replayed == 0
                 && self.file_miss == 0
                 && self.recording_claimed == 0
                 && self.recording_declined == 0
@@ -6187,9 +6630,10 @@ pub mod xlat_census {
             );
             let _ = writeln!(
                 out,
-                "STORE|consulted={}|loaded={}|file_miss={}|recording_claimed={}|recording_declined={}|load_ns={}|publish_ns={}",
+                "STORE|consulted={}|loaded={}|replayed={}|file_miss={}|recording_claimed={}|recording_declined={}|load_ns={}|publish_ns={}",
                 self.store.consulted,
                 self.store.loaded,
+                self.store.replayed,
                 self.store.file_miss,
                 self.store.recording_claimed,
                 self.store.recording_declined,
@@ -6457,6 +6901,7 @@ pub mod xlat_census {
         Ok(CensusStore {
             consulted: parse_u64(field(&fields, "consulted", line)?, line)?,
             loaded: parse_u64(field(&fields, "loaded", line)?, line)?,
+            replayed: parse_u64(field(&fields, "replayed", line)?, line)?,
             file_miss: parse_u64(field(&fields, "file_miss", line)?, line)?,
             recording_claimed: parse_u64(field(&fields, "recording_claimed", line)?, line)?,
             recording_declined: parse_u64(field(&fields, "recording_declined", line)?, line)?,
@@ -6553,6 +6998,7 @@ pub mod xlat_census {
     struct StoreCounters {
         consulted: AtomicU64,
         loaded: AtomicU64,
+        replayed: AtomicU64,
         file_miss: AtomicU64,
         recording_claimed: AtomicU64,
         recording_declined: AtomicU64,
@@ -6565,6 +7011,7 @@ pub mod xlat_census {
     static STORE_COUNTERS: StoreCounters = StoreCounters {
         consulted: AtomicU64::new(0),
         loaded: AtomicU64::new(0),
+        replayed: AtomicU64::new(0),
         file_miss: AtomicU64::new(0),
         recording_claimed: AtomicU64::new(0),
         recording_declined: AtomicU64::new(0),
@@ -6593,6 +7040,7 @@ pub mod xlat_census {
         let mut store = CensusStore {
             consulted: read(&STORE_COUNTERS.consulted),
             loaded: read(&STORE_COUNTERS.loaded),
+            replayed: read(&STORE_COUNTERS.replayed),
             file_miss: read(&STORE_COUNTERS.file_miss),
             recording_claimed: read(&STORE_COUNTERS.recording_claimed),
             recording_declined: read(&STORE_COUNTERS.recording_declined),
@@ -6633,6 +7081,10 @@ pub mod xlat_census {
     fn bump_loaded() {
         bump(&STORE_COUNTERS.consulted);
         bump(&STORE_COUNTERS.loaded);
+    }
+
+    fn bump_replayed() {
+        bump(&STORE_COUNTERS.replayed);
     }
 
     fn bump_file_miss(claimed: bool) {
@@ -6695,6 +7147,17 @@ pub mod xlat_census {
         }
         arm_backstop();
         bump_loaded();
+    }
+
+    /// A lookup was served by replaying a block from an already-attached
+    /// unit — the store itself was not consulted, so this is counted beside
+    /// (never inside) the `consulted` identity.
+    pub fn record_lookup_replayed() {
+        if !armed() {
+            return;
+        }
+        arm_backstop();
+        bump_replayed();
     }
 
     /// The store had no files for this key, and `claim_recording` returned
@@ -7028,6 +7491,7 @@ pub mod xlat_census {
             CensusStore {
                 consulted: 4,
                 loaded: 1,
+                replayed: 7,
                 file_miss: 1,
                 recording_claimed: 0,
                 recording_declined: 1,
@@ -7075,8 +7539,8 @@ pub mod xlat_census {
             let identity = "cd".repeat(32);
             let stem = "aa".repeat(32);
             let expected = format!(
-                "XLATCENSUS3|pid=4242|seq=1|reason=host-self-reexec|total=5|distinct=2|image={identity}|segments=1\n\
-                 STORE|consulted=4|loaded=1|file_miss=1|recording_claimed=0|recording_declined=1|load_ns=1500000|publish_ns=2500000\n\
+                "XLATCENSUS4|pid=4242|seq=1|reason=host-self-reexec|total=5|distinct=2|image={identity}|segments=1\n\
+                 STORE|consulted=4|loaded=1|replayed=7|file_miss=1|recording_claimed=0|recording_declined=1|load_ns=1500000|publish_ns=2500000\n\
                  SKIP|lane-unconfigured|9\n\
                  SKIP|segment-repeat|40\n\
                  MISS|no-authority|2\n\
@@ -7107,8 +7571,8 @@ pub mod xlat_census {
                     ..CensusStore::default()
                 },
             };
-            let expected = "XLATCENSUS3|pid=7|seq=0|reason=process-exit|total=1|distinct=1|image=-|segments=0\n\
-                            STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n\
+            let expected = "XLATCENSUS4|pid=7|seq=0|reason=process-exit|total=1|distinct=1|image=-|segments=0\n\
+                            STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n\
                             SKIP|lane-unconfigured|1\n\
                             VA|0x1000|-|outside|1\n";
             assert_eq!(file.render(), expected);
@@ -7117,14 +7581,21 @@ pub mod xlat_census {
 
         #[test]
         fn parse_fails_closed_on_a_truncated_or_mislabelled_file() {
-            const HEADER: &str = "XLATCENSUS3|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
-            const STORE: &str = "STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
+            const HEADER: &str = "XLATCENSUS4|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
+            const STORE: &str = "STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
             let cases = [
                 (String::new(), "empty"),
                 (
                     "XLATCENSUS2|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n"
                         .to_string(),
                     "superseded schema",
+                ),
+                (
+                    // V3 files lack `replayed=`; a V4 parser must refuse them
+                    // rather than default the field.
+                    "XLATCENSUS3|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n"
+                        .to_string(),
+                    "superseded schema v3",
                 ),
                 (
                     format!("{HEADER}{STORE}").replace("distinct=0", "distinct=1"),
@@ -7159,8 +7630,10 @@ pub mod xlat_census {
                 ),
                 (
                     // A file miss always carries exactly one election verdict.
-                    format!("{HEADER}{STORE}")
-                        .replace("consulted=0|loaded=0|file_miss=0", "consulted=1|loaded=0|file_miss=1"),
+                    format!("{HEADER}{STORE}").replace(
+                        "consulted=0|loaded=0|replayed=0|file_miss=0",
+                        "consulted=1|loaded=0|replayed=0|file_miss=1",
+                    ),
                     "file miss without an election verdict",
                 ),
                 (
@@ -7187,8 +7660,8 @@ pub mod xlat_census {
         /// the maps. It parsed clean and reported zero.
         #[test]
         fn skip_counts_before_the_store_line_are_not_discarded_by_it() {
-            const HEADER: &str = "XLATCENSUS3|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
-            const STORE: &str = "STORE|consulted=0|loaded=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
+            const HEADER: &str = "XLATCENSUS4|pid=1|seq=0|reason=process-exit|total=0|distinct=0|image=-|segments=0\n";
+            const STORE: &str = "STORE|consulted=0|loaded=0|replayed=0|file_miss=0|recording_claimed=0|recording_declined=0|load_ns=0|publish_ns=0\n";
             let reordered = format!("{HEADER}SKIP|segment-repeat|7\nMISS|no-authority|0\n{STORE}");
             let file = CensusFile::parse(&reordered).expect("reordered file parses");
             assert_eq!(

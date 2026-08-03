@@ -262,7 +262,7 @@ pub(crate) struct ProcessesSection {
 ///   publication stops.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct StoreSection {
-    /// Shared-unit lookups attempted: `consulted + skipped_total`.
+    /// Shared-unit lookups attempted: `consulted + replayed + skipped_total`.
     ///
     /// `lookups == translations.total` holds only while `loaded` is 0: a lookup
     /// that RETURNS a unit short-circuits before the block is recorded, and a
@@ -272,6 +272,9 @@ pub(crate) struct StoreSection {
     pub lookups: u64,
     /// Lookups that reached `TranslationUnitStore::load`.
     pub consulted: u64,
+    /// Lookups served by lazily replaying a block from an already-attached
+    /// unit — the lane working, without a store round-trip.
+    pub replayed: u64,
     /// Lookups that returned before touching the store, by reason token.
     pub skipped: BTreeMap<String, u64>,
     pub skipped_total: u64,
@@ -596,6 +599,7 @@ pub(crate) fn aggregate(scan: &CensusScan, top: usize, observed: Option<u64>) ->
 fn store_section(files: &[CensusFile]) -> StoreSection {
     let mut consulted = 0u64;
     let mut loaded = 0u64;
+    let mut replayed = 0u64;
     let mut file_miss = 0u64;
     let mut recording_claimed = 0u64;
     let mut recording_declined = 0u64;
@@ -613,6 +617,7 @@ fn store_section(files: &[CensusFile]) -> StoreSection {
         let store = &file.store;
         consulted = consulted.saturating_add(store.consulted);
         loaded = loaded.saturating_add(store.loaded);
+        replayed = replayed.saturating_add(store.replayed);
         file_miss = file_miss.saturating_add(store.file_miss);
         recording_claimed = recording_claimed.saturating_add(store.recording_claimed);
         load_ns_total = load_ns_total.saturating_add(store.load_ns);
@@ -653,11 +658,14 @@ fn store_section(files: &[CensusFile]) -> StoreSection {
     let miss_total = misses
         .values()
         .fold(0u64, |sum, count| sum.saturating_add(*count));
-    let lookups = consulted.saturating_add(skipped_total);
+    let lookups = consulted
+        .saturating_add(replayed)
+        .saturating_add(skipped_total);
 
     StoreSection {
         lookups,
         consulted,
+        replayed,
         skipped: skipped
             .into_iter()
             .map(|(skip, count)| (skip.token().to_string(), count))
@@ -1178,6 +1186,7 @@ mod tests {
             file.store = CensusStore {
                 consulted: 2,
                 loaded: 0,
+                replayed: 0,
                 file_miss: 0,
                 recording_claimed: 0,
                 recording_declined: 0,
@@ -1191,6 +1200,7 @@ mod tests {
             file.store = CensusStore {
                 consulted: 2,
                 loaded: 1,
+                replayed: 3,
                 file_miss: 1,
                 recording_claimed: 0,
                 recording_declined: 1,
@@ -1201,10 +1211,12 @@ mod tests {
             };
         }
         let report = aggregate(&scan, 8, None);
-        assert_eq!(report.store.lookups, 8);
+        // 4 consulted + 3 replayed-from-attached-unit + 4 skipped.
+        assert_eq!(report.store.lookups, 11);
         assert_eq!(report.store.consulted, 4);
+        assert_eq!(report.store.replayed, 3);
         assert_eq!(report.store.skipped_total, 4);
-        assert!((report.store.consulted_share_of_lookups - 0.5).abs() < 1e-9);
+        assert!((report.store.consulted_share_of_lookups - 4.0 / 11.0).abs() < 1e-9);
         // The whole point: these are different buckets, not one.
         assert_eq!(
             report.store.misses.get(UnitMissReason::NoAuthority.token()),
