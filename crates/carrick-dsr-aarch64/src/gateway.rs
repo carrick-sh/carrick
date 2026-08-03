@@ -13,9 +13,6 @@
 //! shim's ABI helpers, which live in csrc/native_darwin.c).
 
 use super::types::{CacheVa, CodeGeneration, DsrError, NativeDsrExit};
-use crate::direct_binding::{
-    DirectBindingCellVa, DirectBindingExitMetadata, DirectBindingMiss, DirectBindingOrdinal,
-};
 use crate::snapshot::NativeUcontextSnapshot;
 
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
@@ -637,29 +634,10 @@ impl DsrContext {
 fn decode_direct_exit(context: &DsrContext) -> NativeDsrExit {
     // `exit_source` is written by the stub that actually returned to Rust.
     // It is therefore exit-time evidence after any preceding cache/direct
-    // hit, unlike the `PreparedEntry` that began this translated run. The
-    // cold registry classifier combines this exact `(source,target)` with the
-    // miss cell/ordinal below and rejects ambiguous loaded-manifest matches.
-    let binding = if context.direct_binding_present != 1 {
-        DirectBindingExitMetadata::Absent
-    } else if let Some(cell) = usize::try_from(context.direct_binding_cell)
-        .ok()
-        .and_then(DirectBindingCellVa::mapped)
-    {
-        DirectBindingExitMetadata::Mapped(DirectBindingMiss {
-            cell,
-            ordinal: DirectBindingOrdinal::claimed(context.direct_binding_ordinal),
-        })
-    } else {
-        DirectBindingExitMetadata::MappedCellFailure {
-            raw_cell: context.direct_binding_cell,
-            ordinal: DirectBindingOrdinal::claimed(context.direct_binding_ordinal),
-        }
-    };
+    // hit, unlike the `PreparedEntry` that began this translated run.
     NativeDsrExit::ResolveDirect {
         source: carrick_guest_mem::GuestVa(context.exit_source),
         target: carrick_guest_mem::GuestVa(context.exit_target),
-        binding,
     }
 }
 
@@ -918,101 +896,6 @@ mod native_gateway {
         )
     }
 
-    pub fn enter_translated_with_generation_bindings(
-        entry: CacheVa,
-        snapshot: &mut NativeUcontextSnapshot,
-        exit: &mut NativeDsrExit,
-        generation_bindings: &[GenerationBinding],
-    ) -> Result<(), DsrError> {
-        if generation_bindings.is_empty() {
-            return Err(DsrError::Gateway(
-                "binding-index block entered without generation bindings".to_string(),
-            ));
-        }
-        enter_translated_raw(
-            entry,
-            snapshot,
-            exit,
-            std::ptr::null(),
-            CodeGeneration::INITIAL,
-            0,
-            usize::MAX,
-            carrick_dsr::address::NativeAddressMode::Direct,
-            generation_bindings.as_ptr(),
-            std::ptr::null(),
-            true,
-        )
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "shared entry pins its cache and generation-table authorities"
-    )]
-    pub fn enter_translated_with_cache_range_and_generation_bindings(
-        entry: CacheVa,
-        snapshot: &mut NativeUcontextSnapshot,
-        exit: &mut NativeDsrExit,
-        indirect_cache: &IndirectTargetCache,
-        cache_start: usize,
-        cache_end: usize,
-        address_mode: carrick_dsr::address::NativeAddressMode,
-        generation_bindings: &[GenerationBinding],
-    ) -> Result<(), DsrError> {
-        if generation_bindings.is_empty() {
-            return Err(DsrError::Gateway(
-                "shared block entered without generation bindings".to_string(),
-            ));
-        }
-        enter_translated_raw(
-            entry,
-            snapshot,
-            exit,
-            indirect_cache.as_ptr(),
-            CodeGeneration::INITIAL,
-            cache_start,
-            cache_end,
-            address_mode,
-            generation_bindings.as_ptr(),
-            std::ptr::null(),
-            true,
-        )
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "shared process entry pins cache, generation, and catalog authorities"
-    )]
-    pub fn enter_translated_with_cache_range_and_generation_bindings_and_catalog(
-        entry: CacheVa,
-        snapshot: &mut NativeUcontextSnapshot,
-        exit: &mut NativeDsrExit,
-        indirect_cache: &IndirectTargetCache,
-        cache_start: usize,
-        cache_end: usize,
-        address_mode: carrick_dsr::address::NativeAddressMode,
-        generation_bindings: &[GenerationBinding],
-        executable_range_catalog: *const ExecutableRangeCatalogHeader,
-    ) -> Result<(), DsrError> {
-        if generation_bindings.is_empty() {
-            return Err(DsrError::Gateway(
-                "shared block entered without generation bindings".to_string(),
-            ));
-        }
-        enter_translated_raw(
-            entry,
-            snapshot,
-            exit,
-            indirect_cache.as_ptr(),
-            CodeGeneration::INITIAL,
-            cache_start,
-            cache_end,
-            address_mode,
-            generation_bindings.as_ptr(),
-            executable_range_catalog,
-            true,
-        )
-    }
-
     #[allow(
         clippy::too_many_arguments,
         reason = "raw gateway entry pins cache, generation, and address-mode authority together"
@@ -1237,50 +1120,6 @@ mod native_gateway {
     ) -> Result<(), DsrError> {
         Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
     }
-
-    pub fn enter_translated_with_generation_bindings(
-        _entry: CacheVa,
-        _snapshot: &mut NativeUcontextSnapshot,
-        _exit: &mut NativeDsrExit,
-        _generation_bindings: &[GenerationBinding],
-    ) -> Result<(), DsrError> {
-        Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "matches the live shared gateway entry signature"
-    )]
-    pub fn enter_translated_with_cache_range_and_generation_bindings(
-        _entry: CacheVa,
-        _snapshot: &mut NativeUcontextSnapshot,
-        _exit: &mut NativeDsrExit,
-        _indirect_cache: &IndirectTargetCache,
-        _cache_start: usize,
-        _cache_end: usize,
-        _address_mode: carrick_dsr::address::NativeAddressMode,
-        _generation_bindings: &[GenerationBinding],
-    ) -> Result<(), DsrError> {
-        Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "matches the live shared process gateway entry signature"
-    )]
-    pub fn enter_translated_with_cache_range_and_generation_bindings_and_catalog(
-        _entry: CacheVa,
-        _snapshot: &mut NativeUcontextSnapshot,
-        _exit: &mut NativeDsrExit,
-        _indirect_cache: &IndirectTargetCache,
-        _cache_start: usize,
-        _cache_end: usize,
-        _address_mode: carrick_dsr::address::NativeAddressMode,
-        _generation_bindings: &[GenerationBinding],
-        _executable_range_catalog: *const ExecutableRangeCatalogHeader,
-    ) -> Result<(), DsrError> {
-        Err(DsrError::Gateway(GATEWAY_UNAVAILABLE.to_string()))
-    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -1426,14 +1265,13 @@ mod indirect_cache_tests {
     }
 
     #[test]
-    fn direct_exit_decodes_an_exact_typed_binding_miss() {
+    fn direct_exit_decodes_source_and_target() {
         let mut context = DsrContext::new(
             NativeUcontextSnapshot::default(),
             CacheVa::published(carrick_guest_mem::HostVa(0x10_000)),
             NativeDsrExit::ResolveDirect {
                 source: carrick_guest_mem::GuestVa(0x4000),
                 target: carrick_guest_mem::GuestVa(0x5000),
-                binding: DirectBindingExitMetadata::Absent,
             },
             std::ptr::null(),
             CodeGeneration::INITIAL,
@@ -1441,6 +1279,8 @@ mod indirect_cache_tests {
             0x20_000,
             carrick_dsr::address::NativeAddressMode::Direct,
         );
+        // The retired sidecar's exit-capture context fields stay at their
+        // cleared values; the decode reads only source and target.
         context.direct_binding_cell = 0x20_000;
         context.direct_binding_ordinal = 7;
         context.direct_binding_present = 1;
@@ -1450,43 +1290,8 @@ mod indirect_cache_tests {
             NativeDsrExit::ResolveDirect {
                 source: carrick_guest_mem::GuestVa(0x4000),
                 target: carrick_guest_mem::GuestVa(0x5000),
-                binding: crate::direct_binding::DirectBindingExitMetadata::Mapped(
-                    crate::direct_binding::DirectBindingMiss {
-                        cell: crate::direct_binding::DirectBindingCellVa::mapped(0x20_000)
-                            .expect("aligned cell"),
-                        ordinal: crate::direct_binding::DirectBindingOrdinal::claimed(7),
-                    },
-                ),
             }
         );
-
-        for (present, cell) in [(0, 0x20_000), (2, 0x20_000)] {
-            context.direct_binding_present = present;
-            context.direct_binding_cell = cell;
-            assert_eq!(
-                decode_direct_exit(&context),
-                NativeDsrExit::ResolveDirect {
-                    source: carrick_guest_mem::GuestVa(0x4000),
-                    target: carrick_guest_mem::GuestVa(0x5000),
-                    binding: crate::direct_binding::DirectBindingExitMetadata::Absent,
-                }
-            );
-        }
-        for cell in [0, 0x20_001] {
-            context.direct_binding_present = 1;
-            context.direct_binding_cell = cell;
-            assert_eq!(
-                decode_direct_exit(&context),
-                NativeDsrExit::ResolveDirect {
-                    source: carrick_guest_mem::GuestVa(0x4000),
-                    target: carrick_guest_mem::GuestVa(0x5000),
-                    binding: crate::direct_binding::DirectBindingExitMetadata::MappedCellFailure {
-                        raw_cell: cell,
-                        ordinal: crate::direct_binding::DirectBindingOrdinal::claimed(7),
-                    },
-                }
-            );
-        }
     }
 
     #[test]
@@ -1497,7 +1302,6 @@ mod indirect_cache_tests {
             NativeDsrExit::ResolveDirect {
                 source: guest,
                 target: guest,
-                binding: DirectBindingExitMetadata::Absent,
             },
             NativeDsrExit::ResolveIndirect {
                 source: guest,

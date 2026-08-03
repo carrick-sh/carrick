@@ -4,11 +4,8 @@ use carrick_dsr::address::NativeHostBias;
 use carrick_guest_mem::GuestVa;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
-
-use crate::direct_binding::{DirectBindingCellVa, DirectBindingOrdinal};
-use crate::emit::{DirectLinkKind, DirectStubEnvelope};
 
 // 4: the reserved-resident virtualization template (new emitted shapes and
 // the `CommitReservedResident` recovery action, wire tag 21).
@@ -18,15 +15,16 @@ use crate::emit::{DirectLinkKind, DirectStubEnvelope};
 // (wire tags 22/23).
 // 6: the indirect-cache entry's flavor-1 payload packed for paired loads
 // (tagged expected at offset 8, code at 24).
-pub const TRANSLATOR_ABI_CURRENT: u32 = 6;
-pub const TRANSLATION_UNIT_SCHEMA_V1: u32 = 1;
-pub const TRANSLATION_UNIT_SCHEMA_V2: u32 = 2;
-pub const DIRECT_BINDING_CELL_SIZE: u32 = 8;
+// 7: unit payload is the native-emission recording tap — per-block
+// `ArtifactTemplate` metadata (relocations + trusted entry + direct links)
+// over unbaked `.code` words, installed by per-block replay through
+// `publish_emitted`. Replaces the `GenerationGuard::BindingIndex` authority
+// emission, edge trampolines, and the direct-binding cell sidecar.
+pub const TRANSLATOR_ABI_CURRENT: u32 = 7;
+pub const TRANSLATION_UNIT_SCHEMA_V4: u32 = 4;
 pub const MAX_TRANSLATION_UNIT_CODE_BYTES: usize = 64 * 1024 * 1024;
 pub const TRANSLATION_UNIT_BASE_EXPORT: &str = "carrick_aot_unit_base";
-pub const TRANSLATION_UNIT_BINDING_EXPORT: &str = "carrick_aot_unit_bindings";
 const DARWIN_HOST_PAGE_SIZE: u64 = 16 * 1024;
-static DIRECT_BINDING_RUNTIME_ENABLED: OnceLock<bool> = OnceLock::new();
 static SHARED_MANIFEST_ARC_ENABLED: OnceLock<bool> = OnceLock::new();
 static SHARED_SOURCE_FINGERPRINT_REUSE_ENABLED: OnceLock<bool> = OnceLock::new();
 static SHARED_RECOVERY_RUNS_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -69,23 +67,6 @@ fn shared_recovery_runs_enabled() -> bool {
     *SHARED_RECOVERY_RUNS_ENABLED.get_or_init(|| {
         let value = std::env::var_os("CARRICK_DSR_SHARED_RECOVERY_RUNS");
         shared_recovery_runs_enabled_from(value.as_deref())
-    })
-}
-
-/// The direct-binding sidecar is DEFAULT ON (`CARRICK_DSR_DIRECT_BINDINGS=0`
-/// to disable): it is load-bearing for the default persistent store. Without
-/// cells, a copied unit's unresolved direct branches exit to the resolver on
-/// EVERY execution — measured on the warm cold-go-build: 35.0 M gateway
-/// entries / 16.5 M direct-resolver exits and a 12.1 s wall against the
-/// store-off arm's 3.6 M / 0.77 M / 9.6 s. With the sidecar the same warm
-/// build runs 3.0 M entries / 0.50 M exits at 9.4 s — fewer round-trips than
-/// store-off, at ~1 M fewer translations. Both consumers of this gate are
-/// shared-lane surfaces (the registry only carries records once a unit
-/// registers), so the hatch only matters when units load.
-pub fn direct_binding_runtime_enabled() -> bool {
-    *DIRECT_BINDING_RUNTIME_ENABLED.get_or_init(|| {
-        std::env::var_os("CARRICK_DSR_DIRECT_BINDINGS").as_deref()
-            != Some(std::ffi::OsStr::new("0"))
     })
 }
 
@@ -255,30 +236,6 @@ impl TranslationUnitKey {
         self.address_mode.host_bias()
     }
 
-    pub(crate) const fn executable(&self) -> &ExecutableIdentity {
-        &self.executable
-    }
-
-    pub(crate) const fn segment_file_offset(&self) -> ImageFileOffset {
-        self.segment_file_offset
-    }
-
-    pub(crate) const fn segment_file_len(&self) -> ImageFileLen {
-        self.segment_file_len
-    }
-
-    pub(crate) const fn guest_va_len(&self) -> GuestCodeLen {
-        self.guest_va_len
-    }
-
-    pub(crate) const fn page_profile(&self) -> NativePageProfileIdentity {
-        self.page_profile
-    }
-
-    pub(crate) const fn address_mode(&self) -> AddressModeIdentity {
-        self.address_mode
-    }
-
     pub fn file_stem(&self) -> Result<String, serde_json::Error> {
         let encoded = serde_json::to_vec(self)?;
         let digest: [u8; 32] = Sha256::digest(encoded).into();
@@ -305,17 +262,21 @@ pub fn translation_unit_base_export(key: &TranslationUnitKey) -> Result<String, 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortableBlockRecord {
     pub guest_start: GuestVa,
-    pub generation_binding: u32,
     pub entry_offset: u32,
     pub code_len: u32,
     pub requires_sensitive_metadata: bool,
+    /// The block's native-emission recording with `words` and `source_words`
+    /// cleared: the words live in the unit's digest-bound `.code` image at
+    /// `entry_offset`, and the unit key fingerprints the whole segment.
+    /// Relocations, the trusted entry, direct links, the PC map, and
+    /// recovery are all retained so the install can replay the block into
+    /// the private cache exactly like a native emission.
     pub template: crate::artifact_spike::ArtifactTemplate,
 }
 
 #[derive(Serialize, Deserialize)]
 struct WirePortableBlockRecord {
     guest_start: u64,
-    generation_binding: u32,
     entry_offset: u32,
     code_len: u32,
     requires_sensitive_metadata: bool,
@@ -329,7 +290,6 @@ impl Serialize for PortableBlockRecord {
     {
         WirePortableBlockRecord {
             guest_start: self.guest_start.raw(),
-            generation_binding: self.generation_binding,
             entry_offset: self.entry_offset,
             code_len: self.code_len,
             requires_sensitive_metadata: self.requires_sensitive_metadata,
@@ -347,7 +307,6 @@ impl<'de> Deserialize<'de> for PortableBlockRecord {
         let wire = WirePortableBlockRecord::deserialize(deserializer)?;
         Ok(Self {
             guest_start: GuestVa(wire.guest_start),
-            generation_binding: wire.generation_binding,
             entry_offset: wire.entry_offset,
             code_len: wire.code_len,
             requires_sensitive_metadata: wire.requires_sensitive_metadata,
@@ -364,103 +323,25 @@ pub struct TranslationUnitManifest {
     pub base_export: String,
     pub code_len: u64,
     pub blocks: Vec<PortableBlockRecord>,
-    pub binding_layout: DirectBindingLayout,
-    pub binding_export: String,
-    pub binding_data_len: u64,
-    pub cell_size: u32,
-    pub bindings: Vec<UnresolvedDirectBindingRecord>,
-    pub binding_relocations: Vec<DirectBindingRelocation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingTranslationUnit {
     pub key: TranslationUnitKey,
+    /// Concatenated per-block template words, relocation immediates ZEROED
+    /// (unbaked). Nothing is patched at pack time: same-unit links, trusted
+    /// entries, and process values are all resolved at install by per-block
+    /// replay plus `publish_emitted`'s pending-link patching.
     pub code: Vec<u8>,
     pub blocks: Vec<PortableBlockRecord>,
-    pub binding_layout: DirectBindingLayout,
-    pub binding_export: String,
-    pub binding_data_len: u64,
-    pub cell_size: u32,
-    pub bindings: Vec<UnresolvedDirectBindingRecord>,
-    pub binding_relocations: Vec<DirectBindingRelocation>,
-    pub binding_data: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DirectBindingLayout {
-    Disabled,
-    SidecarV1,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnresolvedDirectBindingRecord {
-    pub source: GuestVa,
-    pub target: GuestVa,
-    pub kind: DirectLinkKind,
-    pub ordinal: DirectBindingOrdinal,
-    pub stub_start: u32,
-    pub stub_end: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct WireUnresolvedDirectBindingRecord {
-    source: u64,
-    target: u64,
-    kind: DirectLinkKind,
-    ordinal: DirectBindingOrdinal,
-    stub_start: u32,
-    stub_end: u32,
-}
-
-impl Serialize for UnresolvedDirectBindingRecord {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        WireUnresolvedDirectBindingRecord {
-            source: self.source.raw(),
-            target: self.target.raw(),
-            kind: self.kind,
-            ordinal: self.ordinal,
-            stub_start: self.stub_start,
-            stub_end: self.stub_end,
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for UnresolvedDirectBindingRecord {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = WireUnresolvedDirectBindingRecord::deserialize(deserializer)?;
-        Ok(Self {
-            source: GuestVa(wire.source),
-            target: GuestVa(wire.target),
-            kind: wire.kind,
-            ordinal: wire.ordinal,
-            stub_start: wire.stub_start,
-            stub_end: wire.stub_end,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectBindingRelocation {
-    pub ordinal: DirectBindingOrdinal,
-    pub adrp_offset: u32,
-    pub add_offset: u32,
-    pub miss_adrp_offset: u32,
-    pub miss_add_offset: u32,
-    pub data_offset: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortableBlockCandidate {
     pub guest_start: GuestVa,
-    pub generation_binding: u32,
     pub requires_sensitive_metadata: bool,
+    /// The FULL native-tap recording (`ArtifactRecord::template` from the
+    /// one native emission), words included.
     pub template: crate::artifact_spike::ArtifactTemplate,
 }
 
@@ -468,30 +349,26 @@ impl PendingTranslationUnit {
     pub fn pack(
         key: TranslationUnitKey,
         candidates: Vec<PortableBlockCandidate>,
-        binding_layout: DirectBindingLayout,
     ) -> Result<Self, crate::types::DsrError> {
-        Self::pack_with_recovery_runs(
-            key,
-            candidates,
-            binding_layout,
-            shared_recovery_runs_enabled(),
-        )
+        Self::pack_with_recovery_runs(key, candidates, shared_recovery_runs_enabled())
     }
 
     fn pack_with_recovery_runs(
         key: TranslationUnitKey,
         candidates: Vec<PortableBlockCandidate>,
-        binding_layout: DirectBindingLayout,
         recovery_runs: bool,
     ) -> Result<Self, crate::types::DsrError> {
         let mut code = Vec::new();
         let mut blocks = Vec::with_capacity(candidates.len());
-        let mut entries = BTreeMap::new();
-        let mut direct_links = Vec::new();
+        let mut guest_starts = BTreeSet::new();
         for candidate in candidates {
-            let words = candidate
-                .template
-                .materialize_immutable_words(key.host_bias())?;
+            let words = candidate.template.words();
+            if words.is_empty() {
+                return Err(crate::types::DsrError::CachePolicy(format!(
+                    "translation unit candidate 0x{:x} carries no recorded words",
+                    candidate.guest_start.raw()
+                )));
+            }
             let entry_offset = u32::try_from(code.len()).map_err(|_| {
                 crate::types::DsrError::CachePolicy(
                     "translation unit entry offset exceeds u32".to_string(),
@@ -507,229 +384,32 @@ impl PendingTranslationUnit {
                     "translation unit exceeds the 64 MiB branch-range cap".to_string(),
                 ));
             }
-            if entries
-                .insert(candidate.guest_start, entry_offset)
-                .is_some()
-            {
+            if !guest_starts.insert(candidate.guest_start) {
                 return Err(crate::types::DsrError::CachePolicy(format!(
                     "translation unit contains duplicate block 0x{:x}",
                     candidate.guest_start.raw()
                 )));
             }
-            direct_links.push((entry_offset, candidate.template.direct_links().to_vec()));
             for word in words {
                 code.extend_from_slice(&word.to_le_bytes());
             }
             blocks.push(PortableBlockRecord {
                 guest_start: candidate.guest_start,
-                generation_binding: candidate.generation_binding,
                 entry_offset,
                 code_len,
                 requires_sensitive_metadata: candidate.requires_sensitive_metadata,
                 template: candidate
                     .template
-                    .into_runtime_metadata_only_with_recovery_runs(recovery_runs)?,
+                    .into_unit_record_metadata(recovery_runs)?,
             });
         }
-        let mut unresolved = Vec::new();
-        for (source_entry, links) in direct_links {
-            for link in links {
-                let slot = source_entry.checked_add(link.slot.get()).ok_or_else(|| {
-                    crate::types::DsrError::CachePolicy(
-                        "translation unit direct-link source overflow".to_string(),
-                    )
-                })?;
-                let stub_start =
-                    source_entry
-                        .checked_add(link.stub.start.get())
-                        .ok_or_else(|| {
-                            crate::types::DsrError::CachePolicy(
-                                "translation unit direct-link stub start overflow".to_string(),
-                            )
-                        })?;
-                let stub_end = source_entry
-                    .checked_add(link.stub.end.get())
-                    .ok_or_else(|| {
-                        crate::types::DsrError::CachePolicy(
-                            "translation unit direct-link stub end overflow".to_string(),
-                        )
-                    })?;
-                if !slot.is_multiple_of(4)
-                    || !stub_start.is_multiple_of(4)
-                    || !stub_end.is_multiple_of(4)
-                    || stub_start >= stub_end
-                    || u64::from(stub_end) > code.len() as u64
-                {
-                    return Err(crate::types::DsrError::CachePolicy(format!(
-                        "translation unit direct-link geometry is invalid: slot={slot} stub={stub_start}..{stub_end}"
-                    )));
-                }
-                let absolute = crate::emit::DirectLink {
-                    slot: crate::types::CacheOffset::published(slot),
-                    source: link.source,
-                    target: link.target,
-                    kind: link.kind,
-                    stub: DirectStubEnvelope {
-                        start: crate::types::CacheOffset::published(stub_start),
-                        end: crate::types::CacheOffset::published(stub_end),
-                    },
-                };
-                let Some(target_entry) = entries.get(&link.target).copied() else {
-                    unresolved.push(absolute);
-                    continue;
-                };
-                patch_same_unit_direct_link(&mut code, slot, target_entry)?;
-            }
-        }
-        unresolved.sort_by_key(|link| link.stub.start.get());
-        if unresolved
-            .windows(2)
-            .any(|pair| pair[0].stub.end.get() > pair[1].stub.start.get())
-        {
-            return Err(crate::types::DsrError::CachePolicy(
-                "translation unit has conflicting direct-binding stub owners".to_string(),
-            ));
-        }
-
-        let bindings = unresolved
-            .iter()
-            .enumerate()
-            .map(|(index, link)| {
-                let ordinal = u32::try_from(index)
-                    .map(DirectBindingOrdinal::claimed)
-                    .map_err(|_| {
-                        crate::types::DsrError::CachePolicy(
-                            "translation unit direct-binding ordinal exceeds u32".to_string(),
-                        )
-                    })?;
-                Ok(UnresolvedDirectBindingRecord {
-                    source: link.source,
-                    target: link.target,
-                    kind: link.kind,
-                    ordinal,
-                    stub_start: link.stub.start.get(),
-                    stub_end: link.stub.end.get(),
-                })
-            })
-            .collect::<Result<Vec<_>, crate::types::DsrError>>()?;
-
-        // An empty sidecar is not a layout — the store allocates no cell
-        // block for zero binding bytes, and the registry then fatally
-        // refuses the unit at load ("no mapped cell base"). A unit whose
-        // direct links all resolved inside the unit demotes to `Disabled`.
-        let binding_layout = if bindings.is_empty() {
-            DirectBindingLayout::Disabled
-        } else {
-            binding_layout
-        };
-        let (binding_export, cell_size, binding_data, binding_relocations) = match binding_layout {
-            DirectBindingLayout::Disabled => (String::new(), 0, Vec::new(), Vec::new()),
-            DirectBindingLayout::SidecarV1 => {
-                let binding_data_len = bindings
-                    .len()
-                    .checked_mul(DIRECT_BINDING_CELL_SIZE as usize)
-                    .ok_or_else(|| {
-                        crate::types::DsrError::CachePolicy(
-                            "translation unit binding data length overflow".to_string(),
-                        )
-                    })?;
-                let binding_data = vec![0; binding_data_len];
-                let mut relocations = Vec::with_capacity(bindings.len());
-                for (link, binding) in unresolved.iter().copied().zip(&bindings) {
-                    let data_offset = binding
-                        .ordinal
-                        .get()
-                        .checked_mul(DIRECT_BINDING_CELL_SIZE)
-                        .ok_or_else(|| {
-                            crate::types::DsrError::CachePolicy(
-                                "translation unit binding data offset overflow".to_string(),
-                            )
-                        })?;
-                    relocations.push(crate::emit::rewrite_direct_binding_stub(
-                        &mut code,
-                        link,
-                        binding.ordinal,
-                        data_offset,
-                    )?);
-                }
-                (
-                    TRANSLATION_UNIT_BINDING_EXPORT.to_owned(),
-                    DIRECT_BINDING_CELL_SIZE,
-                    binding_data,
-                    relocations,
-                )
-            }
-        };
-        let binding_data_len = u64::try_from(binding_data.len()).map_err(|_| {
-            crate::types::DsrError::CachePolicy(
-                "translation unit binding data length exceeds u64".to_string(),
-            )
-        })?;
         if code.is_empty() {
             return Err(crate::types::DsrError::CachePolicy(
                 "translation unit contains no blocks".to_string(),
             ));
         }
-        Ok(Self {
-            key,
-            code,
-            blocks,
-            binding_layout,
-            binding_export,
-            binding_data_len,
-            cell_size,
-            bindings,
-            binding_relocations,
-            binding_data,
-        })
+        Ok(Self { key, code, blocks })
     }
-}
-
-fn patch_same_unit_direct_link(
-    code: &mut [u8],
-    source: u32,
-    target_entry: u32,
-) -> Result<(), crate::types::DsrError> {
-    let displacement = i64::from(target_entry) - i64::from(source);
-    if displacement % 4 != 0 {
-        return Err(crate::types::DsrError::CachePolicy(format!(
-            "translation unit direct-link displacement is unaligned: {displacement}"
-        )));
-    }
-    let words = displacement / 4;
-    if !(-(1_i64 << 25)..(1_i64 << 25)).contains(&words) {
-        return Err(crate::types::DsrError::CachePolicy(format!(
-            "translation unit direct-link target is out of range: {displacement}"
-        )));
-    }
-    let offset = usize::try_from(source).map_err(|_| {
-        crate::types::DsrError::CachePolicy(
-            "translation unit direct-link offset does not fit usize".to_string(),
-        )
-    })?;
-    let end = offset.checked_add(4).ok_or_else(|| {
-        crate::types::DsrError::CachePolicy(
-            "translation unit direct-link word overflow".to_string(),
-        )
-    })?;
-    let bytes = code.get_mut(offset..end).ok_or_else(|| {
-        crate::types::DsrError::CachePolicy(
-            "translation unit direct-link slot is out of bounds".to_string(),
-        )
-    })?;
-    let existing = u32::from_le_bytes(bytes.try_into().map_err(|_| {
-        crate::types::DsrError::CachePolicy(
-            "translation unit direct-link word is malformed".to_string(),
-        )
-    })?);
-    if existing & 0xfc00_0000 != 0x1400_0000 {
-        return Err(crate::types::DsrError::CachePolicy(format!(
-            "translation unit direct-link slot is not an AArch64 B: 0x{existing:08x}"
-        )));
-    }
-    let linked = 0x1400_0000 | ((words as i32 as u32) & 0x03ff_ffff);
-    bytes.copy_from_slice(&linked.to_le_bytes());
-    Ok(())
 }
 
 /// Which manifest invariant a preflight rejected. `UnitMissReason::ManifestRange`
@@ -748,14 +428,7 @@ pub enum ManifestDefect {
     BlockGeometry,
     BlockGuestDuplicate,
     BlockExtentOverlap,
-    BindingOrdinal,
-    BindingGeometry,
-    BindingOwnerDuplicate,
-    BindingOrder,
-    BindingTargetInUnit,
-    BindingLayoutDisabled,
-    BindingLayoutSidecar,
-    BindingRelocation,
+    BlockTemplate,
 }
 
 impl ManifestDefect {
@@ -873,106 +546,25 @@ pub enum PublishOutcome {
     Yielded,
 }
 
-#[derive(Clone, Debug)]
-pub enum LoadedTranslationMetadata {
-    V2(std::sync::Arc<TranslationUnitManifest>),
-    V3(std::sync::Arc<crate::mapped_metadata::ValidatedMappedTranslationMetadata>),
-}
-
-impl LoadedTranslationMetadata {
-    pub fn key(&self) -> &TranslationUnitKey {
-        match self {
-            Self::V2(manifest) => &manifest.key,
-            Self::V3(metadata) => metadata.key(),
-        }
-    }
-
-    pub fn code_len(&self) -> u64 {
-        match self {
-            Self::V2(manifest) => manifest.code_len,
-            Self::V3(metadata) => metadata.code_len(),
-        }
-    }
-
-    pub fn block_count(&self) -> usize {
-        match self {
-            Self::V2(manifest) => manifest.blocks.len(),
-            Self::V3(metadata) => metadata.block_count(),
-        }
-    }
-
-    pub fn binding_layout(&self) -> DirectBindingLayout {
-        match self {
-            Self::V2(manifest) => manifest.binding_layout,
-            Self::V3(metadata) => metadata.binding_layout(),
-        }
-    }
-
-    pub fn binding_count(&self) -> usize {
-        match self {
-            Self::V2(manifest) => manifest.bindings.len(),
-            Self::V3(metadata) => metadata.binding_count(),
-        }
-    }
-
-    pub fn binding_data_len(&self) -> u64 {
-        match self {
-            Self::V2(manifest) => manifest.binding_data_len,
-            Self::V3(metadata) => metadata.binding_data_len(),
-        }
-    }
-
-    pub fn v2(&self) -> Option<&Arc<TranslationUnitManifest>> {
-        match self {
-            Self::V2(manifest) => Some(manifest),
-            Self::V3(_) => None,
-        }
-    }
-
-    pub fn v3(&self) -> Option<&Arc<crate::mapped_metadata::ValidatedMappedTranslationMetadata>> {
-        match self {
-            Self::V2(_) => None,
-            Self::V3(metadata) => Some(metadata),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TranslationMetadataMode {
-    #[default]
-    V2,
-    V3,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TranslationMetadataLoadEvidence {
-    pub mode: TranslationMetadataMode,
     pub bytes_read: u64,
     pub bytes_mapped: u64,
     pub validation_ns: u64,
-    /// Physical V3 wire records across all sections, including its three
-    /// retained validation indexes. Zero for V2.
-    pub mapped_records: u64,
-    /// Physical V2 manifest table entries retained after load. This excludes
-    /// guest ranges, edge groups, and validation indexes that only V3 stores.
+    /// Physical manifest table entries retained after load (blocks plus
+    /// their per-block template records).
     pub owned_records: u64,
 }
 
 pub struct SharedLoadedTranslationUnit {
-    // Fields drop in declaration order. Release the source lease first so
-    // mapped metadata remains live through source teardown.
+    // Fields drop in declaration order.
     _lease: Arc<dyn Send + Sync>,
-    pub metadata: LoadedTranslationMetadata,
+    pub manifest: Arc<TranslationUnitManifest>,
     /// Address of the unit's READABLE translated-code bytes
-    /// (`metadata.code_len()` long), pinned by `_lease`. Nothing executes at
-    /// this address: the translator COPIES these bytes into its own
-    /// `MAP_JIT` translation cache at install and re-points the
-    /// direct-binding `ADRP`/`ADD` placeholder pairs at `binding_base`.
+    /// (`manifest.code_len` long), pinned by `_lease`. Nothing executes at
+    /// this address: the install replays each block's words into this
+    /// process's own `MAP_JIT` translation cache.
     pub source_base: usize,
-    /// The unit's zeroed, lease-pinned direct-binding cell block, when the
-    /// unit carries sidecar binding data. Provided by the store (the copy
-    /// transport's replacement for the dylib `__DATA` segment).
-    pub binding_base: Option<DirectBindingCellVa>,
     pub load_evidence: TranslationMetadataLoadEvidence,
 }
 
@@ -980,20 +572,12 @@ impl Clone for SharedLoadedTranslationUnit {
     fn clone(&self) -> Self {
         Self {
             _lease: Arc::clone(&self._lease),
-            metadata: match &self.metadata {
-                LoadedTranslationMetadata::V2(manifest) => {
-                    LoadedTranslationMetadata::V2(if shared_manifest_arc_enabled() {
-                        Arc::clone(manifest)
-                    } else {
-                        Arc::new((**manifest).clone())
-                    })
-                }
-                LoadedTranslationMetadata::V3(metadata) => {
-                    LoadedTranslationMetadata::V3(Arc::clone(metadata))
-                }
+            manifest: if shared_manifest_arc_enabled() {
+                Arc::clone(&self.manifest)
+            } else {
+                Arc::new((*self.manifest).clone())
             },
             source_base: self.source_base,
-            binding_base: self.binding_base,
             load_evidence: self.load_evidence,
         }
     }
@@ -1005,70 +589,30 @@ impl SharedLoadedTranslationUnit {
         source_base: usize,
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
-        Self {
-            _lease: lease,
-            metadata: LoadedTranslationMetadata::V2(retain_loaded_manifest(manifest.into())),
+        Self::new_with_evidence(
+            manifest,
             source_base,
-            binding_base: None,
-            load_evidence: TranslationMetadataLoadEvidence::default(),
-        }
+            TranslationMetadataLoadEvidence::default(),
+            lease,
+        )
     }
 
-    pub fn new_with_binding_base(
+    pub fn new_with_evidence(
         manifest: impl Into<Arc<TranslationUnitManifest>>,
-        source_base: usize,
-        binding_base: Option<DirectBindingCellVa>,
-        lease: Arc<dyn Send + Sync>,
-    ) -> Self {
-        Self {
-            _lease: lease,
-            metadata: LoadedTranslationMetadata::V2(retain_loaded_manifest(manifest.into())),
-            source_base,
-            binding_base,
-            load_evidence: TranslationMetadataLoadEvidence::default(),
-        }
-    }
-
-    pub fn new_mapped(
-        metadata: impl Into<Arc<crate::mapped_metadata::ValidatedMappedTranslationMetadata>>,
         source_base: usize,
         load_evidence: TranslationMetadataLoadEvidence,
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
-        Self::new_mapped_with_binding_base(metadata, source_base, None, load_evidence, lease)
-    }
-
-    pub fn new_mapped_with_binding_base(
-        metadata: impl Into<Arc<crate::mapped_metadata::ValidatedMappedTranslationMetadata>>,
-        source_base: usize,
-        binding_base: Option<DirectBindingCellVa>,
-        mut load_evidence: TranslationMetadataLoadEvidence,
-        lease: Arc<dyn Send + Sync>,
-    ) -> Self {
-        load_evidence.mode = TranslationMetadataMode::V3;
         Self {
             _lease: lease,
-            metadata: LoadedTranslationMetadata::V3(metadata.into()),
+            manifest: retain_loaded_manifest(manifest.into()),
             source_base,
-            binding_base,
             load_evidence,
         }
     }
 
     pub fn key(&self) -> &TranslationUnitKey {
-        self.metadata.key()
-    }
-
-    pub fn binding_layout(&self) -> DirectBindingLayout {
-        self.metadata.binding_layout()
-    }
-
-    pub fn binding_count(&self) -> usize {
-        self.metadata.binding_count()
-    }
-
-    pub fn binding_data_len(&self) -> u64 {
-        self.metadata.binding_data_len()
+        &self.manifest.key
     }
 }
 
@@ -1187,7 +731,7 @@ impl TranslationUnitManifest {
     }
 
     pub fn validate_ranges_detailed(&self) -> Result<(), ManifestDefect> {
-        if self.schema != TRANSLATION_UNIT_SCHEMA_V2 {
+        if self.schema != TRANSLATION_UNIT_SCHEMA_V4 {
             return Err(ManifestDefect::Schema);
         }
         if self.key.translator_abi() != TRANSLATOR_ABI_CURRENT {
@@ -1223,143 +767,62 @@ impl TranslationUnitManifest {
         if cache_extents.windows(2).any(|pair| pair[0].1 > pair[1].0) {
             return Err(ManifestDefect::BlockExtentOverlap);
         }
-        let same_unit_targets = guest_starts;
-        let mut owners = BTreeSet::new();
-        let mut previous_stub_end = None;
-        for (index, binding) in self.bindings.iter().enumerate() {
-            let expected_ordinal =
-                u32::try_from(index).map_err(|_| ManifestDefect::BindingOrdinal)?;
-            if binding.ordinal.get() != expected_ordinal {
-                return Err(ManifestDefect::BindingOrdinal);
+        for block in &self.blocks {
+            // A stored block record must carry no words of its own (the words
+            // live in the digest-bound `.code` image) and every relocation
+            // and trusted entry it references must land inside its extent.
+            // Word-level opcode/immediate validation is replay's job — it
+            // fails closed per block — but geometry that can never replay is
+            // refused here so publication names the defect.
+            let counts = block.template.metadata_counts();
+            if counts.words != 0 || counts.source_words != 0 {
+                return Err(ManifestDefect::BlockTemplate);
             }
-            if !binding.stub_start.is_multiple_of(4)
-                || !binding.stub_end.is_multiple_of(4)
-                || binding.stub_start >= binding.stub_end
-                || u64::from(binding.stub_end) > self.code_len
-            {
-                return Err(ManifestDefect::BindingGeometry);
-            }
-            if !owners.insert(binding.stub_start) {
-                return Err(ManifestDefect::BindingOwnerDuplicate);
-            }
-            if previous_stub_end.is_some_and(|end| end > binding.stub_start) {
-                return Err(ManifestDefect::BindingOrder);
-            }
-            if same_unit_targets.contains(&binding.target) {
-                return Err(ManifestDefect::BindingTargetInUnit);
-            }
-            previous_stub_end = Some(binding.stub_end);
-        }
-        match self.binding_layout {
-            DirectBindingLayout::Disabled => {
-                if !self.binding_export.is_empty()
-                    || self.binding_data_len != 0
-                    || self.cell_size != 0
-                    || !self.binding_relocations.is_empty()
-                {
-                    return Err(ManifestDefect::BindingLayoutDisabled);
-                }
-            }
-            DirectBindingLayout::SidecarV1 => {
-                let expected_len = u64::try_from(self.bindings.len())
-                    .ok()
-                    .and_then(|count| count.checked_mul(u64::from(DIRECT_BINDING_CELL_SIZE)))
-                    .ok_or(ManifestDefect::BindingLayoutSidecar)?;
-                if self.binding_export != TRANSLATION_UNIT_BINDING_EXPORT
-                    || self.cell_size != DIRECT_BINDING_CELL_SIZE
-                    || !self
-                        .binding_data_len
-                        .is_multiple_of(u64::from(DIRECT_BINDING_CELL_SIZE))
-                    || self.binding_data_len != expected_len
-                    || self.binding_relocations.len() != self.bindings.len()
-                {
-                    return Err(ManifestDefect::BindingLayoutSidecar);
-                }
-                let mut relocation_ordinals = BTreeSet::new();
-                for relocation in &self.binding_relocations {
-                    let ordinal = usize::try_from(relocation.ordinal.get())
-                        .map_err(|_| ManifestDefect::BindingLayoutSidecar)?;
-                    let binding = self
-                        .bindings
-                        .get(ordinal)
-                        .ok_or(ManifestDefect::BindingLayoutSidecar)?;
-                    let expected_data_offset = relocation
-                        .ordinal
-                        .get()
-                        .checked_mul(DIRECT_BINDING_CELL_SIZE)
-                        .ok_or(ManifestDefect::BindingLayoutSidecar)?;
-                    let offsets = [
-                        relocation.adrp_offset,
-                        relocation.add_offset,
-                        relocation.miss_adrp_offset,
-                        relocation.miss_add_offset,
-                    ];
-                    let expected_offsets =
-                        expected_direct_binding_relocation_offsets(binding.stub_start)
-                            .ok_or(ManifestDefect::BindingLayoutSidecar)?;
-                    if !relocation_ordinals.insert(relocation.ordinal)
-                        || relocation.data_offset != expected_data_offset
-                        || offsets != expected_offsets
-                        || offsets.iter().any(|offset| {
-                            !offset.is_multiple_of(4)
-                                || *offset < binding.stub_start
-                                || u64::from(*offset) + 4 > u64::from(binding.stub_end)
-                                || u64::from(*offset) + 4 > self.code_len
-                        })
-                    {
-                        return Err(ManifestDefect::BindingLayoutSidecar);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn validate_binding_data(&self, binding_data: &[u8]) -> Result<(), UnitMissReason> {
-        if u64::try_from(binding_data.len()).ok() != Some(self.binding_data_len)
-            || binding_data.iter().any(|byte| *byte != 0)
-        {
-            return Err(UnitMissReason::ManifestRange);
-        }
-        Ok(())
-    }
-
-    pub fn validate_binding_code(&self, code: &[u8]) -> Result<(), UnitMissReason> {
-        self.validate_ranges()?;
-        for relocation in &self.binding_relocations {
-            for (adrp_offset, add_offset) in [
-                (relocation.adrp_offset, relocation.add_offset),
-                (relocation.miss_adrp_offset, relocation.miss_add_offset),
-            ] {
-                let adrp = code_word(code, adrp_offset)?;
-                let add = code_word(code, add_offset)?;
-                if adrp & 0x9f00_001f != 0x9000_000f || add & 0xffc0_03ff != 0x9100_01ef {
-                    return Err(UnitMissReason::ManifestRange);
-                }
+            if !block.template.replay_metadata_fits_code_len(block.code_len) {
+                return Err(ManifestDefect::BlockTemplate);
             }
         }
         Ok(())
     }
 }
 
-fn expected_direct_binding_relocation_offsets(stub_start: u32) -> Option<[u32; 4]> {
-    Some([
-        stub_start.checked_add(20)?,
-        stub_start.checked_add(24)?,
-        stub_start.checked_add(108)?,
-        stub_start.checked_add(112)?,
-    ])
+/// Magic prefix of the serialized unit metadata (`{stem}.metadata-v4`). A
+/// file without it — foreign, truncated, or written by any pre-native-tap
+/// binary — refuses to decode and reads as a schema miss, never as a
+/// lower-quality unit.
+pub const TRANSLATION_UNIT_METADATA_MAGIC: [u8; 8] = *b"CUNITV4\0";
+const TRANSLATION_UNIT_METADATA_DECODE_LIMIT: usize = 256 * 1024 * 1024;
+
+pub fn encode_translation_unit_metadata(
+    manifest: &TranslationUnitManifest,
+) -> Result<Vec<u8>, crate::types::DsrError> {
+    let mut bytes = TRANSLATION_UNIT_METADATA_MAGIC.to_vec();
+    let body = bincode::serde::encode_to_vec(
+        manifest,
+        bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>(),
+    )
+    .map_err(|error| {
+        crate::types::DsrError::CachePolicy(format!("encode translation unit metadata: {error}"))
+    })?;
+    bytes.extend_from_slice(&body);
+    Ok(bytes)
 }
 
-fn code_word(code: &[u8], offset: u32) -> Result<u32, UnitMissReason> {
-    let start = usize::try_from(offset).map_err(|_| UnitMissReason::ManifestRange)?;
-    let end = start.checked_add(4).ok_or(UnitMissReason::ManifestRange)?;
-    let bytes = code.get(start..end).ok_or(UnitMissReason::ManifestRange)?;
-    Ok(u32::from_le_bytes(
-        bytes
-            .try_into()
-            .map_err(|_| UnitMissReason::ManifestRange)?,
-    ))
+pub fn decode_translation_unit_metadata(
+    bytes: &[u8],
+) -> Result<TranslationUnitManifest, UnitMissReason> {
+    let body = bytes
+        .strip_prefix(&TRANSLATION_UNIT_METADATA_MAGIC)
+        .ok_or(UnitMissReason::Schema)?;
+    let (manifest, consumed): (TranslationUnitManifest, usize) = bincode::serde::decode_from_slice(
+        body,
+        bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>(),
+    )
+    .map_err(|_| UnitMissReason::Schema)?;
+    if consumed != body.len() {
+        return Err(UnitMissReason::Schema);
+    }
+    Ok(manifest)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1455,11 +918,12 @@ mod tests {
     use crate::artifact_spike::{ArtifactBindings, ArtifactTemplate};
     use crate::block::{BlockPlan, PlannedExit};
     use crate::emit::{
-        DirectLink, DirectLinkKind, DirectStubEnvelope, PcMapEntry, RecoveryAction, RecoveryEntry,
+        EmitAddressMode, GenerationGuard, PcMapEntry, RecoveryAction, RecoveryEntry,
     };
-    use crate::types::{CacheOffset, CodeGeneration, DirectExit, DirectKind};
+    use crate::types::{CacheOffset, CodeGeneration};
     use carrick_dsr::address::NativeHostBias;
     use carrick_guest_mem::GuestVa;
+    use std::sync::atomic::AtomicU64;
 
     /// The census indexes a fixed counter array by [`UnitMissReason::index`],
     /// so a hand-written index that drifts from `ALL` would silently attribute
@@ -1505,33 +969,44 @@ mod tests {
         )
     }
 
-    fn unresolved_direct_template(source: GuestVa, target: GuestVa) -> ArtifactTemplate {
-        crate::emit::record_portable_block_artifact(
-            &BlockPlan {
-                start: source,
-                end: GuestVa(source.raw() + 4),
-                generation: CodeGeneration::INITIAL,
-                instructions: Vec::new(),
-                exit: PlannedExit::Direct {
-                    guest: source,
-                    word: 0x1400_0001,
-                    exit: DirectExit {
-                        kind: DirectKind::Branch,
-                        target,
-                        resume: GuestVa(source.raw() + 4),
-                        condition: None,
-                        register: None,
-                        bit: None,
-                    },
-                },
-                extensions: Vec::new(),
-            },
-            0,
-            crate::emit::EmitAddressMode::Direct,
-            vec![0x1400_0001],
+    fn fixture_key() -> TranslationUnitKey {
+        key(
+            ExecutableIdentity::Digest([0x11; 32]),
+            SourceFingerprint([0x22; 32]),
+            AddressModeIdentity::Direct,
         )
-        .expect("record unresolved direct template")
-        .template
+    }
+
+    /// A candidate recorded through the NATIVE emission tap for a trivial
+    /// syscall block starting at `guest_start` — words present, trusted
+    /// entry included when the emitter placed one.
+    fn native_tap_candidate(guest_start: GuestVa) -> PortableBlockCandidate {
+        let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+        let plan = BlockPlan {
+            start: guest_start,
+            end: GuestVa(guest_start.raw() + 4),
+            generation: CodeGeneration::INITIAL,
+            instructions: Vec::new(),
+            exit: PlannedExit::Syscall {
+                guest: guest_start,
+                resume: GuestVa(guest_start.raw() + 4),
+            },
+            extensions: Vec::new(),
+        };
+        let mut cache = crate::test_jit::test_cache(64 * 1024);
+        let (_emitted, artifact) = crate::emit::emit_block_recording_artifact(
+            &mut cache,
+            &plan,
+            GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+            EmitAddressMode::Direct,
+            vec![0xd400_0001],
+        )
+        .expect("record native-tap candidate");
+        PortableBlockCandidate {
+            guest_start,
+            requires_sensitive_metadata: false,
+            template: artifact.template,
+        }
     }
 
     fn empty_template() -> ArtifactTemplate {
@@ -1548,128 +1023,327 @@ mod tests {
         .expect("empty template")
     }
 
-    fn manifest_v2_fixture() -> TranslationUnitManifest {
-        let key = key(
-            ExecutableIdentity::Digest([0x11; 32]),
-            SourceFingerprint([0xaa; 32]),
-            AddressModeIdentity::Direct,
-        );
+    fn record_template() -> ArtifactTemplate {
+        ArtifactTemplate::normalize(
+            Vec::new(),
+            vec![PcMapEntry {
+                guest: GuestVa(0x400000),
+                cache: CacheOffset::published(0),
+            }],
+            vec![RecoveryEntry {
+                cache: CacheOffset::published(4),
+                action: RecoveryAction::RestoreGuestX17,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            &ArtifactBindings::from_values([]).expect("empty bindings"),
+        )
+        .expect("record template")
+    }
+
+    fn manifest_block(guest_start: u64, entry_offset: u32, code_len: u32) -> PortableBlockRecord {
+        PortableBlockRecord {
+            guest_start: GuestVa(guest_start),
+            entry_offset,
+            code_len,
+            requires_sensitive_metadata: false,
+            template: record_template(),
+        }
+    }
+
+    fn manifest_fixture() -> TranslationUnitManifest {
+        let key = fixture_key();
+        let base_export = translation_unit_base_export(&key).expect("base export");
         TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V2,
-            base_export: translation_unit_base_export(&key).expect("unit export"),
+            schema: TRANSLATION_UNIT_SCHEMA_V4,
             key,
-            code_sha256: [0x22; 32],
-            code_len: 512,
-            blocks: Vec::new(),
-            binding_layout: DirectBindingLayout::SidecarV1,
-            binding_export: TRANSLATION_UNIT_BINDING_EXPORT.to_owned(),
-            binding_data_len: u64::from(DIRECT_BINDING_CELL_SIZE),
-            cell_size: DIRECT_BINDING_CELL_SIZE,
-            bindings: vec![UnresolvedDirectBindingRecord {
-                source: GuestVa(0x400000),
-                target: GuestVa(0x500000),
-                kind: DirectLinkKind::Branch,
-                ordinal: DirectBindingOrdinal::claimed(0),
-                stub_start: 32,
-                stub_end: 288,
-            }],
-            binding_relocations: vec![DirectBindingRelocation {
-                ordinal: DirectBindingOrdinal::claimed(0),
-                adrp_offset: 52,
-                add_offset: 56,
-                miss_adrp_offset: 140,
-                miss_add_offset: 144,
-                data_offset: 0,
-            }],
+            code_sha256: [0x33; 32],
+            base_export,
+            code_len: 32,
+            blocks: vec![
+                manifest_block(0x400000, 0, 16),
+                manifest_block(0x400010, 16, 16),
+            ],
         }
     }
 
-    #[derive(Debug)]
-    struct SharedLeaseDropProbe;
-
-    #[derive(Debug)]
-    struct SharedLeaseObservedBacking {
-        bytes: Vec<u8>,
-        lease: std::sync::Weak<SharedLeaseDropProbe>,
-        lease_alive_when_dropped: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    impl crate::mapped_metadata::MetadataBacking for SharedLeaseObservedBacking {
-        fn bytes(&self) -> &[u8] {
-            &self.bytes
+    #[test]
+    fn pack_concatenates_unbaked_native_tap_words_per_block() {
+        let first = native_tap_candidate(GuestVa(0x400000));
+        let second = native_tap_candidate(GuestVa(0x400100));
+        let first_words = first.template.words().to_vec();
+        let second_words = second.template.words().to_vec();
+        assert!(!first_words.is_empty());
+        assert!(
+            first.template.trusted_entry().is_some(),
+            "a native-tap candidate carries the trusted entry"
+        );
+        let pending = PendingTranslationUnit::pack(fixture_key(), vec![first, second])
+            .expect("pack native-tap candidates");
+        assert_eq!(pending.blocks.len(), 2);
+        assert_eq!(pending.blocks[0].entry_offset, 0);
+        assert_eq!(
+            pending.blocks[0].code_len as usize,
+            first_words.len() * 4,
+            "first block's extent is its recorded word count"
+        );
+        assert_eq!(
+            pending.blocks[1].entry_offset as usize,
+            first_words.len() * 4
+        );
+        // The code image is EXACTLY the recorded words in order — no
+        // same-unit patching, no sidecar rewriting, nothing baked.
+        let mut expected = Vec::new();
+        for word in first_words.iter().chain(&second_words) {
+            expected.extend_from_slice(&word.to_le_bytes());
         }
-    }
-
-    impl Drop for SharedLeaseObservedBacking {
-        fn drop(&mut self) {
-            self.lease_alive_when_dropped.store(
-                self.lease.upgrade().is_some(),
-                std::sync::atomic::Ordering::Release,
+        assert_eq!(pending.code, expected);
+        for block in &pending.blocks {
+            let counts = block.template.metadata_counts();
+            assert_eq!(counts.words, 0, "stored records carry no words");
+            assert_eq!(counts.source_words, 0, "stored records carry no source");
+            assert!(
+                block.template.trusted_entry().is_some(),
+                "the stored record keeps the trusted entry"
             );
         }
     }
 
     #[test]
-    fn loaded_unit_clones_share_the_immutable_manifest() {
-        let unit = SharedLoadedTranslationUnit::new(manifest_v2_fixture(), 0x1000, Arc::new(()));
-        let cloned = unit.clone();
-        let manifest = unit.metadata.v2().expect("V2 manifest");
-        let cloned_manifest = cloned.metadata.v2().expect("cloned V2 manifest");
-
-        assert!(std::ptr::eq(&manifest.blocks, &cloned_manifest.blocks));
+    fn pack_rejects_duplicate_blocks_and_empty_candidates() {
+        let candidate = native_tap_candidate(GuestVa(0x400000));
+        let duplicate = candidate.clone();
+        assert!(matches!(
+            PendingTranslationUnit::pack(fixture_key(), vec![candidate, duplicate]),
+            Err(crate::types::DsrError::CachePolicy(message))
+                if message.contains("duplicate block")
+        ));
+        assert!(matches!(
+            PendingTranslationUnit::pack(fixture_key(), Vec::new()),
+            Err(crate::types::DsrError::CachePolicy(message))
+                if message.contains("no blocks")
+        ));
+        assert!(matches!(
+            PendingTranslationUnit::pack(
+                fixture_key(),
+                vec![PortableBlockCandidate {
+                    guest_start: GuestVa(0x400000),
+                    requires_sensitive_metadata: false,
+                    template: empty_template(),
+                }],
+            ),
+            Err(crate::types::DsrError::CachePolicy(message))
+                if message.contains("no recorded words")
+        ));
     }
 
     #[test]
-    fn shared_loaded_unit_releases_lease_before_metadata_backing() {
-        let mut manifest = manifest_v2_fixture();
-        manifest.blocks.push(PortableBlockRecord {
+    fn unit_metadata_encode_decode_round_trips_and_refuses_foreign_payloads() {
+        let manifest = manifest_fixture();
+        let bytes = encode_translation_unit_metadata(&manifest).expect("encode metadata");
+        assert!(bytes.starts_with(&TRANSLATION_UNIT_METADATA_MAGIC));
+        let decoded = decode_translation_unit_metadata(&bytes).expect("decode metadata");
+        assert_eq!(decoded, manifest);
+        // No magic: a pre-native-tap or foreign file refuses as Schema.
+        assert_eq!(
+            decode_translation_unit_metadata(&bytes[1..]),
+            Err(UnitMissReason::Schema)
+        );
+        // Trailing bytes: a torn or tampered payload refuses as Schema.
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_translation_unit_metadata(&trailing),
+            Err(UnitMissReason::Schema)
+        );
+        // Truncation refuses.
+        assert_eq!(
+            decode_translation_unit_metadata(&bytes[..bytes.len() - 1]),
+            Err(UnitMissReason::Schema)
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_wrong_schema_and_stale_abi() {
+        let mut manifest = manifest_fixture();
+        manifest.schema = 2;
+        assert_eq!(
+            manifest.validate_ranges_detailed(),
+            Err(ManifestDefect::Schema)
+        );
+        let stale = TranslationUnitKey {
+            translator_abi: TRANSLATOR_ABI_CURRENT - 1,
+            ..fixture_key()
+        };
+        let base_export = translation_unit_base_export(&stale).expect("base export");
+        let manifest = TranslationUnitManifest {
+            schema: TRANSLATION_UNIT_SCHEMA_V4,
+            key: stale,
+            code_sha256: [0x33; 32],
+            base_export,
+            code_len: 16,
+            blocks: vec![manifest_block(0x400000, 0, 16)],
+        };
+        assert_eq!(
+            manifest.validate_ranges_detailed(),
+            Err(ManifestDefect::TranslatorAbi)
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_guest_starts() {
+        let mut manifest = manifest_fixture();
+        manifest.blocks = vec![
+            manifest_block(0x400000, 0, 16),
+            manifest_block(0x400000, 16, 16),
+        ];
+        assert_eq!(
+            manifest.validate_ranges_detailed(),
+            Err(ManifestDefect::BlockGuestDuplicate)
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_overlapping_block_cache_extents() {
+        let mut manifest = manifest_fixture();
+        manifest.blocks = vec![
+            manifest_block(0x400000, 0, 20),
+            manifest_block(0x400010, 16, 16),
+        ];
+        assert_eq!(
+            manifest.validate_ranges_detailed(),
+            Err(ManifestDefect::BlockExtentOverlap)
+        );
+    }
+
+    #[test]
+    fn manifest_allows_adjacent_and_reverse_disjoint_cache_extents() {
+        let mut manifest = manifest_fixture();
+        manifest.blocks = vec![
+            manifest_block(0x400010, 16, 16),
+            manifest_block(0x400000, 0, 16),
+        ];
+        manifest
+            .validate_ranges_detailed()
+            .expect("disjoint extents");
+    }
+
+    #[test]
+    fn manifest_rejects_block_records_that_retain_words() {
+        let mut manifest = manifest_fixture();
+        let candidate = native_tap_candidate(GuestVa(0x400000));
+        let code_len = u32::try_from(candidate.template.words().len() * 4).expect("code length");
+        manifest.code_len = u64::from(code_len);
+        manifest.blocks = vec![PortableBlockRecord {
             guest_start: GuestVa(0x400000),
-            generation_binding: 0,
             entry_offset: 0,
-            code_len: 4,
+            code_len,
             requires_sensitive_metadata: false,
-            template: ArtifactTemplate::normalize(
-                Vec::new(),
-                vec![PcMapEntry {
-                    guest: GuestVa(0x400000),
-                    cache: CacheOffset::published(0),
-                }],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                &ArtifactBindings::from_values([]).expect("empty bindings"),
+            // The FULL template (words still present) must be refused: words
+            // live only in the digest-bound code image.
+            template: candidate.template,
+        }];
+        assert_eq!(
+            manifest.validate_ranges_detailed(),
+            Err(ManifestDefect::BlockTemplate)
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_replay_metadata_outside_the_block_extent() {
+        let mut manifest = manifest_fixture();
+        // A recovery offset at byte 4 needs code_len > 4.
+        manifest.blocks = vec![manifest_block(0x400000, 0, 4)];
+        manifest.code_len = 4;
+        assert_eq!(
+            manifest.validate_ranges_detailed(),
+            Err(ManifestDefect::BlockTemplate)
+        );
+    }
+
+    #[test]
+    fn source_fingerprint_mismatch_is_a_typed_miss() {
+        let manifest = manifest_fixture();
+        assert_eq!(
+            manifest.validate_source(&[0xd503_201f]),
+            Err(UnitMissReason::SourceFingerprint)
+        );
+    }
+
+    #[test]
+    fn same_guest_va_with_different_images_never_aliases() {
+        let left = key(
+            ExecutableIdentity::Digest([0x11; 32]),
+            SourceFingerprint([0x22; 32]),
+            AddressModeIdentity::Direct,
+        );
+        let right = key(
+            ExecutableIdentity::Digest([0x12; 32]),
+            SourceFingerprint([0x22; 32]),
+            AddressModeIdentity::Direct,
+        );
+        assert_ne!(left.file_stem().unwrap(), right.file_stem().unwrap());
+        assert_ne!(
+            translation_unit_base_export(&left).unwrap(),
+            translation_unit_base_export(&right).unwrap()
+        );
+    }
+
+    #[test]
+    fn same_image_with_different_source_fingerprints_never_aliases() {
+        let left = key(
+            ExecutableIdentity::Digest([0x11; 32]),
+            SourceFingerprint([0x22; 32]),
+            AddressModeIdentity::Direct,
+        );
+        let right = key(
+            ExecutableIdentity::Digest([0x11; 32]),
+            SourceFingerprint([0x23; 32]),
+            AddressModeIdentity::Direct,
+        );
+        assert_ne!(left.file_stem().unwrap(), right.file_stem().unwrap());
+    }
+
+    #[test]
+    fn same_image_with_different_host_biases_never_aliases() {
+        let bias = |raw| {
+            AddressModeIdentity::biased(
+                NativeHostBias::new(raw, 16 * 1024).expect("aligned fixture bias"),
             )
-            .expect("drop-order metadata")
-            .into_runtime_metadata_only(),
-        });
-        let bytes = crate::mapped_metadata::encode_translation_metadata_v3(&manifest)
-            .expect("encode V3 metadata");
-        let lease = Arc::new(SharedLeaseDropProbe);
-        let lease_alive_when_dropped = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let backing: Arc<dyn crate::mapped_metadata::MetadataBacking> =
-            Arc::new(SharedLeaseObservedBacking {
-                bytes,
-                lease: Arc::downgrade(&lease),
-                lease_alive_when_dropped: Arc::clone(&lease_alive_when_dropped),
-            });
-        let metadata =
-            crate::mapped_metadata::ValidatedMappedTranslationMetadata::new(backing, &manifest.key)
-                .expect("validate V3 metadata");
-        let unit = SharedLoadedTranslationUnit::new_mapped(
-            Arc::new(metadata),
-            0x1000,
-            TranslationMetadataLoadEvidence::default(),
-            lease,
+        };
+        let left = key(
+            ExecutableIdentity::Digest([0x11; 32]),
+            SourceFingerprint([0x22; 32]),
+            bias(0x10_0000_0000),
         );
-
-        drop(unit);
-
-        assert!(
-            !lease_alive_when_dropped.load(std::sync::atomic::Ordering::Acquire),
-            "shared dyld lease must be released before the mapped metadata backing"
+        let right = key(
+            ExecutableIdentity::Digest([0x11; 32]),
+            SourceFingerprint([0x22; 32]),
+            bias(0x20_0000_0000),
         );
+        assert_ne!(left.file_stem().unwrap(), right.file_stem().unwrap());
+    }
+
+    #[test]
+    fn source_fingerprint_uses_all_words_in_little_endian_order() {
+        assert_ne!(
+            SourceFingerprint::from_words(&[1, 2]),
+            SourceFingerprint::from_words(&[2, 1])
+        );
+        assert_ne!(
+            SourceFingerprint::from_words(&[1]),
+            SourceFingerprint::from_words(&[1, 0])
+        );
+    }
+
+    #[test]
+    fn key_json_round_trips_typed_guest_va() {
+        let key = fixture_key();
+        let encoded = serde_json::to_vec(&key).expect("encode key");
+        let decoded: TranslationUnitKey = serde_json::from_slice(&encoded).expect("decode key");
+        assert_eq!(decoded, key);
     }
 
     #[test]
@@ -1677,9 +1351,6 @@ mod tests {
         assert!(shared_manifest_arc_enabled_from(None));
         assert!(shared_manifest_arc_enabled_from(Some(
             std::ffi::OsStr::new("1")
-        )));
-        assert!(shared_manifest_arc_enabled_from(Some(
-            std::ffi::OsStr::new("false")
         )));
         assert!(!shared_manifest_arc_enabled_from(Some(
             std::ffi::OsStr::new("0")
@@ -1692,9 +1363,6 @@ mod tests {
         assert!(shared_source_fingerprint_reuse_enabled_from(Some(
             std::ffi::OsStr::new("1")
         )));
-        assert!(shared_source_fingerprint_reuse_enabled_from(Some(
-            std::ffi::OsStr::new("false")
-        )));
         assert!(!shared_source_fingerprint_reuse_enabled_from(Some(
             std::ffi::OsStr::new("0")
         )));
@@ -1706,790 +1374,72 @@ mod tests {
         assert!(shared_recovery_runs_enabled_from(Some(
             std::ffi::OsStr::new("1")
         )));
-        assert!(shared_recovery_runs_enabled_from(Some(
-            std::ffi::OsStr::new("false")
-        )));
         assert!(!shared_recovery_runs_enabled_from(Some(
             std::ffi::OsStr::new("0")
         )));
     }
 
     #[test]
-    fn packed_recovery_runs_round_trip_smaller_than_entry_mode() {
-        let key = key(
-            ExecutableIdentity::Digest([0x51; 32]),
-            SourceFingerprint([0x61; 32]),
-            AddressModeIdentity::Direct,
-        );
-        let template = ArtifactTemplate::normalize(
-            vec![0xd503_201f; 1024],
-            vec![PcMapEntry {
-                guest: GuestVa(0x400000),
-                cache: CacheOffset::published(0),
-            }],
-            (0..1024)
-                .map(|index| RecoveryEntry {
-                    cache: CacheOffset::published(index * 4),
-                    action: RecoveryAction::RestoreScratch { register: 16 },
-                })
-                .collect(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            &ArtifactBindings::from_values([]).expect("empty bindings"),
-        )
-        .expect("recovery template");
-        let candidate = PortableBlockCandidate {
-            guest_start: GuestVa(0x400000),
-            generation_binding: 0,
-            requires_sensitive_metadata: false,
-            template,
-        };
+    fn packed_records_run_encode_recovery_when_enabled() {
+        let candidate = native_tap_candidate(GuestVa(0x400000));
+        let entry_count = candidate.template.metadata_counts().recovery_entries;
         let runs = PendingTranslationUnit::pack_with_recovery_runs(
-            key.clone(),
+            fixture_key(),
             vec![candidate.clone()],
-            DirectBindingLayout::Disabled,
             true,
         )
-        .expect("pack recovery runs");
-        let entries = PendingTranslationUnit::pack_with_recovery_runs(
-            key,
-            vec![candidate],
-            DirectBindingLayout::Disabled,
-            false,
-        )
-        .expect("pack recovery entries");
-
+        .expect("pack with runs");
+        let entries =
+            PendingTranslationUnit::pack_with_recovery_runs(fixture_key(), vec![candidate], false)
+                .expect("pack with entries");
         assert!(runs.blocks[0].template.recovery_is_run_encoded());
         assert!(!entries.blocks[0].template.recovery_is_run_encoded());
         assert_eq!(
             runs.blocks[0].template.metadata_counts().recovery_entries,
-            1024
+            entry_count
         );
-        assert_eq!(runs.blocks[0].template.metadata_counts().recovery_runs, 1);
-
-        let manifest = |pending: PendingTranslationUnit| TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V2,
-            base_export: translation_unit_base_export(&pending.key).expect("unit export"),
-            key: pending.key,
-            code_sha256: [0x71; 32],
-            code_len: pending.code.len() as u64,
-            blocks: pending.blocks,
-            binding_layout: pending.binding_layout,
-            binding_export: pending.binding_export,
-            binding_data_len: pending.binding_data_len,
-            cell_size: pending.cell_size,
-            bindings: pending.bindings,
-            binding_relocations: pending.binding_relocations,
-        };
-        let runs = manifest(runs);
-        let entries = manifest(entries);
-        let config = bincode::config::standard().with_fixed_int_encoding();
-        let run_bytes = bincode::serde::encode_to_vec(&runs, config).expect("encode runs");
-        let entry_bytes = bincode::serde::encode_to_vec(&entries, config).expect("encode entries");
-        assert!(run_bytes.len() * 4 < entry_bytes.len());
-        let (decoded, consumed): (TranslationUnitManifest, usize) =
-            bincode::serde::decode_from_slice(&run_bytes, config).expect("decode runs");
-        assert_eq!(consumed, run_bytes.len());
-        assert_eq!(decoded, runs);
-        assert!(decoded.blocks[0].template.recovery_is_run_encoded());
+        assert_eq!(
+            entries.blocks[0]
+                .template
+                .metadata_counts()
+                .recovery_entries,
+            entry_count
+        );
     }
 
     #[test]
     fn shared_segment_key_reuses_its_construction_time_source_fingerprint() {
-        let source_words: Arc<[u32]> = vec![0xd280_0540, 0xd65f_03c0].into();
+        let words: Arc<[u32]> = vec![0xd503_201f; 4].into();
         let segment = SharedExecutableSegment::new(
-            ImageFileOffset::new(0x1000),
-            ImageFileLen::new(8).expect("file length"),
+            ImageFileOffset::new(0),
+            ImageFileLen::new(16).expect("nonzero file length"),
             GuestVa(0x400000),
-            GuestCodeLen::new(8).expect("guest length"),
-            Arc::clone(&source_words),
+            GuestCodeLen::new(16).expect("nonzero guest length"),
+            Arc::clone(&words),
         );
         let image = SharedImageConfig {
-            executable: ExecutableIdentity::Digest([0x11; 32]),
+            executable: ExecutableIdentity::Digest([0x44; 32]),
             page_profile: NativePageProfileIdentity::Native16k,
             address_mode: AddressModeIdentity::Direct,
-            segments: vec![segment.clone()],
+            segments: vec![segment],
         };
-
+        let reused = image.key_for_segment_with_fingerprint_reuse(&image.segments[0], true);
+        let fresh = image.key_for_segment_with_fingerprint_reuse(&image.segments[0], false);
+        assert_eq!(reused, fresh);
         assert_eq!(
-            image.key_for_segment_with_fingerprint_reuse(&segment, true),
-            image.key_for_segment_with_fingerprint_reuse(&segment, false),
-        );
-        assert_eq!(
-            image
-                .key_for_segment_with_fingerprint_reuse(&segment, true)
-                .source_fingerprint(),
-            SourceFingerprint::from_words(&source_words),
-        );
-    }
-
-    fn manifest_block(guest_start: u64, entry_offset: u32, code_len: u32) -> PortableBlockRecord {
-        PortableBlockRecord {
-            guest_start: GuestVa(guest_start),
-            generation_binding: 0,
-            entry_offset,
-            code_len,
-            requires_sensitive_metadata: false,
-            template: empty_template(),
-        }
-    }
-
-    #[test]
-    fn shared_cache_manifest_rejects_duplicate_guest_starts() {
-        let mut manifest = manifest_v2_fixture();
-        manifest.blocks = vec![
-            manifest_block(0x410000, 0, 16),
-            manifest_block(0x410000, 16, 16),
-        ];
-
-        assert_eq!(
-            manifest.validate_ranges(),
-            Err(UnitMissReason::ManifestRange)
+            reused.source_fingerprint(),
+            SourceFingerprint::from_words(&words)
         );
     }
 
     #[test]
-    fn shared_cache_manifest_rejects_overlapping_block_cache_extents() {
-        for (case, blocks) in [
-            (
-                "duplicate",
-                vec![
-                    manifest_block(0x410000, 0, 16),
-                    manifest_block(0x410100, 0, 16),
-                ],
-            ),
-            (
-                "partial",
-                vec![
-                    manifest_block(0x410000, 0, 16),
-                    manifest_block(0x410100, 12, 16),
-                ],
-            ),
-            (
-                "nested",
-                vec![
-                    manifest_block(0x410000, 0, 32),
-                    manifest_block(0x410100, 8, 8),
-                ],
-            ),
-            (
-                "containing in reverse manifest order",
-                vec![
-                    manifest_block(0x410000, 8, 8),
-                    manifest_block(0x410100, 0, 32),
-                ],
-            ),
-        ] {
-            let mut manifest = manifest_v2_fixture();
-            manifest.blocks = blocks;
-
-            assert_eq!(
-                manifest.validate_ranges(),
-                Err(UnitMissReason::ManifestRange),
-                "{case}"
-            );
-        }
-    }
-
-    #[test]
-    fn shared_cache_manifest_allows_adjacent_and_reverse_disjoint_cache_extents() {
-        for (case, blocks) in [
-            (
-                "adjacent",
-                vec![
-                    manifest_block(0x410000, 0, 16),
-                    manifest_block(0x410100, 16, 16),
-                ],
-            ),
-            (
-                "reverse disjoint",
-                vec![
-                    manifest_block(0x410000, 32, 16),
-                    manifest_block(0x410100, 0, 16),
-                ],
-            ),
-        ] {
-            let mut manifest = manifest_v2_fixture();
-            manifest.blocks = blocks;
-
-            assert_eq!(manifest.validate_ranges(), Ok(()), "{case}");
-        }
-    }
-
-    #[test]
-    fn source_fingerprint_mismatch_is_a_typed_miss() {
-        let source = [0xd280_0000_u32];
-        let key = key(
-            ExecutableIdentity::Digest([0x11; 32]),
-            SourceFingerprint::from_words(&source),
-            AddressModeIdentity::Direct,
-        );
-        let manifest = TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V2,
-            base_export: translation_unit_base_export(&key).expect("unit export"),
-            key,
-            code_sha256: [0x22; 32],
-            code_len: 4,
-            blocks: Vec::new(),
-            binding_layout: DirectBindingLayout::Disabled,
-            binding_export: String::new(),
-            binding_data_len: 0,
-            cell_size: 0,
-            bindings: Vec::new(),
-            binding_relocations: Vec::new(),
-        };
-
-        assert_eq!(
-            manifest.validate_source(&[0xd280_0020]),
-            Err(UnitMissReason::SourceFingerprint)
-        );
-    }
-
-    #[test]
-    fn previous_target_cache_abi_is_rejected() {
-        let source = [0xd280_0000_u32];
-        let key = key(
-            ExecutableIdentity::Digest([0x11; 32]),
-            SourceFingerprint::from_words(&source),
-            AddressModeIdentity::Direct,
-        );
-        let mut manifest = TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V2,
-            base_export: translation_unit_base_export(&key).expect("unit export"),
-            key,
-            code_sha256: [0x22; 32],
-            code_len: 4,
-            blocks: Vec::new(),
-            binding_layout: DirectBindingLayout::Disabled,
-            binding_export: String::new(),
-            binding_data_len: 0,
-            cell_size: 0,
-            bindings: Vec::new(),
-            binding_relocations: Vec::new(),
-        };
-        manifest.key.translator_abi = 2;
-
-        assert_eq!(
-            manifest.validate_ranges(),
-            Err(UnitMissReason::TranslatorAbi),
-            "ABI-2 authority precursors must not load into the direct-binding sidecar runtime"
-        );
-    }
-
-    #[test]
-    fn same_unit_links_patch_to_b_and_receive_no_cells() {
-        let bindings = ArtifactBindings::from_values([]).expect("empty bindings");
-        let source = ArtifactTemplate::normalize(
-            vec![0x1400_0001, 0xd503_201f, 0xd503_201f],
-            vec![PcMapEntry {
-                guest: GuestVa(0x400000),
-                cache: CacheOffset::published(0),
-            }],
-            Vec::new(),
-            vec![DirectLink {
-                slot: CacheOffset::published(0),
-                source: GuestVa(0x400000),
-                target: GuestVa(0x400100),
-                kind: crate::emit::DirectLinkKind::Branch,
-                stub: crate::emit::DirectStubEnvelope {
-                    start: CacheOffset::published(4),
-                    end: CacheOffset::published(12),
-                },
-            }],
-            Vec::new(),
-            Vec::new(),
-            None,
-            &bindings,
-        )
-        .expect("source template");
-        let target = ArtifactTemplate::normalize(
-            vec![0xd503_201f],
-            vec![PcMapEntry {
-                guest: GuestVa(0x400100),
-                cache: CacheOffset::published(0),
-            }],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            &bindings,
-        )
-        .expect("target template");
-        let pending = PendingTranslationUnit::pack(
-            key(
-                ExecutableIdentity::Digest([0x11; 32]),
-                SourceFingerprint([0xaa; 32]),
-                AddressModeIdentity::Direct,
-            ),
-            vec![
-                PortableBlockCandidate {
-                    guest_start: GuestVa(0x400000),
-                    generation_binding: 0,
-                    requires_sensitive_metadata: false,
-                    template: source,
-                },
-                PortableBlockCandidate {
-                    guest_start: GuestVa(0x400100),
-                    generation_binding: 1,
-                    requires_sensitive_metadata: false,
-                    template: target,
-                },
-            ],
-            DirectBindingLayout::SidecarV1,
-        )
-        .expect("pack unit");
-
-        assert_eq!(
-            u32::from_le_bytes(pending.code[0..4].try_into().expect("branch word")),
-            0x1400_0003
-        );
-        assert!(pending.bindings.is_empty());
-        assert!(pending.binding_data.is_empty());
-        assert!(pending.binding_relocations.is_empty());
-        // An empty sidecar is not a layout — it is a fatal load: the store
-        // allocates no cell block for `binding_data_len == 0`, and the
-        // registry then refuses the unit ("no mapped cell base"), killing
-        // the guest that loaded it. A unit whose links all resolved at pack
-        // demotes to `Disabled`.
-        assert_eq!(pending.binding_layout, DirectBindingLayout::Disabled);
-        assert!(pending.binding_export.is_empty());
-        assert_eq!(pending.cell_size, 0);
-        assert_eq!(pending.binding_data_len, 0);
-    }
-
-    #[test]
-    fn unresolved_stubs_receive_ordinals_in_source_offset_order() {
-        let bindings = ArtifactBindings::from_values([]).expect("empty bindings");
-        let template = ArtifactTemplate::normalize(
-            vec![
-                0x1400_0001,
-                0x1400_0001,
-                0xd503_201f,
-                0xd503_201f,
-                0xd503_201f,
-                0xd503_201f,
-            ],
-            vec![PcMapEntry {
-                guest: GuestVa(0x400000),
-                cache: CacheOffset::published(0),
-            }],
-            Vec::new(),
-            vec![
-                DirectLink {
-                    slot: CacheOffset::published(4),
-                    source: GuestVa(0x400004),
-                    target: GuestVa(0x600000),
-                    kind: DirectLinkKind::Branch,
-                    stub: DirectStubEnvelope {
-                        start: CacheOffset::published(16),
-                        end: CacheOffset::published(24),
-                    },
-                },
-                DirectLink {
-                    slot: CacheOffset::published(0),
-                    source: GuestVa(0x400000),
-                    target: GuestVa(0x500000),
-                    kind: DirectLinkKind::Branch,
-                    stub: DirectStubEnvelope {
-                        start: CacheOffset::published(8),
-                        end: CacheOffset::published(16),
-                    },
-                },
-            ],
-            Vec::new(),
-            Vec::new(),
-            None,
-            &bindings,
-        )
-        .expect("out-of-order unresolved template");
-        let pending = PendingTranslationUnit::pack(
-            key(
-                ExecutableIdentity::Digest([0x11; 32]),
-                SourceFingerprint([0xaa; 32]),
-                AddressModeIdentity::Direct,
-            ),
-            vec![PortableBlockCandidate {
-                guest_start: GuestVa(0x400000),
-                generation_binding: 0,
-                requires_sensitive_metadata: false,
-                template,
-            }],
-            DirectBindingLayout::Disabled,
-        )
-        .expect("pack disabled unit");
-
-        assert_eq!(
-            pending
-                .bindings
-                .iter()
-                .map(|binding| (
-                    binding.stub_start,
-                    binding.ordinal.get(),
-                    binding.source,
-                    binding.target,
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (8, 0, GuestVa(0x400000), GuestVa(0x500000)),
-                (16, 1, GuestVa(0x400004), GuestVa(0x600000)),
-            ]
-        );
-        assert!(pending.binding_data.is_empty());
-        assert!(pending.binding_relocations.is_empty());
-        assert_eq!(
-            pending
-                .code
-                .chunks_exact(4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("disabled word")))
-                .collect::<Vec<_>>(),
-            vec![
-                0x1400_0001,
-                0x1400_0001,
-                0xd503_201f,
-                0xd503_201f,
-                0xd503_201f,
-                0xd503_201f,
-            ],
-            "Disabled must preserve the authority precursor byte-for-byte"
-        );
-    }
-
-    #[test]
-    fn equal_source_target_pairs_still_own_distinct_cells() {
-        let source = GuestVa(0x400000);
-        let target = GuestVa(0x500000);
-        let template = unresolved_direct_template(source, target);
-        let pending = PendingTranslationUnit::pack(
-            key(
-                ExecutableIdentity::Digest([0x11; 32]),
-                SourceFingerprint([0xaa; 32]),
-                AddressModeIdentity::Direct,
-            ),
-            vec![
-                PortableBlockCandidate {
-                    guest_start: GuestVa(0x400000),
-                    generation_binding: 0,
-                    requires_sensitive_metadata: false,
-                    template: template.clone(),
-                },
-                PortableBlockCandidate {
-                    guest_start: GuestVa(0x400100),
-                    generation_binding: 1,
-                    requires_sensitive_metadata: false,
-                    template,
-                },
-            ],
-            DirectBindingLayout::SidecarV1,
-        )
-        .expect("pack duplicate-edge unit");
-
-        assert_eq!(pending.bindings.len(), 2);
-        assert_eq!(pending.bindings[0].source, source);
-        assert_eq!(pending.bindings[1].source, source);
-        assert_eq!(pending.bindings[0].target, target);
-        assert_eq!(pending.bindings[1].target, target);
-        assert_eq!(pending.bindings[0].ordinal.get(), 0);
-        assert_eq!(pending.bindings[1].ordinal.get(), 1);
-        assert_eq!(pending.binding_data, vec![0; 16]);
-        assert_eq!(pending.binding_relocations.len(), 2);
-        assert_eq!(pending.binding_relocations[0].data_offset, 0);
-        assert_eq!(pending.binding_relocations[1].data_offset, 8);
-    }
-
-    #[test]
-    fn schema_v2_rejects_old_abi_nonzero_cells_and_out_of_stub_relocations() {
-        fn assert_range_miss(case: &str, manifest: TranslationUnitManifest) {
-            assert_eq!(
-                manifest.validate_ranges(),
-                Err(UnitMissReason::ManifestRange),
-                "{case}"
-            );
-        }
-
-        let mut old_schema = manifest_v2_fixture();
-        old_schema.schema = 1;
-        assert_eq!(
-            old_schema.validate_ranges(),
-            Err(UnitMissReason::Schema),
-            "old schema"
-        );
-
-        let mut old_abi = manifest_v2_fixture();
-        old_abi.key.translator_abi = 2;
-        assert_eq!(
-            old_abi.validate_ranges(),
-            Err(UnitMissReason::TranslatorAbi),
-            "old translator ABI"
-        );
-
-        let mut unaligned_data = manifest_v2_fixture();
-        unaligned_data.binding_data_len = 9;
-        assert_range_miss("unaligned data length", unaligned_data);
-
-        let mut inconsistent_data = manifest_v2_fixture();
-        inconsistent_data.binding_data_len = 16;
-        assert_range_miss("inconsistent data length", inconsistent_data);
-
-        let mut duplicate_ordinal = manifest_v2_fixture();
-        duplicate_ordinal
-            .bindings
-            .push(UnresolvedDirectBindingRecord {
-                source: GuestVa(0x400100),
-                target: GuestVa(0x500100),
-                kind: DirectLinkKind::Branch,
-                ordinal: DirectBindingOrdinal::claimed(0),
-                stub_start: 288,
-                stub_end: 512,
-            });
-        duplicate_ordinal
-            .binding_relocations
-            .push(DirectBindingRelocation {
-                ordinal: DirectBindingOrdinal::claimed(0),
-                adrp_offset: 308,
-                add_offset: 312,
-                miss_adrp_offset: 396,
-                miss_add_offset: 400,
-                data_offset: 8,
-            });
-        duplicate_ordinal.binding_data_len = 16;
-        assert_range_miss("duplicate ordinal", duplicate_ordinal);
-
-        let mut conflicting_owner = manifest_v2_fixture();
-        conflicting_owner
-            .bindings
-            .push(UnresolvedDirectBindingRecord {
-                source: GuestVa(0x400100),
-                target: GuestVa(0x500100),
-                kind: DirectLinkKind::Call,
-                ordinal: DirectBindingOrdinal::claimed(1),
-                stub_start: 32,
-                stub_end: 288,
-            });
-        conflicting_owner
-            .binding_relocations
-            .push(DirectBindingRelocation {
-                ordinal: DirectBindingOrdinal::claimed(1),
-                adrp_offset: 52,
-                add_offset: 56,
-                miss_adrp_offset: 140,
-                miss_add_offset: 144,
-                data_offset: 8,
-            });
-        conflicting_owner.binding_data_len = 16;
-        assert_range_miss("conflicting stub owner", conflicting_owner);
-
-        let mut same_unit_binding = manifest_v2_fixture();
-        same_unit_binding.blocks.push(PortableBlockRecord {
-            guest_start: GuestVa(0x500000),
-            generation_binding: 0,
-            entry_offset: 0,
-            code_len: 4,
-            requires_sensitive_metadata: false,
-            template: empty_template(),
-        });
-        assert_range_miss("same-unit binding", same_unit_binding);
-
-        let mut out_of_envelope = manifest_v2_fixture();
-        out_of_envelope.binding_relocations[0].adrp_offset = 28;
-        assert_range_miss("out-of-envelope relocation", out_of_envelope);
-
-        let mut miss_out_of_envelope = manifest_v2_fixture();
-        miss_out_of_envelope.binding_relocations[0].miss_add_offset = 288;
-        assert_range_miss("out-of-envelope miss relocation", miss_out_of_envelope);
-
-        let manifest = manifest_v2_fixture();
-        assert_eq!(
-            manifest.validate_binding_data(&[0; 8]),
-            Ok(()),
-            "zero cells"
-        );
-        assert_eq!(
-            manifest.validate_binding_data(&[0, 0, 0, 0, 0, 0, 0, 1]),
-            Err(UnitMissReason::ManifestRange),
-            "nonzero cell bytes"
-        );
-
-        let mut code = vec![0; 512];
-        for (offset, word) in [
-            (52, 0x9000_000f_u32),
-            (56, 0x9100_01ef),
-            (140, 0x9000_000f),
-            (144, 0x9100_01ef),
-        ] {
-            code[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
-        }
-        assert_eq!(
-            manifest.validate_binding_code(&code),
-            Ok(()),
-            "both typed relocation pairs"
-        );
-        code[144..148].copy_from_slice(&0xd503_201f_u32.to_le_bytes());
-        assert_eq!(
-            manifest.validate_binding_code(&code),
-            Err(UnitMissReason::ManifestRange),
-            "wrong miss relocation instruction shape"
-        );
-    }
-
-    #[test]
-    fn schema_v2_rejects_aliased_direct_binding_relocations() {
-        let mut aliased = manifest_v2_fixture();
-        aliased.binding_relocations[0].miss_adrp_offset =
-            aliased.binding_relocations[0].adrp_offset;
-        aliased.binding_relocations[0].miss_add_offset = aliased.binding_relocations[0].add_offset;
-        assert_eq!(
-            aliased.validate_ranges(),
-            Err(UnitMissReason::ManifestRange),
-            "hit and miss relocation pairs must not alias"
-        );
-    }
-
-    #[test]
-    fn schema_v2_rejects_shifted_but_contained_direct_binding_relocations() {
-        let mut shifted = manifest_v2_fixture();
-        shifted.binding_relocations[0].adrp_offset += 4;
-        shifted.binding_relocations[0].add_offset += 4;
-        assert_eq!(
-            shifted.validate_ranges(),
-            Err(UnitMissReason::ManifestRange),
-            "contained relocation pairs must still own their fixed stub offsets"
-        );
-    }
-
-    #[test]
-    fn direct_binding_relocation_offsets_reject_stub_start_overflow() {
-        assert_eq!(
-            expected_direct_binding_relocation_offsets(u32::MAX - 19),
-            None,
-            "hit ADRP arithmetic must be checked"
-        );
-        assert_eq!(
-            expected_direct_binding_relocation_offsets(u32::MAX - 107),
-            None,
-            "miss ADRP arithmetic must be checked independently"
-        );
-    }
-
-    #[test]
-    fn same_guest_va_with_different_images_never_aliases() {
-        let first = key(
-            ExecutableIdentity::Digest([0x11; 32]),
-            SourceFingerprint([0xaa; 32]),
-            AddressModeIdentity::biased(
-                NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
-            ),
-        );
-        let second = key(
-            ExecutableIdentity::Digest([0x22; 32]),
-            SourceFingerprint([0xaa; 32]),
-            AddressModeIdentity::biased(
-                NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
-            ),
-        );
-
-        assert_ne!(first, second);
-        assert_ne!(
-            first.file_stem().expect("first stem"),
-            second.file_stem().expect("second stem")
-        );
-    }
-
-    #[test]
-    fn translation_unit_base_export_binds_the_full_unit_identity() {
-        let first = key(
-            ExecutableIdentity::Digest([0x11; 32]),
-            SourceFingerprint([0xaa; 32]),
-            AddressModeIdentity::Direct,
-        );
-        let second = key(
-            ExecutableIdentity::Digest([0x22; 32]),
-            SourceFingerprint([0xaa; 32]),
-            AddressModeIdentity::Direct,
-        );
-
-        let first_export = translation_unit_base_export(&first).expect("first export");
-        let second_export = translation_unit_base_export(&second).expect("second export");
-
-        assert!(first_export.starts_with(TRANSLATION_UNIT_BASE_EXPORT));
-        assert_ne!(first_export, second_export);
-        assert_eq!(
-            first_export,
-            format!(
-                "{TRANSLATION_UNIT_BASE_EXPORT}_{}",
-                first.file_stem().expect("first stem")
-            )
-        );
-    }
-
-    #[test]
-    fn same_image_with_different_source_fingerprints_never_aliases() {
-        let first = key(
-            ExecutableIdentity::Digest([0x11; 32]),
-            SourceFingerprint([0xaa; 32]),
-            AddressModeIdentity::Direct,
-        );
-        let second = key(
-            ExecutableIdentity::Digest([0x11; 32]),
-            SourceFingerprint([0xbb; 32]),
-            AddressModeIdentity::Direct,
-        );
-
-        assert_ne!(first, second);
-        assert_ne!(
-            first.file_stem().expect("first stem"),
-            second.file_stem().expect("second stem")
-        );
-    }
-
-    #[test]
-    fn same_image_with_different_host_biases_never_aliases() {
-        let first = key(
-            ExecutableIdentity::Digest([0x11; 32]),
-            SourceFingerprint([0xaa; 32]),
-            AddressModeIdentity::biased(
-                NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
-            ),
-        );
-        let second = key(
-            ExecutableIdentity::Digest([0x11; 32]),
-            SourceFingerprint([0xaa; 32]),
-            AddressModeIdentity::biased(
-                NativeHostBias::new(0x9000_0000, 16 * 1024).expect("aligned bias"),
-            ),
-        );
-
-        assert_ne!(first, second);
-        assert_ne!(
-            first.file_stem().expect("first stem"),
-            second.file_stem().expect("second stem")
-        );
-    }
-
-    #[test]
-    fn source_fingerprint_uses_all_words_in_little_endian_order() {
-        let first = SourceFingerprint::from_words(&[0x0102_0304, 0x0506_0708]);
-        let second = SourceFingerprint::from_words(&[0x0102_0304, 0x0506_0709]);
-        let reordered = SourceFingerprint::from_words(&[0x0506_0708, 0x0102_0304]);
-
-        assert_ne!(first, second);
-        assert_ne!(first, reordered);
-    }
-
-    #[test]
-    fn key_json_round_trips_typed_guest_va() {
-        let original = key(
-            ExecutableIdentity::Digest([0x44; 32]),
-            SourceFingerprint([0x55; 32]),
-            AddressModeIdentity::Direct,
-        );
-
-        let json = serde_json::to_vec(&original).expect("serialize key");
-        let decoded: TranslationUnitKey = serde_json::from_slice(&json).expect("deserialize key");
-
-        assert_eq!(decoded, original);
-        assert_eq!(decoded.guest_va_start(), GuestVa(0x400000));
+    fn loaded_unit_clones_share_the_immutable_manifest() {
+        let manifest = Arc::new(manifest_fixture());
+        let lease: Arc<dyn Send + Sync> = Arc::new(());
+        let unit = SharedLoadedTranslationUnit::new(Arc::clone(&manifest), 0x1000, lease);
+        let clone = unit.clone();
+        assert!(Arc::ptr_eq(&unit.manifest, &clone.manifest));
+        assert_eq!(clone.source_base, 0x1000);
+        assert_eq!(clone.key(), &manifest.key);
     }
 }

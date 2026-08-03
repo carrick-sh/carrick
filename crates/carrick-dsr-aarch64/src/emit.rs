@@ -178,64 +178,29 @@ impl AssembledBlock {
     }
 }
 
+/// The absolute page-generation guard every emitted block runs on entry: an
+/// `ldar` of the page's generation cell compared against the baked expected
+/// value. The once-parallel `BindingIndex` shape (a unit-relative table walk
+/// with a 4-deep dependent chain) is DELETED — recorded unit templates
+/// replay with this exact guard and expose the same trusted entry as native
+/// emission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GenerationGuard {
-    Absolute {
-        address: u64,
-        expected: CodeGeneration,
-    },
-    BindingIndex {
-        index: u32,
-        expected: CodeGeneration,
-    },
+pub struct GenerationGuard {
+    address: u64,
+    expected: CodeGeneration,
 }
 
 impl GenerationGuard {
     pub fn new(current: &AtomicU64, expected: CodeGeneration) -> Self {
-        Self::Absolute {
+        Self {
             address: current as *const AtomicU64 as u64,
             expected,
         }
     }
 
-    pub const fn binding(index: u32, expected: CodeGeneration) -> Self {
-        Self::BindingIndex { index, expected }
-    }
-
     pub const fn expected(self) -> CodeGeneration {
-        match self {
-            Self::Absolute { expected, .. } | Self::BindingIndex { expected, .. } => expected,
-        }
+        self.expected
     }
-}
-
-/// Words in a binding-install trampoline: a four-word `movz`/`movk` chain, the
-/// context store, and the branch to the shared block.
-pub const BINDING_INSTALL_TRAMPOLINE_WORDS: usize = 6;
-
-/// The five words that install `bindings` as the context's generation-binding
-/// table. The caller appends the sixth word, a `b` to the shared block.
-///
-/// A loaded unit's block guards with `GenerationGuard::BindingIndex`, which
-/// reads the table from `CTX_GENERATION_BINDINGS`. Only the gateway installs
-/// that, so a direct branch from a private block would read whatever the
-/// private entry left there. Supplying it at ENTRY cannot work -- a context
-/// holds one pointer while a private context reaches blocks from N units -- so
-/// it is installed here, at the EDGE, where the target's unit is statically
-/// known.
-///
-/// `x17` is dead at an edge: the target's own guard prologue clobbers it before
-/// any use.
-pub fn binding_install_prologue(bindings: u64) -> [u32; BINDING_INSTALL_TRAMPOLINE_WORDS - 1] {
-    let halfword = |shift: u32| u32::from(((bindings >> shift) & 0xffff) as u16) << 5;
-    [
-        0xd280_0011 | halfword(0),  // movz x17, bindings[15:0]
-        0xf2a0_0011 | halfword(16), // movk x17, bindings[31:16], lsl #16
-        0xf2c0_0011 | halfword(32), // movk x17, bindings[47:32], lsl #32
-        0xf2e0_0011 | halfword(48), // movk x17, bindings[63:48], lsl #48
-        // str x17, [x28, #CTX_GENERATION_BINDINGS]
-        0xf900_0000 | ((super::gateway::CTX_GENERATION_BINDINGS / 8) << 10) | (28 << 5) | 17,
-    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -455,12 +420,6 @@ pub enum DirectLinkKind {
 pub struct DirectStubEnvelope {
     pub start: CacheOffset,
     pub end: CacheOffset,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DirectExitEmissionPolicy {
-    PrivateGateway,
-    PortableUnitAuthority,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1615,646 +1574,6 @@ fn emit_target_authority_switch(
     Ok(TargetAuthorityPhases { install_start })
 }
 
-/// Emit a direct edge that can chain through the per-thread target cache.
-///
-/// Immutable translation units cannot patch their branch words after dyld
-/// maps them. This gives their hot direct edges the same unit-scoped chaining
-/// mechanism as indirect edges: the first miss resolves and publishes the
-/// target, then later executions branch directly when the target belongs to
-/// the currently entered unit. The cache-range checks are the generation-
-/// authority boundary; a cross-unit target always returns through the gateway.
-fn record_direct_binding_recovery(
-    recovery: &mut Vec<RecoveryEntry>,
-    cache: CacheOffset,
-    phase: DirectBindingRecoveryPhase,
-    capture_progress: DirectBindingCaptureProgress,
-    committed_link: Option<u64>,
-) {
-    recovery.push(RecoveryEntry {
-        cache,
-        action: RecoveryAction::RestoreDirectBinding {
-            phase,
-            capture_progress,
-            committed_link,
-        },
-    });
-}
-
-fn record_direct_binding_phase(
-    recovery: &mut Vec<RecoveryEntry>,
-    start: CacheOffset,
-    end: CacheOffset,
-    phase: DirectBindingRecoveryPhase,
-    committed_link: Option<u64>,
-) -> Result<(), DsrError> {
-    if start.get() > end.get() || !start.get().is_multiple_of(4) || !end.get().is_multiple_of(4) {
-        return Err(DsrError::CachePolicy(format!(
-            "invalid direct-binding recovery range {}..{}",
-            start.get(),
-            end.get()
-        )));
-    }
-    for offset in (start.get()..end.get()).step_by(4) {
-        record_direct_binding_recovery(
-            recovery,
-            CacheOffset::published(offset),
-            phase,
-            DirectBindingCaptureProgress::Complete,
-            committed_link,
-        );
-    }
-    Ok(())
-}
-
-const DIRECT_BINDING_STUB_WORDS: usize = 64;
-const DIRECT_BINDING_CAPTURE_WORDS: usize = 5;
-const DIRECT_BINDING_HIT_WORDS: usize = 22;
-const DIRECT_BINDING_MISS_WORD: usize = DIRECT_BINDING_CAPTURE_WORDS + DIRECT_BINDING_HIT_WORDS;
-
-fn record_direct_binding_sidecar_phases(
-    recovery: &mut Vec<RecoveryEntry>,
-    start: CacheOffset,
-    end: CacheOffset,
-    committed_link: Option<u64>,
-) -> Result<(), DsrError> {
-    let expected_end = start
-        .get()
-        .checked_add((DIRECT_BINDING_STUB_WORDS * 4) as u32)
-        .ok_or_else(|| DsrError::CachePolicy("direct-binding recovery envelope overflow".into()))?;
-    if end.get() != expected_end {
-        return Err(DsrError::CachePolicy(format!(
-            "direct-binding recovery envelope is {}..{}, expected {} bytes",
-            start.get(),
-            end.get(),
-            DIRECT_BINDING_STUB_WORDS * 4
-        )));
-    }
-    for (first_word, end_word, phase) in [
-        (5, 7, DirectBindingRecoveryPhase::CellAddress),
-        (7, 11, DirectBindingRecoveryPhase::TargetAcquire),
-        (11, 17, DirectBindingRecoveryPhase::AuthorityValidate),
-        (17, 21, DirectBindingRecoveryPhase::AuthorityInstall),
-        (21, 26, DirectBindingRecoveryPhase::ArchitecturalRestore),
-        (26, 27, DirectBindingRecoveryPhase::FinalBranch),
-        (27, 64, DirectBindingRecoveryPhase::MissExit),
-    ] {
-        let phase_start = start
-            .get()
-            .checked_add(first_word * 4)
-            .map(CacheOffset::published)
-            .ok_or_else(|| {
-                DsrError::CachePolicy("direct-binding recovery phase start overflow".into())
-            })?;
-        let phase_end = start
-            .get()
-            .checked_add(end_word * 4)
-            .map(CacheOffset::published)
-            .ok_or_else(|| {
-                DsrError::CachePolicy("direct-binding recovery phase end overflow".into())
-            })?;
-        record_direct_binding_phase(recovery, phase_start, phase_end, phase, committed_link)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn rewrite_direct_binding_stub(
-    code: &mut [u8],
-    link: DirectLink,
-    ordinal: crate::direct_binding::DirectBindingOrdinal,
-    data_offset: u32,
-) -> Result<crate::shared_cache::DirectBindingRelocation, DsrError> {
-    let start = usize::try_from(link.stub.start.get()).map_err(|_| {
-        DsrError::CachePolicy("direct-binding stub start does not fit usize".to_string())
-    })?;
-    let end = usize::try_from(link.stub.end.get()).map_err(|_| {
-        DsrError::CachePolicy("direct-binding stub end does not fit usize".to_string())
-    })?;
-    let stub = code.get_mut(start..end).ok_or_else(|| {
-        DsrError::CachePolicy("direct-binding stub envelope is out of bounds".to_string())
-    })?;
-    if stub.len() != DIRECT_BINDING_STUB_WORDS * std::mem::size_of::<u32>() {
-        return Err(DsrError::CachePolicy(format!(
-            "direct-binding precursor instruction shape has {} bytes, expected {}",
-            stub.len(),
-            DIRECT_BINDING_STUB_WORDS * std::mem::size_of::<u32>()
-        )));
-    }
-    let mut precursor = [0_u32; DIRECT_BINDING_STUB_WORDS];
-    for (word, bytes) in precursor.iter_mut().zip(stub.chunks_exact(4)) {
-        *word = u32::from_le_bytes(bytes.try_into().map_err(|_| {
-            DsrError::CachePolicy(
-                "direct-binding precursor instruction shape is truncated".to_string(),
-            )
-        })?);
-    }
-    let capture = [
-        0xf902_478f, // str x15, [x28, #1160]
-        0xf902_3390, // str x16, [x28, #1120]
-        0xf902_4b9e, // str x30, [x28, #1168]
-        0xd53b_4210, // mrs x16, nzcv
-        0xf901_d790, // str x16, [x28, #936]
-    ];
-    let authority_fixed = [
-        (9, 0xf902_1f91),  // str x17, [x28, #1080]
-        (10, 0xf942_7f8f), // ldr x15, [x28, #1272]
-        (11, 0xb400_044f), // cbz x15, resolver
-        (12, 0xca51_3230), // eor x16, x17, lsr #12
-        (13, 0xd342_4210), // ubfx x16, x16, #2, #15
-        (14, 0x8b10_19ef), // add x15, x15, x16, lsl #6
-        (15, 0xf940_01f0), // ldr x16, [x15]
-        (16, 0xeb11_021f), // cmp x16, x17
-        (17, 0x5400_00a0), // b.eq probe generation
-        (18, 0x9100_81ef), // add x15, x15, #32
-        (19, 0xf940_01f0), // ldr x16, [x15]
-        (20, 0xeb11_021f), // cmp x16, x17
-        (21, 0x5400_0301), // b.ne resolver
-        (22, 0xf940_05f1), // ldr x17, [x15, #8]
-        (23, 0xb400_02d1), // cbz x17, resolver
-        (24, 0xf940_09f0), // ldr x16, [x15, #16]
-        (25, 0xb400_0290), // cbz x16, resolver
-        (26, 0xf940_020f), // ldr x15, [x16]
-        (27, 0xeb0f_023f), // cmp x17, x15
-        (28, 0x5400_0223), // b.lo resolver
-        (29, 0xf940_060f), // ldr x15, [x16, #8]
-        (30, 0xeb0f_023f), // cmp x17, x15
-        (31, 0x5400_01c2), // b.hs resolver
-        (32, 0xf902_538f), // str x15, [x28, #1184]
-        (33, 0xf940_020f), // ldr x15, [x16]
-        (34, 0xf902_4f8f), // str x15, [x28, #1176]
-        (35, 0xf940_0a0f), // ldr x15, [x16, #16]
-        (36, 0xf902_7b8f), // str x15, [x28, #1264]
-        (37, 0xf902_1b91), // str x17, [x28, #1072]
-        (38, 0xf941_d790), // ldr x16, [x28, #936]
-        (39, 0xd51b_4210), // msr nzcv, x16
-        (40, 0xf942_478f), // ldr x15, [x28, #1160]
-        (41, 0xf942_3390), // ldr x16, [x28, #1120]
-        (42, 0xf942_4b9e), // ldr x30, [x28, #1168]
-        (43, 0xf942_1b91), // ldr x17, [x28, #1072]
-        (44, 0xd61f_0220), // br x17
-        (45, 0xf941_d790), // ldr x16, [x28, #936]
-        (46, 0xd51b_4210), // msr nzcv, x16
-        (47, 0xf942_478f), // ldr x15, [x28, #1160]
-        (48, 0xf942_3390), // ldr x16, [x28, #1120]
-        (49, 0xf942_4b9e), // ldr x30, [x28, #1168]
-        (54, 0xf902_1f91), // str x17, [x28, #1080]
-        (59, 0xf902_2391), // str x17, [x28, #1088]
-        (60, 0x5280_0051), // mov w17, #2
-        (61, 0xb904_4b91), // str w17, [x28, #1096]
-        (62, 0xf942_6791), // ldr x17, [x28, #1224]
-        (63, 0xd61f_0220), // br x17
-    ];
-    if precursor[..capture.len()] != capture
-        || decode_mov_wide_x17(&precursor[5..9]) != Some(link.target.raw())
-        || decode_mov_wide_x17(&precursor[50..54]) != Some(link.target.raw())
-        || decode_mov_wide_x17(&precursor[55..59]) != Some(link.source.raw())
-        || authority_fixed
-            .iter()
-            .any(|(index, expected)| precursor[*index] != *expected)
-    {
-        return Err(DsrError::CachePolicy(
-            "direct-binding precursor instruction shape or owner identity does not match the authority resolver"
-                .to_string(),
-        ));
-    }
-
-    let hit = [
-        0x9000_000f, // adrp x15, binding-cell-page
-        0x9100_01ef, // add x15, x15, binding-cell-pageoff
-        0xc8df_fdf1, // ldar x17, [x15]
-        0xb400_0271, // cbz x17, miss
-        0xf902_8b91, // str x17, [x28, #1296]
-        0xf940_0230, // ldr x16, [x17]
-        0xa940_fa2f, // ldp x15, x30, [x17, #8]
-        0xeb0f_021f, // cmp x16, x15
-        0x5400_01c3, // b.lo miss
-        0xeb1e_021f, // cmp x16, x30
-        0x5400_0182, // b.hs miss
-        0xf940_0e31, // ldr x17, [x17, #24]
-        0xf902_7b91, // str x17, [x28, #1264]
-        0x9112_6391, // add x17, x28, #1176
-        0xa900_7a2f, // stp x15, x30, [x17]
-        0xf902_1b90, // str x16, [x28, #1072]
-        0xf851_0230, // ldur x16, [x17, #-240]
-        0xd51b_4210, // msr nzcv, x16
-        0xa97f_7a2f, // ldp x15, x30, [x17, #-16]
-        0xf85c_8230, // ldur x16, [x17, #-56]
-        0xf859_8231, // ldur x17, [x17, #-104]
-        0xd61f_0220, // br x17
-    ];
-    let low_ordinal = ordinal.get() & 0xffff;
-    let high_ordinal = ordinal.get() >> 16;
-    let miss_prefix = [
-        0x9000_000f,                       // adrp x15, binding-cell-page
-        0x9100_01ef,                       // add x15, x15, binding-cell-pageoff
-        0xf902_838f,                       // str x15, [x28, #1280]
-        0x5280_0011 | (low_ordinal << 5),  // movz w17, ordinal[15:0]
-        0x72a0_0011 | (high_ordinal << 5), // movk w17, ordinal[31:16], lsl #16
-        0xb905_0b91,                       // str w17, [x28, #1288]
-        0x5280_0031,                       // mov w17, #1
-        0xb905_0f91,                       // str w17, [x28, #1292]
-        0xf902_8b9f,                       // str xzr, [x28, #1296]
-        0xf941_d790,                       // ldr x16, [x28, #936]
-        0xd51b_4210,                       // msr nzcv, x16
-        0xf942_478f,                       // ldr x15, [x28, #1160]
-        0xf942_3390,                       // ldr x16, [x28, #1120]
-        0xf942_4b9e,                       // ldr x30, [x28, #1168]
-    ];
-    let resolver = precursor[50..64].to_vec();
-    let mut rewritten = vec![0xd503_201f; DIRECT_BINDING_STUB_WORDS];
-    rewritten[..capture.len()].copy_from_slice(&capture);
-    rewritten[DIRECT_BINDING_CAPTURE_WORDS..DIRECT_BINDING_MISS_WORD].copy_from_slice(&hit);
-    let miss_prefix_end = DIRECT_BINDING_MISS_WORD + miss_prefix.len();
-    rewritten[DIRECT_BINDING_MISS_WORD..miss_prefix_end].copy_from_slice(&miss_prefix);
-    rewritten[miss_prefix_end..miss_prefix_end + resolver.len()].copy_from_slice(&resolver);
-    for (bytes, word) in stub.chunks_exact_mut(4).zip(rewritten) {
-        bytes.copy_from_slice(&word.to_le_bytes());
-    }
-
-    let adrp_offset = link
-        .stub
-        .start
-        .get()
-        .checked_add((DIRECT_BINDING_CAPTURE_WORDS * 4) as u32)
-        .ok_or_else(|| DsrError::CachePolicy("hit relocation offset overflow".to_string()))?;
-    let miss_adrp_offset = link
-        .stub
-        .start
-        .get()
-        .checked_add((DIRECT_BINDING_MISS_WORD * 4) as u32)
-        .ok_or_else(|| DsrError::CachePolicy("miss relocation offset overflow".to_string()))?;
-    Ok(crate::shared_cache::DirectBindingRelocation {
-        ordinal,
-        adrp_offset,
-        add_offset: adrp_offset
-            .checked_add(4)
-            .ok_or_else(|| DsrError::CachePolicy("hit ADD offset overflow".to_string()))?,
-        miss_adrp_offset,
-        miss_add_offset: miss_adrp_offset
-            .checked_add(4)
-            .ok_or_else(|| DsrError::CachePolicy("miss ADD offset overflow".to_string()))?,
-        data_offset,
-    })
-}
-
-/// Point a copied unit's direct-binding `ADRP x15`/`ADD x15` placeholder
-/// pairs at this process's freshly allocated binding cells.
-///
-/// `rewrite_direct_binding_stub` leaves each pair as the zero-immediate
-/// placeholders (`adrp x15, 0` / `add x15, x15, #0`); the dylib transport had
-/// its Mach-O emitter resolve them against the unit's own `__DATA` segment at
-/// publish. The copy transport resolves them at INSTALL, against the real
-/// runtime addresses: `code_base` is where the copy will execute and
-/// `cell_base` is the per-process cell allocation. Both legs (hit and miss)
-/// of every relocation address the same cell.
-///
-/// Validates before encoding; on error the caller discards the scratch
-/// buffer, so partially patched bytes never become executable.
-pub(crate) fn patch_copied_binding_cell_relocations(
-    code: &mut [u8],
-    code_base: usize,
-    cell_base: usize,
-    cell_len: usize,
-    relocations: &[crate::shared_cache::DirectBindingRelocation],
-) -> Result<(), DsrError> {
-    const ADRP_X15: u32 = 0x9000_000f;
-    const ADD_X15_X15_0: u32 = 0x9100_01ef;
-    /// Architectural page size `ADRP` addresses, NOT the host page size.
-    const ADRP_PAGE: usize = 4096;
-    const ADRP_MIN_PAGES: i128 = -(1 << 20);
-    const ADRP_MAX_PAGES: i128 = (1 << 20) - 1;
-
-    for relocation in relocations {
-        let data_offset = usize::try_from(relocation.data_offset).map_err(|_| {
-            DsrError::CachePolicy("binding-cell data offset does not fit usize".to_string())
-        })?;
-        if !data_offset.is_multiple_of(8)
-            || data_offset.checked_add(8).is_none_or(|end| end > cell_len)
-        {
-            return Err(DsrError::CachePolicy(format!(
-                "binding-cell data offset {data_offset} is outside the {cell_len}-byte cell block"
-            )));
-        }
-        let target = cell_base.checked_add(data_offset).ok_or_else(|| {
-            DsrError::CachePolicy("binding-cell target address overflow".to_string())
-        })?;
-        for (adrp_offset, add_offset) in [
-            (relocation.adrp_offset, relocation.add_offset),
-            (relocation.miss_adrp_offset, relocation.miss_add_offset),
-        ] {
-            let adrp_offset = usize::try_from(adrp_offset).map_err(|_| {
-                DsrError::CachePolicy("binding relocation offset does not fit usize".to_string())
-            })?;
-            let add_offset = usize::try_from(add_offset).map_err(|_| {
-                DsrError::CachePolicy("binding relocation offset does not fit usize".to_string())
-            })?;
-            if !adrp_offset.is_multiple_of(4)
-                || !add_offset.is_multiple_of(4)
-                || adrp_offset
-                    .checked_add(4)
-                    .is_none_or(|end| end > code.len())
-                || add_offset.checked_add(4).is_none_or(|end| end > code.len())
-            {
-                return Err(DsrError::CachePolicy(format!(
-                    "binding relocation offsets {adrp_offset}/{add_offset} are outside the \
-                     {}-byte unit",
-                    code.len()
-                )));
-            }
-            let read_word = |offset: usize| -> Result<u32, DsrError> {
-                code.get(offset..offset + 4)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map(u32::from_le_bytes)
-                    .ok_or_else(|| {
-                        DsrError::CachePolicy("binding relocation word is truncated".to_string())
-                    })
-            };
-            if read_word(adrp_offset)? != ADRP_X15 || read_word(add_offset)? != ADD_X15_X15_0 {
-                return Err(DsrError::CachePolicy(
-                    "binding relocation does not address the ADRP/ADD placeholder pair".to_string(),
-                ));
-            }
-            let pc = code_base.checked_add(adrp_offset).ok_or_else(|| {
-                DsrError::CachePolicy("binding relocation PC overflow".to_string())
-            })?;
-            let delta_pages = (i128::try_from(target & !(ADRP_PAGE - 1)).unwrap_or(i128::MAX)
-                - i128::try_from(pc & !(ADRP_PAGE - 1)).unwrap_or(i128::MAX))
-                / ADRP_PAGE as i128;
-            if !(ADRP_MIN_PAGES..=ADRP_MAX_PAGES).contains(&delta_pages) {
-                return Err(DsrError::CachePolicy(format!(
-                    "binding cells are outside ADRP range of the copied unit: \
-                     {delta_pages} pages"
-                )));
-            }
-            let encoded_delta = if delta_pages < 0 {
-                delta_pages + (1 << 21)
-            } else {
-                delta_pages
-            };
-            let immediate = u32::try_from(encoded_delta).map_err(|_| {
-                DsrError::CachePolicy("binding relocation page delta is unencodable".to_string())
-            })?;
-            let patched_adrp = ADRP_X15 | ((immediate & 0x3) << 29) | ((immediate >> 2) << 5);
-            let low_twelve = u32::try_from(target & (ADRP_PAGE - 1)).map_err(|_| {
-                DsrError::CachePolicy("binding cell page offset is unencodable".to_string())
-            })?;
-            let patched_add = ADD_X15_X15_0 | (low_twelve << 10);
-            code[adrp_offset..adrp_offset + 4].copy_from_slice(&patched_adrp.to_le_bytes());
-            code[add_offset..add_offset + 4].copy_from_slice(&patched_add.to_le_bytes());
-        }
-    }
-    Ok(())
-}
-
-fn decode_mov_wide_x17(words: &[u32]) -> Option<u64> {
-    const IMM16_MASK: u32 = 0x001f_ffe0;
-    let expected = [0xd280_0011, 0xf2a0_0011, 0xf2c0_0011, 0xf2e0_0011];
-    if words.len() != expected.len() {
-        return None;
-    }
-    let mut value = 0_u64;
-    for (index, (word, expected)) in words.iter().zip(expected).enumerate() {
-        if *word & !IMM16_MASK != expected {
-            return None;
-        }
-        value |= u64::from((*word & IMM16_MASK) >> 5) << (index * 16);
-    }
-    Some(value)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_cached_direct_exit(
-    assembler: &mut VecAssembler<Aarch64Relocation>,
-    entries: &mut Vec<PcMapEntry>,
-    map_guest: GuestVa,
-    source_guest: GuestVa,
-    target: GuestVa,
-    committed_link: Option<u64>,
-    recovery: &mut Vec<RecoveryEntry>,
-    mut recording: Option<&mut ArtifactRecording>,
-) -> Result<(), DsrError> {
-    let scratch_capture_start = current_offset(assembler)?;
-    record_direct_binding_recovery(
-        recovery,
-        scratch_capture_start,
-        DirectBindingRecoveryPhase::ScratchCapture,
-        DirectBindingCaptureProgress::None,
-        committed_link,
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x15, [x28, #1160]
-    );
-    record_direct_binding_recovery(
-        recovery,
-        current_offset(assembler)?,
-        DirectBindingRecoveryPhase::ScratchCapture,
-        DirectBindingCaptureProgress::X15,
-        committed_link,
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x16, [x28, #1120]
-    );
-    record_direct_binding_recovery(
-        recovery,
-        current_offset(assembler)?,
-        DirectBindingRecoveryPhase::ScratchCapture,
-        DirectBindingCaptureProgress::X15X16,
-        committed_link,
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x30, [x28, #1168]
-    );
-    record_direct_binding_recovery(
-        recovery,
-        current_offset(assembler)?,
-        DirectBindingRecoveryPhase::ScratchCapture,
-        DirectBindingCaptureProgress::X15X16X30,
-        committed_link,
-    );
-    emit_word(assembler, entries, map_guest, 0xd53b_4210)?; // mrs x16, nzcv
-    record_direct_binding_recovery(
-        recovery,
-        current_offset(assembler)?,
-        DirectBindingRecoveryPhase::ScratchCapture,
-        DirectBindingCaptureProgress::X15X16X30,
-        committed_link,
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x16, [x28, #936]
-    );
-    emit_mov_u64(
-        assembler,
-        entries,
-        map_guest,
-        17,
-        MaterializedValue::Guest(target.raw()),
-        recording.as_deref_mut(),
-    )?;
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x17, [x28, #1080]
-    );
-
-    let miss = assembler.new_dynamic_label();
-    let hit = assembler.new_dynamic_label();
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x15, [x28, super::gateway::CTX_INDIRECT_CACHE]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; cbz x15, =>miss
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; eor x16, x17, x17, LSR #12
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ubfx x16, x16, #2, #super::gateway::INDIRECT_CACHE_INDEX_BITS
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; add x15, x15, x16, LSL #super::gateway::INDIRECT_CACHE_ENTRY_SHIFT
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x16, [x15]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; cmp x16, x17
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; b.eq =>hit
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; add x15, x15, #32
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x16, [x15]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; cmp x16, x17
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; b.ne =>miss
-        ; =>hit
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x17, [x15, #8]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; cbz x17, =>miss
-    );
-    let authority = emit_target_authority_switch(assembler, entries, map_guest, miss)?;
-    let _ = authority.install_start;
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; str x17, [x28, #1072]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x16, [x28, #936]
-    );
-    emit_word(assembler, entries, map_guest, 0xd51b_4210)?; // msr nzcv, x16
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x15, [x28, #1160]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x16, [x28, #1120]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x30, [x28, #1168]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x17, [x28, #1072]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; br x17
-        ; =>miss
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x16, [x28, #936]
-    );
-    emit_word(assembler, entries, map_guest, 0xd51b_4210)?; // msr nzcv, x16
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x15, [x28, #1160]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x16, [x28, #1120]
-    );
-    map_next(assembler, entries, map_guest)?;
-    dynasmrt::dynasm!(assembler
-        ; .arch aarch64
-        ; ldr x30, [x28, #1168]
-    );
-    emit_gateway_exit(
-        assembler,
-        entries,
-        map_guest,
-        target,
-        Some(source_guest),
-        2,
-        GatewayKind::Direct,
-        recording,
-        GuestPcWidth::Fixed,
-    )?;
-    record_direct_binding_sidecar_phases(
-        recovery,
-        scratch_capture_start,
-        current_offset(assembler)?,
-        committed_link,
-    )
-}
-
 /// One item of a fused block's emission stream: either a guest instruction
 /// from some segment's body, or the internal edge joining two segments.
 ///
@@ -2449,7 +1768,6 @@ fn emit_internal_taken_stub(
     direct_links: &mut Vec<DirectLink>,
     recovery: &mut Vec<RecoveryEntry>,
     edge: PendingTakenEdge,
-    direct_exit_policy: DirectExitEmissionPolicy,
     recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     dynasmrt::dynasm!(assembler
@@ -2463,15 +1781,10 @@ fn emit_internal_taken_stub(
         edge.guest,
         edge.guest,
         edge.target,
-        None,
-        recovery,
-        direct_exit_policy,
         recording,
     )?;
     let stub_end = current_offset(assembler)?;
-    if edge.restore_guest_x17_across_stub
-        && direct_exit_policy == DirectExitEmissionPolicy::PrivateGateway
-    {
+    if edge.restore_guest_x17_across_stub {
         record_guest_x17_recovery_range(recovery, stub_start, stub_end);
     }
     direct_links.push(DirectLink {
@@ -2487,45 +1800,25 @@ fn emit_internal_taken_stub(
     Ok(())
 }
 
-#[allow(
-    clippy::needless_option_as_deref,
-    clippy::too_many_arguments,
-    reason = "policy chooses the compact private exit or the immutable-unit authority precursor"
-)]
 fn emit_direct_exit(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     map_guest: GuestVa,
     source_guest: GuestVa,
     target: GuestVa,
-    committed_link: Option<u64>,
-    recovery: &mut Vec<RecoveryEntry>,
-    policy: DirectExitEmissionPolicy,
     recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
-    match policy {
-        DirectExitEmissionPolicy::PrivateGateway => emit_gateway_exit(
-            assembler,
-            entries,
-            map_guest,
-            target,
-            Some(source_guest),
-            2,
-            GatewayKind::Direct,
-            recording,
-            GuestPcWidth::Narrow,
-        ),
-        DirectExitEmissionPolicy::PortableUnitAuthority => emit_cached_direct_exit(
-            assembler,
-            entries,
-            map_guest,
-            source_guest,
-            target,
-            committed_link,
-            recovery,
-            recording,
-        ),
-    }
+    emit_gateway_exit(
+        assembler,
+        entries,
+        map_guest,
+        target,
+        Some(source_guest),
+        2,
+        GatewayKind::Direct,
+        recording,
+        GuestPcWidth::Narrow,
+    )
 }
 
 /// Rewrite every register-field mention of `virtual_register` in `word` onto
@@ -5064,14 +4357,7 @@ pub fn emit_block(
     plan: &BlockPlan,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    assemble_block_inner(
-        plan,
-        None,
-        mode,
-        DirectExitEmissionPolicy::PrivateGateway,
-        None,
-    )?
-    .publish(cache)
+    assemble_block_inner(plan, None, mode, None)?.publish(cache)
 }
 
 pub fn emit_block_direct(
@@ -5087,14 +4373,7 @@ pub fn emit_block_with_generation(
     guard: GenerationGuard,
     mode: EmitAddressMode,
 ) -> Result<EmittedBlock, DsrError> {
-    assemble_block_inner(
-        plan,
-        Some(guard),
-        mode,
-        DirectExitEmissionPolicy::PrivateGateway,
-        None,
-    )?
-    .publish(cache)
+    assemble_block_inner(plan, Some(guard), mode, None)?.publish(cache)
 }
 
 pub fn emit_block_recording_artifact(
@@ -5123,13 +4402,7 @@ pub fn emit_block_recording_artifact_optional(
     if let EmitAddressMode::Biased { host_bias } = mode {
         recording.bind(ProcessValue::HostBias, host_bias.get())?;
     }
-    let assembled = assemble_block_inner(
-        plan,
-        Some(guard),
-        mode,
-        DirectExitEmissionPolicy::PrivateGateway,
-        Some(&mut recording),
-    )?;
+    let assembled = assemble_block_inner(plan, Some(guard), mode, Some(&mut recording))?;
     let artifact = recording
         .finish(
             assembled.instruction_words(),
@@ -5141,35 +4414,6 @@ pub fn emit_block_recording_artifact_optional(
         .ok();
     let emitted = assembled.publish(cache)?;
     Ok((emitted, artifact))
-}
-
-pub fn record_portable_block_artifact(
-    plan: &BlockPlan,
-    generation_binding: u32,
-    mode: EmitAddressMode,
-    source_words: Vec<u32>,
-) -> Result<ArtifactRecord, DsrError> {
-    let mut recording = ArtifactRecording::default();
-    if let EmitAddressMode::Biased { host_bias } = mode {
-        recording.bind(ProcessValue::HostBias, host_bias.get())?;
-    }
-    let assembled = assemble_block_inner(
-        plan,
-        Some(GenerationGuard::binding(
-            generation_binding,
-            plan.generation,
-        )),
-        mode,
-        DirectExitEmissionPolicy::PortableUnitAuthority,
-        Some(&mut recording),
-    )?;
-    recording.finish(
-        assembled.instruction_words(),
-        assembled.map.entries().to_vec(),
-        assembled.recovery,
-        assembled.direct_links,
-        source_words,
-    )
 }
 
 pub fn emit_block_with_generation_direct(
@@ -5198,12 +4442,10 @@ fn emit_region_direct_exit(
     assembler: &mut VecAssembler<Aarch64Relocation>,
     entries: &mut Vec<PcMapEntry>,
     direct_links: &mut Vec<DirectLink>,
-    recovery: &mut Vec<RecoveryEntry>,
     map_guest: GuestVa,
     source_guest: GuestVa,
     target: GuestVa,
     clear_monitor: bool,
-    policy: DirectExitEmissionPolicy,
     recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     if clear_monitor {
@@ -5223,9 +4465,6 @@ fn emit_region_direct_exit(
         map_guest,
         source_guest,
         target,
-        None,
-        recovery,
-        policy,
         recording,
     )?;
     direct_links.push(DirectLink {
@@ -5339,7 +4578,6 @@ fn emit_biased_exclusive_region(
     exit: super::types::ExclusiveRegionExit,
     scratch: super::types::BiasedExclusiveScratch,
     host_bias: carrick_dsr::address::NativeHostBias,
-    policy: DirectExitEmissionPolicy,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     let address = scratch.address.index();
@@ -5764,12 +5002,10 @@ fn emit_biased_exclusive_region(
         assembler,
         entries,
         direct_links,
-        recovery,
         exit.end,
         retry_pc,
         exit.end,
         false,
-        policy,
         recording.as_deref_mut(),
     )?;
     if let Some((_, tail, branch_guest, target)) = early_exit {
@@ -5781,12 +5017,10 @@ fn emit_biased_exclusive_region(
             assembler,
             entries,
             direct_links,
-            recovery,
             target,
             branch_guest,
             target,
             false,
-            policy,
             recording.as_deref_mut(),
         )?;
     }
@@ -5839,7 +5073,6 @@ fn emit_exclusive_region(
     exit: super::types::ExclusiveRegionExit,
     fusion: super::types::ExclusiveFusionSite,
     mode: EmitAddressMode,
-    policy: DirectExitEmissionPolicy,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<(), DsrError> {
     if let EmitAddressMode::Biased { host_bias } = mode {
@@ -5860,7 +5093,6 @@ fn emit_exclusive_region(
             exit,
             scratch,
             host_bias,
-            policy,
             recording.as_deref_mut(),
         );
     }
@@ -5983,12 +5215,10 @@ fn emit_exclusive_region(
         assembler,
         entries,
         direct_links,
-        recovery,
         exit.end,
         retry_pc,
         exit.end,
         false,
-        policy,
         recording.as_deref_mut(),
     )?;
 
@@ -6003,12 +5233,10 @@ fn emit_exclusive_region(
             assembler,
             entries,
             direct_links,
-            recovery,
             target,
             branch_guest,
             target,
             true,
-            policy,
             recording.as_deref_mut(),
         )?;
     }
@@ -6024,7 +5252,6 @@ fn assemble_block_inner(
     plan: &BlockPlan,
     guard: Option<GenerationGuard>,
     mode: EmitAddressMode,
-    direct_exit_policy: DirectExitEmissionPolicy,
     mut recording: Option<&mut ArtifactRecording>,
 ) -> Result<AssembledBlock, DsrError> {
     let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
@@ -6111,61 +5338,27 @@ fn assemble_block_inner(
             action: RecoveryAction::RestoreGenerationGuardRegisters,
         });
         let guard_ready = current_offset(&assembler)?;
-        match guard {
-            GenerationGuard::Absolute { address, expected } => {
-                emit_mov_u64(
-                    &mut assembler,
-                    &mut entries,
-                    plan.start,
-                    16,
-                    MaterializedValue::Process(ProcessValue::GenerationAddress, address),
-                    recording.as_deref_mut(),
-                )?;
-                map_next(&assembler, &mut entries, plan.start)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; ldar x16, [x16]
-                );
-                emit_mov_u64(
-                    &mut assembler,
-                    &mut entries,
-                    plan.start,
-                    17,
-                    MaterializedValue::Process(ProcessValue::GenerationExpected, expected.get()),
-                    recording.as_deref_mut(),
-                )?;
-            }
-            GenerationGuard::BindingIndex { index, .. } => {
-                map_next(&assembler, &mut entries, plan.start)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; ldr x16, [x28, super::gateway::CTX_GENERATION_BINDINGS]
-                );
-                emit_mov_u64(
-                    &mut assembler,
-                    &mut entries,
-                    plan.start,
-                    17,
-                    MaterializedValue::Stable(u64::from(index)),
-                    recording.as_deref_mut(),
-                )?;
-                map_next(&assembler, &mut entries, plan.start)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; add x16, x16, x17, LSL #4
-                );
-                map_next(&assembler, &mut entries, plan.start)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; ldp x16, x17, [x16]
-                );
-                map_next(&assembler, &mut entries, plan.start)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; ldar x16, [x16]
-                );
-            }
-        }
+        emit_mov_u64(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            16,
+            MaterializedValue::Process(ProcessValue::GenerationAddress, guard.address),
+            recording.as_deref_mut(),
+        )?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldar x16, [x16]
+        );
+        emit_mov_u64(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            17,
+            MaterializedValue::Process(ProcessValue::GenerationExpected, guard.expected.get()),
+            recording.as_deref_mut(),
+        )?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
@@ -6236,61 +5429,27 @@ fn assemble_block_inner(
         // publish).
         const _: () = assert!(crate::gateway::RESERVED_SCRATCH == 19);
         let guard_start = current_offset(&assembler)?;
-        match guard {
-            GenerationGuard::Absolute { address, expected } => {
-                emit_mov_u64(
-                    &mut assembler,
-                    &mut entries,
-                    plan.start,
-                    crate::gateway::RESERVED_SCRATCH,
-                    MaterializedValue::Process(ProcessValue::GenerationAddress, address),
-                    recording.as_deref_mut(),
-                )?;
-                map_next(&assembler, &mut entries, plan.start)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; ldar x19, [x19]
-                );
-                emit_mov_u64(
-                    &mut assembler,
-                    &mut entries,
-                    plan.start,
-                    17,
-                    MaterializedValue::Process(ProcessValue::GenerationExpected, expected.get()),
-                    recording.as_deref_mut(),
-                )?;
-            }
-            GenerationGuard::BindingIndex { index, .. } => {
-                map_next(&assembler, &mut entries, plan.start)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; ldr x19, [x28, super::gateway::CTX_GENERATION_BINDINGS]
-                );
-                emit_mov_u64(
-                    &mut assembler,
-                    &mut entries,
-                    plan.start,
-                    17,
-                    MaterializedValue::Stable(u64::from(index)),
-                    recording.as_deref_mut(),
-                )?;
-                map_next(&assembler, &mut entries, plan.start)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; add x19, x19, x17, LSL #4
-                );
-                map_next(&assembler, &mut entries, plan.start)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; ldp x19, x17, [x19]
-                );
-                map_next(&assembler, &mut entries, plan.start)?;
-                dynasmrt::dynasm!(assembler
-                    ; .arch aarch64
-                    ; ldar x19, [x19]
-                );
-            }
-        }
+        emit_mov_u64(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            crate::gateway::RESERVED_SCRATCH,
+            MaterializedValue::Process(ProcessValue::GenerationAddress, guard.address),
+            recording.as_deref_mut(),
+        )?;
+        map_next(&assembler, &mut entries, plan.start)?;
+        dynasmrt::dynasm!(assembler
+            ; .arch aarch64
+            ; ldar x19, [x19]
+        );
+        emit_mov_u64(
+            &mut assembler,
+            &mut entries,
+            plan.start,
+            17,
+            MaterializedValue::Process(ProcessValue::GenerationExpected, guard.expected.get()),
+            recording.as_deref_mut(),
+        )?;
         map_next(&assembler, &mut entries, plan.start)?;
         dynasmrt::dynasm!(assembler
             ; .arch aarch64
@@ -6314,7 +5473,8 @@ fn assemble_block_inner(
         // edges land past the guard exactly like native code. The entry's
         // narrow materialization bakes `expected` in, so the recording
         // carries the value and replay refuses a different generation.
-        if let GenerationGuard::Absolute { expected, .. } = guard {
+        {
+            let expected = guard.expected;
             let offset = current_offset(&assembler)?;
             trusted_entry = Some(offset);
             if let Some(recording) = recording.as_deref_mut() {
@@ -6402,7 +5562,6 @@ fn assemble_block_inner(
             exit,
             fusion,
             mode,
-            direct_exit_policy,
             recording.as_deref_mut(),
         )?;
     } else {
@@ -6830,10 +5989,10 @@ fn assemble_block_inner(
                 let slot = current_offset(&assembler)?;
                 emit_word(&mut assembler, &mut entries, exit_guest, 0x1400_0001)?;
                 let stub_start = current_offset(&assembler)?;
-                let (kind, committed_link) = if exit.kind == super::types::DirectKind::Call {
-                    (DirectLinkKind::Call, Some(exit.resume.raw()))
+                let kind = if exit.kind == super::types::DirectKind::Call {
+                    DirectLinkKind::Call
                 } else {
-                    (DirectLinkKind::Branch, None)
+                    DirectLinkKind::Branch
                 };
                 emit_direct_exit(
                     &mut assembler,
@@ -6841,9 +6000,6 @@ fn assemble_block_inner(
                     exit_guest,
                     exit_guest,
                     exit.target,
-                    committed_link,
-                    &mut recovery,
-                    direct_exit_policy,
                     recording.as_deref_mut(),
                 )?;
                 direct_links.push(DirectLink {
@@ -6919,15 +6075,10 @@ fn assemble_block_inner(
                     exit_guest,
                     exit_guest,
                     exit.resume,
-                    None,
-                    &mut recovery,
-                    direct_exit_policy,
                     recording.as_deref_mut(),
                 )?;
                 let fall_stub_end = current_offset(&assembler)?;
-                if virtual_offset.is_some()
-                    && direct_exit_policy == DirectExitEmissionPolicy::PrivateGateway
-                {
+                if virtual_offset.is_some() {
                     record_guest_x17_recovery_range(&mut recovery, fall_stub_start, fall_stub_end);
                 }
                 direct_links.push(DirectLink {
@@ -6951,15 +6102,10 @@ fn assemble_block_inner(
                     exit_guest,
                     exit_guest,
                     exit.target,
-                    None,
-                    &mut recovery,
-                    direct_exit_policy,
                     recording.as_deref_mut(),
                 )?;
                 let taken_stub_end = current_offset(&assembler)?;
-                if virtual_offset.is_some()
-                    && direct_exit_policy == DirectExitEmissionPolicy::PrivateGateway
-                {
+                if virtual_offset.is_some() {
                     record_guest_x17_recovery_range(
                         &mut recovery,
                         taken_stub_start,
@@ -7007,12 +6153,10 @@ fn assemble_block_inner(
                     &mut assembler,
                     &mut entries,
                     &mut direct_links,
-                    &mut recovery,
                     exit.resume,
                     exit_guest,
                     exit.resume,
                     false,
-                    direct_exit_policy,
                     recording.as_deref_mut(),
                 )?;
             } else {
@@ -7038,9 +6182,6 @@ fn assemble_block_inner(
                 exit_guest,
                 exit_guest,
                 target,
-                None,
-                &mut recovery,
-                direct_exit_policy,
                 recording.as_deref_mut(),
             )?;
             direct_links.push(DirectLink {
@@ -7079,7 +6220,6 @@ fn assemble_block_inner(
                 &mut direct_links,
                 &mut recovery,
                 edge,
-                direct_exit_policy,
                 recording.as_deref_mut(),
             )?;
         }
@@ -7688,121 +6828,6 @@ mod tests {
     };
     use super::*;
 
-    /// Decode a patched `ADRP x15`/`ADD x15` pair back into the absolute
-    /// address it materializes, from the pair's runtime PC.
-    fn decode_adrp_add_target(code: &[u8], adrp_offset: usize, code_base: usize) -> usize {
-        let word = |offset: usize| {
-            u32::from_le_bytes(code[offset..offset + 4].try_into().expect("code word"))
-        };
-        let adrp = word(adrp_offset);
-        let add = word(adrp_offset + 4);
-        let imm21 = (((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 0x3);
-        let page_delta = i64::from(((imm21 << 11) as i32) >> 11);
-        let pc_page = (code_base + adrp_offset) & !0xfff;
-        let target_page = (i128::from(pc_page as u64) + i128::from(page_delta) * 4096) as usize;
-        target_page + usize::try_from((add >> 10) & 0xfff).expect("page offset")
-    }
-
-    fn placeholder_relocation_code() -> Vec<u8> {
-        // [hit ADRP, hit ADD, NOP, miss ADRP, miss ADD, NOP]
-        [
-            0x9000_000f_u32,
-            0x9100_01ef,
-            0xd503_201f,
-            0x9000_000f,
-            0x9100_01ef,
-            0xd503_201f,
-        ]
-        .iter()
-        .flat_map(|word| word.to_le_bytes())
-        .collect()
-    }
-
-    fn cell_relocation() -> crate::shared_cache::DirectBindingRelocation {
-        crate::shared_cache::DirectBindingRelocation {
-            ordinal: crate::direct_binding::DirectBindingOrdinal::claimed(0),
-            adrp_offset: 0,
-            add_offset: 4,
-            miss_adrp_offset: 12,
-            miss_add_offset: 16,
-            data_offset: 8,
-        }
-    }
-
-    #[test]
-    fn copied_binding_relocations_materialize_the_cell_address_in_both_legs() {
-        // Both directions: cells above the copy and cells below it.
-        for (code_base, cell_base) in [
-            (0x1_0000_0000_usize, 0x1_0bad_d000_usize & !0xfff),
-            (0x2_0000_0000, 0x1_f000_0000),
-        ] {
-            let mut code = placeholder_relocation_code();
-            patch_copied_binding_cell_relocations(
-                &mut code,
-                code_base,
-                cell_base,
-                16,
-                &[cell_relocation()],
-            )
-            .expect("patch both relocation legs");
-            let expected = cell_base + 8;
-            assert_eq!(decode_adrp_add_target(&code, 0, code_base), expected);
-            assert_eq!(decode_adrp_add_target(&code, 12, code_base), expected);
-            // The words between the pairs stay untouched.
-            assert_eq!(&code[8..12], &0xd503_201f_u32.to_le_bytes());
-            assert_eq!(&code[20..24], &0xd503_201f_u32.to_le_bytes());
-        }
-    }
-
-    #[test]
-    fn copied_binding_relocations_reject_non_placeholder_words() {
-        // An already-patched (nonzero-immediate) pair must be refused: it
-        // means the unit was produced by a different transport or patched
-        // twice, and re-patching would silently double-apply the offset.
-        let mut code = placeholder_relocation_code();
-        code[0..4].copy_from_slice(&0x9000_002f_u32.to_le_bytes());
-        assert!(
-            patch_copied_binding_cell_relocations(
-                &mut code,
-                0x1_0000_0000,
-                0x1_0001_0000,
-                16,
-                &[cell_relocation()],
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn copied_binding_relocations_reject_cell_offsets_outside_the_block() {
-        let mut code = placeholder_relocation_code();
-        assert!(
-            patch_copied_binding_cell_relocations(
-                &mut code,
-                0x1_0000_0000,
-                0x1_0001_0000,
-                8, // data_offset 8 + 8 > 8
-                &[cell_relocation()],
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn copied_binding_relocations_fail_closed_outside_adrp_range() {
-        let mut code = placeholder_relocation_code();
-        assert!(
-            patch_copied_binding_cell_relocations(
-                &mut code,
-                0x1_0000_0000,
-                0x3_0000_0000, // 8 GiB away: outside ADRP's +/-4 GiB
-                16,
-                &[cell_relocation()],
-            )
-            .is_err()
-        );
-    }
-
     #[test]
     fn direct_instruction_bytes_are_default_on_with_an_exact_opt_out() {
         assert!(direct_instruction_bytes_enabled_from(None));
@@ -7846,14 +6871,9 @@ mod tests {
     /// deliberately mapped to `plan.start`, the same guest PC the first copied
     /// instruction carries.
     fn guarded_prologue_words(guard: GenerationGuard) -> Vec<u32> {
-        let assembled = assemble_block_inner(
-            &copy_plan(),
-            Some(guard),
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .expect("assemble guarded block");
+        let assembled =
+            assemble_block_inner(&copy_plan(), Some(guard), EmitAddressMode::Direct, None)
+                .expect("assemble guarded block");
         let first_guest = assembled
             .words
             .iter()
@@ -7892,14 +6912,8 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(
-            &plan,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .expect("assemble single-virtual fixture block");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble single-virtual fixture block");
         (assembled, plan)
     }
 
@@ -8055,7 +7069,6 @@ mod tests {
                 CodeGeneration::claimed(7),
             )),
             EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
             None,
         )
         .expect("assemble trusted-entry block");
@@ -8073,19 +7086,6 @@ mod tests {
             "trusted entry words: {:#010x?}",
             &assembled.words[index..(index + 4).min(assembled.words.len())]
         );
-
-        let bound = assemble_block_inner(
-            &copy_plan(),
-            Some(GenerationGuard::binding(3, CodeGeneration::claimed(7))),
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .expect("assemble binding-guarded block");
-        assert_eq!(
-            bound.trusted_entry, None,
-            "shared-unit guards keep their blocks trusted-entry-free"
-        );
     }
 
     /// Recording is a pure tap, never a second emission mode: recording the
@@ -8102,20 +7102,13 @@ mod tests {
         ] {
             let generation = std::sync::atomic::AtomicU64::new(0);
             let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);
-            let native = assemble_block_inner(
-                &plan,
-                Some(guard),
-                EmitAddressMode::Direct,
-                DirectExitEmissionPolicy::PrivateGateway,
-                None,
-            )
-            .expect("assemble native block");
+            let native = assemble_block_inner(&plan, Some(guard), EmitAddressMode::Direct, None)
+                .expect("assemble native block");
             let mut recording = ArtifactRecording::default();
             let recorded = assemble_block_inner(
                 &plan,
                 Some(guard),
                 EmitAddressMode::Direct,
-                DirectExitEmissionPolicy::PrivateGateway,
                 Some(&mut recording),
             )
             .expect("assemble recorded block");
@@ -8178,14 +7171,8 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(
-            &plan,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .expect("assemble adr block");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble adr block");
         let expected = [
             0xD292_9013, // movz x19, #0x9480
             0xF2C0_0093, // movk x19, #4, lsl #32
@@ -8280,14 +7267,8 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(
-            &plan,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .expect("assemble virtual indirect target");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble virtual indirect target");
         let words = &assembled.words;
 
         // The virtualized target (guest x19) loads straight into
@@ -8339,14 +7320,8 @@ mod tests {
             },
             extensions: Vec::new(),
         };
-        let assembled = assemble_block_inner(
-            &plan,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .expect("assemble lean indirect exit");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble lean indirect exit");
         let words = &assembled.words;
 
         // Exactly ONE unconditional spill: x15 to slot 1160. No up-front x16
@@ -8458,14 +7433,8 @@ mod tests {
     #[test]
     fn terminal_virtual_condition_never_crosses_darwin_x18() {
         let plan = direct_plan(virtual_test_bit_exit(GuestVa(0x4000), GuestVa(0x5000)));
-        let assembled = assemble_block_inner(
-            &plan,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .expect("assemble virtual conditional exit");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble virtual conditional exit");
         let words = &assembled.words;
         let stable_staging = [
             0xf940_4f91, // ldr x17, [x28, #152] — guest x19
@@ -8522,14 +7491,8 @@ mod tests {
     fn fused_virtual_condition_never_crosses_darwin_x18() {
         let mut plan = fused_two_segment_plan();
         plan.exit = virtual_test_bit_exit(GuestVa(0x4004), GuestVa(0x5000));
-        let assembled = assemble_block_inner(
-            &plan,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .expect("assemble fused virtual conditional edge");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble fused virtual conditional edge");
         let words = &assembled.words;
         let stable_staging = [
             0xf902_3791, // str x17, [x28, #1128] — recovery guest x17
@@ -8608,16 +7571,10 @@ mod tests {
         use std::sync::atomic::AtomicU64;
 
         let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
-        for (name, guard) in [
-            (
-                "absolute",
-                GenerationGuard::new(&generation, CodeGeneration::INITIAL),
-            ),
-            (
-                "binding",
-                GenerationGuard::binding(3, CodeGeneration::INITIAL),
-            ),
-        ] {
+        for (name, guard) in [(
+            "absolute",
+            GenerationGuard::new(&generation, CodeGeneration::INITIAL),
+        )] {
             let words = guarded_prologue_words(guard);
             let stores = words.iter().copied().filter(|word| is_store(*word)).count();
 
@@ -8747,7 +7704,6 @@ mod tests {
             &biased_memory_plan(memory),
             None,
             EmitAddressMode::Biased { host_bias },
-            DirectExitEmissionPolicy::PrivateGateway,
             None,
         )
         .expect("assemble biased memory fixture");
@@ -8769,14 +7725,8 @@ mod tests {
     fn assemble_biased_emission(plan: &BlockPlan, bias: u64) -> AssembledBlock {
         let host_bias =
             carrick_dsr::address::NativeHostBias::new(bias, 0x4000).expect("aligned test bias");
-        assemble_block_inner(
-            plan,
-            None,
-            EmitAddressMode::Biased { host_bias },
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .expect("assemble biased memory fixture")
+        assemble_block_inner(plan, None, EmitAddressMode::Biased { host_bias }, None)
+            .expect("assemble biased memory fixture")
     }
 
     fn biased_guest_words(assembled: &AssembledBlock, guest: GuestVa) -> Vec<u32> {
@@ -9480,17 +8430,6 @@ mod tests {
         assert!(error.to_string().contains("non-monotonic cache offsets"));
     }
 
-    #[derive(Clone, Copy)]
-    struct ExpectedDirectLink {
-        source: GuestVa,
-        target: GuestVa,
-        kind: DirectLinkKind,
-        slot: u32,
-        stub_start: u32,
-        stub_end: u32,
-        committed_link: Option<u64>,
-    }
-
     fn direct_plan(exit: PlannedExit) -> BlockPlan {
         BlockPlan {
             start: GuestVa(0x4000),
@@ -9502,215 +8441,7 @@ mod tests {
         }
     }
 
-    fn assert_direct_links(
-        case: &str,
-        links: &[DirectLink],
-        recovery: &[RecoveryEntry],
-        expected: &[ExpectedDirectLink],
-    ) {
-        assert_eq!(links.len(), expected.len(), "{case}: direct-link count");
-        for (link, expected) in links.iter().zip(expected) {
-            assert_eq!(link.source, expected.source, "{case}: source");
-            assert_eq!(link.target, expected.target, "{case}: target");
-            assert_eq!(link.kind, expected.kind, "{case}: kind");
-            assert_eq!(link.slot.get(), expected.slot, "{case}: slot");
-            assert_eq!(
-                link.stub,
-                DirectStubEnvelope {
-                    start: CacheOffset::published(expected.stub_start),
-                    end: CacheOffset::published(expected.stub_end),
-                },
-                "{case}: stub envelope"
-            );
-            assert!(
-                link.stub.start.get() < link.stub.end.get(),
-                "{case}: stub envelope must be nonempty"
-            );
-            for offset in (link.stub.start.get()..link.stub.end.get()).step_by(4) {
-                let actions = recovery
-                    .iter()
-                    .filter(|entry| entry.cache.get() == offset)
-                    .map(|entry| entry.action)
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    actions.len(),
-                    1,
-                    "{case}: offset {offset} must have exactly one recovery action"
-                );
-                assert!(
-                    matches!(
-                        actions[0],
-                        RecoveryAction::RestoreDirectBinding {
-                            phase: DirectBindingRecoveryPhase::ScratchCapture
-                                | DirectBindingRecoveryPhase::CellAddress
-                                | DirectBindingRecoveryPhase::TargetAcquire
-                                | DirectBindingRecoveryPhase::AuthorityValidate
-                                | DirectBindingRecoveryPhase::AuthorityInstall
-                                | DirectBindingRecoveryPhase::ArchitecturalRestore
-                                | DirectBindingRecoveryPhase::FinalBranch
-                                | DirectBindingRecoveryPhase::MissExit,
-                            capture_progress: _,
-                            committed_link,
-                        } if committed_link == expected.committed_link
-                    ),
-                    "{case}: offset {offset} must declare a direct-binding recovery phase"
-                );
-            }
-        }
-    }
-
-    fn expected_sidecar_recovery_phase(word: u32) -> DirectBindingRecoveryPhase {
-        match word {
-            0..=4 => DirectBindingRecoveryPhase::ScratchCapture,
-            5..=6 => DirectBindingRecoveryPhase::CellAddress,
-            7..=10 => DirectBindingRecoveryPhase::TargetAcquire,
-            11..=16 => DirectBindingRecoveryPhase::AuthorityValidate,
-            17..=20 => DirectBindingRecoveryPhase::AuthorityInstall,
-            21..=25 => DirectBindingRecoveryPhase::ArchitecturalRestore,
-            26 => DirectBindingRecoveryPhase::FinalBranch,
-            27..=63 => DirectBindingRecoveryPhase::MissExit,
-            _ => panic!("sidecar recovery word is outside the fixed envelope: {word}"),
-        }
-    }
-
-    fn check_direct_binding_recovery(
-        link: DirectLink,
-        recovery: &[RecoveryEntry],
-        committed_link: Option<u64>,
-    ) -> Result<(), String> {
-        let original = crate::snapshot::NativeUcontextSnapshot {
-            x: std::array::from_fn(|index| 0x1000_0000_0000_0000 | index as u64),
-            pstate: 0xa000_0000,
-            ..crate::snapshot::NativeUcontextSnapshot::default()
-        };
-        for offset in (link.stub.start.get()..link.stub.end.get()).step_by(4) {
-            let actions = recovery
-                .iter()
-                .filter(|entry| entry.cache.get() == offset)
-                .map(|entry| entry.action)
-                .collect::<Vec<_>>();
-            if actions.len() != 1 {
-                return Err(format!(
-                    "offset {offset} has {} recovery entries, expected exactly one",
-                    actions.len()
-                ));
-            }
-            let RecoveryAction::RestoreDirectBinding {
-                phase,
-                capture_progress,
-                committed_link: action_link,
-            } = actions[0]
-            else {
-                return Err(format!(
-                    "offset {offset} is not direct-binding recovery: {:?}",
-                    actions[0]
-                ));
-            };
-            let word = (offset - link.stub.start.get()) / 4;
-            let expected_phase = expected_sidecar_recovery_phase(word);
-            if phase != expected_phase {
-                return Err(format!(
-                    "offset {offset} word {word} has phase {phase:?}, expected {expected_phase:?}"
-                ));
-            }
-            if action_link != committed_link {
-                return Err(format!(
-                    "offset {offset} has committed link {action_link:?}, expected {committed_link:?}"
-                ));
-            }
-
-            let mut interrupted = original;
-            interrupted.x[15] = 0xdead_0000_0000_0015;
-            interrupted.x[16] = 0xdead_0000_0000_0016;
-            interrupted.x[17] = 0xdead_0000_0000_0017;
-            interrupted.x[30] = 0xdead_0000_0000_0030;
-            interrupted.pstate = 0x5000_0000;
-            let (saved_x15, saved_x16, saved_x30, saved_nzcv) = match capture_progress {
-                DirectBindingCaptureProgress::None => (
-                    0xdead_1000_0000_0015,
-                    0xdead_1000_0000_0016,
-                    0xdead_1000_0000_0030,
-                    0xdead_1000_0000_0000,
-                ),
-                DirectBindingCaptureProgress::X15 => (
-                    original.x[15],
-                    0xdead_1000_0000_0016,
-                    0xdead_1000_0000_0030,
-                    0xdead_1000_0000_0000,
-                ),
-                DirectBindingCaptureProgress::X15X16 => (
-                    original.x[15],
-                    original.x[16],
-                    0xdead_1000_0000_0030,
-                    0xdead_1000_0000_0000,
-                ),
-                DirectBindingCaptureProgress::X15X16X30 => (
-                    original.x[15],
-                    original.x[16],
-                    original.x[30],
-                    0xdead_1000_0000_0000,
-                ),
-                DirectBindingCaptureProgress::Complete => (
-                    original.x[15],
-                    original.x[16],
-                    original.x[30],
-                    original.pstate,
-                ),
-            };
-            if capture_progress == DirectBindingCaptureProgress::None {
-                interrupted.x[15] = original.x[15];
-            }
-            if matches!(
-                capture_progress,
-                DirectBindingCaptureProgress::None | DirectBindingCaptureProgress::X15
-            ) {
-                interrupted.x[16] = original.x[16];
-            }
-            if !matches!(
-                capture_progress,
-                DirectBindingCaptureProgress::X15X16X30 | DirectBindingCaptureProgress::Complete
-            ) {
-                interrupted.x[30] = original.x[30];
-            }
-            if capture_progress != DirectBindingCaptureProgress::Complete {
-                interrupted.pstate = original.pstate;
-            }
-
-            recover_rewrite_state(
-                &mut interrupted,
-                actions[0],
-                saved_x16,
-                original.x[17],
-                saved_nzcv,
-                saved_x15,
-                saved_x30,
-                0,
-            )
-            .map_err(|error| format!("offset {offset} recovery failed: {error}"))?;
-            let expected_x30 = committed_link.unwrap_or(original.x[30]);
-            if interrupted.x[15] != original.x[15]
-                || interrupted.x[16] != original.x[16]
-                || interrupted.x[17] != original.x[17]
-                || interrupted.x[30] != expected_x30
-                || interrupted.pstate != original.pstate
-            {
-                return Err(format!(
-                    "offset {offset} did not recover x15/x16/x17/x30/NZCV exactly"
-                ));
-            }
-            let resume = recovery_resume_pc(link.source, Some(actions[0]))
-                .map_err(|error| format!("offset {offset} resume failed: {error}"))?;
-            if resume != link.source.raw() {
-                return Err(format!(
-                    "offset {offset} resumes at 0x{resume:x}, expected source 0x{:x}",
-                    link.source.raw()
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn direct_edge_cases(policy: DirectExitEmissionPolicy) -> Vec<(&'static str, AssembledBlock)> {
+    fn direct_edge_cases() -> Vec<(&'static str, AssembledBlock)> {
         let branch = direct_plan(PlannedExit::Direct {
             guest: GuestVa(0x4000),
             word: 0x1400_0400,
@@ -9754,84 +8485,40 @@ mod tests {
         vec![
             (
                 "branch",
-                assemble_block_inner(&branch, None, EmitAddressMode::Direct, policy, None)
+                assemble_block_inner(&branch, None, EmitAddressMode::Direct, None)
                     .expect("assemble branch recovery fixture"),
             ),
             (
                 "call",
-                assemble_block_inner(&call, None, EmitAddressMode::Direct, policy, None)
+                assemble_block_inner(&call, None, EmitAddressMode::Direct, None)
                     .expect("assemble call recovery fixture"),
             ),
             (
                 "conditional",
-                assemble_block_inner(&conditional, None, EmitAddressMode::Direct, policy, None)
+                assemble_block_inner(&conditional, None, EmitAddressMode::Direct, None)
                     .expect("assemble conditional recovery fixture"),
             ),
             (
                 "continue",
-                assemble_block_inner(&continuation, None, EmitAddressMode::Direct, policy, None)
+                assemble_block_inner(&continuation, None, EmitAddressMode::Direct, None)
                     .expect("assemble continuation recovery fixture"),
             ),
         ]
     }
 
     #[test]
-    fn direct_binding_recovery_covers_every_sidecar_boundary_and_edge_class() {
-        let mut kinds = std::collections::BTreeSet::new();
-        for (case, emitted) in direct_edge_cases(DirectExitEmissionPolicy::PortableUnitAuthority) {
-            for link in &emitted.direct_links {
-                kinds.insert(link.kind as u8);
-                assert_eq!(link.source.raw() & 3, 0, "{case}: exact source PC");
-                assert_eq!(link.target.raw() & 3, 0, "{case}: exact target PC");
-                let committed_link = (link.kind == DirectLinkKind::Call)
-                    .then_some(link.source.raw().checked_add(4).expect("call link"));
-                check_direct_binding_recovery(*link, &emitted.recovery, committed_link)
-                    .unwrap_or_else(|error| panic!("{case} {:?}: {error}", link.kind));
-            }
-        }
-        assert_eq!(
-            kinds.len(),
-            5,
-            "branch, call, conditional taken/fall-through, and Continue must all be covered"
-        );
-    }
-
-    #[test]
-    fn direct_binding_recovery_gate_rejects_first_authority_store_hole() {
-        let emitted = direct_edge_cases(DirectExitEmissionPolicy::PortableUnitAuthority)
-            .into_iter()
-            .next()
-            .expect("branch recovery fixture")
-            .1;
-        let link = emitted.direct_links[0];
-        let first_authority_store = link.stub.start.get() + 17 * 4;
-        let mut recovery = emitted.recovery.to_vec();
-        recovery.retain(|entry| entry.cache.get() != first_authority_store);
-        let error = check_direct_binding_recovery(link, &recovery, None)
-            .expect_err("missing first authority-store recovery entry must fail");
-        assert!(
-            error.contains("expected exactly one"),
-            "unexpected coverage failure: {error}"
-        );
-    }
-
-    #[test]
     fn private_direct_edges_use_compact_gateway_stubs() {
-        // The stub is no longer a FIXED size: it stores two guest PCs, and each is
+        // The stub is not a FIXED size: it stores two guest PCs, and each is
         // materialized in only the `movz`/`movk` halfwords its value needs
         // (`GuestPcWidth::Narrow`). 56 bytes is the worst case, when both PCs
         // occupy all four halfwords; these fixtures use low guest addresses and
         // land at 32, a 43% reduction. `dsr:x17-materialize` was measured at
         // 29.1% of ALL emitted words, so this is the largest emitted class.
-        //
-        // The SIDECAR path keeps the fixed four-word form
-        // (`GuestPcWidth::Fixed`), because `rewrite_direct_binding_stub`
-        // validates its instruction shape at fixed word offsets.
         const PRIVATE_DIRECT_GATEWAY_STUB_WORST_CASE_BYTES: u32 = 56;
         const PRIVATE_DIRECT_GATEWAY_STUB_FIXTURE_BYTES: u32 = 32;
 
         let mut kinds = std::collections::BTreeSet::new();
-        for (case, emitted) in direct_edge_cases(DirectExitEmissionPolicy::PrivateGateway) {
+        for (case, emitted) in direct_edge_cases() {
             for link in emitted.direct_links {
                 kinds.insert(link.kind as u8);
                 let bytes = link.stub.end.get() - link.stub.start.get();
@@ -9856,17 +8543,14 @@ mod tests {
         let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
         let mut entries = Vec::new();
         let mut direct_links = Vec::new();
-        let mut recovery = Vec::new();
         emit_region_direct_exit(
             &mut assembler,
             &mut entries,
             &mut direct_links,
-            &mut recovery,
             GuestVa(0x7010),
             GuestVa(0x7008),
             GuestVa(0x7010),
             false,
-            DirectExitEmissionPolicy::PrivateGateway,
             None,
         )
         .expect("emit private fused-exclusive continuation");
@@ -9928,14 +8612,8 @@ mod tests {
     #[test]
     fn fused_segment_edge_falls_through_in_two_words_without_saving_guest_x17() {
         let plan = fused_two_segment_plan();
-        let assembled = assemble_block_inner(
-            &plan,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .expect("assemble fused block");
+        let assembled = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .expect("assemble fused block");
         let words = &assembled.words;
 
         // Anchor on the relocated conditional rather than a fixed index: the
@@ -10006,19 +8684,11 @@ mod tests {
     /// The point of the whole exercise: N guest blocks, ONE generation guard.
     #[test]
     fn fused_block_emits_a_single_generation_guard() {
-        let guard = GenerationGuard::BindingIndex {
-            index: 3,
-            expected: CodeGeneration::INITIAL,
-        };
+        let generation = std::sync::atomic::AtomicU64::new(CodeGeneration::INITIAL.get());
+        let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);
         let count_acquires = |plan: &BlockPlan| {
-            let assembled = assemble_block_inner(
-                plan,
-                Some(guard),
-                EmitAddressMode::Direct,
-                DirectExitEmissionPolicy::PrivateGateway,
-                None,
-            )
-            .expect("assemble guarded block");
+            let assembled = assemble_block_inner(plan, Some(guard), EmitAddressMode::Direct, None)
+                .expect("assemble guarded block");
             assembled
                 .words
                 .iter()
@@ -10051,613 +8721,13 @@ mod tests {
             word,
             op: bad64::Op::B_NE,
         };
-        let error = assemble_block_inner(
-            &plan,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PrivateGateway,
-            None,
-        )
-        .err()
-        .expect("a non-conditional fused edge must be rejected");
+        let error = assemble_block_inner(&plan, None, EmitAddressMode::Direct, None)
+            .err()
+            .expect("a non-conditional fused edge must be rejected");
         assert!(
             format!("{error:?}").contains("not a direct branch"),
             "unexpected error: {error:?}"
         );
-    }
-
-    #[test]
-    fn direct_edges_record_exact_identity_and_recovery_envelopes() {
-        let branch = direct_plan(PlannedExit::Direct {
-            guest: GuestVa(0x4000),
-            word: 0x1400_0400,
-            exit: DirectExit {
-                kind: DirectKind::Branch,
-                target: GuestVa(0x5000),
-                resume: GuestVa(0x4004),
-                condition: None,
-                register: None,
-                bit: None,
-            },
-        });
-        let call = direct_plan(PlannedExit::Direct {
-            guest: GuestVa(0x4000),
-            word: 0x9400_0400,
-            exit: DirectExit {
-                kind: DirectKind::Call,
-                target: GuestVa(0x5000),
-                resume: GuestVa(0x4004),
-                condition: None,
-                register: None,
-                bit: None,
-            },
-        });
-        let conditional = direct_plan(PlannedExit::Direct {
-            guest: GuestVa(0x4000),
-            word: 0x5400_8000,
-            exit: DirectExit {
-                kind: DirectKind::Conditional,
-                target: GuestVa(0x5000),
-                resume: GuestVa(0x4004),
-                condition: Some(bad64::Condition::EQ),
-                register: None,
-                bit: None,
-            },
-        });
-        let continuation = direct_plan(PlannedExit::Continue {
-            target: GuestVa(0x4004),
-            limit: super::super::block::BlockLimit::InstructionLimit,
-        });
-
-        let cases = [
-            (
-                "branch",
-                assemble_block_inner(
-                    &branch,
-                    None,
-                    EmitAddressMode::Direct,
-                    DirectExitEmissionPolicy::PortableUnitAuthority,
-                    None,
-                )
-                .expect("assemble branch"),
-                vec![ExpectedDirectLink {
-                    source: GuestVa(0x4000),
-                    target: GuestVa(0x5000),
-                    kind: DirectLinkKind::Branch,
-                    slot: 8,
-                    stub_start: 12,
-                    stub_end: 268,
-                    committed_link: None,
-                }],
-            ),
-            (
-                "call",
-                assemble_block_inner(
-                    &call,
-                    None,
-                    EmitAddressMode::Direct,
-                    DirectExitEmissionPolicy::PortableUnitAuthority,
-                    None,
-                )
-                .expect("assemble call"),
-                vec![ExpectedDirectLink {
-                    source: GuestVa(0x4000),
-                    target: GuestVa(0x5000),
-                    kind: DirectLinkKind::Call,
-                    slot: 24,
-                    stub_start: 28,
-                    stub_end: 284,
-                    committed_link: Some(0x4004),
-                }],
-            ),
-            (
-                "conditional",
-                assemble_block_inner(
-                    &conditional,
-                    None,
-                    EmitAddressMode::Direct,
-                    DirectExitEmissionPolicy::PortableUnitAuthority,
-                    None,
-                )
-                .expect("assemble conditional"),
-                vec![
-                    ExpectedDirectLink {
-                        source: GuestVa(0x4000),
-                        target: GuestVa(0x4004),
-                        kind: DirectLinkKind::ConditionalFallthrough,
-                        slot: 12,
-                        stub_start: 20,
-                        stub_end: 276,
-                        committed_link: None,
-                    },
-                    ExpectedDirectLink {
-                        source: GuestVa(0x4000),
-                        target: GuestVa(0x5000),
-                        kind: DirectLinkKind::ConditionalTaken,
-                        slot: 16,
-                        stub_start: 276,
-                        stub_end: 532,
-                        committed_link: None,
-                    },
-                ],
-            ),
-            (
-                "continue",
-                assemble_block_inner(
-                    &continuation,
-                    None,
-                    EmitAddressMode::Direct,
-                    DirectExitEmissionPolicy::PortableUnitAuthority,
-                    None,
-                )
-                .expect("assemble continuation"),
-                vec![ExpectedDirectLink {
-                    source: GuestVa(0x4004),
-                    target: GuestVa(0x4004),
-                    kind: DirectLinkKind::Continue,
-                    slot: 8,
-                    stub_start: 12,
-                    stub_end: 268,
-                    committed_link: None,
-                }],
-            ),
-        ];
-        for (case, assembled, expected) in cases {
-            assert_direct_links(
-                case,
-                &assembled.direct_links,
-                &assembled.recovery,
-                &expected,
-            );
-        }
-
-        let mut assembler = VecAssembler::<Aarch64Relocation>::new(0);
-        let mut entries = Vec::new();
-        let mut direct_links = Vec::new();
-        let mut recovery = Vec::new();
-        emit_region_direct_exit(
-            &mut assembler,
-            &mut entries,
-            &mut direct_links,
-            &mut recovery,
-            GuestVa(0x7010),
-            GuestVa(0x7008),
-            GuestVa(0x7010),
-            false,
-            DirectExitEmissionPolicy::PortableUnitAuthority,
-            None,
-        )
-        .expect("emit fused-exclusive continuation");
-        let _ = assembler
-            .finalize()
-            .expect("finalize fused-exclusive continuation");
-        assert_direct_links(
-            "fused-exclusive continuation",
-            &direct_links,
-            &recovery,
-            &[ExpectedDirectLink {
-                source: GuestVa(0x7008),
-                target: GuestVa(0x7010),
-                kind: DirectLinkKind::Continue,
-                slot: 4,
-                stub_start: 8,
-                stub_end: 264,
-                committed_link: None,
-            }],
-        );
-    }
-
-    #[test]
-    fn direct_binding_capture_prefix_recovers_only_committed_scratch() {
-        let branch = direct_plan(PlannedExit::Direct {
-            guest: GuestVa(0x4000),
-            word: 0x1400_0400,
-            exit: DirectExit {
-                kind: DirectKind::Branch,
-                target: GuestVa(0x5000),
-                resume: GuestVa(0x4004),
-                condition: None,
-                register: None,
-                bit: None,
-            },
-        });
-        let assembled = assemble_block_inner(
-            &branch,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PortableUnitAuthority,
-            None,
-        )
-        .expect("assemble direct branch");
-        let stub = assembled.direct_links[0].stub;
-        let live_x15 = 0x1500_0015;
-        let live_x16 = 0x1600_0016;
-        let live_x17 = 0x1700_0017;
-        let live_x30 = 0x3000_0030;
-        let live_nzcv = 0x6000_0000;
-        let stale_x15 = 0xdead_0015;
-        let stale_x16 = 0xdead_0016;
-        let stale_x30 = 0xdead_0030;
-        let stale_nzcv = 0xdead_0000;
-        let cases = [
-            (
-                "before x15 capture",
-                0,
-                DirectBindingCaptureProgress::None,
-                stale_x15,
-                stale_x16,
-                stale_x30,
-                live_x16,
-            ),
-            (
-                "after x15 capture",
-                4,
-                DirectBindingCaptureProgress::X15,
-                live_x15,
-                stale_x16,
-                stale_x30,
-                live_x16,
-            ),
-            (
-                "after x16 capture",
-                8,
-                DirectBindingCaptureProgress::X15X16,
-                live_x15,
-                live_x16,
-                stale_x30,
-                live_x16,
-            ),
-            (
-                "after x30 capture",
-                12,
-                DirectBindingCaptureProgress::X15X16X30,
-                live_x15,
-                live_x16,
-                live_x30,
-                live_x16,
-            ),
-            (
-                "after nzcv read",
-                16,
-                DirectBindingCaptureProgress::X15X16X30,
-                live_x15,
-                live_x16,
-                live_x30,
-                live_nzcv,
-            ),
-        ];
-
-        for (case, delta, expected_progress, saved_x15, saved_x16, saved_x30, interrupted_x16) in
-            cases
-        {
-            let action = assembled
-                .recovery
-                .iter()
-                .find(|entry| entry.cache.get() == stub.start.get() + delta)
-                .unwrap_or_else(|| panic!("{case}: capture recovery entry"))
-                .action;
-            assert_eq!(
-                action,
-                RecoveryAction::RestoreDirectBinding {
-                    phase: DirectBindingRecoveryPhase::ScratchCapture,
-                    capture_progress: expected_progress,
-                    committed_link: None,
-                },
-                "{case}: typed capture progress"
-            );
-            let mut snapshot = crate::snapshot::NativeUcontextSnapshot::default();
-            snapshot.x[15] = live_x15;
-            snapshot.x[16] = interrupted_x16;
-            snapshot.x[17] = live_x17;
-            snapshot.x[30] = live_x30;
-            snapshot.pstate = live_nzcv;
-
-            recover_rewrite_state(
-                &mut snapshot,
-                action,
-                saved_x16,
-                live_x17,
-                stale_nzcv,
-                saved_x15,
-                saved_x30,
-                0,
-            )
-            .unwrap_or_else(|error| panic!("{case}: recover capture prefix: {error}"));
-
-            assert_eq!(snapshot.x[15], live_x15, "{case}: x15");
-            assert_eq!(snapshot.x[16], live_x16, "{case}: x16");
-            assert_eq!(snapshot.x[17], live_x17, "{case}: x17");
-            assert_eq!(snapshot.x[30], live_x30, "{case}: x30");
-            assert_eq!(snapshot.pstate, live_nzcv, "{case}: NZCV");
-        }
-    }
-
-    #[test]
-    fn sidecar_v1_hit_path_is_exactly_twenty_two_instructions() {
-        let branch = direct_plan(PlannedExit::Direct {
-            guest: GuestVa(0x4000),
-            word: 0x1400_0400,
-            exit: DirectExit {
-                kind: DirectKind::Branch,
-                target: GuestVa(0x5000),
-                resume: GuestVa(0x4004),
-                condition: None,
-                register: None,
-                bit: None,
-            },
-        });
-        let assembled = assemble_block_inner(
-            &branch,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PortableUnitAuthority,
-            None,
-        )
-        .expect("assemble direct branch");
-        let link = assembled.direct_links[0];
-        let mut code = assembled
-            .words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect::<Vec<_>>();
-
-        let relocation = rewrite_direct_binding_stub(
-            &mut code,
-            link,
-            crate::direct_binding::DirectBindingOrdinal::claimed(7),
-            56,
-        )
-        .expect("rewrite sidecar stub");
-        assert_eq!(relocation.adrp_offset, link.stub.start.get() + 20);
-        assert_eq!(relocation.add_offset, link.stub.start.get() + 24);
-        assert_eq!(relocation.miss_adrp_offset, link.stub.start.get() + 108);
-        assert_eq!(relocation.miss_add_offset, link.stub.start.get() + 112);
-        assert_eq!(relocation.data_offset, 56);
-
-        let hit_start = usize::try_from(relocation.adrp_offset).expect("hit start");
-        let hit_end = hit_start + 22 * std::mem::size_of::<u32>();
-        let hit_words = code[hit_start..hit_end]
-            .chunks_exact(std::mem::size_of::<u32>())
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("instruction word")))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            hit_words,
-            vec![
-                0x9000_000f, // adrp x15, binding-cell-page
-                0x9100_01ef, // add x15, x15, binding-cell-pageoff
-                0xc8df_fdf1, // ldar x17, [x15]
-                0xb400_0271, // cbz x17, miss
-                0xf902_8b91, // str x17, [x28, #1296]
-                0xf940_0230, // ldr x16, [x17]
-                0xa940_fa2f, // ldp x15, x30, [x17, #8]
-                0xeb0f_021f, // cmp x16, x15
-                0x5400_01c3, // b.lo miss
-                0xeb1e_021f, // cmp x16, x30
-                0x5400_0182, // b.hs miss
-                0xf940_0e31, // ldr x17, [x17, #24]
-                0xf902_7b91, // str x17, [x28, #1264]
-                0x9112_6391, // add x17, x28, #1176
-                0xa900_7a2f, // stp x15, x30, [x17]
-                0xf902_1b90, // str x16, [x28, #1072]
-                0xf851_0230, // ldur x16, [x17, #-240]
-                0xd51b_4210, // msr nzcv, x16
-                0xa97f_7a2f, // ldp x15, x30, [x17, #-16]
-                0xf85c_8230, // ldur x16, [x17, #-56]
-                0xf859_8231, // ldur x17, [x17, #-104]
-                0xd61f_0220, // br x17
-            ]
-        );
-
-        let stub_start = usize::try_from(link.stub.start.get()).expect("stub start");
-        let capture_words = code[stub_start..hit_start]
-            .chunks_exact(std::mem::size_of::<u32>())
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("capture word")))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            capture_words,
-            vec![
-                0xf902_478f,
-                0xf902_3390,
-                0xf902_4b9e,
-                0xd53b_4210,
-                0xf901_d790,
-            ],
-            "scratch capture must remain before the 22-word hit path"
-        );
-
-        let miss_start = usize::try_from(relocation.miss_adrp_offset).expect("miss start");
-        let miss_end = miss_start + 28 * std::mem::size_of::<u32>();
-        let miss_words = code[miss_start..miss_end]
-            .chunks_exact(std::mem::size_of::<u32>())
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("miss word")))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            miss_words,
-            vec![
-                0x9000_000f, // adrp x15, binding-cell-page
-                0x9100_01ef, // add x15, x15, binding-cell-pageoff
-                0xf902_838f, // str x15, [x28, #1280]
-                0x5280_00f1, // movz w17, #7
-                0x72a0_0011, // movk w17, #0, lsl #16
-                0xb905_0b91, // str w17, [x28, #1288]
-                0x5280_0031, // mov w17, #1
-                0xb905_0f91, // str w17, [x28, #1292]
-                0xf902_8b9f, // str xzr, [x28, #1296]
-                0xf941_d790, // ldr x16, [x28, #936]
-                0xd51b_4210, // msr nzcv, x16
-                0xf942_478f, // ldr x15, [x28, #1160]
-                0xf942_3390, // ldr x16, [x28, #1120]
-                0xf942_4b9e, // ldr x30, [x28, #1168]
-                0xd28a_0011, // mov x17, #0x5000
-                0xf2a0_0011,
-                0xf2c0_0011,
-                0xf2e0_0011,
-                0xf902_1f91, // str x17, [x28, #1080]
-                0xd288_0011, // mov x17, #0x4000
-                0xf2a0_0011,
-                0xf2c0_0011,
-                0xf2e0_0011,
-                0xf902_2391, // str x17, [x28, #1088]
-                0x5280_0051, // mov w17, #2
-                0xb904_4b91, // str w17, [x28, #1096]
-                0xf942_6791, // ldr x17, [x28, #1224]
-                0xd61f_0220, // br x17
-            ],
-            "miss path must publish typed identity, restore state, and reuse the direct resolver"
-        );
-        assert!(
-            code[miss_end..usize::try_from(link.stub.end.get()).expect("stub end")]
-                .chunks_exact(4)
-                .all(|bytes| bytes == 0xd503_201f_u32.to_le_bytes()),
-            "unused envelope words must remain unreachable NOP padding"
-        );
-    }
-
-    #[test]
-    fn sidecar_rewrite_rejects_an_envelope_with_the_wrong_instruction_shape() {
-        let branch = direct_plan(PlannedExit::Direct {
-            guest: GuestVa(0x4000),
-            word: 0x1400_0400,
-            exit: DirectExit {
-                kind: DirectKind::Branch,
-                target: GuestVa(0x5000),
-                resume: GuestVa(0x4004),
-                condition: None,
-                register: None,
-                bit: None,
-            },
-        });
-        let assembled = assemble_block_inner(
-            &branch,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PortableUnitAuthority,
-            None,
-        )
-        .expect("assemble direct branch");
-        let link = assembled.direct_links[0];
-        let mut code = assembled
-            .words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect::<Vec<_>>();
-        let stub_start = usize::try_from(link.stub.start.get()).expect("stub start");
-        code[stub_start..stub_start + 4].copy_from_slice(&0xd503_201f_u32.to_le_bytes());
-
-        let error = rewrite_direct_binding_stub(
-            &mut code,
-            link,
-            crate::direct_binding::DirectBindingOrdinal::claimed(0),
-            0,
-        )
-        .expect_err("wrong precursor shape must reject");
-        assert!(
-            error
-                .to_string()
-                .contains("direct-binding precursor instruction shape"),
-            "unexpected error: {error}"
-        );
-    }
-
-    fn assert_shape_valid_owner_identity_mismatch_rejects(case: &str, mov_word: usize) {
-        let branch = direct_plan(PlannedExit::Direct {
-            guest: GuestVa(0x4000),
-            word: 0x1400_0400,
-            exit: DirectExit {
-                kind: DirectKind::Branch,
-                target: GuestVa(0x5000),
-                resume: GuestVa(0x4004),
-                condition: None,
-                register: None,
-                bit: None,
-            },
-        });
-        let assembled = assemble_block_inner(
-            &branch,
-            None,
-            EmitAddressMode::Direct,
-            DirectExitEmissionPolicy::PortableUnitAuthority,
-            None,
-        )
-        .expect("assemble direct branch");
-        let link = assembled.direct_links[0];
-        let mut code = assembled
-            .words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect::<Vec<_>>();
-        let word_offset =
-            usize::try_from(link.stub.start.get()).expect("stub start") + mov_word * 4;
-        let original = u32::from_le_bytes(
-            code[word_offset..word_offset + 4]
-                .try_into()
-                .expect("MOV-wide word"),
-        );
-        code[word_offset..word_offset + 4].copy_from_slice(&(original ^ (1 << 5)).to_le_bytes());
-
-        let error = match rewrite_direct_binding_stub(
-            &mut code,
-            link,
-            crate::direct_binding::DirectBindingOrdinal::claimed(0),
-            0,
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("{case}: shape-valid wrong identity must reject"),
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("direct-binding precursor instruction shape"),
-            "{case}: unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn sidecar_rewrite_rejects_shape_valid_first_target_identity_mismatch() {
-        assert_shape_valid_owner_identity_mismatch_rejects("first target identity", 5);
-    }
-
-    #[test]
-    fn sidecar_rewrite_rejects_shape_valid_second_target_identity_mismatch() {
-        assert_shape_valid_owner_identity_mismatch_rejects("second target identity", 50);
-    }
-
-    #[test]
-    fn sidecar_rewrite_rejects_shape_valid_source_identity_mismatch() {
-        assert_shape_valid_owner_identity_mismatch_rejects("source identity", 55);
-    }
-
-    #[test]
-    fn direct_binding_recovery_preserves_a_committed_call_link() {
-        let committed_link = 0x5004;
-        let mut snapshot = crate::snapshot::NativeUcontextSnapshot::default();
-        snapshot.x[15] = 0xdead_0015;
-        snapshot.x[16] = 0xdead_0016;
-        snapshot.x[17] = 0xdead_0017;
-        snapshot.x[30] = 0xdead_0030;
-        snapshot.pstate = 0xdead_0000;
-
-        recover_rewrite_state(
-            &mut snapshot,
-            RecoveryAction::RestoreDirectBinding {
-                phase: DirectBindingRecoveryPhase::FinalBranch,
-                capture_progress: DirectBindingCaptureProgress::Complete,
-                committed_link: Some(committed_link),
-            },
-            0x16,
-            0x17,
-            0x6000_0000,
-            0x15,
-            0x30,
-            0,
-        )
-        .expect("recover direct-binding preamble");
-
-        assert_eq!(snapshot.x[15], 0x15);
-        assert_eq!(snapshot.x[16], 0x16);
-        assert_eq!(snapshot.x[17], 0x17);
-        assert_eq!(snapshot.x[30], committed_link);
-        assert_eq!(snapshot.pstate, 0x6000_0000);
     }
 
     #[test]
