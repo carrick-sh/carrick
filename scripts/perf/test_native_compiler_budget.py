@@ -729,6 +729,22 @@ def nativeperf_frames_v4(pid=10, tid=11, era=12, exec_epoch=0):
     ]
 
 
+def nativeperf_frames_v5(pid=10, tid=11, era=12, exec_epoch=0):
+    lines = nativeperf_frames_v4(
+        pid=pid,
+        tid=tid,
+        era=era,
+        exec_epoch=exec_epoch,
+    )
+    shared_index = next(
+        index
+        for index, line in enumerate(lines)
+        if "|frame=resolver-shared|" in line
+    )
+    lines[shared_index] += "|shared_blocks_attached=7"
+    return lines
+
+
 def nativeperf_frames_v3_with_exclusive(
     pid=10, tid=11, era=12, exec_epoch=0, *, executions=1, unique_sites=1
 ):
@@ -861,6 +877,22 @@ class NativePerfTests(unittest.TestCase):
 
 
 class NativePerfV2Tests(unittest.TestCase):
+    def test_v5_parses_and_round_trips_the_lazy_attach_counter(self):
+        profile = budget.parse_nativeperf(nativeperf_frames_v5())
+        budget.validate_profile(profile)
+        self.assertEqual(profile.version, 5)
+        self.assertEqual(
+            profile.threads[0].value("resolver-shared", "shared_blocks_attached"),
+            7,
+        )
+
+        encoded = budget.run_record_json(
+            budget.RunRecord.synthetic(profile=profile, schedule_label="on-1")
+        )
+        decoded = budget.parse_result_row(encoded)
+        self.assertEqual(decoded.profile, profile)
+        self.assertEqual(decoded.profile.version, 5)
+
     def test_v4_parses_the_exact_producer_shaped_metadata_contract(self):
         profile = budget.parse_nativeperf(nativeperf_frames_v4())
         budget.validate_profile(profile)
