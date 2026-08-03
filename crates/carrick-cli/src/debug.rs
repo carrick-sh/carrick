@@ -63,6 +63,15 @@ pub(crate) fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
             jit_share,
             output.as_deref(),
         )?,
+        DebugCommand::TrustedRouteCapture {
+            evidence_dir,
+            jit_share,
+            command,
+        } => crate::debug_trusted_route::run_trusted_route_capture(
+            &evidence_dir,
+            jit_share,
+            &command,
+        )?,
         DebugCommand::DecodeEsr { syndrome } => {
             let stripped = syndrome.trim();
             let value = if let Some(hex) = stripped
