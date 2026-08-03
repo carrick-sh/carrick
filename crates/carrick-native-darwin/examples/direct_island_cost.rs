@@ -14,7 +14,7 @@
 
 #[cfg(target_arch = "aarch64")]
 fn main() {
-    use carrick_native_darwin::direct::{DirectImage, GuestContext, SVC_0};
+    use carrick_native_darwin::direct::{DirectLoadGroup, GuestContext, SVC_0};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -60,8 +60,8 @@ fn main() {
     code.push(0xd65f_03c0); // ret
 
     let elf = elf_with_code(&code);
-    let image = match DirectImage::load(&elf, count_only) {
-        Ok(Ok(image)) => image,
+    let group = match DirectLoadGroup::load(&elf, count_only) {
+        Ok(Ok(group)) => group,
         Ok(Err(reason)) => {
             eprintln!("ineligible: {reason}");
             return;
@@ -71,11 +71,11 @@ fn main() {
             return;
         }
     };
-    println!("patched {} svc site(s)", image.svc_sites());
-    let entry = image.entry();
+    println!("patched {} svc site(s)", group.main().svc_sites());
+    let entry = group.main().entry();
     let started = std::time::Instant::now();
     // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-    unsafe { image.enter(entry) };
+    unsafe { group.enter(entry) };
     let elapsed = started.elapsed();
 
     let calls = CALLS.load(Ordering::Relaxed);

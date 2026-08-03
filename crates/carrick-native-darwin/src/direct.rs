@@ -39,7 +39,7 @@
 //! A tier-D guest leaves guest execution ONLY through the handler. The handler
 //! requests it (`GuestContext::request_leave`) and the island's LEAVE LEG —
 //! never the guest's own code — restores the host's stack discipline (SP and
-//! link register, captured by `DirectImage::enter` at the moment of entry)
+//! link register, captured by `DirectLoadGroup::enter` at the moment of entry)
 //! and returns to `enter`'s caller. At that point the guest's complete
 //! register file, SP included, sits in the `GuestContext` exactly as it was
 //! at the syscall, with `pc` naming the resume site — which is precisely the
@@ -79,7 +79,7 @@ pub struct GuestContext {
     pub pc: u64,
     /// `extern "C" fn(*mut GuestContext)`, called with the context in x0.
     pub handler: u64,
-    /// Host SP at guest entry, captured by [`DirectImage::enter`]. The
+    /// Host SP at guest entry, captured by [`DirectLoadGroup::enter`]. The
     /// island's leave leg restores it before returning to Rust.
     host_sp: u64,
     /// Host return address for the leave leg: the landing point after
@@ -108,7 +108,7 @@ impl GuestContext {
     /// Ask the island to LEAVE guest execution when this handler returns.
     ///
     /// The island's leave leg restores the host stack discipline captured at
-    /// entry and returns to [`DirectImage::enter`]'s caller instead of
+    /// entry and returns to [`DirectLoadGroup::enter`]'s caller instead of
     /// resuming the guest. The guest's full register file stays parked in
     /// this context (see the module-level guest-leave contract). Do NOT also
     /// call [`Self::set_return`] on the leave path: the parked state should
@@ -538,9 +538,11 @@ pub enum DirectIneligible {
     /// which would run unrelocated PLT/GOT code and fault far from the cause.
     ///
     /// This is the fail-closed edge of Phase 1 item 3 (dynamic linking):
-    /// ld.so is more PIE mappings through this same loader plus TLS init, but
-    /// until that chain exists, and until the per-image `guest_tls`/
-    /// `guest_x18` slots become per-load-group, a dynamic image is tier T's.
+    /// ld.so is more PIE mappings through this same loader plus TLS init.
+    /// The slot seam is done — `guest_tls`/`guest_x18`/context are
+    /// per-[`DirectLoadGroup`], shared coherently by every member image —
+    /// but until the interpreter chain itself exists, a dynamic image is
+    /// tier T's.
     NeedsInterpreter { path: String },
 }
 
@@ -674,32 +676,37 @@ pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, i
     Ok(Ok(svc_sites))
 }
 
-/// A loaded, patched, directly-executable guest image.
+/// One loaded, patched, directly-executable guest mapping.
+///
+/// An image never stands alone: it is a member of a [`DirectLoadGroup`],
+/// which owns the guest's coherent slot set (context, TLS, x18) shared by
+/// every image's islands and veneers. The image itself is only the mapping —
+/// where it landed, its biased entry, and what was patched.
 pub struct DirectImage {
     base: *mut u8,
     len: usize,
     entry: u64,
-    context: Box<GuestContext>,
+    /// `mapped base - min(p_vaddr)`: what to ADD to an image-relative vaddr.
+    /// Equals `base` whenever the lowest `PT_LOAD` begins at vaddr 0, which
+    /// is every real PIE.
+    bias: u64,
     svc_sites: usize,
     tpidr_sites: usize,
     x18_sites: usize,
-    /// The guest's TLS base. XNU will not hold it in `TPIDR_EL0`, so the
-    /// veneers read and write it here. One slot per image is correct while
-    /// tier D is single-threaded; threads need one per thread.
-    guest_tls: Box<u64>,
-    /// The guest's x18. Darwin rewrites the physical register at every trap
-    /// return, so the guest's value lives here and the veneers move it in and
-    /// out around each use.
-    guest_x18: Box<u64>,
 }
 
 // SAFETY: the mapping is owned solely by this value and unmapped in `Drop`.
 unsafe impl Send for DirectImage {}
 
 impl DirectImage {
-    /// Where the image was mapped. For a PIE this IS the load bias.
+    /// Where the image was mapped.
     pub fn base(&self) -> u64 {
         self.base as u64
+    }
+    /// The load bias: mapped base minus the image's lowest `p_vaddr`. Add it
+    /// to any image-relative vaddr (entry, phdr) to get the runtime address.
+    pub fn bias(&self) -> u64 {
+        self.bias
     }
     /// Guest entry point, already biased.
     pub fn entry(&self) -> u64 {
@@ -717,101 +724,9 @@ impl DirectImage {
     pub fn x18_sites(&self) -> usize {
         self.x18_sites
     }
-    /// The guest's x18, as the veneers see it.
-    pub fn guest_x18(&self) -> u64 {
-        *self.guest_x18
-    }
-    /// The guest's TLS base, as the veneers see it.
-    pub fn guest_tls(&self) -> u64 {
-        *self.guest_tls
-    }
     /// Byte length of the mapping, for inspection.
     pub fn mapped_len(&self) -> usize {
         self.len
-    }
-
-    /// The address the ISLANDS were built to use for the context.
-    ///
-    /// Diagnostic: the islands materialize this as a patch-time constant, so
-    /// it must equal `context_address()`. A mismatch means the context moved
-    /// after patching, which would make every island restore the guest through
-    /// the wrong memory.
-    pub fn context_address(&mut self) -> u64 {
-        std::ptr::from_mut(self.context.as_mut()) as u64
-    }
-
-    pub fn context(&mut self) -> &mut GuestContext {
-        &mut self.context
-    }
-
-    /// Load `elf`, patch its syscall sites, and make it executable.
-    ///
-    /// `handler` is called with the guest context on every syscall. The image
-    /// is mapped wherever the kernel chooses: `MAP_JIT` rejects `MAP_FIXED`
-    /// (probed), and for a PIE any base is valid, so the returned base is the
-    /// load bias.
-    pub fn load(
-        elf: &[u8],
-        handler: extern "C" fn(*mut GuestContext),
-    ) -> Result<Result<Self, DirectIneligible>, io::Error> {
-        // Fail closed BEFORE mapping: a refusal must cost no allocation, and
-        // an image that reaches the patcher is one the scan proved safe.
-        match scan_eligibility(elf)? {
-            Ok(_) => {}
-            Err(reason) => return Ok(Err(reason)),
-        }
-        let segments = executable_segments(elf)?;
-        // Span every PT_LOAD so guest-relative addressing stays intact, plus a
-        // tail for islands.
-        let (lo, hi) = load_span(elf)?;
-        let island_budget = 64 * 1024 + segments.iter().map(|s| s.2).sum::<usize>();
-        let len = ((hi - lo) as usize + island_budget).next_multiple_of(16 * 1024);
-
-        // SAFETY: kernel-chosen address, MAP_JIT as probed to be the only way
-        // to obtain writable-then-executable pages under Darwin's W^X policy.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let base = base.cast::<u8>();
-        let mut image = Self {
-            base,
-            len,
-            entry: 0,
-            context: Box::new(GuestContext {
-                handler: handler as usize as u64,
-                ..GuestContext::default()
-            }),
-            svc_sites: 0,
-            tpidr_sites: 0,
-            x18_sites: 0,
-            guest_tls: Box::new(0),
-            guest_x18: Box::new(0),
-        };
-        let bias = base as u64 - lo;
-        image.entry = read_u64(elf, 0x18)? + bias;
-
-        // Patching happens with the region writable and no guest thread able
-        // to enter it, so there is no cross-modifying-code hazard.
-        jit_write_protect(false);
-        let result = image.copy_and_patch(elf, lo, bias);
-        jit_write_protect(true);
-        // SAFETY: the region was just written; publish it to the i-cache.
-        unsafe { sys_icache_invalidate(base.cast(), len) };
-        match result {
-            Ok(Ok(())) => Ok(Ok(image)),
-            Ok(Err(reason)) => Ok(Err(reason)),
-            Err(error) => Err(error),
-        }
     }
 
     fn copy_and_patch(
@@ -819,6 +734,9 @@ impl DirectImage {
         elf: &[u8],
         lo: u64,
         bias: u64,
+        ctx_addr: u64,
+        tls_addr: u64,
+        x18_addr: u64,
     ) -> Result<Result<(), DirectIneligible>, io::Error> {
         let (_, hi) = load_span(elf)?;
         let image_len = (hi - lo) as usize;
@@ -838,10 +756,6 @@ impl DirectImage {
         // Islands live past the image, inside the same mapping, so a `b` from
         // any site reaches them well within ±128 MiB.
         let mut island_cursor = image_len.next_multiple_of(16);
-        let ctx_addr = std::ptr::from_mut(self.context.as_mut()) as u64;
-
-        let tls_addr = std::ptr::from_mut(self.guest_tls.as_mut()) as u64;
-        let x18_addr = std::ptr::from_mut(self.guest_x18.as_mut()) as u64;
         // Patch over the same SECTIONS the scan proved, not the PF_X segment:
         // patching a `.note` byte pattern that merely looks like `svc` would
         // corrupt data the guest reads.
@@ -940,8 +854,173 @@ impl DirectImage {
             );
         }
     }
+}
 
-    /// Arm THIS thread to execute the image's `MAP_JIT` pages.
+impl Drop for DirectImage {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the mapping.
+        unsafe { libc::munmap(self.base.cast(), self.len) };
+    }
+}
+
+/// A guest's load group: every image it executes, plus the ONE coherent slot
+/// set they all share.
+///
+/// The slots are per-GROUP, not per-image, because the group is one guest:
+/// ld.so and the main image are separate mappings, but a thread pointer the
+/// interpreter's veneers write must be the same one the main image's veneers
+/// read. Per-image slots would give one thread two TLS values depending on
+/// which mapping its PC happens to be in — incoherent by construction. The
+/// same argument covers the `GuestContext`: `enter` captures the host stack
+/// discipline in it, and an island in ANY member image must restore that same
+/// capture on a leave.
+///
+/// One slot set per group is correct while tier D is single-threaded; threads
+/// share a load group but need private TLS/x18/context (roadmap Phase 1
+/// item 4).
+pub struct DirectLoadGroup {
+    context: Box<GuestContext>,
+    /// The guest's TLS base. XNU will not hold it in `TPIDR_EL0`, so the
+    /// veneers of every member image read and write it here.
+    guest_tls: Box<u64>,
+    /// The guest's x18. Darwin rewrites the physical register at every trap
+    /// return, so the value lives here and the veneers move it in and out
+    /// around each use.
+    guest_x18: Box<u64>,
+    images: Vec<DirectImage>,
+}
+
+// SAFETY: the images' mappings are owned solely by this value, and the slot
+// boxes move with it.
+unsafe impl Send for DirectLoadGroup {}
+
+impl DirectLoadGroup {
+    /// Load `elf` as the group's MAIN image, patch it, make it executable.
+    ///
+    /// `handler` is called with the group's context on every syscall from any
+    /// member image. The image is mapped wherever the kernel chooses:
+    /// `MAP_JIT` rejects `MAP_FIXED` (probed), and for a PIE any base is
+    /// valid, so the mapped base is the load bias.
+    pub fn load(
+        elf: &[u8],
+        handler: extern "C" fn(*mut GuestContext),
+    ) -> Result<Result<Self, DirectIneligible>, io::Error> {
+        let mut group = Self {
+            context: Box::new(GuestContext {
+                handler: handler as usize as u64,
+                ..GuestContext::default()
+            }),
+            guest_tls: Box::new(0),
+            guest_x18: Box::new(0),
+            images: Vec::new(),
+        };
+        match group.load_image(elf)? {
+            Ok(_) => Ok(Ok(group)),
+            Err(reason) => Ok(Err(reason)),
+        }
+    }
+
+    /// Load one more image into the group, sharing the group's slot set.
+    ///
+    /// Returns the image's index in [`Self::image`]. This is how ld.so
+    /// arrives: a second PIE through the same scan/patch pipeline, veneered
+    /// against the SAME TLS/x18 slots and the same context.
+    pub fn load_image(&mut self, elf: &[u8]) -> Result<Result<usize, DirectIneligible>, io::Error> {
+        // Fail closed BEFORE mapping: a refusal must cost no allocation, and
+        // an image that reaches the patcher is one the scan proved safe.
+        match scan_eligibility(elf)? {
+            Ok(_) => {}
+            Err(reason) => return Ok(Err(reason)),
+        }
+        let segments = executable_segments(elf)?;
+        // Span every PT_LOAD so guest-relative addressing stays intact, plus a
+        // tail for islands.
+        let (lo, hi) = load_span(elf)?;
+        let island_budget = 64 * 1024 + segments.iter().map(|s| s.2).sum::<usize>();
+        let len = ((hi - lo) as usize + island_budget).next_multiple_of(16 * 1024);
+
+        // SAFETY: kernel-chosen address, MAP_JIT as probed to be the only way
+        // to obtain writable-then-executable pages under Darwin's W^X policy.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let base = base.cast::<u8>();
+        let bias = base as u64 - lo;
+        let mut image = DirectImage {
+            base,
+            len,
+            entry: read_u64(elf, 0x18)? + bias,
+            bias,
+            svc_sites: 0,
+            tpidr_sites: 0,
+            x18_sites: 0,
+        };
+        let ctx_addr = std::ptr::from_mut(self.context.as_mut()) as u64;
+        let tls_addr = std::ptr::from_mut(self.guest_tls.as_mut()) as u64;
+        let x18_addr = std::ptr::from_mut(self.guest_x18.as_mut()) as u64;
+
+        // Patching happens with the region writable and no guest thread able
+        // to enter it, so there is no cross-modifying-code hazard.
+        jit_write_protect(false);
+        let result = image.copy_and_patch(elf, lo, bias, ctx_addr, tls_addr, x18_addr);
+        jit_write_protect(true);
+        // SAFETY: the region was just written; publish it to the i-cache.
+        unsafe { sys_icache_invalidate(base.cast(), len) };
+        match result {
+            Ok(Ok(())) => {
+                self.images.push(image);
+                Ok(Ok(self.images.len() - 1))
+            }
+            Ok(Err(reason)) => Ok(Err(reason)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The group's main image (the one [`Self::load`] was given).
+    pub fn main(&self) -> &DirectImage {
+        &self.images[0]
+    }
+
+    /// A member image by the index [`Self::load_image`] returned (the main
+    /// image is index 0).
+    pub fn image(&self, index: usize) -> &DirectImage {
+        &self.images[index]
+    }
+
+    /// The guest's x18, as the veneers see it.
+    pub fn guest_x18(&self) -> u64 {
+        *self.guest_x18
+    }
+    /// The guest's TLS base, as the veneers see it.
+    pub fn guest_tls(&self) -> u64 {
+        *self.guest_tls
+    }
+
+    /// The address the ISLANDS were built to use for the context.
+    ///
+    /// Diagnostic: the islands materialize this as a patch-time constant, so
+    /// it must equal `context_address()`. A mismatch means the context moved
+    /// after patching, which would make every island restore the guest through
+    /// the wrong memory.
+    pub fn context_address(&mut self) -> u64 {
+        std::ptr::from_mut(self.context.as_mut()) as u64
+    }
+
+    pub fn context(&mut self) -> &mut GuestContext {
+        &mut self.context
+    }
+
+    /// Arm THIS thread to execute the group's `MAP_JIT` pages.
     ///
     /// `pthread_jit_write_protect_np` is PER-THREAD on Apple Silicon: a thread
     /// that has never enabled write protection sees `MAP_JIT` pages as
@@ -962,7 +1041,8 @@ impl DirectImage {
     /// contract), or when a test fixture `ret`s with SP balanced.
     ///
     /// # Safety
-    /// The image must be fully patched, and `pc` must be an address inside it.
+    /// Every member image must be fully patched, and `pc` must be an address
+    /// inside one of them.
     pub unsafe fn enter(&self, pc: u64) {
         self.arm_current_thread();
         let ctx = std::ptr::from_ref::<GuestContext>(self.context.as_ref()) as u64;
@@ -1018,13 +1098,6 @@ impl DirectImage {
                 clobber_abi("C"),
             );
         }
-    }
-}
-
-impl Drop for DirectImage {
-    fn drop(&mut self) {
-        // SAFETY: this value owns the mapping.
-        unsafe { libc::munmap(self.base.cast(), self.len) };
     }
 }
 
@@ -1286,9 +1359,10 @@ mod tests {
     #[test]
     fn patches_every_svc_site_and_leaves_other_words_verbatim() {
         let elf = fixture_elf();
-        let image = DirectImage::load(&elf, record_only)
+        let group = DirectLoadGroup::load(&elf, record_only)
             .expect("load")
             .expect("eligible");
+        let image = group.main();
         assert_eq!(image.svc_sites(), 2, "fixture has two syscall sites");
         // SAFETY: reading back the mapped image we just wrote.
         let mapped = unsafe { std::slice::from_raw_parts(image.base as *const u8, image.len) };
@@ -1335,14 +1409,14 @@ mod tests {
             // SAFETY: child side of the pipe.
             unsafe { libc::close(fds[0]) };
             let elf = fixture_elf();
-            let Ok(Ok(image)) = DirectImage::load(&elf, child_handler) else {
+            let Ok(Ok(group)) = DirectLoadGroup::load(&elf, child_handler) else {
                 // SAFETY: child bail-out.
                 unsafe { libc::_exit(90) };
             };
             CHILD_PIPE.store(fds[1], std::sync::atomic::Ordering::SeqCst);
-            let entry = image.entry();
+            let entry = group.main().entry();
             // SAFETY: the image is patched and `entry` is inside it.
-            unsafe { image.enter(entry) };
+            unsafe { group.enter(entry) };
             // SAFETY: the guest must leave through `exit`, never here.
             unsafe { libc::_exit(91) };
         }
@@ -1404,15 +1478,15 @@ mod tests {
             0xd65f_03c0,     // ret
         ];
         let elf = elf_with_code(&code);
-        let image = DirectImage::load(&elf, record_only)
+        let group = DirectLoadGroup::load(&elf, record_only)
             .expect("load")
             .expect("eligible");
-        assert_eq!(image.svc_sites(), 2);
+        assert_eq!(group.main().svc_sites(), 2);
         seen_clear();
-        let entry = image.entry();
+        let entry = group.main().entry();
         // SAFETY: the image is patched, `entry` is inside it, and this fixture
         // returns through `ret` rather than exiting.
-        unsafe { image.enter(entry) };
+        unsafe { group.enter(entry) };
 
         let seen = seen_snapshot();
         assert_eq!(seen.len(), 2, "both syscalls reached the handler");
@@ -1446,20 +1520,20 @@ mod tests {
             0xd65f_03c0,
         ];
         let elf = elf_with_code(&code);
-        let image = DirectImage::load(&elf, record_only)
+        let group = DirectLoadGroup::load(&elf, record_only)
             .expect("load")
             .expect("eligible");
         seen_clear();
-        let entry = image.entry();
+        let entry = group.main().entry();
         // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { image.enter(entry) };
+        unsafe { group.enter(entry) };
         let seen = seen_snapshot();
         assert_eq!(
             seen[0].1[0], 0xcafe,
             "TLS reached the guest's x18 slot without touching either real register"
         );
-        assert_eq!(image.guest_x18(), 0xcafe);
-        assert_eq!(image.guest_tls(), 0xcafe);
+        assert_eq!(group.guest_x18(), 0xcafe);
+        assert_eq!(group.guest_tls(), 0xcafe);
     }
 
     #[test]
@@ -1538,15 +1612,19 @@ mod tests {
             0xd65f_03c0, // ret
         ];
         let elf = elf_with_code(&code);
-        let image = DirectImage::load(&elf, record_only)
+        let group = DirectLoadGroup::load(&elf, record_only)
             .expect("load")
             .expect("eligible");
-        assert_eq!(image.tpidr_sites(), 2, "both tpidr accesses were veneered");
-        assert_eq!(image.svc_sites(), 1);
+        assert_eq!(
+            group.main().tpidr_sites(),
+            2,
+            "both tpidr accesses were veneered"
+        );
+        assert_eq!(group.main().svc_sites(), 1);
         seen_clear();
-        let entry = image.entry();
+        let entry = group.main().entry();
         // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { image.enter(entry) };
+        unsafe { group.enter(entry) };
 
         let seen = seen_snapshot();
         assert_eq!(seen.len(), 1);
@@ -1555,9 +1633,9 @@ mod tests {
             "the guest read back the thread pointer it wrote"
         );
         assert_eq!(
-            image.guest_tls(),
+            group.guest_tls(),
             0xfeed,
-            "the write landed in the image's TLS slot, not the real register"
+            "the write landed in the group's TLS slot, not the real register"
         );
     }
 
@@ -1578,13 +1656,13 @@ mod tests {
             0xd65f_03c0,
         ];
         let elf = elf_with_code(&code);
-        let image = DirectImage::load(&elf, record_only)
+        let group = DirectLoadGroup::load(&elf, record_only)
             .expect("load")
             .expect("eligible");
         seen_clear();
-        let entry = image.entry();
+        let entry = group.main().entry();
         // SAFETY: patched image, entry inside it.
-        unsafe { image.enter(entry) };
+        unsafe { group.enter(entry) };
         let seen = seen_snapshot();
         let args = seen[0].1;
         assert_eq!(args[1], 0xbeef, "x0 survived being the veneer's borrow");
@@ -1629,21 +1707,21 @@ mod tests {
             0xd65f_03c0,
         ];
         let elf = elf_with_code(&code);
-        let image = DirectImage::load(&elf, record_only)
+        let group = DirectLoadGroup::load(&elf, record_only)
             .expect("load")
             .expect("eligible");
         assert_eq!(
-            image.x18_sites(),
+            group.main().x18_sites(),
             4,
             "every x18-using instruction was veneered"
         );
         seen_clear();
-        let entry = image.entry();
+        let entry = group.main().entry();
         // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { image.enter(entry) };
+        unsafe { group.enter(entry) };
         let seen = seen_snapshot();
         assert_eq!(seen[0].1[0], 9, "x18 arithmetic ran against the slot");
-        assert_eq!(image.guest_x18(), 9, "and the slot holds the final value");
+        assert_eq!(group.guest_x18(), 9, "and the slot holds the final value");
     }
 
     #[test]
@@ -1693,12 +1771,12 @@ mod tests {
             0xd65f_03c0, // ret
         ];
         let elf = elf_with_code(&code);
-        let image = DirectImage::load(&elf, heavy)
+        let group = DirectLoadGroup::load(&elf, heavy)
             .expect("load")
             .expect("eligible");
-        let entry = image.entry();
+        let entry = group.main().entry();
         // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { image.enter(entry) };
+        unsafe { group.enter(entry) };
         assert_eq!(
             DEPTH.with(std::cell::Cell::get),
             1,
@@ -1735,17 +1813,17 @@ mod tests {
             0xd65f_03c0, // ret
         ];
         // Load HERE, execute THERE.
-        let image = DirectImage::load(&elf_with_code(&code), count)
+        let group = DirectLoadGroup::load(&elf_with_code(&code), count)
             .expect("load")
             .expect("eligible");
-        let entry = image.entry();
+        let entry = group.main().entry();
         std::thread::spawn(move || {
             // SAFETY: patched image, entry inside it; `enter` arms this thread.
-            unsafe { image.enter(entry) };
+            unsafe { group.enter(entry) };
             // Drop on the executing thread too: isolating it showed the abort
             // happens during the run regardless, so this keeps the reproducer
             // faithful to what the bridge does.
-            drop(image);
+            drop(group);
         })
         .join()
         .expect("executor thread");
@@ -1812,26 +1890,86 @@ mod tests {
             0xd65f_03c0, // ret - reached only if BOTH leaves fail
         ];
         let elf = elf_with_code(&code);
-        let mut image = DirectImage::load(&elf, leave_now)
+        let mut group = DirectLoadGroup::load(&elf, leave_now)
             .expect("load")
             .expect("eligible");
         seen_clear();
-        let entry = image.entry();
+        let entry = group.main().entry();
         // SAFETY: patched image, entry inside it; the leave leg returns here.
-        unsafe { image.enter(entry) };
+        unsafe { group.enter(entry) };
         let seen = seen_snapshot();
         assert_eq!(seen.len(), 1, "the guest left AT the first syscall");
         assert_eq!(seen[0].0, 93);
         assert_eq!(seen[0].1[0], 7, "the exit code is parked in the context");
         assert_eq!(
-            image.context().pc,
+            group.context().pc,
             entry + 3 * 4,
             "ctx.pc names the resume site the guest was parked at"
         );
         assert!(
-            !image.context().leave_requested(),
+            !group.context().leave_requested(),
             "the leave leg re-armed the flag for the next entry"
         );
+    }
+
+    /// The load-group seam: EVERY image in a guest's load group shares ONE
+    /// coherent slot set — one `GuestContext`, one TLS slot, one x18 slot.
+    ///
+    /// This is the prerequisite for dynamic linking: ld.so and the main image
+    /// are separate mappings but ONE guest. With per-image slots, TLS written
+    /// by ld.so's veneers would land in a slot the main image's veneers never
+    /// read — two thread pointers for one thread. The test loads two images
+    /// into one group, writes TLS and x18 from the first, reads both back from
+    /// the second, and requires the values to be coherent.
+    #[test]
+    fn load_group_images_share_one_tls_and_x18_slot() {
+        const CHECK_NR: u64 = 0x0ffa;
+        // Image A: set the thread pointer and x18, then return balanced.
+        let writer = elf_with_code(&[
+            mov_reg(20, 30),
+            movz(9, 0xcafe, 0),
+            msr_tpidr_el0_word(9), // guest TLS = 0xcafe
+            movz(18, 7, 0),        // guest x18 = 7 (veneered to the slot)
+            mov_reg(30, 20),
+            RET,
+        ]);
+        // Image B: read both back and hand them to a syscall.
+        let reader = elf_with_code(&[
+            mov_reg(20, 30),
+            mrs_tpidr_el0_word(0), // x0 = guest TLS
+            mov_reg(1, 18),        // x1 = guest x18 (veneered from the slot)
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            RET,
+        ]);
+        let mut group = DirectLoadGroup::load(&writer, record_only)
+            .expect("load writer")
+            .expect("eligible");
+        let reader_index = group
+            .load_image(&reader)
+            .expect("load reader")
+            .expect("eligible");
+        seen_clear();
+        let writer_entry = group.main().entry();
+        let reader_entry = group.image(reader_index).entry();
+        // SAFETY: both images are patched and the entries are inside them.
+        unsafe {
+            group.enter(writer_entry);
+            group.enter(reader_entry);
+        }
+        let seen = seen_snapshot();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].1[0], 0xcafe,
+            "TLS written in one image is read coherently from another"
+        );
+        assert_eq!(
+            seen[0].1[1], 7,
+            "x18 written in one image is read coherently from another"
+        );
+        assert_eq!(group.guest_tls(), 0xcafe);
+        assert_eq!(group.guest_x18(), 7);
     }
 
     static CHILD_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
