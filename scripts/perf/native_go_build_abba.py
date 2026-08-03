@@ -86,6 +86,11 @@ DEFAULT_ON_ZERO_OPT_OUT_KEYS = frozenset(
         "CARRICK_DSR_SHARED_RECOVERY_RUNS",
     )
 )
+DEFAULT_OFF_ONE_OPT_IN_KEYS = frozenset(
+    (
+        "CARRICK_DSR_PERSISTENT_STORE",
+    )
+)
 QUAD_METRICS = (
     "cpu_s",
     "cpu_user_s",
@@ -289,6 +294,13 @@ def validate_arm_mode(control: ArmSpec, candidate: ArmSpec) -> str:
         if candidate_environment[key] is None and (
             declared_disable or declared_default_on_opt_out
         ):
+            return "same-binary"
+        declared_default_off_opt_in = (
+            key in DEFAULT_OFF_ONE_OPT_IN_KEYS
+            and control_environment[key] is None
+            and candidate_environment[key] == "1"
+        )
+        if declared_default_off_opt_in:
             return "same-binary"
     raise ValueError(
         "same-binary environments must be equal or one declared variant"
