@@ -830,12 +830,42 @@ impl DirectImage {
     /// The image must be fully patched, and `pc` must be an address inside it.
     pub unsafe fn enter(&self, pc: u64) {
         self.arm_current_thread();
-        // SAFETY: transmuting the mapped, i-cache-invalidated entry point to a
-        // function and calling it. This is a one-way door in M1 (see the
-        // module docs): the guest exits through the handler.
+        // Enter through asm that declares the guest clobbers every
+        // callee-saved register, NOT as a plain `extern "C"` call.
+        //
+        // A C call promises x19-x28 and d8-d15 survive it. No guest promises
+        // anything of the sort - it owns every register, and a fixture as small
+        // as `mov x20, x30` destroys one. Calling the guest as if it were a C
+        // function let the compiler keep live values in those registers across
+        // the call, and the guest silently corrupted them.
+        //
+        // That was invisible on the main thread, where nothing important
+        // happened to live in x20, and fatal on a spawned one, where the
+        // thread's own machinery does: the corruption surfaced far away as
+        // `malloc: pointer being freed was not allocated` on a static address,
+        // and whether it fired at all depended on heap layout. Declaring the
+        // clobbers makes the compiler preserve them, which is exactly what a
+        // gateway does.
+        //
+        // x18 is Darwin's platform register and cannot be named as a clobber;
+        // the kernel rewrites it at every trap return anyway, and tier D
+        // veneers guest x18 to a memory slot rather than keeping it live.
+        // SAFETY: `pc` is inside the patched, i-cache-invalidated mapping.
         unsafe {
-            let entry: extern "C" fn() = std::mem::transmute(pc as usize as *const ());
-            entry();
+            std::arch::asm!(
+                // x19 and x29 cannot be named as clobbers - LLVM reserves both
+                // - so preserve them by hand around the guest.
+                "stp x19, x29, [sp, #-16]!",
+                "blr {entry}",
+                "ldp x19, x29, [sp], #16",
+                entry = in(reg) pc,
+                out("x20") _, out("x21") _, out("x22") _, out("x23") _,
+                out("x24") _, out("x25") _, out("x26") _, out("x27") _,
+                out("x28") _,
+                out("d8") _, out("d9") _, out("d10") _, out("d11") _,
+                out("d12") _, out("d13") _, out("d14") _, out("d15") _,
+                clobber_abi("C"),
+            );
         }
     }
 }
@@ -1498,20 +1528,18 @@ mod tests {
 
     /// A guest must run on a thread that did not load it.
     ///
-    /// `pthread_jit_write_protect_np` is per-thread on Apple Silicon, so the
-    /// loading thread is armed as a side effect and a load-then-enter on ONE
-    /// thread hides whether a pure executor thread works. Every libtest test
-    /// runs on a spawned thread, so this is also the shape the tier-D bridge
-    /// has to survive.
+    /// This failed for a long time, and the cause was not threads at all: the
+    /// guest clobbers callee-saved registers, and `enter` used to call it as a
+    /// plain `extern "C" fn`, which promises x19-x28 and d8-d15 survive. The
+    /// compiler kept live values in those registers across the call and the
+    /// guest destroyed them. Nothing important happened to live in x20 on the
+    /// main thread; on a spawned thread the thread's own machinery does, so the
+    /// damage surfaced far away as a malloc error on a static address, and
+    /// whether it fired depended on heap layout.
+    ///
+    /// Every libtest test runs on a spawned thread, which is why this shape is
+    /// the one the tier-D bridge has to survive.
     #[test]
-    #[ignore = "KNOWN FAILURE, tier D blocker: a guest loaded on one thread and \
-                entered from another aborts (signal 6, with a malloc error \
-                reported earlier in the same shape), even with the executing \
-                thread armed via `arm_current_thread`. Suppressing the drop does \
-                NOT help, so the corruption happens during the RUN, not teardown. \
-                Kept runnable (`cargo test -- --ignored guest_runs_on_a_thread`) \
-                because every libtest test runs on a spawned thread, which is \
-                exactly why the dispatcher bridge could not be wired."]
     fn guest_runs_on_a_thread_that_did_not_load_it() {
         static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         extern "C" fn count(ctx: *mut GuestContext) {
