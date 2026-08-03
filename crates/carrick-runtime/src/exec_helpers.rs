@@ -322,6 +322,10 @@ pub(crate) fn forked_child_exit(
     );
     flush_fork_child_fd(1, stdout_buf.as_ref());
     flush_fork_child_fd(2, stderr_buf.as_ref());
+    // Untraced lifecycle gauge: last stamp this image can write; the delta to
+    // the parent's `WaitReaped` is host kernel address-space teardown plus
+    // parent wake latency.
+    crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::PreHostExit);
     unsafe { libc::_exit(code) };
 }
 

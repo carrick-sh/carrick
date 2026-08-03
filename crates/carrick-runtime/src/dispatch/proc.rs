@@ -3330,6 +3330,9 @@ impl SyscallDispatcher {
             // phase (the original kill12/kill10 failure mode).
             let terminal_reap = libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status);
             if terminal_reap {
+                // Untraced lifecycle gauge (CARRICK_EXEC_STAMPS): closes the
+                // child's `PreHostExit` window from the parent side.
+                crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::WaitReaped);
                 this.publish_terminal_child_exit_signal(result);
                 // The child host process is now dead; tear down its leaked host VM
                 // node (bhyve's named /dev/vmm/carrick-<pid>-* persists past the

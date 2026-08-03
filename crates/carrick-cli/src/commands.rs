@@ -475,6 +475,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     println!("native_self_reexec_pid_preserved={}", before == after);
                 }
                 carrick_runtime::NativeSelfReexecOutcome::GuestExit(code) => {
+                    // Untraced lifecycle gauge: an exec'd guest child exits
+                    // HERE, not via `forked_child_exit` — the runtime has
+                    // fully unwound (dispatcher/memory drops included), so
+                    // this is the last stamp before the host process dies.
+                    carrick_runtime::exec_stamps::stamp(
+                        carrick_runtime::exec_stamps::ExecStampPhase::PreHostExit,
+                    );
                     std::process::exit(code);
                 }
             }

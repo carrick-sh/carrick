@@ -1,4 +1,4 @@
-//! Env-gated monotonic stamps for the native self-reexec fixed-cost window.
+//! Env-gated monotonic stamps for the native guest process lifecycle.
 //!
 //! The PID-preserving host self-reexec (`native_exec_capsule`) pays a fixed
 //! per-exec cost that the USDT lifecycle probes can only measure while a
@@ -9,6 +9,16 @@
 //! `CARRICK_EXEC_STAMPS=<path>` set, each phase appends one
 //! `EXECSTAMP1|pid=<pid>|phase=<name>|mono_ns=<ns>` line to `<path>`.
 //!
+//! Beyond the exec chain itself, the gauge covers the surrounding
+//! fork/exit/reap lifecycle (the 2026-08-03 exec-window attribution needed
+//! the wall between one guest exec and the next fully partitioned): the
+//! parent's fork dispatch (`CloneEnter`/`CloneParentReturn`), the child's
+//! first post-fork instruction (`ForkChildStart`), the exiting image's
+//! teardown (`ExitBegin`/`PreHostExit`), and the parent's terminal reap
+//! (`WaitReaped`). A `pid`'s lines therefore interleave across images and
+//! roles; consumers must key on (pid, phase) pairs, not assume one chain per
+//! pid.
+//!
 //! `CLOCK_MONOTONIC_RAW` is boot-stable and survives `execve`, so deltas
 //! between the pre-exec image and the post-exec image of the same pid are
 //! meaningful; a single `O_APPEND` write per stamp keeps concurrent guest
@@ -16,11 +26,19 @@
 
 use std::io::Write;
 
-/// Ordered phases of one fork-child guest `execve` under the native backend.
-/// An enum rather than free strings so the producer and any parser agree on
-/// the vocabulary (typed-domain rule: no stringly-typed phase names).
+/// Ordered phases of one guest process lifecycle under the native backend:
+/// fork, execve chain, exit, reap. An enum rather than free strings so the
+/// producer and any parser agree on the vocabulary (typed-domain rule: no
+/// stringly-typed phase names).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecStampPhase {
+    /// Parent image: guest fork/clone dispatch entered (`handle_native_fork`).
+    CloneEnter,
+    /// Child image: first stamp after `fork(2)` returned 0, before any
+    /// post-fork runtime repair.
+    ForkChildStart,
+    /// Parent image: fork dispatch returns the child pid to the guest.
+    CloneParentReturn,
     /// Old image: guest `execve` dispatch entered (fork-child path).
     ExecveDispatch,
     /// Old image: capsule snapshot/preparation begins.
@@ -43,11 +61,24 @@ pub enum ExecStampPhase {
     /// signal plumbing, thread runtime); the next work is the thread
     /// translator and the entry block's translation.
     RuntimeReady,
+    /// Exiting image: `exit_group` (or last-thread `exit`) dispatch reached;
+    /// everything from here to `PreHostExit` is carrick's own process
+    /// teardown (profile finalize, censuses, exit-status publication).
+    ExitBegin,
+    /// Exiting image: immediately before the host `_exit(2)` of a forked
+    /// guest child. The delta to the parent's `WaitReaped` is host kernel
+    /// address-space teardown plus parent wake latency.
+    PreHostExit,
+    /// Parent image: `wait4` completed a terminal reap of a child.
+    WaitReaped,
 }
 
 impl ExecStampPhase {
     fn name(self) -> &'static str {
         match self {
+            Self::CloneEnter => "clone-enter",
+            Self::ForkChildStart => "fork-child-start",
+            Self::CloneParentReturn => "clone-parent-return",
             Self::ExecveDispatch => "execve-dispatch",
             Self::CapsulePrepare => "capsule-prepare",
             Self::PreExec => "pre-exec",
@@ -57,6 +88,9 @@ impl ExecStampPhase {
             Self::DispatcherReady => "dispatcher-ready",
             Self::ImageMapped => "image-mapped",
             Self::RuntimeReady => "runtime-ready",
+            Self::ExitBegin => "exit-begin",
+            Self::PreHostExit => "pre-host-exit",
+            Self::WaitReaped => "wait-reaped",
         }
     }
 }
