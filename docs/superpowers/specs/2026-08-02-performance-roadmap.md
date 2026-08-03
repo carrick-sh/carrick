@@ -92,15 +92,28 @@ Nothing real runs on tier D yet. In order:
    real `libc.so.6` through the dispatcher's VFS and stops, NAMED, at
    `mmap(PROT_EXEC, fd)` — which is item 5's scan+patch boundary (plus
    guest-fd → host-fd translation for the file-backed data mappings).
-4. **Threads.** The slots moved from per-image to per-LOAD-GROUP (the
-   dynamic-linking seam); threads share a load group but need them
-   per-thread on top.
-5. **fork/exec, signals, guest-created executable pages** (scan+patch at the
-   intercepted `mmap`/`mprotect` PROT_EXEC boundary; RWX-without-flip falls
-   back to tier T).
+4. **Threads — boundary named, veneer deliberately not attempted.** Slots
+   are per-load-group; a thread-creating clone (`CLONE_VM|CLONE_THREAD`)
+   fails CLOSED with the boundary pinned red-first. The per-thread veneer
+   (Darwin TSD via EL0-readable `TPIDRRO_EL0`) is the Phase-2 remainder;
+   landing it unsoundly would regress the verified single-threaded gates.
+5. **Guest-created executable pages — DONE; fork/exec/signal orchestration
+   remains.** `mmap(PROT_EXEC, fd)` routes through the same scan+patch
+   pipeline with two lowerings (whole-span MAP_JIT windows, and MAP_FIXED
+   plain-anon text with a separate `IslandArena` for modern glibc's
+   map-over-reservation), `mprotect(PROT_EXEC)` is approved only inside
+   still-patched mappings, and everything unproven fails closed to tier T.
+   Live: real ld-2.28 maps real libc-2.28 through the window pipeline. The
+   x18 veneers became sound for pc-relative and operand-attribute shapes on
+   the way (two silent-GNU-hash-corruption bugs found by lldb on the live
+   guest).
 
-**Gate:** `/bin/dash -c 'echo hi'` end to end, then `python3 -c`, then the full
-native conformance smoke green with tier D forced on for eligible images.
+**Gate:** `/bin/dash -c 'echo hi'` — **MET** (real debian dash + ld.so +
+libc on tier D, exit 0, `hi`). `python3 -I -S -c 'print(1)'` — **MET
+single-threaded** (real CPython 3.12, ~436 syscalls). Remaining for
+Phase 2: the native conformance smoke green with tier D forced on (the
+gate fixtures under `target/tierd-live` skip loudly and need harness
+wiring), and the item-4 veneer for thread-creating guests.
 **Worth:** zero directly. Everything in Phase 2 depends on it.
 
 ### Phase 2 — tier D default-on (the compute win)
