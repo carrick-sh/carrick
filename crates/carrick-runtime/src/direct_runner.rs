@@ -290,6 +290,25 @@ impl IdentityBrk {
     const RESERVE: usize = 1 << 30;
 }
 
+/// Placement hint cursor for the identity tier's non-fixed anonymous
+/// mappings.
+///
+/// Without a hint the kernel packs guest reservations into the crowded
+/// region near the images and dyld's neighbors, and a `MAP_FIXED` exec
+/// window landing there can find NO free island-arena slot within the
+/// ±128 MiB `b` range — observed as a load- and layout-probabilistic
+/// fail-closed refusal (`island for site 0x106c50000 out of ±128 MiB branch
+/// range`, ~1/30 runs of the CPython print gate). Hinting reservations into
+/// sparse space keeps the arena neighborhood free. This is a HINT: without
+/// `MAP_FIXED` the kernel relocates when the range is occupied, so the
+/// fallback is exactly the unhinted behavior — never a clobber, never an
+/// error.
+///
+/// The base is 32 GiB: probed on this host, hints below 0x8000000000 are
+/// relocated into the default anon area (0x7000000000 — exactly the crowd
+/// to avoid) while 0x8000000000 and far beyond are honored.
+static ANON_HINT_CURSOR: AtomicU64 = AtomicU64::new(0x80_0000_0000);
+
 /// One plain anonymous PRIVATE RW mapping this runner created for the guest,
 /// tracked so `mremap` can be serviced with PROOF instead of guesswork: the
 /// identity tier keeps no general mapping table, and moving or growing a
@@ -535,11 +554,22 @@ impl DirectRunner {
                 if flags.contains(LinuxMmapFlags::FIXED) {
                     host_flags |= libc::MAP_FIXED;
                 }
+                // A guest that names no address gets a SPARSE-space hint so
+                // later MAP_FIXED exec windows over the reservation can place
+                // their island arena within `b` range (see ANON_HINT_CURSOR).
+                // The address stays untyped Linux semantics: any placement is
+                // a valid non-fixed mmap result.
+                let request_addr = if a0 == 0 && !flags.contains(LinuxMmapFlags::FIXED) {
+                    ANON_HINT_CURSOR
+                        .fetch_add(a1.next_multiple_of(HOST_PAGE_SIZE), Ordering::Relaxed)
+                } else {
+                    a0
+                };
                 // SAFETY: identity tier — the guest's address space IS this
                 // process's, so a host mmap is the exact semantic.
                 let mapped = unsafe {
                     libc::mmap(
-                        a0 as usize as *mut libc::c_void,
+                        request_addr as usize as *mut libc::c_void,
                         a1 as usize,
                         host_prot(prot),
                         host_flags,
