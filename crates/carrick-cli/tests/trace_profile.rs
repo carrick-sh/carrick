@@ -649,6 +649,26 @@ fn indirect_profile_aggregates_sources_pairs_and_exact_total_once() {
 }
 
 #[test]
+fn indirect_profile_is_self_bounded_and_defines_its_completion_flag() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/dtrace/dsr-indirect.d");
+    let script = std::fs::read_to_string(path).unwrap();
+
+    assert!(
+        script.contains("tick-1s"),
+        "the in-process consumer waits for custom profiles to exit themselves"
+    );
+    assert!(
+        script.contains("/secs >= 60/"),
+        "the indirect profile must bound a wedged target"
+    );
+    assert!(
+        script.contains("bounded = 1;"),
+        "the timeout path must define the completion flag consumed in END"
+    );
+}
+
+#[test]
 fn fork_profile_pairs_repair_reset_and_first_prepare_latency() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/dtrace/dsr-fork.d");
