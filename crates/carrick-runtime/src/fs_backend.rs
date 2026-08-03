@@ -184,6 +184,16 @@ pub trait FsBackend: Send + Sync {
         })
     }
 
+    /// Open the regular file at `path` read-only as a REAL host fd, using
+    /// exactly the resolution `file_contents` uses (so the accept set and the
+    /// followed symlinks are identical). `None` for backends without host
+    /// files, for missing paths, or for non-file entries. The execve path
+    /// maps guest images MAP_PRIVATE straight from this fd instead of
+    /// materializing their bytes per exec.
+    fn open_file_readonly(&self, _path: &str) -> Option<std::fs::File> {
+        None
+    }
+
     /// Return a cheap shared snapshot for an in-memory file when the backend
     /// can expose one without materializing the whole payload.
     fn shared_file_contents(&self, _path: &str) -> Option<SharedFileContents> {
@@ -4006,6 +4016,17 @@ impl FsBackend for HostFsBackend {
         let mut bounded = std::io::Read::take(file, max as u64);
         bounded.read_to_end(&mut buf).ok()?;
         Some(buf)
+    }
+
+    fn open_file_readonly(&self, path: &str) -> Option<std::fs::File> {
+        // Same contained resolution as `file_contents`/`file_head`; the fd is
+        // handed to the execve image mapper, so only REGULAR files qualify.
+        let normalized = self.resolve_following(path)?;
+        let rel = Self::rel_path(&normalized)?;
+        let (dir, at_rel) = self.at(rel).ok()?;
+        let file = dir.open(&at_rel).ok()?.into_std();
+        let metadata = file.metadata().ok()?;
+        metadata.is_file().then_some(file)
     }
 
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {

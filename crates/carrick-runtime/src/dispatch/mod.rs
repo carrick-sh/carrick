@@ -2846,6 +2846,17 @@ impl SyscallDispatcher {
             })
     }
 
+    /// Open the exec target as a REAL host fd when the overlay backend can
+    /// serve one (`--fs host`; the only backend in a default build). The
+    /// native execve path maps the image MAP_PRIVATE straight from this fd —
+    /// same accept set and symlink policy as `read_exec_file`'s overlay layer,
+    /// so a path this declines simply keeps the byte-materializing load. The
+    /// overlay is consulted FIRST in `read_exec_file` too, so when both this
+    /// and the layered read answer, they answer from the same inode.
+    pub fn open_exec_host_file(&self, path: &str) -> Option<std::fs::File> {
+        self.fs.rootfs_vfs.overlay.open_file_readonly(path)
+    }
+
     pub fn stdout(&self) -> Vec<u8> {
         self.io.stdout.lock().clone()
     }

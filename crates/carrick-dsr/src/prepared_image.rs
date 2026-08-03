@@ -133,6 +133,76 @@ impl NativeRelativeRelocation {
     }
 }
 
+/// Wire form of one executable-file-backed region window.
+///
+/// The region's initialized bytes are exactly
+/// `exec_file[file_offset .. file_offset + file_bytes)` mapped MAP_PRIVATE at
+/// the region start, with `[0, zero_lead)` and `[file_bytes, page-end)` zeroed
+/// after mapping (the loader's zero lead before `p_vaddr` and Linux's padzero
+/// tail past `p_filesz`), and any remaining region extent mapped anonymous.
+/// `file_offset` is host-page aligned by construction (the producer only emits
+/// a window when `p_vaddr ≡ p_offset (mod host page)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePreparedExecWindowV1 {
+    file_offset: PreparedArtifactOffset,
+    file_bytes: PreparedGuestLen,
+    zero_lead: PreparedGuestOffset,
+}
+
+impl NativePreparedExecWindowV1 {
+    pub fn file_offset(&self) -> u64 {
+        self.file_offset.get()
+    }
+
+    pub fn file_bytes(&self) -> u64 {
+        self.file_bytes.get()
+    }
+
+    pub fn zero_lead(&self) -> u64 {
+        self.zero_lead.get()
+    }
+}
+
+/// Where a prepared region's initialized bytes come from at map time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativePreparedRegionBackingV1 {
+    /// The sparse prepared artifact window `[artifact_offset, +extent)`.
+    Artifact,
+    /// A window of the transported guest-executable fd itself — no artifact
+    /// bytes are written or hashed for this region.
+    ExecutableFile(NativePreparedExecWindowV1),
+}
+
+/// Identity of the transported guest-executable fd, verified on resume the
+/// same way the artifact fd is (device/inode/size + transit fd flags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedExecutableFileV1 {
+    pub file_fd: RawFd,
+    pub original_host_fd_flags: i32,
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+}
+
+/// Producer-side description of a region window into the guest executable,
+/// in raw units; converted to (and validated as) the typed wire form by
+/// [`prepare`]. `file_offset` must be host-page aligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedExecRegionWindow {
+    pub file_offset: u64,
+    pub file_bytes: u64,
+    pub zero_lead: u64,
+}
+
+/// Producer-side executable backing input to [`prepare`]: the opened guest
+/// executable plus one optional window per image region (parallel to
+/// `image.regions()`).
+#[derive(Debug)]
+pub struct PreparedExecutableBacking {
+    pub file: File,
+    pub windows: Vec<Option<PreparedExecRegionWindow>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativePreparedRegionV1 {
     guest_start: PreparedGuestVa,
@@ -141,6 +211,7 @@ pub struct NativePreparedRegionV1 {
     shared: bool,
     artifact_offset: PreparedArtifactOffset,
     artifact_extent: PreparedGuestLen,
+    backing: NativePreparedRegionBackingV1,
 }
 
 impl NativePreparedRegionV1 {
@@ -181,10 +252,19 @@ pub struct NativePreparedImageV1 {
     ro_spans: Vec<NativePreparedRoSpanV1>,
     relocations: Vec<NativeRelativeRelocation>,
     written_byte_count: u64,
+    /// Present exactly when at least one region is
+    /// [`NativePreparedRegionBackingV1::ExecutableFile`]-backed.
+    executable_file: Option<PreparedExecutableFileV1>,
     digest: [u8; 32],
 }
 
 impl NativePreparedImageV1 {
+    /// Whether any region maps straight from the transported guest-executable
+    /// fd (vs the copy-materialized artifact alone).
+    pub fn maps_from_executable_file(&self) -> bool {
+        self.executable_file.is_some()
+    }
+
     // `test-hooks` (not bare `cfg(test)`): driven cross-crate by the
     // runtime's native test module — see `carrick_dsr::test_hooks`.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -198,6 +278,9 @@ impl NativePreparedImageV1 {
 pub struct PreparedImageArtifact {
     pub record: NativePreparedImageV1,
     pub file: File,
+    /// Keeps the guest-executable fd alive for the execve transport whenever
+    /// any region is executable-file-backed.
+    pub executable_file: Option<File>,
 }
 
 impl PreparedImageArtifact {
@@ -208,12 +291,34 @@ impl PreparedImageArtifact {
         );
         (self.record.artifact_fd, self.record.original_host_fd_flags)
     }
+
+    pub fn transport_executable_fd_snapshot(&self) -> Option<(RawFd, i32)> {
+        let executable = self.record.executable_file.as_ref()?;
+        debug_assert_eq!(
+            self.executable_file
+                .as_ref()
+                .map(std::os::fd::AsRawFd::as_raw_fd),
+            Some(executable.file_fd)
+        );
+        Some((executable.file_fd, executable.original_host_fd_flags))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedImageFileBacking {
     pub artifact_offset: PreparedArtifactOffset,
     pub artifact_extent: PreparedGuestLen,
+}
+
+/// Resolved per-region backing handed to the mapping layer after
+/// [`validate_for_resume`]. Extent invariants are already checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedRegionBackingResolved {
+    Artifact(PreparedImageFileBacking),
+    ExecutableFile {
+        window: NativePreparedExecWindowV1,
+        artifact_extent: PreparedGuestLen,
+    },
 }
 
 #[derive(Debug)]
@@ -223,15 +328,22 @@ pub struct PreparedImageFileBacking {
 // macos-gated with the self-reexec transport that feeds it.
 pub struct ValidatedPreparedImage {
     pub file: File,
+    /// The validated guest-executable fd; `Some` exactly when any backing is
+    /// [`PreparedRegionBackingResolved::ExecutableFile`].
+    pub executable_file: Option<File>,
     pub host_page_size: u64,
     pub image: AddressSpace,
-    pub backings: Vec<PreparedImageFileBacking>,
+    pub backings: Vec<PreparedRegionBackingResolved>,
     pub relocations: Vec<NativeRelativeRelocation>,
 }
 
 impl ValidatedPreparedImage {
     pub fn file_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+
+    pub fn executable_file_fd(&self) -> Option<RawFd> {
+        self.executable_file.as_ref().map(|file| file.as_raw_fd())
     }
 
     pub fn host_page_size(&self) -> u64 {
@@ -249,20 +361,37 @@ impl ValidatedPreparedImage {
 pub fn resume_record_for_test(
     artifact: PreparedImageArtifact,
 ) -> Result<NativePreparedImageV1, NativePreparedImageError> {
-    let mut record = artifact.record.clone();
-    let inherited = unsafe { libc::fcntl(artifact.file.as_raw_fd(), libc::F_DUPFD, 0) };
-    if inherited < 0 {
-        return Err(io_error("duplicate-test-artifact-fd"));
+    fn duplicate_transit_fd(
+        file: &File,
+        original_flags: i32,
+    ) -> Result<RawFd, NativePreparedImageError> {
+        let inherited = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 0) };
+        if inherited < 0 {
+            return Err(io_error("duplicate-test-artifact-fd"));
+        }
+        let transit_flags = original_flags & !libc::FD_CLOEXEC;
+        if unsafe { libc::fcntl(inherited, libc::F_SETFD, transit_flags) } != 0 {
+            let source = std::io::Error::last_os_error();
+            unsafe { libc::close(inherited) };
+            return Err(NativePreparedImageError::Io {
+                stage: "prepare-test-artifact-fd-flags",
+                source,
+            });
+        }
+        Ok(inherited)
     }
-    record.artifact_fd = inherited;
-    let transit_flags = record.original_host_fd_flags & !libc::FD_CLOEXEC;
-    if unsafe { libc::fcntl(inherited, libc::F_SETFD, transit_flags) } != 0 {
-        let source = std::io::Error::last_os_error();
-        unsafe { libc::close(inherited) };
-        return Err(NativePreparedImageError::Io {
-            stage: "prepare-test-artifact-fd-flags",
-            source,
-        });
+
+    let mut record = artifact.record.clone();
+    record.artifact_fd = duplicate_transit_fd(&artifact.file, record.original_host_fd_flags)?;
+    if let Some(executable) = record.executable_file.as_mut() {
+        let file = artifact.executable_file.as_ref().ok_or_else(|| {
+            file_identity_error(
+                "test-executable-owner",
+                executable.file_fd,
+                "record names an executable fd the artifact does not own".to_owned(),
+            )
+        })?;
+        executable.file_fd = duplicate_transit_fd(file, executable.original_host_fd_flags)?;
     }
     Ok(record)
 }
@@ -278,7 +407,7 @@ pub fn validate_artifact_for_test(
 
 #[derive(Debug)]
 pub enum PreparedImageDisposition {
-    Prepared(PreparedImageArtifact),
+    Prepared(Box<PreparedImageArtifact>),
     Ineligible(PreparedImageIneligibleReason),
 }
 
@@ -410,11 +539,13 @@ pub fn prepare(
     image: &AddressSpace,
     relocations: &[NativeRelativeRelocation],
     host_page_size: u64,
+    executable: Option<PreparedExecutableBacking>,
 ) -> Result<PreparedImageDisposition, NativePreparedImageError> {
     prepare_with_limits(
         image,
         relocations,
         host_page_size,
+        executable,
         PreparedImageLimits::v1(),
     )
 }
@@ -423,6 +554,7 @@ fn prepare_with_limits(
     image: &AddressSpace,
     relocations: &[NativeRelativeRelocation],
     host_page_size: u64,
+    executable: Option<PreparedExecutableBacking>,
     limits: PreparedImageLimits,
 ) -> Result<PreparedImageDisposition, NativePreparedImageError> {
     if image.regions().len() > limits.max_regions {
@@ -450,8 +582,33 @@ fn prepare_with_limits(
         }
     }
 
+    // The executable backing is usable only when its window list is parallel
+    // to the region list and the file is a regular file; the window bounds
+    // are validated against its live size below.
+    let executable = match executable {
+        Some(backing) => {
+            if backing.windows.len() != image.regions().len() {
+                return Err(validation(
+                    "executable-window-arity",
+                    None,
+                    backing.windows.len() as u64,
+                ));
+            }
+            let identity = FileIdentity::for_fd(backing.file.as_raw_fd())?
+                .require_regular(backing.file.as_raw_fd())?;
+            Some((backing, identity))
+        }
+        None => None,
+    };
+    let region_window = |index: usize| -> Option<PreparedExecRegionWindow> {
+        executable
+            .as_ref()
+            .and_then(|(backing, _)| backing.windows.get(index).copied().flatten())
+    };
+
     let mut artifact_size = 0_u64;
     let mut regions = Vec::with_capacity(image.regions().len());
+    let mut any_executable_window = false;
     for (index, region) in image.regions().iter().enumerate() {
         if !region.start.is_multiple_of(host_page_size) || region.start >= region.end {
             return Ok(ineligible_limit(
@@ -460,12 +617,84 @@ fn prepare_with_limits(
                 host_page_size,
             ));
         }
-        artifact_size = align_up(artifact_size, host_page_size, "artifact-region-offset")?;
         let region_len = region
             .end
             .checked_sub(region.start)
             .ok_or_else(|| validation("region-length", Some(index), region.end))?;
         let extent = align_up(region_len, host_page_size, "artifact-region-extent")?;
+        let guest_start = PreparedGuestVa::new(region.start)
+            .ok_or_else(|| validation("region-start-representation", Some(index), region.start))?;
+        let guest_end = PreparedGuestVa::new(region.end)
+            .ok_or_else(|| validation("region-end-representation", Some(index), region.end))?;
+        let artifact_extent = PreparedGuestLen::new(extent)
+            .ok_or_else(|| validation("artifact-extent-representation", Some(index), extent))?;
+
+        if let Some(window) = region_window(index) {
+            // An executable-file-backed region consumes NO artifact space:
+            // its bytes come straight from the guest executable at map time.
+            let (_, identity) = executable
+                .as_ref()
+                .ok_or_else(|| validation("executable-window-without-file", Some(index), 0))?;
+            let window_end = window
+                .file_offset
+                .checked_add(window.file_bytes)
+                .ok_or_else(|| {
+                    validation(
+                        "executable-window-overflow",
+                        Some(index),
+                        window.file_offset,
+                    )
+                })?;
+            if !window.file_offset.is_multiple_of(host_page_size)
+                || window.file_bytes == 0
+                || window.zero_lead > window.file_bytes
+                || window.file_bytes > extent
+                || window_end > identity.size
+            {
+                return Ok(ineligible_limit(
+                    "executable-window-bounds",
+                    window.file_offset,
+                    identity.size,
+                ));
+            }
+            let wire_window = NativePreparedExecWindowV1 {
+                file_offset: PreparedArtifactOffset::new(window.file_offset).ok_or_else(|| {
+                    validation(
+                        "executable-window-offset-representation",
+                        Some(index),
+                        window.file_offset,
+                    )
+                })?,
+                file_bytes: PreparedGuestLen::new(window.file_bytes).ok_or_else(|| {
+                    validation(
+                        "executable-window-bytes-representation",
+                        Some(index),
+                        window.file_bytes,
+                    )
+                })?,
+                zero_lead: PreparedGuestOffset::new(window.zero_lead).ok_or_else(|| {
+                    validation(
+                        "executable-window-lead-representation",
+                        Some(index),
+                        window.zero_lead,
+                    )
+                })?,
+            };
+            any_executable_window = true;
+            regions.push(NativePreparedRegionV1 {
+                guest_start,
+                guest_end,
+                permissions: permissions_to_wire(region.perms),
+                shared: region.shared,
+                artifact_offset: PreparedArtifactOffset::new(0)
+                    .ok_or_else(|| validation("artifact-offset-representation", Some(index), 0))?,
+                artifact_extent,
+                backing: NativePreparedRegionBackingV1::ExecutableFile(wire_window),
+            });
+            continue;
+        }
+
+        artifact_size = align_up(artifact_size, host_page_size, "artifact-region-offset")?;
         let next_size = artifact_size
             .checked_add(extent)
             .ok_or_else(|| validation("artifact-size-overflow", Some(index), extent))?;
@@ -476,15 +705,9 @@ fn prepare_with_limits(
                 limits.max_artifact_size,
             ));
         }
-        let guest_start = PreparedGuestVa::new(region.start)
-            .ok_or_else(|| validation("region-start-representation", Some(index), region.start))?;
-        let guest_end = PreparedGuestVa::new(region.end)
-            .ok_or_else(|| validation("region-end-representation", Some(index), region.end))?;
         let artifact_offset = PreparedArtifactOffset::new(artifact_size).ok_or_else(|| {
             validation("artifact-offset-representation", Some(index), artifact_size)
         })?;
-        let artifact_extent = PreparedGuestLen::new(extent)
-            .ok_or_else(|| validation("artifact-extent-representation", Some(index), extent))?;
         regions.push(NativePreparedRegionV1 {
             guest_start,
             guest_end,
@@ -492,6 +715,7 @@ fn prepare_with_limits(
             shared: region.shared,
             artifact_offset,
             artifact_extent,
+            backing: NativePreparedRegionBackingV1::Artifact,
         });
         artifact_size = next_size;
     }
@@ -500,6 +724,9 @@ fn prepare_with_limits(
     let mut payloads = Vec::<Vec<u8>>::new();
     let mut written_byte_count = 0_u64;
     for (region_index, (region, wire_region)) in image.regions().iter().zip(&regions).enumerate() {
+        if !matches!(wire_region.backing, NativePreparedRegionBackingV1::Artifact) {
+            continue;
+        }
         let window = native_region_copy_window(region, image.initial_stack_pointer());
         let page_size = usize::try_from(host_page_size)
             .map_err(|_| validation("host-page-usize", None, host_page_size))?;
@@ -631,6 +858,22 @@ fn prepare_with_limits(
             })
         })
         .collect::<Result<Vec<_>, NativePreparedImageError>>()?;
+    // The record names the executable fd only when a window consumed it; a
+    // provided-but-unused backing is dropped here (its fd must not cross the
+    // execve boundary for nothing).
+    let executable_file_record = if any_executable_window {
+        executable
+            .as_ref()
+            .map(|(backing, identity)| PreparedExecutableFileV1 {
+                file_fd: backing.file.as_raw_fd(),
+                original_host_fd_flags: identity.fd_flags,
+                device: identity.device,
+                inode: identity.inode,
+                size: identity.size,
+            })
+    } else {
+        None
+    };
     let mut record = NativePreparedImageV1 {
         artifact_fd: std::os::fd::AsRawFd::as_raw_fd(&file),
         original_host_fd_flags: identity.fd_flags,
@@ -647,6 +890,7 @@ fn prepare_with_limits(
         ro_spans,
         relocations: relocations.to_vec(),
         written_byte_count,
+        executable_file: executable_file_record,
         digest: [0; 32],
     };
     validate_record(&record, &identity)?;
@@ -664,10 +908,18 @@ fn prepare_with_limits(
     let final_identity =
         FileIdentity::for_fd(record.artifact_fd)?.require_regular(record.artifact_fd)?;
     validate_record(&record, &final_identity)?;
-    Ok(PreparedImageDisposition::Prepared(PreparedImageArtifact {
-        record,
-        file,
-    }))
+    let executable_file = if any_executable_window {
+        executable.map(|(backing, _)| backing.file)
+    } else {
+        None
+    };
+    Ok(PreparedImageDisposition::Prepared(Box::new(
+        PreparedImageArtifact {
+            record,
+            file,
+            executable_file,
+        },
+    )))
 }
 
 pub fn validate_for_resume(
@@ -693,6 +945,56 @@ pub fn validate_for_resume(
     let duplicate_identity = FileIdentity::for_fd(duplicate)?.require_regular(duplicate)?;
     verify_identity_fields(&record, &duplicate_identity, duplicate, true)?;
     drop(inherited);
+
+    // The transported guest-executable fd (when present) gets the exact same
+    // treatment as the artifact fd: dup to an owned CLOEXEC fd, verify transit
+    // flags and identity against the record, close the inherited number. Its
+    // CONTENT is deliberately not hashed — the fd pins the inode the parent
+    // opened and mapped windows read through it, matching Linux's own execve
+    // semantics where the image is whatever the opened file contains.
+    let executable_file = match record.executable_file.as_ref() {
+        Some(executable) => {
+            let inherited = RawFdGuard(executable.file_fd);
+            let duplicate = unsafe { libc::fcntl(inherited.0, libc::F_DUPFD_CLOEXEC, 0) };
+            if duplicate < 0 {
+                return Err(io_error("duplicate-executable-fd"));
+            }
+            let file = unsafe { File::from_raw_fd(duplicate) };
+            let inherited_flags =
+                fd_flags_for_fd(inherited.0, "get-inherited-executable-fd-flags")?;
+            let expected_transit_flags = executable.original_host_fd_flags & !libc::FD_CLOEXEC;
+            if inherited_flags != expected_transit_flags {
+                return Err(file_identity_error(
+                    "executable-transit-fd-flags",
+                    inherited.0,
+                    format!("expected=0x{expected_transit_flags:x}, actual=0x{inherited_flags:x}"),
+                ));
+            }
+            let identity = FileIdentity::for_fd(duplicate)?.require_regular(duplicate)?;
+            if identity.device != executable.device
+                || identity.inode != executable.inode
+                || identity.size != executable.size
+            {
+                return Err(file_identity_error(
+                    "executable-identity",
+                    duplicate,
+                    format!(
+                        "expected dev={} ino={} size={}; actual dev={} ino={} size={}",
+                        executable.device,
+                        executable.inode,
+                        executable.size,
+                        identity.device,
+                        identity.inode,
+                        identity.size
+                    ),
+                ));
+            }
+            drop(inherited);
+            Some(file)
+        }
+        None => None,
+    };
+
     validate_record(&record, &duplicate_identity)?;
     let actual_digest = digest_with_file_payload(&record, &file)?;
     if actual_digest != record.digest {
@@ -733,13 +1035,24 @@ pub fn validate_for_resume(
     let backings = record
         .regions
         .iter()
-        .map(|region| PreparedImageFileBacking {
-            artifact_offset: region.artifact_offset,
-            artifact_extent: region.artifact_extent,
+        .map(|region| match region.backing {
+            NativePreparedRegionBackingV1::Artifact => {
+                PreparedRegionBackingResolved::Artifact(PreparedImageFileBacking {
+                    artifact_offset: region.artifact_offset,
+                    artifact_extent: region.artifact_extent,
+                })
+            }
+            NativePreparedRegionBackingV1::ExecutableFile(window) => {
+                PreparedRegionBackingResolved::ExecutableFile {
+                    window,
+                    artifact_extent: region.artifact_extent,
+                }
+            }
         })
         .collect();
     Ok(ValidatedPreparedImage {
         file,
+        executable_file,
         host_page_size: record.host_page_size,
         image,
         backings,
@@ -824,7 +1137,8 @@ fn validate_record(
     }
 
     let mut previous_guest_end = 0_u64;
-    let mut previous_artifact_end = 0_u64;
+    let mut previous_artifact_end: Option<u64> = None;
+    let mut any_executable_region = false;
     for (index, region) in record.regions.iter().enumerate() {
         let start = region.guest_start.get();
         let end = region.guest_end.get();
@@ -839,27 +1153,73 @@ fn validate_record(
         let region_len = end
             .checked_sub(start)
             .ok_or_else(|| validation("region-guest-length", Some(index), end))?;
-        let offset = region.artifact_offset.get();
         let extent = region.artifact_extent.get();
-        let artifact_end = offset
-            .checked_add(extent)
-            .ok_or_else(|| validation("region-artifact-overflow", Some(index), offset))?;
-        if PreparedArtifactOffset::new(offset).is_none()
-            || PreparedGuestLen::new(extent).is_none()
-            || !offset.is_multiple_of(record.host_page_size)
+        if PreparedGuestLen::new(extent).is_none()
             || !extent.is_multiple_of(record.host_page_size)
             || extent != align_up(region_len, record.host_page_size, "region-extent-check")?
-            || artifact_end > record.artifact_size
-            || (index != 0 && offset < previous_artifact_end)
         {
-            return Err(validation("region-artifact-extent", Some(index), offset));
+            return Err(validation("region-artifact-extent", Some(index), extent));
+        }
+        match region.backing {
+            NativePreparedRegionBackingV1::Artifact => {
+                let offset = region.artifact_offset.get();
+                let artifact_end = offset
+                    .checked_add(extent)
+                    .ok_or_else(|| validation("region-artifact-overflow", Some(index), offset))?;
+                if PreparedArtifactOffset::new(offset).is_none()
+                    || !offset.is_multiple_of(record.host_page_size)
+                    || artifact_end > record.artifact_size
+                    || previous_artifact_end.is_some_and(|previous| offset < previous)
+                {
+                    return Err(validation("region-artifact-extent", Some(index), offset));
+                }
+                previous_artifact_end = Some(artifact_end);
+            }
+            NativePreparedRegionBackingV1::ExecutableFile(window) => {
+                let executable = record
+                    .executable_file
+                    .as_ref()
+                    .ok_or_else(|| validation("executable-window-without-file", Some(index), 0))?;
+                let window_end = window
+                    .file_offset
+                    .get()
+                    .checked_add(window.file_bytes.get())
+                    .ok_or_else(|| {
+                        validation(
+                            "executable-window-overflow",
+                            Some(index),
+                            window.file_offset.get(),
+                        )
+                    })?;
+                if !window
+                    .file_offset
+                    .get()
+                    .is_multiple_of(record.host_page_size)
+                    || window.zero_lead.get() > window.file_bytes.get()
+                    || window.file_bytes.get() > extent
+                    || window_end > executable.size
+                {
+                    return Err(validation(
+                        "executable-window-bounds",
+                        Some(index),
+                        window.file_offset.get(),
+                    ));
+                }
+                any_executable_region = true;
+            }
         }
         if region.shared {
             return Err(validation("shared-region-import", Some(index), 1));
         }
         permissions_from_wire(region.permissions, index)?;
         previous_guest_end = end;
-        previous_artifact_end = artifact_end;
+    }
+    if record.executable_file.is_some() != any_executable_region {
+        return Err(validation(
+            "executable-file-consumer",
+            None,
+            u64::from(any_executable_region),
+        ));
     }
 
     let entry_count = record
@@ -939,6 +1299,13 @@ fn validate_record(
             .regions
             .get(region_index)
             .ok_or_else(|| validation("span-region-index", Some(index), region_index as u64))?;
+        if !matches!(region.backing, NativePreparedRegionBackingV1::Artifact) {
+            return Err(validation(
+                "span-region-backing",
+                Some(index),
+                region_index as u64,
+            ));
+        }
         let guest_end = span
             .guest_offset
             .get()
@@ -1150,6 +1517,28 @@ fn digest_metadata(record: &NativePreparedImageV1) -> Sha256 {
         hasher.update([region.permissions, u8::from(region.shared)]);
         hash_u64(&mut hasher, region.artifact_offset.get());
         hash_u64(&mut hasher, region.artifact_extent.get());
+        match region.backing {
+            NativePreparedRegionBackingV1::Artifact => hasher.update([0_u8]),
+            NativePreparedRegionBackingV1::ExecutableFile(window) => {
+                hasher.update([1_u8]);
+                hash_u64(&mut hasher, window.file_offset.get());
+                hash_u64(&mut hasher, window.file_bytes.get());
+                hash_u64(&mut hasher, window.zero_lead.get());
+            }
+        }
+    }
+    // The executable's identity (never its fd number or transit flags — those
+    // are renumbered/re-checked at the boundary) is part of the tamper-evident
+    // metadata, so a swapped window source fails the checksum, not just the
+    // identity check.
+    match record.executable_file.as_ref() {
+        None => hasher.update([0_u8]),
+        Some(executable) => {
+            hasher.update([1_u8]);
+            hash_u64(&mut hasher, executable.device);
+            hash_u64(&mut hasher, executable.inode);
+            hash_u64(&mut hasher, executable.size);
+        }
     }
     hash_u64(&mut hasher, record.initialized_spans.len() as u64);
     for span in &record.initialized_spans {
@@ -1357,10 +1746,10 @@ mod tests {
     }
 
     fn prepared() -> PreparedImageArtifact {
-        match prepare(&synthetic_image(), &relocations(), HOST_PAGE_SIZE)
+        match prepare(&synthetic_image(), &relocations(), HOST_PAGE_SIZE, None)
             .expect("prepare sparse artifact")
         {
-            PreparedImageDisposition::Prepared(artifact) => artifact,
+            PreparedImageDisposition::Prepared(artifact) => *artifact,
             PreparedImageDisposition::Ineligible(reason) => {
                 panic!("synthetic image unexpectedly ineligible: {reason:?}")
             }
@@ -1393,14 +1782,21 @@ mod tests {
         assert!(validate_record(record, &identity).is_err());
     }
 
+    fn artifact_backing(backing: &PreparedRegionBackingResolved) -> PreparedImageFileBacking {
+        match backing {
+            PreparedRegionBackingResolved::Artifact(backing) => *backing,
+            other => panic!("expected artifact backing, got {other:?}"),
+        }
+    }
+
     #[test]
     fn prepared_image_round_trips_sparse_bytes_and_metadata() {
         if !host_page_geometry_matches_fixtures() {
             return;
         }
         let source = synthetic_image();
-        let artifact = match prepare(&source, &relocations(), HOST_PAGE_SIZE).unwrap() {
-            PreparedImageDisposition::Prepared(artifact) => artifact,
+        let artifact = match prepare(&source, &relocations(), HOST_PAGE_SIZE, None).unwrap() {
+            PreparedImageDisposition::Prepared(artifact) => *artifact,
             PreparedImageDisposition::Ineligible(reason) => panic!("ineligible: {reason:?}"),
         };
         let record = duplicate_for_resume(&artifact);
@@ -1432,6 +1828,7 @@ mod tests {
             );
             assert_eq!(metadata.perms, source_region.perms);
             assert_eq!(metadata.shared, source_region.shared);
+            let backing = artifact_backing(backing);
             let mut bytes = vec![0_u8; usize::try_from(source_region.len()).unwrap()];
             validated
                 .file
@@ -1575,7 +1972,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            prepare(&shared, &[], HOST_PAGE_SIZE).unwrap(),
+            prepare(&shared, &[], HOST_PAGE_SIZE, None).unwrap(),
             PreparedImageDisposition::Ineligible(
                 PreparedImageIneligibleReason::SharedRegion { .. }
             )
@@ -1606,7 +2003,7 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(
-            prepare(&too_many_source_regions, &[], HOST_PAGE_SIZE).unwrap(),
+            prepare(&too_many_source_regions, &[], HOST_PAGE_SIZE, None).unwrap(),
             PreparedImageDisposition::Ineligible(
                 PreparedImageIneligibleReason::RepresentationLimit {
                     stage: "region-count",
@@ -1638,9 +2035,14 @@ mod tests {
     }
 
     fn assert_constructor_ineligible_at(limits: PreparedImageLimits, expected_stage: &str) {
-        let disposition =
-            prepare_with_limits(&synthetic_image(), &relocations(), HOST_PAGE_SIZE, limits)
-                .expect("limit selection is not an artifact error");
+        let disposition = prepare_with_limits(
+            &synthetic_image(),
+            &relocations(),
+            HOST_PAGE_SIZE,
+            None,
+            limits,
+        )
+        .expect("limit selection is not an artifact error");
         assert!(matches!(
             disposition,
             PreparedImageDisposition::Ineligible(
@@ -1788,8 +2190,8 @@ mod tests {
             return;
         }
         let source = synthetic_image();
-        let artifact = match prepare(&source, &relocations(), HOST_PAGE_SIZE).unwrap() {
-            PreparedImageDisposition::Prepared(artifact) => artifact,
+        let artifact = match prepare(&source, &relocations(), HOST_PAGE_SIZE, None).unwrap() {
+            PreparedImageDisposition::Prepared(artifact) => *artifact,
             PreparedImageDisposition::Ineligible(reason) => panic!("ineligible: {reason:?}"),
         };
         let stack_start = LINUX_STACK_TOP - LINUX_STACK_SIZE;
@@ -1884,12 +2286,13 @@ mod tests {
             HOST_PAGE_SIZE,
         )
         .expect("add subpage-vvar stack");
-        let artifact = match prepare(&source, &[], HOST_PAGE_SIZE).expect("prepare subpage vvar") {
-            PreparedImageDisposition::Prepared(artifact) => artifact,
-            PreparedImageDisposition::Ineligible(reason) => {
-                panic!("unexpected ineligible: {reason:?}")
-            }
-        };
+        let artifact =
+            match prepare(&source, &[], HOST_PAGE_SIZE, None).expect("prepare subpage vvar") {
+                PreparedImageDisposition::Prepared(artifact) => *artifact,
+                PreparedImageDisposition::Ineligible(reason) => {
+                    panic!("unexpected ineligible: {reason:?}")
+                }
+            };
         let index = artifact
             .record
             .regions
@@ -1910,7 +2313,9 @@ mod tests {
         let vvar = &validated.image.regions()[index];
         assert_eq!((vvar.start, vvar.end), (vvar_base, vvar_base + 0x1000));
         assert_eq!(
-            validated.backings[index].artifact_extent.get(),
+            artifact_backing(&validated.backings[index])
+                .artifact_extent
+                .get(),
             HOST_PAGE_SIZE
         );
         let next = &validated.image.regions()[index + 1];
@@ -1930,6 +2335,168 @@ mod tests {
         let json = serde_json::to_vec(&artifact.record).unwrap();
         let decoded: NativePreparedImageV1 = serde_json::from_slice(&json).unwrap();
         assert_eq!(decoded, artifact.record);
+    }
+
+    /// A stand-in guest executable: a regular temp file large enough to
+    /// contain the fixture's first-region window.
+    fn synthetic_executable_file(len: u64) -> File {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(len).unwrap();
+        file.write_all_at(b"exec-bytes", 0).unwrap();
+        file
+    }
+
+    fn exec_backing_for_first_region(
+        file: File,
+        region_count: usize,
+        window: PreparedExecRegionWindow,
+    ) -> PreparedExecutableBacking {
+        let mut windows = vec![None; region_count];
+        windows[0] = Some(window);
+        PreparedExecutableBacking { file, windows }
+    }
+
+    fn prepared_with_exec_window() -> PreparedImageArtifact {
+        let source = synthetic_image();
+        let file = synthetic_executable_file(4 * HOST_PAGE_SIZE);
+        let backing = exec_backing_for_first_region(
+            file,
+            source.regions().len(),
+            PreparedExecRegionWindow {
+                file_offset: 0,
+                file_bytes: 0x1000,
+                zero_lead: 0x40,
+            },
+        );
+        match prepare(&source, &relocations(), HOST_PAGE_SIZE, Some(backing)).unwrap() {
+            PreparedImageDisposition::Prepared(artifact) => *artifact,
+            PreparedImageDisposition::Ineligible(reason) => panic!("ineligible: {reason:?}"),
+        }
+    }
+
+    #[test]
+    fn executable_window_regions_consume_no_artifact_space_and_round_trip() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
+        let source = synthetic_image();
+        let plain = prepared();
+        let artifact = prepared_with_exec_window();
+
+        // The windowed region contributes nothing to the artifact: the whole
+        // artifact shrinks by exactly the first region's extent.
+        let first_extent = plain.record.regions[0].artifact_extent.get();
+        assert_eq!(
+            artifact.record.artifact_size,
+            plain.record.artifact_size - first_extent
+        );
+        assert!(artifact.record.executable_file.is_some());
+        assert!(artifact.executable_file.is_some());
+        assert!(matches!(
+            artifact.record.regions[0].backing,
+            NativePreparedRegionBackingV1::ExecutableFile(_)
+        ));
+        // No initialized span may target the windowed region.
+        assert!(
+            artifact
+                .record
+                .initialized_spans
+                .iter()
+                .all(|span| span.region_index.get() != 0)
+        );
+
+        let record = resume_record_for_test(artifact).unwrap();
+        let validated = validate_for_resume(record).expect("validate exec-window artifact");
+        assert!(validated.executable_file.is_some());
+        assert_eq!(validated.image.regions().len(), source.regions().len());
+        match &validated.backings[0] {
+            PreparedRegionBackingResolved::ExecutableFile {
+                window,
+                artifact_extent,
+            } => {
+                assert_eq!(window.file_offset(), 0);
+                assert_eq!(window.file_bytes(), 0x1000);
+                assert_eq!(window.zero_lead(), 0x40);
+                assert_eq!(artifact_extent.get(), first_extent);
+            }
+            other => panic!("expected executable backing, got {other:?}"),
+        }
+        assert!(matches!(
+            validated.backings[1],
+            PreparedRegionBackingResolved::Artifact(_)
+        ));
+    }
+
+    #[test]
+    fn executable_windows_reject_unaligned_offsets_and_eof_overruns() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
+        let source = synthetic_image();
+        for window in [
+            // Unaligned file offset can never be mmapped at a page boundary.
+            PreparedExecRegionWindow {
+                file_offset: 0x200,
+                file_bytes: 0x1000,
+                zero_lead: 0,
+            },
+            // Window runs past the executable's EOF page span.
+            PreparedExecRegionWindow {
+                file_offset: 0,
+                file_bytes: 64 * HOST_PAGE_SIZE,
+                zero_lead: 0,
+            },
+            // Lead larger than the window is incoherent.
+            PreparedExecRegionWindow {
+                file_offset: 0,
+                file_bytes: 0x100,
+                zero_lead: 0x200,
+            },
+        ] {
+            let file = synthetic_executable_file(4 * HOST_PAGE_SIZE);
+            let backing = exec_backing_for_first_region(file, source.regions().len(), window);
+            assert!(matches!(
+                prepare(&source, &relocations(), HOST_PAGE_SIZE, Some(backing)).unwrap(),
+                PreparedImageDisposition::Ineligible(
+                    PreparedImageIneligibleReason::RepresentationLimit {
+                        stage: "executable-window-bounds",
+                        ..
+                    }
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn executable_window_records_reject_tampering_on_resume() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
+        // Dropping the executable identity while a window remains must fail.
+        let artifact = prepared_with_exec_window();
+        let mut record = resume_record_for_test(artifact).unwrap();
+        record.executable_file = None;
+        assert!(validate_for_resume(record).is_err());
+
+        // A grown window that stays within bounds must still fail the
+        // checksum: the window geometry is tamper-evident metadata.
+        let artifact = prepared_with_exec_window();
+        let mut record = resume_record_for_test(artifact).unwrap();
+        let NativePreparedRegionBackingV1::ExecutableFile(window) = &mut record.regions[0].backing
+        else {
+            panic!("fixture lost its executable window");
+        };
+        window.file_bytes = PreparedGuestLen::new(0x2000).unwrap();
+        assert!(matches!(
+            validate_for_resume(record),
+            Err(NativePreparedImageError::ChecksumMismatch { .. })
+        ));
+
+        // An initialized span redirected at the windowed region must fail.
+        let artifact = prepared_with_exec_window();
+        let mut record = resume_record_for_test(artifact).unwrap();
+        record.initialized_spans[0].region_index = PreparedRegionIndex::new(0).unwrap();
+        assert!(validate_for_resume(record).is_err());
     }
 
     #[test]

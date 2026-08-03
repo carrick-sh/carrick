@@ -341,6 +341,7 @@ pub(crate) fn begin_guest_exec(
     dispatcher: &crate::dispatch::SyscallDispatcher,
     image: &crate::memory::AddressSpace,
     relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
+    exec_backing: Option<crate::native_prepared_image::PreparedExecutableBacking>,
     resolved_path: String,
     argv: Vec<Vec<u8>>,
     env: Vec<Vec<u8>>,
@@ -428,6 +429,7 @@ pub(crate) fn begin_guest_exec(
         &mut payload,
         image,
         relative_relocations,
+        exec_backing,
         plan.page_geometry.host_page_size,
     );
     // Pay for the digest only if the guard that reads it will actually run.
@@ -480,9 +482,17 @@ fn attach_prepared_image(
     payload: &mut NativeExecCapsuleV1,
     image: &crate::memory::AddressSpace,
     relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
+    exec_backing: Option<crate::native_prepared_image::PreparedExecutableBacking>,
     host_page_size: u64,
 ) -> Option<crate::native_prepared_image::PreparedImageArtifact> {
-    attach_prepared_image_inner(payload, image, relative_relocations, host_page_size, None)
+    attach_prepared_image_inner(
+        payload,
+        image,
+        relative_relocations,
+        exec_backing,
+        host_page_size,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -497,6 +507,7 @@ fn attach_prepared_image_with_failpoint(
         payload,
         image,
         relative_relocations,
+        None,
         host_page_size,
         Some(failpoint),
     )
@@ -507,6 +518,7 @@ fn attach_prepared_image_inner(
     payload: &mut NativeExecCapsuleV1,
     image: &crate::memory::AddressSpace,
     relative_relocations: &[crate::native_prepared_image::NativeRelativeRelocation],
+    exec_backing: Option<crate::native_prepared_image::PreparedExecutableBacking>,
     host_page_size: u64,
     failpoint: Option<PreparedImageFailpoint>,
 ) -> Option<crate::native_prepared_image::PreparedImageArtifact> {
@@ -534,11 +546,20 @@ fn attach_prepared_image_inner(
             ),
         )
     } else {
-        crate::native_prepared_image::prepare(image, relative_relocations, host_page_size)
+        crate::native_prepared_image::prepare(
+            image,
+            relative_relocations,
+            host_page_size,
+            exec_backing,
+        )
     };
     #[cfg(not(test))]
-    let preparation =
-        crate::native_prepared_image::prepare(image, relative_relocations, host_page_size);
+    let preparation = crate::native_prepared_image::prepare(
+        image,
+        relative_relocations,
+        host_page_size,
+        exec_backing,
+    );
     let disposition = match preparation {
         Ok(disposition) => disposition,
         Err(error) => {
@@ -554,7 +575,7 @@ fn attach_prepared_image_inner(
         crate::probes::DsrCacheLifecyclePhase::HostSelfReexecPreparedBuildEnd,
     );
     let artifact = match disposition {
-        crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => artifact,
+        crate::native_prepared_image::PreparedImageDisposition::Prepared(artifact) => *artifact,
         crate::native_prepared_image::PreparedImageDisposition::Ineligible(reason) => {
             tracing::debug!(
                 ?reason,
@@ -587,6 +608,10 @@ fn attach_prepared_image_inner(
         );
         return None;
     };
+    tracing::debug!(
+        executable_file_backed = artifact.record.maps_from_executable_file(),
+        "native prepared image attached to exec capsule"
+    );
     guest.prepared_image = Some(artifact.record.clone());
     Some(artifact)
 }
@@ -725,6 +750,12 @@ where
     if let Some(artifact) = &prepared_artifact {
         let (fd, flags) = artifact.transport_fd_snapshot();
         prepared_host_fds.prepare(fd, flags, flags & !libc::FD_CLOEXEC)?;
+        // The guest-executable fd (when regions map from it) crosses the
+        // execve exactly like the artifact fd: clear CLOEXEC for transit;
+        // the resumed process re-checks identity + flags and re-closes it.
+        if let Some((exec_fd, exec_flags)) = artifact.transport_executable_fd_snapshot() {
+            prepared_host_fds.prepare(exec_fd, exec_flags, exec_flags & !libc::FD_CLOEXEC)?;
+        }
     }
 
     emit_lifecycle(
@@ -1403,8 +1434,9 @@ mod tests {
             return;
         }
         let mut payload = sample();
-        let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
-            .expect("eligible prepared artifact");
+        let artifact =
+            attach_prepared_image(&mut payload, &synthetic_image(), &[], None, HOST_PAGE_SIZE)
+                .expect("eligible prepared artifact");
         let artifact_len = artifact.file.metadata().expect("artifact metadata").len();
         let capsule = tempfile::tempfile().expect("temporary capsule");
         let nonce = [0x44; 16];
@@ -1775,8 +1807,9 @@ mod tests {
             return;
         }
         let mut payload = sample();
-        let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
-            .expect("eligible prepared artifact");
+        let artifact =
+            attach_prepared_image(&mut payload, &synthetic_image(), &[], None, HOST_PAGE_SIZE)
+                .expect("eligible prepared artifact");
         let artifact_fd = artifact.file.as_raw_fd();
         let artifact_flags = fd_flags(artifact_fd);
         let artifact_identity = host_identity(artifact_fd);
@@ -1815,8 +1848,9 @@ mod tests {
             return;
         }
         let mut payload = sample();
-        let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
-            .expect("eligible prepared artifact");
+        let artifact =
+            attach_prepared_image(&mut payload, &synthetic_image(), &[], None, HOST_PAGE_SIZE)
+                .expect("eligible prepared artifact");
         let artifact_fd = artifact.file.as_raw_fd();
         let artifact_original_flags = fd_flags(artifact_fd);
         let artifact_identity = host_identity(artifact_fd);
@@ -1893,8 +1927,9 @@ mod tests {
             return;
         }
         let mut payload = sample();
-        let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
-            .expect("eligible prepared artifact");
+        let artifact =
+            attach_prepared_image(&mut payload, &synthetic_image(), &[], None, HOST_PAGE_SIZE)
+                .expect("eligible prepared artifact");
         let artifact_fd = artifact.file.as_raw_fd();
         let artifact_identity = host_identity(artifact_fd);
         let xsig = tempfile::tempfile().expect("xsignal file");
@@ -1924,8 +1959,9 @@ mod tests {
             return;
         }
         let mut payload = sample();
-        let artifact = attach_prepared_image(&mut payload, &synthetic_image(), &[], HOST_PAGE_SIZE)
-            .expect("eligible prepared artifact");
+        let artifact =
+            attach_prepared_image(&mut payload, &synthetic_image(), &[], None, HOST_PAGE_SIZE)
+                .expect("eligible prepared artifact");
         let inherited_fd = unsafe { libc::fcntl(artifact.file.as_raw_fd(), libc::F_DUPFD, 0) };
         assert!(inherited_fd >= 0);
         let inherited_identity = host_identity(inherited_fd);
