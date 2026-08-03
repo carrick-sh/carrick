@@ -61,6 +61,41 @@ pub const BIASED_GUEST_LITERAL_TARGET_END: u64 =
 pub const BIASED_GUEST_UNDERFLOW_WINDOW: u64 = 1024 * 1024;
 pub const INVALID_BIASED_HOST_ADDRESS_BIT: u64 = 1 << 47;
 
+/// First host VA ABOVE every span a biased candidate layout can reserve —
+/// the exclusion floor for other subsystems' deliberate long-lived host
+/// placements.
+///
+/// The bias probe treats `[bias - underflow, bias + literal-target-end]`
+/// as its own for every candidate, and it FAILS CLOSED when no candidate's
+/// span is free. Tier D's identity-tier placement hints once started at
+/// exactly `BIAS_CANDIDATES[0]`: its process-lifetime guest mappings then
+/// occupied the first candidate's span, and in a process whose remaining
+/// candidates were also occupied the probe had nowhere left to go —
+/// `NoCollisionFreeBias` on a healthy host (caught by
+/// `biased_address_above_ceiling_cannot_alias_an_outside_host_sentinel`
+/// running after tier D tests in one process). Anything that CHOOSES where
+/// to put long-lived host mappings must choose at or above this address.
+///
+/// Derived (and compile-asserted) from the largest constructible bias —
+/// the test-only compact-lowering bias, which exceeds every production
+/// candidate — plus the span a candidate reserves, rounded up to a whole
+/// TiB.
+pub const BIASED_HOST_RESERVATION_CEILING: u64 = 0x500_0000_0000;
+const _: () = {
+    let mut index = 0;
+    while index < BIAS_CANDIDATES.len() {
+        assert!(BIAS_CANDIDATES[index] <= APERTURE_DISJOINT_ORR_BIAS);
+        index += 1;
+    }
+    // One host page of tail slack beyond the literal window, matching the
+    // observed reservation length, plus headroom.
+    assert!(
+        APERTURE_DISJOINT_ORR_BIAS + BIASED_GUEST_LITERAL_TARGET_END + 0x10000
+            < BIASED_HOST_RESERVATION_CEILING
+    );
+    assert!(BIASED_HOST_RESERVATION_CEILING < DARWIN_USER_VA_END);
+};
+
 pub struct OwnedHostMapping {
     range: Range<HostVa>,
     unmap_on_drop: bool,

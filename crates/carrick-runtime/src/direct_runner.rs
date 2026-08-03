@@ -304,10 +304,17 @@ impl IdentityBrk {
 /// fallback is exactly the unhinted behavior — never a clobber, never an
 /// error.
 ///
-/// The base is 32 GiB: probed on this host, hints below 0x8000000000 are
-/// relocated into the default anon area (0x7000000000 — exactly the crowd
-/// to avoid) while 0x8000000000 and far beyond are honored.
-static ANON_HINT_CURSOR: AtomicU64 = AtomicU64::new(0x80_0000_0000);
+/// The base sits at the DSR biased lane's reservation ceiling
+/// ([`carrick_dsr::address::BIASED_HOST_RESERVATION_CEILING`], 5 TiB): a
+/// first cut used 32 GiB — exactly `BIAS_CANDIDATES[0]` — and this cursor's
+/// process-lifetime guest mappings then starved the biased lane's
+/// candidate probe into `NoCollisionFreeBias` when both tiers ran in one
+/// process. Probed on this host: plain-anon hints are honored at 5 TiB
+/// (and everywhere sampled from 32 GiB to 15 TiB); below 32 GiB they are
+/// relocated into the default anon area (0x7000000000 — the crowd to
+/// avoid).
+static ANON_HINT_CURSOR: AtomicU64 =
+    AtomicU64::new(carrick_dsr::address::BIASED_HOST_RESERVATION_CEILING);
 
 /// One plain anonymous PRIVATE RW mapping this runner created for the guest,
 /// tracked so `mremap` can be serviced with PROOF instead of guesswork: the

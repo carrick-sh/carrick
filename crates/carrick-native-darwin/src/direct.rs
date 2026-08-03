@@ -1253,12 +1253,19 @@ fn b_in_range(delta: i64) -> bool {
 /// arena, a clone child's parked-entry stub — can find NO free slot: an
 /// address-layout-probabilistic fail-closed refusal (observed ~1/25 under
 /// machine load). Hinting the text itself into sparse space makes those
-/// neighborhoods empty. Probed on this host: `MAP_JIT` honors hints at
-/// 36 GiB and 3 TiB; the cursor starts at 1 TiB, far from the data-side
-/// reservation cursor. A hint only — when the kernel relocates, behavior is
+/// neighborhoods empty. A hint only — when the kernel relocates, behavior is
 /// exactly the unhinted path, and every branch stays range-checked.
-static EXEC_HINT_CURSOR: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0x100_0000_0000);
+///
+/// The base sits ONE TiB above the DSR biased lane's reservation ceiling
+/// ([`carrick_dsr::address::BIASED_HOST_RESERVATION_CEILING`]) — a first
+/// cut used 1 TiB, which is `BIAS_CANDIDATES[2]`, and tier D mappings
+/// inside a biased candidate's span starve that lane's bias probe when
+/// both tiers run in one process — and one TiB above the identity tier's
+/// DATA cursor so text neighborhoods stay free of data reservations.
+/// Probed on this host: `MAP_JIT` honors hints at 36 GiB, 3 TiB and 6 TiB.
+static EXEC_HINT_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
+    carrick_dsr::address::BIASED_HOST_RESERVATION_CEILING + 0x100_0000_0000,
+);
 
 /// Claim the next sparse hint for a mapping of `len` bytes (rounded, plus a
 /// page of slack so consecutive mappings never abut exactly).
