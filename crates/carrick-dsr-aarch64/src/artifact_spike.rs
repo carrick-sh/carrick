@@ -206,6 +206,157 @@ struct WirePortableRecoveryRun {
     action: PortableRecoveryAction,
 }
 
+/// The replay-critical stream of one unit block: what `replay_unit_block`
+/// must have to re-bake, validate, and link the words sliced from the
+/// unit's `.code` image. Small by construction (~2% of a unit's records).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnitBlockHotWire {
+    pub(crate) relocations: Vec<ArtifactRelocation>,
+    pub(crate) trusted_entry: Option<TrustedEntryTemplate>,
+    pub(crate) direct_links: Vec<DirectLink>,
+}
+
+/// The fault-reconstruction stream of one unit block: the pc map and
+/// recovery metadata a replayed block leaves UNDECODED in the unit's
+/// mapped metadata until a guest fault interrogates it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnitBlockColdWire {
+    pub(crate) map: Vec<PcMapEntry>,
+    pub(crate) recovery: PortableRecoveryMetadata,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireUnitBlockHot {
+    relocations: Vec<ArtifactRelocation>,
+    trusted_entry: Option<TrustedEntryTemplate>,
+    direct_links: Vec<WireDirectLink>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireUnitBlockCold {
+    map_deltas: Vec<(i64, u32)>,
+    recovery: WirePortableRecoveryMetadata,
+}
+
+fn pc_map_to_deltas(map: &[PcMapEntry]) -> Vec<(i64, u32)> {
+    let mut previous_guest = 0_i64;
+    let mut previous_cache = 0_u32;
+    map.iter()
+        .map(|entry| {
+            let guest = entry.guest.raw() as i64;
+            let cache = entry.cache.get();
+            let delta = (
+                guest.wrapping_sub(previous_guest),
+                cache.wrapping_sub(previous_cache),
+            );
+            previous_guest = guest;
+            previous_cache = cache;
+            delta
+        })
+        .collect()
+}
+
+fn pc_map_from_deltas(deltas: Vec<(i64, u32)>) -> Vec<PcMapEntry> {
+    let mut guest = 0_i64;
+    let mut cache = 0_u32;
+    deltas
+        .into_iter()
+        .map(|(guest_delta, cache_delta)| {
+            guest = guest.wrapping_add(guest_delta);
+            cache = cache.wrapping_add(cache_delta);
+            PcMapEntry {
+                guest: carrick_guest_mem::GuestVa(guest as u64),
+                cache: CacheOffset::published(cache),
+            }
+        })
+        .collect()
+}
+
+fn direct_links_to_wire(links: &[DirectLink]) -> Vec<WireDirectLink> {
+    links
+        .iter()
+        .map(|link| WireDirectLink {
+            slot: link.slot.get(),
+            source: link.source.raw(),
+            target: link.target.raw(),
+            kind: link.kind,
+            stub_start: link.stub.start.get(),
+            stub_end: link.stub.end.get(),
+        })
+        .collect()
+}
+
+fn direct_links_from_wire(links: Vec<WireDirectLink>) -> Vec<DirectLink> {
+    links
+        .into_iter()
+        .map(|link| DirectLink {
+            slot: CacheOffset::published(link.slot),
+            source: carrick_guest_mem::GuestVa(link.source),
+            target: carrick_guest_mem::GuestVa(link.target),
+            kind: link.kind,
+            stub: DirectStubEnvelope {
+                start: CacheOffset::published(link.stub_start),
+                end: CacheOffset::published(link.stub_end),
+            },
+        })
+        .collect()
+}
+
+impl serde::Serialize for UnitBlockHotWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        WireUnitBlockHot {
+            relocations: self.relocations.clone(),
+            trusted_entry: self.trusted_entry,
+            direct_links: direct_links_to_wire(&self.direct_links),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for UnitBlockHotWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WireUnitBlockHot::deserialize(deserializer)?;
+        Ok(Self {
+            relocations: wire.relocations,
+            trusted_entry: wire.trusted_entry,
+            direct_links: direct_links_from_wire(wire.direct_links),
+        })
+    }
+}
+
+impl serde::Serialize for UnitBlockColdWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        WireUnitBlockCold {
+            map_deltas: pc_map_to_deltas(&self.map),
+            recovery: WirePortableRecoveryMetadata::from(&self.recovery),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for UnitBlockColdWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WireUnitBlockCold::deserialize(deserializer)?;
+        Ok(Self {
+            map: pc_map_from_deltas(wire.map_deltas),
+            recovery: PortableRecoveryMetadata::try_from(wire.recovery)
+                .map_err(serde::de::Error::custom)?,
+        })
+    }
+}
+
 impl serde::Serialize for ArtifactTemplate {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -228,39 +379,11 @@ impl<'de> serde::Deserialize<'de> for ArtifactTemplate {
 
 impl From<&ArtifactTemplate> for WireArtifactTemplate {
     fn from(template: &ArtifactTemplate) -> Self {
-        let mut previous_guest = 0_i64;
-        let mut previous_cache = 0_u32;
-        let map_deltas = template
-            .map
-            .iter()
-            .map(|entry| {
-                let guest = entry.guest.raw() as i64;
-                let cache = entry.cache.get();
-                let delta = (
-                    guest.wrapping_sub(previous_guest),
-                    cache.wrapping_sub(previous_cache),
-                );
-                previous_guest = guest;
-                previous_cache = cache;
-                delta
-            })
-            .collect();
         Self {
             words: template.words.clone(),
-            map_deltas,
+            map_deltas: pc_map_to_deltas(&template.map),
             recovery: WirePortableRecoveryMetadata::from(&template.recovery),
-            direct_links: template
-                .direct_links
-                .iter()
-                .map(|link| WireDirectLink {
-                    slot: link.slot.get(),
-                    source: link.source.raw(),
-                    target: link.target.raw(),
-                    kind: link.kind,
-                    stub_start: link.stub.start.get(),
-                    stub_end: link.stub.end.get(),
-                })
-                .collect(),
+            direct_links: direct_links_to_wire(&template.direct_links),
             relocations: template.relocations.clone(),
             source_words: template.source_words.clone(),
             trusted_entry: template.trusted_entry,
@@ -272,39 +395,12 @@ impl TryFrom<WireArtifactTemplate> for ArtifactTemplate {
     type Error = DsrError;
 
     fn try_from(template: WireArtifactTemplate) -> Result<Self, Self::Error> {
-        let mut guest = 0_i64;
-        let mut cache = 0_u32;
-        let map = template
-            .map_deltas
-            .into_iter()
-            .map(|(guest_delta, cache_delta)| {
-                guest = guest.wrapping_add(guest_delta);
-                cache = cache.wrapping_add(cache_delta);
-                PcMapEntry {
-                    guest: carrick_guest_mem::GuestVa(guest as u64),
-                    cache: CacheOffset::published(cache),
-                }
-            })
-            .collect();
         let recovery = PortableRecoveryMetadata::try_from(template.recovery)?;
         Ok(Self {
             words: template.words,
-            map,
+            map: pc_map_from_deltas(template.map_deltas),
             recovery,
-            direct_links: template
-                .direct_links
-                .into_iter()
-                .map(|link| DirectLink {
-                    slot: CacheOffset::published(link.slot),
-                    source: carrick_guest_mem::GuestVa(link.source),
-                    target: carrick_guest_mem::GuestVa(link.target),
-                    kind: link.kind,
-                    stub: DirectStubEnvelope {
-                        start: CacheOffset::published(link.stub_start),
-                        end: CacheOffset::published(link.stub_end),
-                    },
-                })
-                .collect(),
+            direct_links: direct_links_from_wire(template.direct_links),
             relocations: template.relocations,
             source_words: template.source_words,
             trusted_entry: template.trusted_entry,
@@ -1352,7 +1448,7 @@ impl PortableRecoveryAction {
         })
     }
 
-    fn rebind(self, bindings: &ArtifactBindings) -> Result<RecoveryAction, DsrError> {
+    pub(crate) fn rebind(self, bindings: &ArtifactBindings) -> Result<RecoveryAction, DsrError> {
         self.rebind_with(|value| bindings.value(value))
     }
 
@@ -1669,7 +1765,7 @@ impl PortableRecoveryMetadata {
             .transpose()
     }
 
-    fn into_entries(self) -> Result<Vec<PortableRecoveryEntry>, DsrError> {
+    pub(crate) fn into_entries(self) -> Result<Vec<PortableRecoveryEntry>, DsrError> {
         let runs = match self {
             Self::Entries(entries) => return Ok(entries),
             Self::Runs(runs) => runs,
@@ -1968,15 +2064,39 @@ impl ArtifactTemplate {
         Ok(self)
     }
 
-    /// Decompose a unit-record template (words already cleared) for replay
-    /// against words sliced from the unit's `.code` image.
-    pub(crate) fn into_unit_replay_parts(self) -> UnitReplayParts {
-        UnitReplayParts {
-            map: self.map,
-            recovery: self.recovery,
-            direct_links: self.direct_links,
-            relocations: self.relocations,
-            trusted_entry: self.trusted_entry,
+    /// Split a unit-record template (words already cleared) into the two
+    /// wire streams: HOT is everything replay must have (relocations to
+    /// re-bake, the trusted entry to validate, direct links to patch); COLD
+    /// is the fault-reconstruction metadata (pc map + recovery) that a
+    /// replayed block leaves in the unit until a fault interrogates it. The
+    /// census that forced the split: pc map + recovery are ~98% of a unit's
+    /// records (1.75M of 1.79M on the go toolchain unit), and decoding them
+    /// per exec cost more than the retranslation the store avoids.
+    pub(crate) fn into_unit_wire_parts(self) -> (UnitBlockHotWire, UnitBlockColdWire) {
+        (
+            UnitBlockHotWire {
+                relocations: self.relocations,
+                trusted_entry: self.trusted_entry,
+                direct_links: self.direct_links,
+            },
+            UnitBlockColdWire {
+                map: self.map,
+                recovery: self.recovery,
+            },
+        )
+    }
+
+    /// Reassemble a template from its two wire streams (words and source
+    /// words stay empty — they live in the unit's `.code` image and key).
+    pub(crate) fn from_unit_wire_parts(hot: UnitBlockHotWire, cold: UnitBlockColdWire) -> Self {
+        Self {
+            words: Vec::new(),
+            map: cold.map,
+            recovery: cold.recovery,
+            direct_links: hot.direct_links,
+            relocations: hot.relocations,
+            source_words: Vec::new(),
+            trusted_entry: hot.trusted_entry,
         }
     }
 
@@ -2295,30 +2415,25 @@ pub fn replay_artifact_owned(
     )
 }
 
-/// The replay-relevant decomposition of a unit block's stored template
-/// (words live separately in the unit's `.code` image).
-pub(crate) struct UnitReplayParts {
-    map: Vec<PcMapEntry>,
-    recovery: PortableRecoveryMetadata,
-    direct_links: Vec<DirectLink>,
-    relocations: Vec<ArtifactRelocation>,
-    trusted_entry: Option<TrustedEntryTemplate>,
-}
-
 /// Replay one translation-unit block: words sliced from the unit's
-/// digest-bound `.code` image plus the block's recorded metadata, published
-/// into this process's own cache exactly like a native emission. Fails
-/// closed (the caller falls back to fresh translation) on any relocation,
-/// trusted-entry, or recovery mismatch — the words came from disk, so the
-/// trusted entry's baked materialization is re-validated here rather than
-/// trusted from the record alone.
+/// digest-bound `.code` image plus the block's HOT stream, published into
+/// this process's own cache exactly like a native emission. Fails closed
+/// (the caller falls back to fresh translation) on any relocation or
+/// trusted-entry mismatch — the words came from disk, so the trusted
+/// entry's baked materialization is re-validated here rather than trusted
+/// from the record alone.
+///
+/// The emitted block carries NO pc map or recovery: a replayed block's
+/// fault-reconstruction metadata stays in the unit's mapped COLD stream
+/// (the caller retains a handle to it), decoded only if a fault ever
+/// interrogates this block.
 pub(crate) fn replay_unit_block(
     cache: &mut TranslationCache,
     words: Vec<u32>,
-    parts: UnitReplayParts,
+    hot: UnitBlockHotWire,
     bindings: &ArtifactBindings,
 ) -> Result<EmittedBlock, DsrError> {
-    if let Some(trusted) = parts.trusted_entry {
+    if let Some(trusted) = hot.trusted_entry {
         let index = usize::try_from(trusted.offset / 4)
             .map_err(|_| DsrError::CachePolicy("unit trusted-entry offset overflow".to_string()))?;
         let expected_movz = 0xd280_0011 | (((trusted.expected & 0xffff) as u32) << 5);
@@ -2332,11 +2447,11 @@ pub(crate) fn replay_unit_block(
     replay_artifact_parts(
         cache,
         words,
-        parts.map,
-        parts.recovery.into_entries()?,
-        parts.direct_links,
-        &parts.relocations,
-        parts.trusted_entry,
+        Vec::new(),
+        Vec::new(),
+        hot.direct_links,
+        &hot.relocations,
+        hot.trusted_entry,
         bindings,
     )
 }
