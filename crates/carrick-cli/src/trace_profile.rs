@@ -18,6 +18,7 @@ const JSON_SCHEMA: &str = "carrick.dsr-profile.v1";
 const V2_PROTOCOL_PREFIX: &str = "DSRPROF2";
 const V2_STACK_PREFIX: &str = "DSRSTACK2";
 const V2_RAW_SCHEMA: &str = "carrick.dsrprof.raw.v2";
+const TRUSTED_ROUTE_CAPTURE_SCHEMA: &str = "carrick.trusted-route-capture.v1";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProcessBirthKey {
@@ -1881,6 +1882,7 @@ pub(crate) enum TraceProfileKind {
     DsrIndirect,
     DsrFork,
     NativeWall,
+    TrustedRoute,
 }
 
 impl TraceProfileKind {
@@ -1890,6 +1892,7 @@ impl TraceProfileKind {
             Self::DsrIndirect => "dsr-indirect",
             Self::DsrFork => "dsr-fork",
             Self::NativeWall => "native-wall",
+            Self::TrustedRoute => "trusted-route",
         }
     }
 
@@ -1904,6 +1907,7 @@ impl TraceProfileKind {
             Self::DsrIndirect => carrick_runtime::dtrace_consumer::BUNDLED_DSR_INDIRECT_D,
             Self::DsrFork => carrick_runtime::dtrace_consumer::BUNDLED_DSR_FORK_D,
             Self::NativeWall => carrick_runtime::dtrace_consumer::BUNDLED_NATIVE_WALL_D,
+            Self::TrustedRoute => carrick_runtime::dtrace_consumer::BUNDLED_TRUSTED_ROUTE_D,
         }
     }
 
@@ -1913,6 +1917,7 @@ impl TraceProfileKind {
             "dsr-indirect" => Ok(Self::DsrIndirect),
             "dsr-fork" => Ok(Self::DsrFork),
             "native-wall" => Ok(Self::NativeWall),
+            "trusted-route" => Ok(Self::TrustedRoute),
             other => bail!("unknown DSR profile {other:?}"),
         }
     }
@@ -2442,7 +2447,7 @@ where
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct ProfileCaptureStatus {
     pub(crate) principal_drops: u64,
     pub(crate) aggregation_drops: u64,
@@ -2468,7 +2473,7 @@ impl From<carrick_runtime::dtrace_consumer::DTraceRunReport> for ProfileCaptureS
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct ProfileProvenance {
     pub(crate) run_id: String,
     pub(crate) git_sha: String,
@@ -2476,6 +2481,314 @@ pub(crate) struct ProfileProvenance {
     pub(crate) binary_sha256: String,
     pub(crate) command: Vec<String>,
     pub(crate) host: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TrustedRouteCaptureReceipt {
+    pub(crate) schema: String,
+    pub(crate) raw_trace_sha256: String,
+    pub(crate) program_sha256: String,
+    pub(crate) provenance: ProfileProvenance,
+    pub(crate) drops: ProfileCaptureStatus,
+    pub(crate) copyin_errors: u64,
+    pub(crate) total_samples: u64,
+    pub(crate) pc_samples: u64,
+    pub(crate) pc_rows: u64,
+    pub(crate) bounded: bool,
+    pub(crate) target_completed: bool,
+    pub(crate) target_exit_reason: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustedRouteSection {
+    Totals,
+    Region,
+    Pc,
+    Complete,
+}
+
+impl TrustedRouteCaptureReceipt {
+    pub(crate) fn program_sha256() -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(carrick_runtime::dtrace_consumer::BUNDLED_TRUSTED_ROUTE_D.as_bytes())
+        )
+    }
+
+    pub(crate) fn from_path(
+        path: &Path,
+        drops: ProfileCaptureStatus,
+        provenance: ProfileProvenance,
+    ) -> Result<Self> {
+        let raw = fs::read(path)
+            .with_context(|| format!("read trusted-route trace {}", path.display()))?;
+        Self::from_bytes(&raw, drops, provenance)
+    }
+
+    fn from_bytes(
+        raw: &[u8],
+        drops: ProfileCaptureStatus,
+        provenance: ProfileProvenance,
+    ) -> Result<Self> {
+        if drops.principal_drops != 0
+            || drops.aggregation_drops != 0
+            || drops.dynamic_drops != 0
+            || drops.dynamic_rinse_drops != 0
+            || drops.dynamic_dirty_drops != 0
+            || drops.other_drops != 0
+            || drops.interrupted
+        {
+            bail!(
+                "trusted-route capture is not lossless: principal={}, aggregation={}, dynamic={}, dynamic_rinse={}, dynamic_dirty={}, other={}, interrupted={}",
+                drops.principal_drops,
+                drops.aggregation_drops,
+                drops.dynamic_drops,
+                drops.dynamic_rinse_drops,
+                drops.dynamic_dirty_drops,
+                drops.other_drops,
+                drops.interrupted
+            );
+        }
+        let contents = std::str::from_utf8(raw).context("trusted-route trace is not UTF-8")?;
+        let mut section = None;
+        let mut total_samples = None;
+        let mut copyin_errors = None;
+        let mut pc_samples = 0_u64;
+        let mut pc_rows = 0_u64;
+        let mut bounded = None;
+        let mut target_completed = None;
+        let mut target_exit_reason = None;
+
+        for (index, raw_line) in contents.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if section == Some(TrustedRouteSection::Complete) {
+                bail!(
+                    "trusted-route record appears after completion at line {}",
+                    index + 1
+                );
+            }
+            match line {
+                "SHAPE1|section=totals" => {
+                    if section.replace(TrustedRouteSection::Totals).is_some() {
+                        bail!(
+                            "duplicate or out-of-order totals section at line {}",
+                            index + 1
+                        );
+                    }
+                }
+                "SHAPE1|section=region" => {
+                    if section != Some(TrustedRouteSection::Totals)
+                        || total_samples.is_none()
+                        || copyin_errors.is_none()
+                    {
+                        bail!(
+                            "incomplete or out-of-order region section at line {}",
+                            index + 1
+                        );
+                    }
+                    section = Some(TrustedRouteSection::Region);
+                }
+                "SHAPE1|section=pc" => {
+                    if section != Some(TrustedRouteSection::Region) {
+                        bail!("out-of-order PC section at line {}", index + 1);
+                    }
+                    section = Some(TrustedRouteSection::Pc);
+                }
+                _ if line.starts_with("SHAPE1|samples=") => {
+                    if section != Some(TrustedRouteSection::Totals) || total_samples.is_some() {
+                        bail!("duplicate or misplaced sample total at line {}", index + 1);
+                    }
+                    total_samples = Some(parse_shape_u64(line, "SHAPE1|samples=")?);
+                }
+                _ if line.starts_with("SHAPE1|copyin-errors=") => {
+                    if section != Some(TrustedRouteSection::Totals) || copyin_errors.is_some() {
+                        bail!("duplicate or misplaced copyin total at line {}", index + 1);
+                    }
+                    copyin_errors = Some(parse_shape_u64(line, "SHAPE1|copyin-errors=")?);
+                }
+                _ if line.starts_with("SHAPE1|region=") => {
+                    if section != Some(TrustedRouteSection::Region) {
+                        bail!("misplaced region row at line {}", index + 1);
+                    }
+                    parse_trusted_route_region(line)
+                        .with_context(|| format!("invalid region row at line {}", index + 1))?;
+                }
+                _ if line.starts_with("PC ") => {
+                    if section != Some(TrustedRouteSection::Pc) {
+                        bail!("misplaced PC row at line {}", index + 1);
+                    }
+                    let samples = parse_trusted_route_pc(line)
+                        .with_context(|| format!("invalid PC row at line {}", index + 1))?;
+                    pc_samples = pc_samples
+                        .checked_add(samples)
+                        .ok_or_else(|| anyhow!("trusted-route PC population overflow"))?;
+                    pc_rows = pc_rows
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("trusted-route PC row count overflow"))?;
+                }
+                _ if line.starts_with("SHAPE1|complete|") => {
+                    if section != Some(TrustedRouteSection::Pc) {
+                        bail!("out-of-order completion at line {}", index + 1);
+                    }
+                    let fields = parse_shape_fields(line, "SHAPE1|complete|")?;
+                    if fields.len() != 3 {
+                        bail!("trusted-route completion has unknown or missing fields");
+                    }
+                    bounded = Some(parse_binary_shape_field(&fields, "bounded")?);
+                    target_completed = Some(parse_binary_shape_field(&fields, "target_completed")?);
+                    target_exit_reason =
+                        Some(parse_shape_field_u64(&fields, "target_exit_reason")?);
+                    section = Some(TrustedRouteSection::Complete);
+                }
+                _ => bail!(
+                    "unknown trusted-route record at line {}: {line:?}",
+                    index + 1
+                ),
+            }
+        }
+
+        if section != Some(TrustedRouteSection::Complete) {
+            bail!("trusted-route stream is missing its completion record");
+        }
+        let total_samples = total_samples
+            .filter(|samples| *samples != 0)
+            .ok_or_else(|| anyhow!("trusted-route stream has zero total samples"))?;
+        let copyin_errors = copyin_errors
+            .ok_or_else(|| anyhow!("trusted-route stream is missing copyin-errors"))?;
+        if copyin_errors != 0 {
+            bail!("trusted-route capture observed {copyin_errors} DTrace error(s)");
+        }
+        if pc_rows == 0 || pc_samples == 0 {
+            bail!("trusted-route stream has zero PC rows or samples");
+        }
+        if pc_samples > total_samples {
+            bail!("trusted-route PC population {pc_samples} exceeds total samples {total_samples}");
+        }
+        let bounded = bounded.ok_or_else(|| anyhow!("trusted-route completion lacks bounded"))?;
+        let target_completed = target_completed
+            .ok_or_else(|| anyhow!("trusted-route completion lacks target_completed"))?;
+        let target_exit_reason = target_exit_reason
+            .ok_or_else(|| anyhow!("trusted-route completion lacks target_exit_reason"))?;
+        if bounded || !target_completed || target_exit_reason != 1 {
+            bail!(
+                "trusted-route target did not complete normally: bounded={bounded}, target_completed={target_completed}, target_exit_reason={target_exit_reason}"
+            );
+        }
+
+        Ok(Self {
+            schema: TRUSTED_ROUTE_CAPTURE_SCHEMA.to_owned(),
+            raw_trace_sha256: format!("{:x}", Sha256::digest(raw)),
+            program_sha256: Self::program_sha256(),
+            provenance,
+            drops,
+            copyin_errors,
+            total_samples,
+            pc_samples,
+            pc_rows,
+            bounded,
+            target_completed,
+            target_exit_reason,
+        })
+    }
+
+    pub(crate) fn render_human(&self) -> String {
+        format!(
+            "trusted-route capture: total_samples={}, pc_samples={}, pc_rows={}, target_completed={}, drops=0, raw_sha256={}",
+            self.total_samples,
+            self.pc_samples,
+            self.pc_rows,
+            self.target_completed,
+            self.raw_trace_sha256
+        )
+    }
+}
+
+fn parse_shape_u64(line: &str, prefix: &str) -> Result<u64> {
+    line.strip_prefix(prefix)
+        .ok_or_else(|| anyhow!("missing {prefix:?} prefix"))?
+        .parse::<u64>()
+        .with_context(|| format!("invalid decimal in {line:?}"))
+}
+
+fn parse_trusted_route_region(line: &str) -> Result<()> {
+    let fields = parse_shape_fields(line, "SHAPE1|")?;
+    if fields.len() != 2 || !fields.contains_key("region") {
+        bail!("region row has unknown or missing fields");
+    }
+    let count = parse_shape_field_u64(&fields, "count")?;
+    if count == 0 {
+        bail!("region row has zero count");
+    }
+    Ok(())
+}
+
+fn parse_trusted_route_pc(line: &str) -> Result<u64> {
+    let mut fields = line.split_ascii_whitespace();
+    if fields.next() != Some("PC") {
+        bail!("PC row lacks PC prefix");
+    }
+    fields
+        .next()
+        .ok_or_else(|| anyhow!("PC row lacks pid"))?
+        .parse::<u32>()
+        .context("PC row has invalid pid")?;
+    let pc = fields
+        .next()
+        .and_then(|value| value.strip_prefix("0x"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("PC row lacks hexadecimal PC"))?;
+    u64::from_str_radix(pc, 16).context("PC row has invalid PC")?;
+    let samples = fields
+        .next()
+        .ok_or_else(|| anyhow!("PC row lacks sample count"))?
+        .parse::<u64>()
+        .context("PC row has invalid sample count")?;
+    if fields.next().is_some() {
+        bail!("PC row has trailing fields");
+    }
+    if samples == 0 {
+        bail!("PC row has zero samples");
+    }
+    Ok(samples)
+}
+
+fn parse_shape_fields(line: &str, prefix: &str) -> Result<BTreeMap<String, String>> {
+    let suffix = line
+        .strip_prefix(prefix)
+        .ok_or_else(|| anyhow!("missing {prefix:?} prefix"))?;
+    let mut fields = BTreeMap::new();
+    for raw in suffix.split('|') {
+        let (name, value) = raw
+            .split_once('=')
+            .ok_or_else(|| anyhow!("SHAPE1 field lacks '=': {raw:?}"))?;
+        if name.is_empty() || value.is_empty() {
+            bail!("SHAPE1 field has empty name or value");
+        }
+        if fields.insert(name.to_owned(), value.to_owned()).is_some() {
+            bail!("duplicate SHAPE1 field {name:?}");
+        }
+    }
+    Ok(fields)
+}
+
+fn parse_shape_field_u64(fields: &BTreeMap<String, String>, name: &str) -> Result<u64> {
+    fields
+        .get(name)
+        .ok_or_else(|| anyhow!("SHAPE1 record lacks {name:?}"))?
+        .parse::<u64>()
+        .with_context(|| format!("SHAPE1 field {name:?} is not decimal"))
+}
+
+fn parse_binary_shape_field(fields: &BTreeMap<String, String>, name: &str) -> Result<bool> {
+    match parse_shape_field_u64(fields, name)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => bail!("SHAPE1 field {name:?} must be 0 or 1, got {value}"),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -3731,6 +4044,58 @@ pub(crate) fn write_summary_atomic(
     temporary
         .persist(path)
         .map_err(|error| anyhow!("publish DSR profile {}: {}", path.display(), error.error))?;
+    Ok(())
+}
+
+pub(crate) fn write_trusted_route_capture_atomic(
+    path: &Path,
+    receipt: &TrustedRouteCaptureReceipt,
+    owner: Option<(u32, u32)>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "create trusted-route capture directory {}",
+            parent.display()
+        )
+    })?;
+    let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "create temporary trusted-route capture in {}",
+            parent.display()
+        )
+    })?;
+    {
+        let mut writer = BufWriter::new(temporary.as_file_mut());
+        serde_json::to_writer_pretty(&mut writer, receipt)
+            .context("serialize trusted-route capture receipt")?;
+        writer
+            .write_all(b"\n")
+            .context("terminate trusted-route capture receipt")?;
+        writer
+            .flush()
+            .context("flush trusted-route capture receipt")?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .context("sync trusted-route capture receipt")?;
+    if let Some((uid, gid)) = owner {
+        let result = unsafe { libc::fchown(temporary.as_raw_fd(), uid, gid) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("set trusted-route capture owner");
+        }
+    }
+    temporary.persist(path).map_err(|error| {
+        anyhow!(
+            "publish trusted-route capture {}: {}",
+            path.display(),
+            error.error
+        )
+    })?;
     Ok(())
 }
 
@@ -5223,5 +5588,153 @@ mod tests {
         assert_eq!(row["run_id"], "test-run");
         assert_eq!(row["git_dirty"], true);
         assert_eq!(row["metric"]["type"], "completion");
+    }
+
+    fn trusted_route_raw() -> &'static str {
+        "SHAPE1|section=totals\n\
+         SHAPE1|samples=20\n\
+         SHAPE1|copyin-errors=0\n\
+         SHAPE1|section=region\n\
+         SHAPE1|region=jit-or-guest|count=12\n\
+         SHAPE1|section=pc\n\
+         PC 42 0x1010 7\n\
+         PC 42 0x1020 5\n\
+         SHAPE1|complete|bounded=0|target_completed=1|target_exit_reason=1\n"
+    }
+
+    fn trusted_route_provenance() -> ProfileProvenance {
+        ProfileProvenance {
+            run_id: "trusted-route-test".to_owned(),
+            git_sha: "abc123".to_owned(),
+            git_dirty: Some(false),
+            binary_sha256: "def456".to_owned(),
+            command: vec!["run-elf".to_owned(), "fixture".to_owned()],
+            host: "test-host".to_owned(),
+        }
+    }
+
+    #[test]
+    fn trusted_route_profile_bundles_the_shape_census_without_runtime_probes() {
+        assert!(!TraceProfileKind::TrustedRoute.requires_runtime_profile());
+        let script = TraceProfileKind::TrustedRoute.bundled_script();
+        assert_eq!(
+            script,
+            include_str!("../../../scripts/dtrace/native-shape-census.d")
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(script.as_bytes())),
+            TrustedRouteCaptureReceipt::program_sha256()
+        );
+    }
+
+    #[test]
+    fn trusted_route_capture_receipt_preserves_population_loss_and_provenance() {
+        let receipt = TrustedRouteCaptureReceipt::from_bytes(
+            trusted_route_raw().as_bytes(),
+            ProfileCaptureStatus::default(),
+            trusted_route_provenance(),
+        )
+        .expect("lossless trusted-route capture");
+
+        assert_eq!(receipt.schema, "carrick.trusted-route-capture.v1");
+        assert_eq!(receipt.total_samples, 20);
+        assert_eq!(receipt.pc_samples, 12);
+        assert_eq!(receipt.pc_rows, 2);
+        assert_eq!(receipt.copyin_errors, 0);
+        assert!(receipt.target_completed);
+        assert_eq!(receipt.target_exit_reason, 1);
+        assert_eq!(receipt.provenance.run_id, "trusted-route-test");
+        assert_eq!(
+            receipt.raw_trace_sha256,
+            format!("{:x}", Sha256::digest(trusted_route_raw().as_bytes()))
+        );
+    }
+
+    #[test]
+    fn trusted_route_capture_receipt_is_one_atomically_published_json_object() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("trusted-route.json");
+        let receipt = TrustedRouteCaptureReceipt::from_bytes(
+            trusted_route_raw().as_bytes(),
+            ProfileCaptureStatus::default(),
+            trusted_route_provenance(),
+        )
+        .expect("lossless trusted-route capture");
+
+        write_trusted_route_capture_atomic(&path, &receipt, None).expect("write receipt");
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("published trusted-route receipt"))
+                .expect("one JSON object");
+        assert_eq!(value["schema"], TRUSTED_ROUTE_CAPTURE_SCHEMA);
+        assert_eq!(value["drops"]["interrupted"], false);
+        assert_eq!(value["provenance"]["command"][0], "run-elf");
+    }
+
+    #[test]
+    fn trusted_route_capture_rejects_every_dtrace_loss_class_and_interruption() {
+        for status in [
+            ProfileCaptureStatus {
+                principal_drops: 1,
+                ..ProfileCaptureStatus::default()
+            },
+            ProfileCaptureStatus {
+                aggregation_drops: 1,
+                ..ProfileCaptureStatus::default()
+            },
+            ProfileCaptureStatus {
+                dynamic_drops: 1,
+                ..ProfileCaptureStatus::default()
+            },
+            ProfileCaptureStatus {
+                dynamic_rinse_drops: 1,
+                ..ProfileCaptureStatus::default()
+            },
+            ProfileCaptureStatus {
+                dynamic_dirty_drops: 1,
+                ..ProfileCaptureStatus::default()
+            },
+            ProfileCaptureStatus {
+                other_drops: 1,
+                ..ProfileCaptureStatus::default()
+            },
+            ProfileCaptureStatus {
+                interrupted: true,
+                ..ProfileCaptureStatus::default()
+            },
+        ] {
+            assert!(
+                TrustedRouteCaptureReceipt::from_bytes(
+                    trusted_route_raw().as_bytes(),
+                    status,
+                    trusted_route_provenance(),
+                )
+                .is_err(),
+                "loss state was accepted: {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_route_capture_rejects_incomplete_or_malformed_shape_streams() {
+        let malformed = [
+            trusted_route_raw().replace("copyin-errors=0", "copyin-errors=1"),
+            trusted_route_raw().replace("samples=20", "samples=0"),
+            trusted_route_raw().replace("SHAPE1|section=pc\n", ""),
+            trusted_route_raw().replace("PC 42 0x1010 7", "PC malformed"),
+            trusted_route_raw().replace("PC 42 0x1010 7\nPC 42 0x1020 5\n", ""),
+            trusted_route_raw().replace("target_completed=1", "target_completed=0"),
+        ];
+        for raw in malformed {
+            assert!(
+                TrustedRouteCaptureReceipt::from_bytes(
+                    raw.as_bytes(),
+                    ProfileCaptureStatus::default(),
+                    trusted_route_provenance(),
+                )
+                .is_err(),
+                "malformed stream was accepted:\n{raw}"
+            );
+        }
     }
 }

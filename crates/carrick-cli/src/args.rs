@@ -796,7 +796,8 @@ pub(crate) enum Commands {
         /// Run one of Carrick's bounded, machine-readable DSR profiles.
         #[arg(long, value_enum, conflicts_with = "script")]
         profile: Option<TraceProfileKind>,
-        /// Atomically publish the parsed profile as versioned JSONL.
+        /// Atomically publish the parsed profile. Generic profiles use
+        /// versioned JSONL; trusted-route uses one versioned JSON receipt.
         #[arg(long, value_name = "FILE", requires = "profile")]
         summary_jsonl: Option<std::path::PathBuf>,
         /// Write DTrace events + aggregations to this file instead of stdout.

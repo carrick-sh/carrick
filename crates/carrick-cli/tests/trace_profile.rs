@@ -458,6 +458,22 @@ fn trace_profile_keeps_raw_and_summary_outputs_distinct() {
 }
 
 #[test]
+fn trusted_route_profile_is_cli_visible_and_has_a_target_completion_marker() {
+    cli()
+        .args(["trace", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("trusted-route"));
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/dtrace/native-shape-census.d");
+    let script = std::fs::read_to_string(path).unwrap();
+    assert_eq!(script.matches("SHAPE1|complete|").count(), 1);
+    assert!(script.contains("target_completed=%d"));
+    assert!(script.contains("target_exit_reason=%d"));
+}
+
+#[test]
 fn bundled_profile_scripts_emit_one_versioned_completion() {
     for (name, profile) in [
         ("dsr-profile.d", "dsr"),

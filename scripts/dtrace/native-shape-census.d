@@ -20,6 +20,15 @@
  * Samples are proportional under uniform tracing overhead; absolute times
  * from a traced run are never wall evidence.
  *
+ * Provider ABI qualified live on macOS 26A5388g (2026-08-03):
+ * `proc:::create`, `proc:::exit`, and `profile-997` all list on this host;
+ * successful captures on this host qualified `proc:::create` child identity as
+ * `args[0]->pr_pid`, `proc:::exit` arg0 as the CLD_* exit reason, profile arg1
+ * as the sampled PC, and carrick's `host-image-base` arguments as
+ * (pid, Mach-O base).
+ * The 997 Hz sampling plus aggregation is perturbing; use it only for
+ * same-instrument attribution ratios, never absolute timing.
+ *
  * HAZARD (2026-07-28, unexplained): enabling the copyin clause below against
  * a live native-DSR guest killed the guest 2/2 times within about a second
  * of guest start ("DSR could not read guest instruction at <wild address>"),
@@ -34,6 +43,9 @@ dtrace:::BEGIN
 	tracked[$target] = 1;
 	host_base[$target] = (uint64_t)0;
 	copyin_errors = 0;
+	bounded = 0;
+	target_completed = 0;
+	target_exit_reason = 0;
 }
 
 proc:::create
@@ -53,6 +65,8 @@ proc:::exit
 proc:::exit
 /pid == $target/
 {
+	target_completed = 1;
+	target_exit_reason = arg0;
 	exit(0);
 }
 
@@ -99,6 +113,7 @@ tick-1s
 tick-1s
 /seconds >= 120/
 {
+	bounded = 1;
 	exit(0);
 }
 
@@ -111,4 +126,6 @@ dtrace:::END
 	printa("SHAPE1|region=%s|count=%@d\n", @region);
 	printf("SHAPE1|section=pc\n");
 	printa("PC %d 0x%x %@d\n", @pc);
+	printf("SHAPE1|complete|bounded=%d|target_completed=%d|target_exit_reason=%d\n",
+	    bounded, target_completed, target_exit_reason);
 }

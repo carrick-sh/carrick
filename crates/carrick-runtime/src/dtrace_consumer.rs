@@ -94,6 +94,8 @@ pub const BUNDLED_NATIVE_BIRTH_QUALIFY_D: &str =
     include_str!("../../../scripts/dtrace/native-birth-qualify.d");
 pub const BUNDLED_NATIVE_TERMINAL_QUALIFY_D: &str =
     include_str!("../../../scripts/dtrace/native-terminal-qualify.d");
+pub const BUNDLED_TRUSTED_ROUTE_D: &str =
+    include_str!("../../../scripts/dtrace/native-shape-census.d");
 
 const DTRACE_VERSION: c_int = 3;
 const DTRACE_PROBESPEC_NAME: c_int = 3;
