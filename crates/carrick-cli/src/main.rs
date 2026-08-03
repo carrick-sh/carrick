@@ -209,6 +209,10 @@ fn start_alloc_census() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // FIRST statement: the exec-stamp gauge measures kernel exec + dyld +
+    // static initializers as `pre-exec -> main-entry`, so nothing may run
+    // before it (env-gated; one getenv when off).
+    carrick_runtime::exec_stamps::stamp(carrick_runtime::exec_stamps::ExecStampPhase::MainEntry);
     #[cfg(feature = "alloc-census")]
     start_alloc_census();
     // FIRST, before any dispatch or fork: record this process as the one
@@ -228,6 +232,7 @@ fn main() -> anyhow::Result<()> {
         0,
         0,
     );
+    carrick_runtime::exec_stamps::stamp(carrick_runtime::exec_stamps::ExecStampPhase::ProbesReady);
 
     run_cli(Cli::parse())
 }
