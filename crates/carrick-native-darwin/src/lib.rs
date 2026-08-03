@@ -20,7 +20,6 @@
 
 #![cfg(target_os = "macos")]
 
-pub mod aot;
 pub mod aot_cache;
 /// Tier D: run guest code directly, patching only `svc`/x18/`tpidr_el0`.
 /// aarch64-only — the whole premise is same-ISA execution.

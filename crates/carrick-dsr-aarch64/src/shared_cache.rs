@@ -26,7 +26,6 @@ pub const MAX_TRANSLATION_UNIT_CODE_BYTES: usize = 64 * 1024 * 1024;
 pub const TRANSLATION_UNIT_BASE_EXPORT: &str = "carrick_aot_unit_base";
 pub const TRANSLATION_UNIT_BINDING_EXPORT: &str = "carrick_aot_unit_bindings";
 const DARWIN_HOST_PAGE_SIZE: u64 = 16 * 1024;
-const DARWIN_HOST_PAGE_SIZE_USIZE: usize = 16 * 1024;
 static DIRECT_BINDING_RUNTIME_ENABLED: OnceLock<bool> = OnceLock::new();
 static SHARED_MANIFEST_ARC_ENABLED: OnceLock<bool> = OnceLock::new();
 static SHARED_SOURCE_FINGERPRINT_REUSE_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -71,66 +70,6 @@ fn shared_recovery_runs_enabled() -> bool {
         let value = std::env::var_os("CARRICK_DSR_SHARED_RECOVERY_RUNS");
         shared_recovery_runs_enabled_from(value.as_deref())
     })
-}
-
-/// Exact maximum protection assigned to one loaded AOT mapping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LoadedTranslationProtection {
-    ImmutableCode,
-    BindingCells,
-}
-
-/// Pins both the current and maximum protection of a loaded AOT mapping.
-///
-/// # Safety
-///
-/// `address..address + length` must identify live pages owned exclusively by
-/// the loaded translation unit. Pinning maximum protection is irreversible for
-/// the lifetime of that mapping.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub unsafe fn pin_loaded_translation_protection(
-    address: std::ptr::NonNull<u8>,
-    length: usize,
-    protection: LoadedTranslationProtection,
-) -> Result<(), i32> {
-    use mach2::kern_return::KERN_SUCCESS;
-    use mach2::vm::mach_vm_protect;
-
-    if length == 0 {
-        return Err(libc::KERN_INVALID_ARGUMENT);
-    }
-    let page_size = DARWIN_HOST_PAGE_SIZE_USIZE;
-    let start = address.as_ptr() as usize;
-    if !start.is_multiple_of(page_size) || !length.is_multiple_of(page_size) {
-        return Err(libc::KERN_INVALID_ARGUMENT);
-    }
-    start
-        .checked_add(length)
-        .ok_or(libc::KERN_INVALID_ADDRESS)?;
-    let size = u64::try_from(length).map_err(|_| libc::KERN_INVALID_ADDRESS)?;
-    let native_protection = match protection {
-        LoadedTranslationProtection::ImmutableCode => libc::VM_PROT_READ | libc::VM_PROT_EXECUTE,
-        LoadedTranslationProtection::BindingCells => libc::VM_PROT_READ | libc::VM_PROT_WRITE,
-    };
-    let task = unsafe { mach2::traps::mach_task_self() };
-    let set_maximum = unsafe { mach_vm_protect(task, start as u64, size, 1, native_protection) };
-    if set_maximum != KERN_SUCCESS {
-        return Err(set_maximum);
-    }
-    let set_current = unsafe { mach_vm_protect(task, start as u64, size, 0, native_protection) };
-    if set_current != KERN_SUCCESS {
-        return Err(set_current);
-    }
-    Ok(())
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub unsafe fn pin_loaded_translation_protection(
-    _address: std::ptr::NonNull<u8>,
-    _length: usize,
-    _protection: LoadedTranslationProtection,
-) -> Result<(), i32> {
-    Err(libc::ENOTSUP)
 }
 
 pub fn direct_binding_runtime_enabled() -> bool {
@@ -342,10 +281,10 @@ impl TranslationUnitKey {
     }
 }
 
-/// A dyld export whose signed symbol identity is unique to one translation
-/// unit key. Resolving this exact symbol after `dlopen` cheaply binds a loaded
-/// image to the manifest without rereading and hashing the entire dylib in
-/// every descendant process.
+/// A per-key identity string retained in the manifest (`base_export`) and
+/// validated on both sides of the store. Under the retired dylib transport it
+/// named the unit's `dlsym` export; the copy transport keeps it purely as a
+/// manifest-to-key binding check.
 pub fn translation_unit_base_export(key: &TranslationUnitKey) -> Result<String, serde_json::Error> {
     Ok(format!(
         "{TRANSLATION_UNIT_BASE_EXPORT}_{}",
@@ -411,7 +350,7 @@ impl<'de> Deserialize<'de> for PortableBlockRecord {
 pub struct TranslationUnitManifest {
     pub schema: u32,
     pub key: TranslationUnitKey,
-    pub dylib_sha256: [u8; 32],
+    pub code_sha256: [u8; 32],
     pub base_export: String,
     pub code_len: u64,
     pub blocks: Vec<PortableBlockRecord>,
@@ -838,9 +777,9 @@ pub enum UnitMissReason {
     SourceFingerprint,
     AddressMode,
     PageProfile,
-    DylibDigest,
+    CodeDigest,
     ManifestRange,
-    Dlopen,
+    CodeMapping,
 }
 
 impl UnitMissReason {
@@ -856,9 +795,9 @@ impl UnitMissReason {
         Self::SourceFingerprint,
         Self::AddressMode,
         Self::PageProfile,
-        Self::DylibDigest,
+        Self::CodeDigest,
         Self::ManifestRange,
-        Self::Dlopen,
+        Self::CodeMapping,
     ];
 
     /// Stable wire token used by the census file and by anything that reports
@@ -874,9 +813,9 @@ impl UnitMissReason {
             Self::SourceFingerprint => "source-fingerprint",
             Self::AddressMode => "address-mode",
             Self::PageProfile => "page-profile",
-            Self::DylibDigest => "dylib-digest",
+            Self::CodeDigest => "code-digest",
             Self::ManifestRange => "manifest-range",
-            Self::Dlopen => "dlopen",
+            Self::CodeMapping => "code-mapping",
         }
     }
 
@@ -898,9 +837,9 @@ impl UnitMissReason {
             Self::SourceFingerprint => 6,
             Self::AddressMode => 7,
             Self::PageProfile => 8,
-            Self::DylibDigest => 9,
+            Self::CodeDigest => 9,
             Self::ManifestRange => 10,
-            Self::Dlopen => 11,
+            Self::CodeMapping => 11,
         }
     }
 }
@@ -997,11 +936,19 @@ pub struct TranslationMetadataLoadEvidence {
 }
 
 pub struct SharedLoadedTranslationUnit {
-    // Fields drop in declaration order. Release the dyld lease first so mapped
-    // metadata remains live through handle teardown.
+    // Fields drop in declaration order. Release the source lease first so
+    // mapped metadata remains live through source teardown.
     _lease: Arc<dyn Send + Sync>,
     pub metadata: LoadedTranslationMetadata,
-    pub base: usize,
+    /// Address of the unit's READABLE translated-code bytes
+    /// (`metadata.code_len()` long), pinned by `_lease`. Nothing executes at
+    /// this address: the translator COPIES these bytes into its own
+    /// `MAP_JIT` translation cache at install and re-points the
+    /// direct-binding `ADRP`/`ADD` placeholder pairs at `binding_base`.
+    pub source_base: usize,
+    /// The unit's zeroed, lease-pinned direct-binding cell block, when the
+    /// unit carries sidecar binding data. Provided by the store (the copy
+    /// transport's replacement for the dylib `__DATA` segment).
     pub binding_base: Option<DirectBindingCellVa>,
     pub load_evidence: TranslationMetadataLoadEvidence,
 }
@@ -1022,7 +969,7 @@ impl Clone for SharedLoadedTranslationUnit {
                     LoadedTranslationMetadata::V3(Arc::clone(metadata))
                 }
             },
-            base: self.base,
+            source_base: self.source_base,
             binding_base: self.binding_base,
             load_evidence: self.load_evidence,
         }
@@ -1032,13 +979,13 @@ impl Clone for SharedLoadedTranslationUnit {
 impl SharedLoadedTranslationUnit {
     pub fn new(
         manifest: impl Into<Arc<TranslationUnitManifest>>,
-        base: usize,
+        source_base: usize,
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
         Self {
             _lease: lease,
             metadata: LoadedTranslationMetadata::V2(retain_loaded_manifest(manifest.into())),
-            base,
+            source_base,
             binding_base: None,
             load_evidence: TranslationMetadataLoadEvidence::default(),
         }
@@ -1046,14 +993,14 @@ impl SharedLoadedTranslationUnit {
 
     pub fn new_with_binding_base(
         manifest: impl Into<Arc<TranslationUnitManifest>>,
-        base: usize,
+        source_base: usize,
         binding_base: Option<DirectBindingCellVa>,
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
         Self {
             _lease: lease,
             metadata: LoadedTranslationMetadata::V2(retain_loaded_manifest(manifest.into())),
-            base,
+            source_base,
             binding_base,
             load_evidence: TranslationMetadataLoadEvidence::default(),
         }
@@ -1061,16 +1008,16 @@ impl SharedLoadedTranslationUnit {
 
     pub fn new_mapped(
         metadata: impl Into<Arc<crate::mapped_metadata::ValidatedMappedTranslationMetadata>>,
-        base: usize,
+        source_base: usize,
         load_evidence: TranslationMetadataLoadEvidence,
         lease: Arc<dyn Send + Sync>,
     ) -> Self {
-        Self::new_mapped_with_binding_base(metadata, base, None, load_evidence, lease)
+        Self::new_mapped_with_binding_base(metadata, source_base, None, load_evidence, lease)
     }
 
     pub fn new_mapped_with_binding_base(
         metadata: impl Into<Arc<crate::mapped_metadata::ValidatedMappedTranslationMetadata>>,
-        base: usize,
+        source_base: usize,
         binding_base: Option<DirectBindingCellVa>,
         mut load_evidence: TranslationMetadataLoadEvidence,
         lease: Arc<dyn Send + Sync>,
@@ -1079,7 +1026,7 @@ impl SharedLoadedTranslationUnit {
         Self {
             _lease: lease,
             metadata: LoadedTranslationMetadata::V3(metadata.into()),
-            base,
+            source_base,
             binding_base,
             load_evidence,
         }
@@ -1587,7 +1534,7 @@ mod tests {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
             base_export: translation_unit_base_export(&key).expect("unit export"),
             key,
-            dylib_sha256: [0x22; 32],
+            code_sha256: [0x22; 32],
             code_len: 512,
             blocks: Vec::new(),
             binding_layout: DirectBindingLayout::SidecarV1,
@@ -1800,7 +1747,7 @@ mod tests {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
             base_export: translation_unit_base_export(&pending.key).expect("unit export"),
             key: pending.key,
-            dylib_sha256: [0x71; 32],
+            code_sha256: [0x71; 32],
             code_len: pending.code.len() as u64,
             blocks: pending.blocks,
             binding_layout: pending.binding_layout,
@@ -1957,7 +1904,7 @@ mod tests {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
             base_export: translation_unit_base_export(&key).expect("unit export"),
             key,
-            dylib_sha256: [0x22; 32],
+            code_sha256: [0x22; 32],
             code_len: 4,
             blocks: Vec::new(),
             binding_layout: DirectBindingLayout::Disabled,
@@ -1986,7 +1933,7 @@ mod tests {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
             base_export: translation_unit_base_export(&key).expect("unit export"),
             key,
-            dylib_sha256: [0x22; 32],
+            code_sha256: [0x22; 32],
             code_len: 4,
             blocks: Vec::new(),
             binding_layout: DirectBindingLayout::Disabled,

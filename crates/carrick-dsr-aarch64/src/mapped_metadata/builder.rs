@@ -480,7 +480,7 @@ fn serialize_metadata(
         reserved: U32::new(0),
         total_len: U64::new(offset),
         key,
-        dylib_sha256: manifest.dylib_sha256,
+        code_sha256: manifest.code_sha256,
         code_len: U64::new(manifest.code_len),
         binding_data_len: U64::new(manifest.binding_data_len),
         binding_layout: U32::new(binding_layout(manifest.binding_layout)),

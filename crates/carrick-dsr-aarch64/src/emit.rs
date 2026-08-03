@@ -1894,6 +1894,115 @@ pub(crate) fn rewrite_direct_binding_stub(
     })
 }
 
+/// Point a copied unit's direct-binding `ADRP x15`/`ADD x15` placeholder
+/// pairs at this process's freshly allocated binding cells.
+///
+/// `rewrite_direct_binding_stub` leaves each pair as the zero-immediate
+/// placeholders (`adrp x15, 0` / `add x15, x15, #0`); the dylib transport had
+/// its Mach-O emitter resolve them against the unit's own `__DATA` segment at
+/// publish. The copy transport resolves them at INSTALL, against the real
+/// runtime addresses: `code_base` is where the copy will execute and
+/// `cell_base` is the per-process cell allocation. Both legs (hit and miss)
+/// of every relocation address the same cell.
+///
+/// Validates before encoding; on error the caller discards the scratch
+/// buffer, so partially patched bytes never become executable.
+pub(crate) fn patch_copied_binding_cell_relocations(
+    code: &mut [u8],
+    code_base: usize,
+    cell_base: usize,
+    cell_len: usize,
+    relocations: &[crate::shared_cache::DirectBindingRelocation],
+) -> Result<(), DsrError> {
+    const ADRP_X15: u32 = 0x9000_000f;
+    const ADD_X15_X15_0: u32 = 0x9100_01ef;
+    /// Architectural page size `ADRP` addresses, NOT the host page size.
+    const ADRP_PAGE: usize = 4096;
+    const ADRP_MIN_PAGES: i128 = -(1 << 20);
+    const ADRP_MAX_PAGES: i128 = (1 << 20) - 1;
+
+    for relocation in relocations {
+        let data_offset = usize::try_from(relocation.data_offset).map_err(|_| {
+            DsrError::CachePolicy("binding-cell data offset does not fit usize".to_string())
+        })?;
+        if !data_offset.is_multiple_of(8)
+            || data_offset.checked_add(8).is_none_or(|end| end > cell_len)
+        {
+            return Err(DsrError::CachePolicy(format!(
+                "binding-cell data offset {data_offset} is outside the {cell_len}-byte cell block"
+            )));
+        }
+        let target = cell_base.checked_add(data_offset).ok_or_else(|| {
+            DsrError::CachePolicy("binding-cell target address overflow".to_string())
+        })?;
+        for (adrp_offset, add_offset) in [
+            (relocation.adrp_offset, relocation.add_offset),
+            (relocation.miss_adrp_offset, relocation.miss_add_offset),
+        ] {
+            let adrp_offset = usize::try_from(adrp_offset).map_err(|_| {
+                DsrError::CachePolicy("binding relocation offset does not fit usize".to_string())
+            })?;
+            let add_offset = usize::try_from(add_offset).map_err(|_| {
+                DsrError::CachePolicy("binding relocation offset does not fit usize".to_string())
+            })?;
+            if !adrp_offset.is_multiple_of(4)
+                || !add_offset.is_multiple_of(4)
+                || adrp_offset
+                    .checked_add(4)
+                    .is_none_or(|end| end > code.len())
+                || add_offset.checked_add(4).is_none_or(|end| end > code.len())
+            {
+                return Err(DsrError::CachePolicy(format!(
+                    "binding relocation offsets {adrp_offset}/{add_offset} are outside the \
+                     {}-byte unit",
+                    code.len()
+                )));
+            }
+            let read_word = |offset: usize| -> Result<u32, DsrError> {
+                code.get(offset..offset + 4)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    .ok_or_else(|| {
+                        DsrError::CachePolicy("binding relocation word is truncated".to_string())
+                    })
+            };
+            if read_word(adrp_offset)? != ADRP_X15 || read_word(add_offset)? != ADD_X15_X15_0 {
+                return Err(DsrError::CachePolicy(
+                    "binding relocation does not address the ADRP/ADD placeholder pair".to_string(),
+                ));
+            }
+            let pc = code_base.checked_add(adrp_offset).ok_or_else(|| {
+                DsrError::CachePolicy("binding relocation PC overflow".to_string())
+            })?;
+            let delta_pages = (i128::try_from(target & !(ADRP_PAGE - 1)).unwrap_or(i128::MAX)
+                - i128::try_from(pc & !(ADRP_PAGE - 1)).unwrap_or(i128::MAX))
+                / ADRP_PAGE as i128;
+            if !(ADRP_MIN_PAGES..=ADRP_MAX_PAGES).contains(&delta_pages) {
+                return Err(DsrError::CachePolicy(format!(
+                    "binding cells are outside ADRP range of the copied unit: \
+                     {delta_pages} pages"
+                )));
+            }
+            let encoded_delta = if delta_pages < 0 {
+                delta_pages + (1 << 21)
+            } else {
+                delta_pages
+            };
+            let immediate = u32::try_from(encoded_delta).map_err(|_| {
+                DsrError::CachePolicy("binding relocation page delta is unencodable".to_string())
+            })?;
+            let patched_adrp = ADRP_X15 | ((immediate & 0x3) << 29) | ((immediate >> 2) << 5);
+            let low_twelve = u32::try_from(target & (ADRP_PAGE - 1)).map_err(|_| {
+                DsrError::CachePolicy("binding cell page offset is unencodable".to_string())
+            })?;
+            let patched_add = ADD_X15_X15_0 | (low_twelve << 10);
+            code[adrp_offset..adrp_offset + 4].copy_from_slice(&patched_adrp.to_le_bytes());
+            code[add_offset..add_offset + 4].copy_from_slice(&patched_add.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
 fn decode_mov_wide_x17(words: &[u32]) -> Option<u64> {
     const IMM16_MASK: u32 = 0x001f_ffe0;
     let expected = [0xd280_0011, 0xf2a0_0011, 0xf2c0_0011, 0xf2e0_0011];
@@ -7568,6 +7677,121 @@ mod tests {
         IndirectKind,
     };
     use super::*;
+
+    /// Decode a patched `ADRP x15`/`ADD x15` pair back into the absolute
+    /// address it materializes, from the pair's runtime PC.
+    fn decode_adrp_add_target(code: &[u8], adrp_offset: usize, code_base: usize) -> usize {
+        let word = |offset: usize| {
+            u32::from_le_bytes(code[offset..offset + 4].try_into().expect("code word"))
+        };
+        let adrp = word(adrp_offset);
+        let add = word(adrp_offset + 4);
+        let imm21 = (((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 0x3);
+        let page_delta = i64::from(((imm21 << 11) as i32) >> 11);
+        let pc_page = (code_base + adrp_offset) & !0xfff;
+        let target_page = (i128::from(pc_page as u64) + i128::from(page_delta) * 4096) as usize;
+        target_page + usize::try_from((add >> 10) & 0xfff).expect("page offset")
+    }
+
+    fn placeholder_relocation_code() -> Vec<u8> {
+        // [hit ADRP, hit ADD, NOP, miss ADRP, miss ADD, NOP]
+        [
+            0x9000_000f_u32,
+            0x9100_01ef,
+            0xd503_201f,
+            0x9000_000f,
+            0x9100_01ef,
+            0xd503_201f,
+        ]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect()
+    }
+
+    fn cell_relocation() -> crate::shared_cache::DirectBindingRelocation {
+        crate::shared_cache::DirectBindingRelocation {
+            ordinal: crate::direct_binding::DirectBindingOrdinal::claimed(0),
+            adrp_offset: 0,
+            add_offset: 4,
+            miss_adrp_offset: 12,
+            miss_add_offset: 16,
+            data_offset: 8,
+        }
+    }
+
+    #[test]
+    fn copied_binding_relocations_materialize_the_cell_address_in_both_legs() {
+        // Both directions: cells above the copy and cells below it.
+        for (code_base, cell_base) in [
+            (0x1_0000_0000_usize, 0x1_0bad_d000_usize & !0xfff),
+            (0x2_0000_0000, 0x1_f000_0000),
+        ] {
+            let mut code = placeholder_relocation_code();
+            patch_copied_binding_cell_relocations(
+                &mut code,
+                code_base,
+                cell_base,
+                16,
+                &[cell_relocation()],
+            )
+            .expect("patch both relocation legs");
+            let expected = cell_base + 8;
+            assert_eq!(decode_adrp_add_target(&code, 0, code_base), expected);
+            assert_eq!(decode_adrp_add_target(&code, 12, code_base), expected);
+            // The words between the pairs stay untouched.
+            assert_eq!(&code[8..12], &0xd503_201f_u32.to_le_bytes());
+            assert_eq!(&code[20..24], &0xd503_201f_u32.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn copied_binding_relocations_reject_non_placeholder_words() {
+        // An already-patched (nonzero-immediate) pair must be refused: it
+        // means the unit was produced by a different transport or patched
+        // twice, and re-patching would silently double-apply the offset.
+        let mut code = placeholder_relocation_code();
+        code[0..4].copy_from_slice(&0x9000_002f_u32.to_le_bytes());
+        assert!(
+            patch_copied_binding_cell_relocations(
+                &mut code,
+                0x1_0000_0000,
+                0x1_0001_0000,
+                16,
+                &[cell_relocation()],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn copied_binding_relocations_reject_cell_offsets_outside_the_block() {
+        let mut code = placeholder_relocation_code();
+        assert!(
+            patch_copied_binding_cell_relocations(
+                &mut code,
+                0x1_0000_0000,
+                0x1_0001_0000,
+                8, // data_offset 8 + 8 > 8
+                &[cell_relocation()],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn copied_binding_relocations_fail_closed_outside_adrp_range() {
+        let mut code = placeholder_relocation_code();
+        assert!(
+            patch_copied_binding_cell_relocations(
+                &mut code,
+                0x1_0000_0000,
+                0x3_0000_0000, // 8 GiB away: outside ADRP's +/-4 GiB
+                16,
+                &[cell_relocation()],
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn direct_instruction_bytes_are_default_on_with_an_exact_opt_out() {

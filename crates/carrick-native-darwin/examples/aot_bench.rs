@@ -3,19 +3,34 @@
 // correct response and an `Err` return would only obscure it. The workspace
 // no-panic gate targets the runtime, which this is not.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-//! Benchmark the file-backed AOT publish pipeline against `MAP_JIT`.
+//! Benchmark the raw-code shared-unit transport: publish and per-process load.
 //!
-//! Two questions, both end-to-end on OUR emitter rather than a compiler-built
-//! dylib:
-//!
-//! 1. What does publishing a unit cost? (emit -> sign -> dlopen)
-//! 2. Does a unit we emitted actually avoid the `MAP_JIT` fork penalty?
+//! The question this answers: what does one process pay to LOAD a published
+//! translation unit through the copy transport (openat + mmap + SHA-256
+//! digest + binding-cell allocation), as a function of unit size? The
+//! superseded signed-dylib + `dlopen` transport paid ~2.4 ms/MB (page-fault
+//! plus code-signature validation of the whole image,
+//! `docs/perf-results/2026-08-02-exec-cost-decomposed.jsonl`); the number
+//! printed here is what replaced it. The translator's install adds one
+//! `memcpy` of the same bytes into its `MAP_JIT` cache on top of this.
 //!
 //! Run: `cargo run -p carrick-native-darwin --example aot_bench --release`
-//! Keep the box quiet: fork timings are load-sensitive.
+//! Keep the box quiet, and treat single-run numbers as "suggests".
 
-use carrick_native_darwin::aot::{AotExport, AotImage, AotSection, emit_dylib};
 use std::time::Instant;
+
+use carrick_dsr::address::NativeHostBias;
+use carrick_dsr_aarch64::artifact_spike::{ArtifactBindings, ArtifactTemplate};
+use carrick_dsr_aarch64::emit::PcMapEntry;
+use carrick_dsr_aarch64::shared_cache::TranslationUnitStore as _;
+use carrick_dsr_aarch64::shared_cache::{
+    AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
+    ImageFileOffset, NativePageProfileIdentity, PendingTranslationUnit, PortableBlockRecord,
+    SourceFingerprint, TranslationUnitKey,
+};
+use carrick_dsr_aarch64::types::CacheOffset;
+use carrick_guest_mem::GuestVa;
+use carrick_native_darwin::aot_cache::{ActiveContainerUnitStore, begin_container_cache};
 
 /// `mov w0, #42 ; ret`
 const MOV42_RET: [u8; 8] = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
@@ -31,137 +46,99 @@ fn unit_code(bytes: usize) -> Vec<u8> {
     code
 }
 
+fn pending_of_size(bytes: usize, seed: u8) -> PendingTranslationUnit {
+    let code = unit_code(bytes);
+    let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
+    let template = ArtifactTemplate::normalize(
+        Vec::new(),
+        vec![PcMapEntry {
+            guest: GuestVa(0x40_0000),
+            cache: CacheOffset::published(0),
+        }],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
+    )
+    .expect("bench block metadata")
+    .into_runtime_metadata_only();
+    PendingTranslationUnit {
+        key: TranslationUnitKey::for_segment(
+            ExecutableIdentity::Digest([seed; 32]),
+            ImageFileOffset::new(0),
+            ImageFileLen::new(bytes as u64).expect("nonzero file length"),
+            GuestVa(0x40_0000),
+            GuestCodeLen::new(bytes as u64).expect("nonzero guest length"),
+            SourceFingerprint::from_words(&source_words),
+            NativePageProfileIdentity::Native16k,
+            AddressModeIdentity::biased(
+                NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
+            ),
+        ),
+        code: code.clone(),
+        blocks: vec![PortableBlockRecord {
+            guest_start: GuestVa(0x40_0000),
+            generation_binding: 0,
+            entry_offset: 0,
+            code_len: u32::try_from(code.len()).expect("bench unit fits u32"),
+            requires_sensitive_metadata: false,
+            template,
+        }],
+        binding_layout: DirectBindingLayout::Disabled,
+        binding_export: String::new(),
+        binding_data_len: 0,
+        cell_size: 0,
+        bindings: Vec::new(),
+        binding_relocations: Vec::new(),
+        binding_data: Vec::new(),
+    }
+}
+
 fn median(mut v: Vec<u128>) -> u128 {
     v.sort_unstable();
     v[v.len() / 2]
 }
 
-/// fork + child `_exit(0)` + `waitpid`, the same shape as `perf_fork_scale`.
-fn fork_p50_us(iters: usize) -> u128 {
-    let mut samples = Vec::with_capacity(iters);
-    for i in 0..iters {
-        let t0 = Instant::now();
-        // SAFETY: the child does nothing but `_exit`, which is async-signal-safe.
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            unsafe { libc::_exit(0) };
-        }
-        assert!(pid > 0, "fork failed");
-        let mut status = 0;
-        while unsafe { libc::waitpid(pid, &mut status, 0) } != pid {}
-        // Discard warmup: the first forks pay one-time COW setup.
-        if i >= 15 {
-            samples.push(t0.elapsed().as_nanos());
-        }
-    }
-    median(samples) / 1000
-}
-
-fn publish(
-    dir: &std::path::Path,
-    name: &str,
-    code: &[u8],
-) -> (u128, u128, u128, std::path::PathBuf) {
-    let export = AotExport {
-        name: "carrick_aot_entry",
-        section: AotSection::Text,
-        offset: 0,
-    };
-
-    let t = Instant::now();
-    let bytes = emit_dylib(&AotImage {
-        code,
-        data: &[],
-        exports: &[export],
-        relocations: &[],
-    })
-    .expect("emit");
-    let emit_us = t.elapsed().as_micros();
-
-    let path = dir.join(format!("{name}.dylib"));
-    std::fs::write(&path, &bytes).expect("write");
-
-    let t = Instant::now();
-    let out = std::process::Command::new("/usr/bin/codesign")
-        .args(["-s", "-"])
-        .arg(&path)
-        .output()
-        .expect("codesign");
-    let sign_us = t.elapsed().as_micros();
-    assert!(
-        out.status.success(),
-        "sign: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    let t = Instant::now();
-    // SAFETY: freshly written, signed file.
-    let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW) };
-    let dlopen_us = t.elapsed().as_micros();
-    assert!(!h.is_null(), "dlopen failed for {name}");
-
-    // Prove the loaded unit is real before we time anything against it.
-    let sym = std::ffi::CString::new("carrick_aot_entry").unwrap();
-    // SAFETY: live handle, symbol exported by `emit_dylib`.
-    let addr = unsafe { libc::dlsym(h, sym.as_ptr()) };
-    assert!(!addr.is_null(), "dlsym failed for {name}");
-    // SAFETY: the symbol addresses `mov w0,#42; ret`.
-    let f: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
-    assert_eq!(
-        f(),
-        42,
-        "emitted unit executed but returned the wrong value"
-    );
-
-    (emit_us, sign_us, dlopen_us, path)
-}
-
 fn main() {
-    let dir = std::env::temp_dir().join(format!("carrick-aot-bench-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let _session = begin_container_cache().expect("begin bench cache session");
+    let store = ActiveContainerUnitStore;
+    println!("size_mb publish_ms load_cold_ms load_warm_p50_ms load_warm_mb_per_s");
+    for (index, size_mb) in [1_usize, 6, 16].into_iter().enumerate() {
+        let bytes = size_mb * 1024 * 1024;
+        let pending = pending_of_size(bytes, 0x11 + index as u8);
+        let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
 
-    println!("=== publish cost (emit -> sign -> dlopen -> verified by CALL) ===");
-    println!(
-        "{:>8}  {:>10}  {:>10}  {:>12}",
-        "size", "emit_us", "sign_us", "dlopen_us"
-    );
-    let mut big = None;
-    for mib in [1usize, 16, 64] {
-        let code = unit_code(mib << 20);
-        let (e, s, d, path) = publish(&dir, &format!("u{mib}"), &code);
-        println!("{:>7}M  {:>10}  {:>10}  {:>12}", mib, e, s, d);
-        if mib == 64 {
-            big = Some(path);
+        let t0 = Instant::now();
+        store.publish(&pending).expect("publish bench unit");
+        let publish_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t0 = Instant::now();
+        let cold = store
+            .load(&pending.key, &source_words)
+            .expect("cold load")
+            .expect("published bench unit");
+        let cold_ms = t0.elapsed().as_secs_f64() * 1e3;
+        drop(cold);
+
+        let mut samples = Vec::new();
+        for _ in 0..21 {
+            let t0 = Instant::now();
+            let loaded = store
+                .load(&pending.key, &source_words)
+                .expect("warm load")
+                .expect("published bench unit");
+            samples.push(t0.elapsed().as_nanos());
+            drop(loaded);
         }
+        let warm_ns = median(samples);
+        let warm_ms = warm_ns as f64 / 1e6;
+        let mb_per_s = (bytes as f64 / (1024.0 * 1024.0)) / (warm_ns as f64 / 1e9);
+        println!("{size_mb} {publish_ms:.2} {cold_ms:.2} {warm_ms:.3} {mb_per_s:.0}");
     }
-
-    println!("\n=== fork p50 (us), 100 timed iterations after 15 warmup ===");
-    // Baseline is this process AFTER the units above are already loaded, so the
-    // comparison isolates MAP_JIT rather than re-measuring the loads.
-    let with_aot = fork_p50_us(115);
-    println!("{:>34}  {:>8}", "with emitted AOT units loaded", with_aot);
-
-    let size = 64usize << 20;
-    // SAFETY: a fresh MAP_JIT region of the same size as the largest unit.
-    let jit = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
-            -1,
-            0,
-        )
-    };
-    assert!(jit != libc::MAP_FAILED, "MAP_JIT mmap failed");
-    let with_jit = fork_p50_us(115);
-    println!("{:>34}  {:>8}", "+ a 64 MiB MAP_JIT region", with_jit);
+    println!();
     println!(
-        "\nMAP_JIT delta: {:+} us per fork  (the cost the AOT cache removes)",
-        with_jit as i128 - with_aot as i128
+        "note: dylib-era load was ~2.4 ms/MB (14.76 ms median for a 6 MB unit); \
+         single-run numbers above are load-sensitive and only 'suggest'."
     );
-
-    let _ = big;
-    let _ = std::fs::remove_dir_all(&dir);
 }
