@@ -139,14 +139,19 @@ fn active_host_jit() -> Result<&'static dyn NativeHostJit, types::DsrError> {
 }
 const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
 
-/// The persistent per-image translation store is DEFAULT ON; the exact
-/// escape hatch is `CARRICK_DSR_PERSISTENT_STORE=0` (bisection, A/B arms).
-/// This replaces the retired opt-in `CARRICK_DSR_SHARED_TRANSLATION=1`
-/// spelling: the opt-in transport was measured 30% WORSE on the parallel
-/// cold go build (concurrent publishers, recording deferred past the second
-/// exec — 2026-08-03 scoreboard correction), and the fixes to that shape
-/// are structural (fork-claim clearing, first-miss election, per-host
-/// persistence), not a flag.
+/// The persistent per-image translation store is DEFAULT OFF; opt in with
+/// `CARRICK_DSR_PERSISTENT_STORE=1` (A/B arms, bisection). It is NOT
+/// finished enough to default on, and the blocker is measured, not
+/// structural: attached RECORDED-TEMPLATE units run materially slower than
+/// natively-emitted code on compute-bound paths — the awk-8M compute shape
+/// regresses 358 → ~594 ms (+65%, counterbalanced ABBA n=8,
+/// 2026-08-03 final scoreboard) once busybox's units attach, against a
+/// ~3% cold-build win and an 11% serial-micro win. Per the two-gates rule
+/// that trade cannot ship as a default. The election/persistence mechanics
+/// ARE sound (the old opt-in transport's 30% parallel-build regression is
+/// fixed by fork-claim clearing, first-miss election, per-host
+/// persistence); the re-flip condition is template code quality reaching
+/// parity on hot loops (superblock-fusion loss is the recorded suspect).
 pub fn persistent_store_runtime_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -155,7 +160,7 @@ pub fn persistent_store_runtime_enabled() -> bool {
 }
 
 fn persistent_store_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("0"))
+    value == Some(std::ffi::OsStr::new("1"))
 }
 
 /// Encode the AArch64 `B` instruction that links `site` to `target`.
@@ -6352,19 +6357,24 @@ mod tests {
 
     const PC: GuestVa = GuestVa(0x1000);
 
-    /// The persistent store is opt-OUT: unset means ON, and `=0` is the
-    /// exact escape hatch. Pinned on the pure parser because the runtime
-    /// gate caches the environment in a `OnceLock`.
+    /// The persistent store is opt-IN until template code quality reaches
+    /// parity on hot loops: unset means OFF, `=1` enables (see the gate's
+    /// doc comment for the +65% compute-shape ABBA that forced this).
+    /// Pinned on the pure parser because the runtime gate caches the
+    /// environment in a `OnceLock`.
     #[test]
     fn persistent_store_default_and_hatch_parse() {
-        assert!(super::persistent_store_enabled_from(None), "default is ON");
         assert!(
-            !super::persistent_store_enabled_from(Some(std::ffi::OsStr::new("0"))),
-            "=0 is the exact hatch"
+            !super::persistent_store_enabled_from(None),
+            "default is OFF until template quality reaches parity"
         );
-        assert!(super::persistent_store_enabled_from(Some(
-            std::ffi::OsStr::new("1")
+        assert!(!super::persistent_store_enabled_from(Some(
+            std::ffi::OsStr::new("0")
         )));
+        assert!(
+            super::persistent_store_enabled_from(Some(std::ffi::OsStr::new("1"))),
+            "=1 is the exact opt-in"
+        );
     }
 
     struct TestHostJit;
