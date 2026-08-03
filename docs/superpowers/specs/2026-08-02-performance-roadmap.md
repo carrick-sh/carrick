@@ -79,10 +79,22 @@ Nothing real runs on tier D yet. In order:
    mechanism lives (`carrick_native_darwin::direct` module doc, the
    `direct_runner` bridge header, and the design doc §6): a tier-D guest
    leaves through the handler, never by returning.
-3. **Dynamic linking.** `ld.so` is more PIE mappings through the same loader,
-   plus TLS initialisation now that `tpidr_el0` is veneered.
-4. **Threads.** `guest_tls`/`guest_x18` are per-image today; they must be
-   per-thread.
+3. **Dynamic linking — DONE at the loader/runner level.** `ld.so` maps as a
+   second member image of a `DirectLoadGroup` (same scan/patch pipeline,
+   slots per-load-group so TLS is coherent across images), the runner builds
+   the exec stack (argv/envp/auxv with `AT_BASE`/`AT_ENTRY`/`AT_PHDR`,
+   `AT_PAGESZ` = 16 KiB host page) reusing carrick-mem's serializer, and an
+   identity memory model lowers anon mmap/munmap/mprotect/brk to host
+   primitives. LIVE-VERIFIED: real glibc `ld-2.28.so` runs a dynamic
+   `-nostdlib` PIE end to end on tier D — self-relocation, TLS init through
+   the veneers into the group slot, handoff via `AT_ENTRY`, exit through the
+   handler. The `/bin/dash` frontier is pinned by a test: ld.so finds the
+   real `libc.so.6` through the dispatcher's VFS and stops, NAMED, at
+   `mmap(PROT_EXEC, fd)` — which is item 5's scan+patch boundary (plus
+   guest-fd → host-fd translation for the file-backed data mappings).
+4. **Threads.** The slots moved from per-image to per-LOAD-GROUP (the
+   dynamic-linking seam); threads share a load group but need them
+   per-thread on top.
 5. **fork/exec, signals, guest-created executable pages** (scan+patch at the
    intercepted `mmap`/`mprotect` PROT_EXEC boundary; RWX-without-flip falls
    back to tier T).
