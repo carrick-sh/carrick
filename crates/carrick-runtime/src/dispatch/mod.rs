@@ -2857,6 +2857,29 @@ impl SyscallDispatcher {
         self.fs.rootfs_vfs.overlay.open_file_readonly(path)
     }
 
+    /// Dup the HOST descriptor behind an ordinary host-backed guest file fd.
+    ///
+    /// Tier D's identity memory services guest `mmap(MAP_SHARED, fd)` with a
+    /// REAL host `mmap` of the same file — the only lowering that keeps the
+    /// sharing contract (writes visible to every opener, coherent across
+    /// fork) — and that needs the file's host fd. `None` for every other
+    /// description (pipes, sockets, synthetic files): the caller fails
+    /// closed rather than approximating.
+    pub(crate) fn dup_host_file_fd(&self, fd: i32) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::HostFile { host_fd, .. } => {
+                // SAFETY: dup of a live host fd; ownership of the duplicate
+                // transfers to the returned OwnedFd exactly once.
+                let duped = unsafe { libc::dup(host_fd.raw()) };
+                (duped >= 0).then(|| unsafe { OwnedFd::from_raw_fd(duped) })
+            }
+            _ => None,
+        }
+    }
+
     pub fn stdout(&self) -> Vec<u8> {
         self.io.stdout.lock().clone()
     }

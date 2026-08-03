@@ -686,6 +686,12 @@ where
     );
 
     let file = std::fs::read(path).map_err(AddressSpaceError::Io)?;
+    let direct = native_direct_candidate(
+        &file,
+        argv.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+        env.iter().map(|entry| entry.as_bytes().to_vec()).collect(),
+        &canonical_host_executable_path(path),
+    );
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)?;
     let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
         &file,
@@ -719,6 +725,7 @@ where
         max_traps,
         relative_relocations,
         plan,
+        direct,
     )
 }
 
@@ -770,6 +777,12 @@ where
             resolved.clone(),
         )))
     })?;
+    let direct = native_direct_candidate(
+        &file,
+        argv.clone(),
+        env.iter().map(|entry| entry.as_bytes().to_vec()).collect(),
+        &resolved,
+    );
     let relative_relocations = native_relative_relocations(&file, NATIVE_DARWIN_PIE_BASE)?;
     let image = AddressSpace::load_elf_bytes_with_reader_at_pie_base_without_runtime_regions(
         &file,
@@ -795,7 +808,275 @@ where
         max_traps,
         relative_relocations,
         plan,
+        direct,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Tier D (direct execution) — the shipped driver's tier decision and runner
+// ---------------------------------------------------------------------------
+
+/// The tier-D wiring default when `CARRICK_NATIVE_DIRECT` is unset.
+///
+/// OFF until the native conformance smoke is green with tier D exercised:
+/// a tier-D guest that hits a leave the runner cannot service mid-run has NO
+/// sound fallback (its side effects already happened), so the default flip is
+/// gated on the smoke, per the Phase 2 plan. `CARRICK_NATIVE_DIRECT=1` is the
+/// exact opt-in; `=0` the exact opt-out for bisection once the default flips.
+const NATIVE_DIRECT_DEFAULT: bool = false;
+
+/// Whether the tier decision runs at all (see [`NATIVE_DIRECT_DEFAULT`]).
+/// Unknown spellings fail closed to tier T.
+pub(crate) fn native_direct_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("CARRICK_NATIVE_DIRECT") {
+        Some(value) if value == "1" => true,
+        Some(_) => false,
+        None => NATIVE_DIRECT_DEFAULT,
+    })
+}
+
+/// Tier-decision census: one appended line per decision when
+/// `CARRICK_TIER_CENSUS` names a file (the smoke's per-case tier census),
+/// plus an always-on `tracing` event. Follows the `CARRICK_EXEC_STAMPS`
+/// untraced-gauge pattern: env-gated diagnostics, zero cost when unset.
+pub(crate) fn native_tier_census(event: &str, image: &str, detail: &str) {
+    tracing::debug!(target: "carrick::tier", event, image, detail, "native tier decision");
+    let Some(path) = std::env::var_os("CARRICK_TIER_CENSUS") else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "pid={} event={event} image={image} detail={detail}",
+            std::process::id()
+        );
+    }
+}
+
+/// The raw material for a tier-D launch attempt: the resolved executable's
+/// bytes plus the exact argv/envp the exec stack must carry (identical to
+/// what the DSR image builder was given).
+pub(crate) struct DirectLaunchCandidate {
+    elf: Vec<u8>,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+}
+
+/// The exec-time tier decision, made in the launching parent BEFORE any fork:
+/// `Some` = the main image's own text is tier-D provable (the group load in
+/// the child re-proves it, interpreter included, and still falls back on
+/// refusal); `None` = tier T, with the reason in the census.
+fn native_direct_candidate(
+    file: &[u8],
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+    resolved: &str,
+) -> Option<DirectLaunchCandidate> {
+    if !native_direct_enabled() {
+        return None;
+    }
+    match carrick_native_darwin::direct::scan_eligibility_as_interpreted(file) {
+        Ok(Ok(_)) => {
+            native_tier_census("scan-direct", resolved, "");
+            Some(DirectLaunchCandidate {
+                elf: file.to_vec(),
+                argv,
+                env,
+            })
+        }
+        Ok(Err(reason)) => {
+            native_tier_census("scan-refused", resolved, &reason.to_string());
+            None
+        }
+        Err(error) => {
+            native_tier_census("scan-error", resolved, &error.to_string());
+            None
+        }
+    }
+}
+
+/// How a tier-D launch attempt left [`run_direct_in_current_process`].
+enum DirectLaunchFlow {
+    /// The guest ran on tier D and exited with this code.
+    Completed(i32),
+    /// Refused BEFORE any guest instruction ran — the dispatcher comes back
+    /// untouched so the caller falls back to tier T for this exec.
+    Refused {
+        dispatcher: Box<SyscallDispatcher>,
+        reason: String,
+    },
+}
+
+/// Run an eligible image on tier D in THIS process, through the one shared
+/// dispatcher, with real fd passthrough (the dispatcher arrives configured —
+/// stream stdio, fs backend, identity — exactly as the DSR path receives it).
+///
+/// Fail-closed shape: every refusal up to and including the exec-stack build
+/// happens BEFORE the first guest instruction and returns the dispatcher for
+/// the tier T fallback. Once the guest has entered, there is no fallback —
+/// its side effects are real — so a mid-run leave the runner cannot service
+/// surfaces as a NAMED error, never a silent partial run.
+fn run_direct_in_current_process(
+    candidate: DirectLaunchCandidate,
+    resolved: &str,
+    dispatcher: SyscallDispatcher,
+    max_traps: usize,
+    plan: &ExecutionPlan,
+) -> Result<DirectLaunchFlow, RuntimeError> {
+    use crate::direct_runner as dr;
+    let group = match carrick_native_darwin::direct::DirectLoadGroup::load_with_interpreter(
+        &candidate.elf,
+        |path| {
+            dispatcher
+                .read_exec_file(path)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, path.to_owned()))
+        },
+        dr::island_handler(),
+    ) {
+        Ok(Ok(group)) => group,
+        Ok(Err(reason)) => {
+            return Ok(DirectLaunchFlow::Refused {
+                dispatcher: Box::new(dispatcher),
+                reason: reason.to_string(),
+            });
+        }
+        Err(error) => {
+            return Ok(DirectLaunchFlow::Refused {
+                dispatcher: Box::new(dispatcher),
+                reason: format!("tier D group load: {error}"),
+            });
+        }
+    };
+    let stack = match dr::DirectStack::build(
+        &candidate.elf,
+        group.main().bias(),
+        group.interpreter().map(|interp| interp.bias()),
+        &candidate.argv,
+        &candidate.env,
+    ) {
+        Ok(stack) => stack,
+        Err(error) => {
+            return Ok(DirectLaunchFlow::Refused {
+                dispatcher: Box::new(dispatcher),
+                reason: format!("tier D exec stack: {error}"),
+            });
+        }
+    };
+    native_tier_census("direct-enter", resolved, "");
+    // Process-wide runtime services every native tier needs, mirroring the
+    // DSR boot in `run_image_in_current_process` (minus the translator, the
+    // vCPU-kick machinery, and the /proc image publication — the last is a
+    // known tier-D gap: /proc/self/maps renders only dynamic mmaps).
+    let _ = crate::ulock::preinit_waiter_table();
+    if crate::namespace::pid::requested() && !crate::namespace::pid::enabled() {
+        let _ = crate::namespace::pid::init(std::process::id());
+    }
+    crate::guest_cpu::set_native_darwin_provider();
+    // Installs the SIGINT + xsig-nudge handlers and initializes the xsig/
+    // fasync shared rings (fork/kill need them).
+    crate::host_signal::install_default_handlers();
+    let mut runner = dr::DirectRunner::new(dispatcher, dr::IdentityMemory::new(0, u64::MAX));
+    runner.enable_exec_services(dr::DirectExecServices {
+        plan: plan.clone(),
+        max_traps,
+    });
+    let entry = group.entry_pc();
+    let sp = stack.sp();
+    // SAFETY: patched images built with `island_handler`; the guest leaves
+    // through the handler (guest-leave contract).
+    let (entered, _slots) =
+        unsafe { dr::with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .map_err(|error| RuntimeError::Unsupported(format!("tier D thread slots: {error}")))?;
+    entered.map_err(|error| RuntimeError::Unsupported(format!("tier D enter: {error}")))?;
+    match runner.outcome() {
+        Some(dr::DirectRunOutcome::Exited { code }) => {
+            native_tier_census("direct-exit", resolved, &code.to_string());
+            Ok(DirectLaunchFlow::Completed(code))
+        }
+        Some(dr::DirectRunOutcome::Unsupported { syscall, outcome }) => {
+            native_tier_census(
+                "direct-leave",
+                resolved,
+                &format!("syscall={syscall} {outcome}"),
+            );
+            Err(RuntimeError::Unsupported(format!(
+                "tier D leave at syscall {syscall}: {outcome} (the guest already ran; \
+                 no tier T fallback exists mid-run)"
+            )))
+        }
+        None => Err(RuntimeError::Unsupported(
+            "tier D guest left without an outcome".to_string(),
+        )),
+    }
+}
+
+/// Service a tier-D guest's `execve(2)` through the EXISTING host
+/// self-re-exec capsule — the same transport the DSR forked-child exec uses;
+/// the resumed process tier-decides anew for the new image
+/// (`resume_guest_from_capsule`). Returns the guest retval to resume with on
+/// any pre-commit failure; on success the host `execve` replaces this
+/// process inside `begin_guest_exec` and this function never returns.
+pub(crate) fn tier_d_service_execve(
+    dispatcher: &SyscallDispatcher,
+    path: String,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+    plan: &ExecutionPlan,
+    max_traps: usize,
+) -> i64 {
+    crate::probes::execve_argv(&path, &argv);
+    let capsule_env = env.clone();
+    let loaded = load_native_execve_image(
+        dispatcher,
+        &path,
+        argv,
+        env,
+        plan,
+        ExecDigestPolicy::DeferredUnlessConsumed,
+        ExecFileBackingPolicy::Compute,
+    );
+    let (image, relative_relocations, resolved, resolved_argv, executable_digest, exec_backing) =
+        match loaded {
+            Ok(loaded) => loaded,
+            Err(errno) => return errno.guest_retval(),
+        };
+    if let Err(reason) = dispatcher.validate_native_reexec_fd_state() {
+        tracing::warn!(
+            %reason,
+            descriptors = ?dispatcher.native_reexec_fd_state_summary(),
+            "tier D execve rejected unsupported fd state"
+        );
+        return crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval();
+    }
+    if let Err(error) = crate::native_exec_capsule::begin_guest_exec(
+        dispatcher,
+        &image,
+        &relative_relocations,
+        exec_backing,
+        resolved.clone(),
+        resolved_argv,
+        capsule_env,
+        executable_digest,
+        max_traps,
+        plan,
+    ) {
+        tracing::warn!(
+            %error,
+            path = resolved,
+            "tier D execve host self-reexec preparation failed"
+        );
+        return crate::linux_abi::LINUX_EIO.guest_retval();
+    }
+    // `begin_guest_exec` ends in `libc::execve`; reaching here means the
+    // exec unexpectedly returned without an error.
+    tracing::warn!(path = resolved, "tier D execve unexpectedly returned");
+    crate::linux_abi::LINUX_EIO.guest_retval()
 }
 
 type LoadedNativeExecveImage = (
@@ -1248,6 +1529,73 @@ pub(crate) fn resume_guest_from_capsule(
         carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecDispatcherReady,
     );
     crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::DispatcherReady);
+    // Tier decision for the EXEC'D image (Phase 2): every tier-D execve —
+    // and any DSR forked-child execve of an eligible image once the wiring
+    // is on — lands here through the capsule, so this is the one place the
+    // new image's tier is decided. An eligible image runs directly (the
+    // prepared DSR artifact, if any, is discarded — carried because the
+    // producer cannot know the consumer's verdict); a refusal falls through
+    // to the DSR resume below with the dispatcher intact.
+    if native_direct_enabled()
+        && let Some(file) = dispatcher.read_exec_file(&guest.resolved_path)
+    {
+        match carrick_native_darwin::direct::scan_eligibility_as_interpreted(&file) {
+            Ok(Ok(_)) => {
+                native_tier_census("scan-direct", &guest.resolved_path, "exec-resume");
+                // Digest-guard parity with the legacy resume path: when a
+                // consumer armed a real digest, verify the re-read bytes
+                // are the executable the pre-exec image loaded.
+                if guest.executable_digest != DEFERRED_EXEC_DIGEST {
+                    let digest: [u8; 32] = sha2::Sha256::digest(&file).into();
+                    if digest != guest.executable_digest {
+                        anyhow::bail!(
+                            "guest executable changed across native host self-reexec (tier D)"
+                        );
+                    }
+                }
+                // The execve resets the DSR path also applies, in its order.
+                dispatcher.reset_memory_state_on_execve();
+                dispatcher.reset_signal_handlers_on_execve();
+                dispatcher.set_executable_identity(
+                    guest.resolved_path.clone(),
+                    argv.iter()
+                        .map(|value| String::from_utf8_lossy(value).into_owned())
+                        .collect(),
+                    env.clone(),
+                );
+                crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::RuntimeReady);
+                let candidate = DirectLaunchCandidate {
+                    elf: file,
+                    argv: argv.clone(),
+                    env: env.clone(),
+                };
+                match run_direct_in_current_process(
+                    candidate,
+                    &guest.resolved_path,
+                    dispatcher,
+                    max_traps,
+                    &plan,
+                )
+                .map_err(anyhow::Error::from)?
+                {
+                    DirectLaunchFlow::Completed(code) => return Ok(code),
+                    DirectLaunchFlow::Refused {
+                        dispatcher: returned,
+                        reason,
+                    } => {
+                        native_tier_census("load-refused", &guest.resolved_path, &reason);
+                        dispatcher = *returned;
+                    }
+                }
+            }
+            Ok(Err(reason)) => {
+                native_tier_census("scan-refused", &guest.resolved_path, &reason.to_string());
+            }
+            Err(error) => {
+                native_tier_census("scan-error", &guest.resolved_path, &error.to_string());
+            }
+        }
+    }
     let prepared_image = guest.prepared_image.take();
     let executable_digest = guest.executable_digest;
     let resumed = select_resumed_image(prepared_image, executable_digest, || {
@@ -1905,6 +2253,7 @@ fn run_image_in_child(
     max_traps: usize,
     relative_relocations: Vec<NativeRelativeRelocation>,
     plan: &ExecutionPlan,
+    direct: Option<DirectLaunchCandidate>,
 ) -> Result<RunResult, RuntimeError> {
     let _cache_session =
         carrick_native_darwin::aot_cache::begin_container_cache().map_err(AddressSpaceError::Io)?;
@@ -1937,6 +2286,34 @@ fn run_image_in_child(
         // child, and its rusage clock restarted at fork, so the window must
         // anchor after the fork (env-gated; profile-off reads no clocks).
         dsr::profile::mark_native_process_runtime_entry();
+        // Tier decision (Phase 2): an eligible image runs DIRECTLY, through
+        // the same dispatcher; a refusal at LOAD time (before any guest
+        // instruction) falls back to the DSR tier below with the dispatcher
+        // untouched. A tier-D guest fork unwinds to this `_exit` too — the
+        // forked child's outcome IS its run's outcome.
+        let mut dispatcher = dispatcher;
+        if let Some(candidate) = direct {
+            match run_direct_in_current_process(
+                candidate,
+                &resolved_path,
+                dispatcher,
+                max_traps,
+                plan,
+            ) {
+                Ok(DirectLaunchFlow::Completed(code)) => unsafe { libc::_exit(code) },
+                Ok(DirectLaunchFlow::Refused {
+                    dispatcher: returned,
+                    reason,
+                }) => {
+                    native_tier_census("load-refused", &resolved_path, &reason);
+                    dispatcher = *returned;
+                }
+                Err(err) => {
+                    child_write_stderr(format!("native tier D child error: {err}\n").as_bytes());
+                    unsafe { libc::_exit(125) };
+                }
+            }
+        }
         let guest_image = NativeGuestImageCompatibility::from_image(&image, resolved_path);
         match run_image_in_current_process(
             NativeImageSource::Legacy {
@@ -7205,7 +7582,7 @@ fn wait_native_vfork_completion(
     }
 }
 
-fn native_register_child_exit_watch(
+pub(crate) fn native_register_child_exit_watch(
     dispatcher: &SyscallDispatcher,
     child: i32,
     exit_signal: u32,
