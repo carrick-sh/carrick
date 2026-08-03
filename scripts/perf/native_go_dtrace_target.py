@@ -45,6 +45,7 @@ import time
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
+import native_go_build
 from scripts.perf.native_go_build import (
     DEFAULT_IMAGE,
     ENGINE_CARRICK,
@@ -730,6 +731,16 @@ def main() -> int:
         type=pathlib.Path,
         help="arm the per-process translation census in an existing empty directory",
     )
+    parser.add_argument(
+        "--store-dir",
+        type=pathlib.Path,
+        help="use one existing production-validated unit-v1 store",
+    )
+    parser.add_argument(
+        "--store-augmentation",
+        choices=("on", "off"),
+        help="enable augmentation or select its exact zero-valued opt-out",
+    )
     parser.add_argument("--pair-id")
     parser.add_argument("--pair-ordinal", type=int)
     parser.add_argument("--campaign-id")
@@ -752,6 +763,8 @@ def main() -> int:
     )
     if standalone_capture and (not arguments.campaign_id or not arguments.arm):
         parser.error("standalone trace mode requires --campaign-id and --arm")
+    if (arguments.store_dir is None) != (arguments.store_augmentation is None):
+        parser.error("--store-dir and --store-augmentation must be supplied together")
     run_id = arguments.run_id or os.environ.get("CARRICK_RUN_ID")
     if not run_id:
         parser.error("CARRICK_RUN_ID must be set")
@@ -764,6 +777,13 @@ def main() -> int:
     except ValueError as error:
         parser.error(str(error))
 
+    ambient = {
+        key: value
+        for key, value in os.environ.items()
+        if key != "CARRICK_RUN_ID"
+    }
+    native_go_build.reject_ambient_carrick(ambient, {})
+
     xlat_census_dir: pathlib.Path | None = None
     if arguments.xlat_census_dir is not None:
         xlat_census_dir = arguments.xlat_census_dir.resolve()
@@ -771,6 +791,22 @@ def main() -> int:
             parser.error("--xlat-census-dir must name an existing directory")
         if any(xlat_census_dir.iterdir()):
             parser.error("--xlat-census-dir must be empty")
+
+    store_receipt: dict[str, object] | None = None
+    store_dir: pathlib.Path | None = None
+    if arguments.store_dir is not None:
+        store_dir = arguments.store_dir.resolve()
+        if not store_dir.is_dir():
+            parser.error("--store-dir must name an existing directory")
+        validator = REPO / "target/release/examples/native_manifest_census"
+        try:
+            store_receipt = native_go_build.validate_sparse_store_tree(
+                store_dir,
+                validator=validator,
+                require_read_only=False,
+            )
+        except (OSError, ValueError) as error:
+            parser.error(f"--store-dir is not a production-validated sparse store: {error}")
 
     trace_identity = TraceIdentity.current()
 
@@ -800,6 +836,12 @@ def main() -> int:
             "CARRICK_DSR_SHARED_RECOVERY_RUNS": (
                 "0" if arguments.recovery_wire == "entries" else None
             ),
+            "CARRICK_DSR_STORE_DIR": (
+                str(store_dir) if store_dir is not None else None
+            ),
+            "CARRICK_DSR_STORE_AUGMENTATION": (
+                "0" if arguments.store_augmentation == "off" else None
+            ),
         },
     )
     environment["CARRICK_RUN_ID"] = run_id
@@ -814,6 +856,8 @@ def main() -> int:
                 "xlat_census_dir": (
                     str(xlat_census_dir) if xlat_census_dir is not None else None
                 ),
+                "store": store_receipt,
+                "store_augmentation": arguments.store_augmentation,
                 "expected_effective_identity": trace_identity.receipt(),
             },
             sort_keys=True,
