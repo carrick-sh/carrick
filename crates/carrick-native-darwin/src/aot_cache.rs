@@ -1716,6 +1716,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
         )
         .expect("fixture block metadata")
@@ -1807,6 +1808,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
         )
         .expect("complete metadata fixture")

@@ -187,6 +187,10 @@ struct WireArtifactTemplate {
     direct_links: Vec<WireDirectLink>,
     relocations: Vec<ArtifactRelocation>,
     source_words: Vec<u32>,
+    // No #[serde(default)]: a payload without the field predates trusted-entry
+    // recording and must be refused (decode error -> store miss -> re-record),
+    // never replayed as a lower-quality template.
+    trusted_entry: Option<TrustedEntryTemplate>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -259,6 +263,7 @@ impl From<&ArtifactTemplate> for WireArtifactTemplate {
                 .collect(),
             relocations: template.relocations.clone(),
             source_words: template.source_words.clone(),
+            trusted_entry: template.trusted_entry,
         }
     }
 }
@@ -302,6 +307,7 @@ impl TryFrom<WireArtifactTemplate> for ArtifactTemplate {
                 .collect(),
             relocations: template.relocations,
             source_words: template.source_words,
+            trusted_entry: template.trusted_entry,
         })
     }
 }
@@ -941,13 +947,46 @@ struct PendingRelocation {
     value: ProcessValue,
 }
 
+/// The trusted second entry point a recorded Absolute-guarded block exposes.
+///
+/// The entry's narrow `movz`/`movk` materialization BAKES the expected
+/// generation into the template words (unlike the guard's fixed-width
+/// relocations), so replay must bind the SAME expected generation or refuse —
+/// `replay_artifact*` fails closed to fresh translation on a mismatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrustedEntryTemplate {
+    /// Byte offset of the trusted entry within the emitted block.
+    pub offset: u32,
+    /// The generation value the entry's materialization encodes.
+    pub expected: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct ArtifactRecording {
     bindings: BTreeMap<ProcessValue, u64>,
     relocations: Vec<PendingRelocation>,
+    trusted_entry: Option<TrustedEntryTemplate>,
 }
 
 impl ArtifactRecording {
+    /// Record the trusted second entry point the emitter placed past the
+    /// generation guard. At most one per block.
+    pub fn record_trusted_entry(
+        &mut self,
+        offset: CacheOffset,
+        expected: u64,
+    ) -> Result<(), DsrError> {
+        if self.trusted_entry.is_some() {
+            return Err(DsrError::CachePolicy(
+                "artifact recording already carries a trusted entry".to_string(),
+            ));
+        }
+        self.trusted_entry = Some(TrustedEntryTemplate {
+            offset: offset.get(),
+            expected,
+        });
+        Ok(())
+    }
     pub fn bind(&mut self, kind: ProcessValue, value: u64) -> Result<(), DsrError> {
         let mut bindings = ArtifactBindings {
             values: std::mem::take(&mut self.bindings),
@@ -1071,6 +1110,7 @@ impl ArtifactRecording {
             direct_links,
             source_words,
             relocations,
+            self.trusted_entry,
             &bindings,
         )?;
         Ok(ArtifactRecord { template, bindings })
@@ -1779,6 +1819,9 @@ pub struct ArtifactTemplate {
     direct_links: Vec<DirectLink>,
     relocations: Vec<ArtifactRelocation>,
     source_words: Vec<u32>,
+    /// The recorded trusted entry, when the emission exposed one. Its
+    /// expected generation is baked into `words`; replay validates it.
+    trusted_entry: Option<TrustedEntryTemplate>,
 }
 
 /// Cardinalities for attributing an artifact template's retained metadata.
@@ -1841,6 +1884,7 @@ impl ArtifactTemplate {
         self.direct_links.clear();
         self.relocations.clear();
         self.source_words.clear();
+        self.trusted_entry = None;
         self
     }
 
@@ -1961,6 +2005,19 @@ impl ArtifactTemplate {
         Ok((self.map.clone(), recovery, self.direct_links.clone()))
     }
 
+    /// The exact executable words a replay of this template would publish
+    /// under `bindings` — the parity oracle for "recorded template == native
+    /// emission". Test-only: production replays through the cache.
+    #[cfg(test)]
+    pub(crate) fn replayed_words_for_test(
+        &self,
+        bindings: &ArtifactBindings,
+    ) -> Result<Vec<u32>, DsrError> {
+        let mut words = self.words.clone();
+        apply_replay_relocations(&mut words, &self.relocations, bindings)?;
+        Ok(words)
+    }
+
     pub fn mismatch_summary(&self, fresh: &Self) -> Option<String> {
         if let Some((index, (stored, fresh))) = self
             .words
@@ -2001,6 +2058,12 @@ impl ArtifactTemplate {
                 self.relocations, fresh.relocations
             ));
         }
+        if self.trusted_entry != fresh.trusted_entry {
+            return Some(format!(
+                "trusted_entry: stored={:?} fresh={:?}",
+                self.trusted_entry, fresh.trusted_entry
+            ));
+        }
         if self.source_words != fresh.source_words {
             return Some(format!(
                 "source_words: stored={:?} fresh={:?}",
@@ -2014,6 +2077,10 @@ impl ArtifactTemplate {
         clippy::too_many_arguments,
         reason = "an artifact template owns code and all replay metadata"
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "normalization captures the complete recorded emission"
+    )]
     pub fn normalize(
         mut words: Vec<u32>,
         map: Vec<PcMapEntry>,
@@ -2021,8 +2088,30 @@ impl ArtifactTemplate {
         direct_links: Vec<DirectLink>,
         source_words: Vec<u32>,
         mut relocations: Vec<ArtifactRelocation>,
+        trusted_entry: Option<TrustedEntryTemplate>,
         bindings: &ArtifactBindings,
     ) -> Result<Self, DsrError> {
+        if let Some(trusted) = trusted_entry {
+            let byte_len = words.len().saturating_mul(4) as u64;
+            if !trusted.offset.is_multiple_of(4) || u64::from(trusted.offset) >= byte_len {
+                return Err(DsrError::CachePolicy(format!(
+                    "trusted entry offset {} is outside the recorded block ({byte_len} bytes)",
+                    trusted.offset
+                )));
+            }
+            // The entry's first word is the narrow `movz x17, #lo16` of the
+            // baked expected generation -- verify the recording matches the
+            // emission it claims to describe.
+            let index = (trusted.offset / 4) as usize;
+            let expected_movz = 0xd280_0011 | (((trusted.expected & 0xffff) as u32) << 5);
+            if words.get(index) != Some(&expected_movz) {
+                return Err(DsrError::CachePolicy(format!(
+                    "trusted entry word 0x{:08x} does not materialize expected generation {}",
+                    words.get(index).copied().unwrap_or(0),
+                    trusted.expected
+                )));
+            }
+        }
         relocations.sort_by_key(|relocation| relocation.first_word);
         let mut consumed = BTreeSet::new();
         for relocation in &relocations {
@@ -2086,6 +2175,7 @@ impl ArtifactTemplate {
             direct_links,
             relocations,
             source_words,
+            trusted_entry,
         })
     }
 }
@@ -2102,6 +2192,7 @@ pub fn replay_artifact(
         template.recovery.clone().into_entries()?,
         template.direct_links.clone(),
         &template.relocations,
+        template.trusted_entry,
         bindings,
     )
 }
@@ -2118,19 +2209,16 @@ pub fn replay_artifact_owned(
         template.recovery.into_entries()?,
         template.direct_links,
         &template.relocations,
+        template.trusted_entry,
         bindings,
     )
 }
 
-fn replay_artifact_parts(
-    cache: &mut TranslationCache,
-    mut words: Vec<u32>,
-    map: Vec<PcMapEntry>,
-    recovery: Vec<PortableRecoveryEntry>,
-    direct_links: Vec<DirectLink>,
+fn apply_replay_relocations(
+    words: &mut [u32],
     relocations: &[ArtifactRelocation],
     bindings: &ArtifactBindings,
-) -> Result<EmittedBlock, DsrError> {
+) -> Result<(), DsrError> {
     for relocation in relocations {
         let first = usize::try_from(relocation.first_word).map_err(|_| {
             DsrError::CachePolicy("artifact replay relocation index overflow".to_string())
@@ -2157,6 +2245,40 @@ fn replay_artifact_parts(
             *word |= immediate << 5;
         }
     }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "replay consumes the complete template decomposition"
+)]
+fn replay_artifact_parts(
+    cache: &mut TranslationCache,
+    mut words: Vec<u32>,
+    map: Vec<PcMapEntry>,
+    recovery: Vec<PortableRecoveryEntry>,
+    direct_links: Vec<DirectLink>,
+    relocations: &[ArtifactRelocation],
+    trusted_entry: Option<TrustedEntryTemplate>,
+    bindings: &ArtifactBindings,
+) -> Result<EmittedBlock, DsrError> {
+    // The trusted entry's narrow materialization BAKES the recorded expected
+    // generation into the words; a replay at any other generation would leave
+    // guarded and trusted entries disagreeing. Refuse — the caller falls back
+    // to fresh translation.
+    let trusted_offset = trusted_entry
+        .map(|trusted| -> Result<CacheOffset, DsrError> {
+            let replay_expected = bindings.value(ProcessValue::GenerationExpected)?;
+            if replay_expected != trusted.expected {
+                return Err(DsrError::CachePolicy(format!(
+                    "trusted entry bakes generation {} but replay binds {replay_expected}",
+                    trusted.expected
+                )));
+            }
+            Ok(CacheOffset::published(trusted.offset))
+        })
+        .transpose()?;
+    apply_replay_relocations(&mut words, relocations, bindings)?;
     let recovery = recovery
         .into_iter()
         .map(|entry| {
@@ -2167,7 +2289,7 @@ fn replay_artifact_parts(
         })
         .collect::<Result<Vec<_>, DsrError>>()?;
     let code = cache.publish_words(&words)?;
-    EmittedBlock::from_artifact_parts(code, map, direct_links, recovery)
+    EmittedBlock::from_artifact_parts(code, map, direct_links, recovery, trusted_offset)
 }
 
 #[cfg(test)]
@@ -2259,6 +2381,7 @@ mod tests {
             }],
             vec![0xd280_0540, 0xd65f_03c0],
             vec![relocation],
+            None,
             &bindings,
         )
         .expect("normalize fixture");
@@ -2301,6 +2424,7 @@ mod tests {
             direct_links: Vec::new(),
             relocations: Vec::new(),
             source_words: Vec::new(),
+            trusted_entry: None,
         };
 
         assert_eq!(

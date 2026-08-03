@@ -1542,6 +1542,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             &ArtifactBindings::from_values([]).expect("empty bindings"),
         )
         .expect("empty template")
@@ -1637,6 +1638,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                None,
                 &ArtifactBindings::from_values([]).expect("empty bindings"),
             )
             .expect("drop-order metadata")
@@ -1734,6 +1736,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             &ArtifactBindings::from_values([]).expect("empty bindings"),
         )
         .expect("recovery template");
@@ -1997,6 +2000,7 @@ mod tests {
             }],
             Vec::new(),
             Vec::new(),
+            None,
             &bindings,
         )
         .expect("source template");
@@ -2010,6 +2014,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             &bindings,
         )
         .expect("target template");
@@ -2096,6 +2101,7 @@ mod tests {
             ],
             Vec::new(),
             Vec::new(),
+            None,
             &bindings,
         )
         .expect("out-of-order unresolved template");

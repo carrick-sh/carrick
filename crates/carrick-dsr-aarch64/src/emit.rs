@@ -112,9 +112,10 @@ pub struct EmittedBlock {
     recovery: Vec<RecoveryEntry>,
     /// Offset of the trusted second entry point: past the generation guard,
     /// at the words that publish this block's generation and reload guest
-    /// x17. Present only on private (`Absolute`-guarded, unrecorded) blocks;
-    /// patched direct links may target it because eager link severing
-    /// (Phase 2a) now invalidates links when their target's page bumps.
+    /// x17. Present on `Absolute`-guarded blocks — native AND recorded, so a
+    /// replayed template keeps the native hot-edge shape; patched direct
+    /// links may target it because eager link severing (Phase 2a)
+    /// invalidates links when their target's page bumps.
     trusted_entry: Option<CacheOffset>,
 }
 
@@ -477,20 +478,21 @@ impl EmittedBlock {
         entries: Vec<PcMapEntry>,
         direct_links: Vec<DirectLink>,
         recovery: Vec<RecoveryEntry>,
+        trusted_entry: Option<CacheOffset>,
     ) -> Result<Self, DsrError> {
         Ok(Self {
             code,
             map: InstructionMap::new(entries)?,
             direct_links,
             recovery,
-            // Artifact-loaded blocks are shared-unit material; they keep
-            // their guards and never expose a trusted entry.
-            trusted_entry: None,
+            // Recorded templates carry the native trusted entry (replay
+            // validates the baked expected generation before honoring it).
+            trusted_entry,
         })
     }
 
     /// Trusted second entry point past the generation guard, when this block
-    /// has one (private Absolute-guarded blocks only).
+    /// has one (Absolute-guarded blocks, native or replayed).
     pub const fn trusted_entry(&self) -> Option<CacheOffset> {
         self.trusted_entry
     }
@@ -6299,17 +6301,25 @@ fn assemble_block_inner(
             ; .arch aarch64
             ; cbnz x19, =>stale
         );
-        // Trusted second entry point (private Absolute-guarded blocks only):
-        // patched direct links land here, past the guard, because Phase 2a's
-        // eager severing invalidates the links themselves when the target's
-        // page bumps. The entrant's x17 holds guest x17 (dead: slots 136 and
+        // Trusted second entry point (Absolute-guarded blocks): patched
+        // direct links land here, past the guard, because Phase 2a's eager
+        // severing invalidates the links themselves when the target's page
+        // bumps. The entrant's x17 holds guest x17 (dead: slots 136 and
         // 1128 are authoritative at every exit), so re-materialize this
         // block's generation into it -- the guarded fall-through rewrites the
         // identical value -- and share the publish and x17 reload below.
-        if recording.is_none()
-            && let GenerationGuard::Absolute { expected, .. } = guard
-        {
-            trusted_entry = Some(current_offset(&assembler)?);
+        //
+        // RECORDED emissions keep the identical entry: recording is a pure
+        // tap, never a second emission mode, so a replayed template's hot
+        // edges land past the guard exactly like native code. The entry's
+        // narrow materialization bakes `expected` in, so the recording
+        // carries the value and replay refuses a different generation.
+        if let GenerationGuard::Absolute { expected, .. } = guard {
+            let offset = current_offset(&assembler)?;
+            trusted_entry = Some(offset);
+            if let Some(recording) = recording.as_deref_mut() {
+                recording.record_trusted_entry(offset, expected.get())?;
+            }
             let mut value = expected.get();
             emit_word(
                 &mut assembler,
@@ -8076,6 +8086,72 @@ mod tests {
             bound.trusted_entry, None,
             "shared-unit guards keep their blocks trusted-entry-free"
         );
+    }
+
+    /// Recording is a pure tap, never a second emission mode: recording the
+    /// same plan under the same Absolute guard must produce words IDENTICAL
+    /// to the native emission — trusted entry included — on both a plain and
+    /// a representative FUSED (superblock) plan. This is the parity that
+    /// keeps attached recorded-template units from running hot loops slower
+    /// than natively-emitted code (the 2026-08-03 awk-8M +65% regression).
+    #[test]
+    fn recorded_emission_is_word_identical_to_native_emission() {
+        for (name, plan) in [
+            ("copy", copy_plan()),
+            ("fused-two-segment", fused_two_segment_plan()),
+        ] {
+            let generation = std::sync::atomic::AtomicU64::new(0);
+            let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);
+            let native = assemble_block_inner(
+                &plan,
+                Some(guard),
+                EmitAddressMode::Direct,
+                DirectExitEmissionPolicy::PrivateGateway,
+                None,
+            )
+            .expect("assemble native block");
+            let mut recording = ArtifactRecording::default();
+            let recorded = assemble_block_inner(
+                &plan,
+                Some(guard),
+                EmitAddressMode::Direct,
+                DirectExitEmissionPolicy::PrivateGateway,
+                Some(&mut recording),
+            )
+            .expect("assemble recorded block");
+            assert_eq!(
+                native.words, recorded.words,
+                "{name}: recorded emission must be word-identical to native emission"
+            );
+            assert_eq!(
+                native.trusted_entry, recorded.trusted_entry,
+                "{name}: recorded emission must keep the native trusted entry"
+            );
+            assert!(
+                native.trusted_entry.is_some(),
+                "{name}: an Absolute-guarded block exposes a trusted entry"
+            );
+            // The finished template must materialize back to the exact native
+            // words under the recording process's own bindings (normalize
+            // zeroes relocation sites; replay re-applies them).
+            let record = recording
+                .finish(
+                    recorded.instruction_words(),
+                    recorded.map.entries().to_vec(),
+                    recorded.recovery.clone(),
+                    recorded.direct_links.clone(),
+                    Vec::new(),
+                )
+                .expect("finish recording");
+            let replayed = record
+                .template
+                .replayed_words_for_test(&record.bindings)
+                .expect("materialize template under recording bindings");
+            assert_eq!(
+                native.words, replayed,
+                "{name}: replayed template words must equal the native emission"
+            );
+        }
     }
 
     /// `adr x1, <target>` materializes through carrick-owned x19 - minimal

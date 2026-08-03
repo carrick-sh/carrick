@@ -119,6 +119,7 @@ mod tests {
             }],
             vec![0xd280_0540, 0xd65f_03c0],
             vec![relocation],
+            None,
             &bindings,
         )
         .expect("normalize fixture");
@@ -203,6 +204,14 @@ mod tests {
         assert_eq!(fresh.recovery(), replay.recovery());
         assert_eq!(fresh.direct_links(), replay.direct_links());
         assert_eq!(fresh.len(), replay.len());
+        // Template parity: the recorded emission exposes the native trusted
+        // entry and replay preserves it, so replayed blocks keep the native
+        // hot-edge shape (patched links land past the guard).
+        assert!(
+            fresh.trusted_entry().is_some(),
+            "recorded Absolute-guarded block keeps its trusted entry"
+        );
+        assert_eq!(fresh.trusted_entry(), replay.trusted_entry());
         for offset in (0..fresh.len()).step_by(std::mem::size_of::<u32>()) {
             // SAFETY: both published blocks contain `len` executable bytes,
             // and the loop visits aligned-width words wholly within them.
@@ -215,5 +224,63 @@ mod tests {
             };
             assert_eq!(fresh_word, replay_word, "counter replay word {offset}");
         }
+    }
+
+    /// The trusted entry BAKES the recorded expected generation into the
+    /// template words, so a replay binding a different generation must be
+    /// refused (the caller falls back to fresh translation) rather than
+    /// publishing a block whose guard and trusted entry disagree.
+    #[test]
+    fn replay_refuses_a_trusted_entry_generation_mismatch() {
+        let guest = GuestVa(0x6000);
+        let plan = BlockPlan {
+            start: guest,
+            end: GuestVa(guest.raw() + 8),
+            generation: CodeGeneration::INITIAL,
+            instructions: vec![PlannedInst {
+                guest,
+                action: InstAction::Copy(0xd503_201f),
+            }],
+            exit: PlannedExit::Syscall {
+                guest: GuestVa(guest.raw() + 4),
+                resume: GuestVa(guest.raw() + 8),
+            },
+            extensions: Vec::new(),
+        };
+        let generation = AtomicU64::new(CodeGeneration::INITIAL.get());
+        let guard = GenerationGuard::new(&generation, CodeGeneration::INITIAL);
+        let mut fresh_cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("fresh cache");
+        let (_fresh, record) = super::super::emit::emit_block_recording_artifact(
+            &mut fresh_cache,
+            &plan,
+            guard,
+            EmitAddressMode::Direct,
+            vec![0xd503_201f, 0xd400_0001],
+        )
+        .expect("record artifact");
+        let mut replay_cache = TranslationCache::new(
+            16 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("replay cache");
+        let mismatched = ArtifactBindings::for_replay(
+            0x1000_0000,
+            CodeGeneration::INITIAL.get() + 1,
+            EmitAddressMode::Direct,
+        )
+        .expect("mismatched bindings");
+        let error =
+            match replay_artifact_owned(&mut replay_cache, record.template.clone(), &mismatched) {
+                Ok(_) => panic!("replay must refuse a baked-generation mismatch"),
+                Err(error) => error,
+            };
+        assert!(
+            error.to_string().contains("trusted entry bakes generation"),
+            "unexpected refusal: {error}"
+        );
     }
 }

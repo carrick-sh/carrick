@@ -59,6 +59,7 @@ fn pending_of_size(bytes: usize, seed: u8) -> PendingTranslationUnit {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        None,
         &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
     )
     .expect("bench block metadata")
