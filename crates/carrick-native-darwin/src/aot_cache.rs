@@ -1,9 +1,24 @@
-//! Container-lifetime authority for portable native AArch64 translations.
+//! Per-host persistent store for portable native AArch64 translations.
+//!
+//! # The store
+//!
+//! Units live in ONE host directory (`persistent_store_root`: the
+//! `~/.carrick` convention, translator-ABI versioned) that outlives every
+//! container: a unit is published once per key ever, every later exec of
+//! the same binary — in this run or any future one — attaches instead of
+//! translating, and the unit key's content bindings (`source_fingerprint`
+//! over the mapped text, `code_sha256` over the published bytes) keep a
+//! stale or colliding unit from ever executing. Recording is elected
+//! first-miss-claims per unit (`claim_recording`), publication is
+//! winner-takes-all under a non-blocking per-unit `flock`, and a
+//! size-capped LRU prune runs once per container begin. A host whose cache
+//! directory cannot be prepared falls back to the pre-persistence per-run
+//! tempdir.
 //!
 //! # The transport
 //!
-//! A published unit is a PAIR of plain files in the container-private cache
-//! directory: `{stem}.code` (the raw translated instruction bytes, with the
+//! A published unit is a PAIR of plain files in the store:
+//! `{stem}.code` (the raw translated instruction bytes, with the
 //! direct-binding `ADRP`/`ADD` placeholder pairs UNRESOLVED) and
 //! `{stem}.metadata-v3` (the mapped metadata, carrying `code_sha256` over
 //! those exact bytes). Loading maps both read-only, digest-verifies the code
@@ -65,6 +80,225 @@ const AUTHORITY_MARKER: &str = ".carrick-authority";
 const AUTHORITY_NONCE_LEN: usize = 16;
 const MANIFEST_DECODE_LIMIT: usize = 256 * 1024 * 1024;
 const MAX_MAPPED_METADATA_BYTES: u64 = MANIFEST_DECODE_LIMIT as u64;
+/// A recording claim older than this is stale even if its pid looks alive:
+/// pids recycle across the runs a persistent store outlives, and no
+/// legitimate recorder runs this long before publishing at exit or exec.
+const BUILDER_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Total `{stem}.code` + `{stem}.metadata-v3` bytes the store may retain;
+/// beyond it the oldest pairs (by modification time, refreshed on load) are
+/// evicted at container begin. A whole go toolchain's units measure in tens
+/// of MiB, so this cap is generous without being unbounded.
+const STORE_SIZE_CAP_BYTES: u64 = 1024 * 1024 * 1024;
+/// Auxiliary election/lock files (`.builder`, `.lock`, the retired `.seen`)
+/// older than this are crash leftovers.
+const AUX_FILE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+/// Unrenamed publication temporaries older than this are crash leftovers.
+const TEMP_FILE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Where the persistent unit store lives: `$CARRICK_DSR_STORE_DIR` when set
+/// (tests, bisection), else the carrick home convention shared with the
+/// image store (`$CARRICK_HOME`, else `~/.carrick`, else `./.carrick` —
+/// `carrick_image::ImageStore::default_for_user`), under a translator-ABI
+/// versioned subdirectory so an ABI bump starts a fresh population and the
+/// old one ages out by the size cap.
+fn persistent_store_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("CARRICK_DSR_STORE_DIR") {
+        return PathBuf::from(root);
+    }
+    let home = std::env::var_os("CARRICK_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".carrick")))
+        .unwrap_or_else(|| PathBuf::from(".carrick"));
+    home.join("native-units").join(format!(
+        "abi-{}",
+        carrick_dsr_aarch64::shared_cache::TRANSLATOR_ABI_CURRENT
+    ))
+}
+
+/// Read the store's authority nonce, publishing a fresh one exactly once
+/// per store lifetime. Publication uses `link(2)` (never-replace), so two
+/// concurrent first runs converge on one winner and the loser reads the
+/// winner's nonce — a rename here would silently replace the marker and
+/// strand the first creator's descendants on adoption.
+fn read_or_publish_marker(
+    directory: &File,
+    path: &Path,
+) -> std::io::Result<[u8; AUTHORITY_NONCE_LEN]> {
+    let marker_name = CString::new(AUTHORITY_MARKER)
+        .map_err(|_| invalid_data("cache authority marker contains NUL"))?;
+    for _ in 0..8 {
+        let marker_fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                marker_name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if marker_fd >= 0 {
+            let mut marker = unsafe { File::from_raw_fd(marker_fd) };
+            let mut authority_nonce = [0_u8; AUTHORITY_NONCE_LEN];
+            marker.read_exact(&mut authority_nonce)?;
+            let mut trailing = [0_u8; 1];
+            if marker.read(&mut trailing)? != 0 {
+                return Err(invalid_data("cache authority marker is malformed"));
+            }
+            return Ok(authority_nonce);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error);
+        }
+        let mut authority_nonce = [0_u8; AUTHORITY_NONCE_LEN];
+        getrandom::fill(&mut authority_nonce)
+            .map_err(|error| invalid_data(format!("generate cache authority nonce: {error}")))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(path)?;
+        temporary.write_all(&authority_nonce)?;
+        temporary.as_file().sync_all()?;
+        let temporary_path = CString::new(temporary.path().as_os_str().as_bytes())
+            .map_err(|_| invalid_data("marker temporary path contains NUL"))?;
+        let marker_path = CString::new(path.join(AUTHORITY_MARKER).as_os_str().as_bytes())
+            .map_err(|_| invalid_data("marker path contains NUL"))?;
+        let linked = unsafe { libc::link(temporary_path.as_ptr(), marker_path.as_ptr()) };
+        if linked == 0 {
+            return Ok(authority_nonce);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(error);
+        }
+        // Lost the publish race: loop around and read the winner's nonce.
+    }
+    Err(invalid_data("cache authority marker kept vanishing"))
+}
+
+/// One published unit pair as the pruner sees it.
+struct StoredPair {
+    stem: String,
+    bytes: u64,
+    newest_modified: std::time::SystemTime,
+}
+
+/// Bound the store: remove crash leftovers (aged temporaries, orphaned
+/// election files, half pairs, the retired `.seen` markers) and evict the
+/// oldest complete pairs until total pair bytes fit under `cap_bytes`.
+/// Best-effort by design — every removal races benignly with concurrent
+/// runs (loads pin inodes; a vanished pair is an ordinary miss), so errors
+/// are swallowed rather than failing the container.
+fn prune_store(directory: &File, path: &Path, cap_bytes: u64) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    let mut code_halves = std::collections::BTreeMap::new();
+    let mut metadata_halves = std::collections::BTreeMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == AUTHORITY_MARKER {
+            continue;
+        }
+        let Ok(identity) = entry.metadata() else {
+            continue;
+        };
+        let age = identity
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .unwrap_or_default();
+        if let Some(stem) = name.strip_suffix(".code") {
+            code_halves.insert(stem.to_owned(), identity);
+        } else if let Some(stem) = name.strip_suffix(".metadata-v3") {
+            metadata_halves.insert(stem.to_owned(), identity);
+        } else if name.ends_with(".seen") {
+            // The retired recurrence-deferral marker: never produced again.
+            let _ = std::fs::remove_file(entry.path());
+        } else if name.ends_with(".builder") || name.ends_with(".lock") {
+            if age > AUX_FILE_TTL {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        } else if age > TEMP_FILE_TTL {
+            // Publication temporaries carry tempfile's random names; anything
+            // unrecognized and this old is a crash leftover.
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let mut pairs = Vec::new();
+    let mut total_bytes = 0_u64;
+    for (stem, code_identity) in &code_halves {
+        let Some(metadata_identity) = metadata_halves.get(stem) else {
+            // A half pair is either a publication in flight (young) or a
+            // crash leftover (old). Only the old ones are removable.
+            if code_identity
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > TEMP_FILE_TTL)
+            {
+                let _ = std::fs::remove_file(path.join(format!("{stem}.code")));
+            }
+            continue;
+        };
+        let bytes = code_identity.len().saturating_add(metadata_identity.len());
+        let newest_modified = code_identity
+            .modified()
+            .ok()
+            .into_iter()
+            .chain(metadata_identity.modified().ok())
+            .max()
+            .unwrap_or(std::time::UNIX_EPOCH);
+        total_bytes = total_bytes.saturating_add(bytes);
+        pairs.push(StoredPair {
+            stem: stem.clone(),
+            bytes,
+            newest_modified,
+        });
+    }
+    for (stem, metadata_identity) in &metadata_halves {
+        if !code_halves.contains_key(stem)
+            && metadata_identity
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > TEMP_FILE_TTL)
+        {
+            let _ = std::fs::remove_file(path.join(format!("{stem}.metadata-v3")));
+        }
+    }
+    if total_bytes <= cap_bytes {
+        return;
+    }
+    pairs.sort_by_key(|pair| pair.newest_modified);
+    for pair in pairs {
+        if total_bytes <= cap_bytes {
+            break;
+        }
+        // Evict under the unit lock so a concurrent publisher or claimant of
+        // this stem is not raced; busy means in use — skip it this round.
+        let Some(lock) = try_lock_stem_for_prune(directory, path, &pair.stem) else {
+            continue;
+        };
+        let _ = std::fs::remove_file(path.join(format!("{}.code", pair.stem)));
+        let _ = std::fs::remove_file(path.join(format!("{}.metadata-v3", pair.stem)));
+        let _ = std::fs::remove_file(path.join(format!("{}.builder", pair.stem)));
+        drop(lock);
+        let _ = std::fs::remove_file(path.join(format!("{}.lock", pair.stem)));
+        total_bytes = total_bytes.saturating_sub(pair.bytes);
+    }
+}
+
+fn try_lock_stem_for_prune(_directory: &File, path: &Path, stem: &str) -> Option<UnitFileLock> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path.join(format!("{stem}.lock")))
+        .ok()?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    Some(UnitFileLock(lock))
+}
 
 static CONTAINER_CACHE: Mutex<Option<ContainerCacheAuthority>> = Mutex::new(None);
 
@@ -579,7 +813,59 @@ pub struct ContainerCacheAuthority {
 }
 
 impl ContainerCacheAuthority {
+    /// Open the per-host persistent store, falling back to a per-run
+    /// ephemeral directory if the host location cannot be prepared. The
+    /// fallback keeps `begin_container_cache` infallible-in-practice: a
+    /// broken cache directory costs persistence, never the container.
     fn create() -> std::io::Result<Self> {
+        match Self::open_persistent_at(&persistent_store_root()) {
+            Ok(authority) => Ok(authority),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "persistent translation store unavailable; using a per-run directory"
+                );
+                Self::create_ephemeral()
+            }
+        }
+    }
+
+    /// Open (creating if absent) the persistent unit store rooted at `root`.
+    ///
+    /// The directory outlives every container: publication is publish-once
+    /// per unit key FOREVER, and a second `carrick run` of the same image
+    /// attaches instead of translating. The authority nonce lives in the
+    /// store's marker file so descendants of any run can validate adoption
+    /// against the same identity. Pruning (size cap + stale auxiliary files)
+    /// runs here, once per container, in the supervisor.
+    fn open_persistent_at(root: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(root)?;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+        // Adoption after self-reexec requires an absolute path.
+        let path = std::fs::canonicalize(root)?;
+        let directory = open_directory(&path)?;
+        let identity = directory.metadata()?;
+        if !identity.is_dir()
+            || identity.uid() != unsafe { libc::geteuid() }
+            || identity.mode() & 0o777 != 0o700
+        {
+            return Err(invalid_data("persistent store root identity mismatch"));
+        }
+        let authority_nonce = read_or_publish_marker(&directory, &path)?;
+        prune_store(&directory, &path, STORE_SIZE_CAP_BYTES);
+        Ok(Self {
+            directory,
+            path,
+            creator_pid: unsafe { libc::getpid() },
+            authority_nonce,
+            cleanup_owner: false,
+        })
+    }
+
+    /// The pre-persistence per-run store: a private tempdir removed when the
+    /// creating supervisor exits. Kept solely as `create`'s fallback for a
+    /// host whose cache directory cannot be prepared.
+    fn create_ephemeral() -> std::io::Result<Self> {
         let tempdir = tempfile::Builder::new()
             .prefix("carrick-native-aot-")
             .tempdir()?;
@@ -776,8 +1062,12 @@ impl ContainerCacheAuthority {
         })?;
         // Winner selection precedes all file emission. Toolchain workloads
         // retire many identical siblings at once; every loser should pay one
-        // lock round-trip, not a full unit emission.
-        let _lock = self.lock_unit(&stem)?;
+        // lock round-trip, not a full unit emission — and a HELD lock means a
+        // rival is emitting this same unit right now, so yielding (not
+        // waiting) is the correct, non-blocking answer.
+        let Some(_lock) = self.try_lock_unit(&stem)? else {
+            return Ok(PublishOutcome::Yielded);
+        };
         let (final_code, final_metadata) = self.final_paths(&stem);
         if final_code.is_file() && final_metadata.is_file() {
             return Ok(PublishOutcome::Existing);
@@ -882,39 +1172,50 @@ impl ContainerCacheAuthority {
         Ok(PublishOutcome::Winner)
     }
 
+    /// Elect the ONE process that records portable templates for this unit.
+    ///
+    /// The first process to miss claims immediately: with a persistent store
+    /// the publication amortizes across every future exec and run, so the
+    /// retired `.seen` deferral ("prove the unit recurs first") only delayed
+    /// the unit past the second exec's exit — too late for a parallel
+    /// build's serial exec trains. A live claim (its `.builder` pid alive
+    /// and the file younger than [`BUILDER_CLAIM_TTL`]) blocks rivals, so
+    /// concurrent processes translate privately WITHOUT recording or
+    /// publishing; a dead or aged claim is taken over. Never blocks: a busy
+    /// unit lock means another process is deciding right now, and "do not
+    /// record" is always a correct answer.
     pub fn claim_recording(&self, key: &TranslationUnitKey) -> Result<bool, UnitStoreError> {
         let stem = key.file_stem().map_err(|error| {
             UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
         })?;
-        let _lock = self.lock_unit(&stem)?;
+        let Some(_lock) = self.try_lock_unit(&stem)? else {
+            return Ok(false);
+        };
         let (code, metadata) = self.final_paths(&stem);
         if code.is_file() && metadata.is_file() {
             return Ok(false);
         }
-        let seen = self.path.join(format!("{stem}.seen"));
-        if !seen.exists() {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(seen)
-                .map_err(|error| {
-                    UnitStoreError::with_source(
-                        "mark first unit observation",
-                        UnitMissReason::MissingPair,
-                        error,
-                    )
-                })?;
-            return Ok(false);
-        }
         let builder = self.path.join(format!("{stem}.builder"));
-        if let Ok(owner) = std::fs::read_to_string(&builder)
-            && let Ok(owner) = owner.trim().parse::<i32>()
-        {
-            let rc = unsafe { libc::kill(owner, 0) };
-            if rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-                return Ok(false);
-            }
+        let claim_is_live = std::fs::metadata(&builder).is_ok_and(|identity| {
+            let fresh = identity
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age < BUILDER_CLAIM_TTL);
+            // A pid recycled across runs can stay "alive" forever against a
+            // persistent store; age above is the final arbiter.
+            fresh
+                && std::fs::read_to_string(&builder)
+                    .ok()
+                    .and_then(|owner| owner.trim().parse::<i32>().ok())
+                    .is_some_and(|owner| {
+                        let rc = unsafe { libc::kill(owner, 0) };
+                        rc == 0
+                            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                    })
+        });
+        if claim_is_live {
+            return Ok(false);
         }
         let mut builder_file = OpenOptions::new()
             .write(true)
@@ -1030,6 +1331,11 @@ impl ContainerCacheAuthority {
                 UnitMissReason::CodeDigest,
             ));
         }
+        // Refresh the pair's modification time so the pruner's LRU order
+        // reflects USE, not publication age. Timestamps only: the mapped
+        // content bytes are still never written in place. Best-effort — a
+        // failed touch costs eviction order, never correctness.
+        let _ = unsafe { libc::futimens(code_file.as_raw_fd(), std::ptr::null()) };
         if metadata.binding_count() != 0
             && let Err(reason) = validate_loaded_binding_code(&metadata, &mapping)
         {
@@ -1080,7 +1386,11 @@ impl ContainerCacheAuthority {
         })
     }
 
-    fn lock_unit(&self, stem: &str) -> Result<UnitFileLock, UnitStoreError> {
+    /// Acquire one unit's store lock without blocking. `None` means another
+    /// process holds it right now — and every caller has a correct
+    /// non-waiting answer for that (skip the claim, yield the publication):
+    /// no process ever blocks on another's translation.
+    fn try_lock_unit(&self, stem: &str) -> Result<Option<UnitFileLock>, UnitStoreError> {
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1091,14 +1401,18 @@ impl ContainerCacheAuthority {
             .map_err(|error| {
                 UnitStoreError::with_source("open unit lock", UnitMissReason::MissingPair, error)
             })?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
             return Err(UnitStoreError::with_source(
                 "lock unit",
                 UnitMissReason::MissingPair,
-                std::io::Error::last_os_error(),
+                error,
             ));
         }
-        Ok(UnitFileLock(lock))
+        Ok(Some(UnitFileLock(lock)))
     }
 
     fn final_paths(&self, stem: &str) -> (PathBuf, PathBuf) {
@@ -1116,20 +1430,18 @@ impl ContainerCacheAuthority {
 
 impl Drop for ContainerCacheAuthority {
     fn drop(&mut self) {
+        // Only the ephemeral fallback is removable: the persistent store is
+        // the point of the mechanism, and pruning (not container exit)
+        // bounds it.
         if self.cleanup_owner && owns_cleanup(self.creator_pid, unsafe { libc::getpid() }) {
-            if std::env::var_os("CARRICK_DSR_KEEP_CONTAINER_CACHE").as_deref()
-                == Some(std::ffi::OsStr::new("1"))
-            {
-                eprintln!("CARRICK_SHARED_CACHE_KEPT path={}", self.path.display());
-                return;
-            }
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }
 
 /// Scope guard owned by the parent process that launched one native
-/// container. Dropping it after the root guest exits removes the cache.
+/// container. Dropping it after the root guest exits releases this
+/// process's authority slot; the persistent store itself outlives it.
 #[derive(Debug)]
 pub struct ContainerCacheSession {
     creator_pid: i32,
@@ -1151,7 +1463,19 @@ impl Drop for ContainerCacheSession {
 }
 
 pub fn begin_container_cache() -> std::io::Result<ContainerCacheSession> {
-    let authority = ContainerCacheAuthority::create()?;
+    install_container_cache(ContainerCacheAuthority::create()?)
+}
+
+/// Test and bench entry: a persistent store rooted at an explicit directory
+/// instead of the host default, so fixtures with deterministic keys never
+/// touch (or inherit state from) the user's real store.
+pub fn begin_container_cache_at(root: &Path) -> std::io::Result<ContainerCacheSession> {
+    install_container_cache(ContainerCacheAuthority::open_persistent_at(root)?)
+}
+
+fn install_container_cache(
+    authority: ContainerCacheAuthority,
+) -> std::io::Result<ContainerCacheSession> {
     let creator_pid = authority.creator_pid;
     let mut active = CONTAINER_CACHE
         .lock()
@@ -1632,6 +1956,46 @@ mod tests {
         child_exit(0)
     }
 
+    /// A hermetic persistent-store authority rooted in a private tempdir.
+    /// Returns the root guard alongside so the store outlives the authority
+    /// (persistence is the property under test) and is removed when the test
+    /// ends. Fixture keys are deterministic, so tests must never share the
+    /// user's real store.
+    fn persistent_fixture_authority() -> (tempfile::TempDir, ContainerCacheAuthority) {
+        let root = tempfile::Builder::new()
+            .prefix("carrick-aot-test-")
+            .tempdir()
+            .expect("create test store root");
+        let authority = ContainerCacheAuthority::open_persistent_at(root.path())
+            .expect("open persistent store authority");
+        (root, authority)
+    }
+
+    fn set_file_age(path: &Path, age: std::time::Duration) {
+        let past = std::time::SystemTime::now() - age;
+        let seconds = past
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("past epoch")
+            .as_secs();
+        let times = [
+            libc::timeval {
+                tv_sec: seconds as libc::time_t,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: seconds as libc::time_t,
+                tv_usec: 0,
+            },
+        ];
+        let c_path = CString::new(path.as_os_str().as_bytes()).expect("path without NUL");
+        assert_eq!(
+            unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) },
+            0,
+            "age file {}",
+            path.display()
+        );
+    }
+
     fn duplicated_snapshot(authority: &ContainerCacheAuthority) -> ContainerCacheReexecConfig {
         let mut snapshot = authority.snapshot().expect("snapshot cache authority");
         let duplicate =
@@ -1643,7 +2007,7 @@ mod tests {
 
     #[test]
     fn authority_is_private_and_survives_validated_reexec_adoption() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let snapshot = duplicated_snapshot(&authority);
         let adopted = ContainerCacheAuthority::adopt(&snapshot).expect("adopt cache authority");
 
@@ -1664,8 +2028,8 @@ mod tests {
 
     #[test]
     fn authority_rejects_substituted_directory_fd() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
-        let substitute = ContainerCacheAuthority::create().expect("create substitute authority");
+        let (_store, authority) = persistent_fixture_authority();
+        let (_substitute_store, substitute) = persistent_fixture_authority();
         let mut snapshot = duplicated_snapshot(&substitute);
         let expected = authority.snapshot().expect("snapshot expected authority");
         snapshot.host_device = expected.host_device;
@@ -1678,8 +2042,8 @@ mod tests {
 
     #[test]
     fn authority_rejects_substituted_directory_path() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
-        let substitute = ContainerCacheAuthority::create().expect("create substitute authority");
+        let (_store, authority) = persistent_fixture_authority();
+        let (_substitute_store, substitute) = persistent_fixture_authority();
         let mut snapshot = duplicated_snapshot(&authority);
         snapshot.path = substitute.path().to_path_buf();
 
@@ -1713,7 +2077,11 @@ mod tests {
             Some(UnitMissReason::NoAuthority),
         );
 
-        let session = begin_container_cache().expect("begin container cache");
+        let root = tempfile::Builder::new()
+            .prefix("carrick-aot-test-")
+            .tempdir()
+            .expect("create test store root");
+        let session = begin_container_cache_at(root.path()).expect("begin container cache");
         // Authority installed, files absent: a genuine miss, and the only shape
         // that reaches the recorder election.
         assert!(matches!(store.load(&pending.key, &source_words), Ok(None)));
@@ -1725,10 +2093,17 @@ mod tests {
         );
     }
 
+    /// The persistent store is the point: a session ending releases this
+    /// process's authority slot but leaves the directory — and its published
+    /// units — for every future run.
     #[test]
-    fn creator_session_removes_cache_after_container_exit() {
+    fn creator_session_keeps_the_persistent_store_after_container_exit() {
         let _slot = cache_slot();
-        let session = begin_container_cache().expect("begin container cache");
+        let root = tempfile::Builder::new()
+            .prefix("carrick-aot-test-")
+            .tempdir()
+            .expect("create test store root");
+        let session = begin_container_cache_at(root.path()).expect("begin container cache");
         let path = container_cache_snapshot()
             .expect("snapshot container cache")
             .expect("active container cache")
@@ -1737,7 +2112,11 @@ mod tests {
 
         drop(session);
 
-        assert!(!path.exists());
+        assert!(path.is_dir(), "the store must survive the container");
+        assert!(
+            path.join(AUTHORITY_MARKER).is_file(),
+            "the authority marker must survive for future adoptions"
+        );
         assert!(
             container_cache_snapshot()
                 .expect("snapshot inactive cache")
@@ -1747,7 +2126,11 @@ mod tests {
 
     #[test]
     fn inherited_process_cannot_remove_creator_cache() {
-        let mut authority = ContainerCacheAuthority::create().expect("create cache authority");
+        // Removal-at-drop only exists on the ephemeral fallback; the
+        // ownership rule protects a creator's live directory from a
+        // descendant's authority drop.
+        let mut authority =
+            ContainerCacheAuthority::create_ephemeral().expect("create cache authority");
         let path = authority.path().to_path_buf();
         authority.creator_pid = unsafe { libc::getpid() }.saturating_add(1);
 
@@ -1758,8 +2141,20 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_fallback_is_removed_by_its_creator() {
+        let authority =
+            ContainerCacheAuthority::create_ephemeral().expect("create cache authority");
+        let path = authority.path().to_path_buf();
+        assert!(path.is_dir());
+
+        drop(authority);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn adoption_takes_ownership_of_the_inherited_fd() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let snapshot = duplicated_snapshot(&authority);
         let inherited_fd = snapshot.host_fd;
         let adopted = ContainerCacheAuthority::adopt(&snapshot).expect("adopt cache authority");
@@ -1771,10 +2166,230 @@ mod tests {
         assert_eq!(result, -1);
     }
 
+    /// With a persistent store, publish-once amortizes across every future
+    /// run and exec, so the first process to MISS a unit must claim its
+    /// recording. The retired `.seen` deferral ("prove the unit recurs in
+    /// this container first") pushed publication past the SECOND exec's exit
+    /// — on the parallel build shape that is "within-build reuse arrives too
+    /// late" (2026-08-03 scoreboard correction).
+    #[test]
+    fn first_file_miss_claims_recording_immediately() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        assert!(
+            authority
+                .claim_recording(&pending.key)
+                .expect("first claim"),
+            "the first process to miss must claim recording"
+        );
+        // The claim is sticky: the same (still live) claimant blocks rivals.
+        assert!(
+            !authority
+                .claim_recording(&pending.key)
+                .expect("second claim"),
+            "a live claim must not be handed out twice"
+        );
+    }
+
+    /// A `.builder` claim from a crashed run must not park a unit forever:
+    /// a persistent store outlives pids, and a recycled pid can look alive
+    /// indefinitely. Age is the tiebreaker.
+    #[test]
+    fn stale_builder_claims_are_taken_over_by_age() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        let stem = pending.key.file_stem().expect("unit stem");
+        let builder = authority.path().join(format!("{stem}.builder"));
+        // Pid 1 (launchd) is always alive and never carrick: exactly the
+        // recycled-pid shape.
+        std::fs::write(&builder, b"1").expect("write stale builder");
+        set_file_age(&builder, std::time::Duration::from_secs(60 * 60));
+
+        assert!(
+            authority
+                .claim_recording(&pending.key)
+                .expect("claim over stale builder"),
+            "an hour-old claim is stale regardless of pid liveness"
+        );
+    }
+
+    /// The core of the lane: a unit published by one authority (one run)
+    /// loads from a fresh authority over the same root (the next run), and
+    /// the recorder election reports "already published" instead of handing
+    /// out a claim.
+    #[test]
+    fn published_units_survive_into_a_new_authority_over_the_same_root() {
+        let (store, first) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        assert_eq!(
+            first.publish_unit(&pending).expect("publish unit"),
+            PublishOutcome::Winner
+        );
+        drop(first);
+
+        let second = ContainerCacheAuthority::open_persistent_at(store.path())
+            .expect("reopen persistent store");
+        let loaded = second
+            .load_unit(&pending.key, &fixture_source_words())
+            .expect("load unit published by the previous authority");
+        assert!(matches!(&loaded.metadata, LoadedTranslationMetadata::V3(_)));
+        assert!(
+            !second
+                .claim_recording(&pending.key)
+                .expect("claim against a published unit"),
+            "a published unit needs no recorder"
+        );
+        assert_eq!(
+            second.publish_unit(&pending).expect("republish unit"),
+            PublishOutcome::Existing
+        );
+    }
+
+    /// Both authorities over one root must agree on the marker nonce, or a
+    /// descendant of the second run could not adopt the snapshot.
+    #[test]
+    fn reopened_store_reads_the_same_authority_nonce() {
+        let (store, first) = persistent_fixture_authority();
+        let first_nonce = first.authority_nonce;
+        drop(first);
+        let second = ContainerCacheAuthority::open_persistent_at(store.path())
+            .expect("reopen persistent store");
+        assert_eq!(second.authority_nonce, first_nonce);
+    }
+
+    /// A truncated metadata half — a torn copy, a bad disk — must fail
+    /// closed to a load miss reason, never a panic, and the pair must
+    /// remain repairable by a later publish.
+    #[test]
+    fn corrupt_metadata_fails_closed_and_republish_repairs() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
+        assert_eq!(
+            authority.publish_unit(&pending).expect("publish unit"),
+            PublishOutcome::Winner
+        );
+        let stem = pending.key.file_stem().expect("unit stem");
+        let metadata_path = authority.path().join(format!("{stem}.metadata-v3"));
+        let intact = std::fs::read(&metadata_path).expect("read metadata");
+        std::fs::write(&metadata_path, &intact[..intact.len() / 2]).expect("truncate metadata");
+
+        let error = authority
+            .load_unit(&pending.key, &fixture_source_words())
+            .expect_err("truncated metadata must not load");
+        assert_ne!(error.reason(), UnitMissReason::MissingPair);
+
+        // The pair exists (corrupt), so publish takes the repair path:
+        // remove-and-replace under the unit lock.
+        std::fs::remove_file(authority.path().join(format!("{stem}.code")))
+            .expect("break the pair so publish repairs it");
+        assert_eq!(
+            authority.publish_unit(&pending).expect("republish"),
+            PublishOutcome::Winner
+        );
+        authority
+            .load_unit(&pending.key, &fixture_source_words())
+            .expect("repaired unit loads");
+    }
+
+    /// The size cap evicts oldest-used pairs first and leaves the store
+    /// under the cap; the authority marker survives pruning.
+    #[test]
+    fn prune_evicts_oldest_pairs_down_to_the_cap() {
+        let (store, authority) = persistent_fixture_authority();
+        let old = fixture_pending();
+        let mut new = fixture_pending();
+        // A distinct key: different guest start yields a different stem.
+        new.key = TranslationUnitKey::for_segment(
+            ExecutableIdentity::Digest([0x33; 32]),
+            ImageFileOffset::new(0),
+            ImageFileLen::new(8).expect("nonzero file length"),
+            GuestVa(0x400000),
+            GuestCodeLen::new(8).expect("nonzero guest length"),
+            SourceFingerprint::from_words(&fixture_source_words()),
+            NativePageProfileIdentity::Native16k,
+            AddressModeIdentity::biased(
+                NativeHostBias::new(0x8000_0000, 16 * 1024).expect("aligned bias"),
+            ),
+        );
+        new.blocks[0].guest_start = GuestVa(0x400000);
+        assert_eq!(
+            authority.publish_unit(&old).expect("publish old"),
+            PublishOutcome::Winner
+        );
+        assert_eq!(
+            authority.publish_unit(&new).expect("publish new"),
+            PublishOutcome::Winner
+        );
+        let old_stem = old.key.file_stem().expect("old stem");
+        let new_stem = new.key.file_stem().expect("new stem");
+        for suffix in [".code", ".metadata-v3"] {
+            set_file_age(
+                &store.path().join(format!("{old_stem}{suffix}")),
+                std::time::Duration::from_secs(3 * 60 * 60),
+            );
+        }
+
+        // A cap of one byte forces eviction of everything not in use; the
+        // oldest pair goes first and eviction stops at the cap — here after
+        // both, so assert the ORDER by capping between the two pair sizes.
+        let pair_bytes = |stem: &str| -> u64 {
+            [".code", ".metadata-v3"]
+                .iter()
+                .map(|suffix| {
+                    std::fs::metadata(store.path().join(format!("{stem}{suffix}")))
+                        .expect("pair half")
+                        .len()
+                })
+                .sum()
+        };
+        let keep_bytes = pair_bytes(&new_stem);
+        prune_store(authority.directory(), store.path(), keep_bytes);
+
+        assert!(
+            !store.path().join(format!("{old_stem}.code")).exists(),
+            "the oldest pair must be evicted"
+        );
+        assert!(
+            store.path().join(format!("{new_stem}.code")).is_file(),
+            "the newest pair must survive"
+        );
+        assert!(store.path().join(AUTHORITY_MARKER).is_file());
+        authority
+            .load_unit(&new.key, &fixture_source_words())
+            .expect("survivor still loads");
+    }
+
+    /// Legacy `.seen` markers (the retired recurrence deferral) and aged
+    /// publication temporaries are crash leftovers the pruner removes.
+    #[test]
+    fn prune_removes_retired_and_aged_auxiliary_files() {
+        let (store, authority) = persistent_fixture_authority();
+        let seen = store.path().join("deadbeef.seen");
+        std::fs::write(&seen, b"").expect("write legacy seen marker");
+        let fresh_temp = store.path().join(".tmpfresh1");
+        std::fs::write(&fresh_temp, b"half-written").expect("write fresh temporary");
+        let stale_temp = store.path().join(".tmpstale1");
+        std::fs::write(&stale_temp, b"half-written").expect("write stale temporary");
+        set_file_age(
+            &stale_temp,
+            TEMP_FILE_TTL + std::time::Duration::from_secs(60),
+        );
+
+        prune_store(authority.directory(), store.path(), STORE_SIZE_CAP_BYTES);
+
+        assert!(!seen.exists(), "legacy .seen markers are always removed");
+        assert!(
+            fresh_temp.exists(),
+            "a young temporary may be a publication in flight"
+        );
+        assert!(!stale_temp.exists(), "aged temporaries are crash leftovers");
+        assert!(store.path().join(AUTHORITY_MARKER).is_file());
+    }
+
     #[test]
     fn concurrent_publishers_converge_on_one_published_unit() {
-        let authority =
-            std::sync::Arc::new(ContainerCacheAuthority::create().expect("create cache authority"));
+        let (_store, authority) = persistent_fixture_authority();
+        let authority = std::sync::Arc::new(authority);
         let pending = fixture_pending();
         let threads = (0..2)
             .map(|_| {
@@ -1794,11 +2409,19 @@ mod tests {
             .collect::<Vec<_>>();
         outcomes.sort_by_key(|outcome| match outcome {
             PublishOutcome::Winner => 0,
-            PublishOutcome::Existing => 1,
+            PublishOutcome::Existing | PublishOutcome::Yielded => 1,
         });
-        assert_eq!(
-            outcomes,
-            vec![PublishOutcome::Winner, PublishOutcome::Existing]
+        assert_eq!(outcomes[0], PublishOutcome::Winner);
+        // The loser either saw the winner's finished pair (Existing) or its
+        // held lock (Yielded) — both are non-blocking single-publisher
+        // outcomes.
+        assert!(
+            matches!(
+                outcomes[1],
+                PublishOutcome::Existing | PublishOutcome::Yielded
+            ),
+            "loser outcome: {:?}",
+            outcomes[1]
         );
 
         let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
@@ -1830,7 +2453,7 @@ mod tests {
 
     #[test]
     fn published_unit_loads_zero_aligned_binding_cells() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending_with_binding_sidecar();
 
         assert_eq!(
@@ -1892,7 +2515,7 @@ mod tests {
     /// copy transport removes that aliasing entirely.
     #[test]
     fn each_load_gets_a_fresh_private_cell_block() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending_with_binding_sidecar();
         authority
             .publish_unit(&pending)
@@ -1938,7 +2561,7 @@ mod tests {
         const CHILD_A_TARGET: usize = 0x1111_0000;
         const CHILD_B_TARGET: usize = 0x2222_0000;
 
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending_with_binding_sidecar();
         authority
             .publish_unit(&pending)
@@ -2014,7 +2637,7 @@ mod tests {
     fn loaded_code_uses_a_private_read_only_vm_region() {
         use mach2::vm_prot::VM_PROT_READ;
 
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish unit");
         let loaded = authority
@@ -2030,7 +2653,7 @@ mod tests {
 
     #[test]
     fn loaded_unit_lease_keeps_code_and_cells_alive_after_unlink() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending_with_binding_sidecar();
         authority
             .publish_unit(&pending)
@@ -2090,7 +2713,7 @@ mod tests {
     /// must fail the digest, not run bytes under the wrong pc-maps.
     #[test]
     fn code_digest_rejects_another_units_substituted_code_file() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let first = fixture_pending();
         let mut second = fixture_pending();
         // Same length, different bytes: `mov w0, #43 ; ret`.
@@ -2126,28 +2749,37 @@ mod tests {
         );
     }
 
+    /// The retired `.seen` deferral made the SECOND observer the recorder;
+    /// with a persistent store the FIRST claim wins
+    /// (`first_file_miss_claims_recording_immediately`) and this test pins
+    /// the remaining property: one live claim excludes the herd, and a
+    /// finished pair needs no recorder at all.
     #[test]
-    fn recurring_unit_elects_exactly_one_recorder() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
-        let key = fixture_pending().key;
+    fn one_live_recorder_excludes_the_herd() {
+        let (_store, authority) = persistent_fixture_authority();
+        let pending = fixture_pending();
 
         assert!(
-            !authority
-                .claim_recording(&key)
-                .expect("record first observation"),
-            "a one-off executable must not pay portable recording cost"
-        );
-        assert!(
             authority
-                .claim_recording(&key)
-                .expect("elect second observation"),
-            "the second process proves recurrence and owns recording"
+                .claim_recording(&pending.key)
+                .expect("elect first observer"),
+            "the first process to miss owns recording"
         );
         assert!(
             !authority
-                .claim_recording(&key)
+                .claim_recording(&pending.key)
                 .expect("observe live recorder"),
             "a live recorder must exclude the thundering herd"
+        );
+        assert_eq!(
+            authority.publish_unit(&pending).expect("publish unit"),
+            PublishOutcome::Winner
+        );
+        assert!(
+            !authority
+                .claim_recording(&pending.key)
+                .expect("claim against a published unit"),
+            "a published unit needs no recorder"
         );
     }
 
@@ -2155,7 +2787,7 @@ mod tests {
     /// signature, no dylib anywhere in the store.
     #[test]
     fn published_pair_is_raw_code_beside_mapped_metadata() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         assert_eq!(
             authority.publish_unit(&pending).expect("publish unit"),
@@ -2180,7 +2812,7 @@ mod tests {
 
     #[test]
     fn load_rejects_a_flipped_code_byte() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish unit");
         let stem = pending.key.file_stem().expect("unit stem");
@@ -2200,7 +2832,7 @@ mod tests {
 
     #[test]
     fn load_rejects_a_code_file_with_the_wrong_extent() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish unit");
         let stem = pending.key.file_stem().expect("unit stem");
@@ -2220,7 +2852,7 @@ mod tests {
 
     #[test]
     fn partial_publish_pair_is_never_loadable() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         let stem = pending.key.file_stem().expect("unit stem");
         let (code, manifest) = authority.final_paths(&stem);
@@ -2247,7 +2879,7 @@ mod tests {
 
     #[test]
     fn published_v3_unit_is_mapped_with_zero_read_evidence() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
 
         assert_eq!(
@@ -2287,7 +2919,7 @@ mod tests {
 
     #[test]
     fn mapped_metadata_uses_the_bounded_open_extent() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish V3 unit");
         let stem = pending.key.file_stem().expect("unit stem");
@@ -2317,7 +2949,7 @@ mod tests {
     #[test]
     fn mapped_metadata_evidence_counts_all_twelve_wire_sections() {
         let pending = fixture_pending_with_complete_metadata_tables();
-        let v3_authority = ContainerCacheAuthority::create().expect("create V3 cache authority");
+        let (_v3_store, v3_authority) = persistent_fixture_authority();
         v3_authority
             .publish_unit(&pending)
             .expect("publish complete V3 metadata fixture");
@@ -2333,7 +2965,7 @@ mod tests {
 
     #[test]
     fn mapped_metadata_and_code_pair_rejects_either_lone_half() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         let stem = pending.key.file_stem().expect("unit stem");
         let (code, metadata) = authority.final_paths(&stem);
@@ -2359,7 +2991,7 @@ mod tests {
 
     #[test]
     fn corrupt_v3_metadata_is_typed_before_the_code_half() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish V3 unit");
         let stem = pending.key.file_stem().expect("unit stem");
@@ -2383,7 +3015,7 @@ mod tests {
 
     #[test]
     fn mapped_metadata_survives_unlink_until_the_final_clone_drops() {
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending_with_binding_sidecar();
         authority
             .publish_unit(&pending)
@@ -2436,7 +3068,7 @@ mod tests {
         use mach2::vm_prot::VM_PROT_READ;
         use mach2::vm_region::SM_COW;
 
-        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish V3 unit");
         let stem = pending.key.file_stem().expect("unit stem");
