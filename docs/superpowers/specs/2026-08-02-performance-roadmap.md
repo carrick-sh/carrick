@@ -178,6 +178,46 @@ sample): cpython-math fell below the 10x outlier bar under tier D (15.31x
 in the control) and glob read 13.30x vs 16.65x — consistent with the
 estimate below, not yet a controlled measurement.
 
+**Async signal delivery + sigreturn LANDED (2026-08-03, lane L,
+`5b6a09d1`) — the #1 class above is closed.** Delivery reuses the one
+signal semantics (`vcpu_loop::deliver_pending_signal` +
+`carrick_hal::sigframe` through a tier-D trap adapter) at (a) every
+syscall boundary and (b) interrupted blocking waits (EINTR/SA_RESTART),
+with a `WaitOnSignals` arm, a per-group vDSO-shaped sigreturn trampoline,
+and frame-exact restore through a leave-leg FP park + an extras-restoring
+parked re-entry. Truly-async interruption of RUNNING guest code stays
+fail-closed. Live through the shipped binary: `timeout 1 sleep 5` →
+`rc=124`, the dash→timeout→sleep chain all-tier-D, cross-process SIGTERM
+death included.
+
+**Smoke re-run (2026-08-03, lane L, one sample, sibling lane
+concurrent): control (tier D off) = 20/20 MATCH, no regressions; tier D
+forced = 17 gating (was 19), node-app + node-v8 now MATCH.** The census
+shows ZERO `WaitOnSignals`/`SignalThread` leaves; the four remaining
+named leaves are exactly the other classes (`BlockingRecordLock`,
+undecodable `0x38764d52` ×2, MT fork). The residue re-attributes:
+
+- **LTP (10× Empty, unchanged verdicts, NEW cause):** with signals fixed
+  the LTP chains run past `sigsuspend` and die at a PRE-EXISTING,
+  image-content-specific tier-D crash — deterministic SIGSEGV at
+  interp+0x70ae4, fault addr 0x13, x18=0 — reproduced on `ubuntu:24.04`
+  `sh -c 'echo hi'` at 1a348627, f4713e5c AND with lane L's change
+  (`debian:stable` works). Signal work unmasked it; it smells like a
+  missed x18-consuming shape in that image's ld.so/libc slipping the
+  scan. It is the LTP class's new blocker.
+- **Go PIE tests (4× CRASH):** previously left NAMED at `SignalThread`
+  with zero tests; now run REAL test bodies (go-context 24/24, go-time
+  10/10 partials) into MT+SIGURG territory and die UNNAMED (host crashes,
+  e.g. pc=0x81 wild branch, 6-7 threads live). Newly-reached ground, not
+  attributed; needs a core/lldb pass before the flip.
+- **cpython-subprocess/-threading (Empty):** MT fork (no sibling
+  quiesce) — the already-named class.
+
+**Flip verdict: still blocked**, now on (1) the image-specific
+scan/veneer crash, (2) MT-fork quiesce, (3) the unattributed Go
+MT+SIGURG crash tail, (4) `BlockingRecordLock` + the `0x38764d52`
+decode gap — signals are no longer on the list.
+
 **Gate:** conformance smoke, plus the outlier ratios the smoke already prints —
 node 22-23x and cpython 14-17x today, both PIE and both dominated by emitted
 code.
