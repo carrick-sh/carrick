@@ -2817,6 +2817,35 @@ impl SyscallDispatcher {
             .and_then(|m| m.vfs.read_file(path).ok())
     }
 
+    /// Bounded head of [`SyscallDispatcher::read_exec_file`]: at most `max`
+    /// leading bytes through the same layered view, `None` exactly when the
+    /// full read would be `None`. The execve path's existence check and `#!`
+    /// shebang probe only need a head, and the full read walked a whole
+    /// multi-MB tool binary per probe (twice per exec, before the loader's
+    /// own read) on the cold `go build`.
+    pub fn read_exec_file_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.fs.rootfs_vfs.overlay.file_head(path, max) {
+            return Some(bytes);
+        }
+        if let Some(shared) = self
+            .fs
+            .rootfs_vfs
+            .rootfs
+            .as_ref()
+            .and_then(|r| r.read_shared(path).ok())
+        {
+            return Some(shared[..shared.len().min(max)].to_vec());
+        }
+        self.fs
+            .vfs_mounts
+            .resolve(path)
+            .and_then(|m| m.vfs.read_file(path).ok())
+            .map(|mut bytes| {
+                bytes.truncate(max);
+                bytes
+            })
+    }
+
     pub fn stdout(&self) -> Vec<u8> {
         self.io.stdout.lock().clone()
     }

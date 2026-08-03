@@ -36,7 +36,11 @@ pub(crate) fn resolve_shebang(
     mut argv: Vec<Vec<u8>>,
 ) -> Result<(String, Vec<Vec<u8>>), LinuxErrno> {
     for _ in 0..4 {
-        let Some(head) = dispatcher.read_exec_file(&path) else {
+        // Only the first BINPRM_BUF_SIZE (256) bytes matter: the kernel reads
+        // exactly that much for the `#!` probe, and `parse_shebang` clamps the
+        // line to 256 bytes anyway. A bounded head read keeps this probe from
+        // walking a whole multi-MB ELF per exec.
+        let Some(head) = dispatcher.read_exec_file_head(&path, 256) else {
             break;
         };
         if !head.starts_with(b"#!") {
@@ -651,6 +655,85 @@ mod tests {
         elf[ph + 40..ph + 48].copy_from_slice(&len.to_le_bytes());
         elf[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
         elf
+    }
+
+    #[cfg(target_os = "macos")]
+    fn host_dispatcher(files: &[(&str, &[u8])]) -> (SyscallDispatcher, tempfile::TempDir) {
+        use crate::fs_backend::FsBackend as _;
+        let scratch = tempfile::TempDir::new().unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .unwrap();
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        for (path, contents) in files {
+            backend.create_file(path).unwrap();
+            backend.set_file_contents(path, contents.to_vec()).unwrap();
+        }
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        (dispatcher, scratch)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_shebang_splices_interpreter_from_bounded_head() {
+        // The probe reads only a 256-byte head (BINPRM_BUF_SIZE); the splice
+        // must still match Linux: `#!/i x` on argv [script, a] becomes path
+        // /i, argv [/i, x, script, a].
+        let (dispatcher, _scratch) =
+            host_dispatcher(&[("/bin/tool.sh", b"#!/bin/sh -e\nexit 0\n")]);
+
+        let (path, argv) = resolve_shebang(
+            &dispatcher,
+            "/bin/tool.sh".to_owned(),
+            vec![b"/bin/tool.sh".to_vec(), b"a".to_vec()],
+        )
+        .unwrap();
+
+        assert_eq!(path, "/bin/sh");
+        assert_eq!(
+            argv,
+            vec![
+                b"/bin/sh".to_vec(),
+                b"-e".to_vec(),
+                b"/bin/tool.sh".to_vec(),
+                b"a".to_vec(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_shebang_leaves_binaries_untouched_and_clamps_long_lines() {
+        // A large ELF-like binary passes through unchanged (and the probe
+        // must not depend on reading the whole payload); a shebang line
+        // longer than 256 bytes is clamped to the head, exactly as
+        // `parse_shebang` clamped it when handed the full file.
+        let mut binary = b"\x7fELF".to_vec();
+        binary.extend(std::iter::repeat_n(0xAB_u8, 1 << 20));
+        let mut long = b"#!/".to_vec();
+        long.extend(std::iter::repeat_n(b'x', 400));
+        long.push(b'\n');
+        let (dispatcher, _scratch) =
+            host_dispatcher(&[("/bin/big", binary.as_slice()), ("/bin/long.sh", &long)]);
+
+        let (path, argv) = resolve_shebang(
+            &dispatcher,
+            "/bin/big".to_owned(),
+            vec![b"/bin/big".to_vec()],
+        )
+        .unwrap();
+        assert_eq!(path, "/bin/big");
+        assert_eq!(argv, vec![b"/bin/big".to_vec()]);
+
+        let expected = parse_shebang(&long).unwrap().0;
+        let (path, _argv) = resolve_shebang(
+            &dispatcher,
+            "/bin/long.sh".to_owned(),
+            vec![b"/bin/long.sh".to_vec()],
+        )
+        .unwrap();
+        assert_eq!(path, expected);
+        assert_eq!(path.len(), 254, "interpreter clamped to the 256-byte head");
     }
 
     #[test]
