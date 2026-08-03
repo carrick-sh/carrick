@@ -19,7 +19,7 @@
 //!
 //! A published unit is a PAIR of plain files in the store:
 //! `{stem}.code` (the concatenated per-block NATIVE-EMISSION template words,
-//! relocation immediates zeroed) and `{stem}.metadata-v4` (the serialized
+//! relocation immediates zeroed) and `{stem}.metadata-v5` (the serialized
 //! manifest: per-block relocations, trusted entries, direct links, PC maps,
 //! and recovery, carrying `code_sha256` over the exact code bytes). Loading
 //! maps the code read-only, digest-verifies it against the metadata, and
@@ -65,10 +65,9 @@ use carrick_dsr_aarch64::shared_cache::ManifestDefect;
 pub use carrick_dsr_aarch64::shared_cache::PublishOutcome;
 use carrick_dsr_aarch64::shared_cache::{
     MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit, SourceFingerprint,
-    TRANSLATION_UNIT_SCHEMA_V4, TranslationMetadataLoadEvidence, TranslationUnitKey,
-    TranslationUnitManifest, UnitMissReason, decode_translation_unit_metadata,
-    encode_translation_unit_metadata, shared_source_fingerprint_reuse_enabled,
-    translation_unit_base_export,
+    TranslationMetadataLoadEvidence, TranslationUnitKey, TranslationUnitManifest, UnitMissReason,
+    decode_translation_unit_metadata, encode_translation_unit_metadata,
+    shared_source_fingerprint_reuse_enabled,
 };
 use sha2::{Digest, Sha256};
 
@@ -80,7 +79,7 @@ const MAX_MAPPED_METADATA_BYTES: u64 = MANIFEST_DECODE_LIMIT as u64;
 /// pids recycle across the runs a persistent store outlives, and no
 /// legitimate recorder runs this long before publishing at exit or exec.
 const BUILDER_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-/// Total `{stem}.code` + `{stem}.metadata-v4` bytes the store may retain;
+/// Total `{stem}.code` + `{stem}.metadata-v5` bytes the store may retain;
 /// beyond it the oldest pairs (by modification time, refreshed on load) are
 /// evicted at container begin. A whole go toolchain's units measure in tens
 /// of MiB, so this cap is generous without being unbounded.
@@ -202,7 +201,7 @@ fn prune_store(directory: &File, path: &Path, cap_bytes: u64) {
             .unwrap_or_default();
         if let Some(stem) = name.strip_suffix(".code") {
             code_halves.insert(stem.to_owned(), identity);
-        } else if let Some(stem) = name.strip_suffix(".metadata-v4") {
+        } else if let Some(stem) = name.strip_suffix(".metadata-v5") {
             metadata_halves.insert(stem.to_owned(), identity);
         } else if name.ends_with(".seen") || name.ends_with(".metadata-v3") {
             // Retired formats: the recurrence-deferral marker and the
@@ -257,7 +256,7 @@ fn prune_store(directory: &File, path: &Path, cap_bytes: u64) {
                 .and_then(|modified| modified.elapsed().ok())
                 .is_some_and(|age| age > TEMP_FILE_TTL)
         {
-            let _ = std::fs::remove_file(path.join(format!("{stem}.metadata-v4")));
+            let _ = std::fs::remove_file(path.join(format!("{stem}.metadata-v5")));
         }
     }
     if total_bytes <= cap_bytes {
@@ -274,7 +273,7 @@ fn prune_store(directory: &File, path: &Path, cap_bytes: u64) {
             continue;
         };
         let _ = std::fs::remove_file(path.join(format!("{}.code", pair.stem)));
-        let _ = std::fs::remove_file(path.join(format!("{}.metadata-v4", pair.stem)));
+        let _ = std::fs::remove_file(path.join(format!("{}.metadata-v5", pair.stem)));
         let _ = std::fs::remove_file(path.join(format!("{}.builder", pair.stem)));
         drop(lock);
         let _ = std::fs::remove_file(path.join(format!("{}.lock", pair.stem)));
@@ -541,9 +540,18 @@ fn open_unit_regular_file_at(
     Ok((file, length))
 }
 
-/// Read and validate one unit's serialized metadata through the READER path
-/// (used both at load and as the publish preflight): decode fail-closed,
-/// require the exact expected key, and re-run the manifest invariants.
+/// Map and validate one unit's serialized metadata through the READER path
+/// (used both at load and as the publish preflight): decode the header and
+/// fixed-width index fail-closed, require the exact expected key, and
+/// re-run the INDEX invariants. Per-block blobs stay undecoded — this is
+/// what makes the per-exec attach proportional to the block count instead
+/// of the metadata size. The publish preflight layers `validate_deep` on
+/// top (see `publish_unit`); a corrupt blob served to a loader fails
+/// closed at that block's replay.
+///
+/// The mmap (not a read) is load-bearing twice over: the manifest keeps
+/// the mapping alive for on-demand blob decode, and untouched cold bytes
+/// are never paged in at all.
 fn read_and_validate_metadata(
     directory: &File,
     name: &CStr,
@@ -555,21 +563,26 @@ fn read_and_validate_metadata(
     ),
     UnitStoreError,
 > {
-    let (mut file, length) = open_metadata_at(directory, name)?;
+    let (file, length) = open_metadata_at(directory, name)?;
     #[cfg(test)]
     run_after_bounded_metadata_open_for_test();
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(length)
-        .map_err(|_| UnitStoreError::new("reserve unit metadata", UnitMissReason::ManifestRange))?;
-    file.read_to_end(&mut bytes).map_err(|error| {
-        UnitStoreError::with_source("read unit metadata", UnitMissReason::Schema, error)
+    // SAFETY: `map_copy_read_only` requests `MAP_PRIVATE|PROT_READ`. The
+    // private cache authority never writes a published inode in place
+    // (publication and repair replace pathnames by whole-file rename), the
+    // mmap length is the exact bounded extent accepted by the fstat in
+    // `open_metadata_at` (a test-only seam may append past it; the mapping
+    // cannot see those bytes), and the mapping is kept alive inside the
+    // manifest for the lifetime of every on-demand blob decode.
+    let mapping = unsafe {
+        memmap2::MmapOptions::new()
+            .len(length)
+            .map_copy_read_only(&file)
+    }
+    .map_err(|error| {
+        UnitStoreError::with_source("map unit metadata", UnitMissReason::Schema, error)
     })?;
-    // The test-only seam may append beyond the fstat'd extent; everything
-    // past it is not part of the published payload.
-    bytes.truncate(length);
     let validation_started = std::time::Instant::now();
-    let manifest = decode_translation_unit_metadata(&bytes)
+    let manifest = decode_translation_unit_metadata(Arc::new(mapping))
         .map_err(|reason| UnitStoreError::new("decode unit metadata", reason))?;
     if manifest.key != *expected_key {
         return Err(UnitStoreError::new(
@@ -581,42 +594,16 @@ fn read_and_validate_metadata(
         .validate_ranges()
         .map_err(|reason| UnitStoreError::new("validate unit metadata ranges", reason))?;
     let validation_ns = u64::try_from(validation_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let owned_records = manifest
-        .blocks
-        .iter()
-        .map(|block| {
-            let counts = block.template.metadata_counts();
-            1_u64
-                .saturating_add(counts.pc_map_entries as u64)
-                .saturating_add(counts.recovery_entries as u64)
-                .saturating_add(counts.direct_links as u64)
-                .saturating_add(counts.relocations as u64)
-        })
-        .fold(0_u64, u64::saturating_add);
+    let owned_records = manifest.blocks().len() as u64;
     Ok((
         Arc::new(manifest),
         TranslationMetadataLoadEvidence {
-            bytes_read: u64::try_from(length).unwrap_or(u64::MAX),
-            bytes_mapped: 0,
+            bytes_read: 0,
+            bytes_mapped: u64::try_from(length).unwrap_or(u64::MAX),
             validation_ns,
             owned_records,
         },
     ))
-}
-
-fn manifest_for_pending(
-    pending: &PendingTranslationUnit,
-    code_sha256: [u8; 32],
-    base_export: &str,
-) -> TranslationUnitManifest {
-    TranslationUnitManifest {
-        schema: TRANSLATION_UNIT_SCHEMA_V4,
-        key: pending.key.clone(),
-        code_sha256,
-        base_export: base_export.to_owned(),
-        code_len: pending.code.len() as u64,
-        blocks: pending.blocks.clone(),
-    }
 }
 
 /// Identity required to adopt one container's cache directory after host
@@ -838,25 +825,45 @@ impl ContainerCacheAuthority {
                 UnitMissReason::ManifestRange,
             ));
         }
-        let base_export = translation_unit_base_export(&pending.key).map_err(|error| {
-            UnitStoreError::with_source(
-                "derive keyed translation export",
-                UnitMissReason::Schema,
-                error,
-            )
-        })?;
         // Digest the raw code FIRST so the metadata half binds the exact
         // bytes the code half will carry: a loader that ever pairs a stale
         // orphan with fresh metadata fails the digest instead of running
         // code its metadata does not describe.
-        let manifest =
-            manifest_for_pending(pending, Sha256::digest(&pending.code).into(), &base_export);
+        let code_sha256: [u8; 32] = Sha256::digest(&pending.code).into();
+        let metadata_bytes = Arc::new(
+            encode_translation_unit_metadata(
+                &pending.key,
+                code_sha256,
+                pending.code.len() as u64,
+                &pending.blocks,
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    blocks = pending.blocks.len(),
+                    error = ?error,
+                    "unit metadata encode rejected a freshly packed unit"
+                );
+                UnitStoreError::with_source(
+                    "encode unit metadata",
+                    UnitMissReason::Schema,
+                    invalid_data(format!("{error:?}")),
+                )
+            })?,
+        );
+        let manifest = decode_translation_unit_metadata(
+            Arc::clone(&metadata_bytes) as Arc<dyn AsRef<[u8]> + Send + Sync>
+        )
+        .map_err(|reason| UnitStoreError::new("decode freshly encoded unit metadata", reason))?;
         // Name the broken invariant. This preflight rejects a unit CARRICK
         // ITSELF just built, so "ManifestRange" alone says only that the
         // producer and its validator disagree - which is exactly the state a
         // cold go build has been in (33 publication attempts, 0 units, 30 of
-        // them ManifestRange with no further detail).
-        if let Err(defect) = manifest.validate_ranges_detailed() {
+        // them ManifestRange with no further detail). `validate_deep`
+        // decodes EVERY hot and cold blob: publication is rare and off the
+        // hot path, and it is the last moment a producer/reader
+        // disagreement can be named rather than read as a store that never
+        // loads.
+        if let Err(defect) = manifest.validate_deep() {
             return Err(UnitStoreError::new(
                 match defect {
                     ManifestDefect::Schema => "validate pending unit: schema",
@@ -910,18 +917,6 @@ impl ContainerCacheAuthority {
                 )
             })?;
         }
-        let metadata_bytes = encode_translation_unit_metadata(&manifest).map_err(|error| {
-            tracing::warn!(
-                blocks = manifest.blocks.len(),
-                error = ?error,
-                "unit metadata encode rejected a freshly packed unit"
-            );
-            UnitStoreError::with_source(
-                "encode unit metadata",
-                UnitMissReason::Schema,
-                invalid_data(format!("{error:?}")),
-            )
-        })?;
         let mut code_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
             UnitStoreError::with_source("create code temporary", UnitMissReason::MissingPair, error)
         })?;
@@ -1089,7 +1084,7 @@ impl ContainerCacheAuthority {
                 UnitMissReason::MissingPair,
             ));
         }
-        let metadata_name = CString::new(format!("{stem}.metadata-v4")).map_err(|error| {
+        let metadata_name = CString::new(format!("{stem}.metadata-v5")).map_err(|error| {
             UnitStoreError::with_source("encode unit metadata name", UnitMissReason::Schema, error)
         })?;
         let (manifest, load_evidence) =
@@ -1197,7 +1192,7 @@ impl ContainerCacheAuthority {
     fn final_paths(&self, stem: &str) -> (PathBuf, PathBuf) {
         (
             self.path.join(format!("{stem}.code")),
-            self.path.join(format!("{stem}.metadata-v4")),
+            self.path.join(format!("{stem}.metadata-v5")),
         )
     }
 
@@ -1811,7 +1806,7 @@ mod tests {
             PublishOutcome::Winner
         );
         let stem = pending.key.file_stem().expect("unit stem");
-        let metadata_path = authority.path().join(format!("{stem}.metadata-v4"));
+        let metadata_path = authority.path().join(format!("{stem}.metadata-v5"));
         let intact = std::fs::read(&metadata_path).expect("read metadata");
         std::fs::write(&metadata_path, &intact[..intact.len() / 2]).expect("truncate metadata");
 
@@ -1864,7 +1859,7 @@ mod tests {
         );
         let old_stem = old.key.file_stem().expect("old stem");
         let new_stem = new.key.file_stem().expect("new stem");
-        for suffix in [".code", ".metadata-v4"] {
+        for suffix in [".code", ".metadata-v5"] {
             set_file_age(
                 &store.path().join(format!("{old_stem}{suffix}")),
                 std::time::Duration::from_secs(3 * 60 * 60),
@@ -1875,7 +1870,7 @@ mod tests {
         // oldest pair goes first and eviction stops at the cap — here after
         // both, so assert the ORDER by capping between the two pair sizes.
         let pair_bytes = |stem: &str| -> u64 {
-            [".code", ".metadata-v4"]
+            [".code", ".metadata-v5"]
                 .iter()
                 .map(|suffix| {
                     std::fs::metadata(store.path().join(format!("{stem}{suffix}")))
@@ -1975,7 +1970,7 @@ mod tests {
         assert!(
             authority
                 .path()
-                .join(format!("{stem}.metadata-v4"))
+                .join(format!("{stem}.metadata-v5"))
                 .is_file()
         );
         // The copy transport hands out READABLE source bytes; nothing at
@@ -2184,7 +2179,7 @@ mod tests {
     }
 
     #[test]
-    fn published_unit_reads_serialized_metadata_with_read_evidence() {
+    fn published_unit_maps_serialized_metadata_with_mapped_evidence() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
 
@@ -2196,7 +2191,7 @@ mod tests {
         let (_, metadata_path) = authority.final_paths(&stem);
         assert_eq!(
             metadata_path.extension().and_then(std::ffi::OsStr::to_str),
-            Some("metadata-v4")
+            Some("metadata-v5")
         );
         assert!(
             !authority
@@ -2208,20 +2203,23 @@ mod tests {
         let loaded = authority
             .load_unit(&pending.key, &fixture_source_words())
             .expect("load unit");
-        assert_eq!(loaded.manifest.blocks.len(), 1);
-        assert_eq!(loaded.manifest.blocks[0].guest_start, GuestVa(0x400000));
+        assert_eq!(loaded.manifest.blocks().len(), 1);
+        assert_eq!(loaded.manifest.blocks()[0].guest_start, GuestVa(0x400000));
+        // v5 maps the metadata instead of reading it: untouched cold
+        // blobs are never paged in, and the mapping backs on-demand
+        // per-block decode for the manifest's lifetime.
+        assert_eq!(loaded.load_evidence.bytes_read, 0);
         assert_eq!(
-            loaded.load_evidence.bytes_read,
+            loaded.load_evidence.bytes_mapped,
             std::fs::metadata(metadata_path)
                 .expect("stat unit metadata")
                 .len()
         );
-        assert_eq!(loaded.load_evidence.bytes_mapped, 0);
         assert!(loaded.load_evidence.owned_records > 0);
     }
 
     #[test]
-    fn unit_metadata_reads_the_bounded_open_extent() {
+    fn unit_metadata_maps_the_bounded_open_extent() {
         let (_store, authority) = persistent_fixture_authority();
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish unit");
@@ -2244,9 +2242,9 @@ mod tests {
 
         let loaded = authority
             .load_unit(&pending.key, &fixture_source_words())
-            .expect("read only the extent accepted by bounded open");
+            .expect("map only the extent accepted by bounded open");
 
-        assert_eq!(loaded.load_evidence.bytes_read, bounded_len);
+        assert_eq!(loaded.load_evidence.bytes_mapped, bounded_len);
     }
 
     #[test]

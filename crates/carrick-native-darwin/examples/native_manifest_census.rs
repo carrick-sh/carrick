@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-use carrick_dsr_aarch64::shared_cache::TranslationUnitManifest;
+use carrick_dsr_aarch64::shared_cache::{
+    TranslationUnitManifest, decode_translation_unit_metadata,
+};
 
-const MANIFEST_DECODE_LIMIT: usize = 256 * 1024 * 1024;
-const SCHEMA: &str = "carrick.native-manifest-census.v1";
+const SCHEMA: &str = "carrick.native-manifest-census.v3";
 
 fn manifest_paths(arguments: impl IntoIterator<Item = String>) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
@@ -37,102 +38,84 @@ fn manifest_paths(arguments: impl IntoIterator<Item = String>) -> Result<Vec<Pat
     Ok(paths)
 }
 
-fn decode_manifest(bytes: &[u8]) -> Result<TranslationUnitManifest, String> {
-    let (manifest, consumed): (TranslationUnitManifest, usize) = bincode::serde::decode_from_slice(
-        bytes,
-        bincode::config::standard()
-            .with_fixed_int_encoding()
-            .with_limit::<MANIFEST_DECODE_LIMIT>(),
-    )
-    .map_err(|error| format!("decode fixed-width manifest: {error}"))?;
-    if consumed != bytes.len() {
-        return Err(format!(
-            "manifest has {} trailing bytes",
-            bytes.len().saturating_sub(consumed)
-        ));
-    }
-    Ok(manifest)
-}
-
-fn encoded_len(manifest: &TranslationUnitManifest) -> Result<usize, String> {
-    bincode::serde::encode_to_vec(
-        manifest,
-        bincode::config::standard()
-            .with_fixed_int_encoding()
-            .with_limit::<MANIFEST_DECODE_LIMIT>(),
-    )
-    .map(|bytes| bytes.len())
-    .map_err(|error| format!("re-encode fixed-width manifest: {error}"))
-}
-
-fn removed_len(
-    total: usize,
-    manifest: &mut TranslationUnitManifest,
-    remove: impl FnOnce(&mut TranslationUnitManifest),
-) -> Result<usize, String> {
-    remove(manifest);
-    let remainder = encoded_len(manifest)?;
-    total
-        .checked_sub(remainder)
-        .ok_or_else(|| "component removal increased the encoded manifest".to_string())
+/// Decode through THE runtime wire (`decode_translation_unit_metadata`), not
+/// a private bincode config: this example once carried its own fixed-int
+/// decode and silently rotted when the store moved to the magic-prefixed
+/// varint wire — an offline tool that cannot read the real store measures
+/// nothing.
+fn decode_manifest(bytes: Vec<u8>) -> Result<TranslationUnitManifest, String> {
+    decode_translation_unit_metadata(std::sync::Arc::new(bytes))
+        .map_err(|reason| format!("decode unit metadata: {reason:?}"))
 }
 
 fn census(path: &Path) -> Result<serde_json::Value, String> {
     let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let mut manifest = decode_manifest(&bytes)?;
+    let file_bytes = bytes.len();
+    let manifest = decode_manifest(bytes)?;
     manifest
         .validate_ranges()
         .map_err(|reason| format!("validate {}: {reason:?}", path.display()))?;
-    let encoded = encoded_len(&manifest)?;
-    if encoded != bytes.len() {
-        return Err(format!(
-            "{} re-encoded to {encoded} bytes instead of {}",
-            path.display(),
-            bytes.len()
-        ));
-    }
+    manifest
+        .validate_deep()
+        .map_err(|defect| format!("deep-validate {}: {defect:?}", path.display()))?;
 
-    let block_count = manifest.blocks.len();
-    let metadata_counts = manifest.blocks.iter().fold(
-        carrick_dsr_aarch64::artifact_spike::ArtifactTemplateMetadataCounts {
-            words: 0,
-            pc_map_entries: 0,
-            recovery_entries: 0,
-            recovery_runs: 0,
-            direct_links: 0,
-            relocations: 0,
-            source_words: 0,
-        },
-        |mut total, block| {
-            let counts = block.template.metadata_counts();
-            total.words += counts.words;
-            total.pc_map_entries += counts.pc_map_entries;
-            total.recovery_entries += counts.recovery_entries;
-            total.recovery_runs += counts.recovery_runs;
-            total.direct_links += counts.direct_links;
-            total.relocations += counts.relocations;
-            total.source_words += counts.source_words;
-            total
-        },
-    );
-    let blocks = std::mem::take(&mut manifest.blocks);
-    let block_metadata_bytes = removed_len(encoded, &mut manifest, |_| {})?;
-    manifest.blocks = blocks;
-
-    let attributed = block_metadata_bytes;
-    let other_manifest_bytes = encoded
-        .checked_sub(attributed)
+    let block_count = manifest.blocks().len();
+    let sensitive_block_count = manifest
+        .blocks()
+        .iter()
+        .filter(|block| block.requires_sensitive_metadata)
+        .count();
+    // The v5 wire attributes itself: every payload byte belongs to exactly
+    // one block's HOT (replay) or COLD (fault-reconstruction) blob.
+    let hot_blob_bytes: usize = manifest
+        .blocks()
+        .iter()
+        .map(|block| block.hot_blob_len())
+        .sum();
+    let cold_blob_bytes: usize = manifest
+        .blocks()
+        .iter()
+        .map(|block| block.cold_blob_len())
+        .sum();
+    let block_metadata_bytes = hot_blob_bytes + cold_blob_bytes;
+    let other_manifest_bytes = file_bytes
+        .checked_sub(block_metadata_bytes)
         .ok_or_else(|| "manifest attribution exceeds file size".to_string())?;
+    let mut metadata_counts = carrick_dsr_aarch64::artifact_spike::ArtifactTemplateMetadataCounts {
+        words: 0,
+        pc_map_entries: 0,
+        recovery_entries: 0,
+        recovery_runs: 0,
+        direct_links: 0,
+        relocations: 0,
+        source_words: 0,
+    };
+    for at in 0..block_count {
+        let record = manifest
+            .block_record(at)
+            .map_err(|reason| format!("decode block {at} of {}: {reason:?}", path.display()))?;
+        let counts = record.template.metadata_counts();
+        metadata_counts.words += counts.words;
+        metadata_counts.pc_map_entries += counts.pc_map_entries;
+        metadata_counts.recovery_entries += counts.recovery_entries;
+        metadata_counts.recovery_runs += counts.recovery_runs;
+        metadata_counts.direct_links += counts.direct_links;
+        metadata_counts.relocations += counts.relocations;
+        metadata_counts.source_words += counts.source_words;
+    }
 
     Ok(serde_json::json!({
         "schema": SCHEMA,
         "path": path,
-        "manifest_bytes": encoded,
+        "manifest_bytes": file_bytes,
         "code_bytes": manifest.code_len,
-        "manifest_to_code_ratio": encoded as f64 / manifest.code_len as f64,
+        "manifest_to_code_ratio": file_bytes as f64 / manifest.code_len as f64,
         "block_count": block_count,
+        "sensitive_block_count": sensitive_block_count,
         "block_metadata_bytes": block_metadata_bytes,
-        "block_metadata_fraction": block_metadata_bytes as f64 / encoded as f64,
+        "block_metadata_fraction": block_metadata_bytes as f64 / file_bytes as f64,
+        "hot_blob_bytes": hot_blob_bytes,
+        "cold_blob_bytes": cold_blob_bytes,
         "retained_word_count": metadata_counts.words,
         "pc_map_entry_count": metadata_counts.pc_map_entries,
         "recovery_entry_count": metadata_counts.recovery_entries,

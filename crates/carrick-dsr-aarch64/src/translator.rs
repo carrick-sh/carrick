@@ -977,9 +977,67 @@ pub struct TranslationResult {
 pub struct PublishedBlock {
     pub entry: types::CacheVa,
     pub len: usize,
-    map: Vec<emit::PcMapEntry>,
-    recovery: Vec<emit::RecoveryEntry>,
+    metadata: PublishedBlockMetadata,
     pub _generation: cache::PageGenerationObservation,
+}
+
+/// Where a published block's fault-reconstruction metadata (pc map and
+/// recovery) lives. Faults are rare; replay is not — so a unit-replayed
+/// block leaves this metadata UNDECODED in the unit's mapped cold stream
+/// instead of materializing ~98% of the unit's records per exec.
+pub enum PublishedBlockMetadata {
+    /// Built by this process (native translation or private artifact
+    /// replay): owned outright.
+    Owned {
+        map: Vec<emit::PcMapEntry>,
+        recovery: Vec<emit::RecoveryEntry>,
+    },
+    /// Replayed from an attached unit: decode the block's cold blob on
+    /// demand. `bindings` are the replay-time bindings, so a fault-time
+    /// recovery rebind produces exactly what an eager replay would have.
+    Unit {
+        manifest: Arc<crate::shared_cache::TranslationUnitManifest>,
+        block: u32,
+        bindings: artifact_spike::ArtifactBindings,
+    },
+}
+
+impl PublishedBlockMetadata {
+    /// Materialize the block's pc map and rebound recovery entries — owned
+    /// directly, or decoded from the unit's cold stream. Test-support
+    /// sweeps use this; the fault path (`guest_pc_for_cache`) searches the
+    /// decoded stream directly instead so it rebinds only the entry it
+    /// found.
+    fn materialize(
+        &self,
+    ) -> Result<(Vec<emit::PcMapEntry>, Vec<emit::RecoveryEntry>), types::DsrError> {
+        match self {
+            Self::Owned { map, recovery } => Ok((map.clone(), recovery.clone())),
+            Self::Unit {
+                manifest,
+                block,
+                bindings,
+            } => {
+                let cold = manifest.block_cold(*block as usize).map_err(|reason| {
+                    types::DsrError::CachePolicy(format!(
+                        "unit cold metadata refused at materialize: {reason:?}"
+                    ))
+                })?;
+                let recovery = cold
+                    .recovery
+                    .into_entries()?
+                    .into_iter()
+                    .map(|entry| {
+                        Ok(emit::RecoveryEntry {
+                            cache: entry.cache(),
+                            action: entry.action().rebind(bindings)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, types::DsrError>>()?;
+                Ok((cold.map, recovery))
+            }
+        }
+    }
 }
 /// One entry of an address-ordered index over [`ProcessState::published`]:
 /// where a block's emitted code starts, and where the block itself sits in
@@ -2507,7 +2565,7 @@ impl ProcessState {
             types::DsrError::CachePolicy("attached unit count exceeds u32".to_string())
         })?;
         let mut indexed = 0_u64;
-        for (block_index, block) in unit.manifest.blocks.iter().enumerate() {
+        for (block_index, block) in unit.manifest.blocks().iter().enumerate() {
             let block_index = u32::try_from(block_index).map_err(|_| {
                 types::DsrError::CachePolicy("attached unit block index exceeds u32".to_string())
             })?;
@@ -2560,7 +2618,7 @@ impl ProcessState {
         // of `self.attached_units` ends before the `&mut self` replay calls.
         let manifest = Arc::clone(&attached.manifest);
         let source_base = attached.source_base;
-        let Some(record) = manifest.blocks.get(block as usize) else {
+        let Some(&record) = manifest.blocks().get(block as usize) else {
             return Err(types::DsrError::CachePolicy(format!(
                 "attached unit block index {block} is out of bounds"
             )));
@@ -2610,12 +2668,18 @@ impl ProcessState {
         if record.requires_sensitive_metadata {
             self.harvest_unit_block_sensitive_metadata(memory, guest)?;
         }
-        let replayed = artifact_spike::replay_unit_block(
-            &mut self.cache,
-            words,
-            record.template.clone().into_unit_replay_parts(),
-            &bindings,
-        );
+        // Decode ONLY the block's hot blob (relocations, trusted entry,
+        // direct links). The cold blob (pc map + recovery, ~98% of the
+        // unit's records) stays undecoded in the unit's mapped metadata;
+        // publication retains a handle to it for fault-time decode.
+        let replayed = manifest
+            .block_hot(block as usize)
+            .map_err(|reason| {
+                types::DsrError::CachePolicy(format!("shared unit hot blob refused: {reason:?}"))
+            })
+            .and_then(|hot| {
+                artifact_spike::replay_unit_block(&mut self.cache, words, hot, &bindings)
+            });
         let emitted = match replayed {
             Ok(emitted) => emitted,
             // Replay validation refused the recorded bytes. The unit is
@@ -2648,7 +2712,7 @@ impl ProcessState {
             return Ok(AttachedReplayOutcome::Regenerated);
         }
         let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
-        match self.publish_emitted(
+        match self.publish_emitted_with_metadata(
             memory,
             key,
             observation.page(),
@@ -2656,6 +2720,11 @@ impl ProcessState {
             emitted,
             emitted_bytes,
             TranslationOutcome::SharedUnit,
+            Some(PublishedBlockMetadata::Unit {
+                manifest: Arc::clone(&manifest),
+                block,
+                bindings,
+            }),
         ) {
             Ok(_) => {}
             Err(types::DsrError::GenerationChanged { .. }) => {
@@ -2797,6 +2866,33 @@ impl ProcessState {
         emitted_bytes: u64,
         outcome: TranslationOutcome,
     ) -> Result<TranslationResult, types::DsrError> {
+        self.publish_emitted_with_metadata(
+            memory,
+            key,
+            source_page,
+            observation,
+            emitted,
+            emitted_bytes,
+            outcome,
+            None,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "publication consumes the complete emission decomposition"
+    )]
+    fn publish_emitted_with_metadata(
+        &mut self,
+        memory: &NativeMappedMemory,
+        key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
+        source_page: carrick_guest_mem::GuestVa,
+        observation: cache::PageGenerationObservation,
+        emitted: emit::EmittedBlock,
+        emitted_bytes: u64,
+        outcome: TranslationOutcome,
+        metadata: Option<PublishedBlockMetadata>,
+    ) -> Result<TranslationResult, types::DsrError> {
         let entry = emitted.entry();
         // `ProcessState::translate` owns `&mut self` from the process
         // translator's write guard. It re-checks `blocks` after acquiring
@@ -2809,11 +2905,14 @@ impl ProcessState {
         let emitted_len = emitted.len();
         let trusted_entry = emitted.trusted_entry();
         let (map, links, recovery) = emitted.into_runtime_metadata();
+        // A unit-replayed block's emission carries EMPTY map/recovery (its
+        // fault metadata lives undecoded in the unit); the caller supplies
+        // the handle instead.
+        let metadata = metadata.unwrap_or(PublishedBlockMetadata::Owned { map, recovery });
         self.push_published(PublishedBlock {
             entry,
             len: emitted_len,
-            map,
-            recovery,
+            metadata,
             _generation: observation,
         });
         self.blocks.insert(key, entry);
@@ -3535,21 +3634,54 @@ impl ProcessState {
                 types::DsrError::CachePolicy("cache PC offset exceeds u32".to_string())
             })?;
             let offset = types::CacheOffset::published(offset);
-            let guest = block
-                .map
-                .iter()
-                .find(|entry| entry.cache == offset)
-                .map(|entry| entry.guest)
-                .ok_or_else(|| {
-                    types::DsrError::CachePolicy(format!(
-                        "cache PC 0x{cache_pc:x} is not an emitted instruction boundary"
-                    ))
-                })?;
-            let recovery = block
-                .recovery
-                .iter()
-                .find(|entry| entry.cache == offset)
-                .map(|entry| entry.action);
+            let (guest, recovery) = match &block.metadata {
+                PublishedBlockMetadata::Owned { map, recovery } => (
+                    map.iter()
+                        .find(|entry| entry.cache == offset)
+                        .map(|entry| entry.guest),
+                    recovery
+                        .iter()
+                        .find(|entry| entry.cache == offset)
+                        .map(|entry| entry.action),
+                ),
+                // A unit-replayed block: its pc map and recovery live
+                // undecoded in the unit's mapped cold stream. Decode them
+                // NOW — faults are rare, replays are not — and rebind the
+                // found recovery action with the replay-time bindings, so
+                // the outcome is bit-identical to an eager replay's.
+                PublishedBlockMetadata::Unit {
+                    manifest,
+                    block: unit_block,
+                    bindings,
+                } => {
+                    let cold = manifest
+                        .block_cold(*unit_block as usize)
+                        .map_err(|reason| {
+                            types::DsrError::CachePolicy(format!(
+                                "unit cold metadata refused at fault for cache PC \
+                             0x{cache_pc:x}: {reason:?}"
+                            ))
+                        })?;
+                    let guest = cold
+                        .map
+                        .iter()
+                        .find(|entry| entry.cache == offset)
+                        .map(|entry| entry.guest);
+                    let action = cold
+                        .recovery
+                        .into_entries()?
+                        .into_iter()
+                        .find(|entry| entry.cache() == offset)
+                        .map(|entry| entry.action().rebind(bindings))
+                        .transpose()?;
+                    (guest, action)
+                }
+            };
+            let guest = guest.ok_or_else(|| {
+                types::DsrError::CachePolicy(format!(
+                    "cache PC 0x{cache_pc:x} is not an emitted instruction boundary"
+                ))
+            })?;
             return Ok((guest, recovery));
         }
         let first = self
@@ -3897,8 +4029,13 @@ impl ThreadTranslator {
         let state = self.process.state.read();
         let mut points = Vec::new();
         for block in &state.published {
-            let (map, recovery) = (&block.map, &block.recovery);
-            for recovery in recovery {
+            let Ok((map, recovery)) = block.metadata.materialize() else {
+                // Test-support sweep: a block whose unit metadata cannot
+                // materialize has no recovery points to offer here; the
+                // production fault path reports the decode failure itself.
+                continue;
+            };
+            for recovery in &recovery {
                 if !matches!(
                     recovery.action,
                     emit::RecoveryAction::RestoreScratch { .. }
@@ -3946,8 +4083,8 @@ impl ThreadTranslator {
         let state = self.process.state.read();
         let mut points = Vec::new();
         for block in &state.published {
-            let cache_offsets = block
-                .map
+            let (map, _recovery) = block.metadata.materialize()?;
+            let cache_offsets = map
                 .iter()
                 .filter(|mapping| mapping.guest == guest)
                 .map(|mapping| mapping.cache)
@@ -3993,7 +4130,9 @@ impl ThreadTranslator {
         let mut state = self.process.state.write();
         let is_recovery = state.published.iter().any(|block| {
             let start = block.entry.host().raw();
-            let recovery = &block.recovery;
+            let Ok((_map, recovery)) = block.metadata.materialize() else {
+                return false;
+            };
             recovery.iter().any(|recovery| {
                 start
                     .checked_add(recovery.cache.get() as usize)
@@ -5412,18 +5551,15 @@ mod tests {
             // Round-trip the manifest through the exact wire the store
             // persists, so serde of relocations, trusted entries, direct
             // links, and run-encoded recovery is part of what this proves.
-            let bytes =
-                encode_translation_unit_metadata(&crate::shared_cache::TranslationUnitManifest {
-                    schema: crate::shared_cache::TRANSLATION_UNIT_SCHEMA_V4,
-                    key: pending.key.clone(),
-                    code_sha256: [0; 32],
-                    base_export: crate::shared_cache::translation_unit_base_export(&pending.key)
-                        .expect("base export"),
-                    code_len: pending.code.len() as u64,
-                    blocks: pending.blocks.clone(),
-                })
-                .expect("encode manifest");
-            let manifest = decode_translation_unit_metadata(&bytes).expect("decode manifest");
+            let bytes = encode_translation_unit_metadata(
+                &pending.key,
+                [0; 32],
+                pending.code.len() as u64,
+                &pending.blocks,
+            )
+            .expect("encode manifest");
+            let manifest =
+                decode_translation_unit_metadata(Arc::new(bytes)).expect("decode manifest");
             let code = Arc::new(pending.code.clone());
             let unit = SharedLoadedTranslationUnit::new(
                 manifest,
@@ -5609,6 +5745,66 @@ mod tests {
             );
         }
 
+        /// A replayed block's pc map and recovery stay UNDECODED in the
+        /// unit (the whole point of the hot/cold wire split); a fault that
+        /// interrogates the block must decode them on demand and answer
+        /// EXACTLY as a natively-translated block would.
+        #[test]
+        fn a_fault_on_a_replayed_block_decodes_unit_cold_metadata() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (a, _native_a, _words_a) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let reference = a.template.clone();
+            let fixture = lookup_fixture(vec![a]);
+            let entry_a = fixture
+                .translator
+                .state
+                .write()
+                .try_load_shared_unit(&memory, BLOCK_A, CodeGeneration::INITIAL)
+                .expect("lookup A")
+                .expect("A must be served from the unit");
+
+            let state = fixture.translator.state.read();
+            let block = state
+                .published
+                .iter()
+                .find(|block| block.entry == entry_a)
+                .expect("replayed block is published");
+            assert!(
+                matches!(
+                    block.metadata,
+                    crate::translator::PublishedBlockMetadata::Unit { .. }
+                ),
+                "a replayed block must retain a UNIT metadata handle, not \
+                 materialized maps"
+            );
+            let map = reference.pc_map_entries();
+            assert!(!map.is_empty(), "the recording carries a pc map");
+            for entry in map {
+                let cache_pc = GuestVa(
+                    u64::try_from(entry_a.host().raw()).expect("host pointer fits u64")
+                        + u64::from(entry.cache.get()),
+                );
+                let (guest, _recovery) = state
+                    .guest_pc_for_cache(cache_pc)
+                    .expect("fault lowering decodes the unit's cold metadata");
+                assert_eq!(
+                    guest, entry.guest,
+                    "cold-decoded pc map must answer like the recording"
+                );
+            }
+            // A PC BETWEEN instruction boundaries still refuses, exactly as
+            // an owned map would.
+            let unmapped = GuestVa(
+                u64::try_from(entry_a.host().raw()).expect("host pointer fits u64")
+                    + u64::from(map[0].cache.get())
+                    + 2,
+            );
+            assert!(
+                state.guest_pc_for_cache(unmapped).is_err(),
+                "a non-boundary PC must refuse from cold metadata too"
+            );
+        }
+
         /// Attach a packed unit and replay EVERY candidate block by looking
         /// each one up — the lazy equivalent of the old eager whole-unit
         /// install, for tests that assert on the fully-replayed state.
@@ -5714,15 +5910,13 @@ mod tests {
             let (candidate, _native, _words) = record_candidate(&memory, &syscall_plan(BLOCK_A));
             let pending =
                 PendingTranslationUnit::pack(unit_key(), vec![candidate]).expect("pack unit");
-            let manifest = crate::shared_cache::TranslationUnitManifest {
-                schema: crate::shared_cache::TRANSLATION_UNIT_SCHEMA_V4,
-                key: pending.key.clone(),
-                code_sha256: [0; 32],
-                base_export: crate::shared_cache::translation_unit_base_export(&pending.key)
-                    .expect("base export"),
-                code_len: pending.code.len() as u64,
-                blocks: pending.blocks.clone(),
-            };
+            let manifest = crate::shared_cache::TranslationUnitManifest::from_blocks(
+                &pending.key,
+                [0; 32],
+                pending.code.len() as u64,
+                &pending.blocks,
+            )
+            .expect("round-trip corrupt-image manifest");
             // Corrupt the first relocation site (the guard's
             // generation-address materialization): replay's opcode
             // validation must refuse rather than publish wrong code.
@@ -5826,7 +6020,9 @@ mod tests {
     /// publication order -- for a PC in no block at all.
     mod guest_pc_lowering {
         use super::TEST_HOST_JIT;
-        use crate::translator::{ProcessState, ProcessTranslator, PublishedBlock};
+        use crate::translator::{
+            ProcessState, ProcessTranslator, PublishedBlock, PublishedBlockMetadata,
+        };
         use crate::{emit, gateway, types};
         use carrick_dsr::cache::PageGenerationTable;
         use carrick_guest_mem::{GuestVa, HostVa};
@@ -5847,16 +6043,18 @@ mod tests {
             PublishedBlock {
                 entry,
                 len: words as usize * 4,
-                map: (0..words)
-                    .map(|word| emit::PcMapEntry {
-                        guest: GuestVa(guest.raw() + u64::from(word) * 4),
-                        cache: types::CacheOffset::published(word * 4),
-                    })
-                    .collect(),
-                recovery: vec![emit::RecoveryEntry {
-                    cache: types::CacheOffset::published(4),
-                    action: emit::RecoveryAction::RestoreGuestX17,
-                }],
+                metadata: PublishedBlockMetadata::Owned {
+                    map: (0..words)
+                        .map(|word| emit::PcMapEntry {
+                            guest: GuestVa(guest.raw() + u64::from(word) * 4),
+                            cache: types::CacheOffset::published(word * 4),
+                        })
+                        .collect(),
+                    recovery: vec![emit::RecoveryEntry {
+                        cache: types::CacheOffset::published(4),
+                        action: emit::RecoveryAction::RestoreGuestX17,
+                    }],
+                },
                 _generation: generations.observe(guest).expect("generation observation"),
             }
         }

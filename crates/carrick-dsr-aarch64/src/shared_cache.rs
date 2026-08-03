@@ -20,8 +20,16 @@ use std::sync::{Arc, OnceLock};
 // over unbaked `.code` words, installed by per-block replay through
 // `publish_emitted`. Replaces the `GenerationGuard::BindingIndex` authority
 // emission, edge trampolines, and the direct-binding cell sidecar.
-pub const TRANSLATOR_ABI_CURRENT: u32 = 7;
-pub const TRANSLATION_UNIT_SCHEMA_V4: u32 = 4;
+// 8: offset-indexed metadata (`CUNITV5`): a fixed-width per-block index up
+// front, then per-block HOT (relocations/trusted entry/links — replay) and
+// COLD (pc map/recovery — fault reconstruction) streams, each its own
+// bincode blob. Attach parses ONLY the index; a block's hot blob decodes on
+// its first lookup and its cold blob only if a fault interrogates it. The
+// v4 whole-manifest decode cost more per exec than the retranslation the
+// store avoided (~11.6 ms of ~1.79M-record varint decode on the go
+// toolchain unit, ~98% of it pc map + recovery).
+pub const TRANSLATOR_ABI_CURRENT: u32 = 8;
+pub const TRANSLATION_UNIT_SCHEMA_V5: u32 = 5;
 pub const MAX_TRANSLATION_UNIT_CODE_BYTES: usize = 64 * 1024 * 1024;
 pub const TRANSLATION_UNIT_BASE_EXPORT: &str = "carrick_aot_unit_base";
 const DARWIN_HOST_PAGE_SIZE: u64 = 16 * 1024;
@@ -274,56 +282,93 @@ pub struct PortableBlockRecord {
     pub template: crate::artifact_spike::ArtifactTemplate,
 }
 
-#[derive(Serialize, Deserialize)]
-struct WirePortableBlockRecord {
-    guest_start: u64,
-    entry_offset: u32,
-    code_len: u32,
-    requires_sensitive_metadata: bool,
-    template: crate::artifact_spike::ArtifactTemplate,
+/// One block of a loaded unit as the fixed-width index describes it. The
+/// hot/cold blob extents are parsed alongside but stay private: blob bytes
+/// are reached through [`TranslationUnitManifest::block_hot`] /
+/// [`TranslationUnitManifest::block_cold`], never raw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitBlockIndexEntry {
+    pub guest_start: GuestVa,
+    pub entry_offset: u32,
+    pub code_len: u32,
+    pub requires_sensitive_metadata: bool,
+    /// Absolute offset of this block's hot blob within the payload region;
+    /// the cold blob follows it immediately (tight packing is enforced at
+    /// decode).
+    payload_offset: usize,
+    hot_len: usize,
+    cold_len: usize,
 }
 
-impl Serialize for PortableBlockRecord {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        WirePortableBlockRecord {
-            guest_start: self.guest_start.raw(),
-            entry_offset: self.entry_offset,
-            code_len: self.code_len,
-            requires_sensitive_metadata: self.requires_sensitive_metadata,
-            template: self.template.clone(),
-        }
-        .serialize(serializer)
+impl UnitBlockIndexEntry {
+    /// Serialized size of the block's HOT (replay) blob — diagnostics only.
+    pub fn hot_blob_len(&self) -> usize {
+        self.hot_len
+    }
+
+    /// Serialized size of the block's COLD (fault) blob — diagnostics only.
+    pub fn cold_blob_len(&self) -> usize {
+        self.cold_len
     }
 }
 
-impl<'de> Deserialize<'de> for PortableBlockRecord {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = WirePortableBlockRecord::deserialize(deserializer)?;
-        Ok(Self {
-            guest_start: GuestVa(wire.guest_start),
-            entry_offset: wire.entry_offset,
-            code_len: wire.code_len,
-            requires_sensitive_metadata: wire.requires_sensitive_metadata,
-            template: wire.template,
-        })
+/// The undecoded per-block blob region, pinned by whatever owns the bytes
+/// (the store's metadata mmap, or an in-memory encode for fixtures).
+#[derive(Clone)]
+struct UnitPayload {
+    bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    start: usize,
+    len: usize,
+}
+
+impl UnitPayload {
+    fn as_slice(&self) -> &[u8] {
+        let all: &[u8] = (*self.bytes).as_ref();
+        // The decode that built this payload bounds-checked start/len against
+        // the buffer; an sliced-out-of-range here would be a construction bug.
+        &all[self.start..self.start + self.len]
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A loaded unit's metadata: the decoded header and fixed-width block
+/// index, over the UNDECODED per-block hot/cold blob payload. Per-block
+/// templates decode on demand — never as part of loading the unit.
+#[derive(Clone)]
 pub struct TranslationUnitManifest {
     pub schema: u32,
     pub key: TranslationUnitKey,
     pub code_sha256: [u8; 32],
     pub base_export: String,
     pub code_len: u64,
-    pub blocks: Vec<PortableBlockRecord>,
+    index: Vec<UnitBlockIndexEntry>,
+    payload: UnitPayload,
 }
+
+impl std::fmt::Debug for TranslationUnitManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TranslationUnitManifest")
+            .field("schema", &self.schema)
+            .field("key", &self.key)
+            .field("code_len", &self.code_len)
+            .field("blocks", &self.index.len())
+            .field("payload_len", &self.payload.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for TranslationUnitManifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema
+            && self.key == other.key
+            && self.code_sha256 == other.code_sha256
+            && self.base_export == other.base_export
+            && self.code_len == other.code_len
+            && self.index == other.index
+            && self.payload.as_slice() == other.payload.as_slice()
+    }
+}
+
+impl Eq for TranslationUnitManifest {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingTranslationUnit {
@@ -730,8 +775,12 @@ impl TranslationUnitManifest {
             .map_err(ManifestDefect::reason)
     }
 
+    /// Index-level invariants ONLY — no per-block blob is decoded. This is
+    /// the load/attach gate; it must stay proportional to the block COUNT,
+    /// never the metadata size, or the attach cost the v5 wire removed
+    /// creeps back.
     pub fn validate_ranges_detailed(&self) -> Result<(), ManifestDefect> {
-        if self.schema != TRANSLATION_UNIT_SCHEMA_V4 {
+        if self.schema != TRANSLATION_UNIT_SCHEMA_V5 {
             return Err(ManifestDefect::Schema);
         }
         if self.key.translator_abi() != TRANSLATOR_ABI_CURRENT {
@@ -746,8 +795,8 @@ impl TranslationUnitManifest {
             return Err(ManifestDefect::CodeLen);
         }
         let mut guest_starts = BTreeSet::new();
-        let mut cache_extents = Vec::with_capacity(self.blocks.len());
-        for block in &self.blocks {
+        let mut cache_extents = Vec::with_capacity(self.index.len());
+        for block in &self.index {
             let end = u64::from(block.entry_offset)
                 .checked_add(u64::from(block.code_len))
                 .ok_or(ManifestDefect::BlockGeometry)?;
@@ -767,62 +816,344 @@ impl TranslationUnitManifest {
         if cache_extents.windows(2).any(|pair| pair[0].1 > pair[1].0) {
             return Err(ManifestDefect::BlockExtentOverlap);
         }
-        for block in &self.blocks {
-            // A stored block record must carry no words of its own (the words
-            // live in the digest-bound `.code` image) and every relocation
-            // and trusted entry it references must land inside its extent.
-            // Word-level opcode/immediate validation is replay's job — it
-            // fails closed per block — but geometry that can never replay is
-            // refused here so publication names the defect.
-            let counts = block.template.metadata_counts();
+        Ok(())
+    }
+
+    /// Publication-preflight form: decode EVERY block's hot and cold blobs
+    /// and re-check what the index alone cannot see — a stored record must
+    /// carry no words of its own (the words live in the digest-bound
+    /// `.code` image) and every replay-relevant offset must land inside its
+    /// block extent. Load never runs this (a corrupt blob fails closed at
+    /// replay, per block); publication does, so a unit carrick built that
+    /// its own validators refuse names the defect BEFORE it is renamed
+    /// into the store.
+    pub fn validate_deep(&self) -> Result<(), ManifestDefect> {
+        self.validate_ranges_detailed()?;
+        for at in 0..self.index.len() {
+            let record = self
+                .block_record(at)
+                .map_err(|_| ManifestDefect::BlockTemplate)?;
+            let counts = record.template.metadata_counts();
             if counts.words != 0 || counts.source_words != 0 {
                 return Err(ManifestDefect::BlockTemplate);
             }
-            if !block.template.replay_metadata_fits_code_len(block.code_len) {
+            if !record
+                .template
+                .replay_metadata_fits_code_len(record.code_len)
+            {
                 return Err(ManifestDefect::BlockTemplate);
             }
         }
         Ok(())
     }
+
+    /// The fixed-width block index, in wire order. Attach iterates this;
+    /// nothing here required a blob decode.
+    pub fn blocks(&self) -> &[UnitBlockIndexEntry] {
+        &self.index
+    }
+
+    fn blob(&self, at: usize, cold: bool) -> Result<&[u8], UnitMissReason> {
+        let entry = self.index.get(at).ok_or(UnitMissReason::ManifestRange)?;
+        let payload = self.payload.as_slice();
+        let start = if cold {
+            entry
+                .payload_offset
+                .checked_add(entry.hot_len)
+                .ok_or(UnitMissReason::ManifestRange)?
+        } else {
+            entry.payload_offset
+        };
+        let len = if cold { entry.cold_len } else { entry.hot_len };
+        let end = start
+            .checked_add(len)
+            .ok_or(UnitMissReason::ManifestRange)?;
+        payload.get(start..end).ok_or(UnitMissReason::ManifestRange)
+    }
+
+    fn decode_blob<T: serde::de::DeserializeOwned>(blob: &[u8]) -> Result<T, UnitMissReason> {
+        let (decoded, consumed): (T, usize) = bincode::serde::decode_from_slice(
+            blob,
+            bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>(),
+        )
+        .map_err(|_| UnitMissReason::Schema)?;
+        if consumed != blob.len() {
+            return Err(UnitMissReason::Schema);
+        }
+        Ok(decoded)
+    }
+
+    /// Decode one block's HOT stream (relocations, trusted entry, direct
+    /// links) — what replay must have, ~2% of a unit's records.
+    pub(crate) fn block_hot(
+        &self,
+        at: usize,
+    ) -> Result<crate::artifact_spike::UnitBlockHotWire, UnitMissReason> {
+        Self::decode_blob(self.blob(at, false)?)
+    }
+
+    /// Decode one block's COLD stream (pc map, recovery) — fault
+    /// reconstruction only; a replayed block never touches this unless a
+    /// fault interrogates it.
+    pub(crate) fn block_cold(
+        &self,
+        at: usize,
+    ) -> Result<crate::artifact_spike::UnitBlockColdWire, UnitMissReason> {
+        Self::decode_blob(self.blob(at, true)?)
+    }
+
+    /// Reassemble one block's full logical record (both streams). Publish
+    /// preflight and offline diagnostics use this; the runtime replay path
+    /// never does.
+    pub fn block_record(&self, at: usize) -> Result<PortableBlockRecord, UnitMissReason> {
+        let entry = self.index.get(at).ok_or(UnitMissReason::ManifestRange)?;
+        let hot = self.block_hot(at)?;
+        let cold = self.block_cold(at)?;
+        Ok(PortableBlockRecord {
+            guest_start: entry.guest_start,
+            entry_offset: entry.entry_offset,
+            code_len: entry.code_len,
+            requires_sensitive_metadata: entry.requires_sensitive_metadata,
+            template: crate::artifact_spike::ArtifactTemplate::from_unit_wire_parts(hot, cold),
+        })
+    }
+
+    /// Build a manifest by round-tripping records through THE wire, so a
+    /// fixture or in-memory store is bit-identical to what the persistent
+    /// store would serve. There is deliberately no way to hand-assemble the
+    /// decoded form.
+    pub fn from_blocks(
+        key: &TranslationUnitKey,
+        code_sha256: [u8; 32],
+        code_len: u64,
+        blocks: &[PortableBlockRecord],
+    ) -> Result<Self, crate::types::DsrError> {
+        let bytes = encode_translation_unit_metadata(key, code_sha256, code_len, blocks)?;
+        decode_translation_unit_metadata(Arc::new(bytes)).map_err(|reason| {
+            crate::types::DsrError::CachePolicy(format!(
+                "encoded unit metadata failed to decode: {reason:?}"
+            ))
+        })
+    }
 }
 
-/// Magic prefix of the serialized unit metadata (`{stem}.metadata-v4`). A
-/// file without it — foreign, truncated, or written by any pre-native-tap
+/// Magic prefix of the serialized unit metadata (`{stem}.metadata-v5`). A
+/// file without it — foreign, truncated, or written by any pre-index
 /// binary — refuses to decode and reads as a schema miss, never as a
 /// lower-quality unit.
-pub const TRANSLATION_UNIT_METADATA_MAGIC: [u8; 8] = *b"CUNITV4\0";
+pub const TRANSLATION_UNIT_METADATA_MAGIC: [u8; 8] = *b"CUNITV5\0";
 const TRANSLATION_UNIT_METADATA_DECODE_LIMIT: usize = 256 * 1024 * 1024;
+/// Fixed wire width of one index row: guest_start u64, entry_offset u32,
+/// code_len u32, flags u32, hot_len u32, cold_len u32, all little-endian.
+const UNIT_BLOCK_INDEX_ROW_BYTES: usize = 28;
+const UNIT_BLOCK_FLAG_SENSITIVE: u32 = 1;
 
+/// The bincode-encoded (varint) leading header of the v5 metadata file; the
+/// fixed-width index and the per-block blob payload follow it raw.
+#[derive(Serialize, Deserialize)]
+struct WireUnitHeader {
+    schema: u32,
+    key: TranslationUnitKey,
+    code_sha256: [u8; 32],
+    base_export: String,
+    code_len: u64,
+    block_count: u64,
+    payload_len: u64,
+}
+
+/// Serialize unit metadata: magic, a small bincode header, a fixed-width
+/// per-block index, then every block's hot blob immediately followed by its
+/// cold blob, tightly packed in index order (the decoder recomputes and
+/// ENFORCES the packing, so offsets never appear on the wire).
 pub fn encode_translation_unit_metadata(
-    manifest: &TranslationUnitManifest,
+    key: &TranslationUnitKey,
+    code_sha256: [u8; 32],
+    code_len: u64,
+    blocks: &[PortableBlockRecord],
 ) -> Result<Vec<u8>, crate::types::DsrError> {
-    let mut bytes = TRANSLATION_UNIT_METADATA_MAGIC.to_vec();
-    let body = bincode::serde::encode_to_vec(
-        manifest,
-        bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>(),
-    )
-    .map_err(|error| {
-        crate::types::DsrError::CachePolicy(format!("encode translation unit metadata: {error}"))
+    let config = bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>();
+    let base_export = translation_unit_base_export(key).map_err(|error| {
+        crate::types::DsrError::CachePolicy(format!("derive unit base export: {error}"))
     })?;
-    bytes.extend_from_slice(&body);
+    let mut index = Vec::with_capacity(blocks.len() * UNIT_BLOCK_INDEX_ROW_BYTES);
+    let mut payload = Vec::new();
+    for record in blocks {
+        let (hot, cold) = record.template.clone().into_unit_wire_parts();
+        let hot_blob = bincode::serde::encode_to_vec(&hot, config).map_err(|error| {
+            crate::types::DsrError::CachePolicy(format!("encode unit block hot blob: {error}"))
+        })?;
+        let cold_blob = bincode::serde::encode_to_vec(&cold, config).map_err(|error| {
+            crate::types::DsrError::CachePolicy(format!("encode unit block cold blob: {error}"))
+        })?;
+        let hot_len = u32::try_from(hot_blob.len()).map_err(|_| {
+            crate::types::DsrError::CachePolicy("unit block hot blob exceeds u32".to_string())
+        })?;
+        let cold_len = u32::try_from(cold_blob.len()).map_err(|_| {
+            crate::types::DsrError::CachePolicy("unit block cold blob exceeds u32".to_string())
+        })?;
+        let mut flags = 0_u32;
+        if record.requires_sensitive_metadata {
+            flags |= UNIT_BLOCK_FLAG_SENSITIVE;
+        }
+        index.extend_from_slice(&record.guest_start.raw().to_le_bytes());
+        index.extend_from_slice(&record.entry_offset.to_le_bytes());
+        index.extend_from_slice(&record.code_len.to_le_bytes());
+        index.extend_from_slice(&flags.to_le_bytes());
+        index.extend_from_slice(&hot_len.to_le_bytes());
+        index.extend_from_slice(&cold_len.to_le_bytes());
+        payload.extend_from_slice(&hot_blob);
+        payload.extend_from_slice(&cold_blob);
+    }
+    let header = WireUnitHeader {
+        schema: TRANSLATION_UNIT_SCHEMA_V5,
+        key: key.clone(),
+        code_sha256,
+        base_export,
+        code_len,
+        block_count: blocks.len() as u64,
+        payload_len: payload.len() as u64,
+    };
+    let header_bytes = bincode::serde::encode_to_vec(&header, config).map_err(|error| {
+        crate::types::DsrError::CachePolicy(format!("encode unit metadata header: {error}"))
+    })?;
+    let header_len = u32::try_from(header_bytes.len()).map_err(|_| {
+        crate::types::DsrError::CachePolicy("unit metadata header exceeds u32".to_string())
+    })?;
+    let mut bytes = TRANSLATION_UNIT_METADATA_MAGIC.to_vec();
+    bytes.extend_from_slice(&header_len.to_le_bytes());
+    bytes.extend_from_slice(&header_bytes);
+    bytes.extend_from_slice(&index);
+    bytes.extend_from_slice(&payload);
     Ok(bytes)
 }
 
+fn read_le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_le_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
+/// Structural decode of the v5 metadata: magic, header, index geometry and
+/// EXACT extent accounting (index rows == block count, payload == declared
+/// length, file ends where the payload ends). No per-block blob is decoded
+/// here — a blob decodes on the block's first lookup (hot) or first fault
+/// (cold), fail-closed per block. Semantic invariants (schema/ABI/extents
+/// against `code_len`) stay in [`TranslationUnitManifest::validate_ranges`].
+///
+/// `bytes` is the WHOLE file, kept alive by the returned manifest (the
+/// store passes its mmap; fixtures pass the encoded vector) — this is what
+/// makes per-block decode possible without copying the payload.
 pub fn decode_translation_unit_metadata(
-    bytes: &[u8],
+    bytes: Arc<dyn AsRef<[u8]> + Send + Sync>,
 ) -> Result<TranslationUnitManifest, UnitMissReason> {
-    let body = bytes
+    let data: &[u8] = (*bytes).as_ref();
+    let body = data
         .strip_prefix(&TRANSLATION_UNIT_METADATA_MAGIC)
         .ok_or(UnitMissReason::Schema)?;
-    let (manifest, consumed): (TranslationUnitManifest, usize) = bincode::serde::decode_from_slice(
-        body,
-        bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>(),
-    )
-    .map_err(|_| UnitMissReason::Schema)?;
-    if consumed != body.len() {
+    let header_len =
+        usize::try_from(read_le_u32(body, 0).ok_or(UnitMissReason::Schema)?).unwrap_or(usize::MAX);
+    let header_bytes = body
+        .get(
+            4..4_usize
+                .checked_add(header_len)
+                .ok_or(UnitMissReason::Schema)?,
+        )
+        .ok_or(UnitMissReason::Schema)?;
+    let config = bincode::config::standard().with_limit::<TRANSLATION_UNIT_METADATA_DECODE_LIMIT>();
+    let (header, consumed): (WireUnitHeader, usize) =
+        bincode::serde::decode_from_slice(header_bytes, config)
+            .map_err(|_| UnitMissReason::Schema)?;
+    if consumed != header_bytes.len() {
         return Err(UnitMissReason::Schema);
     }
-    Ok(manifest)
+    let block_count =
+        usize::try_from(header.block_count).map_err(|_| UnitMissReason::ManifestRange)?;
+    let payload_len =
+        usize::try_from(header.payload_len).map_err(|_| UnitMissReason::ManifestRange)?;
+    let index_start = 4_usize
+        .checked_add(header_len)
+        .ok_or(UnitMissReason::Schema)?;
+    let index_len = block_count
+        .checked_mul(UNIT_BLOCK_INDEX_ROW_BYTES)
+        .ok_or(UnitMissReason::ManifestRange)?;
+    let payload_start = index_start
+        .checked_add(index_len)
+        .ok_or(UnitMissReason::ManifestRange)?;
+    let expected_total = payload_start
+        .checked_add(payload_len)
+        .ok_or(UnitMissReason::ManifestRange)?;
+    if body.len() != expected_total {
+        return Err(UnitMissReason::Schema);
+    }
+    let index_bytes = body
+        .get(index_start..payload_start)
+        .ok_or(UnitMissReason::Schema)?;
+    let mut index = Vec::with_capacity(block_count);
+    let mut payload_offset = 0_usize;
+    for row in 0..block_count {
+        let at = row * UNIT_BLOCK_INDEX_ROW_BYTES;
+        let guest_start = read_le_u64(index_bytes, at).ok_or(UnitMissReason::Schema)?;
+        let entry_offset = read_le_u32(index_bytes, at + 8).ok_or(UnitMissReason::Schema)?;
+        let block_code_len = read_le_u32(index_bytes, at + 12).ok_or(UnitMissReason::Schema)?;
+        let flags = read_le_u32(index_bytes, at + 16).ok_or(UnitMissReason::Schema)?;
+        let hot_len =
+            usize::try_from(read_le_u32(index_bytes, at + 20).ok_or(UnitMissReason::Schema)?)
+                .map_err(|_| UnitMissReason::ManifestRange)?;
+        let cold_len =
+            usize::try_from(read_le_u32(index_bytes, at + 24).ok_or(UnitMissReason::Schema)?)
+                .map_err(|_| UnitMissReason::ManifestRange)?;
+        if flags & !UNIT_BLOCK_FLAG_SENSITIVE != 0 {
+            return Err(UnitMissReason::Schema);
+        }
+        let blob_len = hot_len
+            .checked_add(cold_len)
+            .ok_or(UnitMissReason::ManifestRange)?;
+        let blob_end = payload_offset
+            .checked_add(blob_len)
+            .ok_or(UnitMissReason::ManifestRange)?;
+        if blob_end > payload_len {
+            return Err(UnitMissReason::ManifestRange);
+        }
+        index.push(UnitBlockIndexEntry {
+            guest_start: GuestVa(guest_start),
+            entry_offset,
+            code_len: block_code_len,
+            requires_sensitive_metadata: flags & UNIT_BLOCK_FLAG_SENSITIVE != 0,
+            payload_offset,
+            hot_len,
+            cold_len,
+        });
+        payload_offset = blob_end;
+    }
+    // Tight packing: the last blob must end exactly at the payload's end,
+    // or the file carries bytes no index row accounts for.
+    if payload_offset != payload_len {
+        return Err(UnitMissReason::Schema);
+    }
+    // The payload region is addressed relative to the whole buffer.
+    let payload_abs_start = TRANSLATION_UNIT_METADATA_MAGIC
+        .len()
+        .checked_add(payload_start)
+        .ok_or(UnitMissReason::ManifestRange)?;
+    Ok(TranslationUnitManifest {
+        schema: header.schema,
+        key: header.key,
+        code_sha256: header.code_sha256,
+        base_export: header.base_export,
+        code_len: header.code_len,
+        index,
+        payload: UnitPayload {
+            bytes,
+            start: payload_abs_start,
+            len: payload_len,
+        },
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1053,20 +1384,21 @@ mod tests {
         }
     }
 
+    /// Build a manifest through THE wire (encode + decode) from records —
+    /// the only construction path the new model offers.
+    fn manifest_from(code_len: u64, blocks: &[PortableBlockRecord]) -> TranslationUnitManifest {
+        TranslationUnitManifest::from_blocks(&fixture_key(), [0x33; 32], code_len, blocks)
+            .expect("round-trip fixture manifest")
+    }
+
     fn manifest_fixture() -> TranslationUnitManifest {
-        let key = fixture_key();
-        let base_export = translation_unit_base_export(&key).expect("base export");
-        TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V4,
-            key,
-            code_sha256: [0x33; 32],
-            base_export,
-            code_len: 32,
-            blocks: vec![
+        manifest_from(
+            32,
+            &[
                 manifest_block(0x400000, 0, 16),
                 manifest_block(0x400010, 16, 16),
             ],
-        }
+        )
     }
 
     #[test]
@@ -1141,28 +1473,52 @@ mod tests {
 
     #[test]
     fn unit_metadata_encode_decode_round_trips_and_refuses_foreign_payloads() {
-        let manifest = manifest_fixture();
-        let bytes = encode_translation_unit_metadata(&manifest).expect("encode metadata");
+        let blocks = vec![
+            manifest_block(0x400000, 0, 16),
+            manifest_block(0x400010, 16, 16),
+        ];
+        let bytes = encode_translation_unit_metadata(&fixture_key(), [0x33; 32], 32, &blocks)
+            .expect("encode metadata");
         assert!(bytes.starts_with(&TRANSLATION_UNIT_METADATA_MAGIC));
-        let decoded = decode_translation_unit_metadata(&bytes).expect("decode metadata");
-        assert_eq!(decoded, manifest);
-        // No magic: a pre-native-tap or foreign file refuses as Schema.
+        let decoded =
+            decode_translation_unit_metadata(Arc::new(bytes.clone())).expect("decode metadata");
+        assert_eq!(decoded, manifest_fixture());
+        decoded.validate_ranges().expect("index invariants hold");
+        decoded.validate_deep().expect("deep invariants hold");
+        // Per-block round trip: the reassembled records equal the inputs
+        // (words and source words excepted — the wire cannot carry them).
+        for (at, block) in blocks.iter().enumerate() {
+            let record = decoded.block_record(at).expect("decode block record");
+            assert_eq!(record, *block);
+        }
+        // No magic: a pre-index or foreign file refuses as Schema.
         assert_eq!(
-            decode_translation_unit_metadata(&bytes[1..]),
+            decode_translation_unit_metadata(Arc::new(bytes[1..].to_vec())),
             Err(UnitMissReason::Schema)
         );
         // Trailing bytes: a torn or tampered payload refuses as Schema.
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert_eq!(
-            decode_translation_unit_metadata(&trailing),
+            decode_translation_unit_metadata(Arc::new(trailing)),
             Err(UnitMissReason::Schema)
         );
-        // Truncation refuses.
-        assert_eq!(
-            decode_translation_unit_metadata(&bytes[..bytes.len() - 1]),
-            Err(UnitMissReason::Schema)
-        );
+        // Truncation refuses — at EVERY byte length, not just the last:
+        // the header, the index rows, and the payload must all be exactly
+        // accounted for.
+        for cut in [
+            bytes.len() - 1,
+            bytes.len() - 17,
+            TRANSLATION_UNIT_METADATA_MAGIC.len() + 3,
+            TRANSLATION_UNIT_METADATA_MAGIC.len() + 12,
+            4,
+        ] {
+            assert_eq!(
+                decode_translation_unit_metadata(Arc::new(bytes[..cut].to_vec())),
+                Err(UnitMissReason::Schema),
+                "a {cut}-byte prefix must refuse"
+            );
+        }
     }
 
     #[test]
@@ -1177,15 +1533,13 @@ mod tests {
             translator_abi: TRANSLATOR_ABI_CURRENT - 1,
             ..fixture_key()
         };
-        let base_export = translation_unit_base_export(&stale).expect("base export");
-        let manifest = TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V4,
-            key: stale,
-            code_sha256: [0x33; 32],
-            base_export,
-            code_len: 16,
-            blocks: vec![manifest_block(0x400000, 0, 16)],
-        };
+        let manifest = TranslationUnitManifest::from_blocks(
+            &stale,
+            [0x33; 32],
+            16,
+            &[manifest_block(0x400000, 0, 16)],
+        )
+        .expect("round-trip stale-abi manifest");
         assert_eq!(
             manifest.validate_ranges_detailed(),
             Err(ManifestDefect::TranslatorAbi)
@@ -1194,11 +1548,13 @@ mod tests {
 
     #[test]
     fn manifest_rejects_duplicate_guest_starts() {
-        let mut manifest = manifest_fixture();
-        manifest.blocks = vec![
-            manifest_block(0x400000, 0, 16),
-            manifest_block(0x400000, 16, 16),
-        ];
+        let manifest = manifest_from(
+            32,
+            &[
+                manifest_block(0x400000, 0, 16),
+                manifest_block(0x400000, 16, 16),
+            ],
+        );
         assert_eq!(
             manifest.validate_ranges_detailed(),
             Err(ManifestDefect::BlockGuestDuplicate)
@@ -1207,11 +1563,13 @@ mod tests {
 
     #[test]
     fn manifest_rejects_overlapping_block_cache_extents() {
-        let mut manifest = manifest_fixture();
-        manifest.blocks = vec![
-            manifest_block(0x400000, 0, 20),
-            manifest_block(0x400010, 16, 16),
-        ];
+        let manifest = manifest_from(
+            36,
+            &[
+                manifest_block(0x400000, 0, 20),
+                manifest_block(0x400010, 16, 16),
+            ],
+        );
         assert_eq!(
             manifest.validate_ranges_detailed(),
             Err(ManifestDefect::BlockExtentOverlap)
@@ -1220,47 +1578,53 @@ mod tests {
 
     #[test]
     fn manifest_allows_adjacent_and_reverse_disjoint_cache_extents() {
-        let mut manifest = manifest_fixture();
-        manifest.blocks = vec![
-            manifest_block(0x400010, 16, 16),
-            manifest_block(0x400000, 0, 16),
-        ];
+        let manifest = manifest_from(
+            32,
+            &[
+                manifest_block(0x400010, 16, 16),
+                manifest_block(0x400000, 0, 16),
+            ],
+        );
         manifest
             .validate_ranges_detailed()
             .expect("disjoint extents");
     }
 
     #[test]
-    fn manifest_rejects_block_records_that_retain_words() {
-        let mut manifest = manifest_fixture();
+    fn the_wire_cannot_carry_block_words() {
+        // v4 enforced "stored records carry no words" as a validation rule;
+        // the v5 hot/cold streams cannot REPRESENT words at all, so a full
+        // template (words still present) round-trips to a wordless record —
+        // the words live only in the digest-bound code image.
         let candidate = native_tap_candidate(GuestVa(0x400000));
         let code_len = u32::try_from(candidate.template.words().len() * 4).expect("code length");
-        manifest.code_len = u64::from(code_len);
-        manifest.blocks = vec![PortableBlockRecord {
-            guest_start: GuestVa(0x400000),
-            entry_offset: 0,
-            code_len,
-            requires_sensitive_metadata: false,
-            // The FULL template (words still present) must be refused: words
-            // live only in the digest-bound code image.
-            template: candidate.template,
-        }];
-        assert_eq!(
-            manifest.validate_ranges_detailed(),
-            Err(ManifestDefect::BlockTemplate)
+        assert!(candidate.template.metadata_counts().words > 0);
+        let manifest = manifest_from(
+            u64::from(code_len),
+            &[PortableBlockRecord {
+                guest_start: GuestVa(0x400000),
+                entry_offset: 0,
+                code_len,
+                requires_sensitive_metadata: false,
+                template: candidate.template,
+            }],
         );
+        let record = manifest.block_record(0).expect("decode block record");
+        let counts = record.template.metadata_counts();
+        assert_eq!(counts.words, 0);
+        assert_eq!(counts.source_words, 0);
+        manifest.validate_deep().expect("wordless record is valid");
     }
 
     #[test]
     fn manifest_rejects_replay_metadata_outside_the_block_extent() {
-        let mut manifest = manifest_fixture();
-        // A recovery offset at byte 4 needs code_len > 4.
-        manifest.blocks = vec![manifest_block(0x400000, 0, 4)];
-        manifest.code_len = 4;
-        assert_eq!(
-            manifest.validate_ranges_detailed(),
-            Err(ManifestDefect::BlockTemplate)
-        );
+        // A recovery offset at byte 4 needs code_len > 4. The index alone
+        // cannot see it — the deep (publication-preflight) pass must.
+        let manifest = manifest_from(4, &[manifest_block(0x400000, 0, 4)]);
+        manifest
+            .validate_ranges_detailed()
+            .expect("index invariants alone cannot see template geometry");
+        assert_eq!(manifest.validate_deep(), Err(ManifestDefect::BlockTemplate));
     }
 
     #[test]

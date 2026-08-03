@@ -3872,9 +3872,8 @@ fn published_shared_block_prevents_second_process_translation() {
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
         NativePageProfileIdentity, PortableBlockRecord, PublishOutcome, SharedExecutableSegment,
-        SharedImageConfig, SharedLoadedTranslationUnit, SourceFingerprint,
-        TRANSLATION_UNIT_SCHEMA_V4, TranslationUnitKey, TranslationUnitManifest,
-        TranslationUnitStore, UnitMissReason, translation_unit_base_export,
+        SharedImageConfig, SharedLoadedTranslationUnit, SourceFingerprint, TranslationUnitKey,
+        TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
     };
 
     #[derive(Clone)]
@@ -3956,20 +3955,19 @@ fn published_shared_block_prevents_second_process_translation() {
         NativePageProfileIdentity::Native16k,
         AddressModeIdentity::biased(fixture.host_bias),
     );
-    let manifest = TranslationUnitManifest {
-        schema: TRANSLATION_UNIT_SCHEMA_V4,
-        key: key.clone(),
-        code_sha256: [0x22; 32],
-        base_export: translation_unit_base_export(&key).expect("keyed translation export"),
-        code_len: code_len as u64,
-        blocks: vec![PortableBlockRecord {
+    let manifest = TranslationUnitManifest::from_blocks(
+        &key,
+        [0x22; 32],
+        code_len as u64,
+        &[PortableBlockRecord {
             guest_start: guest,
             entry_offset: 0,
             code_len: code_len as u32,
             requires_sensitive_metadata: false,
             template: record_template,
         }],
-    };
+    )
+    .expect("round-trip fixture manifest");
     let lease: Arc<dyn Send + Sync> = Arc::clone(&code) as Arc<dyn Send + Sync>;
     let store = Arc::new(FixtureStore {
         unit: SharedLoadedTranslationUnit::new(manifest, base, lease),
@@ -4044,9 +4042,8 @@ fn translated_block_is_published_on_retirement_and_reused() {
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
         NativePageProfileIdentity, PendingTranslationUnit, PublishOutcome, SharedExecutableSegment,
-        SharedImageConfig, SharedLoadedTranslationUnit, TRANSLATION_UNIT_SCHEMA_V4,
-        TranslationUnitKey, TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
-        translation_unit_base_export,
+        SharedImageConfig, SharedLoadedTranslationUnit, TranslationUnitKey,
+        TranslationUnitManifest, TranslationUnitStore, UnitMissReason,
     };
 
     #[derive(Default)]
@@ -4084,15 +4081,13 @@ fn translated_block_is_published_on_retirement_and_reused() {
             // own cache.
             let code: Arc<Vec<u8>> = Arc::new(pending.code.clone());
             let base = code.as_ptr() as usize;
-            let manifest = TranslationUnitManifest {
-                schema: TRANSLATION_UNIT_SCHEMA_V4,
-                key: pending.key.clone(),
-                code_sha256: [0x33; 32],
-                base_export: translation_unit_base_export(&pending.key)
-                    .expect("keyed translation export"),
-                code_len: pending.code.len() as u64,
-                blocks: pending.blocks.clone(),
-            };
+            let manifest = TranslationUnitManifest::from_blocks(
+                &pending.key,
+                [0x33; 32],
+                pending.code.len() as u64,
+                &pending.blocks,
+            )
+            .expect("round-trip retirement manifest");
             let lease: Arc<dyn Send + Sync> = code;
             *loaded = Some(SharedLoadedTranslationUnit::new(manifest, base, lease));
             Ok(PublishOutcome::Winner)
