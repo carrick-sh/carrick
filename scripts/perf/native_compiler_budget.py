@@ -154,10 +154,9 @@ FRAME_FIELDS_V3 = {
     "fusion-sites-b": set(_FUSION_FIELDS_B),
 }
 REQUIRED_FRAMES_V3 = frozenset(FRAME_FIELDS_V3)
-# NATIVEPERF v4 is the current 18-frame producer contract. It preserves every
-# v3 field exactly and makes the four newer process-mechanism frames mandatory.
-# Historical v1-v3 records remain readable as their own exact schemas; none of
-# these v4 frames or fields is optional in a v4 group.
+# NATIVEPERF v4 introduced the 18-frame process-mechanism contract. Historical
+# v1-v4 records remain readable as their own exact schemas; none of a schema's
+# frames or fields is optional in a group.
 FRAME_FIELDS_V4 = {
     **{frame: set(fields) for frame, fields in FRAME_FIELDS_V3.items()},
     "resolver-shared": {
@@ -194,6 +193,15 @@ FRAME_FIELDS_V4 = {
     },
 }
 REQUIRED_FRAMES_V4 = frozenset(FRAME_FIELDS_V4)
+# NATIVEPERF v5 is the current producer contract. Lazy unit attachment added a
+# counter to the existing resolver-shared frame; keeping it as a distinct exact
+# field set prevents old V4 evidence from being silently reinterpreted.
+FRAME_FIELDS_V5 = {
+    **{frame: set(fields) for frame, fields in FRAME_FIELDS_V4.items()},
+    "resolver-shared": FRAME_FIELDS_V4["resolver-shared"]
+    | {"shared_blocks_attached"},
+}
+REQUIRED_FRAMES_V5 = frozenset(FRAME_FIELDS_V5)
 # The supervisor record (`NATIVEPERF1|supervisor|...`) is a v2-era, per-PROFILE
 # (not per-thread-group) record: the top-level `carrick run` process's own
 # getrusage(RUSAGE_SELF)/getrusage(RUSAGE_CHILDREN) CPU. It is a top-level
@@ -916,9 +924,9 @@ def _protocol_fields(line: str) -> tuple[str, dict[str, str]]:
 
 
 def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]:
-    """Match one frame's field set against the v1/v2/v3/v4 contracts.
+    """Match one frame's field set against the v1-v5 contracts.
 
-    Returns (version, field set): version 1 through 4 for contract-splitting
+    Returns (version, field set): version 1 through 5 for contract-splitting
     frames, and None for version-neutral frames.
     Raises the same unknown/missing diagnostics as the historical v1 parser.
     """
@@ -926,7 +934,14 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
     fields_v2 = FRAME_FIELDS_V2.get(frame)
     fields_v3 = FRAME_FIELDS_V3.get(frame)
     fields_v4 = FRAME_FIELDS_V4.get(frame)
-    if fields_v1 is None and fields_v2 is None and fields_v3 is None and fields_v4 is None:
+    fields_v5 = FRAME_FIELDS_V5.get(frame)
+    if (
+        fields_v1 is None
+        and fields_v2 is None
+        and fields_v3 is None
+        and fields_v4 is None
+        and fields_v5 is None
+    ):
         raise BudgetError(f"unknown profile frame: {frame}")
     if fields_v1 is not None and extras == fields_v1:
         return (None if fields_v1 == fields_v2 else 1), fields_v1
@@ -942,16 +957,25 @@ def _frame_contract(frame: str, extras: set[str]) -> tuple[int | None, set[str]]
                 return (None if fields_v1 == fields_v4 else 2), fields_v4
             return 3, fields_v4
         return 4, fields_v4
+    if fields_v5 is not None and extras == fields_v5:
+        if fields_v4 == fields_v5:
+            if fields_v3 == fields_v5:
+                if fields_v2 == fields_v5:
+                    return (None if fields_v1 == fields_v5 else 2), fields_v5
+                return 3, fields_v5
+            return 4, fields_v5
+        return 5, fields_v5
     allowed = (
         (fields_v1 or set())
         | (fields_v2 or set())
         | (fields_v3 or set())
         | (fields_v4 or set())
+        | (fields_v5 or set())
     )
     unknown = extras - allowed
     if unknown:
         raise BudgetError(f"unknown field(s) in {frame}: {', '.join(sorted(unknown))}")
-    expected = fields_v1 or fields_v2 or fields_v3 or fields_v4
+    expected = fields_v1 or fields_v2 or fields_v3 or fields_v4 or fields_v5
     assert expected is not None
     missing = expected - extras
     if not missing:
@@ -1022,7 +1046,9 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
     for (pid, tid, era), frames in sorted(groups.items()):
         key = (pid, tid, era)
         versions = group_versions.get(key, set())
-        if versions == {2, 3, 4}:
+        if versions == {2, 3, 4, 5}:
+            version = 5
+        elif versions == {2, 3, 4}:
             version = 4
         elif versions == {2, 3}:
             version = 3
@@ -1039,6 +1065,7 @@ def parse_nativeperf(lines: Iterable[str]) -> ProfileRun:
             2: REQUIRED_FRAMES_V2,
             3: REQUIRED_FRAMES_V3,
             4: REQUIRED_FRAMES_V4,
+            5: REQUIRED_FRAMES_V5,
         }[version]
         missing = required - set(frames)
         if missing:
@@ -2614,6 +2641,8 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
         values = thread["values"]
         if not isinstance(frames, list):
             raise BudgetError("profile thread frames are not the exact required set")
+        if not isinstance(values, dict) or not all(isinstance(key, str) for key in values):
+            raise BudgetError("profile thread values must be an object")
         if frames == sorted(REQUIRED_FRAMES):
             version = 1
             fields_by_frame = FRAME_FIELDS
@@ -2623,9 +2652,13 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
         elif frames == sorted(REQUIRED_FRAMES_V3):
             version = 3
             fields_by_frame = FRAME_FIELDS_V3
-        elif frames == sorted(REQUIRED_FRAMES_V4):
-            version = 4
-            fields_by_frame = FRAME_FIELDS_V4
+        elif frames == sorted(REQUIRED_FRAMES_V5):
+            if "resolver-shared.shared_blocks_attached" in values:
+                version = 5
+                fields_by_frame = FRAME_FIELDS_V5
+            else:
+                version = 4
+                fields_by_frame = FRAME_FIELDS_V4
         else:
             raise BudgetError("profile thread frames are not the exact required set")
         if version >= 3 and "exec_epoch" not in thread:
@@ -2633,8 +2666,6 @@ def _parse_profile_json(value: object) -> ProfileRun | None:
         if version < 3 and "exec_epoch" in thread:
             raise BudgetError("exec_epoch requires a NATIVEPERF v3+ profile thread")
         profile_versions.add(version)
-        if not isinstance(values, dict) or not all(isinstance(key, str) for key in values):
-            raise BudgetError("profile thread values must be an object")
         expected_keys = {
             f"{frame}.{field}"
             for frame, fields in fields_by_frame.items()
