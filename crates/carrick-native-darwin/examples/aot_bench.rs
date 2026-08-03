@@ -22,6 +22,7 @@ use std::time::Instant;
 use carrick_dsr::address::NativeHostBias;
 use carrick_dsr_aarch64::artifact_spike::{ArtifactBindings, ArtifactTemplate};
 use carrick_dsr_aarch64::emit::PcMapEntry;
+use carrick_dsr_aarch64::pending_augmentation::RecordingOwner;
 use carrick_dsr_aarch64::shared_cache::TranslationUnitStore as _;
 use carrick_dsr_aarch64::shared_cache::{
     AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
@@ -110,7 +111,21 @@ fn main() {
         let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
 
         let t0 = Instant::now();
-        store.publish(&pending).expect("publish bench unit");
+        let owner = RecordingOwner {
+            pid: std::process::id() as i32,
+            incarnation: [0x5a; 16],
+        };
+        let claim = match store
+            .claim_recording(&pending.key, &owner)
+            .expect("claim bench unit")
+        {
+            carrick_dsr_aarch64::shared_cache::ClaimOutcome::Won(claim) => claim,
+            outcome => {
+                eprintln!("bench claim was not won: {outcome:?}");
+                std::process::exit(2);
+            }
+        };
+        store.merge(&pending, &claim).expect("publish bench unit");
         let publish_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         let t0 = Instant::now();

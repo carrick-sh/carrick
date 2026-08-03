@@ -55,16 +55,23 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use carrick_dsr_aarch64::pending_augmentation::RecordingOwner;
-pub use carrick_dsr_aarch64::shared_cache::PublishOutcome;
 use carrick_dsr_aarch64::shared_cache::{
-    DecodedUnitBundle, MergeKind, MergeOutcome, MergeRefusal, PendingTranslationUnit,
-    SourceFingerprint, TranslationMetadataLoadEvidence, TranslationUnitKey,
+    ClaimOutcome, DecodedUnitBundle, MergeKind, MergeOutcome, MergeRefusal, PendingTranslationUnit,
+    RecordingClaim, SourceFingerprint, TranslationMetadataLoadEvidence, TranslationUnitKey,
     TranslationUnitManifest, UnitMissReason, UnitStoreFailure, UnitStoreFailureClass,
     decode_unit_bundle_v1, encode_unit_bundle_v1, merge_normalized_artifacts,
     shared_source_fingerprint_reuse_enabled,
 };
 
 const AUTHORITY_MARKER: &str = ".carrick-authority";
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Winner,
+    Existing,
+    Yielded,
+}
 const AUTHORITY_NONCE_LEN: usize = 16;
 const MAX_MAPPED_UNIT_BUNDLE_BYTES: u64 = (104 + 7 + 64 * 1024 * 1024 + 256 * 1024 * 1024) as u64;
 const UNIT_V1_SUFFIX: &str = ".unit-v1";
@@ -86,19 +93,6 @@ const STORE_SIZE_CAP_BYTES: u64 = 1024 * 1024 * 1024;
 const AUX_FILE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 /// Unrenamed publication temporaries older than this are crash leftovers.
 const TEMP_FILE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecordingClaim {
-    pub owner: RecordingOwner,
-    pub stale_takeover: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClaimOutcome {
-    Won(RecordingClaim),
-    LiveOwner,
-    Yielded,
-}
 
 /// Where the persistent unit store lives: `$CARRICK_DSR_STORE_DIR` when set
 /// (tests, bisection), else the carrick home convention shared with the
@@ -865,6 +859,8 @@ impl ContainerCacheAuthority {
         &self.path
     }
 
+    #[cfg(test)]
+    #[cfg(test)]
     pub fn publish_unit(
         &self,
         pending: &PendingTranslationUnit,
@@ -897,7 +893,6 @@ impl ContainerCacheAuthority {
         }
     }
 
-    #[allow(dead_code)]
     /// Elect one recorder without waiting. Existing units remain claimable:
     /// a process may augment a sparse bundle after an attached-unit gap.
     pub fn claim_recording(
@@ -1442,42 +1437,36 @@ impl carrick_dsr_aarch64::shared_cache::TranslationUnitStore for ActiveContainer
         }
     }
 
-    fn publish(&self, pending: &PendingTranslationUnit) -> Result<PublishOutcome, UnitMissReason> {
-        let active = CONTAINER_CACHE
-            .lock()
-            .map_err(|_| UnitMissReason::StoreUnavailable)?;
-        let authority = active.as_ref().ok_or(UnitMissReason::NoAuthority)?;
-        authority.publish_unit(pending).map_err(|error| {
-            // The trait returns a bare reason, so the context naming WHICH
-            // invariant broke would be lost right here - and publication
-            // failing silently is exactly how this lane published zero units
-            // across an entire build without anyone noticing. Surface it
-            // before narrowing.
-            tracing::warn!(
-                error = %error,
-                reason = ?error.reason(),
-                "shared translation rejected a unit carrick itself built"
-            );
-            error.reason()
-        })
+    fn claim_recording(
+        &self,
+        key: &TranslationUnitKey,
+        owner: &RecordingOwner,
+    ) -> Result<ClaimOutcome, UnitStoreFailure> {
+        let active = CONTAINER_CACHE.lock().map_err(|_| UnitStoreFailure {
+            class: UnitStoreFailureClass::Io,
+            reason: UnitMissReason::StoreUnavailable,
+        })?;
+        let authority = active.as_ref().ok_or(UnitStoreFailure {
+            class: UnitStoreFailureClass::Validation,
+            reason: UnitMissReason::NoAuthority,
+        })?;
+        authority.claim_recording(key, owner)
     }
 
-    fn claim_recording(&self, key: &TranslationUnitKey) -> bool {
-        let owner = RecordingOwner {
-            pid: unsafe { libc::getpid() },
-            // Transitional trait adapter until Task 4 passes the process
-            // incarnation owned by `PendingAugmentation`.
-            incarnation: [0x4c; 16],
-        };
-        CONTAINER_CACHE
-            .lock()
-            .ok()
-            .and_then(|active| {
-                active
-                    .as_ref()
-                    .and_then(|authority| authority.claim_recording(key, &owner).ok())
-            })
-            .is_some_and(|outcome| matches!(outcome, ClaimOutcome::Won(_)))
+    fn merge(
+        &self,
+        pending: &PendingTranslationUnit,
+        claim: &RecordingClaim,
+    ) -> Result<MergeOutcome, UnitStoreFailure> {
+        let active = CONTAINER_CACHE.lock().map_err(|_| UnitStoreFailure {
+            class: UnitStoreFailureClass::Io,
+            reason: UnitMissReason::StoreUnavailable,
+        })?;
+        let authority = active.as_ref().ok_or(UnitStoreFailure {
+            class: UnitStoreFailureClass::Validation,
+            reason: UnitMissReason::NoAuthority,
+        })?;
+        authority.merge(pending, claim)
     }
 }
 

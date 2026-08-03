@@ -7,7 +7,7 @@
 //! not create a second pending copy.
 
 use crate::shared_cache::{
-    MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit, StoredBlockArtifact,
+    MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit, RecordingClaim, StoredBlockArtifact,
     TranslationUnitKey,
 };
 use crate::types::CodeGeneration;
@@ -270,6 +270,7 @@ impl OwnedChunk {
 struct OwnedUnit {
     abi: XlatPendingUnitV1,
     key: TranslationUnitKey,
+    claim: RecordingClaim,
     key_bytes: Box<[u8]>,
     chunks: Vec<Box<OwnedChunk>>,
     prepared_chunk: Option<Box<OwnedChunk>>,
@@ -283,7 +284,7 @@ impl OwnedUnit {
         key: TranslationUnitKey,
         key_bytes: Box<[u8]>,
         segment_end: GuestVa,
-        owner: RecordingOwner,
+        claim: RecordingClaim,
     ) -> Box<Self> {
         let mut first_chunk = OwnedChunk::empty();
         let first_chunk_ptr = &mut first_chunk.abi as *mut XlatPendingChunkV1;
@@ -297,14 +298,15 @@ impl OwnedUnit {
                 segment_start: key.guest_va_start().raw(),
                 segment_end: segment_end.raw(),
                 claim_state: AtomicU32::new(SegmentClaimState::ClaimWon as u32),
-                owner_pid: AtomicI32::new(owner.pid),
-                owner_incarnation_hi: AtomicU64::new(owner.incarnation_hi()),
-                owner_incarnation_lo: AtomicU64::new(owner.incarnation_lo()),
+                owner_pid: AtomicI32::new(claim.owner.pid),
+                owner_incarnation_hi: AtomicU64::new(claim.owner.incarnation_hi()),
+                owner_incarnation_lo: AtomicU64::new(claim.owner.incarnation_lo()),
                 first_chunk: AtomicPtr::new(first_chunk_ptr),
                 committed_chunks: AtomicU64::new(1),
                 next_unit: AtomicPtr::new(ptr::null_mut()),
             },
             key,
+            claim,
             metadata_bytes: PENDING_UNIT_METADATA_BASE_BYTES.saturating_add(key_bytes.len()),
             key_bytes,
             chunks: vec![first_chunk],
@@ -381,8 +383,15 @@ impl OwnedUnit {
 struct SegmentEntry {
     segment_end: GuestVa,
     state: SegmentClaimState,
-    owner: Option<RecordingOwner>,
+    claim: Option<RecordingClaim>,
     unit_index: Option<usize>,
+}
+
+#[derive(Debug)]
+pub struct ClaimedPendingTranslationUnit {
+    pub pending: PendingTranslationUnit,
+    pub claim: RecordingClaim,
+    pub capacity_refused: bool,
 }
 
 /// Single-writer owner of the pending translation arena.
@@ -392,6 +401,7 @@ pub struct PendingAugmentation {
     owner: Option<RecordingOwner>,
     segments: HashMap<TranslationUnitKey, SegmentEntry>,
     units: Vec<Box<OwnedUnit>>,
+    publish_attempted: bool,
 }
 
 impl Default for PendingAugmentation {
@@ -406,6 +416,7 @@ impl PendingAugmentation {
             owner: None,
             segments: HashMap::new(),
             units: Vec::new(),
+            publish_attempted: false,
         }
     }
 
@@ -441,12 +452,12 @@ impl PendingAugmentation {
         key: TranslationUnitKey,
         segment_end: GuestVa,
         state: SegmentClaimState,
-        owner: Option<RecordingOwner>,
+        claim: Option<RecordingClaim>,
     ) -> Result<(), PendingAugmentationError> {
         if segment_end.raw() <= key.guest_va_start().raw() {
             return Err(PendingAugmentationError::InvalidSegment);
         }
-        if state == SegmentClaimState::ClaimWon && owner != self.owner {
+        if state == SegmentClaimState::ClaimWon && claim.map(|claim| claim.owner) != self.owner {
             return Err(PendingAugmentationError::OwnerMismatch);
         }
         let existing_needs_unit = if let Some(entry) = self.segments.get_mut(&key) {
@@ -454,7 +465,7 @@ impl PendingAugmentation {
                 return Err(PendingAugmentationError::InvalidSegment);
             }
             entry.state = state;
-            entry.owner = owner;
+            entry.claim = claim;
             if let Some(index) = entry.unit_index {
                 self.units[index]
                     .abi
@@ -470,8 +481,8 @@ impl PendingAugmentation {
         if self.segments.contains_key(&key) {
             let needs_unit = existing_needs_unit;
             if needs_unit {
-                let exact_owner = owner.ok_or(PendingAugmentationError::OwnerMismatch)?;
-                let index = self.create_unit(key.clone(), segment_end, exact_owner)?;
+                let exact_claim = claim.ok_or(PendingAugmentationError::OwnerMismatch)?;
+                let index = self.create_unit(key.clone(), segment_end, exact_claim)?;
                 if let Some(entry) = self.segments.get_mut(&key) {
                     entry.unit_index = Some(index);
                 }
@@ -480,8 +491,8 @@ impl PendingAugmentation {
         }
 
         let unit_index = if state == SegmentClaimState::ClaimWon {
-            let exact_owner = owner.ok_or(PendingAugmentationError::OwnerMismatch)?;
-            Some(self.create_unit(key.clone(), segment_end, exact_owner)?)
+            let exact_claim = claim.ok_or(PendingAugmentationError::OwnerMismatch)?;
+            Some(self.create_unit(key.clone(), segment_end, exact_claim)?)
         } else {
             None
         };
@@ -490,7 +501,7 @@ impl PendingAugmentation {
             SegmentEntry {
                 segment_end,
                 state,
-                owner,
+                claim,
                 unit_index,
             },
         );
@@ -509,7 +520,9 @@ impl PendingAugmentation {
         let Some(entry) = self.segments.get(key) else {
             return PendingAppendOutcome::Ineligible;
         };
-        if entry.state != SegmentClaimState::ClaimWon || entry.owner != self.owner {
+        if entry.state != SegmentClaimState::ClaimWon
+            || entry.claim.map(|claim| claim.owner) != self.owner
+        {
             return PendingAppendOutcome::Ineligible;
         }
         let Some(index) = entry.unit_index else {
@@ -530,12 +543,20 @@ impl PendingAugmentation {
     }
 
     /// Detach the ABI root before moving the canonical buffers into batches.
-    pub fn drain_committed_units(&mut self) -> Vec<PendingTranslationUnit> {
+    pub fn drain_committed_units(&mut self) -> Option<Vec<ClaimedPendingTranslationUnit>> {
+        if self.publish_attempted {
+            return None;
+        }
+        self.publish_attempted = true;
         self.detach_root_if_owned();
         let mut pending = Vec::with_capacity(self.units.len());
         for unit in std::mem::take(&mut self.units) {
             let OwnedUnit {
-                key, mut chunks, ..
+                key,
+                claim,
+                mut chunks,
+                capacity_refused,
+                ..
             } = *unit;
             let mut blocks = Vec::new();
             for chunk in chunks.drain(..) {
@@ -544,11 +565,15 @@ impl PendingAugmentation {
                 blocks.extend(artifacts.drain(..committed));
             }
             blocks.sort_by_key(|block| block.guest_start);
-            pending.push(PendingTranslationUnit { key, blocks });
+            pending.push(ClaimedPendingTranslationUnit {
+                pending: PendingTranslationUnit { key, blocks },
+                claim,
+                capacity_refused,
+            });
         }
         self.segments.clear();
         self.owner = None;
-        pending
+        Some(pending)
     }
 
     pub fn reset_after_fork_child(&mut self) {
@@ -556,13 +581,14 @@ impl PendingAugmentation {
         self.segments.clear();
         self.units.clear();
         self.owner = None;
+        self.publish_attempted = false;
     }
 
     fn create_unit(
         &mut self,
         key: TranslationUnitKey,
         segment_end: GuestVa,
-        owner: RecordingOwner,
+        claim: RecordingClaim,
     ) -> Result<usize, PendingAugmentationError> {
         let key_bytes = bincode::serde::encode_to_vec(
             &key,
@@ -570,7 +596,7 @@ impl PendingAugmentation {
         )
         .map_err(|error| PendingAugmentationError::KeyEncoding(error.to_string()))?
         .into_boxed_slice();
-        let mut unit = OwnedUnit::new(key, key_bytes, segment_end, owner);
+        let mut unit = OwnedUnit::new(key, key_bytes, segment_end, claim);
         let unit_ptr = &mut unit.abi as *mut XlatPendingUnitV1;
         if let Some(previous) = self.units.last_mut() {
             previous.abi.next_unit.store(unit_ptr, Ordering::Release);
@@ -812,7 +838,10 @@ mod tests {
                 key.clone(),
                 GuestVa(0x401000),
                 SegmentClaimState::ClaimWon,
-                Some(owner),
+                Some(RecordingClaim {
+                    owner,
+                    stale_takeover: false,
+                }),
             )
             .expect("track claimed segment");
         (pending, key, owner)
@@ -869,11 +898,14 @@ mod tests {
         assert_eq!(descriptor.hot_ptr, expected.1);
         assert_eq!(descriptor.cold_ptr, expected.2);
 
-        let units = pending.drain_committed_units();
+        let units = pending
+            .drain_committed_units()
+            .expect("first drain is authoritative");
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].blocks[0].code.as_ptr(), expected.0);
-        assert_eq!(units[0].blocks[0].hot.as_ptr(), expected.1);
-        assert_eq!(units[0].blocks[0].cold.as_ptr(), expected.2);
+        assert_eq!(units[0].pending.blocks[0].code.as_ptr(), expected.0);
+        assert_eq!(units[0].pending.blocks[0].hot.as_ptr(), expected.1);
+        assert_eq!(units[0].pending.blocks[0].cold.as_ptr(), expected.2);
+        assert!(pending.drain_committed_units().is_none());
     }
 
     #[test]
@@ -897,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_reset_after_fork_clears_owner_claims_chunks_and_root() {
+    fn fork_child_clears_claim_nonce_pending_prefix_and_publish_guard() {
         let _serial = core_test_guard();
         let (mut pending, key, _) = claimed_pending();
         assert_eq!(
