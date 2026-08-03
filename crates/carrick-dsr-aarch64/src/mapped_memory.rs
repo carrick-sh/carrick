@@ -32,6 +32,7 @@ use crate::prepared_image::{
     NativeRelativeRelocation, PreparedRegionBackingResolved, ValidatedPreparedImage,
     native_region_copy_window,
 };
+use crate::prot_ranges::NativeProtRanges;
 
 /// Path-compat alias for the translator layer this module grew up next to:
 /// the moved code keeps addressing it as `dsr::…` exactly as it did inside
@@ -424,7 +425,13 @@ pub struct NativeMappedMemory {
     pub owned_host_ranges: Arc<Vec<std::ops::Range<carrick_guest_mem::HostVa>>>,
     pub regions: Vec<NativeMappedRegion>,
     pub protections: MemoryProtections,
-    pub native_page_protections: BTreeMap<u64, u64>,
+    /// Guest protection overrides where they differ from the owning region's
+    /// `default_prot`, as coalesced intervals. Interval (not per-page)
+    /// bookkeeping is load-bearing: Go reserves ~4.5 GiB of
+    /// `mmap(PROT_NONE)` address space per process, and per-16KiB-page
+    /// entries made every reserve O(pages) (~295k map entries per Go
+    /// process) instead of O(1).
+    pub native_prot_ranges: NativeProtRanges,
     pub native_write_exec_writable_pages: BTreeSet<u64>,
     pub linux4k_page_protections: BTreeMap<u64, [u64; 4]>,
     // The exclusive-monitor reservation itself now lives per guest thread
@@ -741,7 +748,7 @@ impl NativeMappedMemory {
             owned_host_ranges: Arc::new(Vec::new()),
             regions: Vec::new(),
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
+            native_prot_ranges: NativeProtRanges::default(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
@@ -1036,20 +1043,17 @@ impl NativeMappedMemory {
         if len == 0 {
             return false;
         }
-        let end = address.saturating_add(len as u64);
-        let mut page = address & !(self.host_page_size - 1);
-        while page < end {
-            let prot = self
-                .native_page_protections
-                .get(&page)
-                .copied()
-                .unwrap_or_else(|| self.default_linux_prot_at(page));
-            if prot & carrick_abi::LINUX_PROT_EXEC != 0 {
-                return true;
-            }
-            page = page.saturating_add(self.host_page_size);
-        }
-        false
+        // Page-align outward: protection is page-granular, so a partial first
+        // or last page executes iff its whole page does (the per-page
+        // predecessor's exact semantics, now O(segments)).
+        let start = address & !(self.host_page_size - 1);
+        let end = address
+            .saturating_add(len as u64)
+            .saturating_add(self.host_page_size - 1)
+            & !(self.host_page_size - 1);
+        self.effective_prot_segments(start, end)
+            .iter()
+            .any(|&(_, _, prot)| prot & carrick_abi::LINUX_PROT_EXEC != 0)
     }
 
     // Test-only entry, kept always-compiled: cross-crate `cfg(test)` does
@@ -1436,7 +1440,7 @@ impl NativeMappedMemory {
                 owned_host_ranges,
                 regions,
                 protections,
-                native_page_protections: BTreeMap::new(),
+                native_prot_ranges: NativeProtRanges::default(),
                 native_write_exec_writable_pages: BTreeSet::new(),
                 linux4k_page_protections: BTreeMap::new(),
                 exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
@@ -1889,9 +1893,8 @@ impl NativeMappedMemory {
         }
         let page_start = address & !(self.host_page_size - 1);
         let prot = self
-            .native_page_protections
-            .get(&page_start)
-            .copied()
+            .native_prot_ranges
+            .prot_at(page_start)
             .unwrap_or_else(|| self.default_linux_prot_at(address));
         let write_exec = carrick_abi::LINUX_PROT_WRITE | carrick_abi::LINUX_PROT_EXEC;
         (prot & write_exec == write_exec).then_some(page_start)
@@ -1902,9 +1905,8 @@ impl NativeMappedMemory {
             return false;
         }
         let write_exec = carrick_abi::LINUX_PROT_WRITE | carrick_abi::LINUX_PROT_EXEC;
-        self.native_page_protections
-            .values()
-            .copied()
+        self.native_prot_ranges
+            .iter_prots()
             .chain(self.regions.iter().map(|region| region.default_prot))
             .any(|prot| prot & write_exec == write_exec)
     }
@@ -1962,9 +1964,8 @@ impl NativeMappedMemory {
             .raw() as *mut u8;
         native_clear_icache(ptr.cast(), page_len);
         let prot = self
-            .native_page_protections
-            .get(&page_start)
-            .copied()
+            .native_prot_ranges
+            .prot_at(page_start)
             .unwrap_or_else(|| self.default_linux_prot_at(page_start));
         self.mprotect_host_page(
             page_start,
@@ -2061,6 +2062,65 @@ impl NativeMappedMemory {
             .map_or(0, |region| region.default_prot)
     }
 
+    /// `[start, end)` split into maximal segments whose winning region -- the
+    /// newest region covering the address, exactly [`Self::default_linux_prot_at`]'s
+    /// resolution rule -- is constant, with each segment's `default_prot`
+    /// (0 where no region covers it). The interval form of the per-page
+    /// default lookup: O(overlapping regions), not O(pages).
+    fn default_prot_segments(&self, start: u64, end: u64) -> Vec<(u64, u64, u64)> {
+        if start >= end {
+            return Vec::new();
+        }
+        let mut cuts = vec![start, end];
+        for region in &self.regions {
+            if region.end > start && region.start < end {
+                if region.start > start {
+                    cuts.push(region.start);
+                }
+                if region.end < end {
+                    cuts.push(region.end);
+                }
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut segments: Vec<(u64, u64, u64)> = Vec::with_capacity(cuts.len() - 1);
+        for pair in cuts.windows(2) {
+            let (segment_start, segment_end) = (pair[0], pair[1]);
+            let prot = self.default_linux_prot_at(segment_start);
+            match segments.last_mut() {
+                Some((_, last_end, last_prot))
+                    if *last_end == segment_start && *last_prot == prot =>
+                {
+                    *last_end = segment_end;
+                }
+                _ => segments.push((segment_start, segment_end, prot)),
+            }
+        }
+        segments
+    }
+
+    /// The effective guest Linux protection over `[start, end)` as address-
+    /// ordered constant-protection segments: explicit overrides
+    /// (`native_prot_ranges`) where present, the winning region's
+    /// `default_prot` in the gaps. Every range-shaped protection query walks
+    /// these segments instead of pages.
+    fn effective_prot_segments(&self, start: u64, end: u64) -> Vec<(u64, u64, u64)> {
+        let mut segments = Vec::new();
+        let mut cursor = start;
+        for (override_start, override_end, prot) in self.native_prot_ranges.overlaps(start, end) {
+            if cursor < override_start {
+                segments.extend(self.default_prot_segments(cursor, override_start));
+            }
+            segments.push((override_start, override_end, prot));
+            cursor = override_end;
+        }
+        if cursor < end {
+            segments.extend(self.default_prot_segments(cursor, end));
+        }
+        segments
+    }
+
     pub fn guest_address_is_executable(&self, address: u64) -> bool {
         let prot = if self.uses_linux4k_subpages() {
             let host_page = address & !(self.host_page_size - 1);
@@ -2071,9 +2131,8 @@ impl NativeMappedMemory {
                 .unwrap_or(0)
         } else {
             let page = address & !(self.host_page_size - 1);
-            self.native_page_protections
-                .get(&page)
-                .copied()
+            self.native_prot_ranges
+                .prot_at(page)
                 .unwrap_or_else(|| self.default_linux_prot_at(address))
         };
         prot & carrick_abi::LINUX_PROT_EXEC != 0
@@ -2094,20 +2153,9 @@ impl NativeMappedMemory {
         } else {
             carrick_abi::LINUX_PROT_READ
         };
-        let mut cursor = address;
-        while cursor < end {
-            let page = cursor & !(self.host_page_size - 1);
-            let prot = self
-                .native_page_protections
-                .get(&page)
-                .copied()
-                .unwrap_or_else(|| self.default_linux_prot_at(cursor));
-            if prot & required == 0 {
-                return false;
-            }
-            cursor = page.saturating_add(self.host_page_size).min(end);
-        }
-        true
+        self.effective_prot_segments(address, end)
+            .iter()
+            .all(|&(_, _, prot)| prot & required != 0)
     }
 
     pub fn linux4k_host_page_protections(&self, page_start: u64) -> [u64; 4] {
@@ -2349,7 +2397,7 @@ impl NativeMappedMemory {
     /// the whole copy window and serializes the lift/restore `mprotect`s so two
     /// concurrent read-guard accessors cannot strand each other with a
     /// PROT_NONE page. It never mutates
-    /// `native_write_exec_writable_pages`/`native_page_protections`, so it
+    /// `native_write_exec_writable_pages`/`native_prot_ranges`, so it
     /// never needs to run under a write lock. Callers that may hit a native16k
     /// write-exec page must use [`Self::write_exec_page_bytes`] instead.
     ///
@@ -2420,7 +2468,7 @@ impl NativeMappedMemory {
 
     /// The exec-page (SMC/JIT) guest-RAM write path: same exclusive-monitor
     /// and DSR bookkeeping as [`Self::write_bytes_raw_shared`], plus the
-    /// `native_write_exec_writable_pages`/`native_page_protections` metadata
+    /// `native_write_exec_writable_pages`/`native_prot_ranges` metadata
     /// update that a write hitting a native16k write-exec page requires.
     /// Needs `&mut self` -- this is the ONLY reason the guest-RAM write path
     /// as a whole still needs a mutable borrow. The trait's `write_bytes_raw`
@@ -2825,9 +2873,8 @@ impl NativeMappedMemory {
     pub fn native_host_prot_for_page(&self, page_start: u64) -> libc::c_int {
         if !self.uses_linux4k_subpages() {
             let prot = self
-                .native_page_protections
-                .get(&page_start)
-                .copied()
+                .native_prot_ranges
+                .prot_at(page_start)
                 .unwrap_or_else(|| self.default_linux_prot_at(page_start));
             if self.native_write_exec_writable_pages.contains(&page_start) {
                 return libc::PROT_READ | libc::PROT_WRITE;
@@ -3679,13 +3726,24 @@ impl NativeMappedMemory {
         // the newly writable page to no-access (Go user arenas remap freed
         // 8 MiB chunks this way). Clear whole host pages, matching mmap's
         // replacement granularity; Linux-4K subpage state is stale for the
-        // same reason.
-        let mut replaced_page = guest_map_start;
-        while replaced_page < replaced_end {
-            self.native_page_protections.remove(&replaced_page);
-            self.native_write_exec_writable_pages.remove(&replaced_page);
-            self.linux4k_page_protections.remove(&replaced_page);
-            replaced_page = replaced_page.saturating_add(self.host_page_size);
+        // same reason. Range operations, not per-page walks: cost scales with
+        // entries actually present, not with the replaced span.
+        self.native_prot_ranges.clear(guest_map_start, replaced_end);
+        let stale_write_exec: Vec<u64> = self
+            .native_write_exec_writable_pages
+            .range(guest_map_start..replaced_end)
+            .copied()
+            .collect();
+        for page in stale_write_exec {
+            self.native_write_exec_writable_pages.remove(&page);
+        }
+        let stale_linux4k: Vec<u64> = self
+            .linux4k_page_protections
+            .range(guest_map_start..replaced_end)
+            .map(|(&page, _)| page)
+            .collect();
+        for page in stale_linux4k {
+            self.linux4k_page_protections.remove(&page);
         }
 
         if file.is_none() && !payload.is_empty() {
@@ -3731,14 +3789,26 @@ impl NativeMappedMemory {
         F: FnMut(carrick_guest_mem::HostVa, usize, libc::c_int) -> Result<(), MemoryError>,
     {
         let host_prot = native16k_host_prot(prot);
-        let mut pages = BTreeSet::new();
+        // Page-aligned, sorted, merged runs of host-protecting memory
+        // intersecting the request. Regions can overlap (a file alias pushed
+        // over the shared arena), so overlap segments must be merged. Runs --
+        // not pages -- are the unit of work throughout: a guest
+        // `mmap(PROT_NONE)` reservation of N GiB is one run, one host
+        // `mprotect`, and one metadata splice, independent of N (Go reserves
+        // ~4.5 GiB of address space this way per process).
+        let mut runs: Vec<(u64, u64)> = Vec::new();
         for (start, end) in self.host_protected_overlaps(address, len) {
             let (page_start, page_len) = self.host_page_range(start, end)?;
-            let page_end = page_start.saturating_add(page_len as u64);
-            let mut page = page_start;
-            while page < page_end {
-                pages.insert(page);
-                page = page.saturating_add(self.host_page_size);
+            runs.push((page_start, page_start.saturating_add(page_len as u64)));
+        }
+        runs.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(runs.len());
+        for (start, end) in runs {
+            match merged.last_mut() {
+                Some((_, merged_end)) if start <= *merged_end => {
+                    *merged_end = (*merged_end).max(end);
+                }
+                _ => merged.push((start, end)),
             }
         }
         let host_page_len =
@@ -3747,91 +3817,84 @@ impl NativeMappedMemory {
                 length: len,
             })?;
 
-        let pages: Vec<(u64, carrick_guest_mem::HostVa, *mut libc::c_void)> = pages
-            .into_iter()
-            .map(|page_start| {
-                let host_page = self.host_address(carrick_guest_mem::GuestVa(page_start))?;
-                let ptr = host_page.raw() as *mut libc::c_void;
-                Ok((page_start, host_page, ptr))
-            })
-            .collect::<Result<_, MemoryError>>()?;
-
-        struct ProtectionSnapshot {
-            host_page: carrick_guest_mem::HostVa,
-            ptr: *mut libc::c_void,
-            old_host_prot: libc::c_int,
-            patched_words: Vec<(usize, u32)>,
-        }
-
-        let mut snapshots = Vec::with_capacity(pages.len());
+        // Apply phase: one mprotect per run (an exec run first lifts to
+        // PROT_READ for the icache clear). `attempted` counts runs whose
+        // FINAL mprotect was reached -- exactly the set the rollback below
+        // must restore (an exec run failing its PROT_READ lift left its
+        // protection untouched and is excluded, matching the per-page
+        // predecessor's snapshot ordering).
+        let mut attempted = 0usize;
         let apply_result = (|| {
-            // The final host protection is uniform across this call, so a
-            // maximal run of adjacent host pages collapses into ONE
-            // mprotect per phase. Snapshots and metadata stay per page.
-            let mut index = 0;
-            while index < pages.len() {
-                let mut end = index + 1;
-                while end < pages.len()
-                    && pages[end - 1].0.checked_add(self.host_page_size) == Some(pages[end].0)
-                {
-                    end += 1;
-                }
-                let run_pages = &pages[index..end];
-                let (_, run_host, run_ptr) = run_pages[0];
-                let run_len = host_page_len * run_pages.len();
+            for &(run_start, run_end) in &merged {
+                let run_len =
+                    usize::try_from(run_end - run_start).map_err(|_| MemoryError::OutOfBounds {
+                        address,
+                        length: len,
+                    })?;
+                let run_host = self.host_address(carrick_guest_mem::GuestVa(run_start))?;
+                let run_ptr = run_host.raw() as *mut libc::c_void;
                 if prot & carrick_abi::LINUX_PROT_EXEC != 0 {
                     set_host_prot(run_host, run_len, libc::PROT_READ)?;
-                    for &(page_start, host_page, ptr) in run_pages {
-                        snapshots.push(ProtectionSnapshot {
-                            host_page,
-                            ptr,
-                            old_host_prot: self.native_host_prot_for_page(page_start),
-                            patched_words: Vec::new(),
-                        });
-                    }
-                    // Every page in an exec run received the icache clear
-                    // before coalescing; the run-wide clear covers exactly
-                    // the same pages.
+                    attempted += 1;
                     native_clear_icache(run_ptr, run_len);
                 } else {
-                    for &(page_start, host_page, ptr) in run_pages {
-                        snapshots.push(ProtectionSnapshot {
-                            host_page,
-                            ptr,
-                            old_host_prot: self.native_host_prot_for_page(page_start),
-                            patched_words: Vec::new(),
-                        });
-                    }
+                    attempted += 1;
                 }
                 set_host_prot(run_host, run_len, host_prot)?;
-                index = end;
             }
             Ok(())
         })();
 
         if let Err(error) = apply_result {
+            // Metadata is untouched until every run lands, so the pre-call
+            // protections are still readable here. Restore per
+            // effective-protection segment; a run holding write-exec
+            // writable pages (whose host protection is a page-local RW
+            // override) falls back to per-page restore -- both cold paths.
             let mut rollback_error = None;
-            for snapshot in snapshots.iter().rev() {
-                if !snapshot.patched_words.is_empty() {
-                    match set_host_prot(
-                        snapshot.host_page,
-                        host_page_len,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                    ) {
-                        Ok(()) => unsafe {
-                            for &(offset, original) in &snapshot.patched_words {
-                                let word = snapshot.ptr.cast::<u8>().add(offset).cast::<u32>();
-                                std::ptr::write_unaligned(word, original);
+            for &(run_start, run_end) in merged[..attempted].iter().rev() {
+                let has_writable_pages = self
+                    .native_write_exec_writable_pages
+                    .range(run_start..run_end)
+                    .next()
+                    .is_some();
+                if has_writable_pages {
+                    let mut page = run_start;
+                    while page < run_end {
+                        match self.host_address(carrick_guest_mem::GuestVa(page)) {
+                            Ok(host_page) => {
+                                if let Err(restore_error) = set_host_prot(
+                                    host_page,
+                                    host_page_len,
+                                    self.native_host_prot_for_page(page),
+                                ) {
+                                    rollback_error = Some(restore_error);
+                                }
                             }
-                            native_clear_icache(snapshot.ptr, host_page_len);
-                        },
-                        Err(restore_error) => rollback_error = Some(restore_error),
+                            Err(restore_error) => rollback_error = Some(restore_error),
+                        }
+                        page = page.saturating_add(self.host_page_size);
                     }
-                }
-                if let Err(restore_error) =
-                    set_host_prot(snapshot.host_page, host_page_len, snapshot.old_host_prot)
-                {
-                    rollback_error = Some(restore_error);
+                } else {
+                    for (segment_start, segment_end, old_prot) in
+                        self.effective_prot_segments(run_start, run_end)
+                    {
+                        let Ok(segment_len) = usize::try_from(segment_end - segment_start) else {
+                            continue;
+                        };
+                        match self.host_address(carrick_guest_mem::GuestVa(segment_start)) {
+                            Ok(host_segment) => {
+                                if let Err(restore_error) = set_host_prot(
+                                    host_segment,
+                                    segment_len,
+                                    native16k_host_prot(old_prot),
+                                ) {
+                                    rollback_error = Some(restore_error);
+                                }
+                            }
+                            Err(restore_error) => rollback_error = Some(restore_error),
+                        }
+                    }
                 }
             }
             if let Some(rollback_error) = rollback_error {
@@ -3842,20 +3905,34 @@ impl NativeMappedMemory {
             return Err(error);
         }
 
-        for (page_start, _, _) in pages {
+        for &(run_start, run_end) in &merged {
             // Sparse representation: every reader (`native_range_allows`,
             // `native_host_prot_for_page`, `guest_address_is_executable`,
-            // ...) already falls back to `default_linux_prot_at` for a
-            // MISSING page, so a page whose protection matches its
+            // ...) already falls back to `default_linux_prot_at` for an
+            // uncovered span, so a span whose protection matches its
             // region's default is redundant to store. `region_contains`
             // in `protect_range` guarantees the region (and its
-            // `default_prot`) is already established here.
-            if prot == self.default_linux_prot_at(page_start) {
-                self.native_page_protections.remove(&page_start);
-            } else {
-                self.native_page_protections.insert(page_start, prot);
+            // `default_prot`) is already established here. Split by region
+            // default so a run spanning regions with different defaults
+            // stores overrides only where they differ.
+            for (segment_start, segment_end, default_prot) in
+                self.default_prot_segments(run_start, run_end)
+            {
+                if prot == default_prot {
+                    self.native_prot_ranges.clear(segment_start, segment_end);
+                } else {
+                    self.native_prot_ranges
+                        .set(segment_start, segment_end, prot);
+                }
             }
-            self.native_write_exec_writable_pages.remove(&page_start);
+            let retired_writable: Vec<u64> = self
+                .native_write_exec_writable_pages
+                .range(run_start..run_end)
+                .copied()
+                .collect();
+            for page in retired_writable {
+                self.native_write_exec_writable_pages.remove(&page);
+            }
         }
         Ok(())
     }
@@ -3972,7 +4049,7 @@ impl GuestMemory for NativeMappedMemory {
         // Dispatch to the &self common path (`write_bytes_raw_shared`) unless
         // the write may hit a native16k write-exec page, in which case the
         // &mut self escalation (`write_exec_page_bytes`) is required for the
-        // native_write_exec_writable_pages/native_page_protections metadata
+        // native_write_exec_writable_pages/native_prot_ranges metadata
         // update. Phase 2's hot path calls `write_bytes_raw_shared` directly
         // through a shared reference, bypassing this dispatcher entirely.
         if self.range_may_execute(address, bytes.len()) {
@@ -4142,11 +4219,11 @@ impl GuestMemory for NativeMappedMemory {
             return None;
         }
         // `native_range_allows` only reflects the host-mprotect-fidelity
-        // table (`native_page_protections`), which `munmap()` does NOT reset
+        // table (`native_prot_ranges`), which `munmap()` does NOT reset
         // -- it stays at the last guest-upgraded prot. Software
         // no_access/unmapped state lives in `protections` instead
         // (`unmap_range` sets `unmapped` there without touching
-        // `native_page_protections`), so it must be consulted separately or
+        // `native_prot_ranges`), so it must be consulted separately or
         // a freed/guarded range can still look host-readable here. Mirrors
         // the HVF reference gate (`self.range_no_access` in
         // `carrick-vmm-hvf/src/trap.rs`).
@@ -4983,7 +5060,7 @@ mod tests {
                 shared_key_offset: 0,
             }],
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
+            native_prot_ranges: NativeProtRanges::default(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
@@ -5261,7 +5338,7 @@ mod tests {
                 shared_key_offset: 0,
             }],
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
+            native_prot_ranges: NativeProtRanges::default(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
@@ -5295,7 +5372,95 @@ mod tests {
             );
         }
         assert!(memory.linux4k_page_protections.is_empty());
-        assert!(memory.native_page_protections.is_empty());
+        assert!(memory.native_prot_ranges.is_empty());
+        drop(memory);
+        assert_eq!(unsafe { libc::munmap(raw, RESERVATION) }, 0);
+    }
+
+    /// Guest `mmap(PROT_NONE, MAP_ANON|MAP_PRIVATE)` is an address-space
+    /// reservation: Go's `sysReserve` issues ~66 x 64 MiB + 2 x ~512 MiB of
+    /// these per process, and Darwin lowers the intent to one free
+    /// `mmap(PROT_NONE)`. Carrick's lowering is one coalesced host `mprotect`
+    /// -- also O(1) syscalls -- so the ONLY size-proportional term allowed is
+    /// bookkeeping. This fixture reserves two disjoint spans, 64 MiB and
+    /// 2 GiB (a 32x span ratio), through the same `protect_range` the mmap
+    /// dispatch PROT_NONE arm calls, and asserts the cost ratio stays far
+    /// below linear. Per-16KiB-page bookkeeping (the shipped
+    /// `BTreeMap<page, prot>` shape) makes the 2 GiB span ~32x the 64 MiB
+    /// span and fails this; interval bookkeeping passes with margin.
+    #[test]
+    fn protect_range_prot_none_reservation_cost_is_flat_in_span_length() {
+        const HOST_PAGE: usize = 16 * 1024;
+        const SMALL: usize = 64 * 1024 * 1024;
+        const LARGE: usize = 2 * 1024 * 1024 * 1024;
+        // Arena-shaped fixture: one RW-default, host-protecting region (the
+        // native mmap arena's exact shape) big enough for both spans plus
+        // alignment slack.
+        const RESERVATION: usize = SMALL + LARGE + 2 * HOST_PAGE;
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                RESERVATION,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "map reservation-cost fixture");
+        let raw_start = raw as usize;
+        let host_start = (raw_start + (HOST_PAGE - 1)) & !(HOST_PAGE - 1);
+        let usable = RESERVATION - (host_start - raw_start);
+        assert!(usable >= SMALL + LARGE);
+        let mut memory = direct_test_memory(host_start, usable, HOST_PAGE as u64);
+
+        let small_base = host_start as u64;
+        let large_base = small_base + SMALL as u64;
+        // Alternate arms, min-of-N: minimums are robust against one-sided
+        // preemption noise, and alternation keeps cache/thermal drift from
+        // biasing either arm.
+        let mut small_min = std::time::Duration::MAX;
+        let mut large_min = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            memory
+                .protect_range(small_base, SMALL, 0)
+                .expect("PROT_NONE reserve small span");
+            small_min = small_min.min(started.elapsed());
+
+            let started = std::time::Instant::now();
+            memory
+                .protect_range(large_base, LARGE, 0)
+                .expect("PROT_NONE reserve large span");
+            large_min = large_min.min(started.elapsed());
+
+            // Return both spans to the region default between iterations so
+            // every arm performs the same override-insert work.
+            memory
+                .protect_range(
+                    small_base,
+                    SMALL,
+                    carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE,
+                )
+                .expect("recommit small span");
+            memory
+                .protect_range(
+                    large_base,
+                    LARGE,
+                    carrick_abi::LINUX_PROT_READ | carrick_abi::LINUX_PROT_WRITE,
+                )
+                .expect("recommit large span");
+        }
+
+        // 32x the span; allow 8x the cost. Linear per-page bookkeeping sits
+        // at ~32x and fails; flat interval bookkeeping sits near 1x.
+        assert!(
+            large_min < small_min * 8,
+            "PROT_NONE reservation cost must be flat in span length: \
+             64 MiB took {small_min:?}, 2 GiB took {large_min:?} \
+             (>= 8x -- size-proportional bookkeeping on a reserve-intent mmap)"
+        );
+
         drop(memory);
         assert_eq!(unsafe { libc::munmap(raw, RESERVATION) }, 0);
     }

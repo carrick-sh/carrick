@@ -112,7 +112,7 @@ fn biased_translator_fixture_with(
             },
         ],
         protections: MemoryProtections::default(),
-        native_page_protections: BTreeMap::new(),
+        native_prot_ranges: carrick_dsr_aarch64::prot_ranges::NativeProtRanges::default(),
         native_write_exec_writable_pages: BTreeSet::new(),
         linux4k_page_protections: BTreeMap::new(),
         exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),

@@ -151,7 +151,7 @@ mod tests {
                 shared_key_offset: 0,
             }],
             protections: crate::native_darwin::MemoryProtections::default(),
-            native_page_protections: std::collections::BTreeMap::new(),
+            native_prot_ranges: carrick_dsr_aarch64::prot_ranges::NativeProtRanges::default(),
             native_write_exec_writable_pages: std::collections::BTreeSet::new(),
             linux4k_page_protections: std::collections::BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
