@@ -1187,7 +1187,7 @@ impl ContainerCacheAuthority {
     /// retired `.seen` deferral ("prove the unit recurs first") only delayed
     /// the unit past the second exec's exit — too late for a parallel
     /// build's serial exec trains. A live claim (its `.builder` pid alive
-    /// and the file younger than [`BUILDER_CLAIM_TTL`]) blocks rivals, so
+    /// and the file younger than `BUILDER_CLAIM_TTL`) blocks rivals, so
     /// concurrent processes translate privately WITHOUT recording or
     /// publishing; a dead or aged claim is taken over. Never blocks: a busy
     /// unit lock means another process is deciding right now, and "do not
