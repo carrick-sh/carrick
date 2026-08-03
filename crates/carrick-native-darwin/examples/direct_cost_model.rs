@@ -19,7 +19,7 @@
 
 #[cfg(target_arch = "aarch64")]
 fn main() {
-    use carrick_native_darwin::direct::{DirectImage, GuestContext, SVC_0};
+    use carrick_native_darwin::direct::{DirectLoadGroup, GuestContext, SVC_0};
 
     extern "C" fn stop(ctx: *mut GuestContext) {
         // SAFETY: the island passes the context this image was built with.
@@ -85,8 +85,8 @@ fn main() {
 
     let time = |label: &str, extra: Option<u32>, baseline: Option<f64>| -> f64 {
         let elf = elf_with_code(&build(extra));
-        let image = match DirectImage::load(&elf, stop) {
-            Ok(Ok(image)) => image,
+        let group = match DirectLoadGroup::load(&elf, stop) {
+            Ok(Ok(group)) => group,
             Ok(Err(reason)) => {
                 println!("{label:<26} INELIGIBLE  {reason}");
                 return f64::NAN;
@@ -96,11 +96,11 @@ fn main() {
                 return f64::NAN;
             }
         };
-        let entry = image.entry();
+        let entry = group.main().entry();
         // Warm the mapping so the first run's page faults are not in the number.
         let started = std::time::Instant::now();
         // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-        unsafe { image.enter(entry) };
+        unsafe { group.enter(entry) };
         let elapsed = started.elapsed();
         let per_iter_ns = elapsed.as_secs_f64() * 1e9 / ITERS as f64;
         let delta = match baseline {
@@ -110,8 +110,8 @@ fn main() {
         println!(
             "{label:<26} {:>8.2} ns/iter   veneers={} islands={}{delta}",
             per_iter_ns,
-            image.tpidr_sites() + image.x18_sites(),
-            image.svc_sites()
+            group.main().tpidr_sites() + group.main().x18_sites(),
+            group.main().svc_sites()
         );
         per_iter_ns
     };

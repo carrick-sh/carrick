@@ -7,7 +7,7 @@
 //! x30 and a non-balancing SP far better than a mis-aimed branch.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() {
-    use carrick_native_darwin::direct::{DirectImage, SVC_0};
+    use carrick_native_darwin::direct::{DirectLoadGroup, SVC_0};
     static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     extern "C" fn noop(ctx: *mut carrick_native_darwin::direct::GuestContext) {
         HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -33,8 +33,8 @@ fn main() {
         0xd65f_03c0,
     ];
     let elf = elf_with_code(&code);
-    let image = match DirectImage::load(&elf, noop) {
-        Ok(Ok(image)) => image,
+    let group = match DirectLoadGroup::load(&elf, noop) {
+        Ok(Ok(group)) => group,
         Ok(Err(reason)) => {
             println!("ineligible: {reason}");
             return;
@@ -44,10 +44,10 @@ fn main() {
             return;
         }
     };
-    println!("svc_sites = {}", image.svc_sites());
+    println!("svc_sites = {}", group.main().svc_sites());
     // The single PT_LOAD is lowest, so text sits at bias-relative 0.
     // SAFETY: reading back the mapping this image owns.
-    let words = unsafe { std::slice::from_raw_parts(image.base() as *const u32, 6) };
+    let words = unsafe { std::slice::from_raw_parts(group.main().base() as *const u32, 6) };
     println!("word[0] = {:#010x}   (expect movz x8,#93)", words[0]);
     println!("word[1] = {:#010x}", words[1]);
     let site = words[2];
@@ -61,12 +61,16 @@ fn main() {
     }
 
     // Does the island's baked context address still match the real one?
-    let mut image = image;
-    let real_ctx = image.context_address();
+    let mut group = group;
+    let real_ctx = group.context_address();
     // Follow the patched branch rather than guessing where the island is:
     // the svc site holds `b <island>`, so its imm26 gives the offset.
-    let mapped =
-        unsafe { std::slice::from_raw_parts(image.base() as *const u32, image.mapped_len() / 4) };
+    let mapped = unsafe {
+        std::slice::from_raw_parts(
+            group.main().base() as *const u32,
+            group.main().mapped_len() / 4,
+        )
+    };
     let site_word_index = 2_usize; // the svc in this fixture
     let branch = mapped[site_word_index];
     let imm26 = (branch & 0x03ff_ffff) as i64;
@@ -103,9 +107,9 @@ fn main() {
     );
 
     println!("\nentering the guest on the MAIN thread...");
-    let entry = image.entry();
+    let entry = group.main().entry();
     // SAFETY: patched image, entry inside it, fixture returns via `ret`.
-    unsafe { image.enter(entry) };
+    unsafe { group.enter(entry) };
     println!(
         "returned; handler hits = {}",
         HITS.load(std::sync::atomic::Ordering::Relaxed)
@@ -117,7 +121,7 @@ fn main() {
     println!("\nentering the guest on a SPAWNED thread...");
     HITS.store(0, std::sync::atomic::Ordering::Relaxed);
     let handle = std::thread::spawn(move || {
-        let entry = image.entry();
+        let entry = group.main().entry();
         let run_guest = std::env::var_os("CARRICK_NO_RUN").is_none();
         println!("  spawned: about to enter (run_guest={run_guest})");
         if !run_guest {
@@ -125,14 +129,14 @@ fn main() {
             // MAP_JIT execution, which is the whole point of the experiment.
         } else {
             // SAFETY: patched image, entry inside it.
-            unsafe { image.enter(entry) };
+            unsafe { group.enter(entry) };
         }
         println!("  spawned: guest returned");
         if std::env::var_os("CARRICK_NO_RUN").is_some() {
             println!("  spawned: (guest was skipped)");
         }
         println!("  spawned: dropping image on this thread...");
-        drop(image);
+        drop(group);
         println!("  spawned: drop survived");
     });
     match handle.join() {

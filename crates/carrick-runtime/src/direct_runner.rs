@@ -23,7 +23,7 @@
 //! outcome that ends or suspends the run — `Exit`, and every outcome tier D
 //! does not implement yet (`Execve`, `Fork`, signal delivery, blocking waits)
 //! — makes the handler request a leave. The island's leave leg then returns
-//! control to `DirectImage::enter`'s caller with the guest's complete state
+//! control to `DirectLoadGroup::enter`'s caller with the guest's complete state
 //! parked in its context, and `DirectRunner::outcome` names why the run
 //! stopped. The guest is never resumed past such a syscall with a fabricated
 //! errno.
@@ -223,7 +223,7 @@ pub unsafe fn with_runner<R>(runner: &mut DirectRunner, body: impl FnOnce() -> R
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests {
     use super::*;
-    use carrick_native_darwin::direct::DirectImage;
+    use carrick_native_darwin::direct::DirectLoadGroup;
 
     const NR_WRITE: u32 = 64;
     const SVC_0: u32 = 0xd400_0001;
@@ -277,15 +277,15 @@ mod tests {
     /// same `SyscallDispatcher` the translated lane uses.
     #[test]
     fn guest_write_reaches_the_real_dispatcher() {
-        let image = DirectImage::load(&write_fixture(), island_handler())
+        let group = DirectLoadGroup::load(&write_fixture(), island_handler())
             .expect("load")
             .expect("eligible");
-        assert_eq!(image.svc_sites(), 1);
+        assert_eq!(group.main().svc_sites(), 1);
         let mut runner =
             DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
-        let entry = image.entry();
+        let entry = group.main().entry();
         // SAFETY: the image is patched and built with `island_handler`.
-        unsafe { with_runner(&mut runner, || image.enter(entry)) };
+        unsafe { with_runner(&mut runner, || group.enter(entry)) };
 
         assert_eq!(runner.syscalls(), 1, "exactly one syscall was serviced");
         assert_eq!(
@@ -322,14 +322,14 @@ mod tests {
             mov_reg(30, 20),
             0xd65f_03c0, // ret — reached only when the exit path is broken
         ]);
-        let image = DirectImage::load(&elf, island_handler())
+        let group = DirectLoadGroup::load(&elf, island_handler())
             .expect("load")
             .expect("eligible");
         let mut runner =
             DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
-        let entry = image.entry();
+        let entry = group.main().entry();
         // SAFETY: the image is patched and built with `island_handler`.
-        unsafe { with_runner(&mut runner, || image.enter(entry)) };
+        unsafe { with_runner(&mut runner, || group.enter(entry)) };
 
         assert_eq!(
             runner.outcome(),
@@ -377,14 +377,14 @@ mod tests {
             mov_reg(30, 20),
             0xd65f_03c0, // ret
         ]);
-        let image = DirectImage::load(&elf, island_handler())
+        let group = DirectLoadGroup::load(&elf, island_handler())
             .expect("load")
             .expect("eligible");
         let mut runner =
             DirectRunner::new(SyscallDispatcher::new(), IdentityMemory::new(0, u64::MAX));
-        let entry = image.entry();
+        let entry = group.main().entry();
         // SAFETY: the image is patched and built with `island_handler`.
-        unsafe { with_runner(&mut runner, || image.enter(entry)) };
+        unsafe { with_runner(&mut runner, || group.enter(entry)) };
 
         assert!(
             matches!(

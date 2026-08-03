@@ -173,7 +173,7 @@ memory planner. The only difference is how guest code reaches syscalls.
 - **The guest-leave contract.** A tier-D guest leaves guest execution ONLY
   through the handler: the handler requests it (`GuestContext::request_leave`)
   and the island's LEAVE LEG — never the guest's own code — restores the host
-  stack discipline captured by `DirectImage::enter` at entry (host SP + the
+  stack discipline captured by `DirectLoadGroup::enter` at entry (host SP + the
   landing point `blr` hands the guest in x30) and `ret`s to `enter`'s caller.
   The guest's complete register file, SP and resume `pc` stay parked in the
   `GuestContext`, which is the state `exit`/`execve`/signal orchestration
