@@ -1334,6 +1334,19 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 top,
                 processes_observed,
             } => crate::debug_census::run_xlat_census(&dir, top, processes_observed)?,
+            DebugCommand::TrustedRouteCensus {
+                trace,
+                capture,
+                snapshots,
+                jit_share,
+                output,
+            } => crate::debug_trusted_route::run_trusted_route_census(
+                &trace,
+                &capture,
+                &snapshots,
+                jit_share,
+                output.as_deref(),
+            )?,
             _ => bail!("debug (guest address-space inspection) is HVF-only on this build"),
         },
         Commands::TraceChild {

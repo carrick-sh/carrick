@@ -3366,6 +3366,7 @@ fn code_snapshot_index(pid: u32, snapshot: &dsr::CodeSnapshot) -> serde_json::Va
         "pid": pid,
         "cache_base": snapshot.cache_base,
         "code_len": snapshot.code.len(),
+        "code_sha256": format!("{:x}", sha2::Sha256::digest(&snapshot.code)),
         "blocks": &snapshot.blocks,
         "trusted_routes": &snapshot.trusted_routes,
     })
@@ -7863,6 +7864,10 @@ mod tests {
         assert_eq!(index["schema"], "carrick.code-snapshot.v2");
         assert_eq!(index["pid"], 42);
         assert_eq!(index["code_len"], 64);
+        assert_eq!(
+            index["code_sha256"],
+            format!("{:x}", sha2::Sha256::digest(&snapshot.code))
+        );
         assert_eq!(index["trusted_routes"][0]["generation"], 7);
         assert_eq!(index["trusted_routes"][0]["direct"]["start"], 0x1010);
         assert_eq!(index["trusted_routes"][0]["common_body"], 0x1030);
