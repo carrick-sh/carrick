@@ -1219,19 +1219,6 @@ pub(crate) enum PortableRecoveryAction {
 }
 
 impl PortableRecoveryAction {
-    pub(crate) fn encode_v3(
-        self,
-    ) -> Result<crate::mapped_metadata::wire::WireRecoveryActionV3, DsrError> {
-        crate::mapped_metadata::wire::WireRecoveryActionV3::from_portable(self)
-    }
-
-    pub(crate) fn decode_v3(
-        wire: crate::mapped_metadata::wire::WireRecoveryActionV3,
-        host_bias: Option<u64>,
-    ) -> Result<RecoveryAction, DsrError> {
-        wire.into_recovery_action(host_bias)
-    }
-
     fn normalize(action: RecoveryAction, bindings: &ArtifactBindings) -> Result<Self, DsrError> {
         Ok(match action {
             RecoveryAction::Noop => Self::Noop,
@@ -1869,6 +1856,73 @@ impl ArtifactTemplate {
         &self.source_words
     }
 
+    /// Whether every replay-relevant offset this template records lands
+    /// inside a code image of `code_len` bytes: relocation MOV-wide quads,
+    /// the trusted entry, direct-link slots and stub envelopes, PC-map
+    /// cache offsets, and recovery offsets. Geometry that fails here can
+    /// never replay, so unit publication refuses it up front (word-level
+    /// opcode validation still happens at replay, fail-closed per block).
+    pub(crate) fn replay_metadata_fits_code_len(&self, code_len: u32) -> bool {
+        let word_end = |first_word: u32| {
+            first_word
+                .checked_mul(4)
+                .and_then(|byte| byte.checked_add(16))
+        };
+        if !self
+            .relocations
+            .iter()
+            .all(|relocation| word_end(relocation.first_word).is_some_and(|end| end <= code_len))
+        {
+            return false;
+        }
+        if let Some(trusted) = self.trusted_entry
+            && (!trusted.offset.is_multiple_of(4) || trusted.offset >= code_len)
+        {
+            return false;
+        }
+        if !self.direct_links.iter().all(|link| {
+            link.slot
+                .get()
+                .checked_add(4)
+                .is_some_and(|end| end <= code_len)
+                && link.stub.start.get() < link.stub.end.get()
+                && link.stub.end.get() <= code_len
+        }) {
+            return false;
+        }
+        if !self.map.iter().all(|entry| entry.cache.get() < code_len) {
+            return false;
+        }
+        match &self.recovery {
+            PortableRecoveryMetadata::Entries(entries) => {
+                entries.iter().all(|entry| entry.cache.get() < code_len)
+            }
+            PortableRecoveryMetadata::Runs(runs) => runs
+                .iter()
+                .all(|run| run.last_cache().is_ok_and(|last| last < code_len)),
+        }
+    }
+
+    /// The recorded template words with every process relocation's immediate
+    /// zeroed — the exact bytes a translation unit persists in its `.code`
+    /// image (`PendingTranslationUnit::pack` concatenates these per block).
+    pub fn words(&self) -> &[u32] {
+        &self.words
+    }
+
+    pub fn trusted_entry(&self) -> Option<TrustedEntryTemplate> {
+        self.trusted_entry
+    }
+
+    /// Word index of the first recorded process relocation, for corruption
+    /// fixtures that must hit a validated site.
+    #[cfg(test)]
+    pub(crate) fn first_relocation_word_for_test(&self) -> Option<u32> {
+        self.relocations
+            .first()
+            .map(|relocation| relocation.first_word)
+    }
+
     pub fn direct_links(&self) -> &[DirectLink] {
         &self.direct_links
     }
@@ -1897,6 +1951,33 @@ impl ArtifactTemplate {
             runtime.recovery = std::mem::take(&mut runtime.recovery).into_runs()?;
         }
         Ok(runtime)
+    }
+
+    /// The per-block record a translation unit persists: everything replay
+    /// needs EXCEPT the words (which live in the unit's digest-bound `.code`
+    /// image) and the source words (the unit key fingerprints the whole
+    /// segment). Relocations, the trusted entry, direct links, the PC map,
+    /// and recovery all survive — this is what makes an installed unit block
+    /// indistinguishable from a natively-translated one.
+    pub fn into_unit_record_metadata(mut self, recovery_runs: bool) -> Result<Self, DsrError> {
+        self.words.clear();
+        self.source_words.clear();
+        if recovery_runs {
+            self.recovery = std::mem::take(&mut self.recovery).into_runs()?;
+        }
+        Ok(self)
+    }
+
+    /// Decompose a unit-record template (words already cleared) for replay
+    /// against words sliced from the unit's `.code` image.
+    pub(crate) fn into_unit_replay_parts(self) -> UnitReplayParts {
+        UnitReplayParts {
+            map: self.map,
+            recovery: self.recovery,
+            direct_links: self.direct_links,
+            relocations: self.relocations,
+            trusted_entry: self.trusted_entry,
+        }
     }
 
     pub fn take_runtime_metadata(
@@ -2210,6 +2291,52 @@ pub fn replay_artifact_owned(
         template.direct_links,
         &template.relocations,
         template.trusted_entry,
+        bindings,
+    )
+}
+
+/// The replay-relevant decomposition of a unit block's stored template
+/// (words live separately in the unit's `.code` image).
+pub(crate) struct UnitReplayParts {
+    map: Vec<PcMapEntry>,
+    recovery: PortableRecoveryMetadata,
+    direct_links: Vec<DirectLink>,
+    relocations: Vec<ArtifactRelocation>,
+    trusted_entry: Option<TrustedEntryTemplate>,
+}
+
+/// Replay one translation-unit block: words sliced from the unit's
+/// digest-bound `.code` image plus the block's recorded metadata, published
+/// into this process's own cache exactly like a native emission. Fails
+/// closed (the caller falls back to fresh translation) on any relocation,
+/// trusted-entry, or recovery mismatch — the words came from disk, so the
+/// trusted entry's baked materialization is re-validated here rather than
+/// trusted from the record alone.
+pub(crate) fn replay_unit_block(
+    cache: &mut TranslationCache,
+    words: Vec<u32>,
+    parts: UnitReplayParts,
+    bindings: &ArtifactBindings,
+) -> Result<EmittedBlock, DsrError> {
+    if let Some(trusted) = parts.trusted_entry {
+        let index = usize::try_from(trusted.offset / 4)
+            .map_err(|_| DsrError::CachePolicy("unit trusted-entry offset overflow".to_string()))?;
+        let expected_movz = 0xd280_0011 | (((trusted.expected & 0xffff) as u32) << 5);
+        if !trusted.offset.is_multiple_of(4) || words.get(index) != Some(&expected_movz) {
+            return Err(DsrError::CachePolicy(format!(
+                "unit trusted entry at byte {} does not materialize expected generation {}",
+                trusted.offset, trusted.expected
+            )));
+        }
+    }
+    replay_artifact_parts(
+        cache,
+        words,
+        parts.map,
+        parts.recovery.into_entries()?,
+        parts.direct_links,
+        &parts.relocations,
+        parts.trusted_entry,
         bindings,
     )
 }

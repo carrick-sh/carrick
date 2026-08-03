@@ -24,9 +24,9 @@ use carrick_dsr_aarch64::artifact_spike::{ArtifactBindings, ArtifactTemplate};
 use carrick_dsr_aarch64::emit::PcMapEntry;
 use carrick_dsr_aarch64::shared_cache::TranslationUnitStore as _;
 use carrick_dsr_aarch64::shared_cache::{
-    AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
-    ImageFileOffset, NativePageProfileIdentity, PendingTranslationUnit, PortableBlockRecord,
-    SourceFingerprint, TranslationUnitKey,
+    AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+    NativePageProfileIdentity, PendingTranslationUnit, PortableBlockRecord, SourceFingerprint,
+    TranslationUnitKey,
 };
 use carrick_dsr_aarch64::types::CacheOffset;
 use carrick_guest_mem::GuestVa;
@@ -80,19 +80,11 @@ fn pending_of_size(bytes: usize, seed: u8) -> PendingTranslationUnit {
         code: code.clone(),
         blocks: vec![PortableBlockRecord {
             guest_start: GuestVa(0x40_0000),
-            generation_binding: 0,
             entry_offset: 0,
             code_len: u32::try_from(code.len()).expect("bench unit fits u32"),
             requires_sensitive_metadata: false,
             template,
         }],
-        binding_layout: DirectBindingLayout::Disabled,
-        binding_export: String::new(),
-        binding_data_len: 0,
-        cell_size: 0,
-        bindings: Vec::new(),
-        binding_relocations: Vec::new(),
-        binding_data: Vec::new(),
     }
 }
 

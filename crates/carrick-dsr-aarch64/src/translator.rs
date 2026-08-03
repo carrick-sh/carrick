@@ -44,11 +44,9 @@ impl NativeDsrExitProbeExt for types::NativeDsrExit {
 
         match self {
             Self::Syscall { resume } => (DsrExitKind::Syscall, resume.raw(), 0, 1),
-            Self::ResolveDirect {
-                source,
-                target,
-                binding: _,
-            } => (DsrExitKind::DirectResolver, source.raw(), target.raw(), 2),
+            Self::ResolveDirect { source, target } => {
+                (DsrExitKind::DirectResolver, source.raw(), target.raw(), 2)
+            }
             Self::ResolveIndirect { source, target, .. } => {
                 (DsrExitKind::IndirectResolver, source.raw(), target.raw(), 3)
             }
@@ -140,34 +138,33 @@ fn active_host_jit() -> Result<&'static dyn NativeHostJit, types::DsrError> {
 const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
 
 /// The persistent per-image translation store is DEFAULT OFF; opt in with
-/// `CARRICK_DSR_PERSISTENT_STORE=1` (A/B arms, bisection). It is NOT
-/// finished enough to default on, and the blocker is measured, not
-/// structural: attached RECORDED-TEMPLATE units run materially slower than
-/// natively-emitted code on compute-bound paths — the awk-8M compute shape
-/// regresses 358 → ~594 ms (+65%, counterbalanced ABBA n=8,
-/// 2026-08-03 final scoreboard; reproduced +72-78% on 2026-08-03 lane G)
-/// once busybox's units attach, against a ~3% cold-build win and an 11%
-/// serial-micro win. Per the two-gates rule that trade cannot ship as a
-/// default. The election/persistence mechanics ARE sound (the old opt-in
-/// transport's 30% parallel-build regression is fixed by fork-claim
-/// clearing, first-miss election, per-host persistence).
+/// `CARRICK_DSR_PERSISTENT_STORE=1` (A/B arms, bisection).
 ///
-/// The quality delta is PROVEN at instruction level, and it is NOT fusion
-/// (`docs/perf-results/2026-08-03-store-template-parity-mechanism.md`):
-/// superblock and exclusive fusion are identical across arms. It is the
-/// BLOCK-ENTRY shape. A native block's patched direct links land at its
-/// TRUSTED ENTRY — three instructions past the generation guard — while a
-/// unit block is `GenerationGuard::BindingIndex`-guarded with no trusted
-/// entry, so every patched edge (the hot-loop back-edge included) re-runs
-/// an 11-instruction guard whose 4-deep dependent chain ends in an `ldar`.
-/// The re-flip condition is therefore: units carry NATIVE-emission
-/// templates (Absolute guard relocations + trusted entry + private-gateway
-/// exits — the recording tap of `emit_block_recording_artifact_optional`,
-/// word-identical by
-/// `emit::tests::recorded_emission_is_word_identical_to_native_emission`)
-/// and the install replays them per block through `publish_emitted`, in
-/// place of `record_portable_block_artifact`'s authority-mode emission and
-/// the copy-transport's trampoline/binding-table registration.
+/// The parity blocker that forced opt-in (`707fd9c5`) is FIXED
+/// architecturally: attached units used to run compute-bound shapes +65-78%
+/// slower (awk-8M 358 → ~594 ms) because
+/// `record_portable_block_artifact`'s authority-mode second emission gave
+/// unit blocks a `BindingIndex` guard with no trusted entry, so every
+/// patched edge re-ran an 11-instruction guard ending in an `ldar`
+/// (`docs/perf-results/2026-08-03-store-template-parity-mechanism.md`).
+/// Units now carry the NATIVE recording tap — the ONE emission's
+/// `ArtifactTemplate` with Absolute-guard relocations, the trusted entry,
+/// and private-gateway exits — and the install replays each block through
+/// `publish_emitted`, so an installed block is INDISTINGUISHABLE from a
+/// natively-translated one (word identity + trusted-entry registration +
+/// patched links past the guard pinned by
+/// `translator::tests::native_tap_unit_install` and
+/// `emit::tests::recorded_emission_is_word_identical_to_native_emission`).
+/// The `BindingIndex` guard, `PortableUnitAuthority` emission, edge
+/// trampolines, and the direct-binding cell sidecar are DELETED; the wire
+/// bumped to `TRANSLATOR_ABI_CURRENT = 7` + `{stem}.metadata-v4`, so
+/// pre-parity stores refuse cleanly to a miss and re-record.
+///
+/// The default stays opt-in ONLY until the coordinator's central quiet-box
+/// ABBA confirms store=1 within ~5% of store-unset on the awk-8M compute
+/// shape; flip here (and update this comment) when that lands. The
+/// election/persistence mechanics are sound (fork-claim clearing,
+/// first-miss election, per-host persistence, crash-safe rename+digest).
 pub fn persistent_store_runtime_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -186,9 +183,6 @@ fn persistent_store_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
 /// fully encoded words via `TranslationCache::patch_code_word`, so the
 /// displacement computation, `B`-range check, and opcode encoding stay here
 /// with the rest of the AArch64 layer.
-/// `nop` -- fills a trampoline reservation whose target proved unreachable.
-const NOP_AARCH64: u32 = 0xd503_201f;
-
 pub fn encode_aarch64_direct_branch(
     site: cache::LinkSite,
     target: types::CacheVa,
@@ -336,15 +330,6 @@ impl PreparedDirectBindingExecReset<'_, '_, '_> {
     pub fn commit(self) -> crate::direct_binding::ExecBindingClearStats {
         self.commit_inner(|_| {})
     }
-
-    #[cfg(test)]
-    fn commit_with_recorder(
-        self,
-        recorder: impl FnMut(DirectBindingResetEvent),
-    ) -> crate::direct_binding::ExecBindingClearStats {
-        self.commit_inner(recorder)
-    }
-
     fn commit_inner(
         self,
         mut recorder: impl FnMut(DirectBindingResetEvent),
@@ -355,39 +340,25 @@ impl PreparedDirectBindingExecReset<'_, '_, '_> {
             token,
             catalog,
         } = self;
-        let thread_tid = thread.tid;
+        let _ = thread.tid;
         token.consume();
         if let Some(catalog) = catalog {
             state.translated_ranges.commit_dormant_for_exec(catalog);
         }
-        let clear_stats = state.direct_bindings.clear_all_before_exec_with_evidence(
-            |phase| match phase {
-                crate::direct_binding::DirectBindingExecClearPhase::Cells => {
-                    recorder(DirectBindingResetEvent::CellsCleared);
-                    recorder(DirectBindingResetEvent::ThreadCachesCleared);
-                }
-                crate::direct_binding::DirectBindingExecClearPhase::Indexes => {
-                    recorder(DirectBindingResetEvent::IndexesCleared);
-                }
-                crate::direct_binding::DirectBindingExecClearPhase::Descriptors => {
-                    recorder(DirectBindingResetEvent::DescriptorsDropped);
-                }
-            },
-            |cell| {
-                probes::dsr_cache_event(
-                    thread_tid,
-                    probes::DsrCacheEventKind::DirectBindingClear,
-                    cell.get() as u64,
-                    crate::direct_binding::DirectBindingClearReason::ExecReset.raw(),
-                    0,
-                );
-            },
-        );
+        // No direct-binding cells exist any more (installed unit blocks are
+        // patched like native blocks), so the exec reset's clear phases are
+        // recorded for sequencing evidence but clear nothing.
+        let clear_started = std::time::Instant::now();
+        recorder(DirectBindingResetEvent::CellsCleared);
+        recorder(DirectBindingResetEvent::ThreadCachesCleared);
+        recorder(DirectBindingResetEvent::IndexesCleared);
+        recorder(DirectBindingResetEvent::DescriptorsDropped);
+        let clear_stats = crate::direct_binding::ExecBindingClearStats {
+            duration: clear_started.elapsed(),
+            ..Default::default()
+        };
         state.executable_ranges.reset_head_to_private();
         recorder(DirectBindingResetEvent::ExecutableRangeHeadReset);
-        state.shared_blocks.clear();
-        state.shared_guest_ranges.clear();
-        state.loaded_shared_units.clear();
         recorder(DirectBindingResetEvent::UnitsDropped);
         state.executable_ranges.drop_shared_nodes();
         recorder(DirectBindingResetEvent::ExecutableRangeNodesDropped);
@@ -438,21 +409,7 @@ pub struct PreparedEntry {
     // `pub` for the runtime's still-resident test suites and oracle.
     pub entry: types::CacheVa,
     pub generation: types::CodeGeneration,
-    cache_start: usize,
-    cache_end: usize,
     address_mode: carrick_dsr::address::NativeAddressMode,
-    generation_bindings: usize,
-    generation_binding_count: usize,
-    executable_range_catalog: *const gateway::ExecutableRangeCatalogHeader,
-    /// Whether THIS process has any shared translation unit installed.
-    /// Monotone within an exec epoch (exec reset drops units and thread
-    /// caches together), so a `false` read at prepare proves this thread's
-    /// indirect cache holds no shared-unit target and the trusted
-    /// private-cache gateway entry stays sound. Replaces the old
-    /// env-flag proxy, which forced every entry of every process onto the
-    /// validating arms the moment the lane was enabled — even in processes
-    /// that never installed a unit.
-    has_shared_units: bool,
 }
 
 pub struct PreparedExit {
@@ -704,16 +661,6 @@ struct TranslatedRangeCatalog {
     next_sequence: u64,
     ready_sequence: Option<u64>,
     private: std::ops::Range<carrick_guest_mem::HostVa>,
-    shared: Vec<CatalogSharedRange>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CatalogSharedRange {
-    sequence: probes::TranslatedRangeSequence,
-    unit_id: probes::TranslatedUnitId,
-    range: std::ops::Range<carrick_guest_mem::HostVa>,
-    event: probes::TranslatedSharedRange,
-    next_sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -751,7 +698,6 @@ impl TranslatedRangeCatalog {
             next_sequence: sequence.get(),
             ready_sequence: None,
             private,
-            shared: Vec::new(),
         })
     }
 
@@ -811,32 +757,7 @@ impl TranslatedRangeCatalog {
             probes::TranslatedPrivateRange::private(epoch, private_sequence, self.private.clone())
                 .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
 
-        let mut expected_sequence = 2_u64;
-        for entry in &self.shared {
-            let sequence =
-                probes::TranslatedRangeSequence::new(expected_sequence).map_err(|error| {
-                    types::DsrError::CachePolicy(format!(
-                        "translated-range fork replay sequence is invalid: {error}"
-                    ))
-                })?;
-            let next_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
-                types::DsrError::CachePolicy(
-                    "translated-range sequence overflow during fork replay".to_string(),
-                )
-            })?;
-            if entry.sequence != sequence
-                || entry.next_sequence != next_sequence
-                || entry.event.epoch() != self.epoch
-                || entry.event.sequence() != entry.sequence
-                || entry.event.unit_id() != entry.unit_id
-                || entry.event.range() != &entry.range
-            {
-                return Err(types::DsrError::CachePolicy(
-                    "translated-range catalog is inconsistent during fork replay".to_string(),
-                ));
-            }
-            expected_sequence = next_sequence;
-        }
+        let expected_sequence = 2_u64;
         if expected_sequence != self.next_sequence {
             return Err(types::DsrError::CachePolicy(
                 "translated-range sequence frontier is inconsistent during fork replay".to_string(),
@@ -858,15 +779,7 @@ impl TranslatedRangeCatalog {
 
         recorder.reset(reset);
         recorder.add(probes::TranslatedRangeAdd::Private(private));
-        for entry in &self.shared {
-            recorder.add(probes::TranslatedRangeAdd::Shared(
-                entry.event.replayed_in(epoch),
-            ));
-        }
         recorder.ready(ready);
-        for entry in &mut self.shared {
-            entry.event = entry.event.replayed_in(epoch);
-        }
         self.epoch = epoch;
         self.ready_sequence = Some(frontier);
         Ok(())
@@ -893,106 +806,7 @@ impl TranslatedRangeCatalog {
         self.epoch = prepared.next_epoch;
         self.next_sequence = 1;
         self.ready_sequence = None;
-        self.shared.clear();
     }
-
-    fn prepare_shared(
-        &mut self,
-        unit_id: probes::TranslatedUnitId,
-        range: std::ops::Range<carrick_guest_mem::HostVa>,
-    ) -> Result<CatalogSharedRange, types::DsrError> {
-        if self.ready_sequence.is_none() {
-            return Err(types::DsrError::CachePolicy(
-                "translated-range catalog is not active".to_string(),
-            ));
-        }
-        if self.sequence_frontier().checked_add(1) != Some(self.next_sequence) {
-            return Err(types::DsrError::CachePolicy(
-                "translated-range sequence frontier is inconsistent".to_string(),
-            ));
-        }
-        // The copied-unit transport installs shared code INSIDE the private
-        // cache (one executable authority), so a shared entry is a SUBRANGE
-        // of the private range carrying unit identity — the dlopen-era rule
-        // ("must not overlap the private cache") inverted into containment.
-        if !(self.private.start <= range.start && range.end <= self.private.end) {
-            return Err(types::DsrError::CachePolicy(format!(
-                "shared translated range 0x{:x}..0x{:x} must lie inside the private cache 0x{:x}..0x{:x}",
-                range.start.raw(),
-                range.end.raw(),
-                self.private.start.raw(),
-                self.private.end.raw(),
-            )));
-        }
-        if self.shared.iter().any(|entry| entry.unit_id == unit_id) {
-            return Err(types::DsrError::CachePolicy(
-                "shared translated unit identity is duplicated".to_string(),
-            ));
-        }
-        if self
-            .shared
-            .iter()
-            .any(|entry| ranges_overlap(&entry.range, &range))
-        {
-            return Err(types::DsrError::CachePolicy(
-                "shared translated ranges overlap".to_string(),
-            ));
-        }
-        let sequence =
-            probes::TranslatedRangeSequence::new(self.next_sequence).map_err(|error| {
-                types::DsrError::CachePolicy(format!(
-                    "shared translated-range sequence is invalid: {error}"
-                ))
-            })?;
-        let next_sequence = sequence.get().checked_add(1).ok_or_else(|| {
-            types::DsrError::CachePolicy(
-                "translated-range sequence overflow during shared preparation".to_string(),
-            )
-        })?;
-        let event =
-            probes::TranslatedSharedRange::shared(self.epoch, sequence, unit_id, range.clone())
-                .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
-        self.shared.try_reserve(1).map_err(|error| {
-            types::DsrError::CachePolicy(format!(
-                "shared translated-range catalog reservation failed: {error}"
-            ))
-        })?;
-        Ok(CatalogSharedRange {
-            sequence,
-            unit_id,
-            range,
-            event,
-            next_sequence,
-        })
-    }
-
-    fn commit_shared(&mut self, prepared: CatalogSharedRange) {
-        let mut recorder = DsrTranslatedRangeRecorder;
-        self.commit_shared_with_recorder(prepared, &mut recorder);
-    }
-
-    fn commit_shared_with_recorder(
-        &mut self,
-        prepared: CatalogSharedRange,
-        recorder: &mut dyn TranslatedRangeRecorder,
-    ) {
-        let next_sequence = prepared.next_sequence;
-        let event = prepared.event.clone();
-        self.shared.push(prepared);
-        recorder.add(probes::TranslatedRangeAdd::Shared(event));
-        self.next_sequence = next_sequence;
-    }
-
-    fn sequence_frontier(&self) -> u64 {
-        self.next_sequence.saturating_sub(1)
-    }
-}
-
-fn ranges_overlap(
-    left: &std::ops::Range<carrick_guest_mem::HostVa>,
-    right: &std::ops::Range<carrick_guest_mem::HostVa>,
-) -> bool {
-    left.start < right.end && right.start < left.end
 }
 
 impl Drop for ProcessTranslator {
@@ -1044,39 +858,19 @@ pub struct ProcessState {
     pub unsupported:
         BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), (u32, bad64::Op)>,
     pub published: Vec<PublishedBlock>,
-    /// `published` indices for blocks emitted into the private bump-allocated
-    /// code cache, ascending by cache entry address.
+    /// `published` indices ascending by cache entry address. Installed unit
+    /// blocks replay into the same bump-allocated cache as native
+    /// translations, so one index covers every published block.
     private_published_index: Vec<PublishedIndexEntry>,
-    /// `published` indices for blocks mapped from shared translation units,
-    /// ascending by cache entry address. Kept apart from the private index
-    /// because a unit's own mapping can sit anywhere relative to the private
-    /// cursor -- see [`ProcessState::push_published`].
-    shared_published_index: Vec<PublishedIndexEntry>,
     pub dependencies: cache::PageBlockDependencies,
     pub profiling: bool,
     artifact_image_digest: Option<[u8; 32]>,
     shared_translation: Option<SharedTranslationConfiguration>,
-    shared_blocks:
-        BTreeMap<(carrick_guest_mem::GuestVa, types::CodeGeneration), SharedBlockAuthority>,
-    /// Guest `[start, end)` of every block mapped from a loaded shared unit,
-    /// sorted and non-overlapping, for classifying a guest PC as shared or
-    /// private.
-    ///
-    /// `shared_blocks` is keyed by block START, which answers "is this PC a
-    /// shared block's ENTRY" -- not "is this PC inside shared code". Those differ
-    /// for every PC that is not an entry, and `PlannedExit::Direct` carries the
-    /// BRANCHING instruction's PC, which is an entry only for a one-instruction
-    /// block. Classifying exits with the start-keyed map is exactly what produced
-    /// the retracted `shared_source=178` reading in
-    /// `docs/perf-results/2026-07-29-native-cpu-budget-evidence.md` run 6.
-    shared_guest_ranges: Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>,
-    loaded_shared_units: Vec<LoadedSharedUnit>,
     shared_unit_segments_consulted: BTreeSet<carrick_guest_mem::GuestVa>,
     shared_recording_segments: BTreeSet<carrick_guest_mem::GuestVa>,
     shared_candidates:
         BTreeMap<carrick_guest_mem::GuestVa, Vec<crate::shared_cache::PortableBlockCandidate>>,
     shared_publish_attempted: bool,
-    direct_bindings: crate::direct_binding::DirectBindingRegistry,
     executable_ranges: gateway::ExecutableRangeCatalog,
     /// Guest blocks one emitted block may fuse (1 = no superblock formation).
     /// Resolved once from `block::superblock_segment_limit()`; the only site
@@ -1084,390 +878,9 @@ pub struct ProcessState {
     superblock_segments: usize,
 }
 
-#[cfg(test)]
-#[derive(Debug, Eq, PartialEq)]
-struct SharedInstallLogicalSnapshot {
-    catalog_frontier: u64,
-    catalog_ready: Option<u64>,
-    catalog_shared: Vec<CatalogSharedRange>,
-    blocks: Vec<(
-        (carrick_guest_mem::GuestVa, types::CodeGeneration),
-        types::CacheVa,
-    )>,
-    sensitive: Vec<(
-        (carrick_guest_mem::GuestVa, types::CodeGeneration),
-        SensitiveMetadata,
-    )>,
-    fusion_sites: [Vec<(u64, u32)>; profile::ExclusiveFusionClass::COUNT],
-    published_len: usize,
-    private_published_index: Vec<PublishedIndexEntry>,
-    shared_published_index: Vec<PublishedIndexEntry>,
-    dependencies: Vec<(
-        carrick_guest_mem::GuestVa,
-        Vec<(carrick_guest_mem::GuestVa, types::CodeGeneration)>,
-    )>,
-    shared_blocks: Vec<(
-        (carrick_guest_mem::GuestVa, types::CodeGeneration),
-        SharedBlockAuthority,
-    )>,
-    shared_guest_ranges: Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>,
-    loaded_unit_ids: Vec<probes::TranslatedUnitId>,
-    direct_bindings: crate::direct_binding::DirectBindingLogicalSnapshot,
-    direct_binding_units: usize,
-    stats: ResolverStats,
-    reported_stats: ResolverStats,
-    executable_head: usize,
-    executable_nodes: usize,
-}
-
 struct SharedTranslationConfiguration {
     image: crate::shared_cache::SharedImageConfig,
     store: Arc<dyn crate::shared_cache::TranslationUnitStore>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SharedBlockAuthority {
-    generation_bindings: usize,
-    generation_binding_count: usize,
-    cache_start: usize,
-    cache_end: usize,
-    target_authority: usize,
-    loaded_unit_index: usize,
-}
-
-impl SharedBlockAuthority {
-    fn owns(self, entry: types::CacheVa) -> bool {
-        let address = entry.host().raw();
-        (self.cache_start..self.cache_end).contains(&address)
-    }
-}
-
-struct LoadedSharedUnit {
-    #[allow(
-        dead_code,
-        reason = "retained for the shared catalog replay slice after Task 2b"
-    )]
-    unit_id: probes::TranslatedUnitId,
-    _unit: crate::shared_cache::SharedLoadedTranslationUnit,
-    _generation_bindings: Box<[gateway::GenerationBinding]>,
-    _target_authority: Box<gateway::TargetCacheAuthority>,
-    _direct_binding_unit_index: Option<usize>,
-}
-
-/// Every binding relocation carried by a loaded unit's metadata, in ordinal
-/// order, as one owned list the install copy can patch from — the V2 arm
-/// stores them directly, the V3 arm stores one wire record per binding.
-fn unit_binding_relocations(
-    metadata: &crate::shared_cache::LoadedTranslationMetadata,
-) -> Result<Vec<crate::shared_cache::DirectBindingRelocation>, types::DsrError> {
-    match metadata {
-        crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => {
-            Ok(manifest.binding_relocations.clone())
-        }
-        crate::shared_cache::LoadedTranslationMetadata::V3(mapped) => {
-            // A `Disabled`-layout unit carries bindings but NO relocations and
-            // no cell block; walking one relocation per binding would read
-            // records that do not exist (the exact bug the loader's
-            // `disabled_layout_units_need_no_binding_code_validation` test
-            // pinned down).
-            if mapped.binding_data_len() == 0 {
-                return Ok(Vec::new());
-            }
-            (0..mapped.binding_count())
-                .map(|index| {
-                    mapped
-                        .binding(index)
-                        .map(|binding| binding.relocation())
-                        .ok_or_else(|| {
-                            types::DsrError::CachePolicy(
-                                "mapped binding relocation index is invalid".to_string(),
-                            )
-                        })
-                })
-                .collect()
-        }
-    }
-}
-
-struct PreparedSharedInstall {
-    tid: i32,
-    cache_range: std::ops::Range<usize>,
-    catalog_entry: CatalogSharedRange,
-    blocks: Vec<PreparedSharedBlock>,
-    sensitive_updates: Vec<(
-        (carrick_guest_mem::GuestVa, types::CodeGeneration),
-        SensitiveMetadata,
-    )>,
-    shared_published_index: Vec<PublishedIndexEntry>,
-    normalized_guest_ranges: Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>,
-    loaded_unit: LoadedSharedUnit,
-    direct_binding: crate::direct_binding::PreparedDirectBindingUnit,
-    page_dependencies: carrick_dsr::cache::PreparedPageBlockDependencies,
-    executable_range: gateway::PreparedExecutableRange,
-    direct_binding_probe: DirectBindingUnitLoadedProbe,
-    metadata_load_evidence: crate::shared_cache::TranslationMetadataLoadEvidence,
-    guest_range_derivations: u64,
-    direct_edge_group_builds: u64,
-}
-
-struct PreparedSharedBlock {
-    key: (carrick_guest_mem::GuestVa, types::CodeGeneration),
-    entry: types::CacheVa,
-    published: PublishedBlock,
-    fusion_site: Option<types::ExclusiveFusionSite>,
-    authority: SharedBlockAuthority,
-}
-
-#[derive(Clone, Copy)]
-struct LoadedBlockScalars {
-    guest_start: carrick_guest_mem::GuestVa,
-    generation_binding: u32,
-}
-
-fn loaded_block_scalars(
-    metadata: &crate::shared_cache::LoadedTranslationMetadata,
-    index: usize,
-) -> Option<LoadedBlockScalars> {
-    match metadata {
-        crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => {
-            let block = manifest.blocks.get(index)?;
-            Some(LoadedBlockScalars {
-                guest_start: block.guest_start,
-                generation_binding: block.generation_binding,
-            })
-        }
-        crate::shared_cache::LoadedTranslationMetadata::V3(metadata) => {
-            let block = metadata.block(index)?;
-            Some(LoadedBlockScalars {
-                guest_start: block.guest_start(),
-                generation_binding: block.generation_binding(),
-            })
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SharedInstallCommitPhase {
-    CatalogSharedAdd,
-    LogicalStateInstalled,
-    ExecutableHeadPublished,
-}
-
-#[cfg(test)]
-trait SharedInstallCommitObserver {
-    fn observe(&mut self, phase: SharedInstallCommitPhase, state: &ProcessState);
-}
-
-#[derive(Clone, Copy)]
-struct DirectBindingUnitLoadedProbe {
-    digest: u64,
-    record_count: u64,
-    data_bytes: u64,
-}
-
-fn typed_unit_id_from_digest(digest: u64) -> Result<probes::TranslatedUnitId, types::DsrError> {
-    probes::TranslatedUnitId::new(digest).map_err(|error| {
-        types::DsrError::CachePolicy(format!(
-            "shared translated unit identity is invalid: {error}"
-        ))
-    })
-}
-
-fn translated_unit_id(
-    key: &crate::shared_cache::TranslationUnitKey,
-) -> Result<probes::TranslatedUnitId, types::DsrError> {
-    typed_unit_id_from_digest(crate::direct_binding::direct_binding_unit_digest(key)?)
-}
-
-fn exact_guest_ranges_from_pc_map(
-    guest_start: carrick_guest_mem::GuestVa,
-    block_code_len: usize,
-    map: &[emit::PcMapEntry],
-) -> Result<Vec<std::ops::Range<carrick_guest_mem::GuestVa>>, types::DsrError> {
-    if map.is_empty() {
-        return Err(types::DsrError::CachePolicy(
-            "shared block has an empty PC map".to_string(),
-        ));
-    }
-    let mut guest_pcs = Vec::new();
-    guest_pcs.try_reserve(map.len()).map_err(|error| {
-        types::DsrError::CachePolicy(format!(
-            "shared block PC-map guest reservation failed: {error}"
-        ))
-    })?;
-    let mut previous_cache = None;
-    let mut contains_start = false;
-    for entry in map {
-        let cache = usize::try_from(entry.cache.get()).map_err(|_| {
-            types::DsrError::CachePolicy(
-                "shared block PC-map cache offset does not fit usize".to_string(),
-            )
-        })?;
-        if !cache.is_multiple_of(4)
-            || cache >= block_code_len
-            || previous_cache.is_some_and(|previous| previous >= cache)
-        {
-            return Err(types::DsrError::CachePolicy(
-                "shared block PC-map cache offsets must be aligned, in bounds, and strictly increasing"
-                    .to_string(),
-            ));
-        }
-        if !entry.guest.raw().is_multiple_of(4) {
-            return Err(types::DsrError::CachePolicy(
-                "shared block PC-map guest PC is not four-byte aligned".to_string(),
-            ));
-        }
-        entry.guest.raw().checked_add(4).ok_or_else(|| {
-            types::DsrError::CachePolicy("shared block PC-map guest PC overflows".to_string())
-        })?;
-        contains_start |= entry.guest == guest_start;
-        previous_cache = Some(cache);
-        guest_pcs.push(entry.guest);
-    }
-    if !contains_start {
-        return Err(types::DsrError::CachePolicy(
-            "shared block PC map omits its declared guest start".to_string(),
-        ));
-    }
-    guest_pcs.sort_unstable();
-    guest_pcs.dedup();
-
-    let mut ranges: Vec<std::ops::Range<carrick_guest_mem::GuestVa>> = Vec::new();
-    ranges.try_reserve(guest_pcs.len()).map_err(|error| {
-        types::DsrError::CachePolicy(format!(
-            "shared block guest-range reservation failed: {error}"
-        ))
-    })?;
-    for guest in guest_pcs {
-        let end = carrick_guest_mem::GuestVa(guest.raw().checked_add(4).ok_or_else(|| {
-            types::DsrError::CachePolicy("shared block guest range overflows".to_string())
-        })?);
-        if let Some(previous) = ranges.last_mut()
-            && previous.end == guest
-        {
-            previous.end = end;
-        } else {
-            ranges.push(guest..end);
-        }
-    }
-    Ok(ranges)
-}
-
-fn normalized_guest_range_union(
-    existing: &[(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)],
-    additions: &[std::ops::Range<carrick_guest_mem::GuestVa>],
-) -> Result<Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>, types::DsrError> {
-    let count = existing.len().checked_add(additions.len()).ok_or_else(|| {
-        types::DsrError::CachePolicy("shared guest-range count overflow".to_string())
-    })?;
-    let mut ranges = Vec::new();
-    ranges.try_reserve(count).map_err(|error| {
-        types::DsrError::CachePolicy(format!(
-            "shared guest-range union reservation failed: {error}"
-        ))
-    })?;
-    for &(start, end) in existing {
-        validate_guest_interval(start, end)?;
-        ranges.push((start, end));
-    }
-    for addition in additions {
-        validate_guest_interval(addition.start, addition.end)?;
-        ranges.push((addition.start, addition.end));
-    }
-    ranges.sort_unstable();
-
-    let mut normalized: Vec<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)> = Vec::new();
-    normalized.try_reserve(ranges.len()).map_err(|error| {
-        types::DsrError::CachePolicy(format!(
-            "normalized shared guest-range reservation failed: {error}"
-        ))
-    })?;
-    for (start, end) in ranges {
-        if let Some(previous) = normalized.last_mut()
-            && start <= previous.1
-        {
-            if end > previous.1 {
-                previous.1 = end;
-            }
-        } else {
-            normalized.push((start, end));
-        }
-    }
-    Ok(normalized)
-}
-
-fn validate_guest_interval(
-    start: carrick_guest_mem::GuestVa,
-    end: carrick_guest_mem::GuestVa,
-) -> Result<(), types::DsrError> {
-    if start >= end || !start.raw().is_multiple_of(4) || !end.raw().is_multiple_of(4) {
-        return Err(types::DsrError::CachePolicy(format!(
-            "shared guest interval is empty, reversed, or unaligned: 0x{:x}..0x{:x}",
-            start.raw(),
-            end.raw(),
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SharedInstallPrepareStage {
-    Manifest,
-    Identity,
-    Catalog,
-    CollisionPreflight,
-    GenerationAuthorities,
-    BlockMetadata,
-    GuestUnion,
-    DirectBinding,
-    ProcessVectors,
-    PageDependencies,
-    ExecutableRange,
-    FinalConsistency,
-}
-
-#[cfg(test)]
-impl SharedInstallPrepareStage {
-    const ALL: [Self; 12] = [
-        Self::Manifest,
-        Self::Identity,
-        Self::Catalog,
-        Self::CollisionPreflight,
-        Self::GenerationAuthorities,
-        Self::BlockMetadata,
-        Self::GuestUnion,
-        Self::DirectBinding,
-        Self::ProcessVectors,
-        Self::PageDependencies,
-        Self::ExecutableRange,
-        Self::FinalConsistency,
-    ];
-}
-
-#[cfg(test)]
-thread_local! {
-    static SHARED_INSTALL_PREPARE_FAILPOINT: std::cell::Cell<Option<SharedInstallPrepareStage>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn set_shared_install_prepare_failpoint_for_test(stage: Option<SharedInstallPrepareStage>) {
-    SHARED_INSTALL_PREPARE_FAILPOINT.set(stage);
-}
-
-#[cfg(test)]
-fn shared_install_prepare_checkpoint(
-    stage: SharedInstallPrepareStage,
-) -> Result<(), types::DsrError> {
-    if SHARED_INSTALL_PREPARE_FAILPOINT.get() == Some(stage) {
-        SHARED_INSTALL_PREPARE_FAILPOINT.set(None);
-        return Err(types::DsrError::CachePolicy(format!(
-            "injected shared-install preparation failure at {stage:?}"
-        )));
-    }
-    Ok(())
 }
 
 const fn translation_source_words_required(
@@ -1524,60 +937,10 @@ pub struct TranslationResult {
 pub struct PublishedBlock {
     pub entry: types::CacheVa,
     pub len: usize,
-    metadata: PublishedBlockMetadata,
+    map: Vec<emit::PcMapEntry>,
+    recovery: Vec<emit::RecoveryEntry>,
     pub _generation: cache::PageGenerationObservation,
 }
-
-enum PublishedBlockMetadata {
-    Owned {
-        map: Vec<emit::PcMapEntry>,
-        recovery: Vec<emit::RecoveryEntry>,
-        shared_recovery: Option<SharedRecoveryMetadata>,
-    },
-    Mapped {
-        loaded_unit_index: usize,
-        block_index: u32,
-    },
-}
-
-impl PublishedBlock {
-    #[cfg(test)]
-    fn owned_record_count(&self) -> usize {
-        match &self.metadata {
-            PublishedBlockMetadata::Owned {
-                map,
-                recovery,
-                shared_recovery,
-            } => {
-                map.len()
-                    + recovery.len()
-                    + shared_recovery
-                        .as_ref()
-                        .map_or(0, |metadata| metadata.recovery.entry_count())
-            }
-            PublishedBlockMetadata::Mapped { .. } => 0,
-        }
-    }
-}
-
-struct SharedRecoveryMetadata {
-    recovery: artifact_spike::PortableRecoveryMetadata,
-    host_bias: Option<u64>,
-}
-
-static SHARED_RECOVERY_LAZY_ENABLED: OnceLock<bool> = OnceLock::new();
-
-fn shared_recovery_lazy_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("0"))
-}
-
-fn shared_recovery_lazy_enabled() -> bool {
-    *SHARED_RECOVERY_LAZY_ENABLED.get_or_init(|| {
-        let value = std::env::var_os("CARRICK_DSR_SHARED_RECOVERY_LAZY");
-        shared_recovery_lazy_enabled_from(value.as_deref())
-    })
-}
-
 /// One entry of an address-ordered index over [`ProcessState::published`]:
 /// where a block's emitted code starts, and where the block itself sits in
 /// publication order.
@@ -1585,54 +948,6 @@ fn shared_recovery_lazy_enabled() -> bool {
 struct PublishedIndexEntry {
     start: carrick_guest_mem::HostVa,
     block: usize,
-}
-
-fn merge_published_indexes(
-    current: &[PublishedIndexEntry],
-    incoming: &[PublishedIndexEntry],
-) -> Result<Vec<PublishedIndexEntry>, types::DsrError> {
-    let strictly_ordered = |entries: &[PublishedIndexEntry]| {
-        entries.windows(2).all(|pair| pair[0].start < pair[1].start)
-    };
-    if !strictly_ordered(current) || !strictly_ordered(incoming) {
-        return Err(types::DsrError::CachePolicy(
-            "shared published-block index is not strictly ordered".to_string(),
-        ));
-    }
-    let total = current.len().checked_add(incoming.len()).ok_or_else(|| {
-        types::DsrError::CachePolicy("shared published-index count overflow".to_string())
-    })?;
-    let mut merged = Vec::new();
-    merged.try_reserve_exact(total).map_err(|error| {
-        types::DsrError::CachePolicy(format!(
-            "shared published-index reservation failed: {error}"
-        ))
-    })?;
-    let mut current_index = 0;
-    let mut incoming_index = 0;
-    while current_index < current.len() && incoming_index < incoming.len() {
-        match current[current_index]
-            .start
-            .cmp(&incoming[incoming_index].start)
-        {
-            std::cmp::Ordering::Less => {
-                merged.push(current[current_index]);
-                current_index += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                merged.push(incoming[incoming_index]);
-                incoming_index += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                return Err(types::DsrError::CachePolicy(
-                    "shared published-block index collides".to_string(),
-                ));
-            }
-        }
-    }
-    merged.extend_from_slice(&current[current_index..]);
-    merged.extend_from_slice(&incoming[incoming_index..]);
-    Ok(merged)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2263,24 +1578,12 @@ impl ThreadTranslator {
             nested_translation_ns: self.nested_translation_ns,
             cache_used_bytes: process.cache.used_bytes(),
             cache_capacity_bytes: process.cache.capacity_bytes(),
-            direct_binding_owner_validation_failures: process
-                .direct_bindings
-                .counters()
-                .owner_validation_failures,
-            direct_binding_authority_validation_failures: process
-                .direct_bindings
-                .counters()
-                .authority_validation_failures,
-            direct_binding_cas_wins: process.direct_bindings.counters().cas_wins,
-            direct_binding_cas_losses: process.direct_bindings.counters().cas_losses,
-            direct_binding_stale_winner_clears: process
-                .direct_bindings
-                .counters()
-                .stale_winner_clears,
-            direct_binding_publication_retries: process
-                .direct_bindings
-                .counters()
-                .publication_retries,
+            direct_binding_owner_validation_failures: 0,
+            direct_binding_authority_validation_failures: 0,
+            direct_binding_cas_wins: 0,
+            direct_binding_cas_losses: 0,
+            direct_binding_stale_winner_clears: 0,
+            direct_binding_publication_retries: 0,
             resolve_private_to_shared_distinct_edges: self.profiled_private_to_shared_edges.len()
                 as u64,
             resolve_private_to_private_distinct_edges: self.profiled_private_to_private_edges.len()
@@ -2341,24 +1644,12 @@ impl ThreadTranslator {
             nested_translation_ns: self.nested_translation_ns,
             cache_used_bytes: process.cache.used_bytes(),
             cache_capacity_bytes: process.cache.capacity_bytes(),
-            direct_binding_owner_validation_failures: process
-                .direct_bindings
-                .counters()
-                .owner_validation_failures,
-            direct_binding_authority_validation_failures: process
-                .direct_bindings
-                .counters()
-                .authority_validation_failures,
-            direct_binding_cas_wins: process.direct_bindings.counters().cas_wins,
-            direct_binding_cas_losses: process.direct_bindings.counters().cas_losses,
-            direct_binding_stale_winner_clears: process
-                .direct_bindings
-                .counters()
-                .stale_winner_clears,
-            direct_binding_publication_retries: process
-                .direct_bindings
-                .counters()
-                .publication_retries,
+            direct_binding_owner_validation_failures: 0,
+            direct_binding_authority_validation_failures: 0,
+            direct_binding_cas_wins: 0,
+            direct_binding_cas_losses: 0,
+            direct_binding_stale_winner_clears: 0,
+            direct_binding_publication_retries: 0,
             resolve_private_to_shared_distinct_edges: self.profiled_private_to_shared_edges.len()
                 as u64,
             resolve_private_to_private_distinct_edges: self.profiled_private_to_private_edges.len()
@@ -2429,24 +1720,12 @@ impl ThreadTranslator {
             // Point-in-time gauges, never deltas: real live reads.
             cache_used_bytes: process_state.cache.used_bytes(),
             cache_capacity_bytes: process_state.cache.capacity_bytes(),
-            direct_binding_owner_validation_failures: process_state
-                .direct_bindings
-                .counters()
-                .owner_validation_failures,
-            direct_binding_authority_validation_failures: process_state
-                .direct_bindings
-                .counters()
-                .authority_validation_failures,
-            direct_binding_cas_wins: process_state.direct_bindings.counters().cas_wins,
-            direct_binding_cas_losses: process_state.direct_bindings.counters().cas_losses,
-            direct_binding_stale_winner_clears: process_state
-                .direct_bindings
-                .counters()
-                .stale_winner_clears,
-            direct_binding_publication_retries: process_state
-                .direct_bindings
-                .counters()
-                .publication_retries,
+            direct_binding_owner_validation_failures: 0,
+            direct_binding_authority_validation_failures: 0,
+            direct_binding_cas_wins: 0,
+            direct_binding_cas_losses: 0,
+            direct_binding_stale_winner_clears: 0,
+            direct_binding_publication_retries: 0,
             // Process-wide deltas: owned by the draining thread's own record
             // (see the doc comment above); structurally zero here.
             translations: 0,
@@ -2740,21 +2019,14 @@ impl ProcessTranslator {
                 unsupported: BTreeMap::new(),
                 published: Vec::new(),
                 private_published_index: Vec::new(),
-                shared_published_index: Vec::new(),
                 dependencies: cache::PageBlockDependencies::default(),
                 profiling: std::env::var_os("CARRICK_DSR_PROFILE").is_some(),
                 artifact_image_digest: None,
                 shared_translation: None,
-                shared_blocks: BTreeMap::new(),
-                shared_guest_ranges: Vec::new(),
-                loaded_shared_units: Vec::new(),
                 shared_unit_segments_consulted: BTreeSet::new(),
                 shared_recording_segments: BTreeSet::new(),
                 shared_candidates: BTreeMap::new(),
                 shared_publish_attempted: false,
-                direct_bindings: crate::direct_binding::DirectBindingRegistry::new(
-                    crate::shared_cache::direct_binding_runtime_enabled(),
-                ),
                 executable_ranges: gateway::ExecutableRangeCatalog::new(
                     cache_range.start,
                     cache_range.end,
@@ -2786,44 +2058,13 @@ impl ProcessTranslator {
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    pub fn add_translated_range_for_test(
-        &self,
-        unit_id: u64,
-        range: std::ops::Range<u64>,
-    ) -> Result<(), types::DsrError> {
-        let start = usize::try_from(range.start).map_err(|_| {
-            types::DsrError::CachePolicy(format!(
-                "test translated-range start is not representable: 0x{:x}",
-                range.start,
-            ))
-        })?;
-        let end = usize::try_from(range.end).map_err(|_| {
-            types::DsrError::CachePolicy(format!(
-                "test translated-range end is not representable: 0x{:x}",
-                range.end,
-            ))
-        })?;
-        let unit_id = probes::TranslatedUnitId::new(unit_id)
-            .map_err(|error| types::DsrError::CachePolicy(error.to_string()))?;
-        let mut state = self.state.write();
-        let prepared = state.translated_ranges.prepare_shared(
-            unit_id,
-            carrick_guest_mem::HostVa(start)..carrick_guest_mem::HostVa(end),
-        )?;
-        state.translated_ranges.commit_shared(prepared);
-        Ok(())
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn translated_range_catalog_state_for_test(&self) -> (u64, u64, Option<u64>, usize) {
+    pub fn translated_range_catalog_state_for_test(&self) -> (u64, u64, Option<u64>) {
         let state = self.state.read();
         let catalog = &state.translated_ranges;
         (
             catalog.epoch.get(),
-            catalog.sequence_frontier(),
+            catalog.next_sequence.saturating_sub(1),
             catalog.ready_sequence,
-            catalog.shared.len(),
         )
     }
 
@@ -2936,11 +2177,6 @@ impl ProcessTranslator {
         };
         let (image, store) = configuration;
         let mut outcomes = Vec::new();
-        let binding_layout = if crate::shared_cache::direct_binding_runtime_enabled() {
-            crate::shared_cache::DirectBindingLayout::SidecarV1
-        } else {
-            crate::shared_cache::DirectBindingLayout::Disabled
-        };
         for segment in &image.segments {
             let Some(candidates) = batches.remove(&segment.guest_start) else {
                 continue;
@@ -2958,7 +2194,6 @@ impl ProcessTranslator {
             let pending = crate::shared_cache::PendingTranslationUnit::pack(
                 image.key_for_segment(segment),
                 candidates,
-                binding_layout,
             )?;
             let publish_started = std::time::Instant::now();
             let publish_result = store.publish(&pending);
@@ -2982,32 +2217,6 @@ impl ProcessTranslator {
             .map_or(0, |configuration| configuration.image.segments.len())
     }
 
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn enable_direct_bindings_for_test(&self) {
-        self.state.write().direct_bindings =
-            crate::direct_binding::DirectBindingRegistry::new(true);
-    }
-
-    /// The binding-cell base of the INSTALLED shared unit whose key starts at
-    /// `guest`, if one is loaded. Under the copy transport the cells a
-    /// traversal publishes into belong to the unit the TRANSLATOR loaded at
-    /// install — a fixture's own separate store load observes a different,
-    /// never-consulted cell block, so tests must read this one.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn shared_unit_binding_base_for_test(
-        &self,
-        guest: carrick_guest_mem::GuestVa,
-    ) -> Option<crate::direct_binding::DirectBindingCellVa> {
-        let state = self.state.read();
-        state.loaded_shared_units.iter().find_map(|unit| {
-            (unit._unit.key().guest_va_start() == guest)
-                .then_some(unit._unit.binding_base)
-                .flatten()
-        })
-    }
-
     #[doc(hidden)]
     pub fn lifecycle_snapshot(&self) -> (u64, u64, u64) {
         let state = self.state.read();
@@ -3024,31 +2233,12 @@ impl ProcessTranslator {
         let mut recorder = DsrTranslatedRangeRecorder;
         self.after_fork_child_inner(&mut recorder)
     }
-
-    #[cfg(test)]
-    fn after_fork_child_with_recorder(
-        &self,
-        recorder: &mut impl ForkChildRepairRecorder,
-    ) -> Result<crate::direct_binding::ForkBindingClearStats, types::DsrError> {
-        self.after_fork_child_inner(recorder)
-    }
-
     fn after_fork_child_inner(
         &self,
         recorder: &mut impl ForkChildRepairRecorder,
     ) -> Result<crate::direct_binding::ForkBindingClearStats, types::DsrError> {
         let mut state = self.state.write();
-        let direct_binding_stats = state
-            .direct_bindings
-            .clear_inherited_after_fork_with_recorder(|cell| {
-                probes::dsr_cache_event(
-                    0,
-                    probes::DsrCacheEventKind::DirectBindingClear,
-                    cell.get() as u64,
-                    crate::direct_binding::DirectBindingClearReason::ForkReset.raw(),
-                    0,
-                );
-            });
+        let direct_binding_stats = crate::direct_binding::ForkBindingClearStats::default();
         state.cache.after_fork_child();
         state.stats = ResolverStats::default();
         state.reported_stats = ResolverStats::default();
@@ -3083,19 +2273,6 @@ impl ProcessTranslator {
             .prepare_reset_after_fork_for_exec(thread, token, false)?
             .commit())
     }
-
-    #[cfg(test)]
-    pub(crate) fn reset_after_fork_for_exec_with_recorder(
-        &self,
-        thread: &ThreadTranslator,
-        token: &mut DirectBindingExecResetToken,
-        recorder: impl FnMut(DirectBindingResetEvent),
-    ) -> Result<crate::direct_binding::ExecBindingClearStats, types::DsrError> {
-        Ok(self
-            .prepare_reset_after_fork_for_exec(thread, token, false)?
-            .commit_with_recorder(recorder))
-    }
-
     /// Preflights the complete retiring-translator reset while the old image
     /// remains authoritative. No logical process state or token is mutated.
     pub fn prepare_reset_after_fork_for_exec<'process, 'thread, 'token>(
@@ -3108,13 +2285,10 @@ impl ProcessTranslator {
         let token = token.prepare_consumption(self, thread)?;
         let live_private_leases =
             crate::direct_binding::PrivateJitEpoch::live_descriptor_leases(&self.private_jit_epoch);
-        let registry_private_leases = state
-            .direct_bindings
-            .private_descriptor_leases_for(&self.private_jit_epoch)?;
-        if live_private_leases != registry_private_leases {
+        if live_private_leases != 0 {
             return Err(types::DsrError::CachePolicy(format!(
                 "private JIT descriptor lease ownership mismatch: {live_private_leases} live, \
-                 {registry_private_leases} owned by the direct-binding registry"
+                 but no holder can retain an epoch lease"
             )));
         }
         let catalog = reset_translated_catalog
@@ -3144,7 +2318,6 @@ impl ProcessTranslator {
 impl ProcessState {
     fn try_load_shared_unit(
         &mut self,
-        tid: i32,
         memory: &NativeMappedMemory,
         guest: carrick_guest_mem::GuestVa,
         generation: types::CodeGeneration,
@@ -3201,18 +2374,20 @@ impl ProcessState {
             }
         };
         self.stats.shared_unit_loads = self.stats.shared_unit_loads.saturating_add(1);
-        let prepared = match self.prepare_shared_install(tid, memory, unit) {
-            Ok(prepared) => prepared,
+        match self.install_shared_unit(memory, unit) {
+            Ok(()) => {}
             Err(types::DsrError::GenerationChanged { .. }) => return Ok(None),
-            // The copy transport spends this process's own cache capacity; a
-            // full cache means "translate privately" (which will fail the
-            // same way if truly out of room), never a hard guest error.
+            // The install replays into this process's own cache; a full
+            // cache means "translate privately" (which will fail the same
+            // way if truly out of room), never a hard guest error.
             Err(types::DsrError::CacheCapacity { .. }) => return Ok(None),
-            // A unit the installer's own validators refuse (e.g. a stale
-            // store shape) must fail closed to private translation, never
-            // kill the guest that consulted the store: the prepare stage
-            // mutates nothing, so declining it is always safe. The warn —
-            // not silence — is what keeps a store that never installs from
+            // A unit the installer's own validators refuse (a stale store
+            // shape, a corrupt template) must fail closed to private
+            // translation, never kill the guest that consulted the store.
+            // Blocks replayed before the refusal are VALID native blocks
+            // (each one passed replay validation), so a partial install is
+            // exactly "some blocks were already translated". The warn — not
+            // silence — is what keeps a store that never installs from
             // reading as a plain miss.
             Err(types::DsrError::CachePolicy(reason)) => {
                 tracing::warn!(
@@ -3223,8 +2398,7 @@ impl ProcessState {
                 return Ok(None);
             }
             Err(error) => return Err(error),
-        };
-        self.commit_shared_install(prepared);
+        }
         let result = self.blocks.get(&(guest, generation)).copied();
         if result.is_some() {
             self.stats.shared_unit_hits = self.stats.shared_unit_hits.saturating_add(1);
@@ -3234,780 +2408,157 @@ impl ProcessState {
         Ok(result)
     }
 
-    fn prepare_shared_install(
+    /// Install a loaded unit by replaying each block's recorded native
+    /// emission into this process's own cache and publishing it through
+    /// `publish_emitted` — THE publication point — so an installed block is
+    /// INDISTINGUISHABLE from a natively-translated one: Absolute guard,
+    /// trusted entry registered, pending links patched, incoming links
+    /// severable, page dependencies recorded. No binding tables, no edge
+    /// trampolines, no separate shared indexes.
+    ///
+    /// Per-block skips (an already-present block, a regenerated page) are
+    /// not errors: the remaining blocks still install, and a skipped guest
+    /// PC falls back to private translation. Any validation failure aborts
+    /// the remainder of the unit fail-closed; blocks already replayed are
+    /// valid native blocks and stay.
+    fn install_shared_unit(
         &mut self,
-        tid: i32,
         memory: &NativeMappedMemory,
         unit: crate::shared_cache::SharedLoadedTranslationUnit,
-    ) -> Result<PreparedSharedInstall, types::DsrError> {
-        let superblock_segments = self.superblock_segments;
-        self.prepare_shared_install_with_sensitive_planner(tid, memory, unit, |block_start| {
-            let planned = block::plan_block_with_segments(
-                memory,
-                block_start,
-                types::CodeGeneration::INITIAL,
-                256,
-                superblock_segments,
-            )?;
-            let block::PlannedExit::Sensitive {
-                guest: sensitive_guest,
-                exit,
-                fusion,
-                ..
-            } = planned.terminal_exit()
-            else {
-                return Err(types::DsrError::CachePolicy(format!(
-                    "shared block 0x{:x} lost sensitive metadata identity",
-                    block_start.raw(),
-                )));
-            };
-            Ok((
-                (sensitive_guest, types::CodeGeneration::INITIAL),
-                SensitiveMetadata { exit, fusion },
-                fusion,
-            ))
-        })
-    }
-
-    fn prepare_shared_install_with_sensitive_planner(
-        &mut self,
-        tid: i32,
-        memory: &NativeMappedMemory,
-        mut unit: crate::shared_cache::SharedLoadedTranslationUnit,
-        mut sensitive_planner: impl FnMut(
-            carrick_guest_mem::GuestVa,
-        ) -> Result<
-            (
-                (carrick_guest_mem::GuestVa, types::CodeGeneration),
-                SensitiveMetadata,
-                Option<types::ExclusiveFusionSite>,
-            ),
-            types::DsrError,
-        >,
-    ) -> Result<PreparedSharedInstall, types::DsrError> {
+    ) -> Result<(), types::DsrError> {
         let metadata_load_evidence = unit.load_evidence;
-        if let crate::shared_cache::LoadedTranslationMetadata::V2(manifest) = &unit.metadata {
-            manifest.validate_ranges().map_err(|reason| {
-                types::DsrError::CachePolicy(format!(
-                    "loaded shared translation manifest is invalid: {reason:?}"
-                ))
-            })?;
-        }
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::Manifest)?;
-
-        let unit_id = translated_unit_id(unit.key())?;
-        let code_len = usize::try_from(unit.metadata.code_len()).map_err(|_| {
+        unit.manifest.validate_ranges().map_err(|reason| {
+            types::DsrError::CachePolicy(format!(
+                "loaded shared translation manifest is invalid: {reason:?}"
+            ))
+        })?;
+        let code_len = usize::try_from(unit.manifest.code_len).map_err(|_| {
             types::DsrError::CachePolicy(
                 "shared translation range length does not fit usize".to_string(),
             )
         })?;
-        // COPY the unit into this process's own translation cache — the
-        // single executable authority. The store's `base` is READABLE source
-        // bytes pinned by the unit's lease (a file mapping for the real
-        // store); nothing ever executes at that address. A later prepare
-        // failure leaks the copied extent until the exec-time cursor reset,
-        // which is safe (never reachable: no block points at it) and rare
-        // (every later rejection means a malformed or colliding unit).
         let source_base = unit.source_base;
         if source_base == 0 || !source_base.is_multiple_of(4) {
             return Err(types::DsrError::CachePolicy(format!(
                 "shared translation source address is unusable: 0x{source_base:x}"
             )));
         }
-        // SAFETY: `TranslationUnitStore::load` contract — `base` addresses
-        // `code_len` readable bytes kept alive by the unit's `_lease`, and
-        // `code_len` was bounds-checked against the metadata just above.
+        // SAFETY: `TranslationUnitStore::load` contract — `source_base`
+        // addresses `code_len` readable bytes kept alive by the unit's
+        // lease, and `code_len` was bounds-checked against the metadata just
+        // above. The lease only needs to outlive this install: every block
+        // is COPIED into the private cache by replay.
         let source = unsafe { std::slice::from_raw_parts(source_base as *const u8, code_len) };
-        let relocations = unit_binding_relocations(&unit.metadata)?;
-        let binding_data_len = usize::try_from(unit.metadata.binding_data_len()).map_err(|_| {
-            types::DsrError::CachePolicy("binding data length does not fit usize".to_string())
-        })?;
-        // Cell block presence is the store's half of the contract: a unit
-        // with sidecar data must arrive with the lease-pinned, zeroed cell
-        // block the copied code's ADRP/ADD pairs will be pointed at.
-        if (binding_data_len == 0) != unit.binding_base.is_none() {
-            return Err(types::DsrError::CachePolicy(
-                "binding cell block does not match the unit's binding data length".to_string(),
-            ));
-        }
-        let published = {
-            let mut writer = self.cache.begin_write(code_len)?;
-            if relocations.is_empty() {
-                writer.write_instruction_bytes(source)?;
-            } else {
-                let code_base = writer.entry().host().raw();
-                let mut patched = source.to_vec();
-                let cell_base = unit
-                    .binding_base
-                    .ok_or_else(|| {
-                        types::DsrError::CachePolicy(
-                            "unit carries binding relocations but no cell block".to_string(),
-                        )
-                    })?
-                    .get();
-                emit::patch_copied_binding_cell_relocations(
-                    &mut patched,
-                    code_base,
-                    cell_base,
-                    binding_data_len,
-                    &relocations,
-                )?;
-                writer.write_instruction_bytes(&patched)?;
-            }
-            writer.publish()?
-        };
-        let cache_start = published.entry().host().raw();
-        let cache_end = cache_start.checked_add(code_len).ok_or_else(|| {
-            types::DsrError::CachePolicy("shared translation range overflow".to_string())
-        })?;
-        let host_range =
-            carrick_guest_mem::HostVa(cache_start)..carrick_guest_mem::HostVa(cache_end);
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::Identity)?;
-
-        let catalog_entry = self.translated_ranges.prepare_shared(unit_id, host_range)?;
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::Catalog)?;
-
-        let block_count = unit.metadata.block_count();
-        if block_count == 0 {
-            return Err(types::DsrError::CachePolicy(
-                "shared translation unit has no blocks".to_string(),
-            ));
-        }
-        let mut incoming_keys = BTreeSet::new();
-        for block_index in 0..block_count {
-            let block = loaded_block_scalars(&unit.metadata, block_index).ok_or_else(|| {
-                types::DsrError::CachePolicy(
-                    "shared translation block index is invalid".to_string(),
-                )
-            })?;
+        let mode: emit::EmitAddressMode = memory.address_mode().into();
+        let manifest = Arc::clone(&unit.manifest);
+        let mut installed = 0_u64;
+        for block in &manifest.blocks {
             let key = (block.guest_start, types::CodeGeneration::INITIAL);
-            if !incoming_keys.insert(key)
-                || self.blocks.contains_key(&key)
-                || self.shared_blocks.contains_key(&key)
-            {
-                return Err(types::DsrError::CachePolicy(format!(
-                    "shared block identity collides at guest 0x{:x}",
-                    block.guest_start.raw()
-                )));
+            if self.blocks.contains_key(&key) {
+                continue;
             }
-        }
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::CollisionPreflight)?;
-
-        let mut max_generation_binding = None;
-        for block_index in 0..block_count {
-            let block = loaded_block_scalars(&unit.metadata, block_index).ok_or_else(|| {
-                types::DsrError::CachePolicy(
-                    "shared translation block index is invalid".to_string(),
-                )
-            })?;
-            let binding = usize::try_from(block.generation_binding).map_err(|_| {
-                types::DsrError::CachePolicy(
-                    "shared generation binding index does not fit usize".to_string(),
-                )
-            })?;
-            max_generation_binding =
-                Some(max_generation_binding.map_or(binding, |current: usize| current.max(binding)));
-        }
-        let binding_count = max_generation_binding
-            .and_then(|index| index.checked_add(1))
-            .ok_or_else(|| {
-                types::DsrError::CachePolicy(
-                    "shared translation unit has invalid generation bindings".to_string(),
-                )
-            })?;
-        if binding_count == 0 || binding_count > block_count {
-            return Err(types::DsrError::CachePolicy(
-                "shared translation unit has invalid generation bindings".to_string(),
-            ));
-        }
-        let mut binding_slots = Vec::new();
-        binding_slots
-            .try_reserve_exact(binding_count)
-            .map_err(|error| {
-                types::DsrError::CachePolicy(format!(
-                    "shared generation-binding reservation failed: {error}"
-                ))
-            })?;
-        binding_slots.resize_with(binding_count, || None);
-        let mut observations = Vec::new();
-        observations
-            .try_reserve_exact(block_count)
-            .map_err(|error| {
-                types::DsrError::CachePolicy(format!(
-                    "shared generation observation reservation failed: {error}"
-                ))
-            })?;
-        for block_index in 0..block_count {
-            let block = loaded_block_scalars(&unit.metadata, block_index).ok_or_else(|| {
-                types::DsrError::CachePolicy(
-                    "shared translation block index is invalid".to_string(),
-                )
-            })?;
             let observation = memory.dsr_generation_observation(block.guest_start)?;
             if observation.expected() != types::CodeGeneration::INITIAL {
-                return Err(types::DsrError::GenerationChanged {
-                    page: observation.page().raw(),
-                    expected: types::CodeGeneration::INITIAL.get(),
-                    observed: observation.expected().get(),
-                });
+                continue;
             }
-            let slot = binding_slots
-                .get_mut(usize::try_from(block.generation_binding).map_err(|_| {
-                    types::DsrError::CachePolicy(
-                        "shared generation binding index does not fit usize".to_string(),
-                    )
-                })?)
-                .ok_or_else(|| {
-                    types::DsrError::CachePolicy(
-                        "shared generation binding index is out of range".to_string(),
-                    )
-                })?;
-            if slot.is_some() {
-                return Err(types::DsrError::CachePolicy(
-                    "shared generation binding index is duplicated".to_string(),
-                ));
-            }
-            *slot = Some(gateway::GenerationBinding::new(
-                observation.current_atomic(),
-                types::CodeGeneration::INITIAL,
-            ));
-            observations.push(observation);
-        }
-        let generation_bindings = binding_slots
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
+            let start = usize::try_from(block.entry_offset).map_err(|_| {
                 types::DsrError::CachePolicy(
-                    "shared generation binding table has a hole".to_string(),
+                    "shared block entry offset does not fit usize".to_string(),
                 )
-            })?
-            .into_boxed_slice();
-        let bindings_pointer = generation_bindings.as_ptr() as usize;
-        let target_authority = Box::new(gateway::TargetCacheAuthority::new(
-            cache_start,
-            cache_end,
-            generation_bindings.as_ptr(),
-        ));
-        let target_authority_pointer = target_authority.as_ref() as *const _;
-        let loaded_unit_index = self.loaded_shared_units.len();
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::GenerationAuthorities)?;
-
-        let host_bias = unit.key().host_bias();
-        let mut blocks = Vec::new();
-        blocks.try_reserve_exact(block_count).map_err(|error| {
-            types::DsrError::CachePolicy(format!(
-                "shared prepared-block reservation failed: {error}"
-            ))
-        })?;
-        let mut guest_range_additions = Vec::new();
-        let mut guest_range_derivations = 0_u64;
-        let mut dependency_records = Vec::new();
-        dependency_records
-            .try_reserve_exact(block_count)
-            .map_err(|error| {
-                types::DsrError::CachePolicy(format!(
-                    "shared page-dependency tuple reservation failed: {error}"
-                ))
             })?;
-        let mut sensitive_updates = Vec::new();
-        sensitive_updates
-            .try_reserve_exact(block_count)
-            .map_err(|error| {
-                types::DsrError::CachePolicy(format!(
-                    "shared sensitive-metadata reservation failed: {error}"
-                ))
-            })?;
-        match &mut unit.metadata {
-            crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => {
-                for (block, observation) in
-                    Arc::make_mut(manifest).blocks.iter_mut().zip(observations)
-                {
-                    let address = cache_start
-                        .checked_add(block.entry_offset as usize)
-                        .ok_or_else(|| {
-                            types::DsrError::CachePolicy(
-                                "shared block address overflow".to_string(),
-                            )
-                        })?;
-                    let block_end =
-                        address
-                            .checked_add(block.code_len as usize)
-                            .ok_or_else(|| {
-                                types::DsrError::CachePolicy(
-                                    "shared block extent overflow".to_string(),
-                                )
-                            })?;
-                    if block_end > cache_end {
-                        return Err(types::DsrError::CachePolicy(
-                            "shared block extent exceeds its unit".to_string(),
-                        ));
-                    }
-                    let entry = types::CacheVa::published(carrick_guest_mem::HostVa(address));
-                    let (map, recovery, shared_recovery) = if shared_recovery_lazy_enabled() {
-                        let (map, recovery, _direct_links) =
-                            block.template.take_portable_runtime_metadata();
-                        (
-                            map,
-                            Vec::new(),
-                            Some(SharedRecoveryMetadata {
-                                recovery,
-                                host_bias,
-                            }),
-                        )
-                    } else {
-                        let (map, recovery, _direct_links) =
-                            block.template.take_runtime_metadata(host_bias)?;
-                        (map, recovery, None)
-                    };
-                    let guest_ranges = exact_guest_ranges_from_pc_map(
-                        block.guest_start,
-                        block.code_len as usize,
-                        &map,
-                    )?;
-                    guest_range_derivations = guest_range_derivations.saturating_add(1);
-                    guest_range_additions
-                        .try_reserve(guest_ranges.len())
-                        .map_err(|error| {
-                            types::DsrError::CachePolicy(format!(
-                                "shared guest-range addition reservation failed: {error}"
-                            ))
-                        })?;
-                    guest_range_additions.extend(guest_ranges);
-
-                    let key = (block.guest_start, types::CodeGeneration::INITIAL);
-                    let fusion_site = if block.requires_sensitive_metadata {
-                        let (sensitive_key, metadata, fusion) =
-                            sensitive_planner(block.guest_start)?;
-                        if let Some((_, current)) = sensitive_updates
-                            .iter_mut()
-                            .find(|(key, _)| *key == sensitive_key)
-                        {
-                            *current = merge_sensitive_metadata(sensitive_key, *current, metadata)?;
-                        } else {
-                            let metadata =
-                                self.sensitive.get(&sensitive_key).copied().map_or_else(
-                                    || Ok(metadata),
-                                    |installed| {
-                                        merge_sensitive_metadata(sensitive_key, installed, metadata)
-                                    },
-                                )?;
-                            sensitive_updates.push((sensitive_key, metadata));
-                        }
-                        fusion
-                    } else {
-                        None
-                    };
-                    let published = PublishedBlock {
-                        entry,
-                        len: block.code_len as usize,
-                        metadata: PublishedBlockMetadata::Owned {
-                            map,
-                            recovery,
-                            shared_recovery,
-                        },
-                        _generation: observation.clone(),
-                    };
-                    dependency_records.push((
-                        observation.page(),
-                        block.guest_start,
-                        observation.expected(),
-                    ));
-                    blocks.push(PreparedSharedBlock {
-                        key,
-                        entry,
-                        published,
-                        fusion_site,
-                        authority: SharedBlockAuthority {
-                            generation_bindings: bindings_pointer,
-                            generation_binding_count: generation_bindings.len(),
-                            cache_start,
-                            cache_end,
-                            target_authority: target_authority_pointer as usize,
-                            loaded_unit_index,
-                        },
-                    });
-                }
-            }
-            crate::shared_cache::LoadedTranslationMetadata::V3(metadata) => {
-                for (block_index, observation) in observations.into_iter().enumerate() {
-                    let block = metadata.block(block_index).ok_or_else(|| {
-                        types::DsrError::CachePolicy(format!(
-                            "mapped shared block index {block_index} is invalid"
-                        ))
-                    })?;
-                    let entry_offset = usize::try_from(block.entry_offset()).map_err(|_| {
-                        types::DsrError::CachePolicy(
-                            "mapped shared block entry offset does not fit usize".to_string(),
-                        )
-                    })?;
-                    let address = cache_start.checked_add(entry_offset).ok_or_else(|| {
-                        types::DsrError::CachePolicy(
-                            "mapped shared block address overflow".to_string(),
-                        )
-                    })?;
-                    let block_len = usize::try_from(block.code_len()).map_err(|_| {
-                        types::DsrError::CachePolicy(
-                            "mapped shared block length does not fit usize".to_string(),
-                        )
-                    })?;
-                    let block_end = address.checked_add(block_len).ok_or_else(|| {
-                        types::DsrError::CachePolicy(
-                            "mapped shared block extent overflow".to_string(),
-                        )
-                    })?;
-                    if block_end > cache_end {
-                        return Err(types::DsrError::CachePolicy(
-                            "mapped shared block extent exceeds its unit".to_string(),
-                        ));
-                    }
-                    guest_range_additions
-                        .try_reserve(block.guest_range_count())
-                        .map_err(|error| {
-                            types::DsrError::CachePolicy(format!(
-                                "mapped shared guest-range reservation failed: {error}"
-                            ))
-                        })?;
-                    for range_index in 0..block.guest_range_count() {
-                        guest_range_additions.push(block.guest_range(range_index).ok_or_else(
-                            || {
-                                types::DsrError::CachePolicy(format!(
-                                    "mapped shared guest-range index {range_index} is invalid"
-                                ))
-                            },
-                        )?);
-                    }
-
-                    let key = (block.guest_start(), types::CodeGeneration::INITIAL);
-                    let fusion_site = if block.requires_sensitive_metadata() {
-                        let (sensitive_key, metadata, fusion) =
-                            sensitive_planner(block.guest_start())?;
-                        if let Some((_, current)) = sensitive_updates
-                            .iter_mut()
-                            .find(|(key, _)| *key == sensitive_key)
-                        {
-                            *current = merge_sensitive_metadata(sensitive_key, *current, metadata)?;
-                        } else {
-                            let metadata =
-                                self.sensitive.get(&sensitive_key).copied().map_or_else(
-                                    || Ok(metadata),
-                                    |installed| {
-                                        merge_sensitive_metadata(sensitive_key, installed, metadata)
-                                    },
-                                )?;
-                            sensitive_updates.push((sensitive_key, metadata));
-                        }
-                        fusion
-                    } else {
-                        None
-                    };
-                    let entry = types::CacheVa::published(carrick_guest_mem::HostVa(address));
-                    let block_index = u32::try_from(block_index).map_err(|_| {
-                        types::DsrError::CachePolicy(
-                            "mapped shared block index exceeds u32".to_string(),
-                        )
-                    })?;
-                    let published = PublishedBlock {
-                        entry,
-                        len: block_len,
-                        metadata: PublishedBlockMetadata::Mapped {
-                            loaded_unit_index,
-                            block_index,
-                        },
-                        _generation: observation.clone(),
-                    };
-                    dependency_records.push((
-                        observation.page(),
-                        block.guest_start(),
-                        observation.expected(),
-                    ));
-                    blocks.push(PreparedSharedBlock {
-                        key,
-                        entry,
-                        published,
-                        fusion_site,
-                        authority: SharedBlockAuthority {
-                            generation_bindings: bindings_pointer,
-                            generation_binding_count: generation_bindings.len(),
-                            cache_start,
-                            cache_end,
-                            target_authority: target_authority_pointer as usize,
-                            loaded_unit_index,
-                        },
-                    });
-                }
-            }
-        }
-        sensitive_updates.sort_unstable_by_key(|(key, _)| *key);
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::BlockMetadata)?;
-
-        let normalized_guest_ranges =
-            normalized_guest_range_union(&self.shared_guest_ranges, &guest_range_additions)?;
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::GuestUnion)?;
-
-        let direct_binding = self.direct_bindings.prepare_loaded_unit(&unit)?;
-        let direct_edge_group_builds =
-            u64::try_from(direct_binding.edge_group_builds()).unwrap_or(u64::MAX);
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::DirectBinding)?;
-
-        self.published.try_reserve(block_count).map_err(|error| {
-            types::DsrError::CachePolicy(format!(
-                "shared published-block reservation failed: {error}"
-            ))
-        })?;
-        self.loaded_shared_units.try_reserve(1).map_err(|error| {
-            types::DsrError::CachePolicy(format!(
-                "shared loaded-unit retention reservation failed: {error}"
-            ))
-        })?;
-        let shared_published_index = match &unit.metadata {
-            crate::shared_cache::LoadedTranslationMetadata::V2(_) => {
-                let shared_index_count = self
-                    .shared_published_index
-                    .len()
-                    .checked_add(block_count)
-                    .ok_or_else(|| {
-                        types::DsrError::CachePolicy(
-                            "shared published-index count overflow".to_string(),
-                        )
-                    })?;
-                let mut shared_published_index = Vec::new();
-                shared_published_index
-                    .try_reserve_exact(shared_index_count)
-                    .map_err(|error| {
-                        types::DsrError::CachePolicy(format!(
-                            "shared published-index reservation failed: {error}"
-                        ))
-                    })?;
-                shared_published_index.extend_from_slice(&self.shared_published_index);
-                for (offset, block) in blocks.iter().enumerate() {
-                    let block_index =
-                        self.published.len().checked_add(offset).ok_or_else(|| {
-                            types::DsrError::CachePolicy(
-                                "shared published-block index overflow".to_string(),
-                            )
-                        })?;
-                    shared_published_index.push(PublishedIndexEntry {
-                        start: block.entry.host(),
-                        block: block_index,
-                    });
-                }
-                shared_published_index.sort_unstable_by_key(|entry| entry.start);
-                if shared_published_index
-                    .windows(2)
-                    .any(|pair| pair[0].start == pair[1].start)
-                {
-                    return Err(types::DsrError::CachePolicy(
-                        "shared published-block index collides".to_string(),
-                    ));
-                }
-                shared_published_index
-            }
-            crate::shared_cache::LoadedTranslationMetadata::V3(_) => {
-                let mut incoming = Vec::new();
-                incoming.try_reserve_exact(block_count).map_err(|error| {
-                    types::DsrError::CachePolicy(format!(
-                        "mapped shared published-index reservation failed: {error}"
-                    ))
+            let end = start
+                .checked_add(block.code_len as usize)
+                .filter(|end| *end <= code_len)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy("shared block extent exceeds its unit".to_string())
                 })?;
-                for (offset, block) in blocks.iter().enumerate() {
-                    let block_index =
-                        self.published.len().checked_add(offset).ok_or_else(|| {
-                            types::DsrError::CachePolicy(
-                                "mapped shared published-block index overflow".to_string(),
-                            )
-                        })?;
-                    incoming.push(PublishedIndexEntry {
-                        start: block.entry.host(),
-                        block: block_index,
-                    });
-                }
-                merge_published_indexes(&self.shared_published_index, &incoming)?
+            let words = source[start..end]
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                .collect::<Vec<_>>();
+            let bindings = artifact_spike::ArtifactBindings::for_replay(
+                observation.current_atomic() as *const std::sync::atomic::AtomicU64 as u64,
+                types::CodeGeneration::INITIAL.get(),
+                mode,
+            )?;
+            // Sensitive-exit metadata is not part of the template (it is
+            // plan-derived), so re-plan the block to harvest it BEFORE the
+            // block becomes reachable.
+            if block.requires_sensitive_metadata {
+                self.harvest_unit_block_sensitive_metadata(memory, block.guest_start)?;
             }
-        };
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::ProcessVectors)?;
-
-        let page_dependencies = self
-            .dependencies
-            .prepare_record_batch(&dependency_records)?;
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::PageDependencies)?;
-
-        let executable_range = self
-            .executable_ranges
-            .prepare_prepend(cache_start, cache_end)?;
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::ExecutableRange)?;
-
-        if loaded_unit_index != self.loaded_shared_units.len()
-            || direct_binding.unit_index() != self.direct_bindings.unit_count()
-        {
-            return Err(types::DsrError::CachePolicy(
-                "shared prepared owner index changed before commit".to_string(),
-            ));
-        }
-        #[cfg(test)]
-        shared_install_prepare_checkpoint(SharedInstallPrepareStage::FinalConsistency)?;
-
-        let direct_binding_probe = DirectBindingUnitLoadedProbe {
-            digest: unit_id.get(),
-            record_count: u64::try_from(unit.binding_count()).unwrap_or(u64::MAX),
-            data_bytes: unit.binding_data_len(),
-        };
-        Ok(PreparedSharedInstall {
-            tid,
-            cache_range: cache_start..cache_end,
-            catalog_entry,
-            blocks,
-            sensitive_updates,
-            shared_published_index,
-            normalized_guest_ranges,
-            loaded_unit: LoadedSharedUnit {
-                unit_id,
-                _unit: unit,
-                _generation_bindings: generation_bindings,
-                _target_authority: target_authority,
-                _direct_binding_unit_index: None,
-            },
-            direct_binding,
-            page_dependencies,
-            executable_range,
-            direct_binding_probe,
-            metadata_load_evidence,
-            guest_range_derivations,
-            direct_edge_group_builds,
-        })
-    }
-
-    fn commit_shared_install(&mut self, prepared: PreparedSharedInstall) {
-        #[cfg(test)]
-        self.commit_shared_install_inner(prepared, None, None);
-        #[cfg(not(test))]
-        self.commit_shared_install_inner(prepared, None);
-    }
-
-    #[cfg(test)]
-    fn commit_shared_install_with_recorder(
-        &mut self,
-        prepared: PreparedSharedInstall,
-        recorder: &mut impl TranslatedRangeRecorder,
-    ) {
-        self.commit_shared_install_inner(prepared, Some(recorder), None);
-    }
-
-    #[cfg(test)]
-    fn commit_shared_install_with_observer(
-        &mut self,
-        prepared: PreparedSharedInstall,
-        recorder: &mut impl TranslatedRangeRecorder,
-        observer: &mut impl SharedInstallCommitObserver,
-    ) {
-        self.commit_shared_install_inner(prepared, Some(recorder), Some(observer));
-    }
-
-    fn commit_shared_install_inner(
-        &mut self,
-        prepared: PreparedSharedInstall,
-        recorder: Option<&mut dyn TranslatedRangeRecorder>,
-        #[cfg(test)] mut observer: Option<&mut dyn SharedInstallCommitObserver>,
-    ) {
-        let PreparedSharedInstall {
-            tid,
-            cache_range,
-            catalog_entry,
-            blocks,
-            sensitive_updates,
-            shared_published_index,
-            normalized_guest_ranges,
-            mut loaded_unit,
-            direct_binding,
-            page_dependencies,
-            executable_range,
-            direct_binding_probe,
-            metadata_load_evidence,
-            guest_range_derivations,
-            direct_edge_group_builds,
-        } = prepared;
-        let block_count = blocks.len();
-
-        if let Some(recorder) = recorder {
-            self.translated_ranges
-                .commit_shared_with_recorder(catalog_entry, recorder);
-        } else {
-            self.translated_ranges.commit_shared(catalog_entry);
-        }
-        #[cfg(test)]
-        if let Some(observer) = observer.as_mut() {
-            observer.observe(SharedInstallCommitPhase::CatalogSharedAdd, self);
-        }
-        loaded_unit._direct_binding_unit_index =
-            self.direct_bindings.commit_loaded_unit(direct_binding);
-        self.loaded_shared_units.push(loaded_unit);
-
-        for block in blocks {
-            let PreparedSharedBlock {
+            let emitted = artifact_spike::replay_unit_block(
+                &mut self.cache,
+                words,
+                block.template.clone().into_unit_replay_parts(),
+                &bindings,
+            )?;
+            if observation.current() != types::CodeGeneration::INITIAL {
+                // The page regenerated between observation and replay: a
+                // block published under the INITIAL key could never be
+                // looked up. Skip it; the replayed extent is unreachable.
+                continue;
+            }
+            let emitted_bytes = u64::try_from(emitted.len()).unwrap_or(u64::MAX);
+            self.publish_emitted(
+                memory,
                 key,
-                entry,
-                published,
-                fusion_site,
-                authority,
-            } = block;
-            if let Some(site) = fusion_site {
-                self.record_exclusive_fusion_site(site);
-            }
-            self.published.push(published);
-            self.blocks.insert(key, entry);
-            self.shared_blocks.insert(key, authority);
+                observation.page(),
+                observation,
+                emitted,
+                emitted_bytes,
+                TranslationOutcome::SharedUnit,
+            )?;
+            installed = installed.saturating_add(1);
         }
-        for (key, metadata) in sensitive_updates {
-            self.sensitive.insert(key, metadata);
-        }
-        self.shared_published_index = shared_published_index;
-        self.dependencies.commit_record_batch(page_dependencies);
-        self.shared_guest_ranges = normalized_guest_ranges;
-        self.stats.shared_blocks_mapped = self
-            .stats
-            .shared_blocks_mapped
-            .saturating_add(block_count as u64);
+        self.stats.shared_blocks_mapped = self.stats.shared_blocks_mapped.saturating_add(installed);
+        self.apply_shared_metadata_evidence(metadata_load_evidence);
+        Ok(())
+    }
 
-        #[cfg(test)]
-        if let Some(observer) = observer.as_mut() {
-            observer.observe(SharedInstallCommitPhase::LogicalStateInstalled, self);
+    /// Re-plan a unit block whose terminal exit carries sensitive metadata
+    /// and merge that metadata into the process table, exactly as a fresh
+    /// translation's plan phase would.
+    fn harvest_unit_block_sensitive_metadata(
+        &mut self,
+        memory: &NativeMappedMemory,
+        block_start: carrick_guest_mem::GuestVa,
+    ) -> Result<(), types::DsrError> {
+        let planned = block::plan_block_with_segments(
+            memory,
+            block_start,
+            types::CodeGeneration::INITIAL,
+            256,
+            self.superblock_segments,
+        )?;
+        let block::PlannedExit::Sensitive {
+            guest: sensitive_guest,
+            exit,
+            fusion,
+            ..
+        } = planned.terminal_exit()
+        else {
+            return Err(types::DsrError::CachePolicy(format!(
+                "shared block 0x{:x} lost sensitive metadata identity",
+                block_start.raw(),
+            )));
+        };
+        if let Some(site) = fusion {
+            self.record_exclusive_fusion_site(site);
         }
-        self.executable_ranges.commit_prepend(executable_range);
-        #[cfg(test)]
-        if let Some(observer) = observer.as_mut() {
-            observer.observe(SharedInstallCommitPhase::ExecutableHeadPublished, self);
-        }
-
-        probes::dsr_cache_bounds(cache_range.start as u64, cache_range.end as u64);
-        probes::dsr_cache_event(
-            tid,
-            probes::DsrCacheEventKind::DirectBindingUnitLoaded,
-            direct_binding_probe.digest,
-            direct_binding_probe.record_count,
-            direct_binding_probe.data_bytes,
-        );
-        self.apply_shared_metadata_evidence(
-            metadata_load_evidence,
-            guest_range_derivations,
-            direct_edge_group_builds,
-        );
+        let sensitive_key = (sensitive_guest, types::CodeGeneration::INITIAL);
+        let metadata = SensitiveMetadata { exit, fusion };
+        let merged = match self.sensitive.get(&sensitive_key).copied() {
+            Some(current) => merge_sensitive_metadata(sensitive_key, current, metadata)?,
+            None => metadata,
+        };
+        self.sensitive.insert(sensitive_key, merged);
+        Ok(())
     }
 
     fn apply_shared_metadata_evidence(
         &mut self,
         evidence: crate::shared_cache::TranslationMetadataLoadEvidence,
-        guest_range_derivations: u64,
-        direct_edge_group_builds: u64,
     ) {
         for (stat, value) in [
             (ResolverStat::SharedMetadataBytesRead, evidence.bytes_read),
@@ -4020,66 +2571,11 @@ impl ProcessState {
                 evidence.validation_ns,
             ),
             (
-                ResolverStat::SharedMappedImmutableRecords,
-                evidence.mapped_records,
-            ),
-            (
                 ResolverStat::SharedOwnedImmutableRecords,
                 evidence.owned_records,
             ),
-            (
-                ResolverStat::SharedGuestRangeDerivations,
-                guest_range_derivations,
-            ),
-            (
-                ResolverStat::SharedDirectEdgeGroupBuilds,
-                direct_edge_group_builds,
-            ),
         ] {
             self.stats.saturating_add(stat, value);
-        }
-    }
-
-    #[cfg(test)]
-    fn shared_install_logical_snapshot_for_test(&self) -> SharedInstallLogicalSnapshot {
-        SharedInstallLogicalSnapshot {
-            catalog_frontier: self.translated_ranges.sequence_frontier(),
-            catalog_ready: self.translated_ranges.ready_sequence,
-            catalog_shared: self.translated_ranges.shared.clone(),
-            blocks: self
-                .blocks
-                .iter()
-                .map(|(key, entry)| (*key, *entry))
-                .collect(),
-            sensitive: self
-                .sensitive
-                .iter()
-                .map(|(key, metadata)| (*key, *metadata))
-                .collect(),
-            fusion_sites: std::array::from_fn(|index| {
-                self.exclusive_fusion_sites[index].iter().copied().collect()
-            }),
-            published_len: self.published.len(),
-            private_published_index: self.private_published_index.clone(),
-            shared_published_index: self.shared_published_index.clone(),
-            dependencies: self.dependencies.snapshot_for_test(),
-            shared_blocks: self
-                .shared_blocks
-                .iter()
-                .map(|(key, authority)| (*key, *authority))
-                .collect(),
-            shared_guest_ranges: self.shared_guest_ranges.clone(),
-            loaded_unit_ids: self
-                .loaded_shared_units
-                .iter()
-                .map(|unit| unit.unit_id)
-                .collect(),
-            direct_bindings: self.direct_bindings.logical_snapshot_for_test(),
-            direct_binding_units: self.direct_bindings.unit_count(),
-            stats: self.stats,
-            reported_stats: self.reported_stats,
-            executable_head: self.executable_ranges.head_ptr() as usize,
-            executable_nodes: self.executable_ranges.shared_node_count(),
         }
     }
 
@@ -4150,11 +2646,8 @@ impl ProcessState {
         self.push_published(PublishedBlock {
             entry,
             len: emitted_len,
-            metadata: PublishedBlockMetadata::Owned {
-                map,
-                recovery,
-                shared_recovery: None,
-            },
+            map,
+            recovery,
             _generation: observation,
         });
         self.blocks.insert(key, entry);
@@ -4170,39 +2663,15 @@ impl ProcessState {
                 source: entry,
                 slot: link.slot,
             };
-            // A SHARED target is patched THROUGH a trampoline, never directly.
-            // A loaded unit's block guards with `GenerationGuard::BindingIndex`,
-            // reading its unit's table from `CTX_GENERATION_BINDINGS`, which only
-            // the gateway installs when it enters that unit. A bare direct branch
-            // bypasses the installation and the guard reads whatever the private
-            // entry left there -- MEASURED, the go-build guest dies immediately
-            // with "native DSR fault lies outside guest-owned host memory: 0x20"
-            // (docs/perf-results/2026-07-29-native-cpu-budget-evidence.md run 13).
-            //
-            // Installing the table at ENTRY instead cannot work: a context holds
-            // ONE pointer while a private context reaches blocks from N units, so
-            // the guard indexes the wrong unit's table as soon as a second unit is
-            // touched (run 22b). The trampoline installs it at the EDGE, where the
-            // target's unit is statically known.
-            let shared_bindings = self
-                .shared_blocks
-                .get(&target_key)
-                .map(|authority| authority.generation_bindings);
-            match (self.blocks.get(&target_key).copied(), shared_bindings) {
-                (Some(target), None) => {
+            // Installed unit blocks come through `publish_emitted` exactly
+            // like native translations, so every target is patched directly
+            // at its trusted entry — no binding-table trampolines.
+            match self.blocks.get(&target_key).copied() {
+                Some(target) => {
                     let target = self.trusted_target(target_key, target);
                     self.patch_direct_link_if_reachable(site, target, link.target)?
                 }
-                (Some(target), Some(bindings)) => {
-                    self.patch_shared_edge_via_binding_trampoline(
-                        site,
-                        target,
-                        bindings,
-                        link.target,
-                        &target_observation,
-                    )?;
-                }
-                (None, _) => {
+                None => {
                     self.pending.entry(target_key).or_default().push(site);
                 }
             }
@@ -4238,18 +2707,7 @@ impl ProcessState {
                 .add_usize(ResolverStat::InvalidatedBlocks, stale_blocks.len());
         }
         for stale in stale_blocks {
-            self.direct_bindings
-                .invalidate_target_with_recorder(stale.0, stale.1, |cell| {
-                    probes::dsr_cache_event(
-                        tid,
-                        probes::DsrCacheEventKind::DirectBindingClear,
-                        cell.get() as u64,
-                        crate::direct_binding::DirectBindingClearReason::TargetInvalidation.raw(),
-                        stale.1.get(),
-                    );
-                });
             self.blocks.remove(&stale);
-            self.shared_blocks.remove(&stale);
             probes::dsr_cache_event(
                 tid,
                 probes::DsrCacheEventKind::Invalidate,
@@ -4281,7 +2739,7 @@ impl ProcessState {
                 cache_used_bytes: u64::try_from(self.cache.used_bytes()).unwrap_or(u64::MAX),
             });
         }
-        if let Some(entry) = self.try_load_shared_unit(tid, memory, guest, generation)? {
+        if let Some(entry) = self.try_load_shared_unit(memory, guest, generation)? {
             return Ok(TranslationResult {
                 entry,
                 generation,
@@ -4542,25 +3000,19 @@ impl ProcessState {
                         })
                     })
                     .map(|segment| segment.guest_start);
-                let portable_candidate = if generation == types::CodeGeneration::INITIAL
+                // Fused (superblock) plans ARE in scope for the unit lane.
+                // Superblock formation extends only along the FALL-THROUGH
+                // edge and stops at `page_end`, so a fused plan is contiguous
+                // and single-page and `block.end` covers every segment.
+                // Excluding them cost 2.2x of shared coverage: 14.4% fused vs
+                // 32.1% unfused (run 26).
+                //
+                // `ExclusiveRegion` stays out via the terminal-exit list
+                // below: that lowering owns its whole block and is not a
+                // segment.
+                let unit_candidate_segment = if generation == types::CodeGeneration::INITIAL
                     && let Some(segment) = portable_segment
                     && self.shared_recording_segments.contains(&segment)
-                    && let Some(source_words) = block_source_words.clone()
-                    // Fused (superblock) plans ARE in scope. Superblock
-                    // formation extends only along the FALL-THROUGH edge and
-                    // stops at `page_end`, so a fused plan is contiguous and
-                    // single-page and `block.end` covers every segment. The
-                    // template key is `instruction_fingerprint_words(start,
-                    // (end - start) / 4)`, which therefore already spans the
-                    // whole fused region, and `record_portable_block_artifact`
-                    // assembles from the same `BlockPlan` -- extensions
-                    // included -- that the plain emit path uses. Excluding them
-                    // cost 2.2x of shared coverage: 14.4% fused vs 32.1%
-                    // unfused (run 26).
-                    //
-                    // `ExclusiveRegion` stays out via the terminal-exit list
-                    // below: that lowering owns its whole block and is not a
-                    // segment.
                     && matches!(
                         block.terminal_exit(),
                         block::PlannedExit::Syscall { .. }
@@ -4569,30 +3021,7 @@ impl ProcessState {
                             | block::PlannedExit::Sensitive { .. }
                             | block::PlannedExit::Continue { .. }
                     ) {
-                    let binding = self.shared_candidates.get(&segment).map_or(0, Vec::len);
-                    u32::try_from(binding).ok().and_then(|generation_binding| {
-                        emit::record_portable_block_artifact(
-                            &block,
-                            generation_binding,
-                            memory.address_mode().into(),
-                            source_words,
-                        )
-                        .ok()
-                        .map(|artifact| {
-                            (
-                                segment,
-                                crate::shared_cache::PortableBlockCandidate {
-                                    guest_start: block.start,
-                                    generation_binding,
-                                    requires_sensitive_metadata: matches!(
-                                        block.terminal_exit(),
-                                        block::PlannedExit::Sensitive { .. }
-                                    ),
-                                    template: artifact.template,
-                                },
-                            )
-                        })
-                    })
+                    Some(segment)
                 } else {
                     None
                 };
@@ -4611,7 +3040,12 @@ impl ProcessState {
                             | block::PlannedExit::Indirect { .. }
                             | block::PlannedExit::Continue { .. }
                     );
-                let (emitted, artifact) = if artifact_eligible {
+                // ONE native emission serves execution, the per-image
+                // artifact store, AND the unit lane: recording is a pure tap
+                // (byte-identical words, trusted entry included), so a unit
+                // candidate IS the native emission — not a second
+                // authority-mode assembly.
+                let (emitted, artifact) = if artifact_eligible || unit_candidate_segment.is_some() {
                     emit::emit_block_recording_artifact_optional(
                         &mut self.cache,
                         &block,
@@ -4629,6 +3063,20 @@ impl ProcessState {
                         )?,
                         None,
                     )
+                };
+                let portable_candidate = match (unit_candidate_segment, artifact.as_ref()) {
+                    (Some(segment), Some(artifact)) => Some((
+                        segment,
+                        crate::shared_cache::PortableBlockCandidate {
+                            guest_start: block.start,
+                            requires_sensitive_metadata: matches!(
+                                block.terminal_exit(),
+                                block::PlannedExit::Sensitive { .. }
+                            ),
+                            template: artifact.template.clone(),
+                        },
+                    )),
+                    _ => None,
                 };
                 if let (Some(store), Some(artifact_key), Some(artifact)) = (
                     self.artifact_store.as_ref(),
@@ -4854,86 +3302,6 @@ impl ProcessState {
         Ok(severed)
     }
 
-    /// Patch a private -> shared edge through a trampoline that installs the
-    /// TARGET unit's generation-binding table, then branches to the block.
-    ///
-    /// Costs `BINDING_INSTALL_TRAMPOLINE_WORDS` of private cache per edge and
-    /// replaces a full gateway round trip on every traversal.
-    fn patch_shared_edge_via_binding_trampoline(
-        &mut self,
-        site: cache::LinkSite,
-        target: types::CacheVa,
-        bindings: usize,
-        target_guest: carrick_guest_mem::GuestVa,
-        observation: &cache::PageGenerationObservation,
-    ) -> Result<(), types::DsrError> {
-        if bindings == 0 {
-            // No table to install; leaving the site unpatched keeps the gateway
-            // exit, which is correct, just not fast.
-            return Ok(());
-        }
-        let len = emit::BINDING_INSTALL_TRAMPOLINE_WORDS * std::mem::size_of::<u32>();
-        let mut writer = self.cache.begin_write(len)?;
-        let entry = writer.entry();
-        let branch_slot = types::CacheOffset::published(
-            u32::try_from((emit::BINDING_INSTALL_TRAMPOLINE_WORDS - 1) * 4).unwrap_or(u32::MAX),
-        );
-        let branch = encode_aarch64_direct_branch(
-            cache::LinkSite {
-                source: entry,
-                slot: branch_slot,
-            },
-            target,
-        );
-        let mut words = [NOP_AARCH64; emit::BINDING_INSTALL_TRAMPOLINE_WORDS];
-        let reachable = match branch {
-            Ok(word) => {
-                words[..emit::BINDING_INSTALL_TRAMPOLINE_WORDS - 1]
-                    .copy_from_slice(&emit::binding_install_prologue(bindings as u64));
-                words[emit::BINDING_INSTALL_TRAMPOLINE_WORDS - 1] = word;
-                true
-            }
-            // Out of `B` range: publish the reservation as NOPs (the writer owes
-            // the cache exactly `len` bytes) and leave the site on its gateway
-            // exit.
-            Err(types::DsrError::CachePolicy(ref reason))
-                if reason.contains("outside AArch64 B range") =>
-            {
-                false
-            }
-            Err(error) => return Err(error),
-        };
-        writer.write_words(&words)?;
-        let published = writer.publish()?;
-        // Register the trampoline so a PC inside it resolves to a block. Every
-        // word maps to the TARGET's guest start: the trampoline executes no
-        // guest instruction, so a signal landing in it recovers to "about to
-        // run the target", and re-entry through the gateway reinstalls the
-        // authority the trampoline was writing. Skipping this registration is
-        // what produced "cache PC ... is outside published DSR blocks
-        // (in_cache=true)" on the first run of this change.
-        let map = (0..emit::BINDING_INSTALL_TRAMPOLINE_WORDS)
-            .map(|word| emit::PcMapEntry {
-                guest: target_guest,
-                cache: types::CacheOffset::published(u32::try_from(word * 4).unwrap_or(u32::MAX)),
-            })
-            .collect();
-        self.push_published(PublishedBlock {
-            entry: published.entry(),
-            len,
-            metadata: PublishedBlockMetadata::Owned {
-                map,
-                recovery: Vec::new(),
-                shared_recovery: None,
-            },
-            _generation: observation.clone(),
-        });
-        if reachable {
-            self.patch_direct_link_if_reachable(site, published.entry(), target_guest)?;
-        }
-        Ok(())
-    }
-
     fn push_published(&mut self, block: PublishedBlock) {
         let entry = PublishedIndexEntry {
             start: block.entry.host(),
@@ -4942,16 +3310,9 @@ impl ProcessState {
         // The private cache is a bump allocator: `begin_write` hands out
         // strictly increasing extents, and the one cursor rewind
         // (`reset_after_fork_for_exec`) clears `published` with it, so a
-        // private block appends. Shared units' blocks never come through
-        // here -- the install path indexes them into the shared list
-        // directly -- so under the copy transport (units live inside the
-        // cache range too) every caller lands in the private arm. The range
-        // test survives as a fail-safe for any non-cache entry.
-        let index = if self.cache.host_range().contains(&entry.start.raw()) {
-            &mut self.private_published_index
-        } else {
-            &mut self.shared_published_index
-        };
+        // block appends. Installed unit blocks replay into this same cache
+        // and come through here like every native translation.
+        let index = &mut self.private_published_index;
         let at = match index.last() {
             Some(last) if last.start > entry.start => {
                 index.partition_point(|indexed| indexed.start <= entry.start)
@@ -4962,29 +3323,9 @@ impl ProcessState {
         self.published.push(block);
     }
 
-    /// Drop every published block together with the indexes over them.
-    /// Is `pc` inside a block mapped from a loaded shared unit?
-    ///
-    /// Binary search over the sorted ranges: this runs on every `ResolveDirect`
-    /// under profiling, so it must not be a scan.
-    fn shared_block_contains(&self, pc: carrick_guest_mem::GuestVa) -> bool {
-        let ranges = &self.shared_guest_ranges;
-        match ranges.binary_search_by(|(start, _)| start.raw().cmp(&pc.raw())) {
-            // Exact hit on a block start.
-            Ok(_) => true,
-            // Otherwise the candidate is the range starting just below `pc`.
-            Err(0) => false,
-            Err(index) => {
-                let (_, end) = ranges[index - 1];
-                pc.raw() < end.raw()
-            }
-        }
-    }
-
     fn clear_published(&mut self) {
         self.published.clear();
         self.private_published_index.clear();
-        self.shared_published_index.clear();
     }
 
     /// The published block whose emitted extent contains `cache_pc`, if any.
@@ -5001,7 +3342,7 @@ impl ProcessState {
     /// out of step with `published` must degrade into this function's existing
     /// "outside published DSR blocks" diagnostic, not panic a guest fault.
     fn published_block_containing(&self, cache_pc: usize) -> Option<&PublishedBlock> {
-        [&self.private_published_index, &self.shared_published_index]
+        [&self.private_published_index]
             .into_iter()
             .find_map(|index| {
                 let at = index.partition_point(|indexed| indexed.start.raw() <= cache_pc);
@@ -5028,79 +3369,21 @@ impl ProcessState {
                 types::DsrError::CachePolicy("cache PC offset exceeds u32".to_string())
             })?;
             let offset = types::CacheOffset::published(offset);
-            let (guest, recovery) = match &block.metadata {
-                PublishedBlockMetadata::Owned {
-                    map,
-                    recovery,
-                    shared_recovery,
-                } => {
-                    let guest = map
-                        .iter()
-                        .find(|entry| entry.cache == offset)
-                        .map(|entry| entry.guest)
-                        .ok_or_else(|| {
-                            types::DsrError::CachePolicy(format!(
-                                "cache PC 0x{cache_pc:x} is not an emitted instruction boundary"
-                            ))
-                        })?;
-                    let recovery = recovery
-                        .iter()
-                        .find(|entry| entry.cache == offset)
-                        .map(|entry| entry.action);
-                    let recovery = match recovery {
-                        Some(recovery) => Some(recovery),
-                        None => match shared_recovery.as_ref() {
-                            Some(metadata) => metadata
-                                .recovery
-                                .rebind_for_cache(offset, metadata.host_bias)?,
-                            None => None,
-                        },
-                    };
-                    (guest, recovery)
-                }
-                PublishedBlockMetadata::Mapped {
-                    loaded_unit_index,
-                    block_index,
-                } => {
-                    let loaded = self
-                        .loaded_shared_units
-                        .get(*loaded_unit_index)
-                        .ok_or_else(|| {
-                            types::DsrError::CachePolicy(format!(
-                                "mapped shared loaded-unit index {loaded_unit_index} is invalid"
-                            ))
-                        })?;
-                    let metadata = loaded._unit.metadata.v3().ok_or_else(|| {
-                        types::DsrError::CachePolicy(format!(
-                            "mapped shared loaded-unit index {loaded_unit_index} is not V3"
-                        ))
-                    })?;
-                    let block_index = usize::try_from(*block_index).map_err(|_| {
-                        types::DsrError::CachePolicy(format!(
-                            "mapped shared block index {block_index} does not fit usize"
-                        ))
-                    })?;
-                    let mapped = metadata.block(block_index).ok_or_else(|| {
-                        types::DsrError::CachePolicy(format!(
-                            "mapped shared block index {block_index} is invalid"
-                        ))
-                    })?;
-                    let guest = mapped.pc_map().guest_for_cache(offset).ok_or_else(|| {
-                        types::DsrError::CachePolicy(format!(
-                            "cache PC 0x{cache_pc:x} is not an emitted instruction boundary"
-                        ))
-                    })?;
-                    let recovery = mapped
-                        .recovery()
-                        .action_for_cache(offset)
-                        .map_err(|error| {
-                            types::DsrError::CachePolicy(format!(
-                                "mapped shared recovery lookup failed: {error:?}"
-                            ))
-                        })?;
-                    (guest, recovery)
-                }
-            };
+            let guest = block
+                .map
+                .iter()
+                .find(|entry| entry.cache == offset)
+                .map(|entry| entry.guest)
+                .ok_or_else(|| {
+                    types::DsrError::CachePolicy(format!(
+                        "cache PC 0x{cache_pc:x} is not an emitted instruction boundary"
+                    ))
+                })?;
+            let recovery = block
+                .recovery
+                .iter()
+                .find(|entry| entry.cache == offset)
+                .map(|entry| entry.action);
             return Ok((guest, recovery));
         }
         let first = self
@@ -5269,75 +3552,12 @@ impl ThreadTranslator {
         generation: types::CodeGeneration,
         entry: types::CacheVa,
     ) -> Result<*const gateway::TargetCacheAuthority, types::DsrError> {
-        let state = self.process.state.read();
-        if let Some(authority) = state
-            .shared_blocks
-            .get(&(guest, generation))
-            .copied()
-            .filter(|authority| authority.owns(entry))
-        {
-            return Ok(authority.target_authority as *const gateway::TargetCacheAuthority);
-        }
-        drop(state);
+        let _ = (guest, generation);
         if self.process.private_target_authority.owns(entry) {
             return Ok(self.process.private_target_authority.as_ref() as *const _);
         }
         Err(types::DsrError::CachePolicy(format!(
             "translated target 0x{:x} has no executable authority",
-            entry.host().raw()
-        )))
-    }
-
-    fn direct_binding_target(
-        &self,
-        guest: carrick_guest_mem::GuestVa,
-        generation: types::CodeGeneration,
-        entry: types::CacheVa,
-    ) -> Result<crate::direct_binding::DirectBindingTarget, types::DsrError> {
-        let state = self.process.state.read();
-        if let Some(authority) = state
-            .shared_blocks
-            .get(&(guest, generation))
-            .copied()
-            .filter(|authority| authority.owns(entry))
-        {
-            let loaded = state
-                .loaded_shared_units
-                .get(authority.loaded_unit_index)
-                .ok_or_else(|| {
-                    types::DsrError::CachePolicy(
-                        "shared direct-binding authority lost its loaded unit".to_string(),
-                    )
-                })?;
-            return Ok(crate::direct_binding::DirectBindingTarget::shared_in_unit(
-                crate::direct_binding::DirectBindingTargetPrefix {
-                    target_cache_pc: entry.host().raw() as u64,
-                    cache_start: authority.cache_start as u64,
-                    cache_end: authority.cache_end as u64,
-                    generation_bindings: authority.generation_bindings as u64,
-                },
-                guest,
-                generation,
-                loaded._unit.clone(),
-                authority.loaded_unit_index,
-            ));
-        }
-        let cache_range = state.cache.host_range();
-        if self.process.private_target_authority.owns(entry) {
-            return Ok(crate::direct_binding::DirectBindingTarget::private(
-                crate::direct_binding::DirectBindingTargetPrefix {
-                    target_cache_pc: entry.host().raw() as u64,
-                    cache_start: cache_range.start as u64,
-                    cache_end: cache_range.end as u64,
-                    generation_bindings: 0,
-                },
-                guest,
-                generation,
-                &self.process.private_jit_epoch,
-            ));
-        }
-        Err(types::DsrError::CachePolicy(format!(
-            "translated target 0x{:x} has no retained direct-binding authority",
             entry.host().raw()
         )))
     }
@@ -5510,9 +3730,7 @@ impl ThreadTranslator {
         let state = self.process.state.read();
         let mut points = Vec::new();
         for block in &state.published {
-            let PublishedBlockMetadata::Owned { map, recovery, .. } = &block.metadata else {
-                continue;
-            };
+            let (map, recovery) = (&block.map, &block.recovery);
             for recovery in recovery {
                 if !matches!(
                     recovery.action,
@@ -5561,47 +3779,12 @@ impl ThreadTranslator {
         let state = self.process.state.read();
         let mut points = Vec::new();
         for block in &state.published {
-            let cache_offsets = match &block.metadata {
-                PublishedBlockMetadata::Owned { map, .. } => map
-                    .iter()
-                    .filter(|mapping| mapping.guest == guest)
-                    .map(|mapping| mapping.cache)
-                    .collect::<Vec<_>>(),
-                PublishedBlockMetadata::Mapped {
-                    loaded_unit_index,
-                    block_index,
-                } => {
-                    let loaded = state
-                        .loaded_shared_units
-                        .get(*loaded_unit_index)
-                        .ok_or_else(|| {
-                            types::DsrError::CachePolicy(format!(
-                                "mapped shared loaded-unit index {loaded_unit_index} is invalid"
-                            ))
-                        })?;
-                    let metadata = loaded._unit.metadata.v3().ok_or_else(|| {
-                        types::DsrError::CachePolicy(format!(
-                            "mapped shared loaded-unit index {loaded_unit_index} is not V3"
-                        ))
-                    })?;
-                    let block_index = usize::try_from(*block_index).map_err(|_| {
-                        types::DsrError::CachePolicy(format!(
-                            "mapped shared block index {block_index} does not fit usize"
-                        ))
-                    })?;
-                    let mapped = metadata.block(block_index).ok_or_else(|| {
-                        types::DsrError::CachePolicy(format!(
-                            "mapped shared block index {block_index} is invalid"
-                        ))
-                    })?;
-                    mapped
-                        .pc_map()
-                        .iter()
-                        .filter(|mapping| mapping.guest == guest)
-                        .map(|mapping| mapping.cache)
-                        .collect::<Vec<_>>()
-                }
-            };
+            let cache_offsets = block
+                .map
+                .iter()
+                .filter(|mapping| mapping.guest == guest)
+                .map(|mapping| mapping.cache)
+                .collect::<Vec<_>>();
             for cache in cache_offsets {
                 let address = block
                     .entry
@@ -5643,9 +3826,7 @@ impl ThreadTranslator {
         let mut state = self.process.state.write();
         let is_recovery = state.published.iter().any(|block| {
             let start = block.entry.host().raw();
-            let PublishedBlockMetadata::Owned { recovery, .. } = &block.metadata else {
-                return false;
-            };
+            let recovery = &block.recovery;
             recovery.iter().any(|recovery| {
                 start
                     .checked_add(recovery.cache.get() as usize)
@@ -5773,27 +3954,10 @@ impl ThreadTranslator {
                 return Err(error);
             }
         };
-        let state = self.process.state.read();
-        let shared = state
-            .shared_blocks
-            .get(&(guest, generation))
-            .copied()
-            .filter(|authority| authority.owns(entry));
-        let cache_range = state.cache.host_range();
-        let executable_range_catalog = state.executable_ranges.header_ptr();
-        let has_shared_units = !state.loaded_shared_units.is_empty();
-        drop(state);
         let prepared = PreparedEntry {
             entry,
             generation,
-            cache_start: shared.map_or(cache_range.start, |authority| authority.cache_start),
-            cache_end: shared.map_or(cache_range.end, |authority| authority.cache_end),
             address_mode: memory.address_mode(),
-            generation_bindings: shared.map_or(0, |authority| authority.generation_bindings),
-            generation_binding_count: shared
-                .map_or(0, |authority| authority.generation_binding_count),
-            executable_range_catalog,
-            has_shared_units,
         };
         if PROFILE {
             probes::dsr_prepare_end(
@@ -5834,48 +3998,16 @@ impl ThreadTranslator {
                 prepared.generation.get(),
             );
         }
-        let gateway_result = if prepared.generation_binding_count == 0 && !prepared.has_shared_units
-        {
-            gateway::enter_translated_with_trusted_private_cache(
-                prepared.entry,
-                snapshot,
-                &mut exit,
-                &self.indirect_cache,
-                prepared.address_mode,
-            )
-        } else if prepared.generation_binding_count == 0 {
-            gateway::enter_translated_with_cache_range_and_catalog(
-                prepared.entry,
-                snapshot,
-                &mut exit,
-                &self.indirect_cache,
-                prepared.cache_start,
-                prepared.cache_end,
-                prepared.address_mode,
-                prepared.executable_range_catalog,
-            )
-        } else {
-            // SAFETY: `ProcessState::loaded_shared_units` owns the boxed table
-            // for the entire configured image lifetime. Exec reset cannot run
-            // concurrently with an active prepared entry.
-            let bindings = unsafe {
-                std::slice::from_raw_parts(
-                    prepared.generation_bindings as *const gateway::GenerationBinding,
-                    prepared.generation_binding_count,
-                )
-            };
-            gateway::enter_translated_with_cache_range_and_generation_bindings_and_catalog(
-                prepared.entry,
-                snapshot,
-                &mut exit,
-                &self.indirect_cache,
-                prepared.cache_start,
-                prepared.cache_end,
-                prepared.address_mode,
-                bindings,
-                prepared.executable_range_catalog,
-            )
-        };
+        // Installed unit blocks replay into the private cache with trusted
+        // entries, so every prepared entry takes the trusted private-cache
+        // arm — the shared cache-range/binding-table gateway arms are gone.
+        let gateway_result = gateway::enter_translated_with_trusted_private_cache(
+            prepared.entry,
+            snapshot,
+            &mut exit,
+            &self.indirect_cache,
+            prepared.address_mode,
+        );
         if let Err(error) = gateway_result {
             if PROFILE {
                 probes::dsr_run_end(
@@ -5923,16 +4055,9 @@ impl ThreadTranslator {
                 }
                 types::NativeDsrExit::ResolveDirect { source, target, .. } => {
                     self.stats.add(ResolverStat::DirectResolverExits, 1);
-                    // A0's exit criterion: classify by RANGE containment, and
-                    // report source and target together. One shared `read()` for
-                    // both, under the profiling guard only.
-                    let (source_shared, target_shared) = {
-                        let state = self.process.state.read();
-                        (
-                            state.shared_block_contains(source),
-                            state.shared_block_contains(target),
-                        )
-                    };
+                    // Installed unit blocks are indistinguishable from native
+                    // translations, so every resolve edge is private->private.
+                    let (source_shared, target_shared) = (false, false);
                     self.stats.add(
                         match (source_shared, target_shared) {
                             (true, true) => ResolverStat::ResolveSrcSharedTgtShared,
@@ -5957,44 +4082,13 @@ impl ThreadTranslator {
         }
         Ok(match exit.exit {
             types::NativeDsrExit::Syscall { resume } => ThreadExit::Syscall { resume },
-            types::NativeDsrExit::ResolveDirect {
-                source,
-                target,
-                binding,
-            } => {
-                let binding_cell = binding.raw_cell();
+            types::NativeDsrExit::ResolveDirect { source, target } => {
                 probes::dsr_resolve_begin(
                     self.tid,
                     probes::DsrResolveKind::Direct,
                     source.raw(),
                     target.raw(),
                 );
-                let binding_eligibility = self
-                    .process
-                    .state
-                    .write()
-                    .direct_bindings
-                    .classify_cold_exit(source, target, binding);
-                match &binding_eligibility {
-                    Ok(eligibility) => {
-                        probes::dsr_cache_event(
-                            self.tid,
-                            probes::DsrCacheEventKind::DirectBindingEligible,
-                            source.raw(),
-                            u64::from(eligibility.ordinal.get()),
-                            eligibility.cell.map_or(0, |cell| cell.get() as u64),
-                        );
-                    }
-                    Err(reason) => {
-                        probes::dsr_cache_event(
-                            self.tid,
-                            probes::DsrCacheEventKind::DirectBindingValidationFailure,
-                            source.raw(),
-                            reason.raw(),
-                            binding_cell,
-                        );
-                    }
-                }
                 let translated = match self.translate::<PROFILE>(memory, target) {
                     Ok(translated) => translated,
                     Err(error) => {
@@ -6009,79 +4103,6 @@ impl ThreadTranslator {
                     }
                 };
                 self.publish_indirect_target(memory, target, &translated)?;
-                if let Ok(eligibility) = binding_eligibility
-                    && let Some(cell) = eligibility.cell
-                {
-                    let binding = crate::direct_binding::DirectBindingMiss {
-                        cell,
-                        ordinal: eligibility.ordinal,
-                    };
-                    match self.direct_binding_target(
-                        target,
-                        translated.generation,
-                        translated.entry,
-                    ) {
-                        Ok(descriptor) => {
-                            let evidence = self
-                                .process
-                                .state
-                                .write()
-                                .direct_bindings
-                                .publish_with_evidence(binding, source, target, descriptor);
-                            for _ in 0..evidence.cas_losses {
-                                probes::dsr_cache_event(
-                                    self.tid,
-                                    probes::DsrCacheEventKind::DirectBindingCasLoss,
-                                    source.raw(),
-                                    u64::from(eligibility.ordinal.get()),
-                                    cell.get() as u64,
-                                );
-                            }
-                            if let Some(generation) = evidence.stale_clear_generation {
-                                probes::dsr_cache_event(
-                                    self.tid,
-                                    probes::DsrCacheEventKind::DirectBindingClear,
-                                    cell.get() as u64,
-                                    crate::direct_binding::DirectBindingClearReason::StaleWinnerRemoval
-                                        .raw(),
-                                    generation.get(),
-                                );
-                            }
-                            if matches!(
-                                evidence.outcome,
-                                crate::direct_binding::DirectBindingPublishOutcome::Published
-                                    | crate::direct_binding::DirectBindingPublishOutcome::PublishedAfterStale
-                            ) {
-                                probes::dsr_cache_event(
-                                    self.tid,
-                                    probes::DsrCacheEventKind::DirectBindingPublish,
-                                    source.raw(),
-                                    u64::from(eligibility.ordinal.get()),
-                                    cell.get() as u64,
-                                );
-                            }
-                            if let Some(reason) = evidence.validation_failure {
-                                probes::dsr_cache_event(
-                                    self.tid,
-                                    probes::DsrCacheEventKind::DirectBindingValidationFailure,
-                                    source.raw(),
-                                    reason.raw(),
-                                    cell.get() as u64,
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            probes::dsr_cache_event(
-                                self.tid,
-                                probes::DsrCacheEventKind::DirectBindingValidationFailure,
-                                source.raw(),
-                                crate::direct_binding::DirectBindingValidationReason::AuthorityMismatch
-                                    .raw(),
-                                cell.get() as u64,
-                            );
-                        }
-                    }
-                }
                 probes::dsr_cache_event(
                     self.tid,
                     probes::DsrCacheEventKind::TargetPublish,
@@ -6338,37 +4359,17 @@ mod tests {
     // by the mirrored-ordinal tests in carrick-dsr).
     use super::{
         DsrErrorProbeExt as _, ForkChildRepairRecorder, NativeDsrExitProbeExt as _,
-        ProcessTranslator, PublishedBlockMetadata, ResolverStats, SensitiveMetadata,
-        SharedBlockAuthority, SharedInstallCommitObserver, SharedInstallCommitPhase,
-        SharedInstallLogicalSnapshot, SharedInstallPrepareStage, ThreadTranslator,
-        TranslatedRangeCatalog, TranslatedRangeRecorder, exact_guest_ranges_from_pc_map,
-        merge_published_indexes, merge_sensitive_metadata, normalized_guest_range_union,
-        set_shared_install_prepare_failpoint_for_test, shared_recovery_lazy_enabled_from,
-        translated_unit_id, translation_source_words_required, typed_unit_id_from_digest,
-    };
-    use crate::artifact_spike::{ArtifactBindings, ArtifactTemplate};
-    use crate::emit::PcMapEntry;
-    use crate::mapped_memory::NativeMappedMemory;
-    use crate::mapped_metadata::{
-        MetadataBacking, ValidatedMappedTranslationMetadata, VecMetadataBacking,
-        encode_translation_metadata_v3,
-    };
-    use crate::shared_cache::{
-        DirectBindingLayout, PortableBlockRecord, SharedLoadedTranslationUnit,
-        TRANSLATION_UNIT_SCHEMA_V2, TranslationMetadataLoadEvidence, TranslationMetadataMode,
-        TranslationUnitManifest, translation_unit_base_export,
+        ProcessTranslator, SensitiveMetadata, ThreadTranslator, TranslatedRangeCatalog,
+        TranslatedRangeRecorder, merge_sensitive_metadata, translation_source_words_required,
     };
     use crate::types;
     use carrick_dsr::host::{ForkChildJit, JitRegion, NativeHostJit};
     use carrick_dsr::probes::{
         DsrCacheLifecyclePhase, TranslatedPrivateRange, TranslatedRangeAdd, TranslatedRangeEpoch,
-        TranslatedRangeReady, TranslatedRangeReset, TranslatedRangeSequence, TranslatedUnitId,
+        TranslatedRangeReady, TranslatedRangeReset, TranslatedRangeSequence,
     };
     use carrick_guest_mem::{GuestVa, HostVa};
-    use std::cell::RefCell;
     use std::ptr::NonNull;
-    use std::rc::Rc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     const PC: GuestVa = GuestVa(0x1000);
@@ -6474,8 +4475,6 @@ mod tests {
 
     struct ForkChildRepairRecorderFixture<'a> {
         state: &'a parking_lot::RwLock<super::ProcessState>,
-        published_cell:
-            Option<&'a std::sync::atomic::AtomicPtr<crate::direct_binding::DirectBindingTarget>>,
         events: Vec<RecordedForkChildRepair>,
     }
 
@@ -6514,113 +4513,8 @@ mod tests {
     impl ForkChildRepairRecorder for ForkChildRepairRecorderFixture<'_> {
         fn process_repaired(&mut self) {
             self.assert_writer_held();
-            if let Some(cell) = self.published_cell {
-                assert!(
-                    cell.load(std::sync::atomic::Ordering::Acquire).is_null(),
-                    "translated replay began before inherited binding repair"
-                );
-            }
             self.events.push(RecordedForkChildRepair::ProcessRepaired);
         }
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum SharedInstallCommitOrderEvent {
-        CatalogEvent,
-        Phase(SharedInstallCommitPhase),
-    }
-
-    struct SharedInstallCommitRecorderFixture {
-        order: Rc<RefCell<Vec<SharedInstallCommitOrderEvent>>>,
-    }
-
-    impl TranslatedRangeRecorder for SharedInstallCommitRecorderFixture {
-        fn reset(&mut self, _event: TranslatedRangeReset) {
-            panic!("shared-install commit must not emit reset");
-        }
-
-        fn add(&mut self, event: TranslatedRangeAdd) {
-            assert!(matches!(event, TranslatedRangeAdd::Shared(_)));
-            self.order
-                .borrow_mut()
-                .push(SharedInstallCommitOrderEvent::CatalogEvent);
-        }
-
-        fn ready(&mut self, _event: TranslatedRangeReady) {
-            panic!("shared-install commit must not emit ready");
-        }
-    }
-
-    struct SharedInstallCommitObserverFixture {
-        order: Rc<RefCell<Vec<SharedInstallCommitOrderEvent>>>,
-        observations: Vec<(SharedInstallCommitPhase, SharedInstallLogicalSnapshot)>,
-    }
-
-    impl SharedInstallCommitObserver for SharedInstallCommitObserverFixture {
-        fn observe(&mut self, phase: SharedInstallCommitPhase, state: &super::ProcessState) {
-            self.order
-                .borrow_mut()
-                .push(SharedInstallCommitOrderEvent::Phase(phase));
-            self.observations
-                .push((phase, state.shared_install_logical_snapshot_for_test()));
-        }
-    }
-
-    fn assert_non_catalog_commit_state_equal(
-        actual: &SharedInstallLogicalSnapshot,
-        expected: &SharedInstallLogicalSnapshot,
-    ) {
-        assert_eq!(actual.blocks, expected.blocks);
-        assert_eq!(actual.sensitive, expected.sensitive);
-        assert_eq!(actual.fusion_sites, expected.fusion_sites);
-        assert_eq!(actual.published_len, expected.published_len);
-        assert_eq!(
-            actual.private_published_index,
-            expected.private_published_index
-        );
-        assert_eq!(
-            actual.shared_published_index,
-            expected.shared_published_index
-        );
-        assert_eq!(actual.dependencies, expected.dependencies);
-        assert_eq!(actual.shared_blocks, expected.shared_blocks);
-        assert_eq!(actual.shared_guest_ranges, expected.shared_guest_ranges);
-        assert_eq!(actual.loaded_unit_ids, expected.loaded_unit_ids);
-        assert_eq!(actual.direct_bindings, expected.direct_bindings);
-        assert_eq!(actual.direct_binding_units, expected.direct_binding_units);
-        assert_eq!(actual.stats, expected.stats);
-        assert_eq!(actual.reported_stats, expected.reported_stats);
-        assert_eq!(actual.executable_head, expected.executable_head);
-        assert_eq!(actual.executable_nodes, expected.executable_nodes);
-    }
-
-    fn assert_commit_state_except_executable_equal(
-        actual: &SharedInstallLogicalSnapshot,
-        expected: &SharedInstallLogicalSnapshot,
-    ) {
-        assert_eq!(actual.catalog_frontier, expected.catalog_frontier);
-        assert_eq!(actual.catalog_ready, expected.catalog_ready);
-        assert_eq!(actual.catalog_shared, expected.catalog_shared);
-        assert_eq!(actual.blocks, expected.blocks);
-        assert_eq!(actual.sensitive, expected.sensitive);
-        assert_eq!(actual.fusion_sites, expected.fusion_sites);
-        assert_eq!(actual.published_len, expected.published_len);
-        assert_eq!(
-            actual.private_published_index,
-            expected.private_published_index
-        );
-        assert_eq!(
-            actual.shared_published_index,
-            expected.shared_published_index
-        );
-        assert_eq!(actual.dependencies, expected.dependencies);
-        assert_eq!(actual.shared_blocks, expected.shared_blocks);
-        assert_eq!(actual.shared_guest_ranges, expected.shared_guest_ranges);
-        assert_eq!(actual.loaded_unit_ids, expected.loaded_unit_ids);
-        assert_eq!(actual.direct_bindings, expected.direct_bindings);
-        assert_eq!(actual.direct_binding_units, expected.direct_binding_units);
-        assert_eq!(actual.stats, expected.stats);
-        assert_eq!(actual.reported_stats, expected.reported_stats);
     }
 
     #[test]
@@ -6709,82 +4603,6 @@ mod tests {
     }
 
     #[test]
-    fn translated_range_catalog_shared_prepare_is_atomic_and_commit_publishes_once() {
-        let (mut catalog, mut recorder) = active_catalog();
-        let before = (
-            catalog.next_sequence,
-            catalog.ready_sequence,
-            catalog.shared.clone(),
-        );
-        let unit_id = TranslatedUnitId::new(11).expect("unit id");
-
-        let prepared = catalog
-            .prepare_shared(unit_id, HostVa(0x2000)..HostVa(0x3000))
-            .expect("private-adjacent shared range");
-
-        assert_eq!(
-            (
-                catalog.next_sequence,
-                catalog.ready_sequence,
-                catalog.shared.clone(),
-            ),
-            before,
-            "preparation must not consume sequence or publish"
-        );
-        assert!(recorder.events.is_empty());
-
-        catalog.commit_shared_with_recorder(prepared.clone(), &mut recorder);
-
-        assert_eq!(catalog.next_sequence, 3);
-        assert_eq!(catalog.ready_sequence, Some(1));
-        assert_eq!(catalog.shared, vec![prepared.clone()]);
-        assert_eq!(
-            recorder.events,
-            vec![RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(
-                carrick_dsr::probes::TranslatedSharedRange::shared(
-                    catalog.epoch,
-                    prepared.sequence,
-                    unit_id,
-                    prepared.range,
-                )
-                .expect("typed shared event"),
-            ))]
-        );
-    }
-
-    #[test]
-    fn translated_range_catalog_assigns_ordered_shared_sequences_once() {
-        let (mut catalog, mut recorder) = active_catalog();
-        for (unit, start, end) in [(11, 0x3000, 0x4000), (12, 0x5000, 0x6000)] {
-            let prepared = catalog
-                .prepare_shared(
-                    TranslatedUnitId::new(unit).expect("unit id"),
-                    HostVa(start)..HostVa(end),
-                )
-                .expect("prepare disjoint shared range");
-            catalog.commit_shared_with_recorder(prepared, &mut recorder);
-        }
-
-        assert_eq!(
-            catalog
-                .shared
-                .iter()
-                .map(|entry| entry.sequence.get())
-                .collect::<Vec<_>>(),
-            vec![2, 3]
-        );
-        assert_eq!(catalog.next_sequence, 4);
-        assert_eq!(recorder.events.len(), 2);
-        assert!(matches!(
-            recorder.events.as_slice(),
-            [
-                RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(first)),
-                RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(second)),
-            ] if first.sequence().get() == 2 && second.sequence().get() == 3
-        ));
-    }
-
-    #[test]
     fn translated_range_catalog_replays_private_range_under_checked_fork_epoch() {
         let (mut catalog, mut recorder) = active_catalog();
         let private = catalog.private.clone();
@@ -6810,7 +4628,6 @@ mod tests {
         assert_eq!(catalog.next_sequence, 2);
         assert_eq!(catalog.ready_sequence, Some(1));
         assert_eq!(catalog.private, private);
-        assert!(catalog.shared.is_empty());
     }
 
     #[test]
@@ -6826,7 +4643,6 @@ mod tests {
             catalog.next_sequence,
             catalog.ready_sequence,
             catalog.private.clone(),
-            catalog.shared.clone(),
         );
 
         let result = catalog.replay_after_fork(&mut recorder);
@@ -6839,7 +4655,6 @@ mod tests {
                 catalog.next_sequence,
                 catalog.ready_sequence,
                 catalog.private,
-                catalog.shared,
             ),
             before
         );
@@ -6847,15 +4662,8 @@ mod tests {
 
     #[test]
     fn translated_range_catalog_rejects_invalid_inherited_ready_frontier() {
-        for invalid_ready in [0, 3] {
+        for invalid_ready in [0, 2] {
             let (mut catalog, mut recorder) = active_catalog();
-            let prepared = catalog
-                .prepare_shared(
-                    TranslatedUnitId::new(11).expect("unit id"),
-                    HostVa(0x3000)..HostVa(0x4000),
-                )
-                .expect("prepare shared range");
-            catalog.commit_shared_with_recorder(prepared, &mut recorder);
             recorder.events.clear();
             catalog.ready_sequence = Some(invalid_ready);
             let before = (
@@ -6863,7 +4671,6 @@ mod tests {
                 catalog.next_sequence,
                 catalog.ready_sequence,
                 catalog.private.clone(),
-                catalog.shared.clone(),
             );
 
             let result = catalog.replay_after_fork(&mut recorder);
@@ -6879,7 +4686,6 @@ mod tests {
                     catalog.next_sequence,
                     catalog.ready_sequence,
                     catalog.private.clone(),
-                    catalog.shared.clone(),
                 ),
                 before,
                 "invalid ready {invalid_ready} mutated the catalog"
@@ -6888,124 +4694,8 @@ mod tests {
     }
 
     #[test]
-    fn translated_range_catalog_replays_full_shared_frontier_after_fork() {
-        let (mut catalog, mut recorder) = active_catalog();
-        for (unit, start, end) in [(11, 0x3000, 0x4000), (12, 0x5000, 0x6000)] {
-            let prepared = catalog
-                .prepare_shared(
-                    TranslatedUnitId::new(unit).expect("unit id"),
-                    HostVa(start)..HostVa(end),
-                )
-                .expect("prepare shared range");
-            catalog.commit_shared_with_recorder(prepared, &mut recorder);
-        }
-        recorder.events.clear();
-        let private = catalog.private.clone();
-        let shared = catalog.shared.clone();
-        let epoch = TranslatedRangeEpoch::new(2).expect("nonzero epoch");
-
-        catalog
-            .replay_after_fork(&mut recorder)
-            .expect("fork replay");
-
-        let expected = vec![
-            RecordedTranslatedRange::Reset(TranslatedRangeReset::reset(epoch)),
-            RecordedTranslatedRange::Add(TranslatedRangeAdd::Private(
-                TranslatedPrivateRange::private(
-                    epoch,
-                    TranslatedRangeSequence::new(1).expect("private sequence"),
-                    private.clone(),
-                )
-                .expect("valid private range"),
-            )),
-            RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(
-                carrick_dsr::probes::TranslatedSharedRange::shared(
-                    epoch,
-                    TranslatedRangeSequence::new(2).expect("first shared sequence"),
-                    TranslatedUnitId::new(11).expect("first unit"),
-                    HostVa(0x3000)..HostVa(0x4000),
-                )
-                .expect("first replayed shared range"),
-            )),
-            RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(
-                carrick_dsr::probes::TranslatedSharedRange::shared(
-                    epoch,
-                    TranslatedRangeSequence::new(3).expect("second shared sequence"),
-                    TranslatedUnitId::new(12).expect("second unit"),
-                    HostVa(0x5000)..HostVa(0x6000),
-                )
-                .expect("second replayed shared range"),
-            )),
-            RecordedTranslatedRange::Ready(TranslatedRangeReady::ready(epoch, 3)),
-        ];
-        assert_eq!(recorder.events, expected);
-        assert_eq!(catalog.epoch, epoch);
-        assert_eq!(catalog.next_sequence, 4);
-        assert_eq!(catalog.ready_sequence, Some(3));
-        assert_eq!(catalog.private, private);
-        assert_eq!(
-            catalog
-                .shared
-                .iter()
-                .map(|entry| (entry.sequence, entry.unit_id, entry.range.clone()))
-                .collect::<Vec<_>>(),
-            shared
-                .iter()
-                .map(|entry| (entry.sequence, entry.unit_id, entry.range.clone()))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn translated_range_catalog_rekeys_retained_shared_events_for_grandchild_replay() {
-        let (mut catalog, mut recorder) = active_catalog();
-        let prepared = catalog
-            .prepare_shared(
-                TranslatedUnitId::new(11).expect("unit id"),
-                HostVa(0x3000)..HostVa(0x4000),
-            )
-            .expect("prepare shared range");
-        catalog.commit_shared_with_recorder(prepared, &mut recorder);
-        recorder.events.clear();
-        catalog
-            .replay_after_fork(&mut recorder)
-            .expect("child replay");
-        recorder.events.clear();
-
-        catalog
-            .replay_after_fork(&mut recorder)
-            .expect("grandchild replay");
-
-        let epoch = TranslatedRangeEpoch::new(3).expect("grandchild epoch");
-        assert_eq!(catalog.epoch, epoch);
-        assert_eq!(catalog.next_sequence, 3);
-        assert_eq!(catalog.ready_sequence, Some(2));
-        assert_eq!(catalog.shared[0].event.epoch(), epoch);
-        assert!(matches!(
-            recorder.events.as_slice(),
-            [
-                RecordedTranslatedRange::Reset(reset),
-                RecordedTranslatedRange::Add(TranslatedRangeAdd::Private(private)),
-                RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(shared)),
-                RecordedTranslatedRange::Ready(ready),
-            ] if reset.epoch() == epoch
-                && private.epoch() == epoch
-                && shared.epoch() == epoch
-                && ready.epoch() == epoch
-                && ready.final_sequence() == 2
-        ));
-    }
-
-    #[test]
     fn translated_range_catalog_fork_epoch_overflow_is_failure_atomic() {
         let (mut catalog, mut recorder) = active_catalog();
-        let prepared = catalog
-            .prepare_shared(
-                TranslatedUnitId::new(11).expect("unit id"),
-                HostVa(0x3000)..HostVa(0x4000),
-            )
-            .expect("prepare shared range");
-        catalog.commit_shared_with_recorder(prepared, &mut recorder);
         recorder.events.clear();
         catalog.epoch = TranslatedRangeEpoch::new(u64::MAX).expect("maximum epoch is nonzero");
         let before = (
@@ -7013,7 +4703,6 @@ mod tests {
             catalog.next_sequence,
             catalog.ready_sequence,
             catalog.private.clone(),
-            catalog.shared.clone(),
         );
 
         let result = catalog.replay_after_fork(&mut recorder);
@@ -7026,29 +4715,14 @@ mod tests {
                 catalog.next_sequence,
                 catalog.ready_sequence,
                 catalog.private,
-                catalog.shared,
             ),
             before
         );
     }
 
-    fn active_catalog_with_shared_range() -> (TranslatedRangeCatalog, TranslatedRangeRecorderFixture)
-    {
-        let (mut catalog, mut recorder) = active_catalog();
-        let prepared = catalog
-            .prepare_shared(
-                TranslatedUnitId::new(41).expect("unit id"),
-                HostVa(0x3000)..HostVa(0x4000),
-            )
-            .expect("prepare shared range");
-        catalog.commit_shared_with_recorder(prepared, &mut recorder);
-        recorder.events.clear();
-        (catalog, recorder)
-    }
-
     #[test]
     fn translated_range_catalog_exec_reset_prepares_then_commits_dormant() {
-        let (mut catalog, recorder) = active_catalog_with_shared_range();
+        let (mut catalog, recorder) = active_catalog();
         let private = catalog.private.clone();
 
         let prepared = catalog
@@ -7056,9 +4730,8 @@ mod tests {
             .expect("prepare active catalog retirement");
 
         assert_eq!(catalog.epoch.get(), 1, "preparation changed the live epoch");
-        assert_eq!(catalog.next_sequence, 3);
+        assert_eq!(catalog.next_sequence, 2);
         assert_eq!(catalog.ready_sequence, Some(1));
-        assert_eq!(catalog.shared.len(), 1);
         assert!(recorder.events.is_empty());
 
         catalog.commit_dormant_for_exec(prepared);
@@ -7067,7 +4740,6 @@ mod tests {
         assert_eq!(catalog.next_sequence, 1);
         assert_eq!(catalog.ready_sequence, None);
         assert_eq!(catalog.private, private);
-        assert!(catalog.shared.is_empty());
         assert!(
             recorder.events.is_empty(),
             "exec reset emitted range events"
@@ -7076,14 +4748,13 @@ mod tests {
 
     #[test]
     fn translated_range_catalog_exec_epoch_overflow_is_eventless_and_atomic() {
-        let (mut catalog, recorder) = active_catalog_with_shared_range();
+        let (mut catalog, recorder) = active_catalog();
         catalog.epoch = TranslatedRangeEpoch::new(u64::MAX).expect("maximum epoch");
         let before = (
             catalog.epoch,
             catalog.next_sequence,
             catalog.ready_sequence,
             catalog.private.clone(),
-            catalog.shared.clone(),
         );
 
         let result = catalog.prepare_dormant_for_exec();
@@ -7096,7 +4767,6 @@ mod tests {
                 catalog.next_sequence,
                 catalog.ready_sequence,
                 catalog.private.clone(),
-                catalog.shared.clone(),
             ),
             before,
         );
@@ -7104,7 +4774,7 @@ mod tests {
 
     #[test]
     fn translated_range_catalog_second_exec_reset_rejects_dormant_unchanged() {
-        let (mut catalog, recorder) = active_catalog_with_shared_range();
+        let (mut catalog, recorder) = active_catalog();
         let prepared = catalog
             .prepare_dormant_for_exec()
             .expect("prepare first reset");
@@ -7114,7 +4784,6 @@ mod tests {
             catalog.next_sequence,
             catalog.ready_sequence,
             catalog.private.clone(),
-            catalog.shared.clone(),
         );
 
         let result = catalog.prepare_dormant_for_exec();
@@ -7127,7 +4796,6 @@ mod tests {
                 catalog.next_sequence,
                 catalog.ready_sequence,
                 catalog.private.clone(),
-                catalog.shared.clone(),
             ),
             before,
         );
@@ -7135,7 +4803,7 @@ mod tests {
 
     #[test]
     fn translated_range_catalog_post_exec_activation_replays_private_once() {
-        let (mut catalog, mut recorder) = active_catalog_with_shared_range();
+        let (mut catalog, mut recorder) = active_catalog();
         let prepared = catalog
             .prepare_dormant_for_exec()
             .expect("prepare exec reset");
@@ -7167,18 +4835,16 @@ mod tests {
         );
         assert_eq!(catalog.next_sequence, 2);
         assert_eq!(catalog.ready_sequence, Some(1));
-        assert!(catalog.shared.is_empty());
     }
 
     #[test]
     fn translated_range_catalog_abandoned_exec_preparation_leaves_active_state() {
-        let (catalog, recorder) = active_catalog_with_shared_range();
+        let (catalog, recorder) = active_catalog();
         let before = (
             catalog.epoch,
             catalog.next_sequence,
             catalog.ready_sequence,
             catalog.private.clone(),
-            catalog.shared.clone(),
         );
 
         let _prepared = catalog
@@ -7192,7 +4858,6 @@ mod tests {
                 catalog.next_sequence,
                 catalog.ready_sequence,
                 catalog.private.clone(),
-                catalog.shared.clone(),
             ),
             before,
         );
@@ -7218,7 +4883,6 @@ mod tests {
         );
         let mut repair_recorder = ForkChildRepairRecorderFixture {
             state: &process.state,
-            published_cell: None,
             events: Vec::new(),
         };
         let mut lifecycle = Vec::new();
@@ -7242,292 +4906,6 @@ mod tests {
             "failed replay must not announce fork repair completion"
         );
     }
-
-    #[test]
-    fn translated_range_catalog_rejects_shared_overlap_and_duplicate_identity_atomically() {
-        let (mut catalog, mut recorder) = active_catalog();
-        let committed = catalog
-            .prepare_shared(
-                TranslatedUnitId::new(11).expect("unit id"),
-                HostVa(0x3000)..HostVa(0x4000),
-            )
-            .expect("first shared range");
-        catalog.commit_shared_with_recorder(committed, &mut recorder);
-        recorder.events.clear();
-
-        for (case, unit, start, end) in [
-            ("escapes private below", 12, 0x0800, 0x1400),
-            ("contains private", 12, 0x0800, 0x8800),
-            ("escapes private above", 12, 0x7800, 0x8800),
-            ("entirely outside private", 12, 0x9000, 0xa000),
-            ("duplicate id equal range", 11, 0x3000, 0x4000),
-            ("duplicate id disjoint range", 11, 0x5000, 0x6000),
-            ("exact shared overlap", 12, 0x3000, 0x4000),
-            ("partial shared overlap", 12, 0x3800, 0x4800),
-            ("nested shared overlap", 12, 0x3400, 0x3800),
-            ("contains shared", 12, 0x2800, 0x4800),
-        ] {
-            let before = (
-                catalog.next_sequence,
-                catalog.ready_sequence,
-                catalog.shared.clone(),
-            );
-            let result = catalog.prepare_shared(
-                TranslatedUnitId::new(unit).expect("unit id"),
-                HostVa(start)..HostVa(end),
-            );
-
-            assert!(result.is_err(), "{case}");
-            assert_eq!(
-                (
-                    catalog.next_sequence,
-                    catalog.ready_sequence,
-                    catalog.shared.clone(),
-                ),
-                before,
-                "{case}"
-            );
-            assert!(recorder.events.is_empty(), "{case}");
-        }
-
-        for (case, start, end) in [
-            ("empty", 0x5000, 0x5000),
-            ("reversed", 0x6000, 0x5000),
-            ("unaligned start", 0x5002, 0x6000),
-            ("unaligned end", 0x5000, 0x6002),
-        ] {
-            let before = catalog.next_sequence;
-            assert!(
-                catalog
-                    .prepare_shared(
-                        TranslatedUnitId::new(12).expect("unit id"),
-                        HostVa(start)..HostVa(end),
-                    )
-                    .is_err(),
-                "{case}"
-            );
-            assert_eq!(catalog.next_sequence, before, "{case}");
-        }
-
-        assert!(
-            catalog
-                .prepare_shared(
-                    TranslatedUnitId::new(12).expect("unit id"),
-                    HostVa(0x4000)..HostVa(0x5000),
-                )
-                .is_ok(),
-            "shared adjacency is valid"
-        );
-    }
-
-    #[test]
-    fn translated_range_catalog_rejects_sequence_overflow_without_advancing() {
-        let (mut catalog, recorder) = active_catalog();
-        catalog.next_sequence = u64::MAX;
-        let before = (
-            catalog.next_sequence,
-            catalog.ready_sequence,
-            catalog.shared.clone(),
-        );
-
-        assert!(
-            catalog
-                .prepare_shared(
-                    TranslatedUnitId::new(12).expect("unit id"),
-                    HostVa(0x3000)..HostVa(0x4000),
-                )
-                .is_err()
-        );
-        assert_eq!(
-            (
-                catalog.next_sequence,
-                catalog.ready_sequence,
-                catalog.shared,
-            ),
-            before
-        );
-        assert!(recorder.events.is_empty());
-    }
-
-    fn pc_map(entries: &[(u64, u32)]) -> Vec<PcMapEntry> {
-        entries
-            .iter()
-            .map(|(guest, cache)| PcMapEntry {
-                guest: GuestVa(*guest),
-                cache: types::CacheOffset::published(*cache),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn shared_unit_pc_map_rejects_malformed_geometry() {
-        for (case, guest_start, code_len, map) in [
-            ("empty", GuestVa(0x4000), 8, pc_map(&[])),
-            (
-                "unaligned guest",
-                GuestVa(0x4000),
-                8,
-                pc_map(&[(0x4002, 0)]),
-            ),
-            (
-                "unaligned cache",
-                GuestVa(0x4000),
-                8,
-                pc_map(&[(0x4000, 2)]),
-            ),
-            (
-                "cache at block end",
-                GuestVa(0x4000),
-                8,
-                pc_map(&[(0x4000, 8)]),
-            ),
-            (
-                "duplicate cache",
-                GuestVa(0x4000),
-                8,
-                pc_map(&[(0x4000, 0), (0x4004, 0)]),
-            ),
-            (
-                "descending cache",
-                GuestVa(0x4000),
-                8,
-                pc_map(&[(0x4000, 4), (0x4004, 0)]),
-            ),
-            (
-                "declared start absent",
-                GuestVa(0x4000),
-                8,
-                pc_map(&[(0x4004, 0)]),
-            ),
-            (
-                "guest end overflow",
-                GuestVa(u64::MAX - 3),
-                8,
-                pc_map(&[(u64::MAX - 3, 0)]),
-            ),
-        ] {
-            assert!(
-                exact_guest_ranges_from_pc_map(guest_start, code_len, &map).is_err(),
-                "{case}"
-            );
-        }
-    }
-
-    #[test]
-    fn shared_unit_pc_map_accepts_repeated_guests_and_preserves_holes() {
-        assert_eq!(
-            exact_guest_ranges_from_pc_map(
-                GuestVa(0x4000),
-                12,
-                &pc_map(&[(0x4000, 0), (0x4000, 4), (0x4004, 8)]),
-            )
-            .expect("repeated guest PCs are legal"),
-            vec![GuestVa(0x4000)..GuestVa(0x4008)]
-        );
-        assert_eq!(
-            exact_guest_ranges_from_pc_map(
-                GuestVa(0x4000),
-                24,
-                &pc_map(&[
-                    (0x4000, 0),
-                    (0x4000, 4),
-                    (0x4004, 8),
-                    (0x4010, 12),
-                    (0x4010, 16),
-                    (0x4014, 20),
-                ]),
-            )
-            .expect("non-contiguous guest PCs"),
-            vec![
-                GuestVa(0x4000)..GuestVa(0x4008),
-                GuestVa(0x4010)..GuestVa(0x4018),
-            ]
-        );
-        assert_eq!(
-            exact_guest_ranges_from_pc_map(
-                GuestVa(0x4000),
-                12,
-                &pc_map(&[(0x4010, 0), (0x4000, 4), (0x4004, 8)]),
-            )
-            .expect("cache order need not equal guest order"),
-            vec![
-                GuestVa(0x4000)..GuestVa(0x4008),
-                GuestVa(0x4010)..GuestVa(0x4014),
-            ]
-        );
-    }
-
-    #[test]
-    fn shared_unit_guest_range_union_is_deterministic_and_preserves_gaps() {
-        let existing = vec![
-            (GuestVa(0x1000), GuestVa(0x1010)),
-            (GuestVa(0x1030), GuestVa(0x1040)),
-            (GuestVa(0x1080), GuestVa(0x1090)),
-        ];
-        let additions = vec![
-            GuestVa(0x1050)..GuestVa(0x1060),
-            GuestVa(0x1028)..GuestVa(0x1034),
-            GuestVa(0x100c)..GuestVa(0x1010),
-            GuestVa(0x1014)..GuestVa(0x1020),
-            GuestVa(0x1008)..GuestVa(0x1014),
-            GuestVa(0x1008)..GuestVa(0x1014),
-        ];
-
-        assert_eq!(
-            normalized_guest_range_union(&existing, &additions).expect("normalized union"),
-            vec![
-                (GuestVa(0x1000), GuestVa(0x1020)),
-                (GuestVa(0x1028), GuestVa(0x1040)),
-                (GuestVa(0x1050), GuestVa(0x1060)),
-                (GuestVa(0x1080), GuestVa(0x1090)),
-            ]
-        );
-        assert_eq!(
-            normalized_guest_range_union(
-                &[],
-                &[
-                    GuestVa(0x2010)..GuestVa(0x2020),
-                    GuestVa(0x2000)..GuestVa(0x2004),
-                    GuestVa(0x2008)..GuestVa(0x2010),
-                    GuestVa(0x2000)..GuestVa(0x2004),
-                ],
-            )
-            .expect("reverse additions"),
-            vec![
-                (GuestVa(0x2000), GuestVa(0x2004)),
-                (GuestVa(0x2008), GuestVa(0x2020)),
-            ],
-            "one four-byte gap must remain visible"
-        );
-        assert_eq!(
-            normalized_guest_range_union(&[], &[]).expect("empty union"),
-            Vec::<(GuestVa, GuestVa)>::new()
-        );
-    }
-
-    #[test]
-    fn shared_unit_identity_is_stable_typed_and_zero_is_rejected() {
-        let first = direct_binding_owner_and_publication::key(40);
-        let second = direct_binding_owner_and_publication::key(41);
-        let first_id = translated_unit_id(&first).expect("first unit id");
-
-        assert_ne!(first_id.get(), 0);
-        assert_eq!(
-            translated_unit_id(&first).expect("stable first unit id"),
-            first_id
-        );
-        assert_ne!(
-            translated_unit_id(&second).expect("second unit id"),
-            first_id
-        );
-        assert!(
-            typed_unit_id_from_digest(0)
-                .expect_err("zero digest must not receive a replacement")
-                .to_string()
-                .contains("unit identity")
-        );
-    }
-
     fn shared_sensitive_metadata(
         resume: GuestVa,
         fusion: Option<types::ExclusiveFusionSite>,
@@ -7605,1133 +4983,6 @@ mod tests {
         ));
     }
 
-    fn shared_install_manifest() -> TranslationUnitManifest {
-        let map = pc_map(&[(0x400000, 0), (0x400000, 4), (0x400004, 8), (0x400010, 12)]);
-        let template = ArtifactTemplate::normalize(
-            Vec::new(),
-            map,
-            vec![crate::emit::RecoveryEntry {
-                cache: types::CacheOffset::published(4),
-                action: crate::emit::RecoveryAction::RestoreGuestX17,
-            }],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
-        )
-        .expect("shared block metadata")
-        .into_runtime_metadata_only_with_recovery_runs(true)
-        .expect("compact shared recovery metadata");
-        let key = direct_binding_owner_and_publication::key(42);
-        let base_export = translation_unit_base_export(&key).expect("keyed translation export");
-        TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V2,
-            key,
-            code_sha256: [0x42; 32],
-            base_export,
-            code_len: 16,
-            blocks: vec![PortableBlockRecord {
-                guest_start: GuestVa(0x400000),
-                generation_binding: 0,
-                entry_offset: 0,
-                code_len: 16,
-                requires_sensitive_metadata: false,
-                template,
-            }],
-            binding_layout: DirectBindingLayout::Disabled,
-            binding_export: String::new(),
-            binding_data_len: 0,
-            cell_size: 0,
-            bindings: Vec::new(),
-            binding_relocations: Vec::new(),
-        }
-    }
-
-    /// Lease-pinned readable source bytes for a fixture unit — the copy
-    /// transport's install DEREFERENCES `base`, so a fixture can no longer
-    /// hand out a fabricated address the way the dlopen-era fixtures did.
-    fn leased_fixture_code(code_len: usize) -> (usize, Arc<dyn Send + Sync>) {
-        const NOP: u32 = 0xd503_201f;
-        let words: Vec<u8> = std::iter::repeat_n(NOP.to_le_bytes(), code_len.div_ceil(4))
-            .flatten()
-            .take(code_len)
-            .collect();
-        let lease: Arc<Vec<u8>> = Arc::new(words);
-        let base = lease.as_ptr() as usize;
-        (base, lease)
-    }
-
-    fn shared_install_unit() -> SharedLoadedTranslationUnit {
-        let manifest = shared_install_manifest();
-        let (base, lease) = leased_fixture_code(manifest.code_len as usize);
-        SharedLoadedTranslationUnit::new(manifest, base, lease)
-    }
-
-    fn v2_shared_install_unit() -> SharedLoadedTranslationUnit {
-        let mut unit = shared_install_unit();
-        unit.load_evidence = TranslationMetadataLoadEvidence {
-            mode: TranslationMetadataMode::V2,
-            bytes_read: 2_468,
-            bytes_mapped: 0,
-            validation_ns: 74,
-            mapped_records: 0,
-            owned_records: 5,
-        };
-        unit
-    }
-
-    fn mapped_shared_install_unit() -> SharedLoadedTranslationUnit {
-        let manifest = shared_install_manifest();
-        let bytes = encode_translation_metadata_v3(&manifest).expect("encode mapped fixture");
-        let metadata = ValidatedMappedTranslationMetadata::new(
-            Arc::new(VecMetadataBacking::new(bytes)),
-            &manifest.key,
-        )
-        .expect("validate mapped fixture");
-        let (base, lease) = leased_fixture_code(manifest.code_len as usize);
-        SharedLoadedTranslationUnit::new_mapped(
-            metadata,
-            base,
-            TranslationMetadataLoadEvidence {
-                mode: TranslationMetadataMode::V3,
-                bytes_read: 0,
-                bytes_mapped: 1_234,
-                validation_ns: 37,
-                mapped_records: 6,
-                owned_records: 0,
-            },
-            lease,
-        )
-    }
-
-    fn metadata_stats(stats: ResolverStats) -> [u64; 7] {
-        [
-            stats.shared_metadata_bytes_read,
-            stats.shared_metadata_bytes_mapped,
-            stats.shared_metadata_validation_ns,
-            stats.shared_mapped_immutable_records,
-            stats.shared_owned_immutable_records,
-            stats.shared_guest_range_derivations,
-            stats.shared_direct_edge_group_builds,
-        ]
-    }
-
-    #[derive(Debug)]
-    struct DropCountingMetadataBacking {
-        bytes: Vec<u8>,
-        drops: Arc<AtomicUsize>,
-    }
-
-    impl MetadataBacking for DropCountingMetadataBacking {
-        fn bytes(&self) -> &[u8] {
-            &self.bytes
-        }
-    }
-
-    impl Drop for DropCountingMetadataBacking {
-        fn drop(&mut self) {
-            self.drops.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    struct DropCountingLease(Arc<AtomicUsize>);
-
-    impl Drop for DropCountingLease {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn shared_sensitive_install_unit() -> SharedLoadedTranslationUnit {
-        let block = |guest_start: GuestVa, generation_binding, entry_offset| {
-            let map = pc_map(&[
-                (guest_start.raw(), 0),
-                (guest_start.raw(), 4),
-                (guest_start.raw() + 4, 8),
-                (guest_start.raw() + 8, 12),
-            ]);
-            let template = ArtifactTemplate::normalize(
-                Vec::new(),
-                map,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                &ArtifactBindings::from_values([]).expect("empty artifact bindings"),
-            )
-            .expect("shared sensitive block metadata")
-            .into_runtime_metadata_only();
-            PortableBlockRecord {
-                guest_start,
-                generation_binding,
-                entry_offset,
-                code_len: 16,
-                requires_sensitive_metadata: true,
-                template,
-            }
-        };
-        let key = direct_binding_owner_and_publication::key(43);
-        let base_export = translation_unit_base_export(&key).expect("keyed translation export");
-        let (base, lease) = leased_fixture_code(32);
-        SharedLoadedTranslationUnit::new(
-            TranslationUnitManifest {
-                schema: TRANSLATION_UNIT_SCHEMA_V2,
-                key,
-                code_sha256: [0x43; 32],
-                base_export,
-                code_len: 32,
-                blocks: vec![
-                    block(GuestVa(0x400000), 0, 0),
-                    block(GuestVa(0x400010), 1, 16),
-                ],
-                binding_layout: DirectBindingLayout::Disabled,
-                binding_export: String::new(),
-                binding_data_len: 0,
-                cell_size: 0,
-                bindings: Vec::new(),
-                binding_relocations: Vec::new(),
-            },
-            base,
-            lease,
-        )
-    }
-
-    #[test]
-    fn shared_sensitive_converging_owners_prepare_and_commit_one_terminal_record() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-        state.profiling = true;
-        let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
-        let fusion = shared_sensitive_fusion(sensitive_key.0, 0x885f_fc20);
-        let metadata = shared_sensitive_metadata(GuestVa(0x40000c), Some(fusion));
-        let before = state.shared_install_logical_snapshot_for_test();
-        let head_before = state.executable_ranges.head_ptr();
-        let commit_order = Rc::new(RefCell::new(Vec::new()));
-        let mut commit_recorder = SharedInstallCommitRecorderFixture {
-            order: Rc::clone(&commit_order),
-        };
-        let mut commit_observer = SharedInstallCommitObserverFixture {
-            order: Rc::clone(&commit_order),
-            observations: Vec::new(),
-        };
-
-        let prepared = state
-            .prepare_shared_install_with_sensitive_planner(
-                73,
-                &memory,
-                shared_sensitive_install_unit(),
-                |_| Ok((sensitive_key, metadata, Some(fusion))),
-            )
-            .expect("converging sensitive owners");
-
-        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
-        assert_eq!(prepared.sensitive_updates, vec![(sensitive_key, metadata)]);
-        assert_eq!(prepared.blocks.len(), 2);
-        state.commit_shared_install_with_observer(
-            prepared,
-            &mut commit_recorder,
-            &mut commit_observer,
-        );
-
-        let [
-            (catalog_phase, catalog_state),
-            (logical_phase, logical_state),
-            (executable_phase, executable_state),
-        ] = commit_observer.observations.as_slice()
-        else {
-            panic!(
-                "expected three commit observations, got {:?}",
-                commit_observer
-                    .observations
-                    .iter()
-                    .map(|(phase, _)| phase)
-                    .collect::<Vec<_>>()
-            );
-        };
-        assert_eq!(*catalog_phase, SharedInstallCommitPhase::CatalogSharedAdd);
-        assert_eq!(catalog_state.catalog_frontier, before.catalog_frontier + 1);
-        assert_eq!(catalog_state.catalog_ready, before.catalog_ready);
-        assert_eq!(
-            catalog_state.catalog_shared.len(),
-            before.catalog_shared.len() + 1
-        );
-        assert_non_catalog_commit_state_equal(catalog_state, &before);
-
-        assert_eq!(
-            *logical_phase,
-            SharedInstallCommitPhase::LogicalStateInstalled
-        );
-        assert_eq!(
-            logical_state.catalog_frontier,
-            catalog_state.catalog_frontier
-        );
-        assert_eq!(logical_state.catalog_ready, catalog_state.catalog_ready);
-        assert_eq!(logical_state.catalog_shared, catalog_state.catalog_shared);
-        assert_eq!(logical_state.blocks.len(), 2);
-        assert_eq!(logical_state.sensitive, vec![(sensitive_key, metadata)]);
-        assert_eq!(
-            logical_state
-                .fusion_sites
-                .iter()
-                .map(Vec::len)
-                .sum::<usize>(),
-            1
-        );
-        assert_eq!(logical_state.published_len, 2);
-        assert_eq!(logical_state.shared_published_index.len(), 2);
-        assert_eq!(
-            logical_state
-                .dependencies
-                .iter()
-                .map(|(_, records)| records.len())
-                .sum::<usize>(),
-            2
-        );
-        assert_eq!(logical_state.shared_blocks.len(), 2);
-        assert_eq!(
-            logical_state.shared_guest_ranges,
-            vec![
-                (GuestVa(0x400000), GuestVa(0x40000c)),
-                (GuestVa(0x400010), GuestVa(0x40001c)),
-            ]
-        );
-        assert_eq!(logical_state.loaded_unit_ids.len(), 1);
-        assert_ne!(logical_state.direct_bindings, before.direct_bindings);
-        assert_eq!(
-            logical_state.direct_binding_units,
-            before.direct_binding_units + 1
-        );
-        assert_eq!(
-            logical_state.stats.shared_blocks_mapped,
-            before.stats.shared_blocks_mapped + 2
-        );
-        assert_eq!(logical_state.executable_head, before.executable_head);
-        assert_eq!(logical_state.executable_nodes, before.executable_nodes);
-
-        assert_eq!(
-            *executable_phase,
-            SharedInstallCommitPhase::ExecutableHeadPublished
-        );
-        assert_commit_state_except_executable_equal(executable_state, logical_state);
-        assert_ne!(
-            executable_state.executable_head,
-            logical_state.executable_head
-        );
-        assert_eq!(
-            executable_state.executable_nodes,
-            logical_state.executable_nodes + 1
-        );
-        assert_eq!(
-            commit_order.borrow().as_slice(),
-            [
-                SharedInstallCommitOrderEvent::CatalogEvent,
-                SharedInstallCommitOrderEvent::Phase(SharedInstallCommitPhase::CatalogSharedAdd),
-                SharedInstallCommitOrderEvent::Phase(
-                    SharedInstallCommitPhase::LogicalStateInstalled,
-                ),
-                SharedInstallCommitOrderEvent::Phase(
-                    SharedInstallCommitPhase::ExecutableHeadPublished,
-                ),
-            ]
-        );
-
-        assert_eq!(state.sensitive.get(&sensitive_key), Some(&metadata));
-        assert_eq!(state.sensitive.len(), 1);
-        for block_start in [GuestVa(0x400000), GuestVa(0x400010)] {
-            assert!(
-                state
-                    .blocks
-                    .contains_key(&(block_start, types::CodeGeneration::INITIAL))
-            );
-        }
-        assert_eq!(state.blocks.len(), 2);
-        assert_eq!(state.exclusive_fusion_site_counts().iter().sum::<u64>(), 1);
-        assert_ne!(state.executable_ranges.head_ptr(), head_before);
-        let entry = state.blocks[&(GuestVa(0x400000), types::CodeGeneration::INITIAL)];
-        assert!(state.executable_ranges.contains(entry.host().raw()));
-    }
-
-    #[test]
-    fn shared_sensitive_converging_owners_keep_sites_but_drop_ambiguous_lookup_fusion() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-        state.profiling = true;
-        let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
-        let first_fusion = shared_sensitive_fusion(GuestVa(0x400000), 0x885f_fc20);
-        let second_fusion = shared_sensitive_fusion(GuestVa(0x400010), 0x885f_7c20);
-        let exit = GuestVa(0x40000c);
-
-        let prepared = state
-            .prepare_shared_install_with_sensitive_planner(
-                73,
-                &memory,
-                shared_sensitive_install_unit(),
-                |block_start| {
-                    let fusion = if block_start == GuestVa(0x400000) {
-                        first_fusion
-                    } else {
-                        second_fusion
-                    };
-                    Ok((
-                        sensitive_key,
-                        shared_sensitive_metadata(exit, Some(fusion)),
-                        Some(fusion),
-                    ))
-                },
-            )
-            .expect("converging owners with distinct profiling sites");
-
-        assert_eq!(
-            prepared.sensitive_updates,
-            vec![(
-                sensitive_key,
-                shared_sensitive_metadata(GuestVa(0x40000c), None),
-            )]
-        );
-        assert_eq!(
-            prepared
-                .blocks
-                .iter()
-                .map(|block| block.fusion_site)
-                .collect::<Vec<_>>(),
-            vec![Some(first_fusion), Some(second_fusion)]
-        );
-        state.commit_shared_install(prepared);
-
-        assert_eq!(
-            state.sensitive.get(&sensitive_key),
-            Some(&shared_sensitive_metadata(GuestVa(0x40000c), None))
-        );
-        assert_eq!(state.exclusive_fusion_site_counts().iter().sum::<u64>(), 2);
-    }
-
-    #[test]
-    fn shared_sensitive_matching_installed_record_merges_without_preparation_mutation() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-        let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
-        let fusion = shared_sensitive_fusion(sensitive_key.0, 0x885f_fc20);
-        let metadata = shared_sensitive_metadata(GuestVa(0x40000c), Some(fusion));
-        state.sensitive.insert(sensitive_key, metadata);
-        let before = state.shared_install_logical_snapshot_for_test();
-
-        let prepared = state
-            .prepare_shared_install_with_sensitive_planner(
-                73,
-                &memory,
-                shared_sensitive_install_unit(),
-                |_| Ok((sensitive_key, metadata, Some(fusion))),
-            )
-            .expect("matching installed sensitive metadata");
-
-        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
-        assert_eq!(prepared.sensitive_updates, vec![(sensitive_key, metadata)]);
-    }
-
-    #[test]
-    fn shared_sensitive_conflicting_exit_fails_without_logical_mutation() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-        let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
-        let installed = shared_sensitive_metadata(GuestVa(0x40000c), None);
-        let conflict = shared_sensitive_metadata(GuestVa(0x400010), None);
-        state.sensitive.insert(sensitive_key, installed);
-        let before = state.shared_install_logical_snapshot_for_test();
-
-        let result = state.prepare_shared_install_with_sensitive_planner(
-            73,
-            &memory,
-            shared_sensitive_install_unit(),
-            |_| Ok((sensitive_key, conflict, None)),
-        );
-
-        assert!(matches!(
-            result,
-            Err(types::DsrError::CachePolicy(message))
-                if message.contains("sensitive exit")
-        ));
-        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
-    }
-
-    #[test]
-    fn shared_sensitive_conflicting_converging_owners_fail_without_logical_mutation() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-        let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
-        let before = state.shared_install_logical_snapshot_for_test();
-
-        let result = state.prepare_shared_install_with_sensitive_planner(
-            73,
-            &memory,
-            shared_sensitive_install_unit(),
-            |block_start| {
-                let resume = if block_start == GuestVa(0x400000) {
-                    GuestVa(0x40000c)
-                } else {
-                    GuestVa(0x400010)
-                };
-                Ok((sensitive_key, shared_sensitive_metadata(resume, None), None))
-            },
-        );
-
-        assert!(matches!(
-            result,
-            Err(types::DsrError::CachePolicy(message))
-                if message.contains("sensitive exit")
-        ));
-        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
-    }
-
-    #[test]
-    fn shared_sensitive_terminal_identity_does_not_collide_with_a_block_start() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-        let key = (GuestVa(0x400000), types::CodeGeneration::INITIAL);
-        state
-            .sensitive
-            .insert(key, shared_sensitive_metadata(GuestVa(0x500004), None));
-        let before = state.shared_install_logical_snapshot_for_test();
-
-        state
-            .prepare_shared_install(73, &memory, shared_install_unit())
-            .expect("terminal metadata is not a block-start collision");
-
-        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
-    }
-
-    #[test]
-    fn resolver_stats_v2_prepare_failpoints_retry_exactly_once() {
-        for stage in SharedInstallPrepareStage::ALL {
-            let process = Arc::new(
-                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator"),
-            );
-            let mut recorder = TranslatedRangeRecorderFixture::default();
-            process
-                .activate_translated_range_catalog_with_recorder(&mut recorder)
-                .expect("activate catalog");
-            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-            let mut state = process.state.write();
-            let before = state.shared_install_logical_snapshot_for_test();
-            assert_eq!(before.stats, ResolverStats::default());
-            assert_eq!(before.reported_stats, ResolverStats::default());
-            set_shared_install_prepare_failpoint_for_test(Some(stage));
-
-            let result = state.prepare_shared_install(73, &memory, v2_shared_install_unit());
-            set_shared_install_prepare_failpoint_for_test(None);
-
-            assert!(result.is_err(), "{stage:?}");
-            assert_eq!(
-                state.shared_install_logical_snapshot_for_test(),
-                before,
-                "{stage:?}"
-            );
-            assert_eq!(metadata_stats(state.stats), [0; 7], "{stage:?}");
-
-            let prepared = state
-                .prepare_shared_install(73, &memory, v2_shared_install_unit())
-                .unwrap_or_else(|error| panic!("{stage:?} retry prepare: {error}"));
-            assert_eq!(
-                state.shared_install_logical_snapshot_for_test(),
-                before,
-                "{stage:?} successful preparation must still be nonpublishing"
-            );
-            state.commit_shared_install(prepared);
-            assert_eq!(metadata_stats(state.stats), [2_468, 0, 74, 0, 5, 1, 1]);
-            assert_eq!(state.reported_stats, ResolverStats::default());
-            drop(state);
-
-            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 41);
-            assert_eq!(
-                metadata_stats(thread.resolver_stats()),
-                [2_468, 0, 74, 0, 5, 1, 1]
-            );
-            assert_eq!(
-                metadata_stats(thread.resolver_stats()),
-                [2_468, 0, 74, 0, 5, 1, 1]
-            );
-            let first = thread.claim_profile_snapshot().expect("first V2 report");
-            assert_eq!(
-                [
-                    first.shared_metadata_bytes_read,
-                    first.shared_metadata_bytes_mapped,
-                    first.shared_metadata_validation_ns,
-                    first.shared_mapped_immutable_records,
-                    first.shared_owned_immutable_records,
-                    first.shared_guest_range_derivations,
-                    first.shared_direct_edge_group_builds,
-                ],
-                [2_468, 0, 74, 0, 5, 1, 1]
-            );
-            let second = thread.claim_profile_snapshot().expect("second V2 report");
-            assert_eq!(
-                [
-                    second.shared_metadata_bytes_read,
-                    second.shared_metadata_bytes_mapped,
-                    second.shared_metadata_validation_ns,
-                    second.shared_mapped_immutable_records,
-                    second.shared_owned_immutable_records,
-                    second.shared_guest_range_derivations,
-                    second.shared_direct_edge_group_builds,
-                ],
-                [0; 7]
-            );
-            let final_state = process.state.read();
-            assert_eq!(
-                metadata_stats(final_state.stats),
-                [2_468, 0, 74, 0, 5, 1, 1]
-            );
-            assert_eq!(final_state.reported_stats, final_state.stats);
-        }
-    }
-
-    #[test]
-    fn shared_unit_stale_generation_is_a_nonpublishing_preparation_miss() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        memory
-            .dsr_generations
-            .note_guest_code_write(GuestVa(0x400000)..GuestVa(0x400004))
-            .expect("advance guest generation");
-        let mut state = process.state.write();
-        let before = state.shared_install_logical_snapshot_for_test();
-
-        assert!(matches!(
-            state.prepare_shared_install(73, &memory, shared_install_unit()),
-            Err(types::DsrError::GenerationChanged { .. })
-        ));
-        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
-    }
-
-    #[test]
-    fn shared_unit_commit_installs_exact_ranges_and_one_typed_identity() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        recorder.events.clear();
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-        let head_before = state.executable_ranges.head_ptr();
-
-        let prepared = state
-            .prepare_shared_install(73, &memory, shared_install_unit())
-            .expect("prepare shared install");
-        let prepared_id = prepared.loaded_unit.unit_id;
-        assert_eq!(prepared.catalog_entry.unit_id, prepared_id);
-        // The copy transport decides where the unit lives: read it back from
-        // the prepared range rather than assuming a foreign mapping address.
-        let base = prepared.cache_range.start;
-        state.commit_shared_install_with_recorder(prepared, &mut recorder);
-
-        assert_eq!(state.translated_ranges.shared.len(), 1);
-        assert_eq!(state.translated_ranges.shared[0].unit_id, prepared_id);
-        assert_eq!(state.loaded_shared_units.len(), 1);
-        assert_eq!(state.loaded_shared_units[0].unit_id, prepared_id);
-        assert_eq!(
-            state.shared_guest_ranges,
-            vec![
-                (GuestVa(0x400000), GuestVa(0x400008)),
-                (GuestVa(0x400010), GuestVa(0x400014)),
-            ]
-        );
-        assert!(state.shared_block_contains(GuestVa(0x400000)));
-        assert!(state.shared_block_contains(GuestVa(0x400004)));
-        assert!(!state.shared_block_contains(GuestVa(0x400008)));
-        assert!(state.shared_block_contains(GuestVa(0x400010)));
-        assert!(!state.shared_block_contains(GuestVa(0x400014)));
-        assert!(
-            state
-                .blocks
-                .contains_key(&(GuestVa(0x400000), types::CodeGeneration::INITIAL,))
-        );
-        assert_ne!(state.executable_ranges.head_ptr(), head_before);
-        assert!(state.executable_ranges.contains(base));
-        assert!(matches!(
-            recorder.events.as_slice(),
-            [RecordedTranslatedRange::Add(TranslatedRangeAdd::Shared(event))]
-                if event.unit_id() == prepared_id
-                    && event.range() == &(HostVa(base)..HostVa(base + 16))
-        ));
-        let PublishedBlockMetadata::Owned {
-            recovery,
-            shared_recovery,
-            ..
-        } = &state.published[0].metadata
-        else {
-            panic!("V2 shared block must retain owned metadata");
-        };
-        assert!(recovery.is_empty());
-        assert!(shared_recovery.is_some());
-        assert!(
-            shared_recovery
-                .as_ref()
-                .expect("shared recovery metadata")
-                .recovery
-                .is_run_encoded()
-        );
-        assert_eq!(
-            state
-                .guest_pc_for_cache(GuestVa(u64::try_from(base + 4).expect("cache PC")))
-                .expect("bind one shared recovery action on demand"),
-            (
-                GuestVa(0x400000),
-                Some(crate::emit::RecoveryAction::RestoreGuestX17),
-            )
-        );
-    }
-
-    /// The shared-unit transport contract: a loaded unit's `base` is READABLE
-    /// source bytes, and installing it COPIES those bytes into this process's
-    /// own translation cache — the single executable authority. Entries must
-    /// come out inside `cache.host_range()`, and the copied words must equal
-    /// the source words. Red against the dlopen-era install, which executed
-    /// the unit in place at a foreign mapping outside the cache.
-    #[test]
-    fn shared_install_copies_unit_code_into_the_process_cache() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-        // Distinctive source words so the copy is provable byte-for-byte.
-        let source_words: Vec<u8> = [0xd503_201f_u32, 0xd503_2020, 0xd503_2040, 0xd503_2060]
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect();
-        let lease: Arc<Vec<u8>> = Arc::new(source_words.clone());
-        let base = lease.as_ptr() as usize;
-        let unit = SharedLoadedTranslationUnit::new(shared_install_manifest(), base, lease);
-        let cache_range = state.cache.host_range();
-
-        let prepared = state
-            .prepare_shared_install(73, &memory, unit)
-            .expect("prepare copied shared install");
-        assert!(
-            cache_range.contains(&prepared.cache_range.start)
-                && prepared.cache_range.end <= cache_range.end,
-            "copied unit must live inside the process cache: unit {:x?} vs cache {cache_range:x?}",
-            prepared.cache_range,
-        );
-        state.commit_shared_install(prepared);
-
-        let entry = state.blocks[&(GuestVa(0x400000), types::CodeGeneration::INITIAL)];
-        let entry_address = entry.host().raw();
-        assert!(
-            cache_range.contains(&entry_address),
-            "installed shared entry 0x{entry_address:x} must be inside the cache {cache_range:x?}",
-        );
-        // SAFETY: the entry was just published inside the process cache
-        // mapping, which stays alive for the duration of this test.
-        let copied =
-            unsafe { std::slice::from_raw_parts(entry_address as *const u8, source_words.len()) };
-        assert_eq!(copied, source_words.as_slice(), "copy must be byte-exact");
-    }
-
-    #[test]
-    fn mapped_shared_unit_references_metadata_and_resolves_every_cache_offset() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-
-        let prepared = state
-            .prepare_shared_install(73, &memory, mapped_shared_install_unit())
-            .expect("prepare mapped shared install");
-        let base = prepared.cache_range.start;
-        state.commit_shared_install(prepared);
-
-        assert_eq!(state.loaded_shared_units.len(), 1);
-        assert_eq!(
-            state.loaded_shared_units[0]._unit.load_evidence,
-            TranslationMetadataLoadEvidence {
-                mode: TranslationMetadataMode::V3,
-                bytes_read: 0,
-                bytes_mapped: 1_234,
-                validation_ns: 37,
-                mapped_records: 6,
-                owned_records: 0,
-            }
-        );
-        assert!(matches!(
-            &state.published[0].metadata,
-            PublishedBlockMetadata::Mapped {
-                loaded_unit_index: 0,
-                block_index: 0,
-            }
-        ));
-        assert_eq!(state.published[0].owned_record_count(), 0);
-        for (offset, expected_guest_pc, expected_recovery) in [
-            (0_usize, GuestVa(0x400000), None),
-            (
-                4,
-                GuestVa(0x400000),
-                Some(crate::emit::RecoveryAction::RestoreGuestX17),
-            ),
-            (8, GuestVa(0x400004), None),
-            (12, GuestVa(0x400010), None),
-        ] {
-            let mapped_cache_pc = GuestVa(u64::try_from(base + offset).expect("mapped cache PC"));
-            assert_eq!(
-                state
-                    .guest_pc_for_cache(mapped_cache_pc)
-                    .expect("mapped lookup"),
-                (expected_guest_pc, expected_recovery),
-                "cache offset {offset}"
-            );
-        }
-        assert_eq!(
-            state.shared_guest_ranges,
-            vec![
-                (GuestVa(0x400000), GuestVa(0x400008)),
-                (GuestVa(0x400010), GuestVa(0x400014)),
-            ]
-        );
-    }
-
-    #[test]
-    fn resolver_stats_bind_mapped_metadata_evidence_only_at_commit() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-
-        let prepared = state
-            .prepare_shared_install(73, &memory, mapped_shared_install_unit())
-            .expect("prepare mapped shared install");
-        assert_eq!(state.stats.shared_metadata_bytes_mapped, 0);
-        assert_eq!(state.stats.shared_mapped_immutable_records, 0);
-
-        state.commit_shared_install(prepared);
-
-        assert_eq!(state.stats.shared_metadata_bytes_read, 0);
-        assert_eq!(state.stats.shared_metadata_bytes_mapped, 1_234);
-        assert_eq!(state.stats.shared_metadata_validation_ns, 37);
-        assert_eq!(state.stats.shared_mapped_immutable_records, 6);
-        assert_eq!(state.stats.shared_owned_immutable_records, 0);
-        assert_eq!(state.stats.shared_guest_range_derivations, 0);
-        assert_eq!(state.stats.shared_direct_edge_group_builds, 0);
-    }
-
-    #[test]
-    fn resolver_stats_bind_v2_metadata_evidence_only_at_commit() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-
-        let prepared = state
-            .prepare_shared_install(73, &memory, v2_shared_install_unit())
-            .expect("prepare V2 shared install");
-        assert_eq!(state.stats.shared_metadata_bytes_read, 0);
-        assert_eq!(state.stats.shared_owned_immutable_records, 0);
-
-        state.commit_shared_install(prepared);
-
-        assert_eq!(state.stats.shared_metadata_bytes_read, 2_468);
-        assert_eq!(state.stats.shared_metadata_bytes_mapped, 0);
-        assert_eq!(state.stats.shared_metadata_validation_ns, 74);
-        assert_eq!(state.stats.shared_mapped_immutable_records, 0);
-        assert_eq!(state.stats.shared_owned_immutable_records, 5);
-        assert_eq!(state.stats.shared_guest_range_derivations, 1);
-        assert_eq!(state.stats.shared_direct_edge_group_builds, 1);
-    }
-
-    #[test]
-    fn resolver_stats_saturate_actual_preparation_work() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut state = process.state.write();
-        state.stats.shared_guest_range_derivations = u64::MAX - 1;
-        state.stats.shared_direct_edge_group_builds = u64::MAX - 2;
-
-        state.apply_shared_metadata_evidence(TranslationMetadataLoadEvidence::default(), 2, 3);
-
-        assert_eq!(state.stats.shared_guest_range_derivations, u64::MAX);
-        assert_eq!(state.stats.shared_direct_edge_group_builds, u64::MAX);
-    }
-
-    #[test]
-    fn mapped_shared_unit_lookup_fails_closed_on_invalid_owner_indexes() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-        let prepared = state
-            .prepare_shared_install(73, &memory, mapped_shared_install_unit())
-            .expect("prepare mapped shared install");
-        let base = prepared.cache_range.start;
-        state.commit_shared_install(prepared);
-        let cache_pc = GuestVa(u64::try_from(base).expect("cache PC"));
-
-        state.published[0].metadata = PublishedBlockMetadata::Mapped {
-            loaded_unit_index: usize::MAX,
-            block_index: 0,
-        };
-        assert!(matches!(
-            state.guest_pc_for_cache(cache_pc),
-            Err(types::DsrError::CachePolicy(message))
-                if message.contains("loaded-unit index")
-        ));
-
-        state.published[0].metadata = PublishedBlockMetadata::Mapped {
-            loaded_unit_index: 0,
-            block_index: u32::MAX,
-        };
-        assert!(matches!(
-            state.guest_pc_for_cache(cache_pc),
-            Err(types::DsrError::CachePolicy(message))
-                if message.contains("block index")
-        ));
-    }
-
-    #[test]
-    fn mapped_shared_unit_published_indexes_merge_strictly_without_resorting() {
-        let current = [
-            super::PublishedIndexEntry {
-                start: HostVa(0x1000),
-                block: 1,
-            },
-            super::PublishedIndexEntry {
-                start: HostVa(0x3000),
-                block: 3,
-            },
-        ];
-        let incoming = [
-            super::PublishedIndexEntry {
-                start: HostVa(0x2000),
-                block: 2,
-            },
-            super::PublishedIndexEntry {
-                start: HostVa(0x4000),
-                block: 4,
-            },
-        ];
-
-        assert_eq!(
-            merge_published_indexes(&current, &incoming).expect("merge ordered indexes"),
-            vec![current[0], incoming[0], current[1], incoming[1]]
-        );
-        assert!(merge_published_indexes(&[current[1], current[0]], &incoming).is_err());
-        assert!(merge_published_indexes(&current, &[incoming[1], incoming[0]]).is_err());
-        assert!(merge_published_indexes(&current, &[current[1]]).is_err());
-    }
-
-    #[test]
-    fn resolver_stats_v3_prepare_failpoints_retry_exactly_once() {
-        for stage in SharedInstallPrepareStage::ALL {
-            let process = Arc::new(
-                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator"),
-            );
-            let mut recorder = TranslatedRangeRecorderFixture::default();
-            process
-                .activate_translated_range_catalog_with_recorder(&mut recorder)
-                .expect("activate catalog");
-            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-            let mut state = process.state.write();
-            let before = state.shared_install_logical_snapshot_for_test();
-            assert_eq!(before.stats, ResolverStats::default());
-            assert_eq!(before.reported_stats, ResolverStats::default());
-            set_shared_install_prepare_failpoint_for_test(Some(stage));
-
-            let result = state.prepare_shared_install(73, &memory, mapped_shared_install_unit());
-            set_shared_install_prepare_failpoint_for_test(None);
-
-            assert!(result.is_err(), "{stage:?}");
-            assert_eq!(
-                state.shared_install_logical_snapshot_for_test(),
-                before,
-                "{stage:?}"
-            );
-            assert_eq!(metadata_stats(state.stats), [0; 7], "{stage:?}");
-
-            let prepared = state
-                .prepare_shared_install(73, &memory, mapped_shared_install_unit())
-                .unwrap_or_else(|error| panic!("{stage:?} retry prepare: {error}"));
-            assert_eq!(
-                state.shared_install_logical_snapshot_for_test(),
-                before,
-                "{stage:?} successful preparation must still be nonpublishing"
-            );
-            state.commit_shared_install(prepared);
-            assert_eq!(metadata_stats(state.stats), [0, 1_234, 37, 6, 0, 0, 0]);
-            assert_eq!(state.reported_stats, ResolverStats::default());
-            drop(state);
-
-            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 41);
-            assert_eq!(
-                metadata_stats(thread.resolver_stats()),
-                [0, 1_234, 37, 6, 0, 0, 0]
-            );
-            assert_eq!(
-                metadata_stats(thread.resolver_stats()),
-                [0, 1_234, 37, 6, 0, 0, 0]
-            );
-            let first = thread.claim_profile_snapshot().expect("first V3 report");
-            assert_eq!(
-                [
-                    first.shared_metadata_bytes_read,
-                    first.shared_metadata_bytes_mapped,
-                    first.shared_metadata_validation_ns,
-                    first.shared_mapped_immutable_records,
-                    first.shared_owned_immutable_records,
-                    first.shared_guest_range_derivations,
-                    first.shared_direct_edge_group_builds,
-                ],
-                [0, 1_234, 37, 6, 0, 0, 0]
-            );
-            let second = thread.claim_profile_snapshot().expect("second V3 report");
-            assert_eq!(
-                [
-                    second.shared_metadata_bytes_read,
-                    second.shared_metadata_bytes_mapped,
-                    second.shared_metadata_validation_ns,
-                    second.shared_mapped_immutable_records,
-                    second.shared_owned_immutable_records,
-                    second.shared_guest_range_derivations,
-                    second.shared_direct_edge_group_builds,
-                ],
-                [0; 7]
-            );
-            let final_state = process.state.read();
-            assert_eq!(
-                metadata_stats(final_state.stats),
-                [0, 1_234, 37, 6, 0, 0, 0]
-            );
-            assert_eq!(final_state.reported_stats, final_state.stats);
-        }
-    }
-
-    #[test]
-    fn mapped_shared_unit_bad_guest_range_fails_real_preparation_atomically() {
-        let process =
-            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-        let mut recorder = TranslatedRangeRecorderFixture::default();
-        process
-            .activate_translated_range_catalog_with_recorder(&mut recorder)
-            .expect("activate catalog");
-        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut state = process.state.write();
-        let before = state.shared_install_logical_snapshot_for_test();
-        let manifest = shared_install_manifest();
-        // Local readable code bytes: the copy transport dereferences `base`
-        // during prepare, before the armed guest-range fault fires.
-        let source_code = vec![0_u8; manifest.code_len as usize];
-        let base = source_code.as_ptr() as usize;
-        let backing_drops = Arc::new(AtomicUsize::new(0));
-        let lease_drops = Arc::new(AtomicUsize::new(0));
-        let metadata = ValidatedMappedTranslationMetadata::new(
-            Arc::new(DropCountingMetadataBacking {
-                bytes: encode_translation_metadata_v3(&manifest).expect("encode mapped fixture"),
-                drops: Arc::clone(&backing_drops),
-            }),
-            &manifest.key,
-        )
-        .expect("validate mapped fixture before arming the accessor fault");
-        metadata.arm_guest_range_access_fault_for_test();
-        let unit = SharedLoadedTranslationUnit::new_mapped(
-            metadata,
-            base,
-            TranslationMetadataLoadEvidence {
-                mode: TranslationMetadataMode::V3,
-                bytes_read: 0,
-                bytes_mapped: 1_234,
-                validation_ns: 37,
-                mapped_records: 6,
-                owned_records: 0,
-            },
-            Arc::new(DropCountingLease(Arc::clone(&lease_drops))),
-        );
-        assert_eq!(backing_drops.load(Ordering::Relaxed), 0);
-        assert_eq!(lease_drops.load(Ordering::Relaxed), 0);
-
-        assert!(matches!(
-            state.prepare_shared_install(73, &memory, unit),
-            Err(types::DsrError::CachePolicy(message))
-                if message.contains("mapped shared guest-range index 0 is invalid")
-        ));
-        assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
-        assert_eq!(backing_drops.load(Ordering::Relaxed), 1);
-        assert_eq!(lease_drops.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn shared_recovery_binding_is_default_lazy_with_an_exact_opt_out() {
-        assert!(shared_recovery_lazy_enabled_from(None));
-        assert!(shared_recovery_lazy_enabled_from(Some(
-            std::ffi::OsStr::new("1")
-        )));
-        assert!(shared_recovery_lazy_enabled_from(Some(
-            std::ffi::OsStr::new("false")
-        )));
-        assert!(!shared_recovery_lazy_enabled_from(Some(
-            std::ffi::OsStr::new("0")
-        )));
-    }
-
     #[test]
     fn source_words_are_captured_only_for_enabled_reuse_consumers() {
         assert!(!translation_source_words_required(false, false));
@@ -8787,18 +5038,348 @@ mod tests {
         assert_eq!(snapshot.blocks, vec![(0x40_0000, entry.host().0 as u64)]);
     }
 
-    #[test]
-    fn shared_authority_only_owns_entries_inside_its_unit() {
-        let authority = SharedBlockAuthority {
-            generation_bindings: 0x7000,
-            generation_binding_count: 3,
-            cache_start: 0x1000,
-            cache_end: 0x2000,
-            target_authority: 0,
-            loaded_unit_index: 0,
+    /// The native-tap unit contract, end to end at the translator level:
+    /// record candidates through the ONE native emission, pack them into a
+    /// unit, round-trip the manifest through the serialized wire, install by
+    /// per-block replay, and prove the installed blocks are
+    /// INDISTINGUISHABLE from native translations — word-identical code,
+    /// trusted entries registered, and cross-block direct links patched to
+    /// land PAST the generation guard. This is the store side of the
+    /// 2026-08-03 parity mechanism
+    /// (`docs/perf-results/2026-08-03-store-template-parity-mechanism.md`):
+    /// the emission side pinned word identity of the RECORDING
+    /// (`emit::tests::recorded_emission_is_word_identical_to_native_emission`);
+    /// these pin word identity of the INSTALL.
+    mod native_tap_unit_install {
+        use super::TEST_HOST_JIT;
+        use crate::block::{BlockPlan, PlannedExit};
+        use crate::mapped_memory::NativeMappedMemory;
+        use crate::shared_cache::{
+            AddressModeIdentity, ExecutableIdentity, GuestCodeLen, ImageFileLen, ImageFileOffset,
+            NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate,
+            SharedLoadedTranslationUnit, SourceFingerprint, TranslationUnitKey,
+            decode_translation_unit_metadata, encode_translation_unit_metadata,
         };
-        assert!(authority.owns(types::CacheVa::published(carrick_guest_mem::HostVa(0x1800))));
-        assert!(!authority.owns(types::CacheVa::published(carrick_guest_mem::HostVa(0x2800))));
+        use crate::translator::{ProcessTranslator, encode_aarch64_direct_branch};
+        use crate::types::{CodeGeneration, DirectExit, DirectKind};
+        use crate::{emit, types};
+        use carrick_dsr::cache;
+        use carrick_guest_mem::GuestVa;
+        use std::sync::Arc;
+
+        const BLOCK_A: GuestVa = GuestVa(0x40_0000);
+        const BLOCK_B: GuestVa = GuestVa(0x40_0100);
+
+        fn unit_key() -> TranslationUnitKey {
+            TranslationUnitKey::for_segment(
+                ExecutableIdentity::Digest([0x7a; 32]),
+                ImageFileOffset::new(0),
+                ImageFileLen::new(0x4000).expect("file length"),
+                BLOCK_A,
+                GuestCodeLen::new(0x4000).expect("guest length"),
+                SourceFingerprint::from_words(&[0x1400_0001, 0xd400_0001]),
+                NativePageProfileIdentity::Native16k,
+                AddressModeIdentity::Direct,
+            )
+        }
+
+        fn syscall_plan(start: GuestVa) -> BlockPlan {
+            BlockPlan {
+                start,
+                end: GuestVa(start.raw() + 4),
+                generation: CodeGeneration::INITIAL,
+                instructions: Vec::new(),
+                exit: PlannedExit::Syscall {
+                    guest: start,
+                    resume: GuestVa(start.raw() + 4),
+                },
+                extensions: Vec::new(),
+            }
+        }
+
+        fn branch_plan(start: GuestVa, target: GuestVa) -> BlockPlan {
+            BlockPlan {
+                start,
+                end: GuestVa(start.raw() + 4),
+                generation: CodeGeneration::INITIAL,
+                instructions: Vec::new(),
+                exit: PlannedExit::Direct {
+                    guest: start,
+                    word: 0x1400_0001,
+                    exit: DirectExit {
+                        kind: DirectKind::Branch,
+                        target,
+                        resume: GuestVa(start.raw() + 4),
+                        condition: None,
+                        register: None,
+                        bit: None,
+                    },
+                },
+                extensions: Vec::new(),
+            }
+        }
+
+        /// Record a candidate through the native tap against the SAME
+        /// generation cell the install will observe, returning the candidate
+        /// and the native reference emission for word comparison.
+        fn record_candidate(
+            memory: &NativeMappedMemory,
+            plan: &BlockPlan,
+        ) -> (PortableBlockCandidate, emit::EmittedBlock, Vec<u32>) {
+            let observation = memory
+                .dsr_generation_observation(plan.start)
+                .expect("record-time observation");
+            let mut scratch = crate::test_jit::test_cache(256 * 1024);
+            let (emitted, artifact) = emit::emit_block_recording_artifact(
+                &mut scratch,
+                plan,
+                emit::GenerationGuard::new(observation.current_atomic(), CodeGeneration::INITIAL),
+                emit::EmitAddressMode::Direct,
+                vec![0xd503_201f],
+            )
+            .expect("record native-tap candidate");
+            // Capture the reference words BEFORE any patching can occur.
+            let words = read_words(emitted.entry(), emitted.len());
+            (
+                PortableBlockCandidate {
+                    guest_start: plan.start,
+                    requires_sensitive_metadata: false,
+                    template: artifact.template,
+                },
+                emitted,
+                words,
+            )
+        }
+
+        fn read_words(entry: types::CacheVa, len: usize) -> Vec<u32> {
+            // SAFETY: the test JIT is plain RW anonymous memory owned by the
+            // cache for the duration of the test.
+            let bytes = unsafe { std::slice::from_raw_parts(entry.host().raw() as *const u8, len) };
+            bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                .collect()
+        }
+
+        struct InstalledUnit {
+            translator: ProcessTranslator,
+            _code: Arc<Vec<u8>>,
+        }
+
+        fn pack_round_trip_and_install(
+            memory: &NativeMappedMemory,
+            candidates: Vec<PortableBlockCandidate>,
+        ) -> Result<InstalledUnit, types::DsrError> {
+            let pending = PendingTranslationUnit::pack(unit_key(), candidates).expect("pack unit");
+            // Round-trip the manifest through the exact wire the store
+            // persists, so serde of relocations, trusted entries, direct
+            // links, and run-encoded recovery is part of what this proves.
+            let bytes =
+                encode_translation_unit_metadata(&crate::shared_cache::TranslationUnitManifest {
+                    schema: crate::shared_cache::TRANSLATION_UNIT_SCHEMA_V4,
+                    key: pending.key.clone(),
+                    code_sha256: [0; 32],
+                    base_export: crate::shared_cache::translation_unit_base_export(&pending.key)
+                        .expect("base export"),
+                    code_len: pending.code.len() as u64,
+                    blocks: pending.blocks.clone(),
+                })
+                .expect("encode manifest");
+            let manifest = decode_translation_unit_metadata(&bytes).expect("decode manifest");
+            let code = Arc::new(pending.code.clone());
+            let unit = SharedLoadedTranslationUnit::new(
+                manifest,
+                code.as_ptr() as usize,
+                Arc::clone(&code) as Arc<dyn Send + Sync>,
+            );
+            let translator =
+                ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator");
+            translator.state.write().install_shared_unit(memory, unit)?;
+            Ok(InstalledUnit {
+                translator,
+                _code: code,
+            })
+        }
+
+        #[test]
+        fn installed_blocks_are_word_identical_with_registered_trusted_entries() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (candidate, _native, native_words) =
+                record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let trusted = candidate
+                .template
+                .trusted_entry()
+                .expect("native tap records the trusted entry");
+
+            let installed = pack_round_trip_and_install(&memory, vec![candidate])
+                .expect("install native-tap unit");
+            let state = installed.translator.state.read();
+            let key = (BLOCK_A, CodeGeneration::INITIAL);
+            let entry = *state.blocks.get(&key).expect("installed block");
+            assert_eq!(
+                state.trusted_entries.get(&key).map(|offset| offset.get()),
+                Some(trusted.offset),
+                "the installed block registers the SAME trusted entry native \
+                 emission exposes — patched links will land past the guard"
+            );
+            let installed_words = read_words(entry, native_words.len() * 4);
+            assert_eq!(
+                installed_words, native_words,
+                "replayed unit block must be word-identical to the native \
+                 emission against the same generation cell"
+            );
+        }
+
+        #[test]
+        fn cross_block_direct_links_patch_to_the_target_trusted_entry() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (branch, native_branch, branch_words) =
+                record_candidate(&memory, &branch_plan(BLOCK_A, BLOCK_B));
+            let (target, _native_target, target_words) =
+                record_candidate(&memory, &syscall_plan(BLOCK_B));
+            let link = native_branch.direct_links()[0];
+
+            let installed = pack_round_trip_and_install(&memory, vec![branch, target])
+                .expect("install two-block unit");
+            let state = installed.translator.state.read();
+            let entry_a = *state
+                .blocks
+                .get(&(BLOCK_A, CodeGeneration::INITIAL))
+                .expect("installed branch block");
+            let entry_b = *state
+                .blocks
+                .get(&(BLOCK_B, CodeGeneration::INITIAL))
+                .expect("installed target block");
+            let trusted_b = *state
+                .trusted_entries
+                .get(&(BLOCK_B, CodeGeneration::INITIAL))
+                .expect("target trusted entry");
+
+            let installed_a = read_words(entry_a, branch_words.len() * 4);
+            let slot_index = (link.slot.get() / 4) as usize;
+            let expected_branch = encode_aarch64_direct_branch(
+                cache::LinkSite {
+                    source: entry_a,
+                    slot: link.slot,
+                },
+                types::CacheVa::published(carrick_guest_mem::HostVa(
+                    entry_b.host().raw() + trusted_b.get() as usize,
+                )),
+            )
+            .expect("encode expected patched link");
+            assert_eq!(
+                installed_a[slot_index], expected_branch,
+                "the A->B edge must be a patched direct branch landing at \
+                 B's trusted entry, past the generation guard"
+            );
+            // Every word except the patched slot is the native emission.
+            for (index, (installed, native)) in installed_a.iter().zip(&branch_words).enumerate() {
+                if index != slot_index {
+                    assert_eq!(installed, native, "word {index} diverges");
+                }
+            }
+            let installed_b = read_words(entry_b, target_words.len() * 4);
+            assert_eq!(installed_b, target_words);
+        }
+
+        #[test]
+        fn a_corrupt_code_image_fails_closed_to_translation() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (candidate, _native, _words) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let pending =
+                PendingTranslationUnit::pack(unit_key(), vec![candidate]).expect("pack unit");
+            let manifest = crate::shared_cache::TranslationUnitManifest {
+                schema: crate::shared_cache::TRANSLATION_UNIT_SCHEMA_V4,
+                key: pending.key.clone(),
+                code_sha256: [0; 32],
+                base_export: crate::shared_cache::translation_unit_base_export(&pending.key)
+                    .expect("base export"),
+                code_len: pending.code.len() as u64,
+                blocks: pending.blocks.clone(),
+            };
+            // Corrupt the first relocation site (the guard's
+            // generation-address materialization): replay's opcode
+            // validation must refuse rather than publish wrong code.
+            let mut code = pending.code.clone();
+            let first_relocation_word = pending
+                .blocks
+                .iter()
+                .find_map(|block| {
+                    block
+                        .template
+                        .first_relocation_word_for_test()
+                        .map(|offset| (block.entry_offset / 4 + offset) as usize)
+                })
+                .expect("native tap records process relocations");
+            code[first_relocation_word * 4..first_relocation_word * 4 + 4]
+                .copy_from_slice(&0xd503_201f_u32.to_le_bytes());
+            let code = Arc::new(code);
+            let unit = SharedLoadedTranslationUnit::new(
+                manifest,
+                code.as_ptr() as usize,
+                Arc::clone(&code) as Arc<dyn Send + Sync>,
+            );
+            let translator =
+                ProcessTranslator::new_with_host(256 * 1024, &TEST_HOST_JIT).expect("translator");
+            let result = translator.state.write().install_shared_unit(&memory, unit);
+            assert!(
+                matches!(result, Err(types::DsrError::CachePolicy(ref message))
+                    if message.contains("opcode mismatch")),
+                "corrupt code must fail closed: {result:?}"
+            );
+            assert!(
+                translator.state.read().blocks.is_empty(),
+                "no block may publish from a refused unit"
+            );
+        }
+
+        #[test]
+        fn a_regenerated_page_skips_installation_without_error() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (candidate, _native, _words) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            // Regenerate the page between record and install.
+            let observation = memory
+                .dsr_generation_observation(BLOCK_A)
+                .expect("observe page");
+            observation.current_atomic().store(
+                CodeGeneration::INITIAL.get() + 1,
+                std::sync::atomic::Ordering::Release,
+            );
+
+            let installed = pack_round_trip_and_install(&memory, vec![candidate])
+                .expect("install skips the stale block");
+            let state = installed.translator.state.read();
+            assert!(
+                state.blocks.is_empty(),
+                "a block recorded at INITIAL must not publish on a regenerated page"
+            );
+            assert!(state.trusted_entries.is_empty());
+        }
+
+        #[test]
+        fn install_registers_page_dependencies_for_invalidation() {
+            let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+            let (candidate, _native, _words) = record_candidate(&memory, &syscall_plan(BLOCK_A));
+            let installed = pack_round_trip_and_install(&memory, vec![candidate])
+                .expect("install native-tap unit");
+            let mut state = installed.translator.state.write();
+            let key = (BLOCK_A, CodeGeneration::INITIAL);
+            assert!(state.blocks.contains_key(&key));
+            // Guest code-page replacement: the dependency recorded through
+            // `publish_emitted` must invalidate the installed block exactly
+            // like a natively-translated one.
+            let observation = memory
+                .dsr_generation_observation(BLOCK_A)
+                .expect("observe page");
+            let page = observation.page();
+            let stale = state
+                .dependencies
+                .invalidate_page(page, CodeGeneration::claimed(2));
+            assert!(
+                stale.contains(&key),
+                "installed block must be registered for page invalidation: {stale:?}"
+            );
+        }
     }
 
     /// `ProcessState::guest_pc_for_cache` lowers a cache PC back to the guest
@@ -8832,19 +5413,16 @@ mod tests {
             PublishedBlock {
                 entry,
                 len: words as usize * 4,
-                metadata: super::super::PublishedBlockMetadata::Owned {
-                    map: (0..words)
-                        .map(|word| emit::PcMapEntry {
-                            guest: GuestVa(guest.raw() + u64::from(word) * 4),
-                            cache: types::CacheOffset::published(word * 4),
-                        })
-                        .collect(),
-                    recovery: vec![emit::RecoveryEntry {
-                        cache: types::CacheOffset::published(4),
-                        action: emit::RecoveryAction::RestoreGuestX17,
-                    }],
-                    shared_recovery: None,
-                },
+                map: (0..words)
+                    .map(|word| emit::PcMapEntry {
+                        guest: GuestVa(guest.raw() + u64::from(word) * 4),
+                        cache: types::CacheOffset::published(word * 4),
+                    })
+                    .collect(),
+                recovery: vec![emit::RecoveryEntry {
+                    cache: types::CacheOffset::published(4),
+                    action: emit::RecoveryAction::RestoreGuestX17,
+                }],
                 _generation: generations.observe(guest).expect("generation observation"),
             }
         }
@@ -9035,2621 +5613,6 @@ mod tests {
         }
     }
 
-    mod direct_binding_owner_and_publication {
-        use super::{ProcessTranslator, TEST_HOST_JIT};
-        use crate::direct_binding::{
-            DirectBindingCellRef, DirectBindingCellVa, DirectBindingEligibility,
-            DirectBindingExitMetadata, DirectBindingMiss, DirectBindingOrdinal,
-            DirectBindingPublishOutcome, DirectBindingRegistry, DirectBindingTarget,
-            DirectBindingTargetPrefix, DirectBindingValidationReason, PrivateJitEpoch,
-        };
-        use crate::emit::DirectLinkKind;
-        use crate::mapped_metadata::{
-            BINDING_RECORD_V3_SIZE, MappedMetadataError, SectionKind,
-            ValidatedMappedTranslationMetadata, VecMetadataBacking, encode_translation_metadata_v3,
-        };
-        use crate::shared_cache::{
-            AddressModeIdentity, DIRECT_BINDING_CELL_SIZE, DirectBindingLayout,
-            DirectBindingRelocation, ExecutableIdentity, GuestCodeLen, ImageFileLen,
-            ImageFileOffset, NativePageProfileIdentity, SharedLoadedTranslationUnit,
-            SourceFingerprint, TRANSLATION_UNIT_BINDING_EXPORT, TRANSLATION_UNIT_SCHEMA_V2,
-            TranslationMetadataLoadEvidence, TranslationUnitKey, TranslationUnitManifest,
-            UnresolvedDirectBindingRecord,
-        };
-        use crate::types::CodeGeneration;
-        use carrick_guest_mem::GuestVa;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicPtr, Ordering};
-
-        pub(super) struct UnitFixture {
-            pub(super) storage: Box<[AtomicPtr<DirectBindingTarget>]>,
-            pub(super) unit: SharedLoadedTranslationUnit,
-        }
-
-        pub(super) fn key(seed: u8) -> TranslationUnitKey {
-            TranslationUnitKey::for_segment(
-                ExecutableIdentity::Digest([seed; 32]),
-                ImageFileOffset::new(u64::from(seed) * 0x1000),
-                ImageFileLen::new(0x4000).expect("nonzero file length"),
-                GuestVa(0x40_0000),
-                GuestCodeLen::new(0x4000).expect("nonzero guest length"),
-                SourceFingerprint([seed.wrapping_add(1); 32]),
-                NativePageProfileIdentity::Native16k,
-                AddressModeIdentity::Direct,
-            )
-        }
-
-        pub(super) fn record(
-            source: GuestVa,
-            target: GuestVa,
-            ordinal: u32,
-        ) -> UnresolvedDirectBindingRecord {
-            UnresolvedDirectBindingRecord {
-                source,
-                target,
-                kind: DirectLinkKind::Branch,
-                ordinal: DirectBindingOrdinal::claimed(ordinal),
-                stub_start: ordinal * 128,
-                stub_end: ordinal * 128 + 128,
-            }
-        }
-
-        pub(super) fn sidecar_unit(
-            unit_key: TranslationUnitKey,
-            records: Vec<UnresolvedDirectBindingRecord>,
-        ) -> UnitFixture {
-            let base_export =
-                super::translation_unit_base_export(&unit_key).expect("keyed translation export");
-            let storage = std::iter::repeat_with(|| {
-                AtomicPtr::new(std::ptr::null_mut::<DirectBindingTarget>())
-            })
-            .take(records.len())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-            let binding_base =
-                DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
-            let binding_data_len = u64::try_from(
-                records
-                    .len()
-                    .checked_mul(DIRECT_BINDING_CELL_SIZE as usize)
-                    .expect("binding data length"),
-            )
-            .expect("binding data length fits u64");
-            let unit = SharedLoadedTranslationUnit::new_with_binding_base(
-                TranslationUnitManifest {
-                    schema: TRANSLATION_UNIT_SCHEMA_V2,
-                    key: unit_key,
-                    code_sha256: [0x55; 32],
-                    base_export,
-                    code_len: 0x1000,
-                    blocks: Vec::new(),
-                    binding_layout: DirectBindingLayout::SidecarV1,
-                    binding_export: "test_bindings".to_string(),
-                    binding_data_len,
-                    cell_size: DIRECT_BINDING_CELL_SIZE,
-                    bindings: records,
-                    binding_relocations: Vec::new(),
-                },
-                0x10_0000,
-                Some(binding_base),
-                Arc::new(()),
-            );
-            UnitFixture { storage, unit }
-        }
-
-        fn disabled_unit(
-            unit_key: TranslationUnitKey,
-            records: Vec<UnresolvedDirectBindingRecord>,
-        ) -> SharedLoadedTranslationUnit {
-            let base_export =
-                super::translation_unit_base_export(&unit_key).expect("keyed translation export");
-            SharedLoadedTranslationUnit::new_with_binding_base(
-                TranslationUnitManifest {
-                    schema: TRANSLATION_UNIT_SCHEMA_V2,
-                    key: unit_key,
-                    code_sha256: [0x66; 32],
-                    base_export,
-                    code_len: 0x1000,
-                    blocks: Vec::new(),
-                    binding_layout: DirectBindingLayout::Disabled,
-                    binding_export: String::new(),
-                    binding_data_len: 0,
-                    cell_size: 0,
-                    bindings: records,
-                    binding_relocations: Vec::new(),
-                },
-                0x20_0000,
-                None,
-                Arc::new(()),
-            )
-        }
-
-        fn mapped_direct_binding_manifest() -> TranslationUnitManifest {
-            let unit_key = key(72);
-            let records = vec![
-                record(GuestVa(0x4000), GuestVa(0x5000), 0),
-                record(GuestVa(0x4000), GuestVa(0x5000), 1),
-                record(GuestVa(0x6000), GuestVa(0x7000), 2),
-            ];
-            let binding_relocations = records
-                .iter()
-                .map(|record| DirectBindingRelocation {
-                    ordinal: record.ordinal,
-                    adrp_offset: record.stub_start + 20,
-                    add_offset: record.stub_start + 24,
-                    miss_adrp_offset: record.stub_start + 108,
-                    miss_add_offset: record.stub_start + 112,
-                    data_offset: record.ordinal.get() * DIRECT_BINDING_CELL_SIZE,
-                })
-                .collect();
-            let mut manifest = super::shared_install_manifest();
-            manifest.base_export =
-                super::translation_unit_base_export(&unit_key).expect("keyed translation export");
-            manifest.key = unit_key;
-            manifest.code_sha256 = [0x72; 32];
-            manifest.code_len = 0x1000;
-            manifest.binding_layout = DirectBindingLayout::SidecarV1;
-            manifest.binding_export = TRANSLATION_UNIT_BINDING_EXPORT.to_string();
-            manifest.binding_data_len = 3 * u64::from(DIRECT_BINDING_CELL_SIZE);
-            manifest.cell_size = DIRECT_BINDING_CELL_SIZE;
-            manifest.bindings = records;
-            manifest.binding_relocations = binding_relocations;
-            manifest
-        }
-
-        fn mapped_direct_binding_unit(manifest: &TranslationUnitManifest) -> UnitFixture {
-            let bytes = encode_translation_metadata_v3(manifest).expect("encode mapped bindings");
-            let metadata = ValidatedMappedTranslationMetadata::new(
-                Arc::new(VecMetadataBacking::new(bytes)),
-                &manifest.key,
-            )
-            .expect("validate mapped bindings");
-            let storage = std::iter::repeat_with(|| {
-                AtomicPtr::new(std::ptr::null_mut::<DirectBindingTarget>())
-            })
-            .take(manifest.bindings.len())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-            let binding_base =
-                DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
-            let unit = SharedLoadedTranslationUnit::new_mapped_with_binding_base(
-                metadata,
-                0x30_0000,
-                Some(binding_base),
-                TranslationMetadataLoadEvidence::default(),
-                Arc::new(()),
-            );
-            UnitFixture { storage, unit }
-        }
-
-        fn v2_direct_binding_unit(manifest: TranslationUnitManifest) -> UnitFixture {
-            let storage = std::iter::repeat_with(|| AtomicPtr::new(std::ptr::null_mut()))
-                .take(manifest.bindings.len())
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let binding_base =
-                DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
-            let unit = SharedLoadedTranslationUnit::new_with_binding_base(
-                manifest,
-                0x30_0000,
-                Some(binding_base),
-                Arc::new(()),
-            );
-            UnitFixture { storage, unit }
-        }
-
-        fn section_offset(bytes: &[u8], kind: SectionKind) -> usize {
-            let layout = crate::mapped_metadata::ValidatedLayout::parse(bytes)
-                .expect("encoded metadata layout");
-            usize::try_from(
-                layout
-                    .section(kind)
-                    .expect("encoded metadata section")
-                    .offset()
-                    .get(),
-            )
-            .expect("section offset fits usize")
-        }
-
-        fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
-            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        }
-
-        fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
-            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        }
-
-        fn register_mapped_direct_binding_bytes(
-            registry: &mut DirectBindingRegistry,
-            manifest: &TranslationUnitManifest,
-            bytes: Vec<u8>,
-            binding_base: DirectBindingCellVa,
-        ) -> Result<Option<usize>, MappedMetadataError> {
-            let metadata = ValidatedMappedTranslationMetadata::new(
-                Arc::new(VecMetadataBacking::new(bytes)),
-                &manifest.key,
-            )?;
-            let unit = SharedLoadedTranslationUnit::new_mapped_with_binding_base(
-                metadata,
-                0x30_0000,
-                Some(binding_base),
-                TranslationMetadataLoadEvidence::default(),
-                Arc::new(()),
-            );
-            Ok(registry
-                .register_loaded_unit(&unit)
-                .expect("validated mapped direct-binding unit must prepare"))
-        }
-
-        #[test]
-        fn mapped_direct_binding_preparation_reuses_records_and_pre_grouped_edges() {
-            let manifest = mapped_direct_binding_manifest();
-            let mapped = mapped_direct_binding_unit(&manifest);
-            let mut mapped_registry = DirectBindingRegistry::new(true);
-            let prepared = mapped_registry
-                .prepare_loaded_unit(&mapped.unit)
-                .expect("prepare mapped direct bindings");
-            let first_cell = mapped.unit.binding_base.expect("mapped binding base");
-
-            assert_eq!(prepared.record_count(), 3);
-            assert_eq!(prepared.owned_record_count(), 0);
-            assert_eq!(prepared.edge_group_builds(), 0);
-            assert_eq!(prepared.cell_owner_count(), 3);
-            for index in 0..3_u32 {
-                assert_eq!(
-                    prepared.mapped_record_owner(index as usize),
-                    Some((
-                        index,
-                        DirectBindingCellVa::mapped(
-                            first_cell.get() + index as usize * DIRECT_BINDING_CELL_SIZE as usize,
-                        )
-                        .expect("indexed mapped cell"),
-                    )),
-                );
-            }
-            assert_eq!(
-                prepared.edge_members(GuestVa(0x4000), GuestVa(0x5000)),
-                &[(0, 0), (0, 1)]
-            );
-
-            let v2 = v2_direct_binding_unit(manifest);
-            let mut v2_registry = DirectBindingRegistry::new(true);
-            let v2_prepared = v2_registry
-                .prepare_loaded_unit(&v2.unit)
-                .expect("prepare V2 control bindings");
-            assert_eq!(v2_prepared.owned_record_count(), 3);
-            assert_eq!(v2_prepared.edge_group_builds(), 1);
-            assert_eq!(
-                v2_prepared.edge_members(GuestVa(0x4000), GuestVa(0x5000)),
-                prepared.edge_members(GuestVa(0x4000), GuestVa(0x5000)),
-            );
-
-            drop(mapped.unit);
-            assert_eq!(
-                prepared.record_count(),
-                3,
-                "prepared owner retains V3 lease"
-            );
-            assert_eq!(mapped.storage.len(), 3, "mapped cells remain live");
-            let unit_index = mapped_registry
-                .commit_loaded_unit(prepared)
-                .expect("mapped SidecarV1 owner");
-            let miss = DirectBindingMiss {
-                cell: first_cell,
-                ordinal: DirectBindingOrdinal::claimed(0),
-            };
-            assert_eq!(
-                mapped_registry
-                    .classify_cold_exit(
-                        GuestVa(0x4000),
-                        GuestVa(0x5000),
-                        DirectBindingExitMetadata::Mapped(miss),
-                    )
-                    .expect("mapped edge lookup"),
-                DirectBindingEligibility {
-                    unit: key(72),
-                    ordinal: DirectBindingOrdinal::claimed(0),
-                    cell: Some(first_cell),
-                }
-            );
-            assert_eq!(
-                mapped_registry
-                    .owner_key(miss, GuestVa(0x4000), GuestVa(0x5000))
-                    .expect("mapped owner validation")
-                    .ordinal,
-                DirectBindingOrdinal::claimed(0),
-            );
-
-            let epoch = PrivateJitEpoch::process_owner();
-            assert_eq!(
-                mapped_registry.publish(
-                    miss,
-                    GuestVa(0x4000),
-                    GuestVa(0x5000),
-                    private_target(GuestVa(0x5000), CodeGeneration::INITIAL, 0x80_7200, &epoch,),
-                ),
-                DirectBindingPublishOutcome::Published,
-            );
-            assert!(mapped_registry.is_published(unit_index, miss.ordinal));
-            assert_eq!(
-                mapped_registry.clear_inherited_after_fork().cells_cleared,
-                1
-            );
-            assert!(mapped.storage[0].load(Ordering::Acquire).is_null());
-
-            assert_eq!(
-                mapped_registry.publish(
-                    miss,
-                    GuestVa(0x4000),
-                    GuestVa(0x5000),
-                    private_target(GuestVa(0x5000), CodeGeneration::INITIAL, 0x80_7200, &epoch,),
-                ),
-                DirectBindingPublishOutcome::Published,
-            );
-            let exec = mapped_registry.clear_all_before_exec();
-            assert_eq!(exec.cells_cleared, 1);
-            assert_eq!(exec.units_dropped, 1);
-            assert!(mapped.storage[0].load(Ordering::Acquire).is_null());
-        }
-
-        #[test]
-        fn mapped_direct_binding_member_corruption_is_failure_atomic() {
-            let manifest = mapped_direct_binding_manifest();
-            let mut bytes =
-                encode_translation_metadata_v3(&manifest).expect("encode mapped bindings");
-            let member = section_offset(&bytes, SectionKind::EdgeMember);
-            put_u32(&mut bytes, member, 2);
-            let storage = std::iter::repeat_with(|| {
-                AtomicPtr::new(std::ptr::null_mut::<DirectBindingTarget>())
-            })
-            .take(manifest.bindings.len())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-            let binding_base =
-                DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
-            let mut registry = DirectBindingRegistry::new(true);
-            let before = registry.logical_snapshot_for_test();
-
-            let error =
-                register_mapped_direct_binding_bytes(&mut registry, &manifest, bytes, binding_base)
-                    .expect_err("member must not point at a binding on another edge");
-
-            assert_eq!(error, MappedMetadataError::EdgeBackReference);
-            assert_eq!(registry.logical_snapshot_for_test(), before);
-        }
-
-        #[test]
-        fn mapped_direct_binding_back_reference_corruption_is_failure_atomic() {
-            let manifest = mapped_direct_binding_manifest();
-            let mut bytes =
-                encode_translation_metadata_v3(&manifest).expect("encode mapped bindings");
-            let binding = section_offset(&bytes, SectionKind::Binding);
-            // `edge_member_index` is the final u64 in the fixed 40-byte V3 binding record.
-            put_u64(&mut bytes, binding + BINDING_RECORD_V3_SIZE - 8, 3);
-            let storage = std::iter::repeat_with(|| {
-                AtomicPtr::new(std::ptr::null_mut::<DirectBindingTarget>())
-            })
-            .take(manifest.bindings.len())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-            let binding_base =
-                DirectBindingCellVa::mapped(storage.as_ptr() as usize).expect("aligned cells");
-            let mut registry = DirectBindingRegistry::new(true);
-            let before = registry.logical_snapshot_for_test();
-
-            let error =
-                register_mapped_direct_binding_bytes(&mut registry, &manifest, bytes, binding_base)
-                    .expect_err("binding must not point beyond the member table");
-
-            assert_eq!(error, MappedMetadataError::Binding);
-            assert_eq!(registry.logical_snapshot_for_test(), before);
-        }
-
-        #[test]
-        fn mapped_direct_binding_relationship_failure_preserves_registry_allocations() {
-            let manifest = mapped_direct_binding_manifest();
-            let mut v2_manifest = manifest.clone();
-            v2_manifest.key = key(73);
-            v2_manifest.base_export = super::translation_unit_base_export(&v2_manifest.key)
-                .expect("keyed V2 control export");
-            let v2 = v2_direct_binding_unit(v2_manifest);
-            let mut registry = DirectBindingRegistry::new(true);
-            registry
-                .register_loaded_unit(&v2.unit)
-                .expect("register V2 edge control");
-
-            let mut seed = 80_u8;
-            loop {
-                let snapshot = registry.preparation_snapshot_for_test();
-                if snapshot.units_len == snapshot.units_capacity {
-                    assert!(
-                        !snapshot.edge_vector_capacities.is_empty(),
-                        "the pressured registry must retain existing edge vectors"
-                    );
-                    break;
-                }
-                registry
-                    .register_loaded_unit(&disabled_unit(key(seed), Vec::new()))
-                    .expect("fill V2 unit reservation control");
-                seed = seed.checked_add(1).expect("fixture seed capacity");
-            }
-
-            let mapped = mapped_direct_binding_unit(&manifest);
-            mapped
-                .unit
-                .metadata
-                .v3()
-                .expect("mapped metadata")
-                .arm_edge_group_access_fault_for_test(1);
-            let before_logical = registry.logical_snapshot_for_test();
-            let before_allocations = registry.preparation_snapshot_for_test();
-
-            let error = match registry.prepare_loaded_unit(&mapped.unit) {
-                Ok(_) => panic!("post-validation edge-group access must fail"),
-                Err(error) => error,
-            };
-
-            assert!(error.to_string().contains("edge-group index 1"));
-            assert_eq!(registry.logical_snapshot_for_test(), before_logical);
-            assert_eq!(
-                registry.preparation_snapshot_for_test(),
-                before_allocations,
-                "mapped relationship failure must not reserve existing registry state"
-            );
-        }
-
-        pub(super) fn process_with_direct_bindings() -> ProcessTranslator {
-            let process =
-                ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
-            process.state.write().direct_bindings = DirectBindingRegistry::new(true);
-            process
-        }
-
-        pub(super) fn private_target(
-            target: GuestVa,
-            generation: CodeGeneration,
-            cache_pc: u64,
-            epoch: &Arc<PrivateJitEpoch>,
-        ) -> DirectBindingTarget {
-            DirectBindingTarget::private(
-                DirectBindingTargetPrefix {
-                    target_cache_pc: cache_pc,
-                    cache_start: 0x80_0000,
-                    cache_end: 0x81_0000,
-                    generation_bindings: 0,
-                },
-                target,
-                generation,
-                epoch,
-            )
-        }
-
-        #[test]
-        fn miss_must_match_one_exact_loaded_owner_cell_and_ordinal() {
-            let source = GuestVa(0x40_0100);
-            let target = GuestVa(0x50_0100);
-            let fixture = sidecar_unit(key(1), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register owner")
-                .expect("SidecarV1 owner");
-            let cell = fixture.unit.binding_base.expect("binding base");
-
-            let owner = state
-                .direct_bindings
-                .owner_key(
-                    DirectBindingMiss {
-                        cell,
-                        ordinal: DirectBindingOrdinal::claimed(0),
-                    },
-                    source,
-                    target,
-                )
-                .expect("exact owner");
-            assert_eq!(&owner.unit, fixture.unit.key());
-            assert_eq!(owner.ordinal, DirectBindingOrdinal::claimed(0));
-            assert_eq!(
-                state.direct_bindings.owner_key(
-                    DirectBindingMiss {
-                        cell,
-                        ordinal: DirectBindingOrdinal::claimed(1),
-                    },
-                    source,
-                    target,
-                ),
-                None,
-            );
-            assert_eq!(
-                state.direct_bindings.owner_key(
-                    DirectBindingMiss {
-                        cell: DirectBindingCellVa::mapped(
-                            fixture.storage.as_ptr() as usize + DIRECT_BINDING_CELL_SIZE as usize,
-                        )
-                        .expect("aligned adjacent address"),
-                        ordinal: DirectBindingOrdinal::claimed(0),
-                    },
-                    source,
-                    target,
-                ),
-                None,
-            );
-        }
-
-        #[test]
-        fn guest_source_target_pair_cannot_select_another_unit_instance() {
-            let source = GuestVa(0x40_0200);
-            let target = GuestVa(0x50_0200);
-            let first = sidecar_unit(key(2), vec![record(source, target, 0)]);
-            let second = sidecar_unit(key(3), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&first.unit)
-                .expect("register first")
-                .expect("first owner");
-            state
-                .direct_bindings
-                .register_loaded_unit(&second.unit)
-                .expect("register second")
-                .expect("second owner");
-
-            let owner = state
-                .direct_bindings
-                .owner_key(
-                    DirectBindingMiss {
-                        cell: first.unit.binding_base.expect("first binding base"),
-                        ordinal: DirectBindingOrdinal::claimed(0),
-                    },
-                    source,
-                    target,
-                )
-                .expect("first exact owner");
-
-            assert_eq!(&owner.unit, first.unit.key());
-            assert_ne!(&owner.unit, second.unit.key());
-        }
-
-        #[test]
-        fn active_source_after_cross_unit_hit_selects_exit_time_authority() {
-            let a_source = GuestVa(0x40_1000);
-            let b_source = GuestVa(0x40_2000);
-            let target = GuestVa(0x50_1000);
-            let first = sidecar_unit(key(20), vec![record(a_source, b_source, 0)]);
-            let second = sidecar_unit(key(21), vec![record(b_source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&first.unit)
-                .expect("register A");
-            state
-                .direct_bindings
-                .register_loaded_unit(&second.unit)
-                .expect("register B");
-
-            let selected = state
-                .direct_bindings
-                .classify_cold_exit(
-                    b_source,
-                    target,
-                    DirectBindingExitMetadata::Mapped(DirectBindingMiss {
-                        cell: second.unit.binding_base.expect("B cell"),
-                        ordinal: DirectBindingOrdinal::claimed(0),
-                    }),
-                )
-                .expect("B is the exact exit-time source");
-
-            assert_eq!(
-                selected,
-                DirectBindingEligibility {
-                    unit: second.unit.key().clone(),
-                    ordinal: DirectBindingOrdinal::claimed(0),
-                    cell: second.unit.binding_base,
-                }
-            );
-        }
-
-        #[test]
-        fn duplicate_source_target_never_guesses_active_source() {
-            let source = GuestVa(0x40_3000);
-            let target = GuestVa(0x50_3000);
-            let first = disabled_unit(key(22), vec![record(source, target, 0)]);
-            let second = disabled_unit(key(23), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&first)
-                .expect("register first disabled manifest");
-            state
-                .direct_bindings
-                .register_loaded_unit(&second)
-                .expect("register second disabled manifest");
-
-            assert_eq!(
-                state.direct_bindings.classify_cold_exit(
-                    source,
-                    target,
-                    DirectBindingExitMetadata::Absent
-                ),
-                Err(DirectBindingValidationReason::AmbiguousEligibleRecord),
-            );
-        }
-
-        #[test]
-        fn disabled_unit_retains_manifest_ordinal_with_zero_cell() {
-            let source = GuestVa(0x40_4000);
-            let target = GuestVa(0x50_4000);
-            let unit = disabled_unit(key(24), vec![record(source, target, 7)]);
-            let process = process_with_direct_bindings();
-            let mut state = process.state.write();
-            assert_eq!(
-                state
-                    .direct_bindings
-                    .register_loaded_unit(&unit)
-                    .expect("retain disabled manifest"),
-                None,
-            );
-
-            let selected = state
-                .direct_bindings
-                .classify_cold_exit(source, target, DirectBindingExitMetadata::Absent)
-                .expect("disabled eligibility remains authoritative");
-            assert_eq!(selected.ordinal, DirectBindingOrdinal::claimed(7));
-            assert_eq!(selected.cell, None);
-        }
-
-        #[test]
-        fn missing_or_mismatched_cold_authority_fails_before_publication() {
-            let source = GuestVa(0x40_5000);
-            let target = GuestVa(0x50_5000);
-            let fixture = sidecar_unit(key(25), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register sidecar");
-
-            assert_eq!(
-                state.direct_bindings.classify_cold_exit(
-                    GuestVa(0x40_5004),
-                    target,
-                    DirectBindingExitMetadata::Absent,
-                ),
-                Err(DirectBindingValidationReason::MissingEligibleRecord),
-            );
-            assert_eq!(
-                state.direct_bindings.classify_cold_exit(
-                    source,
-                    target,
-                    DirectBindingExitMetadata::Absent
-                ),
-                Err(DirectBindingValidationReason::MissMetadataMismatch),
-            );
-            assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
-        }
-
-        #[test]
-        fn malformed_present_cell_is_a_mapped_cell_failure() {
-            let source = GuestVa(0x40_6000);
-            let target = GuestVa(0x50_6000);
-            let fixture = sidecar_unit(key(26), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register sidecar");
-
-            assert_eq!(
-                state.direct_bindings.classify_cold_exit(
-                    source,
-                    target,
-                    DirectBindingExitMetadata::MappedCellFailure {
-                        raw_cell: 0x20_001,
-                        ordinal: DirectBindingOrdinal::claimed(0),
-                    },
-                ),
-                Err(DirectBindingValidationReason::MappedCellFailure),
-            );
-            assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
-        }
-
-        #[test]
-        fn first_publisher_sets_the_bitmap_and_incoming_record() {
-            let source = GuestVa(0x40_0300);
-            let target = GuestVa(0x50_0300);
-            let fixture = sidecar_unit(key(4), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let epoch = PrivateJitEpoch::process_owner();
-            let miss = DirectBindingMiss {
-                cell: fixture.unit.binding_base.expect("binding base"),
-                ordinal: DirectBindingOrdinal::claimed(0),
-            };
-            let mut state = process.state.write();
-            let unit_index = state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register owner")
-                .expect("SidecarV1 owner");
-
-            let outcome = state.direct_bindings.publish(
-                miss,
-                source,
-                target,
-                private_target(target, CodeGeneration::INITIAL, 0x80_0100, &epoch),
-            );
-
-            assert_eq!(outcome, DirectBindingPublishOutcome::Published);
-            assert!(state.direct_bindings.is_published(unit_index, miss.ordinal));
-            assert_eq!(
-                state
-                    .direct_bindings
-                    .incoming_count(target, CodeGeneration::INITIAL),
-                1,
-            );
-            assert!(!fixture.storage[0].load(Ordering::Acquire).is_null());
-        }
-
-        #[test]
-        fn a_valid_losing_publisher_accepts_the_complete_winner() {
-            let source = GuestVa(0x40_0400);
-            let target = GuestVa(0x50_0400);
-            let fixture = sidecar_unit(key(5), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let epoch = PrivateJitEpoch::process_owner();
-            let miss = DirectBindingMiss {
-                cell: fixture.unit.binding_base.expect("binding base"),
-                ordinal: DirectBindingOrdinal::claimed(0),
-            };
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register owner")
-                .expect("SidecarV1 owner");
-            assert_eq!(
-                state.direct_bindings.publish(
-                    miss,
-                    source,
-                    target,
-                    private_target(target, CodeGeneration::INITIAL, 0x80_0200, &epoch),
-                ),
-                DirectBindingPublishOutcome::Published,
-            );
-            let winner = fixture.storage[0].load(Ordering::Acquire);
-
-            let outcome = state.direct_bindings.publish(
-                miss,
-                source,
-                target,
-                private_target(target, CodeGeneration::INITIAL, 0x80_0200, &epoch),
-            );
-
-            assert_eq!(outcome, DirectBindingPublishOutcome::ExistingWinner);
-            assert_eq!(fixture.storage[0].load(Ordering::Acquire), winner);
-            assert_eq!(
-                state
-                    .direct_bindings
-                    .incoming_count(target, CodeGeneration::INITIAL),
-                1,
-            );
-            assert_eq!(state.direct_bindings.counters().cas_losses, 1);
-        }
-
-        #[test]
-        fn a_stale_winner_is_exactly_cleared_and_retried_once() {
-            let source = GuestVa(0x40_0500);
-            let target = GuestVa(0x50_0500);
-            let fixture = sidecar_unit(key(6), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let epoch = PrivateJitEpoch::process_owner();
-            let miss = DirectBindingMiss {
-                cell: fixture.unit.binding_base.expect("binding base"),
-                ordinal: DirectBindingOrdinal::claimed(0),
-            };
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register owner")
-                .expect("SidecarV1 owner");
-            assert_eq!(
-                state.direct_bindings.publish(
-                    miss,
-                    source,
-                    target,
-                    private_target(target, CodeGeneration::claimed(1), 0x80_0300, &epoch),
-                ),
-                DirectBindingPublishOutcome::Published,
-            );
-            let stale = fixture.storage[0].load(Ordering::Acquire);
-
-            let outcome = state.direct_bindings.publish(
-                miss,
-                source,
-                target,
-                private_target(target, CodeGeneration::claimed(2), 0x80_0400, &epoch),
-            );
-
-            assert_eq!(outcome, DirectBindingPublishOutcome::PublishedAfterStale);
-            assert_ne!(fixture.storage[0].load(Ordering::Acquire), stale);
-            assert_eq!(state.direct_bindings.counters().stale_winner_clears, 1);
-            assert_eq!(state.direct_bindings.counters().publication_retries, 1);
-            assert_eq!(
-                state
-                    .direct_bindings
-                    .incoming_count(target, CodeGeneration::claimed(2)),
-                1,
-            );
-        }
-
-        #[test]
-        fn a_replacement_winner_survives_a_lost_exact_stale_clear() {
-            let source = GuestVa(0x40_0580);
-            let target = GuestVa(0x50_0580);
-            let fixture = sidecar_unit(key(8), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let epoch = PrivateJitEpoch::process_owner();
-            let miss = DirectBindingMiss {
-                cell: fixture.unit.binding_base.expect("binding base"),
-                ordinal: DirectBindingOrdinal::claimed(0),
-            };
-            let mut state = process.state.write();
-            let unit_index = state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register owner")
-                .expect("SidecarV1 owner");
-            assert_eq!(
-                state.direct_bindings.publish(
-                    miss,
-                    source,
-                    target,
-                    private_target(target, CodeGeneration::claimed(1), 0x80_0600, &epoch),
-                ),
-                DirectBindingPublishOutcome::Published,
-            );
-            let stale = fixture.storage[0].load(Ordering::Acquire);
-            let mut replacement = std::ptr::null_mut();
-
-            let outcome = state.direct_bindings.publish_with_stale_observer_for_test(
-                miss,
-                source,
-                target,
-                private_target(target, CodeGeneration::claimed(2), 0x80_0700, &epoch),
-                |registry, observed_stale| {
-                    assert_eq!(observed_stale, stale);
-                    // SAFETY: the fixture owns this live `AtomicPtr` cell
-                    // until the state guard and registry are dropped.
-                    let cell = unsafe {
-                        DirectBindingCellRef::from_mapped_address(miss.cell).expect("fixture cell")
-                    };
-                    assert!(cell.clear_if(observed_stale));
-                    assert_eq!(
-                        registry.publish(
-                            miss,
-                            source,
-                            target,
-                            private_target(target, CodeGeneration::claimed(3), 0x80_0800, &epoch,),
-                        ),
-                        DirectBindingPublishOutcome::Published,
-                    );
-                    replacement = cell.load_acquire();
-                    assert!(!replacement.is_null());
-                },
-            );
-
-            assert_eq!(outcome, DirectBindingPublishOutcome::Rejected);
-            assert_eq!(fixture.storage[0].load(Ordering::Acquire), replacement);
-            assert!(state.direct_bindings.is_published(unit_index, miss.ordinal));
-            assert_eq!(
-                state
-                    .direct_bindings
-                    .incoming_count(target, CodeGeneration::claimed(3)),
-                1,
-            );
-        }
-
-        #[test]
-        fn failed_owner_or_authority_validation_leaves_the_cell_null() {
-            let source = GuestVa(0x40_0600);
-            let target = GuestVa(0x50_0600);
-            let fixture = sidecar_unit(key(7), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let epoch = PrivateJitEpoch::process_owner();
-            let cell = fixture.unit.binding_base.expect("binding base");
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register owner")
-                .expect("SidecarV1 owner");
-
-            assert_eq!(
-                state.direct_bindings.publish(
-                    DirectBindingMiss {
-                        cell,
-                        ordinal: DirectBindingOrdinal::claimed(1),
-                    },
-                    source,
-                    target,
-                    private_target(target, CodeGeneration::INITIAL, 0x80_0500, &epoch),
-                ),
-                DirectBindingPublishOutcome::Rejected,
-            );
-            assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
-
-            assert_eq!(
-                state.direct_bindings.publish(
-                    DirectBindingMiss {
-                        cell,
-                        ordinal: DirectBindingOrdinal::claimed(0),
-                    },
-                    source,
-                    target,
-                    private_target(target, CodeGeneration::INITIAL, 0x90_0000, &epoch),
-                ),
-                DirectBindingPublishOutcome::Rejected,
-            );
-            assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
-        }
-    }
-
-    mod direct_binding_fork_reset {
-        use super::direct_binding_owner_and_publication::{
-            UnitFixture, key, private_target, process_with_direct_bindings, record, sidecar_unit,
-        };
-        use crate::direct_binding::{
-            DirectBindingCellRef, DirectBindingCellVa, DirectBindingMiss, DirectBindingOrdinal,
-            DirectBindingPublishOutcome, DirectBindingTarget,
-        };
-        use crate::types::CodeGeneration;
-        use carrick_guest_mem::GuestVa;
-        use std::sync::atomic::Ordering;
-        use std::time::{Duration, Instant};
-
-        pub(super) fn one_published_binding(
-            seed: u8,
-        ) -> (UnitFixture, super::ProcessTranslator, GuestVa, GuestVa) {
-            let source = GuestVa(0x41_0000 + u64::from(seed) * 0x100);
-            let target = GuestVa(0x51_0000 + u64::from(seed) * 0x100);
-            let fixture = sidecar_unit(key(seed), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register owner")
-                .expect("SidecarV1 owner");
-            assert_eq!(
-                state.direct_bindings.publish(
-                    DirectBindingMiss {
-                        cell: fixture.unit.binding_base.expect("binding base"),
-                        ordinal: DirectBindingOrdinal::claimed(0),
-                    },
-                    source,
-                    target,
-                    private_target(
-                        target,
-                        CodeGeneration::INITIAL,
-                        0x80_0100,
-                        &process.private_jit_epoch,
-                    ),
-                ),
-                DirectBindingPublishOutcome::Published,
-            );
-            drop(state);
-            (fixture, process, source, target)
-        }
-
-        fn child_exit_status(pid: libc::pid_t) -> i32 {
-            let mut status = 0;
-            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-            assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
-            libc::WEXITSTATUS(status)
-        }
-
-        /// A fork child inherits the parent's recording claim and candidate
-        /// batches by COW, but the store's builder election belongs to the
-        /// PARENT pid: the child republishing the inherited batch at its own
-        /// exec/exit is exactly the "concurrent publishers" term the
-        /// 2026-08-03 scoreboard correction measured (+6.4 ms per exec on the
-        /// parallel build, with the parent publishing the same unit anyway).
-        #[test]
-        fn fork_child_drops_inherited_recording_claims_and_candidates() {
-            let (_fixture, process, source, _target) = one_published_binding(31);
-            process
-                .activate_translated_range_catalog()
-                .expect("activate catalog");
-            {
-                let mut state = process.state.write();
-                state.shared_recording_segments.insert(source);
-                state.shared_candidates.insert(source, Vec::new());
-            }
-
-            process.after_fork_child().expect("fork repair");
-
-            let state = process.state.read();
-            assert!(
-                state.shared_recording_segments.is_empty(),
-                "the recording claim belongs to the parent pid, not the child"
-            );
-            assert!(
-                state.shared_candidates.is_empty(),
-                "inherited candidate batches must not be republished by the child"
-            );
-        }
-
-        struct ForkChildPipeRecorder<'a> {
-            state: &'a parking_lot::RwLock<crate::translator::ProcessState>,
-            events: Vec<super::RecordedForkChildRepair>,
-            writer_held: bool,
-        }
-
-        impl ForkChildPipeRecorder<'_> {
-            fn record(&mut self, event: super::RecordedForkChildRepair) {
-                self.writer_held &= self.state.try_read().is_none();
-                self.events.push(event);
-            }
-        }
-
-        impl super::TranslatedRangeRecorder for ForkChildPipeRecorder<'_> {
-            fn reset(&mut self, event: carrick_dsr::probes::TranslatedRangeReset) {
-                self.record(super::RecordedForkChildRepair::Range(
-                    super::RecordedTranslatedRange::Reset(event),
-                ));
-            }
-
-            fn add(&mut self, event: carrick_dsr::probes::TranslatedRangeAdd) {
-                self.record(super::RecordedForkChildRepair::Range(
-                    super::RecordedTranslatedRange::Add(event),
-                ));
-            }
-
-            fn ready(&mut self, event: carrick_dsr::probes::TranslatedRangeReady) {
-                self.record(super::RecordedForkChildRepair::Range(
-                    super::RecordedTranslatedRange::Ready(event),
-                ));
-            }
-        }
-
-        impl super::ForkChildRepairRecorder for ForkChildPipeRecorder<'_> {
-            fn process_repaired(&mut self) {
-                self.record(super::RecordedForkChildRepair::ProcessRepaired);
-            }
-        }
-
-        fn terminate_and_reap_exact_child(pid: libc::pid_t) -> Result<i32, String> {
-            let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
-            if killed != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(format!("kill({pid}, SIGKILL) failed: {error}"));
-                }
-            }
-            loop {
-                let mut status = 0;
-                let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-                if waited == pid {
-                    return Ok(status);
-                }
-                let error = std::io::Error::last_os_error();
-                if waited < 0 && error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(format!("waitpid({pid}) after SIGKILL failed: {error}"));
-            }
-        }
-
-        fn child_supervision_failure(
-            pid: libc::pid_t,
-            read_fd: libc::c_int,
-            status: Option<i32>,
-            detail: String,
-        ) -> String {
-            let _ = unsafe { libc::close(read_fd) };
-            if status.is_some() {
-                return detail;
-            }
-            match terminate_and_reap_exact_child(pid) {
-                Ok(_) => detail,
-                Err(cleanup) => format!("{detail}; exact-child cleanup failed: {cleanup}"),
-            }
-        }
-
-        fn supervise_child_payload(
-            pid: libc::pid_t,
-            read_fd: libc::c_int,
-            payload: &mut [u8],
-            timeout: Duration,
-        ) -> Result<i32, String> {
-            let deadline = Instant::now() + timeout;
-            let mut read = 0_usize;
-            let mut status = None;
-            loop {
-                if status.is_none() {
-                    let mut child_status = 0;
-                    let waited = unsafe { libc::waitpid(pid, &mut child_status, libc::WNOHANG) };
-                    if waited == pid {
-                        status = Some(child_status);
-                    } else if waited < 0 {
-                        let error = std::io::Error::last_os_error();
-                        if error.raw_os_error() != Some(libc::EINTR) {
-                            if error.raw_os_error() == Some(libc::ECHILD) {
-                                let _ = unsafe { libc::close(read_fd) };
-                                return Err(format!(
-                                    "waitpid({pid}, WNOHANG) lost child ownership; refusing \
-                                     cleanup signal"
-                                ));
-                            }
-                            return Err(child_supervision_failure(
-                                pid,
-                                read_fd,
-                                status,
-                                format!("waitpid({pid}, WNOHANG) failed: {error}"),
-                            ));
-                        }
-                    }
-                }
-                if read == payload.len()
-                    && let Some(status) = status
-                {
-                    let _ = unsafe { libc::close(read_fd) };
-                    return Ok(status);
-                }
-
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(child_supervision_failure(
-                        pid,
-                        read_fd,
-                        status,
-                        format!("child {pid} payload timed out after {timeout:?}"),
-                    ));
-                }
-                let poll_ms = (deadline - now).as_millis().clamp(1, 50) as libc::c_int;
-                let polled = if read < payload.len() {
-                    let mut poll_fd = libc::pollfd {
-                        fd: read_fd,
-                        events: libc::POLLIN | libc::POLLHUP,
-                        revents: 0,
-                    };
-                    let result = unsafe { libc::poll(&mut poll_fd, 1, poll_ms) };
-                    (result, poll_fd.revents)
-                } else {
-                    (unsafe { libc::poll(std::ptr::null_mut(), 0, poll_ms) }, 0)
-                };
-                if polled.0 < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    return Err(child_supervision_failure(
-                        pid,
-                        read_fd,
-                        status,
-                        format!("poll child {pid} payload failed: {error}"),
-                    ));
-                }
-                if polled.0 == 0 || read == payload.len() {
-                    continue;
-                }
-                if polled.1 & libc::POLLNVAL != 0 {
-                    return Err(child_supervision_failure(
-                        pid,
-                        read_fd,
-                        status,
-                        format!("poll child {pid} payload reported POLLNVAL"),
-                    ));
-                }
-                if polled.1 & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
-                    continue;
-                }
-                let result = unsafe {
-                    libc::read(
-                        read_fd,
-                        payload.as_mut_ptr().add(read).cast::<libc::c_void>(),
-                        payload.len() - read,
-                    )
-                };
-                if result > 0 {
-                    read += result as usize;
-                    continue;
-                }
-                if result < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    return Err(child_supervision_failure(
-                        pid,
-                        read_fd,
-                        status,
-                        format!("read child {pid} payload failed: {error}"),
-                    ));
-                }
-                return Err(child_supervision_failure(
-                    pid,
-                    read_fd,
-                    status,
-                    format!(
-                        "child {pid} closed payload pipe after {read}/{} bytes",
-                        payload.len()
-                    ),
-                ));
-            }
-        }
-
-        #[test]
-        fn child_payload_deadline_kills_and_reaps_exact_child() {
-            let mut pipe_fds = [-1; 2];
-            assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-            let pid = unsafe { libc::fork() };
-            if pid < 0 {
-                let error = std::io::Error::last_os_error();
-                let _ = unsafe { libc::close(pipe_fds[0]) };
-                let _ = unsafe { libc::close(pipe_fds[1]) };
-                panic!("fork failed: {error}");
-            }
-            if pid == 0 {
-                let _ = unsafe { libc::close(pipe_fds[0]) };
-                loop {
-                    unsafe { libc::pause() };
-                }
-            }
-
-            let _ = unsafe { libc::close(pipe_fds[1]) };
-            let mut payload = [0_u8; 1];
-            let result =
-                supervise_child_payload(pid, pipe_fds[0], &mut payload, Duration::from_millis(50));
-
-            assert!(
-                result
-                    .as_ref()
-                    .is_err_and(|error| error.contains("timed out")),
-                "unexpected supervision result: {result:?}"
-            );
-            let mut status = 0;
-            assert_eq!(
-                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
-                -1
-            );
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ECHILD),
-                "the exact timed-out child must already be reaped"
-            );
-        }
-
-        #[test]
-        fn fork_child_clears_only_published_ordinals_without_allocation() {
-            let records = (0..70_u32)
-                .map(|ordinal| {
-                    record(
-                        GuestVa(0x42_0000 + u64::from(ordinal) * 4),
-                        GuestVa(0x52_0000 + u64::from(ordinal) * 4),
-                        ordinal,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let fixture = sidecar_unit(key(20), records);
-            let process = process_with_direct_bindings();
-            let unit_index;
-            {
-                let mut state = process.state.write();
-                unit_index = state
-                    .direct_bindings
-                    .register_loaded_unit(&fixture.unit)
-                    .expect("register owner")
-                    .expect("SidecarV1 owner");
-                for ordinal in [1_u32, 65] {
-                    let source = GuestVa(0x42_0000 + u64::from(ordinal) * 4);
-                    let target = GuestVa(0x52_0000 + u64::from(ordinal) * 4);
-                    assert_eq!(
-                        state.direct_bindings.publish(
-                            DirectBindingMiss {
-                                cell: DirectBindingCellVa::mapped(
-                                    fixture.storage.as_ptr() as usize
-                                        + ordinal as usize
-                                            * crate::shared_cache::DIRECT_BINDING_CELL_SIZE
-                                                as usize,
-                                )
-                                .expect("published cell"),
-                                ordinal: DirectBindingOrdinal::claimed(ordinal),
-                            },
-                            source,
-                            target,
-                            private_target(
-                                target,
-                                CodeGeneration::INITIAL,
-                                0x80_1000 + u64::from(ordinal) * 4,
-                                &process.private_jit_epoch,
-                            ),
-                        ),
-                        DirectBindingPublishOutcome::Published,
-                    );
-                }
-            }
-            let unpublished_target = Box::new(private_target(
-                GuestVa(0x52_0008),
-                CodeGeneration::INITIAL,
-                0x80_2000,
-                &process.private_jit_epoch,
-            ));
-            let unpublished_pointer =
-                std::ptr::from_ref::<DirectBindingTarget>(unpublished_target.as_ref()).cast_mut();
-            let unpublished_cell =
-                DirectBindingCellVa::mapped(fixture.storage.as_ptr() as usize + 2 * 8)
-                    .expect("unpublished cell");
-            // SAFETY: the fixture owns this live cell and `unpublished_target`
-            // outlives every load below.
-            unsafe {
-                DirectBindingCellRef::from_mapped_address(unpublished_cell)
-                    .expect("fixture cell")
-                    .publish_null(unpublished_pointer)
-                    .expect("install untracked sentinel");
-            }
-            let before = process
-                .state
-                .read()
-                .direct_bindings
-                .arena_snapshot_for_test(unit_index);
-            process
-                .activate_translated_range_catalog()
-                .expect("activate catalog");
-
-            let stats = process.after_fork_child().expect("fork repair");
-
-            let after = process
-                .state
-                .read()
-                .direct_bindings
-                .arena_snapshot_for_test(unit_index);
-            assert_eq!(after, before, "fork repair must not grow or reclaim arenas");
-            assert_eq!(stats.cells_cleared, 2);
-            assert!(stats.pages_touched >= 1);
-            assert!(fixture.storage[1].load(Ordering::Acquire).is_null());
-            assert!(fixture.storage[65].load(Ordering::Acquire).is_null());
-            assert_eq!(
-                fixture.storage[2].load(Ordering::Acquire),
-                unpublished_pointer,
-                "a cell without a published bitmap bit must not be touched"
-            );
-        }
-
-        #[test]
-        fn fork_child_process_repair_precedes_replay_under_one_writer() {
-            let (fixture, process, _, _) = one_published_binding(29);
-            let mut recorder = super::ForkChildRepairRecorderFixture {
-                state: &process.state,
-                published_cell: Some(&fixture.storage[0]),
-                events: Vec::new(),
-            };
-            process
-                .activate_translated_range_catalog_with_recorder(&mut recorder)
-                .expect("activate catalog");
-            recorder.events.clear();
-            {
-                let mut state = process.state.write();
-                // A copied unit is a subrange of the private cache.
-                let private = state.translated_ranges.private.clone();
-                let prepared = state
-                    .translated_ranges
-                    .prepare_shared(
-                        carrick_dsr::probes::TranslatedUnitId::new(29).expect("unit id"),
-                        private.start..carrick_guest_mem::HostVa(private.start.raw() + 0x100),
-                    )
-                    .expect("prepare inherited shared range");
-                state
-                    .translated_ranges
-                    .commit_shared_with_recorder(prepared, &mut recorder);
-            }
-            recorder.events.clear();
-            let private = process.state.read().translated_ranges.private.clone();
-            let shared_range =
-                private.start..carrick_guest_mem::HostVa(private.start.raw() + 0x100);
-            let epoch = carrick_dsr::probes::TranslatedRangeEpoch::new(2).expect("child epoch");
-
-            let stats = process
-                .after_fork_child_with_recorder(&mut recorder)
-                .expect("fork repair and replay");
-
-            assert_eq!(stats.cells_cleared, 1);
-            assert_eq!(
-                recorder.events,
-                vec![
-                    super::RecordedForkChildRepair::ProcessRepaired,
-                    super::RecordedForkChildRepair::Range(super::RecordedTranslatedRange::Reset(
-                        carrick_dsr::probes::TranslatedRangeReset::reset(epoch),
-                    ),),
-                    super::RecordedForkChildRepair::Range(super::RecordedTranslatedRange::Add(
-                        carrick_dsr::probes::TranslatedRangeAdd::Private(
-                            carrick_dsr::probes::TranslatedPrivateRange::private(
-                                epoch,
-                                carrick_dsr::probes::TranslatedRangeSequence::new(1)
-                                    .expect("private sequence"),
-                                private,
-                            )
-                            .expect("private replay"),
-                        ),
-                    ),),
-                    super::RecordedForkChildRepair::Range(super::RecordedTranslatedRange::Add(
-                        carrick_dsr::probes::TranslatedRangeAdd::Shared(
-                            carrick_dsr::probes::TranslatedSharedRange::shared(
-                                epoch,
-                                carrick_dsr::probes::TranslatedRangeSequence::new(2)
-                                    .expect("shared sequence"),
-                                carrick_dsr::probes::TranslatedUnitId::new(29).expect("unit id"),
-                                shared_range,
-                            )
-                            .expect("shared replay"),
-                        ),
-                    ),),
-                    super::RecordedForkChildRepair::Range(super::RecordedTranslatedRange::Ready(
-                        carrick_dsr::probes::TranslatedRangeReady::ready(epoch, 2),
-                    ),),
-                ]
-            );
-        }
-
-        #[test]
-        fn fork_child_clear_is_cow_private_from_the_parent() {
-            let (fixture, process, _, _) = one_published_binding(21);
-            process
-                .activate_translated_range_catalog()
-                .expect("activate catalog");
-            let parent_pointer = fixture.storage[0].load(Ordering::Acquire);
-            assert!(!parent_pointer.is_null());
-
-            let pid = unsafe { libc::fork() };
-            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
-            if pid == 0 {
-                process.after_fork_child().expect("child fork repair");
-                let cleared = fixture.storage[0].load(Ordering::Acquire).is_null();
-                unsafe { libc::_exit(i32::from(!cleared)) };
-            }
-
-            assert_eq!(
-                child_exit_status(pid),
-                0,
-                "child did not clear its COW cell"
-            );
-            assert_eq!(
-                fixture.storage[0].load(Ordering::Acquire),
-                parent_pointer,
-                "child repair must not mutate the parent's COW sidecar"
-            );
-        }
-
-        #[test]
-        fn fork_child_replays_once_while_parent_catalog_remains_unchanged() {
-            let process = std::sync::Arc::new(process_with_direct_bindings());
-            let mut setup_recorder = super::TranslatedRangeRecorderFixture::default();
-            process
-                .activate_translated_range_catalog_with_recorder(&mut setup_recorder)
-                .expect("activate parent catalog");
-            {
-                let mut state = process.state.write();
-                // A copied unit is a subrange of the private cache.
-                let private = state.translated_ranges.private.clone();
-                let prepared = state
-                    .translated_ranges
-                    .prepare_shared(
-                        carrick_dsr::probes::TranslatedUnitId::new(30).expect("unit id"),
-                        private.start..carrick_guest_mem::HostVa(private.start.raw() + 0x100),
-                    )
-                    .expect("prepare inherited shared range");
-                state
-                    .translated_ranges
-                    .commit_shared_with_recorder(prepared, &mut setup_recorder);
-            }
-            let parent_before = {
-                let state = process.state.read();
-                (
-                    state.translated_ranges.epoch,
-                    state.translated_ranges.next_sequence,
-                    state.translated_ranges.ready_sequence,
-                    state.translated_ranges.private.clone(),
-                    state.translated_ranges.shared.clone(),
-                )
-            };
-            let _non_surviving_sibling =
-                super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 50);
-            let mut surviving =
-                super::ThreadTranslator::for_process(std::sync::Arc::clone(&process), 51);
-            let mut recorder = ForkChildPipeRecorder {
-                state: &process.state,
-                events: Vec::with_capacity(8),
-                writer_held: true,
-            };
-            let mut lifecycle = Vec::with_capacity(2);
-            let mut pipe_fds = [-1; 2];
-            assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-
-            let pid = unsafe { libc::fork() };
-            if pid < 0 {
-                let error = std::io::Error::last_os_error();
-                let _ = unsafe { libc::close(pipe_fds[0]) };
-                let _ = unsafe { libc::close(pipe_fds[1]) };
-                panic!("fork failed: {error}");
-            }
-            if pid == 0 {
-                let _ = unsafe { libc::close(pipe_fds[0]) };
-                let mut record_lifecycle = |phase| lifecycle.push(phase);
-                let repaired = surviving
-                    .after_fork_child_with_recorders(52, &mut recorder, &mut record_lifecycle)
-                    .is_ok();
-                let mut epoch = 0_u64;
-                let mut frontier = 0_u64;
-                let mut reset_count = 0_u64;
-                for event in &recorder.events {
-                    match event {
-                        super::RecordedForkChildRepair::Range(
-                            super::RecordedTranslatedRange::Reset(reset),
-                        ) => {
-                            epoch = reset.epoch().get();
-                            reset_count += 1;
-                        }
-                        super::RecordedForkChildRepair::Range(
-                            super::RecordedTranslatedRange::Ready(ready),
-                        ) => frontier = ready.final_sequence(),
-                        _ => {}
-                    }
-                }
-                let mut lifecycle_end_count = 0_u64;
-                for phase in &lifecycle {
-                    if *phase == carrick_dsr::probes::DsrCacheLifecyclePhase::ForkChildRepairEnd {
-                        lifecycle_end_count += 1;
-                    }
-                }
-                let payload = [
-                    epoch,
-                    frontier,
-                    reset_count,
-                    lifecycle_end_count,
-                    u64::from(recorder.writer_held),
-                ];
-                let bytes = std::mem::size_of_val(&payload);
-                let written = unsafe {
-                    libc::write(pipe_fds[1], payload.as_ptr().cast::<libc::c_void>(), bytes)
-                };
-                let _ = unsafe { libc::close(pipe_fds[1]) };
-                unsafe {
-                    libc::_exit(i32::from(
-                        !repaired
-                            || recorder.events.len() != 5
-                            || lifecycle.len() != 2
-                            || written != bytes as isize,
-                    ))
-                };
-            }
-
-            let _ = unsafe { libc::close(pipe_fds[1]) };
-            let mut payload = [0_u64; 5];
-            let payload_bytes = unsafe {
-                std::slice::from_raw_parts_mut(
-                    payload.as_mut_ptr().cast::<u8>(),
-                    std::mem::size_of_val(&payload),
-                )
-            };
-            let status =
-                supervise_child_payload(pid, pipe_fds[0], payload_bytes, Duration::from_secs(5))
-                    .unwrap_or_else(|error| panic!("child replay supervision failed: {error}"));
-
-            assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
-            assert_eq!(libc::WEXITSTATUS(status), 0, "child replay failed");
-            assert_eq!(payload, [2, 2, 1, 1, 1]);
-            let parent_after = {
-                let state = process.state.read();
-                (
-                    state.translated_ranges.epoch,
-                    state.translated_ranges.next_sequence,
-                    state.translated_ranges.ready_sequence,
-                    state.translated_ranges.private.clone(),
-                    state.translated_ranges.shared.clone(),
-                )
-            };
-            assert_eq!(
-                parent_after, parent_before,
-                "child replay must stay private to the child's COW image"
-            );
-        }
-
-        #[test]
-        fn child_rebind_does_not_mutate_parent_cells() {
-            let (fixture, process, source, target) = one_published_binding(22);
-            process
-                .activate_translated_range_catalog()
-                .expect("activate catalog");
-            let parent_pointer = fixture.storage[0].load(Ordering::Acquire);
-            assert!(!parent_pointer.is_null());
-
-            let pid = unsafe { libc::fork() };
-            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
-            if pid == 0 {
-                process.after_fork_child().expect("child fork repair");
-                let outcome = process.state.write().direct_bindings.publish(
-                    DirectBindingMiss {
-                        cell: fixture.unit.binding_base.expect("binding base"),
-                        ordinal: DirectBindingOrdinal::claimed(0),
-                    },
-                    source,
-                    target,
-                    private_target(
-                        target,
-                        CodeGeneration::INITIAL,
-                        0x80_0200,
-                        &process.private_jit_epoch,
-                    ),
-                );
-                let rebound = fixture.storage[0].load(Ordering::Acquire);
-                let private_rebind =
-                    outcome == DirectBindingPublishOutcome::Published && rebound != parent_pointer;
-                unsafe { libc::_exit(i32::from(!private_rebind)) };
-            }
-
-            assert_eq!(child_exit_status(pid), 0, "child did not rebind from null");
-            assert_eq!(
-                fixture.storage[0].load(Ordering::Acquire),
-                parent_pointer,
-                "the child's new descriptor must stay private to its COW image"
-            );
-        }
-
-        #[test]
-        fn fork_child_retains_inherited_catalog_and_publishes_through_cow() {
-            let process = process_with_direct_bindings();
-            process
-                .activate_translated_range_catalog()
-                .expect("activate catalog");
-            let inherited = 0x90_0000..0x91_0000;
-            process
-                .state
-                .write()
-                .executable_ranges
-                .prepend(inherited.start, inherited.end)
-                .expect("publish inherited executable range");
-            let parent_head = process.state.read().executable_ranges.head_ptr();
-
-            let pid = unsafe { libc::fork() };
-            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
-            if pid == 0 {
-                process.after_fork_child().expect("child fork repair");
-                let child_only = 0xa0_0000..0xa1_0000;
-                let mut state = process.state.write();
-                let inherited_visible = state.executable_ranges.contains(inherited.start + 0x100);
-                state
-                    .executable_ranges
-                    .prepend(child_only.start, child_only.end)
-                    .expect("publish child-only executable range");
-                let child_visible = state.executable_ranges.contains(child_only.start + 0x100);
-                let child_head_changed = state.executable_ranges.head_ptr() != parent_head;
-                unsafe {
-                    libc::_exit(i32::from(
-                        !(inherited_visible && child_visible && child_head_changed),
-                    ))
-                };
-            }
-
-            assert_eq!(
-                child_exit_status(pid),
-                0,
-                "child did not retain and extend its inherited catalog"
-            );
-            let state = process.state.read();
-            assert_eq!(
-                state.executable_ranges.head_ptr(),
-                parent_head,
-                "child catalog publication must not mutate the parent COW header"
-            );
-            assert!(state.executable_ranges.contains(inherited.start + 0x100));
-            assert!(
-                !state.executable_ranges.contains(0xa0_0100),
-                "child-only executable range leaked into the parent catalog"
-            );
-        }
-    }
-
-    mod direct_binding_exec_reset {
-        use super::super::{DirectBindingResetEvent, ThreadTranslator};
-        use super::direct_binding_fork_reset::one_published_binding;
-        use crate::types::{CacheVa, CodeGeneration};
-        use carrick_guest_mem::{GuestVa, HostVa};
-        use std::sync::Arc;
-
-        const EXPECTED_ORDER: [DirectBindingResetEvent; 8] = [
-            DirectBindingResetEvent::CellsCleared,
-            DirectBindingResetEvent::ThreadCachesCleared,
-            DirectBindingResetEvent::IndexesCleared,
-            DirectBindingResetEvent::DescriptorsDropped,
-            DirectBindingResetEvent::ExecutableRangeHeadReset,
-            DirectBindingResetEvent::UnitsDropped,
-            DirectBindingResetEvent::ExecutableRangeNodesDropped,
-            DirectBindingResetEvent::PrivateCursorReset,
-        ];
-
-        fn publish_catalog_range(
-            process: &super::super::ProcessTranslator,
-            seed: usize,
-        ) -> std::ops::Range<usize> {
-            let start = 0xb0_0000 + seed * 0x20_000;
-            let range = start..start + 0x10_000;
-            process
-                .state
-                .write()
-                .executable_ranges
-                .prepend(range.start, range.end)
-                .expect("publish test executable range");
-            range
-        }
-
-        #[derive(Debug, PartialEq, Eq)]
-        struct ExecResetLogicalSnapshot {
-            catalog_epoch: u64,
-            catalog_frontier: u64,
-            catalog_ready: Option<u64>,
-            catalog_private: std::ops::Range<HostVa>,
-            catalog_shared: Vec<super::super::CatalogSharedRange>,
-            direct_bindings: crate::direct_binding::DirectBindingLogicalSnapshot,
-            blocks: Vec<((GuestVa, CodeGeneration), CacheVa)>,
-            pending: Vec<((GuestVa, CodeGeneration), usize)>,
-            stats: super::super::ResolverStats,
-            reported_stats: super::super::ResolverStats,
-            sensitive: Vec<((GuestVa, CodeGeneration), super::super::SensitiveMetadata)>,
-            unsupported: Vec<((GuestVa, CodeGeneration), u32)>,
-            published_len: usize,
-            private_published_index: Vec<super::super::PublishedIndexEntry>,
-            shared_published_index: Vec<super::super::PublishedIndexEntry>,
-            dependencies: Vec<(GuestVa, Vec<(GuestVa, CodeGeneration)>)>,
-            shared_translation_configured: bool,
-            shared_blocks: Vec<(
-                (GuestVa, CodeGeneration),
-                super::super::SharedBlockAuthority,
-            )>,
-            shared_guest_ranges: Vec<(GuestVa, GuestVa)>,
-            loaded_unit_ids: Vec<carrick_dsr::probes::TranslatedUnitId>,
-            shared_unit_segments_consulted: Vec<GuestVa>,
-            shared_recording_segments: Vec<GuestVa>,
-            shared_candidates: Vec<(GuestVa, usize)>,
-            shared_publish_attempted: bool,
-            executable_head: usize,
-            executable_nodes: usize,
-            cache_used_bytes: usize,
-        }
-
-        fn activate_catalog_with_shared(process: &super::super::ProcessTranslator, seed: u64) {
-            process
-                .activate_translated_range_catalog()
-                .expect("activate translated catalog");
-            let mut state = process.state.write();
-            // Copied units live INSIDE the private cache, so the fixture's
-            // shared range must be a private-cache subrange.
-            let private = state.translated_ranges.private.clone();
-            let start = private
-                .start
-                .raw()
-                .checked_add(usize::try_from(seed).expect("seed") * 0x100)
-                .expect("seeded shared range start");
-            let end = start.checked_add(0x80).expect("seeded shared range end");
-            assert!(
-                end <= private.end.raw(),
-                "fixture shared range must stay inside the private cache"
-            );
-            let prepared = state
-                .translated_ranges
-                .prepare_shared(
-                    carrick_dsr::probes::TranslatedUnitId::new(seed).expect("unit id"),
-                    HostVa(start)..HostVa(end),
-                )
-                .expect("prepare translated shared range");
-            state.translated_ranges.commit_shared(prepared);
-        }
-
-        fn exec_reset_snapshot(
-            process: &super::super::ProcessTranslator,
-        ) -> ExecResetLogicalSnapshot {
-            let state = process.state.read();
-            ExecResetLogicalSnapshot {
-                catalog_epoch: state.translated_ranges.epoch.get(),
-                catalog_frontier: state.translated_ranges.sequence_frontier(),
-                catalog_ready: state.translated_ranges.ready_sequence,
-                catalog_private: state.translated_ranges.private.clone(),
-                catalog_shared: state.translated_ranges.shared.clone(),
-                direct_bindings: state.direct_bindings.logical_snapshot_for_test(),
-                blocks: state
-                    .blocks
-                    .iter()
-                    .map(|(key, entry)| (*key, *entry))
-                    .collect(),
-                pending: state
-                    .pending
-                    .iter()
-                    .map(|(key, links)| (*key, links.len()))
-                    .collect(),
-                stats: state.stats,
-                reported_stats: state.reported_stats,
-                sensitive: state
-                    .sensitive
-                    .iter()
-                    .map(|(key, metadata)| (*key, *metadata))
-                    .collect(),
-                unsupported: state
-                    .unsupported
-                    .iter()
-                    .map(|(key, (word, _))| (*key, *word))
-                    .collect(),
-                published_len: state.published.len(),
-                private_published_index: state.private_published_index.clone(),
-                shared_published_index: state.shared_published_index.clone(),
-                dependencies: state.dependencies.snapshot_for_test(),
-                shared_translation_configured: state.shared_translation.is_some(),
-                shared_blocks: state
-                    .shared_blocks
-                    .iter()
-                    .map(|(key, authority)| (*key, *authority))
-                    .collect(),
-                shared_guest_ranges: state.shared_guest_ranges.clone(),
-                loaded_unit_ids: state
-                    .loaded_shared_units
-                    .iter()
-                    .map(|unit| unit.unit_id)
-                    .collect(),
-                shared_unit_segments_consulted: state
-                    .shared_unit_segments_consulted
-                    .iter()
-                    .copied()
-                    .collect(),
-                shared_recording_segments: state
-                    .shared_recording_segments
-                    .iter()
-                    .copied()
-                    .collect(),
-                shared_candidates: state
-                    .shared_candidates
-                    .iter()
-                    .map(|(guest, candidates)| (*guest, candidates.len()))
-                    .collect(),
-                shared_publish_attempted: state.shared_publish_attempted,
-                executable_head: state.executable_ranges.head_ptr() as usize,
-                executable_nodes: state.executable_ranges.shared_node_count(),
-                cache_used_bytes: state.cache.used_bytes(),
-            }
-        }
-
-        fn prepare_thread(
-            process: &Arc<super::super::ProcessTranslator>,
-        ) -> (ThreadTranslator, super::super::DirectBindingExecResetToken) {
-            let guest = GuestVa(0x60_0000);
-            let entry = CacheVa::published(HostVa(process.cache_host_range().start as usize));
-            let mut thread = ThreadTranslator::for_process(Arc::clone(process), 42);
-            thread
-                .block_cache
-                .insert(guest, CodeGeneration::INITIAL, entry);
-            thread.indirect_cache.publish(
-                guest,
-                CodeGeneration::INITIAL,
-                entry,
-                process.private_target_authority.as_ref(),
-            );
-            // SAFETY: the thread exclusively owns this fixed-layout cache,
-            // and the slice covers exactly its two 32-byte ways per set.
-            let words_before = unsafe {
-                std::slice::from_raw_parts(
-                    thread.indirect_cache.as_ptr().cast::<u64>(),
-                    crate::gateway::INDIRECT_CACHE_ENTRIES * 8,
-                )
-            };
-            assert!(words_before.iter().any(|word| *word != 0));
-
-            let token = thread
-                .prepare_direct_binding_exec_reset()
-                .expect("mint exec reset authority");
-
-            assert!(thread.block_cache.is_empty());
-            // SAFETY: as above; preparation completed synchronously while
-            // this test retains exclusive access to the thread translator.
-            let words_after = unsafe {
-                std::slice::from_raw_parts(
-                    thread.indirect_cache.as_ptr().cast::<u64>(),
-                    crate::gateway::INDIRECT_CACHE_ENTRIES * 8,
-                )
-            };
-            assert!(words_after.iter().all(|word| *word == 0));
-            (thread, token)
-        }
-
-        #[test]
-        fn valid_exec_reset_token_yields_exact_catalog_lifecycle_order() {
-            let (fixture, process, _, _) = one_published_binding(23);
-            let process = Arc::new(process);
-            let shared_range = publish_catalog_range(&process, 23);
-            let (thread, mut token) = prepare_thread(&process);
-            let mut events = Vec::new();
-
-            process
-                .reset_after_fork_for_exec_with_recorder(&thread, &mut token, |event| {
-                    events.push(event);
-                })
-                .expect("valid exec reset authority");
-
-            assert_eq!(events, EXPECTED_ORDER);
-            let state = process.state.read();
-            assert_eq!(state.executable_ranges.shared_node_count(), 0);
-            assert!(
-                !state.executable_ranges.contains(shared_range.start + 0x100),
-                "authorized exec reset retained a shared executable range"
-            );
-            drop(state);
-            assert!(
-                fixture.storage[0]
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    .is_null(),
-                "exec must clear every published cell before retiring its descriptor"
-            );
-        }
-
-        #[test]
-        fn private_cursor_reuse_requires_the_last_descriptor_epoch_lease_to_drop() {
-            let (_fixture, process, _, _) = one_published_binding(24);
-            let process = Arc::new(process);
-            let (mut thread, mut token) = prepare_thread(&process);
-            assert_eq!(process.private_epoch_leases_for_test(), 1);
-            let mut first = Vec::new();
-
-            process
-                .reset_after_fork_for_exec_with_recorder(&thread, &mut token, |event| {
-                    first.push(event);
-                })
-                .expect("first authorized reset");
-
-            assert_eq!(process.private_epoch_leases_for_test(), 0);
-            assert_eq!(first, EXPECTED_ORDER);
-            let mut second_token = thread
-                .prepare_direct_binding_exec_reset()
-                .expect("mint second exec reset authority");
-            let mut second = Vec::new();
-            process
-                .reset_after_fork_for_exec_with_recorder(&thread, &mut second_token, |event| {
-                    second.push(event)
-                })
-                .expect("fresh authority keeps successful reset idempotent");
-            assert_eq!(second, EXPECTED_ORDER, "exec reset must be idempotent");
-            assert_eq!(process.private_epoch_leases_for_test(), 0);
-            thread
-                .reset_for_exec(Arc::clone(&process))
-                .expect("reset surviving thread for exec");
-            assert!(thread.block_cache.is_empty());
-        }
-
-        #[test]
-        fn external_private_epoch_lease_rejects_before_mutation_and_preserves_token() {
-            let (fixture, process, _, _) = one_published_binding(31);
-            let process = Arc::new(process);
-            let _shared_range = publish_catalog_range(&process, 31);
-            activate_catalog_with_shared(&process, 31);
-            process
-                .state
-                .write()
-                .cache
-                .publish_words(&[0xd503_201f])
-                .expect("seed private cache cursor");
-            let external_lease = Arc::clone(&process.private_jit_epoch);
-            let (thread, mut token) = prepare_thread(&process);
-            let before = exec_reset_snapshot(&process);
-            assert!(
-                before.direct_bindings.has_published_exec_reset_state(),
-                "rejection fixture must seed descriptor, incoming-edge, bitmap, and counter state"
-            );
-            let pointer_before = fixture.storage[0].load(std::sync::atomic::Ordering::Acquire);
-
-            let outcome = process.prepare_reset_after_fork_for_exec(&thread, &mut token, true);
-
-            assert!(matches!(
-                outcome,
-                Err(crate::types::DsrError::CachePolicy(_))
-            ));
-            assert_eq!(exec_reset_snapshot(&process), before);
-            assert_eq!(
-                fixture.storage[0].load(std::sync::atomic::Ordering::Acquire),
-                pointer_before,
-                "lease rejection cleared the published cell",
-            );
-            assert_eq!(process.private_epoch_leases_for_test(), 2);
-
-            drop(external_lease);
-            let prepared = process
-                .prepare_reset_after_fork_for_exec(&thread, &mut token, true)
-                .expect("same token remains valid after external lease drops");
-            let mut events = Vec::new();
-            prepared.commit_with_recorder(|event| {
-                events.push(event);
-            });
-
-            assert_eq!(events, EXPECTED_ORDER);
-            assert!(
-                fixture.storage[0]
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    .is_null(),
-            );
-            let state = process.state.read();
-            assert_eq!(state.cache.used_bytes(), 0);
-            assert_eq!(state.translated_ranges.epoch.get(), 2);
-            assert_eq!(state.translated_ranges.next_sequence, 1);
-            assert_eq!(state.translated_ranges.ready_sequence, None);
-            assert!(state.translated_ranges.shared.is_empty());
-        }
-
-        #[test]
-        fn registry_owned_private_descriptor_leases_pass_exact_preflight() {
-            let (_fixture, process, _, _) = one_published_binding(32);
-            let process = Arc::new(process);
-            let _shared_range = publish_catalog_range(&process, 32);
-            activate_catalog_with_shared(&process, 32);
-            let (thread, mut token) = prepare_thread(&process);
-            assert_eq!(process.private_epoch_leases_for_test(), 1);
-
-            let prepared = process
-                .prepare_reset_after_fork_for_exec(&thread, &mut token, true)
-                .expect("registry owns the exact live descriptor lease");
-            prepared.commit();
-
-            assert_eq!(process.private_epoch_leases_for_test(), 0);
-            let state = process.state.read();
-            assert_eq!(state.translated_ranges.epoch.get(), 2);
-            assert_eq!(state.translated_ranges.ready_sequence, None);
-        }
-
-        #[test]
-        fn foreign_process_exec_reset_authority_is_rejected() {
-            let (_authority_fixture, authority_process, _, _) = one_published_binding(25);
-            let authority_process = Arc::new(authority_process);
-            let (_authority_thread, mut token) = prepare_thread(&authority_process);
-            let (victim_fixture, victim_process, _, _) = one_published_binding(26);
-            let victim_process = Arc::new(victim_process);
-            let _shared_range = publish_catalog_range(&victim_process, 26);
-            activate_catalog_with_shared(&victim_process, 26);
-            let before = exec_reset_snapshot(&victim_process);
-            let victim_thread = ThreadTranslator::for_process(Arc::clone(&victim_process), 43);
-
-            let outcome = victim_process.reset_after_fork_for_exec(&victim_thread, &mut token);
-
-            assert!(outcome.is_err(), "foreign process token must fail");
-            assert_eq!(exec_reset_snapshot(&victim_process), before);
-            assert!(
-                !victim_fixture.storage[0]
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    .is_null(),
-                "failed validation must precede every published-cell mutation"
-            );
-        }
-
-        #[test]
-        fn exec_reset_authority_from_another_thread_is_rejected() {
-            let (fixture, process, _, _) = one_published_binding(27);
-            let process = Arc::new(process);
-            let _shared_range = publish_catalog_range(&process, 27);
-            activate_catalog_with_shared(&process, 27);
-            let before = exec_reset_snapshot(&process);
-            let (_other_thread, mut token) = prepare_thread(&process);
-            let surviving_thread = ThreadTranslator::for_process(Arc::clone(&process), 43);
-            assert!(surviving_thread.block_cache.is_empty());
-
-            let outcome = process.reset_after_fork_for_exec(&surviving_thread, &mut token);
-
-            assert!(
-                outcome.is_err(),
-                "a different surviving thread must not inherit reset authority"
-            );
-            assert_eq!(exec_reset_snapshot(&process), before);
-            assert!(
-                !fixture.storage[0]
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    .is_null(),
-                "foreign-thread rejection must leave published cells intact"
-            );
-        }
-
-        #[test]
-        fn reused_exec_reset_authority_is_rejected() {
-            let (_fixture, process, _, _) = one_published_binding(28);
-            let process = Arc::new(process);
-            let _shared_range = publish_catalog_range(&process, 28);
-            activate_catalog_with_shared(&process, 28);
-            let (thread, mut token) = prepare_thread(&process);
-
-            process
-                .reset_after_fork_for_exec(&thread, &mut token)
-                .expect("first token consumption");
-            let before_reuse = exec_reset_snapshot(&process);
-            let second = process.reset_after_fork_for_exec(&thread, &mut token);
-
-            assert!(second.is_err(), "exec reset authority must be single-use");
-            assert_eq!(exec_reset_snapshot(&process), before_reuse);
-        }
-
-        #[test]
-        fn failed_exec_reset_validation_leaves_published_cell_intact() {
-            let (fixture, process, _, _) = one_published_binding(29);
-            let process = Arc::new(process);
-            let _shared_range = publish_catalog_range(&process, 29);
-            activate_catalog_with_shared(&process, 29);
-            let before = exec_reset_snapshot(&process);
-            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 42);
-            let mut stale = thread
-                .prepare_direct_binding_exec_reset()
-                .expect("mint stale authority");
-            let _current = thread
-                .prepare_direct_binding_exec_reset()
-                .expect("mint current authority");
-
-            let outcome = process.reset_after_fork_for_exec(&thread, &mut stale);
-
-            assert!(outcome.is_err(), "stale reset authority must fail");
-            assert_eq!(exec_reset_snapshot(&process), before);
-            assert!(
-                !fixture.storage[0]
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    .is_null(),
-                "validation must complete before the first cell clear"
-            );
-        }
-
-        #[test]
-        fn prepared_exec_reset_holds_process_state_exclusively_until_commit() {
-            let (_fixture, process, _, _) = one_published_binding(33);
-            let process = Arc::new(process);
-            let (thread, mut token) = prepare_thread(&process);
-
-            let prepared = process
-                .prepare_reset_after_fork_for_exec(&thread, &mut token, false)
-                .expect("prepare reset authority");
-
-            assert!(
-                process.state.try_read().is_none(),
-                "prepared authority must freeze process state through mapped-memory PONR"
-            );
-            prepared.commit();
-            assert!(
-                process.state.try_read().is_some(),
-                "commit must release the held process-state authority"
-            );
-        }
-
-        #[test]
-        fn exec_reset_snapshot_tracks_every_rejection_sensitive_field() {
-            let (_fixture, process, _, _) = one_published_binding(34);
-            let process = Arc::new(process);
-            macro_rules! assert_tracked {
-                ($label:literal, $mutation:expr) => {{
-                    let before = exec_reset_snapshot(&process);
-                    $mutation;
-                    assert_ne!(exec_reset_snapshot(&process), before, $label);
-                }};
-            }
-
-            assert_tracked!("process stats", {
-                let mut state = process.state.write();
-                state.stats.translations = 1;
-            });
-            assert_tracked!("reported process stats", {
-                let mut state = process.state.write();
-                state.reported_stats.translations = 1;
-            });
-            assert_tracked!("private block index", {
-                let mut state = process.state.write();
-                state.blocks.insert(
-                    (GuestVa(0x7100_0000), CodeGeneration::INITIAL),
-                    CacheVa::published(HostVa(0x1000)),
-                );
-            });
-            assert_tracked!("pending link index", {
-                let mut state = process.state.write();
-                state
-                    .pending
-                    .insert((GuestVa(0x7101_0000), CodeGeneration::INITIAL), Vec::new());
-            });
-            assert_tracked!("page dependencies", {
-                let mut state = process.state.write();
-                state.dependencies.record(
-                    GuestVa(0x7102_0000),
-                    GuestVa(0x7103_0000),
-                    CodeGeneration::INITIAL,
-                );
-            });
-            assert_tracked!("shared guest ranges", {
-                let mut state = process.state.write();
-                state
-                    .shared_guest_ranges
-                    .push((GuestVa(0x7104_0000), GuestVa(0x7105_0000)));
-            });
-            assert_tracked!("consulted shared segments", {
-                let mut state = process.state.write();
-                state
-                    .shared_unit_segments_consulted
-                    .insert(GuestVa(0x7106_0000));
-            });
-            assert_tracked!("recording shared segments", {
-                let mut state = process.state.write();
-                state.shared_recording_segments.insert(GuestVa(0x7107_0000));
-            });
-            assert_tracked!("shared candidates", {
-                let mut state = process.state.write();
-                state
-                    .shared_candidates
-                    .insert(GuestVa(0x7108_0000), Vec::new());
-            });
-            assert_tracked!("shared publish attempt", {
-                let mut state = process.state.write();
-                state.shared_publish_attempted = true;
-            });
-            assert_tracked!("private cache cursor", {
-                let mut state = process.state.write();
-                state
-                    .cache
-                    .publish_words(&[0xd503_201f])
-                    .expect("publish one cache word");
-            });
-            assert_tracked!(
-                "translated catalog lifecycle",
-                activate_catalog_with_shared(&process, 34)
-            );
-            assert_tracked!(
-                "executable range catalog",
-                publish_catalog_range(&process, 34)
-            );
-            assert_tracked!("direct-binding descriptors and indexes", {
-                let mut state = process.state.write();
-                state
-                    .direct_bindings
-                    .clear_all_before_exec_with_evidence(|_| {}, |_| {});
-            });
-        }
-
-        #[test]
-        fn exec_reset_epoch_overflow_is_rejected_without_wrapping() {
-            let (_reserved_fixture, reserved_process, _, _) = one_published_binding(37);
-            let reserved_process = Arc::new(reserved_process);
-            let mut reserved_thread =
-                ThreadTranslator::for_process(Arc::clone(&reserved_process), 41);
-            reserved_thread.exec_reset_epoch = u64::MAX - 1;
-            reserved_thread.block_cache.insert(
-                GuestVa(0x7200_0000),
-                CodeGeneration::INITIAL,
-                CacheVa::published(HostVa(0x1000)),
-            );
-
-            let reserved_outcome = reserved_thread.prepare_direct_binding_exec_reset();
-
-            assert!(matches!(
-                reserved_outcome,
-                Err(crate::types::DsrError::CachePolicy(_))
-            ));
-            assert_eq!(reserved_thread.exec_reset_epoch, u64::MAX - 1);
-            assert!(
-                !reserved_thread.block_cache.is_empty(),
-                "failed full-exec generation reservation must precede cache clearing"
-            );
-
-            let (_fixture, process, _, _) = one_published_binding(35);
-            let process = Arc::new(process);
-            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 42);
-            thread.exec_reset_epoch = u64::MAX;
-
-            let token_outcome = thread.prepare_direct_binding_exec_reset();
-
-            assert!(matches!(
-                token_outcome,
-                Err(crate::types::DsrError::CachePolicy(_))
-            ));
-            assert_eq!(thread.exec_reset_epoch, u64::MAX);
-
-            let (_next_fixture, next_process, _, _) = one_published_binding(36);
-            let next_process = Arc::new(next_process);
-            let reset_outcome = thread.reset_for_exec(Arc::clone(&next_process));
-
-            assert!(matches!(
-                reset_outcome,
-                Err(crate::types::DsrError::CachePolicy(_))
-            ));
-            assert!(Arc::ptr_eq(&thread.process, &process));
-            assert_eq!(thread.exec_reset_epoch, u64::MAX);
-
-            let fork_outcome = thread.after_fork_child(43);
-
-            assert!(matches!(
-                fork_outcome,
-                Err(crate::types::DsrError::CachePolicy(_))
-            ));
-            assert_eq!(thread.tid, 42);
-            assert_eq!(thread.exec_reset_epoch, u64::MAX);
-        }
-
-        #[test]
-        fn exec_handoff_prepares_the_checked_epoch_before_infallible_commit() {
-            let (_fixture, process, _, _) = one_published_binding(38);
-            let process = Arc::new(process);
-            let mut thread = ThreadTranslator::for_process(Arc::clone(&process), 44);
-            thread.exec_reset_epoch = u64::MAX - 2;
-            let _authority = thread
-                .prepare_direct_binding_exec_reset()
-                .expect("reserve the reset and replacement generations");
-            thread.block_cache.insert(
-                GuestVa(0x7300_0000),
-                CodeGeneration::INITIAL,
-                CacheVa::published(HostVa(0x2000)),
-            );
-            let (_next_fixture, next, _, _) = one_published_binding(39);
-            let next = Arc::new(next);
-
-            let prepared = thread
-                .prepare_reset_for_exec(Arc::clone(&next))
-                .expect("MAX replacement generation was reserved before PONR");
-            let _: () = prepared.commit_with_sink(|_| {});
-
-            assert!(Arc::ptr_eq(&thread.process, &next));
-            assert_eq!(thread.exec_reset_epoch, u64::MAX);
-            assert!(thread.block_cache.is_empty());
-        }
-    }
-
-    mod direct_binding_target_generation_invalidation {
-        use super::direct_binding_owner_and_publication::{
-            key, private_target, process_with_direct_bindings, record, sidecar_unit,
-        };
-        use crate::direct_binding::{
-            DirectBindingCellRef, DirectBindingMiss, DirectBindingOrdinal,
-            DirectBindingPublishOutcome, DirectBindingTarget, PrivateJitEpoch,
-        };
-        use crate::types::CodeGeneration;
-        use carrick_dsr::cache::PageGenerationTable;
-        use carrick_guest_mem::GuestVa;
-        use std::sync::atomic::Ordering;
-
-        fn traversal_or_resolve(
-            cell: DirectBindingCellRef,
-            resolver: impl FnOnce(),
-        ) -> *mut DirectBindingTarget {
-            let acquired = cell.load_acquire();
-            if !acquired.is_null() {
-                return acquired;
-            }
-            resolver();
-            let rebound = cell.load_acquire();
-            assert!(
-                !rebound.is_null(),
-                "resolver must publish the rebound target"
-            );
-            rebound
-        }
-
-        #[test]
-        fn target_generation_invalidation_clears_only_the_expected_descriptor() {
-            let first_source = GuestVa(0x41_0100);
-            let second_source = GuestVa(0x41_0200);
-            let target = GuestVa(0x51_0100);
-            let old_generation = CodeGeneration::claimed(1);
-            let new_generation = CodeGeneration::claimed(2);
-            let fixture = sidecar_unit(
-                key(9),
-                vec![
-                    record(first_source, target, 0),
-                    record(second_source, target, 1),
-                ],
-            );
-            let process = process_with_direct_bindings();
-            let epoch = PrivateJitEpoch::process_owner();
-            let first_miss = DirectBindingMiss {
-                cell: fixture.unit.binding_base.expect("binding base"),
-                ordinal: DirectBindingOrdinal::claimed(0),
-            };
-            let second_miss = DirectBindingMiss {
-                cell: crate::direct_binding::DirectBindingCellVa::mapped(
-                    fixture.storage.as_ptr() as usize
-                        + crate::shared_cache::DIRECT_BINDING_CELL_SIZE as usize,
-                )
-                .expect("second cell"),
-                ordinal: DirectBindingOrdinal::claimed(1),
-            };
-            let mut state = process.state.write();
-            let unit_index = state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register owner")
-                .expect("SidecarV1 owner");
-            assert_eq!(
-                state.direct_bindings.publish(
-                    first_miss,
-                    first_source,
-                    target,
-                    private_target(target, old_generation, 0x80_1100, &epoch),
-                ),
-                DirectBindingPublishOutcome::Published,
-            );
-            assert_eq!(
-                state.direct_bindings.publish(
-                    second_miss,
-                    second_source,
-                    target,
-                    private_target(target, old_generation, 0x80_1200, &epoch),
-                ),
-                DirectBindingPublishOutcome::Published,
-            );
-            assert_eq!(
-                state.direct_bindings.publish(
-                    second_miss,
-                    second_source,
-                    target,
-                    private_target(target, new_generation, 0x80_1300, &epoch),
-                ),
-                DirectBindingPublishOutcome::PublishedAfterStale,
-            );
-            let newer = fixture.storage[1].load(Ordering::Acquire);
-
-            let stats = state
-                .direct_bindings
-                .invalidate_target(target, old_generation);
-
-            assert!(
-                fixture.storage[0].load(Ordering::Acquire).is_null(),
-                "the exact old descriptor must be cleared"
-            );
-            assert_eq!(fixture.storage[1].load(Ordering::Acquire), newer);
-            assert!(
-                !state
-                    .direct_bindings
-                    .is_published(unit_index, DirectBindingOrdinal::claimed(0))
-            );
-            assert!(
-                state
-                    .direct_bindings
-                    .is_published(unit_index, DirectBindingOrdinal::claimed(1))
-            );
-            assert_eq!(stats.visited, 2);
-            assert_eq!(stats.exact_clears, 1);
-            assert_eq!(stats.newer_publication_misses, 1);
-            assert_eq!(stats.bitmap_bits_cleared, 1);
-            assert_eq!(
-                state.direct_bindings.incoming_count(target, old_generation),
-                0,
-            );
-            assert_eq!(
-                state.direct_bindings.incoming_count(target, new_generation),
-                1,
-            );
-        }
-
-        #[test]
-        fn a_reader_of_the_old_descriptor_remains_safe_until_generation_guard() {
-            let source = GuestVa(0x42_0100);
-            let target = GuestVa(0x52_0100);
-            let generations = PageGenerationTable::new(16 * 1024).expect("generation table");
-            let old_generation = generations
-                .observe(target)
-                .expect("old target observation")
-                .expected();
-            let fixture = sidecar_unit(key(10), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let epoch = PrivateJitEpoch::process_owner();
-            let miss = DirectBindingMiss {
-                cell: fixture.unit.binding_base.expect("binding base"),
-                ordinal: DirectBindingOrdinal::claimed(0),
-            };
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register owner")
-                .expect("SidecarV1 owner");
-            assert_eq!(
-                state.direct_bindings.publish(
-                    miss,
-                    source,
-                    target,
-                    private_target(target, old_generation, 0x80_2100, &epoch),
-                ),
-                DirectBindingPublishOutcome::Published,
-            );
-            let acquired = fixture.storage[0].load(Ordering::Acquire);
-            assert!(!acquired.is_null());
-            let current_generation = generations
-                .note_guest_code_write(target..GuestVa(target.raw() + 4))
-                .expect("target generation mutation");
-
-            let stats = state
-                .direct_bindings
-                .invalidate_target(target, old_generation);
-
-            assert!(fixture.storage[0].load(Ordering::Acquire).is_null());
-            assert_eq!(stats.exact_clears, 1);
-            assert_eq!(PrivateJitEpoch::live_descriptor_leases(&epoch), 1);
-            // SAFETY: invalidation unpublishes but never reclaims descriptors;
-            // the process-owned registry still pins this acquired pointer.
-            let old_reader = unsafe { &*acquired };
-            assert_eq!(old_reader.target_page(), target);
-            assert_eq!(old_reader.target_generation(), old_generation);
-            assert_eq!(
-                generations
-                    .generation_for_pc(target)
-                    .expect("current target generation"),
-                current_generation
-            );
-            assert_ne!(
-                old_reader.target_generation(),
-                current_generation,
-                "the target entry generation guard must reject the old reader"
-            );
-            assert!(
-                !generations
-                    .is_current(target, old_reader.target_generation())
-                    .expect("generation guard check")
-            );
-        }
-
-        #[test]
-        fn the_next_traversal_rebinds_and_then_stays_out_of_the_resolver() {
-            let source = GuestVa(0x43_0100);
-            let target = GuestVa(0x53_0100);
-            let old_generation = CodeGeneration::claimed(7);
-            let new_generation = CodeGeneration::claimed(8);
-            let fixture = sidecar_unit(key(11), vec![record(source, target, 0)]);
-            let process = process_with_direct_bindings();
-            let epoch = PrivateJitEpoch::process_owner();
-            let miss = DirectBindingMiss {
-                cell: fixture.unit.binding_base.expect("binding base"),
-                ordinal: DirectBindingOrdinal::claimed(0),
-            };
-            let mut state = process.state.write();
-            state
-                .direct_bindings
-                .register_loaded_unit(&fixture.unit)
-                .expect("register owner")
-                .expect("SidecarV1 owner");
-            assert_eq!(
-                state.direct_bindings.publish(
-                    miss,
-                    source,
-                    target,
-                    private_target(target, old_generation, 0x80_3100, &epoch),
-                ),
-                DirectBindingPublishOutcome::Published,
-            );
-            let _ = state
-                .direct_bindings
-                .invalidate_target(target, old_generation);
-            let cell = unsafe {
-                DirectBindingCellRef::from_mapped_address(miss.cell).expect("fixture cell")
-            };
-            let mut resolver_exits = 0_u64;
-
-            let rebound = traversal_or_resolve(cell, || {
-                resolver_exits += 1;
-                assert_eq!(
-                    state.direct_bindings.publish(
-                        miss,
-                        source,
-                        target,
-                        private_target(target, new_generation, 0x80_3200, &epoch),
-                    ),
-                    DirectBindingPublishOutcome::Published,
-                );
-            });
-            let repeated = traversal_or_resolve(cell, || {
-                resolver_exits += 1;
-            });
-
-            assert_eq!(resolver_exits, 1);
-            assert_eq!(repeated, rebound);
-            // SAFETY: the registry pins the rebound descriptor.
-            assert_eq!(unsafe { &*rebound }.target_generation(), new_generation);
-        }
-    }
-
     #[test]
     fn dsr_error_probe_outcomes_cover_every_error_category() {
         use carrick_dsr::probes::DsrOperationOutcome;
@@ -11757,11 +5720,7 @@ mod tests {
                 (DsrExitKind::Syscall, target.raw(), 0, 1),
             ),
             (
-                NativeDsrExit::ResolveDirect {
-                    source: PC,
-                    target,
-                    binding: crate::direct_binding::DirectBindingExitMetadata::Absent,
-                },
+                NativeDsrExit::ResolveDirect { source: PC, target },
                 (DsrExitKind::DirectResolver, PC.raw(), target.raw(), 2),
             ),
             (

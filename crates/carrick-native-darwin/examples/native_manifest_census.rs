@@ -119,18 +119,7 @@ fn census(path: &Path) -> Result<serde_json::Value, String> {
     let block_metadata_bytes = removed_len(encoded, &mut manifest, |_| {})?;
     manifest.blocks = blocks;
 
-    let bindings = std::mem::take(&mut manifest.bindings);
-    let binding_record_bytes = removed_len(encoded, &mut manifest, |_| {})?;
-    manifest.bindings = bindings;
-
-    let relocations = std::mem::take(&mut manifest.binding_relocations);
-    let binding_relocation_bytes = removed_len(encoded, &mut manifest, |_| {})?;
-    manifest.binding_relocations = relocations;
-
-    let attributed = block_metadata_bytes
-        .checked_add(binding_record_bytes)
-        .and_then(|value| value.checked_add(binding_relocation_bytes))
-        .ok_or_else(|| "manifest attribution byte count overflow".to_string())?;
+    let attributed = block_metadata_bytes;
     let other_manifest_bytes = encoded
         .checked_sub(attributed)
         .ok_or_else(|| "manifest attribution exceeds file size".to_string())?;
@@ -151,10 +140,6 @@ fn census(path: &Path) -> Result<serde_json::Value, String> {
         "retained_direct_link_count": metadata_counts.direct_links,
         "retained_relocation_count": metadata_counts.relocations,
         "retained_source_word_count": metadata_counts.source_words,
-        "binding_record_count": manifest.bindings.len(),
-        "binding_record_bytes": binding_record_bytes,
-        "binding_relocation_count": manifest.binding_relocations.len(),
-        "binding_relocation_bytes": binding_relocation_bytes,
         "other_manifest_bytes": other_manifest_bytes,
     }))
 }

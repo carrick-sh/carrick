@@ -7506,7 +7506,7 @@ mod tests {
         assert!(Arc::ptr_eq(&installed, &process));
         assert_eq!(
             process.translated_range_catalog_state_for_test(),
-            (1, 1, Some(1), 0),
+            (1, 1, Some(1)),
         );
         assert_eq!(
             events.into_inner(),
@@ -7683,7 +7683,7 @@ mod tests {
             );
             assert_eq!(
                 replacement.translated_range_catalog_state_for_test(),
-                (1, 0, None, 0),
+                (1, 0, None),
                 "{failpoint:?} activated the replacement catalog",
             );
         }
@@ -7782,7 +7782,7 @@ mod tests {
         );
         assert_eq!(
             initial_process.translated_range_catalog_state_for_test(),
-            (1, 1, Some(1), 0),
+            (1, 1, Some(1)),
         );
 
         let detached_process =
@@ -7820,7 +7820,7 @@ mod tests {
         assert_eq!(detached_events.into_inner(), ["install"]);
         assert_eq!(
             detached_process.translated_range_catalog_state_for_test(),
-            (1, 0, None, 0),
+            (1, 0, None),
         );
     }
 
@@ -9855,16 +9855,6 @@ mod tests {
             retiring
                 .activate_translated_range_catalog()
                 .expect("activate retiring catalog");
-            // The copied-unit transport installs shared units INSIDE the
-            // private cache, so a valid shared entry is a subrange of the
-            // retiring translator's own cache.
-            let retiring_cache = retiring.cache_host_range();
-            retiring
-                .add_translated_range_for_test(
-                    71,
-                    retiring_cache.start + 0x1_0000..retiring_cache.start + 0x2_0000,
-                )
-                .expect("seed retiring shared catalog entry");
             retiring
                 .set_translated_range_epoch_for_test(u64::MAX)
                 .expect("seed overflow boundary");
@@ -9879,7 +9869,7 @@ mod tests {
                 abandoned
                     .process_translator
                     .translated_range_catalog_state_for_test(),
-                (1, 0, None, 0),
+                (1, 0, None),
                 "fresh candidate activated before the exec point of no return",
             );
             drop(abandoned);
@@ -9912,7 +9902,7 @@ mod tests {
             );
             assert_eq!(
                 candidate.translated_range_catalog_state_for_test(),
-                (1, 0, None, 0),
+                (1, 0, None),
                 "preflight/commit slice must leave fresh replacement dormant",
             );
 
@@ -9955,7 +9945,7 @@ mod tests {
             );
             assert_eq!(
                 candidate.translated_range_catalog_state_for_test(),
-                (1, 1, Some(1), 0),
+                (1, 1, Some(1)),
                 "fresh replacement must activate exactly once at handoff",
             );
         });
@@ -10262,16 +10252,6 @@ mod tests {
             inherited_process
                 .activate_translated_range_catalog()
                 .expect("activate inherited catalog");
-            // The copied-unit transport installs shared units INSIDE the
-            // private cache, so a valid shared entry is a subrange of the
-            // inherited translator's own cache.
-            let inherited_cache = inherited_process.cache_host_range();
-            inherited_process
-                .add_translated_range_for_test(
-                    72,
-                    inherited_cache.start + 0x1_0000..inherited_cache.start + 0x2_0000,
-                )
-                .expect("seed inherited shared range");
             let inherited_before = inherited_process.translated_range_catalog_state_for_test();
             let mut exec_thread =
                 dsr::ThreadTranslator::for_process(Arc::clone(&inherited_process), 42);
@@ -10315,7 +10295,7 @@ mod tests {
                     unsafe { libc::_exit(5) };
                 }
                 let dormant =
-                    inherited_process.translated_range_catalog_state_for_test() == (3, 0, None, 0);
+                    inherited_process.translated_range_catalog_state_for_test() == (3, 0, None);
                 if !dormant {
                     unsafe { libc::_exit(6) };
                 }
@@ -10354,7 +10334,7 @@ mod tests {
                     .activate_translated_range_catalog()
                     .is_err()
                     || inherited_process.translated_range_catalog_state_for_test() != activated
-                    || activated != (3, 1, Some(1), 0)
+                    || activated != (3, 1, Some(1))
                 {
                     unsafe { libc::_exit(8) };
                 }
