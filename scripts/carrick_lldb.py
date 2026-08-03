@@ -20,6 +20,8 @@ Commands
     carrick decode-esr <hex>             # ARMv8 ESR_EL1 decoder
     carrick gva <addr>                   # resolve guest VA to region/segment
     carrick where                        # one-line situational dump
+    carrick xlat-pending                 # pending translation prefix (live/core)
+    carrick xlat-pending --output <abs>  # atomically export <abs>.json/.bin
 
 The plugin caches the state file path between calls so you only have to
 `load-state` once per session. Run `carrick info` to confirm it stuck.
@@ -27,13 +29,20 @@ The plugin caches the state file path between calls so you only have to
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shlex
+import sys
 from typing import Any, Optional
 
 import lldb
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+import carrick_lldb_xlat
 
 
 _STATE: Optional[dict] = None
@@ -387,7 +396,7 @@ def _static_load_addr(target, fullname: str) -> Optional[int]:
         var = var_list.GetValueAtIndex(i)
         name = var.GetName() or ""
         parts = name.split("::")
-        if module_name in parts and base in parts:
+        if name == base or (module_name in parts and base in parts):
             addr = var.GetLoadAddress()
             if addr != lldb.LLDB_INVALID_ADDRESS:
                 return addr
@@ -395,10 +404,8 @@ def _static_load_addr(target, fullname: str) -> Optional[int]:
     for module in target.modules:
         for sym in module:
             name = sym.GetName() or ""
-            if "event_ring" not in name:
-                continue
             parts = name.split("::")
-            if module_name in parts and base in parts:
+            if name == base or (module_name in parts and base in parts):
                 addr = sym.GetStartAddress().GetLoadAddress(target)
                 if addr != lldb.LLDB_INVALID_ADDRESS:
                     return addr
@@ -458,6 +465,97 @@ def cmd_eventring(debugger, command, exe_ctx, result, internal_dict):
     result.AppendMessage("\n".join(out))
 
 
+def _main_module_uuid(target) -> str:
+    executable = target.GetExecutable()
+    for module in target.modules:
+        file_spec = module.GetFileSpec()
+        if file_spec.GetFilename() == executable.GetFilename():
+            return module.GetUUIDString() or "unknown"
+    return "unknown"
+
+
+def _file_spec_path(file_spec) -> str:
+    directory = file_spec.GetDirectory() or ""
+    filename = file_spec.GetFilename() or ""
+    return os.path.join(directory, filename) if directory else filename
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cmd_xlat_pending(debugger, command, exe_ctx, result, internal_dict):
+    """carrick xlat-pending [--output /absolute/path/base]"""
+    args = shlex.split(command)
+    output = None
+    if args:
+        if len(args) != 2 or args[0] != "--output":
+            result.SetError("usage: carrick xlat-pending [--output /absolute/path/base]")
+            return
+        output = args[1]
+        if not os.path.isabs(output) or not os.path.basename(output):
+            result.SetError("xlat-pending --output requires an absolute path with a nonempty stem")
+            return
+        if not os.path.isdir(os.path.dirname(output)):
+            result.SetError("xlat-pending --output parent directory does not exist")
+            return
+    target = exe_ctx.GetTarget() or debugger.GetSelectedTarget()
+    if not target or not target.IsValid():
+        result.SetError("no target; load a live carrick process or core")
+        return
+    process = exe_ctx.GetProcess() or target.GetProcess()
+    if not process or not process.IsValid():
+        result.SetError("no process/core loaded")
+        return
+    root_address = _static_load_addr(
+        target,
+        "carrick_dsr_aarch64::pending_augmentation::carrick_xlat_pending_core_v1",
+    )
+    if root_address is None:
+        result.SetError(
+            "pending translation root symbol not found; use the matching unstripped carrick binary"
+        )
+        return
+
+    def read_memory(address, length):
+        error = lldb.SBError()
+        data = process.ReadMemory(address, length, error)
+        if not error.Success():
+            raise carrick_lldb_xlat.MemoryReadError(
+                address, length, error.GetCString() or "lldb read failed"
+            )
+        return data
+
+    plugin = process.GetPluginName() or "unknown"
+    pid = process.GetProcessID()
+    core_file = process.GetCoreFile()
+    core_path = _file_spec_path(core_file) if core_file and core_file.IsValid() else ""
+    source_identity = f"core:{core_path}" if core_path else f"live:pid={pid}"
+    executable_path = _file_spec_path(target.GetExecutable())
+    try:
+        export = carrick_lldb_xlat.read_pending(
+            read_memory,
+            root_address,
+            source_identity=source_identity,
+            mach_o_uuid=_main_module_uuid(target),
+            executable_sha256=_sha256_file(executable_path),
+        )
+        if output is not None:
+            json_path, binary_path = carrick_lldb_xlat.write_export(export, output)
+            result.AppendMessage(
+                f"wrote {json_path} and {binary_path}\n"
+                + json.dumps(export.summary, indent=2, sort_keys=True)
+            )
+        else:
+            result.AppendMessage(json.dumps(export.summary, indent=2, sort_keys=True))
+    except (carrick_lldb_xlat.PendingReadError, OSError, ValueError) as error:
+        result.SetError(f"xlat-pending: {error}")
+
+
 # ----- the top-level `carrick` multiplex command --------------------------
 
 _SUBCOMMANDS = {
@@ -468,6 +566,7 @@ _SUBCOMMANDS = {
     "gva": cmd_gva,
     "where": cmd_where,
     "eventring": cmd_eventring,
+    "xlat-pending": cmd_xlat_pending,
 }
 
 
