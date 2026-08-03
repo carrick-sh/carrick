@@ -7,6 +7,14 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
+mod unit_bundle;
+pub use unit_bundle::{
+    DecodedUnitBundle, MergeKind, MergeOutcome, MergeRefusal, NormalizedUnion, StoredBlockArtifact,
+    TRANSLATION_UNIT_SCHEMA_V6, UNIT_BUNDLE_HEADER_BYTES_V1, UNIT_BUNDLE_MAGIC_V1,
+    UNIT_BUNDLE_SCHEMA_V1, UnitStoreFailure, UnitStoreFailureClass, decode_unit_bundle_v1,
+    encode_unit_bundle_v1, merge_normalized_artifacts,
+};
+
 // 4: the reserved-resident virtualization template (new emitted shapes and
 // the `CommitReservedResident` recovery action, wire tag 21).
 // 5: the lean indirect-branch lookup (flag-free probe, flavor-gated
@@ -28,7 +36,10 @@ use std::sync::{Arc, OnceLock};
 // v4 whole-manifest decode cost more per exec than the retranslation the
 // store avoided (~11.6 ms of ~1.79M-record varint decode on the go
 // toolchain unit, ~98% of it pc map + recovery).
-pub const TRANSLATOR_ABI_CURRENT: u32 = 8;
+// 9: one-inode `unit-v1` bundles with V6 block indexes. Each row binds the
+// guest source extent and INITIAL generation, so a later producer can merge
+// only byte-identical normalized artifacts at the same guest start.
+pub const TRANSLATOR_ABI_CURRENT: u32 = 9;
 pub const TRANSLATION_UNIT_SCHEMA_V5: u32 = 5;
 pub const MAX_TRANSLATION_UNIT_CODE_BYTES: usize = 64 * 1024 * 1024;
 pub const TRANSLATION_UNIT_BASE_EXPORT: &str = "carrick_aot_unit_base";
@@ -373,17 +384,16 @@ impl Eq for TranslationUnitManifest {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingTranslationUnit {
     pub key: TranslationUnitKey,
-    /// Concatenated per-block template words, relocation immediates ZEROED
-    /// (unbaked). Nothing is patched at pack time: same-unit links, trusted
-    /// entries, and process values are all resolved at install by per-block
-    /// replay plus `publish_emitted`'s pending-link patching.
-    pub code: Vec<u8>,
-    pub blocks: Vec<PortableBlockRecord>,
+    /// Canonical owned artifacts. Publication, deterministic union, and the
+    /// crash-readable pending ABI all consume this same representation.
+    pub blocks: Vec<StoredBlockArtifact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortableBlockCandidate {
     pub guest_start: GuestVa,
+    pub source_end: GuestVa,
+    pub generation: crate::types::CodeGeneration,
     pub requires_sensitive_metadata: bool,
     /// The FULL native-tap recording (`ArtifactRecord::template` from the
     /// one native emission), words included.
@@ -403,57 +413,59 @@ impl PendingTranslationUnit {
         candidates: Vec<PortableBlockCandidate>,
         recovery_runs: bool,
     ) -> Result<Self, crate::types::DsrError> {
-        let mut code = Vec::new();
         let mut blocks = Vec::with_capacity(candidates.len());
         let mut guest_starts = BTreeSet::new();
         for candidate in candidates {
-            let words = candidate.template.words();
-            if words.is_empty() {
-                return Err(crate::types::DsrError::CachePolicy(format!(
-                    "translation unit candidate 0x{:x} carries no recorded words",
-                    candidate.guest_start.raw()
-                )));
-            }
-            let entry_offset = u32::try_from(code.len()).map_err(|_| {
-                crate::types::DsrError::CachePolicy(
-                    "translation unit entry offset exceeds u32".to_string(),
-                )
-            })?;
-            let code_len = u32::try_from(words.len().saturating_mul(4)).map_err(|_| {
-                crate::types::DsrError::CachePolicy(
-                    "translation unit block length exceeds u32".to_string(),
-                )
-            })?;
-            if code.len().saturating_add(code_len as usize) > MAX_TRANSLATION_UNIT_CODE_BYTES {
-                return Err(crate::types::DsrError::CachePolicy(
-                    "translation unit exceeds the 64 MiB branch-range cap".to_string(),
-                ));
-            }
             if !guest_starts.insert(candidate.guest_start) {
                 return Err(crate::types::DsrError::CachePolicy(format!(
                     "translation unit contains duplicate block 0x{:x}",
                     candidate.guest_start.raw()
                 )));
             }
-            for word in words {
-                code.extend_from_slice(&word.to_le_bytes());
-            }
-            blocks.push(PortableBlockRecord {
-                guest_start: candidate.guest_start,
+            blocks.push(StoredBlockArtifact::from_candidate(
+                candidate,
+                recovery_runs,
+            )?);
+        }
+        blocks.sort_by_key(|block| block.guest_start);
+        Ok(Self { key, blocks })
+    }
+
+    /// Transitional encoder used only until the Darwin store switches from
+    /// the ABI-8 pair writer to `unit-v1`. The canonical pending state remains
+    /// `StoredBlockArtifact`; this method derives the old pair bytes on demand.
+    pub fn pack_legacy_pair(
+        &self,
+    ) -> Result<(Vec<u8>, Vec<PortableBlockRecord>), crate::types::DsrError> {
+        let mut code = Vec::new();
+        let mut records = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            let entry_offset = u32::try_from(code.len()).map_err(|_| {
+                crate::types::DsrError::CachePolicy(
+                    "translation unit entry offset exceeds u32".to_string(),
+                )
+            })?;
+            let code_len = u32::try_from(block.code.len()).map_err(|_| {
+                crate::types::DsrError::CachePolicy(
+                    "translation unit block length exceeds u32".to_string(),
+                )
+            })?;
+            code.extend_from_slice(&block.code);
+            let template = block.decode_template().map_err(|reason| {
+                crate::types::DsrError::CachePolicy(format!(
+                    "normalized unit block 0x{:x} failed to decode: {reason:?}",
+                    block.guest_start.raw()
+                ))
+            })?;
+            records.push(PortableBlockRecord {
+                guest_start: block.guest_start,
                 entry_offset,
                 code_len,
-                requires_sensitive_metadata: candidate.requires_sensitive_metadata,
-                template: candidate
-                    .template
-                    .into_unit_record_metadata(recovery_runs)?,
+                requires_sensitive_metadata: block.requires_sensitive_metadata,
+                template,
             });
         }
-        if code.is_empty() {
-            return Err(crate::types::DsrError::CachePolicy(
-                "translation unit contains no blocks".to_string(),
-            ));
-        }
-        Ok(Self { key, code, blocks })
+        Ok((code, records))
     }
 }
 
@@ -1335,6 +1347,8 @@ mod tests {
         .expect("record native-tap candidate");
         PortableBlockCandidate {
             guest_start,
+            source_end: GuestVa(guest_start.raw() + 4),
+            generation: CodeGeneration::INITIAL,
             requires_sensitive_metadata: false,
             template: artifact.template,
         }
@@ -1402,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_concatenates_unbaked_native_tap_words_per_block() {
+    fn pack_retains_canonical_normalized_native_tap_artifacts() {
         let first = native_tap_candidate(GuestVa(0x400000));
         let second = native_tap_candidate(GuestVa(0x400100));
         let first_words = first.template.words().to_vec();
@@ -1415,36 +1429,28 @@ mod tests {
         let pending = PendingTranslationUnit::pack(fixture_key(), vec![first, second])
             .expect("pack native-tap candidates");
         assert_eq!(pending.blocks.len(), 2);
-        assert_eq!(pending.blocks[0].entry_offset, 0);
         assert_eq!(
-            pending.blocks[0].code_len as usize,
+            pending.blocks[0].code.len(),
             first_words.len() * 4,
             "first block's extent is its recorded word count"
         );
-        assert_eq!(
-            pending.blocks[1].entry_offset as usize,
-            first_words.len() * 4
-        );
-        // The code image is EXACTLY the recorded words in order — no
-        // same-unit patching, no sidecar rewriting, nothing baked.
-        let mut expected = Vec::new();
-        for word in first_words.iter().chain(&second_words) {
-            expected.extend_from_slice(&word.to_le_bytes());
-        }
-        assert_eq!(pending.code, expected);
+        assert_eq!(pending.blocks[0].source_end, GuestVa(0x400004));
+        assert_eq!(pending.blocks[0].generation, CodeGeneration::INITIAL);
+        assert_eq!(pending.blocks[1].code.len(), second_words.len() * 4);
         for block in &pending.blocks {
-            let counts = block.template.metadata_counts();
+            let template = block.decode_template().expect("decode normalized metadata");
+            let counts = template.metadata_counts();
             assert_eq!(counts.words, 0, "stored records carry no words");
             assert_eq!(counts.source_words, 0, "stored records carry no source");
             assert!(
-                block.template.trusted_entry().is_some(),
+                template.trusted_entry().is_some(),
                 "the stored record keeps the trusted entry"
             );
         }
     }
 
     #[test]
-    fn pack_rejects_duplicate_blocks_and_empty_candidates() {
+    fn pack_rejects_duplicates_and_empty_templates_but_allows_empty_batch() {
         let candidate = native_tap_candidate(GuestVa(0x400000));
         let duplicate = candidate.clone();
         assert!(matches!(
@@ -1452,16 +1458,16 @@ mod tests {
             Err(crate::types::DsrError::CachePolicy(message))
                 if message.contains("duplicate block")
         ));
-        assert!(matches!(
-            PendingTranslationUnit::pack(fixture_key(), Vec::new()),
-            Err(crate::types::DsrError::CachePolicy(message))
-                if message.contains("no blocks")
-        ));
+        let empty = PendingTranslationUnit::pack(fixture_key(), Vec::new())
+            .expect("empty pending unit releases a lease without publication");
+        assert!(empty.blocks.is_empty());
         assert!(matches!(
             PendingTranslationUnit::pack(
                 fixture_key(),
                 vec![PortableBlockCandidate {
                     guest_start: GuestVa(0x400000),
+                    source_end: GuestVa(0x400004),
+                    generation: CodeGeneration::INITIAL,
                     requires_sensitive_metadata: false,
                     template: empty_template(),
                 }],
@@ -1756,17 +1762,20 @@ mod tests {
         let entries =
             PendingTranslationUnit::pack_with_recovery_runs(fixture_key(), vec![candidate], false)
                 .expect("pack with entries");
-        assert!(runs.blocks[0].template.recovery_is_run_encoded());
-        assert!(!entries.blocks[0].template.recovery_is_run_encoded());
+        let runs_template = runs.blocks[0]
+            .decode_template()
+            .expect("decode run metadata");
+        let entries_template = entries.blocks[0]
+            .decode_template()
+            .expect("decode entry metadata");
+        assert!(runs_template.recovery_is_run_encoded());
+        assert!(!entries_template.recovery_is_run_encoded());
         assert_eq!(
-            runs.blocks[0].template.metadata_counts().recovery_entries,
+            runs_template.metadata_counts().recovery_entries,
             entry_count
         );
         assert_eq!(
-            entries.blocks[0]
-                .template
-                .metadata_counts()
-                .recovery_entries,
+            entries_template.metadata_counts().recovery_entries,
             entry_count
         );
     }

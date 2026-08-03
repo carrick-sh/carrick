@@ -3376,6 +3376,8 @@ impl ProcessState {
                         segment,
                         crate::shared_cache::PortableBlockCandidate {
                             guest_start: block.start,
+                            source_end: block.end,
+                            generation: block.generation,
                             requires_sensitive_metadata: matches!(
                                 block.terminal_exit(),
                                 block::PlannedExit::Sensitive { .. }
@@ -5594,6 +5596,8 @@ mod tests {
             (
                 PortableBlockCandidate {
                     guest_start: plan.start,
+                    source_end: plan.end,
+                    generation: plan.generation,
                     requires_sensitive_metadata: false,
                     template: artifact.template,
                 },
@@ -5691,19 +5695,20 @@ mod tests {
         /// serve it through a `fixture_for_unit` translator.
         fn lookup_fixture(candidates: Vec<PortableBlockCandidate>) -> LookupFixture {
             let pending = PendingTranslationUnit::pack(unit_key(), candidates).expect("pack unit");
+            let (code, records) = pending.pack_legacy_pair().expect("pack legacy test pair");
             // Round-trip the manifest through the exact wire the store
             // persists, so serde of relocations, trusted entries, direct
             // links, and run-encoded recovery is part of what this proves.
             let bytes = encode_translation_unit_metadata(
                 &pending.key,
                 [0; 32],
-                pending.code.len() as u64,
-                &pending.blocks,
+                code.len() as u64,
+                &records,
             )
             .expect("encode manifest");
             let manifest =
                 decode_translation_unit_metadata(Arc::new(bytes)).expect("decode manifest");
-            let code = Arc::new(pending.code.clone());
+            let code = Arc::new(code);
             let unit = SharedLoadedTranslationUnit::new(
                 manifest,
                 code.as_ptr() as usize,
@@ -6053,19 +6058,18 @@ mod tests {
             let (candidate, _native, _words) = record_candidate(&memory, &syscall_plan(BLOCK_A));
             let pending =
                 PendingTranslationUnit::pack(unit_key(), vec![candidate]).expect("pack unit");
+            let (mut code, records) = pending.pack_legacy_pair().expect("pack legacy test pair");
             let manifest = crate::shared_cache::TranslationUnitManifest::from_blocks(
                 &pending.key,
                 [0; 32],
-                pending.code.len() as u64,
-                &pending.blocks,
+                code.len() as u64,
+                &records,
             )
             .expect("round-trip corrupt-image manifest");
             // Corrupt the first relocation site (the guard's
             // generation-address materialization): replay's opcode
             // validation must refuse rather than publish wrong code.
-            let mut code = pending.code.clone();
-            let first_relocation_word = pending
-                .blocks
+            let first_relocation_word = records
                 .iter()
                 .find_map(|block| {
                     block
