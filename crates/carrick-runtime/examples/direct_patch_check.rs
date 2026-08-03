@@ -60,6 +60,48 @@ fn main() {
         println!("\nVERDICT: word is neither svc nor a branch — mapping is not what we think.");
     }
 
+    // Does the island's baked context address still match the real one?
+    let mut image = image;
+    let real_ctx = image.context_address();
+    // Follow the patched branch rather than guessing where the island is:
+    // the svc site holds `b <island>`, so its imm26 gives the offset.
+    let mapped =
+        unsafe { std::slice::from_raw_parts(image.base() as *const u32, image.mapped_len() / 4) };
+    let site_word_index = 2_usize; // the svc in this fixture
+    let branch = mapped[site_word_index];
+    let imm26 = (branch & 0x03ff_ffff) as i64;
+    let island_word_index = site_word_index as i64 + imm26;
+    println!(
+        "island at word {island_word_index} (byte {})",
+        island_word_index * 4
+    );
+    let island_word = |i: usize| mapped[island_word_index as usize + i];
+    println!(
+        "island[0] = {:#010x}  (expect str x0,[sp,#-16]!)",
+        island_word(0)
+    );
+    let baked = {
+        let mut value = 0_u64;
+        for (index, word) in (0..4).map(|i| (i, island_word(1 + i))) {
+            // movz/movk: imm16 sits at bits 20:5, the shift at bits 22:21.
+            let imm16 = u64::from((word >> 5) & 0xffff);
+            let shift = ((word >> 21) & 0x3) * 16;
+            value |= imm16 << shift;
+            let _ = index;
+        }
+        value
+    };
+    println!("island-baked ctx = {baked:#x}");
+    println!("real ctx address = {real_ctx:#x}");
+    println!(
+        "MATCH: {}",
+        if baked == real_ctx {
+            "yes"
+        } else {
+            "NO — islands restore through the wrong memory"
+        }
+    );
+
     println!("\nentering the guest on the MAIN thread...");
     let entry = image.entry();
     // SAFETY: patched image, entry inside it, fixture returns via `ret`.

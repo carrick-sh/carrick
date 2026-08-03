@@ -614,6 +614,21 @@ impl DirectImage {
     pub fn guest_tls(&self) -> u64 {
         *self.guest_tls
     }
+    /// Byte length of the mapping, for inspection.
+    pub fn mapped_len(&self) -> usize {
+        self.len
+    }
+
+    /// The address the ISLANDS were built to use for the context.
+    ///
+    /// Diagnostic: the islands materialize this as a patch-time constant, so
+    /// it must equal `context_address()`. A mismatch means the context moved
+    /// after patching, which would make every island restore the guest through
+    /// the wrong memory.
+    pub fn context_address(&mut self) -> u64 {
+        std::ptr::from_mut(self.context.as_mut()) as u64
+    }
+
     pub fn context(&mut self) -> &mut GuestContext {
         &mut self.context
     }

@@ -120,6 +120,10 @@ pub mod cred_ipc;
 #[cfg(target_os = "macos")]
 pub(crate) mod darwin_fs;
 pub mod deadlock_watchdog;
+/// Tier D: serve directly-executed guests from the same dispatcher the
+/// translated lane uses. macOS/aarch64 only — the premise is same-ISA.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod direct_runner;
 pub mod dispatch;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub mod dtrace_consumer;
