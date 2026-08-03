@@ -316,6 +316,44 @@ class NativeWallAttributionTest(unittest.TestCase):
         self.assertEqual(summary["cpu"]["unresolved"]["samples"], 0)
         self.assertTrue(summary["accepted"])
 
+    def test_v2_jit_range_classifies_translated_user_pcs(self):
+        rows = [
+            value
+            for value in profile_rows()
+            if not (
+                value["scope"].get("phase") == "image-base"
+                and value["scope"].get("kind") in {"jit-start", "jit-end"}
+            )
+        ]
+        rows.insert(
+            -1,
+            {
+                **row(
+                    "jit-range",
+                    exact(count=1),
+                    kind="private",
+                    pid=42,
+                    source_pc=0x1000,
+                ),
+                "scope": {
+                    "phase": "jit-range",
+                    "kind": "private",
+                    "pid": 42,
+                    "source_pc": 0x1000,
+                    "target_pc": 0x2000,
+                },
+            },
+        )
+
+        summary = native_wall_attribution.summarize(
+            native_wall_attribution.load_profile(self.write_profile(rows)),
+            pathlib.Path("/unused/carrick"),
+        )
+
+        self.assertEqual(summary["cpu"]["translated-guest"]["samples"], 450)
+        self.assertEqual(summary["cpu"]["unresolved"]["samples"], 0)
+        self.assertTrue(summary["accepted"])
+
     def test_accepts_profile_with_no_offcpu_aggregations(self):
         rows = [
             value
@@ -336,6 +374,33 @@ class NativeWallAttributionTest(unittest.TestCase):
         self.assertEqual(summary["offcpu"]["voluntary_ns"], 0)
         self.assertEqual(summary["offcpu"]["runnable_ns"], 0)
         self.assertEqual(summary["offcpu"]["top_stack_coverage"], 1.0)
+        self.assertTrue(summary["accepted"])
+
+    def test_kernel_stacks_do_not_enter_offcpu_duration_coverage(self):
+        rows = profile_rows()
+        rows.insert(
+            -1,
+            row(
+                "cpu-kernel-stack",
+                {
+                    "type": "stack-trace",
+                    "state": "kernel-named-syscall",
+                    "pid": 42,
+                    "count": 49,
+                    "frames": ["0xfffffe0010010010", "0xfffffe0010020020"],
+                },
+                kind="kernel-named-syscall",
+                pid=42,
+            ),
+        )
+
+        summary = native_wall_attribution.summarize(
+            native_wall_attribution.load_profile(self.write_profile(rows)),
+            pathlib.Path("/unused/carrick"),
+        )
+
+        self.assertEqual(summary["offcpu"]["top_stack_coverage"], 0.9)
+        self.assertEqual(len(summary["offcpu"]["top_stacks"]), 1)
         self.assertTrue(summary["accepted"])
 
     def test_rejects_duplicate_exact_publisher_row(self):

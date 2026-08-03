@@ -265,11 +265,24 @@ def _address_ranges(
     rows: tuple[ProfileRow, ...],
     binary: pathlib.Path,
 ) -> tuple[dict[int, list[tuple[int, int]]], dict[int, list[tuple[int, int]]]]:
+    jit_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
     jit_points: dict[int, dict[str, list[int]]] = defaultdict(
         lambda: defaultdict(list)
     )
     host_bases: dict[int, list[int]] = defaultdict(list)
     for row in rows:
+        if row.phase == "jit-range":
+            if row.pid is None or row.source_pc is None or row.target_pc is None:
+                raise ValueError("jit-range row is missing pid or endpoint")
+            if row.source_pc >= row.target_pc:
+                raise ValueError(
+                    f"pid {row.pid}: invalid JIT range "
+                    f"{row.source_pc:#x}..{row.target_pc:#x}"
+                )
+            if _exact_count(row) <= 0:
+                raise ValueError(f"pid {row.pid}: empty JIT range publication")
+            jit_ranges[row.pid].append((row.source_pc, row.target_pc))
+            continue
         if row.phase != "image-base" or row.pid is None or row.source_pc is None:
             continue
         if row.kind in {"jit-start", "jit-end"}:
@@ -277,7 +290,6 @@ def _address_ranges(
         elif row.kind == "host":
             host_bases[row.pid].append(row.source_pc)
 
-    jit_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
     for pid, points in jit_points.items():
         starts = sorted(set(points["jit-start"]))
         ends = sorted(set(points["jit-end"]))
@@ -287,6 +299,8 @@ def _address_ranges(
             if start >= end:
                 raise ValueError(f"pid {pid}: invalid JIT range {start:#x}..{end:#x}")
             jit_ranges[pid].append((start, end))
+    for pid, ranges in jit_ranges.items():
+        jit_ranges[pid] = sorted(set(ranges))
 
     host_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
     if host_bases:
@@ -512,7 +526,13 @@ def summarize(profile: Profile, binary: pathlib.Path) -> dict[str, object]:
     stacks: list[dict[str, object]] = []
     stack_total_ns = 0
     for row in rows:
-        if row.metric_type != "stack-trace":
+        # Kernel stacks carry sampled counts and runnable stacks carry a
+        # different off-CPU population. Only voluntary stacks reconcile with
+        # voluntary_ns and participate in this duration coverage metric.
+        if (
+            row.metric_type != "stack-trace"
+            or row.phase != "offcpu-voluntary-stack"
+        ):
             continue
         value_ns = _require_int(row.metric.get("value_ns"), "stack value_ns")
         stack_total_ns += value_ns
