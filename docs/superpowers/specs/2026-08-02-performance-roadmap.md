@@ -114,6 +114,25 @@ Three sized items, largest first:
 | zygote / no self-re-exec (kill the fixed ~18 ms) | ~1.1 s |
 | cheap shared-unit load (MAP_JIT copy instead of signed dylib + `dlopen`; publishing currently shells out to `codesign` twice) | ~0.8 s |
 
+> **Correction (2026-08-03, exec lane) — the "fixed ~18 ms" item is measured
+> at 8.5-9.0 ms and is mostly Darwin's exec floor.** Untraced decomposition
+> ([2026-08-03 perf-results](../../perf-results/2026-08-03-native-exec-fixed-cost-decomposition.md)):
+> 5.3 ms is kernel execve + dyld (of which ~1.8 ms is the floor for ANY
+> binary, ~1.6 ms teardown of the dying guest's resident pages, ~0.9 ms
+> CF/HVF/dtrace initializers, ~0.8 ms carrick-binary premium) and only
+> ~3.2 ms is carrick's own code, already spread thin. The zygote shape
+> cannot exist under the standing constraints: the libdispatch finding
+> (2026-07-13 self-reexec design) forces a real exec before the new image may
+> create threads, and PID preservation forbids handing off to a pooled
+> process. What WAS in this item and landed: the prepared-artifact payload
+> digest was ~1.5-2 ms/MB per exec (hashing image bytes twice), i.e. a
+> per-MB term misfiled as fixed — now metadata-only by default
+> (`CARRICK_EXEC_FAST=0` hatch), which A/B suggests is worth more than this
+> item's original ~1.1 s estimate on the cold build. The residual fixed chain
+> (~8.5 ms × 61 execs ≈ 0.5 s) is near its floor; chained fixups, DOF
+> stripping, and symbol stripping were each measured at ~0.1 ms or less and
+> rejected.
+
 **Gate:** paired A/B on the cold `go build` with arms alternating, plus the
 20-exec microbenchmark. Both, because they have disagreed before.
 **Worth:** ~3.5 s of a 10.4 s build, i.e. build ~6.9 s ≈ **3.4x** Docker.
