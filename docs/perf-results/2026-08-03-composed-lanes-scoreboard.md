@@ -76,3 +76,33 @@ Raw logs: `target/perf-spread-composed-20260802.log`,
 `target/perf-hatch-abba-20260802.log`, `target/perf-micro-abba-20260802.log`,
 `target/perf-shared-abba-20260802.log`, stamps/profile in the session
 transcript.
+
+## Correction (same day): the ABBA "no effect" results were placebo-vs-placebo
+
+All three control knobs are read from the HOST environment
+(`std::env::var_os` — `prepared_image.rs:576`, `translator.rs:145`,
+`native_darwin.rs:828`), and the experiments above passed them as guest
+`-e` vars, so both arms ran identical configurations. Every "no effect"
+verdict above is the experiment's error, not the mechanism's. Re-run with
+host env, same counterbalanced design (`target/perf-hostenv-abba-20260803.log`):
+
+- **Exec-lane hatches, 20-exec micro: ON ~2082 ms vs OFF ~2426 ms —
+  ~17 ms/exec.** The landed mechanisms do exactly what their lanes sized.
+- **Shared translation, micro (serial): ON ~1952 vs OFF ~2060 —
+  ~5 ms/exec net win**, consistent with the exec-window attribution
+  (translate 63→24 ms) minus the +12 ms/exec publish/copy cost.
+- **Shared translation, cold build (parallel): ON ~12 750 vs OFF ~9 823 —
+  30% WORSE.** Concurrent publishers pay the transport's cost with little
+  reuse (each process translates ahead of the store). The default stays
+  OFF on measured grounds — now from a valid experiment, and the
+  shape-dependence (serial win, parallel regression) is the recorded fact.
+- The "Where one compile -V exec goes" table above is superseded by
+  [`2026-08-03-exec-window-attribution.md`](2026-08-03-exec-window-attribution.md):
+  guest CPU is ~97 ms/process (not ~10), translation 61–63 ms (not 2.8),
+  and the 30.5 ms "blocked" was a sibling Go thread parked in overlap.
+
+The build shape's wall remains unexplained by per-exec terms
+(61 × 17 ms at width ~10 ≈ 0.1 s of a ~9 s excess over Docker): the next
+attribution target is **what serializes the parallel build** — fs-walk's
+18.4x and the `HostAliasTransactions` exclusive gate are the standing
+suspects.
