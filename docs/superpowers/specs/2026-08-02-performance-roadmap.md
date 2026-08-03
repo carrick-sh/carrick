@@ -64,15 +64,21 @@ execs 61 times and computes little. Neither track helps the other's shape.
 
 Nothing real runs on tier D yet. In order:
 
-1. **Exit path.** `GuestContext::pc` is informational because the island's
-   return leg is a CONSTANT branch — which is exactly what makes it
-   register-free. Signal delivery and `execve` need a real exit: a gateway like
-   the DSR one, or islands that branch indirectly through a scratch slot.
-   Until this exists a guest can only leave by calling `exit`.
-2. **Guest-leave contract.** The fixture bug that blocked the bridge for a full
-   session (a guest returning to Rust with SP unbalanced) was a symptom of
-   there being no stated contract. Write it down: a tier-D guest leaves through
-   the handler, never by returning.
+1. **Exit path — DONE.** `GuestContext::pc` was informational because the
+   island's return leg is a CONSTANT branch — which is exactly what makes it
+   register-free. The landed shape is the gateway, not the scratch-slot
+   indirect branch: the resume leg stays a constant branch (an indirect
+   resume would need a register and every register is the guest's), and each
+   island grew a LEAVE leg that restores the host stack discipline `enter`
+   now captures and `ret`s to `enter`'s caller with the guest parked in its
+   context. The bridge leaves on `Exit`/`Execve`/every unimplemented outcome.
+   Design doc M1b has the red-first test names.
+2. **Guest-leave contract — DONE.** The fixture bug that blocked the bridge
+   for a full session (a guest returning to Rust with SP unbalanced) was a
+   symptom of there being no stated contract. Now written down where the
+   mechanism lives (`carrick_native_darwin::direct` module doc, the
+   `direct_runner` bridge header, and the design doc §6): a tier-D guest
+   leaves through the handler, never by returning.
 3. **Dynamic linking.** `ld.so` is more PIE mappings through the same loader,
    plus TLS initialisation now that `tpidr_el0` is veneered.
 4. **Threads.** `guest_tls`/`guest_x18` are per-image today; they must be
