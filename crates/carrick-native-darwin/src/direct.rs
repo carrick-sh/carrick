@@ -171,6 +171,17 @@ fn island(ctx: u64, return_pc: u64) -> Vec<u32> {
     // Call the Rust handler with the context in x0.
     w.push(ldr_imm(1, 0, GuestContext::HANDLER));
     w.push(blr(1));
+    // RE-MATERIALIZE the context pointer. x0 held it on the way in, but x0 is
+    // caller-saved: the handler is entitled to destroy it, and a Rust handler
+    // routinely does. Restoring the guest through a clobbered x0 reads the
+    // register file out of whatever x0 now points at, which is how this
+    // surfaced - the guest resumed with a stack address in x30 and `ret`
+    // branched into the stack (EXC_BAD_ACCESS code=2 with PC on the stack).
+    // Whether x0 survived depended on the handler's codegen, so the failure
+    // looked like it depended on the crate, the handler's weight and the heap
+    // layout. The address is a patch-time constant, so re-materializing costs
+    // four words and cannot be clobbered by anything.
+    w.extend_from_slice(&mov_imm64(0, ctx));
     // Restore. SP first (through x1, restored after), then x30..x1, then x0.
     w.push(ldr_imm(1, 0, GuestContext::SP));
     w.push(mov_to_sp(1));
