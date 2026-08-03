@@ -1,8 +1,9 @@
 # Native translation-store monotonic augmentation: mechanism gate
 
 **Date:** 2026-08-03. **Lane:** shipped-default Darwin/AArch64 native (DSR).
-**Decision:** the causal mechanism gate passes; proceed to receipt-bound,
-untraced ABBA. This document does **not** claim an end-to-end performance win.
+**Decision:** rejected and removed. The causal mechanism gate passed, but the
+receipt-bound untraced ABBA gate found a statistically decisive regression.
+The runtime candidate and its temporary controls were removed in `291359b4`.
 
 ## 1. Bound implementation and workload
 
@@ -107,20 +108,52 @@ including 18,202 `segment-repeat` translations. This is the direct replay proof
 that a later process can execute the newly merged coverage without changing
 guest-visible semantics.
 
-## 5. Timing is deliberately unresolved
+## 5. Receipt-bound ABBA rejects the candidate
 
 These captures enabled high-volume NATIVEPERF and census instrumentation and
 are causal evidence only. They are not retention timing. Their diagnostics are
 also adverse: control/candidate child CPU was 22.706/24.192 seconds and the
 in-guest workload window was 8.763/11.424 seconds. The candidate paid 3.788
-seconds of summed publication work while building the augmented units. This
-makes the untraced ABBA gate especially important; the implementation is not a
-performance win unless that gate independently passes.
+seconds of summed publication work while building the augmented units. The
+untraced ABBA authority confirmed that this was a product cost, not merely
+instrumentation tax.
+
+The same signed binary was prepared from clean source commit
+`e626b117b1e8142a11e2a73733ffbd566da30c01`; its SHA-256 and Mach-O UUID were
+unchanged from the mechanism receipt. One immutable arm receipt was used for
+both overlays, as required by the harness's same-binary mode. The campaign ran
+two excluded warmups followed by eight complete A1/B1/B2/A2 quads: 32 measured
+samples, no overlap, and a two-second cooldown between positions.
+
+| metric | control median | candidate median | candidate/control | paired 95% interval | candidate wins |
+|---|---:|---:|---:|---:|---:|
+| **child CPU seconds** | 23.7104 | 25.5479 | **1.0728** | **[1.0653, 1.0806]** | 0/8 |
+| child user CPU seconds | 17.0524 | 19.3396 | 1.1307 | [1.1276, 1.1385] | 0/8 |
+| child system CPU seconds | 6.6736 | 6.2083 | 0.9278 | [0.9004, 0.9338] | 8/8 |
+| workload wall milliseconds | 9,012.25 | 11,547.00 | **1.2786** | **[1.2495, 1.2928]** | 0/8 |
+| process elapsed milliseconds | 9,512.00 | 12,120.75 | 1.2724 | [1.2448, 1.2857] | 0/8 |
+
+The user/system split explains the negative result: replay removed enough
+translation and kernel work to improve system CPU by about 7.2%, but eager
+bundle construction and publication increased user CPU by about 13.1%. Net
+child CPU became 7.3% worse and wall time became 27.9% worse. Every primary
+quad lost; the stored exact sign-test probability was 1.0, failing its `<0.05`
+gate, and the complete two-sided CPU interval lies above 1.0.
+
+The campaign artifact is structurally accepted and complete, but its retention
+decision is `retained=false`. All 34 executions returned zero and reported
+`BUILD_OK`. Before every warmup and measured sample the production reader
+decoded and atomically restored the same
+`db1225d3ac5c30d1067ef91749bd32415af97b025bb23a34b4f8bb63e51e3272`
+seed tree at the same active path. All nine quiet-box preflights reported no
+foreign Carrick process, Docker oracle, load exclusion, or thermal/performance
+warning. The host was on AC power, retained as metadata only.
 
 The design's earlier estimate of roughly 4.5 child CPU-seconds, or 18%, was a
 projection from translation-time opportunity. The measurements here establish
-a 56% reduction in private translation count, not an 18% CPU improvement. No
-official cold-build ratio changes on the strength of this mechanism capture.
+a 56% reduction in private translation count and a measured 7.3% CPU
+regression, not an 18% CPU improvement. No official cold-build ratio changes:
+the prior 10.44x shipped-default result remains authoritative.
 
 ## 6. Reproduction and receipts
 
@@ -151,6 +184,21 @@ target/release/carrick debug xlat-census <arm>-census \
   --processes-observed "$(jq -r .processes.incarnations <arm>-profile.json)"
 ```
 
+The untraced authority used one receipt path for both same-binary arms:
+
+```bash
+python3 scripts/perf/native_go_build_abba.py run \
+  --harness-repo "$PWD" \
+  --control-receipt target/perf/native-store-augmentation/arms/control/arm.json \
+  --candidate-receipt target/perf/native-store-augmentation/arms/control/arm.json \
+  --control-overlay scripts/perf/overlays/native-store-augment-control.json \
+  --candidate-overlay scripts/perf/overlays/native-store-augment-candidate.json \
+  --store-seed-dir target/perf/native-store-augmentation/mechanism/seed \
+  --active-store-dir target/perf/native-store-augmentation/abba/active-store \
+  --quads 8 \
+  --output target/perf/native-store-augmentation/abba/campaign.json
+```
+
 The compact, machine-readable decision receipt is
 `target/perf/native-store-augmentation/mechanism/mechanism-decision.json`,
 SHA-256
@@ -167,7 +215,19 @@ Important bound artifact hashes are:
 | post-candidate production census | `2564d7242f281aa2dde0b5df5146fb40fd027ef98d92c7bd929f93c90016ed55` |
 | post-candidate store receipt | `4f171af6fb363645288f2a03da55929dd1fbacaa790e27c2613bf53252187a3d` |
 | replay profile / summary | `ac87a7dd9f3892b7c358171df02a4fdabac1f3b4e2abf26d7c8ebfa75d5c6a11` / `8ca45e2ef2848058eb7149e6115a4b4de67c1f59b3101d15d7ece7d92564f091` |
+| accepted ABBA campaign | `683f0b473271eec9c041627da80a1b45639bac92c6ae317e48acc7dd266a3105` |
 
-The mechanism decision is therefore **go to untraced ABBA**, not retain. The
-next authority is at least eight counterbalanced ABBA quads from the same seed,
-with child CPU as primary and workload wall as a required improving secondary.
+The final decision is therefore **reject**. Per the approved plan, no
+same-binary regression screens, hatch-removal-for-retention gate, or official
+Carrick/Docker ratio refresh was run: those steps cannot rescue a candidate
+which already fails its primary workload. The runtime, crash-export companion,
+temporary hatch, seed-restoration campaign controls, and candidate overlays
+were restored to their pre-candidate state. The approved design and this
+negative evidence remain durable so the 56% mechanism win is not mistaken for
+an end-to-end opportunity again.
+
+The rejection cleanup is `291359b4`. Every candidate-owned runtime and harness
+path is byte-for-byte identical to pre-candidate commit `6f3f0024`. The
+restored tree passed 219/219 AArch64 DSR tests, 61/61 native-Darwin tests, 87/87
+performance/DTrace harness tests, and the complete `RUST_TEST_THREADS=1 just
+ci` gate. No augmentation control remains under `crates/` or `scripts/`.

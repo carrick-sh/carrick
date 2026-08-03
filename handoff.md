@@ -1,9 +1,10 @@
 # Native-lane performance: state of play
 
-**Date:** 2026-08-03 · **Branch:** `main` @ `fd547039` · **Scope:** Darwin/aarch64
-native backend (`--exec-backend native`, the shipped default). VMM is explicitly
-NOT the target: one process per VM against a ~127-VM macOS ceiling makes it a
-dead end for build-shaped workloads.
+**Date:** 2026-08-03 · **Branch:** `codex/native-store-default` · **Latest
+implementation decision:** rejected augmentation cleanup `291359b4` ·
+**Scope:** Darwin/aarch64 native backend (`--exec-backend native`, the shipped
+default). VMM is explicitly NOT the target: one process per VM against a
+~127-VM macOS ceiling makes it a dead end for build-shaped workloads.
 
 ## The goal
 
@@ -17,28 +18,28 @@ an appendix of rejected alternatives so nobody re-litigates them.
 
 ## Where we are
 
-Measured 2026-08-03, quiet box, serial carrick-then-docker phases, in-guest wall,
-shipped defaults ([`docs/perf-results/2026-08-03-wave3-scoreboard.md`](docs/perf-results/2026-08-03-wave3-scoreboard.md)):
+The authoritative shipped-default cold-build scoreboard is the serialized,
+five-sample Carrick-then-Docker run in
+[`docs/perf-results/2026-08-03-persistent-store-default-confirmation.md`](docs/perf-results/2026-08-03-persistent-store-default-confirmation.md):
 
-| workload shape | carrick | docker | ratio | 08-02 start |
-|---|---|---|---|---|
-| cold `go build` | 9613 ms | 805 ms | **11.9x** | 13.3x |
-| compute (awk 8M) | 365 ms | 111 ms | **3.3x** | 3.8x |
-| fs-walk | 252 ms | 13 ms | 19.4x | ~18-20x |
-| startup (2 execs) | 37 ms | ~0 | — | 42 ms |
+| metric | Carrick | Docker | ratio |
+|---|---:|---:|---:|
+| cold `go build` workload wall | 8,575 ms | 821 ms | **10.4446x** |
+| cold `go build` process elapsed | 9,326 ms | 977 ms | **9.5455x** |
 
-**That table predates the last two merges** (store v5 wire, tier-D signals).
-Re-measuring is step 1 below.
+This is still the official ratio. Reaching 3x requires removing another 71.28%
+of Carrick's current workload wall (a 3.4815x reduction); reaching the 2x
+product bar requires removing 80.85% (5.2223x). The older shape table remains
+useful only as historical direction: compute was ~3.3x and fs-walk ~19.4x, but
+both must be rerun before being quoted as current.
 
-**Overhead is a function of workload SHAPE** — quote the shape with the number,
-always. The build is not slow because it is serialized: it runs at Docker-equal
-core width (~2.5) and burns **25.6 s CPU against Docker's 2.1 s**, i.e. ~12x
-amplification ([`2026-08-03-build-serialization-attribution.md`](docs/perf-results/2026-08-03-build-serialization-attribution.md)).
-That CPU decomposes: **translate 14.6 s** (1.74 M blocks — every process
-retranslates its image), **gateway 7.1 s** (3.65 M entries, roughly half
-cold-cache branch resolves), **translated_run 7.9 s** (only ~2.1 s of it useful
-work), dispatch 2.6 s. `HostAliasTransactions`, fs amplification, and futex
-lowering are all REFUTED for this shape — do not go back to them for the build.
+The latest campaign tested monotonic augmentation of already-published
+translation units. Its mechanism was real: private translations fell 56.0%
+and `segment-repeat` fell 56.3%. Its product result was decisively negative:
+eight-quad same-binary ABBA measured child CPU ratio **1.0728**, paired 95%
+interval **[1.0653, 1.0806]**, and workload-wall ratio **1.2786**. The candidate
+lost every quad, so it and its temporary controls were removed. Full evidence:
+[`docs/perf-results/2026-08-03-native-store-monotonic-augmentation.md`](docs/perf-results/2026-08-03-native-store-monotonic-augmentation.md).
 
 ## What landed (2026-08-02/03, six waves, all merged with `just ci` green)
 
@@ -70,9 +71,11 @@ regression was root-caused to block-ENTRY shape — an 11-12 instruction
 `BindingIndex` guard versus a 3-instruction trusted entry, NOT the recorded
 fusion-loss suspect. The v5 wire splits each block into a hot blob (decoded at
 first lookup) and a cold blob (pc-map/recovery, ~98% of records, left undecoded
-in the mmap until a fault needs it). Reachable behind
-`CARRICK_DSR_PERSISTENT_STORE=1`; **default OFF pending confirmation** (below).
-Roughly 22k lines of superseded machinery (the Mach-O emitter, the
+in the mmap until a fault needs it). The persistent store is now **default
+ON**; exact
+`CARRICK_DSR_PERSISTENT_STORE=0` is the rollback/control hatch. Its retained
+same-binary result was -8.33% child CPU and -8.84% workload wall. Roughly 22k
+lines of superseded machinery (the Mach-O emitter, the
 codesign+dlopen transport, `BindingIndex`, cell sidecars, edge trampolines, V3
 metadata) were DELETED, not parked behind flags.
 
@@ -83,73 +86,45 @@ went 1.66 s → <10 ms. Identical host syscall sequence, identical guest ABI.
 
 ## What's next
 
-### Continuation checkpoint — quiet gate still pending
+The rejected branch is closed cleanly: 219/219 AArch64 DSR tests, 61/61
+native-Darwin tests, 87/87 performance/DTrace harness tests, and
+`RUST_TEST_THREADS=1 just ci` all pass against the exact pre-candidate source
+state. Same-binary regression screens and an official ratio refresh were
+intentionally skipped: a candidate that already regresses the primary workload
+cannot be rescued by secondary screens.
 
-The 2026-08-03 continuation is recorded in
-[`docs/perf-results/2026-08-03-store-default-quiet-gate-checkpoint.md`](docs/perf-results/2026-08-03-store-default-quiet-gate-checkpoint.md).
-Current branch `codex/native-store-default` carries two narrow prerequisites:
+1. **Re-attribute the current default before selecting another fix.** Use the
+   supported DTrace/USDT profiles on the now-default-on store, with the tracer's
+   own PID excluded, and re-run the emitted-shape census. Prior profiles put
+   emitted JIT execution near 45% of build CPU and stolen-register context
+   traffic near 15% of total CPU, but those are pre-current-store numbers and
+   must be requalified. Use LLDB/core evidence for any crash or silent process
+   loss. Pursue only a freshly measured >=10% end-to-end opportunity.
+2. **Keep eager full translation as a deferred future design, not the next
+   patch.** Translating a complete eligible image once up front could amortize
+   publication and avoid the losing per-process merge path measured here. It
+   would not replace incremental augmentation for JIT-on-JIT/dynamically
+   generated code, so both semantics would eventually be required. The user
+   explicitly deferred this until the current performance campaign has a
+   higher-confidence next bucket.
+3. **Tier D remains default-off.** Its ubuntu image-specific x18 crash,
+   multi-threaded fork/signal tail, bad64 decode gap, and record-lock blocker
+   still require correctness closure before any performance flip.
 
-- `245635e7` fixes private-target rustdoc links that made the initial
-  `RUST_TEST_THREADS=1 just ci` requalification fail; the full gate is green.
-- `0d8f8f4d` makes benchmark timeout snapshots stack-first; all 38 harness
-  tests pass, and the signed measured executable is byte-identical to the
-  pre-fix arm (`3b21bd24...ecf0`, UUID `89649BB2-...-8EB0`).
+## Confidence
 
-The first official ABBA caught one real 900-second Go `compile` wedge on the
-store-on arm, but its attempted multi-process core save exhausted the
-diagnostic budget before preserving stacks. A matched bounded soak then ran
-store-on 12/12 and store-off 8/8 clean, so neither a deterministic corrupt unit
-nor store-specific attribution is established. A second official attempt
-completed one clean quad and then failed closed when the host changed from AC
-to Battery Power. Both artifacts are incomplete and non-authoritative; the
-store remains default-off. Resume the exact `abba-v3.json` command in the
-checkpoint doc after AC power is restored.
-
-### 1. Re-measure, then land the two default flips (local work, no fan-out)
-`just ci` on `fd547039`, `just build`, then the quiet-box round: awk-8M compute
-ABBA, 20-exec `compile -V` micro, cold build, and `workload-spread.sh 3`. Arms
-must be defined by the **host-env** knobs, counterbalanced, n≥8.
-
-- **`CARRICK_DSR_PERSISTENT_STORE`** — the re-flip condition ("install cheaper
-  than the retranslation it avoids, and no build regression") is *measured as
-  met* under sibling load: micro −26%, build −9%, translate phase 50→18 ms per
-  exec ([`2026-08-03-store-v5-lazy-hotcold-wire.md`](docs/perf-results/2026-08-03-store-v5-lazy-hotcold-wire.md)).
-  One quiet-box confirmation and it flips ON. This is the 14.6 s retranslation
-  lever — the single largest term in the build.
-- **`CARRICK_NATIVE_DIRECT`** — stays OFF until the blockers below clear.
-
-### 2. Tier D flip blockers, ranked (tasks #14, #15)
-1. **The ubuntu:24.04 tier-D SIGSEGV.** Deterministic, image-content-specific,
-   and reproduces on three commits including ones predating the signal lane — it
-   was masked by the signal gap, not caused by it. Repro:
-   `CARRICK_NATIVE_DIRECT=1 carrick run --exec-backend native --native-page-profile native16k ubuntu:24.04 /bin/sh -c 'echo hi'`
-   → exit 139, pc `interp+0x70ae4`, fault addr `0x13`, x18=0. `debian:stable`
-   works; DSR works. Suspect: an x18-consuming shape slipping the scan in that
-   image's ld.so/libc. **This is the LTP-class blocker.**
-2. **MT-fork sibling quiesce** — cpython-subprocess/threading, go.
-3. **The Go MT+SIGURG crash tail.** Go PIE tests now run real bodies
-   (go-context 24/24 subtests) and then die in unnamed host crashes under
-   multi-threaded load (wild branch pc=0x81, 6-7 live threads). Newly-reached
-   ground; needs a core + lldb pass. Note this is a *diagnosability* regression
-   (named leave → crash) that the flip decision must weigh.
-4. **Undecodable word `0x38764d52`** — a bad64 decode gap blocking node itself
-   and two CPython extension `.so` windows.
-5. `BlockingRecordLock` arm (cpython-fcntl).
-
-Smoke status: control lane clean, no regressions. Tier-D-forced: **17 gating**
-(down from 19 — node-app and node-v8 flipped to MATCH once signals landed), with
-zero `WaitOnSignals`/`SignalThread` leaves remaining. cpython-glob/json/math run
-on tier D at full workload scale, and directionally cpython-math fell from 15.3x
-to below the 10x outlier bar — the Phase 2 estimate showing up in real data.
-
-### 3. After the flips
-Re-run the shape table; the build should move materially on the store flip
-alone. Then the remaining sized levers: gateway round-trips (~2.3 s, largely
-subsumed by a warm store), emitted-code overhead via tier D on the serial
-compile-runtime path (~1.7-2.5 s), a guest-memory copy fast path (tier D
-currently pays a mach trap per copy), CPU exposure (0.3-0.4 s measured), and
-driver setup fs + clonefile seed (~0.6 s). fs-walk at 19.4x is untouched and is
-the other big shape.
+- **Very high (99%):** monotonic augmentation as implemented is an end-to-end
+  regression. Same binary, identical restored seed, eight counterbalanced
+  quads, 0/8 wins, and the entire paired CPU interval is above 1.0.
+- **High (97%):** the causal tradeoff is understood. System CPU improved 7.2%,
+  but user CPU regressed 13.1%; the reconciled publication counters measured
+  the work that overwhelms the translation savings.
+- **High (95%):** the official shipped-default result remains 10.4446x. No
+  rejected candidate code is retained and no projection was substituted for a
+  fresh Carrick/Docker run.
+- **Medium (70%):** emitted-code/stolen-register traffic remains the largest
+  actionable next bucket. It was previously measured, but must be re-profiled
+  on the current default before committing to a design.
 
 ## Discipline that earned its keep (do not relearn these)
 
@@ -172,10 +147,10 @@ the other big shape.
 - Counter and mechanism evidence beat wall clock under load. Wall numbers taken
   with siblings running are "suggests", never "confirmed".
 
-## Constraint at handoff
+## Branch state at handoff
 
-The monthly API spend limit is reached, so **no subagent fan-out can run** until
-it resets or is raised. Everything in step 1 is local work and can proceed
-without it. Open tasks: #7 tier D Phase 2, #8 Phase 4 levers, #9 the
-`NativeMemoryHandle` RwLock wedge soak, #14 the ubuntu crash, #15 the remaining
-tier D flip blockers.
+`291359b4` is the narrow rejection cleanup. The evidence/handoff update is the
+only intended follow-up change. The worktree must be clean after that commit;
+nothing has been pushed and local `main` has not moved. Target-only raw ABBA,
+mechanism, signed-binary, and store receipts remain under
+`target/perf/native-store-augmentation/` and are intentionally not committed.
