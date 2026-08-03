@@ -4775,7 +4775,7 @@ fn published_shared_block_prevents_second_process_translation() {
     let manifest = TranslationUnitManifest {
         schema: TRANSLATION_UNIT_SCHEMA_V2,
         key: key.clone(),
-        dylib_sha256: [0x22; 32],
+        code_sha256: [0x22; 32],
         base_export: translation_unit_base_export(&key).expect("keyed translation export"),
         code_len: code_len as u64,
         blocks: vec![PortableBlockRecord {
@@ -4950,7 +4950,7 @@ fn shared_to_private_indirect_cache_hit_installs_target_authority() {
     let manifest = TranslationUnitManifest {
         schema: TRANSLATION_UNIT_SCHEMA_V2,
         key: key.clone(),
-        dylib_sha256: [0x88; 32],
+        code_sha256: [0x88; 32],
         base_export: translation_unit_base_export(&key).expect("keyed translation export"),
         code_len: pending.code.len() as u64,
         blocks: pending.blocks,
@@ -5123,7 +5123,7 @@ fn indirect_authority_switch_jittered_sigpipe_never_becomes_entry_kick() {
     let manifest = TranslationUnitManifest {
         schema: TRANSLATION_UNIT_SCHEMA_V2,
         key: key.clone(),
-        dylib_sha256: [0x89; 32],
+        code_sha256: [0x89; 32],
         base_export: translation_unit_base_export(&key).expect("keyed translation export"),
         code_len: pending.code.len() as u64,
         blocks: pending.blocks,
@@ -5311,15 +5311,42 @@ struct DirectBindingLiveFixture {
     fixture: BiasedTranslatorFixture,
     source: GuestVa,
     target: GuestVa,
-    source_cell: Option<carrick_dsr_aarch64::direct_binding::DirectBindingCellRef>,
-    target_cell: Option<carrick_dsr_aarch64::direct_binding::DirectBindingCellRef>,
-    _source_loaded: Option<carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit>,
-    _target_loaded: Option<carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit>,
     _cache_session: carrick_native_darwin::aot_cache::ContainerCacheSession,
     stack: Vec<u8>,
 }
 
 impl DirectBindingLiveFixture {
+    /// The cell of the unit the TRANSLATOR installed for `guest`. Exists
+    /// only after the first traversal of that guest (installation happens
+    /// inside `prepare_entry`); the copy transport allocates cells per
+    /// LOAD, so a fixture's own store load would observe a different,
+    /// never-consulted block.
+    fn installed_cell(
+        &self,
+        guest: GuestVa,
+    ) -> Option<carrick_dsr_aarch64::direct_binding::DirectBindingCellRef> {
+        let base = self
+            .fixture
+            .translator
+            .process
+            .shared_unit_binding_base_for_test(guest)?;
+        // SAFETY: the installed unit is retained by the ProcessTranslator
+        // for this fixture's lifetime, pinning the cell block.
+        Some(
+            unsafe {
+                carrick_dsr_aarch64::direct_binding::DirectBindingCellRef::from_mapped_address(base)
+            }
+            .expect("adapt installed direct-binding cell"),
+        )
+    }
+
+    fn source_cell(&self) -> Option<carrick_dsr_aarch64::direct_binding::DirectBindingCellRef> {
+        self.installed_cell(self.source)
+    }
+
+    fn target_cell(&self) -> Option<carrick_dsr_aarch64::direct_binding::DirectBindingCellRef> {
+        self.installed_cell(self.target)
+    }
     fn traverse(&mut self, guest: GuestVa) -> NativeDsrExit {
         let mut snapshot =
             seeded_snapshot(self.stack.as_mut_ptr() as u64 + self.stack.len() as u64);
@@ -5357,7 +5384,6 @@ fn direct_binding_live_fixture(
     target_shared: bool,
     cyclic: bool,
 ) -> DirectBindingLiveFixture {
-    use carrick_dsr_aarch64::direct_binding::DirectBindingCellRef;
     use carrick_dsr_aarch64::shared_cache::{
         AddressModeIdentity, DirectBindingLayout, ExecutableIdentity, GuestCodeLen, ImageFileLen,
         ImageFileOffset, NativePageProfileIdentity, PendingTranslationUnit, PortableBlockCandidate,
@@ -5482,62 +5508,6 @@ fn direct_binding_live_fixture(
             PublishOutcome::Winner
         );
     }
-    let source_loaded = if source_shared {
-        Some(
-            store
-                .load(&source_key, &[source_word])
-                .expect("load live direct-binding source")
-                .expect("published live direct-binding source"),
-        )
-    } else {
-        None
-    };
-    let source_cell = source_loaded
-        .as_ref()
-        .and_then(|loaded| loaded.binding_base)
-        .map(|address| {
-            // SAFETY: `_source_loaded` pins the writable mapped sidecar cell for
-            // the lifetime of this fixture and all copied adapters.
-            unsafe {
-                DirectBindingCellRef::from_mapped_address(address)
-                    .expect("adapt live direct-binding cell")
-            }
-        });
-    let target_loaded = if target_shared && cyclic {
-        Some(
-            store
-                .load(
-                    &TranslationUnitKey::for_segment(
-                        executable.clone(),
-                        ImageFileOffset::new(4),
-                        ImageFileLen::new(4).expect("target file length"),
-                        target,
-                        GuestCodeLen::new(4).expect("target guest length"),
-                        SourceFingerprint::from_words(&[target_word]),
-                        NativePageProfileIdentity::Native16k,
-                        AddressModeIdentity::biased(fixture.host_bias),
-                    ),
-                    &[target_word],
-                )
-                .expect("load live cyclic target")
-                .expect("published live cyclic target"),
-        )
-    } else {
-        None
-    };
-    let target_cell = target_loaded
-        .as_ref()
-        .and_then(|loaded| loaded.binding_base)
-        .map(|address| {
-            // SAFETY: `_target_loaded` pins this mapped writable cell.
-            unsafe {
-                DirectBindingCellRef::from_mapped_address(address)
-                    .expect("adapt live cyclic target cell")
-            }
-        });
-    if let Some(cell) = source_cell {
-        assert!(cell.load_acquire().is_null());
-    }
     fixture
         .translator
         .process
@@ -5576,10 +5546,6 @@ fn direct_binding_live_fixture(
         fixture,
         source,
         target,
-        source_cell,
-        target_cell,
-        _source_loaded: source_loaded,
-        _target_loaded: target_loaded,
         _cache_session: cache_session,
         stack: vec![0_u8; 16 * 1024],
     }
@@ -5611,8 +5577,8 @@ fn direct_binding_shared_to_shared_switch_executes() {
     ));
     assert!(
         !fixture
-            .source_cell
-            .expect("shared source cell")
+            .source_cell()
+            .expect("installed shared source cell")
             .load_acquire()
             .is_null()
     );
@@ -5628,15 +5594,39 @@ fn direct_binding_shared_to_shared_switch_executes() {
 #[test]
 fn direct_binding_first_miss_then_hit_bypasses_gateway() {
     let mut fixture = direct_binding_live_fixture(true, false, false);
-    let cell = fixture.source_cell.expect("shared source cell");
+    // Install the shared source without resolving it: `prepare_entry` loads
+    // the unit (allocating its fresh cell block), and the resolver has not
+    // run yet, so the installed cell must start null.
+    let mut snapshot =
+        seeded_snapshot(fixture.stack.as_mut_ptr() as u64 + fixture.stack.len() as u64);
+    snapshot.pc = fixture.source.raw();
+    let prepared = fixture
+        .fixture
+        .translator
+        .prepare_entry::<false>(&fixture.fixture.memory, &snapshot)
+        .expect("install shared source unit");
+    let cell = fixture.source_cell().expect("installed source cell");
     assert!(cell.load_acquire().is_null());
+    let entered = fixture
+        .fixture
+        .translator
+        .enter_prepared::<false>(prepared, &mut snapshot)
+        .expect("enter installed source");
     assert!(matches!(
-        fixture.traverse_source(),
+        entered.exit,
         NativeDsrExit::ResolveDirect {
             source,
             target,
             binding: DirectBindingExitMetadata::Mapped(_),
         } if source == fixture.source && target == fixture.target
+    ));
+    assert!(matches!(
+        fixture
+            .fixture
+            .translator
+            .finish_exit(&fixture.fixture.memory, &mut snapshot, prepared, entered)
+            .expect("finish first sidecar miss"),
+        super::ThreadExit::Continue
     ));
     assert!(!cell.load_acquire().is_null());
     assert_eq!(
@@ -5893,8 +5883,8 @@ fn direct_binding_jittered_sigpipe_stress_preserves_state() {
             binding: DirectBindingExitMetadata::Mapped(_),
         } if source == fixture.target && target == fixture.source
     ));
-    let source_cell = fixture.source_cell.expect("cyclic source cell");
-    let target_cell = fixture.target_cell.expect("cyclic target cell");
+    let source_cell = fixture.source_cell().expect("cyclic source cell");
+    let target_cell = fixture.target_cell().expect("cyclic target cell");
     assert!(!source_cell.load_acquire().is_null());
     assert!(!target_cell.load_acquire().is_null());
 
@@ -6156,16 +6146,18 @@ impl ForcedDirectBindingSite {
 fn direct_binding_cell_addresses(fixture: &DirectBindingLiveFixture) -> [usize; 2] {
     [
         fixture
-            ._source_loaded
-            .as_ref()
-            .and_then(|loaded| loaded.binding_base)
-            .expect("source binding cell")
+            .fixture
+            .translator
+            .process
+            .shared_unit_binding_base_for_test(fixture.source)
+            .expect("installed source binding cell")
             .get(),
         fixture
-            ._target_loaded
-            .as_ref()
-            .and_then(|loaded| loaded.binding_base)
-            .expect("target binding cell")
+            .fixture
+            .translator
+            .process
+            .shared_unit_binding_base_for_test(fixture.target)
+            .expect("installed target binding cell")
             .get(),
     ]
 }
@@ -6735,18 +6727,6 @@ fn direct_binding_generation_change_clears_and_rebinds() {
         store.publish(&pending).expect("publish sidecar unit"),
         carrick_dsr_aarch64::shared_cache::PublishOutcome::Winner,
     );
-    let loaded = store
-        .load(&key, &[source_word])
-        .expect("load sidecar unit")
-        .expect("published sidecar unit");
-    let binding_base = loaded.binding_base.expect("SidecarV1 binding base");
-    // SAFETY: `loaded` pins the dylib and its writable binding cell until the
-    // final traversal and all acquired loads below have completed.
-    let cell = unsafe {
-        DirectBindingCellRef::from_mapped_address(binding_base).expect("loaded sidecar cell")
-    };
-    assert!(cell.load_acquire().is_null());
-
     fixture
         .translator
         .process
@@ -6779,6 +6759,19 @@ fn direct_binding_generation_change_clears_and_rebinds() {
         .translator
         .prepare_entry::<false>(&fixture.memory, &snapshot)
         .expect("load shared direct source");
+    // The translator's install just allocated the unit's cell block; the
+    // resolver has not run, so the installed cell starts null.
+    let binding_base = fixture
+        .translator
+        .process
+        .shared_unit_binding_base_for_test(source)
+        .expect("installed SidecarV1 binding base");
+    // SAFETY: the installed unit is retained by the ProcessTranslator until
+    // the final traversal and all acquired loads below have completed.
+    let cell = unsafe {
+        DirectBindingCellRef::from_mapped_address(binding_base).expect("installed sidecar cell")
+    };
+    assert!(cell.load_acquire().is_null());
     let first_miss = fixture
         .translator
         .enter_prepared::<false>(prepared_source, &mut snapshot)
@@ -6964,7 +6957,7 @@ fn translated_block_is_published_on_retirement_and_reused() {
             let manifest = TranslationUnitManifest {
                 schema: TRANSLATION_UNIT_SCHEMA_V2,
                 key: pending.key.clone(),
-                dylib_sha256: [0x33; 32],
+                code_sha256: [0x33; 32],
                 base_export: translation_unit_base_export(&pending.key)
                     .expect("keyed translation export"),
                 code_len: pending.code.len() as u64,

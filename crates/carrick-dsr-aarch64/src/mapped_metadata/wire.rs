@@ -220,7 +220,7 @@ pub(crate) struct WireHeaderV3 {
     pub reserved: U32<LittleEndian>,
     pub total_len: U64<LittleEndian>,
     pub key: WireTranslationUnitKeyV3,
-    pub dylib_sha256: [u8; 32],
+    pub code_sha256: [u8; 32],
     pub code_len: U64<LittleEndian>,
     pub binding_data_len: U64<LittleEndian>,
     pub binding_layout: U32<LittleEndian>,

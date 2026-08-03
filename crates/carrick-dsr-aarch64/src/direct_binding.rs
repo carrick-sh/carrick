@@ -199,12 +199,12 @@ impl DirectBindingTarget {
             (Some(left), None, None, Some(right), None, None) => Arc::ptr_eq(left, right),
             (None, Some(left), Some(left_index), None, Some(right), Some(right_index)) => {
                 left_index == right_index
-                    && left.base == right.base
+                    && left.source_base == right.source_base
                     && left.binding_base == right.binding_base
                     && left.key() == right.key()
             }
             (None, Some(left), None, None, Some(right), None) => {
-                left.base == right.base
+                left.source_base == right.source_base
                     && left.binding_base == right.binding_base
                     && left.key() == right.key()
             }
@@ -1515,7 +1515,7 @@ impl DirectBindingRegistry {
                             .collect(),
                         unit.published_bitmap.to_vec(),
                         unit.source_lease.key().clone(),
-                        unit.source_lease.base,
+                        unit.source_lease.source_base,
                         unit.source_lease.binding_base,
                     )
                 })
@@ -1546,10 +1546,9 @@ impl DirectBindingRegistry {
                             .private_epoch
                             .as_ref()
                             .map(|epoch| Arc::as_ptr(epoch) as usize),
-                        descriptor
-                            .shared_lease
-                            .as_ref()
-                            .map(|lease| (lease.key().clone(), lease.base, lease.binding_base)),
+                        descriptor.shared_lease.as_ref().map(|lease| {
+                            (lease.key().clone(), lease.source_base, lease.binding_base)
+                        }),
                         descriptor.shared_unit_index,
                     )
                 })

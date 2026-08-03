@@ -6,6 +6,14 @@
  * a redundant payload pid; Darwin exposes at most five reliable scalar
  * arguments at these probe sites.
  *
+ * Shared-range semantics (2026-08-02, copied-unit transport): a
+ * host-translated-shared-range event now names a SUBRANGE OF THE PRIVATE
+ * CACHE carrying unit identity — shared units are copied into the process's
+ * own MAP_JIT cache rather than dlopen'd into their own mapping. Private and
+ * shared ranges therefore OVERLAP by construction; do not add a
+ * disjointness check between them. Per-event range membership and the
+ * lifecycle counts below are unaffected.
+ *
  * Run:
  *   CARRICK_RUN_ID=<exact-id> timeout 120s target/release/carrick trace \
  *     --script scripts/dtrace/native-translated-range-catalog.d \

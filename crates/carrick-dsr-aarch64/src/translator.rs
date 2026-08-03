@@ -870,9 +870,13 @@ impl TranslatedRangeCatalog {
                 "translated-range sequence frontier is inconsistent".to_string(),
             ));
         }
-        if ranges_overlap(&self.private, &range) {
+        // The copied-unit transport installs shared code INSIDE the private
+        // cache (one executable authority), so a shared entry is a SUBRANGE
+        // of the private range carrying unit identity — the dlopen-era rule
+        // ("must not overlap the private cache") inverted into containment.
+        if !(self.private.start <= range.start && range.end <= self.private.end) {
             return Err(types::DsrError::CachePolicy(
-                "shared translated range overlaps the private cache".to_string(),
+                "shared translated range must lie inside the private cache".to_string(),
             ));
         }
         if self.shared.iter().any(|entry| entry.unit_id == unit_id) {
@@ -1103,6 +1107,41 @@ struct LoadedSharedUnit {
     _generation_bindings: Box<[gateway::GenerationBinding]>,
     _target_authority: Box<gateway::TargetCacheAuthority>,
     _direct_binding_unit_index: Option<usize>,
+}
+
+/// Every binding relocation carried by a loaded unit's metadata, in ordinal
+/// order, as one owned list the install copy can patch from — the V2 arm
+/// stores them directly, the V3 arm stores one wire record per binding.
+fn unit_binding_relocations(
+    metadata: &crate::shared_cache::LoadedTranslationMetadata,
+) -> Result<Vec<crate::shared_cache::DirectBindingRelocation>, types::DsrError> {
+    match metadata {
+        crate::shared_cache::LoadedTranslationMetadata::V2(manifest) => {
+            Ok(manifest.binding_relocations.clone())
+        }
+        crate::shared_cache::LoadedTranslationMetadata::V3(mapped) => {
+            // A `Disabled`-layout unit carries bindings but NO relocations and
+            // no cell block; walking one relocation per binding would read
+            // records that do not exist (the exact bug the loader's
+            // `disabled_layout_units_need_no_binding_code_validation` test
+            // pinned down).
+            if mapped.binding_data_len() == 0 {
+                return Ok(Vec::new());
+            }
+            (0..mapped.binding_count())
+                .map(|index| {
+                    mapped
+                        .binding(index)
+                        .map(|binding| binding.relocation())
+                        .ok_or_else(|| {
+                            types::DsrError::CachePolicy(
+                                "mapped binding relocation index is invalid".to_string(),
+                            )
+                        })
+                })
+                .collect()
+        }
+    }
 }
 
 struct PreparedSharedInstall {
@@ -2905,6 +2944,25 @@ impl ProcessTranslator {
             crate::direct_binding::DirectBindingRegistry::new(true);
     }
 
+    /// The binding-cell base of the INSTALLED shared unit whose key starts at
+    /// `guest`, if one is loaded. Under the copy transport the cells a
+    /// traversal publishes into belong to the unit the TRANSLATOR loaded at
+    /// install — a fixture's own separate store load observes a different,
+    /// never-consulted cell block, so tests must read this one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn shared_unit_binding_base_for_test(
+        &self,
+        guest: carrick_guest_mem::GuestVa,
+    ) -> Option<crate::direct_binding::DirectBindingCellVa> {
+        let state = self.state.read();
+        state.loaded_shared_units.iter().find_map(|unit| {
+            (unit._unit.key().guest_va_start() == guest)
+                .then_some(unit._unit.binding_base)
+                .flatten()
+        })
+    }
+
     #[doc(hidden)]
     pub fn lifecycle_snapshot(&self) -> (u64, u64, u64) {
         let state = self.state.read();
@@ -3093,6 +3151,10 @@ impl ProcessState {
         let prepared = match self.prepare_shared_install(tid, memory, unit) {
             Ok(prepared) => prepared,
             Err(types::DsrError::GenerationChanged { .. }) => return Ok(None),
+            // The copy transport spends this process's own cache capacity; a
+            // full cache means "translate privately" (which will fail the
+            // same way if truly out of room), never a hard guest error.
+            Err(types::DsrError::CacheCapacity { .. }) => return Ok(None),
             Err(error) => return Err(error),
         };
         self.commit_shared_install(prepared);
@@ -3173,7 +3235,62 @@ impl ProcessState {
                 "shared translation range length does not fit usize".to_string(),
             )
         })?;
-        let cache_start = unit.base;
+        // COPY the unit into this process's own translation cache — the
+        // single executable authority. The store's `base` is READABLE source
+        // bytes pinned by the unit's lease (a file mapping for the real
+        // store); nothing ever executes at that address. A later prepare
+        // failure leaks the copied extent until the exec-time cursor reset,
+        // which is safe (never reachable: no block points at it) and rare
+        // (every later rejection means a malformed or colliding unit).
+        let source_base = unit.source_base;
+        if source_base == 0 || !source_base.is_multiple_of(4) {
+            return Err(types::DsrError::CachePolicy(format!(
+                "shared translation source address is unusable: 0x{source_base:x}"
+            )));
+        }
+        // SAFETY: `TranslationUnitStore::load` contract — `base` addresses
+        // `code_len` readable bytes kept alive by the unit's `_lease`, and
+        // `code_len` was bounds-checked against the metadata just above.
+        let source = unsafe { std::slice::from_raw_parts(source_base as *const u8, code_len) };
+        let relocations = unit_binding_relocations(&unit.metadata)?;
+        let binding_data_len = usize::try_from(unit.metadata.binding_data_len()).map_err(|_| {
+            types::DsrError::CachePolicy("binding data length does not fit usize".to_string())
+        })?;
+        // Cell block presence is the store's half of the contract: a unit
+        // with sidecar data must arrive with the lease-pinned, zeroed cell
+        // block the copied code's ADRP/ADD pairs will be pointed at.
+        if (binding_data_len == 0) != unit.binding_base.is_none() {
+            return Err(types::DsrError::CachePolicy(
+                "binding cell block does not match the unit's binding data length".to_string(),
+            ));
+        }
+        let published = {
+            let mut writer = self.cache.begin_write(code_len)?;
+            if relocations.is_empty() {
+                writer.write_instruction_bytes(source)?;
+            } else {
+                let code_base = writer.entry().host().raw();
+                let mut patched = source.to_vec();
+                let cell_base = unit
+                    .binding_base
+                    .ok_or_else(|| {
+                        types::DsrError::CachePolicy(
+                            "unit carries binding relocations but no cell block".to_string(),
+                        )
+                    })?
+                    .get();
+                emit::patch_copied_binding_cell_relocations(
+                    &mut patched,
+                    code_base,
+                    cell_base,
+                    binding_data_len,
+                    &relocations,
+                )?;
+                writer.write_instruction_bytes(&patched)?;
+            }
+            writer.publish()?
+        };
+        let cache_start = published.entry().host().raw();
         let cache_end = cache_start.checked_add(code_len).ok_or_else(|| {
             types::DsrError::CachePolicy("shared translation range overflow".to_string())
         })?;
@@ -4758,10 +4875,11 @@ impl ProcessState {
         // The private cache is a bump allocator: `begin_write` hands out
         // strictly increasing extents, and the one cursor rewind
         // (`reset_after_fork_for_exec`) clears `published` with it, so a
-        // private block appends. A shared translation unit is dlopen'd into
-        // its OWN mapping at a base unrelated to that cursor, so its blocks
-        // can land below everything published so far -- they get their own
-        // list rather than breaking the append the private list relies on.
+        // private block appends. Shared units' blocks never come through
+        // here -- the install path indexes them into the shared list
+        // directly -- so under the copy transport (units live inside the
+        // cache range too) every caller lands in the private arm. The range
+        // test survives as a fail-safe for any non-cache entry.
         let index = if self.cache.host_range().contains(&entry.start.raw()) {
             &mut self.private_published_index
         } else {
@@ -6486,8 +6604,11 @@ mod tests {
 
     fn active_catalog() -> (TranslatedRangeCatalog, TranslatedRangeRecorderFixture) {
         let mut recorder = TranslatedRangeRecorderFixture::default();
+        // Wide enough that the shared fixture subranges (0x2000-0x6000) are
+        // CONTAINED: the copy transport installs shared units inside the
+        // private cache, so containment is the catalog's validity rule.
         let mut catalog = TranslatedRangeCatalog::dormant_with_recorder(
-            HostVa(0x1000)..HostVa(0x2000),
+            HostVa(0x1000)..HostVa(0x8000),
             &mut recorder,
         )
         .expect("dormant catalog");
@@ -7046,11 +7167,10 @@ mod tests {
         recorder.events.clear();
 
         for (case, unit, start, end) in [
-            ("exact private", 12, 0x1000, 0x2000),
-            ("inside private", 12, 0x1400, 0x1800),
-            ("contains private", 12, 0x0800, 0x2800),
-            ("partial private below", 12, 0x0800, 0x1400),
-            ("partial private above", 12, 0x1800, 0x2800),
+            ("escapes private below", 12, 0x0800, 0x1400),
+            ("contains private", 12, 0x0800, 0x8800),
+            ("escapes private above", 12, 0x7800, 0x8800),
+            ("entirely outside private", 12, 0x9000, 0xa000),
             ("duplicate id equal range", 11, 0x3000, 0x4000),
             ("duplicate id disjoint range", 11, 0x5000, 0x6000),
             ("exact shared overlap", 12, 0x3000, 0x4000),
@@ -7418,7 +7538,7 @@ mod tests {
         TranslationUnitManifest {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
             key,
-            dylib_sha256: [0x42; 32],
+            code_sha256: [0x42; 32],
             base_export,
             code_len: 16,
             blocks: vec![PortableBlockRecord {
@@ -7438,12 +7558,28 @@ mod tests {
         }
     }
 
-    fn shared_install_unit(base: usize) -> SharedLoadedTranslationUnit {
-        SharedLoadedTranslationUnit::new(shared_install_manifest(), base, Arc::new(()))
+    /// Lease-pinned readable source bytes for a fixture unit — the copy
+    /// transport's install DEREFERENCES `base`, so a fixture can no longer
+    /// hand out a fabricated address the way the dlopen-era fixtures did.
+    fn leased_fixture_code(code_len: usize) -> (usize, Arc<dyn Send + Sync>) {
+        const NOP: u32 = 0xd503_201f;
+        let words: Vec<u8> = std::iter::repeat_n(NOP.to_le_bytes(), code_len.div_ceil(4))
+            .flatten()
+            .take(code_len)
+            .collect();
+        let lease: Arc<Vec<u8>> = Arc::new(words);
+        let base = lease.as_ptr() as usize;
+        (base, lease)
     }
 
-    fn v2_shared_install_unit(base: usize) -> SharedLoadedTranslationUnit {
-        let mut unit = shared_install_unit(base);
+    fn shared_install_unit() -> SharedLoadedTranslationUnit {
+        let manifest = shared_install_manifest();
+        let (base, lease) = leased_fixture_code(manifest.code_len as usize);
+        SharedLoadedTranslationUnit::new(manifest, base, lease)
+    }
+
+    fn v2_shared_install_unit() -> SharedLoadedTranslationUnit {
+        let mut unit = shared_install_unit();
         unit.load_evidence = TranslationMetadataLoadEvidence {
             mode: TranslationMetadataMode::V2,
             bytes_read: 2_468,
@@ -7455,7 +7591,7 @@ mod tests {
         unit
     }
 
-    fn mapped_shared_install_unit(base: usize) -> SharedLoadedTranslationUnit {
+    fn mapped_shared_install_unit() -> SharedLoadedTranslationUnit {
         let manifest = shared_install_manifest();
         let bytes = encode_translation_metadata_v3(&manifest).expect("encode mapped fixture");
         let metadata = ValidatedMappedTranslationMetadata::new(
@@ -7463,6 +7599,7 @@ mod tests {
             &manifest.key,
         )
         .expect("validate mapped fixture");
+        let (base, lease) = leased_fixture_code(manifest.code_len as usize);
         SharedLoadedTranslationUnit::new_mapped(
             metadata,
             base,
@@ -7474,7 +7611,7 @@ mod tests {
                 mapped_records: 6,
                 owned_records: 0,
             },
-            Arc::new(()),
+            lease,
         )
     }
 
@@ -7516,7 +7653,7 @@ mod tests {
         }
     }
 
-    fn shared_sensitive_install_unit(base: usize) -> SharedLoadedTranslationUnit {
+    fn shared_sensitive_install_unit() -> SharedLoadedTranslationUnit {
         let block = |guest_start: GuestVa, generation_binding, entry_offset| {
             let map = pc_map(&[
                 (guest_start.raw(), 0),
@@ -7546,11 +7683,12 @@ mod tests {
         };
         let key = direct_binding_owner_and_publication::key(43);
         let base_export = translation_unit_base_export(&key).expect("keyed translation export");
+        let (base, lease) = leased_fixture_code(32);
         SharedLoadedTranslationUnit::new(
             TranslationUnitManifest {
                 schema: TRANSLATION_UNIT_SCHEMA_V2,
                 key,
-                dylib_sha256: [0x43; 32],
+                code_sha256: [0x43; 32],
                 base_export,
                 code_len: 32,
                 blocks: vec![
@@ -7565,7 +7703,7 @@ mod tests {
                 binding_relocations: Vec::new(),
             },
             base,
-            Arc::new(()),
+            lease,
         )
     }
 
@@ -7580,7 +7718,6 @@ mod tests {
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
         state.profiling = true;
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
         let fusion = shared_sensitive_fusion(sensitive_key.0, 0x885f_fc20);
         let metadata = shared_sensitive_metadata(GuestVa(0x40000c), Some(fusion));
@@ -7599,7 +7736,7 @@ mod tests {
             .prepare_shared_install_with_sensitive_planner(
                 73,
                 &memory,
-                shared_sensitive_install_unit(base),
+                shared_sensitive_install_unit(),
                 |_| Ok((sensitive_key, metadata, Some(fusion))),
             )
             .expect("converging sensitive owners");
@@ -7727,7 +7864,8 @@ mod tests {
         assert_eq!(state.blocks.len(), 2);
         assert_eq!(state.exclusive_fusion_site_counts().iter().sum::<u64>(), 1);
         assert_ne!(state.executable_ranges.head_ptr(), head_before);
-        assert!(state.executable_ranges.contains(base));
+        let entry = state.blocks[&(GuestVa(0x400000), types::CodeGeneration::INITIAL)];
+        assert!(state.executable_ranges.contains(entry.host().raw()));
     }
 
     #[test]
@@ -7741,7 +7879,6 @@ mod tests {
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
         state.profiling = true;
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
         let first_fusion = shared_sensitive_fusion(GuestVa(0x400000), 0x885f_fc20);
         let second_fusion = shared_sensitive_fusion(GuestVa(0x400010), 0x885f_7c20);
@@ -7751,7 +7888,7 @@ mod tests {
             .prepare_shared_install_with_sensitive_planner(
                 73,
                 &memory,
-                shared_sensitive_install_unit(base),
+                shared_sensitive_install_unit(),
                 |block_start| {
                     let fusion = if block_start == GuestVa(0x400000) {
                         first_fusion
@@ -7801,7 +7938,6 @@ mod tests {
             .expect("activate catalog");
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
         let fusion = shared_sensitive_fusion(sensitive_key.0, 0x885f_fc20);
         let metadata = shared_sensitive_metadata(GuestVa(0x40000c), Some(fusion));
@@ -7812,7 +7948,7 @@ mod tests {
             .prepare_shared_install_with_sensitive_planner(
                 73,
                 &memory,
-                shared_sensitive_install_unit(base),
+                shared_sensitive_install_unit(),
                 |_| Ok((sensitive_key, metadata, Some(fusion))),
             )
             .expect("matching installed sensitive metadata");
@@ -7831,7 +7967,6 @@ mod tests {
             .expect("activate catalog");
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
         let installed = shared_sensitive_metadata(GuestVa(0x40000c), None);
         let conflict = shared_sensitive_metadata(GuestVa(0x400010), None);
@@ -7841,7 +7976,7 @@ mod tests {
         let result = state.prepare_shared_install_with_sensitive_planner(
             73,
             &memory,
-            shared_sensitive_install_unit(base),
+            shared_sensitive_install_unit(),
             |_| Ok((sensitive_key, conflict, None)),
         );
 
@@ -7863,14 +7998,13 @@ mod tests {
             .expect("activate catalog");
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let sensitive_key = (GuestVa(0x400008), types::CodeGeneration::INITIAL);
         let before = state.shared_install_logical_snapshot_for_test();
 
         let result = state.prepare_shared_install_with_sensitive_planner(
             73,
             &memory,
-            shared_sensitive_install_unit(base),
+            shared_sensitive_install_unit(),
             |block_start| {
                 let resume = if block_start == GuestVa(0x400000) {
                     GuestVa(0x40000c)
@@ -7899,7 +8033,6 @@ mod tests {
             .expect("activate catalog");
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let key = (GuestVa(0x400000), types::CodeGeneration::INITIAL);
         state
             .sensitive
@@ -7907,7 +8040,7 @@ mod tests {
         let before = state.shared_install_logical_snapshot_for_test();
 
         state
-            .prepare_shared_install(73, &memory, shared_install_unit(base))
+            .prepare_shared_install(73, &memory, shared_install_unit())
             .expect("terminal metadata is not a block-start collision");
 
         assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
@@ -7925,13 +8058,12 @@ mod tests {
                 .expect("activate catalog");
             let memory = NativeMappedMemory::shared_install_test_fixture(4096);
             let mut state = process.state.write();
-            let base = (state.cache.host_range().end + 0x10_000) & !3;
             let before = state.shared_install_logical_snapshot_for_test();
             assert_eq!(before.stats, ResolverStats::default());
             assert_eq!(before.reported_stats, ResolverStats::default());
             set_shared_install_prepare_failpoint_for_test(Some(stage));
 
-            let result = state.prepare_shared_install(73, &memory, v2_shared_install_unit(base));
+            let result = state.prepare_shared_install(73, &memory, v2_shared_install_unit());
             set_shared_install_prepare_failpoint_for_test(None);
 
             assert!(result.is_err(), "{stage:?}");
@@ -7943,7 +8075,7 @@ mod tests {
             assert_eq!(metadata_stats(state.stats), [0; 7], "{stage:?}");
 
             let prepared = state
-                .prepare_shared_install(73, &memory, v2_shared_install_unit(base))
+                .prepare_shared_install(73, &memory, v2_shared_install_unit())
                 .unwrap_or_else(|error| panic!("{stage:?} retry prepare: {error}"));
             assert_eq!(
                 state.shared_install_logical_snapshot_for_test(),
@@ -8013,11 +8145,10 @@ mod tests {
             .note_guest_code_write(GuestVa(0x400000)..GuestVa(0x400004))
             .expect("advance guest generation");
         let mut state = process.state.write();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let before = state.shared_install_logical_snapshot_for_test();
 
         assert!(matches!(
-            state.prepare_shared_install(73, &memory, shared_install_unit(base)),
+            state.prepare_shared_install(73, &memory, shared_install_unit()),
             Err(types::DsrError::GenerationChanged { .. })
         ));
         assert_eq!(state.shared_install_logical_snapshot_for_test(), before);
@@ -8034,14 +8165,16 @@ mod tests {
         recorder.events.clear();
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let head_before = state.executable_ranges.head_ptr();
 
         let prepared = state
-            .prepare_shared_install(73, &memory, shared_install_unit(base))
+            .prepare_shared_install(73, &memory, shared_install_unit())
             .expect("prepare shared install");
         let prepared_id = prepared.loaded_unit.unit_id;
         assert_eq!(prepared.catalog_entry.unit_id, prepared_id);
+        // The copy transport decides where the unit lives: read it back from
+        // the prepared range rather than assuming a foreign mapping address.
+        let base = prepared.cache_range.start;
         state.commit_shared_install_with_recorder(prepared, &mut recorder);
 
         assert_eq!(state.translated_ranges.shared.len(), 1);
@@ -8101,6 +8234,56 @@ mod tests {
         );
     }
 
+    /// The shared-unit transport contract: a loaded unit's `base` is READABLE
+    /// source bytes, and installing it COPIES those bytes into this process's
+    /// own translation cache — the single executable authority. Entries must
+    /// come out inside `cache.host_range()`, and the copied words must equal
+    /// the source words. Red against the dlopen-era install, which executed
+    /// the unit in place at a foreign mapping outside the cache.
+    #[test]
+    fn shared_install_copies_unit_code_into_the_process_cache() {
+        let process =
+            ProcessTranslator::new_with_host(64 * 1024, &TEST_HOST_JIT).expect("translator");
+        let mut recorder = TranslatedRangeRecorderFixture::default();
+        process
+            .activate_translated_range_catalog_with_recorder(&mut recorder)
+            .expect("activate catalog");
+        let memory = NativeMappedMemory::shared_install_test_fixture(4096);
+        let mut state = process.state.write();
+        // Distinctive source words so the copy is provable byte-for-byte.
+        let source_words: Vec<u8> = [0xd503_201f_u32, 0xd503_2020, 0xd503_2040, 0xd503_2060]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let lease: Arc<Vec<u8>> = Arc::new(source_words.clone());
+        let base = lease.as_ptr() as usize;
+        let unit = SharedLoadedTranslationUnit::new(shared_install_manifest(), base, lease);
+        let cache_range = state.cache.host_range();
+
+        let prepared = state
+            .prepare_shared_install(73, &memory, unit)
+            .expect("prepare copied shared install");
+        assert!(
+            cache_range.contains(&prepared.cache_range.start)
+                && prepared.cache_range.end <= cache_range.end,
+            "copied unit must live inside the process cache: unit {:x?} vs cache {cache_range:x?}",
+            prepared.cache_range,
+        );
+        state.commit_shared_install(prepared);
+
+        let entry = state.blocks[&(GuestVa(0x400000), types::CodeGeneration::INITIAL)];
+        let entry_address = entry.host().raw();
+        assert!(
+            cache_range.contains(&entry_address),
+            "installed shared entry 0x{entry_address:x} must be inside the cache {cache_range:x?}",
+        );
+        // SAFETY: the entry was just published inside the process cache
+        // mapping, which stays alive for the duration of this test.
+        let copied =
+            unsafe { std::slice::from_raw_parts(entry_address as *const u8, source_words.len()) };
+        assert_eq!(copied, source_words.as_slice(), "copy must be byte-exact");
+    }
+
     #[test]
     fn mapped_shared_unit_references_metadata_and_resolves_every_cache_offset() {
         let process =
@@ -8111,11 +8294,11 @@ mod tests {
             .expect("activate catalog");
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
 
         let prepared = state
-            .prepare_shared_install(73, &memory, mapped_shared_install_unit(base))
+            .prepare_shared_install(73, &memory, mapped_shared_install_unit())
             .expect("prepare mapped shared install");
+        let base = prepared.cache_range.start;
         state.commit_shared_install(prepared);
 
         assert_eq!(state.loaded_shared_units.len(), 1);
@@ -8176,10 +8359,9 @@ mod tests {
             .expect("activate catalog");
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
 
         let prepared = state
-            .prepare_shared_install(73, &memory, mapped_shared_install_unit(base))
+            .prepare_shared_install(73, &memory, mapped_shared_install_unit())
             .expect("prepare mapped shared install");
         assert_eq!(state.stats.shared_metadata_bytes_mapped, 0);
         assert_eq!(state.stats.shared_mapped_immutable_records, 0);
@@ -8205,10 +8387,9 @@ mod tests {
             .expect("activate catalog");
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
 
         let prepared = state
-            .prepare_shared_install(73, &memory, v2_shared_install_unit(base))
+            .prepare_shared_install(73, &memory, v2_shared_install_unit())
             .expect("prepare V2 shared install");
         assert_eq!(state.stats.shared_metadata_bytes_read, 0);
         assert_eq!(state.stats.shared_owned_immutable_records, 0);
@@ -8248,10 +8429,10 @@ mod tests {
             .expect("activate catalog");
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let prepared = state
-            .prepare_shared_install(73, &memory, mapped_shared_install_unit(base))
+            .prepare_shared_install(73, &memory, mapped_shared_install_unit())
             .expect("prepare mapped shared install");
+        let base = prepared.cache_range.start;
         state.commit_shared_install(prepared);
         let cache_pc = GuestVa(u64::try_from(base).expect("cache PC"));
 
@@ -8320,14 +8501,12 @@ mod tests {
                 .expect("activate catalog");
             let memory = NativeMappedMemory::shared_install_test_fixture(4096);
             let mut state = process.state.write();
-            let base = (state.cache.host_range().end + 0x10_000) & !3;
             let before = state.shared_install_logical_snapshot_for_test();
             assert_eq!(before.stats, ResolverStats::default());
             assert_eq!(before.reported_stats, ResolverStats::default());
             set_shared_install_prepare_failpoint_for_test(Some(stage));
 
-            let result =
-                state.prepare_shared_install(73, &memory, mapped_shared_install_unit(base));
+            let result = state.prepare_shared_install(73, &memory, mapped_shared_install_unit());
             set_shared_install_prepare_failpoint_for_test(None);
 
             assert!(result.is_err(), "{stage:?}");
@@ -8339,7 +8518,7 @@ mod tests {
             assert_eq!(metadata_stats(state.stats), [0; 7], "{stage:?}");
 
             let prepared = state
-                .prepare_shared_install(73, &memory, mapped_shared_install_unit(base))
+                .prepare_shared_install(73, &memory, mapped_shared_install_unit())
                 .unwrap_or_else(|error| panic!("{stage:?} retry prepare: {error}"));
             assert_eq!(
                 state.shared_install_logical_snapshot_for_test(),
@@ -8406,8 +8585,11 @@ mod tests {
         let memory = NativeMappedMemory::shared_install_test_fixture(4096);
         let mut state = process.state.write();
         let before = state.shared_install_logical_snapshot_for_test();
-        let base = (state.cache.host_range().end + 0x10_000) & !3;
         let manifest = shared_install_manifest();
+        // Local readable code bytes: the copy transport dereferences `base`
+        // during prepare, before the armed guest-range fault fires.
+        let source_code = vec![0_u8; manifest.code_len as usize];
+        let base = source_code.as_ptr() as usize;
         let backing_drops = Arc::new(AtomicUsize::new(0));
         let lease_drops = Arc::new(AtomicUsize::new(0));
         let metadata = ValidatedMappedTranslationMetadata::new(
@@ -8601,11 +8783,10 @@ mod tests {
             publish_private_sized(state, generations, guest, WORDS)
         }
 
-        /// Index a block whose code is NOT in the private cache. A shared
-        /// translation unit is dlopen'd into its own mapping, so
-        /// `try_load_shared_unit` publishes entries at a base that bears no
-        /// relation to the bump cursor -- including below every private block
-        /// published so far.
+        /// Index a block whose code is NOT in the private cache. Real
+        /// shared units are copied INTO the cache now, but the shared index
+        /// must stay correct for entries at arbitrary addresses -- this
+        /// fixture pins the ordering behavior for the non-cache case.
         fn publish_foreign(
             state: &mut ProcessState,
             generations: &PageGenerationTable,
@@ -8847,7 +9028,7 @@ mod tests {
                 TranslationUnitManifest {
                     schema: TRANSLATION_UNIT_SCHEMA_V2,
                     key: unit_key,
-                    dylib_sha256: [0x55; 32],
+                    code_sha256: [0x55; 32],
                     base_export,
                     code_len: 0x1000,
                     blocks: Vec::new(),
@@ -8875,7 +9056,7 @@ mod tests {
                 TranslationUnitManifest {
                     schema: TRANSLATION_UNIT_SCHEMA_V2,
                     key: unit_key,
-                    dylib_sha256: [0x66; 32],
+                    code_sha256: [0x66; 32],
                     base_export,
                     code_len: 0x1000,
                     blocks: Vec::new(),
@@ -8914,7 +9095,7 @@ mod tests {
             manifest.base_export =
                 super::translation_unit_base_export(&unit_key).expect("keyed translation export");
             manifest.key = unit_key;
-            manifest.dylib_sha256 = [0x72; 32];
+            manifest.code_sha256 = [0x72; 32];
             manifest.code_len = 0x1000;
             manifest.binding_layout = DirectBindingLayout::SidecarV1;
             manifest.binding_export = TRANSLATION_UNIT_BINDING_EXPORT.to_string();
@@ -10134,11 +10315,13 @@ mod tests {
             recorder.events.clear();
             {
                 let mut state = process.state.write();
+                // A copied unit is a subrange of the private cache.
+                let private = state.translated_ranges.private.clone();
                 let prepared = state
                     .translated_ranges
                     .prepare_shared(
                         carrick_dsr::probes::TranslatedUnitId::new(29).expect("unit id"),
-                        carrick_guest_mem::HostVa(0x30_0000)..carrick_guest_mem::HostVa(0x31_0000),
+                        private.start..carrick_guest_mem::HostVa(private.start.raw() + 0x100),
                     )
                     .expect("prepare inherited shared range");
                 state
@@ -10147,6 +10330,8 @@ mod tests {
             }
             recorder.events.clear();
             let private = process.state.read().translated_ranges.private.clone();
+            let shared_range =
+                private.start..carrick_guest_mem::HostVa(private.start.raw() + 0x100);
             let epoch = carrick_dsr::probes::TranslatedRangeEpoch::new(2).expect("child epoch");
 
             let stats = process
@@ -10179,8 +10364,7 @@ mod tests {
                                 carrick_dsr::probes::TranslatedRangeSequence::new(2)
                                     .expect("shared sequence"),
                                 carrick_dsr::probes::TranslatedUnitId::new(29).expect("unit id"),
-                                carrick_guest_mem::HostVa(0x30_0000)
-                                    ..carrick_guest_mem::HostVa(0x31_0000),
+                                shared_range,
                             )
                             .expect("shared replay"),
                         ),
@@ -10230,11 +10414,13 @@ mod tests {
                 .expect("activate parent catalog");
             {
                 let mut state = process.state.write();
+                // A copied unit is a subrange of the private cache.
+                let private = state.translated_ranges.private.clone();
                 let prepared = state
                     .translated_ranges
                     .prepare_shared(
                         carrick_dsr::probes::TranslatedUnitId::new(30).expect("unit id"),
-                        carrick_guest_mem::HostVa(0x32_0000)..carrick_guest_mem::HostVa(0x33_0000),
+                        private.start..carrick_guest_mem::HostVa(private.start.raw() + 0x100),
                     )
                     .expect("prepare inherited shared range");
                 state
@@ -10520,12 +10706,24 @@ mod tests {
                 .activate_translated_range_catalog()
                 .expect("activate translated catalog");
             let mut state = process.state.write();
-            let start = 0x2000_0000 + seed * 0x20_000;
+            // Copied units live INSIDE the private cache, so the fixture's
+            // shared range must be a private-cache subrange.
+            let private = state.translated_ranges.private.clone();
+            let start = private
+                .start
+                .raw()
+                .checked_add(usize::try_from(seed).expect("seed") * 0x100)
+                .expect("seeded shared range start");
+            let end = start.checked_add(0x80).expect("seeded shared range end");
+            assert!(
+                end <= private.end.raw(),
+                "fixture shared range must stay inside the private cache"
+            );
             let prepared = state
                 .translated_ranges
                 .prepare_shared(
                     carrick_dsr::probes::TranslatedUnitId::new(seed).expect("unit id"),
-                    HostVa(start as usize)..HostVa((start + 0x10_000) as usize),
+                    HostVa(start)..HostVa(end),
                 )
                 .expect("prepare translated shared range");
             state.translated_ranges.commit_shared(prepared);

@@ -115,8 +115,8 @@ impl ValidatedMappedTranslationMetadata {
     pub fn key(&self) -> &TranslationUnitKey {
         &self.key
     }
-    pub fn dylib_sha256(&self) -> [u8; 32] {
-        self.header().dylib_sha256
+    pub fn code_sha256(&self) -> [u8; 32] {
+        self.header().code_sha256
     }
     pub fn code_len(&self) -> u64 {
         self.header().code_len.get()
@@ -1273,7 +1273,7 @@ pub(super) mod tests {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
             base_export: translation_unit_base_export(&key).expect("base export"),
             key,
-            dylib_sha256: [0x33; 32],
+            code_sha256: [0x33; 32],
             code_len: 512,
             blocks: vec![
                 PortableBlockRecord {
@@ -1411,7 +1411,7 @@ pub(super) mod tests {
         .expect("validate V3 fixture");
 
         assert_eq!(mapped.key(), &manifest.key);
-        assert_eq!(mapped.dylib_sha256(), manifest.dylib_sha256);
+        assert_eq!(mapped.code_sha256(), manifest.code_sha256);
         assert_eq!(mapped.code_len(), manifest.code_len);
         assert_eq!(mapped.block_count(), manifest.blocks.len());
         for (index, owned) in manifest.blocks.iter().enumerate() {

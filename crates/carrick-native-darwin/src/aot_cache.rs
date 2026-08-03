@@ -1,15 +1,52 @@
 //! Container-lifetime authority for portable native AArch64 translations.
+//!
+//! # The transport
+//!
+//! A published unit is a PAIR of plain files in the container-private cache
+//! directory: `{stem}.code` (the raw translated instruction bytes, with the
+//! direct-binding `ADRP`/`ADD` placeholder pairs UNRESOLVED) and
+//! `{stem}.metadata-v3` (the mapped metadata, carrying `code_sha256` over
+//! those exact bytes). Loading maps both read-only, digest-verifies the code
+//! against the metadata, and hands the bytes to the translator, which COPIES
+//! them into its own per-process `MAP_JIT` translation cache and re-points
+//! the binding placeholders at the zeroed cell block this store allocates
+//! per load.
+//!
+//! # Why not a signed dylib (the previous transport)
+//!
+//! Units used to be emitted as ad-hoc-signed Mach-O dylibs and loaded with
+//! `dlopen` — chosen because a file-backed executable mapping is free at
+//! `fork(2)` while `MAP_JIT` VA range is not (MEASURED: +567 us fork p50 per
+//! 64 MiB of `MAP_JIT`), and AMFI refuses `mmap(PROT_EXEC)` of unsigned
+//! files. But the LOAD cost the dylib transport what the fork path saved,
+//! many times over: 14.76 ms median per process for a ~6 MiB unit (~400
+//! MB/s — page-fault plus code-signature validation, not dyld CPU;
+//! `docs/perf-results/2026-08-02-exec-cost-decomposed.jsonl`), paid by
+//! every one of a build's ~61 exec'd processes, plus two `/usr/bin/codesign`
+//! process spawns per publication. The copy transport adds NO `MAP_JIT`
+//! range (the per-process translation cache is already mapped at fixed
+//! capacity; copied units consume its cursor exactly like privately
+//! translated code), needs no signature (nothing maps the file executable),
+//! and loads at memcpy-plus-digest speed.
+//!
+//! # Crash safety
+//!
+//! Both halves are written to `NamedTempFile`s, flushed, fsync'd, preflighted
+//! through the READER (metadata), and atomically renamed into place — a
+//! half-written unit is never loadable, and the digest binds the code file
+//! to the metadata that describes it (a stale orphan from a crashed publish
+//! can never pair with fresh metadata).
 
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use carrick_dsr_aarch64::direct_binding::{DirectBindingCellRef, DirectBindingCellVa};
+use carrick_dsr_aarch64::direct_binding::DirectBindingCellVa;
 use carrick_dsr_aarch64::mapped_metadata::{
     MappedMetadataError, MetadataBacking, ValidatedMappedTranslationMetadata,
     encode_translation_metadata_v3,
@@ -17,10 +54,9 @@ use carrick_dsr_aarch64::mapped_metadata::{
 use carrick_dsr_aarch64::shared_cache::ManifestDefect;
 pub use carrick_dsr_aarch64::shared_cache::PublishOutcome;
 use carrick_dsr_aarch64::shared_cache::{
-    LoadedTranslationMetadata, LoadedTranslationProtection, MAX_TRANSLATION_UNIT_CODE_BYTES,
-    PendingTranslationUnit, SourceFingerprint, TRANSLATION_UNIT_BINDING_EXPORT,
-    TRANSLATION_UNIT_SCHEMA_V2, TranslationMetadataLoadEvidence, TranslationMetadataMode,
-    TranslationUnitKey, TranslationUnitManifest, UnitMissReason, pin_loaded_translation_protection,
+    LoadedTranslationMetadata, MAX_TRANSLATION_UNIT_CODE_BYTES, PendingTranslationUnit,
+    SourceFingerprint, TRANSLATION_UNIT_SCHEMA_V2, TranslationMetadataLoadEvidence,
+    TranslationMetadataMode, TranslationUnitKey, TranslationUnitManifest, UnitMissReason,
     shared_source_fingerprint_reuse_enabled, translation_unit_base_export,
 };
 use sha2::{Digest, Sha256};
@@ -29,7 +65,6 @@ const AUTHORITY_MARKER: &str = ".carrick-authority";
 const AUTHORITY_NONCE_LEN: usize = 16;
 const MANIFEST_DECODE_LIMIT: usize = 256 * 1024 * 1024;
 const MAX_MAPPED_METADATA_BYTES: u64 = MANIFEST_DECODE_LIMIT as u64;
-const AOT_SEGMENT_PAGE_SIZE: u64 = 16 * 1024;
 
 static CONTAINER_CACHE: Mutex<Option<ContainerCacheAuthority>> = Mutex::new(None);
 
@@ -118,23 +153,26 @@ impl std::error::Error for UnitStoreError {
 
 #[derive(Debug)]
 pub struct LoadedTranslationUnit {
-    // Fields drop in declaration order. Release dyld first so the mapped
-    // metadata remains live through handle teardown.
-    lease: Arc<LoadedTranslationLease>,
+    // Fields drop in declaration order. Release the source lease (the code
+    // file mapping plus the unit's cell block) last, after nothing else can
+    // reference either.
+    lease: Arc<CodeSourceLease>,
     pub metadata: LoadedTranslationMetadata,
-    pub base: std::ptr::NonNull<u8>,
+    /// Readable source bytes for the translator's install copy. Nothing
+    /// executes here — see `SharedLoadedTranslationUnit::source_base`.
+    pub source_base: std::ptr::NonNull<u8>,
     pub binding_base: Option<DirectBindingCellVa>,
     pub load_evidence: TranslationMetadataLoadEvidence,
 }
 
 impl LoadedTranslationUnit {
     fn into_shared(self) -> carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit {
-        let base = self.base.as_ptr() as usize;
+        let source_base = self.source_base.as_ptr() as usize;
         match self.metadata {
             LoadedTranslationMetadata::V2(manifest) => {
                 let mut unit = carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit::new_with_binding_base(
                     manifest,
-                    base,
+                    source_base,
                     self.binding_base,
                     self.lease,
                 );
@@ -144,7 +182,7 @@ impl LoadedTranslationUnit {
             LoadedTranslationMetadata::V3(metadata) => {
                 carrick_dsr_aarch64::shared_cache::SharedLoadedTranslationUnit::new_mapped_with_binding_base(
                     metadata,
-                    base,
+                    source_base,
                     self.binding_base,
                     self.load_evidence,
                     self.lease,
@@ -166,31 +204,73 @@ impl MetadataBacking for ReadOnlyMetadataMapping {
     }
 }
 
+/// Pins one loaded unit's backing for the copy transport: the read-only
+/// private mapping of `{stem}.code` (and the inode under it, which
+/// publication never writes in place — only whole-file renames), plus the
+/// unit's zeroed direct-binding cell block when it carries sidecar data.
 #[derive(Debug)]
-struct LoadedTranslationLease {
-    handle: std::ptr::NonNull<libc::c_void>,
+struct CodeSourceLease {
+    _mapping: memmap2::Mmap,
+    _file: File,
+    _cells: Option<BindingCellBlock>,
 }
 
-// SAFETY: dyld owns the immutable code mapping for `handle`; writable data is
-// reachable only through `DirectBindingCellRef` atomics. The manifest is
-// immutable, and Drop is the sole `dlclose` after the final lease releases the
-// loaded unit.
-unsafe impl Send for LoadedTranslationUnit {}
-// SAFETY: see `Send`; code is immutable and binding data is reachable only
-// through `DirectBindingCellRef` atomics.
-unsafe impl Sync for LoadedTranslationUnit {}
+/// Anonymous, zero-initialized, plain-RW cell block — the copy transport's
+/// replacement for the dylib `__DATA` segment. Deliberately NOT `MAP_JIT`:
+/// cells are written through `DirectBindingCellRef` atomics by threads whose
+/// per-thread JIT write window is closed.
+#[derive(Debug)]
+struct BindingCellBlock {
+    base: std::ptr::NonNull<u8>,
+    len: usize,
+}
 
-// SAFETY: dyld owns the handle's immutable mappings; the handle is only
-// released when the final `Arc` drops.
-unsafe impl Send for LoadedTranslationLease {}
-// SAFETY: see `Send`; no mutation is exposed through this lifetime token.
-unsafe impl Sync for LoadedTranslationLease {}
+impl BindingCellBlock {
+    fn new(len: usize) -> std::io::Result<Self> {
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let base = std::ptr::NonNull::new(mapped.cast::<u8>())
+            .ok_or_else(|| std::io::Error::other("cell block mapped at null"))?;
+        Ok(Self { base, len })
+    }
 
-impl Drop for LoadedTranslationLease {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::dlclose(self.handle.as_ptr()) };
+    fn base_va(&self) -> Option<DirectBindingCellVa> {
+        DirectBindingCellVa::mapped(self.base.as_ptr() as usize)
     }
 }
+
+impl Drop for BindingCellBlock {
+    fn drop(&mut self) {
+        // SAFETY: `base`/`len` are exactly the mapping created in `new`.
+        let _ = unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
+    }
+}
+
+// SAFETY: the code mapping is immutable (read-only private map of an inode
+// that is never written in place) and the cell block is only ever mutated
+// through `DirectBindingCellRef` atomics; unmapping happens solely on the
+// final lease drop.
+unsafe impl Send for BindingCellBlock {}
+// SAFETY: see `Send`; shared access to cells is atomic-only.
+unsafe impl Sync for BindingCellBlock {}
+
+// SAFETY: `source_base` addresses the immutable read-only mapping owned by
+// `lease`; `binding_base` addresses the lease's cell block, mutated only
+// through `DirectBindingCellRef` atomics. The metadata is immutable.
+unsafe impl Send for LoadedTranslationUnit {}
+// SAFETY: see `Send`.
+unsafe impl Sync for LoadedTranslationUnit {}
 
 struct UnitFileLock(File);
 
@@ -300,6 +380,62 @@ fn open_metadata_at(directory: &File, name: &CStr) -> Result<(File, usize), Unit
     })?;
     Ok((file, length))
 }
+
+/// Open one published unit half by name inside the authority directory:
+/// `O_NOFOLLOW`, regular-file-only, with its exact byte length. `ENOENT` is a
+/// `MissingPair` (a genuine cache miss); everything else is schema-shaped.
+fn open_unit_regular_file_at(
+    directory: &File,
+    name: &CStr,
+) -> Result<(File, usize), UnitStoreError> {
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        let reason = if error.raw_os_error() == Some(libc::ENOENT) {
+            UnitMissReason::MissingPair
+        } else {
+            UnitMissReason::Schema
+        };
+        return Err(UnitStoreError::with_source(
+            "open translation code",
+            reason,
+            error,
+        ));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(file.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+        return Err(UnitStoreError::with_source(
+            "stat translation code",
+            UnitMissReason::Schema,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let status = unsafe { status.assume_init() };
+    if status.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(UnitStoreError::new(
+            "validate translation code file type",
+            UnitMissReason::Schema,
+        ));
+    }
+    let length = u64::try_from(status.st_size)
+        .ok()
+        .and_then(|length| usize::try_from(length).ok())
+        .ok_or_else(|| {
+            UnitStoreError::new(
+                "validate translation code size",
+                UnitMissReason::ManifestRange,
+            )
+        })?;
+    Ok((file, length))
+}
+
 fn map_and_validate_metadata(
     directory: &File,
     name: &CStr,
@@ -356,382 +492,6 @@ fn map_and_validate_metadata(
     ))
 }
 
-#[derive(Clone, Copy)]
-struct MachOSectionRange {
-    address: u64,
-    size: u64,
-    segment_address: u64,
-    segment_size: u64,
-    init_protection: i32,
-    max_protection: i32,
-}
-
-struct MachOTranslationRanges {
-    image_vmaddr: u64,
-    text: MachOSectionRange,
-    data: Option<MachOSectionRange>,
-}
-
-fn read_macho_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
-    ))
-}
-
-fn read_macho_i32(bytes: &[u8], offset: usize) -> Option<i32> {
-    read_macho_u32(bytes, offset).map(|value| value as i32)
-}
-
-fn read_macho_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(
-        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
-    ))
-}
-
-fn macho_name_matches(raw: &[u8], expected: &[u8]) -> bool {
-    raw.get(..expected.len()) == Some(expected)
-        && raw
-            .get(expected.len()..)
-            .is_some_and(|tail| tail.iter().all(|byte| *byte == 0))
-}
-
-fn translation_ranges(dylib: &[u8]) -> Result<MachOTranslationRanges, UnitMissReason> {
-    const MACH_HEADER_64_SIZE: usize = 32;
-    const MH_MAGIC_64: u32 = 0xfeed_facf;
-    const LC_SEGMENT_64: u32 = 0x19;
-    const SEGMENT_COMMAND_64_SIZE: usize = 72;
-    const SECTION_64_SIZE: usize = 80;
-
-    if read_macho_u32(dylib, 0) != Some(MH_MAGIC_64) {
-        return Err(UnitMissReason::ManifestRange);
-    }
-    let command_count =
-        usize::try_from(read_macho_u32(dylib, 16).ok_or(UnitMissReason::ManifestRange)?)
-            .map_err(|_| UnitMissReason::ManifestRange)?;
-    let command_bytes =
-        usize::try_from(read_macho_u32(dylib, 20).ok_or(UnitMissReason::ManifestRange)?)
-            .map_err(|_| UnitMissReason::ManifestRange)?;
-    let commands_end = MACH_HEADER_64_SIZE
-        .checked_add(command_bytes)
-        .ok_or(UnitMissReason::ManifestRange)?;
-    if commands_end > dylib.len() {
-        return Err(UnitMissReason::ManifestRange);
-    }
-
-    let mut image_vmaddr = None;
-    let mut text = None;
-    let mut data = None;
-    let mut command_offset = MACH_HEADER_64_SIZE;
-    for _ in 0..command_count {
-        let command = read_macho_u32(dylib, command_offset).ok_or(UnitMissReason::ManifestRange)?;
-        let command_size = usize::try_from(
-            read_macho_u32(dylib, command_offset + 4).ok_or(UnitMissReason::ManifestRange)?,
-        )
-        .map_err(|_| UnitMissReason::ManifestRange)?;
-        let command_end = command_offset
-            .checked_add(command_size)
-            .ok_or(UnitMissReason::ManifestRange)?;
-        if command_size < 8 || command_end > commands_end {
-            return Err(UnitMissReason::ManifestRange);
-        }
-        if command == LC_SEGMENT_64 {
-            if command_size < SEGMENT_COMMAND_64_SIZE {
-                return Err(UnitMissReason::ManifestRange);
-            }
-            let segment_name = dylib
-                .get(command_offset + 8..command_offset + 24)
-                .ok_or(UnitMissReason::ManifestRange)?;
-            let segment_vmaddr =
-                read_macho_u64(dylib, command_offset + 24).ok_or(UnitMissReason::ManifestRange)?;
-            let segment_vmsize =
-                read_macho_u64(dylib, command_offset + 32).ok_or(UnitMissReason::ManifestRange)?;
-            let segment_end = segment_vmaddr
-                .checked_add(segment_vmsize)
-                .ok_or(UnitMissReason::ManifestRange)?;
-            let max_protection =
-                read_macho_i32(dylib, command_offset + 56).ok_or(UnitMissReason::ManifestRange)?;
-            let init_protection =
-                read_macho_i32(dylib, command_offset + 60).ok_or(UnitMissReason::ManifestRange)?;
-            let section_count = usize::try_from(
-                read_macho_u32(dylib, command_offset + 64).ok_or(UnitMissReason::ManifestRange)?,
-            )
-            .map_err(|_| UnitMissReason::ManifestRange)?;
-            let sections_size = section_count
-                .checked_mul(SECTION_64_SIZE)
-                .ok_or(UnitMissReason::ManifestRange)?;
-            if SEGMENT_COMMAND_64_SIZE
-                .checked_add(sections_size)
-                .is_none_or(|size| size > command_size)
-            {
-                return Err(UnitMissReason::ManifestRange);
-            }
-
-            let wanted_section = if macho_name_matches(segment_name, b"__TEXT") {
-                if image_vmaddr.replace(segment_vmaddr).is_some() {
-                    return Err(UnitMissReason::ManifestRange);
-                }
-                Some((b"__text".as_slice(), &mut text))
-            } else if macho_name_matches(segment_name, b"__DATA") {
-                Some((b"__data".as_slice(), &mut data))
-            } else {
-                None
-            };
-            if let Some((section_name, output)) = wanted_section {
-                for index in 0..section_count {
-                    let section_offset = command_offset
-                        .checked_add(SEGMENT_COMMAND_64_SIZE)
-                        .and_then(|offset| {
-                            index
-                                .checked_mul(SECTION_64_SIZE)
-                                .and_then(|index_offset| offset.checked_add(index_offset))
-                        })
-                        .ok_or(UnitMissReason::ManifestRange)?;
-                    let name = dylib
-                        .get(section_offset..section_offset + 16)
-                        .ok_or(UnitMissReason::ManifestRange)?;
-                    let owning_segment = dylib
-                        .get(section_offset + 16..section_offset + 32)
-                        .ok_or(UnitMissReason::ManifestRange)?;
-                    if !macho_name_matches(name, section_name)
-                        || !macho_name_matches(owning_segment, segment_name)
-                    {
-                        continue;
-                    }
-                    let address = read_macho_u64(dylib, section_offset + 32)
-                        .ok_or(UnitMissReason::ManifestRange)?;
-                    let size = read_macho_u64(dylib, section_offset + 40)
-                        .ok_or(UnitMissReason::ManifestRange)?;
-                    let end = address
-                        .checked_add(size)
-                        .ok_or(UnitMissReason::ManifestRange)?;
-                    if address < segment_vmaddr || end > segment_end || output.is_some() {
-                        return Err(UnitMissReason::ManifestRange);
-                    }
-                    *output = Some(MachOSectionRange {
-                        address,
-                        size,
-                        segment_address: segment_vmaddr,
-                        segment_size: segment_vmsize,
-                        init_protection,
-                        max_protection,
-                    });
-                }
-            }
-        }
-        command_offset = command_end;
-    }
-    if command_offset != commands_end {
-        return Err(UnitMissReason::ManifestRange);
-    }
-
-    let image_vmaddr = image_vmaddr.ok_or(UnitMissReason::ManifestRange)?;
-    let text = text.ok_or(UnitMissReason::ManifestRange)?;
-    if text.size == 0
-        || !text.segment_address.is_multiple_of(AOT_SEGMENT_PAGE_SIZE)
-        || !text.segment_size.is_multiple_of(AOT_SEGMENT_PAGE_SIZE)
-        || text.init_protection & (libc::PROT_READ | libc::PROT_EXEC)
-            != libc::PROT_READ | libc::PROT_EXEC
-        || text.max_protection & libc::PROT_WRITE != 0
-    {
-        return Err(UnitMissReason::ManifestRange);
-    }
-    if let Some(data) = data
-        && (data.size == 0
-            || !data.segment_address.is_multiple_of(AOT_SEGMENT_PAGE_SIZE)
-            || !data.segment_size.is_multiple_of(AOT_SEGMENT_PAGE_SIZE)
-            || text
-                .segment_address
-                .checked_add(text.segment_size)
-                .is_none_or(|text_end| text_end > data.segment_address)
-            || data.init_protection & (libc::PROT_READ | libc::PROT_WRITE)
-                != libc::PROT_READ | libc::PROT_WRITE
-            || data.max_protection & libc::PROT_EXEC != 0)
-    {
-        return Err(UnitMissReason::ManifestRange);
-    }
-    Ok(MachOTranslationRanges {
-        image_vmaddr,
-        text,
-        data,
-    })
-}
-
-fn translation_ranges_from_file(path: &Path) -> Result<MachOTranslationRanges, UnitStoreError> {
-    const MACH_HEADER_64_SIZE: usize = 32;
-    const MH_MAGIC_64: u32 = 0xfeed_facf;
-    const MAX_LOAD_COMMAND_BYTES: usize = 1024 * 1024;
-
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| {
-            UnitStoreError::with_source(
-                "open translation unit headers",
-                UnitMissReason::ManifestRange,
-                error,
-            )
-        })?;
-    let metadata = file.metadata().map_err(|error| {
-        UnitStoreError::with_source(
-            "stat translation unit headers",
-            UnitMissReason::ManifestRange,
-            error,
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(UnitStoreError::new(
-            "validate translation unit file type",
-            UnitMissReason::ManifestRange,
-        ));
-    }
-
-    let mut header = [0_u8; MACH_HEADER_64_SIZE];
-    file.read_exact_at(&mut header, 0).map_err(|error| {
-        UnitStoreError::with_source(
-            "read translation unit header",
-            UnitMissReason::ManifestRange,
-            error,
-        )
-    })?;
-    if read_macho_u32(&header, 0) != Some(MH_MAGIC_64) {
-        return Err(UnitStoreError::new(
-            "validate translation unit header",
-            UnitMissReason::ManifestRange,
-        ));
-    }
-    let command_bytes = read_macho_u32(&header, 20)
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| *value <= MAX_LOAD_COMMAND_BYTES)
-        .ok_or_else(|| {
-            UnitStoreError::new(
-                "validate translation unit load commands",
-                UnitMissReason::ManifestRange,
-            )
-        })?;
-    let header_bytes = MACH_HEADER_64_SIZE
-        .checked_add(command_bytes)
-        .filter(|value| u64::try_from(*value).is_ok_and(|value| value <= metadata.len()))
-        .ok_or_else(|| {
-            UnitStoreError::new(
-                "validate translation unit load command extent",
-                UnitMissReason::ManifestRange,
-            )
-        })?;
-    let mut bytes = vec![0_u8; header_bytes];
-    bytes[..MACH_HEADER_64_SIZE].copy_from_slice(&header);
-    if command_bytes != 0 {
-        file.read_exact_at(
-            &mut bytes[MACH_HEADER_64_SIZE..],
-            MACH_HEADER_64_SIZE as u64,
-        )
-        .map_err(|error| {
-            UnitStoreError::with_source(
-                "read translation unit load commands",
-                UnitMissReason::ManifestRange,
-                error,
-            )
-        })?;
-    }
-    translation_ranges(&bytes)
-        .map_err(|reason| UnitStoreError::new("validate translation unit sections", reason))
-}
-
-fn image_base_for_symbol(symbol: std::ptr::NonNull<u8>) -> Result<usize, UnitMissReason> {
-    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
-    if unsafe { libc::dladdr(symbol.as_ptr().cast(), info.as_mut_ptr()) } == 0 {
-        return Err(UnitMissReason::Dlopen);
-    }
-    let info = unsafe { info.assume_init() };
-    std::ptr::NonNull::new(info.dli_fbase)
-        .map(|base| base.as_ptr() as usize)
-        .ok_or(UnitMissReason::Dlopen)
-}
-
-fn export_is_in_section(
-    symbol: std::ptr::NonNull<u8>,
-    length: usize,
-    image_base: usize,
-    image_vmaddr: u64,
-    section: MachOSectionRange,
-) -> bool {
-    let Some(relative_start) = section.address.checked_sub(image_vmaddr) else {
-        return false;
-    };
-    let Ok(relative_start) = usize::try_from(relative_start) else {
-        return false;
-    };
-    let Ok(section_len) = usize::try_from(section.size) else {
-        return false;
-    };
-    let Some(section_start) = image_base.checked_add(relative_start) else {
-        return false;
-    };
-    let Some(section_end) = section_start.checked_add(section_len) else {
-        return false;
-    };
-    let symbol_start = symbol.as_ptr() as usize;
-    symbol_start >= section_start
-        && symbol_start
-            .checked_add(length)
-            .is_some_and(|symbol_end| symbol_end <= section_end)
-}
-
-fn loaded_segment_range(
-    image_base: usize,
-    image_vmaddr: u64,
-    section: MachOSectionRange,
-) -> Option<(std::ptr::NonNull<u8>, usize)> {
-    let relative_start = section.segment_address.checked_sub(image_vmaddr)?;
-    let relative_start = usize::try_from(relative_start).ok()?;
-    let length = usize::try_from(section.segment_size).ok()?;
-    let start = image_base.checked_add(relative_start)?;
-    start.checked_add(length)?;
-    std::ptr::NonNull::new(start as *mut u8).map(|start| (start, length))
-}
-
-fn validate_loaded_binding_cells_atomically(
-    metadata: &ValidatedMappedTranslationMetadata,
-    binding_base: DirectBindingCellVa,
-) -> Result<(), UnitMissReason> {
-    let binding_len =
-        usize::try_from(metadata.binding_data_len()).map_err(|_| UnitMissReason::ManifestRange)?;
-    let cell_size =
-        usize::try_from(metadata.cell_size()).map_err(|_| UnitMissReason::ManifestRange)?;
-    let binding_count = metadata.binding_count();
-    for index in 0..binding_count {
-        let binding = metadata
-            .binding(index)
-            .map(|binding| binding.record())
-            .ok_or(UnitMissReason::ManifestRange)?;
-        let ordinal =
-            usize::try_from(binding.ordinal.get()).map_err(|_| UnitMissReason::ManifestRange)?;
-        let offset = ordinal
-            .checked_mul(cell_size)
-            .ok_or(UnitMissReason::ManifestRange)?;
-        let cell_end = offset
-            .checked_add(cell_size)
-            .ok_or(UnitMissReason::ManifestRange)?;
-        if cell_end > binding_len {
-            return Err(UnitMissReason::ManifestRange);
-        }
-        let address = binding_base
-            .get()
-            .checked_add(offset)
-            .ok_or(UnitMissReason::ManifestRange)?;
-        let address = DirectBindingCellVa::mapped(address).ok_or(UnitMissReason::ManifestRange)?;
-        // SAFETY: the loaded data export and manifest range were validated
-        // before this function is called. Checked ordinal arithmetic keeps
-        // this address within that live initialized binding-cell mapping.
-        let cell = unsafe { DirectBindingCellRef::from_mapped_address(address) }
-            .map_err(|_| UnitMissReason::ManifestRange)?;
-        if !cell.load_acquire().is_null() {
-            return Err(UnitMissReason::ManifestRange);
-        }
-    }
-    Ok(())
-}
-
 fn code_word(code: &[u8], offset: u32) -> Result<u32, UnitMissReason> {
     let start = usize::try_from(offset).map_err(|_| UnitMissReason::ManifestRange)?;
     let end = start.checked_add(4).ok_or(UnitMissReason::ManifestRange)?;
@@ -775,13 +535,13 @@ fn validate_loaded_binding_code(
 
 fn manifest_for_pending(
     pending: &PendingTranslationUnit,
-    dylib_sha256: [u8; 32],
+    code_sha256: [u8; 32],
     base_export: &str,
 ) -> TranslationUnitManifest {
     TranslationUnitManifest {
         schema: TRANSLATION_UNIT_SCHEMA_V2,
         key: pending.key.clone(),
-        dylib_sha256,
+        code_sha256,
         base_export: base_export.to_owned(),
         code_len: pending.code.len() as u64,
         blocks: pending.blocks.clone(),
@@ -960,13 +720,18 @@ impl ContainerCacheAuthority {
                 error,
             )
         })?;
-        let preflight_manifest = manifest_for_pending(pending, [0; 32], &base_export);
+        // Digest the raw code FIRST so the metadata half binds the exact
+        // bytes the code half will carry: a loader that ever pairs a stale
+        // orphan with fresh metadata fails the digest instead of running
+        // code its metadata does not describe.
+        let manifest =
+            manifest_for_pending(pending, Sha256::digest(&pending.code).into(), &base_export);
         // Name the broken invariant. This preflight rejects a unit CARRICK
         // ITSELF just built, so "ManifestRange" alone says only that the
         // producer and its validator disagree - which is exactly the state a
         // cold go build has been in (33 publication attempts, 0 units, 30 of
         // them ManifestRange with no further detail).
-        if let Err(defect) = preflight_manifest.validate_ranges_detailed() {
+        if let Err(defect) = manifest.validate_ranges_detailed() {
             return Err(UnitStoreError::new(
                 match defect {
                     ManifestDefect::Schema => "validate pending unit: schema",
@@ -1002,26 +767,25 @@ impl ContainerCacheAuthority {
                 defect.reason(),
             ));
         }
-        preflight_manifest
+        manifest
             .validate_binding_data(&pending.binding_data)
-            .and_then(|()| preflight_manifest.validate_binding_code(&pending.code))
+            .and_then(|()| manifest.validate_binding_code(&pending.code))
             .map_err(|reason| UnitStoreError::new("validate pending unit payload", reason))?;
         let stem = pending.key.file_stem().map_err(|error| {
             UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
         })?;
-        // Winner selection must precede Mach-O emission and codesigning.
-        // Toolchain workloads retire many identical siblings at once; taking
-        // the per-key lock only after signing made every loser pay the full
-        // signing cost even though exactly one pair could be published.
+        // Winner selection precedes all file emission. Toolchain workloads
+        // retire many identical siblings at once; every loser should pay one
+        // lock round-trip, not a full unit emission.
         let _lock = self.lock_unit(&stem)?;
-        let (final_dylib, final_metadata) = self.final_paths(&stem);
-        if final_dylib.is_file() && final_metadata.is_file() {
+        let (final_code, final_metadata) = self.final_paths(&stem);
+        if final_code.is_file() && final_metadata.is_file() {
             return Ok(PublishOutcome::Existing);
         }
-        if final_dylib.exists() {
-            std::fs::remove_file(&final_dylib).map_err(|error| {
+        if final_code.exists() {
+            std::fs::remove_file(&final_code).map_err(|error| {
                 UnitStoreError::with_source(
-                    "remove partial dylib",
+                    "remove partial code file",
                     UnitMissReason::MissingPair,
                     error,
                 )
@@ -1036,81 +800,6 @@ impl ContainerCacheAuthority {
                 )
             })?;
         }
-        let mut exports = vec![crate::aot::AotExport {
-            name: &base_export,
-            section: crate::aot::AotSection::Text,
-            offset: 0,
-        }];
-        if !pending.binding_data.is_empty() {
-            exports.push(crate::aot::AotExport {
-                name: &pending.binding_export,
-                section: crate::aot::AotSection::Data,
-                offset: 0,
-            });
-        }
-        let relocations = pending
-            .binding_relocations
-            .iter()
-            .flat_map(|relocation| {
-                [
-                    crate::aot::AotCodeToDataRelocation {
-                        adrp_offset: relocation.adrp_offset,
-                        add_offset: relocation.add_offset,
-                        data_offset: relocation.data_offset,
-                    },
-                    crate::aot::AotCodeToDataRelocation {
-                        adrp_offset: relocation.miss_adrp_offset,
-                        add_offset: relocation.miss_add_offset,
-                        data_offset: relocation.data_offset,
-                    },
-                ]
-            })
-            .collect::<Vec<_>>();
-        let image = crate::aot::AotImage {
-            code: &pending.code,
-            data: &pending.binding_data,
-            exports: &exports,
-            relocations: &relocations,
-        };
-        let dylib = crate::aot::emit_dylib(&image).map_err(|error| {
-            UnitStoreError::with_source(
-                "emit translation dylib",
-                UnitMissReason::ManifestRange,
-                error,
-            )
-        })?;
-        let mut dylib_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
-            UnitStoreError::with_source(
-                "create dylib temporary",
-                UnitMissReason::MissingPair,
-                error,
-            )
-        })?;
-        dylib_temp.write_all(&dylib).map_err(|error| {
-            UnitStoreError::with_source("write dylib temporary", UnitMissReason::MissingPair, error)
-        })?;
-        dylib_temp.flush().map_err(|error| {
-            UnitStoreError::with_source("flush dylib temporary", UnitMissReason::MissingPair, error)
-        })?;
-        dylib_temp.as_file().sync_all().map_err(|error| {
-            UnitStoreError::with_source("sync dylib temporary", UnitMissReason::MissingPair, error)
-        })?;
-        sign_and_verify(dylib_temp.path())?;
-        dylib_temp.as_file().sync_all().map_err(|error| {
-            UnitStoreError::with_source(
-                "sync signed dylib temporary",
-                UnitMissReason::MissingPair,
-                error,
-            )
-        })?;
-        let signed_dylib = std::fs::read(dylib_temp.path()).map_err(|error| {
-            UnitStoreError::with_source("read signed dylib", UnitMissReason::DylibDigest, error)
-        })?;
-        let manifest =
-            manifest_for_pending(pending, Sha256::digest(&signed_dylib).into(), &base_export);
-        manifest
-            .validate_ranges()
-            .map_err(|reason| UnitStoreError::new("validate manifest", reason))?;
         let metadata_bytes = encode_translation_metadata_v3(&manifest).map_err(|error| {
             tracing::warn!(
                 bindings = manifest.bindings.len(),
@@ -1124,6 +813,18 @@ impl ContainerCacheAuthority {
                 "mapped metadata encode rejected a freshly packed unit"
             );
             mapped_metadata_error("encode mapped metadata", error)
+        })?;
+        let mut code_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
+            UnitStoreError::with_source("create code temporary", UnitMissReason::MissingPair, error)
+        })?;
+        code_temp.write_all(&pending.code).map_err(|error| {
+            UnitStoreError::with_source("write code temporary", UnitMissReason::MissingPair, error)
+        })?;
+        code_temp.flush().map_err(|error| {
+            UnitStoreError::with_source("flush code temporary", UnitMissReason::MissingPair, error)
+        })?;
+        code_temp.as_file().sync_all().map_err(|error| {
+            UnitStoreError::with_source("sync code temporary", UnitMissReason::MissingPair, error)
         })?;
         let mut metadata_temp = tempfile::NamedTempFile::new_in(&self.path).map_err(|error| {
             UnitStoreError::with_source(
@@ -1172,8 +873,8 @@ impl ContainerCacheAuthority {
         })?;
         let _validated = map_and_validate_metadata(&self.directory, &temporary_name, &pending.key)?;
 
-        std::fs::rename(dylib_temp.path(), &final_dylib).map_err(|error| {
-            UnitStoreError::with_source("publish dylib", UnitMissReason::MissingPair, error)
+        std::fs::rename(code_temp.path(), &final_code).map_err(|error| {
+            UnitStoreError::with_source("publish code", UnitMissReason::MissingPair, error)
         })?;
         std::fs::rename(metadata_temp.path(), &final_metadata).map_err(|error| {
             UnitStoreError::with_source("publish metadata", UnitMissReason::MissingPair, error)
@@ -1186,8 +887,8 @@ impl ContainerCacheAuthority {
             UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
         })?;
         let _lock = self.lock_unit(&stem)?;
-        let (dylib, metadata) = self.final_paths(&stem);
-        if dylib.is_file() && metadata.is_file() {
+        let (code, metadata) = self.final_paths(&stem);
+        if code.is_file() && metadata.is_file() {
             return Ok(false);
         }
         let seen = self.path.join(format!("{stem}.seen"));
@@ -1261,8 +962,8 @@ impl ContainerCacheAuthority {
         let stem = expected_key.file_stem().map_err(|error| {
             UnitStoreError::with_source("derive unit filename", UnitMissReason::Schema, error)
         })?;
-        let (dylib_path, metadata_path) = self.final_paths(&stem);
-        if !dylib_path.is_file() || !metadata_path.is_file() {
+        let (code_path, metadata_path) = self.final_paths(&stem);
+        if !code_path.is_file() || !metadata_path.is_file() {
             return Err(UnitStoreError::new(
                 "locate translation unit",
                 UnitMissReason::MissingPair,
@@ -1285,207 +986,96 @@ impl ContainerCacheAuthority {
                 UnitMissReason::SourceFingerprint,
             ));
         }
-        // The exact key is part of the signed Mach-O export name. `dlopen`
-        // validates the signed image and the later `dlsym` of that exact export
-        // binds it to this already-validated manifest. Reading only the bounded
-        // load-command prefix avoids pulling a 60+ MiB unit through every
-        // descendant merely to rediscover its digest.
-        let ranges = translation_ranges_from_file(&dylib_path)?;
         let code_len = usize::try_from(metadata.code_len()).map_err(|_| {
             UnitStoreError::new(
                 "validate translation code length",
                 UnitMissReason::ManifestRange,
             )
         })?;
-        let binding_len = usize::try_from(metadata.binding_data_len()).map_err(|_| {
+        let code_name = CString::new(format!("{stem}.code")).map_err(|error| {
+            UnitStoreError::with_source("encode code name", UnitMissReason::Schema, error)
+        })?;
+        let (code_file, code_file_len) = open_unit_regular_file_at(&self.directory, &code_name)?;
+        // The file must be EXACTLY the declared code extent: publication
+        // writes nothing else into it, so any difference means it is not the
+        // file this metadata describes.
+        if code_file_len != code_len || code_len == 0 || code_len > MAX_TRANSLATION_UNIT_CODE_BYTES
+        {
+            return Err(UnitStoreError::new(
+                "validate translation code extent",
+                UnitMissReason::ManifestRange,
+            ));
+        }
+        // SAFETY: `map_copy_read_only` requests `MAP_PRIVATE|PROT_READ`. The
+        // private cache authority never writes a published inode in place
+        // (publication and repair replace pathnames by whole-file rename),
+        // the mmap length is the exact bounded extent accepted by the fstat
+        // in `open_unit_regular_file_at`, and `_file` pins the inode for the
+        // mapping's lifetime.
+        let mapping = unsafe {
+            memmap2::MmapOptions::new()
+                .len(code_len)
+                .map_copy_read_only(&code_file)
+        }
+        .map_err(|error| {
+            UnitStoreError::with_source("map translation code", UnitMissReason::CodeMapping, error)
+        })?;
+        // The digest binds this code file to this metadata: a mismatch means
+        // a stale orphan or torn repair race, and running such bytes under
+        // this metadata's pc-maps would be memory-unsafe.
+        let digest: [u8; 32] = Sha256::digest(&mapping[..]).into();
+        if digest != metadata.code_sha256() {
+            return Err(UnitStoreError::new(
+                "verify translation code digest",
+                UnitMissReason::CodeDigest,
+            ));
+        }
+        if metadata.binding_count() != 0
+            && let Err(reason) = validate_loaded_binding_code(&metadata, &mapping)
+        {
+            return Err(UnitStoreError::new(
+                "validate mapped translation code",
+                reason,
+            ));
+        }
+        let binding_data_len = usize::try_from(metadata.binding_data_len()).map_err(|_| {
             UnitStoreError::new(
                 "validate binding data length",
                 UnitMissReason::ManifestRange,
             )
         })?;
-        if ranges.text.size != metadata.code_len()
-            || match (binding_len, ranges.data) {
-                (0, None) => false,
-                (0, Some(_)) | (_, None) => true,
-                (_, Some(data)) => data.size != metadata.binding_data_len(),
-            }
-        {
-            return Err(UnitStoreError::new(
-                "validate translation unit section lengths",
-                UnitMissReason::ManifestRange,
-            ));
-        }
-        let c_path = CString::new(dylib_path.as_os_str().as_bytes()).map_err(|error| {
-            UnitStoreError::with_source("encode dylib path", UnitMissReason::Dlopen, error)
-        })?;
-        let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-        let handle = std::ptr::NonNull::new(handle).ok_or_else(|| {
-            UnitStoreError::new("dlopen translation unit", UnitMissReason::Dlopen)
-        })?;
-        let base_export = translation_unit_base_export(expected_key).map_err(|error| {
-            UnitStoreError::with_source(
-                "derive keyed translation export",
-                UnitMissReason::Schema,
-                error,
-            )
-        })?;
-        let symbol = CString::new(base_export.as_bytes()).map_err(|error| {
-            UnitStoreError::with_source("encode base export", UnitMissReason::Dlopen, error)
-        })?;
-        let base = unsafe { libc::dlsym(handle.as_ptr(), symbol.as_ptr()) };
-        let Some(base) = std::ptr::NonNull::new(base.cast::<u8>()) else {
-            let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-            return Err(UnitStoreError::new(
-                "resolve translation unit base",
-                UnitMissReason::Dlopen,
-            ));
-        };
-        let image_base = match image_base_for_symbol(base) {
-            Ok(image_base) => image_base,
-            Err(reason) => {
-                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                return Err(UnitStoreError::new(
-                    "identify translation unit image",
-                    reason,
-                ));
-            }
-        };
-        if !export_is_in_section(base, code_len, image_base, ranges.image_vmaddr, ranges.text) {
-            let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-            return Err(UnitStoreError::new(
-                "validate translation base export",
-                UnitMissReason::ManifestRange,
-            ));
-        }
-        let Some((text_segment, text_segment_len)) =
-            loaded_segment_range(image_base, ranges.image_vmaddr, ranges.text)
-        else {
-            let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-            return Err(UnitStoreError::new(
-                "validate loaded translation text segment",
-                UnitMissReason::ManifestRange,
-            ));
-        };
-        if let Err(status) = unsafe {
-            pin_loaded_translation_protection(
-                text_segment,
-                text_segment_len,
-                LoadedTranslationProtection::ImmutableCode,
-            )
-        } {
-            let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-            return Err(UnitStoreError::with_source(
-                "pin loaded translation text protections",
-                UnitMissReason::Dlopen,
-                invalid_data(format!("mach_vm_protect returned {status}")),
-            ));
-        }
-        if metadata.binding_count() != 0 {
-            // SAFETY: `base` is the validated translation-unit text export and
-            // schema validation bounds the declared code length. The mapping
-            // remains live under `handle` for this validation.
-            let mapped_code = unsafe { std::slice::from_raw_parts(base.as_ptr(), code_len) };
-            if let Err(reason) = validate_loaded_binding_code(&metadata, mapped_code) {
-                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                return Err(UnitStoreError::new(
-                    "validate mapped translation code",
-                    reason,
-                ));
-            }
-        }
-        let mut loaded_binding_base = None;
-        if metadata.binding_data_len() != 0 {
-            let binding_export = TRANSLATION_UNIT_BINDING_EXPORT;
-            let binding_symbol = CString::new(binding_export.as_bytes()).map_err(|error| {
-                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                UnitStoreError::with_source("encode binding export", UnitMissReason::Dlopen, error)
-            })?;
-            let binding_base =
-                unsafe { libc::dlsym(handle.as_ptr(), binding_symbol.as_ptr()) }.cast::<u8>();
-            let Some(binding_base) = std::ptr::NonNull::new(binding_base) else {
-                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                return Err(UnitStoreError::new(
-                    "resolve translation unit bindings",
-                    UnitMissReason::Dlopen,
-                ));
-            };
-            let binding_image_base = match image_base_for_symbol(binding_base) {
-                Ok(binding_image_base) => binding_image_base,
-                Err(reason) => {
-                    let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                    return Err(UnitStoreError::new(
-                        "identify translation binding image",
-                        reason,
-                    ));
-                }
-            };
-            let Some(data_range) = ranges.data else {
-                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                return Err(UnitStoreError::new(
-                    "validate translation binding section",
-                    UnitMissReason::ManifestRange,
-                ));
-            };
-            if binding_image_base != image_base
-                || !export_is_in_section(
-                    binding_base,
-                    binding_len,
-                    image_base,
-                    ranges.image_vmaddr,
-                    data_range,
+        let cells = if binding_data_len == 0 {
+            None
+        } else {
+            Some(BindingCellBlock::new(binding_data_len).map_err(|error| {
+                UnitStoreError::with_source(
+                    "allocate binding cell block",
+                    UnitMissReason::CodeMapping,
+                    error,
                 )
-            {
-                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                return Err(UnitStoreError::new(
-                    "validate translation binding export",
+            })?)
+        };
+        let binding_base = match &cells {
+            Some(cells) => Some(cells.base_va().ok_or_else(|| {
+                UnitStoreError::new(
+                    "validate binding cell alignment",
                     UnitMissReason::ManifestRange,
-                ));
-            }
-            let Some(binding_cell_base) =
-                DirectBindingCellVa::mapped(binding_base.as_ptr() as usize)
-            else {
-                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                return Err(UnitStoreError::new(
-                    "validate mapped binding alignment",
-                    UnitMissReason::ManifestRange,
-                ));
-            };
-            let Some((data_segment, data_segment_len)) =
-                loaded_segment_range(image_base, ranges.image_vmaddr, data_range)
-            else {
-                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                return Err(UnitStoreError::new(
-                    "validate loaded translation data segment",
-                    UnitMissReason::ManifestRange,
-                ));
-            };
-            if let Err(status) = unsafe {
-                pin_loaded_translation_protection(
-                    data_segment,
-                    data_segment_len,
-                    LoadedTranslationProtection::BindingCells,
                 )
-            } {
-                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                return Err(UnitStoreError::with_source(
-                    "pin loaded translation data protections",
-                    UnitMissReason::Dlopen,
-                    invalid_data(format!("mach_vm_protect returned {status}")),
-                ));
-            }
-            if let Err(reason) =
-                validate_loaded_binding_cells_atomically(&metadata, binding_cell_base)
-            {
-                let _ = unsafe { libc::dlclose(handle.as_ptr()) };
-                return Err(UnitStoreError::new("validate mapped binding cells", reason));
-            }
-            loaded_binding_base = Some(binding_cell_base);
-        }
+            })?),
+            None => None,
+        };
+        let source_base = std::ptr::NonNull::new(mapping.as_ptr().cast_mut()).ok_or_else(|| {
+            UnitStoreError::new("map translation code", UnitMissReason::CodeMapping)
+        })?;
         Ok(LoadedTranslationUnit {
-            lease: Arc::new(LoadedTranslationLease { handle }),
+            lease: Arc::new(CodeSourceLease {
+                _mapping: mapping,
+                _file: code_file,
+                _cells: cells,
+            }),
             metadata: LoadedTranslationMetadata::V3(metadata),
-            base,
-            binding_base: loaded_binding_base,
+            source_base,
+            binding_base,
             load_evidence,
         })
     }
@@ -1513,7 +1103,7 @@ impl ContainerCacheAuthority {
 
     fn final_paths(&self, stem: &str) -> (PathBuf, PathBuf) {
         (
-            self.path.join(format!("{stem}.dylib")),
+            self.path.join(format!("{stem}.code")),
             self.path.join(format!("{stem}.metadata-v3")),
         )
     }
@@ -1522,36 +1112,6 @@ impl ContainerCacheAuthority {
     fn directory(&self) -> &File {
         &self.directory
     }
-}
-
-fn sign_and_verify(path: &Path) -> Result<(), UnitStoreError> {
-    let signed = std::process::Command::new("/usr/bin/codesign")
-        .args(["-s", "-"])
-        .arg(path)
-        .output()
-        .map_err(|error| {
-            UnitStoreError::with_source("run codesign", UnitMissReason::Dlopen, error)
-        })?;
-    if !signed.status.success() {
-        return Err(UnitStoreError::new(
-            "sign translation unit",
-            UnitMissReason::Dlopen,
-        ));
-    }
-    let verified = std::process::Command::new("/usr/bin/codesign")
-        .args(["--verify", "--strict"])
-        .arg(path)
-        .output()
-        .map_err(|error| {
-            UnitStoreError::with_source("run codesign verification", UnitMissReason::Dlopen, error)
-        })?;
-    if !verified.status.success() {
-        return Err(UnitStoreError::new(
-            "verify translation unit signature",
-            UnitMissReason::Dlopen,
-        ));
-    }
-    Ok(())
 }
 
 impl Drop for ContainerCacheAuthority {
@@ -1748,7 +1308,7 @@ mod tests {
         let manifest = TranslationUnitManifest {
             schema: TRANSLATION_UNIT_SCHEMA_V2,
             key: pending.key,
-            dylib_sha256: [0x22; 32],
+            code_sha256: [0x22; 32],
             base_export,
             code_len: pending.code.len() as u64,
             blocks: pending.blocks,
@@ -1798,7 +1358,6 @@ mod tests {
     use carrick_guest_mem::GuestVa;
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     const MOV42_RET: [u8; 8] = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
 
@@ -1858,26 +1417,6 @@ mod tests {
             bindings: Vec::new(),
             binding_relocations: Vec::new(),
             binding_data: Vec::new(),
-        }
-    }
-
-    fn fixture_manifest() -> TranslationUnitManifest {
-        let pending = fixture_pending();
-        let base_export =
-            translation_unit_base_export(&pending.key).expect("keyed translation export");
-        TranslationUnitManifest {
-            schema: TRANSLATION_UNIT_SCHEMA_V2,
-            key: pending.key,
-            dylib_sha256: [0x22; 32],
-            base_export,
-            code_len: pending.code.len() as u64,
-            blocks: pending.blocks,
-            binding_layout: pending.binding_layout,
-            binding_export: pending.binding_export,
-            binding_data_len: pending.binding_data_len,
-            cell_size: pending.cell_size,
-            bindings: pending.bindings,
-            binding_relocations: pending.binding_relocations,
         }
     }
 
@@ -1945,26 +1484,6 @@ mod tests {
 
     fn fixture_source_words() -> [u32; 1] {
         [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))]
-    }
-
-    #[derive(Debug)]
-    struct LeaseObservedMetadataBacking {
-        bytes: Vec<u8>,
-        lease: std::sync::Weak<LoadedTranslationLease>,
-        lease_alive_when_dropped: std::sync::Arc<AtomicBool>,
-    }
-
-    impl MetadataBacking for LeaseObservedMetadataBacking {
-        fn bytes(&self) -> &[u8] {
-            &self.bytes
-        }
-    }
-
-    impl Drop for LeaseObservedMetadataBacking {
-        fn drop(&mut self) {
-            self.lease_alive_when_dropped
-                .store(self.lease.upgrade().is_some(), Ordering::Release);
-        }
     }
 
     fn current_region_extended_info(address: usize) -> mach2::vm_region::vm_region_extended_info {
@@ -2253,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_publishers_converge_on_one_signed_unit() {
+    fn concurrent_publishers_converge_on_one_published_unit() {
         let authority =
             std::sync::Arc::new(ContainerCacheAuthority::create().expect("create cache authority"));
         let pending = fixture_pending();
@@ -2294,8 +1813,12 @@ mod tests {
                 .join(format!("{stem}.metadata-v3"))
                 .is_file()
         );
-        let function: extern "C" fn() -> i32 = unsafe { std::mem::transmute(loaded.base.as_ptr()) };
-        assert_eq!(function(), 42);
+        // The copy transport hands out READABLE source bytes; nothing at
+        // this address is executable. The translator copies them into its
+        // own MAP_JIT cache.
+        let source =
+            unsafe { std::slice::from_raw_parts(loaded.source_base.as_ptr(), pending.code.len()) };
+        assert_eq!(source, pending.code.as_slice());
         assert!(
             std::fs::read_dir(authority.path())
                 .expect("read cache directory")
@@ -2307,28 +1830,6 @@ mod tests {
 
     #[test]
     fn published_unit_loads_zero_aligned_binding_cells() {
-        fn decoded_cell_address(
-            code: &[u8],
-            code_addr: usize,
-            adrp_offset: usize,
-            add_offset: usize,
-        ) -> usize {
-            let adrp = u32::from_le_bytes(
-                code[adrp_offset..adrp_offset + 4]
-                    .try_into()
-                    .expect("mapped ADRP"),
-            );
-            let add = u32::from_le_bytes(
-                code[add_offset..add_offset + 4]
-                    .try_into()
-                    .expect("mapped ADD"),
-            );
-            let immediate = (((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 0x3);
-            let delta_pages = i128::from(((immediate << 11) as i32) >> 11);
-            let pc_page = (code_addr + adrp_offset) & !0xfff;
-            (pc_page as i128 + delta_pages * 4096) as usize + ((add >> 10) & 0xfff) as usize
-        }
-
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending_with_binding_sidecar();
 
@@ -2350,20 +1851,31 @@ mod tests {
         let cell = unsafe { DirectBindingCellRef::from_mapped_address(binding_base) }
             .expect("mapped atomic binding cell");
         assert!(cell.load_acquire().is_null());
-        // SAFETY: the base export and manifest code length were validated by
-        // `load_unit`; the dlopen handle remains owned by `loaded`.
+        // The SOURCE keeps its ADRP/ADD placeholder pairs untouched: the
+        // translator patches them in ITS COPY at install, against these
+        // exact cell addresses. A source that arrived pre-patched would be
+        // double-applied.
+        // SAFETY: `load_unit` validated the code extent; `loaded` pins it.
         let mapped_code =
-            unsafe { std::slice::from_raw_parts(loaded.base.as_ptr(), pending.code.len()) };
+            unsafe { std::slice::from_raw_parts(loaded.source_base.as_ptr(), pending.code.len()) };
         for (adrp_offset, add_offset) in [(52, 56), (140, 144)] {
             assert_eq!(
-                decoded_cell_address(
-                    mapped_code,
-                    loaded.base.as_ptr() as usize,
-                    adrp_offset,
-                    add_offset,
+                u32::from_le_bytes(
+                    mapped_code[adrp_offset..adrp_offset + 4]
+                        .try_into()
+                        .expect("placeholder ADRP"),
                 ),
-                binding_base.get(),
-                "hit and miss sites must both address the same binding cell"
+                0x9000_000f,
+                "hit/miss ADRP placeholder must stay unresolved in the source"
+            );
+            assert_eq!(
+                u32::from_le_bytes(
+                    mapped_code[add_offset..add_offset + 4]
+                        .try_into()
+                        .expect("placeholder ADD"),
+                ),
+                0x9100_01ef,
+                "hit/miss ADD placeholder must stay unresolved in the source"
             );
         }
         assert_eq!(
@@ -2374,8 +1886,12 @@ mod tests {
         );
     }
 
+    /// Every load gets its OWN zeroed cell block. Under the dylib transport
+    /// a second in-process `dlopen` handed back the SAME `__DATA` cells, so
+    /// a published descriptor forced the loader to reject the reload; the
+    /// copy transport removes that aliasing entirely.
     #[test]
-    fn second_load_rejects_atomically_published_binding_cell() {
+    fn each_load_gets_a_fresh_private_cell_block() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending_with_binding_sidecar();
         authority
@@ -2399,25 +1915,17 @@ mod tests {
             CodeGeneration::claimed(1),
             &epoch,
         )));
-        assert!(
-            (target as usize).is_multiple_of(std::mem::align_of::<DirectBindingTarget>()),
-            "published descriptor pointer must be naturally aligned"
-        );
         cell.publish_null(target)
             .expect("atomically publish descriptor");
 
-        let LoadedTranslationMetadata::V3(validated_metadata) = &first.metadata else {
-            panic!("units publish and load as mapped V3 metadata");
-        };
-        assert_eq!(
-            validate_loaded_binding_cells_atomically(validated_metadata, binding_base),
-            Err(UnitMissReason::ManifestRange),
-            "atomic revalidation must observe the published descriptor"
-        );
-        let error = authority
+        let second = authority
             .load_unit(&pending.key, &fixture_source_words())
-            .expect_err("second load must reject a process-private nonzero cell");
-        assert_eq!(error.reason(), UnitMissReason::ManifestRange);
+            .expect("second load must not observe the first load's cells");
+        let second_base = second.binding_base.expect("second typed binding base");
+        assert_ne!(second_base.get(), binding_base.get());
+        let second_cell = unsafe { DirectBindingCellRef::from_mapped_address(second_base) }
+            .expect("second mapped atomic binding cell");
+        assert!(second_cell.load_acquire().is_null());
 
         assert!(cell.clear_if(target), "clear published test descriptor");
         // SAFETY: this test allocated `target`, successfully cleared its sole
@@ -2426,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn two_independent_processes_bind_the_same_dylib_cell_privately() {
+    fn two_independent_processes_bind_their_own_cell_blocks_privately() {
         const CHILD_A_TARGET: usize = 0x1111_0000;
         const CHILD_B_TARGET: usize = 0x2222_0000;
 
@@ -2499,122 +2007,36 @@ mod tests {
         wait_for_child(child_b, "binding child B");
     }
 
+    /// The loaded code source must be a plain read-only private mapping —
+    /// never executable. Executability belongs exclusively to the process's
+    /// MAP_JIT translation cache the bytes are copied into.
     #[test]
-    fn text_cannot_gain_write_permission_and_data_cannot_gain_execute_permission() {
+    fn loaded_code_uses_a_private_read_only_vm_region() {
+        use mach2::vm_prot::VM_PROT_READ;
+
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
-        let pending = fixture_pending_with_binding_sidecar();
-        authority
-            .publish_unit(&pending)
-            .expect("publish protected binding sidecar");
-        let report = pipe_pair();
+        let pending = fixture_pending();
+        authority.publish_unit(&pending).expect("publish unit");
+        let loaded = authority
+            .load_unit(&pending.key, &fixture_source_words())
+            .expect("load unit");
 
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork protection child");
-        if child == 0 {
-            close_fd(report[0]);
-            let loaded = match authority.load_unit(&pending.key, &fixture_source_words()) {
-                Ok(loaded) => loaded,
-                Err(_) => unsafe { libc::_exit(20) },
-            };
-            let Some(binding_base) = loaded.binding_base else {
-                unsafe { libc::_exit(21) };
-            };
-            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            if page_size <= 0 {
-                unsafe { libc::_exit(22) };
-            }
-            let page_size = page_size as usize;
-            let text_page = (loaded.base.as_ptr() as usize) & !(page_size - 1);
-            let data_page = binding_base.get() & !(page_size - 1);
-            let text_rc = unsafe {
-                libc::mprotect(
-                    text_page as *mut libc::c_void,
-                    page_size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                )
-            };
-            let text_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            let data_rc = unsafe {
-                libc::mprotect(
-                    data_page as *mut libc::c_void,
-                    page_size,
-                    libc::PROT_READ | libc::PROT_EXEC,
-                )
-            };
-            let data_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            let mut code_still_executes = 0;
-            let mut data_still_writes = 0;
-            if text_rc == -1 && data_rc == -1 {
-                let function: extern "C" fn() -> i32 =
-                    unsafe { std::mem::transmute(loaded.base.as_ptr()) };
-                code_still_executes = i32::from(function() == 42);
-                let cell = unsafe { DirectBindingCellRef::from_mapped_address(binding_base) }
-                    .unwrap_or_else(|_| child_exit(24));
-                let target = std::ptr::without_provenance_mut::<DirectBindingTarget>(0x3333_0000);
-                if cell.publish_null(target).is_ok() && cell.load_acquire() == target {
-                    data_still_writes = 1;
-                }
-            }
-            for value in [
-                text_rc,
-                text_errno,
-                data_rc,
-                data_errno,
-                code_still_executes,
-                data_still_writes,
-            ] {
-                if !write_all_fd(report[1], &value.to_ne_bytes()) {
-                    unsafe { libc::_exit(23) };
-                }
-            }
-            unsafe { libc::_exit(0) };
-        }
-
-        close_fd(report[1]);
-        let mut values = [0_i32; 6];
-        for value in &mut values {
-            let mut bytes = [0; std::mem::size_of::<i32>()];
-            assert!(read_exact_fd(report[0], &mut bytes));
-            *value = i32::from_ne_bytes(bytes);
-        }
-        close_fd(report[0]);
-        wait_for_child(child, "protection child");
-
-        eprintln!(
-            "live dylib protection probes: text add-write rc={} errno={}; data add-exec rc={} errno={}; code_exec={}; data_write={}",
-            values[0], values[1], values[2], values[3], values[4], values[5]
-        );
+        let region = current_region_extended_info(loaded.source_base.as_ptr() as usize);
         assert_eq!(
-            values[0], -1,
-            "live __TEXT unexpectedly gained write permission (errno={})",
-            values[1]
-        );
-        assert_eq!(
-            values[2], -1,
-            "live __DATA unexpectedly gained execute permission (errno={})",
-            values[3]
-        );
-        assert_ne!(values[1], 0, "failed text mprotect must report errno");
-        assert_ne!(values[3], 0, "failed data mprotect must report errno");
-        assert_eq!(
-            values[4], 1,
-            "text must retain its original execute permission"
-        );
-        assert_eq!(
-            values[5], 1,
-            "binding data must retain its original write permission"
+            region.protection, VM_PROT_READ,
+            "code source must map read-only, never executable"
         );
     }
 
     #[test]
-    fn loaded_unit_lease_keeps_code_data_and_handle_alive() {
+    fn loaded_unit_lease_keeps_code_and_cells_alive_after_unlink() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending_with_binding_sidecar();
         authority
             .publish_unit(&pending)
             .expect("publish leased binding sidecar");
         let stem = pending.key.file_stem().expect("unit stem");
-        let (dylib_path, manifest_path) = authority.final_paths(&stem);
+        let (code_path, manifest_path) = authority.final_paths(&stem);
         let loaded = std::sync::Arc::new(
             authority
                 .load_unit(&pending.key, &fixture_source_words())
@@ -2626,7 +2048,7 @@ mod tests {
             LoadedTranslationMetadata::V2(manifest) => {
                 SharedLoadedTranslationUnit::new_with_binding_base(
                     std::sync::Arc::clone(manifest),
-                    loaded.base.as_ptr() as usize,
+                    loaded.source_base.as_ptr() as usize,
                     Some(binding_base),
                     lease,
                 )
@@ -2634,7 +2056,7 @@ mod tests {
             LoadedTranslationMetadata::V3(metadata) => {
                 SharedLoadedTranslationUnit::new_mapped_with_binding_base(
                     std::sync::Arc::clone(metadata),
-                    loaded.base.as_ptr() as usize,
+                    loaded.source_base.as_ptr() as usize,
                     Some(binding_base),
                     loaded.load_evidence,
                     lease,
@@ -2642,25 +2064,37 @@ mod tests {
             }
         };
         drop(loaded);
-        std::fs::remove_file(dylib_path).expect("unlink loaded dylib");
+        std::fs::remove_file(code_path).expect("unlink loaded code");
         std::fs::remove_file(manifest_path).expect("unlink loaded manifest");
 
-        let function: extern "C" fn() -> i32 = unsafe { std::mem::transmute(shared.base) };
-        assert_eq!(function(), 42, "retained lease must keep code mapped");
+        // SAFETY: the shared unit's lease pins the unlinked inode's mapping.
+        let source = unsafe {
+            std::slice::from_raw_parts(shared.source_base as *const u8, pending.code.len())
+        };
+        assert_eq!(
+            source,
+            pending.code.as_slice(),
+            "retained lease must keep the source mapped after unlink"
+        );
         let cell = unsafe {
             DirectBindingCellRef::from_mapped_address(
                 shared.binding_base.expect("shared typed binding base"),
             )
         }
-        .expect("retained lease must keep data mapped");
+        .expect("retained lease must keep cells mapped");
         assert!(cell.load_acquire().is_null());
     }
 
+    /// The digest in the metadata binds the code file to the metadata that
+    /// describes it: swapping in another unit's (equally valid) code file
+    /// must fail the digest, not run bytes under the wrong pc-maps.
     #[test]
-    fn keyed_dylib_identity_rejects_another_valid_signed_unit() {
+    fn code_digest_rejects_another_units_substituted_code_file() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let first = fixture_pending();
         let mut second = fixture_pending();
+        // Same length, different bytes: `mov w0, #43 ; ret`.
+        second.code[..4].copy_from_slice(&0x5280_0560_u32.to_le_bytes());
         second.key = TranslationUnitKey::for_segment(
             ExecutableIdentity::Digest([0x33; 32]),
             ImageFileOffset::new(0),
@@ -2677,18 +2111,18 @@ mod tests {
         authority
             .publish_unit(&second)
             .expect("publish second unit");
-        let (first_dylib, _) =
+        let (first_code, _) =
             authority.final_paths(&first.key.file_stem().expect("first unit stem"));
-        let (second_dylib, _) =
+        let (second_code, _) =
             authority.final_paths(&second.key.file_stem().expect("second unit stem"));
-        std::fs::copy(second_dylib, first_dylib).expect("substitute valid signed unit");
+        std::fs::copy(second_code, first_code).expect("substitute valid code file");
 
         assert_eq!(
             authority
                 .load_unit(&first.key, &fixture_source_words())
-                .expect_err("another key's signed dylib must not load")
+                .expect_err("another unit's code file must not load")
                 .reason(),
-            UnitMissReason::Dlopen
+            UnitMissReason::CodeDigest
         );
     }
 
@@ -2717,12 +2151,79 @@ mod tests {
         );
     }
 
+    /// The published pair is raw code beside mapped metadata — no Mach-O, no
+    /// signature, no dylib anywhere in the store.
+    #[test]
+    fn published_pair_is_raw_code_beside_mapped_metadata() {
+        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let pending = fixture_pending();
+        assert_eq!(
+            authority.publish_unit(&pending).expect("publish unit"),
+            PublishOutcome::Winner
+        );
+        let stem = pending.key.file_stem().expect("unit stem");
+        let (code_path, metadata_path) = authority.final_paths(&stem);
+        assert_eq!(
+            std::fs::read(&code_path).expect("read published code"),
+            pending.code,
+            "the code half is the raw translated bytes, verbatim"
+        );
+        assert!(metadata_path.is_file());
+        assert!(
+            std::fs::read_dir(authority.path())
+                .expect("read cache directory")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".dylib")),
+            "the copy transport publishes no dylib"
+        );
+    }
+
+    #[test]
+    fn load_rejects_a_flipped_code_byte() {
+        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let pending = fixture_pending();
+        authority.publish_unit(&pending).expect("publish unit");
+        let stem = pending.key.file_stem().expect("unit stem");
+        let (code_path, _) = authority.final_paths(&stem);
+        let mut bytes = std::fs::read(&code_path).expect("read published code");
+        bytes[0] ^= 0x01;
+        std::fs::write(&code_path, bytes).expect("flip one code byte");
+
+        assert_eq!(
+            authority
+                .load_unit(&pending.key, &fixture_source_words())
+                .expect_err("a flipped byte must fail the digest")
+                .reason(),
+            UnitMissReason::CodeDigest
+        );
+    }
+
+    #[test]
+    fn load_rejects_a_code_file_with_the_wrong_extent() {
+        let authority = ContainerCacheAuthority::create().expect("create cache authority");
+        let pending = fixture_pending();
+        authority.publish_unit(&pending).expect("publish unit");
+        let stem = pending.key.file_stem().expect("unit stem");
+        let (code_path, _) = authority.final_paths(&stem);
+        let mut bytes = std::fs::read(&code_path).expect("read published code");
+        bytes.extend_from_slice(&[0; 4]);
+        std::fs::write(&code_path, bytes).expect("grow the code file");
+
+        assert_eq!(
+            authority
+                .load_unit(&pending.key, &fixture_source_words())
+                .expect_err("a grown code file is not the described extent")
+                .reason(),
+            UnitMissReason::ManifestRange
+        );
+    }
+
     #[test]
     fn partial_publish_pair_is_never_loadable() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending();
         let stem = pending.key.file_stem().expect("unit stem");
-        let (dylib, manifest) = authority.final_paths(&stem);
+        let (code, manifest) = authority.final_paths(&stem);
         let source_words = [u32::from_le_bytes(MOV42_RET[..4].try_into().expect("word"))];
 
         std::fs::write(&manifest, b"{}").expect("write lone manifest");
@@ -2734,11 +2235,11 @@ mod tests {
             UnitMissReason::MissingPair
         );
         std::fs::remove_file(&manifest).expect("remove lone manifest");
-        std::fs::write(&dylib, MOV42_RET).expect("write lone dylib");
+        std::fs::write(&code, MOV42_RET).expect("write lone code file");
         assert_eq!(
             authority
                 .load_unit(&pending.key, &source_words)
-                .expect_err("lone dylib must miss")
+                .expect_err("lone code file must miss")
                 .reason(),
             UnitMissReason::MissingPair
         );
@@ -2831,11 +2332,11 @@ mod tests {
     }
 
     #[test]
-    fn mapped_metadata_and_dylib_pair_rejects_either_lone_half() {
+    fn mapped_metadata_and_code_pair_rejects_either_lone_half() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending();
         let stem = pending.key.file_stem().expect("unit stem");
-        let (dylib, metadata) = authority.final_paths(&stem);
+        let (code, metadata) = authority.final_paths(&stem);
 
         std::fs::write(&metadata, b"metadata only").expect("write lone V3 metadata");
         assert_eq!(
@@ -2846,35 +2347,35 @@ mod tests {
             UnitMissReason::MissingPair
         );
         std::fs::remove_file(&metadata).expect("remove lone V3 metadata");
-        std::fs::write(&dylib, MOV42_RET).expect("write lone dylib");
+        std::fs::write(&code, MOV42_RET).expect("write lone code file");
         assert_eq!(
             authority
                 .load_unit(&pending.key, &fixture_source_words())
-                .expect_err("lone dylib must miss")
+                .expect_err("lone code file must miss")
                 .reason(),
             UnitMissReason::MissingPair
         );
     }
 
     #[test]
-    fn corrupt_v3_metadata_is_typed_before_dylib_authority() {
+    fn corrupt_v3_metadata_is_typed_before_the_code_half() {
         let authority = ContainerCacheAuthority::create().expect("create cache authority");
         let pending = fixture_pending();
         authority.publish_unit(&pending).expect("publish V3 unit");
         let stem = pending.key.file_stem().expect("unit stem");
-        let (dylib, metadata) = authority.final_paths(&stem);
+        let (code, metadata) = authority.final_paths(&stem);
         std::fs::OpenOptions::new()
             .write(true)
             .open(&metadata)
             .expect("open V3 metadata")
             .write_all(b"BROKEN!!")
             .expect("corrupt V3 magic");
-        std::fs::write(dylib, b"not a Mach-O image").expect("corrupt dylib authority");
+        std::fs::write(code, b"garbage bytes").expect("corrupt code half");
 
         assert_eq!(
             authority
                 .load_unit(&pending.key, &fixture_source_words())
-                .expect_err("corrupt V3 metadata must miss before dylib")
+                .expect_err("corrupt V3 metadata must miss before the code half")
                 .reason(),
             UnitMissReason::Schema
         );
@@ -2888,7 +2389,7 @@ mod tests {
             .publish_unit(&pending)
             .expect("publish V3 sidecar");
         let stem = pending.key.file_stem().expect("unit stem");
-        let (dylib_path, metadata_path) = authority.final_paths(&stem);
+        let (code_path, metadata_path) = authority.final_paths(&stem);
         let loaded = authority
             .load_unit(&pending.key, &fixture_source_words())
             .expect("load V3 sidecar");
@@ -2898,14 +2399,14 @@ mod tests {
         let metadata_drops = std::sync::Arc::downgrade(&metadata);
         let shared = SharedLoadedTranslationUnit::new_mapped_with_binding_base(
             std::sync::Arc::clone(&metadata),
-            loaded.base.as_ptr() as usize,
+            loaded.source_base.as_ptr() as usize,
             loaded.binding_base,
             loaded.load_evidence,
             loaded.lease,
         );
         drop(metadata);
         let clone = shared.clone();
-        std::fs::remove_file(dylib_path).expect("unlink loaded dylib");
+        std::fs::remove_file(code_path).expect("unlink loaded code");
         std::fs::remove_file(metadata_path).expect("unlink mapped metadata");
 
         let mapped = clone.metadata.v3().expect("cloned mapped metadata");
@@ -2919,8 +2420,11 @@ mod tests {
                 .get(),
             0
         );
-        let function: extern "C" fn() -> i32 = unsafe { std::mem::transmute(clone.base) };
-        assert_eq!(function(), 42);
+        // SAFETY: the clone's lease pins the unlinked code mapping.
+        let source = unsafe {
+            std::slice::from_raw_parts(clone.source_base as *const u8, pending.code.len())
+        };
+        assert_eq!(source, pending.code.as_slice());
         drop(shared);
         assert!(metadata_drops.upgrade().is_some());
         drop(clone);
@@ -2950,41 +2454,5 @@ mod tests {
             "metadata mapping must be kernel-classified as COW"
         );
         drop(metadata);
-    }
-
-    #[test]
-    fn loaded_unit_releases_the_dyld_lease_before_metadata_backing() {
-        let manifest = fixture_manifest();
-        let bytes = encode_translation_metadata_v3(&manifest).expect("encode V3 metadata");
-        // SAFETY: a null path requests a valid handle for the current process;
-        // `LoadedTranslationLease::drop` balances this successful `dlopen`.
-        let handle = std::ptr::NonNull::new(unsafe {
-            libc::dlopen(std::ptr::null(), libc::RTLD_LAZY | libc::RTLD_LOCAL)
-        })
-        .expect("open current process image");
-        let lease = std::sync::Arc::new(LoadedTranslationLease { handle });
-        let lease_alive_when_dropped = std::sync::Arc::new(AtomicBool::new(true));
-        let backing: std::sync::Arc<dyn MetadataBacking> =
-            std::sync::Arc::new(LeaseObservedMetadataBacking {
-                bytes,
-                lease: std::sync::Arc::downgrade(&lease),
-                lease_alive_when_dropped: std::sync::Arc::clone(&lease_alive_when_dropped),
-            });
-        let metadata = ValidatedMappedTranslationMetadata::new(backing, &manifest.key)
-            .expect("validate V3 metadata");
-        let loaded = LoadedTranslationUnit {
-            lease,
-            metadata: LoadedTranslationMetadata::V3(std::sync::Arc::new(metadata)),
-            base: std::ptr::NonNull::dangling(),
-            binding_base: None,
-            load_evidence: TranslationMetadataLoadEvidence::default(),
-        };
-
-        drop(loaded);
-
-        assert!(
-            !lease_alive_when_dropped.load(Ordering::Acquire),
-            "dyld lease must be released before the mapped metadata backing"
-        );
     }
 }
