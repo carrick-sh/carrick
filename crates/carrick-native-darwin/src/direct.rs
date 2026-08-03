@@ -532,6 +532,16 @@ pub enum DirectIneligible {
     /// unmappable. The Go toolchain lives at 0x10000 and is therefore tier T's
     /// by physics, whatever its instruction mix says.
     FixedLoadAddress { vaddr: u64 },
+    /// A `PT_INTERP` image: it must be entered through its interpreter
+    /// (ld.so), which this loader cannot map yet. Refused with the
+    /// interpreter named rather than loaded and entered at its own entry —
+    /// which would run unrelocated PLT/GOT code and fault far from the cause.
+    ///
+    /// This is the fail-closed edge of Phase 1 item 3 (dynamic linking):
+    /// ld.so is more PIE mappings through this same loader plus TLS init, but
+    /// until that chain exists, and until the per-image `guest_tls`/
+    /// `guest_x18` slots become per-load-group, a dynamic image is tier T's.
+    NeedsInterpreter { path: String },
 }
 
 impl std::fmt::Display for DirectIneligible {
@@ -547,6 +557,9 @@ impl std::fmt::Display for DirectIneligible {
                 f,
                 "ET_EXEC must load at its own vaddr {vaddr:#x}, which __PAGEZERO forbids"
             ),
+            Self::NeedsInterpreter { path } => {
+                write!(f, "needs interpreter {path}, which tier D cannot map yet")
+            }
         }
     }
 }
@@ -594,6 +607,12 @@ pub fn scan_eligibility(elf: &[u8]) -> Result<Result<usize, DirectIneligible>, i
     if read_u16(elf, 0x10)? == ET_EXEC {
         let (lo, _) = load_span(elf)?;
         return Ok(Err(DirectIneligible::FixedLoadAddress { vaddr: lo }));
+    }
+    // A PT_INTERP image must be ENTERED through its interpreter; loading it
+    // alone and jumping to its own entry would run unrelocated code. Refuse
+    // with the interpreter named until the ld.so chain exists.
+    if let Some(path) = interpreter_path(elf)? {
+        return Ok(Err(DirectIneligible::NeedsInterpreter { path }));
     }
     // Only real code: see `executable_sections` for why the PF_X segment is
     // the wrong unit. No section headers means nothing can be proved, so fail
@@ -1048,6 +1067,35 @@ fn all_load_segments(elf: &[u8]) -> Result<Vec<(usize, usize, usize, u64)>, io::
         ));
     }
     Ok(out)
+}
+
+/// The `PT_INTERP` path, if the image declares one.
+///
+/// The segment's file bytes are the NUL-terminated interpreter path (e.g.
+/// `/lib/ld-linux-aarch64.so.1`). A declared-but-unreadable path is an error,
+/// not `None`: fail closed rather than misread a malformed image as static.
+fn interpreter_path(elf: &[u8]) -> Result<Option<String>, io::Error> {
+    const PT_INTERP: u64 = 3;
+    let phoff = read_u64(elf, 0x20)? as usize;
+    let phentsize = read_u16(elf, 0x36)? as usize;
+    let phnum = read_u16(elf, 0x38)? as usize;
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
+        if read_u16(elf, ph)? != PT_INTERP {
+            continue;
+        }
+        let offset = read_u64(elf, ph + 0x08)? as usize;
+        let filesz = read_u64(elf, ph + 0x20)? as usize;
+        let bytes = elf
+            .get(offset..offset + filesz)
+            .ok_or_else(|| io::Error::other("PT_INTERP outside the file"))?;
+        let end = bytes
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(|| io::Error::other("PT_INTERP path is not NUL-terminated"))?;
+        return Ok(Some(String::from_utf8_lossy(&bytes[..end]).into_owned()));
+    }
+    Ok(None)
 }
 
 /// PT_LOADs carrying PF_X.
@@ -1705,6 +1753,35 @@ mod tests {
             HITS.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the guest took its syscall on a thread that never loaded the image"
+        );
+    }
+
+    /// A `PT_INTERP` image must be refused with the interpreter NAMED, not
+    /// loaded and entered at its own entry: without ld.so mapped, its
+    /// unrelocated PLT/GOT code would fault far from the cause. This is the
+    /// fail-closed edge of dynamic linking — the scan already knowing WHICH
+    /// interpreter is required is the first ingredient of the future chain.
+    #[test]
+    fn scan_refuses_a_dynamic_image_and_names_its_interpreter() {
+        let mut elf = elf_with_code(&[movz(8, 93, 0), SVC_0]);
+        // Interpreter path appended past the section headers (nothing after
+        // it reads by offset), and a second program header in the padding
+        // between the first phdr and the code at 0x1000.
+        let interp = b"/lib/ld-linux-aarch64.so.1\0";
+        let interp_off = elf.len();
+        elf.extend_from_slice(interp);
+        let ph = 0x40 + 56;
+        elf[ph..ph + 4].copy_from_slice(&3_u32.to_le_bytes()); // PT_INTERP
+        elf[ph + 0x08..ph + 0x10].copy_from_slice(&(interp_off as u64).to_le_bytes());
+        elf[ph + 0x20..ph + 0x28].copy_from_slice(&(interp.len() as u64).to_le_bytes());
+        elf[0x38..0x3a].copy_from_slice(&2_u16.to_le_bytes()); // e_phnum = 2
+        assert!(
+            matches!(
+                scan_eligibility(&elf).expect("scan runs"),
+                Err(DirectIneligible::NeedsInterpreter { ref path })
+                    if path == "/lib/ld-linux-aarch64.so.1"
+            ),
+            "a dynamic image fails closed with its interpreter named"
         );
     }
 
