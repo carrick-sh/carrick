@@ -486,6 +486,16 @@ fn native_wall_profile_emits_categorized_completion_contract() {
     let completion = "DSRPROF2|complete|profile=native-wall|bounded=%d|timed_out=%d|identity_violations=%d|lifecycle_violations=%d|range_violations=%d|kernel_violations=%d|offcpu_violations=%d|probe_errors=%d|target_exit_reason=%d|live_at_end=%d|elapsed_ns=%d";
 
     assert_eq!(script.matches(completion).count(), 1);
+    assert!(
+        !script.contains("dtrace:::BEGIN\n{\n\tstarted = timestamp;"),
+        "elapsed authority must not include launch time before the native owner exists"
+    );
+    assert!(script.split("\n\n").any(|clause| {
+        clause.contains("carrick*:::host-translated-range-reset\n/root_pid == (pid_t)0")
+            && clause.contains("started = timestamp;")
+    }));
+    assert!(script.contains("stopped = pid == root_pid ? timestamp : stopped;"));
+    assert!(script.contains("(stopped != 0 ? stopped : timestamp) - started"));
     for counter in [
         "identity_violations",
         "lifecycle_violations",
