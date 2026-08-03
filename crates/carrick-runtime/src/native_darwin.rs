@@ -3342,26 +3342,56 @@ fn maybe_dump_code_snapshot(translator: &dsr::ThreadTranslator) {
     let Some(dir) = std::env::var_os("CARRICK_DSR_CODE_SNAPSHOT_DIR") else {
         return;
     };
-    let snapshot = translator.process.code_snapshot();
     let pid = std::process::id();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos() as u64)
         .unwrap_or(0);
     let base = std::path::PathBuf::from(&dir);
-    let code_path = base.join(format!("{pid}-{stamp}.bin"));
-    let index_path = base.join(format!("{pid}-{stamp}.json"));
-    let index = serde_json::json!({
-        "pid": pid,
-        "cache_base": snapshot.cache_base,
-        "code_len": snapshot.code.len(),
-        "blocks": snapshot.blocks,
-    });
-    let written = std::fs::write(&code_path, &snapshot.code)
-        .and_then(|_| std::fs::write(&index_path, serde_json::to_vec(&index).unwrap_or_default()));
+    let written = translator
+        .process
+        .code_snapshot()
+        .map_err(|error| error.to_string())
+        .and_then(|snapshot| {
+            write_code_snapshot(&base, pid, stamp, &snapshot).map_err(|error| error.to_string())
+        });
     if let Err(error) = written {
         tracing::warn!(%error, "code snapshot dump failed");
     }
+}
+
+fn code_snapshot_index(pid: u32, snapshot: &dsr::CodeSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "carrick.code-snapshot.v2",
+        "pid": pid,
+        "cache_base": snapshot.cache_base,
+        "code_len": snapshot.code.len(),
+        "blocks": &snapshot.blocks,
+        "trusted_routes": &snapshot.trusted_routes,
+    })
+}
+
+/// Write code first and publish the JSON index last by atomic rename. The
+/// final `.json` is the completion marker: consumers must ignore orphaned
+/// binaries and temporary indexes left by an interrupted process exit.
+fn write_code_snapshot(
+    base: &std::path::Path,
+    pid: u32,
+    stamp: u64,
+    snapshot: &dsr::CodeSnapshot,
+) -> std::io::Result<()> {
+    let code_path = base.join(format!("{pid}-{stamp}.bin"));
+    let index_path = base.join(format!("{pid}-{stamp}.json"));
+    let index_tmp_path = base.join(format!(".{pid}-{stamp}.json.tmp"));
+    std::fs::write(&code_path, &snapshot.code)?;
+    let index =
+        serde_json::to_vec(&code_snapshot_index(pid, snapshot)).map_err(std::io::Error::other)?;
+    let publish_index = std::fs::write(&index_tmp_path, index)
+        .and_then(|()| std::fs::rename(&index_tmp_path, &index_path));
+    if publish_index.is_err() {
+        let _ = std::fs::remove_file(&index_tmp_path);
+    }
+    publish_index
 }
 
 fn run_native_thread_loop(
@@ -7807,6 +7837,59 @@ mod tests {
 
     fn handoff_host_images() -> crate::probes::PreparedHostImagePublication {
         crate::probes::prepare_host_image_publication()
+    }
+
+    #[test]
+    fn code_snapshot_index_includes_validated_trusted_route_schema() {
+        let snapshot = dsr::CodeSnapshot {
+            cache_base: 0x1000,
+            code: vec![0; 64],
+            blocks: vec![(0x40_0000, 0x1000)],
+            trusted_routes: vec![dsr::TrustedRouteSnapshot {
+                guest_start: 0x40_0000,
+                generation: 7,
+                fallthrough: 0x1000..0x100c,
+                direct: 0x1010..0x101c,
+                indirect: 0x1020..0x102c,
+                fallthrough_branch: 0x100c,
+                direct_branch: 0x101c,
+                indirect_branch: 0x102c,
+                common_body: 0x1030,
+            }],
+        };
+
+        let index = code_snapshot_index(42, &snapshot);
+
+        assert_eq!(index["schema"], "carrick.code-snapshot.v2");
+        assert_eq!(index["pid"], 42);
+        assert_eq!(index["code_len"], 64);
+        assert_eq!(index["trusted_routes"][0]["generation"], 7);
+        assert_eq!(index["trusted_routes"][0]["direct"]["start"], 0x1010);
+        assert_eq!(index["trusted_routes"][0]["common_body"], 0x1030);
+    }
+
+    #[test]
+    fn code_snapshot_json_is_published_as_completion_marker() {
+        let temp = tempfile::tempdir().expect("snapshot directory");
+        let snapshot = dsr::CodeSnapshot {
+            cache_base: 0x1000,
+            code: vec![0xaa; 16],
+            blocks: vec![(0x40_0000, 0x1000)],
+            trusted_routes: Vec::new(),
+        };
+
+        write_code_snapshot(temp.path(), 42, 99, &snapshot).expect("snapshot write");
+
+        let code_path = temp.path().join("42-99.bin");
+        let index_path = temp.path().join("42-99.json");
+        let temporary_index = temp.path().join(".42-99.json.tmp");
+        assert_eq!(std::fs::read(code_path).expect("code bytes"), snapshot.code);
+        assert!(index_path.is_file(), "final JSON is the commit marker");
+        assert!(!temporary_index.exists(), "temporary index was retired");
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(index_path).expect("published snapshot index"))
+                .expect("valid snapshot JSON");
+        assert_eq!(index["schema"], "carrick.code-snapshot.v2");
     }
 
     struct RecordingNativeImagePublisher<'a> {

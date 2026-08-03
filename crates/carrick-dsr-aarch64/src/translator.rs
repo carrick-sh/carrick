@@ -616,11 +616,26 @@ impl PreparedThreadExecHandoff<'_> {
 
 /// One process's published JIT code plus its guest-to-cache block index,
 /// copied out for offline diagnostics (see `ProcessTranslator::code_snapshot`).
+#[derive(Debug)]
 pub struct CodeSnapshot {
     pub cache_base: u64,
     pub code: Vec<u8>,
     /// `(guest_va, cache_entry_host_va)` for every published private block.
     pub blocks: Vec<(u64, u64)>,
+    pub trusted_routes: Vec<TrustedRouteSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct TrustedRouteSnapshot {
+    pub guest_start: u64,
+    pub generation: u64,
+    pub fallthrough: std::ops::Range<u64>,
+    pub direct: std::ops::Range<u64>,
+    pub indirect: std::ops::Range<u64>,
+    pub fallthrough_branch: u64,
+    pub direct_branch: u64,
+    pub indirect_branch: u64,
+    pub common_body: u64,
 }
 
 pub struct ProcessTranslator {
@@ -2276,7 +2291,7 @@ impl ProcessTranslator {
     /// no writer expectations: the read guard excludes emitters, and at the
     /// process-exit seam where this runs no sibling thread is left to patch
     /// direct links.
-    pub fn code_snapshot(&self) -> CodeSnapshot {
+    pub fn code_snapshot(&self) -> Result<CodeSnapshot, types::DsrError> {
         let state = self.state.read();
         let range = state.cache.host_range();
         let used = state.cache.used_bytes().min(range.end - range.start);
@@ -2289,11 +2304,109 @@ impl ProcessTranslator {
             .iter()
             .map(|((guest, _generation), entry)| (guest.raw(), entry.host().0 as u64))
             .collect();
-        CodeSnapshot {
+        if !code.len().is_multiple_of(4) {
+            return Err(types::DsrError::CachePolicy(format!(
+                "code snapshot length {} is not instruction aligned",
+                code.len()
+            )));
+        }
+        let words = code
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect::<Vec<_>>();
+        let cache_base = range.start as u64;
+        let mut trusted_routes = Vec::with_capacity(state.trusted_route_entries.len());
+        for (&(guest, generation), routes) in &state.trusted_route_entries {
+            if !state.blocks.contains_key(&(guest, generation)) {
+                return Err(types::DsrError::CachePolicy(format!(
+                    "trusted route for guest 0x{:x} generation {} has no block",
+                    guest.raw(),
+                    generation.get()
+                )));
+            }
+            let relative = |address: types::CacheVa, name: &str| {
+                let address = address.host().raw() as u64;
+                let offset = address.checked_sub(cache_base).ok_or_else(|| {
+                    types::DsrError::CachePolicy(format!(
+                        "trusted {name} route address 0x{address:x} precedes cache"
+                    ))
+                })?;
+                u32::try_from(offset).map_err(|_| {
+                    types::DsrError::CachePolicy(format!(
+                        "trusted {name} route offset {offset} exceeds u32"
+                    ))
+                })
+            };
+            let fallthrough = relative(routes.fallthrough, "fallthrough")?;
+            let derived = emit::derive_trusted_route_offsets(
+                &words,
+                fallthrough,
+                generation,
+                emit::TrustedRouteSplit::Enabled,
+            )?
+            .ok_or_else(|| {
+                types::DsrError::CachePolicy("trusted route derivation was disabled".to_string())
+            })?;
+            let expected = TrustedRouteEntries {
+                fallthrough: types::CacheVa::published(carrick_guest_mem::HostVa(
+                    range.start + derived.fallthrough.get() as usize,
+                )),
+                direct: types::CacheVa::published(carrick_guest_mem::HostVa(
+                    range.start + derived.direct.get() as usize,
+                )),
+                indirect: types::CacheVa::published(carrick_guest_mem::HostVa(
+                    range.start + derived.indirect.get() as usize,
+                )),
+                sequence_bytes: derived.sequence_bytes,
+                common_body: types::CacheVa::published(carrick_guest_mem::HostVa(
+                    range.start + derived.common_body.get() as usize,
+                )),
+            };
+            if *routes != expected {
+                return Err(types::DsrError::CachePolicy(format!(
+                    "trusted route geometry mismatch for guest 0x{:x} generation {}",
+                    guest.raw(),
+                    generation.get()
+                )));
+            }
+            let sequence_bytes = u64::from(routes.sequence_bytes);
+            let span = |start: types::CacheVa| -> Result<std::ops::Range<u64>, types::DsrError> {
+                let start = start.host().raw() as u64;
+                let end = start.checked_add(sequence_bytes).ok_or_else(|| {
+                    types::DsrError::CachePolicy("trusted route span overflow".to_string())
+                })?;
+                Ok(start..end)
+            };
+            let fallthrough = span(routes.fallthrough)?;
+            let direct = span(routes.direct)?;
+            let indirect = span(routes.indirect)?;
+            trusted_routes.push(TrustedRouteSnapshot {
+                guest_start: guest.raw(),
+                generation: generation.get(),
+                fallthrough_branch: fallthrough.end,
+                direct_branch: direct.end,
+                indirect_branch: indirect.end,
+                fallthrough,
+                direct,
+                indirect,
+                common_body: routes.common_body.host().raw() as u64,
+            });
+        }
+        trusted_routes.sort_by_key(|route| route.fallthrough.start);
+        for pair in trusted_routes.windows(2) {
+            if pair[0].indirect_branch >= pair[1].fallthrough.start {
+                return Err(types::DsrError::CachePolicy(format!(
+                    "trusted route spans overlap between guest 0x{:x} and 0x{:x}",
+                    pair[0].guest_start, pair[1].guest_start
+                )));
+            }
+        }
+        Ok(CodeSnapshot {
             cache_base: range.start as u64,
             code,
             blocks,
-        }
+            trusted_routes,
+        })
     }
 
     pub fn configure_shared_image(
@@ -5540,7 +5653,7 @@ mod tests {
             published.entry()
         };
 
-        let snapshot = translator.code_snapshot();
+        let snapshot = translator.code_snapshot().expect("valid code snapshot");
 
         let base = translator.cache_host_range().start;
         assert_eq!(snapshot.cache_base, base);
@@ -5555,6 +5668,161 @@ mod tests {
             &0xd65f_03c0_u32.to_le_bytes()
         );
         assert_eq!(snapshot.blocks, vec![(0x40_0000, entry.host().0 as u64)]);
+        assert!(snapshot.trusted_routes.is_empty());
+    }
+
+    fn diagnostic_snapshot_fixture(words: &[u32]) -> ProcessTranslator {
+        let translator = ProcessTranslator::new_with_host_and_route_split(
+            64 * 1024,
+            &TEST_HOST_JIT,
+            crate::emit::TrustedRouteSplit::Enabled,
+        )
+        .expect("translator");
+        let mut state = translator.state.write();
+        let published = state.cache.publish_words(words).expect("publish");
+        let entry = published.entry();
+        let key = (GuestVa(0x40_0000), types::CodeGeneration::claimed(7));
+        state.blocks.insert(key, entry);
+        let at = |offset: usize| types::CacheVa::published(HostVa(entry.host().raw() + offset));
+        state.trusted_route_entries.insert(
+            key,
+            super::TrustedRouteEntries {
+                fallthrough: at(0),
+                direct: at(16),
+                indirect: at(32),
+                sequence_bytes: 12,
+                common_body: at(48),
+            },
+        );
+        drop(state);
+        translator
+    }
+
+    #[test]
+    fn code_snapshot_exports_validated_trusted_route_spans() {
+        let translator = diagnostic_snapshot_fixture(&[
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0009,
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0005,
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0001,
+            0xd503_201f,
+        ]);
+
+        let snapshot = translator
+            .code_snapshot()
+            .expect("valid diagnostic snapshot");
+        let route = snapshot.trusted_routes.first().expect("one route row");
+        let base = snapshot.cache_base;
+        assert_eq!(route.guest_start, 0x40_0000);
+        assert_eq!(route.generation, 7);
+        assert_eq!(route.fallthrough, base..base + 12);
+        assert_eq!(route.direct, base + 16..base + 28);
+        assert_eq!(route.indirect, base + 32..base + 44);
+        assert_eq!(route.fallthrough_branch, base + 12);
+        assert_eq!(route.direct_branch, base + 28);
+        assert_eq!(route.indirect_branch, base + 44);
+        assert_eq!(route.common_body, base + 48);
+    }
+
+    #[test]
+    fn code_snapshot_rejects_mismatched_trusted_route_sequences() {
+        let translator = diagnostic_snapshot_fixture(&[
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0009,
+            0xd503_201f,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0005,
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0001,
+            0xd503_201f,
+        ]);
+
+        let error = translator
+            .code_snapshot()
+            .expect_err("unequal trusted sequences must fail closed");
+        assert!(
+            error.to_string().contains("trusted route sequences differ"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn code_snapshot_rejects_trusted_route_without_block() {
+        let translator = diagnostic_snapshot_fixture(&[
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0009,
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0005,
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0001,
+            0xd503_201f,
+        ]);
+        translator.state.write().blocks.clear();
+
+        let error = translator
+            .code_snapshot()
+            .expect_err("orphan trusted route must fail closed");
+        assert!(
+            error.to_string().contains("has no block"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn code_snapshot_rejects_stale_trusted_route_geometry() {
+        let translator = diagnostic_snapshot_fixture(&[
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0009,
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0005,
+            0xd280_00f1,
+            0xf902_3f91,
+            0xf942_3791,
+            0x1400_0001,
+            0xd503_201f,
+        ]);
+        {
+            let mut state = translator.state.write();
+            let routes = state
+                .trusted_route_entries
+                .values_mut()
+                .next()
+                .expect("one trusted route");
+            routes.direct = routes.fallthrough;
+        }
+
+        let error = translator
+            .code_snapshot()
+            .expect_err("stale route geometry must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("trusted route geometry mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     /// The native-tap unit contract, end to end at the translator level:
