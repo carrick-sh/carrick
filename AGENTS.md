@@ -407,10 +407,17 @@ concern — it is half the product.
     quoting a figure here;
   - guest `mmap(MAP_PRIVATE, fd)` → a `pread` of the FULL mapping length into
     fresh anon (`dispatch/mem.rs:2517`), instead of a host file-backed mmap;
-  - guest `execve` → 4 full ELF materializations + 3 SHA-256 passes + a host
-    self-re-exec, while the file-backed `map_prepared_for_plan`
-    (`mapped_memory.rs:1018`) sits marked `dead_code`;
-  - guest `MAP_FIXED|MAP_ANONYMOUS` → an unconditional full remap.
+  - guest `execve` → WAS 4 full ELF materializations + 3 SHA-256 passes; the
+    2026-08-02 exec lanes removed the payload hashing (metadata-only
+    `ArtifactDigestCoverage`, hatch `CARRICK_EXEC_FAST=0`) and map eligible
+    PT_LOADs `MAP_PRIVATE` from the executable's own host file (hatch
+    `CARRICK_EXEC_FILE_BACKED=0`). What remains: the host self-re-exec's
+    ~8.5 ms fixed chain, mostly Darwin's own exec floor
+    (`docs/perf-results/2026-08-03-native-exec-fixed-cost-decomposition.md`),
+    and ONE remaining full read of the executable for loader planning.
+    (Two prior claims here were stale and are corrected: `MAP_FIXED|
+    MAP_ANONYMOUS` is already a single host mmap on the identity backend, and
+    `map_prepared_for_plan` was live, not `dead_code`.)
   Drive each toward 1. **Do NOT assume carrick's own copies cause the fault
   term** — the committed census refutes it: JIT first-touch is 2.08% of zfod and
   inserted code 1.48%, so faults are dominated by the GUEST's own anonymous
