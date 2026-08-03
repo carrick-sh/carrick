@@ -41,11 +41,12 @@
 //! resumed past such a syscall with a fabricated errno.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use carrick_abi::{CanonicalNr, LinuxGuestAbi, NativeNr};
+use carrick_abi::{CanonicalNr, LinuxGuestAbi, NativeNr, SigSet};
 use carrick_guest_mem::{GuestMemory, MemoryError};
+use carrick_hal::{Reg, RegAccess, SysReg, SyscallTrap, TrapError};
 use carrick_native_darwin::direct::{
     DirectLoadGroup, DirectThreadSlots, GuestContext, InstalledThreadSlots,
     current_thread_slots_ptr,
@@ -449,8 +450,13 @@ pub struct DirectRunner {
     /// every other access is a read.
     registry: RwLock<crate::thread::ThreadRegistry>,
     /// Private-futex parking for this guest, shared with the dispatcher's
-    /// futex handler so waits and wakes meet in one table.
-    futex: crate::thread::FutexTable,
+    /// futex handler so waits and wakes meet in one table. `Arc` so it can be
+    /// published as the PROCESS-current table
+    /// (`crate::thread::set_current_futex_table`) — that is how out-of-band
+    /// wake sources (timer fallback threads via
+    /// `notify_current_futex_signal_pending`) reach futex-parked tier-D
+    /// guest threads when a signal becomes pending.
+    futex: Arc<crate::thread::FutexTable>,
     /// Host threads spawned for guest `clone(CLONE_THREAD)`s; joined by
     /// [`with_runner`] before it returns.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -488,6 +494,15 @@ impl Drop for DirectRunner {
 
 impl DirectRunner {
     pub fn new(dispatcher: SyscallDispatcher, memory: IdentityMemory) -> Self {
+        let futex = Arc::new(crate::thread::FutexTable::new());
+        // Publish the table process-wide so timer fallback threads
+        // (`deliver_native_process_signal` → notify_current_futex_signal_
+        // pending) wake tier-D futex parks, and register the native
+        // TimerDelivery so a tier-D guest's setitimer/timer_settime arms the
+        // fallback threads at all (set-once; the DSR boot registers the same
+        // implementation).
+        crate::thread::set_current_futex_table(&futex);
+        crate::native_darwin::ensure_native_timer_delivery();
         Self {
             dispatcher,
             memory,
@@ -499,7 +514,7 @@ impl DirectRunner {
             registry: RwLock::new(crate::thread::ThreadRegistry::new(
                 ThreadId::main_from_host_pid(),
             )),
-            futex: crate::thread::FutexTable::new(),
+            futex,
             threads: Mutex::new(Vec::new()),
             exec: None,
             forked_child: AtomicBool::new(false),
@@ -1354,17 +1369,26 @@ impl DirectRunner {
         ServiceVerdict::Resume(addr as i64)
     }
 
-    /// Service one syscall from a tier-D island.
+    /// Service one syscall from a tier-D island: dispatch, then run the
+    /// signal-delivery boundary — every completed syscall is a delivery
+    /// point, exactly the DSR loop's `complete_dsr_syscall` contract.
+    fn service(&self, ctx: &mut GuestContext) -> ServiceVerdict {
+        match self.service_syscall(ctx) {
+            ServiceVerdict::Resume(value) => self.deliver_pending_at_boundary(ctx, value),
+            leave => leave,
+        }
+    }
+
+    /// The dispatch half of [`Self::service`].
     ///
     /// The dispatch runs in a RE-DISPATCH loop, mirroring the DSR native
     /// loop's contract for blocking outcomes: a wait that reports `Ready`
     /// re-dispatches the SAME request so the handler completes it against
     /// fresh state; `TimedOut` completes with the outcome's timeout value;
     /// an interruption is classified — process exit retires the thread, and
-    /// a deliverable pending signal fails CLOSED (delivery is unimplemented
-    /// on tier D; silently dropping a signal a handler is installed for
-    /// would be corruption, not compatibility).
-    fn service(&self, ctx: &mut GuestContext) -> ServiceVerdict {
+    /// a deliverable pending signal completes the syscall with `EINTR` so
+    /// the boundary delivers its handler (or restarts, per `SA_RESTART`).
+    fn service_syscall(&self, ctx: &mut GuestContext) -> ServiceVerdict {
         self.syscalls.fetch_add(1, Ordering::Relaxed);
         let number = ctx.syscall_nr();
         if let Some(verdict) = self.service_identity_memory(ctx) {
@@ -1385,6 +1409,8 @@ impl DirectRunner {
         // must not restart a finite timeout from zero (the DSR loop's
         // `remaining_native_wait_timeout` contract).
         let mut fd_wait_deadline: Option<Instant> = None;
+        // The signal-wait (`WaitOnSignals`) overall deadline, same contract.
+        let mut signal_wait_deadline: Option<Instant> = None;
         loop {
             let outcome = self.dispatcher.dispatch_threaded(
                 request,
@@ -1493,20 +1519,94 @@ impl DirectRunner {
                         exec.max_traps,
                     ));
                 }
+                // `rt_sigreturn(2)`: pop the frame, chain-deliver, re-enter
+                // at the RESTORED pc (constant resume branches cannot).
+                Ok(DispatchOutcome::SigReturn) => {
+                    return self.service_sigreturn(ctx, tid);
+                }
+                // `tkill`/`tgkill` to a sibling guest thread: publish into
+                // its pending state and wake its parks (futex notify + the
+                // waiter self-pipe); the target delivers at its next
+                // boundary or interrupted wait. A SELF-directed tkill is
+                // delivered immediately by this syscall's own boundary
+                // epilogue.
+                Ok(DispatchOutcome::SignalThread {
+                    tid: target,
+                    signum,
+                }) => {
+                    let value = if read_lock(&self.registry).is_live(target) {
+                        crate::native_darwin::publish_native_pending_for(target.raw(), signum);
+                        0
+                    } else {
+                        crate::linux_abi::LINUX_ESRCH.guest_retval()
+                    };
+                    return ServiceVerdict::Resume(value);
+                }
+                // The dispatcher resolved a signal to immediate thread-group
+                // death (e.g. an unblockable fatal directed at self).
+                Ok(DispatchOutcome::SignalDeath { signum }) => {
+                    return self.die_by_guest_signal(signum);
+                }
+                // Synchronous signal wait (`rt_sigtimedwait`/`rt_sigsuspend`
+                // /`pause`): park until a wait-set signal is pending (Ready
+                // → re-dispatch dequeues it and writes siginfo), a caught
+                // signal OUTSIDE the set interrupts with EINTR (its handler
+                // delivers at this syscall's boundary), or the guest timeout
+                // expires (EAGAIN).
+                Ok(DispatchOutcome::WaitOnSignals {
+                    wait_set,
+                    block_mask,
+                    timeout,
+                }) => {
+                    use crate::native_darwin::NativeSignalWaitResult;
+                    match self.wait_on_signals(
+                        tid,
+                        wait_set,
+                        block_mask,
+                        timeout,
+                        &mut signal_wait_deadline,
+                    ) {
+                        NativeSignalWaitResult::Ready => continue,
+                        NativeSignalWaitResult::Interrupted => {
+                            if self.exiting.load(Ordering::SeqCst) {
+                                return ServiceVerdict::Leave;
+                            }
+                            return ServiceVerdict::Resume(
+                                crate::linux_abi::LINUX_EINTR.guest_retval(),
+                            );
+                        }
+                        NativeSignalWaitResult::TimedOut => {
+                            return ServiceVerdict::Resume(
+                                crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                            );
+                        }
+                    }
+                }
                 // FUTEX_WAIT whose value check passed under the dispatcher
                 // lock: park on the shared table (the dispatcher's wake side
-                // uses the same one).
+                // uses the same one). A deliverable pending signal breaks
+                // the park with EINTR so the boundary delivers its handler.
                 Ok(DispatchOutcome::FutexWait { wait, timeout }) => {
                     return match self
                         .futex
                         .wait_prepared_for_thread(wait, timeout, tid, &|| {
                             self.exiting.load(Ordering::SeqCst)
+                                || self.deliverable_wait_signal_pending(
+                                    tid,
+                                    carrick_abi::WaitSigMask::NONE,
+                                )
                         }) {
                         crate::thread::FutexWaitOutcome::Woken => ServiceVerdict::Resume(0),
                         crate::thread::FutexWaitOutcome::TimedOut => {
                             ServiceVerdict::Resume(crate::linux_abi::LINUX_ETIMEDOUT.guest_retval())
                         }
-                        crate::thread::FutexWaitOutcome::Interrupted => ServiceVerdict::Leave,
+                        crate::thread::FutexWaitOutcome::Interrupted => {
+                            if self.exiting.load(Ordering::SeqCst) {
+                                ServiceVerdict::Leave
+                            } else {
+                                ServiceVerdict::Resume(crate::linux_abi::LINUX_EINTR.guest_retval())
+                            }
+                        }
                     };
                 }
                 // Blocking fd waits: park on the per-thread waiter, then
@@ -1522,16 +1622,14 @@ impl DirectRunner {
                     else {
                         return ServiceVerdict::Resume(on_timeout);
                     };
-                    match self.wait_on_fds(
-                        number,
-                        tid,
-                        &fds,
-                        remaining,
-                        sig_mask,
-                        FdWaitKind::Kqueue,
-                    ) {
+                    match self.wait_on_fds(tid, &fds, remaining, sig_mask, FdWaitKind::Kqueue) {
                         TierDWait::Ready => continue,
                         TierDWait::TimedOut => return ServiceVerdict::Resume(on_timeout),
+                        TierDWait::Interrupted => {
+                            return ServiceVerdict::Resume(
+                                crate::linux_abi::LINUX_EINTR.guest_retval(),
+                            );
+                        }
                         TierDWait::Leave => return ServiceVerdict::Leave,
                     }
                 }
@@ -1545,10 +1643,14 @@ impl DirectRunner {
                     else {
                         return ServiceVerdict::Resume(on_timeout);
                     };
-                    match self.wait_on_fds(number, tid, &fds, remaining, sig_mask, FdWaitKind::Poll)
-                    {
+                    match self.wait_on_fds(tid, &fds, remaining, sig_mask, FdWaitKind::Poll) {
                         TierDWait::Ready => continue,
                         TierDWait::TimedOut => return ServiceVerdict::Resume(on_timeout),
+                        TierDWait::Interrupted => {
+                            return ServiceVerdict::Resume(
+                                crate::linux_abi::LINUX_EINTR.guest_retval(),
+                            );
+                        }
                         TierDWait::Leave => return ServiceVerdict::Leave,
                     }
                 }
@@ -1570,45 +1672,84 @@ impl DirectRunner {
                     else {
                         return timed_out(self);
                     };
-                    match self.wait_on_fds(
-                        number,
-                        tid,
-                        &fds,
-                        remaining,
-                        sig_mask,
-                        FdWaitKind::Kqueue,
-                    ) {
+                    match self.wait_on_fds(tid, &fds, remaining, sig_mask, FdWaitKind::Kqueue) {
                         TierDWait::Ready => continue,
                         TierDWait::TimedOut => return timed_out(self),
+                        TierDWait::Interrupted => {
+                            return ServiceVerdict::Resume(
+                                crate::linux_abi::LINUX_EINTR.guest_retval(),
+                            );
+                        }
                         TierDWait::Leave => return ServiceVerdict::Leave,
                     }
                 }
                 // Blocking child wait: park on the child's exit (EVFILT_PROC
                 // under the per-thread waiter), then re-dispatch to reap.
+                // EINTR here is the SA_RESTART-restartable case (wait4 and
+                // waitid are the kernel's restartable set): the boundary
+                // epilogue restarts or surfaces EINTR per the handler flags.
                 Ok(DispatchOutcome::WaitOnProcExit { pid, sig_mask }) => {
-                    match self.wait_on_proc_exit(number, tid, pid, sig_mask) {
+                    match self.wait_on_proc_exit(tid, pid, sig_mask) {
                         TierDWait::Ready | TierDWait::TimedOut => continue,
+                        TierDWait::Interrupted => {
+                            return ServiceVerdict::Resume(
+                                crate::linux_abi::LINUX_EINTR.guest_retval(),
+                            );
+                        }
                         TierDWait::Leave => return ServiceVerdict::Leave,
                     }
                 }
                 // Non-terminal child state (WSTOPPED/WCONTINUED): bounded
                 // re-poll, the DSR arm's exact shape.
                 Ok(DispatchOutcome::WaitOnProcState { pid: _, sig_mask }) => {
-                    match self.wait_on_proc_state(number, tid, sig_mask) {
+                    match self.wait_on_proc_state(tid, sig_mask) {
                         TierDWait::Ready | TierDWait::TimedOut => continue,
+                        TierDWait::Interrupted => {
+                            return ServiceVerdict::Resume(
+                                crate::linux_abi::LINUX_EINTR.guest_retval(),
+                            );
+                        }
                         TierDWait::Leave => return ServiceVerdict::Leave,
                     }
                 }
-                // Relative sleep. Without signal delivery the only interrupt
-                // source is process end, so a completed sleep returns 0 and
-                // `remaining` is never written (it only matters on EINTR).
+                // Relative sleep: completes with 0, or EINTR on a delivered
+                // signal — writing the remaining time first, as nanosleep
+                // does.
                 Ok(DispatchOutcome::WaitOnSleep {
                     duration,
-                    remaining: _,
-                }) => match self.wait_on_sleep(number, tid, duration) {
-                    TierDWait::Ready | TierDWait::TimedOut => return ServiceVerdict::Resume(0),
-                    TierDWait::Leave => return ServiceVerdict::Leave,
-                },
+                    remaining,
+                }) => {
+                    let deadline = Instant::now() + duration;
+                    match self.wait_on_sleep(tid, deadline) {
+                        TierDWait::Ready | TierDWait::TimedOut => return ServiceVerdict::Resume(0),
+                        TierDWait::Interrupted => {
+                            let mut memory = self.memory;
+                            let completed = crate::dispatch::complete_interrupted_sleep(
+                                &mut memory,
+                                remaining,
+                                deadline.saturating_duration_since(Instant::now()),
+                            );
+                            return match completed {
+                                DispatchOutcome::Returned { value } => {
+                                    ServiceVerdict::Resume(value)
+                                }
+                                DispatchOutcome::Errno { errno } => {
+                                    ServiceVerdict::Resume(errno.guest_retval())
+                                }
+                                other => {
+                                    self.end_process(DirectRunOutcome::Unsupported {
+                                        syscall: number,
+                                        outcome: format!(
+                                            "interrupted sleep completed with {other:?}"
+                                        ),
+                                    });
+                                    ServiceVerdict::Leave
+                                }
+                            };
+                        }
+                        TierDWait::Leave => return ServiceVerdict::Leave,
+                    }
+                }
                 Ok(other) => {
                     self.end_process(DirectRunOutcome::Unsupported {
                         syscall: number,
@@ -1726,6 +1867,11 @@ impl DirectRunner {
                 // leaves through the handler.
                 if let Err(error) = unsafe { group.enter_parked() } {
                     fail_closed(format!("clone child parked entry failed: {error}"));
+                } else {
+                    // Delivery/sigreturn re-entries for THIS guest thread.
+                    // SAFETY: the parked context was written by this thread's
+                    // own delivery path from a genuine guest state.
+                    unsafe { reenter_until_final(runner, group) };
                 }
                 drop(guard);
             });
@@ -1990,32 +2136,42 @@ impl DirectRunner {
         carrick_abi::SigBlockMask::blocking_all_of(effective)
     }
 
-    /// Classify an interrupted wait, failing CLOSED on the one thing tier D
-    /// cannot do: deliver a signal. A deliverable pending signal with the
-    /// wait's mask means Linux would run a handler and EINTR the syscall;
-    /// resuming as if nothing happened would silently drop the signal, so
-    /// the run leaves named instead. Process end retires the thread quietly
-    /// (the outcome is already recorded).
+    /// A deliverable pending signal for `tid` under a WAIT's mask, checked
+    /// across BOTH pending stores: the dispatcher-owned pending state AND
+    /// the host slot (`host_signal`) — timers and host-delivered signals
+    /// publish into the latter, and the per-thread waiter's own interrupt
+    /// check reads it, so a classifier that consulted only dispatcher state
+    /// re-dispatched forever against a host-slot pending (the observed
+    /// 100%-CPU read spin).
+    fn deliverable_wait_signal_pending(
+        &self,
+        tid: ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> bool {
+        self.dispatcher
+            .has_deliverable_dispatch_pending_for_wait(tid, sig_mask)
+            || crate::host_signal::has_unblocked_pending_for(
+                tid.raw(),
+                self.wait_block_mask(tid, sig_mask),
+            )
+    }
+
+    /// Classify an interrupted wait. Process end retires the thread quietly
+    /// (the outcome is already recorded). A deliverable pending signal with
+    /// the wait's mask is what Linux calls an interrupted syscall: the wait
+    /// completes with `EINTR` and the boundary-delivery epilogue runs the
+    /// handler (or restarts the syscall, per `SA_RESTART`) — exactly the DSR
+    /// lane's wait→EINTR→`complete`+`deliver_pending_signal` shape.
     fn classify_wait_interrupt(
         &self,
-        number: u64,
         tid: ThreadId,
         sig_mask: carrick_abi::WaitSigMask,
     ) -> Option<TierDWait> {
         if self.exiting.load(Ordering::SeqCst) {
             return Some(TierDWait::Leave);
         }
-        if self
-            .dispatcher
-            .has_deliverable_dispatch_pending_for_wait(tid, sig_mask)
-        {
-            self.end_process(DirectRunOutcome::Unsupported {
-                syscall: number,
-                outcome: "deliverable pending signal during a blocking wait \
-                          (signal delivery is unimplemented on tier D)"
-                    .to_string(),
-            });
-            return Some(TierDWait::Leave);
+        if self.deliverable_wait_signal_pending(tid, sig_mask) {
+            return Some(TierDWait::Interrupted);
         }
         None
     }
@@ -2024,16 +2180,12 @@ impl DirectRunner {
     /// for process end or for a deliverable pending signal (which the caller
     /// then classifies — see [`Self::classify_wait_interrupt`]).
     fn wait_should_interrupt(&self, tid: ThreadId, sig_mask: carrick_abi::WaitSigMask) -> bool {
-        self.exiting.load(Ordering::SeqCst)
-            || self
-                .dispatcher
-                .has_deliverable_dispatch_pending_for_wait(tid, sig_mask)
+        self.exiting.load(Ordering::SeqCst) || self.deliverable_wait_signal_pending(tid, sig_mask)
     }
 
     /// Park on host-fd readiness (`WaitOnFds`/`WaitOnPollFds`/select).
     fn wait_on_fds(
         &self,
-        number: u64,
         tid: ThreadId,
         fds: &[crate::io_wait::WaitFd],
         timeout: Option<Duration>,
@@ -2060,9 +2212,9 @@ impl DirectRunner {
             // remaining time from the per-syscall deadline), and a
             // wait-infrastructure errno is not a guest result — a fresh
             // dispatch takes a fresh look. Only a classified interrupt
-            // (process end / undeliverable signal) leaves.
+            // (process end / deliverable signal) breaks the wait.
             crate::io_wait::WaitResult::Interrupted => self
-                .classify_wait_interrupt(number, tid, sig_mask)
+                .classify_wait_interrupt(tid, sig_mask)
                 .unwrap_or(TierDWait::Ready),
             crate::io_wait::WaitResult::Errno(_) => TierDWait::Ready,
         }
@@ -2071,7 +2223,6 @@ impl DirectRunner {
     /// Park until the guest child `pid` is reapable (`WaitOnProcExit`).
     fn wait_on_proc_exit(
         &self,
-        number: u64,
         tid: ThreadId,
         pid: i32,
         sig_mask: carrick_abi::WaitSigMask,
@@ -2087,19 +2238,14 @@ impl DirectRunner {
                 TierDWait::Ready
             }
             crate::io_wait::WaitResult::Interrupted => self
-                .classify_wait_interrupt(number, tid, sig_mask)
+                .classify_wait_interrupt(tid, sig_mask)
                 .unwrap_or(TierDWait::Ready),
             crate::io_wait::WaitResult::Errno(_) => TierDWait::Ready,
         }
     }
 
     /// Bounded re-poll for a non-terminal child state (`WaitOnProcState`).
-    fn wait_on_proc_state(
-        &self,
-        number: u64,
-        tid: ThreadId,
-        sig_mask: carrick_abi::WaitSigMask,
-    ) -> TierDWait {
+    fn wait_on_proc_state(&self, tid: ThreadId, sig_mask: carrick_abi::WaitSigMask) -> TierDWait {
         let block_mask = self.wait_block_mask(tid, sig_mask);
         let result = with_thread_waiter(tid, |waiter| {
             waiter.wait_proc_state_with_dispatch_pending(block_mask, || {
@@ -2111,19 +2257,17 @@ impl DirectRunner {
                 TierDWait::Ready
             }
             crate::io_wait::WaitResult::Interrupted => self
-                .classify_wait_interrupt(number, tid, sig_mask)
+                .classify_wait_interrupt(tid, sig_mask)
                 .unwrap_or(TierDWait::Ready),
             crate::io_wait::WaitResult::Errno(_) => TierDWait::Ready,
         }
     }
 
-    /// A relative sleep (`WaitOnSleep`), interruptible only by process end
-    /// or a deliverable pending signal (both classified by the caller's
-    /// `Leave` handling).
-    fn wait_on_sleep(&self, number: u64, tid: ThreadId, duration: Duration) -> TierDWait {
+    /// A relative sleep (`WaitOnSleep`), interruptible by process end or a
+    /// deliverable pending signal (nanosleep's EINTR).
+    fn wait_on_sleep(&self, tid: ThreadId, deadline: Instant) -> TierDWait {
         let sig_mask = carrick_abi::WaitSigMask::NONE;
         let block_mask = self.wait_block_mask(tid, sig_mask);
-        let deadline = Instant::now() + duration;
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -2137,14 +2281,239 @@ impl DirectRunner {
             match result {
                 crate::io_wait::WaitResult::TimedOut => return TierDWait::TimedOut,
                 crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::Interrupted => {
-                    if let Some(leave) = self.classify_wait_interrupt(number, tid, sig_mask) {
-                        return leave;
+                    if let Some(interrupt) = self.classify_wait_interrupt(tid, sig_mask) {
+                        return interrupt;
                     }
                     // Spurious: re-park for the remaining time.
                 }
                 crate::io_wait::WaitResult::Errno(_) => return TierDWait::TimedOut,
             }
         }
+    }
+
+    /// Park until a signal in `wait_set` is pending (`WaitOnSignals` —
+    /// `rt_sigtimedwait`/`rt_sigsuspend`/`pause`), the DSR lane's
+    /// `wait_native_signals` shape: slice-bounded parks with the pending
+    /// classification re-run on every wake (the slices are also the delivery
+    /// backstop for publications that raced the park).
+    fn wait_on_signals(
+        &self,
+        tid: ThreadId,
+        wait_set: SigSet,
+        block_mask: carrick_abi::SigBlockMask,
+        timeout: Option<Duration>,
+        deadline: &mut Option<Instant>,
+    ) -> crate::native_darwin::NativeSignalWaitResult {
+        use crate::native_darwin::{NativeSignalWaitResult, native_signal_wait_pending};
+        loop {
+            if self.exiting.load(Ordering::SeqCst) {
+                // The caller's Interrupted arm re-checks `exiting` and leaves.
+                return NativeSignalWaitResult::Interrupted;
+            }
+            let Some(slice) = crate::vcpu_loop::signal_wait_slice(deadline, timeout) else {
+                return NativeSignalWaitResult::TimedOut;
+            };
+            if let Some(result) =
+                native_signal_wait_pending(&self.dispatcher, tid, wait_set, block_mask)
+            {
+                return result;
+            }
+            let result = with_thread_waiter(tid, |waiter| {
+                waiter.wait_with_dispatch_pending(&[], Some(slice), block_mask, || {
+                    self.exiting.load(Ordering::SeqCst)
+                        || native_signal_wait_pending(&self.dispatcher, tid, wait_set, block_mask)
+                            .is_some()
+                })
+            });
+            match result {
+                crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::Interrupted => {
+                    if let Some(result) =
+                        native_signal_wait_pending(&self.dispatcher, tid, wait_set, block_mask)
+                    {
+                        return result;
+                    }
+                }
+                crate::io_wait::WaitResult::TimedOut | crate::io_wait::WaitResult::Errno(_) => {
+                    if crate::vcpu_loop::signal_wait_expired(*deadline) {
+                        return NativeSignalWaitResult::TimedOut;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The syscall-boundary delivery point (the DSR lane's
+    /// `complete_dsr_syscall` contract), split across the leave because of a
+    /// STACK constraint unique to tier D: islands call this Rust handler ON
+    /// THE GUEST'S OWN STACK, so the live dispatch frames occupy exactly the
+    /// bytes below the parked guest SP where a signal frame must be written.
+    /// Building the frame in-handler would overwrite our own caller frames.
+    /// So the boundary only CHECKS (non-destructively) for a deliverable
+    /// pending signal here; when one exists it parks the COMPLETED syscall
+    /// state and defers the actual `deliver_pending_signal` cycle to
+    /// [`reenter_until_final`], which runs on the restored HOST stack after
+    /// the island's leave leg (the guest stack is then fully parked).
+    fn deliver_pending_at_boundary(&self, ctx: &mut GuestContext, value: i64) -> ServiceVerdict {
+        let tid = self.current_tid();
+        if !self.deliverable_signal_is_pending(tid) {
+            return ServiceVerdict::Resume(value);
+        }
+        // Park the completed syscall state: retval visible in x0, pc already
+        // the resume site. The ORIGINAL arg0 rides the deferred record — the
+        // SA_RESTART path re-executes the syscall with it.
+        let orig_x0 = ctx.x[0];
+        ctx.set_return(value);
+        defer_boundary_delivery(DeferredBoundaryDelivery {
+            retval: value,
+            orig_x0,
+        });
+        ServiceVerdict::Leave
+    }
+
+    /// Non-destructive "would `deliver_pending_signal` find work?" check, so
+    /// the common no-signal syscall boundary stays leave-free. False
+    /// positives cost one leave/re-enter round trip; the sources checked are
+    /// exactly the ones the deferred delivery consumes (the xsig ring is
+    /// DRAINED into dispatcher pending state here, which is a move between
+    /// pending stores, not a delivery).
+    fn deliverable_signal_is_pending(&self, tid: ThreadId) -> bool {
+        self.dispatcher.drain_xsignals_process_directed();
+        self.deliverable_wait_signal_pending(tid, carrick_abi::WaitSigMask::NONE)
+    }
+
+    /// The deferred half of [`Self::deliver_pending_at_boundary`], run by
+    /// [`reenter_until_final`] on the HOST stack with the guest parked. Runs
+    /// one `deliver_pending_signal` cycle against the parked context (frame
+    /// writes below the parked guest SP are safe here — nothing lives
+    /// there). Returns whether the guest should be re-entered.
+    fn deliver_parked_boundary(
+        &self,
+        ctx: &mut GuestContext,
+        group: &DirectLoadGroup,
+        deferred: DeferredBoundaryDelivery,
+    ) -> bool {
+        let tid = self.current_tid();
+        let mut trap = TierDSignalTrap::from_parked(
+            ctx,
+            self.memory,
+            Some(ctx.syscall_nr()),
+            group.sigreturn_trampoline(),
+        );
+        // The parked x0 is the COMPLETED retval; SA_RESTART needs the call's
+        // original arg0, which the boundary stashed before completing.
+        trap.orig_x0 = deferred.orig_x0;
+        match crate::vcpu_loop::deliver_pending_signal(
+            &mut trap,
+            &self.dispatcher,
+            Some(deferred.retval),
+            tid,
+            None,
+        ) {
+            Ok(action) => {
+                if let Some(action) = action {
+                    if let Some(signum) = action.stop_signal {
+                        // Default-stop: host-stop until SIGCONT, then resume.
+                        crate::exec_helpers::stop_by_signal(signum);
+                    }
+                    if let Some(signum) = action.term_signal {
+                        self.terminate_by_guest_signal(signum);
+                        return false;
+                    }
+                }
+                // Injected: pc now names the handler entry. Not injected
+                // (ignored/blocked): pc is still the resume site. Either way
+                // the parked-entry stub resumes the right state.
+                trap.write_back(ctx, false);
+                true
+            }
+            Err(error) => {
+                self.end_process(DirectRunOutcome::Unsupported {
+                    syscall: ctx.syscall_nr(),
+                    outcome: format!("signal delivery failed: {error}"),
+                });
+                false
+            }
+        }
+    }
+
+    /// `rt_sigreturn(2)`: restore the pre-signal context from the frame the
+    /// handler is returning through, chain-deliver any remaining pending
+    /// signal (Linux delivers every deliverable signal before returning to
+    /// the interrupted context), and re-enter the guest at the RESTORED pc
+    /// with the frame's FP/NZCV state armed for the parked-entry stub.
+    fn service_sigreturn(&self, ctx: &mut GuestContext, tid: ThreadId) -> ServiceVerdict {
+        let Some(group) = active_group() else {
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: 139,
+                outcome: "rt_sigreturn with no tier-D load group installed".to_string(),
+            });
+            return ServiceVerdict::Leave;
+        };
+        let mut trap =
+            TierDSignalTrap::from_parked(ctx, self.memory, None, group.sigreturn_trampoline());
+        let restored_sigmask = match trap.restore_from_sigframe() {
+            Ok(mask) => mask,
+            Err(_) => {
+                // Linux force_sigsegv: an unreadable/forged frame at SP
+                // terminates the thread-group by SIGSEGV, not carrick.
+                return self.die_by_guest_signal(crate::linux_abi::LINUX_SIGSEGV);
+            }
+        };
+        self.dispatcher
+            .restore_signal_mask(tid, SigSet::from_raw(restored_sigmask));
+        let restored_pc = trap.pc();
+        match crate::vcpu_loop::deliver_pending_signal(
+            &mut trap,
+            &self.dispatcher,
+            None,
+            tid,
+            Some(restored_pc),
+        ) {
+            Ok(action) => {
+                if let Some(action) = action {
+                    if let Some(signum) = action.stop_signal {
+                        crate::exec_helpers::stop_by_signal(signum);
+                    }
+                    if let Some(signum) = action.term_signal {
+                        return self.die_by_guest_signal(signum);
+                    }
+                }
+            }
+            Err(error) => {
+                self.end_process(DirectRunOutcome::Unsupported {
+                    syscall: 139,
+                    outcome: format!("post-sigreturn delivery failed: {error}"),
+                });
+                return ServiceVerdict::Leave;
+            }
+        }
+        // The frame's state (possibly with a chained handler frame on top)
+        // is the guest's next state; NZCV + FP restore rides the stub.
+        trap.write_back(ctx, true);
+        request_reenter();
+        ServiceVerdict::Leave
+    }
+
+    /// A signal whose action is termination kills the whole thread-group,
+    /// exactly as the DSR lane: a forked guest child dies BY the host signal
+    /// (its guest parent observes WIFSIGNALED), the main guest process ends
+    /// with the shell convention `128 + signum`.
+    fn terminate_by_guest_signal(&self, signum: i32) {
+        if self.forked_guest_child() || self.dispatcher.is_forked_guest_process() {
+            self.dispatcher.cleanup_sysv_ipc_on_process_exit();
+            crate::exec_helpers::forked_child_die_by_signal(
+                signum,
+                self.dispatcher.stdout(),
+                self.dispatcher.stderr(),
+            );
+        }
+        self.end_process(DirectRunOutcome::Exited { code: 128 + signum });
+    }
+
+    /// [`Self::terminate_by_guest_signal`] as an island verdict.
+    fn die_by_guest_signal(&self, signum: i32) -> ServiceVerdict {
+        self.terminate_by_guest_signal(signum);
+        ServiceVerdict::Leave
     }
 }
 
@@ -2166,6 +2535,10 @@ enum TierDWait {
     Ready,
     /// Complete the syscall with its timeout value.
     TimedOut,
+    /// A deliverable pending signal interrupted the wait: complete the
+    /// syscall with `EINTR` and let the boundary-delivery epilogue run the
+    /// handler (or restart, per `SA_RESTART`).
+    Interrupted,
     /// Leave guest execution (process end, or a named fail-closed reason
     /// already recorded via `end_process`).
     Leave,
@@ -2225,6 +2598,363 @@ fn with_thread_waiter<R>(
         };
         f(waiter)
     })
+}
+
+// ---------------------------------------------------------------------------
+// Signal delivery: the tier-D engine view of a parked guest thread
+// ---------------------------------------------------------------------------
+
+/// The tier-D signal engine: `carrick_hal::sigframe`'s (and
+/// `vcpu_loop::deliver_pending_signal`'s) view of a PARKED tier-D guest
+/// thread. GPRs/SP/PC come from the parked [`GuestContext`]; the FP/SIMD
+/// file is captured LIVE from the physical registers when (and only when) a
+/// frame is actually built or restored — delivery runs on the guest's own
+/// host thread, so the physical file is this guest's.
+///
+/// Honesty note on the V registers at a syscall boundary: islands park
+/// x0-x30+SP only, so by capture time the caller-saved vector registers may
+/// have been clobbered by the Rust dispatch path — exactly the preservation
+/// level the guest already observes across ANY tier-D syscall (the recorded
+/// SIMD-across-islands approximation; the host C ABI preserves v8-v15's low
+/// halves through the handler chain). The frame is SELF-CONSISTENT: what
+/// `build_sigframe` captures here, `rt_sigreturn` restores verbatim
+/// (including handler mutations of the frame), which is the Linux contract.
+/// The same applies to PSTATE: NZCV at a tier-D syscall boundary is not
+/// preserved (the Rust handler clobbers flags), so the frame records EL0t
+/// with clear flags — consistent with what a resumed guest observes today.
+/// Truly-async delivery (mid-guest-execution, where the interrupted host
+/// mcontext carries the exact V file and flags) is the one case this cannot
+/// serve; it stays fail-closed.
+struct TierDSignalTrap {
+    memory: IdentityMemory,
+    x: [u64; 31],
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+    v: [u128; 32],
+    fpsr: u64,
+    fpcr: u64,
+    orig_x0: u64,
+    last_syscall_nr: Option<u64>,
+    sigreturn_trampoline: u64,
+}
+
+impl TierDSignalTrap {
+    /// Build the engine view of the guest parked in `ctx`. `last_syscall_nr`
+    /// feeds the SA_RESTART restartable-set check; `sigreturn_trampoline` is
+    /// the group's handler-return stub (the aarch64 ABI has no
+    /// `sa_restorer` in practice).
+    ///
+    /// The FP/SIMD file comes from the slots' resume extras, PARKED BY THE
+    /// ISLAND'S LEAVE LEG — the only point where the physical vector file
+    /// still carries the guest's values (any Rust frame between the leave
+    /// and this constructor may have spilled a callee-saved q register for
+    /// its own use, so reading the live registers here would capture that
+    /// frame's temporary — observed as d8 coming back wrong).
+    fn from_parked(
+        ctx: &GuestContext,
+        memory: IdentityMemory,
+        last_syscall_nr: Option<u64>,
+        sigreturn_trampoline: u64,
+    ) -> Self {
+        // The context IS the slots (offset 0 by `repr(C)` contract), and the
+        // reference derives from the slots pointer, so the upcast keeps
+        // provenance.
+        let slots = std::ptr::from_ref(ctx).cast::<DirectThreadSlots>();
+        // SAFETY: this thread's own installed slots; the guest is parked.
+        // `parked_fp` is the leave leg's capture — NOT `resume_extras`,
+        // which the runner itself arms (single-writer split).
+        let parked_fp = unsafe { (*slots).parked_fp };
+        Self {
+            memory,
+            x: ctx.x,
+            sp: ctx.sp,
+            pc: ctx.pc,
+            // EL0t, flags clear — see the struct doc's PSTATE note.
+            pstate: 0,
+            v: parked_fp.v.map(u128::from_le_bytes),
+            fpsr: parked_fp.fpsr,
+            fpcr: parked_fp.fpcr,
+            // Captured BEFORE any completion write: the parked x0 IS the
+            // syscall's original arg0 (SA_RESTART re-executes with it).
+            orig_x0: ctx.x[0],
+            last_syscall_nr,
+            sigreturn_trampoline,
+        }
+    }
+
+    fn pc(&self) -> u64 {
+        self.pc
+    }
+
+    /// Write the engine state back into the parked context (the state the
+    /// next `enter_parked` resumes from). With `restore_extras`, also arm
+    /// the parked-resume extras — NZCV + the FP/SIMD file — for the next
+    /// entry (the sigreturn path, where the frame's state is authoritative).
+    fn write_back(&self, ctx: &mut GuestContext, restore_extras: bool) {
+        ctx.x = self.x;
+        ctx.sp = self.sp;
+        ctx.pc = self.pc;
+        if restore_extras {
+            // The context IS the slots (offset 0 by `repr(C)` contract), and
+            // `ctx` was derived from the slots pointer, so casting back up
+            // is provenance-preserving.
+            let slots = std::ptr::from_mut(ctx).cast::<DirectThreadSlots>();
+            // SAFETY: this thread's own installed slots; the guest is parked.
+            unsafe {
+                (*slots).resume_extras.pstate = self.pstate;
+                (*slots).resume_extras.fpsr = self.fpsr;
+                (*slots).resume_extras.fpcr = self.fpcr;
+                for (i, value) in self.v.iter().enumerate() {
+                    (*slots).resume_extras.v[i] = value.to_le_bytes();
+                }
+                (*slots).resume_extras.restore = 1;
+            }
+        }
+    }
+}
+
+impl GuestMemory for TierDSignalTrap {
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.memory.read_bytes_raw(address, length)
+    }
+
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let mut memory = self.memory;
+        memory.write_bytes_raw(address, bytes)
+    }
+}
+
+impl RegAccess for TierDSignalTrap {
+    fn get_reg(&self, reg: Reg) -> Result<u64, carrick_hal::OsError> {
+        Ok(match reg {
+            Reg::X(index) => usize::try_from(index)
+                .ok()
+                .and_then(|i| self.x.get(i).copied())
+                .unwrap_or(0),
+            Reg::Sp => self.sp,
+            Reg::Pc | Reg::ElrEl1 => self.pc,
+            Reg::Pstate | Reg::SpsrEl1 => self.pstate,
+            _ => 0,
+        })
+    }
+
+    fn set_reg(&mut self, reg: Reg, value: u64) -> Result<(), carrick_hal::OsError> {
+        match reg {
+            Reg::X(index) => {
+                if let Ok(i) = usize::try_from(index)
+                    && let Some(slot) = self.x.get_mut(i)
+                {
+                    *slot = value;
+                }
+            }
+            Reg::Sp => self.sp = value,
+            Reg::Pc | Reg::ElrEl1 => self.pc = value,
+            Reg::Pstate | Reg::SpsrEl1 => self.pstate = value,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn get_sys_reg(&self, _reg: SysReg) -> Result<u64, carrick_hal::OsError> {
+        Ok(0)
+    }
+
+    fn set_sys_reg(&mut self, _reg: SysReg, _value: u64) -> Result<(), carrick_hal::OsError> {
+        Ok(())
+    }
+
+    fn get_vreg(&self, n: u32) -> Result<u128, carrick_hal::OsError> {
+        Ok(usize::try_from(n)
+            .ok()
+            .and_then(|index| self.v.get(index).copied())
+            .unwrap_or(0))
+    }
+
+    fn set_vreg(&mut self, n: u32, value: u128) -> Result<(), carrick_hal::OsError> {
+        if let Ok(index) = usize::try_from(n)
+            && let Some(slot) = self.v.get_mut(index)
+        {
+            *slot = value;
+        }
+        Ok(())
+    }
+
+    fn get_fpcr(&self) -> Result<u64, carrick_hal::OsError> {
+        Ok(self.fpcr)
+    }
+
+    fn set_fpcr(&mut self, value: u64) -> Result<(), carrick_hal::OsError> {
+        self.fpcr = value;
+        Ok(())
+    }
+
+    fn get_fpsr(&self) -> Result<u64, carrick_hal::OsError> {
+        Ok(self.fpsr)
+    }
+
+    fn set_fpsr(&mut self, value: u64) -> Result<(), carrick_hal::OsError> {
+        self.fpsr = value;
+        Ok(())
+    }
+}
+
+impl SyscallTrap for TierDSignalTrap {
+    fn next_syscall(&mut self) -> Result<Option<carrick_hal::RawSyscall>, TrapError> {
+        Err(TrapError::Hypervisor(
+            "tier-D signal adapter cannot enter guest".to_string(),
+        ))
+    }
+
+    fn current_pc(&self) -> Result<u64, TrapError> {
+        Ok(self.pc)
+    }
+
+    fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
+        self.x[0] = return_value as u64;
+        Ok(())
+    }
+
+    fn fork(&mut self) -> Result<carrick_hal::ForkOutcome, TrapError> {
+        Err(TrapError::Hypervisor(
+            "tier-D signal adapter cannot fork".to_string(),
+        ))
+    }
+
+    fn execve_into(&mut self, _new_image: &crate::memory::AddressSpace) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "tier-D signal adapter cannot execve".to_string(),
+        ))
+    }
+
+    fn inject_signal(
+        &mut self,
+        signum: i32,
+        handler: u64,
+        sa_restorer: u64,
+        pending_syscall_retval: Option<i64>,
+        interrupted_pc: Option<u64>,
+        altstack: Option<(u64, u64)>,
+        saved_sigmask: u64,
+        fault_siginfo: Option<(i32, u64)>,
+        queued_siginfo: Option<carrick_abi::LinuxSiginfo>,
+        restart_syscall: bool,
+    ) -> Result<(), TrapError> {
+        let params = carrick_hal::sigframe::InjectParams {
+            signum,
+            handler,
+            sa_restorer,
+            pending_syscall_retval,
+            interrupted_pc: interrupted_pc.or(Some(self.pc)),
+            altstack,
+            saved_sigmask,
+            fault_siginfo,
+            queued_siginfo,
+            restart_syscall,
+            pstate_source: self.pstate & !0xf,
+            orig_x0: self.orig_x0,
+            fault_esr: 0,
+            fpsimd_enabled: true,
+            sigreturn_trampoline_base: self.sigreturn_trampoline,
+        };
+        carrick_hal::sigframe::build_sigframe(self, params)?;
+        Ok(())
+    }
+
+    fn last_syscall_nr(&self) -> Option<u64> {
+        self.last_syscall_nr
+    }
+
+    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
+        // The constructor baselined the FP file from the leave-parked
+        // extras, so a frame WITHOUT an fpsimd record (foreign/rebuilt
+        // frames) falls back to the state parked at the delivery leave
+        // rather than zeros; a normal carrick frame overwrites everything.
+        let restored = carrick_hal::sigframe::restore_sigframe(self, true)?;
+        self.pc = restored.saved_pc;
+        Ok(restored.sigmask)
+    }
+}
+
+/// A syscall boundary that observed a deliverable pending signal, parked the
+/// completed syscall and left — the delivery itself runs on the host stack
+/// (see [`DirectRunner::deliver_pending_at_boundary`]'s stack constraint).
+#[derive(Clone, Copy)]
+struct DeferredBoundaryDelivery {
+    /// The completed syscall's retval (already written to the parked x0).
+    retval: i64,
+    /// The syscall's ORIGINAL arg0, for the SA_RESTART re-execution.
+    orig_x0: u64,
+}
+
+thread_local! {
+    /// Set by the delivery/sigreturn paths on THIS guest thread: after the
+    /// island's leave leg returns to `enter`'s caller, RE-ENTER the guest
+    /// from its parked context instead of ending the run. The island's
+    /// resume leg is a constant branch, so a redirected pc (handler entry,
+    /// sigreturn's restored pc) can only be reached through a leave +
+    /// [`DirectLoadGroup::enter_parked`] round trip — this flag is that
+    /// round trip's request bit.
+    static REENTER_PARKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A boundary-observed pending signal whose delivery cycle must run on
+    /// the host stack before the next re-entry.
+    static PENDING_BOUNDARY_DELIVERY: std::cell::Cell<Option<DeferredBoundaryDelivery>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn request_reenter() {
+    REENTER_PARKED.with(|cell| cell.set(true));
+}
+
+fn take_reenter() -> bool {
+    REENTER_PARKED.with(|cell| cell.replace(false))
+}
+
+fn defer_boundary_delivery(deferred: DeferredBoundaryDelivery) {
+    PENDING_BOUNDARY_DELIVERY.with(|cell| cell.set(Some(deferred)));
+}
+
+fn take_deferred_boundary_delivery() -> Option<DeferredBoundaryDelivery> {
+    PENDING_BOUNDARY_DELIVERY.with(std::cell::Cell::take)
+}
+
+/// Drive the leave/re-enter loop for the guest thread running on THIS host
+/// thread: run any deferred boundary delivery (now safely on the host
+/// stack), then re-enter from the parked context, until the guest leaves
+/// for real (exit, thread exit, termination, or a named refusal).
+///
+/// # Safety
+/// As [`DirectLoadGroup::enter_parked`]: the parked context was written by
+/// this thread's own delivery path from a genuine guest state of `group`.
+unsafe fn reenter_until_final(runner: &DirectRunner, group: &DirectLoadGroup) {
+    loop {
+        if let Some(deferred) = take_deferred_boundary_delivery() {
+            let slots = current_thread_slots_ptr();
+            if slots.is_null() {
+                runner.end_process(DirectRunOutcome::Unsupported {
+                    syscall: 0,
+                    outcome: "deferred signal delivery with no installed thread slots".to_string(),
+                });
+                return;
+            }
+            // SAFETY: this thread's own installed slots; the guest is parked
+            // (its leave leg just returned control here).
+            let ctx = unsafe { &mut (*slots).context };
+            if !runner.deliver_parked_boundary(ctx, group, deferred) {
+                return;
+            }
+        } else if !take_reenter() {
+            return;
+        }
+        // SAFETY: caller contract.
+        if let Err(error) = unsafe { group.enter_parked() } {
+            runner.end_process(DirectRunOutcome::Unsupported {
+                syscall: 0,
+                outcome: format!("signal re-entry failed: {error}"),
+            });
+            return;
+        }
+    }
 }
 
 /// Raw runner pointer that crosses into a spawned guest thread; safety is
@@ -2359,6 +3089,11 @@ pub unsafe fn with_runner<R>(
     let slots = group.install_thread_slots()?;
     let context = install_thread_context(runner, group, runner.main_tid());
     let result = body();
+    // Signal delivery / sigreturn park the guest and request a re-entry at a
+    // redirected pc; drive those round trips until the guest leaves for real.
+    // SAFETY: the parked context was written by this thread's delivery path
+    // from a genuine guest state of `group` (caller contract for `body`).
+    unsafe { reenter_until_final(runner, group) };
     drop(context);
     runner.join_guest_threads();
     Ok((result, slots.into_slots()))
@@ -3679,4 +4414,370 @@ __attribute__((naked)) void _start(void) {
         }
         elf
     }
+
+    // ==== tier-D signal gates (transplantable block for the red proof) ====
+
+    /// Two-pass fixture assembler: emit words, mark labels, fix up the
+    /// pc-relative forms (`adr`/`cbnz`/`b.ne`) once every index is known —
+    /// hand-counted branch offsets are exactly the bug shape this avoids.
+    #[derive(Default)]
+    struct Asm {
+        words: Vec<u32>,
+        fixups: Vec<(usize, AsmFix)>,
+        labels: std::collections::HashMap<&'static str, usize>,
+    }
+
+    enum AsmFix {
+        Adr { rd: u32, label: &'static str },
+        Cbnz { rt: u32, label: &'static str },
+        Bne { label: &'static str },
+    }
+
+    impl Asm {
+        fn put(&mut self, word: u32) -> &mut Self {
+            self.words.push(word);
+            self
+        }
+        fn label(&mut self, name: &'static str) -> &mut Self {
+            self.labels.insert(name, self.words.len());
+            self
+        }
+        fn adr(&mut self, rd: u32, label: &'static str) -> &mut Self {
+            self.fixups
+                .push((self.words.len(), AsmFix::Adr { rd, label }));
+            self.words.push(0);
+            self
+        }
+        fn cbnz(&mut self, rt: u32, label: &'static str) -> &mut Self {
+            self.fixups
+                .push((self.words.len(), AsmFix::Cbnz { rt, label }));
+            self.words.push(0);
+            self
+        }
+        fn b_ne(&mut self, label: &'static str) -> &mut Self {
+            self.fixups.push((self.words.len(), AsmFix::Bne { label }));
+            self.words.push(0);
+            self
+        }
+        /// `write(1, &byte, 1)` through the guest stack (8 words).
+        fn write_stdout(&mut self, byte: u8) -> &mut Self {
+            self.put(movz(9, u32::from(byte), 0))
+                .put(str_pre_sp(9))
+                .put(mov_from_sp(1))
+                .put(movz(0, 1, 0))
+                .put(movz(2, 1, 0))
+                .put(movz(8, NR_WRITE, 0))
+                .put(SVC_0)
+                .put(ADD_SP_16)
+        }
+        /// `exit_group(code)` (3 words).
+        fn exit_group(&mut self, code: u32) -> &mut Self {
+            self.put(movz(0, code, 0)).put(movz(8, 94, 0)).put(SVC_0)
+        }
+        /// Install a SIGALRM handler at `label` via `rt_sigaction` — flags,
+        /// restorer and mask all zero, the aarch64 glibc shape (no
+        /// `sa_restorer`: the handler returns through carrick's trampoline).
+        /// Branches to `fail` on a nonzero retval. (16 words)
+        fn sigaction_sigalrm(&mut self, handler: &'static str, fail: &'static str) -> &mut Self {
+            self.adr(1, handler)
+                .put(sub_sp(32))
+                .put(str_sp(1, 0)) // sa_handler
+                .put(str_sp(31, 8)) // sa_flags = 0
+                .put(str_sp(31, 16)) // sa_restorer = 0
+                .put(str_sp(31, 24)) // sa_mask = 0
+                .put(movz(0, 14, 0)) // SIGALRM
+                .put(mov_from_sp(1))
+                .put(movz(2, 0, 0))
+                .put(movz(3, 8, 0))
+                .put(movz(8, 134, 0)) // rt_sigaction
+                .put(SVC_0)
+                .put(add_sp(32))
+                .cbnz(0, fail)
+        }
+        /// One-shot `setitimer(ITIMER_REAL, {0, 0, 0, usec})`, branching to
+        /// `fail` on a nonzero retval. (13 words)
+        fn setitimer_oneshot(&mut self, usec: u32, fail: &'static str) -> &mut Self {
+            self.put(sub_sp(32))
+                .put(str_sp(31, 0)) // interval.sec = 0
+                .put(str_sp(31, 8)) // interval.usec = 0
+                .put(str_sp(31, 16)) // value.sec = 0
+                .put(movz(1, usec, 0))
+                .put(str_sp(1, 24)) // value.usec
+                .put(movz(0, 0, 0)) // ITIMER_REAL
+                .put(mov_from_sp(1))
+                .put(movz(2, 0, 0))
+                .put(movz(8, 103, 0)) // setitimer
+                .put(SVC_0)
+                .put(add_sp(32))
+                .cbnz(0, fail)
+        }
+        // Test-only assembler; a bad label is a fixture bug (clippy's
+        // in-tests allowance does not see through the module's cfg(all(...))).
+        #[allow(clippy::panic)]
+        fn assemble(&mut self) -> Vec<u8> {
+            for (at, fix) in &self.fixups {
+                let target = |name: &&'static str| {
+                    *self
+                        .labels
+                        .get(*name)
+                        .unwrap_or_else(|| panic!("undefined label {name}"))
+                };
+                let word = match fix {
+                    AsmFix::Adr { rd, label } => {
+                        let imm = ((target(label) as i64 - *at as i64) * 4) as u32;
+                        0x1000_0000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7_ffff) << 5) | rd
+                    }
+                    AsmFix::Cbnz { rt, label } => {
+                        let off = (target(label) as i64 - *at as i64) * 4;
+                        0xb500_0000 | ((((off >> 2) as u32) & 0x7_ffff) << 5) | rt
+                    }
+                    AsmFix::Bne { label } => {
+                        let off = (target(label) as i64 - *at as i64) * 4;
+                        0x5400_0000 | ((((off >> 2) as u32) & 0x7_ffff) << 5) | 0x1
+                    }
+                };
+                self.words[*at] = word;
+            }
+            elf_with_code(&self.words)
+        }
+    }
+
+    /// `sub sp, sp, #imm` / `add sp, sp, #imm`.
+    const fn sub_sp(imm: u32) -> u32 {
+        0xd100_0000 | (imm << 10) | (31 << 5) | 31
+    }
+    const fn add_sp(imm: u32) -> u32 {
+        0x9100_0000 | (imm << 10) | (31 << 5) | 31
+    }
+    /// `str xt, [sp, #off]` (rt = 31 stores xzr).
+    const fn str_sp(rt: u32, off: u32) -> u32 {
+        0xf900_0000 | ((off / 8) << 10) | (31 << 5) | rt
+    }
+    /// `ldr wt, [sp, #off]`.
+    const fn ldr_w_sp(rt: u32, off: u32) -> u32 {
+        0xb940_0000 | ((off / 4) << 10) | (31 << 5) | rt
+    }
+    /// `add xd, sp, #imm`.
+    const fn add_x_sp(rd: u32, imm: u32) -> u32 {
+        0x9100_0000 | (imm << 10) | (31 << 5) | rd
+    }
+    /// `cmn xn, #imm` (ADDS xzr) — `cmn x0, #4` is the `retval == -EINTR`
+    /// check.
+    const fn cmn_imm(rn: u32, imm: u32) -> u32 {
+        0xb100_0000 | (imm << 10) | (rn << 5) | 31
+    }
+    /// `fmov dd, xn` / `fmov xd, dn`.
+    const fn fmov_d_x(d: u32, x: u32) -> u32 {
+        0x9e67_0000 | (x << 5) | d
+    }
+    const fn fmov_x_d(x: u32, d: u32) -> u32 {
+        0x9e66_0000 | (d << 5) | x
+    }
+    const RET_WORD: u32 = 0xd65f_03c0;
+
+    /// Run an assembled fixture on tier D with a REAL exec stack (signal
+    /// frames are written below the parked guest SP, so the guest must run
+    /// on its own stack, never the host thread's — exactly the shipped
+    /// driver's shape) and hand back the runner for assertions.
+    // Test-only harness (clippy's in-tests allowance does not see through
+    // the module's cfg(all(...))).
+    #[allow(clippy::expect_used)]
+    fn run_signal_fixture(elf: &[u8], dispatcher: SyscallDispatcher) -> DirectRunner {
+        let group = DirectLoadGroup::load(elf, island_handler())
+            .expect("load")
+            .expect("eligible");
+        let stack = DirectStack::build(elf, group.main().bias(), None, &[b"fixture".to_vec()], &[])
+            .expect("stack");
+        let runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
+        let entry = group.main().entry();
+        let sp = stack.sp();
+        // SAFETY: patched image built with `island_handler`; the guest
+        // leaves through the handler (exit_group in every path).
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
+        runner
+    }
+
+    /// The island-boundary delivery gate: a self-directed `kill(SIGALRM)`
+    /// with a registered handler must run the handler AT the kill's own
+    /// syscall boundary and `rt_sigreturn` back — through carrick's
+    /// trampoline (no `sa_restorer`, the aarch64 reality) — restoring the
+    /// exact pre-signal state: the kill's retval in x0, a callee register
+    /// the handler deliberately trashed, and a V register the handler
+    /// deliberately trashed (the frame's fpsimd record, restored by the
+    /// parked-entry stub's extras block).
+    ///
+    /// Red against the pre-delivery runner: the pending signal was silently
+    /// dropped — stdout read "M" (no handler) instead of "HM".
+    #[test]
+    fn sigalrm_delivers_at_the_kill_boundary_and_sigreturns_exactly() {
+        let mut asm = Asm::default();
+        asm.sigaction_sigalrm("handler", "fail")
+            // Markers the handler will trash and sigreturn must restore.
+            .put(movz(21, 0x77, 0))
+            .put(movz(9, 0x99, 0))
+            .put(fmov_d_x(8, 9))
+            // kill(getpid(), SIGALRM)
+            .put(movz(8, 172, 0)) // getpid
+            .put(SVC_0)
+            .put(movz(1, 14, 0))
+            .put(movz(8, 129, 0)) // kill
+            .put(SVC_0)
+            // Post-handler: the frame restored x0 = kill's retval (0).
+            .cbnz(0, "fail_x0")
+            .put(cmp_imm(21, 0x77))
+            .b_ne("fail_x21")
+            .put(fmov_x_d(9, 8))
+            .put(cmp_imm(9, 0x99))
+            .b_ne("fail_d8")
+            .write_stdout(b'M')
+            .exit_group(42)
+            .label("fail")
+            .exit_group(1)
+            .label("fail_x0")
+            .exit_group(3)
+            .label("fail_x21")
+            .exit_group(4)
+            .label("fail_d8")
+            .exit_group(5)
+            .label("handler")
+            .put(movz(21, 0x11, 0)) // trash x21 (frame must restore)
+            .put(movz(9, 0x55, 0))
+            .put(fmov_d_x(8, 9)) // trash d8 (frame must restore)
+            .write_stdout(b'H')
+            .put(RET_WORD); // x30 = the tier-D sigreturn trampoline
+        let runner = run_signal_fixture(&asm.assemble(), SyscallDispatcher::new());
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 42 }),
+            "handler ran and sigreturn restored the exact pre-signal state \
+             (stdout: {:?})",
+            String::from_utf8_lossy(&runner.dispatcher().stdout()),
+        );
+        assert_eq!(
+            runner.dispatcher().stdout(),
+            b"HM",
+            "the handler wrote FIRST (delivery at the kill boundary), then \
+             the interrupted flow resumed"
+        );
+    }
+
+    /// The `timeout(1)` shape (the smoke's dominant tier-D failure class):
+    /// park in `rt_sigsuspend`, receive the one-shot `ITIMER_REAL` SIGALRM,
+    /// run the handler, and return -EINTR from sigsuspend.
+    ///
+    /// Red against the pre-delivery runner: `WaitOnSignals` was an
+    /// unimplemented outcome — the run left named and stdout stayed empty.
+    #[test]
+    fn sigsuspend_wakes_for_the_itimer_sigalrm_and_eintrs() {
+        let mut asm = Asm::default();
+        asm.sigaction_sigalrm("handler", "fail")
+            .setitimer_oneshot(50_000, "fail")
+            // rt_sigsuspend(&empty_mask, 8)
+            .put(sub_sp(16))
+            .put(str_sp(31, 0))
+            .put(mov_from_sp(0))
+            .put(movz(1, 8, 0))
+            .put(movz(8, 133, 0)) // rt_sigsuspend
+            .put(SVC_0)
+            .put(add_sp(16))
+            .put(cmn_imm(0, 4)) // retval must be -EINTR
+            .b_ne("fail")
+            .write_stdout(b'M')
+            .exit_group(42)
+            .label("fail")
+            .exit_group(1)
+            .label("handler")
+            .write_stdout(b'H')
+            .put(RET_WORD);
+        let runner = run_signal_fixture(&asm.assemble(), SyscallDispatcher::new());
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 42 }),
+            "sigsuspend was interrupted by the delivered SIGALRM \
+             (stdout: {:?})",
+            String::from_utf8_lossy(&runner.dispatcher().stdout()),
+        );
+        assert_eq!(runner.dispatcher().stdout(), b"HM");
+    }
+
+    /// A blocking fd wait (`read(2)` on an empty pipe) interrupted by a
+    /// delivered handler must complete with EINTR (the handler has no
+    /// SA_RESTART, and read is not in the kernel's restartable set anyway).
+    ///
+    /// Red against the pre-delivery runner: the run left named at the wait
+    /// ("deliverable pending signal during a blocking wait").
+    #[test]
+    fn blocked_pipe_read_eintrs_when_the_itimer_handler_fires() {
+        let mut asm = Asm::default();
+        asm.sigaction_sigalrm("handler", "fail")
+            .setitimer_oneshot(50_000, "fail")
+            // pipe2(&fds, 0), then read(fds[0], buf, 1) — blocks until the
+            // SIGALRM interrupts it.
+            .put(sub_sp(16))
+            .put(mov_from_sp(0))
+            .put(movz(1, 0, 0))
+            .put(movz(8, 59, 0)) // pipe2
+            .put(SVC_0)
+            .cbnz(0, "fail")
+            .put(ldr_w_sp(0, 0)) // read end
+            .put(add_x_sp(1, 8)) // buf
+            .put(movz(2, 1, 0))
+            .put(movz(8, 63, 0)) // read
+            .put(SVC_0)
+            .put(add_sp(16))
+            .put(cmn_imm(0, 4)) // retval must be -EINTR
+            .b_ne("fail")
+            .write_stdout(b'M')
+            .exit_group(42)
+            .label("fail")
+            .exit_group(1)
+            .label("handler")
+            .write_stdout(b'H')
+            .put(RET_WORD);
+        let runner = run_signal_fixture(&asm.assemble(), SyscallDispatcher::new());
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 42 }),
+            "the blocked read was interrupted with EINTR after the handler \
+             (stdout: {:?})",
+            String::from_utf8_lossy(&runner.dispatcher().stdout()),
+        );
+        assert_eq!(runner.dispatcher().stdout(), b"HM");
+    }
+
+    /// A self-directed fatal signal with NO handler takes the default
+    /// action: the whole run ends `128 + signum`, and nothing after the
+    /// kill executes.
+    ///
+    /// Red against the pre-delivery runner: the signal was dropped and the
+    /// poison write ran.
+    #[test]
+    fn unhandled_fatal_signal_ends_the_process_with_its_signal() {
+        let mut asm = Asm::default();
+        asm.put(movz(8, 172, 0)) // getpid
+            .put(SVC_0)
+            .put(movz(1, 10, 0)) // SIGUSR1, no handler
+            .put(movz(8, 129, 0)) // kill
+            .put(SVC_0)
+            // POISON: default-terminate must end the run at the kill.
+            .write_stdout(b'P')
+            .exit_group(0);
+        let runner = run_signal_fixture(&asm.assemble(), SyscallDispatcher::new());
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 138 }),
+            "SIGUSR1's default action terminated the run (stdout: {:?})",
+            String::from_utf8_lossy(&runner.dispatcher().stdout()),
+        );
+        assert_eq!(
+            runner.dispatcher().stdout(),
+            b"",
+            "no poison bytes: the guest did not run past its own death"
+        );
+    }
+
+    // ==== end tier-D signal gates ====
 }
