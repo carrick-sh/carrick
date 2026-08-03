@@ -1096,6 +1096,108 @@ __attribute__((naked)) void _start(void) {
             String::from_utf8_lossy(&runner.dispatcher().stdout()),
             String::from_utf8_lossy(&runner.dispatcher().stderr()),
         );
+        assert_ne!(
+            group.guest_tls(),
+            0,
+            "real ld.so initialized TLS through the veneers into the \
+             LOAD-GROUP slot (glibc's TLS_INIT_TP is an `msr tpidr_el0`)"
+        );
+    }
+
+    /// The `/bin/dash` FRONTIER, pinned: a real libc-linked binary
+    /// (`DT_NEEDED libc.so.6`). ld.so runs, SEARCHES for libc through the
+    /// dispatcher's VFS (16 candidate openats — the whole fs path works),
+    /// FINDS it, reads its headers — and its first mapping request is
+    /// `mmap(PROT_EXEC, fd)`: guest-created executable memory, the
+    /// scan+patch-at-mmap boundary that is roadmap Phase 1 item 5. The run
+    /// must stop THERE, on the identity model's named fail-closed edge, not
+    /// somewhere random. When item 5 lands (scan+patch the mapped file
+    /// pages, plus guest-fd -> host-fd translation for the data mappings),
+    /// this test is the one that changes.
+    #[test]
+    fn dt_needed_binary_stops_at_the_named_exec_mmap_gap() {
+        let probe = std::process::Command::new("aarch64-linux-gnu-gcc")
+            .arg("-print-sysroot")
+            .output();
+        let Ok(output) = probe else {
+            eprintln!("skipping: aarch64-linux-gnu-gcc not on PATH");
+            return;
+        };
+        assert!(output.status.success(), "-print-sysroot failed");
+        let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let ld_bytes =
+            std::fs::read(format!("{sysroot}/lib/ld-linux-aarch64.so.1")).expect("ld.so");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("hello.c");
+        std::fs::write(&src, "int main(void) { return 41; }\n").expect("write");
+        let out = dir.path().join("hello");
+        // -pie -fpie explicitly: this toolchain's default is ET_EXEC at
+        // 0x400000, which tier D refuses by physics (the __PAGEZERO wall).
+        let compile = std::process::Command::new("aarch64-linux-gnu-gcc")
+            .args(["-pie", "-fpie", "-o"])
+            .arg(&out)
+            .arg(&src)
+            .output()
+            .expect("cross gcc runs");
+        assert!(
+            compile.status.success(),
+            "compile failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let main_elf = std::fs::read(&out).expect("read fixture");
+
+        let group = DirectLoadGroup::load_with_interpreter(
+            &main_elf,
+            |_| Ok(ld_bytes.clone()),
+            island_handler(),
+        )
+        .expect("load")
+        .expect("eligible");
+        let interp = group.interpreter().expect("interpreter mapped");
+        let stack = DirectStack::build(
+            &main_elf,
+            group.main().bias(),
+            Some(interp.bias()),
+            &[b"hello-libc".to_vec()],
+            &[],
+        )
+        .expect("stack builds");
+
+        // A rootfs whose /lib64 holds the sysroot's REAL libc.so.6 — /lib64
+        // because that is this toolchain's system search path, read from
+        // ld.so's own `LD_DEBUG=libs` trace through the dispatcher — so the
+        // search SUCCEEDS through the VFS and the run reaches the file mmap
+        // itself instead of dying on the lookup.
+        use crate::fs_backend::FsBackend as _;
+        let libc_bytes = std::fs::read(format!("{sysroot}/lib/libc.so.6")).expect("sysroot libc");
+        let scratch = tempfile::tempdir().expect("scratch rootfs");
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .expect("open scratch");
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        backend.make_dir("/lib64").expect("mkdir /lib64");
+        backend
+            .set_file_contents("/lib64/libc.so.6", libc_bytes)
+            .expect("place libc");
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
+        let entry = group.entry_pc();
+        let sp = stack.sp();
+        // SAFETY: patched images built with `island_handler`; the run leaves
+        // through the named identity-model gap.
+        unsafe { with_runner(&mut runner, || group.enter_on_stack(entry, sp)) };
+        assert!(
+            matches!(
+                runner.outcome(),
+                Some(&DirectRunOutcome::Unsupported { syscall: 222, ref outcome })
+                    if outcome.contains("PROT_EXEC")
+            ),
+            "the run stops AT the named exec-mmap gap, nowhere else \
+             (outcome: {:?}; stderr: {:?})",
+            runner.outcome(),
+            String::from_utf8_lossy(&runner.dispatcher().stderr()),
+        );
     }
 
     /// `ldr xt, [sp, #imm]`
