@@ -170,6 +170,15 @@ memory planner. The only difference is how guest code reaches syscalls.
   conservative scan cannot rule out x18/tpidr in a region, that image falls
   back to tier T with a named reason, counted in the census — never a silent
   best-effort.
+- **Writable segments must NOT live in the `MAP_JIT` region.**
+  `pthread_jit_write_protect_np` is per-thread and REGION-GLOBAL: with the
+  executing thread armed for execution, every page of a `MAP_JIT` mapping is
+  non-writable, data included — and a real guest's first act is to write its
+  own data (ld.so self-relocates its GOT before its first syscall). The
+  loader replaces each writable `PT_LOAD`'s pages in place with a plain
+  anonymous mapping (`MAP_FIXED` over JIT pages is allowed; only `MAP_JIT`
+  itself rejects `MAP_FIXED`) and re-copies the file bytes; it fails closed
+  if a writable segment shares a host page with executable text.
 - **The guest-leave contract.** A tier-D guest leaves guest execution ONLY
   through the handler: the handler requests it (`GuestContext::request_leave`)
   and the island's LEAVE LEG — never the guest's own code — restores the host
@@ -229,14 +238,42 @@ memory planner. The only difference is how guest code reaches syscalls.
   both fail against the pre-exit-path runner (the guest ran PAST its own
   `exit`), plus `handler_requested_leave_parks_the_guest_and_returns_to_rust`
   for the raw mechanism.
+- **M1c (done):** the load-group seam, the exec stack, and the interpreter
+  chain — REAL glibc ld.so runs on tier D. In order, each red-first:
+  - `guest_tls`/`guest_x18`/the `GuestContext` moved from per-image to
+    per-`DirectLoadGroup` (one coherent slot set shared by every member
+    image — the seam `NeedsInterpreter` recorded), proven by a two-image
+    TLS/x18 coherence test;
+  - `DirectStack` builds the argc/argv/envp/auxv exec stack in host memory
+    REUSING carrick-mem's serializer and auxv builder (`AT_BASE` = interp
+    bias, `AT_PAGESZ` = the 16 KiB HOST page — glibc EINVALed its RELRO
+    mprotect under the default 4096), and `enter_on_stack` switches to it
+    with x0 zeroed (the rtld_fini slot);
+  - `load_with_interpreter` maps `PT_INTERP`'s target as a second member
+    image through the same scan/patch pipeline; entry becomes the
+    interpreter's;
+  - two loader facts learned by SIGBUS: writable `PT_LOAD`s must LEAVE the
+    `MAP_JIT` region (§6), and the island tail must be page-aligned away
+    from the last segment;
+  - the identity memory model in the runner: anon mmap/munmap/non-EXEC
+    mprotect lower to host primitives, `brk` gets a committed-on-demand
+    reservation; PROT_EXEC/file-backed/mremap LEAVE with the gap named.
+  Proven end-to-end by `real_glibc_ld_so_runs_a_dynamic_binary_on_tier_d`:
+  a cross-compiled `-nostdlib -pie` dynamic guest + the real ld-2.28.so
+  (39 islands, 22 tpidr + 12 x18 veneers), TLS initialized through the
+  veneers into the group slot, exit 42 through the handler. The dash
+  frontier is PINNED by `dt_needed_binary_stops_at_the_named_exec_mmap_gap`:
+  ld.so finds the real libc.so.6 through the dispatcher's VFS and stops,
+  named, at `mmap(PROT_EXEC, fd)` — the scan+patch-at-mmap boundary below.
 - **M1:** tier D for static-PIE + brk-trap syscalls, behind
   `CARRICK_NATIVE_DIRECT` during bring-up only. Prove: dash/coreutils run
   end-to-end; conformance smoke green with the flag on; measure one-process
   compute vs Docker (target ~1x, vs today's 5x).
-- **M2:** dynamic linking (ld.so is just more PIE mappings through the same
-  loader), tpidr/x18 veneers (libc needs them), syscall islands replacing
-  brk. Prove: cpython + node smokes green on tier D; node/cpython outlier
-  ratios collapse.
+- **M2:** dynamic linking of REAL libc programs: scan+patch at the
+  intercepted `mmap(PROT_EXEC)` boundary (the pinned frontier) plus
+  guest-fd → host-fd translation for file-backed mappings; syscall islands
+  replacing brk. Prove: `/bin/dash -c 'echo hi'`, then cpython + node
+  smokes green on tier D; node/cpython outlier ratios collapse.
 - **M3:** default ON for eligible images (opt-out hatch `=0` for bisection),
   tier decision logged + counted; exec-work cache for patched images.
   Delete what tier D obsoletes in the DSR-only path *for eligible images*
