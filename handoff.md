@@ -83,6 +83,28 @@ went 1.66 s → <10 ms. Identical host syscall sequence, identical guest ABI.
 
 ## What's next
 
+### Continuation checkpoint — quiet gate still pending
+
+The 2026-08-03 continuation is recorded in
+[`docs/perf-results/2026-08-03-store-default-quiet-gate-checkpoint.md`](docs/perf-results/2026-08-03-store-default-quiet-gate-checkpoint.md).
+Current branch `codex/native-store-default` carries two narrow prerequisites:
+
+- `245635e7` fixes private-target rustdoc links that made the initial
+  `RUST_TEST_THREADS=1 just ci` requalification fail; the full gate is green.
+- `0d8f8f4d` makes benchmark timeout snapshots stack-first; all 38 harness
+  tests pass, and the signed measured executable is byte-identical to the
+  pre-fix arm (`3b21bd24...ecf0`, UUID `89649BB2-...-8EB0`).
+
+The first official ABBA caught one real 900-second Go `compile` wedge on the
+store-on arm, but its attempted multi-process core save exhausted the
+diagnostic budget before preserving stacks. A matched bounded soak then ran
+store-on 12/12 and store-off 8/8 clean, so neither a deterministic corrupt unit
+nor store-specific attribution is established. A second official attempt
+completed one clean quad and then failed closed when the host changed from AC
+to Battery Power. Both artifacts are incomplete and non-authoritative; the
+store remains default-off. Resume the exact `abba-v3.json` command in the
+checkpoint doc after AC power is restored.
+
 ### 1. Re-measure, then land the two default flips (local work, no fan-out)
 `just ci` on `fd547039`, `just build`, then the quiet-box round: awk-8M compute
 ABBA, 20-exec `compile -V` micro, cold build, and `workload-spread.sh 3`. Arms
