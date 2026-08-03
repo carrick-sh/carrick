@@ -122,6 +122,14 @@ carrick's host userspace. Known levers, already scoped elsewhere:
 - per-guest-page cost on Darwin — translate the guest's INTENT, using Go's
   dual-port allocator as the oracle (`MADV_FREE_REUSABLE`/`REUSE` rather than
   re-issuing Linux's `mprotect` idiom);
+- the `HostAliasTransactions` exclusive gate: `zero_backing` runs while holding
+  a process-global lock taken by every memory syscall (`dispatch/mod.rs:2434`),
+  so 10 guest threads in one process pay 9.74 µs/fault where the same
+  parallelism across 10 processes pays 6.42 µs, with 15x the involuntary
+  context switches (controlled topology sweep,
+  [2026-08-01 audit §4](../../perf-results/2026-08-01-native-wall-audit-and-fault-cost.md)).
+  The lever is per-region locking, or not holding the gate across
+  `zero_backing` at all;
 - the syscall floor (0.29 µs measured) against Docker's.
 
 **Gate:** re-measure the workload-shape table in section 0. That table is the
@@ -151,3 +159,51 @@ at container start and carrick pays per exec — Phase 3 shrinks it, and a zygot
 shrinks it further, but 61 process creations will not be free.
 
 State the shape with the number, always.
+
+## 5. Appendix — rejected alternatives, and the DSR fallback playbook
+
+Folded from a superseded draft plan so nobody re-litigates or re-loses these.
+
+### Rejected — measured worse or structurally impossible on Darwin
+
+- **Single-instruction ORR-encodable bias** (compact biased addressing): tried
+  as H008 Spike 1, measured **3.76% slower** (lost 5 of 6 paired runs) and
+  carries an unfixed host-address leak. `APERTURE_DISJOINT_ORR_BIAS` survives
+  for tests only (`crates/carrick-dsr/src/address.rs:25-35`).
+- **General `GuestVA == HostVA` identity mapping**: Darwin's `__PAGEZERO`
+  occupies 0–4 GiB (`NATIVE_DARWIN_HARD_PAGEZERO_END`), and static Linux
+  binaries load at `0x400000`. Direct mode already exists for PIE guests whose
+  regions all sit above 4 GiB (`address.rs:507`); the general case is
+  structurally excluded.
+- **`DsrContext` in `TPIDR_EL0` to free x28**: macOS owns `TPIDR_EL0`
+  (pthread_self, errno, host TLS) and the guest needs it for Linux TLS;
+  `TPIDRRO_EL0` is read-only from EL0. There is no spare AArch64 system
+  register, and the signal handler finds `DsrContext` via x28 in `ucontext`.
+- **`mprotect`-based W^X invalidation of the JIT cache**: incompatible with
+  `MAP_JIT` / per-thread `pthread_jit_write_protect_np`. The generation guard
+  also covers guest `mmap`/`munmap` replacing code pages and shared-unit
+  invalidation across fork/exec — not just self-modifying code — so page
+  protection cannot replace it.
+
+### DSR fallback playbook — only if tier D cannot hold a workload
+
+If the §3 invalidation fires and cpython/node land on tier T, the emitted-code
+levers below are the plan for the residue. All ESTIMATED, none measured:
+
+- **Aperture bounds check → guard pages**: drop the per-access `lsr`/`cbz`
+  pair by extending the existing PROT_NONE guard windows to the whole
+  out-of-aperture range; the SIGSEGV path already lowers to
+  `NativeDsrExit::Fault`.
+- **Bias preloaded in a reserved register** instead of per-access
+  `movz`/`movk` materialization — consistent with the 2026-08-02 finding that
+  ctx traffic is borrow save/restore (x17 ~21%), not guest-register spilling.
+- **Scratch spill folding** across consecutive memory ops in a block.
+- **Monomorphic inline cache + shadow return stack** for indirect exits: the
+  ~35-40-instruction inline resolver becomes a ~3-instruction hit path.
+
+### Open research question
+
+Can Hypervisor.framework provide **stage-2 address translation without a
+vCPU**? Hardware guest-PA→host-PA mapping would eliminate the bias entirely
+and make every guest `ldr`/`str` a single host instruction. Unclear whether
+HVF exposes stage-2 tables independently of a virtual CPU; nobody has checked.
