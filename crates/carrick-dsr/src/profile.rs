@@ -797,8 +797,12 @@ pub struct ProfileSnapshot {
     pub shared_unit_lookups: u64,
     pub shared_unit_hits: u64,
     pub shared_unit_loads: u64,
+    /// Blocks REPLAYED from attached units (each on its first lookup).
     pub shared_blocks_mapped: u64,
     pub shared_translations_avoided: u64,
+    /// Blocks indexed at unit attach, available for lazy replay. The gap to
+    /// `shared_blocks_mapped` is the replay work lazy install avoided.
+    pub shared_blocks_attached: u64,
     /// Low-frequency mechanism evidence for loaded immutable translation
     /// metadata. These counters do not provide timing authority.
     pub shared_metadata_bytes_read: u64,
@@ -981,12 +985,13 @@ impl CompleteThreadRecord {
         let mut shared = self.frame_header("resolver-shared");
         let _ = write!(
             shared,
-            "|shared_unit_lookups={}|shared_unit_hits={}|shared_unit_loads={}|shared_blocks_mapped={}|shared_translations_avoided={}",
+            "|shared_unit_lookups={}|shared_unit_hits={}|shared_unit_loads={}|shared_blocks_mapped={}|shared_translations_avoided={}|shared_blocks_attached={}",
             resolver.shared_unit_lookups,
             resolver.shared_unit_hits,
             resolver.shared_unit_loads,
             resolver.shared_blocks_mapped,
             resolver.shared_translations_avoided,
+            resolver.shared_blocks_attached,
         );
         frames.push(shared);
         let mut metadata = self.frame_header("resolver-metadata");
@@ -1753,6 +1758,7 @@ mod tests {
                     shared_unit_loads: u64::MAX,
                     shared_blocks_mapped: u64::MAX,
                     shared_translations_avoided: u64::MAX,
+                    shared_blocks_attached: u64::MAX,
                     shared_metadata_bytes_read: u64::MAX,
                     shared_metadata_bytes_mapped: u64::MAX,
                     shared_metadata_validation_ns: u64::MAX,
