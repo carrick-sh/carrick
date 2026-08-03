@@ -727,6 +727,12 @@ pub enum DirectIneligible {
     /// but until the interpreter chain itself exists, a dynamic image is
     /// tier T's.
     NeedsInterpreter { path: String },
+    /// A patched site's island landed more than ±128 MiB away, so the `b`
+    /// that reaches it cannot be encoded. Only a separate-arena `MAP_FIXED`
+    /// window can hit this (an in-image arena is always adjacent); it is the
+    /// fail-closed edge when the kernel places the island arena too far from
+    /// the guest's fixed text address.
+    IslandOutOfRange { vaddr: u64 },
 }
 
 impl std::fmt::Display for DirectIneligible {
@@ -744,6 +750,9 @@ impl std::fmt::Display for DirectIneligible {
             ),
             Self::NeedsInterpreter { path } => {
                 write!(f, "needs interpreter {path}, which tier D cannot map yet")
+            }
+            Self::IslandOutOfRange { vaddr } => {
+                write!(f, "island for site {vaddr:#x} out of ±128 MiB branch range")
             }
         }
     }
@@ -901,6 +910,43 @@ fn scan_executable_words(code: &[u8], vaddr0: u64) -> Result<usize, DirectInelig
     Ok(svc_sites)
 }
 
+/// Where islands and veneers are WRITTEN, addressed by runtime address so a
+/// branch from patched text to an island is computed the same whether the
+/// island lives in the text's own mapping (the common case) or in a separate
+/// arena (a `MAP_FIXED` exec window, whose text must sit at the guest's fixed
+/// address where `MAP_JIT` cannot append islands past it).
+///
+/// `base_addr` is the runtime address of `ptr[0]`. For an in-image arena the
+/// two are the same pointer; for a separate arena they name a different
+/// mapping. Branch distances are always `island_runtime - site_runtime`, so
+/// the same-mapping case reduces to the old offset arithmetic exactly.
+struct IslandArena {
+    ptr: *mut u8,
+    base_addr: u64,
+    len: usize,
+    cursor: usize,
+}
+
+impl IslandArena {
+    fn write_word(&self, offset: usize, word: u32) {
+        // SAFETY: callers bound `offset + 4` by `self.len`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(word.to_le_bytes().as_ptr(), self.ptr.add(offset), 4);
+        }
+    }
+    /// Runtime address of a byte offset in the arena.
+    fn runtime(&self, offset: usize) -> u64 {
+        self.base_addr + offset as u64
+    }
+}
+
+/// A64 `b` reaches ±128 MiB. A branch whose distance exceeds that cannot be
+/// encoded, so the image is refused rather than mis-encoded.
+const B_RANGE: i64 = 128 * 1024 * 1024;
+fn b_in_range(delta: i64) -> bool {
+    (-B_RANGE..B_RANGE).contains(&delta)
+}
+
 /// One loaded, patched, directly-executable guest mapping.
 ///
 /// An image never stands alone: it is a member of a [`DirectLoadGroup`],
@@ -918,6 +964,10 @@ pub struct DirectImage {
     svc_sites: usize,
     tpidr_sites: usize,
     x18_sites: usize,
+    /// A SEPARATE island arena mapping this image owns, when its text sits at
+    /// a fixed address that cannot hold appended islands (a `MAP_FIXED` exec
+    /// window). `None` when islands live in the text mapping itself.
+    island_mapping: Option<(*mut u8, usize)>,
 }
 
 // SAFETY: the mapping is owned solely by this value and unmapped in `Drop`.
@@ -984,7 +1034,12 @@ impl DirectImage {
         // the image's last segment, because a writable last segment's pages
         // get replaced with plain (non-JIT) mappings and would take the
         // islands with them.
-        let mut island_cursor = image_len.next_multiple_of(HOST_PAGE);
+        let mut arena = IslandArena {
+            ptr: self.base,
+            base_addr: self.base as u64,
+            len: self.len,
+            cursor: image_len.next_multiple_of(HOST_PAGE),
+        };
         // Patch over the same SECTIONS the scan proved, not the PF_X segment:
         // patching a `.note` byte pattern that merely looks like `svc` would
         // corrupt data the guest reads.
@@ -994,14 +1049,7 @@ impl DirectImage {
                 return Err(io::Error::other("executable section outside the file"));
             };
             match self.patch_executable_words(
-                code,
-                vaddr,
-                lo,
-                bias,
-                &mut island_cursor,
-                ctx_addr,
-                tls_addr,
-                x18_addr,
+                code, vaddr, lo, bias, &mut arena, ctx_addr, tls_addr, x18_addr,
             )? {
                 Ok(()) => {}
                 Err(reason) => return Ok(Err(reason)),
@@ -1012,13 +1060,16 @@ impl DirectImage {
 
     /// Patch ONE contiguous run of executable words in place: `svc #0` sites
     /// become islands, `tpidr_el0` accesses and x18 uses become veneers, all
-    /// appended at `island_cursor`. Shared by the load-time image patcher and
-    /// the runtime `mmap(PROT_EXEC, fd)` window patcher — one pipeline, two
-    /// boundaries.
+    /// appended into `arena`. Shared by the load-time image patcher, the
+    /// runtime `mmap(PROT_EXEC, fd)` window patcher, and the `MAP_FIXED`
+    /// window (whose arena is a SEPARATE mapping) — one pipeline, three
+    /// boundaries, one branch model: every distance is `island_runtime -
+    /// site_runtime`, computed by absolute address.
     ///
     /// `vaddr0` names the run's first word in the caller's address domain,
-    /// `lo` maps that domain to mapping byte offsets (`host = vaddr - lo`),
-    /// and `bias` maps it to runtime addresses (`runtime = vaddr + bias`).
+    /// `lo` maps that domain to text-mapping byte offsets (`host = vaddr -
+    /// lo`), and `bias` maps it to runtime addresses (`runtime = vaddr +
+    /// bias`). A branch that cannot reach in ±128 MiB refuses the image.
     #[allow(clippy::too_many_arguments)]
     fn patch_executable_words(
         &mut self,
@@ -1026,30 +1077,41 @@ impl DirectImage {
         vaddr0: u64,
         lo: u64,
         bias: u64,
-        island_cursor: &mut usize,
+        arena: &mut IslandArena,
         ctx_addr: u64,
         tls_addr: u64,
         x18_addr: u64,
     ) -> Result<Result<(), DirectIneligible>, io::Error> {
+        // Runtime address of a text byte offset. The text mapping is always
+        // `self.base`; the arena may or may not be the same mapping.
+        let text_runtime = |site_host: usize| self.base as u64 + site_host as u64;
         for (index, chunk) in code.chunks_exact(4).enumerate() {
             let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let site_vaddr = vaddr0 + (index * 4) as u64;
             // `tpidr_el0` accesses are veneered in the same pass.
             if let Some(access) = tpidr_access(word) {
                 let site_host = (site_vaddr - lo) as usize;
-                let veneer_host = *island_cursor;
+                let veneer_cursor = arena.cursor;
                 let words = tpidr_veneer(access, tls_addr, x18_addr);
                 let bytes = words.len() * 4;
-                if veneer_host + bytes + 4 > self.len {
+                if veneer_cursor + bytes + 4 > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
                 }
                 for (i, w) in words.iter().enumerate() {
-                    self.write_word(veneer_host + i * 4, *w);
+                    arena.write_word(veneer_cursor + i * 4, *w);
                 }
-                let from = (veneer_host + bytes) as i64;
-                self.write_word(veneer_host + bytes, b_rel((site_host as i64 + 4) - from));
-                self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
-                *island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
+                let return_delta = (text_runtime(site_host) + 4) as i64
+                    - arena.runtime(veneer_cursor + bytes) as i64;
+                let entry_delta =
+                    arena.runtime(veneer_cursor) as i64 - text_runtime(site_host) as i64;
+                if !b_in_range(return_delta) || !b_in_range(entry_delta) {
+                    return Ok(Err(DirectIneligible::IslandOutOfRange {
+                        vaddr: site_vaddr,
+                    }));
+                }
+                arena.write_word(veneer_cursor + bytes, b_rel(return_delta));
+                self.write_word(site_host, b_rel(entry_delta));
+                arena.cursor = (veneer_cursor + bytes + 4).next_multiple_of(4);
                 self.tpidr_sites += 1;
                 continue;
             }
@@ -1065,27 +1127,39 @@ impl DirectImage {
                 };
                 let target_host = site_host as i64 + branch_offset;
                 if target_host < 0 || target_host as usize >= self.len {
-                    // A branch out of the mapping cannot be retargeted.
+                    // A branch out of the text mapping cannot be retargeted.
                     return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
                 }
-                let veneer_host = *island_cursor;
+                let veneer_cursor = arena.cursor;
                 let (words, taken_slot, fallthrough_slot) = x18_branch_veneer(word, x18_addr);
                 let bytes = words.len() * 4;
-                if veneer_host + bytes > self.len {
+                if veneer_cursor + bytes > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
                 }
                 for (i, w) in words.iter().enumerate() {
-                    self.write_word(veneer_host + i * 4, *w);
+                    arena.write_word(veneer_cursor + i * 4, *w);
                 }
-                let fallthrough_at = veneer_host + fallthrough_slot * 4;
-                self.write_word(
-                    fallthrough_at,
-                    b_rel((site_host as i64 + 4) - fallthrough_at as i64),
+                let fallthrough_delta = (text_runtime(site_host) + 4) as i64
+                    - arena.runtime(veneer_cursor + fallthrough_slot * 4) as i64;
+                let taken_delta = text_runtime(target_host as usize) as i64
+                    - arena.runtime(veneer_cursor + taken_slot * 4) as i64;
+                let entry_delta =
+                    arena.runtime(veneer_cursor) as i64 - text_runtime(site_host) as i64;
+                if !b_in_range(fallthrough_delta)
+                    || !b_in_range(taken_delta)
+                    || !b_in_range(entry_delta)
+                {
+                    return Ok(Err(DirectIneligible::IslandOutOfRange {
+                        vaddr: site_vaddr,
+                    }));
+                }
+                arena.write_word(
+                    veneer_cursor + fallthrough_slot * 4,
+                    b_rel(fallthrough_delta),
                 );
-                let taken_at = veneer_host + taken_slot * 4;
-                self.write_word(taken_at, b_rel(target_host - taken_at as i64));
-                self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
-                *island_cursor = (veneer_host + bytes).next_multiple_of(4);
+                arena.write_word(veneer_cursor + taken_slot * 4, b_rel(taken_delta));
+                self.write_word(site_host, b_rel(entry_delta));
+                arena.cursor = (veneer_cursor + bytes).next_multiple_of(4);
                 self.x18_sites += 1;
                 continue;
             }
@@ -1094,19 +1168,27 @@ impl DirectImage {
             if pc_relative_address_to_x18(word) {
                 let site_host = (site_vaddr - lo) as usize;
                 let value = pc_relative_address_value(word, site_vaddr + bias);
-                let veneer_host = *island_cursor;
+                let veneer_cursor = arena.cursor;
                 let words = x18_pc_address_veneer(value, x18_addr);
                 let bytes = words.len() * 4;
-                if veneer_host + bytes + 4 > self.len {
+                if veneer_cursor + bytes + 4 > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
                 }
                 for (i, w) in words.iter().enumerate() {
-                    self.write_word(veneer_host + i * 4, *w);
+                    arena.write_word(veneer_cursor + i * 4, *w);
                 }
-                let from = (veneer_host + bytes) as i64;
-                self.write_word(veneer_host + bytes, b_rel((site_host as i64 + 4) - from));
-                self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
-                *island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
+                let return_delta = (text_runtime(site_host) + 4) as i64
+                    - arena.runtime(veneer_cursor + bytes) as i64;
+                let entry_delta =
+                    arena.runtime(veneer_cursor) as i64 - text_runtime(site_host) as i64;
+                if !b_in_range(return_delta) || !b_in_range(entry_delta) {
+                    return Ok(Err(DirectIneligible::IslandOutOfRange {
+                        vaddr: site_vaddr,
+                    }));
+                }
+                arena.write_word(veneer_cursor + bytes, b_rel(return_delta));
+                self.write_word(site_host, b_rel(entry_delta));
+                arena.cursor = (veneer_cursor + bytes + 4).next_multiple_of(4);
                 self.x18_sites += 1;
                 continue;
             }
@@ -1131,19 +1213,27 @@ impl DirectImage {
                     return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
                 };
                 let site_host = (site_vaddr - lo) as usize;
-                let veneer_host = *island_cursor;
+                let veneer_cursor = arena.cursor;
                 let words = x18_veneer(rewritten, value_reg, addr_reg, x18_addr);
                 let bytes = words.len() * 4;
-                if veneer_host + bytes + 4 > self.len {
+                if veneer_cursor + bytes + 4 > arena.len {
                     return Err(io::Error::other("veneer budget exhausted"));
                 }
                 for (i, w) in words.iter().enumerate() {
-                    self.write_word(veneer_host + i * 4, *w);
+                    arena.write_word(veneer_cursor + i * 4, *w);
                 }
-                let from = (veneer_host + bytes) as i64;
-                self.write_word(veneer_host + bytes, b_rel((site_host as i64 + 4) - from));
-                self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
-                *island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
+                let return_delta = (text_runtime(site_host) + 4) as i64
+                    - arena.runtime(veneer_cursor + bytes) as i64;
+                let entry_delta =
+                    arena.runtime(veneer_cursor) as i64 - text_runtime(site_host) as i64;
+                if !b_in_range(return_delta) || !b_in_range(entry_delta) {
+                    return Ok(Err(DirectIneligible::IslandOutOfRange {
+                        vaddr: site_vaddr,
+                    }));
+                }
+                arena.write_word(veneer_cursor + bytes, b_rel(return_delta));
+                self.write_word(site_host, b_rel(entry_delta));
+                arena.cursor = (veneer_cursor + bytes + 4).next_multiple_of(4);
                 self.x18_sites += 1;
                 continue;
             }
@@ -1151,28 +1241,35 @@ impl DirectImage {
                 continue;
             }
             let site_host = (site_vaddr - lo) as usize;
-            let island_host = *island_cursor;
+            let island_cursor = arena.cursor;
             let (words, resume_slot) = island(ctx_addr, site_vaddr + bias + 4);
             let island_bytes = words.len() * 4;
-            if island_host + island_bytes > self.len {
+            if island_cursor + island_bytes > arena.len {
                 return Err(io::Error::other("island budget exhausted"));
             }
             for (i, w) in words.iter().enumerate() {
-                self.write_word(island_host + i * 4, *w);
+                arena.write_word(island_cursor + i * 4, *w);
             }
             // Resume leg: a constant branch back to the next instruction,
             // written into the slot the island reserved for it.
-            let resume_at = island_host + resume_slot * 4;
-            self.write_word(resume_at, b_rel((site_host as i64 + 4) - resume_at as i64));
+            let resume_delta = (text_runtime(site_host) + 4) as i64
+                - arena.runtime(island_cursor + resume_slot * 4) as i64;
             // Entry leg: replace the `svc` itself.
-            self.write_word(site_host, b_rel(island_host as i64 - site_host as i64));
-            *island_cursor = (island_host + island_bytes).next_multiple_of(4);
+            let entry_delta = arena.runtime(island_cursor) as i64 - text_runtime(site_host) as i64;
+            if !b_in_range(resume_delta) || !b_in_range(entry_delta) {
+                return Ok(Err(DirectIneligible::IslandOutOfRange {
+                    vaddr: site_vaddr,
+                }));
+            }
+            arena.write_word(island_cursor + resume_slot * 4, b_rel(resume_delta));
+            self.write_word(site_host, b_rel(entry_delta));
+            arena.cursor = (island_cursor + island_bytes).next_multiple_of(4);
             self.svc_sites += 1;
         }
         Ok(Ok(()))
     }
 
-    fn write_word(&mut self, byte_offset: usize, word: u32) {
+    fn write_word(&self, byte_offset: usize, word: u32) {
         // SAFETY: callers bound `byte_offset + 4` by `self.len`.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1272,6 +1369,10 @@ impl Drop for DirectImage {
     fn drop(&mut self) {
         // SAFETY: this value owns the mapping.
         unsafe { libc::munmap(self.base.cast(), self.len) };
+        if let Some((ptr, len)) = self.island_mapping {
+            // SAFETY: this value also owns its separate island arena.
+            unsafe { libc::munmap(ptr.cast(), len) };
+        }
     }
 }
 
@@ -1446,6 +1547,7 @@ impl DirectLoadGroup {
             svc_sites: 0,
             tpidr_sites: 0,
             x18_sites: 0,
+            island_mapping: None,
         };
         let ctx_addr = std::ptr::from_mut(self.context.as_mut()) as u64;
         let tls_addr = std::ptr::from_mut(self.guest_tls.as_mut()) as u64;
@@ -1541,6 +1643,7 @@ impl DirectLoadGroup {
             svc_sites: 0,
             tpidr_sites: 0,
             x18_sites: 0,
+            island_mapping: None,
         };
         let ctx_addr = std::ptr::from_ref::<GuestContext>(self.context.as_ref()) as u64;
         let tls_addr = std::ptr::from_ref::<u64>(self.guest_tls.as_ref()) as u64;
@@ -1563,7 +1666,14 @@ impl DirectLoadGroup {
                 std::ptr::copy_nonoverlapping(file.as_ptr().add(offset_usize), image.base, avail);
             }
         }
-        let mut island_cursor = window_len;
+        // Islands live in the window's own tail (past the mapped bytes),
+        // reachable by a `b` well within ±128 MiB.
+        let mut arena = IslandArena {
+            ptr: image.base,
+            base_addr: image.base as u64,
+            len: total,
+            cursor: window_len,
+        };
         let mut patched = Ok(());
         for (range_offset, range_len) in &ranges {
             let end = (range_offset + range_len).min(file.len());
@@ -1580,7 +1690,7 @@ impl DirectLoadGroup {
                 vaddr0,
                 image.base as u64,
                 0,
-                &mut island_cursor,
+                &mut arena,
                 ctx_addr,
                 tls_addr,
                 x18_addr,
@@ -1608,6 +1718,170 @@ impl DirectLoadGroup {
             // `image` drops here and unmaps the refused window.
             Err(reason) => Ok(Err(reason)),
         }
+    }
+
+    /// Map an executable file window at a guest-CHOSEN FIXED address: modern
+    /// glibc reserves the whole library span `PROT_NONE` and then
+    /// `MAP_FIXED`s the R+X segment over it, so the text MUST land at that
+    /// reservation address. `MAP_JIT` rejects `MAP_FIXED` (probed), so the
+    /// text is a PLAIN anonymous mapping — Darwin under carrick's ad-hoc
+    /// signing lets a plain page be written, `mprotect`ed to `R+X`, and
+    /// executed (probed) — and the islands live in a SEPARATE arena because
+    /// nothing can be appended past a fixed-length window (the guest's next
+    /// `MAP_FIXED` data segment would overwrite it).
+    ///
+    /// The arena is a kernel-placed plain mapping; every branch to it is
+    /// range-checked and the window is refused (`IslandOutOfRange`) if it
+    /// lands beyond ±128 MiB, so placement is fail-closed, never a
+    /// mis-encoded branch. Returns `addr` on success, which `MAP_FIXED`
+    /// requires the caller see unchanged.
+    pub fn map_fixed_exec_file_window(
+        &self,
+        file: &[u8],
+        offset: u64,
+        addr: u64,
+        len: usize,
+    ) -> Result<Result<u64, DirectIneligible>, io::Error> {
+        let ranges = exec_ranges_in_window(file, offset, len)?;
+        if ranges.is_empty() {
+            return Ok(Err(DirectIneligible::NoExecutableText));
+        }
+        // Scan before touching the address space: a refusal costs nothing.
+        for (range_offset, range_len) in &ranges {
+            let end = (range_offset + range_len).min(file.len());
+            let Some(code) = file.get(*range_offset..end) else {
+                return Err(io::Error::other("executable section outside the file"));
+            };
+            if let Err(reason) = scan_executable_words(code, *range_offset as u64) {
+                return Ok(Err(reason));
+            }
+        }
+        let window_len = len.next_multiple_of(HOST_PAGE);
+        // SAFETY: plain-anon MAP_FIXED over the guest's own reservation — the
+        // guest reserved this range and asked for its text here. Unlike
+        // MAP_JIT, a plain mapping honors MAP_FIXED.
+        let text = unsafe {
+            libc::mmap(
+                addr as usize as *mut libc::c_void,
+                window_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if text == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let text = text.cast::<u8>();
+        // A separate island arena, kernel-placed; branch range decides whether
+        // it can serve this text.
+        let arena_len = (64 * 1024 + ranges.iter().map(|(_, size)| size).sum::<usize>())
+            .next_multiple_of(HOST_PAGE);
+        // SAFETY: fresh plain anonymous mapping for islands.
+        let arena_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                arena_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if arena_ptr == libc::MAP_FAILED {
+            let err = io::Error::last_os_error();
+            // SAFETY: undo the text mapping this constructor made.
+            unsafe { libc::munmap(text.cast(), window_len) };
+            return Err(err);
+        }
+        let arena_ptr = arena_ptr.cast::<u8>();
+        let mut image = DirectImage {
+            base: text,
+            len: window_len,
+            entry: addr,
+            bias: addr,
+            svc_sites: 0,
+            tpidr_sites: 0,
+            x18_sites: 0,
+            island_mapping: Some((arena_ptr, arena_len)),
+        };
+        let ctx_addr = std::ptr::from_ref::<GuestContext>(self.context.as_ref()) as u64;
+        let tls_addr = std::ptr::from_ref::<u64>(self.guest_tls.as_ref()) as u64;
+        let x18_addr = std::ptr::from_ref::<u64>(self.guest_x18.as_ref()) as u64;
+        // Copy the window's file bytes; past EOF stays zero (mmap semantic).
+        let offset_usize = offset as usize;
+        if offset_usize < file.len() {
+            let avail = (file.len() - offset_usize).min(len);
+            // SAFETY: `avail <= len <= window_len`; source inside the file.
+            unsafe {
+                std::ptr::copy_nonoverlapping(file.as_ptr().add(offset_usize), image.base, avail);
+            }
+        }
+        let mut arena = IslandArena {
+            ptr: arena_ptr,
+            base_addr: arena_ptr as u64,
+            len: arena_len,
+            cursor: 0,
+        };
+        let mut patched = Ok(());
+        for (range_offset, range_len) in &ranges {
+            let end = (range_offset + range_len).min(file.len());
+            let Some(code) = file.get(*range_offset..end) else {
+                return Err(io::Error::other("executable section outside the file"));
+            };
+            let vaddr0 = image.base as u64 + (*range_offset as u64 - offset);
+            match image.patch_executable_words(
+                code,
+                vaddr0,
+                image.base as u64,
+                0,
+                &mut arena,
+                ctx_addr,
+                tls_addr,
+                x18_addr,
+            ) {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => {
+                    patched = Err(reason);
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Err(reason) = patched {
+            // `image` drops here and unmaps both the text and the arena.
+            return Ok(Err(reason));
+        }
+        // Publish: the text becomes R+X, the arena becomes R+X (islands
+        // execute), then one i-cache invalidate over each before any guest
+        // thread can reach them.
+        // SAFETY: both are plain mappings this image owns.
+        let rc_text = unsafe {
+            libc::mprotect(
+                image.base.cast(),
+                window_len,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        };
+        let rc_arena = unsafe {
+            libc::mprotect(
+                arena_ptr.cast(),
+                arena_len,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        };
+        if rc_text != 0 || rc_arena != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both regions were just written; publish to the i-cache.
+        unsafe {
+            sys_icache_invalidate(image.base.cast(), window_len);
+            sys_icache_invalidate(arena_ptr.cast(), arena_len);
+        }
+        let mapped = image.base as u64;
+        lock(&self.windows).push(image);
+        Ok(Ok(mapped))
     }
 
     /// Is `[addr, addr + len)` entirely inside ONE tier-D executable mapping
@@ -2043,7 +2317,7 @@ fn exec_ranges_in_window(
         if lo >= hi {
             continue;
         }
-        if (lo - window_lo) % 4 != 0 || (hi - lo) % 4 != 0 {
+        if !(lo - window_lo).is_multiple_of(4) || !(hi - lo).is_multiple_of(4) {
             return Err(io::Error::other(
                 "executable section misaligned inside the mmap window",
             ));

@@ -350,7 +350,7 @@ impl DirectRunner {
                         ));
                     }
                     if prot.contains(LinuxProtFlags::EXEC) {
-                        return Some(self.service_exec_file_mmap(flags, a4, a5, a1));
+                        return Some(self.service_exec_file_mmap(a0, flags, a4, a5, a1));
                     }
                     return Some(self.service_data_file_mmap(a0, a1, prot, flags, a4, a5));
                 }
@@ -482,6 +482,7 @@ impl DirectRunner {
     /// prove.
     fn service_exec_file_mmap(
         &mut self,
+        addr: u64,
         flags: carrick_abi::LinuxMmapFlags,
         fd: u64,
         offset: u64,
@@ -494,16 +495,10 @@ impl DirectRunner {
             });
             ServiceVerdict::Leave
         };
-        if flags.contains(carrick_abi::LinuxMmapFlags::FIXED) {
-            // A MAP_FIXED exec mapping lands inside an EXISTING mapping at a
-            // guest-chosen address, which MAP_JIT cannot honor (it rejects
-            // MAP_FIXED, probed). No real 2-segment library needs it; the
-            // 4-segment R/RX/R/RW layout will, and names itself here.
-            return leave(
-                self,
-                "mmap(MAP_FIXED|PROT_EXEC, fd) into an existing mapping on tier D".to_string(),
-            );
-        }
+        let fixed = flags.contains(carrick_abi::LinuxMmapFlags::FIXED);
+        // The group reference is derived from a thread-local pointer and
+        // names memory separate from `self`, so it is held across the
+        // `&mut self` file read below without aliasing.
         let Some(group) = active_group() else {
             return leave(
                 self,
@@ -517,7 +512,14 @@ impl DirectRunner {
         let Ok(len_usize) = usize::try_from(len) else {
             return ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EINVAL).guest_retval());
         };
-        match group.map_exec_file_window(&file, offset, len_usize) {
+        let result = if fixed {
+            // The guest reserved this address; a MAP_FIXED exec segment must
+            // land exactly there (plain-anon text + a separate island arena).
+            group.map_fixed_exec_file_window(&file, offset, addr, len_usize)
+        } else {
+            group.map_exec_file_window(&file, offset, len_usize)
+        };
+        match result {
             Ok(Ok(base)) => ServiceVerdict::Resume(base as i64),
             Ok(Err(reason)) => leave(
                 self,
@@ -1498,7 +1500,7 @@ __attribute__((naked)) void _start(void) {
             group.main().bias(),
             Some(interp.bias()),
             &[b"hello-libc".to_vec()],
-            &[b"LD_DEBUG=all".to_vec()],
+            &[],
         )
         .expect("stack builds");
 
@@ -1522,14 +1524,6 @@ __attribute__((naked)) void _start(void) {
         let mut runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
         let entry = group.entry_pc();
         let sp = stack.sp();
-        if std::env::var_os("TIERD_DEBUG_PAUSE").is_some() {
-            eprintln!(
-                "TIERD INTERP_BASE={:#x} pid={}",
-                group.interpreter().expect("interp").base(),
-                std::process::id()
-            );
-            std::thread::sleep(std::time::Duration::from_secs(25));
-        }
         // SAFETY: patched images built with `island_handler`; the guest
         // leaves through its exit.
         unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
@@ -1540,6 +1534,101 @@ __attribute__((naked)) void _start(void) {
              returned 41 (syscalls: {}; stderr: {:?})",
             runner.syscalls(),
             String::from_utf8_lossy(&runner.dispatcher().stderr()),
+        );
+    }
+
+    /// THE GATE: `/bin/dash -c 'echo hi'` end to end on tier D — a real,
+    /// stripped, PIE `/bin/dash` from a debian arm64 image, its real
+    /// ld-linux-aarch64.so.1 as the interpreter, its real libc.so.6 found
+    /// through the dispatcher's VFS and mapped through the exec-mmap window
+    /// pipeline. `echo` is a dash builtin, so the whole run is one process:
+    /// ld.so relocation, glibc startup, dash's parser, the builtin's
+    /// write(2), and exit(0) through the handler.
+    ///
+    /// Binary sources (loud skip when absent): extracted from the cached
+    /// debian OCI layer into `target/tierd-live` —
+    /// `cd target/tierd-live && tar -xzf ~/.carrick/blobs/sha256/<debian
+    /// stable layer digest> usr/bin/dash usr/lib/aarch64-linux-gnu/libc.so.6
+    /// usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1`.
+    #[test]
+    fn real_dash_echoes_through_tier_d() {
+        let live = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tierd-live");
+        let read = |name: &str| std::fs::read(format!("{live}/{name}"));
+        let (Ok(dash_elf), Ok(ld_bytes), Ok(libc_bytes)) = (
+            read("usr/bin/dash"),
+            read("usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"),
+            read("usr/lib/aarch64-linux-gnu/libc.so.6"),
+        ) else {
+            eprintln!("skipping: no debian binaries under target/tierd-live (see test doc)");
+            return;
+        };
+
+        let group = DirectLoadGroup::load_with_interpreter(
+            &dash_elf,
+            |path| {
+                assert_eq!(path, "/lib/ld-linux-aarch64.so.1");
+                Ok(ld_bytes.clone())
+            },
+            island_handler(),
+        )
+        .expect("load")
+        .expect("dash and its ld.so are tier-D eligible");
+        let interp = group.interpreter().expect("interpreter mapped");
+        let stack = DirectStack::build(
+            &dash_elf,
+            group.main().bias(),
+            Some(interp.bias()),
+            &[b"dash".to_vec(), b"-c".to_vec(), b"echo hi".to_vec()],
+            &[b"PATH=/usr/bin:/bin".to_vec()],
+        )
+        .expect("stack builds");
+
+        // A rootfs carrying libc at every stop of debian ld.so's built-in
+        // search list, so the lookup succeeds wherever this ld looks.
+        use crate::fs_backend::FsBackend as _;
+        let scratch = tempfile::tempdir().expect("scratch rootfs");
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .expect("open scratch");
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        for parent in [
+            "/lib",
+            "/lib/aarch64-linux-gnu",
+            "/lib64",
+            "/usr",
+            "/usr/lib",
+        ] {
+            backend.make_dir(parent).expect("mkdir");
+        }
+        for path in [
+            "/lib/aarch64-linux-gnu/libc.so.6",
+            "/lib64/libc.so.6",
+            "/lib/libc.so.6",
+        ] {
+            backend
+                .set_file_contents(path, libc_bytes.clone())
+                .expect("place libc");
+        }
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let mut runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
+        let entry = group.entry_pc();
+        let sp = stack.sp();
+        // SAFETY: patched images built with `island_handler`; the guest
+        // leaves through its exit.
+        unsafe { with_runner(&mut runner, &group, || group.enter_on_stack(entry, sp)) };
+        assert_eq!(
+            runner.outcome(),
+            Some(&DirectRunOutcome::Exited { code: 0 }),
+            "dash -c 'echo hi' ran end to end on tier D (syscalls: {}; \
+             stdout: {:?}; stderr: {:?})",
+            runner.syscalls(),
+            String::from_utf8_lossy(&runner.dispatcher().stdout()),
+            String::from_utf8_lossy(&runner.dispatcher().stderr()),
+        );
+        assert_eq!(
+            runner.dispatcher().stdout(),
+            b"hi\n",
+            "the builtin echo's bytes came through the one dispatcher"
         );
     }
 
