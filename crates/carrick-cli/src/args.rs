@@ -956,6 +956,19 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Populate an isolated diagnostic translation store, run the same native
+    /// workload under the trusted-route profile, and export a validated census.
+    TrustedRouteCapture {
+        /// Fresh evidence root. Its `store` child must be absent or empty.
+        #[arg(long = "evidence-dir")]
+        evidence_dir: PathBuf,
+        /// Receipt-bound fraction of total CPU attributed to emitted JIT code.
+        #[arg(long = "jit-share")]
+        jit_share: f64,
+        /// Carrick workload beginning with `run`, supplied after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
     /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
     /// (with DFSC for data aborts) so the operator doesn't have to hand-
     /// parse syndromes during an interactive session.
@@ -1214,6 +1227,28 @@ mod tests {
                 "/tmp/trace.raw",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn trusted_route_capture_requires_an_evidence_root_and_run_workload() {
+        assert!(
+            Cli::try_parse_from([
+                "carrick",
+                "debug",
+                "trusted-route-capture",
+                "--evidence-dir",
+                "/tmp/evidence",
+                "--jit-share",
+                "0.46505",
+                "--",
+                "run",
+                "--exec-backend",
+                "native",
+                "ubuntu:24.04",
+                "true",
+            ])
+            .is_ok()
         );
     }
 }

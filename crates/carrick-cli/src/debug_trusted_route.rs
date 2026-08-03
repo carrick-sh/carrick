@@ -6,10 +6,13 @@
 //! typed route geometry; this module authenticates both inputs before it
 //! attributes any sample. A plausible partial join is an error, not evidence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -604,6 +607,452 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+const CAPTURE_ENV_REMOVE: &[&str] = &[
+    "CARRICK_DSR_ARTIFACT_MIN_SOURCE_WORDS",
+    "CARRICK_DSR_ARTIFACT_REPORT",
+    "CARRICK_DSR_ARTIFACT_SPIKE",
+    "CARRICK_DSR_ARTIFACT_VALIDATE_FRESH",
+    "CARRICK_DSR_BASELINE_BIN",
+    "CARRICK_DSR_BASELINE_COMMIT",
+    "CARRICK_DSR_CANDIDATE_BIN",
+    "CARRICK_DSR_CANDIDATE_COMMIT",
+    "CARRICK_DSR_CODE_SNAPSHOT_DIR",
+    "CARRICK_DSR_COMPACT_BIASED",
+    "CARRICK_DSR_DIRECT_BINDINGS",
+    "CARRICK_DSR_DIRECT_BYTES",
+    "CARRICK_DSR_ENABLED_CYCLES",
+    "CARRICK_DSR_ENABLED_OUT",
+    "CARRICK_DSR_GATEWAY_OUT",
+    "CARRICK_DSR_HIT_OUT",
+    "CARRICK_DSR_KEEP_CONTAINER_CACHE",
+    "CARRICK_DSR_LEAN_GUARD",
+    "CARRICK_DSR_LINK_SEVER",
+    "CARRICK_DSR_OBJDUMP",
+    "CARRICK_DSR_OPTIMIZATION_OUT",
+    "CARRICK_DSR_OVERHEAD_COOLDOWN_MS",
+    "CARRICK_DSR_PERSISTENT_STORE",
+    "CARRICK_DSR_PROFILE",
+    "CARRICK_DSR_RESERVED_SCRATCH",
+    "CARRICK_DSR_SCAN_CORPUS",
+    "CARRICK_DSR_SCAN_ELF",
+    "CARRICK_DSR_SHARED_DYLIB_KEYED_IDENTITY",
+    "CARRICK_DSR_SHARED_MANIFEST_ARC",
+    "CARRICK_DSR_SHARED_MANIFEST_FIXED",
+    "CARRICK_DSR_SHARED_MAPPED_METADATA",
+    "CARRICK_DSR_SHARED_RECOVERY_LAZY",
+    "CARRICK_DSR_SHARED_RECOVERY_RUNS",
+    "CARRICK_DSR_SHARED_SOURCE_FINGERPRINT_REUSE",
+    "CARRICK_DSR_SHARED_TRANSLATION",
+    "CARRICK_DSR_SUPERBLOCK",
+    "CARRICK_DSR_TRUSTED_ROUTE_SPLIT",
+    "CARRICK_DSR_ZERO_FAST",
+    "CARRICK_EXEC_FAST",
+    "CARRICK_EXEC_FILE_BACKED",
+    "CARRICK_FAST_FS",
+    "CARRICK_NATIVE_PAGE_PROFILE",
+    "CARRICK_XLAT_CENSUS_DIR",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureEnvironment {
+    set: BTreeMap<&'static str, OsString>,
+    remove: Vec<&'static str>,
+}
+
+fn capture_environment(store: &Path, snapshots: Option<&Path>) -> CaptureEnvironment {
+    let mut set = BTreeMap::from([
+        ("CARRICK_DSR_STORE_DIR", store.as_os_str().to_owned()),
+        ("CARRICK_DSR_TRUSTED_ROUTE_SPLIT", OsString::from("1")),
+    ]);
+    if let Some(snapshots) = snapshots {
+        set.insert(
+            "CARRICK_DSR_CODE_SNAPSHOT_DIR",
+            snapshots.as_os_str().to_owned(),
+        );
+    }
+    CaptureEnvironment {
+        set,
+        remove: CAPTURE_ENV_REMOVE.to_vec(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapturePhase {
+    Warmup,
+    Trace,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureCommandSpec {
+    phase: CapturePhase,
+    args: Vec<String>,
+    environment: CaptureEnvironment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaptureExit {
+    success: bool,
+    code: Option<i32>,
+}
+
+#[derive(Clone, Debug)]
+struct CensusRequest {
+    trace: PathBuf,
+    capture: PathBuf,
+    snapshots: PathBuf,
+    jit_share: f64,
+    output: PathBuf,
+}
+
+trait CaptureOps {
+    fn run_command(&mut self, executable: &Path, spec: &CaptureCommandSpec) -> Result<CaptureExit>;
+    fn run_census(&mut self, request: &CensusRequest) -> Result<()>;
+}
+
+struct SystemCaptureOps;
+
+impl CaptureOps for SystemCaptureOps {
+    fn run_command(&mut self, executable: &Path, spec: &CaptureCommandSpec) -> Result<CaptureExit> {
+        let mut command = Command::new(executable);
+        command.args(&spec.args);
+        for key in &spec.environment.remove {
+            command.env_remove(key);
+        }
+        for (key, value) in &spec.environment.set {
+            command.env(key, value);
+        }
+        let status = command.status().with_context(|| {
+            format!(
+                "run trusted-route {} command via {}",
+                match spec.phase {
+                    CapturePhase::Warmup => "warmup",
+                    CapturePhase::Trace => "trace",
+                },
+                executable.display()
+            )
+        })?;
+        Ok(CaptureExit {
+            success: status.success(),
+            code: status.code(),
+        })
+    }
+
+    fn run_census(&mut self, request: &CensusRequest) -> Result<()> {
+        run_trusted_route_census(
+            &request.trace,
+            &request.capture,
+            &request.snapshots,
+            request.jit_share,
+            Some(&request.output),
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct StoreAuthority {
+    device: u64,
+    inode: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct StoreFile {
+    path: String,
+    bytes: u64,
+    device: u64,
+    inode: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct StoreManifest {
+    schema: &'static str,
+    authority: StoreAuthority,
+    payload_count: u64,
+    payload_bytes: u64,
+    files: Vec<StoreFile>,
+}
+
+#[derive(Serialize)]
+struct WarmupReceipt<'a> {
+    schema: &'static str,
+    command: &'a [String],
+    store: String,
+    route_split: u8,
+    persistent_enable_unset: bool,
+    store_manifest_sha256: String,
+    payload_count: u64,
+    payload_bytes: u64,
+}
+
+pub(crate) fn run_trusted_route_capture(
+    evidence_dir: &Path,
+    jit_share: f64,
+    workload: &[String],
+) -> Result<()> {
+    let executable = std::env::current_exe().context("resolve current carrick executable")?;
+    capture_with_ops(
+        &executable,
+        evidence_dir,
+        jit_share,
+        workload,
+        &mut SystemCaptureOps,
+    )
+}
+
+fn capture_with_ops(
+    executable: &Path,
+    evidence_dir: &Path,
+    jit_share: f64,
+    workload: &[String],
+    ops: &mut dyn CaptureOps,
+) -> Result<()> {
+    validate_jit_share(jit_share)?;
+    if workload.first().map(String::as_str) != Some("run") {
+        bail!("trusted-route capture workload must begin with the `run` subcommand");
+    }
+    fs::create_dir_all(evidence_dir)
+        .with_context(|| format!("create evidence directory {}", evidence_dir.display()))?;
+    let store = evidence_dir.join("store");
+    require_empty_store(&store)?;
+    fs::create_dir_all(&store)
+        .with_context(|| format!("create isolated store {}", store.display()))?;
+
+    let trace_path = evidence_dir.join("trace.raw");
+    let capture_path = evidence_dir.join("capture.json");
+    let snapshots = evidence_dir.join("snapshots");
+    let census_path = evidence_dir.join("census.json");
+    let pre_manifest_path = evidence_dir.join("store-pre.json");
+    let post_manifest_path = evidence_dir.join("store-post.json");
+    let warmup_path = evidence_dir.join("warmup.json");
+    for reserved in [
+        &trace_path,
+        &capture_path,
+        &snapshots,
+        &census_path,
+        &pre_manifest_path,
+        &post_manifest_path,
+        &warmup_path,
+    ] {
+        if reserved.exists() {
+            bail!(
+                "trusted-route evidence output already exists: {}",
+                reserved.display()
+            );
+        }
+    }
+
+    let warmup = CaptureCommandSpec {
+        phase: CapturePhase::Warmup,
+        args: workload.to_vec(),
+        environment: capture_environment(&store, None),
+    };
+    require_success(ops.run_command(executable, &warmup)?, CapturePhase::Warmup)?;
+    let pre_manifest = store_manifest(&store).context("census store after warmup")?;
+    require_payloads(&pre_manifest, "warmup")?;
+    write_json_atomic(&pre_manifest_path, &pre_manifest)?;
+    let pre_manifest_bytes = serde_json::to_vec(&pre_manifest).context("serialize pre-manifest")?;
+    write_json_atomic(
+        &warmup_path,
+        &WarmupReceipt {
+            schema: "carrick.trusted-route-warmup.v1",
+            command: workload,
+            store: store.to_string_lossy().into_owned(),
+            route_split: 1,
+            persistent_enable_unset: true,
+            store_manifest_sha256: format!("{:x}", Sha256::digest(&pre_manifest_bytes)),
+            payload_count: pre_manifest.payload_count,
+            payload_bytes: pre_manifest.payload_bytes,
+        },
+    )?;
+
+    fs::create_dir(&snapshots)
+        .with_context(|| format!("create snapshot directory {}", snapshots.display()))?;
+    let mut trace_args = vec![
+        "trace".to_owned(),
+        "--profile".to_owned(),
+        "trusted-route".to_owned(),
+        "--trace-out".to_owned(),
+        trace_path.to_string_lossy().into_owned(),
+        "--summary-jsonl".to_owned(),
+        capture_path.to_string_lossy().into_owned(),
+        "--".to_owned(),
+    ];
+    trace_args.extend_from_slice(workload);
+    let trace = CaptureCommandSpec {
+        phase: CapturePhase::Trace,
+        args: trace_args,
+        environment: capture_environment(&store, Some(&snapshots)),
+    };
+    require_success(ops.run_command(executable, &trace)?, CapturePhase::Trace)?;
+    let post_manifest = store_manifest(&store).context("census store after traced workload")?;
+    require_payloads(&post_manifest, "trace")?;
+    if post_manifest.authority != pre_manifest.authority {
+        bail!("isolated store authority identity changed between warmup and trace");
+    }
+    write_json_atomic(&post_manifest_path, &post_manifest)?;
+
+    ops.run_census(&CensusRequest {
+        trace: trace_path,
+        capture: capture_path,
+        snapshots,
+        jit_share,
+        output: census_path,
+    })
+}
+
+fn require_empty_store(store: &Path) -> Result<()> {
+    if !store.exists() {
+        return Ok(());
+    }
+    if !store.is_dir() {
+        bail!(
+            "isolated store path is not a directory: {}",
+            store.display()
+        );
+    }
+    if fs::read_dir(store)
+        .with_context(|| format!("read isolated store {}", store.display()))?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        bail!(
+            "isolated trusted-route store is not empty: {}",
+            store.display()
+        );
+    }
+    Ok(())
+}
+
+fn require_success(status: CaptureExit, phase: CapturePhase) -> Result<()> {
+    if !status.success {
+        bail!(
+            "trusted-route {} command failed with status {:?}",
+            match phase {
+                CapturePhase::Warmup => "warmup",
+                CapturePhase::Trace => "trace",
+            },
+            status.code
+        );
+    }
+    Ok(())
+}
+
+fn require_payloads(manifest: &StoreManifest, phase: &str) -> Result<()> {
+    if manifest.payload_count == 0 || manifest.payload_bytes == 0 {
+        bail!("trusted-route {phase} produced zero complete store payloads");
+    }
+    Ok(())
+}
+
+fn store_manifest(store: &Path) -> Result<StoreManifest> {
+    let mut paths = Vec::new();
+    collect_store_files(store, store, &mut paths)?;
+    paths.sort();
+    let mut files = Vec::with_capacity(paths.len());
+    let mut code_stems = BTreeSet::new();
+    let mut metadata_stems = BTreeSet::new();
+    let mut payload_bytes = 0_u64;
+    for path in paths {
+        let relative = path
+            .strip_prefix(store)
+            .context("store file escaped its root")?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| anyhow!("store file has a non-UTF-8 path"))?
+            .to_owned();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("stat store file {}", path.display()))?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("read store file {}", path.display()))?;
+        if let Some(stem) = relative.strip_suffix(".code") {
+            if bytes.is_empty() {
+                bail!("store code payload {relative:?} is empty");
+            }
+            code_stems.insert(stem.to_owned());
+            payload_bytes = payload_bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| anyhow!("store payload byte count overflow"))?;
+        } else if let Some(stem) = relative.strip_suffix(".metadata-v5") {
+            if bytes.is_empty() {
+                bail!("store metadata payload {relative:?} is empty");
+            }
+            metadata_stems.insert(stem.to_owned());
+            payload_bytes = payload_bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| anyhow!("store payload byte count overflow"))?;
+        }
+        files.push(StoreFile {
+            path: relative,
+            bytes: metadata.len(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        });
+    }
+    if code_stems != metadata_stems {
+        bail!("isolated store has an incomplete code/metadata payload pair");
+    }
+    let authority_path = store.join(".carrick-authority");
+    let authority_metadata = fs::symlink_metadata(&authority_path)
+        .with_context(|| format!("stat store authority {}", authority_path.display()))?;
+    if !authority_metadata.file_type().is_file() {
+        bail!("store authority marker is not a regular file");
+    }
+    let authority_bytes = fs::read(&authority_path)
+        .with_context(|| format!("read store authority {}", authority_path.display()))?;
+    if authority_bytes.len() != 16 {
+        bail!("store authority marker is malformed");
+    }
+    Ok(StoreManifest {
+        schema: "carrick.trusted-route-store-manifest.v1",
+        authority: StoreAuthority {
+            device: authority_metadata.dev(),
+            inode: authority_metadata.ino(),
+            sha256: format!("{:x}", Sha256::digest(&authority_bytes)),
+        },
+        payload_count: u64::try_from(code_stems.len())
+            .context("store payload count exceeds u64")?,
+        payload_bytes,
+        files,
+    })
+}
+
+fn collect_store_files(root: &Path, directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("read store directory {}", directory.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            bail!(
+                "isolated store contains a symbolic link: {}",
+                path.display()
+            );
+        }
+        if file_type.is_dir() {
+            collect_store_files(root, &path, paths)?;
+        } else if file_type.is_file() {
+            path.strip_prefix(root).context("store path escaped root")?;
+            paths.push(path);
+        } else {
+            bail!(
+                "isolated store contains a non-file entry: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value).context("serialize trusted-route evidence")?;
+    bytes.push(b'\n');
+    write_atomic(path, &bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,6 +1444,262 @@ mod tests {
         assert!(
             build_trusted_route_census(&fixture.trace, &fixture.capture, &fixture.snapshots, 0.45,)
                 .is_err()
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeCaptureMode {
+        Success,
+        WarmupFailure,
+        TraceFailure,
+        NoWarmupPayload,
+        RemoveTracePayload,
+        ReplaceAuthority,
+    }
+
+    struct FakeCaptureOps {
+        mode: FakeCaptureMode,
+        events: Vec<&'static str>,
+        specs: Vec<CaptureCommandSpec>,
+        census_requests: Vec<CensusRequest>,
+    }
+
+    impl FakeCaptureOps {
+        fn new(mode: FakeCaptureMode) -> Self {
+            Self {
+                mode,
+                events: Vec::new(),
+                specs: Vec::new(),
+                census_requests: Vec::new(),
+            }
+        }
+
+        fn store(spec: &CaptureCommandSpec) -> PathBuf {
+            spec.environment
+                .set
+                .get("CARRICK_DSR_STORE_DIR")
+                .map(PathBuf::from)
+                .expect("capture store environment")
+        }
+
+        fn write_warmup_store(&self, store: &Path) {
+            fs::write(store.join(".carrick-authority"), [7_u8; 16]).expect("authority");
+            if !matches!(self.mode, FakeCaptureMode::NoWarmupPayload) {
+                fs::write(store.join("unit.code"), [1_u8, 2, 3, 4]).expect("code payload");
+                fs::write(store.join("unit.metadata-v5"), b"metadata").expect("metadata payload");
+            }
+        }
+    }
+
+    impl CaptureOps for FakeCaptureOps {
+        fn run_command(
+            &mut self,
+            _executable: &Path,
+            spec: &CaptureCommandSpec,
+        ) -> Result<CaptureExit> {
+            self.specs.push(spec.clone());
+            let store = Self::store(spec);
+            match spec.phase {
+                CapturePhase::Warmup => {
+                    self.events.push("warmup");
+                    if matches!(self.mode, FakeCaptureMode::WarmupFailure) {
+                        return Ok(CaptureExit {
+                            success: false,
+                            code: Some(17),
+                        });
+                    }
+                    self.write_warmup_store(&store);
+                }
+                CapturePhase::Trace => {
+                    self.events.push("trace");
+                    if matches!(self.mode, FakeCaptureMode::TraceFailure) {
+                        return Ok(CaptureExit {
+                            success: false,
+                            code: Some(19),
+                        });
+                    }
+                    if matches!(self.mode, FakeCaptureMode::RemoveTracePayload) {
+                        fs::remove_file(store.join("unit.code")).expect("remove code payload");
+                        fs::remove_file(store.join("unit.metadata-v5"))
+                            .expect("remove metadata payload");
+                    }
+                    if matches!(self.mode, FakeCaptureMode::ReplaceAuthority) {
+                        fs::rename(
+                            store.join(".carrick-authority"),
+                            store.join(".old-authority"),
+                        )
+                        .expect("retire authority inode");
+                        fs::write(store.join(".carrick-authority"), [9_u8; 16])
+                            .expect("replacement authority");
+                    }
+                }
+            }
+            Ok(CaptureExit {
+                success: true,
+                code: Some(0),
+            })
+        }
+
+        fn run_census(&mut self, request: &CensusRequest) -> Result<()> {
+            self.events.push("census");
+            self.census_requests.push(request.clone());
+            Ok(())
+        }
+    }
+
+    fn run_fake_capture(evidence: &Path, mode: FakeCaptureMode) -> (Result<()>, FakeCaptureOps) {
+        let mut ops = FakeCaptureOps::new(mode);
+        let result = capture_with_ops(
+            Path::new("/tmp/fake-carrick"),
+            evidence,
+            0.46505,
+            &[
+                "run".to_owned(),
+                "--exec-backend".to_owned(),
+                "native".to_owned(),
+                "fixture".to_owned(),
+            ],
+            &mut ops,
+        );
+        (result, ops)
+    }
+
+    #[test]
+    fn trusted_route_capture_orders_isolated_warmup_trace_and_census() {
+        let temp = tempfile::tempdir().expect("capture root");
+        let evidence = temp.path().join("evidence");
+
+        let (result, ops) = run_fake_capture(&evidence, FakeCaptureMode::Success);
+
+        result.expect("successful capture protocol");
+        assert_eq!(ops.events, ["warmup", "trace", "census"]);
+        assert_eq!(ops.specs.len(), 2);
+        let warmup = &ops.specs[0];
+        let trace = &ops.specs[1];
+        assert_eq!(warmup.phase, CapturePhase::Warmup);
+        assert_eq!(warmup.args[0], "run");
+        assert!(!warmup.args.iter().any(|arg| arg == "trusted-route"));
+        assert_eq!(trace.phase, CapturePhase::Trace);
+        assert_eq!(&trace.args[..3], ["trace", "--profile", "trusted-route"]);
+        for spec in [warmup, trace] {
+            assert!(
+                spec.environment
+                    .remove
+                    .contains(&"CARRICK_DSR_PERSISTENT_STORE")
+            );
+            assert!(
+                !spec
+                    .environment
+                    .set
+                    .contains_key("CARRICK_DSR_PERSISTENT_STORE")
+            );
+            assert_eq!(
+                spec.environment
+                    .set
+                    .get("CARRICK_DSR_TRUSTED_ROUTE_SPLIT")
+                    .map(OsString::as_os_str),
+                Some(std::ffi::OsStr::new("1"))
+            );
+            assert_eq!(
+                spec.environment
+                    .set
+                    .get("CARRICK_DSR_STORE_DIR")
+                    .map(PathBuf::from),
+                Some(evidence.join("store"))
+            );
+        }
+        assert!(
+            !warmup
+                .environment
+                .set
+                .contains_key("CARRICK_DSR_CODE_SNAPSHOT_DIR")
+        );
+        assert_eq!(
+            trace
+                .environment
+                .set
+                .get("CARRICK_DSR_CODE_SNAPSHOT_DIR")
+                .map(PathBuf::from),
+            Some(evidence.join("snapshots"))
+        );
+        assert_eq!(ops.census_requests.len(), 1);
+        let census = &ops.census_requests[0];
+        assert_eq!(census.trace, evidence.join("trace.raw"));
+        assert_eq!(census.capture, evidence.join("capture.json"));
+        assert_eq!(census.snapshots, evidence.join("snapshots"));
+        assert_eq!(census.output, evidence.join("census.json"));
+        assert!(evidence.join("warmup.json").is_file());
+        assert!(evidence.join("store-pre.json").is_file());
+        assert!(evidence.join("store-post.json").is_file());
+    }
+
+    #[test]
+    fn trusted_route_capture_refuses_a_nonempty_store_before_running() {
+        let temp = tempfile::tempdir().expect("capture root");
+        let evidence = temp.path().join("evidence");
+        fs::create_dir_all(evidence.join("store")).expect("store");
+        fs::write(evidence.join("store/existing"), b"do not touch").expect("existing store");
+
+        let (result, ops) = run_fake_capture(&evidence, FakeCaptureMode::Success);
+
+        assert!(result.is_err());
+        assert!(ops.events.is_empty());
+        assert!(evidence.join("store/existing").is_file());
+    }
+
+    #[test]
+    fn trusted_route_capture_rejects_failed_phases_and_zero_payloads_before_census() {
+        for mode in [
+            FakeCaptureMode::WarmupFailure,
+            FakeCaptureMode::TraceFailure,
+            FakeCaptureMode::NoWarmupPayload,
+            FakeCaptureMode::RemoveTracePayload,
+        ] {
+            let temp = tempfile::tempdir().expect("capture root");
+            let (result, ops) = run_fake_capture(&temp.path().join("evidence"), mode);
+            assert!(result.is_err());
+            assert!(!ops.events.contains(&"census"));
+        }
+    }
+
+    #[test]
+    fn trusted_route_capture_rejects_authority_inode_change_before_census() {
+        let temp = tempfile::tempdir().expect("capture root");
+
+        let (result, ops) = run_fake_capture(
+            &temp.path().join("evidence"),
+            FakeCaptureMode::ReplaceAuthority,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(ops.events, ["warmup", "trace"]);
+        assert!(ops.census_requests.is_empty());
+    }
+
+    #[test]
+    fn trusted_route_capture_removes_persistent_enable_from_both_phases() {
+        let environment = capture_environment(Path::new("/tmp/store"), None);
+        assert!(environment.remove.contains(&"CARRICK_DSR_PERSISTENT_STORE"));
+        assert_eq!(
+            environment
+                .set
+                .get("CARRICK_DSR_TRUSTED_ROUTE_SPLIT")
+                .map(OsString::as_os_str),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert!(
+            !environment
+                .set
+                .contains_key("CARRICK_DSR_CODE_SNAPSHOT_DIR")
+        );
+
+        let traced = capture_environment(Path::new("/tmp/store"), Some(Path::new("/tmp/snaps")));
+        assert_eq!(
+            traced
+                .set
+                .get("CARRICK_DSR_CODE_SNAPSHOT_DIR")
+                .map(OsString::as_os_str),
+            Some(std::ffi::OsStr::new("/tmp/snaps"))
         );
     }
 }
