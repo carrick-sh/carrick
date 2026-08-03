@@ -40,8 +40,9 @@
 //! `DirectRunner::outcome` names why the run stopped. The guest is never
 //! resumed past such a syscall with a fabricated errno.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use carrick_abi::{CanonicalNr, LinuxGuestAbi, NativeNr};
 use carrick_guest_mem::{GuestMemory, MemoryError};
@@ -59,6 +60,19 @@ use crate::thread::ThreadId;
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// As [`lock`], for the registry's `RwLock` (read side).
+fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// As [`lock`], for the registry's `RwLock` (write side — fork-child reset
+/// only).
+fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -96,19 +110,66 @@ impl IdentityMemory {
 }
 
 impl GuestMemory for IdentityMemory {
+    /// Kernel-verified copyin: the identity tier keeps NO mapping table, so
+    /// a guest pointer's validity is only decidable by the kernel. A raw
+    /// `memcpy` here SIGSEGVed the whole process on the first bad pointer a
+    /// guest handed a syscall (dash's execve argv walk over-read past a
+    /// mapping edge — layout-probabilistic, caught live by CrashReporter);
+    /// `mach_vm_read_overwrite` performs the same copy with the kernel
+    /// checking every page, returning an error the dispatcher lowers to
+    /// EFAULT — exactly Linux's copy_from_user contract. Costs a mach trap
+    /// per access; a guarded-copy fast path is a named tier-D perf lever.
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        let src = self.resolve(address, length)?;
+        self.resolve(address, length)?;
         let mut out = vec![0_u8; length];
-        // SAFETY: `resolve` proved the range lies inside the runner's window,
-        // and the guest is parked in the handler while this runs.
-        unsafe { std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), length) };
+        if length == 0 {
+            return Ok(out);
+        }
+        let mut out_size: mach2::vm_types::mach_vm_size_t = 0;
+        // SAFETY: destination is the freshly allocated buffer; the kernel
+        // validates the source range and copies at most `length` bytes.
+        let kr = unsafe {
+            mach2::vm::mach_vm_read_overwrite(
+                mach2::traps::mach_task_self(),
+                address,
+                length as mach2::vm_types::mach_vm_size_t,
+                out.as_mut_ptr() as mach2::vm_types::mach_vm_address_t,
+                &mut out_size,
+            )
+        };
+        if kr != mach2::kern_return::KERN_SUCCESS || out_size != length as u64 {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
         Ok(out)
     }
 
+    /// Kernel-verified copyout (see [`Self::read_bytes_raw`]): `mach_vm_write`
+    /// refuses unmapped and non-writable targets instead of faulting.
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        let dst = self.resolve(address, bytes.len())?;
-        // SAFETY: as above.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+        self.resolve(address, bytes.len())?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // `mach_vm_write` counts in u32; chunk so a giant write still lands.
+        for (index, chunk) in bytes.chunks(u32::MAX as usize).enumerate() {
+            let target = address + (index as u64) * u64::from(u32::MAX);
+            // SAFETY: source is our live slice; the kernel validates the
+            // destination range and its writability.
+            let kr = unsafe {
+                mach2::vm::mach_vm_write(
+                    mach2::traps::mach_task_self(),
+                    target,
+                    chunk.as_ptr() as mach2::vm_types::vm_offset_t,
+                    chunk.len() as mach2::message::mach_msg_type_number_t,
+                )
+            };
+            if kr != mach2::kern_return::KERN_SUCCESS {
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -382,14 +443,38 @@ pub struct DirectRunner {
     /// ranges `mremap` is provably safe to service (see [`AnonRwRange`]).
     anon_rw: Mutex<Vec<AnonRwRange>>,
     /// One guest thread = one host thread; tids come from here (main tid =
-    /// host pid, exactly the native lane's convention).
-    registry: crate::thread::ThreadRegistry,
+    /// host pid, exactly the native lane's convention). Behind an `RwLock`
+    /// solely so a FORK CHILD can replace it with a fresh registry keyed to
+    /// its own pid (`ThreadRegistry`'s main tid is immutable by design);
+    /// every other access is a read.
+    registry: RwLock<crate::thread::ThreadRegistry>,
     /// Private-futex parking for this guest, shared with the dispatcher's
     /// futex handler so waits and wakes meet in one table.
     futex: crate::thread::FutexTable,
     /// Host threads spawned for guest `clone(CLONE_THREAD)`s; joined by
     /// [`with_runner`] before it returns.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Execve services for the SHIPPED driver: the execution plan and trap
+    /// budget `tier_d_service_execve` forwards into the existing capsule
+    /// self-re-exec path. `None` outside the shipped binary (unit tests):
+    /// `begin_guest_exec` re-execs `current_exe`, which is only sound when
+    /// that executable is the carrick CLI — a test binary would re-enter its
+    /// own harness — so without services an execve LEAVES named, as before.
+    exec: Option<DirectExecServices>,
+    /// True in a host process created by THIS runner servicing a guest
+    /// `fork(2)`: the run loop above `with_runner` must `_exit` with the
+    /// child's outcome instead of continuing the caller's control flow
+    /// (the shipped driver's child branch already does; tests must too).
+    forked_child: AtomicBool,
+}
+
+/// What [`DirectRunner`] needs to service `execve(2)` through the existing
+/// host self-re-exec capsule (see [`DirectRunner::exec`]). Crate-visible
+/// only: the plan type is the driver's, and only the shipped driver may
+/// install exec services (a test binary must not self-re-exec).
+pub(crate) struct DirectExecServices {
+    pub(crate) plan: crate::page_profile::ExecutionPlan,
+    pub(crate) max_traps: usize,
 }
 
 impl Drop for DirectRunner {
@@ -411,10 +496,19 @@ impl DirectRunner {
             syscalls: AtomicU64::new(0),
             brk: Mutex::new(None),
             anon_rw: Mutex::new(Vec::new()),
-            registry: crate::thread::ThreadRegistry::new(ThreadId::main_from_host_pid()),
+            registry: RwLock::new(crate::thread::ThreadRegistry::new(
+                ThreadId::main_from_host_pid(),
+            )),
             futex: crate::thread::FutexTable::new(),
             threads: Mutex::new(Vec::new()),
+            exec: None,
+            forked_child: AtomicBool::new(false),
         }
+    }
+
+    /// Install execve services (shipped driver only — see [`Self::exec`]).
+    pub(crate) fn enable_exec_services(&mut self, services: DirectExecServices) {
+        self.exec = Some(services);
     }
 
     pub fn outcome(&self) -> Option<DirectRunOutcome> {
@@ -427,15 +521,29 @@ impl DirectRunner {
         &self.dispatcher
     }
 
+    /// True when THIS host process is a fork child this runner created for a
+    /// guest `fork(2)`. The caller above [`with_runner`] must `_exit` with
+    /// the child's outcome instead of continuing its own control flow — the
+    /// shipped driver's forked child branch does so structurally; a test
+    /// harness must check this explicitly or the child re-runs the harness.
+    pub fn forked_guest_child(&self) -> bool {
+        self.forked_child.load(Ordering::Acquire)
+    }
+
     /// The registry key of the guest thread running on THIS host thread
     /// (installed by [`with_runner`] / the clone spawn path).
     fn current_tid(&self) -> ThreadId {
         let tid = ACTIVE_TID.with(std::cell::Cell::get);
         if tid == ThreadId::NONE {
-            self.registry.main_tid()
+            read_lock(&self.registry).main_tid()
         } else {
             tid
         }
+    }
+
+    /// The main guest thread's registry key.
+    fn main_tid(&self) -> ThreadId {
+        read_lock(&self.registry).main_tid()
     }
 
     /// Record a PROCESS-ending outcome (first one wins) and nudge parked
@@ -455,14 +563,14 @@ impl DirectRunner {
     /// teardown. When this was the LAST live thread the process ends with
     /// this thread's code.
     fn finish_thread_bookkeeping(&self, tid: ThreadId, code: i32) {
-        if let Some(address) = self.registry.clear_child_tid(tid)
+        if let Some(address) = read_lock(&self.registry).clear_child_tid(tid)
             && address != 0
         {
             let mut memory = self.memory;
             let _ = memory.write_bytes_raw(address, &0_i32.to_le_bytes());
             self.futex.wake(address, 1);
         }
-        let last = self.registry.exit(tid);
+        let last = read_lock(&self.registry).exit(tid);
         self.dispatcher.forget_thread_signal_state(tid);
         if last {
             let mut slot = lock(&self.outcome);
@@ -527,7 +635,12 @@ impl DirectRunner {
                 let flags = LinuxMmapFlags::from_bits_truncate(a3);
                 if !flags.contains(LinuxMmapFlags::ANONYMOUS) {
                     if flags.contains(LinuxMmapFlags::SHARED) {
-                        return unsupported(self, "MAP_SHARED file mmap on tier D");
+                        if prot.contains(LinuxProtFlags::EXEC) {
+                            // Patching writes the private JIT copy; a SHARED
+                            // exec mapping's patches would hit the file.
+                            return unsupported(self, "MAP_SHARED PROT_EXEC file mmap on tier D");
+                        }
+                        return Some(self.service_shared_file_mmap(a0, a1, prot, flags, a4, a5));
                     }
                     if a5 % HOST_PAGE_SIZE != 0 {
                         // The identity tier's page size IS the host's
@@ -894,6 +1007,77 @@ impl DirectRunner {
         }
     }
 
+    /// A SHARED file-backed data mapping: the ONE correct lowering is a real
+    /// host `mmap(MAP_SHARED)` of the same file — guest writes reach the
+    /// page cache, coherent with every other opener and across fork, which
+    /// is the whole MAP_SHARED contract (glibc maps locale-archive this
+    /// way at every coreutils startup). Identity tier: guest VA is host VA,
+    /// so the host mapping IS the guest mapping. The host fd comes from the
+    /// dispatcher's fd table (`dup_host_file_fd`); anything not an ordinary
+    /// host-backed file fails closed, named.
+    fn service_shared_file_mmap(
+        &self,
+        addr: u64,
+        len: u64,
+        prot: carrick_abi::LinuxProtFlags,
+        flags: carrick_abi::LinuxMmapFlags,
+        fd: u64,
+        offset: u64,
+    ) -> ServiceVerdict {
+        use std::os::fd::AsRawFd as _;
+        if !offset.is_multiple_of(HOST_PAGE_SIZE) {
+            // The identity tier's page size IS the host's (`AT_PAGESZ`).
+            return ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EINVAL).guest_retval());
+        }
+        let Ok(len_usize) = usize::try_from(len) else {
+            return ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EINVAL).guest_retval());
+        };
+        let Some(host_fd) = self.dispatcher.dup_host_file_fd(fd as i32) else {
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: 222,
+                outcome: "MAP_SHARED mmap of a non-host-file fd on tier D".to_string(),
+            });
+            return ServiceVerdict::Leave;
+        };
+        let mut host_flags = libc::MAP_SHARED;
+        if flags.contains(carrick_abi::LinuxMmapFlags::FIXED) {
+            host_flags |= libc::MAP_FIXED;
+        }
+        let request_addr = if addr == 0 && !flags.contains(carrick_abi::LinuxMmapFlags::FIXED) {
+            ANON_HINT_CURSOR.fetch_add(len.next_multiple_of(HOST_PAGE_SIZE), Ordering::Relaxed)
+        } else {
+            addr
+        };
+        // SAFETY: identity tier — a host MAP_SHARED mmap of the guest's own
+        // file is the exact semantic; the dup'd fd is closed after mapping
+        // (the mapping keeps the file referenced).
+        let mapped = unsafe {
+            libc::mmap(
+                request_addr as usize as *mut libc::c_void,
+                len_usize,
+                host_prot(prot),
+                host_flags,
+                host_fd.as_raw_fd(),
+                offset as i64 as libc::off_t,
+            )
+        };
+        drop(host_fd);
+        if mapped == libc::MAP_FAILED {
+            return host_errno_verdict();
+        }
+        if flags.contains(carrick_abi::LinuxMmapFlags::FIXED) {
+            if let Some(group) = active_group() {
+                group.note_plain_replacement(mapped as u64, len);
+            }
+            subtract_anon_range(
+                &mut lock(&self.anon_rw),
+                mapped as u64,
+                (mapped as u64).saturating_add(len.next_multiple_of(HOST_PAGE_SIZE)),
+            );
+        }
+        ServiceVerdict::Resume(mapped as i64)
+    }
+
     /// A PRIVATE file-backed data mapping (ld.so's `MAP_FIXED` data
     /// segments, read-only header windows): fresh anonymous pages plus a
     /// dispatcher read of the file window. MAP_PRIVATE means writes never
@@ -1037,7 +1221,7 @@ impl DirectRunner {
             &mut memory,
             &reporter,
             self.current_tid(),
-            &self.registry,
+            &read_lock(&self.registry),
             &self.futex,
         ) {
             Ok(DispatchOutcome::Returned { value }) => Ok(value),
@@ -1171,7 +1355,16 @@ impl DirectRunner {
     }
 
     /// Service one syscall from a tier-D island.
-    fn service(&self, ctx: &GuestContext) -> ServiceVerdict {
+    ///
+    /// The dispatch runs in a RE-DISPATCH loop, mirroring the DSR native
+    /// loop's contract for blocking outcomes: a wait that reports `Ready`
+    /// re-dispatches the SAME request so the handler completes it against
+    /// fresh state; `TimedOut` completes with the outcome's timeout value;
+    /// an interruption is classified — process exit retires the thread, and
+    /// a deliverable pending signal fails CLOSED (delivery is unimplemented
+    /// on tier D; silently dropping a signal a handler is installed for
+    /// would be corruption, not compatibility).
+    fn service(&self, ctx: &mut GuestContext) -> ServiceVerdict {
         self.syscalls.fetch_add(1, Ordering::Relaxed);
         let number = ctx.syscall_nr();
         if let Some(verdict) = self.service_identity_memory(ctx) {
@@ -1188,77 +1381,248 @@ impl DirectRunner {
         let reporter = crate::compat::CompatReporter::default();
         let tid = self.current_tid();
         let mut memory = self.memory;
-        match self.dispatcher.dispatch_threaded(
-            request,
-            &mut memory,
-            &reporter,
-            tid,
-            &self.registry,
-            &self.futex,
-        ) {
-            Ok(DispatchOutcome::Returned { value }) => ServiceVerdict::Resume(value),
-            Ok(DispatchOutcome::Errno { errno }) => ServiceVerdict::Resume(errno.guest_retval()),
-            Ok(DispatchOutcome::Exit { code }) => {
-                self.end_process(DirectRunOutcome::Exited { code });
-                ServiceVerdict::Leave
-            }
-            // `exit(2)` from a thread that is not the last: retire THIS
-            // thread only (CLEARTID write + wake is pthread_join's other
-            // half), leaving the process running.
-            Ok(DispatchOutcome::ThreadExit { code }) => {
-                self.finish_thread_bookkeeping(tid, code);
-                ServiceVerdict::Leave
-            }
-            // Roadmap Phase 1 item 4: a thread-creating clone spawns a host
-            // thread whose guest enters tier D with its OWN DirectThreadSlots
-            // (the veneers address per-thread state through the proven TSD
-            // chain), parked at the parent's resume site with x0 = 0.
-            Ok(DispatchOutcome::CloneThread {
-                stack,
-                tls,
-                flags: _,
-                parent_tid_addr,
-                child_tid_addr,
-                clear_child_tid_addr,
-            }) => self.service_clone_thread(
-                ctx,
+        // One deadline per syscall INSTANCE: re-dispatches after a Ready wake
+        // must not restart a finite timeout from zero (the DSR loop's
+        // `remaining_native_wait_timeout` contract).
+        let mut fd_wait_deadline: Option<Instant> = None;
+        loop {
+            let outcome = self.dispatcher.dispatch_threaded(
+                request,
+                &mut memory,
+                &reporter,
                 tid,
-                stack,
-                tls,
-                parent_tid_addr,
-                child_tid_addr,
-                clear_child_tid_addr,
-            ),
-            // FUTEX_WAIT whose value check passed under the dispatcher lock:
-            // park on the shared table (the dispatcher's wake side uses the
-            // same one). The only interrupt source tier D has is process
-            // exit, so an interrupted wait retires the thread.
-            Ok(DispatchOutcome::FutexWait { wait, timeout }) => {
-                match self
-                    .futex
-                    .wait_prepared_for_thread(wait, timeout, tid, &|| {
-                        self.exiting.load(Ordering::SeqCst)
-                    }) {
-                    crate::thread::FutexWaitOutcome::Woken => ServiceVerdict::Resume(0),
-                    crate::thread::FutexWaitOutcome::TimedOut => {
-                        ServiceVerdict::Resume(crate::linux_abi::LINUX_ETIMEDOUT.guest_retval())
-                    }
-                    crate::thread::FutexWaitOutcome::Interrupted => ServiceVerdict::Leave,
+                &read_lock(&self.registry),
+                &self.futex,
+            );
+            match outcome {
+                Ok(DispatchOutcome::Returned { value }) => return ServiceVerdict::Resume(value),
+                Ok(DispatchOutcome::Errno { errno }) => {
+                    return ServiceVerdict::Resume(errno.guest_retval());
                 }
-            }
-            Ok(other) => {
-                self.end_process(DirectRunOutcome::Unsupported {
-                    syscall: number,
-                    outcome: format!("{other:?}"),
-                });
-                ServiceVerdict::Leave
-            }
-            Err(error) => {
-                self.end_process(DirectRunOutcome::Unsupported {
-                    syscall: number,
-                    outcome: error.to_string(),
-                });
-                ServiceVerdict::Leave
+                Ok(DispatchOutcome::Exit { code }) => {
+                    self.end_process(DirectRunOutcome::Exited { code });
+                    return ServiceVerdict::Leave;
+                }
+                // `exit(2)` from a thread that is not the last: retire THIS
+                // thread only (CLEARTID write + wake is pthread_join's other
+                // half), leaving the process running.
+                Ok(DispatchOutcome::ThreadExit { code }) => {
+                    self.finish_thread_bookkeeping(tid, code);
+                    return ServiceVerdict::Leave;
+                }
+                // Roadmap Phase 1 item 4: a thread-creating clone spawns a
+                // host thread whose guest enters tier D with its OWN
+                // DirectThreadSlots (the veneers address per-thread state
+                // through the proven TSD chain), parked at the parent's
+                // resume site with x0 = 0.
+                Ok(DispatchOutcome::CloneThread {
+                    stack,
+                    tls,
+                    flags: _,
+                    parent_tid_addr,
+                    child_tid_addr,
+                    clear_child_tid_addr,
+                }) => {
+                    return self.service_clone_thread(
+                        ctx,
+                        tid,
+                        stack,
+                        tls,
+                        parent_tid_addr,
+                        child_tid_addr,
+                        clear_child_tid_addr,
+                    );
+                }
+                // Process-creating clone: a real host fork of this runner
+                // process — identity memory makes the copied address space
+                // the child's guest state by construction (Phase 2 item 2).
+                Ok(DispatchOutcome::Fork {
+                    pidfd_out,
+                    clone_parent,
+                    parent_tid_addr,
+                    child_tid_addr,
+                    exit_signal,
+                    child_stack,
+                    vfork,
+                }) => {
+                    return self.service_fork(
+                        ctx,
+                        tid,
+                        ForkRequest {
+                            pidfd_out,
+                            clone_parent,
+                            parent_tid_addr,
+                            child_tid_addr,
+                            exit_signal,
+                            child_stack,
+                            vfork,
+                        },
+                    );
+                }
+                // `execve(2)`: leave to the existing host self-re-exec path
+                // (the capsule); the resumed process tier-decides ANEW for
+                // the new image. On success the host `execve` replaces this
+                // process inside the call; a pre-commit failure resumes the
+                // guest with the errno, exactly as Linux's execve returns.
+                Ok(DispatchOutcome::Execve { path, argv, env }) => {
+                    let Some(exec) = &self.exec else {
+                        self.end_process(DirectRunOutcome::Unsupported {
+                            syscall: number,
+                            outcome: format!(
+                                "Execve {{ path: {path:?} }} without exec services \
+                                 (tier D outside the shipped driver)"
+                            ),
+                        });
+                        return ServiceVerdict::Leave;
+                    };
+                    if read_lock(&self.registry).live_count() > 1 {
+                        // Linux execve destroys sibling threads; tier D has
+                        // no sibling-teardown orchestration yet. Fail closed.
+                        self.end_process(DirectRunOutcome::Unsupported {
+                            syscall: number,
+                            outcome: "execve with live sibling threads on tier D".to_string(),
+                        });
+                        return ServiceVerdict::Leave;
+                    }
+                    return ServiceVerdict::Resume(crate::native_darwin::tier_d_service_execve(
+                        &self.dispatcher,
+                        path,
+                        argv,
+                        env,
+                        &exec.plan,
+                        exec.max_traps,
+                    ));
+                }
+                // FUTEX_WAIT whose value check passed under the dispatcher
+                // lock: park on the shared table (the dispatcher's wake side
+                // uses the same one).
+                Ok(DispatchOutcome::FutexWait { wait, timeout }) => {
+                    return match self
+                        .futex
+                        .wait_prepared_for_thread(wait, timeout, tid, &|| {
+                            self.exiting.load(Ordering::SeqCst)
+                        }) {
+                        crate::thread::FutexWaitOutcome::Woken => ServiceVerdict::Resume(0),
+                        crate::thread::FutexWaitOutcome::TimedOut => {
+                            ServiceVerdict::Resume(crate::linux_abi::LINUX_ETIMEDOUT.guest_retval())
+                        }
+                        crate::thread::FutexWaitOutcome::Interrupted => ServiceVerdict::Leave,
+                    };
+                }
+                // Blocking fd waits: park on the per-thread waiter, then
+                // RE-DISPATCH on readiness (the handler then finds the ready
+                // fds and completes the syscall itself).
+                Ok(DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                    sig_mask,
+                }) => {
+                    let Some(remaining) = remaining_wait_timeout(timeout, &mut fd_wait_deadline)
+                    else {
+                        return ServiceVerdict::Resume(on_timeout);
+                    };
+                    match self.wait_on_fds(
+                        number,
+                        tid,
+                        &fds,
+                        remaining,
+                        sig_mask,
+                        FdWaitKind::Kqueue,
+                    ) {
+                        TierDWait::Ready => continue,
+                        TierDWait::TimedOut => return ServiceVerdict::Resume(on_timeout),
+                        TierDWait::Leave => return ServiceVerdict::Leave,
+                    }
+                }
+                Ok(DispatchOutcome::WaitOnPollFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                    sig_mask,
+                }) => {
+                    let Some(remaining) = remaining_wait_timeout(timeout, &mut fd_wait_deadline)
+                    else {
+                        return ServiceVerdict::Resume(on_timeout);
+                    };
+                    match self.wait_on_fds(number, tid, &fds, remaining, sig_mask, FdWaitKind::Poll)
+                    {
+                        TierDWait::Ready => continue,
+                        TierDWait::TimedOut => return ServiceVerdict::Resume(on_timeout),
+                        TierDWait::Leave => return ServiceVerdict::Leave,
+                    }
+                }
+                Ok(DispatchOutcome::WaitOnFdsSelect {
+                    fds,
+                    timeout,
+                    sig_mask,
+                    clear_on_timeout,
+                }) => {
+                    let timed_out = |this: &Self| {
+                        // select's timeout contract: zeroed fd-sets, retval 0.
+                        let mut memory = this.memory;
+                        for (addr, len) in &clear_on_timeout {
+                            let _ = memory.write_bytes_raw(*addr, &vec![0_u8; *len]);
+                        }
+                        ServiceVerdict::Resume(0)
+                    };
+                    let Some(remaining) = remaining_wait_timeout(timeout, &mut fd_wait_deadline)
+                    else {
+                        return timed_out(self);
+                    };
+                    match self.wait_on_fds(
+                        number,
+                        tid,
+                        &fds,
+                        remaining,
+                        sig_mask,
+                        FdWaitKind::Kqueue,
+                    ) {
+                        TierDWait::Ready => continue,
+                        TierDWait::TimedOut => return timed_out(self),
+                        TierDWait::Leave => return ServiceVerdict::Leave,
+                    }
+                }
+                // Blocking child wait: park on the child's exit (EVFILT_PROC
+                // under the per-thread waiter), then re-dispatch to reap.
+                Ok(DispatchOutcome::WaitOnProcExit { pid, sig_mask }) => {
+                    match self.wait_on_proc_exit(number, tid, pid, sig_mask) {
+                        TierDWait::Ready | TierDWait::TimedOut => continue,
+                        TierDWait::Leave => return ServiceVerdict::Leave,
+                    }
+                }
+                // Non-terminal child state (WSTOPPED/WCONTINUED): bounded
+                // re-poll, the DSR arm's exact shape.
+                Ok(DispatchOutcome::WaitOnProcState { pid: _, sig_mask }) => {
+                    match self.wait_on_proc_state(number, tid, sig_mask) {
+                        TierDWait::Ready | TierDWait::TimedOut => continue,
+                        TierDWait::Leave => return ServiceVerdict::Leave,
+                    }
+                }
+                // Relative sleep. Without signal delivery the only interrupt
+                // source is process end, so a completed sleep returns 0 and
+                // `remaining` is never written (it only matters on EINTR).
+                Ok(DispatchOutcome::WaitOnSleep {
+                    duration,
+                    remaining: _,
+                }) => match self.wait_on_sleep(number, tid, duration) {
+                    TierDWait::Ready | TierDWait::TimedOut => return ServiceVerdict::Resume(0),
+                    TierDWait::Leave => return ServiceVerdict::Leave,
+                },
+                Ok(other) => {
+                    self.end_process(DirectRunOutcome::Unsupported {
+                        syscall: number,
+                        outcome: format!("{other:?}"),
+                    });
+                    return ServiceVerdict::Leave;
+                }
+                Err(error) => {
+                    self.end_process(DirectRunOutcome::Unsupported {
+                        syscall: number,
+                        outcome: error.to_string(),
+                    });
+                    return ServiceVerdict::Leave;
+                }
             }
         }
     }
@@ -1311,7 +1675,7 @@ impl DirectRunner {
         slots.guest_tls = tls.unwrap_or(parent_tls);
         slots.guest_x18 = parent_x18;
 
-        let tid = self.registry.register_child(clear_child_tid_addr);
+        let tid = read_lock(&self.registry).register_child(clear_child_tid_addr);
         self.dispatcher.inherit_thread_signal_mask(parent_tid, tid);
         let tid_bytes = tid.raw().to_le_bytes();
         let mut memory = self.memory;
@@ -1371,12 +1735,496 @@ impl DirectRunner {
                 ServiceVerdict::Resume(i64::from(tid.raw()))
             }
             Err(_) => {
-                self.registry.exit(tid);
+                read_lock(&self.registry).exit(tid);
                 self.dispatcher.forget_thread_signal_state(tid);
                 ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EAGAIN).guest_retval())
             }
         }
     }
+
+    /// Service a process-creating `clone(2)` (fork) by forking THIS host
+    /// process — the identity tier's structural win: guest VA is host VA, so
+    /// the kernel's CoW copy of the address space IS the child's guest state,
+    /// with no snapshot, no rebuild, and no translator repair.
+    ///
+    /// Both sides resume through the normal island restore: the child
+    /// continues from this handler with x0 = 0 on its (copied) guest stack,
+    /// the parent with the child's guest-visible pid. The pre/post-fork
+    /// bookkeeping mirrors the DSR lane's `handle_native_fork` — ns-pid
+    /// allocation, the guest-cpu child record, the shared dispatcher
+    /// fork-child reset, the child-exit watch — minus the sibling quiesce
+    /// (MT fork fails closed here). vfork is serviced as CoW + true parent
+    /// suspension; see the vfork block below for the one documented
+    /// divergence (no CLONE_VM memory sharing).
+    fn service_fork(
+        &self,
+        ctx: &mut GuestContext,
+        parent_tid: ThreadId,
+        request: ForkRequest,
+    ) -> ServiceVerdict {
+        use carrick_dsr_aarch64::mapped_memory::NATIVE_FORKED_GUEST_CHILD;
+        let eagain =
+            || ServiceVerdict::Resume(crate::host_to_linux_errno(libc::EAGAIN).guest_retval());
+        let unsupported = |what: &str| {
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: ctx.syscall_nr(),
+                outcome: what.to_string(),
+            });
+            ServiceVerdict::Leave
+        };
+        if request.clone_parent {
+            return unsupported("CLONE_PARENT fork on tier D");
+        }
+        if read_lock(&self.registry).live_count() > 1 {
+            // A multithreaded fork needs the sibling quiesce the DSR lane
+            // has and tier D does not (forking with a sibling mid-mutation
+            // hands the child poisoned locks). Fail closed, named.
+            return unsupported("multithreaded fork on tier D (no sibling quiesce)");
+        }
+        crate::probes::fork_pre(ctx.pc, 0, 0);
+        // vfork/CLONE_VFORK: the child gets the same CoW copy an ordinary
+        // fork gets — tier D's identity mappings are MAP_PRIVATE, so the
+        // CLONE_VM sharing HALF of vfork cannot be honored — but the
+        // SUSPENSION half is: the parent blocks here until the child execs
+        // or exits, signalled by EOF on a pipe whose write end is CLOEXEC
+        // in the child (the capsule self-re-exec's host execve closes it;
+        // so does any exit). Within POSIX's vfork contract (the child only
+        // execs or `_exit`s) this is exact; the one divergence is a guest
+        // that WRITES parent-visible memory in the vfork window — glibc
+        // posix_spawn's failed-exec errno write-back — which under CoW the
+        // parent never sees (the spawn "succeeds" and the child exits 127).
+        // Deliberate, documented approximation; full fidelity needs
+        // shareable guest memory, which is the DSR lane's
+        // `set_fork_inheritance` and a tier-D future lever.
+        let vfork_pipe = if request.vfork.is_some() {
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: plain pipe(2) into a local array.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return eagain();
+            }
+            // SAFETY: just-created fd; set the WRITE end close-on-exec so
+            // the child's execve releases the parent without cooperation.
+            unsafe {
+                libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            Some((fds[0], fds[1]))
+        } else {
+            None
+        };
+        let close_pipe = |pipe: Option<(i32, i32)>| {
+            if let Some((read_fd, write_fd)) = pipe {
+                // SAFETY: fds owned by this function.
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+            }
+        };
+        let child_parent = std::process::id();
+        let child_subreaper = self.dispatcher.subreaper_for_fork_child();
+        let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
+        let Ok(prepared_child_record) = crate::guest_cpu::prepare_child_record_pre_fork(
+            child_parent,
+            child_subreaper,
+            child_ns_pid.unwrap_or(0),
+            false,
+            0,
+        ) else {
+            close_pipe(vfork_pipe);
+            return eagain();
+        };
+        // Pin the fork-shared signal-static mutexes an auxiliary thread (the
+        // child-exit watcher mid-publish) can hold, exactly as the DSR fork
+        // does — a fork landing inside such a window hands the child a lock
+        // held by a thread that does not exist there.
+        let fork_signal_locks = crate::host_signal::hold_signal_locks_for_fork();
+        // SAFETY: single guest thread (checked above); the guest is parked in
+        // this handler, so its state is fully in `ctx` and host memory.
+        let child = unsafe { libc::fork() };
+        drop(fork_signal_locks);
+        if child < 0 {
+            crate::guest_cpu::abort_prepared_child_record();
+            close_pipe(vfork_pipe);
+            return eagain();
+        }
+        if child == 0 {
+            // CHILD: repair inherited runtime state before the guest resumes.
+            if let Some((read_fd, _write_fd)) = vfork_pipe {
+                // Keep the CLOEXEC write end: closing it (via exec or exit)
+                // IS the vfork-completion signal. Drop the read end.
+                // SAFETY: the child's own inherited fd.
+                unsafe {
+                    libc::close(read_fd);
+                }
+            }
+            NATIVE_FORKED_GUEST_CHILD.store(true, Ordering::Release);
+            self.forked_child.store(true, Ordering::Release);
+            crate::probes::host_process_birth_current();
+            crate::native::fork_child::dispatcher_after_fork_child(&self.dispatcher);
+            let child_tid = self.reset_after_fork_child();
+            self.dispatcher
+                .retire_sibling_thread_signal_state(parent_tid);
+            self.dispatcher
+                .migrate_thread_signal_state(parent_tid, child_tid);
+            crate::guest_cpu::reset();
+            crate::guest_cpu::complete_child_record_post_fork_child();
+            if let Err(error) = self.dispatcher.rlimit_cpu_after_fork_child() {
+                return unsupported(&format!(
+                    "fork child could not rearm finite RLIMIT_CPU helper: {error}"
+                ));
+            }
+            crate::run_state::reinit_booting_after_fork();
+            let self_tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
+            let mut memory = self.memory;
+            if let Some(addr) = request.parent_tid_addr {
+                let _ = memory.write_bytes_raw(addr, &self_tid);
+            }
+            if let Some(addr) = request.child_tid_addr {
+                let _ = memory.write_bytes_raw(addr, &self_tid);
+            }
+            // A clone with an explicit stack runs the CHILD on it, exactly as
+            // the kernel does; the island's restore reads SP from the context.
+            // (vfork carries its stack argument in the `vfork` payload.)
+            if request.child_stack != 0 {
+                ctx.sp = request.child_stack;
+            }
+            if let Some(stack) = request.vfork
+                && stack != 0
+            {
+                ctx.sp = stack;
+            }
+            crate::probes::fork_post(0, ctx.pc, 0);
+            return ServiceVerdict::Resume(0);
+        }
+        // PARENT. For vfork, SUSPEND until the child execs or exits (EOF on
+        // the pipe): the guest contract, and the same order as the DSR
+        // lane's vfork wait (suspend first, publish after). Single guest
+        // thread is guaranteed above, so a blocking read cannot starve a
+        // sibling; EINTR (a host signal against carrick) just retries.
+        if let Some((read_fd, write_fd)) = vfork_pipe {
+            // SAFETY: parent's copy of the write end; the child holds its own.
+            unsafe {
+                libc::close(write_fd);
+            }
+            let mut byte = [0_u8; 1];
+            loop {
+                // SAFETY: blocking read on the runner-owned pipe read end.
+                let n = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
+                if n > 0 {
+                    continue; // contract violation tolerated: keep draining
+                }
+                if n == 0 {
+                    break; // EOF: the child exec'd or exited
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+            // SAFETY: as above.
+            unsafe {
+                libc::close(read_fd);
+            }
+        }
+        // Publish the child record and arm the exit watch.
+        crate::guest_cpu::publish_prepared_child_record_parent_ref(
+            prepared_child_record,
+            child as u32,
+        );
+        crate::namespace::pid::notify_child_registered();
+        crate::run_state::publish_child_booting(child as u32);
+        let mut memory = self.memory;
+        if let Some(addr) = request.pidfd_out {
+            let fd = self.dispatcher.install_child_pidfd(child).unwrap_or(-1);
+            let _ = memory.write_bytes_raw(addr, &fd.to_le_bytes());
+        }
+        let guest_child_pid = child_ns_pid.unwrap_or(child as u32) as i32;
+        if let Some(addr) = request.parent_tid_addr {
+            let _ = memory.write_bytes_raw(addr, &guest_child_pid.to_le_bytes());
+        }
+        crate::native_darwin::native_register_child_exit_watch(
+            &self.dispatcher,
+            child,
+            request.exit_signal,
+            parent_tid,
+        );
+        crate::probes::fork_post(child, ctx.pc, 0);
+        ServiceVerdict::Resume(i64::from(guest_child_pid))
+    }
+
+    /// Fork-child runner reset: a fresh registry keyed to the child's pid
+    /// (only the forking thread survives `fork`), abandoned sibling join
+    /// handles (their pthreads do not exist here), and this thread's ACTIVE
+    /// tid re-pointed at the new main. The futex table, brk and tracked-anon
+    /// state are the guest's own memory bookkeeping and stay valid across
+    /// the address-space copy.
+    fn reset_after_fork_child(&self) -> ThreadId {
+        let tid = ThreadId::main_from_host_pid();
+        *write_lock(&self.registry) = crate::thread::ThreadRegistry::new(tid);
+        for handle in std::mem::take(&mut *lock(&self.threads)) {
+            // The copied JoinHandle names a PARENT thread; joining or
+            // detaching it here would target a pthread that does not exist
+            // in this process.
+            std::mem::forget(handle);
+        }
+        self.exiting.store(false, Ordering::SeqCst);
+        ACTIVE_TID.with(|slot| slot.set(tid));
+        // The inherited per-thread waiter (if any) wraps a kqueue, which
+        // fork does NOT inherit; drop it so the next wait builds a fresh one.
+        TIER_D_WAITER.with(|cell| cell.borrow_mut().take());
+        tid
+    }
+
+    /// The effective signal block mask for a blocking wait (the DSR lane's
+    /// `native_wait_block_mask`).
+    fn wait_block_mask(
+        &self,
+        tid: ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> carrick_abi::SigBlockMask {
+        let effective = match sig_mask {
+            carrick_abi::WaitSigMask::Replace(mask) => mask,
+            carrick_abi::WaitSigMask::Additive(mask) => {
+                self.dispatcher.signal_mask_for(tid).union(mask)
+            }
+        };
+        carrick_abi::SigBlockMask::blocking_all_of(effective)
+    }
+
+    /// Classify an interrupted wait, failing CLOSED on the one thing tier D
+    /// cannot do: deliver a signal. A deliverable pending signal with the
+    /// wait's mask means Linux would run a handler and EINTR the syscall;
+    /// resuming as if nothing happened would silently drop the signal, so
+    /// the run leaves named instead. Process end retires the thread quietly
+    /// (the outcome is already recorded).
+    fn classify_wait_interrupt(
+        &self,
+        number: u64,
+        tid: ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> Option<TierDWait> {
+        if self.exiting.load(Ordering::SeqCst) {
+            return Some(TierDWait::Leave);
+        }
+        if self
+            .dispatcher
+            .has_deliverable_dispatch_pending_for_wait(tid, sig_mask)
+        {
+            self.end_process(DirectRunOutcome::Unsupported {
+                syscall: number,
+                outcome: "deliverable pending signal during a blocking wait \
+                          (signal delivery is unimplemented on tier D)"
+                    .to_string(),
+            });
+            return Some(TierDWait::Leave);
+        }
+        None
+    }
+
+    /// The wait-interrupt predicate handed to the per-thread waiter: wake
+    /// for process end or for a deliverable pending signal (which the caller
+    /// then classifies — see [`Self::classify_wait_interrupt`]).
+    fn wait_should_interrupt(&self, tid: ThreadId, sig_mask: carrick_abi::WaitSigMask) -> bool {
+        self.exiting.load(Ordering::SeqCst)
+            || self
+                .dispatcher
+                .has_deliverable_dispatch_pending_for_wait(tid, sig_mask)
+    }
+
+    /// Park on host-fd readiness (`WaitOnFds`/`WaitOnPollFds`/select).
+    fn wait_on_fds(
+        &self,
+        number: u64,
+        tid: ThreadId,
+        fds: &[crate::io_wait::WaitFd],
+        timeout: Option<Duration>,
+        sig_mask: carrick_abi::WaitSigMask,
+        kind: FdWaitKind,
+    ) -> TierDWait {
+        let block_mask = self.wait_block_mask(tid, sig_mask);
+        let result = with_thread_waiter(tid, |waiter| match kind {
+            FdWaitKind::Kqueue => {
+                waiter.wait_with_dispatch_pending(fds, timeout, block_mask, || {
+                    self.wait_should_interrupt(tid, sig_mask)
+                })
+            }
+            FdWaitKind::Poll => {
+                waiter.wait_poll_with_dispatch_pending(fds, timeout, block_mask, || {
+                    self.wait_should_interrupt(tid, sig_mask)
+                })
+            }
+        });
+        match result {
+            crate::io_wait::WaitResult::Ready => TierDWait::Ready,
+            crate::io_wait::WaitResult::TimedOut => TierDWait::TimedOut,
+            // A spurious host wake re-dispatches (the caller re-derives the
+            // remaining time from the per-syscall deadline), and a
+            // wait-infrastructure errno is not a guest result — a fresh
+            // dispatch takes a fresh look. Only a classified interrupt
+            // (process end / undeliverable signal) leaves.
+            crate::io_wait::WaitResult::Interrupted => self
+                .classify_wait_interrupt(number, tid, sig_mask)
+                .unwrap_or(TierDWait::Ready),
+            crate::io_wait::WaitResult::Errno(_) => TierDWait::Ready,
+        }
+    }
+
+    /// Park until the guest child `pid` is reapable (`WaitOnProcExit`).
+    fn wait_on_proc_exit(
+        &self,
+        number: u64,
+        tid: ThreadId,
+        pid: i32,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> TierDWait {
+        let block_mask = self.wait_block_mask(tid, sig_mask);
+        let result = with_thread_waiter(tid, |waiter| {
+            waiter.wait_proc_exit_with_dispatch_pending(pid, block_mask, || {
+                self.wait_should_interrupt(tid, sig_mask)
+            })
+        });
+        match result {
+            crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::TimedOut => {
+                TierDWait::Ready
+            }
+            crate::io_wait::WaitResult::Interrupted => self
+                .classify_wait_interrupt(number, tid, sig_mask)
+                .unwrap_or(TierDWait::Ready),
+            crate::io_wait::WaitResult::Errno(_) => TierDWait::Ready,
+        }
+    }
+
+    /// Bounded re-poll for a non-terminal child state (`WaitOnProcState`).
+    fn wait_on_proc_state(
+        &self,
+        number: u64,
+        tid: ThreadId,
+        sig_mask: carrick_abi::WaitSigMask,
+    ) -> TierDWait {
+        let block_mask = self.wait_block_mask(tid, sig_mask);
+        let result = with_thread_waiter(tid, |waiter| {
+            waiter.wait_proc_state_with_dispatch_pending(block_mask, || {
+                self.wait_should_interrupt(tid, sig_mask)
+            })
+        });
+        match result {
+            crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::TimedOut => {
+                TierDWait::Ready
+            }
+            crate::io_wait::WaitResult::Interrupted => self
+                .classify_wait_interrupt(number, tid, sig_mask)
+                .unwrap_or(TierDWait::Ready),
+            crate::io_wait::WaitResult::Errno(_) => TierDWait::Ready,
+        }
+    }
+
+    /// A relative sleep (`WaitOnSleep`), interruptible only by process end
+    /// or a deliverable pending signal (both classified by the caller's
+    /// `Leave` handling).
+    fn wait_on_sleep(&self, number: u64, tid: ThreadId, duration: Duration) -> TierDWait {
+        let sig_mask = carrick_abi::WaitSigMask::NONE;
+        let block_mask = self.wait_block_mask(tid, sig_mask);
+        let deadline = Instant::now() + duration;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return TierDWait::TimedOut;
+            }
+            let result = with_thread_waiter(tid, |waiter| {
+                waiter.wait_with_dispatch_pending(&[], Some(deadline - now), block_mask, || {
+                    self.wait_should_interrupt(tid, sig_mask)
+                })
+            });
+            match result {
+                crate::io_wait::WaitResult::TimedOut => return TierDWait::TimedOut,
+                crate::io_wait::WaitResult::Ready | crate::io_wait::WaitResult::Interrupted => {
+                    if let Some(leave) = self.classify_wait_interrupt(number, tid, sig_mask) {
+                        return leave;
+                    }
+                    // Spurious: re-park for the remaining time.
+                }
+                crate::io_wait::WaitResult::Errno(_) => return TierDWait::TimedOut,
+            }
+        }
+    }
+}
+
+/// A process-creating clone request (the `DispatchOutcome::Fork` payload).
+struct ForkRequest {
+    pidfd_out: Option<u64>,
+    clone_parent: bool,
+    parent_tid_addr: Option<u64>,
+    child_tid_addr: Option<u64>,
+    exit_signal: u32,
+    child_stack: u64,
+    vfork: Option<u64>,
+}
+
+/// How a blocking wait ended, from the service loop's point of view.
+enum TierDWait {
+    /// Re-dispatch the syscall (readiness, or a state change worth a fresh
+    /// look).
+    Ready,
+    /// Complete the syscall with its timeout value.
+    TimedOut,
+    /// Leave guest execution (process end, or a named fail-closed reason
+    /// already recorded via `end_process`).
+    Leave,
+}
+
+/// Which waiter primitive a fd wait uses (`WaitOnFds` vs `WaitOnPollFds` —
+/// the latter polls so epoll's kqueue fd is observed without consuming).
+#[derive(Clone, Copy)]
+enum FdWaitKind {
+    Kqueue,
+    Poll,
+}
+
+/// Per-syscall-instance timeout bookkeeping: `None` = the deadline passed
+/// (complete with the timeout value); `Some(None)` = wait forever;
+/// `Some(Some(d))` = wait at most `d`.
+fn remaining_wait_timeout(
+    timeout: Option<Duration>,
+    deadline: &mut Option<Instant>,
+) -> Option<Option<Duration>> {
+    match timeout {
+        Some(duration) => {
+            let now = Instant::now();
+            let deadline = *deadline.get_or_insert(now + duration);
+            (now < deadline).then_some(Some(deadline.saturating_duration_since(now)))
+        }
+        None => {
+            *deadline = None;
+            Some(None)
+        }
+    }
+}
+
+thread_local! {
+    /// The per-thread blocking-I/O waiter for tier-D guest threads. Lazily
+    /// built (and rebuilt when the tid changes — a fork child's kqueue is
+    /// not inherited).
+    static TIER_D_WAITER: std::cell::RefCell<Option<crate::io_wait::ThreadWaiter>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with this thread's waiter, creating or re-keying it as needed.
+fn with_thread_waiter<R>(
+    tid: ThreadId,
+    f: impl FnOnce(&mut crate::io_wait::ThreadWaiter) -> R,
+) -> R {
+    TIER_D_WAITER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let rebuild = slot.as_ref().is_none_or(|waiter| waiter.tid() != tid);
+        if rebuild {
+            let mut waiter = crate::io_wait::ThreadWaiter::new(tid);
+            waiter.ensure_full();
+            *slot = Some(waiter);
+        }
+        let Some(waiter) = slot.as_mut() else {
+            unreachable!("waiter installed just above");
+        };
+        f(waiter)
+    })
 }
 
 /// Raw runner pointer that crosses into a spawned guest thread; safety is
@@ -1509,7 +2357,7 @@ pub unsafe fn with_runner<R>(
     body: impl FnOnce() -> R,
 ) -> std::io::Result<(R, Box<DirectThreadSlots>)> {
     let slots = group.install_thread_slots()?;
-    let context = install_thread_context(runner, group, runner.registry.main_tid());
+    let context = install_thread_context(runner, group, runner.main_tid());
     let result = body();
     drop(context);
     runner.join_guest_threads();
@@ -2394,6 +3242,235 @@ __attribute__((naked)) void _start(void) {
             runner.dispatcher().stdout(),
             b"hi\n",
             "the builtin echo's bytes came through the one dispatcher"
+        );
+    }
+
+    /// Phase 2 item 2, the FORK half: a guest `fork(2)` on tier D host-forks
+    /// the runner process. The CHILD resumes from this handler with x0 = 0
+    /// in the kernel's CoW copy of the identity address space (no snapshot,
+    /// no rebuild — the structural win of guest VA == host VA); the PARENT
+    /// resumes with the child's pid and REAPS it through the blocking-wait
+    /// path (`WaitOnProcExit` → the per-thread waiter → re-dispatched
+    /// wait4). The script uses only dash BUILTINS (no execve): the subshell
+    /// echoes into a file on the host-dir backend — durable, fork-coherent
+    /// state — which the parent then reads back and echoes, so one stdout
+    /// assertion proves the child EXECUTED (file content), the parent
+    /// resumed and REAPED (`;` sequencing needs wait4), and both exited.
+    ///
+    /// Red against the pre-fork runner: the run leaves
+    /// `Unsupported {{ syscall: 220 }}` at the clone and stdout is empty.
+    /// The child-process epilogue detects the forked copy by host PID (no
+    /// new-API dependence, so the red run compiles) and `_exit`s so the
+    /// harness never continues in the child.
+    #[test]
+    fn tier_d_guest_fork_runs_both_sides_and_the_parent_reaps() {
+        let live = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tierd-live");
+        let read = |name: &str| std::fs::read(format!("{live}/{name}"));
+        let (Ok(dash_elf), Ok(ld_bytes), Ok(libc_bytes)) = (
+            read("usr/bin/dash"),
+            read("usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"),
+            read("usr/lib/aarch64-linux-gnu/libc.so.6"),
+        ) else {
+            eprintln!("skipping: no debian binaries under target/tierd-live (see test doc)");
+            return;
+        };
+        let group = DirectLoadGroup::load_with_interpreter(
+            &dash_elf,
+            |path| {
+                assert_eq!(path, "/lib/ld-linux-aarch64.so.1");
+                Ok(ld_bytes.clone())
+            },
+            island_handler(),
+        )
+        .expect("load")
+        .expect("dash and its ld.so are tier-D eligible");
+        let interp = group.interpreter().expect("interpreter mapped");
+        let stack = DirectStack::build(
+            &dash_elf,
+            group.main().bias(),
+            Some(interp.bias()),
+            &[
+                b"dash".to_vec(),
+                b"-c".to_vec(),
+                b"( echo 42 > /work/out ); read v < /work/out; echo \"got $v\"".to_vec(),
+            ],
+            &[b"PATH=/usr/bin:/bin".to_vec()],
+        )
+        .expect("stack builds");
+
+        use crate::fs_backend::FsBackend as _;
+        let scratch = tempfile::tempdir().expect("scratch rootfs");
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .expect("open scratch");
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        for parent in [
+            "/lib",
+            "/lib/aarch64-linux-gnu",
+            "/lib64",
+            "/usr",
+            "/usr/lib",
+            "/work",
+        ] {
+            backend.make_dir(parent).expect("mkdir");
+        }
+        for path in [
+            "/lib/aarch64-linux-gnu/libc.so.6",
+            "/lib64/libc.so.6",
+            "/lib/libc.so.6",
+        ] {
+            backend
+                .set_file_contents(path, libc_bytes.clone())
+                .expect("place libc");
+        }
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
+        let entry = group.entry_pc();
+        let sp = stack.sp();
+        let host_pid_before = unsafe { libc::getpid() };
+        // SAFETY: patched images built with `island_handler`; the guest
+        // leaves through its exit (both sides of the fork).
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
+        if unsafe { libc::getpid() } != host_pid_before {
+            // We are the guest's fork CHILD: this host process's exit status
+            // IS the child guest's outcome, and the harness must not
+            // continue here (it would re-report the suite from the copy).
+            let code = match runner.outcome() {
+                Some(DirectRunOutcome::Exited { code }) => code,
+                _ => 111,
+            };
+            unsafe { libc::_exit(code) };
+        }
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 0 }),
+            "fork + subshell + wait ran end to end on tier D (syscalls: {}; \
+             stdout: {:?}; stderr: {:?})",
+            runner.syscalls(),
+            String::from_utf8_lossy(&runner.dispatcher().stdout()),
+            String::from_utf8_lossy(&runner.dispatcher().stderr()),
+        );
+        assert_eq!(
+            runner.dispatcher().stdout(),
+            b"got 42\n",
+            "the subshell's file write survived the fork and the parent read it back"
+        );
+    }
+
+    /// Phase 2 item 2, the VFORK half, up to the exec boundary: dash spawns
+    /// an external command via `vfork` (CLONE_VM|CLONE_VFORK). Tier D
+    /// services it as CoW + TRUE parent suspension (the sharing half cannot
+    /// be honored on private identity mappings — documented divergence);
+    /// the child runs its pre-exec work and reaches `execve(2)`, which
+    /// WITHOUT exec services leaves named (`Unsupported {{ syscall: 221 }}`)
+    /// and the child `_exit`s through the test epilogue with 111. That EOF
+    /// releases the suspended parent, whose wait4 reaps 111, and dash's `;`
+    /// continues to the builtin echo — so `done` on stdout + exit 0 proves
+    /// the whole vfork choreography (suspend, child pre-exec, release,
+    /// reap) with the exec boundary itself pinned by the shipped-binary
+    /// gate.
+    #[test]
+    fn tier_d_vfork_child_reaches_the_exec_boundary() {
+        let live = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tierd-live");
+        let read = |name: &str| std::fs::read(format!("{live}/{name}"));
+        let (Ok(dash_elf), Ok(ld_bytes), Ok(libc_bytes)) = (
+            read("usr/bin/dash"),
+            read("usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"),
+            read("usr/lib/aarch64-linux-gnu/libc.so.6"),
+        ) else {
+            eprintln!("skipping: no debian binaries under target/tierd-live (see test doc)");
+            return;
+        };
+        let group = DirectLoadGroup::load_with_interpreter(
+            &dash_elf,
+            |path| {
+                assert_eq!(path, "/lib/ld-linux-aarch64.so.1");
+                Ok(ld_bytes.clone())
+            },
+            island_handler(),
+        )
+        .expect("load")
+        .expect("dash and its ld.so are tier-D eligible");
+        let interp = group.interpreter().expect("interpreter mapped");
+        let stack = DirectStack::build(
+            &dash_elf,
+            group.main().bias(),
+            Some(interp.bias()),
+            &[
+                b"dash".to_vec(),
+                b"-c".to_vec(),
+                b"/bin/true; echo done".to_vec(),
+            ],
+            &[b"PATH=/usr/bin:/bin".to_vec()],
+        )
+        .expect("stack builds");
+
+        use crate::fs_backend::FsBackend as _;
+        let scratch = tempfile::tempdir().expect("scratch rootfs");
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .expect("open scratch");
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(dir);
+        for parent in [
+            "/bin",
+            "/lib",
+            "/lib/aarch64-linux-gnu",
+            "/lib64",
+            "/usr",
+            "/usr/lib",
+        ] {
+            backend.make_dir(parent).expect("mkdir");
+        }
+        for path in [
+            "/lib/aarch64-linux-gnu/libc.so.6",
+            "/lib64/libc.so.6",
+            "/lib/libc.so.6",
+        ] {
+            backend
+                .set_file_contents(path, libc_bytes.clone())
+                .expect("place libc");
+        }
+        // A real executable at /bin/true so dash's PATH search and the
+        // dispatcher's exec resolution both succeed (dash itself works).
+        backend
+            .set_file_contents("/bin/true", dash_elf.clone())
+            .expect("place /bin/true");
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_fs_backend(Box::new(backend));
+        let runner = DirectRunner::new(dispatcher, IdentityMemory::new(0, u64::MAX));
+        let entry = group.entry_pc();
+        let sp = stack.sp();
+        let host_pid_before = unsafe { libc::getpid() };
+        // SAFETY: patched images built with `island_handler`; the guest
+        // leaves through its exit (both sides of the vfork).
+        unsafe { with_runner(&runner, &group, || group.enter_on_stack(entry, sp)) }
+            .expect("with_runner")
+            .0
+            .expect("enter");
+        if unsafe { libc::getpid() } != host_pid_before {
+            // The vfork CHILD: without exec services its execve leaves
+            // named; exit 111 tells the parent's reap apart from a crash.
+            let code = match runner.outcome() {
+                Some(DirectRunOutcome::Exited { code }) => code,
+                _ => 111,
+            };
+            unsafe { libc::_exit(code) };
+        }
+        assert_eq!(
+            runner.outcome(),
+            Some(DirectRunOutcome::Exited { code: 0 }),
+            "vfork + suspended parent + reap ran end to end (syscalls: {}; \
+             stdout: {:?}; stderr: {:?})",
+            runner.syscalls(),
+            String::from_utf8_lossy(&runner.dispatcher().stdout()),
+            String::from_utf8_lossy(&runner.dispatcher().stderr()),
+        );
+        assert_eq!(
+            runner.dispatcher().stdout(),
+            b"done\n",
+            "the parent resumed after the vfork child left at the exec boundary"
         );
     }
 
