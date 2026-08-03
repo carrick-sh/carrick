@@ -92,11 +92,25 @@ Nothing real runs on tier D yet. In order:
    real `libc.so.6` through the dispatcher's VFS and stops, NAMED, at
    `mmap(PROT_EXEC, fd)` — which is item 5's scan+patch boundary (plus
    guest-fd → host-fd translation for the file-backed data mappings).
-4. **Threads — boundary named, veneer deliberately not attempted.** Slots
-   are per-load-group; a thread-creating clone (`CLONE_VM|CLONE_THREAD`)
-   fails CLOSED with the boundary pinned red-first. The per-thread veneer
-   (Darwin TSD via EL0-readable `TPIDRRO_EL0`) is the Phase-2 remainder;
-   landing it unsoundly would regress the verified single-threaded gates.
+4. **Threads — DONE.** Slots are per-THREAD: every veneer and island
+   resolves the executing thread's `DirectThreadSlots` through a proven
+   Darwin TSD slot (`(TPIDRRO_EL0 & !7) + key*8`, a `pthread_key_create`
+   key — the layout is PROVEN at first use on the creating thread and a
+   fresh one, and a host that fails the proof refuses every image, named).
+   The chain costs 3 instructions where the old per-group veneers
+   materialized a 4-instruction constant, so the +0.28 ns tpidr path got
+   cheaper, not dearer. A thread-creating clone spawns a host thread whose
+   guest enters through a runtime-emitted parked-entry stub (the island
+   resume leg's exact register-transparent shape) with the full parent
+   register file, x0 = 0, `CLONE_SETTLS` in its own TLS slot; `exit(2)`
+   retires one thread (CLEARTID write + futex wake), and `FUTEX_WAIT`
+   parks on the runner's shared table. LIVE-VERIFIED: real CPython 3.12
+   WITHOUT `-I -S` runs `threading.Thread` end to end on tier D (clone3 →
+   GIL futex traffic → join → ThreadExit), printing a value computed in
+   the spawned thread; the raw-clone pthread_join-shaped fixture pins the
+   mechanism. The identity memory model also grew a PROVEN `mremap`
+   (tracked plain-anon-RW ranges only; everything else leaves named) —
+   glibc realloc's mmapped-chunk path hits it on the threading run.
 5. **Guest-created executable pages — DONE; fork/exec/signal orchestration
    remains.** `mmap(PROT_EXEC, fd)` routes through the same scan+patch
    pipeline with two lowerings (whole-span MAP_JIT windows, and MAP_FIXED
@@ -109,11 +123,15 @@ Nothing real runs on tier D yet. In order:
    guest).
 
 **Gate:** `/bin/dash -c 'echo hi'` — **MET** (real debian dash + ld.so +
-libc on tier D, exit 0, `hi`). `python3 -I -S -c 'print(1)'` — **MET
-single-threaded** (real CPython 3.12, ~436 syscalls). Remaining for
-Phase 2: the native conformance smoke green with tier D forced on (the
-gate fixtures under `target/tierd-live` skip loudly and need harness
-wiring), and the item-4 veneer for thread-creating guests.
+libc on tier D, exit 0, `hi`). `python3 -I -S -c 'print(1)'` — **MET**
+(real CPython 3.12, ~436 syscalls). `python3 -c 'threading.Thread(...)'`
+— **MET multi-threaded** (item 4 landed: per-thread slots via the proven
+TSD chain, full unrestricted CPython startup). Remaining for Phase 2: the
+native conformance smoke green with tier D forced on — which first needs
+tier D WIRED into the shipped native driver (`run_elf_native_dispatch`
+never reaches `direct_runner`; the in-process gates are the only
+executions), plus fork/execve/signal delivery and fd-wait outcomes, which
+every real multi-process workload hits immediately.
 **Worth:** zero directly. Everything in Phase 2 depends on it.
 
 ### Phase 2 — tier D default-on (the compute win)
