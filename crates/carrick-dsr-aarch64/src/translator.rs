@@ -4312,6 +4312,7 @@ impl ThreadTranslator {
             snapshot,
             &mut exit,
             &self.indirect_cache,
+            self.process.private_target_authority.as_ref(),
             prepared.address_mode,
         );
         if let Err(error) = gateway_result {
