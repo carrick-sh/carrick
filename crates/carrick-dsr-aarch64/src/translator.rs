@@ -3187,6 +3187,20 @@ impl ProcessState {
             // full cache means "translate privately" (which will fail the
             // same way if truly out of room), never a hard guest error.
             Err(types::DsrError::CacheCapacity { .. }) => return Ok(None),
+            // A unit the installer's own validators refuse (e.g. a stale
+            // store shape) must fail closed to private translation, never
+            // kill the guest that consulted the store: the prepare stage
+            // mutates nothing, so declining it is always safe. The warn —
+            // not silence — is what keeps a store that never installs from
+            // reading as a plain miss.
+            Err(types::DsrError::CachePolicy(reason)) => {
+                tracing::warn!(
+                    reason,
+                    guest = guest.raw(),
+                    "shared unit refused at install; translating privately"
+                );
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         self.commit_shared_install(prepared);
