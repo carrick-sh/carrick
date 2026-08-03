@@ -801,13 +801,14 @@ impl NativeMappedMemory {
         store: Arc<dyn crate::shared_cache::TranslationUnitStore>,
     ) -> Result<(), NativeMemoryError> {
         let artifact_enabled = crate::artifact_spike::enabled();
-        let shared_enabled = crate::translator::shared_translation_runtime_enabled();
+        let shared_enabled = crate::translator::persistent_store_runtime_enabled();
         // The translation census needs the SAME segment enumeration and the
         // SAME `TranslationUnitKey`s the shared lane would mint, but it has to
-        // describe the DEFAULT path -- the lane is opt-in, so measuring only
-        // with it on would measure the other arm. Enumerating is pure (one
-        // SHA-256 over the executable spans) and installs no store, so the
-        // census arm below configures nothing the translator can act on.
+        // be able to describe the hatch-disabled path too (the lane is
+        // default-on with a `CARRICK_DSR_PERSISTENT_STORE=0` escape).
+        // Enumerating is pure (one SHA-256 over the executable spans) and
+        // installs no store, so the census arm below configures nothing the
+        // translator can act on.
         //
         // Consequence, deliberate: the enumeration below has several
         // `Unsupported` arms that both call sites turn into a fatal

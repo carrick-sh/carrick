@@ -132,6 +132,12 @@ fmt:
 test *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Guest-running tests must never publish translation units into the
+    # user's real persistent store (fixture guests would warm — and be
+    # warmed by — production state). Point the store at a per-gate tempdir.
+    CARRICK_DSR_STORE_DIR="$(mktemp -d -t carrick-test-store)"
+    export CARRICK_DSR_STORE_DIR
+    trap 'rm -rf "$CARRICK_DSR_STORE_DIR"' EXIT
     if [ "{{os()}}" = "macos" ]; then
         # Runtime tests exercise process-wide signal dispositions, custom-x18
         # transitions, and fork from the test harness. Running those cases on
@@ -150,13 +156,14 @@ test *ARGS:
         # NOT need the HVF runtime or Docker; those belong to a guest-capable
         # lane.
         cargo test --workspace --exclude carrick-runtime --lib --bins {{ARGS}}
-        exec env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
+        env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
+        exit 0
     fi
     # Off-macOS: run the lib tests of THIS host's own crates only (-p list from
     # _platform_crates) under the backend feature set — `--workspace --lib` would
     # pull in carrick-vmm-hvf + the macos-default features and fail to compile.
     pkgs="$(just --justfile {{justfile()}} _platform_crates)"
-    exec cargo test $pkgs {{_platform_features}} --lib --bins {{ARGS}}
+    cargo test $pkgs {{_platform_features}} --lib --bins {{ARGS}}
 
 # Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
 doc *ARGS:
@@ -181,6 +188,10 @@ doc *ARGS:
 test-integration:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Hermetic translation store for guest-running suites; see `test`.
+    CARRICK_DSR_STORE_DIR="$(mktemp -d -t carrick-test-store)"
+    export CARRICK_DSR_STORE_DIR
+    trap 'rm -rf "$CARRICK_DSR_STORE_DIR"' EXIT
     if [ "{{os()}}" = "macos" ]; then
         cargo test -p carrick-runtime --test integration
         cargo test -p carrick-runtime --test syscall_process

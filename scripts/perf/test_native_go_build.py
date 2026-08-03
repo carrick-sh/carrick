@@ -1148,7 +1148,7 @@ class NativeGoBuildTest(unittest.TestCase):
                 if value is not None
             },
             {
-                "CARRICK_DSR_SHARED_TRANSLATION": "1",
+                "CARRICK_DSR_PERSISTENT_STORE": "1",
                 "CARRICK_DSR_DIRECT_BINDINGS": "1",
             },
         )
