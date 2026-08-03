@@ -1046,6 +1046,26 @@ pub struct DirectLoadGroup {
     /// Index of the interpreter image, when the main image declared
     /// `PT_INTERP` and [`Self::load_with_interpreter`] mapped it.
     interpreter: Option<usize>,
+    /// Executable FILE WINDOWS the guest mapped at RUNTIME —
+    /// `mmap(PROT_EXEC, fd)`, which is how ld.so maps libc.so.6's text.
+    /// Interior-mutable because a new window arrives while the guest is
+    /// parked in the handler, i.e. under `enter`'s shared borrow.
+    windows: std::sync::Mutex<Vec<DirectImage>>,
+    /// Subranges of tier-D executable mappings the guest replaced with PLAIN
+    /// host mappings (`MAP_FIXED` data segments, munmap holes). Consulted by
+    /// [`Self::covers_patched_executable`] so an `mprotect(PROT_EXEC)` can
+    /// never bless unpatched bytes just because they sit inside a window's
+    /// original extent.
+    replaced: std::sync::Mutex<Vec<(u64, u64)>>,
+}
+
+/// Lock a group Mutex without poisoning semantics: the guarded state is
+/// only ever mutated by the single thread the guest runs on, so a poisoned
+/// lock means a panic already unwound past us and the data is still sound.
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // SAFETY: the images' mappings are owned solely by this value, and the slot
@@ -1112,6 +1132,8 @@ impl DirectLoadGroup {
             guest_x18: Box::new(0),
             images: Vec::new(),
             interpreter: None,
+            windows: std::sync::Mutex::new(Vec::new()),
+            replaced: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1190,6 +1212,190 @@ impl DirectLoadGroup {
             }
             Ok(Err(reason)) => Ok(Err(reason)),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Map `len` bytes of `file` from `offset` as guest-EXECUTABLE memory:
+    /// the `mmap(PROT_EXEC, fd)` boundary, which is how ld.so maps a needed
+    /// library's text (glibc maps the whole load span with the first
+    /// segment's R+X protection, then `MAP_FIXED`s the data segments over
+    /// it). The window goes through the SAME scan/patch pipeline as a
+    /// load-time image — scan fails closed, `svc` sites become islands,
+    /// `tpidr_el0`/x18 sites become veneers against this group's slots — and
+    /// the mapping is registered as a member window of the group.
+    ///
+    /// Returns the mapped base (the kernel chooses it: `MAP_JIT` rejects
+    /// `MAP_FIXED`, and a non-fixed file mmap is free to land anywhere).
+    /// A window the scan cannot prove safe is refused with the reason named;
+    /// the caller falls back to tier T, never to a best-effort mapping.
+    pub fn map_exec_file_window(
+        &self,
+        file: &[u8],
+        offset: u64,
+        len: usize,
+    ) -> Result<Result<u64, DirectIneligible>, io::Error> {
+        // Which parts of the window are PROVEN instructions? Only the file's
+        // SHF_EXECINSTR sections — everything else in the window (ELF
+        // headers, rodata sharing the R+X segment) is data and is copied
+        // verbatim. A file whose sections cannot place its code fails
+        // closed, exactly like a load-time image.
+        let ranges = exec_ranges_in_window(file, offset, len)?;
+        if ranges.is_empty() {
+            return Ok(Err(DirectIneligible::NoExecutableText));
+        }
+        // Scan BEFORE mapping: a refusal must cost no allocation.
+        for (range_offset, range_len) in &ranges {
+            let end = (range_offset + range_len).min(file.len());
+            let Some(code) = file.get(*range_offset..end) else {
+                return Err(io::Error::other("executable section outside the file"));
+            };
+            // Refusals are labeled with FILE offsets, the only stable name
+            // the window has before a base exists.
+            if let Err(reason) = scan_executable_words(code, *range_offset as u64) {
+                return Ok(Err(reason));
+            }
+        }
+        let window_len = len.next_multiple_of(HOST_PAGE);
+        let island_budget = 64 * 1024 + ranges.iter().map(|(_, size)| size).sum::<usize>();
+        let total = (window_len + island_budget).next_multiple_of(HOST_PAGE);
+        // SAFETY: kernel-chosen address; MAP_JIT is the only way to obtain
+        // writable-then-executable pages under Darwin's W^X policy. A file
+        // mmap without MAP_FIXED is free to land anywhere, so the kernel's
+        // choice IS a correct mmap result.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let base = base.cast::<u8>();
+        let mut image = DirectImage {
+            base,
+            len: total,
+            entry: base as u64,
+            bias: base as u64,
+            svc_sites: 0,
+            tpidr_sites: 0,
+            x18_sites: 0,
+        };
+        let ctx_addr = std::ptr::from_ref::<GuestContext>(self.context.as_ref()) as u64;
+        let tls_addr = std::ptr::from_ref::<u64>(self.guest_tls.as_ref()) as u64;
+        let x18_addr = std::ptr::from_ref::<u64>(self.guest_x18.as_ref()) as u64;
+        // Copy and patch with the region writable and no guest thread able
+        // to enter it — this thread is typically still ARMED for execution
+        // from the load-time patching, so even the plain byte copy must sit
+        // inside the write-enabled window (armed threads cannot write ANY
+        // MAP_JIT page). The base publish below is the only route a guest
+        // has to the window, and it happens after the i-cache invalidate.
+        jit_write_protect(false);
+        // The window's file bytes; anything past EOF stays zero, which is
+        // mmap(2)'s own beyond-EOF semantic.
+        let offset_usize = offset as usize;
+        if offset_usize < file.len() {
+            let avail = (file.len() - offset_usize).min(len);
+            // SAFETY: `avail <= len <= total` and the source range is inside
+            // the file slice.
+            unsafe {
+                std::ptr::copy_nonoverlapping(file.as_ptr().add(offset_usize), image.base, avail);
+            }
+        }
+        let mut island_cursor = window_len;
+        let mut patched = Ok(());
+        for (range_offset, range_len) in &ranges {
+            let end = (range_offset + range_len).min(file.len());
+            let Some(code) = file.get(*range_offset..end) else {
+                jit_write_protect(true);
+                return Err(io::Error::other("executable section outside the file"));
+            };
+            // Runtime-address domain: `vaddr0` is where the range's first
+            // word LANDS, `lo = base` maps it to mapping offsets, `bias = 0`
+            // makes resume constants runtime addresses directly.
+            let vaddr0 = image.base as u64 + (*range_offset as u64 - offset);
+            match image.patch_executable_words(
+                code,
+                vaddr0,
+                image.base as u64,
+                0,
+                &mut island_cursor,
+                ctx_addr,
+                tls_addr,
+                x18_addr,
+            ) {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => {
+                    patched = Err(reason);
+                    break;
+                }
+                Err(error) => {
+                    jit_write_protect(true);
+                    return Err(error);
+                }
+            }
+        }
+        jit_write_protect(true);
+        // SAFETY: the region was just written; publish it to the i-cache.
+        unsafe { sys_icache_invalidate(image.base.cast(), total) };
+        match patched {
+            Ok(()) => {
+                let mapped = image.base as u64;
+                lock(&self.windows).push(image);
+                Ok(Ok(mapped))
+            }
+            // `image` drops here and unmaps the refused window.
+            Err(reason) => Ok(Err(reason)),
+        }
+    }
+
+    /// Is `[addr, addr + len)` entirely inside ONE tier-D executable mapping
+    /// (a load-time image or a runtime window), with NO part of it since
+    /// replaced by a plain host mapping? This is the containment rule behind
+    /// approving a guest `mprotect(PROT_EXEC)`: inside a patched mapping the
+    /// pages are already executable and their text was patched at map time,
+    /// so granting the flip adds nothing; anywhere else the bytes are
+    /// unpatched and the flip must fail closed.
+    pub fn covers_patched_executable(&self, addr: u64, len: u64) -> bool {
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        if len == 0 {
+            return false;
+        }
+        let contains = |image: &DirectImage| {
+            let base = image.base();
+            addr >= base && end <= base + image.len as u64
+        };
+        let inside = self.images.iter().any(contains) || lock(&self.windows).iter().any(contains);
+        inside
+            && !lock(&self.replaced)
+                .iter()
+                .any(|(r_lo, r_hi)| addr < *r_hi && *r_lo < end)
+    }
+
+    /// Record that the guest replaced `[addr, addr + len)` with a PLAIN host
+    /// mapping (a `MAP_FIXED` data segment over a window's reservation, or a
+    /// munmap hole). Ranges outside every tier-D mapping are not recorded —
+    /// they were never patched-executable, so the containment rule already
+    /// refuses them.
+    pub fn note_plain_replacement(&self, addr: u64, len: u64) {
+        let Some(end) = addr.checked_add(len) else {
+            return;
+        };
+        if len == 0 {
+            return;
+        }
+        let intersects = |image: &DirectImage| {
+            let base = image.base();
+            addr < base + image.len as u64 && base < end
+        };
+        if self.images.iter().any(intersects) || lock(&self.windows).iter().any(intersects) {
+            lock(&self.replaced).push((addr, end));
         }
     }
 
@@ -1549,6 +1755,43 @@ fn executable_sections(elf: &[u8]) -> Result<Vec<(usize, usize, u64)>, io::Error
             read_u64(elf, sh + 0x20)? as usize,
             read_u64(elf, sh + 0x10)?,
         ));
+    }
+    Ok(out)
+}
+
+/// `(file_offset, size)` of every SHF_EXECINSTR section intersected with the
+/// file window `[offset, offset + len)` — the unit the `mmap(PROT_EXEC, fd)`
+/// scan+patch walks. File offsets, not vaddrs: an mmap maps FILE bytes, so a
+/// section's place in the mapping is `sh_offset - offset`.
+///
+/// Fails closed on anything that would make the walk unprovable: a non-ELF
+/// file (nothing names its code), or an intersection that is not 4-aligned
+/// relative to the window (word decode would be misframed).
+fn exec_ranges_in_window(
+    elf: &[u8],
+    offset: u64,
+    len: usize,
+) -> Result<Vec<(usize, usize)>, io::Error> {
+    if elf.len() < 0x40 || &elf[..4] != b"\x7fELF" || elf[4] != 2 {
+        return Err(io::Error::other(
+            "mmap(PROT_EXEC) of a non-ELF file: nothing the scan can prove",
+        ));
+    }
+    let window_lo = offset;
+    let window_hi = offset.saturating_add(len as u64);
+    let mut out = Vec::new();
+    for (sh_offset, sh_size, _) in executable_sections(elf)? {
+        let lo = (sh_offset as u64).max(window_lo);
+        let hi = ((sh_offset + sh_size) as u64).min(window_hi);
+        if lo >= hi {
+            continue;
+        }
+        if (lo - window_lo) % 4 != 0 || (hi - lo) % 4 != 0 {
+            return Err(io::Error::other(
+                "executable section misaligned inside the mmap window",
+            ));
+        }
+        out.push((lo as usize, (hi - lo) as usize));
     }
     Ok(out)
 }
@@ -2430,6 +2673,101 @@ mod tests {
         );
         assert_eq!(group.guest_tls(), 0xcafe);
         assert_eq!(group.guest_x18(), 7);
+    }
+
+    /// The `mmap(PROT_EXEC, fd)` boundary: a file window mapped at RUNTIME
+    /// goes through the SAME scan/patch pipeline as a load-time image. The
+    /// window here carries a syscall, a `tpidr_el0` write and an x18 use, so
+    /// the test proves all three patch classes are wired: the island reaches
+    /// the group's handler, and the veneers hit the GROUP's slots (the
+    /// coherence dynamic linking depends on — ld.so's veneers and libc's
+    /// must see one TLS).
+    #[test]
+    fn exec_window_patches_syscall_sites_and_executes() {
+        const CHECK_NR: u64 = 0x0ff7;
+        let window_code: Vec<u32> = vec![
+            mov_reg(20, 30),
+            movz(9, 0xcafe, 0),
+            msr_tpidr_el0_word(9), // guest TLS = 0xcafe, via the group slot
+            movz(18, 7, 0),        // guest x18 = 7, via the group slot
+            mov_reg(0, 18),
+            movz(8, CHECK_NR as u32, 0),
+            SVC_0,
+            mov_reg(30, 20),
+            RET,
+        ];
+        let file = elf_with_code(&window_code);
+        let group = DirectLoadGroup::load(&fixture_elf(), record_only)
+            .expect("load main")
+            .expect("eligible");
+        let base = group
+            .map_exec_file_window(&file, 0, 0x2000)
+            .expect("window maps")
+            .expect("window is eligible");
+        seen_clear();
+        // SAFETY: the window is patched and its code starts at +0x1000 (the
+        // fixture ELF's text file offset); the fixture returns via `ret`.
+        unsafe { group.enter(base + 0x1000) };
+        let seen = seen_snapshot();
+        assert_eq!(seen.len(), 1, "the window's syscall reached the handler");
+        assert_eq!(seen[0].0, CHECK_NR);
+        assert_eq!(seen[0].1[0], 7, "x18 ran against the group slot");
+        assert_eq!(group.guest_tls(), 0xcafe, "tpidr wrote the group slot");
+        assert_eq!(group.guest_x18(), 7);
+        assert!(
+            group.covers_patched_executable(base + 0x1000, window_code.len() as u64 * 4),
+            "the window counts as patched-executable coverage"
+        );
+    }
+
+    /// The window scan fails closed exactly like the load-time scan: a word
+    /// the decoder rejects whose raw bits could name x18 refuses the window,
+    /// named — never a best-effort mapping.
+    #[test]
+    fn exec_window_scan_fails_closed_on_a_word_that_could_name_x18() {
+        let file = elf_with_code(&[0xffff_fff2, movz(8, 93, 0), SVC_0]);
+        let group = DirectLoadGroup::load(&fixture_elf(), record_only)
+            .expect("load main")
+            .expect("eligible");
+        assert!(
+            matches!(
+                group
+                    .map_exec_file_window(&file, 0, 0x2000)
+                    .expect("scan runs"),
+                Err(DirectIneligible::UndecodableText { .. })
+            ),
+            "a suspicious undecodable word refuses the whole window"
+        );
+    }
+
+    /// A `MAP_FIXED` replacement (a data segment ld.so maps over its text
+    /// reservation) voids patched-executable coverage for the replaced
+    /// range: those pages hold unpatched bytes, so an `mprotect(PROT_EXEC)`
+    /// there must not be approved by containment alone.
+    #[test]
+    fn plain_replacement_voids_patched_executable_coverage() {
+        let file = elf_with_code(&[movz(8, 93, 0), SVC_0]);
+        let group = DirectLoadGroup::load(&fixture_elf(), record_only)
+            .expect("load main")
+            .expect("eligible");
+        let base = group
+            .map_exec_file_window(&file, 0, 0x2000)
+            .expect("window maps")
+            .expect("eligible");
+        assert!(group.covers_patched_executable(base + 0x1000, 8));
+        group.note_plain_replacement(base + HOST_PAGE as u64, HOST_PAGE as u64);
+        assert!(
+            group.covers_patched_executable(base + 0x1000, 8),
+            "pages outside the replacement keep their coverage"
+        );
+        assert!(
+            !group.covers_patched_executable(base + HOST_PAGE as u64, 8),
+            "replaced pages lose patched-executable coverage"
+        );
+        assert!(
+            !group.covers_patched_executable(base + 0x1000, HOST_PAGE as u64 * 2),
+            "a range straddling the replacement loses coverage"
+        );
     }
 
     static CHILD_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
