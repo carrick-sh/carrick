@@ -807,12 +807,29 @@ impl DirectImage {
         }
     }
 
+    /// Arm THIS thread to execute the image's `MAP_JIT` pages.
+    ///
+    /// `pthread_jit_write_protect_np` is PER-THREAD on Apple Silicon: a thread
+    /// that has never enabled write protection sees `MAP_JIT` pages as
+    /// writable-not-executable, so entering the image from it faults. Loading
+    /// leaves the LOADING thread armed, which is why a load-then-enter on one
+    /// thread works and hides this; a thread that only executes must arm
+    /// itself. Measured: entering an image from a freshly spawned thread hangs
+    /// until this call is made.
+    ///
+    /// Idempotent and cheap, so `enter` just does it rather than making every
+    /// caller remember.
+    pub fn arm_current_thread(&self) {
+        jit_write_protect(true);
+    }
+
     /// Jump to `pc` with the current context's registers. Never returns
     /// normally in M1: the guest leaves through the handler.
     ///
     /// # Safety
     /// The image must be fully patched, and `pc` must be an address inside it.
     pub unsafe fn enter(&self, pc: u64) {
+        self.arm_current_thread();
         // SAFETY: transmuting the mapped, i-cache-invalidated entry point to a
         // function and calling it. This is a one-way door in M1 (see the
         // module docs): the guest exits through the handler.
