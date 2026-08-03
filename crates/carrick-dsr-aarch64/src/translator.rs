@@ -137,8 +137,9 @@ fn active_host_jit() -> Result<&'static dyn NativeHostJit, types::DsrError> {
 }
 const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
 
-/// The persistent per-image translation store is DEFAULT OFF; opt in with
-/// `CARRICK_DSR_PERSISTENT_STORE=1` (A/B arms, bisection).
+/// The persistent per-image translation store is DEFAULT ON; exact
+/// `CARRICK_DSR_PERSISTENT_STORE=0` restores the per-run translation path for
+/// rollback and controlled comparisons.
 ///
 /// The parity blocker that forced opt-in (`707fd9c5`) is FIXED
 /// architecturally: attached units used to run compute-bound shapes +65-78%
@@ -156,14 +157,16 @@ const ARTIFACT_KEY_PREFIX_INSTRUCTIONS: usize = 16;
 /// `translator::tests::native_tap_unit_install` and
 /// `emit::tests::recorded_emission_is_word_identical_to_native_emission`).
 /// The `BindingIndex` guard, `PortableUnitAuthority` emission, edge
-/// trampolines, and the direct-binding cell sidecar are DELETED; the wire
-/// bumped to `TRANSLATOR_ABI_CURRENT = 7` + `{stem}.metadata-v4`, so
-/// pre-parity stores refuse cleanly to a miss and re-record.
+/// trampolines, and the direct-binding cell sidecar are DELETED; the current
+/// hot/cold wire is `TRANSLATOR_ABI_CURRENT = 8` + `{stem}.metadata-v5`, so
+/// older stores refuse cleanly to a miss and re-record.
 ///
-/// The default stays opt-in ONLY until the coordinator's central quiet-box
-/// ABBA confirms store=1 within ~5% of store-unset on the awk-8M compute
-/// shape; flip here (and update this comment) when that lands. The
-/// election/persistence mechanics are sound (fork-claim clearing,
+/// Default-on authority is the receipt-bound 16-quad cold-Go-build ABBA at
+/// `6821d2ba`: store-on won 16/16 quads, reducing total CPU 8.33%, elapsed
+/// 8.43%, and workload wall 8.84%, with zero failed samples. Mechanism and
+/// correctness qualification are recorded in
+/// `docs/perf-results/2026-08-03-persistent-store-default-confirmation.md`.
+/// The election/persistence mechanics remain fail-soft (fork-claim clearing,
 /// first-miss election, per-host persistence, crash-safe rename+digest).
 pub fn persistent_store_runtime_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -173,7 +176,7 @@ pub fn persistent_store_runtime_enabled() -> bool {
 }
 
 fn persistent_store_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
+    value != Some(std::ffi::OsStr::new("0"))
 }
 
 /// Encode the AArch64 `B` instruction that links `site` to `target`.
@@ -4738,23 +4741,25 @@ mod tests {
 
     const PC: GuestVa = GuestVa(0x1000);
 
-    /// The persistent store is opt-IN until template code quality reaches
-    /// parity on hot loops: unset means OFF, `=1` enables (see the gate's
-    /// doc comment for the +65% compute-shape ABBA that forced this).
+    /// The persistent store is default-ON with an exact `=0` rollback hatch.
     /// Pinned on the pure parser because the runtime gate caches the
     /// environment in a `OnceLock`.
     #[test]
     fn persistent_store_default_and_hatch_parse() {
         assert!(
-            !super::persistent_store_enabled_from(None),
-            "default is OFF until template quality reaches parity"
+            super::persistent_store_enabled_from(None),
+            "persistent translation is the shipped default"
         );
         assert!(!super::persistent_store_enabled_from(Some(
             std::ffi::OsStr::new("0")
         )));
         assert!(
             super::persistent_store_enabled_from(Some(std::ffi::OsStr::new("1"))),
-            "=1 is the exact opt-in"
+            "=1 remains an explicit enable for controlled campaigns"
+        );
+        assert!(
+            super::persistent_store_enabled_from(Some(std::ffi::OsStr::new("false"))),
+            "only exact =0 is the rollback hatch"
         );
     }
 
@@ -4765,8 +4770,10 @@ mod tests {
         );
         let mut translator = ThreadTranslator::for_process(process, 41);
         let memory = crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut snapshot = super::NativeUcontextSnapshot::default();
-        snapshot.pc = 0x1073_36538;
+        let snapshot = super::NativeUcontextSnapshot {
+            pc: 0x1073_36538,
+            ..Default::default()
+        };
 
         let error = match translator.prepare_entry::<false>(&memory, &snapshot) {
             Err(error) => error,
@@ -4789,8 +4796,10 @@ mod tests {
         let cache_pc = process.cache_host_range().start;
         let mut translator = ThreadTranslator::for_process(process, 42);
         let memory = crate::mapped_memory::NativeMappedMemory::shared_install_test_fixture(4096);
-        let mut snapshot = super::NativeUcontextSnapshot::default();
-        snapshot.pc = cache_pc;
+        let snapshot = super::NativeUcontextSnapshot {
+            pc: cache_pc,
+            ..Default::default()
+        };
 
         let error = match translator.prepare_entry::<false>(&memory, &snapshot) {
             Err(error) => error,
