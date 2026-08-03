@@ -33,6 +33,7 @@ fn main() {
                     DirectIneligible::NoExecutableText => "no-text",
                     DirectIneligible::FixedLoadAddress { .. } => "ET_EXEC",
                     DirectIneligible::NeedsInterpreter { .. } => "dynamic",
+                    DirectIneligible::IslandOutOfRange { .. } => "island-range",
                 };
                 println!("{name:<24} tier T    [{bucket}] {reason}");
             }
