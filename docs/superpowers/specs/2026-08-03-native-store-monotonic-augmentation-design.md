@@ -1,6 +1,6 @@
 # Native translation-store monotonic augmentation
 
-- **Status:** section-approved design, written spec awaiting user review
+- **Status:** approved 2026-08-03
 - **Date:** 2026-08-03
 - **Scope:** Darwin/AArch64 native (DSR), shipped-default persistent translation
   store
