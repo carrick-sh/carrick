@@ -170,6 +170,26 @@ memory planner. The only difference is how guest code reaches syscalls.
   conservative scan cannot rule out x18/tpidr in a region, that image falls
   back to tier T with a named reason, counted in the census — never a silent
   best-effort.
+- **The guest-leave contract.** A tier-D guest leaves guest execution ONLY
+  through the handler: the handler requests it (`GuestContext::request_leave`)
+  and the island's LEAVE LEG — never the guest's own code — restores the host
+  stack discipline captured by `DirectImage::enter` at entry (host SP + the
+  landing point `blr` hands the guest in x30) and `ret`s to `enter`'s caller.
+  The guest's complete register file, SP and resume `pc` stay parked in the
+  `GuestContext`, which is the state `exit`/`execve`/signal orchestration
+  re-enters from. The island keeps TWO exits because AArch64 gives it no
+  third option: the RESUME leg is a constant branch (fully
+  register-transparent — an indirect resume would need a register and every
+  register is the guest's), and the leave leg is a gateway exit that reloads
+  nothing (the guest is leaving; its state lives in the context). A guest
+  must never return to Rust with its own stack discipline — the
+  SP-unbalanced fixture that did blocked the dispatcher bridge for a full
+  session. Test fixtures below the runner are the one sanctioned exception:
+  `ret` only with SP exactly balanced and x30 preserved. The dispatcher
+  bridge (`direct_runner`) enforces the contract at the outcome level: any
+  outcome that ends or suspends the run (`Exit`, `Execve`, `Fork`, signal
+  death, blocking waits) leaves with the outcome named; the guest is never
+  resumed past such a syscall with a fabricated errno.
 - **Signals inside veneers/islands**: a handler needs guest-coherent state.
   Island ranges are known; delivery inside one defers (machinery exists —
   carrick already parks/redelivers). The veneer clobbers only x30-saved-first
@@ -199,6 +219,16 @@ memory planner. The only difference is how guest code reaches syscalls.
   genuine reason — the Go tools and libc on `tpidr_el0`, `find` on x18, `rm`
   for being fully stripped. That is the honest gate on M2: the veneers are not
   polish, they are the entry ticket for every real binary.
+- **M1b (done):** the exit path and the guest-leave contract (§6). Islands
+  carry a leave leg; `enter` captures the host stack discipline; the handler
+  requests a leave and `enter` returns with the guest parked in its context.
+  The dispatcher bridge leaves on `Exit`/`Execve`/every unimplemented
+  outcome instead of resuming the guest with a fabricated errno. Proven
+  red-first: `exit_leaves_through_the_handler_instead_of_running_past_it`
+  and `execve_leaves_through_the_handler_with_the_guest_parked_at_the_syscall`
+  both fail against the pre-exit-path runner (the guest ran PAST its own
+  `exit`), plus `handler_requested_leave_parks_the_guest_and_returns_to_rust`
+  for the raw mechanism.
 - **M1:** tier D for static-PIE + brk-trap syscalls, behind
   `CARRICK_NATIVE_DIRECT` during bring-up only. Prove: dash/coreutils run
   end-to-end; conformance smoke green with the flag on; measure one-process
