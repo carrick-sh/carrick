@@ -642,43 +642,9 @@ fn scan_eligibility_inner(
         let Some(code) = elf.get(offset..end) else {
             return Err(io::Error::other("executable segment outside the file"));
         };
-        for (index, chunk) in code.chunks_exact(4).enumerate() {
-            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            let site = vaddr + (index * 4) as u64;
-            if word == SVC_0 {
-                svc_sites += 1;
-                continue;
-            }
-            match bad64::decode(word, site) {
-                Ok(insn) => {
-                    // `tpidr_el0` is veneered, not refused (see
-                    // `tpidr_veneer`). Only the shapes the veneer does not
-                    // model still disqualify.
-                    if matches!(insn.op(), bad64::Op::MRS | bad64::Op::MSR)
-                        && format!("{insn:?}").contains("TPIDR_EL0")
-                        && tpidr_access(word).is_none()
-                    {
-                        return Ok(Err(DirectIneligible::TpidrAccess { vaddr: site }));
-                    }
-                    // x18 is veneered when the instruction can be rewritten
-                    // against a memory slot and that rewrite VERIFIES; only
-                    // the shapes that fail verification disqualify. A
-                    // `tpidr_el0` access naming x18 is already handled by the
-                    // tpidr veneer above, and must NOT be rewritten here -
-                    // substituting its register would leave a real `mrs`
-                    // reading Darwin's thread pointer instead of the guest's.
-                    if tpidr_access(word).is_none()
-                        && instruction_names_x18(&insn)
-                        && !x18_is_veneerable(&insn, word)
-                    {
-                        return Ok(Err(DirectIneligible::X18Access { vaddr: site }));
-                    }
-                }
-                Err(_) if word_could_name_x18(word) => {
-                    return Ok(Err(DirectIneligible::UndecodableText { vaddr: site, word }));
-                }
-                Err(_) => {}
-            }
+        match scan_executable_words(code, vaddr) {
+            Ok(sites) => svc_sites += sites,
+            Err(reason) => return Ok(Err(reason)),
         }
     }
     // ZERO `svc` sites is normal, not a defect: a dynamically linked program
@@ -687,6 +653,57 @@ fn scan_eligibility_inner(
     // "no executable text", which wrongly disqualified every ordinary
     // dynamically linked binary in the corpus.
     Ok(Ok(svc_sites))
+}
+
+/// Apply the fail-closed word rules to ONE contiguous run of executable
+/// words: `svc #0` counts, veneerable `tpidr_el0` and x18 shapes pass, and
+/// anything the decoder cannot rule out refuses the run. Shared by the
+/// load-time eligibility scan and the runtime `mmap(PROT_EXEC, fd)` window
+/// scan so the two boundaries cannot drift.
+///
+/// `vaddr0` names the first word in the CALLER's address domain — image
+/// vaddr at load time, file offset for an mmap window — and only labels
+/// refusals.
+fn scan_executable_words(code: &[u8], vaddr0: u64) -> Result<usize, DirectIneligible> {
+    let mut svc_sites = 0_usize;
+    for (index, chunk) in code.chunks_exact(4).enumerate() {
+        let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let site = vaddr0 + (index * 4) as u64;
+        if word == SVC_0 {
+            svc_sites += 1;
+            continue;
+        }
+        match bad64::decode(word, site) {
+            Ok(insn) => {
+                // `tpidr_el0` is veneered, not refused (see `tpidr_veneer`).
+                // Only the shapes the veneer does not model still disqualify.
+                if matches!(insn.op(), bad64::Op::MRS | bad64::Op::MSR)
+                    && format!("{insn:?}").contains("TPIDR_EL0")
+                    && tpidr_access(word).is_none()
+                {
+                    return Err(DirectIneligible::TpidrAccess { vaddr: site });
+                }
+                // x18 is veneered when the instruction can be rewritten
+                // against a memory slot and that rewrite VERIFIES; only the
+                // shapes that fail verification disqualify. A `tpidr_el0`
+                // access naming x18 is already handled by the tpidr veneer
+                // above, and must NOT be rewritten here - substituting its
+                // register would leave a real `mrs` reading Darwin's thread
+                // pointer instead of the guest's.
+                if tpidr_access(word).is_none()
+                    && instruction_names_x18(&insn)
+                    && !x18_is_veneerable(&insn, word)
+                {
+                    return Err(DirectIneligible::X18Access { vaddr: site });
+                }
+            }
+            Err(_) if word_could_name_x18(word) => {
+                return Err(DirectIneligible::UndecodableText { vaddr: site, word });
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(svc_sites)
 }
 
 /// One loaded, patched, directly-executable guest mapping.
@@ -781,82 +798,119 @@ impl DirectImage {
             let Some(code) = elf.get(offset..end) else {
                 return Err(io::Error::other("executable section outside the file"));
             };
-            for (index, chunk) in code.chunks_exact(4).enumerate() {
-                let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let site_vaddr = vaddr + (index * 4) as u64;
-                // `tpidr_el0` accesses are veneered in the same pass.
-                if let Some(access) = tpidr_access(word) {
-                    let site_host = (site_vaddr - lo) as usize;
-                    let veneer_host = island_cursor;
-                    let words = tpidr_veneer(access, tls_addr, x18_addr);
-                    let bytes = words.len() * 4;
-                    if veneer_host + bytes + 4 > self.len {
-                        return Err(io::Error::other("veneer budget exhausted"));
-                    }
-                    for (i, w) in words.iter().enumerate() {
-                        self.write_word(veneer_host + i * 4, *w);
-                    }
-                    let from = (veneer_host + bytes) as i64;
-                    self.write_word(veneer_host + bytes, b_rel((site_host as i64 + 4) - from));
-                    self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
-                    island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
-                    self.tpidr_sites += 1;
-                    continue;
-                }
-                // x18 uses are veneered in the same pass.
-                if word != SVC_0
-                    && let Ok(insn) = bad64::decode(word, site_vaddr)
-                    && instruction_names_x18(&insn)
-                {
-                    // `tpidr_el0` accesses were handled above; reaching here
-                    // with one would rewrite it into a real system-register
-                    // read of Darwin's thread pointer.
-                    debug_assert!(tpidr_access(word).is_none());
-                    let Some((value_reg, addr_reg)) = pick_scratch_pair(&insn) else {
-                        return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
-                    };
-                    let Some(rewritten) = substitute_x18(word, value_reg) else {
-                        return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
-                    };
-                    let site_host = (site_vaddr - lo) as usize;
-                    let veneer_host = island_cursor;
-                    let words = x18_veneer(rewritten, value_reg, addr_reg, x18_addr);
-                    let bytes = words.len() * 4;
-                    if veneer_host + bytes + 4 > self.len {
-                        return Err(io::Error::other("veneer budget exhausted"));
-                    }
-                    for (i, w) in words.iter().enumerate() {
-                        self.write_word(veneer_host + i * 4, *w);
-                    }
-                    let from = (veneer_host + bytes) as i64;
-                    self.write_word(veneer_host + bytes, b_rel((site_host as i64 + 4) - from));
-                    self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
-                    island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
-                    self.x18_sites += 1;
-                    continue;
-                }
-                if word != SVC_0 {
-                    continue;
-                }
+            match self.patch_executable_words(
+                code,
+                vaddr,
+                lo,
+                bias,
+                &mut island_cursor,
+                ctx_addr,
+                tls_addr,
+                x18_addr,
+            )? {
+                Ok(()) => {}
+                Err(reason) => return Ok(Err(reason)),
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    /// Patch ONE contiguous run of executable words in place: `svc #0` sites
+    /// become islands, `tpidr_el0` accesses and x18 uses become veneers, all
+    /// appended at `island_cursor`. Shared by the load-time image patcher and
+    /// the runtime `mmap(PROT_EXEC, fd)` window patcher — one pipeline, two
+    /// boundaries.
+    ///
+    /// `vaddr0` names the run's first word in the caller's address domain,
+    /// `lo` maps that domain to mapping byte offsets (`host = vaddr - lo`),
+    /// and `bias` maps it to runtime addresses (`runtime = vaddr + bias`).
+    #[allow(clippy::too_many_arguments)]
+    fn patch_executable_words(
+        &mut self,
+        code: &[u8],
+        vaddr0: u64,
+        lo: u64,
+        bias: u64,
+        island_cursor: &mut usize,
+        ctx_addr: u64,
+        tls_addr: u64,
+        x18_addr: u64,
+    ) -> Result<Result<(), DirectIneligible>, io::Error> {
+        for (index, chunk) in code.chunks_exact(4).enumerate() {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let site_vaddr = vaddr0 + (index * 4) as u64;
+            // `tpidr_el0` accesses are veneered in the same pass.
+            if let Some(access) = tpidr_access(word) {
                 let site_host = (site_vaddr - lo) as usize;
-                let island_host = island_cursor;
-                let (words, resume_slot) = island(ctx_addr, site_vaddr + bias + 4);
-                let island_bytes = words.len() * 4;
-                if island_host + island_bytes > self.len {
-                    return Err(io::Error::other("island budget exhausted"));
+                let veneer_host = *island_cursor;
+                let words = tpidr_veneer(access, tls_addr, x18_addr);
+                let bytes = words.len() * 4;
+                if veneer_host + bytes + 4 > self.len {
+                    return Err(io::Error::other("veneer budget exhausted"));
                 }
                 for (i, w) in words.iter().enumerate() {
-                    self.write_word(island_host + i * 4, *w);
+                    self.write_word(veneer_host + i * 4, *w);
                 }
-                // Resume leg: a constant branch back to the next instruction,
-                // written into the slot the island reserved for it.
-                let resume_at = island_host + resume_slot * 4;
-                self.write_word(resume_at, b_rel((site_host as i64 + 4) - resume_at as i64));
-                // Entry leg: replace the `svc` itself.
-                self.write_word(site_host, b_rel(island_host as i64 - site_host as i64));
-                island_cursor = (island_host + island_bytes).next_multiple_of(4);
-                self.svc_sites += 1;
+                let from = (veneer_host + bytes) as i64;
+                self.write_word(veneer_host + bytes, b_rel((site_host as i64 + 4) - from));
+                self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
+                *island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
+                self.tpidr_sites += 1;
+                continue;
             }
+            // x18 uses are veneered in the same pass.
+            if word != SVC_0
+                && let Ok(insn) = bad64::decode(word, site_vaddr)
+                && instruction_names_x18(&insn)
+            {
+                // `tpidr_el0` accesses were handled above; reaching here
+                // with one would rewrite it into a real system-register
+                // read of Darwin's thread pointer.
+                debug_assert!(tpidr_access(word).is_none());
+                let Some((value_reg, addr_reg)) = pick_scratch_pair(&insn) else {
+                    return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
+                };
+                let Some(rewritten) = substitute_x18(word, value_reg) else {
+                    return Ok(Err(DirectIneligible::X18Access { vaddr: site_vaddr }));
+                };
+                let site_host = (site_vaddr - lo) as usize;
+                let veneer_host = *island_cursor;
+                let words = x18_veneer(rewritten, value_reg, addr_reg, x18_addr);
+                let bytes = words.len() * 4;
+                if veneer_host + bytes + 4 > self.len {
+                    return Err(io::Error::other("veneer budget exhausted"));
+                }
+                for (i, w) in words.iter().enumerate() {
+                    self.write_word(veneer_host + i * 4, *w);
+                }
+                let from = (veneer_host + bytes) as i64;
+                self.write_word(veneer_host + bytes, b_rel((site_host as i64 + 4) - from));
+                self.write_word(site_host, b_rel(veneer_host as i64 - site_host as i64));
+                *island_cursor = (veneer_host + bytes + 4).next_multiple_of(4);
+                self.x18_sites += 1;
+                continue;
+            }
+            if word != SVC_0 {
+                continue;
+            }
+            let site_host = (site_vaddr - lo) as usize;
+            let island_host = *island_cursor;
+            let (words, resume_slot) = island(ctx_addr, site_vaddr + bias + 4);
+            let island_bytes = words.len() * 4;
+            if island_host + island_bytes > self.len {
+                return Err(io::Error::other("island budget exhausted"));
+            }
+            for (i, w) in words.iter().enumerate() {
+                self.write_word(island_host + i * 4, *w);
+            }
+            // Resume leg: a constant branch back to the next instruction,
+            // written into the slot the island reserved for it.
+            let resume_at = island_host + resume_slot * 4;
+            self.write_word(resume_at, b_rel((site_host as i64 + 4) - resume_at as i64));
+            // Entry leg: replace the `svc` itself.
+            self.write_word(site_host, b_rel(island_host as i64 - site_host as i64));
+            *island_cursor = (island_host + island_bytes).next_multiple_of(4);
+            self.svc_sites += 1;
         }
         Ok(Ok(()))
     }
