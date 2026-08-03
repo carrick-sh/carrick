@@ -162,7 +162,7 @@ mod tests {
         let plan = copy_plan();
         let source_words = vec![0xd503_201f, 0x9100_0400, 0xd400_0001];
         let first_generation = AtomicU64::new(1);
-        let second_generation = AtomicU64::new(9);
+        let second_generation = AtomicU64::new(1);
         let first_bias = carrick_dsr::address::NativeHostBias::new(0x80_0000_0000, 16 * 1024)
             .expect("first bias");
         let second_bias = carrick_dsr::address::NativeHostBias::new(0x90_0000_0000, 16 * 1024)
@@ -190,14 +190,17 @@ mod tests {
         let (second, second_artifact) = emit_block_recording_artifact(
             &mut second_cache,
             &plan,
-            GenerationGuard::new(&second_generation, CodeGeneration::claimed(9)),
+            GenerationGuard::new(&second_generation, CodeGeneration::claimed(1)),
             EmitAddressMode::Biased {
                 host_bias: second_bias,
             },
-            source_words,
+            source_words.clone(),
         )
         .expect("record second emission");
 
+        // Normalization strips the PER-PROCESS values (generation cell
+        // address, host bias): two processes recording the same plan at the
+        // same generation produce one template with different bindings.
         assert_eq!(first_artifact.template, second_artifact.template);
         assert_ne!(first_artifact.bindings, second_artifact.bindings);
         let mut replay_cache = TranslationCache::new(
@@ -215,6 +218,35 @@ mod tests {
         assert_eq!(second.recovery(), replay.recovery());
         assert_eq!(second.direct_links(), replay.direct_links());
         assert_ne!(first.entry(), replay.entry());
+
+        // The expected GENERATION is deliberately NOT normalized: the trusted
+        // entry's narrow materialization bakes it into the words (that is the
+        // native hot-edge shape recording must preserve), so a recording at a
+        // different generation is a DIFFERENT template — and replay across
+        // generations is refused fail-closed
+        // (`replay_refuses_a_trusted_entry_generation_mismatch`). Production
+        // reuse is unaffected: unit installs and image-key artifact lookups
+        // both happen at `CodeGeneration::INITIAL`.
+        let ninth_generation = AtomicU64::new(9);
+        let mut ninth_cache = TranslationCache::new(
+            64 * 1024,
+            crate::native_darwin::darwin_jit::active_host_jit(),
+        )
+        .expect("ninth cache");
+        let (_ninth, ninth_artifact) = emit_block_recording_artifact(
+            &mut ninth_cache,
+            &plan,
+            GenerationGuard::new(&ninth_generation, CodeGeneration::claimed(9)),
+            EmitAddressMode::Biased {
+                host_bias: first_bias,
+            },
+            source_words,
+        )
+        .expect("record ninth-generation emission");
+        assert_ne!(
+            first_artifact.template, ninth_artifact.template,
+            "a different expected generation is a different template"
+        );
     }
 
     fn emitted_words_for_all_gateway_exits() -> Vec<Vec<u32>> {
