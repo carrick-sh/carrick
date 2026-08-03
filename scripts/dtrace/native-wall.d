@@ -23,6 +23,24 @@
  * Elapsed authority starts when that first complete native-owner catalog begins
  * and stops when the owner exits. Launcher setup and post-owner teardown have no
  * eligible wall ticks and therefore are deliberately outside the denominator.
+ *
+ * PERTURBATION: HIGH. This profile combines profile-499 CPU sampling,
+ * profile-197 wall sampling, kernel stack aggregation, syscall/mach-trap
+ * bracketing, and Carrick lifecycle USDT. On the 2026-08-03 cold-Go captures
+ * bound to source c7e36c87, it stretched an untraced ~9.3 s process to
+ * 16.2-17.7 s and raised the sampled kernel share to 52-53%. Absolute elapsed
+ * and traced-vs-untraced shares are therefore diagnostic only; cite only
+ * same-instrument ratios, and retain improvements only under an untraced gate.
+ *
+ * KERNEL-SAMPLE TRAP (qualified on Darwin 27.0 26A5388g, T8132 KDK): the live
+ * PC 0xfffffe0038dc0b00 symbolizes to the local (`nm` type `s`)
+ * ml_set_interrupts_enabled_with_debug+0x4c. Its preceding instruction is
+ * `msr DAIFClr, #0x7`, which re-enables interrupts. A timer deferred while
+ * interrupts were masked is consequently delivered at +0x4c, so this leaf is
+ * an interrupt-disabled-time bucket, not residency in that function. Nearly
+ * every selected stack was one frame and cannot name the preceding critical
+ * section. Re-qualify the exact address and instruction on every kernel/KDK
+ * change before interpreting this family.
  */
 
 dtrace:::BEGIN

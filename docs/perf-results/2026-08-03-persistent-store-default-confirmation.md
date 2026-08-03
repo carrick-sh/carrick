@@ -122,7 +122,26 @@ candidate arms. Store preparation and replay remain fail-soft: unavailable,
 stale, corrupt, or mismatched persisted state falls back to local translation
 without weakening guest-visible semantics.
 
-The next authority is a newly signed shipped-default scoreboard, with Carrick
-and Docker phases serialized. Applying the measured workload-wall improvement
-to the prior 11.9x number would suggest about 10.8x, but that is a projection,
-not a result, and must not be quoted as the official ratio.
+## Shipped-default scoreboard
+
+The required newly signed, serialized Carrick-then-Docker measurement is now
+complete. Artifact
+`target/perf/store-default-confirm/default-on-native-go-build-v1.json`
+(SHA-256
+`8fab147f7c6825671123e17cc098ba752194a694e0c467e28590cc435afc9edb`)
+binds clean source `2e238aea48da43717b338df22b588d81b056dc3e`, executable
+SHA-256
+`7e9f25dd7e6bf97aac4cbc90612e02f22090eda02efa2b742aaac41a0852c6fc`,
+and the native-arm64 image digest named above. With every performance overlay
+unset, five samples per serialized phase measured:
+
+- Carrick workload median: **8,575 ms**;
+- Docker workload median: **821 ms**;
+- official shipped-default workload ratio: **10.4446x**;
+- process elapsed medians: 9,326 ms / 977 ms = 9.5455x.
+
+This supersedes the projected 10.8x figure. The store flip is a controlled
+8.84% workload-wall win, but the remaining 10.44x-to-3x gap is still large and
+must be attacked through separately attributed mechanisms. The first paired
+kernel capture and its causal disqualification are recorded in
+[`2026-08-03-default-on-kernel-attribution.md`](2026-08-03-default-on-kernel-attribution.md).
