@@ -5172,7 +5172,7 @@ fn measure_native_blocked<const PROFILE: bool, T>(
 
 /// Whether AArch64 canonical syscall `nr` (`crate::linux_abi::syscall::lookup_aarch64`)
 /// can mutate `NativeMappedMemory`'s mapping/protection tables (`regions`,
-/// `owned_host_ranges`, `protections`, `native_page_protections`,
+/// `owned_host_ranges`, `protections`, `native_prot_ranges`,
 /// `native_write_exec_writable_pages`, `linux4k_page_protections`) -- i.e.
 /// whether its handler, reached through `dispatch_threaded`, calls one of the
 /// eight structural `&mut self` `GuestMemory` methods (`protect_range`/
@@ -8240,7 +8240,7 @@ mod tests {
                 shared_key_offset: 0,
             }],
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
+            native_prot_ranges: carrick_dsr_aarch64::prot_ranges::NativeProtRanges::default(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
@@ -8559,8 +8559,9 @@ mod tests {
             // mmap(PROT_WRITE|PROT_EXEC) would have left behind) directly in
             // the table `range_may_execute`/`native16k_write_exec_page`
             // consult.
-            memory.native_page_protections.insert(
+            memory.native_prot_ranges.set(
                 page,
+                page + memory.host_page_size,
                 crate::linux_abi::LINUX_PROT_READ
                     | crate::linux_abi::LINUX_PROT_WRITE
                     | crate::linux_abi::LINUX_PROT_EXEC,
@@ -8652,7 +8653,9 @@ mod tests {
             // Bookkeep the page as guest PROT_NONE (e.g. a temporarily
             // lifted/guarded page): the checked copy path can lift it for
             // the duration of the copy, but a raw zero-copy pointer cannot.
-            memory.native_page_protections.insert(guest.raw(), 0);
+            memory
+                .native_prot_ranges
+                .set(guest.raw(), guest.raw() + page, 0);
             assert_eq!(
                 memory.host_ptr_for_read(guest.raw(), page as usize),
                 None,
@@ -8675,7 +8678,7 @@ mod tests {
             );
             // Mirrors `unmap_range`'s software bookkeeping: munmap() marks the
             // range `unmapped` in `protections` but leaves the stale
-            // `native_page_protections` entry (last guest-upgraded host
+            // `native_prot_ranges` entry (last guest-upgraded host
             // mprotect fidelity) untouched, exactly like a real munmap() on a
             // shared-aperture VA the guest previously upgraded to R/W. A
             // zero-copy read pointer must decline a freed range even though
@@ -8751,8 +8754,9 @@ mod tests {
             let page = memory.regions[0].start;
             // Native16k SMC/JIT write-exec shape: a raw kernel write here
             // would bypass `write_exec_page_bytes`'s W^X-metadata update.
-            memory.native_page_protections.insert(
+            memory.native_prot_ranges.set(
                 page,
+                page + memory.host_page_size,
                 crate::linux_abi::LINUX_PROT_READ
                     | crate::linux_abi::LINUX_PROT_WRITE
                     | crate::linux_abi::LINUX_PROT_EXEC,
@@ -8786,8 +8790,9 @@ mod tests {
         fork_test(|| {
             let mut memory = biased_test_memory(carrick_guest_mem::GuestVa(0x40_0000), 0x4000);
             let page = memory.regions[0].start;
-            memory.native_page_protections.insert(
+            memory.native_prot_ranges.set(
                 page,
+                page + memory.host_page_size,
                 crate::linux_abi::LINUX_PROT_READ
                     | crate::linux_abi::LINUX_PROT_WRITE
                     | crate::linux_abi::LINUX_PROT_EXEC,
@@ -10841,7 +10846,7 @@ mod tests {
                 shared_key_offset: 0,
             }],
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
+            native_prot_ranges: carrick_dsr_aarch64::prot_ranges::NativeProtRanges::default(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
@@ -10974,7 +10979,7 @@ mod tests {
                 shared_key_offset: 0,
             }],
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
+            native_prot_ranges: carrick_dsr_aarch64::prot_ranges::NativeProtRanges::default(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
@@ -11745,7 +11750,7 @@ mod tests {
             ]),
             regions: Vec::new(),
             protections: MemoryProtections::default(),
-            native_page_protections: BTreeMap::new(),
+            native_prot_ranges: carrick_dsr_aarch64::prot_ranges::NativeProtRanges::default(),
             native_write_exec_writable_pages: BTreeSet::new(),
             linux4k_page_protections: BTreeMap::new(),
             exclusive_sequences: parking_lot::Mutex::new(BTreeMap::new()),
@@ -12042,11 +12047,12 @@ mod tests {
                         && memory.read_u32(layout.mmap_base).ok() == Some(SVC_0)
                         && memory.read_u32(layout.mmap_base + page_size).ok() == Some(SVC_0);
                     // Coalesced: apply is [run PROT_READ, run final(fails)],
-                    // rollback restores each page individually -> 4 calls.
+                    // rollback restores per old-protection segment -- the
+                    // whole uniform-default run is ONE restore call -> 3.
                     let rollback_calls = operations.borrow();
                     Ok(result.is_err()
-                        && rollback_calls.len() == 4
-                        && memory.native_page_protections.is_empty()
+                        && rollback_calls.len() == 3
+                        && memory.native_prot_ranges.is_empty()
                         && memory.native_write_exec_writable_pages.is_empty()
                         && words_restored)
                 })
@@ -12131,18 +12137,25 @@ mod tests {
                 vec![(host_base, (4 * page) as usize, libc::PROT_READ)],
                 "a contiguous same-protection run must be ONE host mprotect call"
             );
-            // Per-page bookkeeping must be unchanged by syscall coalescing.
+            // Protection bookkeeping must be unchanged by syscall coalescing.
             for index in 0..4_u64 {
                 assert_eq!(
                     memory
-                        .native_page_protections
-                        .get(&(guest.raw() + index * page))
-                        .copied(),
+                        .native_prot_ranges
+                        .prot_at(guest.raw() + index * page),
                     Some(crate::linux_abi::LINUX_PROT_READ),
-                    "page {index} must keep its own protection entry"
+                    "page {index} must read back its protection override"
                 );
             }
-            assert_eq!(memory.native_page_protections.len(), 4);
+            assert_eq!(
+                memory.native_prot_ranges.overlaps(0, u64::MAX),
+                vec![(
+                    guest.raw(),
+                    guest.raw() + 4 * page,
+                    crate::linux_abi::LINUX_PROT_READ
+                )],
+                "the uniform run must coalesce into one stored interval"
+            );
         });
     }
 
@@ -12181,9 +12194,8 @@ mod tests {
             for index in 0..3_u64 {
                 assert_eq!(
                     memory
-                        .native_page_protections
-                        .get(&(guest.raw() + index * page))
-                        .copied(),
+                        .native_prot_ranges
+                        .prot_at(guest.raw() + index * page),
                     Some(prot),
                 );
             }
@@ -12245,12 +12257,28 @@ mod tests {
                 ],
                 "runs must split exactly at the non-contiguous page boundary"
             );
-            // Bookkeeping only for pages inside host-protected regions.
-            assert_eq!(memory.native_page_protections.len(), 4);
+            // Bookkeeping only for spans inside host-protected regions.
+            assert_eq!(
+                memory.native_prot_ranges.overlaps(0, u64::MAX),
+                vec![
+                    (
+                        guest.raw(),
+                        guest.raw() + 2 * page,
+                        crate::linux_abi::LINUX_PROT_READ
+                    ),
+                    (
+                        guest.raw() + 3 * page,
+                        guest.raw() + 5 * page,
+                        crate::linux_abi::LINUX_PROT_READ
+                    ),
+                ],
+                "override intervals must cover exactly the host-protected runs"
+            );
             assert!(
-                !memory
-                    .native_page_protections
-                    .contains_key(&(guest.raw() + 2 * page)),
+                memory
+                    .native_prot_ranges
+                    .prot_at(guest.raw() + 2 * page)
+                    .is_none(),
                 "the hole page must not gain a protection entry"
             );
         });
@@ -12278,9 +12306,9 @@ mod tests {
                 )
                 .expect("protect to region default");
             assert!(
-                memory.native_page_protections.is_empty(),
+                memory.native_prot_ranges.is_empty(),
                 "protecting to the region default must leave the sparse map empty, got {:?}",
-                memory.native_page_protections
+                memory.native_prot_ranges
             );
             assert!(
                 memory.native_range_allows(guest.raw(), (2 * page) as usize, false),
@@ -12314,7 +12342,7 @@ mod tests {
                 )
                 .expect("protect to non-default prot");
             assert_eq!(
-                memory.native_page_protections.get(&guest.raw()).copied(),
+                memory.native_prot_ranges.prot_at(guest.raw()),
                 Some(read_only),
                 "a non-default protection must be stored explicitly"
             );
@@ -12344,7 +12372,7 @@ mod tests {
                 )
                 .expect("protect to non-default prot");
             assert!(
-                memory.native_page_protections.contains_key(&guest.raw()),
+                memory.native_prot_ranges.prot_at(guest.raw()).is_some(),
                 "sanity: non-default protection must be stored before flipping back"
             );
             memory
@@ -12356,7 +12384,7 @@ mod tests {
                 )
                 .expect("protect back to default prot");
             assert!(
-                !memory.native_page_protections.contains_key(&guest.raw()),
+                memory.native_prot_ranges.prot_at(guest.raw()).is_none(),
                 "flipping back to the region default must remove the stored entry"
             );
             assert!(memory.native_range_allows(guest.raw(), page as usize, true));
@@ -12519,11 +12547,9 @@ mod tests {
                 biased_test_memory_with_geometry(guest, (3 * page) as usize, 16 * 1024);
             // Bookkeep all three pages as guest PROT_NONE so a supervisor
             // read must lift every page.
-            for index in 0..3_u64 {
-                memory
-                    .native_page_protections
-                    .insert(guest.raw() + index * page, 0);
-            }
+            memory
+                .native_prot_ranges
+                .set(guest.raw(), guest.raw() + 3 * page, 0);
             let calls = RefCell::new(Vec::new());
             let changed = memory
                 .prepare_temporary_host_access_with(
@@ -12561,15 +12587,19 @@ mod tests {
             let guest = carrick_guest_mem::GuestVa(0x40_0000);
             let mut memory =
                 biased_test_memory_with_geometry(guest, (3 * page) as usize, 16 * 1024);
-            memory.native_page_protections.insert(guest.raw(), 0);
+            memory
+                .native_prot_ranges
+                .set(guest.raw(), guest.raw() + page, 0);
             // Middle page is already readable: prepare must skip it and
             // split the mprotect runs around it.
+            memory.native_prot_ranges.set(
+                guest.raw() + page,
+                guest.raw() + 2 * page,
+                crate::linux_abi::LINUX_PROT_READ,
+            );
             memory
-                .native_page_protections
-                .insert(guest.raw() + page, crate::linux_abi::LINUX_PROT_READ);
-            memory
-                .native_page_protections
-                .insert(guest.raw() + 2 * page, 0);
+                .native_prot_ranges
+                .set(guest.raw() + 2 * page, guest.raw() + 3 * page, 0);
             let calls = RefCell::new(Vec::new());
             let changed = memory
                 .prepare_temporary_host_access_with(
@@ -12648,7 +12678,9 @@ mod tests {
             let mut memory = biased_test_memory_with_geometry(guest, page as usize, 16 * 1024);
             // Bookkeep the single page as guest PROT_NONE so EVERY accessor must
             // lift it before it can touch the backing.
-            memory.native_page_protections.insert(guest.raw(), 0);
+            memory
+                .native_prot_ranges
+                .set(guest.raw(), guest.raw() + page, 0);
             let host_base = memory.host_address(guest).expect("host base").raw();
             let host_page = 16 * 1024_usize;
             let rw = libc::PROT_READ | libc::PROT_WRITE;
@@ -12743,8 +12775,12 @@ mod tests {
             });
             // Bookkeep BOTH pages as guest PROT_NONE so both overlaps need a
             // lift.
-            memory.native_page_protections.insert(guest.raw(), 0);
-            memory.native_page_protections.insert(guest.raw() + page, 0);
+            memory
+                .native_prot_ranges
+                .set(guest.raw(), guest.raw() + page, 0);
+            memory
+                .native_prot_ranges
+                .set(guest.raw() + page, guest.raw() + 2 * page, 0);
 
             let host_base = memory.host_address(guest).expect("host base").raw();
             let host_page = 16 * 1024_usize;
@@ -12809,7 +12845,9 @@ mod tests {
             // BEFORE it calls `prepare_temporary_host_access`, so an unsupported
             // width never commits a `HostLift` refcount in the first place -- the
             // lift table must stay empty on this error path.
-            memory.native_page_protections.insert(guest.raw(), 0);
+            memory
+                .native_prot_ranges
+                .set(guest.raw(), guest.raw() + page, 0);
             let mut reservation = None;
             let error = memory
                 .exclusive_load_for(guest.raw(), 16, true, &mut reservation)
@@ -12841,7 +12879,9 @@ mod tests {
             // never commit a `HostLift` refcount. The reservation is hand-built
             // (rather than obtained via `exclusive_load_for`) so its
             // `location.width` matches the unsupported width this call passes.
-            memory.native_page_protections.insert(guest.raw(), 0);
+            memory
+                .native_prot_ranges
+                .set(guest.raw(), guest.raw() + page, 0);
             let mut reservation = Some(NativeExclusiveReservation {
                 location: NativeExclusiveLocation {
                     address: guest.raw(),
