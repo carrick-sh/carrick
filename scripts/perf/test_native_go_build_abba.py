@@ -1037,6 +1037,29 @@ class CampaignContractTest(unittest.TestCase):
                     "same-binary",
                 )
 
+    def test_same_binary_accepts_declared_default_off_one_opt_in(self):
+        receipt = self.receipt("control")
+        control = self.overlay()
+        candidate = self.overlay(CARRICK_DSR_PERSISTENT_STORE="1")
+
+        self.assertEqual(
+            native_go_build_abba.validate_arm_mode(
+                self.arm("A", receipt, control),
+                self.arm("B", receipt, candidate),
+            ),
+            "same-binary",
+        )
+
+        for invalid_candidate in (
+            self.overlay(CARRICK_DSR_PERSISTENT_STORE="0"),
+            self.overlay(CARRICK_DSR_DIRECT_BINDINGS="1"),
+        ):
+            with self.assertRaisesRegex(ValueError, "declared variant"):
+                native_go_build_abba.validate_arm_mode(
+                    self.arm("A", receipt, control),
+                    self.arm("B", receipt, invalid_candidate),
+                )
+
     def test_two_binary_mode_requires_separate_source_worktrees(self):
         control_receipt = self.receipt("control")
         candidate_receipt = dataclasses.replace(
