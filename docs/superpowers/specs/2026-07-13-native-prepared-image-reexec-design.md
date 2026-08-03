@@ -76,6 +76,18 @@ The capsule gains a typed `NativePreparedImageV1` record containing:
 - a SHA-256 identity over the artifact header, region table, and initialized
   payload bytes.
 
+> **Correction (2026-08-03):** the digest covers the artifact header, region
+> table, spans, and relocations — the METADATA — by default, not the payload
+> bytes. Hashing every payload byte on both sides cost ~1 ms/MB per side on
+> every guest exec (measured with `CARRICK_EXEC_STAMPS`, ~6-8 ms per exec of a
+> ~4 MB guest) while defending only against kernel/hardware corruption of an
+> unlinked same-lineage fd that has no reachable writer after the producer's
+> write — a coherence class this design already trusts ("a coherence contract,
+> not a crash-recovery contract"). The record itself additionally travels
+> inside the capsule, whose own SHA-256 still covers it. The exact escape
+> hatch `CARRICK_EXEC_FAST=0` restores full payload coverage on both sides
+> (`ArtifactDigestCoverage` in `carrick-dsr/src/prepared_image.rs`).
+
 The record contains no Rust object dump and no raw pointer. Every address is a
 typed guest address or artifact offset validated against the declared geometry.
 The artifact is internal and version-locked to the producing Carrick binary.
@@ -148,7 +160,9 @@ identity and size with `fstat`. It does not add a stable-storage flush or a
 second pre-exec payload read: the private inherited file has a coherence
 contract, not a crash-recovery contract. It then clears `FD_CLOEXEC` on the
 capsule, prepared-image fd, xsignal fd, and approved guest survivors. The fresh
-process performs the independent payload digest before mapping.
+process recomputes and compares the metadata digest before mapping (the
+independent payload digest is hatch-only — see the 2026-08-03 correction
+above).
 
 If artifact construction or its pre-exec self-validation fails, Carrick uses
 the existing digest-bound fresh reload path. If host `execve` returns, Carrick

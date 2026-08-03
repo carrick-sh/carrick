@@ -272,6 +272,19 @@ impl NativePreparedImageV1 {
         self.artifact_fd = artifact_fd;
         self
     }
+
+    /// Flip one digest-covered METADATA byte (the first auxv byte) without
+    /// disturbing structural validity — the fixture for "a tampered record is
+    /// fatal on resume" now that payload bytes are outside the default digest.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_flipped_auxv_byte_for_test(mut self) -> Self {
+        assert!(
+            !self.auxv.is_empty(),
+            "metadata-corruption fixture needs a non-empty auxv image"
+        );
+        self.auxv[0] ^= 0xff;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -535,11 +548,63 @@ pub fn native_region_copy_window(
     offset..region.bytes().len()
 }
 
+/// What the prepared-image artifact digest covers.
+///
+/// The artifact is an unlinked kernel tempfile whose fd crosses exactly one
+/// `execve` within one process lineage: after the producer's write there is no
+/// reachable writer (guest siblings are terminated before the point of no
+/// return, the file has no path, and the record's metadata travels inside the
+/// capsule, which carries its own SHA-256). Hashing every payload byte on both
+/// sides cost ~1 ms/MB per side on every guest exec while defending only
+/// against kernel/hardware corruption — a coherence class this transport
+/// already trusts (it deliberately takes no stable-storage flush). The default
+/// digest therefore covers the metadata table only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactDigestCoverage {
+    /// Default: header, region table, spans, ro-spans, and relocations.
+    Metadata,
+    /// Legacy full coverage (metadata + every initialized payload byte),
+    /// restored by the exact escape hatch `CARRICK_EXEC_FAST=0`.
+    MetadataAndPayload,
+}
+
+/// Resolve the digest coverage from the inherited environment. Producer and
+/// consumer run in the same process lineage (the consumer IS the producer
+/// after `execve`, with the environment copied verbatim), so both sides
+/// always resolve the same coverage.
+pub fn artifact_digest_coverage() -> ArtifactDigestCoverage {
+    artifact_digest_coverage_from(std::env::var_os("CARRICK_EXEC_FAST").as_deref())
+}
+
+fn artifact_digest_coverage_from(value: Option<&std::ffi::OsStr>) -> ArtifactDigestCoverage {
+    if value.is_some_and(|v| v == "0") {
+        ArtifactDigestCoverage::MetadataAndPayload
+    } else {
+        ArtifactDigestCoverage::Metadata
+    }
+}
+
 pub fn prepare(
     image: &AddressSpace,
     relocations: &[NativeRelativeRelocation],
     host_page_size: u64,
     executable: Option<PreparedExecutableBacking>,
+) -> Result<PreparedImageDisposition, NativePreparedImageError> {
+    prepare_with_coverage(
+        image,
+        relocations,
+        host_page_size,
+        executable,
+        artifact_digest_coverage(),
+    )
+}
+
+fn prepare_with_coverage(
+    image: &AddressSpace,
+    relocations: &[NativeRelativeRelocation],
+    host_page_size: u64,
+    executable: Option<PreparedExecutableBacking>,
+    coverage: ArtifactDigestCoverage,
 ) -> Result<PreparedImageDisposition, NativePreparedImageError> {
     prepare_with_limits(
         image,
@@ -547,6 +612,7 @@ pub fn prepare(
         host_page_size,
         executable,
         PreparedImageLimits::v1(),
+        coverage,
     )
 }
 
@@ -556,6 +622,7 @@ fn prepare_with_limits(
     host_page_size: u64,
     executable: Option<PreparedExecutableBacking>,
     limits: PreparedImageLimits,
+    coverage: ArtifactDigestCoverage,
 ) -> Result<PreparedImageDisposition, NativePreparedImageError> {
     if image.regions().len() > limits.max_regions {
         return Ok(ineligible_limit(
@@ -902,7 +969,9 @@ fn prepare_with_limits(
                 stage: "write-initialized-span",
                 source,
             })?;
-        hasher.update(payload);
+        if coverage == ArtifactDigestCoverage::MetadataAndPayload {
+            hasher.update(payload);
+        }
     }
     record.digest = hasher.finalize().into();
     let final_identity =
@@ -924,6 +993,13 @@ fn prepare_with_limits(
 
 pub fn validate_for_resume(
     record: NativePreparedImageV1,
+) -> Result<ValidatedPreparedImage, NativePreparedImageError> {
+    validate_for_resume_with_coverage(record, artifact_digest_coverage())
+}
+
+fn validate_for_resume_with_coverage(
+    record: NativePreparedImageV1,
+    coverage: ArtifactDigestCoverage,
 ) -> Result<ValidatedPreparedImage, NativePreparedImageError> {
     let inherited = RawFdGuard(record.artifact_fd);
     let duplicate = unsafe { libc::fcntl(inherited.0, libc::F_DUPFD_CLOEXEC, 0) };
@@ -996,7 +1072,10 @@ pub fn validate_for_resume(
     };
 
     validate_record(&record, &duplicate_identity)?;
-    let actual_digest = digest_with_file_payload(&record, &file)?;
+    let actual_digest: [u8; 32] = match coverage {
+        ArtifactDigestCoverage::Metadata => digest_metadata(&record).finalize().into(),
+        ArtifactDigestCoverage::MetadataAndPayload => digest_with_file_payload(&record, &file)?,
+    };
     if actual_digest != record.digest {
         return Err(NativePreparedImageError::ChecksumMismatch {
             expected: record.digest,
@@ -1756,6 +1835,23 @@ mod tests {
         }
     }
 
+    fn prepared_with_coverage(coverage: ArtifactDigestCoverage) -> PreparedImageArtifact {
+        match prepare_with_coverage(
+            &synthetic_image(),
+            &relocations(),
+            HOST_PAGE_SIZE,
+            None,
+            coverage,
+        )
+        .expect("prepare sparse artifact")
+        {
+            PreparedImageDisposition::Prepared(artifact) => *artifact,
+            PreparedImageDisposition::Ineligible(reason) => {
+                panic!("synthetic image unexpectedly ineligible: {reason:?}")
+            }
+        }
+    }
+
     fn duplicate_for_resume(artifact: &PreparedImageArtifact) -> NativePreparedImageV1 {
         let mut record = artifact.record.clone();
         let duplicate = unsafe { libc::fcntl(record.artifact_fd, libc::F_DUPFD, 0) };
@@ -2041,6 +2137,7 @@ mod tests {
             HOST_PAGE_SIZE,
             None,
             limits,
+            ArtifactDigestCoverage::Metadata,
         )
         .expect("limit selection is not an artifact error");
         assert!(matches!(
@@ -2161,7 +2258,18 @@ mod tests {
     }
 
     #[test]
-    fn prepared_image_checksum_detects_initialized_byte_changes() {
+    fn prepared_image_payload_bytes_are_not_covered_by_default() {
+        // The artifact travels as an unlinked same-lineage fd: after the
+        // producer's write there is no reachable writer (siblings are
+        // terminated before the point of no return, the fd has no path, and
+        // the record's metadata is independently covered by the capsule's own
+        // SHA-256). Re-reading and re-hashing every payload byte on resume
+        // cost ~1 ms/MB on every guest exec while defending only against
+        // kernel/hardware corruption — a coherence class the transport
+        // already trusts (it deliberately takes no stable-storage flush).
+        // The DEFAULT digest therefore covers metadata only; payload
+        // corruption is NOT detected unless the CARRICK_EXEC_FAST=0 hatch
+        // restores full coverage (test below).
         if !host_page_geometry_matches_fixtures() {
             return;
         }
@@ -2178,10 +2286,74 @@ mod tests {
             .write_all_at(&byte, span.artifact_offset.get())
             .unwrap();
         let record = duplicate_for_resume(&artifact);
+        assert!(validate_for_resume(record).is_ok());
+    }
+
+    #[test]
+    fn prepared_image_metadata_changes_still_fail_the_default_digest() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
+        let artifact = prepared();
+        let mut record = duplicate_for_resume(&artifact);
+        // A metadata mutation that survives structural validation: swap the
+        // recorded relocation VALUES (addresses stay ordered and in range).
+        assert!(record.relocations.len() >= 2);
+        let value_a = record.relocations[0].value();
+        let value_b = record.relocations[1].value();
+        let address_a = record.relocations[0].address();
+        let address_b = record.relocations[1].address();
+        record.relocations[0] = NativeRelativeRelocation::new(address_a, value_b);
+        record.relocations[1] = NativeRelativeRelocation::new(address_b, value_a);
         assert!(matches!(
             validate_for_resume(record),
             Err(NativePreparedImageError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn prepared_image_hatch_restores_payload_coverage() {
+        if !host_page_geometry_matches_fixtures() {
+            return;
+        }
+        let artifact = prepared_with_coverage(ArtifactDigestCoverage::MetadataAndPayload);
+        let span = &artifact.record.initialized_spans[0];
+        let mut byte = [0_u8; 1];
+        artifact
+            .file
+            .read_exact_at(&mut byte, span.artifact_offset.get())
+            .unwrap();
+        byte[0] ^= 0xff;
+        artifact
+            .file
+            .write_all_at(&byte, span.artifact_offset.get())
+            .unwrap();
+        let record = duplicate_for_resume(&artifact);
+        assert!(matches!(
+            validate_for_resume_with_coverage(record, ArtifactDigestCoverage::MetadataAndPayload),
+            Err(NativePreparedImageError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn artifact_digest_coverage_hatch_is_exactly_zero() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            artifact_digest_coverage_from(None),
+            ArtifactDigestCoverage::Metadata
+        );
+        assert_eq!(
+            artifact_digest_coverage_from(Some(OsStr::new("1"))),
+            ArtifactDigestCoverage::Metadata
+        );
+        assert_eq!(
+            artifact_digest_coverage_from(Some(OsStr::new(""))),
+            ArtifactDigestCoverage::Metadata
+        );
+        assert_eq!(
+            artifact_digest_coverage_from(Some(OsStr::new("0"))),
+            ArtifactDigestCoverage::MetadataAndPayload
+        );
     }
 
     #[test]

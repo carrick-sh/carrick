@@ -353,6 +353,7 @@ pub(crate) fn begin_guest_exec(
         unsafe { libc::getpid() },
         crate::probes::DsrCacheLifecyclePhase::HostSelfReexecCapsulePrepareBegin,
     );
+    crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::CapsulePrepare);
     let executable = std::env::current_exe()?;
     let native_page_profile = match plan.page_geometry.native_profile {
         Some(carrick_spec::NativePageProfile::Native16k) => {
@@ -762,6 +763,7 @@ where
         unsafe { libc::getpid() },
         crate::probes::DsrCacheLifecyclePhase::HostSelfReexecBegin,
     );
+    crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::PreExec);
     let exec_error = invoke_exec(HostExecRequest {
         executable: &executable_c,
         argv: &argv_ptrs,
@@ -882,6 +884,7 @@ fn restore_host_fd_flags(prepared: &[(i32, i32)]) {
 }
 
 pub(crate) fn resume(fd: RawFd, nonce_hex: &str) -> anyhow::Result<crate::NativeSelfReexecOutcome> {
+    crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::ResumeEntry);
     let current_pid = unsafe { libc::getpid() };
     emit_lifecycle(
         current_pid,
