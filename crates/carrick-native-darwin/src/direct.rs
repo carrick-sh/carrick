@@ -1244,6 +1244,29 @@ fn b_in_range(delta: i64) -> bool {
     (-B_RANGE..B_RANGE).contains(&delta)
 }
 
+/// Placement-hint cursor for tier D's kernel-placed EXECUTABLE mappings
+/// (`MAP_JIT` images and windows).
+///
+/// Unhinted, the kernel packs them into the crowded low region near the
+/// binary and dyld's neighbors, where the hint-probed placements that must
+/// land within ±128 MiB of patched text — a `MAP_FIXED` window's island
+/// arena, a clone child's parked-entry stub — can find NO free slot: an
+/// address-layout-probabilistic fail-closed refusal (observed ~1/25 under
+/// machine load). Hinting the text itself into sparse space makes those
+/// neighborhoods empty. Probed on this host: `MAP_JIT` honors hints at
+/// 36 GiB and 3 TiB; the cursor starts at 1 TiB, far from the data-side
+/// reservation cursor. A hint only — when the kernel relocates, behavior is
+/// exactly the unhinted path, and every branch stays range-checked.
+static EXEC_HINT_CURSOR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x100_0000_0000);
+
+/// Claim the next sparse hint for a mapping of `len` bytes (rounded, plus a
+/// page of slack so consecutive mappings never abut exactly).
+fn next_exec_hint(len: usize) -> u64 {
+    let step = (len.next_multiple_of(HOST_PAGE) + HOST_PAGE) as u64;
+    EXEC_HINT_CURSOR.fetch_add(step, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One loaded, patched, directly-executable guest mapping.
 ///
 /// An image never stands alone: it is a member of a [`DirectLoadGroup`],
@@ -1819,11 +1842,12 @@ impl DirectLoadGroup {
         let island_budget = 64 * 1024 + segments.iter().map(|s| s.2).sum::<usize>();
         let len = ((hi - lo) as usize + island_budget).next_multiple_of(16 * 1024);
 
-        // SAFETY: kernel-chosen address, MAP_JIT as probed to be the only way
-        // to obtain writable-then-executable pages under Darwin's W^X policy.
+        // SAFETY: sparse-hinted address (the kernel relocates freely — see
+        // EXEC_HINT_CURSOR), MAP_JIT as probed to be the only way to obtain
+        // writable-then-executable pages under Darwin's W^X policy.
         let base = unsafe {
             libc::mmap(
-                std::ptr::null_mut(),
+                next_exec_hint(len) as usize as *mut libc::c_void,
                 len,
                 libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
                 libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
@@ -1910,13 +1934,14 @@ impl DirectLoadGroup {
         let window_len = len.next_multiple_of(HOST_PAGE);
         let island_budget = 64 * 1024 + ranges.iter().map(|(_, size)| size).sum::<usize>();
         let total = (window_len + island_budget).next_multiple_of(HOST_PAGE);
-        // SAFETY: kernel-chosen address; MAP_JIT is the only way to obtain
+        // SAFETY: sparse-hinted address (EXEC_HINT_CURSOR; the kernel
+        // relocates freely); MAP_JIT is the only way to obtain
         // writable-then-executable pages under Darwin's W^X policy. A file
-        // mmap without MAP_FIXED is free to land anywhere, so the kernel's
-        // choice IS a correct mmap result.
+        // mmap without MAP_FIXED is free to land anywhere, so any placement
+        // IS a correct mmap result.
         let base = unsafe {
             libc::mmap(
-                std::ptr::null_mut(),
+                next_exec_hint(total) as usize as *mut libc::c_void,
                 total,
                 libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
                 libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,

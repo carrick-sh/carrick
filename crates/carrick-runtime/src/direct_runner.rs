@@ -1326,19 +1326,35 @@ impl DirectRunner {
                 // group alive across it — so both pointers outlive this
                 // thread.
                 let (runner, group) = unsafe { (&*runner_ptr.0, &*group_ptr.0) };
-                let Ok(guard) = InstalledThreadSlots::install(slots) else {
-                    // The child never ran a guest instruction: retire it so
-                    // a joiner is not left waiting on a tid that will never
-                    // clear.
+                // A child that cannot ENTER is a process-level failure, not
+                // a quiet thread death: the guest was told the clone
+                // succeeded, so a thread that never runs its first
+                // instruction is silent corruption (the pthread_join
+                // "succeeds", the thread's work never happened — exactly
+                // the shape a load-coupled stub-placement refusal produced,
+                // 1/25 as an empty-stdout flake). Fail LOUD: name the
+                // reason as the process outcome, then retire the tid so a
+                // joiner still unblocks and the run can end.
+                let fail_closed = |what: String| {
+                    runner.end_process(DirectRunOutcome::Unsupported {
+                        syscall: 220,
+                        outcome: what,
+                    });
                     runner.finish_thread_bookkeeping(tid, 0);
-                    return;
+                };
+                let guard = match InstalledThreadSlots::install(slots) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        fail_closed(format!("clone child slot install failed: {error}"));
+                        return;
+                    }
                 };
                 let _thread_ctx = install_thread_context(runner, group, tid);
                 // SAFETY: the parked context was seeded from the parent's
                 // state at a patched svc site of this group, and the guest
                 // leaves through the handler.
-                if unsafe { group.enter_parked() }.is_err() {
-                    runner.finish_thread_bookkeeping(tid, 0);
+                if let Err(error) = unsafe { group.enter_parked() } {
+                    fail_closed(format!("clone child parked entry failed: {error}"));
                 }
                 drop(guard);
             });
