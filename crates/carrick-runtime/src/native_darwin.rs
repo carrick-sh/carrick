@@ -1117,6 +1117,7 @@ pub(crate) fn resume_guest_from_capsule(
     native_reexec_lifecycle(
         carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecDispatcherReady,
     );
+    crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::DispatcherReady);
     let prepared_image = guest.prepared_image.take();
     let executable_digest = guest.executable_digest;
     let resumed = select_resumed_image(prepared_image, executable_digest, || {
@@ -1927,6 +1928,9 @@ fn run_image_in_current_process(
     // setitimer; the OnceLock handle is inherited by forked children and
     // resolves the CURRENT process's kicker at fire time.
     crate::timer_delivery::register_delivery(Arc::new(NativeTimerDelivery));
+    if process_entry == NativeCurrentProcessEntry::SelfReexecRestore {
+        crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::RuntimeReady);
+    }
     match run_native_thread_loop(
         dispatcher,
         memory,
@@ -2038,6 +2042,7 @@ fn map_current_process_image_source(
         native_reexec_lifecycle(
             carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecGuestEntry,
         );
+        crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::ImageMapped);
     }
     Ok(mapped)
 }
@@ -3598,6 +3603,7 @@ fn run_native_dsr_thread_loop_profiled<const PROFILE: bool>(
                     native_reexec_lifecycle(
                         carrick_dsr::probes::DsrCacheLifecyclePhase::HostSelfReexecPreflightBegin,
                     );
+                    crate::exec_stamps::stamp(crate::exec_stamps::ExecStampPhase::ExecveDispatch);
                 }
                 let capsule_env = env.clone();
                 let proc_argv: Vec<String> = argv
